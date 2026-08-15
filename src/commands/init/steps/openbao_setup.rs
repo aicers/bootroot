@@ -33,7 +33,6 @@ use crate::cli::args::InitArgs;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::container_name::BootrootContainer;
-use crate::commands::guardrails::COMPOSE_OVERRIDE_MODE;
 use crate::commands::infra::run_compose;
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -798,7 +797,7 @@ async fn write_openbao_agent_files(
     fs_util::atomic_replace_through_symlink(
         &stepca_agent_config,
         stepca_config.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| {
@@ -807,7 +806,7 @@ async fn write_openbao_agent_files(
     fs_util::atomic_replace_through_symlink(
         &responder_agent_config,
         responder_config.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| {
@@ -907,13 +906,13 @@ services:
         secrets_path = mount_root.display(),
         user = user
     );
-    // Published by rename, not flushed, at the destination's mode or the
-    // umask's `0644` on a create — the compose-override decisions
+    // Published by rename, not flushed, at the destination's mode or
+    // the umask's answer on a create — the compose-override decisions
     // `crate::commands::guardrails` records.
     fs_util::atomic_replace_through_symlink(
         &override_path,
         contents.as_bytes(),
-        fs_util::preserved_mode(&override_path, COMPOSE_OVERRIDE_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
@@ -925,9 +924,13 @@ services:
 ///
 /// See the call site for why both decisions go this way.
 async fn write_agent_credential(path: &Path, value: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_write(path, value.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
+    fs_util::atomic_write(
+        path,
+        value.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }
 
 pub(super) fn apply_openbao_agent_compose_override(

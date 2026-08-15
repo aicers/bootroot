@@ -279,9 +279,13 @@ async fn write_remote_bootstrap_artifact_file(
     // operator cannot run the bootstrap and cannot get that token back
     // either, so `service add --remote` has to be re-run against a
     // freshly issued one.
-    fs_util::atomic_write(&artifact_path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
+    fs_util::atomic_write(
+        &artifact_path,
+        payload.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&artifact_path.display().to_string()))?;
     let remote_run_command = render_remote_run_command(artifact);
     Ok(RemoteBootstrapResult {
         bootstrap_file: artifact_path.display().to_string(),

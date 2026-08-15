@@ -17,7 +17,6 @@ use super::InitSecrets;
 use crate::cli::args::{InitArgs, InitSkipPhase};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
-use crate::commands::guardrails::COMPOSE_OVERRIDE_MODE;
 use crate::commands::infra::run_compose;
 use crate::i18n::Messages;
 
@@ -53,7 +52,7 @@ pub(super) async fn write_responder_files(
     fs_util::atomic_replace_through_symlink(
         &template_path,
         template.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
@@ -63,7 +62,7 @@ pub(super) async fn write_responder_files(
     fs_util::atomic_replace_through_symlink(
         &config_path,
         config.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
@@ -176,8 +175,8 @@ services:
         dir = config_dir.display(),
         file_name = file_name,
     );
-    // Published by rename, not flushed, at the destination's mode or the
-    // umask's `0644` on a create — the same three decisions the
+    // Published by rename, not flushed, at the destination's mode or
+    // the umask's answer on a create — the same three decisions the
     // exposure overrides in `crate::commands::guardrails` record, for
     // the same reader: `docker compose` parses this file on every
     // invocation, and it is regenerated from `state.json` by the `init`
@@ -185,7 +184,7 @@ services:
     fs_util::atomic_replace_through_symlink(
         &override_path,
         contents.as_bytes(),
-        fs_util::preserved_mode(&override_path, COMPOSE_OVERRIDE_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;

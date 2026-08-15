@@ -66,7 +66,7 @@ pub(super) async fn write_stepca_templates(
     fs_util::atomic_replace_through_symlink(
         &password_template_path,
         password_template.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| {
@@ -89,7 +89,7 @@ pub(super) async fn write_stepca_templates(
     fs_util::atomic_replace_through_symlink(
         &ca_json_template_path,
         ca_json_template.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| {
@@ -101,17 +101,6 @@ pub(super) async fn write_stepca_templates(
         ca_json_template_path,
     })
 }
-
-/// Fallback mode for a `ca.json` with no destination to read one from.
-///
-/// Every publisher of this file reads it first, so the fallback is
-/// unreachable in practice — but a staged publish has to state a mode.
-/// `0644` is what the umask gave the truncating writes these replaced,
-/// and is the mode `step ca init` leaves on the file it creates. Shared
-/// so the three places that patch `ca.json` — here, the `init`
-/// orchestrator's password rotation, and `bootroot ca update` — cannot
-/// drift on it.
-pub(crate) const CA_JSON_FILE_MODE: u32 = 0o644;
 
 /// Publishes a patched `ca.json` by rename, at the mode it already
 /// carries.
@@ -128,11 +117,15 @@ pub(crate) const CA_JSON_FILE_MODE: u32 = 0o644;
 /// template — so a crash that loses the entry costs the next render
 /// rather than anything unrecoverable. This mirrors the decision
 /// `crate::commands::ca`'s patcher records for the same file.
+///
+/// `step ca init` is what creates `ca.json`, and every publisher here
+/// reads it before writing, so the mode is always the destination's own
+/// and [`fs_util::StagedMode::PreserveOrUmask`]'s create arm never runs.
 async fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
     fs_util::atomic_replace_through_symlink(
         path,
         contents.as_bytes(),
-        fs_util::preserved_mode(path, CA_JSON_FILE_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
@@ -432,9 +425,13 @@ pub(super) async fn write_password_file_with_backup(
     // intermediate CA keys sitting beside it; a crash that loses the
     // directory entry after step-ca has been handed it leaves keys
     // nobody can open, which no re-run of `init` reconstructs.
-    fs_util::atomic_write(&password_path, password.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&password_path.display().to_string()))?;
+    fs_util::atomic_write(
+        &password_path,
+        password.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&password_path.display().to_string()))?;
     Ok(RollbackFile {
         path: password_path,
         original,

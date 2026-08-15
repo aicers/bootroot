@@ -452,7 +452,7 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
 /// same-directory temp file + atomic rename closes the window: a
 /// reader sees either the previous file or the fully written new one.
 ///
-/// The supplied `mode` is applied to the staged file before the
+/// The mode [`StagedMode`] resolves to is on the staged file before the
 /// rename so the on-disk mode never changes after the file appears at
 /// `path`. When `path` already exists, the existing uid/gid is also
 /// re-applied to the staged file before the rename so the caller does
@@ -471,7 +471,7 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
 /// Returns an error if the temp file cannot be created, written,
 /// permissioned, chowned (when ownership preservation is needed),
 /// renamed, or if the containing directory cannot be flushed.
-pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub async fn atomic_write(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
     // Owned once, to move into the blocking task. The blocking half
     // borrows, so this is the only copy either path makes.
     let dest = path.to_path_buf();
@@ -496,7 +496,7 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: u32) -> Result<()>
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
-pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
     publish_staged_blocking(
         path,
         contents,
@@ -525,7 +525,7 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`],
 /// except that no directory flush is attempted.
-pub async fn atomic_replace(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub async fn atomic_replace(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
     // Owned once, to move into the blocking task, exactly as
     // `atomic_write` does.
     let dest = path.to_path_buf();
@@ -544,7 +544,7 @@ pub async fn atomic_replace(path: &Path, contents: &[u8], mode: u32) -> Result<(
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_replace`].
-pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
     publish_staged_blocking(
         path,
         contents,
@@ -597,7 +597,11 @@ pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: u32) -> Resul
 /// Returns an error under the same conditions as [`atomic_write`], or
 /// if the destination's symlink chain cannot be resolved (a cycle, or
 /// an unreadable link).
-pub async fn atomic_write_through_symlink(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub async fn atomic_write_through_symlink(
+    path: &Path,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
     let dest = path.to_path_buf();
     let payload = contents.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -616,7 +620,7 @@ pub async fn atomic_write_through_symlink(path: &Path, contents: &[u8], mode: u3
 pub fn atomic_write_through_symlink_blocking(
     path: &Path,
     contents: &[u8],
-    mode: u32,
+    mode: StagedMode,
 ) -> Result<()> {
     atomic_write_blocking(&resolve_symlink_destination(path)?, contents, mode)
 }
@@ -631,7 +635,11 @@ pub fn atomic_write_through_symlink_blocking(
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_replace`], or
 /// if the destination's symlink chain cannot be resolved.
-pub async fn atomic_replace_through_symlink(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+pub async fn atomic_replace_through_symlink(
+    path: &Path,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
     let dest = path.to_path_buf();
     let payload = contents.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -650,30 +658,91 @@ pub async fn atomic_replace_through_symlink(path: &Path, contents: &[u8], mode: 
 pub fn atomic_replace_through_symlink_blocking(
     path: &Path,
     contents: &[u8],
-    mode: u32,
+    mode: StagedMode,
 ) -> Result<()> {
     atomic_replace_blocking(&resolve_symlink_destination(path)?, contents, mode)
 }
 
-/// The mode a staged publish should apply at `path`: the mode the file
-/// already carries, or `default_mode` when there is no file to read one
-/// from.
+/// Where the mode of the inode a staged publish renames into place
+/// comes from.
 ///
 /// A truncating write left an existing destination's mode alone and let
-/// the umask decide a fresh create's. A rename installs a *fresh* inode
-/// that inherits neither, so every publish replacing such a write has to
-/// state a mode — and stating a constant would silently re-widen a file
-/// an operator narrowed by hand, or that a restrictive umask created
-/// narrow. Reading the destination's own mode back keeps the rewrite
-/// case byte-for-byte as it was; `default_mode` covers only the create,
-/// which is the one case a host with a non-default umask can observe.
+/// the umask decide a fresh create's: `open(2)` asks for `0666` and the
+/// kernel subtracts the process umask. A rename installs a *fresh*
+/// inode that inherits neither, so every publish replacing such a write
+/// has to say where its mode comes from — and naming one constant would
+/// silently re-widen a file an operator narrowed by hand, or that a
+/// restrictive umask created narrow.
 ///
-/// Not for a file with a mode policy of its own — a key, a certificate,
-/// the two `init` outputs — where the policy's constant is the answer
-/// and a stale mode on disk must not outlive it.
-#[must_use]
-pub fn preserved_mode(path: &Path, default_mode: u32) -> u32 {
-    std::fs::metadata(path).map_or(default_mode, |meta| meta.permissions().mode() & 0o7777)
+/// The three answers below are the three things a file in this crate
+/// can have to say about its mode. Only [`StagedMode::Policy`] is a
+/// decision about the file's contents; the other two exist to reproduce,
+/// across a rename, what the truncating write got from the environment
+/// for free.
+#[derive(Clone, Copy)]
+pub enum StagedMode {
+    /// The file has a mode policy: apply exactly this, on create and on
+    /// rewrite alike.
+    ///
+    /// For a key, a certificate, the two `init` outputs,
+    /// `rotation-state.json` — anything whose mode is a property of what
+    /// it holds rather than of the host it was created on. A stale mode
+    /// on disk must not outlive the policy, so the constant is
+    /// re-asserted on every publish.
+    Policy(u32),
+    /// No policy. An existing destination keeps its own mode; a fresh
+    /// create takes what `open(2)` gives `0666` under the process umask
+    /// — exactly what the truncating write this machinery replaced
+    /// produced.
+    ///
+    /// For the files bootroot renders whose mode nobody decided:
+    /// `state.json`, `ca.json`, `openbao.hcl`, the compose overrides,
+    /// `init`'s rollback restore. A host with a restrictive umask
+    /// created these narrow and must keep getting them narrow.
+    PreserveOrUmask,
+    /// No policy on rewrite, but a stated create mode: an existing
+    /// destination keeps its own mode; a fresh create takes exactly
+    /// this, umask or no umask.
+    ///
+    /// For a file whose create mode has to be at least as narrow as any
+    /// umask would make it — the `0600` `agent.toml` editors, `.env`
+    /// with its `POSTGRES_PASSWORD` — while an operator who widened the
+    /// destination by hand keeps that choice across every later
+    /// rewrite.
+    PreserveOrCreate(u32),
+}
+
+/// The mode a staged temporary is created at before the destination's
+/// own mode, or a stated one, is applied to it by `chmod`.
+///
+/// Narrow deliberately: the publish is only observable at its final
+/// mode because the file spends its whole widening at a temporary name.
+const STAGED_CREATE_MODE: u32 = 0o600;
+
+/// What `open(2)` is asked for when the umask is to decide, matching
+/// the truncating write this machinery replaced.
+const STAGED_OPEN_MODE: u32 = 0o666;
+
+impl StagedMode {
+    /// The mode to `chmod` the staged temporary to, or `None` when the
+    /// umask is the answer and the temporary must instead be *created*
+    /// at [`STAGED_OPEN_MODE`].
+    ///
+    /// A destination that cannot be stat'd is treated as absent: the
+    /// staged publish that follows reports the real error, and guessing
+    /// a mode here would only replace it with a worse one.
+    fn resolve(self, path: &Path) -> Option<u32> {
+        let existing = || {
+            std::fs::metadata(path)
+                .map(|meta| meta.permissions().mode() & 0o7777)
+                .ok()
+        };
+        match self {
+            StagedMode::Policy(mode) => Some(mode),
+            StagedMode::PreserveOrCreate(create_mode) => Some(existing().unwrap_or(create_mode)),
+            StagedMode::PreserveOrUmask => existing(),
+        }
+    }
 }
 
 /// Who owns the inode a staged publish renames into place.
@@ -775,16 +844,25 @@ pub enum StagedDurability {
 /// calling in with [`StagedOwner::PolicyGroup`] for the three files the
 /// `--cert-group` policy owns.
 ///
-/// The staged file is created by `tempfile` at `0600` and reaches
-/// `mode` only while it is still at its temporary name, so a wider
-/// `mode` is never observable at the destination — the property issue
-/// #593 asked of the key file, and which now holds for every caller.
-/// The chown runs before the chmod for the same reason: nothing may
-/// sit group-readable under the writer's primary gid, even at the
-/// temporary name, before the policy's gid lands. The staged file is
-/// `fsync`ed last of all, once both have been applied, so a publish
-/// that survives a crash carries the ownership and mode it was
-/// published with rather than the temporary's defaults.
+/// The staged file is created at `0600` and reaches its final mode only
+/// while it is still at its temporary name, so a wider mode is never
+/// observable at the destination — the property issue #593 asked of the
+/// key file, and which now holds for every caller. The chown runs
+/// before the chmod for the same reason: nothing may sit group-readable
+/// under the writer's primary gid, even at the temporary name, before
+/// the policy's gid lands. The staged file is `fsync`ed last of all,
+/// once both have been applied, so a publish that survives a crash
+/// carries the ownership and mode it was published with rather than the
+/// temporary's defaults.
+///
+/// [`StagedMode::PreserveOrUmask`]'s create arm is the one exception,
+/// and has to be: `chmod` ignores the umask, so a mode the umask decided
+/// cannot be reached by applying one afterwards. There the temporary is
+/// *created* asking for `0666` — `tempfile` passes the requested
+/// permissions to `OpenOptions::mode`, so the kernel subtracts the umask
+/// at `open(2)` exactly as the truncating write's `O_CREAT` did — and no
+/// chmod runs at all, which leaves nothing to be observed at a wider
+/// mode either.
 ///
 /// The temporary is removed if any step before the rename fails
 /// (`NamedTempFile` deletes on drop), so a failed publish leaves
@@ -797,12 +875,18 @@ pub enum StagedDurability {
 pub fn publish_staged_blocking(
     path: &Path,
     contents: &[u8],
-    mode: u32,
+    mode: StagedMode,
     owner: StagedOwner,
     durability: StagedDurability,
 ) -> Result<()> {
     let parent = parent_dir(path);
-    let mut tmp = tempfile::NamedTempFile::new_in(&parent)
+    // Resolved before the temporary exists: the umask arm has to be
+    // answered by the `open(2)` that creates it, not by a later chmod.
+    let final_mode = mode.resolve(path);
+    let create_mode = final_mode.map_or(STAGED_OPEN_MODE, |_| STAGED_CREATE_MODE);
+    let mut tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(create_mode))
+        .tempfile_in(&parent)
         .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
     tmp.as_file_mut()
         .write_all(contents)
@@ -838,14 +922,15 @@ pub fn publish_staged_blocking(
         }
         StagedOwner::PolicyGroup(None) => {}
     }
-    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode)).with_context(
-        || {
-            format!(
-                "Failed to set mode {mode:o} on temp file for {}",
-                path.display()
-            )
-        },
-    )?;
+    if let Some(final_mode) = final_mode {
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(final_mode))
+            .with_context(|| {
+                format!(
+                    "Failed to set mode {final_mode:o} on temp file for {}",
+                    path.display()
+                )
+            })?;
+    }
     // Last of the three, after the bytes *and* the uid/gid/mode: `fsync`
     // persists the whole inode, so a flush taken before the chown and
     // the chmod leaves those two changes in memory only. A crash could
@@ -983,6 +1068,69 @@ pub async fn write_ca_bundle(
         .await
         .with_context(|| format!("Failed to create CA bundle dir {}", bundle_dir.display()))?;
     cert_group::write_bundle_file(bundle_path, bundle_pem, policy).await
+}
+
+/// Marker that tells a re-executed test binary it is the isolated child
+/// rather than the parent that spawned it.
+const UMASK_CHILD_MARKER: &str = "BOOTROOT_UMASK_TEST_CHILD";
+
+/// Runs `test_name` — one test of the *calling* test executable — in a
+/// child process of its own, and answers whether it did.
+///
+/// `umask` is a property of the process, not of a thread, so a test that
+/// sets one sets it for every test the harness happens to be running
+/// beside it: the window covers every file those tests create, and no
+/// lock held by the setter can close it, since the tests it would race
+/// take no such lock. Making the umask-dependent test its own process is
+/// the only isolation that actually holds. Both bootroot test
+/// executables have exactly one such test, and each opens with
+///
+/// ```ignore
+/// if fs_util::umask_test_ran_in_child("module::tests::the_test_name") {
+///     return;
+/// }
+/// ```
+///
+/// which is `true` in the parent — the child has run the body and its
+/// result has already been asserted — and `false` in the child, which
+/// goes on to run it with the process to itself.
+///
+/// The child is asked for exactly one test and is held to it: a name
+/// that has drifted from the function it was copied from matches
+/// nothing, and libtest reports *success* for a run of zero tests, so
+/// the count is asserted rather than the exit status alone.
+///
+/// # Panics
+///
+/// Panics if this executable's path cannot be read, if it cannot be
+/// re-executed, if the child fails, or if the child did not run exactly
+/// the one test it was given.
+#[must_use]
+pub fn umask_test_ran_in_child(test_name: &str) -> bool {
+    if std::env::var_os(UMASK_CHILD_MARKER).is_some() {
+        return false;
+    }
+    let exe = std::env::current_exe().expect("a running test binary has a path");
+    let output = std::process::Command::new(&exe)
+        .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+        .env(UMASK_CHILD_MARKER, "1")
+        .output()
+        .unwrap_or_else(|err| panic!("{} must be re-executable: {err}", exe.display()));
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{test_name} failed in its own process:\n{report}"
+    );
+    assert!(
+        report.contains("test result: ok. 1 passed"),
+        "`--exact {test_name}` must name exactly one test of this binary, \
+         and libtest calls a run of none of them a success:\n{report}"
+    );
+    true
 }
 
 #[cfg(test)]
@@ -1356,7 +1504,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"first", KEY_FILE_MODE)
+        super::atomic_write(&path, b"first", StagedMode::Policy(KEY_FILE_MODE))
             .await
             .unwrap();
         let contents = fs::read_to_string(&path).await.unwrap();
@@ -1364,7 +1512,7 @@ mod tests {
         assert_eq!(contents, "first");
         assert_eq!(mode, KEY_FILE_MODE);
 
-        super::atomic_write(&path, b"second", KEY_FILE_MODE)
+        super::atomic_write(&path, b"second", StagedMode::Policy(KEY_FILE_MODE))
             .await
             .unwrap();
         let contents = fs::read_to_string(&path).await.unwrap();
@@ -1386,7 +1534,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("compose.override.yml");
 
-        super::atomic_replace(&path, b"first", 0o644).await.unwrap();
+        super::atomic_replace(&path, b"first", StagedMode::Policy(0o644))
+            .await
+            .unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "first");
         let first_ino = std::fs::metadata(&path).unwrap().ino();
         assert_eq!(
@@ -1394,7 +1544,7 @@ mod tests {
             0o644
         );
 
-        super::atomic_replace(&path, b"second", 0o644)
+        super::atomic_replace(&path, b"second", StagedMode::Policy(0o644))
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "second");
@@ -1432,11 +1582,11 @@ mod tests {
             std::os::unix::fs::symlink(&target, &link).unwrap();
 
             if published {
-                super::atomic_replace_through_symlink(&link, b"fresh", 0o644)
+                super::atomic_replace_through_symlink(&link, b"fresh", StagedMode::Policy(0o644))
                     .await
                     .unwrap();
             } else {
-                super::atomic_write_through_symlink(&link, b"fresh", 0o644)
+                super::atomic_write_through_symlink(&link, b"fresh", StagedMode::Policy(0o644))
                     .await
                     .unwrap();
             }
@@ -1461,7 +1611,9 @@ mod tests {
         std::fs::write(&target, b"seed").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        super::atomic_write(&link, b"fresh", 0o644).await.unwrap();
+        super::atomic_write(&link, b"fresh", StagedMode::Policy(0o644))
+            .await
+            .unwrap();
 
         assert!(
             !std::fs::symlink_metadata(&link)
@@ -1488,7 +1640,8 @@ mod tests {
         let link = dir.path().join("override.yml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        super::atomic_replace_through_symlink_blocking(&link, b"fresh", 0o644).unwrap();
+        super::atomic_replace_through_symlink_blocking(&link, b"fresh", StagedMode::Policy(0o644))
+            .unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
         assert!(
@@ -1510,8 +1663,14 @@ mod tests {
         std::os::unix::fs::symlink(&b, &a).unwrap();
         std::os::unix::fs::symlink(&a, &b).unwrap();
 
-        assert!(super::atomic_write_through_symlink_blocking(&a, b"x", 0o644).is_err());
-        assert!(super::atomic_replace_through_symlink_blocking(&a, b"x", 0o644).is_err());
+        assert!(
+            super::atomic_write_through_symlink_blocking(&a, b"x", StagedMode::Policy(0o644))
+                .is_err()
+        );
+        assert!(
+            super::atomic_replace_through_symlink_blocking(&a, b"x", StagedMode::Policy(0o644))
+                .is_err()
+        );
         assert!(
             std::fs::symlink_metadata(&a)
                 .unwrap()
@@ -1521,28 +1680,124 @@ mod tests {
         );
     }
 
-    /// `preserved_mode` answers with the destination's own mode where
-    /// there is one, and the caller's default only on a create. A
-    /// regression here is a rename silently re-widening a file an
-    /// operator narrowed — the one property the truncating writes these
-    /// publishes replaced got for free.
-    #[test]
-    fn preserved_mode_reads_the_destination_then_falls_back() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("state.json");
+    /// Publishes `contents` at `path` under `mode` and `umask`,
+    /// restoring the umask before returning, and answers with the
+    /// mode the destination ends up carrying.
+    fn publish_under_umask(
+        path: &Path,
+        contents: &[u8],
+        mode: StagedMode,
+        umask: libc::mode_t,
+    ) -> u32 {
+        // SAFETY: `umask` is a libc call with no memory effects, and
+        // the previous value is restored before this returns. The
+        // process it changes is the child `umask_test_ran_in_child`
+        // spawned for the one test calling this, so no other test is
+        // running beside it to observe the change.
+        let prev = unsafe { libc::umask(umask) };
+        let result = publish_staged_blocking(
+            path,
+            contents,
+            mode,
+            StagedOwner::Destination,
+            StagedDurability::RenameOnly,
+        );
+        unsafe { libc::umask(prev) };
+        result.unwrap();
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
+    /// All three [`StagedMode`] arms, on a create and on a rewrite.
+    ///
+    /// Runs in a process of its own (see [`umask_test_ran_in_child`]),
+    /// because it sets the umask and the umask belongs to the process:
+    /// left in this one it would reach every file every test scheduled
+    /// beside it creates. One test rather than three for the same
+    /// reason — one isolated process, every umask-dependent publish in
+    /// this crate sequenced through it.
+    ///
+    /// [`StagedMode::PreserveOrUmask`]'s create arm gets its mode from
+    /// `open(2)` rather than from a `chmod` afterwards — the only way a
+    /// umask can be honoured at all, since `chmod` ignores it. Asserting
+    /// the final mode is therefore the whole assertion: there is no
+    /// chmod on that arm to leave a wider transient behind.
+    #[test]
+    fn staged_mode_arms_answer_the_create_and_the_rewrite() {
+        if umask_test_ran_in_child(
+            "fs_util::tests::staged_mode_arms_answer_the_create_and_the_rewrite",
+        ) {
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let umask_restrictive = dir.path().join("umask-077.json");
+        let umask_permissive = dir.path().join("umask-022.json");
+        let stated = dir.path().join("agent.toml");
+        let policy = dir.path().join("key.pem");
+
+        // PreserveOrUmask: a create is the umask's answer to `0666`,
+        // which is what the truncating write this replaced produced.
         assert_eq!(
-            super::preserved_mode(&path, 0o644),
+            publish_under_umask(
+                &umask_restrictive,
+                b"{}",
+                StagedMode::PreserveOrUmask,
+                0o077
+            ),
+            0o600,
+            "a create under umask 077 must land 0600, not a hardcoded 0644"
+        );
+        assert_eq!(
+            publish_under_umask(&umask_permissive, b"{}", StagedMode::PreserveOrUmask, 0o022),
             0o644,
-            "a missing destination takes the caller's default"
+            "a create under umask 022 must land 0644"
+        );
+        // And a rewrite takes the destination's mode, whatever umask is
+        // in force.
+        std::fs::set_permissions(&umask_permissive, std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        assert_eq!(
+            publish_under_umask(&umask_permissive, b"{}", StagedMode::PreserveOrUmask, 0o077),
+            0o640,
+            "an existing destination keeps the mode it carries"
         );
 
-        std::fs::write(&path, b"{}").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // PreserveOrCreate: the create mode is stated, so no umask
+        // reaches it; the rewrite still keeps what the operator set.
         assert_eq!(
-            super::preserved_mode(&path, 0o644),
+            publish_under_umask(
+                &stated,
+                b"first",
+                StagedMode::PreserveOrCreate(0o600),
+                0o000
+            ),
             0o600,
-            "an existing destination keeps the mode it carries"
+            "a create must land 0600 even under a fully permissive umask"
+        );
+        std::fs::set_permissions(&stated, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            publish_under_umask(
+                &stated,
+                b"second",
+                StagedMode::PreserveOrCreate(0o600),
+                0o000
+            ),
+            0o644,
+            "a rewrite must not re-narrow a destination the operator widened"
+        );
+
+        // Policy: the same answer in every case — that is what makes it
+        // a policy. Neither the umask nor a mode an earlier writer left
+        // on the destination may reach the published file.
+        assert_eq!(
+            publish_under_umask(&policy, b"first", StagedMode::Policy(KEY_FILE_MODE), 0o000),
+            KEY_FILE_MODE
+        );
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            publish_under_umask(&policy, b"second", StagedMode::Policy(KEY_FILE_MODE), 0o077),
+            KEY_FILE_MODE,
+            "a policy mode must outlive a mode left on the destination"
         );
     }
 
@@ -1563,7 +1818,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"first", KEY_FILE_MODE)
+        super::atomic_write(&path, b"first", StagedMode::Policy(KEY_FILE_MODE))
             .await
             .unwrap();
         std::os::unix::fs::chown(&path, None, Some(gid))
@@ -1572,7 +1827,7 @@ mod tests {
         assert_eq!(pre_meta.gid(), gid, "seed gid must take effect");
         let pre_uid = pre_meta.uid();
 
-        super::atomic_write(&path, b"second", KEY_FILE_MODE)
+        super::atomic_write(&path, b"second", StagedMode::Policy(KEY_FILE_MODE))
             .await
             .unwrap();
 
@@ -1605,7 +1860,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"payload", KEY_FILE_MODE)
+        super::atomic_write(&path, b"payload", StagedMode::Policy(KEY_FILE_MODE))
             .await
             .unwrap();
 
@@ -1688,7 +1943,7 @@ mod tests {
             return;
         }
 
-        let result = atomic_write_blocking(&path, b"payload", KEY_FILE_MODE);
+        let result = atomic_write_blocking(&path, b"payload", StagedMode::Policy(KEY_FILE_MODE));
         restore_directory_reads(&published);
 
         let err = result.unwrap_err();
@@ -1728,7 +1983,7 @@ mod tests {
         publish_staged_blocking(
             &preserved,
             b"second",
-            KEY_FILE_MODE,
+            StagedMode::Policy(KEY_FILE_MODE),
             StagedOwner::Destination,
             StagedDurability::RenameOnly,
         )
@@ -1736,7 +1991,7 @@ mod tests {
         publish_staged_blocking(
             &re_owned,
             b"second",
-            KEY_FILE_MODE,
+            StagedMode::Policy(KEY_FILE_MODE),
             StagedOwner::PolicyGroup(None),
             StagedDurability::RenameOnly,
         )

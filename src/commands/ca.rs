@@ -10,7 +10,7 @@ use crate::cli::args::{CaRestartArgs, CaUpdateArgs};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::infra::{collect_container_failures, collect_readiness, run_compose};
 use crate::commands::init::{
-    CA_JSON_FILE_MODE, RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, set_acme_cert_duration,
+    RESPONDER_TEMPLATE_DIR, STEPCA_CA_JSON_TEMPLATE_NAME, set_acme_cert_duration,
 };
 use crate::i18n::Messages;
 
@@ -147,8 +147,11 @@ fn patch_ca_json_ctmpl(
 /// complete new one.
 ///
 /// The mode comes off the destination. Both files are read here before
-/// they are written, so one always exists, and `init` — not this patch —
-/// is what decides their mode.
+/// they are written, so one always exists, and `init` — not this patch
+/// — is what decides their mode. The create arm
+/// [`fs_util::StagedMode::PreserveOrUmask`] carries is therefore
+/// unreachable here; it is the right answer anyway, since a `ca.json`
+/// this command found missing has no mode this crate gets to decide.
 ///
 /// The directory is not flushed. Both are derived files: `ca.json` is
 /// re-rendered from `ca.json.ctmpl` by the sidecar, and the template is
@@ -159,7 +162,7 @@ fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<(
     fs_util::atomic_replace_through_symlink_blocking(
         path,
         contents.as_bytes(),
-        fs_util::preserved_mode(path, CA_JSON_FILE_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }

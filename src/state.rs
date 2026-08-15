@@ -9,16 +9,6 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
-/// Mode for a `state.json` this process creates. The plain `fs::write`
-/// this file used to be published with left the mode to the process
-/// umask on a fresh create (`0644` in practice) and to the destination
-/// on a rewrite. A staged temporary inherits neither, so a create needs
-/// a stated mode, and `0644` is the one the umask produced: the file is
-/// an inventory of services, paths and role ids, carrying no secret —
-/// the `secret_id` behind `secret_id_path` lives in its own `0600`
-/// file. A destination that already exists keeps its own mode instead;
-/// see [`StateFile::publish_mode`].
-const STATE_FILE_MODE: u32 = 0o644;
 pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Describes how to reload a service after its infrastructure certificate
@@ -164,7 +154,8 @@ impl StateFile {
     /// need a runtime to write a state file.
     ///
     /// The mode the file is published at is the destination's own where
-    /// there is one — see [`StateFile::publish_mode`].
+    /// there is one, and the process umask's answer where there is not
+    /// — see [`StateFile::publish`].
     ///
     /// A symlinked destination is resolved first, for the same reason
     /// the two `init` outputs resolve theirs: the `fs::write` this
@@ -203,36 +194,24 @@ impl StateFile {
     }
 
     /// The blocking core both entry points share: publish the bytes by
-    /// rename, through a symlinked destination, at the mode the
-    /// destination carries.
+    /// rename, through a symlinked destination, at whichever mode the
+    /// environment would have given the write this replaced.
+    ///
+    /// `state.json` has no mode policy — it is an inventory of
+    /// services, paths and role ids, carrying no secret, since the
+    /// `secret_id` behind `secret_id_path` lives in its own `0600` file
+    /// — so [`fs_util::StagedMode::PreserveOrUmask`] reproduces exactly
+    /// what the `fs::write` this replaced produced: an existing
+    /// destination keeps its own mode, and a fresh create takes `0666`
+    /// under the process umask. A host that had been getting a `0600`
+    /// state file from a restrictive umask goes on getting one.
     fn publish(path: &Path, contents: &str) -> Result<()> {
         fs_util::atomic_write_through_symlink_blocking(
             path,
             contents.as_bytes(),
-            Self::publish_mode(path),
+            fs_util::StagedMode::PreserveOrUmask,
         )
         .with_context(|| format!("Failed to write {}", path.display()))
-    }
-
-    /// The mode [`StateFile::save`] publishes at: the mode the
-    /// destination already carries, or [`STATE_FILE_MODE`] when there
-    /// is nothing there yet.
-    ///
-    /// The write this replaced opened the destination in place, so a
-    /// `state.json` an operator had narrowed — or that a restrictive
-    /// umask created narrow — stayed that way across every later save.
-    /// A staged temporary inherits nothing from the file it replaces,
-    /// so stating one mode unconditionally would widen theirs on the
-    /// next write bootroot makes. Reading it off the destination keeps
-    /// the rename from changing a property the operator set, the same
-    /// reason `fs_util::atomic_write_blocking` carries the
-    /// destination's uid and gid across it.
-    ///
-    /// A destination that cannot be stat'd is treated as absent: the
-    /// staged write that follows reports the real error, and guessing a
-    /// mode here would only replace it with a worse one.
-    fn publish_mode(path: &Path) -> u32 {
-        fs_util::preserved_mode(path, STATE_FILE_MODE)
     }
 
     pub(crate) fn secrets_dir(&self) -> &Path {
@@ -403,17 +382,61 @@ mod tests {
         assert_eq!(entries, vec![std::ffi::OsString::from("state.json")]);
     }
 
-    /// A file that did not exist gets the stated create mode, which is
-    /// the `0644` the umask used to produce. The file is an inventory,
-    /// not a secret.
+    /// A file that did not exist gets the mode the umask would have
+    /// given the `fs::write` this replaced, not a stated constant. The
+    /// caller-level pin for [`fs_util::StagedMode::PreserveOrUmask`]:
+    /// a host running `077` — common on a hardened install — got a
+    /// `0600` `state.json` before the conversion to a staged publish
+    /// and must go on getting one.
+    ///
+    /// Runs in a process of its own (see
+    /// [`fs_util::umask_test_ran_in_child`]), because `umask` is a
+    /// property of the *process*, not of a thread: left in the test
+    /// binary's own process, the window below would cover every file
+    /// created by every `commands` test the harness scheduled beside
+    /// it. Both umasks are exercised here, in sequence, for the same
+    /// reason `fs_util` puts all three [`fs_util::StagedMode`] arms in
+    /// one test rather than three — one isolated process, every
+    /// umask-dependent assertion in this binary inside it.
     #[test]
-    fn save_creates_a_new_state_file_at_0644() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.json");
-        state_with_url("http://localhost:8200").save(&path).unwrap();
+    fn save_creates_a_new_state_file_under_the_process_umask() {
+        if fs_util::umask_test_ran_in_child(
+            "state::tests::save_creates_a_new_state_file_under_the_process_umask",
+        ) {
+            return;
+        }
 
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, STATE_FILE_MODE);
+        let dir = tempfile::tempdir().unwrap();
+        let restrictive = dir.path().join("restrictive.json");
+        let permissive = dir.path().join("permissive.json");
+
+        // SAFETY: `umask` is a libc call with no memory effects, and
+        // the previous value is restored before the assertions below.
+        // The process it changes is the child spawned just above for
+        // this one test, so no other test is running beside it to
+        // observe the change.
+        let prev = unsafe { libc::umask(0o077) };
+        let restrictive_result = state_with_url("http://localhost:8200").save(&restrictive);
+        unsafe { libc::umask(0o022) };
+        let permissive_result = state_with_url("http://localhost:8200").save(&permissive);
+        unsafe { libc::umask(prev) };
+        restrictive_result.unwrap();
+        permissive_result.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&restrictive)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "umask 077 must still produce a 0600 state.json"
+        );
+        assert_eq!(
+            std::fs::metadata(&permissive).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "umask 022 must still produce a 0644 state.json"
+        );
     }
 
     /// A `state.json` an operator pointed elsewhere with a symlink is

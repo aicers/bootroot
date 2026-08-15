@@ -335,16 +335,6 @@ pub(crate) fn reject_http01_admin_advertise_addr_for_specific_bind(
     Ok(())
 }
 
-/// Mode for a compose override this process creates, when there is no
-/// destination to read one from.
-///
-/// The truncating writes these replaced left a fresh create to the umask
-/// (`0644`) and a rewrite to the destination. The overrides carry a bind
-/// address and nothing secret, and `docker compose` reads them as the
-/// invoking operator, so the umask's answer stays the default; see
-/// [`fs_util::preserved_mode`].
-pub(crate) const COMPOSE_OVERRIDE_MODE: u32 = 0o644;
-
 /// Publishes a generated compose override by rename.
 ///
 /// The three exposure overrides below all have the same reader and the
@@ -360,11 +350,17 @@ pub(crate) const COMPOSE_OVERRIDE_MODE: u32 = 0o644;
 /// re-run of that command rather than anything the operator cannot
 /// reconstruct — and `init` publishes enough of these that a disk round
 /// trip each is worth declining.
+///
+/// The overrides carry a bind address and nothing secret, and `docker
+/// compose` reads them as the invoking operator, so there is no mode to
+/// assert: [`fs_util::StagedMode::PreserveOrUmask`] leaves an existing
+/// override alone and gives a fresh one what the umask would have given
+/// the truncating write this replaced.
 fn publish_compose_override(path: &Path, content: &str, messages: &Messages) -> Result<()> {
     fs_util::atomic_replace_through_symlink_blocking(
         path,
         content.as_bytes(),
-        fs_util::preserved_mode(path, COMPOSE_OVERRIDE_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
 }

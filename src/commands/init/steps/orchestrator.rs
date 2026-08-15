@@ -35,9 +35,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    CA_JSON_FILE_MODE, ensure_step_ca_initialized, reconcile_ca_json_dns_names,
-    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
-    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
+    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
+    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
+    write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -317,7 +317,11 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
-        fs_util::atomic_write_blocking(&dest, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        fs_util::atomic_write_blocking(
+            &dest,
+            payload.as_bytes(),
+            fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
@@ -387,7 +391,11 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
-        fs_util::atomic_write_blocking(&dest, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        fs_util::atomic_write_blocking(
+            &dest,
+            token.as_bytes(),
+            fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
@@ -1342,10 +1350,12 @@ async fn maybe_rotate_env_db_password(
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let mode = fs_util::preserved_mode(&ca_json_path, CA_JSON_FILE_MODE);
-            let _ =
-                fs_util::atomic_replace_through_symlink(&ca_json_path, updated.as_bytes(), mode)
-                    .await;
+            let _ = fs_util::atomic_replace_through_symlink(
+                &ca_json_path,
+                updated.as_bytes(),
+                fs_util::StagedMode::PreserveOrUmask,
+            )
+            .await;
         }
     }
 
@@ -1985,6 +1995,16 @@ mod tests {
     /// helper; tightening the permission contract here guards against
     /// regressions that would leak a freshly minted root token to other
     /// users on the host.
+    ///
+    /// That the `0600` is the writer's [`fs_util::StagedMode::Policy`]
+    /// rather than a umask that happened to agree with it is pinned at
+    /// the primitive, by `fs_util`'s
+    /// `staged_mode_arms_answer_the_create_and_the_rewrite` — which
+    /// publishes under umask `000` and still gets the policy's mode.
+    /// This assertion does not set the umask itself: `umask` is a
+    /// property of the *process*, so a second test changing it races
+    /// every other test in this binary that creates a file, and
+    /// `state.json`'s caller-level pin needs that window to itself.
     #[tokio::test]
     async fn write_root_token_file_persists_with_restricted_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -1998,32 +2018,6 @@ mod tests {
         assert_eq!(body, "hvs.fake-token");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "root token file must be 0600, got {mode:o}");
-    }
-
-    /// Regression for Round 5 reviewer item: `write_root_token_file`
-    /// must open the destination with `OpenOptionsExt::mode(0o600)` so
-    /// a freshly minted root token never exists on disk with permissions
-    /// derived from the process umask (commonly `0644`) between create
-    /// and chmod.  Set a permissive umask, write the file, and assert
-    /// it lands with `0600` — under the previous `tokio::fs::write` +
-    /// post-write chmod path this would (briefly) be `0644`.
-    #[tokio::test]
-    async fn write_root_token_file_creates_with_0600_under_permissive_umask() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // SAFETY: `umask` is a libc thread-local syscall.  We restore
-        // it before the test returns so concurrent tests are unaffected.
-        let prev = unsafe { libc::umask(0) };
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("token");
-        let res = write_root_token_file(&path, "hvs.fake-token").await;
-        unsafe { libc::umask(prev) };
-        res.expect("write");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "root token file must be created atomically with 0600 under any umask, got {mode:o}"
-        );
     }
 
     /// Closes #603 Reviewer Round 1: `run_init` must validate

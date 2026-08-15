@@ -8,6 +8,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- A `.env` bootroot creates is now `0600`. `bootroot infra install`
+  generates `POSTGRES_PASSWORD` into this file, and it sits in the
+  compose directory rather than in the `0700` secrets tree, so on a host
+  with a default umask the database password was world-readable. Only
+  the create is narrowed: a `.env` that already exists keeps whatever
+  mode it carries, so an operator who has widened one deliberately keeps
+  that choice across every later write. An install that predates this
+  release therefore keeps the mode it was created with, so `chmod 0600`
+  its `.env` by hand to narrow a password already on disk. Everything
+  that reads the file — `docker compose` and bootroot itself — is
+  invoked as root; a reader that does lose access fails loudly at the
+  next compose invocation rather than silently, and can be given access
+  back with a `chmod`.
 - Hardened the `bootroot-agent` fast-poll OpenBao channel (#695):
   - Config validation now rejects a non-loopback plaintext `http://`
     `[openbao].url` unless the operator sets the new
@@ -160,11 +173,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   certificates and CA bundle, `0600` for the two `init` outputs and for
   everything inside the secrets tree, and for a file that already exists
   whatever mode it already carries — one narrowed by hand, or by a
-  restrictive umask when it was created, stays narrowed. Where such a
-  file is created fresh it now takes a stated mode rather than whatever
-  the umask decides, which is `0644` for `state.json`, `.env`,
-  `ca.json`, `openbao.hcl` and the compose overrides; a host running a
-  non-default umask is the only one that can observe the difference.
+  restrictive umask when it was created, stays narrowed. A file with no
+  mode of its own — `state.json`, `ca.json`, `openbao.hcl`, the compose
+  overrides, `init`'s rollback restore — is still created at whatever
+  the process umask gives it, as before.
 - Fixed a `--summary-json` or `--root-token-output` destination whose
   symlink chain loops back on itself being accepted by the preflight and
   failing at the write, once `reinit` had already wiped OpenBao. It is

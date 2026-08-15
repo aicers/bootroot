@@ -77,28 +77,39 @@ pub(crate) fn write_dotenv(
         content.push_str(value);
         content.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(
-        path,
-        content.as_bytes(),
-        dotenv_publish_mode(path),
-    )
-    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(path, content.as_bytes(), DOTENV_PUBLISH_MODE)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
-/// Mode for a `.env` this process creates, when there is no destination
-/// to read one from.
+/// Mode for a `.env` this process creates.
 ///
-/// The truncating write this replaced left the mode to the umask on a
-/// create — `0644` in practice — and to the destination on a rewrite.
-/// `.env` is mounted into `docker compose`'s own environment and read by
-/// every later bootroot invocation, so it is not narrowed here on the
-/// way past; see [`fs_util::preserved_mode`].
-const DOTENV_FILE_MODE: u32 = 0o644;
+/// `infra install` writes `POSTGRES_PASSWORD` into this file, and the
+/// file sits in the compose directory rather than in the `0700` secrets
+/// tree, so a create left to the umask hands a host running a
+/// permissive one a world-readable database password. It is created
+/// `0600` instead — the one file in the otherwise policy-free
+/// configuration class that carries a credential.
+///
+/// Every reader of `.env` in the deployed ecosystem runs as root:
+/// `bootler` invokes every bootroot command as root, runs `docker
+/// compose` against this directory itself as root, and generates its
+/// rotation and infra units with no `User=`. The non-root `clumit-*`
+/// agents read `agent.toml`, certificates and relocated credentials,
+/// never this file.
+///
+/// Only the create is decided here. An operator who needs the file
+/// wider widens it once and [`fs_util::StagedMode::PreserveOrCreate`]'s
+/// preserve arm keeps that choice across every later rewrite; a reader
+/// that loses access fails loudly at the next compose invocation
+/// through the `POSTGRES_PASSWORD:?…` guard rather than silently.
+const DOTENV_FILE_MODE: u32 = 0o600;
 
-fn dotenv_publish_mode(path: &Path) -> u32 {
-    fs_util::preserved_mode(path, DOTENV_FILE_MODE)
-}
+/// The mode both `.env` publishers use: [`DOTENV_FILE_MODE`] on a
+/// create, and whatever the destination already carries on a rewrite —
+/// the half the truncating write this replaced left to the destination.
+const DOTENV_PUBLISH_MODE: fs_util::StagedMode =
+    fs_util::StagedMode::PreserveOrCreate(DOTENV_FILE_MODE);
 
 /// Decides which of `entries` [`load_dotenv_into_env`] would apply,
 /// given `is_set`, which answers whether a key already has a value in
@@ -193,12 +204,8 @@ pub(crate) fn update_dotenv_key(
         output.push_str(new_value);
         output.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(
-        path,
-        output.as_bytes(),
-        dotenv_publish_mode(path),
-    )
-    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(path, output.as_bytes(), DOTENV_PUBLISH_MODE)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -429,8 +436,7 @@ mod tests {
     }
 
     /// A `.env` an operator narrowed keeps its mode across a rewrite,
-    /// the way the truncating write left it; only a create takes the
-    /// umask-equivalent `0644`.
+    /// the way the truncating write left it.
     #[test]
     fn dotenv_writers_keep_an_existing_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -440,18 +446,38 @@ mod tests {
         let messages = test_messages();
 
         write_dotenv(&path, &[("A", "1")], &messages).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            DOTENV_FILE_MODE,
-            "a create takes the stated default"
-        );
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         update_dotenv_key(&path, "A", "2", &messages).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "a rewrite must not re-narrow an operator-widened .env"
+        );
+    }
+
+    /// A fresh `.env` is created `0600` whatever the umask says: it
+    /// carries the `POSTGRES_PASSWORD` `infra install` writes and sits
+    /// in the compose directory rather than the `0700` secrets tree, so
+    /// it is the one file in the otherwise policy-free configuration
+    /// class with a stated create mode.
+    ///
+    /// [`write_dotenv`] is the only publisher whose create arm is
+    /// reachable: [`update_dotenv_key`] reads the destination before it
+    /// writes and errors out when there is nothing to read.
+    #[test]
+    fn write_dotenv_creates_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        let messages = test_messages();
+
+        write_dotenv(&path, &[("POSTGRES_PASSWORD", "pw")], &messages).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600,
-            "a rewrite must not re-widen an operator-narrowed .env"
+            "a fresh .env carries a database password and must not be readable beyond its owner"
         );
     }
 
