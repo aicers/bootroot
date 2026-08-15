@@ -388,15 +388,22 @@ mod tests {
     /// a host running `077` — common on a hardened install — got a
     /// `0600` `state.json` before the conversion to a staged publish
     /// and must go on getting one.
+    ///
+    /// The only test in this binary that touches the umask, and it has
+    /// to stay that way: `umask` is a property of the *process*, not of
+    /// a thread, so a second test changing it races every file this one
+    /// creates and would flake the assertions below. Both umasks are
+    /// exercised here, in sequence, for the same reason `fs_util` puts
+    /// all three [`fs_util::StagedMode`] arms in one test rather than
+    /// three.
     #[test]
     fn save_creates_a_new_state_file_under_the_process_umask() {
         let dir = tempfile::tempdir().unwrap();
         let restrictive = dir.path().join("restrictive.json");
         let permissive = dir.path().join("permissive.json");
 
-        // SAFETY: `umask` is a libc call with no memory effects, and it
-        // is restored before the assertions below, matching the
-        // in-tree precedent in `commands::init::steps::orchestrator`.
+        // SAFETY: `umask` is a libc call with no memory effects, and
+        // the previous value is restored before the assertions below.
         let prev = unsafe { libc::umask(0o077) };
         let restrictive_result = state_with_url("http://localhost:8200").save(&restrictive);
         unsafe { libc::umask(0o022) };
