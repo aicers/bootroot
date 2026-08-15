@@ -54,11 +54,20 @@ ok() {
   echo "[$LABEL] ok: $1"
 }
 
-# The marker directory's permission bits, in octal. BSD `stat` first,
-# GNU second: the harness runs on both.
+# The marker directory's permission bits, in octal. The harness runs on
+# both stats, and GNU has to be tried first — the order is the whole
+# point rather than a preference.
+#
+# The two spell the same job with the same letters and opposite meanings:
+# `-f` is BSD's format string, and GNU's *filesystem* status. So a
+# BSD-first probe does not fail over on Linux, it succeeds — GNU `stat
+# -f` happily prints a block-and-inode report for the format string, the
+# `||` never fires, and the mode comparison is left holding a multi-line
+# filesystem dump that is never going to equal `700`. GNU-first has no
+# such trap: BSD `stat` rejects `-c` outright, so the fallback runs.
 marker_dir_mode() {
-  stat -f '%OLp' "$BOOTROOT_E2E_RUN_MARKER_DIR" 2>/dev/null \
-    || stat -c '%a' "$BOOTROOT_E2E_RUN_MARKER_DIR"
+  stat -c '%a' "$BOOTROOT_E2E_RUN_MARKER_DIR" 2>/dev/null \
+    || stat -f '%OLp' "$BOOTROOT_E2E_RUN_MARKER_DIR"
 }
 
 # The lifecycle harnesses, and the instance-name prefix each derives
