@@ -33,6 +33,10 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 # sweep under test removes containers, and a developer's live E2E run
 # must not be a fixture here.
 export BOOTROOT_E2E_RUN_MARKER_DIR="$WORK_DIR/markers"
+# And the hosts lock for the same reason, one step further: the real one
+# is machine-wide, so taking or clearing it here would let a `hosts`-mode
+# run in beside a live one, or refuse the next one outright.
+export BOOTROOT_E2E_HOSTS_LOCK="$WORK_DIR/hosts.lock"
 
 # shellcheck source=impl/lib/run-scope.sh
 . "$IMPL_DIR/lib/run-scope.sh"
@@ -407,6 +411,117 @@ check_default_marker_dir_is_per_user() {
   ok "the default marker directory is per-user, so two users can run the harness on one host"
 }
 
+# ---------------------------------------------------------------------------
+# The /etc/hosts mutex
+# ---------------------------------------------------------------------------
+#
+# `hosts` mode was serialised by accident until every run got its own
+# project, container names and ports: the second run failed at `up` long
+# before it reached `/etc/hosts`. Nothing stops the two from reaching
+# that file together now, and what they do to each other there is silent
+# — the second finds the host names already present and adds nothing,
+# then the first's cleanup strips both marker lines while the second is
+# still resolving through them. So the serialisation is stated instead,
+# and this is what says it still holds.
+
+check_hosts_lock() {
+  local lock="$BOOTROOT_E2E_HOSTS_LOCK" status=0
+  rm -f "$lock"
+  BOOTROOT_HOSTS_LOCK_HELD=0
+
+  acquire_hosts_lock "validator"
+  hosts_lock_held || die "acquire_hosts_lock returned without recording that it holds the lock"
+  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
+    || die "the hosts lock does not record this process's pid"
+  ok "a hosts-mode run takes a lock recording its own pid"
+
+  # The second run is refused, and leaves the holder's lock untouched:
+  # the whole point is that it stops before it can edit the file.
+  status=0
+  (
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    acquire_hosts_lock "the second run"
+  ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] \
+    || die "a second hosts-mode run was not refused while a live run held the lock"
+  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
+    || die "the refused run overwrote the live holder's lock"
+  ok "a second hosts-mode run is refused while a live one holds the lock"
+
+  release_hosts_lock
+  [ ! -e "$lock" ] || die "release_hosts_lock left the lock behind"
+  ! hosts_lock_held || die "release_hosts_lock still reads as holding the lock"
+  ok "a run releases the lock on the way out"
+
+  # A run killed with `SIGKILL` never reaches its release, and a lock
+  # left naming its pid would refuse hosts mode on this machine until
+  # somebody deleted a file by hand.
+  printf 'pid=%s\nholder=%s\n' 4194305 "a killed run" >"$lock"
+  BOOTROOT_HOSTS_LOCK_HELD=0
+  acquire_hosts_lock "after the killed run"
+  [ "$(run_marker_field "$lock" pid)" = "$$" ] \
+    || die "a lock naming a dead pid was not reclaimed"
+  release_hosts_lock
+  ok "a lock naming a dead pid is cleared and taken"
+
+  # And a lock naming another pid is never this run's to drop, however
+  # it came to be there: a third run would then take it alongside
+  # whichever run is actually editing the file.
+  printf 'pid=%s\nholder=%s\n' $(($$ + 1)) "another run" >"$lock"
+  BOOTROOT_HOSTS_LOCK_HELD=1
+  release_hosts_lock
+  [ -e "$lock" ] || die "release_hosts_lock removed a lock recording another pid"
+  rm -f "$lock"
+  BOOTROOT_HOSTS_LOCK_HELD=0
+  ok "a lock recording another pid survives this run's release"
+}
+
+# `noclobber` refuses an existing file but happily creates the target of
+# a dangling link, so a link planted at this predictable machine-wide
+# path would have the lock write wherever it points — and the stale-lock
+# `rm` aim there too.
+check_hosts_lock_refuses_a_symlink() {
+  local target="$WORK_DIR/hosts-lock-target" link="$WORK_DIR/hosts-lock-link"
+  local status=0
+  rm -f "$target" "$link"
+  ln -s "$target" "$link"
+  (
+    BOOTROOT_E2E_HOSTS_LOCK="$link"
+    BOOTROOT_HOSTS_LOCK_HELD=0
+    acquire_hosts_lock "the linked run"
+  ) >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 9 ] || die "the hosts lock was taken through a symbolic link"
+  [ ! -e "$target" ] \
+    || die "the refused symbolic link's target was created by the hosts lock"
+  rm -f "$target" "$link"
+  ok "a hosts lock reached through a symbolic link is refused, not followed"
+}
+
+# Unlike the marker directory, this one must not be per-user.
+# `/etc/hosts` is one file for the whole machine, so a lock only one
+# user's runs can see would leave two users' runs editing it at once —
+# which is the case the accident used to cover, since a second user's
+# containers collided on the Compose project too.
+check_default_hosts_lock_is_machine_wide() {
+  local resolved
+  resolved="$(
+    unset BOOTROOT_E2E_HOSTS_LOCK
+    # shellcheck source=impl/lib/run-scope.sh
+    . "$IMPL_DIR/lib/run-scope.sh"
+    printf '%s' "$BOOTROOT_E2E_HOSTS_LOCK"
+  )"
+  case "$resolved" in
+    /tmp/*) ;;
+    *) die "the default hosts lock '${resolved}' is not at a machine-wide path; \$TMPDIR is per-user on macOS, and /etc/hosts is not" ;;
+  esac
+  case "$resolved" in
+    *"$(id -u)"*)
+      die "the default hosts lock '${resolved}' is per-user, but the file it serialises access to is the whole machine's"
+      ;;
+  esac
+  ok "the default hosts lock is machine-wide, like the file it serialises"
+}
+
 check_liveness() {
   run_pid_is_alive "$$" || die "this process reads as dead"
   # A pid past the kernel's maximum can never name a live process.
@@ -771,6 +886,53 @@ check_responder_image_is_run_scoped() {
   ok "the responder image is one tag per run, derived from the instance and removed with it"
 }
 
+# Both harnesses have to take the lock before their first edit and let
+# it go after their last one, and neither may name a lock of its own:
+# they add the same two host names, so a local run and a remote run
+# overwrite each other exactly as two local runs would.
+check_hosts_mode_is_serialised_in_the_harnesses() {
+  local script path body acquire_line add_line held_line edit_line release_line
+  for script in "${LIFECYCLE_SCRIPTS[@]}"; do
+    path="$IMPL_DIR/$script"
+    ! grep -q 'BOOTROOT_E2E_HOSTS_LOCK=' "$path" \
+      || die "${script} names a hosts lock of its own; both scripts edit the same two entries, so there is one lock"
+
+    body="$(awk '/^configure_resolution_mode\(\) \{$/ { inside = 1; next }
+      inside && $0 == "}" { inside = 0 }
+      inside { print }' "$path")"
+    acquire_line="$(grep -n 'acquire_hosts_lock ' <<<"$body" | head -n 1 | cut -d: -f1)"
+    add_line="$(grep -n 'add_hosts_entry ' <<<"$body" | head -n 1 | cut -d: -f1)"
+    [ -n "$add_line" ] \
+      || die "${script}: configure_resolution_mode no longer adds the /etc/hosts entries this check is about"
+    [ -n "$acquire_line" ] \
+      || die "${script} edits /etc/hosts without taking the lock that keeps hosts mode serialised"
+    [ "$acquire_line" -lt "$add_line" ] \
+      || die "${script} takes the hosts lock after it has already edited /etc/hosts"
+
+    body="$(awk '/^cleanup_hosts\(\) \{$/ { inside = 1; next }
+      inside && $0 == "}" { inside = 0 }
+      inside { print }' "$path")"
+    held_line="$(grep -n 'hosts_lock_held' <<<"$body" | head -n 1 | cut -d: -f1)"
+    edit_line="$(grep -n 'run_sudo ' <<<"$body" | head -n 1 | cut -d: -f1)"
+    release_line="$(grep -n 'release_hosts_lock' <<<"$body" | head -n 1 | cut -d: -f1)"
+    [ -n "$edit_line" ] \
+      || die "${script}: cleanup_hosts no longer rewrites /etc/hosts"
+    [ -n "$held_line" ] && [ -n "$release_line" ] \
+      || die "${script}: cleanup_hosts neither checks that it holds the hosts lock nor releases it"
+    # The rewrite drops every line carrying this script's fixed marker,
+    # so it cannot tell one run's entries from another's: a run refused
+    # at the lock would take the live holder's with it.
+    [ "$held_line" -lt "$edit_line" ] \
+      || die "${script}: cleanup_hosts rewrites /etc/hosts before checking whether this run holds the lock"
+    # And the release comes after that rewrite, or the next run adds its
+    # entries while this one's are still there — which `add_hosts_entry`
+    # reads as nothing to do.
+    [ "$release_line" -gt "$edit_line" ] \
+      || die "${script}: cleanup_hosts releases the hosts lock before it has removed this run's entries"
+  done
+  ok "both harnesses serialise hosts mode on one lock, taken before the first edit and released after the last"
+}
+
 # The marker has to outlive everything that could leave a container
 # behind, or a run killed during its own teardown is collected while its
 # containers are still being removed.
@@ -832,12 +994,16 @@ check_the_binary_ranks_the_override_above_the_flag
 check_markers
 check_marker_dir_refuses_a_symlink
 check_default_marker_dir_is_per_user
+check_hosts_lock
+check_hosts_lock_refuses_a_symlink
+check_default_hosts_lock_is_machine_wide
 check_liveness
 install_docker_stub
 check_sweep_collects_only_dead_runs
 check_sweep_keeps_a_marker_it_could_not_clear
 check_harness_wiring
 check_responder_image_is_run_scoped
+check_hosts_mode_is_serialised_in_the_harnesses
 check_marker_removal_is_last
 check_no_hardcoded_identity
 

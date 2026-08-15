@@ -338,14 +338,22 @@ cleanup_hosts() {
   if [ "$RESOLUTION_MODE" != "hosts" ]; then
     return 0
   fi
-  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  # Only the run holding the lock has entries of its own in that file.
+  # The rewrite below drops every line carrying this script's fixed
+  # marker, so it cannot tell one run's lines from another's — and a run
+  # refused at the lock, or one that failed before taking it, would
+  # strip the live holder's entries out from under it.
+  if ! hosts_lock_held; then
     return 0
   fi
-  local tmp_file
-  tmp_file="$(mktemp)"
-  run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
-  run_sudo cp "$tmp_file" /etc/hosts
-  rm -f "$tmp_file"
+  if [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null 2>&1; then
+    local tmp_file
+    tmp_file="$(mktemp)"
+    run_sudo awk -v marker="$HOSTS_MARKER" 'index($0, marker) == 0 { print }' /etc/hosts >"$tmp_file"
+    run_sudo cp "$tmp_file" /etc/hosts
+    rm -f "$tmp_file"
+  fi
+  release_hosts_lock
 }
 
 stop_remote_agent() {
@@ -417,6 +425,14 @@ configure_resolution_mode() {
         command -v sudo >/dev/null 2>&1 || fail "hosts mode requires sudo"
         run_sudo true || fail "hosts mode requires non-interactive sudo (sudo -n)"
       fi
+      # Before the first edit, and after the sudo checks: a run that
+      # cannot write the file has no business holding the machine's turn
+      # at it.  Everything else about this run is its own, so this is
+      # the one thing a second run still has to wait for.  The lock is
+      # one file rather than one per script, because both scripts add
+      # the same two host names — a local run and a remote run overwrite
+      # each other exactly as two local runs would.
+      acquire_hosts_lock "run-remote-lifecycle.sh, ${ARTIFACT_DIR}"
       add_hosts_entry "$STEPCA_HOST_IP" "$STEPCA_HOST_NAME"
       add_hosts_entry "$RESPONDER_HOST_IP" "$RESPONDER_HOST_NAME"
       STEPCA_SERVER_URL="https://${STEPCA_HOST_NAME}:${STEPCA_HOST_PORT}/acme/acme/directory"

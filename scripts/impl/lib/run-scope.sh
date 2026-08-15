@@ -12,7 +12,10 @@
 #
 # What this library gives a harness is one identity per run, derived from
 # the run identifier its artifact directory is already named after, plus
-# the liveness bookkeeping that unique naming makes necessary.
+# the liveness bookkeeping that unique naming makes necessary — and, at
+# the end, the one lock that keeps `hosts` mode serialised, since
+# `/etc/hosts` is the one thing left that no derivation can give a run
+# its own copy of.
 #
 # The instance and the Compose project are derived separately, from the
 # same run identifier, under different rules — and they have to be.  An
@@ -297,17 +300,23 @@ run_marker_field() {
 # True when a process with this pid exists.
 #
 # `kill -0` reports a process owned by another user as an error, which is
-# indistinguishable here from "no such process", so on Linux the process
-# directory settles it.  Elsewhere — macOS, where there is no `/proc` —
-# the marker directory is per-user, so another user's run has its own set
-# of markers and never reaches this sweep at all.
+# indistinguishable here from "no such process", so two more probes stand
+# behind it: the process directory on Linux, and `ps -p` where there is
+# none.  Both see another user's process, which the `/etc/hosts` lock
+# below needs — that lock is machine-wide, so the pid it records is
+# regularly not this user's, and reading it as dead would hand two runs
+# the file at once.  The marker sweep only gains by the same
+# conservatism: a pid recycled by anyone's process spares a dead run's
+# containers for one more round, which is the trade already recorded
+# below, and never removes a live run's.
 run_pid_is_alive() {
   local pid="$1"
   case "$pid" in
     '' | *[!0-9]*) return 1 ;;
   esac
   kill -0 "$pid" 2>/dev/null && return 0
-  [ -d "/proc/$pid" ]
+  [ -d "/proc/$pid" ] && return 0
+  ps -p "$pid" >/dev/null 2>&1
 }
 
 # Creates the marker directory owner-only, and aborts unless it is this
@@ -503,4 +512,125 @@ sweep_dead_run_instances() {
     fi
   done
   return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# The `/etc/hosts` mutex
+# ---------------------------------------------------------------------------
+#
+# Everything above makes two `no-hosts` runs independent.  `hosts` mode
+# is deliberately left out of that: the entries a run adds are keyed by a
+# fixed host name (`stepca.internal`, `responder.internal`) and removed
+# by a fixed marker literal, and rewriting `/etc/hosts` is an unlocked
+# read-modify-write on one file the whole machine shares.  No spelling of
+# the marker fixes either half.
+#
+# That mode used to be serialised by accident, and only by accident.  Two
+# runs collided on the Compose project, on container names and on ports
+# long before either reached `/etc/hosts`, so the second failed at `up`.
+# Once every run has its own project, names and ports, nothing stops them
+# from reaching that file together — and what happens then is silent
+# rather than loud: the second run finds the host names already there and
+# adds nothing, then the first run's cleanup strips both marker lines
+# while the second is still resolving through them.
+#
+# So the serialisation is stated instead of inherited.  One run at a time
+# holds this lock, and a second is refused before it touches the file.
+#
+# The path is machine-wide, unlike the per-user marker directory above,
+# because `/etc/hosts` is: a per-user lock would leave two users' runs
+# free to interleave on the one file both are editing.  `$TMPDIR` is per
+# user on macOS, which is exactly what is not wanted here, so this is
+# `/tmp` outright.
+#
+# A shared path at a predictable location is worth less caution here than
+# it is for the marker directory, and the difference is what the file is
+# used for.  Nothing is read out of this one and handed to `docker rm`:
+# it holds a pid to test for liveness and a name to put in a message.  So
+# a lock somebody else planted denies `hosts` runs — loudly, naming the
+# path — where a marker directory somebody else planted would have aimed
+# a teardown.
+BOOTROOT_E2E_HOSTS_LOCK="${BOOTROOT_E2E_HOSTS_LOCK:-/tmp/bootroot-e2e-hosts.lock}"
+
+# Whether this process is the run holding the lock.  Consulted by
+# `cleanup_hosts` in both harnesses, which must rewrite `/etc/hosts` only
+# on behalf of a run that put entries there: a run refused at the lock,
+# or one that failed before taking it, would otherwise remove the live
+# holder's lines on its way out.
+BOOTROOT_HOSTS_LOCK_HELD=0
+
+# True when this process holds the `/etc/hosts` lock.
+hosts_lock_held() {
+  [ "$BOOTROOT_HOSTS_LOCK_HELD" -eq 1 ]
+}
+
+# Creates the lock file, and only when it is not already there.
+#
+# `noclobber` turns `>` into an exclusive create, which is the whole
+# mechanism: two runs racing here — at the first attempt, or at the retry
+# after one of them cleared a stale lock — cannot both succeed, where a
+# test-then-write would let both through.
+hosts_lock_create() {
+  local holder="$1"
+  (
+    set -o noclobber
+    printf 'pid=%s\nholder=%s\n' "$$" "$holder" >"$BOOTROOT_E2E_HOSTS_LOCK"
+  ) 2>/dev/null
+}
+
+# Takes the `/etc/hosts` lock for this run, or aborts.
+#
+# Refusal rather than waiting.  A `hosts` run holds the file for its
+# whole length — the entries have to outlive every resolution the run
+# makes — so a queue here is a wait of minutes with no bound worth
+# writing down, and the caller is a harness whose operator can start it
+# again.  What matters is that the second run stops before it edits the
+# file, not that it eventually gets a turn.
+#
+# A lock naming a dead pid is cleared and retried once: a run killed with
+# `SIGKILL` never reaches its own release, and leaving that lock in place
+# would refuse `hosts` mode on this machine until somebody deleted a file
+# by hand.  Its `/etc/hosts` entries survive that too, and are collected
+# by the next run's own `add_hosts_entry`/`cleanup_hosts` pair, which
+# match on the host name and the marker rather than on who wrote them.
+acquire_hosts_lock() {
+  local holder="$1" owner_pid owner_holder
+  # Checked before anything acts on the path, and for the reason
+  # `ensure_run_marker_dir` checks it: `-e` and the rest follow a link,
+  # so a link planted here aims the create and the `rm` below at a file
+  # of somebody else's choosing.
+  [ ! -L "$BOOTROOT_E2E_HOSTS_LOCK" ] \
+    || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} is a symbolic link; it must be the file itself and not a pointer at somebody else's choosing"
+  # Twice: the first attempt, and one more after a lock naming a dead
+  # pid has been cleared.  No further, because a second failure means
+  # another run took it in between, which is the answer rather than a
+  # reason to keep trying.
+  for _ in 1 2; do
+    if hosts_lock_create "$holder"; then
+      BOOTROOT_HOSTS_LOCK_HELD=1
+      return 0
+    fi
+    owner_pid="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
+    owner_holder="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" holder 2>/dev/null || true)"
+    if run_pid_is_alive "$owner_pid"; then
+      fail "another E2E run is already resolving through /etc/hosts (pid ${owner_pid}, ${owner_holder:-unknown}); hosts mode edits one file the whole machine shares under a fixed marker, so it runs one at a time — wait for that run to finish, or use RESOLUTION_MODE=no-hosts, which has no such limit"
+    fi
+    rm -f "$BOOTROOT_E2E_HOSTS_LOCK" 2>/dev/null \
+      || fail "the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK} names the dead pid ${owner_pid:-unknown} and could not be removed; remove it once you are certain no run is resolving through /etc/hosts"
+  done
+  fail "could not take the E2E hosts lock ${BOOTROOT_E2E_HOSTS_LOCK}; another run took it while this one was clearing a dead run's"
+}
+
+# Releases the lock, and only when this process is what it records.
+#
+# The recorded pid is compared for the reason `remove_run_marker`
+# compares it: a lock naming another pid belongs to a run still editing
+# the file, and removing it would let a third run in alongside that one.
+release_hosts_lock() {
+  local owner
+  hosts_lock_held || return 0
+  BOOTROOT_HOSTS_LOCK_HELD=0
+  owner="$(run_marker_field "$BOOTROOT_E2E_HOSTS_LOCK" pid 2>/dev/null || true)"
+  [ "$owner" = "$$" ] || return 0
+  rm -f "$BOOTROOT_E2E_HOSTS_LOCK"
 }

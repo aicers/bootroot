@@ -138,10 +138,42 @@ to finish. Each run:
 - records the instance, the project, the image and the four ports in
   `<artifact dir>/run-identity.json`, so a failed run can be read afterwards.
 
-`hosts` mode still has to be serialised. The marker each script writes into
-`/etc/hosts` is a fixed literal, and rewriting that file is an unlocked
-read-modify-write on state the whole machine shares — which no spelling of the
-marker fixes.
+### `hosts` mode still runs one at a time
+
+The entries a run adds are keyed by fixed host names (`stepca.internal`,
+`responder.internal`) and removed by a fixed marker literal, and rewriting
+`/etc/hosts` is an unlocked read-modify-write on one file the whole machine
+shares — which no spelling of the marker fixes.
+
+That mode used to be serialised by accident, and only by accident: two runs
+collided on the Compose project, the container names and the ports long before
+either reached that file. Nothing stops them now, and what they would do to
+each other there is silent rather than loud — the second run finds the host
+names already present and adds nothing, then the first run's cleanup strips
+both marker lines while the second is still resolving through them.
+
+So the serialisation is stated instead of inherited. A run in `hosts` mode
+takes a lock at `/tmp/bootroot-e2e-hosts.lock` after its `sudo` checks and
+before its first edit, and releases it once its own entries are gone. A second
+such run is refused there, before it touches the file, with a message naming
+the pid that holds it; a lock left behind by a run that was killed names a dead
+pid, and the next run clears it and takes it. A run that was refused, or that
+failed before taking the lock, leaves `/etc/hosts` alone on the way out: the
+cleanup rewrite drops every line carrying the script's marker, so it cannot
+tell one run's entries from another's.
+
+One lock covers both harnesses, because both add the same two host names — a
+local run and a remote run overwrite each other exactly as two local runs
+would. Its path is machine-wide rather than per-user like the run-marker
+directory, because `/etc/hosts` is: a lock only one user's runs could see would
+leave two users' runs editing the one file at once. Nothing is read out of that
+lock and acted on — it holds a pid to test for liveness and a name to put in a
+message — so a file planted at that path denies `hosts` runs loudly rather than
+aiming a teardown, which is why it needs none of the ownership machinery the
+marker directory has.
+
+`no-hosts` runs take no lock and are unaffected. Use that mode when you need
+two lifecycle runs at once.
 
 ### Collecting the runs that were killed
 
@@ -178,8 +210,8 @@ markers. The uid in the path is what gives Linux the separation `$TMPDIR`
 already gives macOS, so two users can run the harness on one host instead of
 the second being refused.
 
-`scripts/validate-e2e-run-scope.sh` covers the derivation, the markers and the
-sweep without Docker, and runs in the `check` CI job.
+`scripts/validate-e2e-run-scope.sh` covers the derivation, the markers, the
+sweep and the `hosts` lock without Docker, and runs in the `check` CI job.
 
 ### Leftover containers fail a run before it starts
 
@@ -366,6 +398,8 @@ Configuration:
 - Resolution mode is `hosts`
 - Script writes temporary `stepca.internal` / `responder.internal` host entries
   (requires `sudo -n`)
+- One `hosts`-mode run at a time, across both lifecycle scripts: a second one
+  is refused at `/tmp/bootroot-e2e-hosts.lock`
 
 Purpose:
 
@@ -374,7 +408,8 @@ Purpose:
 
 Execution steps:
 
-1. Add host entries for `stepca.internal` and `responder.internal`
+1. Take the machine-wide `hosts` lock, then add host entries for
+   `stepca.internal` and `responder.internal`
 2. Run the same end-to-end flow phases as `no-hosts`
 3. Remove temporary host entries during cleanup
 
@@ -486,6 +521,8 @@ Configuration:
 - Same service set as remote `no-hosts`: `edge-proxy`, `web-app`
 - Resolution mode is `hosts`
 - Temporary `/etc/hosts` entries are added/removed by the script
+- One `hosts`-mode run at a time, across both lifecycle scripts: this script
+  and `run-local-lifecycle.sh` add the same two host names and share one lock
 
 Purpose:
 
@@ -494,7 +531,8 @@ Purpose:
 
 Execution steps:
 
-1. Add host entries for `stepca.internal` / `responder.internal`
+1. Take the machine-wide `hosts` lock, then add host entries for
+   `stepca.internal` / `responder.internal`
     - Add `stepca.internal` entry
     - Add `responder.internal` entry
 2. Run all remote-delivery E2E scenario phases
@@ -732,6 +770,12 @@ When local `sudo -n` is unavailable:
 
 Use this only as a local constraint workaround. CI still executes
 `hosts` variants.
+
+`--skip-hosts` is also what lets two matrix runs share one host. The matrix
+runs its own steps in sequence, so a single run never contends with itself,
+but a second run reaching a `hosts` step while the first is inside one is
+refused at the lock rather than made to wait. Every other step is run-scoped
+and unaffected.
 
 The harnesses also assume three host tools, and each check fails in its
 prerequisite block rather than mid-run:
