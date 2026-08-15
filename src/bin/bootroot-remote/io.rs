@@ -113,7 +113,12 @@ pub(super) async fn write_secret_file(path: &Path, contents: &str) -> Result<App
     // this credential and cannot re-read it, so losing the directory
     // entry means re-running `service add` on the control plane, not
     // repeating the write here.
-    fs_util::atomic_write(path, next.as_bytes(), fs_util::KEY_FILE_MODE).await?;
+    fs_util::atomic_write(
+        path,
+        next.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await?;
     Ok(ApplyStatus::Applied)
 }
 

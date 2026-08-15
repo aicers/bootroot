@@ -234,8 +234,12 @@ async fn write_openbao_recovery_output(
     // the truncating write this replaced delivered through a link there,
     // and renaming over the link would leave the keys in a directory
     // nobody picked while the target kept the superseded ones.
-    fs_util::atomic_write_through_symlink(path, payload.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink(
+        path,
+        payload.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }

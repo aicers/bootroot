@@ -168,7 +168,7 @@ pub(super) async fn apply_local_service_configs(
     fs_util::atomic_write(
         &resolved.agent_config,
         next.as_bytes(),
-        fs_util::KEY_FILE_MODE,
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| {

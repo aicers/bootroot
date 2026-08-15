@@ -162,9 +162,13 @@ async fn write_service_credential_file(
         // intervenes rather than costing a rewrite.
         let parent = path.parent().unwrap_or(Path::new("."));
         fs_util::ensure_secrets_dir(parent).await?;
-        fs_util::atomic_write(path, contents.as_bytes(), fs_util::KEY_FILE_MODE)
-            .await
-            .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+        fs_util::atomic_write(
+            path,
+            contents.as_bytes(),
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        )
+        .await
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     }
     Ok(())
 }

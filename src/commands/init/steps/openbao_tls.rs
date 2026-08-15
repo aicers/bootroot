@@ -238,15 +238,6 @@ fn set_openbao_readable_permissions(cert_path: &Path, key_path: &Path) -> Result
     Ok(())
 }
 
-/// Fallback mode for an `openbao.hcl` with no destination to read one
-/// from.
-///
-/// `0644` is what the umask gave the truncating writes these replaced.
-/// The file is bind-mounted into the `OpenBao` container and read by a
-/// process that is not the writing operator, so it is not narrowed here;
-/// see [`fs_util::preserved_mode`].
-const OPENBAO_HCL_MODE: u32 = 0o644;
-
 /// Publishes `openbao.hcl` by rename.
 ///
 /// `OpenBao` reads this file at start and on `SIGHUP`, from inside a
@@ -260,11 +251,19 @@ const OPENBAO_HCL_MODE: u32 = 0o644;
 /// from a constant template plus the mount paths, so a crash that loses
 /// the entry leaves the previous configuration in place and costs a
 /// re-run of the `init` step that produced it.
+///
+/// The file has no mode of its own to assert: it is bind-mounted into
+/// the `OpenBao` container and read by a process that is not the writing
+/// operator, so it is neither narrowed nor widened here.
+/// [`fs_util::StagedMode::PreserveOrUmask`] leaves an existing
+/// `openbao.hcl` at whatever mode it carries and gives a fresh one what
+/// the process umask would have given the truncating write this
+/// replaced.
 fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Result<()> {
     fs_util::atomic_replace_through_symlink_blocking(
         path,
         content.as_bytes(),
-        fs_util::preserved_mode(path, OPENBAO_HCL_MODE),
+        fs_util::StagedMode::PreserveOrUmask,
     )
     .with_context(|| messages.error_openbao_hcl_write_failed())
 }

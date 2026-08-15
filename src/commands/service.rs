@@ -1149,7 +1149,7 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     fs_util::atomic_write_blocking(
         agent_config_path,
         next.as_bytes(),
-        fs_util::preserved_mode(agent_config_path, fs_util::KEY_FILE_MODE),
+        fs_util::StagedMode::PreserveOrCreate(fs_util::KEY_FILE_MODE),
     )
     .with_context(|| format!("Failed to write {}", agent_config_path.display()))?;
     Ok(())

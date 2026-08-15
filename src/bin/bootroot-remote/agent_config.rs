@@ -224,7 +224,7 @@ pub(super) async fn apply_agent_config_updates(
         if let Err(err) = fs_util::atomic_write_through_symlink(
             &args.agent_config_path,
             with_profile.as_bytes(),
-            fs_util::KEY_FILE_MODE,
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
         )
         .await
         {

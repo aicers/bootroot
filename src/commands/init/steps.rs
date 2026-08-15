@@ -399,14 +399,6 @@ fn rollback_openbao_agent_invocation(
     )
 }
 
-/// Fallback mode for a file being restored that is no longer present.
-///
-/// A `RollbackFile` records a destination that existed before `init`, so
-/// the restore normally reads the mode back off it. `0644` covers only
-/// the case where `init` deleted it outright, and is what the umask gave
-/// the truncating write this replaced.
-const ROLLBACK_FILE_MODE: u32 = 0o644;
-
 /// Restores one snapshotted file, or removes it when `init` created it.
 ///
 /// The restore publishes by rename. This runs on the failure path, where
@@ -421,12 +413,18 @@ const ROLLBACK_FILE_MODE: u32 = 0o644;
 /// its last entry to a crash leaves the operator exactly where a crash
 /// one moment earlier would have, and a re-run of `init` is the recovery
 /// either way.
+///
+/// A `RollbackFile` records a destination that existed before `init`, so
+/// the restore normally reads the mode back off it;
+/// [`fs_util::StagedMode::PreserveOrUmask`]'s create arm covers only the
+/// case where `init` deleted it outright, and hands that create to the
+/// umask exactly as the truncating write this replaced did.
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
         fs_util::atomic_replace_through_symlink_blocking(
             &file.path,
             contents.as_bytes(),
-            fs_util::preserved_mode(&file.path, ROLLBACK_FILE_MODE),
+            fs_util::StagedMode::PreserveOrUmask,
         )
         .with_context(|| messages.error_restore_file_failed(&file.path.display().to_string()))?;
     } else if file.path.exists() {

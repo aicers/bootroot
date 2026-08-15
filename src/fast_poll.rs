@@ -211,9 +211,13 @@ impl FastPollState {
         }
         let body =
             serde_json::to_string_pretty(self).context("Failed to serialize fast-poll state")?;
-        fs_util::atomic_write(path, body.as_bytes(), STATE_FILE_MODE)
-            .await
-            .with_context(|| format!("Failed to write fast-poll state at {}", path.display()))
+        fs_util::atomic_write(
+            path,
+            body.as_bytes(),
+            fs_util::StagedMode::Policy(STATE_FILE_MODE),
+        )
+        .await
+        .with_context(|| format!("Failed to write fast-poll state at {}", path.display()))
     }
 }
 
@@ -1190,9 +1194,13 @@ async fn apply_trust_to_disk(
     let trust_updates = build_trust_updates(&payload.trusted_ca_sha256, ca_bundle_path);
     let updated = toml_util::upsert_section_keys(&current, "trust", &trust_updates)
         .context("Failed to upsert [trust] section into agent config")?;
-    fs_util::atomic_write(config_path, updated.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
+    fs_util::atomic_write(
+        config_path,
+        updated.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
     Ok(())
 }
 
@@ -1211,9 +1219,13 @@ async fn apply_responder_hmac_to_disk(config_path: &Path, hmac: &str) -> Result<
     let hmac_updates = build_responder_hmac_updates(hmac);
     let updated = toml_util::upsert_section_keys(&current, ACME_SECTION, &hmac_updates)
         .context("Failed to upsert [acme] responder HMAC into agent config")?;
-    fs_util::atomic_write(config_path, updated.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
+    fs_util::atomic_write(
+        config_path,
+        updated.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| format!("Failed to write agent config to {}", config_path.display()))?;
     Ok(())
 }
 
@@ -1317,11 +1329,13 @@ where
         // read either way.
         let body = format!("{secret_id}\n");
         Box::pin(async move {
-            fs_util::atomic_write(&secret_id_path, body.as_bytes(), fs_util::KEY_FILE_MODE)
-                .await
-                .with_context(|| {
-                    format!("Failed to write secret_id to {}", secret_id_path.display())
-                })
+            fs_util::atomic_write(
+                &secret_id_path,
+                body.as_bytes(),
+                fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            )
+            .await
+            .with_context(|| format!("Failed to write secret_id to {}", secret_id_path.display()))
         })
     }
 

@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 use tokio::fs;
 
-use crate::fs_util::{self, StagedDurability, StagedOwner};
+use crate::fs_util::{self, StagedDurability, StagedMode, StagedOwner};
 
 /// Default mode for the cert/key parent directory when no `--cert-group`
 /// is set. Operator-only access.
@@ -429,7 +429,11 @@ fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolic
     fs_util::publish_staged_blocking(
         dest,
         contents.as_bytes(),
-        mode,
+        // These three files have a mode policy of their own — `0600`
+        // or `0640` for the key, `0644` for the certificate and the
+        // bundle — which is re-asserted on every publish so a mode an
+        // earlier writer left behind cannot outlive it.
+        StagedMode::Policy(mode),
         StagedOwner::PolicyGroup(policy.gid),
         StagedDurability::RenameOnly,
     )

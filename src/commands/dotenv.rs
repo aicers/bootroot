@@ -77,28 +77,19 @@ pub(crate) fn write_dotenv(
         content.push_str(value);
         content.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(
-        path,
-        content.as_bytes(),
-        dotenv_publish_mode(path),
-    )
-    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(path, content.as_bytes(), DOTENV_PUBLISH_MODE)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
-/// Mode for a `.env` this process creates, when there is no destination
-/// to read one from.
+/// The mode both `.env` publishers use.
 ///
 /// The truncating write this replaced left the mode to the umask on a
-/// create — `0644` in practice — and to the destination on a rewrite.
-/// `.env` is mounted into `docker compose`'s own environment and read by
-/// every later bootroot invocation, so it is not narrowed here on the
-/// way past; see [`fs_util::preserved_mode`].
-const DOTENV_FILE_MODE: u32 = 0o644;
-
-fn dotenv_publish_mode(path: &Path) -> u32 {
-    fs_util::preserved_mode(path, DOTENV_FILE_MODE)
-}
+/// create and to the destination on a rewrite, which is exactly
+/// [`fs_util::StagedMode::PreserveOrUmask`]. `.env` is read by `docker
+/// compose` on every invocation and by every later bootroot run, so
+/// nothing here decides a mode for it.
+const DOTENV_PUBLISH_MODE: fs_util::StagedMode = fs_util::StagedMode::PreserveOrUmask;
 
 /// Decides which of `entries` [`load_dotenv_into_env`] would apply,
 /// given `is_set`, which answers whether a key already has a value in
@@ -193,12 +184,8 @@ pub(crate) fn update_dotenv_key(
         output.push_str(new_value);
         output.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(
-        path,
-        output.as_bytes(),
-        dotenv_publish_mode(path),
-    )
-    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_through_symlink_blocking(path, output.as_bytes(), DOTENV_PUBLISH_MODE)
+        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -429,8 +416,7 @@ mod tests {
     }
 
     /// A `.env` an operator narrowed keeps its mode across a rewrite,
-    /// the way the truncating write left it; only a create takes the
-    /// umask-equivalent `0644`.
+    /// the way the truncating write left it.
     #[test]
     fn dotenv_writers_keep_an_existing_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -440,12 +426,6 @@ mod tests {
         let messages = test_messages();
 
         write_dotenv(&path, &[("A", "1")], &messages).unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            DOTENV_FILE_MODE,
-            "a create takes the stated default"
-        );
-
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         update_dotenv_key(&path, "A", "2", &messages).unwrap();
         assert_eq!(

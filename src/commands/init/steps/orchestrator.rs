@@ -35,9 +35,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    CA_JSON_FILE_MODE, ensure_step_ca_initialized, reconcile_ca_json_dns_names,
-    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
-    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
+    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
+    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
+    write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -317,7 +317,11 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
-        fs_util::atomic_write_blocking(&dest, payload.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        fs_util::atomic_write_blocking(
+            &dest,
+            payload.as_bytes(),
+            fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for summary json write failed: {e}"))??;
@@ -387,7 +391,11 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
-        fs_util::atomic_write_blocking(&dest, token.as_bytes(), SECRET_OUTPUT_FILE_MODE)
+        fs_util::atomic_write_blocking(
+            &dest,
+            token.as_bytes(),
+            fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("spawn_blocking for root token write failed: {e}"))??;
@@ -1342,10 +1350,12 @@ async fn maybe_rotate_env_db_password(
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let mode = fs_util::preserved_mode(&ca_json_path, CA_JSON_FILE_MODE);
-            let _ =
-                fs_util::atomic_replace_through_symlink(&ca_json_path, updated.as_bytes(), mode)
-                    .await;
+            let _ = fs_util::atomic_replace_through_symlink(
+                &ca_json_path,
+                updated.as_bytes(),
+                fs_util::StagedMode::PreserveOrUmask,
+            )
+            .await;
         }
     }
 

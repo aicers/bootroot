@@ -163,12 +163,16 @@ list with the `secret_id` beside it for that reason: bootroot can read it from
 OpenBao again, but only on the next `rotate` run, and until then the agent or
 sidecar it belongs to cannot log in.
 
-Modes are taken from the file already at the destination where it has one, so a
-file you narrow by hand stays narrowed across every later write. Only a fresh
-create takes bootroot's stated default: `0600` inside the secrets tree and for
-the two `init` outputs, `0644` for `state.json`, `.env`, `ca.json`,
-`openbao.hcl`, the issued certificates, the CA bundle and the compose
-overrides.
+Modes fall into two groups. Files whose mode is a property of what they hold get
+that mode restated on every write, create or rewrite alike: `0600` inside the
+secrets tree and for the two `init` outputs, `0644` for the issued certificates
+and the CA bundle. For everything else the mode is taken from the file already
+at the destination, so a file you narrow by hand stays narrowed across every
+later write, and a fresh create takes what the process umask allows — the same
+`0666`-under-your-umask an ordinary `open(2)` would give it. That covers
+`state.json`, `ca.json`, `openbao.hcl`, the compose overrides and the files
+`init` restores when it rolls back: on a host running `umask 077` they are
+created at `0600`, on the default `umask 022` at `0644`.
 
 If you point one of these paths at a file elsewhere with a symlink, what happens
 depends on which file it is, because a rename replaces the name it is given

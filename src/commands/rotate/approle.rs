@@ -520,9 +520,13 @@ async fn ensure_infra_role_id_file(
     // run, and until then a lost directory entry is a sidecar that
     // cannot log in. The early return above means this writes only on a
     // backfill, so the round trip is not on any repeated path.
-    fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
+    fs_util::atomic_write(
+        &role_id_path,
+        role_id.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
     Ok(role_id)
 }
 
@@ -720,11 +724,13 @@ async fn ensure_role_id_file(
         // pair the override branch beside it makes. The early return on
         // `role_id_path.exists()` means this only ever creates.
         fs_util::ensure_secrets_dir(service_dir).await?;
-        fs_util::atomic_write(&role_id_path, role_id.as_bytes(), fs_util::KEY_FILE_MODE)
-            .await
-            .with_context(|| {
-                messages.error_write_file_failed(&role_id_path.display().to_string())
-            })?;
+        fs_util::atomic_write(
+            &role_id_path,
+            role_id.as_bytes(),
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        )
+        .await
+        .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
     }
     Ok(())
 }

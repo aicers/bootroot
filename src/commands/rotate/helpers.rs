@@ -71,9 +71,13 @@ pub(super) async fn write_secret_file(
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
     }
-    fs_util::atomic_write(path, contents.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write(
+        path,
+        contents.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -99,9 +103,13 @@ pub(super) async fn write_secret_id_atomic(
         anyhow::bail!(messages.error_parent_not_found(&path.display().to_string()));
     }
     fs_util::ensure_secrets_dir(parent).await?;
-    fs_util::atomic_write(path, value.as_bytes(), fs_util::KEY_FILE_MODE)
-        .await
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write(
+        path,
+        value.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 

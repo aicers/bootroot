@@ -160,11 +160,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   certificates and CA bundle, `0600` for the two `init` outputs and for
   everything inside the secrets tree, and for a file that already exists
   whatever mode it already carries — one narrowed by hand, or by a
-  restrictive umask when it was created, stays narrowed. Where such a
-  file is created fresh it now takes a stated mode rather than whatever
-  the umask decides, which is `0644` for `state.json`, `.env`,
-  `ca.json`, `openbao.hcl` and the compose overrides; a host running a
-  non-default umask is the only one that can observe the difference.
+  restrictive umask when it was created, stays narrowed. A file with no
+  mode of its own — `state.json`, `ca.json`, `openbao.hcl`, the compose
+  overrides, `init`'s rollback restore — is still created at whatever
+  the process umask gives it, as before.
 - Fixed a `--summary-json` or `--root-token-output` destination whose
   symlink chain loops back on itself being accepted by the preflight and
   failing at the write, once `reinit` had already wiped OpenBao. It is

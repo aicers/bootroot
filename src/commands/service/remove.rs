@@ -444,7 +444,7 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
     fs_util::atomic_write_blocking(
         path,
         next.as_bytes(),
-        fs_util::preserved_mode(path, fs_util::KEY_FILE_MODE),
+        fs_util::StagedMode::PreserveOrCreate(fs_util::KEY_FILE_MODE),
     )
     .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(true)
