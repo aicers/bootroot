@@ -22,10 +22,22 @@ cleanup() {
   # writes further down.  A run that stops before that -- the monitoring
   # test above is the first that can -- would otherwise have this
   # teardown die on the guard and remove nothing, silently, because of
-  # the `|| true`.  They are placeholders; `down` reads neither.
-  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-teardown}" \
+  # the `2>/dev/null || true` this used to end in.  They are
+  # placeholders; `down` reads neither.
+  #
+  # Say so when the teardown fails, for the same reason `ComposeGuard` in
+  # tests/monitoring_integration.rs does: what it leaves behind holds the
+  # host ports the monitoring test needs, so the next run of this script
+  # dies on a port conflict with nothing recording why.  Reported rather
+  # than propagated -- this is an EXIT trap, and it must not overwrite
+  # the status of whatever actually ended the run.
+  local teardown
+  if ! teardown="$(POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-teardown}" \
     GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-teardown}" \
-    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>/dev/null || true
+    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>&1)"; then
+    echo "[test-core] WARNING: compose teardown failed; containers may still be running"
+    echo "$teardown"
+  fi
 }
 trap cleanup EXIT
 
