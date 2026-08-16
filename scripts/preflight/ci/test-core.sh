@@ -14,7 +14,18 @@ cleanup() {
   # files above, so a plain `down` treats them as orphans and leaves them
   # running.  `-v` is deliberately not passed: the named volumes are not
   # what this teardown is failing to reach.
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>/dev/null || true
+  #
+  # The two variables for the same reason the `Cleanup` step in
+  # .github/workflows/ci.yml carries them: `down` interpolates the whole
+  # compose file, docker-compose.yml declares both in the fail-if-unset
+  # form, and they only arrive with the `.env` that `infra install`
+  # writes further down.  A run that stops before that -- the monitoring
+  # test above is the first that can -- would otherwise have this
+  # teardown die on the guard and remove nothing, silently, because of
+  # the `|| true`.  They are placeholders; `down` reads neither.
+  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-teardown}" \
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-teardown}" \
+    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT
 

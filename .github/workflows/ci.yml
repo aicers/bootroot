@@ -395,6 +395,21 @@ jobs:
 
       - name: Cleanup
         if: always()
+        # `down` interpolates the whole compose file, and
+        # docker-compose.yml declares POSTGRES_PASSWORD and
+        # GRAFANA_ADMIN_PASSWORD in the fail-if-unset form. They reach
+        # this step through the `.env` that `Install Infrastructure`
+        # writes, so a job that fails ahead of that step has none and
+        # this teardown dies on the guard having removed nothing. That
+        # became reachable when the monitoring test above started
+        # running: it is the first step in this job that can fail, and
+        # it is the one that brings a stack up. The values are
+        # placeholders, and overriding a real `.env` with them is
+        # harmless: `down` matches containers by project label and reads
+        # neither value.
+        env:
+          POSTGRES_PASSWORD: teardown
+          GRAFANA_ADMIN_PASSWORD: teardown
         run: >-
           docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}"
           -f docker-compose.yml -f docker-compose.test.yml down
