@@ -2036,10 +2036,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   paths instead reject a final link. Where a link is replaced bootroot
   now emits a `WARN` naming the destination and the file the link
   pointed at, so a replacement is at least recorded rather than silent.
-  Only `bootroot-agent` installs a log subscriber, so only the
-  replacements it makes are displayed; the `bootroot` CLI and
-  `bootroot-remote` install none, and a replacement either of them
-  makes reaches no recorder at all.
+  Of the programs that write these files only `bootroot-agent` installs
+  a log subscriber, so only the replacements it makes are displayed; the
+  `bootroot` CLI and `bootroot-remote` install none, and a replacement
+  either of them makes reaches no recorder at all.
 - Adopted `aicers/docs-theme` 0.3.0. The theme is vendored under
   `docs/theme/` and committed rather than git-ignored, so a fresh clone
   builds the manual with no network access and no `gh`;
