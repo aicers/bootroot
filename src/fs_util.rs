@@ -810,7 +810,10 @@ pub enum StagedDurability {
 /// path bootroot handed it, and following a link would redirect the
 /// bytes away from it — but decided is not the same as silent, so
 /// [`publish_staged_blocking`] names the link and its former target at
-/// `warn` before the rename.
+/// `warn`. It reads the destination before the rename, because that is
+/// the last moment the link is still there to read, and warns after it,
+/// so a publish that fails at the rename leaves the link standing and
+/// says nothing about having replaced it.
 ///
 /// The `_through_symlink` wrappers resolve the destination before they
 /// publish, so the path they hand the core is the link's target and
@@ -923,8 +926,9 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
 /// which destroys the operator's link. That is the decided behaviour
 /// here — the wrappers that resolve first are the `_through_symlink`
 /// pair — but it is not left silent: the destination is read with
-/// `symlink_metadata` before the rename and a link found there is
-/// reported at `warn`, naming the link and the file it pointed at.
+/// `symlink_metadata` while the link is still there, and once the
+/// rename has replaced it the link and the file it pointed at are
+/// reported at `warn`.
 ///
 /// # Errors
 /// Returns an error if the temp file cannot be created, written,
@@ -995,13 +999,10 @@ pub fn publish_staged_blocking(
     tmp.as_file_mut()
         .sync_all()
         .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
-    if let Some(link_target) = replaced_symlink_target(path) {
-        tracing::warn!(
-            "Replacing the symlink at {} with the published file; it pointed at {}",
-            path.display(),
-            link_target.display()
-        );
-    }
+    // Read while the link is still at the destination; reported only
+    // once the rename has actually replaced it, so a publish that fails
+    // here does not claim an arrangement it left intact.
+    let replaced_link = replaced_symlink_target(path);
     tmp.persist(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to rename temp file to {}: {}",
@@ -1009,6 +1010,13 @@ pub fn publish_staged_blocking(
             e.error
         )
     })?;
+    if let Some(link_target) = replaced_link {
+        tracing::warn!(
+            "Replaced the symlink at {} with the published file; it pointed at {}",
+            path.display(),
+            link_target.display()
+        );
+    }
     match durability {
         StagedDurability::FlushDirectory => sync_parent_dir(path)?,
         StagedDurability::RenameOnly => {}
@@ -1731,6 +1739,17 @@ mod tests {
             replaced_symlink_target(&dir.path().join("absent.env")),
             None
         );
+
+        // A link whose target does not exist is still a link the publish
+        // destroys, and `symlink_metadata` sees it without following it,
+        // so it warns and names where it pointed.
+        let dangling = dir.path().join("dangling.env");
+        let nowhere = dir.path().join("nowhere.env");
+        std::os::unix::fs::symlink(&nowhere, &dangling).unwrap();
+        assert_eq!(
+            replaced_symlink_target(&dangling).as_deref(),
+            Some(&*nowhere)
+        );
     }
 
     /// The `_through_symlink` wrappers are exempt from that warning by
@@ -1755,6 +1774,92 @@ mod tests {
                 "the path a `_through_symlink` wrapper publishes to must not warn"
             );
         }
+    }
+
+    /// Runs `publish` with a subscriber of its own and answers what it
+    /// logged. `with_default` binds the subscriber to this thread, which
+    /// is where the blocking wrappers do their work, so nothing leaks
+    /// between tests running in parallel.
+    fn logs_from(publish: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Captured(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, publish);
+        let captured = buffer.lock().unwrap().clone();
+        String::from_utf8(captured).unwrap()
+    }
+
+    /// The observable half of the helper tests above, through the two
+    /// spellings an operator actually reaches: a bare publish over a
+    /// seeded link says so once and names both ends of it, and the
+    /// `_through_symlink` publish over the same arrangement says
+    /// nothing, because it never hands the core a link.
+    #[test]
+    fn a_bare_publish_over_a_link_warns_once_and_a_resolved_one_stays_quiet() {
+        let dir = tempdir().unwrap();
+        let seed = |name: &str| {
+            let target = dir.path().join(format!("target-{name}"));
+            let link = dir.path().join(name);
+            std::fs::write(&target, b"seed").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (target, link)
+        };
+
+        let (bare_target, bare_link) = seed("bare.env");
+        let logged = logs_from(|| {
+            atomic_write_blocking(&bare_link, b"fresh", StagedMode::Policy(0o644)).unwrap();
+        });
+
+        assert_eq!(
+            logged.matches("Replaced the symlink at").count(),
+            1,
+            "one warning per replaced link, got: {logged}"
+        );
+        assert!(logged.contains("WARN"), "{logged}");
+        assert!(
+            logged.contains(&bare_link.display().to_string()),
+            "{logged}"
+        );
+        assert!(
+            logged.contains(&bare_target.display().to_string()),
+            "{logged}"
+        );
+
+        let (resolved_target, resolved_link) = seed("resolved.env");
+        let quiet = logs_from(|| {
+            atomic_write_through_symlink_blocking(
+                &resolved_link,
+                b"fresh",
+                StagedMode::Policy(0o644),
+            )
+            .unwrap();
+        });
+
+        assert!(
+            !quiet.contains("Replaced the symlink at"),
+            "a publish through a link must not report replacing one, got: {quiet}"
+        );
+        // The silence has to be the silence of a publish that happened.
+        assert_eq!(std::fs::read_to_string(&resolved_target).unwrap(), "fresh");
     }
 
     /// The chown context has to survive as a whole: the uid/gid it was

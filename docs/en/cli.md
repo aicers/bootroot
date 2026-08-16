@@ -235,6 +235,9 @@ rather than following a link at it:
   published by rename for several releases. A link at one of these paths does
   not survive the command that creates the file; for a credential, following a
   link would also mean redirecting its bytes away from the bootroot-managed path.
+  The replacement is not silent: bootroot logs one warning naming the path and the
+  file the link had pointed at, so a link you did not mean to lose shows up in the
+  run's output rather than only in the filesystem afterwards.
 
 ## bootroot infra up
 
