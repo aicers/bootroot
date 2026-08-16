@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod docker_harness;
+pub(crate) mod polling;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
