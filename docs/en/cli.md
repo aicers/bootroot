@@ -135,16 +135,14 @@ Flushed, so the published file survives a power loss:
 - `state.json`, `.env`, `agent.toml`
 - the `init` `--summary-json` and `--root-token-output` files
 - the step-ca CA password and the OpenBao recovery keys
-- every `AppRole` `role_id`/`secret_id`, the `eab.json` beside each
-  service's `secret_id`, the OpenBao unseal keys, and the remote bootstrap
-  artifact
+- every `AppRole` `role_id`/`secret_id`, `eab.json`, the OpenBao unseal keys,
+  and the remote bootstrap artifact
 
 Not flushed, because a crash that loses one costs a rewrite rather than an
 outage:
 
 - issued certificates, keys, and the CA bundle
 - `ca.json` and its OpenBao Agent template
-- a relocated `eab.json`, which the next sync rewrites
 - `openbao.hcl`, and the HTTP-01 responder config and template
 - the OpenBao Agent configs, and the generated compose overrides
 
@@ -156,6 +154,9 @@ rotation to put back rather than the next write. A `role_id` is on the flushed
 list with the `secret_id` beside it for that reason: bootroot can read it from
 OpenBao again, but only on the next `rotate` run, and until then the agent or
 sidecar it belongs to cannot log in.
+Exception: `service add` deliberately does not flush its initial write of a
+relocated `eab.json`. When the agent later republishes that path after an EAB
+update, it flushes the directory.
 
 Modes fall into two groups. Files whose mode is a property of what they hold get
 that mode restated on every write, create or rewrite alike: `0600` inside the

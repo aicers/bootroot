@@ -159,9 +159,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot-remote bootstrap` writes on a target host is written
   through a link there for the same reason. A link at an issued
   certificate, key or CA bundle path is replaced by the published file
-  instead. Every credential path — including the OpenBao unseal-keys
-  and ACME EAB files — now has that behavior, as does the control node's
-  own `agent.toml`.
+  instead. The OpenBao unseal-keys and ACME EAB files now join the
+  credential paths bootroot publishes by rename, as does the control
+  node's own `agent.toml`. Relocated `AppRole` `role_id` and `secret_id`
+  paths instead reject a final link.
 - Fixed the mode of every such file being applied after its bytes had
   already landed, which left a moment in which a freshly created file
   was readable more widely than intended — including the step-ca CA

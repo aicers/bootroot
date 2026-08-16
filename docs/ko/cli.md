@@ -127,14 +127,13 @@ flush하는 파일 — 전원이 끊겨도 게시된 파일이 남습니다.
 - `state.json`, `.env`, `agent.toml`
 - `init`의 `--summary-json`, `--root-token-output` 파일
 - step-ca CA 비밀번호와 OpenBao 복구 키
-- 모든 `AppRole` `role_id`/`secret_id`, 각 서비스 `secret_id` 옆의
-  `eab.json`, OpenBao 언실 키, 원격 부트스트랩 아티팩트
+- 모든 `AppRole` `role_id`/`secret_id`, `eab.json`, OpenBao 언실 키, 원격
+  부트스트랩 아티팩트
 
 flush하지 않는 파일 — 크래시로 잃어도 장애가 아니라 재작성 비용에 그칩니다.
 
 - 발급된 인증서와 키, CA 번들
 - `ca.json`과 그 OpenBao Agent 템플릿
-- 재배치한 `eab.json` — 다음 동기화가 다시 작성합니다
 - `openbao.hcl`, HTTP-01 리스폰더 설정과 템플릿
 - OpenBao Agent 설정, 생성된 compose 오버라이드
 
@@ -145,6 +144,9 @@ bootroot가 재개를 위해 다시 읽는 파일이거나, 스택이 로그인�
 있기 때문입니다. `role_id`가 옆의 `secret_id`와 함께 flush 목록에 있는 것도 같은
 이유입니다. bootroot가 OpenBao에서 다시 읽어올 수는 있지만 그 시점은 다음 `rotate`
 실행이고, 그때까지 해당 에이전트나 사이드카는 로그인하지 못합니다.
+예외로 `service add`는 재배치한 `eab.json`을 처음 쓸 때 의도적으로 디렉터리를
+flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로를 다시 게시할 때에는
+디렉터리를 flush합니다.
 
 권한은 두 갈래로 나뉩니다. 담고 있는 내용에 따라 모드가 정해지는 파일은 새로
 만들 때든 다시 쓸 때든 매번 그 모드를 다시 적용합니다. 시크릿 트리 안과 `init`
