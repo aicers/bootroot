@@ -135,14 +135,16 @@ Flushed, so the published file survives a power loss:
 - `state.json`, `.env`, `agent.toml`
 - the `init` `--summary-json` and `--root-token-output` files
 - the step-ca CA password and the OpenBao recovery keys
-- every `AppRole` `role_id`/`secret_id`, `eab.json`, the OpenBao unseal
-  keys, and the remote bootstrap artifact
+- every `AppRole` `role_id`/`secret_id`, the `eab.json` beside each
+  service's `secret_id`, the OpenBao unseal keys, and the remote bootstrap
+  artifact
 
 Not flushed, because a crash that loses one costs a rewrite rather than an
 outage:
 
 - issued certificates, keys, and the CA bundle
 - `ca.json` and its OpenBao Agent template
+- a relocated `eab.json`, which the next sync rewrites
 - `openbao.hcl`, and the HTTP-01 responder config and template
 - the OpenBao Agent configs, and the generated compose overrides
 

@@ -794,8 +794,8 @@ pub enum StagedDurability {
     FlushDirectory,
     /// Rename and stop: a crash that loses the new directory entry
     /// leaves the previous file in place and costs a rewrite — a
-    /// reissued certificate, the next sync's `eab.json` — rather than
-    /// an outage.
+    /// reissued certificate or regenerated `ca.json` — rather than an
+    /// outage.
     RenameOnly,
 }
 
@@ -807,12 +807,13 @@ pub enum StagedDurability {
 /// writer of a file at a path bootroot itself owns goes through it —
 /// `state.json`, `rotation-state.json`, `agent.toml`, the fast-poll
 /// state, the two `init` outputs, the issued certificate, key and CA
-/// bundle, and the configuration `init` and the rotation commands
-/// generate (`.env`, `ca.json` and its template, `openbao.hcl`, the
-/// responder config, the `OpenBao` Agent configs and credentials, the
-/// compose overrides). For those the destination name is only ever
-/// observed as the previous file or the complete new one, and the final
-/// mode holds from the moment the name appears.
+/// bundle, the `OpenBao` unseal keys and EAB files, and the configuration
+/// `init` and the rotation commands generate (`.env`, `ca.json` and its
+/// template, `openbao.hcl`, the responder config, the `OpenBao` Agent
+/// configs and credentials, the compose overrides). For those the
+/// destination name is only ever observed as the previous file or the
+/// complete new one, and the final mode holds from the moment the name
+/// appears.
 ///
 /// It is not the crate's only staged publish. The override credential
 /// writers — [`create_owned_credential_noclobber`],

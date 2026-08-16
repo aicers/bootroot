@@ -127,13 +127,14 @@ flush하는 파일 — 전원이 끊겨도 게시된 파일이 남습니다.
 - `state.json`, `.env`, `agent.toml`
 - `init`의 `--summary-json`, `--root-token-output` 파일
 - step-ca CA 비밀번호와 OpenBao 복구 키
-- 모든 `AppRole` `role_id`/`secret_id`, `eab.json`, OpenBao 언실 키, 원격
-  부트스트랩 아티팩트
+- 모든 `AppRole` `role_id`/`secret_id`, 각 서비스 `secret_id` 옆의
+  `eab.json`, OpenBao 언실 키, 원격 부트스트랩 아티팩트
 
 flush하지 않는 파일 — 크래시로 잃어도 장애가 아니라 재작성 비용에 그칩니다.
 
 - 발급된 인증서와 키, CA 번들
 - `ca.json`과 그 OpenBao Agent 템플릿
+- 재배치한 `eab.json` — 다음 동기화가 다시 작성합니다
 - `openbao.hcl`, HTTP-01 리스폰더 설정과 템플릿
 - OpenBao Agent 설정, 생성된 compose 오버라이드
 

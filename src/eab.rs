@@ -82,9 +82,12 @@ pub fn serialize_eab_payload(kid: &str, hmac: &str) -> anyhow::Result<String> {
     })
 }
 
-/// Writes `contents` (newline-terminated) to a `0o600` key file idempotently,
-/// mirroring the bootstrap `write_secret_file` behaviour so a first-sighting
-/// re-write from the fast-poll loop is byte-identical to the bootstrap writer.
+/// Writes `contents` (newline-terminated) to a `0o600` key file idempotently.
+///
+/// A first-sighting fast-poll rewrite has the same payload as bootstrap
+/// `write_secret_file`. An identical payload reached through a final symlink
+/// is the deliberate exception: it republishes to replace the link rather
+/// than repairing its target's mode.
 async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
