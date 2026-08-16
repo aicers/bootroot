@@ -78,13 +78,17 @@ mod unix_integration {
             // the whole file here too, and without them `down` would die on
             // the fail-if-unset guards and leave the stack running.
             //
-            // `--profile` for the same reason it is passed on the way up.
-            // `grafana` and `prometheus` are profile-gated, and a `down`
-            // that does not name their profile walks past them: it removes
-            // the four unprofiled services and then fails to remove the
-            // network because those two are still attached to it, leaving
-            // both containers, `grafana-data`, `prometheus-data` and the
-            // network on the host for every step that follows.
+            // `--profile` so the teardown models the same set of services
+            // the bring-up did: `grafana` and `prometheus` are gated behind
+            // it, and naming it here cannot remove less than omitting it
+            // would.
+            //
+            // How much it adds depends on the Compose version. On v5.3.1 a
+            // plain `down` already removes profile-gated containers, having
+            // matched them by project label rather than from the model; on
+            // the version that produced the leftover `…-grafana-1` and
+            // `…-prometheus-1` this issue reported, it did not. Passing it
+            // costs nothing on the former and is the fix on the latter.
             let _ = docker_compose_command(&self.project, &self.compose_file)
                 .args(["--profile", MONITORING_PROFILE])
                 .args(["down", "-v", "--remove-orphans"])
