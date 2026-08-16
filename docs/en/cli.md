@@ -106,7 +106,7 @@ For detailed rules and condition-specific behavior, see the Overview section
 
 ## How bootroot writes files
 
-Nearly every file bootroot produces is published by stage-then-rename: the bytes
+Every file bootroot produces is published by stage-then-rename: the bytes
 go to a temporary file in the destination's own directory, that file is given its
 final mode and ownership and then flushed while it is still at its temporary
 name, and only then is it renamed over the destination. Three consequences are worth
@@ -118,23 +118,14 @@ knowing when you operate around a running stack.
   complete new one. A write that fails partway leaves the previous file
   untouched and removes the temporary.
 - **The final mode holds from the moment the file appears.** There is no window
-  in which a freshly written CA password, recovery key, `secret_id` or
-  responder HMAC is readable more widely than intended.
+  in which a freshly written CA password, recovery key, OpenBao unseal key,
+  `secret_id` or responder HMAC is readable more widely than intended.
 - **A rename installs a new inode.** The file at the destination path is a
   different inode after every write, so anything holding an open file
   descriptor — a `tail -f`, a container that opened the file at start — keeps
   reading the old contents until it reopens the path. Bind mounts of a
   *directory* follow the rename; a bind mount of a single *file* does not, and
   needs the container restarted to pick up a new version.
-
-Two files are not published this way yet, and none of the three points above
-applies to them: `secrets/openbao/unseal-keys.txt`, written by `init
---save-unseal-keys` and `bootroot openbao save-unseal-keys`, and the `eab.json`
-written next to each service's `secret_id`. Both are still written over the
-destination in place and have their `0600` set afterwards, so a reader can catch
-one half-written, and a freshly created one is briefly readable more widely than
-that. Converting them is a separate change; the rest of this section describes
-the staged writers only.
 
 Whether the containing directory is flushed after the rename is decided per
 file, because that flush costs a disk round trip on every write:
@@ -144,7 +135,8 @@ Flushed, so the published file survives a power loss:
 - `state.json`, `.env`, `agent.toml`
 - the `init` `--summary-json` and `--root-token-output` files
 - the step-ca CA password and the OpenBao recovery keys
-- every `AppRole` `role_id`/`secret_id`, and the remote bootstrap artifact
+- every `AppRole` `role_id`/`secret_id`, `eab.json`, the OpenBao unseal keys,
+  and the remote bootstrap artifact
 
 Not flushed, because a crash that loses one costs a rewrite rather than an
 outage:
@@ -162,6 +154,9 @@ rotation to put back rather than the next write. A `role_id` is on the flushed
 list with the `secret_id` beside it for that reason: bootroot can read it from
 OpenBao again, but only on the next `rotate` run, and until then the agent or
 sidecar it belongs to cannot log in.
+Exception: `service add` deliberately does not flush its initial write of a
+relocated `eab.json`. When the agent later republishes that path after an EAB
+update, it flushes the directory.
 
 Modes fall into two groups. Files whose mode is a property of what they hold get
 that mode restated on every write, create or rewrite alike: `0600` inside the
@@ -197,13 +192,16 @@ rather than following a link at it:
   named before. A chain of links that loops back on itself names no target and
   is refused. The `agent.toml` that `bootroot-remote bootstrap` writes on a
   target host is in this group: that command is what creates the file there, so
-  a link you put at its `--agent-config-path` is one you arranged yourself.
+  a link you put at its `--agent-config-path` is one you arranged yourself. Its
+  adjacent `--eab-file-path` remains a credential path, so a link there is
+  replaced instead.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
-  link found there with a regular file. Those files have been published by
-  rename for several releases, so a link at one of those paths has never
-  survived the command that creates the file; for a credential, following a link
-  would also mean a write redirected by whoever could plant one.
+  link found there with a regular file. The OpenBao unseal-keys and secrets-tree
+  EAB files joined this group in the current release; the other files have been
+  published by rename for several releases. A link at one of these paths does
+  not survive the command that creates the file; for a credential, following a
+  link would also mean redirecting its bytes away from the bootroot-managed path.
 
 ## bootroot infra up
 

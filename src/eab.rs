@@ -6,7 +6,7 @@ use tokio::fs;
 use tokio::sync::watch;
 use tracing::warn;
 
-use crate::fs_util;
+use crate::fs_util::{self, KEY_FILE_MODE, StagedMode};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EabCredentials {
@@ -45,8 +45,8 @@ impl SharedEab {
 
 /// Writes EAB credentials to `path` as pretty `{ "kid", "hmac" }` JSON at
 /// key-file permissions (`0o600`), creating the parent secrets directory when
-/// needed. Returns `true` when the on-disk bytes changed and `false` when the
-/// file already held identical content.
+/// needed. Returns `true` when it publishes a replacement at `path` and
+/// `false` when an existing regular file already holds identical content.
 ///
 /// Shared by `bootroot-remote bootstrap` and the remote fast-poll loop so the
 /// producer and the `--eab-file` consumer cannot drift on the on-disk shape.
@@ -82,9 +82,12 @@ pub fn serialize_eab_payload(kid: &str, hmac: &str) -> anyhow::Result<String> {
     })
 }
 
-/// Writes `contents` (newline-terminated) to a `0o600` key file idempotently,
-/// mirroring the bootstrap `write_secret_file` behaviour so a first-sighting
-/// re-write from the fast-poll loop is byte-identical to the bootstrap writer.
+/// Writes `contents` (newline-terminated) to a `0o600` key file idempotently.
+///
+/// A first-sighting fast-poll rewrite has the same payload as bootstrap
+/// `write_secret_file`. For identical bytes at a final symlink, the writers
+/// intentionally diverge: `write_secret_file` repairs the target's mode while
+/// this writer republishes to replace the link.
 async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
@@ -103,13 +106,22 @@ async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
         }
     };
     if current == next {
-        fs_util::set_key_permissions(path).await?;
-        return Ok(false);
+        let destination_is_symlink = fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if !destination_is_symlink {
+            // Repair a mode on an existing file this writer did not create.
+            fs_util::set_key_permissions(path).await?;
+            return Ok(false);
+        }
+        // Republishing replaces the link instead of repairing its target's
+        // mode, even when the target already holds identical bytes.
     }
-    fs::write(path, next)
+    // This credential publishes at its given name, replacing a final symlink
+    // rather than redirecting the credential bytes.
+    fs_util::atomic_write(path, next.as_bytes(), StagedMode::Policy(KEY_FILE_MODE))
         .await
         .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
-    fs_util::set_key_permissions(path).await?;
     Ok(true)
 }
 
@@ -280,8 +292,6 @@ mod tests {
 
         let changed = write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
         assert!(changed);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
 
         let creds = load_credentials(None, None, Some(path.clone()))
             .await
@@ -290,9 +300,123 @@ mod tests {
         assert_eq!(creds.kid, "kid-1");
         assert_eq!(creds.hmac, "hmac-1");
 
-        // A re-write of the identical content reports no change.
+        // An identical payload does not rewrite the bytes, but still repairs
+        // the mode of a file this writer did not create.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let changed_again = write_eab_file(&path, "kid-1", "hmac-1").await.unwrap();
         assert!(!changed_again);
+        let repaired_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(repaired_mode, 0o600);
+    }
+
+    /// A freshly created EAB file holds its policy mode even under a permissive
+    /// umask. This guards the staged create-mode policy, not the former
+    /// create-then-chmod window, which is not observable after the write.
+    #[cfg(unix)]
+    #[test]
+    fn write_eab_file_creates_with_restricted_mode_under_umask_022() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if fs_util::umask_test_ran_in_child(
+            "eab::tests::write_eab_file_creates_with_restricted_mode_under_umask_022",
+        ) {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("secrets").join("eab.json");
+        // SAFETY: this test runs in the child spawned above, with no other
+        // tests sharing the process, and restores the prior umask immediately.
+        let previous = unsafe { libc::umask(0o022) };
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(write_eab_file(&path, "kid-1", "hmac-1"));
+        unsafe { libc::umask(previous) };
+        assert!(result.expect("write EAB file"));
+
+        let mode = std::fs::metadata(path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, KEY_FILE_MODE);
+    }
+
+    /// A secrets-tree link is replaced so EAB credentials are published at
+    /// their bootroot-managed path rather than a link target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_eab_file_replaces_a_symlinked_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).expect("mkdir");
+        let target = dir.path().join("former-target.json");
+        let former_payload = serialize_eab_payload("old-kid", "old-hmac").expect("serialize");
+        std::fs::write(&target, &former_payload).expect("seed target");
+        let path = secrets.join("eab.json");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        assert!(
+            write_eab_file(&path, "kid-1", "hmac-1")
+                .await
+                .expect("write EAB file")
+        );
+
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the secrets-tree symlink must be replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            serialize_eab_payload("kid-1", "hmac-1").expect("serialize")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read former target"),
+            former_payload
+        );
+    }
+
+    /// An identical payload at a link target still replaces the link, without
+    /// repairing permissions on a file outside the bootroot-managed path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_eab_file_replaces_an_identical_symlinked_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).expect("mkdir");
+        let payload = serialize_eab_payload("kid-1", "hmac-1").expect("serialize");
+        let target = dir.path().join("former-target.json");
+        std::fs::write(&target, &payload).expect("seed target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
+            .expect("widen former target");
+        let path = secrets.join("eab.json");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+        assert!(
+            write_eab_file(&path, "kid-1", "hmac-1")
+                .await
+                .expect("write EAB file")
+        );
+
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the secrets-tree symlink must be replaced"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), payload);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read former target"),
+            payload
+        );
+        let target_mode = std::fs::metadata(target)
+            .expect("stat former target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(target_mode, 0o644);
     }
 
     #[tokio::test]

@@ -794,8 +794,8 @@ pub enum StagedDurability {
     FlushDirectory,
     /// Rename and stop: a crash that loses the new directory entry
     /// leaves the previous file in place and costs a rewrite — a
-    /// reissued certificate, the next sync's `eab.json` — rather than
-    /// an outage.
+    /// reissued certificate or regenerated `ca.json` — rather than an
+    /// outage.
     RenameOnly,
 }
 
@@ -807,12 +807,13 @@ pub enum StagedDurability {
 /// writer of a file at a path bootroot itself owns goes through it —
 /// `state.json`, `rotation-state.json`, `agent.toml`, the fast-poll
 /// state, the two `init` outputs, the issued certificate, key and CA
-/// bundle, and the configuration `init` and the rotation commands
-/// generate (`.env`, `ca.json` and its template, `openbao.hcl`, the
-/// responder config, the `OpenBao` Agent configs and credentials, the
-/// compose overrides). For those the destination name is only ever
-/// observed as the previous file or the complete new one, and the final
-/// mode holds from the moment the name appears.
+/// bundle, the `OpenBao` unseal keys and EAB files, and the configuration
+/// `init` and the rotation commands generate (`.env`, `ca.json` and its
+/// template, `openbao.hcl`, the responder config, the `OpenBao` Agent
+/// configs and credentials, the compose overrides). For those the
+/// destination name is only ever observed as the previous file or the
+/// complete new one, and the final mode holds from the moment the name
+/// appears.
 ///
 /// It is not the crate's only staged publish. The override credential
 /// writers — [`create_owned_credential_noclobber`],
@@ -828,14 +829,6 @@ pub enum StagedDurability {
 /// publish that refuses a name already present rather than replacing
 /// it. Neither policy generalises to the files above, and folding them
 /// together would make one of the two callers wrong.
-///
-/// Two production writers stage nothing at all and have neither
-/// property: `save_unseal_keys`, for `secrets/openbao/unseal-keys.txt`,
-/// and [`crate::eab`]'s `write_key_file`, for the secrets-tree
-/// `eab.json` beside each service's `secret_id`. Both still write over
-/// the destination in place and set `0600` once the bytes are down.
-/// Converting them is a separate change; do not read the guarantees
-/// above as covering the crate's writes exhaustively until it lands.
 ///
 /// Callers reach it through one of the four wrappers rather than
 /// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
@@ -1082,8 +1075,8 @@ const UMASK_CHILD_MARKER: &str = "BOOTROOT_UMASK_TEST_CHILD";
 /// beside it: the window covers every file those tests create, and no
 /// lock held by the setter can close it, since the tests it would race
 /// take no such lock. Making the umask-dependent test its own process is
-/// the only isolation that actually holds. Both bootroot test
-/// executables have exactly one such test, and each opens with
+/// the only isolation that actually holds. Each umask-dependent test
+/// re-executes its test executable and opens with
 ///
 /// ```ignore
 /// if fs_util::umask_test_ran_in_child("module::tests::the_test_name") {
@@ -1712,9 +1705,9 @@ mod tests {
     /// Runs in a process of its own (see [`umask_test_ran_in_child`]),
     /// because it sets the umask and the umask belongs to the process:
     /// left in this one it would reach every file every test scheduled
-    /// beside it creates. One test rather than three for the same
-    /// reason — one isolated process, every umask-dependent publish in
-    /// this crate sequenced through it.
+    /// beside it creates. Covers all three [`StagedMode`] arms in one
+    /// isolated run rather than splitting them across three, keeping
+    /// their shared create-and-rewrite assertions together.
     ///
     /// [`StagedMode::PreserveOrUmask`]'s create arm gets its mode from
     /// `open(2)` rather than from a `chmod` afterwards — the only way a

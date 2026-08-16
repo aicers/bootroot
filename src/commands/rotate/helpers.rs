@@ -54,11 +54,8 @@ pub(super) fn ensure_file_exists(path: &Path, messages: &Messages) -> Result<()>
 ///
 /// Applying that mode to the staged temporary also closes the window the
 /// `write` + `set_key_permissions` pair this replaced left open, in
-/// which the password sat world-readable at its final path. That is the
-/// same defect #841's sibling issue tracks for `save_unseal_keys` and
-/// `eab::write_key_file`; those two are left to it, but a site being
-/// re-plumbed for the torn-read fix anyway does not get to keep the
-/// window.
+/// which the password sat world-readable at its final path. A site being
+/// re-plumbed for the torn-read fix does not get to keep that window.
 ///
 /// It takes the directory flush. Losing the new password after step-ca
 /// has re-encrypted its keys with it leaves an intermediate CA key
