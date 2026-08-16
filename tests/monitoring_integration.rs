@@ -13,12 +13,6 @@ mod unix_integration {
     /// Host ports the stack this test brings up publishes on `127.0.0.1`:
     /// `OpenBao` (8200), step-ca (9000), the HTTP-01 responder (8080),
     /// Grafana under the `lan` profile (3000) and `PostgreSQL` (5433).
-    ///
-    /// 9000 belongs here even though `infra up` below does not ask for
-    /// step-ca: `prometheus` declares `depends_on: [step-ca, openbao]`, so
-    /// `monitoring up` starts the container regardless and it publishes
-    /// 9000 the moment it does. Dropping the port from this list would
-    /// trade the named failure for a compose port-allocation error.
     const MONITORING_PORTS: [u16; 5] = [8200, 9000, 8080, 3000, 5433];
 
     /// Grafana admin password given to `monitoring up`, injected into
@@ -158,23 +152,22 @@ mod unix_integration {
     /// Services this test asks `infra up` to bring up and hold to a
     /// readiness check.
     ///
-    /// step-ca is deliberately absent. `infra up` ends in
-    /// `ensure_all_healthy` over exactly this list, and step-ca cannot be
-    /// healthy here: its command is
-    /// `step-ca /home/step/config/ca.json --password-file
-    /// /home/step/password.txt` over the `./secrets` bind mount, and
-    /// `secrets/` is gitignored and written by `bootroot init` — which this
-    /// test runs before, by the constraint that it owns the host ports. On
-    /// a clean checkout the container therefore crash-loops under
-    /// `restart: always` and `infra up` fails with
-    /// `step-ca status=restarting`.
+    /// KNOWN FAILURE, escalated on #825 rather than worked around: step-ca
+    /// cannot pass the readiness check at this point in the job. `infra up`
+    /// ends in `ensure_all_healthy` over exactly this list, and step-ca's
+    /// command is `step-ca /home/step/config/ca.json --password-file
+    /// /home/step/password.txt` over the `./secrets` bind mount. `secrets/`
+    /// is gitignored and written by `bootroot init`, and #825 constrains
+    /// this test to run *before* any install or init so that it owns the
+    /// host ports. On a clean checkout the container therefore crash-loops
+    /// under `restart: always` and `infra up` fails with
+    /// `Infrastructure not healthy: step-ca status=restarting`.
     ///
-    /// This does not remove step-ca from the stack: `prometheus` depends on
-    /// it, so `monitoring up` still starts it. What the list controls is
-    /// what gets asserted, and asserting a service that cannot start on the
-    /// inputs available at this point in the job is what kept the test from
-    /// running at all.
-    const INFRA_SERVICES: &str = "openbao,postgres,bootroot-http01";
+    /// step-ca stays in the list anyway. Dropping it would make the test
+    /// pass while asserting less than the issue commissions it to assert,
+    /// and #825 reserves for a human the decision of whether that trade is
+    /// acceptable or the ordering constraint should move instead.
+    const INFRA_SERVICES: &str = "openbao,postgres,step-ca,bootroot-http01";
 
     fn run_infra_up(project: &str, compose_file: &Path) -> Result<()> {
         let output = run_command(
@@ -238,22 +231,25 @@ mod unix_integration {
         .context("Grafana did not become healthy")
     }
 
-    /// Waits until Prometheus reports the `openbao` scrape target healthy.
+    /// Waits until Prometheus reports both scrape targets healthy.
     ///
-    /// The `step-ca` job in `monitoring/prometheus.yml` is not waited on,
-    /// because nothing can make it go up. It scrapes `step-ca:9102`, and
+    /// KNOWN FAILURE, escalated on #825 rather than worked around: the
+    /// `step-ca` job can never go up. It scrapes `step-ca:9102`, and
     /// step-ca serves metrics only when `metricsAddress` is set in
-    /// `ca.json` — a key no code in this repository writes: `ca.json` comes
-    /// from `step ca init` inside the image, and the patcher in
+    /// `ca.json` — a key no code in this repository writes. `ca.json` comes
+    /// from `step ca init` inside the image, the patcher in
     /// `src/commands/init/steps/stepca_setup.rs` touches only `dnsNames`,
-    /// `db` and ACME. The pinned image's `step-ca` accepts no flag or
-    /// environment variable for it either, so there is no way to set it
-    /// from compose. That target has never had anything to scrape, in this
-    /// test or in production; waiting on it here would only time out.
+    /// `db` and the ACME provisioner, and the pinned image's `step-ca`
+    /// accepts the address through no flag or environment variable, so
+    /// compose cannot supply it either. `monitoring/prometheus.yml` has had
+    /// one commit since it was introduced, so that job has never had
+    /// anything to scrape — in this test or in production.
     ///
-    /// Prometheus scraping is still covered — `openbao` is a real target
-    /// over the same config, so a Prometheus upgrade that breaks scraping
-    /// or the config format still fails this test.
+    /// That is a defect in the monitoring stack, not in this test, and
+    /// fixing it means writing `metricsAddress` from `init` — which #825
+    /// neither authorises nor could benefit from here, since this test runs
+    /// before `init` by the same constraint. Both jobs stay asserted so the
+    /// gap stays visible; the call on where it gets fixed is a human's.
     async fn wait_for_prometheus_targets(project: &str, compose_file: &Path) -> Result<()> {
         wait_for(Duration::from_secs(90), || {
             let mut command = docker_compose_command(project, compose_file);
@@ -277,23 +273,25 @@ mod unix_integration {
                     .and_then(|item| item.as_array())
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                let openbao_up = active.iter().any(|target| {
-                    let job = target
-                        .get("labels")
-                        .and_then(|item| item.get("job"))
-                        .and_then(|item| item.as_str())
-                        .unwrap_or_default();
-                    let health = target
-                        .get("health")
-                        .and_then(|item| item.as_str())
-                        .unwrap_or_default();
-                    job == "openbao" && health == "up"
-                });
-                Ok(openbao_up)
+                let job_is_up = |name: &str| {
+                    active.iter().any(|target| {
+                        let job = target
+                            .get("labels")
+                            .and_then(|item| item.get("job"))
+                            .and_then(|item| item.as_str())
+                            .unwrap_or_default();
+                        let health = target
+                            .get("health")
+                            .and_then(|item| item.as_str())
+                            .unwrap_or_default();
+                        job == name && health == "up"
+                    })
+                };
+                Ok(job_is_up("step-ca") && job_is_up("openbao"))
             }
         })
         .await
-        .context("Prometheus did not report openbao as up")
+        .context("Prometheus did not report step-ca/openbao as up")
     }
 
     async fn assert_grafana_dashboard(client: &Client) -> Result<()> {
