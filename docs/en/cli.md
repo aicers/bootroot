@@ -236,13 +236,14 @@ rather than following a link at it:
   not survive the command that creates the file; for a credential, following a
   link would also mean redirecting its bytes away from the bootroot-managed path.
   The replacement is not silent: bootroot emits one `WARN` naming the path and the
-  file the link had pointed at. Where that warning is displayed depends on the
-  component, because only the long-running ones install a log subscriber:
-  `bootroot-agent` and the HTTP-01 responder print it with their other logs,
-  while the `bootroot` CLI currently installs none and so shows nothing for the
-  paths it writes itself — the unseal-keys file, the secrets-tree EAB file and
-  the control node's `agent.toml`. After a CLI command that writes one of those,
-  check the path with `ls -l` if you had a link there.
+  file the link had pointed at. Whether that warning reaches you depends on which
+  program performed the write, because only `bootroot-agent` installs a log
+  subscriber: a link it replaces while renewing on a service host is reported
+  with its other logs. Neither the `bootroot` CLI nor `bootroot-remote` installs
+  one, so every replacement they make — which is every path in this group written
+  by an operator command rather than by the running daemon — happens with nothing
+  displayed anywhere. After a command that writes one of these files, check the
+  path with `ls -l` if you had a link there.
 
 ## bootroot infra up
 
