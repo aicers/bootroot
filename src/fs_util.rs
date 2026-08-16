@@ -1074,8 +1074,8 @@ const UMASK_CHILD_MARKER: &str = "BOOTROOT_UMASK_TEST_CHILD";
 /// beside it: the window covers every file those tests create, and no
 /// lock held by the setter can close it, since the tests it would race
 /// take no such lock. Making the umask-dependent test its own process is
-/// the only isolation that actually holds. Both bootroot test
-/// executables have exactly one such test, and each opens with
+/// the only isolation that actually holds. Each umask-dependent test
+/// re-executes its test executable and opens with
 ///
 /// ```ignore
 /// if fs_util::umask_test_ran_in_child("module::tests::the_test_name") {
@@ -1704,9 +1704,9 @@ mod tests {
     /// Runs in a process of its own (see [`umask_test_ran_in_child`]),
     /// because it sets the umask and the umask belongs to the process:
     /// left in this one it would reach every file every test scheduled
-    /// beside it creates. One test rather than three for the same
-    /// reason — one isolated process, every umask-dependent publish in
-    /// this crate sequenced through it.
+    /// beside it creates. Covers all three [`StagedMode`] arms in one
+    /// isolated run rather than splitting them across three, keeping
+    /// their shared create-and-rewrite assertions together.
     ///
     /// [`StagedMode::PreserveOrUmask`]'s create arm gets its mode from
     /// `open(2)` rather than from a `chmod` afterwards — the only way a

@@ -394,10 +394,8 @@ mod tests {
     /// property of the *process*, not of a thread: left in the test
     /// binary's own process, the window below would cover every file
     /// created by every `commands` test the harness scheduled beside
-    /// it. Both umasks are exercised here, in sequence, for the same
-    /// reason `fs_util` puts all three [`fs_util::StagedMode`] arms in
-    /// one test rather than three — one isolated process, every
-    /// umask-dependent assertion in this binary inside it.
+    /// it. Both umasks are exercised here in sequence so this
+    /// writer-level assertion needs only one isolated child process.
     #[test]
     fn save_creates_a_new_state_file_under_the_process_umask() {
         if fs_util::umask_test_ran_in_child(

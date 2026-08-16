@@ -111,9 +111,11 @@ async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
             fs_util::set_key_permissions(path).await?;
             return Ok(false);
         }
+        // Republishing replaces the link instead of repairing its target's
+        // mode, even when the target already holds identical bytes.
     }
-    // This bootroot-owned secrets-tree path publishes at its given name,
-    // replacing a final symlink rather than redirecting the credential bytes.
+    // This credential publishes at its given name, replacing a final symlink
+    // rather than redirecting the credential bytes.
     fs_util::atomic_write(path, next.as_bytes(), StagedMode::Policy(KEY_FILE_MODE))
         .await
         .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;

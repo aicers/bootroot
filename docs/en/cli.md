@@ -189,7 +189,9 @@ rather than following a link at it:
   named before. A chain of links that loops back on itself names no target and
   is refused. The `agent.toml` that `bootroot-remote bootstrap` writes on a
   target host is in this group: that command is what creates the file there, so
-  a link you put at its `--agent-config-path` is one you arranged yourself.
+  a link you put at its `--agent-config-path` is one you arranged yourself. Its
+  adjacent `--eab-file-path` remains a credential path, so a link there is
+  replaced instead.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
   link found there with a regular file. The OpenBao unseal-keys and secrets-tree
