@@ -1145,16 +1145,14 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     // agent goes on reading the previous file and renewing against the
     // old `cert_group_gid`.
     //
-    // The rename lands on this path, not through a symlink at it —
-    // `atomic_write_blocking`, not the `_through_symlink` spelling the
-    // configuration writers take. `service::local_config` has published
-    // `agent.toml` by rename since #613, so a link an operator puts here
-    // is already replaced by the `service add` that creates the file;
-    // resolving it in the writer that only *edits* the file would make
-    // the two disagree about the same path rather than preserve anything
-    // that survives a `service add`.
+    // `service::local_config` has published `agent.toml` by rename since
+    // #613, so a link an operator puts here is already replaced by the
+    // `service add` that creates the file; resolving it in the writer
+    // that only *edits* the file would make the two disagree about the
+    // same path rather than preserve anything that survives a
+    // `service add`.
     fs_util::atomic_write_blocking(
-        agent_config_path,
+        fs_util::Destination::bootroot_owned(agent_config_path),
         next.as_bytes(),
         fs_util::StagedMode::PreserveOrCreate(fs_util::KEY_FILE_MODE),
     )

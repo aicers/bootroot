@@ -117,11 +117,13 @@ async fn write_key_file(path: &Path, contents: &str) -> anyhow::Result<bool> {
         // Republishing replaces the link instead of repairing its target's
         // mode, even when the target already holds identical bytes.
     }
-    // This credential publishes at its given name, replacing a final symlink
-    // rather than redirecting the credential bytes.
-    fs_util::atomic_write(path, next.as_bytes(), StagedMode::Policy(KEY_FILE_MODE))
-        .await
-        .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
+    fs_util::atomic_write(
+        fs_util::Destination::bootroot_owned(path),
+        next.as_bytes(),
+        StagedMode::Policy(KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
     Ok(true)
 }
 

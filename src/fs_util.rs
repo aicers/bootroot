@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -61,19 +62,18 @@ fn parent_dir(path: &Path) -> PathBuf {
 ///
 /// A truncating write opens the path with `O_TRUNC`, which follows the
 /// final symlink, so a destination pointed at a link has always
-/// delivered its bytes to the link's target. [`atomic_write`] and
-/// [`atomic_write_blocking`] `rename` over the name they are given
-/// instead, which replaces the link itself: the operator's link is
-/// gone and the target is left holding whatever was written last.
+/// delivered its bytes to the link's target. A staged publish `rename`s
+/// over the name it is given instead, which replaces the link itself:
+/// the operator's link is gone and the target is left holding whatever
+/// was written last.
 ///
-/// Writers reach this through
-/// [`atomic_write_through_symlink`]/[`atomic_replace_through_symlink`]
-/// and their blocking halves, which document what takes that spelling
-/// and what deliberately keeps the bare rename. It is called directly
-/// only where the resolved path itself is needed — `bootroot reinit`'s
-/// two output preflights, which judge the target's mode before the
-/// destructive step, and the two writers behind them, which narrow that
-/// same target before writing a credential over it.
+/// Writers reach this through [`Destination::operator_named`], which
+/// documents which destinations resolve a link and which publish at the
+/// name. It is called directly only where the resolved path itself is
+/// needed — `bootroot reinit`'s two output preflights, which judge the
+/// target's mode before the destructive step, and the two writers behind
+/// them, which narrow that same target before writing a credential over
+/// it.
 ///
 /// Not a security check. It follows whatever the link points at, so a
 /// caller whose destination an untrusted user can plant must reject
@@ -439,7 +439,135 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
     .context("Owned credential write task panicked")?
 }
 
-/// Writes `contents` to `path` atomically by staging it in a sibling
+/// A path a staged publish is aimed at, together with where that path
+/// came from — which is what decides whether a symlink at its final
+/// component is followed or replaced.
+///
+/// A truncating write opened the destination with `O_TRUNC`, which
+/// follows a link at the final component and delivers the bytes to its
+/// target. A staged publish renames over the name it is given instead,
+/// which replaces the link: the operator's arrangement is gone, and
+/// whatever it pointed at is left holding the previous contents while
+/// the write reports success. Both answers are wanted in this crate, and
+/// which one a file wants is not a property of the writer that happens
+/// to be publishing it. It is a property of where the path came from, so
+/// it is stated once, here, by the constructor that names that origin:
+///
+/// - [`Destination::operator_named`] — a path from a CLI flag, a config
+///   value, or a file the operator arranges in bootroot's tree. Resolves
+///   a final symlink and publishes at the target.
+/// - [`Destination::bootroot_owned`] — a path bootroot derived from the
+///   secrets tree or another layout it controls. Publishes at the name.
+///
+/// There is a third answer, and this type deliberately does not express
+/// it. The override credential writers —
+/// [`create_owned_credential_noclobber`], [`write_owned_file_replace`]
+/// and [`atomic_rewrite_owned_no_symlink`] — publish a service's
+/// `role_id`, `secret_id` and `eab.json` into an operator-provisioned,
+/// agent-owned directory, and refuse a link at the destination outright
+/// rather than resolving it or renaming over it, because the
+/// lower-privileged user who owns that directory can plant one. They
+/// stage independently and take their ownership from the parent
+/// directory, and folding them behind a constructor here would make one
+/// of the two callers wrong.
+#[derive(Clone, Copy)]
+pub struct Destination<'a> {
+    path: &'a Path,
+    symlink: SymlinkPolicy,
+}
+
+/// What a staged publish does about a symlink at the destination's final
+/// path component — [`Destination`]'s decision, spelled out.
+#[derive(Clone, Copy)]
+enum SymlinkPolicy {
+    /// Resolve the link and publish at its target, as `O_TRUNC` did.
+    Resolve,
+    /// Publish at the name, replacing a link found there.
+    PublishAtName,
+}
+
+impl<'a> Destination<'a> {
+    /// Creates a destination the operator named: a path from a CLI flag
+    /// or a config value, or a file bootroot renders into its own tree
+    /// that an operator may have pointed elsewhere. A symlink at the
+    /// final path component is resolved and the bytes are delivered to
+    /// its target, leaving the link standing — what the truncating
+    /// write these publishes replaced used to do.
+    ///
+    /// This is what the configuration bootroot generates takes (`.env`,
+    /// `ca.json` and its template, `openbao.hcl`, the compose overrides,
+    /// the responder and `OpenBao` Agent configs, `state.json`), along
+    /// with the output paths named on the command line (`init`'s two,
+    /// `rotate openbao-recovery --output`, and `bootroot-remote
+    /// bootstrap`'s `agent.toml` destination — that command is what
+    /// creates the file on a target host, so a link there is one the
+    /// operator put in place and the truncating write followed).
+    ///
+    /// Not a security check: the link is followed wherever it points,
+    /// so a destination an untrusted user can plant is not this
+    /// constructor's case (see [`resolve_symlink_destination`], and
+    /// [`atomic_rewrite_owned_no_symlink`], which refuses one instead).
+    #[must_use]
+    pub fn operator_named(path: &'a Path) -> Self {
+        Self {
+            path,
+            symlink: SymlinkPolicy::Resolve,
+        }
+    }
+
+    /// Creates a destination bootroot derived from a layout it owns:
+    /// the secrets tree, or a path it hands a reader itself. The
+    /// publish renames over the name, so a symlink found there is
+    /// replaced by the published file.
+    ///
+    /// Two classes take it:
+    ///
+    /// - **Credentials at a path bootroot chose**, inside the secrets
+    ///   tree. A link there is a redirection vector rather than an
+    ///   operator convenience, and the reader reads the path bootroot
+    ///   handed it — which the rename leaves holding the current secret
+    ///   — so following one buys nothing and costs the guarantee.
+    /// - **Files another writer already publishes by rename**, namely
+    ///   the control node's `agent.toml` (since #613) and the issued
+    ///   cert and key (since #593). A link at those paths does not
+    ///   survive the writer that creates the file, so resolving it in
+    ///   the writers that *edit* the file would make the two disagree
+    ///   rather than preserve anything.
+    ///
+    /// The replacement is decided, not silent: `publish_staged_blocking`
+    /// names the link and its former target at `warn` once the rename
+    /// has actually replaced it.
+    #[must_use]
+    pub fn bootroot_owned(path: &'a Path) -> Self {
+        Self {
+            path,
+            symlink: SymlinkPolicy::PublishAtName,
+        }
+    }
+
+    /// The path and the policy, with the path owned so both can cross
+    /// into a `spawn_blocking` closure and be re-borrowed as a
+    /// [`Destination`] on the other side. The one copy either half of an
+    /// async publish makes of the destination.
+    fn to_owned_parts(self) -> (PathBuf, SymlinkPolicy) {
+        (self.path.to_path_buf(), self.symlink)
+    }
+
+    /// The path the staged temporary is renamed onto: the destination's
+    /// own name, or — under [`SymlinkPolicy::Resolve`] — the file a
+    /// symlink there points at.
+    ///
+    /// Borrowed on the publish-at-name side, so the answer costs an
+    /// allocation only where a link actually has to be resolved.
+    fn publish_path(self) -> Result<Cow<'a, Path>> {
+        match self.symlink {
+            SymlinkPolicy::PublishAtName => Ok(Cow::Borrowed(self.path)),
+            SymlinkPolicy::Resolve => Ok(Cow::Owned(resolve_symlink_destination(self.path)?)),
+        }
+    }
+}
+
+/// Writes `contents` to `dest` atomically by staging it in a sibling
 /// temp file and `rename(2)`ing into place.
 ///
 /// `bootroot-agent`'s daemon loop re-reads `agent.toml` on every ACME
@@ -454,12 +582,16 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
 ///
 /// The mode [`StagedMode`] resolves to is on the staged file before the
 /// rename so the on-disk mode never changes after the file appears at
-/// `path`. When `path` already exists, the existing uid/gid is also
-/// re-applied to the staged file before the rename so the caller does
-/// not silently re-own the destination to the writer's effective
-/// uid/gid (e.g. a `service add` run by root replacing an
+/// the destination. When the destination already exists, the existing
+/// uid/gid is also re-applied to the staged file before the rename so
+/// the caller does not silently re-own the destination to the writer's
+/// effective uid/gid (e.g. a `service add` run by root replacing an
 /// agent-readable file with a root-owned `0600` file the long-running
 /// agent process can no longer read).
+///
+/// Whether a symlink at the destination is resolved or replaced is
+/// [`Destination`]'s decision, taken by the constructor the caller
+/// names, not this function's.
 ///
 /// The containing directory is flushed after the rename
 /// ([`sync_parent_dir`]). This is the shared path for
@@ -470,15 +602,26 @@ async fn write_owned_impl(path: &Path, contents: &[u8], mode: u32, publish: Publ
 /// # Errors
 /// Returns an error if the temp file cannot be created, written,
 /// permissioned, chowned (when ownership preservation is needed),
-/// renamed, or if the containing directory cannot be flushed.
-pub async fn atomic_write(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
+/// renamed, if the containing directory cannot be flushed, or if an
+/// [`Destination::operator_named`] destination's symlink chain cannot be
+/// resolved (a cycle, or an unreadable link).
+pub async fn atomic_write(dest: Destination<'_>, contents: &[u8], mode: StagedMode) -> Result<()> {
     // Owned once, to move into the blocking task. The blocking half
     // borrows, so this is the only copy either path makes.
-    let dest = path.to_path_buf();
+    let (path, symlink) = dest.to_owned_parts();
     let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || atomic_write_blocking(&dest, &payload, mode))
-        .await
-        .context("Atomic write task panicked")?
+    tokio::task::spawn_blocking(move || {
+        atomic_write_blocking(
+            Destination {
+                path: &path,
+                symlink,
+            },
+            &payload,
+            mode,
+        )
+    })
+    .await
+    .context("Atomic write task panicked")?
 }
 
 /// The blocking half of [`atomic_write`], for callers that are not async.
@@ -496,9 +639,13 @@ pub async fn atomic_write(path: &Path, contents: &[u8], mode: StagedMode) -> Res
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`].
-pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
+pub fn atomic_write_blocking(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
     publish_staged_blocking(
-        path,
+        &dest.publish_path()?,
         contents,
         mode,
         StagedOwner::Destination,
@@ -506,7 +653,7 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> 
     )
 }
 
-/// Publishes `contents` at `path` by rename, **without** flushing the
+/// Publishes `contents` at `dest` by rename, **without** flushing the
 /// containing directory.
 ///
 /// [`atomic_write`]'s guarantee against a torn read, without its
@@ -525,14 +672,27 @@ pub fn atomic_write_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> 
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_write`],
 /// except that no directory flush is attempted.
-pub async fn atomic_replace(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
+pub async fn atomic_replace(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
     // Owned once, to move into the blocking task, exactly as
     // `atomic_write` does.
-    let dest = path.to_path_buf();
+    let (path, symlink) = dest.to_owned_parts();
     let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || atomic_replace_blocking(&dest, &payload, mode))
-        .await
-        .context("Atomic replace task panicked")?
+    tokio::task::spawn_blocking(move || {
+        atomic_replace_blocking(
+            Destination {
+                path: &path,
+                symlink,
+            },
+            &payload,
+            mode,
+        )
+    })
+    .await
+    .context("Atomic replace task panicked")?
 }
 
 /// The blocking half of [`atomic_replace`], for callers that are not
@@ -544,123 +704,18 @@ pub async fn atomic_replace(path: &Path, contents: &[u8], mode: StagedMode) -> R
 ///
 /// # Errors
 /// Returns an error under the same conditions as [`atomic_replace`].
-pub fn atomic_replace_blocking(path: &Path, contents: &[u8], mode: StagedMode) -> Result<()> {
+pub fn atomic_replace_blocking(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
     publish_staged_blocking(
-        path,
+        &dest.publish_path()?,
         contents,
         mode,
         StagedOwner::Destination,
         StagedDurability::RenameOnly,
     )
-}
-
-/// [`atomic_write`], resolving a symlink at the final path component
-/// first.
-///
-/// The truncating write this pair of functions replaces opened the
-/// destination with `O_TRUNC`, which follows that link and delivers the
-/// bytes to its target. A bare rename replaces the link instead: the
-/// operator's link is gone, and whatever it pointed at is left holding
-/// the previous contents while the write reports success. Resolving
-/// first keeps the file the operator arranged to be written the file
-/// that is written.
-///
-/// This is the spelling for a destination an operator arranges: the
-/// configuration bootroot renders into its own tree and an operator may
-/// have pointed elsewhere (`.env`, `ca.json` and its template,
-/// `openbao.hcl`, the compose overrides, the responder and `OpenBao`
-/// Agent configs, `state.json`), and the output paths they name on the
-/// command line (`init`'s two, `rotate openbao-recovery --output`,
-/// `bootroot-remote bootstrap`'s `agent.toml` destination — that
-/// command is what creates the file on a target host, so a link there
-/// is one the operator put in place and the truncating write followed).
-///
-/// Two classes deliberately keep [`atomic_write`]'s bare rename:
-///
-/// - **Credentials at a path bootroot chose**, inside the secrets tree.
-///   A link there is a redirection vector rather than an operator
-///   convenience, and the reader reads the path bootroot handed it —
-///   which the rename leaves holding the current secret — so following
-///   one buys nothing and costs the guarantee. The override credential
-///   paths, whose directory an unprivileged user owns, go further and
-///   refuse a link outright ([`atomic_rewrite_owned_no_symlink`]).
-/// - **Files another writer already publishes by rename**, namely the
-///   control node's `agent.toml` (since #613) and the issued cert and
-///   key (since #593). A link at those paths does not survive the
-///   writer that creates the file, so resolving it in the writers that
-///   *edit* the file would make the two disagree rather than preserve
-///   anything.
-///
-/// Not a security check: see [`resolve_symlink_destination`].
-///
-/// # Errors
-/// Returns an error under the same conditions as [`atomic_write`], or
-/// if the destination's symlink chain cannot be resolved (a cycle, or
-/// an unreadable link).
-pub async fn atomic_write_through_symlink(
-    path: &Path,
-    contents: &[u8],
-    mode: StagedMode,
-) -> Result<()> {
-    let dest = path.to_path_buf();
-    let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || {
-        atomic_write_through_symlink_blocking(&dest, &payload, mode)
-    })
-    .await
-    .context("Atomic write task panicked")?
-}
-
-/// The blocking half of [`atomic_write_through_symlink`], for callers
-/// that are not async.
-///
-/// # Errors
-/// Returns an error under the same conditions as
-/// [`atomic_write_through_symlink`].
-pub fn atomic_write_through_symlink_blocking(
-    path: &Path,
-    contents: &[u8],
-    mode: StagedMode,
-) -> Result<()> {
-    atomic_write_blocking(&resolve_symlink_destination(path)?, contents, mode)
-}
-
-/// [`atomic_replace`], resolving a symlink at the final path component
-/// first.
-///
-/// The same compatibility decision [`atomic_write_through_symlink`]
-/// documents — see there for which destinations take it and which keep
-/// the bare rename — without the directory flush.
-///
-/// # Errors
-/// Returns an error under the same conditions as [`atomic_replace`], or
-/// if the destination's symlink chain cannot be resolved.
-pub async fn atomic_replace_through_symlink(
-    path: &Path,
-    contents: &[u8],
-    mode: StagedMode,
-) -> Result<()> {
-    let dest = path.to_path_buf();
-    let payload = contents.to_vec();
-    tokio::task::spawn_blocking(move || {
-        atomic_replace_through_symlink_blocking(&dest, &payload, mode)
-    })
-    .await
-    .context("Atomic replace task panicked")?
-}
-
-/// The blocking half of [`atomic_replace_through_symlink`], for callers
-/// that are not async.
-///
-/// # Errors
-/// Returns an error under the same conditions as
-/// [`atomic_replace_through_symlink`].
-pub fn atomic_replace_through_symlink_blocking(
-    path: &Path,
-    contents: &[u8],
-    mode: StagedMode,
-) -> Result<()> {
-    atomic_replace_blocking(&resolve_symlink_destination(path)?, contents, mode)
 }
 
 /// Where the mode of the inode a staged publish renames into place
@@ -815,9 +870,9 @@ pub enum StagedDurability {
 /// so a publish that fails at the rename leaves the link standing and
 /// says nothing about having replaced it.
 ///
-/// The `_through_symlink` wrappers resolve the destination before they
-/// publish, so the path they hand the core is the link's target and
-/// never a link itself. They are exempt by construction rather than by
+/// [`Destination::operator_named`] resolves the destination before the
+/// publish, so the path its callers hand the core is the link's target
+/// and never a link itself. It is exempt by construction rather than by
 /// a flag.
 ///
 /// Reads the destination with `symlink_metadata`, which does not follow
@@ -881,9 +936,12 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
 /// Callers reach it through one of the four wrappers rather than
 /// directly: [`atomic_write`]/[`atomic_write_blocking`] for a file read
 /// back to resume, [`atomic_replace`]/[`atomic_replace_blocking`] for
-/// one that can be regenerated. `crate::cert_group` is the exception,
-/// calling in with [`StagedOwner::PolicyGroup`] for the three files the
-/// `--cert-group` policy owns.
+/// one that can be regenerated. Those four take a [`Destination`] and
+/// have already answered the symlink question by the time they call in
+/// here, so the `path` below is a name to rename onto and never a link
+/// to resolve. `crate::cert_group` is the exception, calling in with
+/// [`StagedOwner::PolicyGroup`] for the three files the `--cert-group`
+/// policy owns.
 ///
 /// The staged file is created at `0600` and reaches its final mode only
 /// while it is still at its temporary name, so a wider mode is never
@@ -924,8 +982,9 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
 ///
 /// A destination that is a symlink is renamed over rather than followed,
 /// which destroys the operator's link. That is the decided behaviour
-/// here — the wrappers that resolve first are the `_through_symlink`
-/// pair — but it is not left silent: the destination is read with
+/// here — a caller wanting the link resolved says so with
+/// [`Destination::operator_named`], which resolves before reaching this
+/// far — but it is not left silent: the destination is read with
 /// `symlink_metadata` while the link is still there, and once the
 /// rename has replaced it the link and the file it pointed at are
 /// reported at `warn`.
@@ -1572,17 +1631,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"first", StagedMode::Policy(KEY_FILE_MODE))
-            .await
-            .unwrap();
+        super::atomic_write(
+            Destination::bootroot_owned(&path),
+            b"first",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
         let contents = fs::read_to_string(&path).await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(contents, "first");
         assert_eq!(mode, KEY_FILE_MODE);
 
-        super::atomic_write(&path, b"second", StagedMode::Policy(KEY_FILE_MODE))
-            .await
-            .unwrap();
+        super::atomic_write(
+            Destination::bootroot_owned(&path),
+            b"second",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
         let contents = fs::read_to_string(&path).await.unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(contents, "second");
@@ -1602,9 +1669,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("compose.override.yml");
 
-        super::atomic_replace(&path, b"first", StagedMode::Policy(0o644))
-            .await
-            .unwrap();
+        super::atomic_replace(
+            Destination::bootroot_owned(&path),
+            b"first",
+            StagedMode::Policy(0o644),
+        )
+        .await
+        .unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "first");
         let first_ino = std::fs::metadata(&path).unwrap().ino();
         assert_eq!(
@@ -1612,9 +1683,13 @@ mod tests {
             0o644
         );
 
-        super::atomic_replace(&path, b"second", StagedMode::Policy(0o644))
-            .await
-            .unwrap();
+        super::atomic_replace(
+            Destination::bootroot_owned(&path),
+            b"second",
+            StagedMode::Policy(0o644),
+        )
+        .await
+        .unwrap();
         assert_eq!(fs::read_to_string(&path).await.unwrap(), "second");
         assert_ne!(
             std::fs::metadata(&path).unwrap().ino(),
@@ -1633,30 +1708,47 @@ mod tests {
         );
     }
 
-    /// The two spellings differ in exactly one observable way, and this
-    /// pins both halves of it: given a symlinked destination, the
-    /// `_through_symlink` wrappers deliver to the target and leave the
-    /// link standing — what `O_TRUNC` did — while the bare wrappers
-    /// replace the link with the published file, which is what the
-    /// `agent.toml` and cert/key writers want.
+    /// The two constructors differ in exactly one observable way, and
+    /// this pins both halves of it at the primitive, over the same
+    /// seeded arrangement: `operator_named` delivers to a live link's
+    /// target and leaves the link standing — what `O_TRUNC` did — while
+    /// `bootroot_owned` replaces the link at that same path with the
+    /// published file, which is what the `agent.toml` and cert/key
+    /// writers want.
+    ///
+    /// Runs through both durability spellings, since the symlink axis is
+    /// the destination's property and must not depend on which of the
+    /// two is publishing.
     #[tokio::test]
-    async fn through_symlink_wrappers_deliver_to_the_target_the_bare_ones_replace() {
+    async fn operator_named_delivers_to_the_target_and_bootroot_owned_replaces_the_link() {
         let dir = tempdir().unwrap();
-
-        for (name, published) in [("write.env", false), ("replace.env", true)] {
+        let seed = |name: &str| {
             let target = dir.path().join(format!("target-{name}"));
             let link = dir.path().join(name);
             std::fs::write(&target, b"seed").unwrap();
             std::os::unix::fs::symlink(&target, &link).unwrap();
+            (target, link)
+        };
 
-            if published {
-                super::atomic_replace_through_symlink(&link, b"fresh", StagedMode::Policy(0o644))
-                    .await
-                    .unwrap();
+        for (name, flushes) in [("write.env", true), ("replace.env", false)] {
+            let (target, link) = seed(name);
+
+            if flushes {
+                super::atomic_write(
+                    Destination::operator_named(&link),
+                    b"fresh",
+                    StagedMode::Policy(0o644),
+                )
+                .await
+                .unwrap();
             } else {
-                super::atomic_write_through_symlink(&link, b"fresh", StagedMode::Policy(0o644))
-                    .await
-                    .unwrap();
+                super::atomic_replace(
+                    Destination::operator_named(&link),
+                    b"fresh",
+                    StagedMode::Policy(0o644),
+                )
+                .await
+                .unwrap();
             }
 
             assert!(
@@ -1674,42 +1766,60 @@ mod tests {
             );
         }
 
-        let target = dir.path().join("target-bare");
-        let link = dir.path().join("bare");
-        std::fs::write(&target, b"seed").unwrap();
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for (name, flushes) in [("bare-write.env", true), ("bare-replace.env", false)] {
+            let (target, link) = seed(name);
 
-        super::atomic_write(&link, b"fresh", StagedMode::Policy(0o644))
-            .await
-            .unwrap();
+            if flushes {
+                super::atomic_write(
+                    Destination::bootroot_owned(&link),
+                    b"fresh",
+                    StagedMode::Policy(0o644),
+                )
+                .await
+                .unwrap();
+            } else {
+                super::atomic_replace(
+                    Destination::bootroot_owned(&link),
+                    b"fresh",
+                    StagedMode::Policy(0o644),
+                )
+                .await
+                .unwrap();
+            }
 
-        assert!(
-            !std::fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the bare spelling publishes at the name, replacing the link"
-        );
-        assert_eq!(std::fs::read_to_string(&link).unwrap(), "fresh");
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "seed",
-            "and leaves the target alone"
-        );
+            assert!(
+                !std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{name}: `bootroot_owned` publishes at the name, replacing the link"
+            );
+            assert_eq!(std::fs::read_to_string(&link).unwrap(), "fresh");
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "seed",
+                "{name}: and leaves the target alone"
+            );
+        }
     }
 
-    /// A dangling link is followed to where it points, so a first write
-    /// through one creates the target rather than replacing the link —
-    /// the `O_CREAT` half of the behaviour being preserved.
+    /// A dangling link is followed to where it points, so a first
+    /// `operator_named` write through one creates the target rather than
+    /// replacing the link — the `O_CREAT` half of the behaviour being
+    /// preserved.
     #[test]
-    fn through_symlink_wrappers_create_a_dangling_links_target() {
+    fn operator_named_creates_a_dangling_links_target() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("absent.yml");
         let link = dir.path().join("override.yml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        super::atomic_replace_through_symlink_blocking(&link, b"fresh", StagedMode::Policy(0o644))
-            .unwrap();
+        super::atomic_replace_blocking(
+            Destination::operator_named(&link),
+            b"fresh",
+            StagedMode::Policy(0o644),
+        )
+        .unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh");
         assert!(
@@ -1752,9 +1862,9 @@ mod tests {
         );
     }
 
-    /// The `_through_symlink` wrappers are exempt from that warning by
-    /// construction rather than by a flag: what they hand the core is
-    /// the resolved target, and a resolved target is never a link.
+    /// [`Destination::operator_named`] is exempt from that warning by
+    /// construction rather than by a flag: what it hands the core is the
+    /// resolved target, and a resolved target is never a link.
     #[test]
     fn a_resolved_destination_is_never_a_replaced_symlink() {
         let dir = tempdir().unwrap();
@@ -1771,7 +1881,7 @@ mod tests {
             assert_eq!(
                 replaced_symlink_target(&resolved),
                 None,
-                "the path a `_through_symlink` wrapper publishes to must not warn"
+                "the path an `operator_named` publish lands on must not warn"
             );
         }
     }
@@ -1809,10 +1919,10 @@ mod tests {
     }
 
     /// The observable half of the helper tests above, through the two
-    /// spellings an operator actually reaches: a bare publish over a
-    /// seeded link says so once and names both ends of it, and the
-    /// `_through_symlink` publish over the same arrangement says
-    /// nothing, because it never hands the core a link.
+    /// constructors an operator actually reaches: a `bootroot_owned`
+    /// publish over a seeded link says so once and names both ends of
+    /// it, and an `operator_named` publish over the same arrangement
+    /// says nothing, because it never hands the core a link.
     #[test]
     fn a_bare_publish_over_a_link_warns_once_and_a_resolved_one_stays_quiet() {
         let dir = tempdir().unwrap();
@@ -1826,7 +1936,12 @@ mod tests {
 
         let (bare_target, bare_link) = seed("bare.env");
         let logged = logs_from(|| {
-            atomic_write_blocking(&bare_link, b"fresh", StagedMode::Policy(0o644)).unwrap();
+            atomic_write_blocking(
+                Destination::bootroot_owned(&bare_link),
+                b"fresh",
+                StagedMode::Policy(0o644),
+            )
+            .unwrap();
         });
 
         assert_eq!(
@@ -1846,8 +1961,8 @@ mod tests {
 
         let (resolved_target, resolved_link) = seed("resolved.env");
         let quiet = logs_from(|| {
-            atomic_write_through_symlink_blocking(
-                &resolved_link,
+            atomic_write_blocking(
+                Destination::operator_named(&resolved_link),
                 b"fresh",
                 StagedMode::Policy(0o644),
             )
@@ -1886,7 +2001,7 @@ mod tests {
     /// the truncating write's `ELOOP` did rather than replacing one of
     /// the links with the file.
     #[test]
-    fn through_symlink_wrappers_refuse_a_symlink_cycle() {
+    fn operator_named_refuses_a_symlink_cycle() {
         let dir = tempdir().unwrap();
         let a = dir.path().join("a.env");
         let b = dir.path().join("b.env");
@@ -1894,12 +2009,20 @@ mod tests {
         std::os::unix::fs::symlink(&a, &b).unwrap();
 
         assert!(
-            super::atomic_write_through_symlink_blocking(&a, b"x", StagedMode::Policy(0o644))
-                .is_err()
+            super::atomic_write_blocking(
+                Destination::operator_named(&a),
+                b"x",
+                StagedMode::Policy(0o644)
+            )
+            .is_err()
         );
         assert!(
-            super::atomic_replace_through_symlink_blocking(&a, b"x", StagedMode::Policy(0o644))
-                .is_err()
+            super::atomic_replace_blocking(
+                Destination::operator_named(&a),
+                b"x",
+                StagedMode::Policy(0o644)
+            )
+            .is_err()
         );
         assert!(
             std::fs::symlink_metadata(&a)
@@ -2048,18 +2171,26 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"first", StagedMode::Policy(KEY_FILE_MODE))
-            .await
-            .unwrap();
+        super::atomic_write(
+            Destination::bootroot_owned(&path),
+            b"first",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
         std::os::unix::fs::chown(&path, None, Some(gid))
             .expect("test process must be able to chgrp to a supplementary gid");
         let pre_meta = std::fs::metadata(&path).unwrap();
         assert_eq!(pre_meta.gid(), gid, "seed gid must take effect");
         let pre_uid = pre_meta.uid();
 
-        super::atomic_write(&path, b"second", StagedMode::Policy(KEY_FILE_MODE))
-            .await
-            .unwrap();
+        super::atomic_write(
+            Destination::bootroot_owned(&path),
+            b"second",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
 
         let post_meta = std::fs::metadata(&path).unwrap();
         assert_eq!(
@@ -2090,9 +2221,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("agent.toml");
 
-        super::atomic_write(&path, b"payload", StagedMode::Policy(KEY_FILE_MODE))
-            .await
-            .unwrap();
+        super::atomic_write(
+            Destination::bootroot_owned(&path),
+            b"payload",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
 
         let mut entries = Vec::new();
         let mut rd = fs::read_dir(dir.path()).await.unwrap();
@@ -2173,7 +2308,11 @@ mod tests {
             return;
         }
 
-        let result = atomic_write_blocking(&path, b"payload", StagedMode::Policy(KEY_FILE_MODE));
+        let result = atomic_write_blocking(
+            Destination::bootroot_owned(&path),
+            b"payload",
+            StagedMode::Policy(KEY_FILE_MODE),
+        );
         restore_directory_reads(&published);
 
         let err = result.unwrap_err();

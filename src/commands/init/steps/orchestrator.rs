@@ -301,11 +301,10 @@ async fn diagnose_partial_init(
 /// credentials that cannot be re-derived, so it is worth the disk round
 /// trip that makes the published name survive a power loss.
 ///
-/// A symlinked destination is resolved first
-/// ([`fs_util::resolve_symlink_destination`]), so the rename lands on
-/// the link's target the way the truncating write's `O_TRUNC` did.
-/// Renaming over the link instead would leave the operator without
-/// their link and the target holding the previous run's credentials.
+/// The destination is [`fs_util::Destination::operator_named`], and the
+/// link it may be is resolved by hand here rather than left to the
+/// publish: [`tighten_existing_secret_file`] has to narrow the file the
+/// rename will land on, which is the link's target and not the link.
 async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -317,8 +316,14 @@ async fn write_init_summary_json(path: &Path, summary: &InitSummary) -> Result<(
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
+        // `dest` is already the resolved target, so the constructor
+        // finds nothing left to follow. It is still the one that names
+        // this destination's side of the symlink axis. Handing it the
+        // unresolved path instead would resolve a second time, on its
+        // own, and the tighten above and the publish could then land on
+        // different files.
         fs_util::atomic_write_blocking(
-            &dest,
+            fs_util::Destination::operator_named(&dest),
             payload.as_bytes(),
             fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
         )
@@ -376,10 +381,11 @@ fn tighten_existing_secret_file(path: &Path) -> Result<()> {
 /// means losing the only copy of a credential `reinit` will not mint
 /// again, which is worth a disk round trip on a once-per-init write.
 ///
-/// A symlinked destination is resolved first, as it is for the summary
-/// JSON — `validate_root_token_output_path` accepts a link to a regular
-/// file on purpose, so the token has to reach the file that preflight
-/// judged and not replace the link that named it.
+/// The destination is [`fs_util::Destination::operator_named`], resolved
+/// by hand as it is for the summary JSON —
+/// `validate_root_token_output_path` accepts a link to a regular file on
+/// purpose, so the token has to reach the file that preflight judged and
+/// not replace the link that named it.
 async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -391,8 +397,10 @@ async fn write_root_token_file(path: &Path, token: &str) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let dest = fs_util::resolve_symlink_destination(&path_buf)?;
         tighten_existing_secret_file(&dest)?;
+        // Already resolved, for the reason `write_init_summary_json`
+        // records.
         fs_util::atomic_write_blocking(
-            &dest,
+            fs_util::Destination::operator_named(&dest),
             token.as_bytes(),
             fs_util::StagedMode::Policy(SECRET_OUTPUT_FILE_MODE),
         )
@@ -1350,8 +1358,8 @@ async fn maybe_rotate_env_db_password(
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let _ = fs_util::atomic_replace_through_symlink(
-                &ca_json_path,
+            let _ = fs_util::atomic_replace(
+                fs_util::Destination::operator_named(&ca_json_path),
                 updated.as_bytes(),
                 fs_util::StagedMode::PreserveOrUmask,
             )

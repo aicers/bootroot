@@ -357,8 +357,8 @@ pub(crate) fn reject_http01_admin_advertise_addr_for_specific_bind(
 /// override alone and gives a fresh one what the umask would have given
 /// the truncating write this replaced.
 fn publish_compose_override(path: &Path, content: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_through_symlink_blocking(
-        path,
+    fs_util::atomic_replace_blocking(
+        fs_util::Destination::operator_named(path),
         content.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
     )

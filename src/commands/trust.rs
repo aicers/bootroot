@@ -164,7 +164,7 @@ pub(crate) async fn update_rotation_state_async(
 /// rename and the directory flush all live in `atomic_write_blocking`.
 fn update_rotation_state_file(path: &Path, json: &str, write_failed: &str) -> Result<()> {
     fs_util::atomic_write_blocking(
-        path,
+        fs_util::Destination::bootroot_owned(path),
         json.as_bytes(),
         fs_util::StagedMode::Policy(ROTATION_STATE_MODE),
     )
