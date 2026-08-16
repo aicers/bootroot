@@ -487,12 +487,12 @@ enum SymlinkPolicy {
 }
 
 impl<'a> Destination<'a> {
-    /// A destination the operator named: a path from a CLI flag or a
-    /// config value, or a file bootroot renders into its own tree that
-    /// an operator may have pointed elsewhere. A symlink at the final
-    /// path component is resolved and the bytes are delivered to its
-    /// target, leaving the link standing — what the truncating write
-    /// these publishes replaced used to do.
+    /// Creates a destination the operator named: a path from a CLI flag
+    /// or a config value, or a file bootroot renders into its own tree
+    /// that an operator may have pointed elsewhere. A symlink at the
+    /// final path component is resolved and the bytes are delivered to
+    /// its target, leaving the link standing — what the truncating
+    /// write these publishes replaced used to do.
     ///
     /// This is what the configuration bootroot generates takes (`.env`,
     /// `ca.json` and its template, `openbao.hcl`, the compose overrides,
@@ -515,10 +515,10 @@ impl<'a> Destination<'a> {
         }
     }
 
-    /// A destination bootroot derived from a layout it owns: the
-    /// secrets tree, or a path it hands a reader itself. The publish
-    /// renames over the name, so a symlink found there is replaced by
-    /// the published file.
+    /// Creates a destination bootroot derived from a layout it owns:
+    /// the secrets tree, or a path it hands a reader itself. The
+    /// publish renames over the name, so a symlink found there is
+    /// replaced by the published file.
     ///
     /// Two classes take it:
     ///
