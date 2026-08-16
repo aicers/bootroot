@@ -238,11 +238,11 @@ rather than following a link at it:
   The replacement is not silent: bootroot emits one `WARN` naming the path and the
   file the link had pointed at. Where that warning is displayed depends on the
   component, because only the long-running ones install a log subscriber:
-  `bootroot-agent` and the HTTP-01 responder print it on stderr, while the
-  `bootroot` CLI currently installs none and so shows nothing for the paths it
-  writes itself — the unseal-keys file, the secrets-tree EAB file and the control
-  node's `agent.toml`. After a CLI command that writes one of those, check the path
-  with `ls -l` if you had a link there.
+  `bootroot-agent` and the HTTP-01 responder print it with their other logs,
+  while the `bootroot` CLI currently installs none and so shows nothing for the
+  paths it writes itself — the unseal-keys file, the secrets-tree EAB file and
+  the control node's `agent.toml`. After a CLI command that writes one of those,
+  check the path with `ls -l` if you had a link there.
 
 ## bootroot infra up
 
