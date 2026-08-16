@@ -122,26 +122,35 @@ mod unix_integration {
     ///
     /// An `Err` is a retry, not an exit: every poll in this file talks HTTP
     /// to a service that may still be binding its port, and a refused or
-    /// dropped connection is an `Err` rather than an `Ok(false)`. The last
-    /// poll's error is kept and reported when the budget runs out, so a
+    /// dropped connection is an `Err` rather than an `Ok(false)`. The error
+    /// is kept across polls and reported when the budget runs out, so a
     /// genuine failure still arrives with its cause attached instead of as
-    /// a bare timeout. A poll that reached the service and answered "not
-    /// yet" clears it: that is the more recent truth about the endpoint.
+    /// a bare timeout.
+    ///
+    /// A later `Ok(false)` does not clear it. An error that the service
+    /// then recovered from is still the only cause anyone has to work
+    /// from at a timeout, and dropping it in favour of "not yet" is the
+    /// diagnostic loss retrying was meant to avoid. The message says the
+    /// error is the last one *seen*, not necessarily the last poll, so a
+    /// reader is not told the service was unreachable at the deadline.
     async fn wait_for<F, Fut>(timeout: Duration, mut check: F) -> Result<()>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<bool>>,
     {
         let started = SystemTime::now();
+        let mut last_error: Option<anyhow::Error> = None;
         loop {
-            let last_error = match check().await {
+            match check().await {
                 Ok(true) => return Ok(()),
-                Ok(false) => None,
-                Err(error) => Some(error),
-            };
+                Ok(false) => {}
+                Err(error) => last_error = Some(error),
+            }
             if started.elapsed().unwrap_or_default() > timeout {
                 return Err(match last_error {
-                    Some(error) => error.context("Timed out waiting for condition"),
+                    Some(error) => {
+                        error.context("Timed out waiting for condition; last error seen")
+                    }
                     None => anyhow::anyhow!("Timed out waiting for condition"),
                 });
             }
@@ -432,5 +441,43 @@ mod unix_integration {
         assert_monitoring_status(&project, &compose_file)?;
 
         Ok(())
+    }
+
+    /// Holds `wait_for` to the diagnostic it exists for: an error seen
+    /// early must still be the reported cause at a timeout, even when
+    /// later polls reached the service and answered "not yet". Needs no
+    /// Docker and no host port, so it is not `#[ignore]`d — nothing in
+    /// this file otherwise runs in CI while #825's blockers stand.
+    #[tokio::test]
+    async fn wait_for_keeps_an_error_a_later_poll_did_not_repeat() {
+        let mut polls = 0_u32;
+        // Two poll intervals of budget, so the run reaches the Ok(false)
+        // that follows the error rather than timing out on the error
+        // itself, which would pass whatever the loop does with it.
+        let error = wait_for(Duration::from_secs(2), || {
+            polls += 1;
+            let poll = polls;
+            async move {
+                if poll == 1 {
+                    Err(anyhow::anyhow!(
+                        "connection closed before message completed"
+                    ))
+                } else {
+                    Ok(false)
+                }
+            }
+        })
+        .await
+        .expect_err("the condition never reports success");
+
+        let report = format!("{error:#}");
+        assert!(
+            report.contains("Timed out waiting for condition"),
+            "{report}"
+        );
+        assert!(
+            report.contains("connection closed before message completed"),
+            "{report}"
+        );
     }
 }
