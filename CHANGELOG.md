@@ -2034,9 +2034,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   credential paths bootroot publishes by rename, as does the control
   node's own `agent.toml`. Relocated `AppRole` `role_id` and `secret_id`
   paths instead reject a final link. Where a link is replaced bootroot
-  now says so, with one warning naming the destination and the file the
-  link pointed at, so a replacement that is intended is at least not
-  silent.
+  now emits a `WARN` naming the destination and the file the link
+  pointed at, so a replacement is at least recorded rather than silent.
+  It reaches a terminal only from the components that install a log
+  subscriber — `bootroot-agent` and the HTTP-01 responder — as the
+  `bootroot` CLI installs none.
 - Adopted `aicers/docs-theme` 0.3.0. The theme is vendored under
   `docs/theme/` and committed rather than git-ignored, so a fresh clone
   builds the manual with no network access and no `gh`;
