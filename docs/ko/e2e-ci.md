@@ -274,8 +274,13 @@ pid가 살아 있는 것은 건너뛰고, 죽은 것은 그 인스턴스의 컨�
 그것을 잘라 버리게 되는 경로이기 때문입니다.
 
 `scripts/validate-e2e-run-scope.sh`가 Docker 없이 이름 생성, 마커, 수거,
-`hosts` 잠금을 모두 확인합니다. 이 스크립트는 로컬 검사이며,
-`scripts/preflight/run-all.sh`가 실행하고 CI 워크플로에서는 실행되지 않습니다.
+`hosts` 잠금을 모두 확인하며, CI의 `check` 잡에서 실행됩니다. 그 잡이 이미
+갖춘 것 외에는 아무것도 필요하지 않고, 마커 디렉터리와 `hosts` 잠금을 자신이
+만든 임시 디렉터리로 돌려놓으므로 러너의 `/etc/hosts`도 다른 잡이 쥔 것도
+건드리지 않습니다. 이 스크립트가 확인하는 내용은 E2E 매트릭스에서는 보이지
+않습니다. 러너마다 빈 호스트에서 한 번씩만 실행하므로, 이름 생성이 충돌하기
+시작하거나 수거가 자기 실행 너머까지 손을 뻗기 시작해도 모든 갈래가 초록으로
+남습니다.
 
 ### 남은 컨테이너는 실행이 시작되기 전에 실패시킵니다
 
@@ -795,6 +800,7 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/validate-compose-instance-names.sh` | `ci.yml` → Validate Compose Instance Names |
 | `scripts/validate-e2e-openssl-compat.sh` | `ci.yml` → Validate E2E OpenSSL Compatibility |
 | `scripts/validate-e2e-leftover-check.sh` | `ci.yml` → Validate E2E Leftover Check |
+| `scripts/validate-e2e-run-scope.sh` | `ci.yml` → Validate E2E Run Scope |
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
@@ -808,7 +814,6 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 
 | 스크립트 | 설명 |
 | --- | --- |
-| `scripts/validate-e2e-run-scope.sh` | 실행 범위 이름 생성, 마커, 수거, `hosts` 잠금 |
 | `scripts/preflight/extra/agent-scenarios.sh` | 에이전트 시나리오 |
 | `scripts/preflight/extra/cli-scenarios.sh` | CLI 시나리오 |
 
