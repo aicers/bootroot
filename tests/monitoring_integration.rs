@@ -89,10 +89,31 @@ mod unix_integration {
             // the version that produced the leftover `…-grafana-1` and
             // `…-prometheus-1` this issue reported, it did not. Passing it
             // costs nothing on the former and is the fix on the latter.
-            let _ = docker_compose_command(&self.project, &self.compose_file)
+            let outcome = docker_compose_command(&self.project, &self.compose_file)
                 .args(["--profile", MONITORING_PROFILE])
                 .args(["down", "-v", "--remove-orphans"])
                 .output();
+            // Say so when it fails. A teardown that removed nothing leaves
+            // the stack holding the host ports every later step in
+            // `test-core` needs, and this one has failed silently before:
+            // until the interpolation variables above reached it, `down`
+            // died on a fail-if-unset guard and the discarded output was
+            // the only place that said so. Cargo captures this unless the
+            // test failed — which is the run whose residue was reported.
+            match outcome {
+                Ok(output) if !output.status.success() => eprintln!(
+                    "compose teardown of {} failed: {}",
+                    self.project,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                Err(error) => {
+                    eprintln!(
+                        "could not spawn compose teardown of {}: {error}",
+                        self.project
+                    );
+                }
+                Ok(_) => {}
+            }
             let _ = std::fs::remove_file(&self.compose_file);
         }
     }
