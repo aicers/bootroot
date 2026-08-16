@@ -25,10 +25,8 @@ pub(crate) async fn save_unseal_keys(
     fs_util::ensure_secrets_dir(&dir).await?;
     let path = dir.join(UNSEAL_KEYS_FILENAME);
     let contents = keys.join("\n") + "\n";
-    // This bootroot-owned secrets-tree path publishes at its given name,
-    // replacing a final symlink rather than redirecting the key bytes.
     fs_util::atomic_write(
-        &path,
+        fs_util::Destination::bootroot_owned(&path),
         contents.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

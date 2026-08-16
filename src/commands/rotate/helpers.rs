@@ -69,7 +69,7 @@ pub(super) async fn write_secret_file(
         fs_util::ensure_secrets_dir(parent).await?;
     }
     fs_util::atomic_write(
-        path,
+        fs_util::Destination::bootroot_owned(path),
         contents.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -101,7 +101,7 @@ pub(super) async fn write_secret_id_atomic(
     }
     fs_util::ensure_secrets_dir(parent).await?;
     fs_util::atomic_write(
-        path,
+        fs_util::Destination::bootroot_owned(path),
         value.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

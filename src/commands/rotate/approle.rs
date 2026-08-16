@@ -521,7 +521,7 @@ async fn ensure_infra_role_id_file(
     // cannot log in. The early return above means this writes only on a
     // backfill, so the round trip is not on any repeated path.
     fs_util::atomic_write(
-        &role_id_path,
+        fs_util::Destination::bootroot_owned(&role_id_path),
         role_id.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -725,7 +725,7 @@ async fn ensure_role_id_file(
         // `role_id_path.exists()` means this only ever creates.
         fs_util::ensure_secrets_dir(service_dir).await?;
         fs_util::atomic_write(
-            &role_id_path,
+            fs_util::Destination::bootroot_owned(&role_id_path),
             role_id.as_bytes(),
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
         )

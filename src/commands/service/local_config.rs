@@ -166,7 +166,7 @@ pub(super) async fn apply_local_service_configs(
     // config" and exhausting the retry budget against a transient
     // partial file.
     fs_util::atomic_write(
-        &resolved.agent_config,
+        fs_util::Destination::bootroot_owned(&resolved.agent_config),
         next.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

@@ -163,7 +163,7 @@ async fn write_service_credential_file(
         let parent = path.parent().unwrap_or(Path::new("."));
         fs_util::ensure_secrets_dir(parent).await?;
         fs_util::atomic_write(
-            path,
+            fs_util::Destination::bootroot_owned(path),
             contents.as_bytes(),
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
         )

@@ -260,8 +260,8 @@ fn set_openbao_readable_permissions(cert_path: &Path, key_path: &Path) -> Result
 /// the process umask would have given the truncating write this
 /// replaced.
 fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_through_symlink_blocking(
-        path,
+    fs_util::atomic_replace_blocking(
+        fs_util::Destination::operator_named(path),
         content.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
     )

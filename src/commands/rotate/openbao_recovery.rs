@@ -229,13 +229,12 @@ async fn write_openbao_recovery_output(
     // the time this runs; a crash that loses the directory entry is not
     // a rewrite, it is an unrecoverable barrier.
     //
-    // A symlinked destination is resolved first, as `init`'s two output
-    // files resolve theirs: `--output` names a path the operator chose,
-    // the truncating write this replaced delivered through a link there,
-    // and renaming over the link would leave the keys in a directory
-    // nobody picked while the target kept the superseded ones.
-    fs_util::atomic_write_through_symlink(
-        path,
+    // The destination is operator-named, as `init`'s two output files
+    // are: `--output` names a path the operator chose, and renaming over
+    // a link there would leave the keys in a directory nobody picked
+    // while the target kept the superseded ones.
+    fs_util::atomic_write(
+        fs_util::Destination::operator_named(path),
         payload.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

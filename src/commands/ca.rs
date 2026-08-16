@@ -159,8 +159,8 @@ fn patch_ca_json_ctmpl(
 /// the previous document in place and costs the next render or a re-run
 /// of `bootroot ca update`, not an unrecoverable state.
 fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_through_symlink_blocking(
-        path,
+    fs_util::atomic_replace_blocking(
+        fs_util::Destination::operator_named(path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
     )

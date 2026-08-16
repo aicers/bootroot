@@ -209,20 +209,17 @@ pub(super) async fn apply_agent_config_updates(
         // against a stale responder HMAC or trust anchor with no signal
         // that a re-sync is needed.
         //
-        // A symlink at the destination is resolved first and the target
-        // is published, unlike the control plane's writers of the same
-        // file name. The rule there is that `service::local_config`
-        // creates `agent.toml` by rename, so a link at the path never
-        // survives the command that creates it and the later editors
-        // have nothing to preserve. On a bootstrap target this writer is
-        // the one that creates the file, and the write it replaces
-        // opened with `O_TRUNC`, which follows a final link — so an
-        // operator who pointed the destination at a config they keep
-        // elsewhere has a working installation today, and a bare rename
-        // would destroy the link, leave its target holding the previous
-        // profile, and report the item applied.
-        if let Err(err) = fs_util::atomic_write_through_symlink(
-            &args.agent_config_path,
+        // The destination is operator-named, unlike the control plane's
+        // writers of the same file name. The rule there is that
+        // `service::local_config` creates `agent.toml` by rename, so a
+        // link at the path never survives the command that creates it
+        // and the later editors have nothing to preserve. On a bootstrap
+        // target this writer is the one that creates the file, and the
+        // write it replaces opened with `O_TRUNC`, which follows a final
+        // link — so an operator who pointed the destination at a config
+        // they keep elsewhere has a working installation today.
+        if let Err(err) = fs_util::atomic_write(
+            fs_util::Destination::operator_named(&args.agent_config_path),
             with_profile.as_bytes(),
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
         )

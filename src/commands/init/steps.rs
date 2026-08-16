@@ -421,8 +421,8 @@ fn rollback_openbao_agent_invocation(
 /// umask exactly as the truncating write this replaced did.
 fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
     if let Some(contents) = &file.original {
-        fs_util::atomic_replace_through_symlink_blocking(
-            &file.path,
+        fs_util::atomic_replace_blocking(
+            fs_util::Destination::operator_named(&file.path),
             contents.as_bytes(),
             fs_util::StagedMode::PreserveOrUmask,
         )

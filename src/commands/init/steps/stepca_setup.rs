@@ -63,8 +63,8 @@ pub(super) async fn write_stepca_templates(
     // container — but the templates are themselves regenerated in full
     // by this function on the next `init`, so losing a directory entry
     // to a crash costs that re-run and nothing more.
-    fs_util::atomic_replace_through_symlink(
-        &password_template_path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&password_template_path),
         password_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -86,8 +86,8 @@ pub(super) async fn write_stepca_templates(
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    fs_util::atomic_replace_through_symlink(
-        &ca_json_template_path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&ca_json_template_path),
         ca_json_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -122,8 +122,8 @@ pub(super) async fn write_stepca_templates(
 /// reads it before writing, so the mode is always the destination's own
 /// and [`fs_util::StagedMode::PreserveOrUmask`]'s create arm never runs.
 async fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_through_symlink(
-        path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
     )
@@ -426,7 +426,7 @@ pub(super) async fn write_password_file_with_backup(
     // directory entry after step-ca has been handed it leaves keys
     // nobody can open, which no re-run of `init` reconstructs.
     fs_util::atomic_write(
-        &password_path,
+        fs_util::Destination::bootroot_owned(&password_path),
         password.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

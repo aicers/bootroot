@@ -48,10 +48,10 @@ fn strip_quotes(value: &str) -> String {
 /// Writes a `.env` file from key-value pairs.
 ///
 /// Published by rename through
-/// [`fs_util::atomic_write_through_symlink_blocking`]. Two readers make
-/// a torn `.env` costly: `docker compose` interpolates it on every
-/// invocation, and bootroot itself reads it back to recover the instance
-/// name and the assigned host ports.
+/// [`fs_util::atomic_write_blocking`]. Two readers make a torn `.env`
+/// costly: `docker compose` interpolates it on every invocation, and
+/// bootroot itself reads it back to recover the instance name and the
+/// assigned host ports.
 ///
 /// It takes the directory flush for that second reader. The ports and
 /// the instance id here are the only record of which containers this
@@ -59,12 +59,11 @@ fn strip_quotes(value: &str) -> String {
 /// fresh ones and unable to find the stack it already started, which no
 /// re-run of `init` repairs.
 ///
-/// A symlinked `.env` is resolved before staging. Compose's own
-/// convention is to keep one `.env` beside the compose file, so pointing
-/// it at a shared file is a thing operators do, and the truncating write
-/// this replaced updated that shared file; a bare rename would replace
-/// the link and leave every other consumer of the target reading stale
-/// ports.
+/// The destination is [`fs_util::Destination::operator_named`]:
+/// compose's own convention is to keep one `.env` beside the compose
+/// file, so pointing it at a shared file is a thing operators do, and
+/// replacing the link would leave every other consumer of the target
+/// reading stale ports.
 pub(crate) fn write_dotenv(
     path: &Path,
     entries: &[(&str, &str)],
@@ -77,8 +76,12 @@ pub(crate) fn write_dotenv(
         content.push_str(value);
         content.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(path, content.as_bytes(), DOTENV_PUBLISH_MODE)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_blocking(
+        fs_util::Destination::operator_named(path),
+        content.as_bytes(),
+        DOTENV_PUBLISH_MODE,
+    )
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 
@@ -165,8 +168,9 @@ pub(crate) fn load_dotenv_into_env(path: &Path, messages: &Messages) -> Result<(
 
 /// Updates a single key in an existing `.env` file, preserving other entries.
 ///
-/// Publishes by rename, through a symlinked `.env`, and flushes — the
-/// same three decisions as [`write_dotenv`], for the same two readers.
+/// Publishes by rename at an operator-named destination, and flushes —
+/// the same three decisions as [`write_dotenv`], for the same two
+/// readers.
 /// This is the hotter of the pair — a rotated `POSTGRES_PASSWORD` lands
 /// here while compose may be interpolating the file — so the torn read
 /// it closes is the one a running stack is most likely to hit.
@@ -204,8 +208,12 @@ pub(crate) fn update_dotenv_key(
         output.push_str(new_value);
         output.push('\n');
     }
-    fs_util::atomic_write_through_symlink_blocking(path, output.as_bytes(), DOTENV_PUBLISH_MODE)
-        .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
+    fs_util::atomic_write_blocking(
+        fs_util::Destination::operator_named(path),
+        output.as_bytes(),
+        DOTENV_PUBLISH_MODE,
+    )
+    .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     Ok(())
 }
 

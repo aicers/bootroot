@@ -212,7 +212,7 @@ impl FastPollState {
         let body =
             serde_json::to_string_pretty(self).context("Failed to serialize fast-poll state")?;
         fs_util::atomic_write(
-            path,
+            fs_util::Destination::bootroot_owned(path),
             body.as_bytes(),
             fs_util::StagedMode::Policy(STATE_FILE_MODE),
         )
@@ -1195,7 +1195,7 @@ async fn apply_trust_to_disk(
     let updated = toml_util::upsert_section_keys(&current, "trust", &trust_updates)
         .context("Failed to upsert [trust] section into agent config")?;
     fs_util::atomic_write(
-        config_path,
+        fs_util::Destination::bootroot_owned(config_path),
         updated.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -1220,7 +1220,7 @@ async fn apply_responder_hmac_to_disk(config_path: &Path, hmac: &str) -> Result<
     let updated = toml_util::upsert_section_keys(&current, ACME_SECTION, &hmac_updates)
         .context("Failed to upsert [acme] responder HMAC into agent config")?;
     fs_util::atomic_write(
-        config_path,
+        fs_util::Destination::bootroot_owned(config_path),
         updated.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -1330,7 +1330,7 @@ where
         let body = format!("{secret_id}\n");
         Box::pin(async move {
             fs_util::atomic_write(
-                &secret_id_path,
+                fs_util::Destination::bootroot_owned(&secret_id_path),
                 body.as_bytes(),
                 fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
             )

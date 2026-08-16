@@ -49,8 +49,8 @@ pub(super) async fn write_responder_files(
     // directory entry costs that re-run.
     let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
     let template = build_responder_template(kv_mount, tls_enabled);
-    fs_util::atomic_replace_through_symlink(
-        &template_path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&template_path),
         template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -59,8 +59,8 @@ pub(super) async fn write_responder_files(
 
     let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
     let config = build_responder_config(hmac, tls_enabled);
-    fs_util::atomic_replace_through_symlink(
-        &config_path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&config_path),
         config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
@@ -181,8 +181,8 @@ services:
     // the same reader: `docker compose` parses this file on every
     // invocation, and it is regenerated from `state.json` by the `init`
     // step that writes it.
-    fs_util::atomic_replace_through_symlink(
-        &override_path,
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&override_path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
     )

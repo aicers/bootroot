@@ -194,8 +194,9 @@ impl StateFile {
     }
 
     /// The blocking core both entry points share: publish the bytes by
-    /// rename, through a symlinked destination, at whichever mode the
-    /// environment would have given the write this replaced.
+    /// rename at an [`fs_util::Destination::operator_named`]
+    /// destination, at whichever mode the environment would have given
+    /// the write this replaced.
     ///
     /// `state.json` has no mode policy — it is an inventory of
     /// services, paths and role ids, carrying no secret, since the
@@ -206,8 +207,8 @@ impl StateFile {
     /// under the process umask. A host that had been getting a `0600`
     /// state file from a restrictive umask goes on getting one.
     fn publish(path: &Path, contents: &str) -> Result<()> {
-        fs_util::atomic_write_through_symlink_blocking(
-            path,
+        fs_util::atomic_write_blocking(
+            fs_util::Destination::operator_named(path),
             contents.as_bytes(),
             fs_util::StagedMode::PreserveOrUmask,
         )

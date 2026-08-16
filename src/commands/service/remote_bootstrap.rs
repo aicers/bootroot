@@ -280,7 +280,7 @@ async fn write_remote_bootstrap_artifact_file(
     // either, so `service add --remote` has to be re-run against a
     // freshly issued one.
     fs_util::atomic_write(
-        &artifact_path,
+        fs_util::Destination::bootroot_owned(&artifact_path),
         payload.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )

@@ -417,11 +417,15 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 /// the key writer has done since #593 and what the certificate and the
 /// bundle now do beside it — the point of the conversion was to remove
 /// the asymmetry between them, not to relocate it into how a link is
-/// treated. The configuration writers take
-/// [`fs_util::atomic_write_through_symlink`] instead, for destinations
+/// treated. That is [`fs_util::Destination::bootroot_owned`]'s answer,
+/// which these three would take were they not calling the publisher
+/// directly for their [`StagedOwner::PolicyGroup`] ownership; the
+/// configuration writers take
+/// [`fs_util::Destination::operator_named`] instead, for destinations
 /// no rename writer has ever owned.
 ///
-/// [`fs_util::atomic_write_through_symlink`]: crate::fs_util::atomic_write_through_symlink
+/// [`fs_util::Destination::bootroot_owned`]: crate::fs_util::Destination::bootroot_owned
+/// [`fs_util::Destination::operator_named`]: crate::fs_util::Destination::operator_named
 ///
 /// [`fs_util::publish_staged_blocking`]: crate::fs_util::publish_staged_blocking
 /// [`fs_util::atomic_write_blocking`]: crate::fs_util::atomic_write_blocking

@@ -441,11 +441,11 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
     // and the agent may be re-reading it as this runs. It takes the
     // directory flush — losing the strip leaves the agent renewing a
     // profile the operator removed, and nothing rewrites the file again
-    // on its own. A symlink at the path is not resolved either, for the
-    // reason recorded there: `agent.toml`'s creating writer has renamed
-    // over the name since #613.
+    // on its own. The destination is bootroot-owned for the reason
+    // recorded there: `agent.toml`'s creating writer has renamed over
+    // the name since #613.
     fs_util::atomic_write_blocking(
-        path,
+        fs_util::Destination::bootroot_owned(path),
         next.as_bytes(),
         fs_util::StagedMode::PreserveOrCreate(fs_util::KEY_FILE_MODE),
     )
