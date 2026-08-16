@@ -141,8 +141,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   template, `openbao.hcl`, the HTTP-01 responder config and template,
   the OpenBao Agent configs and their `AppRole` credentials, the
   generated compose overrides, the OpenBao unseal-keys file, the ACME
-  EAB credentials file, and the remote bootstrap artifact. The files a
-  run reads back to resume flush the directory too,
+  EAB credentials file, and the remote bootstrap artifact. Files a run
+  reads back to resume flush the directory too,
   so the published name survives a power loss and not merely a clean
   replacement — `state.json`, `.env`, `agent.toml`, the two `init`
   outputs, and every credential file the stack logs in with, which takes
@@ -159,9 +159,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot-remote bootstrap` writes on a target host is written
   through a link there for the same reason. A link at an issued
   certificate, key or CA bundle path is replaced by the published file
-  instead, which is what the key file and the control node's own
-  `agent.toml` have always done and what the certificate beside them
-  now matches.
+  instead. Every credential path — including the OpenBao unseal-keys
+  and ACME EAB files — now has that behavior, as does the control node's
+  own `agent.toml`.
 - Fixed the mode of every such file being applied after its bytes had
   already landed, which left a moment in which a freshly created file
   was readable more widely than intended — including the step-ca CA

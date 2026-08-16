@@ -118,8 +118,8 @@ knowing when you operate around a running stack.
   complete new one. A write that fails partway leaves the previous file
   untouched and removes the temporary.
 - **The final mode holds from the moment the file appears.** There is no window
-  in which a freshly written CA password, recovery key, `secret_id` or
-  responder HMAC is readable more widely than intended.
+  in which a freshly written CA password, recovery key, OpenBao unseal key,
+  `secret_id` or responder HMAC is readable more widely than intended.
 - **A rename installs a new inode.** The file at the destination path is a
   different inode after every write, so anything holding an open file
   descriptor — a `tail -f`, a container that opened the file at start — keeps
@@ -135,7 +135,7 @@ Flushed, so the published file survives a power loss:
 - `state.json`, `.env`, `agent.toml`
 - the `init` `--summary-json` and `--root-token-output` files
 - the step-ca CA password and the OpenBao recovery keys
-- every `AppRole` `role_id`/`secret_id` and `eab.json`, the OpenBao unseal
+- every `AppRole` `role_id`/`secret_id`, `eab.json`, the OpenBao unseal
   keys, and the remote bootstrap artifact
 
 Not flushed, because a crash that loses one costs a rewrite rather than an
@@ -192,10 +192,11 @@ rather than following a link at it:
   a link you put at its `--agent-config-path` is one you arranged yourself.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
-  link found there with a regular file. Those files have been published by
-  rename for several releases, so a link at one of those paths has never
-  survived the command that creates the file; for a credential, following a link
-  would also mean a write redirected by whoever could plant one.
+  link found there with a regular file. The OpenBao unseal-keys and secrets-tree
+  EAB files joined this group in the current release; the other files have been
+  published by rename for several releases. A link at one of these paths does
+  not survive the command that creates the file; for a credential, following a
+  link would also mean redirecting its bytes away from the bootroot-managed path.
 
 ## bootroot infra up
 

@@ -25,8 +25,8 @@ pub(crate) async fn save_unseal_keys(
     fs_util::ensure_secrets_dir(&dir).await?;
     let path = dir.join(UNSEAL_KEYS_FILENAME);
     let contents = keys.join("\n") + "\n";
-    // This bootroot-owned secrets-tree path must replace a final symlink,
-    // rather than follow a redirection an attacker could plant there.
+    // This bootroot-owned secrets-tree path publishes at its given name,
+    // replacing a final symlink rather than redirecting the key bytes.
     fs_util::atomic_write(
         &path,
         contents.as_bytes(),
@@ -257,7 +257,9 @@ mod tests {
     /// The unseal-key writer states `0600` independently of the process umask.
     ///
     /// Runs in a child process because umask is process-wide; see
-    /// [`fs_util::umask_test_ran_in_child`].
+    /// [`fs_util::umask_test_ran_in_child`]. This guards the staged
+    /// create-mode policy, not the former create-then-chmod window, which is
+    /// not observable after the write.
     #[cfg(unix)]
     #[test]
     fn save_unseal_keys_creates_with_restricted_mode_under_umask_022() {
@@ -285,8 +287,8 @@ mod tests {
         assert_eq!(mode, fs_util::KEY_FILE_MODE);
     }
 
-    /// A secrets-tree link is replaced so the new key shares cannot be
-    /// redirected to an attacker-selected target.
+    /// A secrets-tree link is replaced so new key shares are published at
+    /// their bootroot-managed path rather than a link target.
     #[cfg(unix)]
     #[tokio::test]
     async fn save_unseal_keys_replaces_a_symlinked_destination() {
