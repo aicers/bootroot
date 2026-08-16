@@ -13,6 +13,12 @@ mod unix_integration {
     /// Host ports the stack this test brings up publishes on `127.0.0.1`:
     /// `OpenBao` (8200), step-ca (9000), the HTTP-01 responder (8080),
     /// Grafana under the `lan` profile (3000) and `PostgreSQL` (5433).
+    ///
+    /// 9000 belongs here even though `infra up` below does not ask for
+    /// step-ca: `prometheus` declares `depends_on: [step-ca, openbao]`, so
+    /// `monitoring up` starts the container regardless and it publishes
+    /// 9000 the moment it does. Dropping the port from this list would
+    /// trade the named failure for a compose port-allocation error.
     const MONITORING_PORTS: [u16; 5] = [8200, 9000, 8080, 3000, 5433];
 
     /// Grafana admin password given to `monitoring up`, injected into
@@ -149,12 +155,33 @@ mod unix_integration {
         }
     }
 
+    /// Services this test asks `infra up` to bring up and hold to a
+    /// readiness check.
+    ///
+    /// step-ca is deliberately absent. `infra up` ends in
+    /// `ensure_all_healthy` over exactly this list, and step-ca cannot be
+    /// healthy here: its command is
+    /// `step-ca /home/step/config/ca.json --password-file
+    /// /home/step/password.txt` over the `./secrets` bind mount, and
+    /// `secrets/` is gitignored and written by `bootroot init` — which this
+    /// test runs before, by the constraint that it owns the host ports. On
+    /// a clean checkout the container therefore crash-loops under
+    /// `restart: always` and `infra up` fails with
+    /// `step-ca status=restarting`.
+    ///
+    /// This does not remove step-ca from the stack: `prometheus` depends on
+    /// it, so `monitoring up` still starts it. What the list controls is
+    /// what gets asserted, and asserting a service that cannot start on the
+    /// inputs available at this point in the job is what kept the test from
+    /// running at all.
+    const INFRA_SERVICES: &str = "openbao,postgres,bootroot-http01";
+
     fn run_infra_up(project: &str, compose_file: &Path) -> Result<()> {
         let output = run_command(
             bootroot_command(project)
                 .args(["infra", "up", "--compose-file"])
                 .arg(compose_file)
-                .args(["--services", "openbao,postgres,step-ca,bootroot-http01"]),
+                .args(["--services", INFRA_SERVICES]),
         )
         .context("Failed to run bootroot infra up")?;
         if !output.status.success() {
@@ -211,6 +238,22 @@ mod unix_integration {
         .context("Grafana did not become healthy")
     }
 
+    /// Waits until Prometheus reports the `openbao` scrape target healthy.
+    ///
+    /// The `step-ca` job in `monitoring/prometheus.yml` is not waited on,
+    /// because nothing can make it go up. It scrapes `step-ca:9102`, and
+    /// step-ca serves metrics only when `metricsAddress` is set in
+    /// `ca.json` — a key no code in this repository writes: `ca.json` comes
+    /// from `step ca init` inside the image, and the patcher in
+    /// `src/commands/init/steps/stepca_setup.rs` touches only `dnsNames`,
+    /// `db` and ACME. The pinned image's `step-ca` accepts no flag or
+    /// environment variable for it either, so there is no way to set it
+    /// from compose. That target has never had anything to scrape, in this
+    /// test or in production; waiting on it here would only time out.
+    ///
+    /// Prometheus scraping is still covered — `openbao` is a real target
+    /// over the same config, so a Prometheus upgrade that breaks scraping
+    /// or the config format still fails this test.
     async fn wait_for_prometheus_targets(project: &str, compose_file: &Path) -> Result<()> {
         wait_for(Duration::from_secs(90), || {
             let mut command = docker_compose_command(project, compose_file);
@@ -232,11 +275,9 @@ mod unix_integration {
                     .get("data")
                     .and_then(|item| item.get("activeTargets"))
                     .and_then(|item| item.as_array())
-                    .cloned()
+                    .map(Vec::as_slice)
                     .unwrap_or_default();
-                let mut stepca_up = false;
-                let mut openbao_up = false;
-                for target in active {
+                let openbao_up = active.iter().any(|target| {
                     let job = target
                         .get("labels")
                         .and_then(|item| item.get("job"))
@@ -246,18 +287,13 @@ mod unix_integration {
                         .get("health")
                         .and_then(|item| item.as_str())
                         .unwrap_or_default();
-                    if job == "step-ca" && health == "up" {
-                        stepca_up = true;
-                    }
-                    if job == "openbao" && health == "up" {
-                        openbao_up = true;
-                    }
-                }
-                Ok(stepca_up && openbao_up)
+                    job == "openbao" && health == "up"
+                });
+                Ok(openbao_up)
             }
         })
         .await
-        .context("Prometheus did not report step-ca/openbao as up")
+        .context("Prometheus did not report openbao as up")
     }
 
     async fn assert_grafana_dashboard(client: &Client) -> Result<()> {
@@ -325,6 +361,27 @@ mod unix_integration {
         Ok(target)
     }
 
+    /// Creates the `secrets/` directory this stack bind-mounts, if it is
+    /// not there already.
+    ///
+    /// step-ca mounts `./secrets` at `/home/step`, and `prometheus`
+    /// depends on step-ca, so the container is created whatever this test
+    /// asks `infra up` for. When the host directory is missing the Docker
+    /// daemon creates it, and the daemon runs as root — leaving a
+    /// root-owned `secrets/` in the workspace for the steps that follow in
+    /// `test-core`, which run unprivileged and write to that same path.
+    /// Creating it here first means the mount finds a directory owned by
+    /// whoever runs the test.
+    ///
+    /// Not removed on teardown: on a developer's machine this path holds
+    /// real CA material, and an empty gitignored directory is not the port
+    /// or volume residue the teardown exists to clear.
+    fn ensure_secrets_dir() -> Result<()> {
+        let secrets = Path::new(env!("CARGO_MANIFEST_DIR")).join("secrets");
+        std::fs::create_dir_all(&secrets)
+            .with_context(|| format!("Failed to create {}", secrets.display()))
+    }
+
     /// Returns the ports of `ports` that something already listens on.
     fn bound_ports(ports: &[u16]) -> Vec<u16> {
         ports
@@ -359,6 +416,7 @@ mod unix_integration {
                  stack on 127.0.0.1 at fixed ports."
             );
         }
+        ensure_secrets_dir()?;
         let compose_file = write_compose_without_container_names(nonce)?;
         let _guard = ComposeGuard {
             project: project.clone(),
