@@ -109,7 +109,7 @@ For detailed rules and condition-specific behavior, see the Overview section
 Every file bootroot produces is published by stage-then-rename: the bytes
 go to a temporary file in the destination's own directory, that file is given its
 final mode and ownership and then flushed while it is still at its temporary
-name, and only then is it renamed over the destination. Three consequences are worth
+name, and only then is it renamed over the destination. Seven consequences are worth
 knowing when you operate around a running stack.
 
 - **A reader never sees a partial file.** A container mounting the file, a
@@ -126,6 +126,39 @@ knowing when you operate around a running stack.
   reading the old contents until it reopens the path. Bind mounts of a
   *directory* follow the rename; a bind mount of a single *file* does not, and
   needs the container restarted to pick up a new version.
+- **Hard links detach.** A truncating write reached every hard link of the
+  inode, because they all name the same one. A rename installs a fresh inode at
+  the single name it is given, so every other link keeps the old contents and
+  stops tracking the file from that write on. Hard links are not supported at a
+  path bootroot writes. Where you need a bootroot-written file to appear
+  somewhere else, use a symlink at one of the paths bootroot writes through
+  (see below), or copy it yourself after the command that produces it.
+- **ACLs, extended attributes and SELinux labels do not survive a write.** They
+  lived on the inode the rename replaces, and the staged temporary is created
+  clean: only the permission bits cross over, by the rules described below. A
+  POSIX ACL you attached to `state.json` or `.env` is gone after the next write,
+  with nothing said about it, and on an SELinux host the new inode takes the
+  containing directory's default labeling rather than a file label you set by
+  hand. Re-apply either after any command that rewrites the file, or arrange it
+  on the containing directory so a fresh file inherits it.
+- **What gates a write moved from the file to its directory.** A truncating
+  write needed write permission on the *file*; a rename needs write permission
+  on the *directory* holding it and none at all on the file. Two arrangements
+  change because of it. A writable file in a read-only directory could be
+  updated before and now fails while the temporary is being created. And a
+  `chmod 444` applied to a bootroot-written path as a write lock no longer
+  blocks anything: the write succeeds by replacing the file rather than by
+  opening it. To hold a path against bootroot, take write permission on the
+  containing directory away, or make the file immutable with `chattr +i`; those
+  are the boundaries a rename still respects.
+- **A crash leaves a `.tmpXXXXXX` sibling, not a torn destination.** If the
+  machine dies between the temporary being created and the rename, the
+  destination still holds the previous file — that is the point — and an
+  unfamiliar `.tmpXXXXXX` file is left beside it in the same directory. It
+  carries whatever mode the write had reached: the `0600` a staged file starts
+  at, the finished file's own mode, or — for the files whose mode the umask
+  decides — what the umask gave it. Nothing reads it and nothing cleans it up,
+  so delete it. A write that merely fails removes its own temporary.
 
 Whether the containing directory is flushed after the rename is decided per
 file, because that flush costs a disk round trip on every write:

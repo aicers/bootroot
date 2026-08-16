@@ -799,6 +799,51 @@ pub enum StagedDurability {
     RenameOnly,
 }
 
+/// The target of a symlink sitting at `path`, or `None` when `path`
+/// holds a regular file, holds nothing, or cannot be read without
+/// following it.
+///
+/// A bare staged publish renames over the name it is given, so a link
+/// found at the destination is replaced by the published file and the
+/// operator's arrangement is gone. That is decided behaviour for a
+/// credential and for the issued cert triple — the reader reads the
+/// path bootroot handed it, and following a link would redirect the
+/// bytes away from it — but decided is not the same as silent, so
+/// [`publish_staged_blocking`] names the link and its former target at
+/// `warn` before the rename.
+///
+/// The `_through_symlink` wrappers resolve the destination before they
+/// publish, so the path they hand the core is the link's target and
+/// never a link itself. They are exempt by construction rather than by
+/// a flag.
+///
+/// Reads the destination with `symlink_metadata`, which does not follow
+/// it. Anything unreadable answers `None`: a destination the publish
+/// cannot stat is a failure the publish itself reports, and guessing at
+/// a link here would only add a warning about a file that is not there.
+fn replaced_symlink_target(path: &Path) -> Option<PathBuf> {
+    if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return None;
+    }
+    std::fs::read_link(path).ok()
+}
+
+/// The context a failed chown of the staged file carries: the ownership
+/// it was reproducing, and the two ways out.
+///
+/// The failure is `EPERM` in every realistic case — re-owning the fresh
+/// inode to a uid/gid the writer does not hold needs `CAP_CHOWN` — and
+/// no retry gets past it, so the message says what to change instead of
+/// only what was attempted.
+fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
+    format!(
+        "Failed to preserve existing uid={uid} gid={gid} on {}: re-owning the staged file \
+         needs CAP_CHOWN (run as root), so either run this command as the destination's \
+         owner or chown the destination to the user running it",
+        path.display()
+    )
+}
+
 /// Publishes `contents` at `path` by staging a temporary in the same
 /// directory, applying `mode` and `owner` to it there, and `rename`ing
 /// it over the destination.
@@ -857,9 +902,29 @@ pub enum StagedDurability {
 /// chmod runs at all, which leaves nothing to be observed at a wider
 /// mode either.
 ///
+/// Mode bits are the only thing that crosses from the file being
+/// replaced onto the fresh inode, and only under the two preserving
+/// arms of [`StagedMode`], which read `& 0o7777`. ACLs, extended
+/// attributes and `SELinux` contexts lived on the old inode and do not
+/// survive the publish: the temporary is created clean and takes the
+/// containing directory's default labeling. Preserving them would take
+/// reading each one off the destination and replaying it onto the
+/// temporary before the rename, which nothing here does.
+///
 /// The temporary is removed if any step before the rename fails
 /// (`NamedTempFile` deletes on drop), so a failed publish leaves
-/// neither a torn destination nor a stray sibling.
+/// neither a torn destination nor a stray sibling. A crash between the
+/// create and the rename does leave one — a `.tmpXXXXXX` sibling in the
+/// destination's own directory, carrying whatever mode the write had
+/// reached — while the destination itself still holds the previous
+/// file.
+///
+/// A destination that is a symlink is renamed over rather than followed,
+/// which destroys the operator's link. That is the decided behaviour
+/// here — the wrappers that resolve first are the `_through_symlink`
+/// pair — but it is not left silent: the destination is read with
+/// `symlink_metadata` before the rename and a link found there is
+/// reported at `warn`, naming the link and the file it pointed at.
 ///
 /// # Errors
 /// Returns an error if the temp file cannot be created, written,
@@ -899,12 +964,7 @@ pub fn publish_staged_blocking(
                 // from failing on a call it did not need to make.
                 if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
                     std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid))
-                        .with_context(|| {
-                            format!(
-                                "Failed to preserve existing uid={dest_uid} gid={dest_gid} on {}",
-                                path.display()
-                            )
-                        })?;
+                        .with_context(|| chown_preserve_context(dest_uid, dest_gid, path))?;
                 }
             }
         }
@@ -935,6 +995,13 @@ pub fn publish_staged_blocking(
     tmp.as_file_mut()
         .sync_all()
         .with_context(|| format!("Failed to fsync temp file for {}", path.display()))?;
+    if let Some(link_target) = replaced_symlink_target(path) {
+        tracing::warn!(
+            "Replacing the symlink at {} with the published file; it pointed at {}",
+            path.display(),
+            link_target.display()
+        );
+    }
     tmp.persist(path).map_err(|e| {
         anyhow::anyhow!(
             "Failed to rename temp file to {}: {}",
@@ -1642,6 +1709,71 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    /// The three destination states the replaced-symlink warning turns
+    /// on. The call site is unconditional on `Some`, so pinning what the
+    /// helper answers pins which publishes warn: a link warns and names
+    /// its target, a regular file does not, and neither does a
+    /// destination that is not there yet.
+    #[test]
+    fn replaced_symlink_target_reports_a_link_and_nothing_else() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.env");
+        let link = dir.path().join("link.env");
+        std::fs::write(&target, b"seed").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(replaced_symlink_target(&link).as_deref(), Some(&*target));
+        assert_eq!(replaced_symlink_target(&target), None);
+        assert_eq!(
+            replaced_symlink_target(&dir.path().join("absent.env")),
+            None
+        );
+    }
+
+    /// The `_through_symlink` wrappers are exempt from that warning by
+    /// construction rather than by a flag: what they hand the core is
+    /// the resolved target, and a resolved target is never a link.
+    #[test]
+    fn a_resolved_destination_is_never_a_replaced_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target.yml");
+        let link = dir.path().join("link.yml");
+        let outer = dir.path().join("outer.yml");
+        std::fs::write(&target, b"seed").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::os::unix::fs::symlink(&link, &outer).unwrap();
+
+        for start in [&link, &outer] {
+            assert!(replaced_symlink_target(start).is_some());
+            let resolved = resolve_symlink_destination(start).unwrap();
+            assert_eq!(
+                replaced_symlink_target(&resolved),
+                None,
+                "the path a `_through_symlink` wrapper publishes to must not warn"
+            );
+        }
+    }
+
+    /// The chown context has to survive as a whole: the uid/gid it was
+    /// preserving is what identifies the failure, and the remediation is
+    /// what an operator hitting `EPERM` can act on.
+    #[test]
+    fn chown_preserve_context_names_the_remediation() {
+        let message = chown_preserve_context(1000, 2000, Path::new("/srv/bootroot/state.json"));
+
+        assert!(message.contains("uid=1000 gid=2000"), "{message}");
+        assert!(message.contains("/srv/bootroot/state.json"), "{message}");
+        assert!(message.contains("CAP_CHOWN"), "{message}");
+        assert!(
+            message.contains("run this command as the destination's owner"),
+            "{message}"
+        );
+        assert!(
+            message.contains("chown the destination to the user running it"),
+            "{message}"
         );
     }
 

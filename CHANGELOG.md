@@ -8,6 +8,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Every file bootroot writes now reaches its final mode before its name
+  exists. The mode used to be applied after the bytes had already landed
+  at the destination, which left a moment in which a freshly created file
+  was readable more widely than intended — the step-ca CA password, the
+  OpenBao recovery and unseal keys, the responder HMAC config and each
+  `AppRole` `secret_id` among them. The mode is now applied while the
+  file is still at the temporary name it is written under, so it holds
+  from the first moment the file is visible at all. The modes themselves
+  are unchanged: `0644` for the certificates and CA bundle, `0600` for
+  the two `init` outputs and for everything inside the secrets tree, and
+  for a file that already exists whatever mode it already carries — one
+  narrowed by hand, or by a restrictive umask when it was created, stays
+  narrowed. A file with no mode of its own — `state.json`, `ca.json`,
+  `openbao.hcl`, the compose overrides, `init`'s rollback restore — is
+  still created at whatever the process umask gives it, as before.
 - A `.env` bootroot creates is now `0600`. `bootroot infra install`
   generates `POSTGRES_PASSWORD` into this file, and it sits in the
   compose directory rather than in the `0700` secrets tree, so on a host
@@ -150,33 +165,6 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are regenerated on their own — a certificate, a rendered `ca.json`, a
   compose override — do not pay for that flush, because a crash that
   loses one costs a rewrite rather than an outage.
-  A destination pointed elsewhere by a symlink keeps being written
-  through that link wherever it names configuration an operator may have
-  relocated — `.env`, `ca.json` and its template, `openbao.hcl`, the
-  responder and OpenBao Agent configs, the compose overrides,
-  `state.json`, and the two `init` outputs — so the link survives the
-  write and goes on naming the same file. The `agent.toml` that
-  `bootroot-remote bootstrap` writes on a target host is written
-  through a link there for the same reason. A link at an issued
-  certificate, key or CA bundle path is replaced by the published file
-  instead. The OpenBao unseal-keys and ACME EAB files now join the
-  credential paths bootroot publishes by rename, as does the control
-  node's own `agent.toml`. Relocated `AppRole` `role_id` and `secret_id`
-  paths instead reject a final link.
-- Fixed the mode of every such file being applied after its bytes had
-  already landed, which left a moment in which a freshly created file
-  was readable more widely than intended — including the step-ca CA
-  password, the OpenBao recovery and unseal keys, the responder HMAC
-  config and each `AppRole` `secret_id`. The mode is now applied while
-  the file is still at its temporary name, so it holds from the moment
-  the file appears. The modes themselves are unchanged: `0644` for the
-  certificates and CA bundle, `0600` for the two `init` outputs and for
-  everything inside the secrets tree, and for a file that already exists
-  whatever mode it already carries — one narrowed by hand, or by a
-  restrictive umask when it was created, stays narrowed. A file with no
-  mode of its own — `state.json`, `ca.json`, `openbao.hcl`, the compose
-  overrides, `init`'s rollback restore — is still created at whatever
-  the process umask gives it, as before.
 - Fixed a `--summary-json` or `--root-token-output` destination whose
   symlink chain loops back on itself being accepted by the preflight and
   failing at the write, once `reinit` had already wiped OpenBao. It is
@@ -2007,6 +1995,48 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Publishing a file by rename installs a fresh inode at the destination,
+  so the file at one of those paths is a different inode after every
+  write. Anything holding an open file descriptor — a `tail -f`, a
+  container that opened the file at start — keeps reading the old
+  contents until it reopens the path. A bind mount of a *directory*
+  follows the rename; a bind mount of a single *file* does not, and
+  needs the container restarted to pick up a new version. Hard links no
+  longer track the file: a truncating write reached every link of the
+  inode, and a rename installs the new inode at the one name it is
+  given, leaving every other link on the old contents. Hard links are
+  not supported at a path bootroot writes. Nor do ACLs, extended
+  attributes and SELinux contexts survive: they lived on the replaced
+  inode, and the staged file is created clean and carries over only the
+  permission bits, so a POSIX ACL attached to `state.json` or `.env`
+  disappears at the next write and a customized SELinux file label gives
+  way to the containing directory's default labeling.
+- What gates a write to one of those files moved from the file to its
+  directory. A truncating write needed write permission on the *file*; a
+  rename needs write permission on the *directory* holding it and none
+  on the file. A writable file inside a read-only directory could be
+  updated before and now fails while the temporary is being created, and
+  a `chmod 444` applied to a bootroot-written path as a write lock no
+  longer blocks anything, because the write succeeds by replacing the
+  file rather than by opening it. Withdrawing write permission on the
+  containing directory, or `chattr +i` on the file, are the boundaries a
+  rename still respects.
+- A destination pointed elsewhere by a symlink keeps being written
+  through that link wherever it names configuration an operator may have
+  relocated — `.env`, `ca.json` and its template, `openbao.hcl`, the
+  responder and OpenBao Agent configs, the compose overrides,
+  `state.json`, and the two `init` outputs — so the link survives the
+  write and goes on naming the same file. The `agent.toml` that
+  `bootroot-remote bootstrap` writes on a target host is written
+  through a link there for the same reason. A link at an issued
+  certificate, key or CA bundle path is replaced by the published file
+  instead. The OpenBao unseal-keys and ACME EAB files now join the
+  credential paths bootroot publishes by rename, as does the control
+  node's own `agent.toml`. Relocated `AppRole` `role_id` and `secret_id`
+  paths instead reject a final link. Where a link is replaced bootroot
+  now says so, with one warning naming the destination and the file the
+  link pointed at, so a replacement that is intended is at least not
+  silent.
 - Adopted `aicers/docs-theme` 0.3.0. The theme is vendored under
   `docs/theme/` and committed rather than git-ignored, so a fresh clone
   builds the manual with no network access and no `gh`;
