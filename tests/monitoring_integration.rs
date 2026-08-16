@@ -10,7 +10,35 @@ mod unix_integration {
     use serde_json::Value;
     use tokio::time::sleep;
 
-    const MONITORING_PORTS: [u16; 4] = [8200, 9000, 8080, 3000];
+    /// Host ports the stack this test brings up publishes on `127.0.0.1`:
+    /// `OpenBao` (8200), step-ca (9000), the HTTP-01 responder (8080),
+    /// Grafana under the `lan` profile (3000) and `PostgreSQL` (5433).
+    const MONITORING_PORTS: [u16; 5] = [8200, 9000, 8080, 3000, 5433];
+
+    /// Grafana admin password given to `monitoring up`, injected into
+    /// compose, and used to authenticate against the Grafana API. One
+    /// constant so the three cannot drift apart.
+    const GRAFANA_ADMIN_PASSWORD: &str = "admin";
+
+    /// Monitoring profile this test brings up, and tears down again.
+    const MONITORING_PROFILE: &str = "lan";
+
+    /// `PostgreSQL` password for the stack this test owns. Never read back:
+    /// compose only needs *a* value for the variable below.
+    const POSTGRES_PASSWORD: &str = "bootroot-itest";
+
+    /// Compose interpolates the whole file on every invocation, and
+    /// `docker-compose.yml` declares exactly these two variables in the
+    /// fail-if-unset form. They normally arrive through the `.env` that
+    /// `infra install` writes, but this test deliberately runs before any
+    /// install (it needs the host ports free), so nothing has written one.
+    /// Every child process that ends up driving compose — `docker compose`
+    /// directly, and `bootroot infra up` / `monitoring up` — therefore
+    /// carries them itself.
+    const COMPOSE_ENV: [(&str, &str); 2] = [
+        ("POSTGRES_PASSWORD", POSTGRES_PASSWORD),
+        ("GRAFANA_ADMIN_PASSWORD", GRAFANA_ADMIN_PASSWORD),
+    ];
 
     fn run_command(command: &mut Command) -> Result<Output> {
         let output = command
@@ -23,7 +51,8 @@ mod unix_integration {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
         command
             .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .env("COMPOSE_PROJECT_NAME", project);
+            .env("COMPOSE_PROJECT_NAME", project)
+            .envs(COMPOSE_ENV);
         command
     }
 
@@ -31,6 +60,7 @@ mod unix_integration {
         let mut command = Command::new("docker");
         command
             .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .envs(COMPOSE_ENV)
             .args(["compose", "-p", project, "-f"])
             .arg(compose_file);
         command
@@ -43,35 +73,52 @@ mod unix_integration {
 
     impl Drop for ComposeGuard {
         fn drop(&mut self) {
-            let _ = Command::new("docker")
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args([
-                    "compose",
-                    "-p",
-                    &self.project,
-                    "-f",
-                    self.compose_file.to_str().unwrap_or("docker-compose.yml"),
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                ])
+            // Through `docker_compose_command` so the teardown carries the
+            // same interpolation variables as the bring-up: compose reads
+            // the whole file here too, and without them `down` would die on
+            // the fail-if-unset guards and leave the stack running.
+            //
+            // `--profile` for the same reason it is passed on the way up.
+            // `grafana` and `prometheus` are profile-gated, and a `down`
+            // that does not name their profile walks past them: it removes
+            // the four unprofiled services and then fails to remove the
+            // network because those two are still attached to it, leaving
+            // both containers, `grafana-data`, `prometheus-data` and the
+            // network on the host for every step that follows.
+            let _ = docker_compose_command(&self.project, &self.compose_file)
+                .args(["--profile", MONITORING_PROFILE])
+                .args(["down", "-v", "--remove-orphans"])
                 .output();
             let _ = std::fs::remove_file(&self.compose_file);
         }
     }
 
+    /// Polls `check` until it reports success or `timeout` elapses.
+    ///
+    /// An `Err` is a retry, not an exit: every poll in this file talks HTTP
+    /// to a service that may still be binding its port, and a refused or
+    /// dropped connection is an `Err` rather than an `Ok(false)`. The last
+    /// one is kept and reported when the budget runs out, so a genuine
+    /// failure still arrives with its cause attached instead of as a bare
+    /// timeout.
     async fn wait_for<F, Fut>(timeout: Duration, mut check: F) -> Result<()>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<bool>>,
     {
         let started = SystemTime::now();
+        let mut last_error: Option<anyhow::Error>;
         loop {
-            if check().await? {
-                return Ok(());
+            match check().await {
+                Ok(true) => return Ok(()),
+                Ok(false) => last_error = None,
+                Err(error) => last_error = Some(error),
             }
             if started.elapsed().unwrap_or_default() > timeout {
-                anyhow::bail!("Timed out waiting for condition");
+                return Err(match last_error {
+                    Some(error) => error.context("Timed out waiting for condition"),
+                    None => anyhow::anyhow!("Timed out waiting for condition"),
+                });
             }
             sleep(Duration::from_millis(1500)).await;
         }
@@ -111,7 +158,8 @@ mod unix_integration {
             bootroot_command(project)
                 .args(["monitoring", "up", "--compose-file"])
                 .arg(compose_file)
-                .args(["--profile", "lan", "--grafana-admin-password", "admin"]),
+                .args(["--profile", MONITORING_PROFILE])
+                .args(["--grafana-admin-password", GRAFANA_ADMIN_PASSWORD]),
         )
         .context("Failed to run bootroot monitoring up")?;
         if !output.status.success() {
@@ -127,7 +175,7 @@ mod unix_integration {
             async move {
                 let response = client
                     .get("http://127.0.0.1:3000/api/health")
-                    .basic_auth("admin", Some("admin"))
+                    .basic_auth("admin", Some(GRAFANA_ADMIN_PASSWORD))
                     .send()
                     .await
                     .context("Failed to query Grafana health")?;
@@ -190,7 +238,7 @@ mod unix_integration {
     async fn assert_grafana_dashboard(client: &Client) -> Result<()> {
         let response = client
             .get("http://127.0.0.1:3000/api/search?query=Bootroot")
-            .basic_auth("admin", Some("admin"))
+            .basic_auth("admin", Some(GRAFANA_ADMIN_PASSWORD))
             .send()
             .await
             .context("Failed to query Grafana search API")?;
@@ -252,26 +300,39 @@ mod unix_integration {
         Ok(target)
     }
 
-    fn ports_available(ports: &[u16]) -> bool {
-        for port in ports {
-            if TcpListener::bind(("127.0.0.1", *port)).is_err() {
-                return false;
-            }
-        }
-        true
+    /// Returns the ports of `ports` that something already listens on.
+    fn bound_ports(ports: &[u16]) -> Vec<u16> {
+        ports
+            .iter()
+            .copied()
+            .filter(|port| TcpListener::bind(("127.0.0.1", *port)).is_err())
+            .collect()
     }
 
     #[tokio::test]
-    #[ignore = "Run explicitly in CI E2E after step-ca init"]
+    #[ignore = "Brings the Docker monitoring stack up on fixed host ports; run with --include-ignored and 8200, 9000, 8080, 3000 and 5433 free"]
     async fn monitoring_stack_is_ready() -> Result<()> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let project = format!("bootroot-itest-{nonce}");
-        if !ports_available(&MONITORING_PORTS) {
-            eprintln!("Skipping monitoring integration test: ports are in use.");
-            return Ok(());
+        // A conflict is a failure, not a skip: the stack publishes these on
+        // 127.0.0.1 from the repo compose file, so there is no port left to
+        // fall back to, and reporting success here is how this test spent
+        // its life being green without running.
+        let bound = bound_ports(&MONITORING_PORTS);
+        if !bound.is_empty() {
+            let ports = bound
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "Required host ports are already in use: {ports}. \
+                 Free them and re-run; this test publishes the monitoring \
+                 stack on 127.0.0.1 at fixed ports."
+            );
         }
         let compose_file = write_compose_without_container_names(nonce)?;
         let _guard = ComposeGuard {

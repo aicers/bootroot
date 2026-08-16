@@ -234,7 +234,13 @@ jobs:
         run: echo "BOOTROOT_SECRETS_DIR=$GITHUB_WORKSPACE/secrets" >> "$GITHUB_ENV"
 
       - name: Monitoring Integration Test (E2E)
-        run: cargo test --test monitoring_integration
+        # `--include-ignored` because the only test in this file is
+        # `#[ignore]`, and without it this step runs zero tests and reports
+        # success. The attribute stays: it is what keeps the Docker stack
+        # this test brings up out of the plain `cargo test` above. The step
+        # also stays ahead of `Install Infrastructure`, because the test
+        # needs the host ports that stack would occupy.
+        run: cargo test --test monitoring_integration -- --include-ignored
 
       - name: Build all binaries
         run: cargo build --bins

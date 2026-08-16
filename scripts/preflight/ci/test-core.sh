@@ -41,8 +41,13 @@ echo "[test-core] running unit tests"
 cargo test
 
 # --- Monitoring Integration Test ---
+# `--include-ignored` because the only test in this file is `#[ignore]`;
+# without it this runs zero tests and reports success.  Keep the
+# arguments identical to the `Monitoring Integration Test (E2E)` step in
+# .github/workflows/ci.yml, and keep this ahead of the install below:
+# the test needs 8200, 9000, 8080, 3000 and 5433 free on the host.
 echo "[test-core] monitoring integration test"
-cargo test --test monitoring_integration
+cargo test --test monitoring_integration -- --include-ignored
 
 # --- Install Infrastructure ---
 echo "[test-core] installing infrastructure"
