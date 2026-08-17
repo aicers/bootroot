@@ -1,6 +1,7 @@
 # RFC-F: bootroot — the runtime registrar surface and its non-self-propagation guarantee
 
-Status: accepted; implementation is decomposed from §7. This is an
+Status: accepted, with post-acceptance amendments recorded in §9;
+implementation is decomposed from §7. This is an
 **`aicers/bootroot`** in-repo RFC (its first —
 filing home `docs/rfcs/`). It is the ecosystem install/update set's
 **RFC-F**, the companion that supplies the one **bootroot-owned** change the
@@ -879,10 +880,15 @@ therefore the flood path — §5.6's own rate-limit rationale names
 `ServiceInstanceMismatch` precisely because it is refused before any OpenBao
 work. So: validate the labels and resolve the multiplicity class **first**, on
 a single global lock, keying that arm's record on a **request id** alone; and
-on this arm the **limiter runs before any intent write**, so a throttled
+on this arm the **limiter runs before any intent write**, so a **limited**
 invocation costs one coalesced counter increment rather than a durable record.
 Otherwise the intent record — introduced to make the refusal free — becomes
-the amplifier for the exhaustion the limiter exists to stop.
+the amplifier for the exhaustion the limiter exists to stop. What the limiter
+suppresses on this arm is the **record**, never the **answer**: the caller
+still receives the real, permanent refusal its input earned, so an invocation
+limited here is **not throttled**. Those two words are not synonyms in this
+section; the vocabulary decision below defines them, and the caller-answer
+decision below settles which check point produces a throttle.
 
 **[DECISION] Both verbs are RATE-LIMITED per client identity, or the audit
 record is the resource the attack exhausts.** With a record required for
@@ -907,19 +913,118 @@ coalesced records (N intents against one counted outcome), not over a strict
 1:1 pairing.
 
 **[DECISION] There is exactly ONE registrar identity, so the limiter must be
-sized from the legitimate fan-out and must be REPORTED as retryable.** "Per
-client identity" is effectively global: throttling an attacker throttles the
-control plane in the same bucket, and an ordinary bring-up — an onboarding
-wave plus five modules per host — is a burst against a limiter sized by "mints
-are rare in steady state". So the limiter is sized from what REView can
-legitimately generate (hosts × modules + onboarding waves, stated in the
-impl-doc), and it uses **per-`(verb, outcome-class)` buckets** so refusals
-throttle without starving accepted mints. Crucially, a throttled invocation
-returns **`RegistrarBusy { retry_after }`** (RFC-C §5) — a **retryable** error
-distinct from `RegistrarUnavailable`, whose four reasons all mean *permanent
-until an operator acts*. Without a distinct type it arrives as generic, review
-classifies generic as transient and retries (RFC-D2 §4b), and the retry storm
-feeds the limiter.
+sized from the legitimate fan-out.** "Per client identity" is effectively
+global: throttling an attacker throttles the control plane in the same bucket,
+and an ordinary bring-up — an onboarding wave plus five modules per host — is
+a burst against a limiter sized by "mints are rare in steady state". So the
+limiter is sized from what REView can legitimately generate (hosts × modules +
+onboarding waves, stated in the impl-doc).
+
+**[DECISION] LIMITED and THROTTLED are different words, and this document uses
+them precisely.** An invocation is **limited** when the limiter suppressed its
+audit records, which happens at **either** check point. It is **throttled**
+when it is limited at the **admission** check point and therefore receives
+`RegistrarBusy { retry_after }` in place of an attempted verb. Every throttled
+invocation is limited; the reverse does not hold — a limited **pre-derivation**
+invocation is not throttled, and keeps the permanent refusal its input earned.
+Read "throttled" and `RegistrarBusy` throughout as the caller-visible
+admission-side outcome and nothing else, and "limited" as suppressed records at
+either check point. The two decisions below were ruled **independently** and
+are independent on the merits — either bucket shape composes with either caller
+answer — and it was this vocabulary's ambiguity that let them look like one
+question.
+
+**[DECISION, amended after acceptance — ruling
+`limiter-bucket-shape-departs-from-rfc`, §9] The limiter's buckets are keyed
+per-`(client identity, verb, bucket)` over a two-value enum:
+`predecision_refusal` and `admission`.** `predecision_refusal` is charged at
+entry to the pre-derivation arm above, before its intent write;
+`admission` is charged at entry to the post-derivation arm, before its intent
+write and before any OpenBao work. This replaces the per-`(verb,
+outcome-class)` buckets this document specified when it was accepted, and the
+reason is narrower than "that shape is not implementable": **the two-value
+enum is the maximal refinement knowable at the point the limiter is charged.**
+A pre-derivation refusal *is* knowable there — that arm fires only on refusals,
+and label validation and multiplicity-class resolution both precede the check
+point — while the outcome of an admitted invocation is not, because
+`ServiceSpecConflict`, `ServiceNameCollision` and `ServiceHostMismatch` are
+settled by OpenBao work that follows the intent write. Keying a bucket on the
+outcome class would therefore require charging **after** the durable intent
+write the limiter exists to prevent, or predicting the outcome. A provisional
+class trued up afterwards, or a second post-outcome bucket shaping only
+*future* admission, are unspecified candidates rather than designs; this
+decision is the one to revisit if either is ever specified.
+
+**State positively what these two buckets isolate.** A flood on
+`predecision_refusal` consumes no `admission` budget, so the **cheapest** flood
+path — malformed labels and components with no multiplicity entry, refused
+before any OpenBao work — **cannot starve accepted mints**. That is exactly the
+path this section's own threat rationale names when it calls
+`ServiceInstanceMismatch` the cheapest refusal, and both of that error's causes
+are pre-derivation, so the delivered guarantee is the one that rationale asks
+for.
+
+**State the residual with its bound.** The **expensive** refusals are not
+isolated: a caller able to produce well-formed, derivable requests consumes
+`admission` budget with invocations that end in refusal, because at the
+admission check point nothing distinguishes them from a real mint. That
+residual is bounded by **attacker cost** — every such attempt spends OpenBao
+work as well as a token — rather than by the limiter, and this document claims
+no guarantee against it.
+
+**[DECISION, amended after acceptance — ruling
+`limiter-predecision-caller-answer`, §9] A THROTTLED invocation returns
+`RegistrarBusy { retry_after }`, and the ADMISSION check point is the only one
+that throttles.** With the `admission` bucket empty the invocation is not
+attempted at all and returns **`RegistrarBusy { retry_after }`** (RFC-C §5) — a
+**retryable** error distinct from `RegistrarUnavailable`, whose reasons all
+mean *permanent until an operator acts*. Without a distinct type it arrives
+as generic, review classifies generic as transient and retries (RFC-D2 §4b),
+and the retry storm feeds the limiter. With the `predecision_refusal` bucket
+empty the invocation is **limited but not throttled**: its two audit records
+are suppressed and it is still given its real, permanent refusal.
+
+**The ground for that split is type-level, not ergonomic.** `RegistrarBusy` is
+the enroll error family's **only** retryable member. The sentence immediately
+above carries the half this document states itself, setting `RegistrarBusy`
+against a `RegistrarUnavailable` whose every reason means *permanent until an
+operator acts*; that it holds across the whole family rests on the
+per-identifier retryable/permanent split transcribed from RFC-C §5 and §8
+into `docs/reference/registrar-wire-contract.md`, whose §6.1 carries the class
+of every identifier so it can be checked one by one without leaving this
+repository, and whose §7 records the same split as a property in its own
+right — its `retryable identifiers` row reads "Exactly one: `RegistrarBusy`".
+What the pre-derivation arm refuses is a `service_name` or `host` that is not
+a DNS label, or a component with no multiplicity entry (the arm's own decision
+above): deterministic faults in the request or in the configuration, not
+conditions that clear on their own.
+Answering `RegistrarBusy` there would hand a caller the one value in the set
+whose contract says *this clears on its own*, for a request that can never
+succeed — a contradiction in the type rather than a poor choice of words — and
+it would do so on the path this section already names as the cheapest to flood,
+so the limiter would feed the very traffic it was added to damp. The
+`predecision_refusal` bucket exists **because** that arm is the cheapest and
+most floodable path, which is why the two rulings, though independent,
+reinforce each other.
+
+The RFC owner's ruling additionally records an operator-facing consequence,
+cited here on that authority rather than as a reading of a document this
+repository can open: **RFC-E §9** is understood to require the UI to render
+`RegistrarBusy` as an in-progress wait honouring `retry_after`, never as a
+failure and with no retry button — under which a malformed `service_name`
+would sit on screen as "waiting" indefinitely with its real cause unreachable.
+This RFC's header block attributes no repository to the letter RFC-E, so
+nothing above rests on it; the type-level ground stands on this section's own
+text.
+
+**Suppressing the records does not suppress the count.** The ratified answers
+suppress the two **audit records** of a limited invocation and nothing else:
+the coalesced counter increment named in the pre-derivation-arm decision still
+happens, at both check points, and the anomaly definition above still counts
+it. Otherwise a flood becomes least visible exactly while it is worst — and
+these records are the only detection this section's "detected, not prevented"
+argument rests on, standing as it does on the per-`(component, host)` ceiling
+RFC-A §6 deferred.
 
 **[DECISION] Retention is bounded and stated, and the audit store has
 reserved capacity.** These records are the only detection for an abuse whose
@@ -1088,13 +1193,22 @@ argument rests on.
   serving — a test asserts the alarm fires before the quota is reached, and
   that the alarm and the intent-without-outcome count reach review over the
   `audit_health` tail field (RFC-C §6, RFC-D2 §4a) rather than staying on the
-  bootroot host. A further test drives the **pre-derivation** arm (a
-  non-DNS-label `service_name`; a component with no multiplicity entry) and
-  asserts the rate limiter runs **before** any intent write, so a flood on
-  that path produces coalesced counters and not one durable record per
-  request; and asserts a throttled invocation returns the **retryable**
-  `RegistrarBusy { retry_after }`, never one of `RegistrarUnavailable`'s
-  permanent reasons.
+  bootroot host. The limiter's buckets are keyed per-`(client identity, verb,
+  bucket)` over the two-value enum `predecision_refusal` / `admission` (§5.6),
+  and a test asserts the two are isolated: draining `predecision_refusal` does
+  not stop a concurrent legitimate mint from being admitted and recorded. A
+  further test drives the **pre-derivation** arm (a non-DNS-label
+  `service_name`; a component with no multiplicity entry) and asserts the rate
+  limiter runs **before** any intent write, so a flood on that path produces
+  coalesced counters and not one durable record per request; and asserts that
+  an invocation **limited** there still reaches the caller as its own real,
+  permanent refusal — that check point suppresses the record, not the answer,
+  so it does not throttle. A separate test drains the **`admission`** bucket,
+  which is the only check point that throttles, and asserts a **throttled**
+  invocation returns the **retryable** `RegistrarBusy { retry_after }`, never
+  one of `RegistrarUnavailable`'s permanent reasons, having written neither
+  intent nor outcome record — its coalesced counter increment still happens —
+  and performed no OpenBao work.
 - **Outcome-record failure keeps the teardown owed (§5.6).** A test makes the
   **outcome** write fail after a successful mint and asserts the verb returns
   `PostMintUnrecordable`, that the identity exists, and that REView's owed
@@ -1174,9 +1288,12 @@ Self-contained issues; dependency order:
    certificate identity and outcome; escaped structured encoding; bounded
    rotation retaining at least 90 days on a **reserved, quota'd** filesystem;
    the **pre-derivation arm** (global lock, request-id-keyed record, limiter
-   **before** any write); **rate limiting** on both verbs with
-   per-`(verb, outcome-class)` buckets, coalesced repeated refusals, and a
-   retryable `RegistrarBusy { retry_after }`; and the `audit_health` relay of
+   **before** any write, and an invocation limited there keeping its real
+   permanent refusal); **rate limiting** on both verbs with
+   per-`(client identity, verb, bucket)` buckets over the two-value enum
+   `predecision_refusal` / `admission` (§5.6), coalesced repeated refusals, and
+   a retryable `RegistrarBusy { retry_after }` returned from the **admission**
+   check point only; and the `audit_health` relay of
    the low-water alarm and the intent-without-outcome count. An invocation
    whose **intent** record cannot be written is refused before anything is
    created; a failed **outcome** write returns `PostMintUnrecordable` and
@@ -1235,3 +1352,111 @@ speak `node.enroll` Register/Deregister and never touched raw OpenBao paths).
   registrar credential only.
 - **bootroot's own update** — out of scope (installer-managed trust anchor,
   never UI-updated — RFC-A §4, RFC-D2 §4e).
+
+## 9. Amendment record
+
+Amendments made to this document **after** it was accepted, so that a later
+reader can tell what changed, on whose authority, and what still has to follow
+from it. Amending an accepted RFC is the RFC owner's decision; each entry names
+the ruling it transcribes.
+
+### 2026-08-17 — the limiter's bucket key and its caller answer
+
+Decomposing §5.6's rate limit into implementation issues surfaced **two**
+places where this document, as accepted, stated a guarantee the design cannot
+deliver. They are **independent** questions — either bucket shape composes with
+either caller answer — they were ruled independently, and both were ruled by
+this RFC's owner. This entry records both outcomes; §5.6, §6 and §7 carry the
+amended text.
+
+**Ruling `limiter-bucket-shape-departs-from-rfc` — the bucket key.** As
+accepted, §5.6 said the limiter "uses **per-`(verb, outcome-class)` buckets** so
+refusals throttle without starving accepted mints", and §7 item 1a restated the
+key in one line. **Ruled: the buckets are keyed per-`(client identity, verb,
+bucket)` over the two-value enum `predecision_refusal` / `admission`.** The
+reason is that the two-value enum is the **maximal refinement knowable at the
+point the limiter is charged** — not that the accepted shape is unimplementable,
+which would be a stronger claim than the ruling makes. What that buys, stated
+positively, is that the cheapest flood path cannot starve accepted mints; what
+it leaves is expensive refusals consuming admission budget, bounded by attacker
+cost rather than by the limiter. §5.6 carries the argument in full. The
+alternative — a provisional outcome class trued up after the fact, or a second
+post-outcome bucket shaping only future admission — was **not** re-opened here,
+because designing it would have had to precede any limiter implementation and
+would reach the record store's `serde` encoding and golden fixture, the record
+reader's pairing over coalesced records, and the acceptance arm's
+bucket-isolation tests, all of which are written against the two-bucket shape.
+That cost is why the ruling went this way; it is recorded so the trade stays
+visible.
+
+**Ruling `limiter-predecision-caller-answer` — the caller answer.** As
+accepted, §5.6 said "a throttled invocation returns **`RegistrarBusy {
+retry_after }`**" without distinguishing check points, §5.6's
+pre-derivation-arm decision called a records-suppressed invocation on that arm
+"throttled", and §6's criterion restated the retryable `RegistrarBusy` for the
+pre-derivation arm specifically. **Ruled: the throttle comes from the
+`admission` check point only; an invocation limited at the pre-derivation check
+point has its two audit records suppressed and still receives its real,
+permanent refusal.** The ground is type-level rather than ergonomic —
+`RegistrarBusy` is the enroll family's only retryable member, and the
+pre-derivation arm refuses deterministic faults that no later attempt clears —
+and it is grounded in §5.6's own text rather than in a document this repository
+cannot open. Suppressing those two records does **not** suppress the coalesced
+counter increment or its place in the intent/outcome anomaly definition. §5.6
+also fixes the vocabulary the ambiguity rested on: **limited** for suppressed
+records at either check point, **throttled** and `RegistrarBusy` for the
+admission-side outcome a caller receives.
+
+**Follow-ups this amendment requires.** The issues below are specified against
+these rulings and are named individually rather than as "the children". **No
+issue on this list is filed for implementation until its own body matches this
+amendment.** This RFC does not edit them; each one's owner does.
+
+1. **Bound both registrar verbs with two token buckets** — the limiter itself.
+   **Unaffected on the merits**: both rulings ratify the shape it already
+   specifies — the two-value bucket key with its check points and retry
+   arithmetic, and the admission-only throttle. What it needs is the purely
+   editorial step it states for itself: remove the status section declaring it
+   blocked on this amendment, fold its bucket-key departure's charge-point
+   reasoning into the Scope bullet that defines the key (the reasoning survives
+   as design rationale), and delete the departures section and **both** its
+   subsections, since neither describes a departure once this entry has landed.
+   Its own gate — that the amendment carries **both** rulings — is discharged
+   here.
+2. **Record limited registrar invocations and report the throttle** —
+   **unaffected on the merits**: its coalescing key `(client identity, verb,
+   limited_bucket)`, the `limited_bucket` domain, the two per-bucket health
+   counters and the admission-only wire mapping are what was ruled. Editorial
+   only: drop the "ratified but the amendment has not landed" framing from its
+   context and its dependency note, and cite §5.6 for the limited/throttled
+   distinction rather than restating it as a local definition.
+3. **Add the append-only record store and its on-disk format for registrar
+   audit records** — **unaffected**. The ruled bucket key fixes the domain of
+   the `limited_bucket` field the future `phase` variant carries, which is what
+   that issue already records, so no re-encoding, no `record_version` bump and
+   no golden-fixture change follows from either ruling. One wording correction:
+   where it describes the limiter as suppressing records "for throttled
+   invocations", the ruled vocabulary makes those **limited** invocations —
+   suppression happens at both check points and only one of them throttles.
+4. **Scan the audit store for anomalies and report them on `bootroot status`**
+   — **unaffected**. Its pairing rule over coalesced records holds under both
+   rulings: each check point suppresses **both** phases together, so a limited
+   invocation is absent rather than anomalous, and the counted record it pairs
+   over carries the ruled two-value `limited_bucket`. Same wording correction as
+   above, where it says "throttled" for records suppressed at either check
+   point.
+5. **Add the cargo acceptance arm for the registrar surface** — **unaffected on
+   the merits**, and its assertions now guard ruled answers rather than
+   provisional ones: the bucket-isolation cases, the `predecision_refusal`
+   spelling, the admission-only `RegistrarBusy` case and the case asserting that
+   a limited pre-derivation invocation reaches the caller as its real permanent
+   refusal all stand. Editorial only: the hedge that the pre-derivation answer
+   is read from the shipped limiter pending a ruling may go, while the
+   precedence rule it states — `docs/reference/registrar-wire-contract.md` wins
+   over shipped behaviour — is untouched by this amendment.
+
+**Left open deliberately.** The letter **RFC-E** is still unresolved to a
+repository by this document's header block, so §5.6's operator-facing rendering
+consequence is carried on the ruling's authority rather than as a reading of
+RFC-E §9. Nothing in either ruling depends on it. Whoever can resolve the set
+index may replace that attribution with a direct citation.
