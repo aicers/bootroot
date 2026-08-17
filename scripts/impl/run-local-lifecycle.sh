@@ -651,6 +651,7 @@ run_bootstrap_chain() {
   # service's own AppRole paths and a service-keyed state_path — one
   # daemon and one identity per service, the supported topology.
   run_bootroot service add \
+    --registration-id "$WEB_SERVICE" \
     --service-name "$WEB_SERVICE" \
     --delivery-mode local-file \
     --hostname "$WEB_HOSTNAME" \
@@ -664,6 +665,7 @@ run_bootstrap_chain() {
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot service add \
+    --registration-id "$REMOTE_SERVICE" \
     --service-name "$REMOTE_SERVICE" \
     --delivery-mode remote-bootstrap \
     --hostname "$REMOTE_HOSTNAME" \
@@ -677,6 +679,7 @@ run_bootstrap_chain() {
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot service add \
+    --registration-id "$EDGE_SERVICE" \
     --service-name "$EDGE_SERVICE" \
     --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" \
@@ -856,7 +859,7 @@ force_reissue_for_service() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     force-reissue \
-    --service-name "$service" \
+    --registration-id "$service" \
     --wait \
     >>"$RUN_LOG" 2>&1
 }
@@ -955,7 +958,7 @@ verify_service_with_retry() {
   local agent_config="$2"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if run_bootroot verify --service-name "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
+    if run_bootroot verify --registration-id "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
@@ -1082,6 +1085,7 @@ run_remote_bootstrap() {
     "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "$OPENBAO_URL" \
       --kv-mount "secret" \
+      --registration-id "$REMOTE_SERVICE" \
       --service-name "$REMOTE_SERVICE" \
       --role-id-path "$role_id_path" \
       --secret-id-path "$secret_id_path" \
@@ -1169,7 +1173,7 @@ run_rotation_secret_id_self_mint() {
       --approle-secret-id-file "$cred_dir/runtime/secret_id" \
       --yes \
       approle-secret-id \
-      --service-name "$EDGE_SERVICE" >>"$RUN_LOG" 2>&1 ||
+      --registration-id "$EDGE_SERVICE" >>"$RUN_LOG" 2>&1 ||
       fail "runtime-rotate self-mint rotation (${pass} pass) failed"
     after="$(cat "$cred_dir/runtime/secret_id")"
     [ -n "$after" ] || fail "runtime-rotate credential file is empty after self-mint (${pass} pass)"

@@ -342,8 +342,18 @@ Each profile represents one daemon instance (one certificate identity).
 At least one `[[profiles]]` entry is required, and `instance_id` must be a
 numeric string.
 
+`registration_id` is required and names every namespace the profile
+polls — the `bootroot/services/<registration_id>/…` KV subtree and the
+per-profile fast-poll state filename. It is lowercase letters, digits and
+hyphens, starts and ends alphanumeric, and is at most 131 characters. A
+`[[profiles]]` block that omits it fails to load. It is deliberately not a
+certificate field: `service_name` remains the SAN's second label, so
+several registrations of one component on one host share a
+`service_name` and differ only in `registration_id`.
+
 ```toml
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
@@ -359,7 +369,8 @@ check_jitter = "0s"
 ```
 
 The DNS SAN is auto-generated as
-`<instance-id>.<service-name>.<hostname>.<domain>`. This
+`<instance-id>.<service-name>.<hostname>.<domain>` — `registration_id`
+never appears in it. This
 name is also the target for HTTP-01 validation, so it must resolve from step-ca
 to the HTTP-01 responder IP. In Compose environments, `bootroot service add`
 registers the alias on the `bootroot-http01` container automatically; for host

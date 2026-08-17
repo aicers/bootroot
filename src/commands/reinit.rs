@@ -1129,6 +1129,7 @@ mod tests {
         services.insert("svc".to_string(), {
             use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
             ServiceEntry {
+                registration_id: "svc".to_string(),
                 service_name: "svc".to_string(),
                 delivery_mode: DeliveryMode::LocalFile,
                 hostname: "h".to_string(),

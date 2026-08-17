@@ -140,6 +140,7 @@ bootroot init: 요약
 
 ```bash
 bootroot service add \
+  --registration-id edge-proxy \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
@@ -179,6 +180,7 @@ Bootroot 자동 반영 항목:
     bootroot-agent를 리로드하세요.
 daemon 프로필 스니펫:
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 ...
 daemon 실행 명령 (systemd ExecStart 또는 셸; EAB 회전이 적용되려면
@@ -206,6 +208,7 @@ bind-mount하는 호스트 디렉터리로 지정하고, 명시적 컨테이너 
 
 ```bash
 bootroot service add \
+  --registration-id web-app \
   --service-name web-app \
   --hostname web-01 \
   --domain trusted.domain \
@@ -230,6 +233,7 @@ bind-mount 패턴과 하드닝 유닛/Docker 소켓 트레이드오프는
 
 ```bash
 bootroot service add \
+  --registration-id edge-remote \
   --service-name edge-remote \
   --delivery-mode remote-bootstrap \
   --hostname edge-node-02 \
@@ -260,6 +264,7 @@ bootroot-remote bootstrap \
 bootroot-remote bootstrap \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
+  --registration-id edge-remote \
   --service-name edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id \
@@ -294,6 +299,7 @@ bootroot-remote bootstrap \
 
 ```bash
 bootroot service add \
+  --registration-id edge-proxy \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
@@ -322,6 +328,7 @@ bootroot service add \
 
 ```bash
 bootroot service add \
+  --registration-id aimer-web \
   --service-name aimer-web \
   --hostname aimer-node-01 \
   --domain trusted.domain \
@@ -346,7 +353,7 @@ fast-poll 루프로 새 secret_id를 직접 받아오므로 수동 전달이 필
 bootroot-remote apply-secret-id \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
-  --service-name edge-remote \
+  --registration-id edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
 ```
@@ -356,25 +363,25 @@ bootroot-remote apply-secret-id \
 `service add`를 다시 실행하지 않고 서비스별 `secret_id` 정책을 변경하려면:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
 ```
 
 서비스의 응답 래핑을 비활성화하려면:
 
 ```bash
-bootroot service update --service-name edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --no-wrap
 ```
 
 기본 래핑 동작을 복원하려면:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 ```
 
 정책 변경 후 다음 회전에 적용:
 
 ```bash
-bootroot rotate approle-secret-id --service-name edge-proxy
+bootroot rotate approle-secret-id --registration-id edge-proxy
 ```
 
 ## 4) HTTP-01 검증을 위한 DNS 해석
@@ -402,13 +409,13 @@ docker exec bootroot-ca sh -c \
 ## 5) service verify
 
 ```bash
-bootroot verify --service-name edge-proxy
+bootroot verify --registration-id edge-proxy
 ```
 
 DB 연결/인증까지 함께 검증하려면:
 
 ```bash
-bootroot verify --service-name edge-proxy --db-check
+bootroot verify --registration-id edge-proxy --db-check
 ```
 
 예시 대화/출력(전체):
@@ -485,7 +492,7 @@ bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
 
 # 등록된 모든 서비스의 secret_id를 한 번의 호출로 회전
-# (서비스별 대상 지정은 --service-name으로 계속 가능)
+# (등록별 대상 지정은 --registration-id으로 계속 가능)
 bootroot rotate approle-secret-id --all-services
 
 # 인프라 OpenBao Agent가 사용하는 인프라 AppRole secret_id 회전
@@ -508,12 +515,12 @@ bootroot rotate \
 bootroot rotate trust-sync
 
 # 특정 서비스의 인증서 강제 재발급
-bootroot rotate force-reissue --service-name edge-proxy
+bootroot rotate force-reissue --registration-id edge-proxy
 
 # remote-bootstrap 서비스를 강제 재발급하고 원격 agent가 반영할 때까지
 # 대기(OpenBao reissue KV 경로의 completed_at 폴링).
 bootroot rotate force-reissue \
-  --service-name edge-remote --wait --wait-timeout 90s
+  --registration-id edge-remote --wait --wait-timeout 90s
 ```
 
 OpenBao 복구 자격증명 수동 회전(언실 키 + 루트 토큰):
@@ -559,8 +566,8 @@ bootroot rotate \
 CA 키 회전 후 모든 서비스에 대해 인증서 강제 재발급:
 
 ```bash
-bootroot rotate force-reissue --service-name edge-proxy
-bootroot rotate force-reissue --service-name web-app
+bootroot rotate force-reissue --registration-id edge-proxy
+bootroot rotate force-reissue --registration-id web-app
 ```
 
 주기 실행(예: cron, 모든 회전 스텝을 한 번에 실행하는 스크립트):

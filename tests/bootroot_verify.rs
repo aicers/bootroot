@@ -38,7 +38,7 @@ fn test_verify_success() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -91,7 +91,7 @@ fn test_verify_oneshot_passes_service_eab_file() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -145,7 +145,7 @@ fn test_verify_second_service_success() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "web-app",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -185,7 +185,7 @@ fn test_verify_san_mismatch_fails() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -342,7 +342,7 @@ fn test_verify_db_check_reports_auth_failure() {
         .env_remove("POSTGRES_HOST_PORT")
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -409,7 +409,7 @@ fn test_verify_db_check_translates_compose_dsn_via_process_env() {
         .env("POSTGRES_HOST_PORT", port.to_string())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -460,7 +460,7 @@ fn test_verify_missing_cert_fails() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -499,7 +499,7 @@ fn test_verify_empty_cert_fails() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -539,7 +539,7 @@ fn test_verify_empty_key_fails_second_service() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "web-app",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -598,7 +598,7 @@ fn test_verify_resolves_sibling_agent_without_path_or_flag() {
         .env("PATH", &empty_path)
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -642,7 +642,7 @@ fn test_verify_agent_failure_reports_error() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),
@@ -671,6 +671,7 @@ fn write_state_with_app(
         "approles": {},
         "services": {
             "edge-proxy": {
+                "registration_id": "edge-proxy",
                 "service_name": "edge-proxy",
                 "hostname": "edge-node-01",
                 "domain": "trusted.domain",
@@ -710,6 +711,7 @@ fn write_state_with_web_app(
         "approles": {},
         "services": {
             "web-app": {
+                "registration_id": "web-app",
                 "service_name": "web-app",
                 "hostname": "web-01",
                 "domain": "trusted.domain",

@@ -115,6 +115,7 @@ ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 
 # 1. 제어 노드에서 서비스 등록
 bootroot service add \
+  --registration-id "$SERVICE" \
   --service-name "$SERVICE" \
   --delivery-mode remote-bootstrap \
   --hostname "$REMOTE_HOST" \
@@ -177,6 +178,7 @@ Type=oneshot
 LoadCredential=secret_id:/etc/credstore/bootroot-edge-remote-secret-id
 ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     --openbao-url https://openbao.internal:8200 \
+    --registration-id edge-remote \
     --service-name edge-remote \
     --secret-id-path %d/secret_id \
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
@@ -267,6 +269,7 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
           bootroot-remote bootstrap
           --openbao-url {{ artifact.openbao_url }}
           --kv-mount {{ artifact.kv_mount }}
+          --registration-id {{ artifact.registration_id }}
           --service-name {{ artifact.service_name }}
           --role-id-path {{ artifact.role_id_path }}
           --secret-id-path {{ artifact.secret_id_path }}
@@ -309,6 +312,7 @@ runcmd:
   - >-
     /usr/local/bin/bootroot-remote bootstrap
     --openbao-url https://openbao.internal:8200
+    --registration-id edge-remote \
     --service-name edge-remote
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id
     --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
@@ -354,7 +358,7 @@ runcmd:
 
 1. 누가 또는 무엇이 토큰을 소비했는지 조사합니다.
 2. `secret_id`를 즉시 회전합니다:
-   `bootroot rotate approle-secret-id --service-name <service>`.
+   `bootroot rotate approle-secret-id --registration-id <service>`.
 3. 동일한 인자로 `bootroot service add`를 다시 실행해 새 `wrap_token`을
    생성합니다.
 4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을

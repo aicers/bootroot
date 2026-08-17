@@ -5,6 +5,7 @@ use crate::i18n::{Messages, ServiceNextStepsDaemon};
 use crate::state::{DeliveryMode, PostRenewHookEntry, ServiceEntry};
 
 pub(crate) struct ServiceAddPlan<'a> {
+    pub(crate) registration_id: &'a str,
     pub(crate) service_name: &'a str,
     pub(crate) delivery_mode: crate::state::DeliveryMode,
     pub(crate) hostname: &'a str,
@@ -95,7 +96,7 @@ pub(crate) fn print_service_add_summary(
     );
     println!(
         "{}",
-        messages.service_summary_openbao_path(&entry.service_name)
+        messages.service_summary_openbao_path(&entry.registration_id)
     );
     // Fixed position, ahead of the optional blocks, so the line an
     // operator or a script looks for does not move with them.
@@ -106,7 +107,7 @@ pub(crate) fn print_service_add_summary(
         print_local_apply_summary(&paths, messages);
     }
     if let Some(remote) = options.remote {
-        print_remote_handoff_summary(&remote, &entry.service_name, messages);
+        print_remote_handoff_summary(&remote, &entry.registration_id, messages);
     }
     if let Some(note) = options.note.as_deref() {
         println!("{note}");
@@ -148,7 +149,7 @@ fn print_local_apply_summary(paths: &ServiceAddAppliedPaths<'_>, messages: &Mess
 
 fn print_remote_handoff_summary(
     remote: &ServiceAddRemoteBootstrap<'_>,
-    service_name: &str,
+    registration_id: &str,
     messages: &Messages,
 ) {
     println!("{}", messages.service_scope_bootroot_managed());
@@ -175,7 +176,8 @@ fn print_remote_handoff_summary(
     }
     println!("{}", messages.service_summary_remote_placeholder_warning());
     println!("{}", messages.service_scope_operator_recommended());
-    let status_check_command = format!("bootroot service info --service-name '{service_name}'");
+    let status_check_command =
+        format!("bootroot service info --registration-id '{registration_id}'");
     println!(
         "{}",
         messages.service_summary_remote_handoff_status_check(&status_check_command)
@@ -220,6 +222,7 @@ fn print_local_deploy_snippet(
     let key_path = entry.key_path.display().to_string();
     let config_path = entry.agent_config_path.display().to_string();
     let data = ServiceNextStepsDaemon {
+        registration_id: &entry.registration_id,
         service_name: &entry.service_name,
         instance_id: entry.instance_id.as_deref().unwrap_or_default(),
         hostname: &entry.hostname,
@@ -279,7 +282,7 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
     }
     println!(
         "{}",
-        messages.service_summary_openbao_path(&entry.service_name)
+        messages.service_summary_openbao_path(&entry.registration_id)
     );
     println!(
         "{}",
@@ -308,6 +311,10 @@ pub(crate) fn print_service_info_summary(entry: &ServiceEntry, messages: &Messag
 
 fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
     let delivery_mode = entry.delivery_mode.to_string();
+    println!(
+        "{}",
+        messages.service_summary_registration_id(&entry.registration_id)
+    );
     println!("{}", messages.service_summary_kind(&entry.service_name));
     println!("{}", messages.service_summary_hostname(&entry.hostname));
     println!("{}", messages.service_summary_domain(&entry.domain));
@@ -325,6 +332,10 @@ fn print_service_fields(entry: &ServiceEntry, messages: &Messages) {
 
 fn print_service_plan_fields(plan: &ServiceAddPlan<'_>, messages: &Messages) {
     let delivery_mode = plan.delivery_mode.to_string();
+    println!(
+        "{}",
+        messages.service_summary_registration_id(plan.registration_id)
+    );
     println!("{}", messages.service_summary_kind(plan.service_name));
     println!("{}", messages.service_summary_hostname(plan.hostname));
     println!("{}", messages.service_summary_domain(plan.domain));
@@ -351,6 +362,10 @@ fn print_daemon_snippet(
     let instance_id = entry.instance_id.as_deref().unwrap_or_default();
     println!("{}", messages.service_snippet_daemon_title());
     println!("[[profiles]]");
+    println!(
+        "registration_id = \"{registration_id}\"",
+        registration_id = entry.registration_id
+    );
     println!(
         "service_name = \"{service_name}\"",
         service_name = entry.service_name
@@ -412,11 +427,13 @@ fn print_trust_snippet(entry: &ServiceEntry, trusted: &[String], messages: &Mess
 }
 
 pub(crate) fn print_verify_plan(
+    registration_id: &str,
     service_name: &str,
     agent_config: &std::path::Path,
     messages: &Messages,
 ) {
     println!("{}", messages.verify_plan_title());
+    println!("{}", messages.verify_registration_id(registration_id));
     println!("{}", messages.verify_service_name(service_name));
     println!(
         "{}",

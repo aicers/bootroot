@@ -42,6 +42,8 @@ async fn test_app_add_writes_state_and_secret() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -131,7 +133,7 @@ async fn test_app_add_writes_state_and_secret() {
         "service add should flag the missing hook: {stdout}"
     );
     assert!(
-        stdout.contains("bootroot service update --service-name"),
+        stdout.contains("bootroot service update --registration-id"),
         "service add should suggest the service-update remediation: {stdout}"
     );
 
@@ -343,6 +345,8 @@ async fn test_app_add_secret_id_path_override_relocates_credentials() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -474,6 +478,8 @@ async fn test_app_add_secret_id_path_rejected_with_remote_bootstrap() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--delivery-mode",
@@ -531,6 +537,8 @@ async fn test_app_add_secret_id_path_rejected_role_id_final_component() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -598,6 +606,8 @@ async fn test_app_add_secret_id_path_rejected_inside_secrets_dir() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -657,6 +667,8 @@ async fn test_app_add_installs_preset_and_custom_hooks_in_order() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -770,6 +782,8 @@ async fn test_app_add_supports_approle_runtime_auth() {
             "runtime-role-id",
             "--approle-secret-id",
             "runtime-secret-id",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -839,6 +853,8 @@ async fn test_app_add_approle_permission_denied_fails() {
             "runtime-role-id",
             "--approle-secret-id",
             "runtime-secret-id",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -896,6 +912,8 @@ async fn test_app_add_creates_missing_parent_dirs_for_output_paths() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -980,6 +998,8 @@ async fn test_app_add_preserves_existing_parent_dir_mode() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1043,6 +1063,8 @@ async fn test_app_add_fails_when_agent_config_parent_is_a_file() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1095,6 +1117,8 @@ async fn test_app_add_print_only_does_not_create_missing_parent_dirs() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1150,6 +1174,8 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1220,6 +1246,8 @@ async fn test_app_add_print_only_with_root_token_shows_trust_snippet() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1267,7 +1295,7 @@ async fn test_app_add_prompts_for_missing_inputs() {
     stub_app_add_service_sync_material(&server, "edge-proxy").await;
 
     let input = format!(
-        "edge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
+        "edge-proxy\nedge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -1316,7 +1344,7 @@ async fn test_app_add_reprompts_on_invalid_inputs() {
     // the only remaining reprompt-on-invalid path here is the empty
     // instance id.
     let input = format!(
-        "edge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n\n001\n",
+        "edge-proxy\nedge-proxy\nedge-node-01\ntrusted.domain\n{}\n{}\n{}\n\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -1352,7 +1380,7 @@ async fn test_app_add_reprompts_on_invalid_identifier_inputs() {
     write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
 
     let input = format!(
-        "edge.proxy\nedge-proxy\nedge_node\nedge-node-01\ntrusted_domain\ntrusted.domain\n{}\n{}\n{}\ninstance-01\n001\n",
+        "Edge-Proxy\nedge-proxy-001\nedge.proxy\nedge-proxy\nedge_node\nedge-node-01\ntrusted_domain\ntrusted.domain\n{}\n{}\n{}\ninstance-01\n001\n",
         agent_config.display(),
         cert_path.display(),
         key_path.display(),
@@ -1373,6 +1401,7 @@ async fn test_app_add_reprompts_on_invalid_identifier_inputs() {
     let output = child.wait_with_output().expect("run service add");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "stdout:\n{stdout}");
+    assert!(stdout.contains("registration_id must be lowercase letters"));
     assert!(stdout.contains("service_name must be a DNS label"));
     assert!(stdout.contains("hostname must be a DNS label"));
     assert!(stdout.contains("domain must be a DNS name"));
@@ -1398,6 +1427,8 @@ async fn test_app_add_rejects_invalid_identifier_args() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-node-01-edge-proxy-001",
             "--service-name",
             "edge.proxy",
             "--hostname",
@@ -1443,6 +1474,8 @@ async fn test_app_add_accepts_docker_restart_reload_style() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1498,6 +1531,8 @@ async fn test_app_add_rejects_removed_sidecar_flags() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             flag,
@@ -1545,6 +1580,8 @@ async fn test_app_add_persists_remote_bootstrap_delivery_mode() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--delivery-mode",
@@ -1658,6 +1695,8 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--delivery-mode",
@@ -1693,7 +1732,8 @@ async fn test_app_add_remote_bootstrap_no_wrap_handoff_includes_secret_id() {
 }
 
 fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
-    assert_eq!(bootstrap["schema_version"], 4);
+    assert_eq!(bootstrap["schema_version"], 5);
+    assert_eq!(bootstrap["registration_id"], "edge-proxy");
     assert_eq!(bootstrap["service_name"], "edge-proxy");
     assert_eq!(bootstrap["kv_mount"], "secret");
     assert!(bootstrap["role_id_path"].is_string());
@@ -1752,6 +1792,8 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
     let args = [
         "service",
         "add",
+        "--registration-id",
+        "edge-proxy",
         "--service-name",
         "edge-proxy",
         "--delivery-mode",
@@ -1889,6 +1931,8 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -1935,7 +1979,7 @@ async fn test_app_add_local_file_sets_verify_prerequisites() {
         .current_dir(temp_dir.path())
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--agent-binary",
             agent_binary.to_string_lossy().as_ref(),
@@ -1971,6 +2015,8 @@ async fn test_app_add_prompts_for_missing_instance_id() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2021,6 +2067,8 @@ async fn test_app_add_rejects_duplicate() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2046,6 +2094,8 @@ async fn test_app_add_rejects_duplicate() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2100,6 +2150,8 @@ async fn test_app_add_rejects_agent_config_shared_across_services() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2128,6 +2180,8 @@ async fn test_app_add_rejects_agent_config_shared_across_services() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "billing-api",
             "--service-name",
             "billing-api",
             "--hostname",
@@ -2183,6 +2237,8 @@ async fn test_app_add_rejects_agent_config_shared_via_relative_spelling() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2211,6 +2267,8 @@ async fn test_app_add_rejects_agent_config_shared_via_relative_spelling() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "billing-api",
             "--service-name",
             "billing-api",
             "--hostname",
@@ -2267,6 +2325,8 @@ async fn test_app_add_rejects_agent_config_shared_via_symlink() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2295,6 +2355,8 @@ async fn test_app_add_rejects_agent_config_shared_via_symlink() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "billing-api",
             "--service-name",
             "billing-api",
             "--hostname",
@@ -2334,6 +2396,9 @@ async fn test_app_add_rejects_agent_config_shared_via_symlink() {
 /// service's credentials.
 #[cfg(unix)]
 #[tokio::test]
+// A linear two-phase scenario (add, remove without --strip-config, re-add)
+// whose argument lists grew by one flag with the `registration_id` split.
+#[allow(clippy::too_many_lines)]
 async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() {
     use support::ROOT_TOKEN;
 
@@ -2354,6 +2419,8 @@ async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() 
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2382,7 +2449,7 @@ async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() 
         .args([
             "service",
             "remove",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--yes",
             "--root-token",
@@ -2409,6 +2476,8 @@ async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() 
         .args([
             "service",
             "add",
+            "--registration-id",
+            "billing-api",
             "--service-name",
             "billing-api",
             "--hostname",
@@ -2465,6 +2534,8 @@ async fn test_app_add_includes_trust_snippet_when_present() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2533,6 +2604,8 @@ async fn test_app_add_uses_synced_trust_when_metadata_missing() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2588,6 +2661,8 @@ async fn test_app_add_fails_when_synced_trust_bundle_missing() {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -2623,7 +2698,7 @@ async fn test_app_info_prints_summary() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service info");
 
@@ -2666,7 +2741,7 @@ fn test_app_info_missing_state_file() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service info");
 
@@ -2771,6 +2846,8 @@ async fn service_add_with_fake_docker(docker: FakeDocker) -> FakeDockerAddRun {
         .args([
             "service",
             "add",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -3077,6 +3154,7 @@ fn write_state_with_app_full(
         approle["token_bound_cidrs"] = json!(cidrs);
     }
     value["services"]["edge-proxy"] = json!({
+        "registration_id": "edge-proxy",
         "service_name": "edge-proxy",
         "hostname": "edge-node-01",
         "domain": "trusted.domain",
@@ -3388,7 +3466,7 @@ fn test_service_update_sets_secret_id_ttl() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "2h",
@@ -3427,7 +3505,7 @@ fn test_service_update_disables_wrapping() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--no-wrap",
         ])
@@ -3464,7 +3542,7 @@ fn test_service_update_inherit_clears_ttl() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "inherit",
@@ -3500,7 +3578,7 @@ fn test_service_update_reenables_wrapping() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-wrap-ttl",
             "15m",
@@ -3536,7 +3614,7 @@ fn test_service_update_wrap_ttl_inherit_restores_default() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-wrap-ttl",
             "inherit",
@@ -3562,7 +3640,7 @@ fn test_service_update_wrap_ttl_inherit_restores_default() {
     // Verify service info shows the default wrap TTL label
     let info_output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service info");
 
@@ -3584,7 +3662,7 @@ fn test_service_update_not_found() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "nonexistent",
             "--secret-id-ttl",
             "1h",
@@ -3606,7 +3684,7 @@ fn test_service_update_no_flags_errors() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "update", "--service-name", "edge-proxy"])
+        .args(["service", "update", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service update");
 
@@ -3627,7 +3705,7 @@ fn test_service_update_shows_rotate_hint() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "1h",
@@ -3659,7 +3737,7 @@ fn test_service_update_shows_ttl_rotation_cadence_hint() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "2h",
@@ -3691,7 +3769,7 @@ fn test_service_update_warns_when_ttl_exceeds_recommended() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "72h",
@@ -3723,7 +3801,7 @@ fn test_service_update_rejects_ttl_exceeding_max() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "200h",
@@ -3756,7 +3834,7 @@ fn test_service_update_noop_when_value_unchanged() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--no-wrap",
         ])
@@ -3781,7 +3859,7 @@ fn test_service_update_noop_when_value_unchanged() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--secret-id-ttl",
             "1h",
@@ -3824,7 +3902,7 @@ fn test_service_update_rn_cidrs_clear_removes_bound_cidrs() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--rn-cidrs",
             "clear",
@@ -3882,7 +3960,7 @@ fn test_service_update_installs_post_renew_hook_via_reload_style() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "sighup",
@@ -3957,7 +4035,7 @@ fn test_service_update_installs_preset_and_custom_hooks_in_order() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "docker-restart",
@@ -4060,7 +4138,7 @@ fn test_service_update_reload_style_preserves_inline_trust() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "sighup",
@@ -4125,7 +4203,7 @@ fn test_service_update_reload_style_keeps_outside_trust_unique() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "sighup",
@@ -4178,7 +4256,7 @@ fn test_service_update_reload_style_no_trust_stays_absent() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "sighup",
@@ -4239,7 +4317,7 @@ fn test_service_update_cert_group_preserves_inline_trust() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--cert-group",
             "clear",
@@ -4299,7 +4377,7 @@ fn test_service_update_cert_group_keeps_outside_trust_unique() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--cert-group",
             "clear",
@@ -4372,7 +4450,7 @@ fn test_service_update_reload_style_none_clears_existing_hook() {
         .args([
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "none",
@@ -4417,6 +4495,8 @@ fn test_service_add_rejects_rn_cidrs_clear() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -4466,6 +4546,8 @@ fn test_service_add_print_only_shows_ttl_rotation_cadence_hint() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -4515,6 +4597,8 @@ fn test_service_add_print_only_warns_when_ttl_exceeds_recommended() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -4564,6 +4648,8 @@ fn test_service_add_print_only_rejects_ttl_exceeding_max() {
             "service",
             "add",
             "--print-only",
+            "--registration-id",
+            "edge-proxy",
             "--service-name",
             "edge-proxy",
             "--hostname",
@@ -4604,7 +4690,7 @@ fn test_service_info_shows_policy_fields() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service info");
 
@@ -4630,7 +4716,7 @@ fn test_service_info_shows_default_policy_fields() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(temp_dir.path())
-        .args(["service", "info", "--service-name", "edge-proxy"])
+        .args(["service", "info", "--registration-id", "edge-proxy"])
         .output()
         .expect("run service info");
 
@@ -4667,7 +4753,7 @@ fn test_service_sidecar_subcommands_are_gone() {
                 "service",
                 subcommand,
                 "start",
-                "--service-name",
+                "--registration-id",
                 "edge-proxy",
             ])
             .output()
@@ -4762,4 +4848,289 @@ async fn stub_app_add_remote_sync_material(server: &MockServer, service_name: &s
         .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
+}
+
+/// Two registrations of one component on one host — `h1-piglet-001` and
+/// `h1-piglet-002`, both `service_name = piglet`, both `hostname = h1` —
+/// must coexist. Every namespace bootroot owns is derived from the
+/// `registration_id`, so the two must differ in registry key, `AppRole`
+/// and policy name, KV subtree, credential directory, managed-block
+/// marker, fast-poll state filename and cert/key paths, while their SANs
+/// differ only in the instance label.
+#[allow(clippy::too_many_lines)]
+#[cfg(unix)]
+#[tokio::test]
+async fn test_two_registrations_of_one_component_on_one_host_are_isolated() {
+    use support::ROOT_TOKEN;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_app_add_trust_missing(&server).await;
+
+    let registrations = ["h1-piglet-001", "h1-piglet-002"];
+    for registration_id in registrations {
+        stub_app_add_openbao(&server, registration_id).await;
+        stub_app_add_service_sync_material(&server, registration_id).await;
+    }
+
+    for (registration_id, instance_id) in registrations.iter().zip(["001", "002"]) {
+        let agent_config = temp_dir.path().join(format!("{registration_id}.toml"));
+        let cert_path = temp_dir
+            .path()
+            .join("certs")
+            .join(format!("{registration_id}.crt"));
+        let key_path = temp_dir
+            .path()
+            .join("certs")
+            .join(format!("{registration_id}.key"));
+        fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "service",
+                "add",
+                "--registration-id",
+                registration_id,
+                "--service-name",
+                "piglet",
+                "--hostname",
+                "h1",
+                "--domain",
+                "trusted.domain",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+                "--cert-path",
+                cert_path.to_string_lossy().as_ref(),
+                "--key-path",
+                key_path.to_string_lossy().as_ref(),
+                "--instance-id",
+                instance_id,
+                "--root-token",
+                ROOT_TOKEN,
+            ])
+            .output()
+            .expect("run service add");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "add {registration_id} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(temp_dir.path().join("state.json")).unwrap())
+            .expect("parse state.json");
+    let services = state["services"].as_object().expect("services map");
+    assert_eq!(
+        services.len(),
+        2,
+        "both registrations must own their own registry entry: {services:?}"
+    );
+
+    let first = &services["h1-piglet-001"];
+    let second = &services["h1-piglet-002"];
+
+    // The SAN inputs are shared; only the instance label separates them.
+    for entry in [first, second] {
+        assert_eq!(entry["service_name"], "piglet");
+        assert_eq!(entry["hostname"], "h1");
+        assert_eq!(entry["domain"], "trusted.domain");
+    }
+    let san = |entry: &serde_json::Value| {
+        format!(
+            "{}.{}.{}.{}",
+            entry["instance_id"].as_str().unwrap(),
+            entry["service_name"].as_str().unwrap(),
+            entry["hostname"].as_str().unwrap(),
+            entry["domain"].as_str().unwrap(),
+        )
+    };
+    assert_eq!(san(first), "001.piglet.h1.trusted.domain");
+    assert_eq!(san(second), "002.piglet.h1.trusted.domain");
+
+    // No SAN input is the registration key, and no SAN carries it.
+    for entry in [first, second] {
+        assert!(!san(entry).contains("h1-piglet"), "{}", san(entry));
+    }
+
+    // Every derived namespace differs.
+    assert_eq!(
+        first["approle"]["role_name"],
+        "bootroot-service-h1-piglet-001"
+    );
+    assert_eq!(
+        second["approle"]["role_name"],
+        "bootroot-service-h1-piglet-002"
+    );
+    assert_eq!(
+        first["approle"]["policy_name"],
+        "bootroot-service-h1-piglet-001"
+    );
+    assert_eq!(
+        second["approle"]["policy_name"],
+        "bootroot-service-h1-piglet-002"
+    );
+    assert_ne!(
+        first["approle"]["secret_id_path"],
+        second["approle"]["secret_id_path"]
+    );
+    assert_ne!(first["cert_path"], second["cert_path"]);
+    assert_ne!(first["key_path"], second["key_path"]);
+    assert_ne!(first["agent_config_path"], second["agent_config_path"]);
+
+    for registration_id in registrations {
+        assert!(
+            temp_dir
+                .path()
+                .join("secrets")
+                .join("services")
+                .join(registration_id)
+                .join("secret_id")
+                .exists(),
+            "{registration_id} must own its credential directory"
+        );
+
+        let rendered = fs::read_to_string(temp_dir.path().join(format!("{registration_id}.toml")))
+            .expect("read agent config");
+        assert!(
+            rendered.contains(&format!("registration_id = \"{registration_id}\"")),
+            "profile must carry its own key: {rendered}"
+        );
+        assert!(
+            rendered.contains("service_name = \"piglet\""),
+            "profile must carry the plain SAN label: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "# BEGIN bootroot managed profile: {registration_id}"
+            )),
+            "managed-block marker must name the key: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("bootroot-agent-state-{registration_id}.json")),
+            "fast-poll state filename must be keyed on the registration: {rendered}"
+        );
+    }
+}
+
+/// The one-key shape has to cover the cases with no instance number too:
+/// a one-per-deployment singleton registers as `review`, and a
+/// one-per-host component as `h1-roxyd`. For the singleton the derived
+/// `OpenBao` paths, `AppRole` name and filenames are byte-identical to
+/// what a pre-split `service_name = "review"` produced, because its key
+/// is still the bare component name.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_singleton_and_one_per_host_registration_shapes() {
+    use support::ROOT_TOKEN;
+
+    for (registration_id, service_name, hostname) in
+        [("review", "review", "cn-01"), ("h1-roxyd", "roxyd", "h1")]
+    {
+        let temp_dir = tempdir().expect("create temp dir");
+        let server = MockServer::start().await;
+        write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+        stub_app_add_trust_missing(&server).await;
+        stub_app_add_openbao(&server, registration_id).await;
+        stub_app_add_service_sync_material(&server, registration_id).await;
+
+        let agent_config = temp_dir.path().join("agent.toml");
+        let cert_path = temp_dir.path().join("certs").join("svc.crt");
+        let key_path = temp_dir.path().join("certs").join("svc.key");
+        fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "service",
+                "add",
+                "--registration-id",
+                registration_id,
+                "--service-name",
+                service_name,
+                "--hostname",
+                hostname,
+                "--domain",
+                "trusted.domain",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+                "--cert-path",
+                cert_path.to_string_lossy().as_ref(),
+                "--key-path",
+                key_path.to_string_lossy().as_ref(),
+                "--instance-id",
+                "001",
+                "--root-token",
+                ROOT_TOKEN,
+            ])
+            .output()
+            .expect("run service add");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "add {registration_id} failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(temp_dir.path().join("state.json")).unwrap())
+                .expect("parse state.json");
+        let entry = &state["services"][registration_id];
+        assert!(entry.is_object(), "registry key must be {registration_id}");
+        assert_eq!(entry["registration_id"], registration_id);
+        assert_eq!(entry["service_name"], service_name);
+        assert_eq!(
+            entry["approle"]["role_name"],
+            format!("bootroot-service-{registration_id}")
+        );
+        assert_eq!(
+            entry["approle"]["policy_name"],
+            format!("bootroot-service-{registration_id}")
+        );
+        assert_eq!(
+            entry["approle"]["secret_id_path"],
+            format!("secrets/services/{registration_id}/secret_id")
+        );
+
+        let rendered = fs::read_to_string(&agent_config).expect("read agent config");
+        assert!(
+            rendered.contains(&format!("bootroot-agent-state-{registration_id}.json")),
+            "state filename must be keyed on {registration_id}: {rendered}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "- OpenBao path: bootroot/services/{registration_id}"
+            )),
+            "summary must report the registration's KV subtree: {stdout}"
+        );
+
+        // The singleton is the compatibility anchor: its key is still the
+        // bare component name, so every derived string is byte-identical
+        // to what the pre-split `service_name` produced. Spelled out
+        // literally so a change to any derivation is visible right here.
+        if registration_id == "review" {
+            assert_eq!(entry["approle"]["role_name"], "bootroot-service-review");
+            assert_eq!(entry["approle"]["policy_name"], "bootroot-service-review");
+            assert_eq!(
+                entry["approle"]["secret_id_path"],
+                "secrets/services/review/secret_id"
+            );
+            assert!(rendered.contains("bootroot-agent-state-review.json"));
+            assert!(rendered.contains("# BEGIN bootroot managed profile: review"));
+            assert!(stdout.contains("- OpenBao path: bootroot/services/review"));
+        }
+
+        // The one-per-host shape keeps the host out of the SAN — it is
+        // in the key instead, and the SAN's service label stays plain.
+        if registration_id == "h1-roxyd" {
+            assert_eq!(entry["approle"]["role_name"], "bootroot-service-h1-roxyd");
+            assert_eq!(entry["service_name"], "roxyd");
+            assert_eq!(entry["hostname"], "h1");
+            assert!(rendered.contains("bootroot-agent-state-h1-roxyd.json"));
+            assert!(rendered.contains("service_name = \"roxyd\""));
+        }
+    }
 }

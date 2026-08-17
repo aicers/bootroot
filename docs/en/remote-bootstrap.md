@@ -119,6 +119,7 @@ ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 
 # 1. Register the service on the control node
 bootroot service add \
+  --registration-id "$SERVICE" \
   --service-name "$SERVICE" \
   --delivery-mode remote-bootstrap \
   --hostname "$REMOTE_HOST" \
@@ -183,6 +184,7 @@ Type=oneshot
 LoadCredential=secret_id:/etc/credstore/bootroot-edge-remote-secret-id
 ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     --openbao-url https://openbao.internal:8200 \
+    --registration-id edge-remote \
     --service-name edge-remote \
     --secret-id-path %d/secret_id \
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
@@ -273,6 +275,7 @@ For larger fleets with existing configuration management.
           bootroot-remote bootstrap
           --openbao-url {{ artifact.openbao_url }}
           --kv-mount {{ artifact.kv_mount }}
+          --registration-id {{ artifact.registration_id }}
           --service-name {{ artifact.service_name }}
           --role-id-path {{ artifact.role_id_path }}
           --secret-id-path {{ artifact.secret_id_path }}
@@ -315,6 +318,7 @@ runcmd:
   - >-
     /usr/local/bin/bootroot-remote bootstrap
     --openbao-url https://openbao.internal:8200
+    --registration-id edge-remote \
     --service-name edge-remote
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id
     --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
@@ -362,7 +366,7 @@ this as a **potential security incident**.
 
 1. Investigate who or what consumed the token.
 2. Rotate the service's `secret_id` immediately:
-   `bootroot rotate approle-secret-id --service-name <service>`.
+   `bootroot rotate approle-secret-id --registration-id <service>`.
 3. Re-run `bootroot service add` with the same arguments to generate a
    new `wrap_token`.
 4. Ship the artifact and run `bootroot-remote bootstrap` on the remote

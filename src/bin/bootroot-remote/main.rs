@@ -87,7 +87,15 @@ struct BootstrapArgs {
     #[arg(long, default_value = "secret", env = "OPENBAO_KV_MOUNT")]
     kv_mount: String,
 
-    /// Service name
+    /// Deployment-wide unique registration key.
+    ///
+    /// Names the `bootroot/services/<key>` KV subtree this host polls,
+    /// the managed `agent.toml` block, the fast-poll state filename and
+    /// the default cert/key filenames.
+    #[arg(long, required_unless_present = "artifact")]
+    registration_id: Option<String>,
+
+    /// Service name used as the SAN's second label
     #[arg(long, required_unless_present = "artifact")]
     service_name: Option<String>,
 
@@ -179,6 +187,10 @@ struct BootstrapArgs {
 struct ResolvedBootstrapArgs {
     openbao_url: String,
     kv_mount: String,
+    /// Deployment-wide unique key every namespace on this host is
+    /// derived from. Never the SAN label; see `service_name`.
+    registration_id: String,
+    /// Second label of the certificate SAN this profile requests.
     service_name: String,
     role_id_path: PathBuf,
     secret_id_path: PathBuf,
@@ -248,9 +260,10 @@ struct ApplySecretIdArgs {
     #[arg(long, default_value = "secret", env = "OPENBAO_KV_MOUNT")]
     kv_mount: String,
 
-    /// Service name
+    /// Registration key naming the KV subtree to read the rotated
+    /// `secret_id` from
     #[arg(long)]
-    service_name: String,
+    registration_id: String,
 
     /// `AppRole` `role_id` file path used for `OpenBao` login
     #[arg(long)]
@@ -318,10 +331,15 @@ async fn run(args: Args, lang: Locale) -> Result<i32> {
 }
 
 /// Lowest `schema_version` that this binary understands.
-const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+///
+/// Raised to 5 with the `registration_id` split: an artifact that
+/// pre-dates the field carries no registration key at all, and the
+/// product ships no compatibility shim that would invent one. Such an
+/// artifact is re-emitted by `bootroot service add`, not migrated.
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 5;
 
 /// Highest `schema_version` that this binary understands.
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 4;
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 5;
 
 /// Minimal header used for the first stage of artifact parsing so that
 /// `schema_version` can be validated before attempting full deserialization.
@@ -337,6 +355,7 @@ struct BootstrapArtifact {
     schema_version: u32,
     openbao_url: String,
     kv_mount: String,
+    registration_id: String,
     service_name: String,
     role_id_path: String,
     secret_id_path: String,
@@ -443,6 +462,11 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         .map(|a| a.openbao_url.clone())
         .or(args.openbao_url)
         .ok_or_else(|| anyhow::anyhow!("--openbao-url is required"))?;
+    let registration_id = artifact
+        .as_ref()
+        .map(|a| a.registration_id.clone())
+        .or(args.registration_id)
+        .ok_or_else(|| anyhow::anyhow!("--registration-id is required"))?;
     let service_name = artifact
         .as_ref()
         .map(|a| a.service_name.clone())
@@ -563,6 +587,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
     Ok(ResolvedBootstrapArgs {
         openbao_url,
         kv_mount,
+        registration_id,
         service_name,
         role_id_path,
         secret_id_path,
@@ -702,9 +727,10 @@ mod tests {
     async fn resolve_bootstrap_args_artifact_overrides_cli_flags() {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 5,
             "openbao_url": "https://artifact-url:8200",
             "kv_mount": "artifact-kv",
+            "registration_id": "artifact-reg",
             "service_name": "artifact-svc",
             "role_id_path": "/artifact/role_id",
             "secret_id_path": "/artifact/secret_id",
@@ -718,6 +744,7 @@ mod tests {
             artifact: Some(artifact_path),
             openbao_url: Some("https://cli-url:8200".to_string()),
             kv_mount: "cli-kv".to_string(),
+            registration_id: Some("cli-reg".to_string()),
             service_name: Some("cli-svc".to_string()),
             role_id_path: Some(PathBuf::from("/cli/role_id")),
             secret_id_path: Some(PathBuf::from("/cli/secret_id")),
@@ -744,6 +771,7 @@ mod tests {
         // Artifact values must win over CLI flags.
         assert_eq!(resolved.openbao_url, "https://artifact-url:8200");
         assert_eq!(resolved.kv_mount, "artifact-kv");
+        assert_eq!(resolved.registration_id, "artifact-reg");
         assert_eq!(resolved.service_name, "artifact-svc");
         assert_eq!(resolved.role_id_path, PathBuf::from("/artifact/role_id"));
         assert_eq!(
@@ -765,9 +793,10 @@ mod tests {
     async fn resolve_bootstrap_args_artifact_hooks_override_cli_hooks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 5,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -787,6 +816,7 @@ mod tests {
             artifact: Some(artifact_path),
             openbao_url: None,
             kv_mount: "secret".to_string(),
+            registration_id: None,
             service_name: None,
             role_id_path: None,
             secret_id_path: None,
@@ -826,9 +856,10 @@ mod tests {
         // ingest dropped the second consumer's refresh action.
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 4,
+            "schema_version": 5,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -877,9 +908,10 @@ mod tests {
     async fn resolve_bootstrap_args_artifact_empty_hooks_override_cli_hooks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 5,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -894,6 +926,7 @@ mod tests {
             artifact: Some(artifact_path),
             openbao_url: None,
             kv_mount: "secret".to_string(),
+            registration_id: None,
             service_name: None,
             role_id_path: None,
             secret_id_path: None,
@@ -929,6 +962,7 @@ mod tests {
             artifact: Some(artifact_path),
             openbao_url: None,
             kv_mount: "secret".to_string(),
+            registration_id: None,
             service_name: None,
             role_id_path: None,
             secret_id_path: None,
@@ -978,6 +1012,7 @@ mod tests {
             "schema_version": 99,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -993,6 +1028,7 @@ mod tests {
             "schema_version": 0,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -1016,9 +1052,10 @@ mod tests {
     async fn resolve_bootstrap_args_no_override_keeps_override_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 5,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -1066,9 +1103,10 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let artifact_json = serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 5,
             "openbao_url": "https://ob:8200",
             "kv_mount": "kv",
+            "registration_id": "svc",
             "service_name": "svc",
             "role_id_path": "/r",
             "secret_id_path": "/s",
@@ -1104,13 +1142,13 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_bootstrap_args_rejects_future_schema_with_unknown_fields() {
-        // A future v5 artifact that has completely different fields.  Without
+        // A future v6 artifact that has completely different fields.  Without
         // two-stage parsing, serde would fail with a confusing missing-field
         // error instead of the explicit version rejection.
         let artifact_json = serde_json::json!({
-            "schema_version": 5,
+            "schema_version": 6,
             "completely_new_field": true,
         });
-        assert_rejects_schema_version(&artifact_json, 5).await;
+        assert_rejects_schema_version(&artifact_json, 6).await;
     }
 }

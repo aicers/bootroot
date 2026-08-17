@@ -281,6 +281,7 @@ poll_interval_secs = 1
 backoff_secs = [1]
 
 [[profiles]]
+registration_id = "edge"
 service_name = "edge"
 instance_id = "001"
 hostname = "node-01"

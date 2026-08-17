@@ -438,12 +438,14 @@ Then start services, re-add a service, and verify issuance:
 
 ```bash
 docker compose up -d
-bootroot service add --service-name edge-proxy --hostname edge-node-01 \
+bootroot service add \
+  --registration-id edge-proxy \
+  --service-name edge-proxy --hostname edge-node-01 \
   --domain trusted.domain --instance-id 001 \
   --agent-config "$(pwd)/tmp/agent-edge-proxy.toml" \
   --cert-path "$(pwd)/certs/edge-proxy.crt" \
   --key-path "$(pwd)/certs/edge-proxy.key"
-bootroot verify --service-name edge-proxy \
+bootroot verify --registration-id edge-proxy \
   --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 ```
 

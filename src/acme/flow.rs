@@ -474,6 +474,7 @@ mod tests {
 
     fn test_profile() -> crate::config::DaemonProfileSettings {
         crate::config::DaemonProfileSettings {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),

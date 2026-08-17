@@ -420,14 +420,14 @@ BOOTROOT_LANG=en bootroot init \
 # 3) service-add
 # Each distinct local service gets its own agent config (one daemon
 # and one [openbao] AppRole identity per service).
-bootroot service add --service-name edge-proxy \
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
-bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
+bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # from init summary
@@ -561,21 +561,22 @@ BOOTROOT_LANG=en bootroot init \
   --confirm-db-provision \
   --db-user "step" --db-name "stepca" \
   --responder-url "$RESPONDER_URL" </dev/null
-bootroot service add --service-name edge-proxy \
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
 # remote node: bootstrap (per service)
 bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
+  --registration-id "$SERVICE_NAME" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
   --output json
 
 # control node: rotate secret_id + publish the trust update to KV
-bootroot rotate --yes approle-secret-id --service-name edge-proxy
-bootroot rotate --yes approle-secret-id --service-name web-app
+bootroot rotate --yes approle-secret-id --registration-id edge-proxy
+bootroot rotate --yes approle-secret-id --registration-id web-app
 # remote node: NO manual re-apply. The running bootroot-agent fast-poll
 # loop refreshes its own secret_id and re-renders trust; a force-reissue
 # --wait round-trip then proves it operates on the fresh credential
@@ -678,9 +679,9 @@ Actual commands (script excerpt):
 ./scripts/impl/run-rotation-recovery.sh
 
 # key commands used in rotation/verify loops
-bootroot rotate --yes approle-secret-id --service-name "$service"
-bootroot-remote bootstrap --service-name "$service" ...
-bootroot verify --service-name "$service" --agent-config "$agent_config_path"
+bootroot rotate --yes approle-secret-id --registration-id "$service"
+bootroot-remote bootstrap --registration-id "$service" --service-name "$service" ...
+bootroot verify --registration-id "$service" --agent-config "$agent_config_path"
 ```
 
 ### 6) CA key rotation failure/recovery

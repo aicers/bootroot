@@ -158,7 +158,7 @@ async fn test_rotate_approle_secret_id_local_updates_secret() {
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -232,7 +232,7 @@ async fn test_rotate_approle_secret_id_applies_default_wrapping_when_policy_abse
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -281,7 +281,7 @@ async fn test_rotate_approle_secret_id_does_not_restart_containers() {
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -335,7 +335,7 @@ async fn test_rotate_approle_secret_id_skips_login_when_cidr_bound() {
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -381,7 +381,7 @@ async fn test_rotate_approle_secret_id_missing_app_fails() {
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             "missing-service",
         ])
         .output()
@@ -417,7 +417,7 @@ async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
             support::ROOT_TOKEN,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .output()
@@ -547,7 +547,7 @@ async fn test_rotate_approle_secret_id_self_mints_with_file_based_auth() {
             cred_path.to_string_lossy().as_ref(),
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -1259,6 +1259,7 @@ fn prepare_app_state_no_policy(
     let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
@@ -1293,6 +1294,7 @@ fn prepare_app_state(
     let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
@@ -1328,6 +1330,7 @@ fn prepare_app_state_with_cidrs(
     let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
     let secret_id_path = PathBuf::from("secrets/services/edge-proxy/secret_id");
     state["services"][SERVICE_NAME] = json!({
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "delivery_mode": delivery_mode,
         "hostname": "edge-node-01",
@@ -1927,7 +1930,7 @@ async fn test_rotate_force_reissue_deletes_cert_and_key() {
             support::ROOT_TOKEN,
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .env("PATH", combined_path)
@@ -2009,7 +2012,7 @@ async fn test_rotate_force_reissue_remote_writes_reissue_kv() {
             support::ROOT_TOKEN,
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .output()
@@ -2093,7 +2096,7 @@ async fn test_rotate_force_reissue_remote_wait_reports_completion() {
             support::ROOT_TOKEN,
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
             "--wait",
             "--wait-timeout",
@@ -2177,7 +2180,7 @@ async fn test_rotate_force_reissue_remote_wait_times_out_with_exit_124() {
             support::ROOT_TOKEN,
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
             "--wait",
             "--wait-timeout",
@@ -2222,7 +2225,7 @@ async fn test_rotate_force_reissue_missing_service_fails() {
             support::ROOT_TOKEN,
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             "missing-service",
         ])
         .output()

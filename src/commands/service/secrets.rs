@@ -22,13 +22,13 @@ pub(super) async fn sync_service_kv_bundle(
     write_service_kv_secrets(
         client,
         &state.kv_mount,
-        &resolved.service_name,
+        &resolved.registration_id,
         &material,
         messages,
     )
     .await?;
     if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
-        let base = format!("{SERVICE_KV_BASE}/{}", resolved.service_name);
+        let base = format!("{SERVICE_KV_BASE}/{}", resolved.registration_id);
         client
             .write_kv(
                 &state.kv_mount,
@@ -134,11 +134,11 @@ async fn read_service_sync_material(
 async fn write_service_kv_secrets(
     client: &OpenBaoClient,
     kv_mount: &str,
-    service_name: &str,
+    registration_id: &str,
     material: &ServiceSyncMaterial,
     messages: &Messages,
 ) -> Result<()> {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+    let base = format!("{SERVICE_KV_BASE}/{registration_id}");
     // Always write `<base>/eab`, even when no EAB material is configured
     // (e.g. `--no-eab` at init, bundled OSS step-ca). The agent's
     // fast-poll loop reads this path on every cycle; an explicit empty
@@ -170,7 +170,7 @@ async fn write_service_kv_secrets(
     crate::commands::trust::write_service_trust(
         client,
         kv_mount,
-        service_name,
+        registration_id,
         &material.trusted_ca_sha256,
         &material.ca_bundle_pem,
         messages,

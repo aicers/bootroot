@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::input_validation::{
     ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
-    validate_numeric_instance_id,
+    validate_numeric_instance_id, validate_registration_id,
 };
 
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
@@ -19,6 +19,13 @@ use crate::state::{
 
 #[derive(Debug)]
 pub(crate) struct ResolvedServiceAdd {
+    /// Deployment-wide unique key every namespace this registration owns
+    /// is derived from. Supplied explicitly by the operator — never
+    /// derived here from `service_name`/`hostname`/`instance_id`, since
+    /// the derivation rule needs the component's multiplicity class,
+    /// which the CLI has no source for.
+    pub(crate) registration_id: String,
+    /// Second label of the certificate SAN. Not a namespace key.
     pub(crate) service_name: String,
     pub(crate) delivery_mode: DeliveryMode,
     pub(crate) hostname: String,
@@ -68,6 +75,15 @@ pub(super) fn resolve_service_add_args(
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
+
+    let registration_id = match &args.registration_id {
+        Some(value) => validate_registration_id_input(value, messages)?,
+        None => {
+            prompt.prompt_with_validation(messages.prompt_registration_id(), None, |value| {
+                validate_registration_id_input(value, messages)
+            })?
+        }
+    };
 
     let service_name = match &args.service_name {
         Some(value) => validate_service_name(value, messages)?,
@@ -164,6 +180,7 @@ pub(super) fn resolve_service_add_args(
         resolve_secret_id_path_override(args.secret_id_path.as_deref(), delivery_mode, messages)?;
 
     Ok(ResolvedServiceAdd {
+        registration_id,
         service_name,
         delivery_mode,
         hostname,
@@ -319,6 +336,7 @@ pub(super) fn resolve_cert_group_for_add(
 }
 
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
+    validate_registration_id_input(&args.registration_id, messages)?;
     validate_service_name(&args.service_name, messages)?;
     validate_hostname(&args.hostname, messages)?;
     validate_domain(&args.domain, messages)?;
@@ -337,6 +355,16 @@ pub(crate) fn effective_wrap_ttl(stored: Option<&str>) -> Option<&str> {
         Some("0") => None,
         Some(ttl) => Some(ttl),
     }
+}
+
+/// Validates an operator-supplied `registration_id` against the shared
+/// path-safe rule in [`bootroot::input_validation`]. The rule lives there
+/// rather than here because the registrar's derivation library applies
+/// the same function to the key it composes — one implementation decides
+/// which keys are legal.
+fn validate_registration_id_input(value: &str, messages: &Messages) -> Result<String> {
+    validate_registration_id(value).map_err(|err| registration_id_error(err, messages))?;
+    Ok(value.to_string())
 }
 
 fn validate_service_name(value: &str, messages: &Messages) -> Result<String> {
@@ -359,6 +387,20 @@ fn validate_instance_id(value: &str, messages: &Messages) -> Result<String> {
     Ok(value.to_string())
 }
 
+fn registration_id_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
+        ValidationError::InvalidRegistrationId
+        | ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
+        | ValidationError::NonNumeric => {
+            anyhow::anyhow!(messages.error_registration_id_invalid())
+        }
+    }
+}
+
 fn service_name_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
     match err {
         ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
@@ -366,7 +408,10 @@ fn service_name_error(err: ValidationError, messages: &Messages) -> anyhow::Erro
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_service_name_invalid()),
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => {
+            anyhow::anyhow!(messages.error_service_name_invalid())
+        }
     }
 }
 
@@ -377,7 +422,10 @@ fn hostname_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_hostname_invalid()),
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => {
+            anyhow::anyhow!(messages.error_hostname_invalid())
+        }
     }
 }
 
@@ -388,7 +436,10 @@ fn domain_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_domain_invalid()),
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => {
+            anyhow::anyhow!(messages.error_domain_invalid())
+        }
     }
 }
 
@@ -399,7 +450,10 @@ fn instance_id_error(err: ValidationError, messages: &Messages) -> anyhow::Error
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(messages.error_instance_id_invalid()),
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => {
+            anyhow::anyhow!(messages.error_instance_id_invalid())
+        }
     }
 }
 
@@ -645,6 +699,7 @@ mod tests {
 
     fn empty_args() -> ServiceAddArgs {
         ServiceAddArgs {
+            registration_id: None,
             service_name: None,
             delivery_mode: None,
             dry_run: false,

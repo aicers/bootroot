@@ -71,6 +71,7 @@ pub(crate) struct StateFile {
     pub(crate) policies: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) approles: BTreeMap<String, String>,
+    /// Registered services, keyed by [`ServiceEntry::registration_id`].
     #[serde(default)]
     pub(crate) services: BTreeMap<String, ServiceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +225,22 @@ impl StateFile {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct ServiceEntry {
+    /// Deployment-wide unique key this registration owns every namespace
+    /// under: the [`StateFile::services`] map key, the `AppRole` and
+    /// policy names, the `bootroot/services/<key>` KV subtree, the
+    /// managed `agent.toml` block markers, the per-service fast-poll
+    /// state filename, and the remote-bootstrap artifact directory.
+    ///
+    /// Required, and deliberately not derived from `service_name`:
+    /// several registrations of one component may share a
+    /// `service_name` on one host, so the SAN label cannot key the
+    /// registry. Validated by
+    /// [`bootroot::input_validation::validate_registration_id`].
+    pub(crate) registration_id: String,
+    /// Second label of the issued certificate's SAN
+    /// (`<instance_id>.<service_name>.<hostname>.<domain>`), and so the
+    /// component's plain keyword — `piglet`, `roxyd`. Never a namespace
+    /// key; see [`ServiceEntry::registration_id`].
     pub(crate) service_name: String,
     #[serde(default)]
     pub(crate) delivery_mode: DeliveryMode,
@@ -613,6 +630,7 @@ mod tests {
     #[test]
     fn service_entry_with_hooks_round_trips_json() {
         let entry = ServiceEntry {
+            registration_id: "h-svc-001".to_string(),
             service_name: "svc".to_string(),
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "h".to_string(),
@@ -702,9 +720,37 @@ mod tests {
         );
     }
 
+    /// `registration_id` is required: there is no `#[serde(default)]`,
+    /// no `Option`, and no fall-back to `service_name`. A state file
+    /// written before the split does not load — registrations are
+    /// re-created by re-installing, not migrated.
+    #[test]
+    fn service_entry_without_registration_id_fails_to_deserialize() {
+        let json = r#"{
+            "service_name": "svc",
+            "hostname": "h",
+            "domain": "d.com",
+            "agent_config_path": "agent.toml",
+            "cert_path": "cert.pem",
+            "key_path": "key.pem",
+            "approle": {
+                "role_name": "r",
+                "role_id": "id",
+                "secret_id_path": "s",
+                "policy_name": "p"
+            }
+        }"#;
+        let err = serde_json::from_str::<ServiceEntry>(json).expect_err("must not deserialize");
+        assert!(
+            err.to_string().contains("registration_id"),
+            "error must name the missing field, got: {err}"
+        );
+    }
+
     #[test]
     fn service_entry_without_hooks_deserializes_empty_vec() {
         let json = r#"{
+            "registration_id": "h-svc-001",
             "service_name": "svc",
             "hostname": "h",
             "domain": "d.com",

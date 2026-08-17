@@ -260,7 +260,7 @@ pub(super) async fn rotate_ca_key(
                 Phase5Action::SkipMigrated => {
                     println!(
                         "{}",
-                        messages.rotate_ca_key_skip_migrated(&entry.service_name)
+                        messages.rotate_ca_key_skip_migrated(&entry.registration_id)
                     );
                 }
                 Phase5Action::LocalReissue => {
@@ -272,7 +272,7 @@ pub(super) async fn rotate_ca_key(
                 Phase5Action::RemoteHint => {
                     println!(
                         "{}",
-                        messages.rotate_ca_key_reissue_remote_hint(&entry.service_name)
+                        messages.rotate_ca_key_reissue_remote_hint(&entry.registration_id)
                     );
                 }
             }
@@ -302,7 +302,7 @@ pub(super) async fn rotate_ca_key(
             let cert_path = &entry.cert_path;
             match cert_issued_by_new_intermediate(cert_path, &new_inter_cert_path, messages) {
                 Ok(true) => {}
-                _ => unmigrated.push(entry.service_name.clone()),
+                _ => unmigrated.push(entry.registration_id.clone()),
             }
         }
 
@@ -696,7 +696,7 @@ pub(super) async fn rotate_trust_sync(
     for entry in ctx.state.services.values() {
         println!(
             "{}",
-            messages.rotate_summary_trust_sync_service(&entry.service_name)
+            messages.rotate_summary_trust_sync_service(&entry.registration_id)
         );
     }
     Ok(())
@@ -712,14 +712,14 @@ pub(super) async fn rotate_force_reissue(
     let entry = ctx
         .state
         .services
-        .get(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?
+        .get(&args.registration_id)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.registration_id)))?
         .clone();
 
     let prompt = if matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap) {
-        messages.prompt_rotate_force_reissue_remote(&args.service_name)
+        messages.prompt_rotate_force_reissue_remote(&args.registration_id)
     } else {
-        messages.prompt_rotate_force_reissue(&args.service_name)
+        messages.prompt_rotate_force_reissue(&args.registration_id)
     };
     confirm_action(&prompt, auto_confirm, messages)?;
 
@@ -750,7 +750,7 @@ async fn rotate_force_reissue_local(
     println!(
         "{}",
         messages.rotate_summary_force_reissue_deleted(
-            &args.service_name,
+            &args.registration_id,
             &cert_path.display().to_string(),
             &key_path.display().to_string(),
         )
@@ -758,7 +758,7 @@ async fn rotate_force_reissue_local(
     signal_bootroot_agent(entry, messages)?;
     println!(
         "{}",
-        messages.rotate_summary_force_reissue_local_signal(&args.service_name)
+        messages.rotate_summary_force_reissue_local_signal(&args.registration_id)
     );
     crate::commands::service::print_consumer_reload_hint(std::iter::once(entry), messages);
 
@@ -782,7 +782,7 @@ async fn rotate_force_reissue_local(
             println!(
                 "{}",
                 messages.rotate_summary_force_reissue_completed(
-                    &args.service_name,
+                    &args.registration_id,
                     &completed_at,
                     &elapsed,
                 )
@@ -793,7 +793,7 @@ async fn rotate_force_reissue_local(
             println!(
                 "{}",
                 messages.rotate_summary_force_reissue_wait_timeout(
-                    &args.service_name,
+                    &args.registration_id,
                     &args.wait_timeout,
                 )
             );
@@ -831,7 +831,7 @@ async fn rotate_force_reissue_remote(
 
     let kv_path = format!(
         "{SERVICE_KV_BASE}/{}/{SERVICE_REISSUE_KV_SUFFIX}",
-        args.service_name
+        args.registration_id
     );
 
     // Capture the version assigned by *this* POST directly from the
@@ -855,11 +855,11 @@ async fn rotate_force_reissue_remote(
     println!("{}", messages.rotate_summary_title());
     println!(
         "{}",
-        messages.rotate_summary_force_reissue_requested(&args.service_name, &requested_at)
+        messages.rotate_summary_force_reissue_requested(&args.registration_id, &requested_at)
     );
     println!(
         "{}",
-        messages.rotate_summary_force_reissue_will_apply(&args.service_name)
+        messages.rotate_summary_force_reissue_will_apply(&args.registration_id)
     );
 
     if !args.wait {
@@ -887,7 +887,7 @@ async fn rotate_force_reissue_remote(
             println!(
                 "{}",
                 messages.rotate_summary_force_reissue_completed(
-                    &args.service_name,
+                    &args.registration_id,
                     &outcome.completed_at,
                     &elapsed,
                 )
@@ -898,7 +898,7 @@ async fn rotate_force_reissue_remote(
             println!(
                 "{}",
                 messages.rotate_summary_force_reissue_wait_timeout(
-                    &args.service_name,
+                    &args.registration_id,
                     &args.wait_timeout,
                 )
             );
@@ -1516,6 +1516,7 @@ mod tests {
         use crate::state::ServiceRoleEntry;
 
         ServiceEntry {
+            registration_id: name.to_string(),
             service_name: name.to_string(),
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "h".to_string(),
@@ -1669,6 +1670,6 @@ mod tests {
             })
             .collect();
         assert_eq!(reissued.len(), 1);
-        assert_eq!(reissued[0].service_name, "svc-old");
+        assert_eq!(reissued[0].registration_id, "svc-old");
     }
 }

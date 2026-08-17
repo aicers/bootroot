@@ -304,8 +304,18 @@ CLI에서도 지정 가능합니다(`--eab-kid`, `--eab-hmac`, `--eab-file`).
 최소 1개 이상의 `[[profiles]]`가 필요하며, `instance_id`는 숫자 문자열이어야
 합니다.
 
+`registration_id`는 필수이며, 이 프로필이 폴링하는 모든 네임스페이스의
+이름이 여기에서 파생됩니다 — `bootroot/services/<registration_id>/…` KV
+서브트리와 프로필별 fast-poll 상태 파일 이름입니다. 영소문자/숫자/하이픈만
+허용하며, 영숫자로 시작하고 끝나야 하고, 최대 131자입니다. 이 키를 생략한
+`[[profiles]]` 블록은 로드에 실패합니다. 인증서 필드가 아니라는 점이
+의도적입니다: SAN의 두 번째 label은 계속 `service_name`이므로, 한 호스트에
+있는 같은 컴포넌트의 여러 등록은 `service_name`을 공유하고
+`registration_id`로만 구분됩니다.
+
 ```toml
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"

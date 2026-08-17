@@ -225,6 +225,7 @@ PY
     cd "$WORK_DIR"
     "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
+      --registration-id "$SERVICE_NAME" \
       --service-name "$SERVICE_NAME" \
       --role-id-path "$role_id_path" \
       --secret-id-path "$secret_id_path" \
@@ -331,7 +332,7 @@ run_verify() {
   (
     cd "$WORK_DIR"
     "$BOOTROOT_BIN" verify \
-      --service-name "$SERVICE_NAME" \
+      --registration-id "$SERVICE_NAME" \
       --agent-config "agent.toml" \
       --agent-binary "$WORK_DIR/bin/bootroot-agent" \
       >/dev/null

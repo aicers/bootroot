@@ -494,6 +494,7 @@ assert_service_add_succeeds() {
   [ -n "$secret_id" ] || fail "failed to parse runtime_service_add secret_id"
 
   if ! run_bootroot service add \
+    --registration-id "$EDGE_SERVICE" \
     --service-name "$EDGE_SERVICE" --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$AGENT_CONFIG_PATH" \

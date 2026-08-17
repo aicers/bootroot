@@ -158,8 +158,10 @@ and re-add it with the new mode — `service add` refuses to flip the
 delivery mode of an existing entry:
 
 ```bash
-bootroot service remove --service-name <name> --yes
-bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
+bootroot service remove --registration-id <name> --yes
+bootroot service add \
+  --registration-id <name> \
+  --service-name <name> --delivery-mode remote-bootstrap ...
 ```
 
 See [CLI → bootroot service remove](cli.md#bootroot-service-remove) for
@@ -198,7 +200,7 @@ Recovery:
 
 1. Investigate who or what consumed the token.
 2. Rotate the `secret_id`:
-   `bootroot rotate approle-secret-id --service-name <service>`.
+   `bootroot rotate approle-secret-id --registration-id <service>`.
 3. Re-run `bootroot service add` to generate a new `wrap_token`.
 4. Ship and run `bootroot-remote bootstrap` on the remote host.
 
@@ -332,7 +334,7 @@ differ, the consumer is wedged on an old FD.
    need to remove and re-add the service:
 
    ```bash
-   bootroot service update --service-name <name> \
+   bootroot service update --registration-id <name> \
      --reload-style sighup --reload-target <process-name>
    ```
 

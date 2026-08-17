@@ -9,6 +9,10 @@ impl Messages {
         self.strings().verify_plan_title
     }
 
+    pub(crate) fn verify_registration_id(&self, value: &str) -> String {
+        format_template(self.strings().verify_registration_id, &[("value", value)])
+    }
+
     pub(crate) fn verify_service_name(&self, value: &str) -> String {
         format_template(self.strings().verify_service_name, &[("value", value)])
     }

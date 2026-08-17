@@ -14,19 +14,19 @@ use crate::state::StateFile;
 pub(super) async fn ensure_service_approle(
     client: &OpenBaoClient,
     state: &StateFile,
-    service_name: &str,
+    registration_id: &str,
     secret_id_options: &SecretIdOptions,
     wrap_ttl: Option<&str>,
     messages: &Messages,
 ) -> Result<ServiceAppRoleMaterialized> {
-    let policy_name = service_policy_name(service_name);
-    let policy = build_service_policy(&state.kv_mount, service_name);
+    let policy_name = service_policy_name(registration_id);
+    let policy = build_service_policy(&state.kv_mount, registration_id);
     client
         .write_policy(&policy_name, &policy)
         .await
         .with_context(|| messages.error_openbao_policy_write_failed())?;
 
-    let role_name = service_role_name(service_name);
+    let role_name = service_role_name(registration_id);
     client
         .create_approle(
             &role_name,
@@ -67,11 +67,11 @@ pub(super) async fn ensure_service_approle(
 pub(super) async fn reapply_service_policy(
     client: &OpenBaoClient,
     state: &StateFile,
-    service_name: &str,
+    registration_id: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let policy_name = service_policy_name(service_name);
-    let policy = build_service_policy(&state.kv_mount, service_name);
+    let policy_name = service_policy_name(registration_id);
+    let policy = build_service_policy(&state.kv_mount, registration_id);
     client
         .write_policy(&policy_name, &policy)
         .await
@@ -79,8 +79,11 @@ pub(super) async fn reapply_service_policy(
     Ok(())
 }
 
-fn build_service_policy(kv_mount: &str, service_name: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{service_name}");
+/// Builds the service `AppRole` policy body. Every path is scoped to the
+/// registration's own KV subtree, so two registrations of one component
+/// on one host never see each other's material.
+fn build_service_policy(kv_mount: &str, registration_id: &str) -> String {
+    let base = format!("{SERVICE_KV_BASE}/{registration_id}");
     // The service subtree is read-only except for its own reissue object: the
     // fast-poll loop must write `completed_at`/`completed_version` back so the
     // control plane's `rotate force-reissue --wait` can observe completion.
@@ -99,12 +102,12 @@ path "{kv_mount}/metadata/{base}/*" {{
     )
 }
 
-pub(super) fn service_role_name(service_name: &str) -> String {
-    format!("{SERVICE_ROLE_PREFIX}{service_name}")
+pub(super) fn service_role_name(registration_id: &str) -> String {
+    format!("{SERVICE_ROLE_PREFIX}{registration_id}")
 }
 
-pub(super) fn service_policy_name(service_name: &str) -> String {
-    format!("{SERVICE_ROLE_PREFIX}{service_name}")
+pub(super) fn service_policy_name(registration_id: &str) -> String {
+    format!("{SERVICE_ROLE_PREFIX}{registration_id}")
 }
 
 pub(super) async fn write_secret_id_file(
@@ -259,6 +262,38 @@ mod tests {
                 "path \"secret/metadata/bootroot/services/edge-proxy/*\" {\n  capabilities = [\"list\"]"
             ),
             "metadata subtree must stay list-only, got:\n{policy}"
+        );
+    }
+
+    /// The policy body is keyed on `registration_id`, so two
+    /// registrations of one component on one host get disjoint KV
+    /// subtrees even though their `service_name` is identical.
+    #[test]
+    fn service_policy_paths_derive_from_registration_id() {
+        let first = build_service_policy("secret", "h1-piglet-001");
+        let second = build_service_policy("secret", "h1-piglet-002");
+
+        assert!(first.contains("secret/data/bootroot/services/h1-piglet-001/"));
+        assert!(second.contains("secret/data/bootroot/services/h1-piglet-002/"));
+        assert!(!first.contains("h1-piglet-002"));
+        assert!(!second.contains("h1-piglet-001"));
+    }
+
+    /// The role and policy names are one and the same derivation off
+    /// `registration_id`, and a one-per-deployment singleton whose key is
+    /// still the bare component name keeps the exact names it had before
+    /// the split.
+    #[test]
+    fn role_and_policy_names_derive_from_registration_id() {
+        assert_eq!(service_role_name("review"), "bootroot-service-review");
+        assert_eq!(service_policy_name("review"), "bootroot-service-review");
+        assert_eq!(
+            service_role_name("h1-piglet-001"),
+            "bootroot-service-h1-piglet-001"
+        );
+        assert_ne!(
+            service_role_name("h1-piglet-001"),
+            service_role_name("h1-piglet-002")
         );
     }
 

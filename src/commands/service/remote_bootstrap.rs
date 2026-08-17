@@ -13,7 +13,7 @@ use crate::i18n::Messages;
 use crate::state::{PostRenewHookEntry, ServiceEntry, StateFile};
 
 /// Machine-readable bootstrap artifact written to
-/// `secrets/remote-bootstrap/services/<service>/bootstrap.json`.
+/// `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json`.
 ///
 /// Downstream automation (shell scripts, Ansible, CI pipelines) can parse
 /// this JSON to drive `bootroot-remote bootstrap` invocations.
@@ -33,6 +33,11 @@ struct RemoteBootstrapArtifact {
     schema_version: u32,
     openbao_url: String,
     kv_mount: String,
+    /// Deployment-wide unique key the remote agent derives its KV
+    /// namespace, managed-block markers and state filename from.
+    registration_id: String,
+    /// SAN label the remote profile requests certificates under. Not a
+    /// namespace key.
     service_name: String,
     role_id_path: String,
     secret_id_path: String,
@@ -137,6 +142,7 @@ fn fingerprints_from_bundle(ca_bundle_pem: &str) -> Vec<String> {
 fn build_artifact(
     openbao_url: &str,
     kv_mount: &str,
+    registration_id: &str,
     service_name: &str,
     secret_id_path: &Path,
     agent_config_path: &Path,
@@ -162,14 +168,15 @@ fn build_artifact(
         .join("ca-bundle.pem");
 
     RemoteBootstrapArtifact {
-        // schema_version 4 removed the `openbao_agent_*` fields: the
-        // remote `bootroot-agent` now self-authenticates and renders trust
-        // via the fast-poll loop, so the OpenBao Agent artifacts
-        // are no longer produced. Per the contract above, a field removal
-        // is breaking and requires a bump.
-        schema_version: 4,
+        // schema_version 5 split the registry key out of `service_name`
+        // into the required `registration_id`: every namespace the remote
+        // agent derives now comes from that key, while `service_name`
+        // stays the SAN label. A new required field is breaking, so per
+        // the contract above it takes a bump.
+        schema_version: 5,
         openbao_url: openbao_url.to_string(),
         kv_mount: kv_mount.to_string(),
+        registration_id: registration_id.to_string(),
         service_name: service_name.to_string(),
         role_id_path: role_id_path.display().to_string(),
         secret_id_path: secret_id_path.display().to_string(),
@@ -206,6 +213,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
     let artifact = build_artifact(
         &artifact_url,
         &state.kv_mount,
+        &resolved.registration_id,
         &resolved.service_name,
         secret_id_path,
         &resolved.agent_config,
@@ -222,8 +230,13 @@ pub(super) async fn write_remote_bootstrap_artifact(
         resolved.agent_responder_url.as_deref(),
         resolved.cert_group_gid,
     );
-    write_remote_bootstrap_artifact_file(secrets_dir, &resolved.service_name, &artifact, messages)
-        .await
+    write_remote_bootstrap_artifact_file(
+        secrets_dir,
+        &resolved.registration_id,
+        &artifact,
+        messages,
+    )
+    .await
 }
 
 pub(super) async fn write_remote_bootstrap_artifact_from_entry(
@@ -238,6 +251,7 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     let artifact = build_artifact(
         &artifact_url,
         &state.kv_mount,
+        &entry.registration_id,
         &entry.service_name,
         &entry.approle.secret_id_path,
         &entry.agent_config_path,
@@ -254,17 +268,17 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         entry.agent_responder_url.as_deref(),
         entry.cert_group_gid,
     );
-    write_remote_bootstrap_artifact_file(secrets_dir, &entry.service_name, &artifact, messages)
+    write_remote_bootstrap_artifact_file(secrets_dir, &entry.registration_id, &artifact, messages)
         .await
 }
 
 async fn write_remote_bootstrap_artifact_file(
     secrets_dir: &Path,
-    service_name: &str,
+    registration_id: &str,
     artifact: &RemoteBootstrapArtifact,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
-    let artifact_dir = secrets_dir.join(REMOTE_BOOTSTRAP_DIR).join(service_name);
+    let artifact_dir = secrets_dir.join(REMOTE_BOOTSTRAP_DIR).join(registration_id);
     fs_util::ensure_secrets_dir(&artifact_dir).await?;
     let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
     let payload = serde_json::to_string_pretty(artifact)
@@ -318,9 +332,10 @@ fn render_remote_run_command_per_field(artifact: &RemoteBootstrapArtifact) -> St
     use std::fmt::Write as _;
 
     let mut cmd = format!(
-        "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}'",
+        "bootroot-remote bootstrap --openbao-url '{}' --kv-mount '{}' --registration-id '{}' --service-name '{}' --role-id-path '{}' --secret-id-path '{}' --eab-file-path '{}' --agent-config-path '{}' --agent-email '{}' --agent-server '{}' --agent-domain '{}' --agent-responder-url '{}' --profile-hostname '{}' --profile-instance-id '{}' --profile-cert-path '{}' --profile-key-path '{}' --ca-bundle-path '{}'",
         artifact.openbao_url,
         artifact.kv_mount,
+        artifact.registration_id,
         artifact.service_name,
         artifact.role_id_path,
         artifact.secret_id_path,
@@ -404,6 +419,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -433,6 +449,7 @@ mod tests {
         let artifact = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
@@ -464,6 +481,7 @@ mod tests {
             "https://openbao.example.com:8200",
             "secret",
             "my-service",
+            "my-service",
             Path::new("/secrets/services/my-service/secret_id"),
             Path::new("/etc/my-service/agent.toml"),
             Path::new("/certs/my-service/cert.pem"),
@@ -480,9 +498,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(artifact.schema_version, 4);
+        assert_eq!(artifact.schema_version, 5);
         assert_eq!(artifact.openbao_url, "https://openbao.example.com:8200");
         assert_eq!(artifact.kv_mount, "secret");
+        assert_eq!(artifact.registration_id, "my-service");
         assert_eq!(artifact.service_name, "my-service");
         assert_eq!(
             artifact.role_id_path,
@@ -525,6 +544,7 @@ mod tests {
         let artifact = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
@@ -573,6 +593,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -614,6 +635,7 @@ mod tests {
             "https://openbao.local",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/svc/cert.pem"),
@@ -634,10 +656,11 @@ mod tests {
     }
 
     #[test]
-    fn build_artifact_different_service_names_produce_different_paths() {
+    fn build_artifact_different_registration_ids_produce_different_paths() {
         let a = build_artifact(
             "https://ob",
             "kv",
+            "alpha",
             "alpha",
             Path::new("/secrets/services/alpha/secret_id"),
             Path::new("/etc/alpha/agent.toml"),
@@ -657,6 +680,7 @@ mod tests {
         let b = build_artifact(
             "https://ob",
             "kv",
+            "beta",
             "beta",
             Path::new("/secrets/services/beta/secret_id"),
             Path::new("/etc/beta/agent.toml"),
@@ -685,6 +709,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -711,6 +736,7 @@ mod tests {
         let artifact = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/secrets/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
@@ -746,6 +772,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -780,6 +807,7 @@ mod tests {
         let artifact = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
@@ -834,6 +862,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -867,6 +896,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -896,6 +926,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -914,6 +945,7 @@ mod tests {
         let with_none = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
@@ -962,6 +994,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -995,6 +1028,7 @@ mod tests {
             "https://ob",
             "kv",
             "svc",
+            "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),
             Path::new("/certs/cert.pem"),
@@ -1027,6 +1061,7 @@ mod tests {
         let artifact = build_artifact(
             "https://ob",
             "kv",
+            "svc",
             "svc",
             Path::new("/s/services/svc/secret_id"),
             Path::new("/etc/svc/agent.toml"),

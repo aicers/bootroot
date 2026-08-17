@@ -114,6 +114,8 @@ fn run_service_add_remote_impl(
     let mut args = vec![
         "service".to_string(),
         "add".to_string(),
+        "--registration-id".to_string(),
+        SERVICE_NAME.to_string(),
         "--service-name".to_string(),
         SERVICE_NAME.to_string(),
         "--delivery-mode".to_string(),
@@ -193,6 +195,8 @@ fn run_remote_bootstrap(service_dir: &Path, openbao_url: &str) -> anyhow::Result
             openbao_url,
             "--kv-mount",
             "secret",
+            "--registration-id",
+            SERVICE_NAME,
             "--service-name",
             SERVICE_NAME,
             "--role-id-path",
@@ -294,6 +298,7 @@ fn write_verify_state(service_dir: &Path) -> anyhow::Result<()> {
         "kv_mount": "secret",
         "services": {
             SERVICE_NAME: {
+                "registration_id": SERVICE_NAME,
                 "service_name": SERVICE_NAME,
                 "delivery_mode": "remote-bootstrap",
                 "hostname": HOSTNAME,
@@ -354,7 +359,7 @@ fn run_verify(service_dir: &Path) -> anyhow::Result<()> {
         .current_dir(service_dir)
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
             "--agent-config",
             service_dir.join("agent.toml").to_string_lossy().as_ref(),
@@ -734,9 +739,10 @@ async fn test_remote_bootstrap_expired_wrap_token() {
 
     // Create a fake artifact with an EXPIRED wrap token
     let artifact = json!({
-        "schema_version": 1,
+        "schema_version": 5,
         "openbao_url": server.uri(),
         "kv_mount": "secret",
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "role_id_path": role_id_path.to_string_lossy(),
         "secret_id_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("secret_id").to_string_lossy(),
@@ -816,9 +822,10 @@ async fn test_remote_bootstrap_already_unwrapped_token() {
 
     // Create a fake artifact with a NOT-YET-EXPIRED wrap token (far future)
     let artifact = json!({
-        "schema_version": 1,
+        "schema_version": 5,
         "openbao_url": server.uri(),
         "kv_mount": "secret",
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "role_id_path": role_id_path.to_string_lossy(),
         "secret_id_path": service_dir.join("secrets").join("services").join(SERVICE_NAME).join("secret_id").to_string_lossy(),
@@ -1040,9 +1047,10 @@ async fn test_remote_bootstrap_https_with_artifact_ca() {
         .join(SERVICE_NAME);
 
     let artifact = json!({
-        "schema_version": 2,
+        "schema_version": 5,
         "openbao_url": format!("https://localhost:{port}"),
         "kv_mount": "secret",
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "role_id_path": role_id_path.to_string_lossy(),
         "secret_id_path": secret_id_path.to_string_lossy(),
@@ -1124,9 +1132,10 @@ async fn test_remote_bootstrap_https_rejects_wrong_ca() {
 
     // Embed the WRONG CA — the server cert was signed by `ca`, not `wrong_ca`.
     let artifact = json!({
-        "schema_version": 2,
+        "schema_version": 5,
         "openbao_url": format!("https://localhost:{port}"),
         "kv_mount": "secret",
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "role_id_path": role_id_path.to_string_lossy(),
         "secret_id_path": secret_id_path.to_string_lossy(),

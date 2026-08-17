@@ -30,6 +30,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [5, 10, 30]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"

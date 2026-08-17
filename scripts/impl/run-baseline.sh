@@ -257,6 +257,7 @@ bootstrap_all() {
       cd "$work_dir"
       "$BOOTROOT_REMOTE_BIN" bootstrap \
         --openbao-url "http://127.0.0.1:$MOCK_OPENBAO_PORT" \
+        --registration-id "$service" \
         --service-name "$service" \
         --role-id-path "$role_id_path" \
         --secret-id-path "$secret_id_path" \
@@ -380,7 +381,7 @@ run_verify_all() {
     (
       cd "$work_dir"
       "$BOOTROOT_BIN" verify \
-        --service-name "$service" \
+        --registration-id "$service" \
         --agent-config "$agent_config_path" \
         --agent-binary "$work_dir/bin/bootroot-agent" \
         >/dev/null

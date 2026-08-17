@@ -1,9 +1,18 @@
 use anyhow::Result;
 use bootroot::input_validation::{
     ValidationError, validate_dns_label, validate_domain_name, validate_numeric_instance_id,
+    validate_registration_id,
 };
 
 use super::{Locale, localized};
+
+/// Validates the `--registration-id` this bootstrap namespaces itself
+/// under, through the shared path-safe rule the control plane applies to
+/// the same value. One implementation decides which keys are legal, so
+/// the two ends of the artifact cannot disagree about a key.
+pub(super) fn validate_registration_id_arg(value: &str, lang: Locale) -> Result<()> {
+    validate_registration_id(value).map_err(|err| registration_id_error(err, lang))
+}
 
 pub(super) fn validate_service_name(value: &str, lang: Locale) -> Result<()> {
     validate_dns_label(value).map_err(|err| service_name_error(err, lang))
@@ -22,6 +31,34 @@ pub(super) fn validate_profile_instance_id(value: Option<&str>, lang: Locale) ->
         .map_err(|err| profile_instance_id_error(err, lang))
 }
 
+fn registration_id_error(err: ValidationError, lang: Locale) -> anyhow::Error {
+    match err {
+        ValidationError::Empty => anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                "--registration-id must not be empty",
+                "--registration-id 값은 비어 있으면 안 됩니다",
+            )
+        ),
+        ValidationError::InvalidRegistrationId
+        | ValidationError::InvalidDnsLabel
+        | ValidationError::InvalidDomainName
+        | ValidationError::InvalidCidr
+        | ValidationError::CidrClearConflict
+        | ValidationError::NonNumeric => anyhow::anyhow!(
+            "{}",
+            localized(
+                lang,
+                "--registration-id must be lowercase letters, digits and hyphens, \
+                 starting and ending with a letter or digit (max 131 chars)",
+                "--registration-id는 영소문자, 숫자, 하이픈만 허용되며 영숫자로 시작하고 \
+                 끝나야 합니다(최대 131자)",
+            )
+        ),
+    }
+}
+
 fn service_name_error(err: ValidationError, lang: Locale) -> anyhow::Error {
     match err {
         ValidationError::Empty => anyhow::anyhow!(
@@ -36,7 +73,8 @@ fn service_name_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => anyhow::anyhow!(
             "{}",
             localized(
                 lang,
@@ -61,7 +99,8 @@ fn profile_hostname_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => anyhow::anyhow!(
             "{}",
             localized(
                 lang,
@@ -86,7 +125,8 @@ fn agent_domain_error(err: ValidationError, lang: Locale) -> anyhow::Error {
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => anyhow::anyhow!(
             "{}",
             localized(
                 lang,
@@ -104,7 +144,8 @@ fn profile_instance_id_error(err: ValidationError, lang: Locale) -> anyhow::Erro
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => anyhow::anyhow!(
+        | ValidationError::NonNumeric
+        | ValidationError::InvalidRegistrationId => anyhow::anyhow!(
             "{}",
             localized(
                 lang,

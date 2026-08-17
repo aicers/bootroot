@@ -63,7 +63,7 @@ pub(super) async fn apply_agent_config_updates(
     let agent_config = strip_foreign_managed_profiles(
         &agent_config,
         REMOTE_BOOTSTRAP_PROFILE_MARKERS,
-        &args.service_name,
+        &args.registration_id,
     );
     // Backfill any baseline fields missing from a pre-existing agent.toml
     // (and seed a fresh file from the same baseline).  Without this step,
@@ -148,6 +148,7 @@ pub(super) async fn apply_agent_config_updates(
             }
         };
     let profile_block = render_managed_profile_block(
+        &args.registration_id,
         &args.service_name,
         args.profile_instance_id
             .as_deref()
@@ -159,7 +160,7 @@ pub(super) async fn apply_agent_config_updates(
     );
     let profile_block = inject_hooks_into_profile_block(&profile_block, args);
     let with_profile =
-        upsert_managed_profile_block(&openbao_updated, &args.service_name, &profile_block);
+        upsert_managed_profile_block(&openbao_updated, &args.registration_id, &profile_block);
 
     let responder_changed = hmac_updated != override_applied;
     let trust_changed = trust_updated != hmac_updated;
@@ -255,14 +256,17 @@ fn resolve_profile_paths(args: &ResolvedBootstrapArgs) -> ProfilePaths {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("certs");
+    // Keyed on `registration_id`, not `service_name`: two registrations
+    // of one component on one host share a `service_name`, and a
+    // service-keyed default would land both on the same cert/key pair.
     let cert_path = args
         .profile_cert_path
         .clone()
-        .unwrap_or_else(|| fallback_dir.join(format!("{}.crt", args.service_name)));
+        .unwrap_or_else(|| fallback_dir.join(format!("{}.crt", args.registration_id)));
     let key_path = args
         .profile_key_path
         .clone()
-        .unwrap_or_else(|| fallback_dir.join(format!("{}.key", args.service_name)));
+        .unwrap_or_else(|| fallback_dir.join(format!("{}.key", args.registration_id)));
     ProfilePaths {
         cert_path,
         key_path,
@@ -338,6 +342,7 @@ fn apply_agent_overrides(
 }
 
 fn render_managed_profile_block(
+    registration_id: &str,
     service_name: &str,
     instance_id: &str,
     hostname: &str,
@@ -348,6 +353,7 @@ fn render_managed_profile_block(
     render_profile(
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
+        registration_id,
         service_name,
         instance_id,
         hostname,
@@ -357,12 +363,16 @@ fn render_managed_profile_block(
     )
 }
 
-fn upsert_managed_profile_block(contents: &str, service_name: &str, replacement: &str) -> String {
+fn upsert_managed_profile_block(
+    contents: &str,
+    registration_id: &str,
+    replacement: &str,
+) -> String {
     upsert_shared_managed_profile_block(
         contents,
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
-        service_name,
+        registration_id,
         replacement,
     )
 }
@@ -442,10 +452,11 @@ fn needs_absolute_state_path_provisioning(contents: &str) -> bool {
 /// avoid; leaving `state_path` unset lets the existing validation
 /// surface the issue instead of silently entrenching a fragile path.
 ///
-/// The basename is keyed by `service_name` so that per-service agent
-/// configs sharing one directory (the supported multi-service-per-host
-/// layout) resolve to distinct state files instead of contending over a
-/// single shared `bootroot-agent-state.json`.
+/// The basename is keyed by `registration_id` so that agent configs
+/// sharing one directory — including two registrations of one component
+/// on the same host, which share a `service_name` — resolve to distinct
+/// state files instead of contending over a single shared
+/// `bootroot-agent-state.json`.
 fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
     let parent = args.agent_config_path.parent()?;
     if !parent.is_absolute() {
@@ -453,27 +464,30 @@ fn default_state_path_for(args: &ResolvedBootstrapArgs) -> Option<String> {
     }
     Some(
         parent
-            .join(state_path_basename(&args.service_name))
+            .join(state_path_basename(&args.registration_id))
             .display()
             .to_string(),
     )
 }
 
-/// Derives the per-service fast-poll state filename.
+/// Derives the per-registration fast-poll state filename.
 ///
-/// `service_name` is a validated DNS label on the bootstrap path
-/// (`validate_service_name` → `validate_dns_label`), so it contains only
-/// letters, digits, and hyphens and can never introduce a path separator
-/// or `..`. The `debug_assert!` pins that invariant: the produced value
-/// is always a plain basename, never a traversal.
-fn state_path_basename(service_name: &str) -> String {
+/// `registration_id` is validated on the bootstrap path against the
+/// shared path-safe rule (`validate_registration_id_arg` →
+/// `validate_registration_id`): lowercase letters, digits and hyphens
+/// only, starting and ending alphanumeric, at most 131 octets — so it can
+/// never introduce a path separator or `..`. It is deliberately not held
+/// to the DNS-label rule, since a registration key may exceed 63 octets.
+/// The `debug_assert!` pins that invariant: the produced value is always
+/// a plain basename, never a traversal.
+fn state_path_basename(registration_id: &str) -> String {
     debug_assert!(
-        !service_name.is_empty()
-            && !service_name.contains(['/', '\\'])
-            && !service_name.contains(".."),
-        "service_name must be a validated DNS label, got {service_name:?}"
+        !registration_id.is_empty()
+            && !registration_id.contains(['/', '\\'])
+            && !registration_id.contains(".."),
+        "registration_id must satisfy the path-safe rule, got {registration_id:?}"
     );
-    format!("bootroot-agent-state-{service_name}.json")
+    format!("bootroot-agent-state-{registration_id}.json")
 }
 
 /// A group of sibling agent configs that resolve to the same absolute
@@ -607,6 +621,7 @@ mod tests {
             bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
             bootroot::trust_bootstrap::LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "giganto",
+            "giganto",
             "001",
             "node-01",
             Path::new("/etc/bootroot-agent/certs/giganto.crt"),
@@ -618,6 +633,7 @@ mod tests {
         let stripped =
             strip_foreign_managed_profiles(&existing, REMOTE_BOOTSTRAP_PROFILE_MARKERS, "giganto");
         let remote_block = render_managed_profile_block(
+            "giganto",
             "giganto",
             "001",
             "node-01",
@@ -656,6 +672,7 @@ mod tests {
         ResolvedBootstrapArgs {
             openbao_url: "https://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             role_id_path: PathBuf::from("/tmp/role_id"),
             secret_id_path: PathBuf::from("/tmp/secrets/services/edge-proxy/secret_id"),
@@ -836,6 +853,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -918,16 +936,16 @@ mod tests {
     }
 
     #[test]
-    fn default_state_path_for_is_service_keyed_and_unique_per_service() {
-        // Two distinct services bootstrapped into the same directory must
-        // resolve to distinct state_paths so their fast-poll agents do not
-        // race on one shared state file (issue #687, constraint 2).
+    fn default_state_path_for_is_registration_keyed_and_unique_per_registration() {
+        // Two distinct registrations bootstrapped into the same directory
+        // must resolve to distinct state_paths so their fast-poll agents do
+        // not race on one shared state file (issue #687, constraint 2).
         let mut args_a = test_bootstrap_args();
-        args_a.service_name = "giganto".to_string();
+        args_a.registration_id = "giganto".to_string();
         args_a.agent_config_path = PathBuf::from("/opt/bootroot-closed/config/giganto.toml");
 
         let mut args_b = test_bootstrap_args();
-        args_b.service_name = "edge-proxy".to_string();
+        args_b.registration_id = "edge-proxy".to_string();
         args_b.agent_config_path = PathBuf::from("/opt/bootroot-closed/config/edge-proxy.toml");
 
         let state_a = default_state_path_for(&args_a).expect("absolute config yields state_path");
@@ -943,7 +961,7 @@ mod tests {
         );
         assert_ne!(
             state_a, state_b,
-            "distinct services in one directory must not collide"
+            "distinct registrations in one directory must not collide"
         );
     }
 
@@ -964,10 +982,18 @@ mod tests {
     }
 
     #[test]
-    fn state_path_basename_is_a_plain_filename_for_valid_dns_labels() {
-        // validate_service_name restricts service_name to a DNS label, so
-        // the derived basename can never contain a path separator or `..`.
-        for service in ["a", "giganto", "edge-proxy", "svc-01", &"x".repeat(63)] {
+    fn state_path_basename_is_a_plain_filename_for_valid_registration_ids() {
+        // validate_registration_id restricts the key to lowercase
+        // alphanumerics and hyphens, so the derived basename can never
+        // contain a path separator or `..`. The 131-octet case is the
+        // structural maximum, well past what a DNS label allows.
+        for service in [
+            "a",
+            "giganto",
+            "edge-proxy",
+            "h1-piglet-001",
+            &"x".repeat(131),
+        ] {
             let basename = state_path_basename(service);
             assert!(
                 !basename.contains('/') && !basename.contains('\\') && !basename.contains(".."),
@@ -1021,6 +1047,42 @@ mod tests {
         assert!(
             detect_state_path_collisions(dir.path()).is_empty(),
             "distinct state_paths must not be reported as a collision"
+        );
+    }
+
+    /// Two registrations of one component on one host share a
+    /// `service_name` and differ only by `registration_id`. Their
+    /// provisioned `state_path`s must differ, so the collision detector
+    /// reports nothing — the very case a service-keyed basename would
+    /// have collapsed onto one state file.
+    #[test]
+    fn detect_state_path_collisions_clears_two_co_located_registrations() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut first = test_bootstrap_args();
+        first.registration_id = "h1-piglet-001".to_string();
+        first.service_name = "piglet".to_string();
+        first.agent_config_path = dir.path().join("h1-piglet-001.toml");
+
+        let mut second = test_bootstrap_args();
+        second.registration_id = "h1-piglet-002".to_string();
+        second.service_name = "piglet".to_string();
+        second.agent_config_path = dir.path().join("h1-piglet-002.toml");
+
+        for args in [&first, &second] {
+            let pairs = build_openbao_updates(args, "");
+            let rendered = bootroot::toml_util::upsert_section_keys("", "openbao", &pairs).unwrap();
+            std::fs::write(&args.agent_config_path, rendered).unwrap();
+        }
+
+        assert_ne!(
+            default_state_path_for(&first),
+            default_state_path_for(&second),
+            "co-located registrations of one component must not share a state file"
+        );
+        assert!(
+            detect_state_path_collisions(dir.path()).is_empty(),
+            "two registrations of one component on one host must not collide"
         );
     }
 

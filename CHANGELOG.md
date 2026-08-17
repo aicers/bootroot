@@ -4,6 +4,60 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A registration is now keyed by a new required `registration_id`,
+  separate from `service_name`. `service_name` used to do two
+  incompatible jobs: it was the certificate SAN's second label, so it
+  wanted to be the component's plain keyword (`piglet`, `roxyd`), and it
+  was also the sole key of every namespace bootroot owns, which demands
+  deployment-wide uniqueness. Those demands are compatible only while a
+  component is installed exactly once across the deployment, which is why
+  each host's `roxyd` had to register under a host-qualified name and
+  ended up with the host in its SAN twice. `registration_id` takes the
+  second job: it names the `state.json` entry, the `AppRole` and policy,
+  the `bootroot/services/<key>` KV subtree and the paths inside the
+  generated policy, the managed `agent.toml` block markers, the
+  per-registration fast-poll state filename, the per-registration
+  credential directory, the default remote cert/key filenames and the
+  remote-bootstrap artifact directory. `service_name` is now the SAN
+  label and nothing else, so two registrations of one component can sit
+  on one host with SANs that differ only in the instance label. A
+  `registration_id` is lowercase letters, digits and hyphens, starts and
+  ends alphanumeric, and is at most 131 octets; it is deliberately not
+  held to the 63-octet DNS-label limit that still binds `service_name`,
+  `hostname` and every `domain` label. For a component installed once per
+  deployment the key is still the bare component name, so its derived
+  `OpenBao` paths, `AppRole` name and filenames are byte-identical to
+  what they were.
+- `bootroot service add` takes a new `--registration-id`, alongside — not
+  instead of — `--service-name`; omitting it prompts, as the other
+  required inputs do. The commands that look a registration up now name
+  what they take: `service info`, `service update`, `service remove`,
+  `verify`, `rotate approle-secret-id` and `rotate force-reissue` accept
+  `--registration-id` and no longer accept `--service-name`.
+  `bootroot-remote bootstrap` takes both flags, and
+  `bootroot-remote apply-secret-id` takes `--registration-id`.
+- Each `[[profiles]]` block in `agent.toml` requires a `registration_id`
+  key. `bootroot-agent` derives its fast-poll KV paths and its
+  per-profile state filename from it, and groups profiles by it when a
+  force-reissue request fans out. Config validation also holds
+  `profiles.service_name` to the DNS-label rule now, so an over-long or
+  non-label SAN component is rejected at config load rather than at CSR
+  time.
+- The remote bootstrap artifact is at `schema_version` 5 and carries
+  `registration_id`. `bootroot-remote` accepts version 5 only.
+
+There is no migration and no compatibility fallback: a `state.json`
+entry, an `agent.toml` profile or a bootstrap artifact without a
+`registration_id` fails to load rather than defaulting to
+`service_name`. Re-create existing registrations by re-installing them —
+`bootroot service remove --registration-id <old-name>` followed by
+`bootroot service add --registration-id <key> --service-name <label> …`,
+then re-run `bootroot-remote bootstrap` on each remote service host.
+
 ## [0.3.0] - 2026-08-17
 
 ### Security
@@ -2347,6 +2401,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.3.0...HEAD
 [0.3.0]: https://github.com/aicers/bootroot/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/aicers/bootroot/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/aicers/bootroot/tree/0.1.0

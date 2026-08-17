@@ -143,6 +143,7 @@ Sections 3-1 and 3-2 below are default (`local-file`) examples, and 3-3 is a
 
 ```bash
 bootroot service add \
+  --registration-id edge-proxy \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
@@ -181,6 +182,7 @@ Operator-managed (required):
     and reload bootroot-agent.
 daemon profile snippet:
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 ...
 daemon run command (systemd ExecStart or shell; --eab-file is required
@@ -208,6 +210,7 @@ post-renew hook with the explicit container name:
 
 ```bash
 bootroot service add \
+  --registration-id web-app \
   --service-name web-app \
   --hostname web-01 \
   --domain trusted.domain \
@@ -234,6 +237,7 @@ Control node onboarding (artifact generation):
 
 ```bash
 bootroot service add \
+  --registration-id edge-remote \
   --service-name edge-remote \
   --delivery-mode remote-bootstrap \
   --hostname edge-node-02 \
@@ -265,6 +269,7 @@ fields directly instead of reading them from the artifact:
 bootroot-remote bootstrap \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
+  --registration-id edge-remote \
   --service-name edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id \
@@ -300,6 +305,7 @@ certificate renewal:
 
 ```bash
 bootroot service add \
+  --registration-id edge-proxy \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
@@ -327,6 +333,7 @@ the custom-command entry (issue #702):
 
 ```bash
 bootroot service add \
+  --registration-id aimer-web \
   --service-name aimer-web \
   --hostname aimer-node-01 \
   --domain trusted.domain \
@@ -352,7 +359,7 @@ already expired:
 bootroot-remote apply-secret-id \
   --openbao-url http://127.0.0.1:8200 \
   --kv-mount secret \
-  --service-name edge-remote \
+  --registration-id edge-remote \
   --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
   --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
 ```
@@ -363,25 +370,25 @@ To change per-service `secret_id` policy without re-running
 `service add`:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
 ```
 
 To disable response wrapping for a service:
 
 ```bash
-bootroot service update --service-name edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --no-wrap
 ```
 
 To restore the default wrapping behavior:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 ```
 
 After updating policy, apply it on the next rotation:
 
 ```bash
-bootroot rotate approle-secret-id --service-name edge-proxy
+bootroot rotate approle-secret-id --registration-id edge-proxy
 ```
 
 ## 4) DNS resolution for HTTP-01 validation
@@ -409,13 +416,13 @@ docker exec bootroot-ca sh -c \
 ## 5) service verify
 
 ```bash
-bootroot verify --service-name edge-proxy
+bootroot verify --registration-id edge-proxy
 ```
 
 To verify DB connectivity/auth as well:
 
 ```bash
-bootroot verify --service-name edge-proxy --db-check
+bootroot verify --registration-id edge-proxy --db-check
 ```
 
 Sample dialog/output (full):
@@ -484,7 +491,7 @@ bootroot rotate responder-hmac
 bootroot rotate openbao-recovery --rotate-root-token
 
 # Rotate every registered service secret_id in one invocation
-# (per-service targeting stays available via --service-name)
+# (per-registration targeting stays available via --registration-id)
 bootroot rotate approle-secret-id --all-services
 
 # Rotate the infra AppRole secret_ids consumed by the infra OpenBao
@@ -507,12 +514,12 @@ bootroot rotate \
 bootroot rotate trust-sync
 
 # Force certificate reissue for a specific service
-bootroot rotate force-reissue --service-name edge-proxy
+bootroot rotate force-reissue --registration-id edge-proxy
 
 # Force reissue for a remote-bootstrap service and wait for the remote
 # agent to apply it (polls completed_at on the OpenBao reissue KV path).
 bootroot rotate force-reissue \
-  --service-name edge-remote --wait --wait-timeout 90s
+  --registration-id edge-remote --wait --wait-timeout 90s
 ```
 
 Rotate OpenBao recovery credentials manually (unseal keys + root token):
@@ -558,8 +565,8 @@ bootroot rotate \
 After CA key rotation, force-reissue certificates for all services:
 
 ```bash
-bootroot rotate force-reissue --service-name edge-proxy
-bootroot rotate force-reissue --service-name web-app
+bootroot rotate force-reissue --registration-id edge-proxy
+bootroot rotate force-reissue --registration-id web-app
 ```
 
 Scheduled execution (cron example, script to run all rotations):

@@ -216,6 +216,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "$service_name"
 service_name = "$service_name"
 instance_id = "$instance_id"
 hostname = "$hostname"
@@ -347,6 +348,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
@@ -449,6 +451,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "multi-201"
 service_name = "multi"
 instance_id = "201"
 hostname = "node-201"
@@ -458,6 +461,7 @@ cert = "certs/multi-201.crt"
 key = "certs/multi-201.key"
 
 [[profiles]]
+registration_id = "multi-202"
 service_name = "multi"
 instance_id = "202"
 hostname = "node-202"
@@ -467,6 +471,7 @@ cert = "certs/multi-202.crt"
 key = "certs/multi-202.key"
 
 [[profiles]]
+registration_id = "multi-203"
 service_name = "multi"
 instance_id = "203"
 hostname = "node-203"
@@ -654,6 +659,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
@@ -700,6 +706,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
@@ -748,6 +755,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"
@@ -823,6 +831,7 @@ http_responder_token_ttl_secs = 300
 backoff_secs = [1, 2, 3]
 
 [[profiles]]
+registration_id = "bootroot-agent"
 service_name = "bootroot-agent"
 instance_id = "001"
 hostname = "bootroot-agent"

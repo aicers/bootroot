@@ -49,6 +49,13 @@ backoff_secs = [5, 10, 30]
 
 # Profiles (one per daemon instance)
 [[profiles]]
+# Deployment-wide unique registration key.  Required.  Names the OpenBao
+# KV subtree this profile polls (bootroot/services/<registration_id>/...)
+# and the per-profile fast-poll state filename.  Lowercase letters,
+# digits and hyphens, starting and ending alphanumeric, max 131 chars.
+# It is NOT part of the certificate SAN.
+registration_id = "edge-node-01-edge-proxy-001"
+# Second label of the DNS SAN.  Must be a DNS label (max 63 chars).
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"

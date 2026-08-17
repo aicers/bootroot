@@ -726,6 +726,7 @@ mod tests {
 
     fn build_profile(cert_path: PathBuf) -> config::DaemonProfileSettings {
         config::DaemonProfileSettings {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -1361,6 +1362,7 @@ http_responder_url = "http://localhost:8080"
 http_responder_hmac = "dev-hmac"
 
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
