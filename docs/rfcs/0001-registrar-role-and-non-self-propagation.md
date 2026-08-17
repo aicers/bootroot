@@ -992,11 +992,12 @@ acts*, and the per-identifier retryable/permanent split behind it is
 transcribed from RFC-C §5 and §8 into
 `docs/reference/registrar-wire-contract.md`, whose §6.1 carries the class of
 every identifier so it can be checked one by one without leaving this
-repository, and whose §7 records "exactly one retryable identifier" as a
-property in its own right. What the pre-derivation arm refuses is a
-`service_name` or `host` that is not a DNS label, or a component with no
-multiplicity entry (the arm's own decision above): deterministic faults in the
-request or in the configuration, not conditions that clear on their own.
+repository, and whose §7 records the same split as a property in its own
+right — its `retryable identifiers` row reads "Exactly one: `RegistrarBusy`".
+What the pre-derivation arm refuses is a `service_name` or `host` that is not
+a DNS label, or a component with no multiplicity entry (the arm's own decision
+above): deterministic faults in the request or in the configuration, not
+conditions that clear on their own.
 Answering `RegistrarBusy` there would hand a caller the one value in the set
 whose contract says *this clears on its own*, for a request that can never
 succeed — a contradiction in the type rather than a poor choice of words — and
