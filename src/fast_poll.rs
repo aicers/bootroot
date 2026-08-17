@@ -288,7 +288,8 @@ pub(crate) trait FastPollHooks: Send + Sync {
 /// extracts the relevant bits (request timestamp, new version) from the
 /// payload. Pure logic, so it is unit-testable without any IO.
 ///
-/// A KV v2 path at `<SERVICE_KV_BASE>/<service>/<SERVICE_REISSUE_KV_SUFFIX>`
+/// A KV v2 path at
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_REISSUE_KV_SUFFIX>`
 /// alternates between two payload shapes: the operator's request
 /// (`requested_at` / `requester`) and the agent's completion ack
 /// (`completed_at` / `completed_version`). Both are writes, and every
@@ -2342,13 +2343,13 @@ mod tests {
         assert!(hooks.writes.lock().unwrap().is_empty());
     }
 
-    // Reviewer round 1, item 1: a service with multiple profiles must
-    // fan the renewal out to every matching profile before the version
-    // is marked consumed. The previous implementation deduped by
-    // registration_id only, so sibling profiles silently kept their old
+    // Reviewer round 1, item 1: a registration with multiple profiles
+    // must fan the renewal out to every matching profile before the
+    // version is marked consumed. An implementation that renewed only the
+    // first profile of the group left its siblings on their old
     // certificate.
     #[tokio::test]
-    async fn tick_fans_renewal_out_to_all_profiles_sharing_a_service() {
+    async fn tick_fans_renewal_out_to_all_profiles_sharing_a_registration() {
         let hooks = FakeHooks::new(vec![Ok(Some(KvReadWithVersion {
             version: 4,
             data: serde_json::json!({

@@ -463,10 +463,13 @@ completion. A `--wait` timeout is not an error — the request stays
 queued and is applied on the next fast-poll tick.
 
 When a remote host runs multiple `[[profiles]]` for the same
-`service_name` (e.g. several instances of one service on the same
-machine), each fast-poll tick fans the renewal trigger out across
+`registration_id` (e.g. several instances registered under one key),
+each fast-poll tick fans the renewal trigger out across
 every matching profile before marking the KV version consumed, so a
-single force-reissue rotates every instance. If any profile in the
+single force-reissue rotates every instance. Profiles that share a
+`service_name` but carry different `registration_id`s are separate
+registrations, each with its own KV subtree and its own reissue
+request — they are not fanned out together. If any profile in the
 fan-out fails, the profiles that already succeeded for that request
 are recorded as per-service `in_flight_renewals` progress in
 `state_path`. The next tick retries *only* the failed sibling(s)

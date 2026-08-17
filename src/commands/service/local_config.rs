@@ -534,10 +534,10 @@ mod tests {
         let stripped = strip_foreign_managed_profiles(
             &existing,
             LOCAL_FILE_PROFILE_MARKERS,
-            &args.service_name,
+            &args.registration_id,
         );
         let local_block = render_managed_profile_block(&args);
-        let updated = upsert_managed_profile(&stripped, &args.service_name, &local_block);
+        let updated = upsert_managed_profile(&stripped, &args.registration_id, &local_block);
 
         assert_eq!(
             updated.matches("[[profiles]]").count(),

@@ -1387,7 +1387,7 @@ pub(crate) struct ServiceAddArgs {
     /// `role_id`/`eab.json` and rewrite `secret_id`. The parent
     /// directory must already exist, be agent-owned, and resolve outside
     /// the secrets tree. Omit to keep the default under
-    /// `<secrets_dir>/services/<svc>/`.
+    /// `<secrets_dir>/services/<registration_id>/`.
     #[arg(long)]
     pub(crate) secret_id_path: Option<PathBuf>,
 

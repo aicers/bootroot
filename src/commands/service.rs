@@ -65,7 +65,7 @@ fn default_service_secret_id_path(secrets_dir: &Path, registration_id: &str) -> 
 
 /// Resolves the effective `secret_id` path for a service: the operator's
 /// absolute `--secret-id-path` override when supplied, otherwise the
-/// default under `<secrets_dir>/services/<svc>/`. This single value is
+/// default under `<secrets_dir>/services/<registration_id>/`. This single value is
 /// the source of truth persisted to `entry.approle.secret_id_path`.
 fn resolved_secret_id_path(
     resolved: &ResolvedServiceAdd,
@@ -290,12 +290,14 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         anyhow::bail!(messages.error_service_duplicate(&resolved.registration_id));
     }
 
-    // One `agent.toml` serves exactly one distinct local-file service:
-    // the top-level `[openbao]` section holds a single AppRole identity,
-    // so a second service writing the same file would overwrite the
-    // first service's `role_id`/`secret_id`/`state_path` and break its
-    // KV reads under per-service policies. Multiple `[[profiles]]` are
-    // reserved for instances of the *same* service.
+    // One `agent.toml` serves exactly one local-file registration: the
+    // top-level `[openbao]` section holds a single AppRole identity, so a
+    // second registration writing the same file would overwrite the
+    // first's `role_id`/`secret_id`/`state_path` and break its KV reads
+    // under per-registration policies. Multiple `[[profiles]]` are
+    // reserved for instances sharing one `registration_id` — two
+    // registrations of one component, which share a `service_name`, own
+    // separate AppRoles and so need separate configs.
     if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         if let Some(conflict) = state.services.values().find(|entry| {
             matches!(entry.delivery_mode, DeliveryMode::LocalFile)
@@ -471,7 +473,7 @@ async fn run_service_add_apply(
     // entry does not exist yet, so nothing reads it "from state"). For an
     // operator `--secret-id-path` override it is the absolute path,
     // agent-owned outside the secrets tree; otherwise the default under
-    // `<secrets_dir>/services/<svc>/`.
+    // `<secrets_dir>/services/<registration_id>/`.
     let is_override = resolved.secret_id_path_override.is_some();
     let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
     let role_id_path = role_id_sibling_path(&secret_id_path);

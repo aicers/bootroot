@@ -60,7 +60,7 @@ pub(crate) struct ResolvedServiceAdd {
     pub(crate) cert_group_gid: Option<u32>,
     /// Operator-supplied absolute `--secret-id-path` override
     /// (local-file delivery only). `None` keeps the default location
-    /// under `<secrets_dir>/services/<svc>/`. When `Some`, `secret_id`,
+    /// under `<secrets_dir>/services/<registration_id>/`. When `Some`, `secret_id`,
     /// its sibling `role_id`, and `eab.json` are relocated there, owned
     /// by the agent account. See issue #722.
     pub(crate) secret_id_path_override: Option<PathBuf>,

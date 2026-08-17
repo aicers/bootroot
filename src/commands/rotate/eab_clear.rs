@@ -6,11 +6,11 @@ use super::helpers::confirm_action;
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
 
-/// Per-service EAB KV path. The init/service flow writes EAB at
-/// `bootroot/services/<svc>/eab` when an operator opts into per-service
-/// EAB; clearing it requires writing the same shape, not a `delete`,
-/// so consumers observing the path see an explicit empty value instead
-/// of a missing secret.
+/// Per-registration EAB KV path. The init/service flow writes EAB at
+/// `bootroot/services/<registration_id>/eab` when an operator opts into
+/// per-service EAB; clearing it requires writing the same shape, not a
+/// `delete`, so consumers observing the path see an explicit empty value
+/// instead of a missing secret.
 fn service_eab_path(registration_id: &str) -> String {
     format!("bootroot/services/{registration_id}/eab")
 }

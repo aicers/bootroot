@@ -271,7 +271,7 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
     let mut files = vec![entry.cert_path.clone(), entry.key_path.clone()];
     // A `--secret-id-path` override relocates `secret_id`, its sibling
     // `role_id`, and `eab.json` outside the default `<secrets_dir>/
-    // services/<svc>` directory removed above, so clean those individual
+    // services/<registration_id>` directory removed above, so clean those
     // files up too — otherwise a remove-then-re-add to the same override
     // location hits the no-clobber guard. The operator-owned parent
     // directory (which bootroot did not create) is left in place.

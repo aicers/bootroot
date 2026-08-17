@@ -1317,6 +1317,9 @@ async fn test_app_add_prompts_for_missing_inputs() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
     assert!(stdout.contains("bootroot service add: summary"));
+    // The registration key is prompted for like every other required
+    // input, so a bare `service add` still registers under one.
+    assert!(stdout.contains("- registration id: edge-proxy"));
     assert!(stdout.contains("- service name: edge-proxy"));
 }
 
