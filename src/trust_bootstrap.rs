@@ -289,8 +289,8 @@ pub fn upsert_managed_profile_block(
 }
 
 /// Strips every managed profile block written under a marker pair *other*
-/// than `own` for `service_name`, leaving the caller's own block (if any)
-/// untouched.
+/// than `own` for `registration_id`, leaving the caller's own block (if
+/// any) untouched.
 ///
 /// A delivery-mode transition (`service remove` + `service add
 /// --delivery-mode <other>`, then re-bootstrap on the service host) runs
@@ -298,7 +298,7 @@ pub fn upsert_managed_profile_block(
 /// Because each path's upsert recognises only its own markers, without
 /// this strip the pre-existing block is never matched and
 /// [`upsert_managed_profile_block`] falls through to its append branch,
-/// leaving a second `[[profiles]]` for the same service.
+/// leaving a second `[[profiles]]` for the same registration.
 ///
 /// Callers must run this on the **raw** `agent.toml` contents before
 /// applying their own `[trust]`/`[openbao]`/profile sections. The end
@@ -330,18 +330,18 @@ pub fn strip_foreign_managed_profiles(
 }
 
 /// Finds the first bootroot-managed profile in `contents` that belongs
-/// to a service other than `service_name`, returning that service's
-/// name.
+/// to a registration other than `registration_id`, returning that
+/// registration's key.
 ///
 /// Scans the begin markers of every marker family
 /// ([`ALL_MANAGED_PROFILE_MARKERS`]), so it sees profiles written by
 /// both the local-file `service add` path and the `bootroot-remote
 /// bootstrap` path. `service add` uses this to reject reusing an
-/// `agent.toml` that still carries another service's managed profile —
-/// the state-based conflict guard cannot see a service whose entry was
-/// dropped by `service remove` without `--strip-config` /
+/// `agent.toml` that still carries another registration's managed profile
+/// — the state-based conflict guard cannot see a registration whose entry
+/// was dropped by `service remove` without `--strip-config` /
 /// `--delete-artifacts`, but its leftover `[[profiles]]` block would
-/// keep being grouped and fast-polled under the new service's single
+/// keep being grouped and fast-polled under the new registration's single
 /// `[openbao]` `AppRole` identity.
 #[must_use]
 pub fn find_foreign_managed_profile_registration(
@@ -364,8 +364,8 @@ pub fn find_foreign_managed_profile_registration(
 
 /// Removes a managed profile block from `agent.toml` contents.
 ///
-/// Deletes the `begin_prefix <service_name> … end_prefix <service_name>`
-/// span, collapsing the surrounding blank lines so the file stays
+/// Deletes the `begin_prefix <registration_id> … end_prefix
+/// <registration_id>` span, collapsing the surrounding blank lines so the file stays
 /// well-formed. Returns the input unchanged when no matching block is
 /// present, so calling it a second time (after the block is already
 /// gone) is a no-op. This is the teardown counterpart to
@@ -394,8 +394,8 @@ pub fn remove_managed_profile_block(
     updated
 }
 
-/// Removes only the managed `[[profiles]]` entry for `service_name` and
-/// its marker comment lines, leaving every other table untouched.
+/// Removes only the managed `[[profiles]]` entry for `registration_id`
+/// and its marker comment lines, leaving every other table untouched.
 ///
 /// Unlike [`remove_managed_profile_block`], which deletes the whole byte
 /// span between the begin and end markers, this preserves global tables
@@ -413,16 +413,16 @@ pub fn remove_managed_profile_block(
 /// begin/end marker comments, which survive as trailing decor. It matches
 /// either code path's markers.
 ///
-/// It removes **every** `[[profiles]]` entry for the service, not just the
-/// first: an already-affected host may carry the exact #662 duplicate (a
-/// local-file block and a remote-bootstrap block for the same service), and
-/// the marker sweep clears both marker pairs, so the profile removal must
+/// It removes **every** `[[profiles]]` entry for the registration, not just
+/// the first: an already-affected host may carry the exact #662 duplicate (a
+/// local-file block and a remote-bootstrap block for the same registration),
+/// and the marker sweep clears both marker pairs, so the profile removal must
 /// be equally exhaustive or a marker-less profile would be orphaned.
 ///
 /// Removal is gated on the presence of a managed begin marker for the
-/// service (under either code path). When no managed marker is present the
-/// input is returned unchanged, so an operator-owned, unmarked
-/// `[[profiles]]` entry that merely shares the `service_name` is never
+/// registration (under either code path). When no managed marker is present
+/// the input is returned unchanged, so an operator-owned, unmarked
+/// `[[profiles]]` entry that merely shares the `registration_id` is never
 /// touched — only bootroot's own managed profile is cleared.
 ///
 /// # Errors
@@ -447,12 +447,12 @@ pub fn remove_managed_service_profile(contents: &str, registration_id: &str) -> 
 }
 
 /// Drops any line that exactly matches a begin/end marker for
-/// `service_name`, under either code path's marker pair.
+/// `registration_id`, under either code path's marker pair.
 ///
 /// Removing the `[[profiles]]` array element leaves its marker comments
 /// behind as document decor, so they must be swept textually. Full-line
-/// equality (mirroring [`find_marker_line`]) keeps a service name that is
-/// a prefix of another from matching the wrong marker.
+/// equality (mirroring [`find_marker_line`]) keeps a registration key that
+/// is a prefix of another from matching the wrong marker.
 fn strip_profile_marker_lines(contents: &str, registration_id: &str) -> String {
     let mut out = String::with_capacity(contents.len());
     for line in contents.split_inclusive('\n') {
@@ -776,10 +776,10 @@ mod tests {
         assert_eq!(out, contents);
     }
 
-    /// An operator-owned `[[profiles]]` entry that merely shares the
-    /// `service_name` but carries no bootroot managed marker must survive
+    /// An operator-owned `[[profiles]]` entry that merely names the same
+    /// component but carries no bootroot managed marker must survive
     /// `--strip-config` untouched. Removal is scoped to bootroot's managed
-    /// profile, not "any profile for this service", so with no managed
+    /// profile, not "any profile for this registration", so with no managed
     /// marker present the file is returned verbatim (no reflow).
     #[test]
     fn remove_managed_service_profile_preserves_unmarked_operator_profile() {

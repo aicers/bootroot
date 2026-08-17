@@ -437,12 +437,14 @@ where it is omitted entirely and falls through to an in-tree
 default), so a misconfiguration is caught at `bootroot-agent`
 startup instead of silently running with a fragile state file.
 
-The provisioned basename is keyed by `service_name`
-(`bootroot-agent-state-<service_name>.json`), so per-service agent
+The provisioned basename is keyed by `registration_id`
+(`bootroot-agent-state-<registration-id>.json`), so per-registration agent
 configs sharing one directory resolve to distinct state files instead
-of contending over a single shared state. Existing deployments already
+of contending over a single shared state — including two registrations of
+one component on one host, which share a `service_name` and differ only
+in their registration key. Existing deployments already
 carry an absolute `state_path`, so a bootstrap rerun preserves the old
-name unchanged — only freshly provisioned configs get the service-keyed
+name unchanged — only freshly provisioned configs get the registration-keyed
 basename. If bootstrap detects two sibling configs in the target
 directory that resolve to the *same* absolute `state_path` (e.g.
 hand-written configs), it prints a warning: two
@@ -513,9 +515,9 @@ Distinct services cannot share one config for two reasons:
 Run `bootroot-remote bootstrap` once per service, targeting a separate
 `--agent-config` for each. Give each config a distinct `state_path`:
 bootstrap does this automatically for freshly provisioned configs by
-keying the basename on `service_name`
-(`bootroot-agent-state-<service_name>.json`), so per-service configs may
-safely share one directory. If you place configs in a shared directory
+keying the basename on `registration_id`
+(`bootroot-agent-state-<registration-id>.json`), so per-registration configs
+may safely share one directory. If you place configs in a shared directory
 with hand-written `state_path` values, make sure no two
 resolve to the same file — bootstrap warns when it detects a collision,
 because two agents sharing one `state_path` race on the fast-poll state

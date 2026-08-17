@@ -21,7 +21,7 @@ pub enum ValidationError {
     NonNumeric,
     /// The value is not a path-safe registration key: it carries a
     /// character outside `[a-z0-9-]`, does not start and end
-    /// alphanumeric, or exceeds [`REGISTRATION_ID_MAX_LEN`] octets.
+    /// alphanumeric, or exceeds 131 octets.
     /// Distinct from [`ValidationError::InvalidDnsLabel`] because a
     /// registration key may legitimately be longer than a DNS label.
     InvalidRegistrationId,

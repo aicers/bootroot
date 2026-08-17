@@ -427,12 +427,14 @@ state_path = "/etc/bootroot/bootroot-agent-state-giganto.json" # bootstrap이 �
 중에 조용히 취약한 상태 파일을 사용하는 대신 `bootroot-agent` 시작
 시점에 드러납니다.
 
-기본 제공되는 basename은 `service_name`을 키로 사용하므로
-(`bootroot-agent-state-<service_name>.json`), 같은 디렉터리를 공유하는
-서비스별 agent 구성이 하나의 상태 파일을 두고 경합하지 않고 서로 다른
-상태 파일로 분리됩니다. 기존 배포는 이미 절대 경로 `state_path`를
-가지고 있으므로 bootstrap 재실행은 기존 이름을 그대로 보존합니다 —
-새로 기본 제공되는 구성만 service_name 기반 basename을 받습니다.
+기본 제공되는 basename은 `registration_id`를 키로 사용하므로
+(`bootroot-agent-state-<registration-id>.json`), 같은 디렉터리를 공유하는
+등록별 agent 구성이 하나의 상태 파일을 두고 경합하지 않고 서로 다른
+상태 파일로 분리됩니다. 한 호스트에 있는 같은 컴포넌트의 두 등록도
+마찬가지입니다 — `service_name`은 공유하고 등록 키만 다릅니다. 기존
+배포는 이미 절대 경로 `state_path`를 가지고 있으므로 bootstrap 재실행은
+기존 이름을 그대로 보존합니다 — 새로 기본 제공되는 구성만
+registration_id 기반 basename을 받습니다.
 bootstrap이 대상 디렉터리에서 동일한 절대 `state_path`로 해석되는 두
 개의 sibling 구성(직접 작성한 구성 등)을 감지하면 경고를
 출력합니다. 하나의 상태 파일을 공유하는 두 `bootroot-agent` 프로세스는
@@ -499,8 +501,8 @@ fast-poll 틱은 KV 버전을 소비된 것으로 표시하기 전에 일치하�
 서비스마다 `--agent-config`를 별도로 지정하여 `bootroot-remote
 bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`를
 부여합니다. bootstrap은 새로 기본 제공되는 구성에 대해 basename을
-`service_name` 기반(`bootroot-agent-state-<service_name>.json`)으로
-설정하므로, 서비스별 구성이 한 디렉터리를 안전하게 공유할 수 있습니다.
+`registration_id` 기반(`bootroot-agent-state-<registration-id>.json`)으로
+설정하므로, 등록별 구성이 한 디렉터리를 안전하게 공유할 수 있습니다.
 직접 작성한 `state_path` 값이 있는 구성을 한 디렉터리에 둘
 경우, 두 구성이 같은 파일로 해석되지 않도록 하세요 — bootstrap은 충돌을
 감지하면 경고합니다. 하나의 `state_path`를 공유하는 두 agent는 fast-poll
