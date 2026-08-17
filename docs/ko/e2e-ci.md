@@ -70,7 +70,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 원격 전달 E2E 시나리오 (`hosts`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
 - reinit 복구
-- step-ca 인증서 SAN
+- step-ca 인증서 SAN 및 Prometheus 메트릭 리스너
 - compose 델타 없는 OpenBao TLS 전환
 - `secrets/` 소유자 변경 이후 OpenBao TLS 인증서 재발급
 - 같은 호스트의 두 인스턴스가 서로 독립적으로 유지되는지(설치,

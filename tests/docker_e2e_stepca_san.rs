@@ -27,6 +27,9 @@ mod unix_integration {
     /// the value survives a real sidecar render and that the endpoint
     /// answers from inside the Compose network — where the port is
     /// reachable — rather than from the host, where it is not published.
+    /// On the clean install it also brings Prometheus up and waits for
+    /// the `step-ca` job the bundled scrape config has always declared
+    /// to report `up`.
     #[test]
     #[ignore = "Requires local Docker and a non-loopback bind host for step-ca SAN validation"]
     fn docker_stepca_san_bind_and_repair() -> Result<()> {
@@ -103,6 +106,27 @@ mod unix_integration {
                 "{label} step-ca /metrics returned no Prometheus exposition data: {body}"
             );
         }
+
+        // Prometheus's own view of the same endpoint, on the clean
+        // install. The endpoint answering and the declared scrape target
+        // resolving to it are two claims, and the operator reads the
+        // second one.
+        let targets = artifact_dir.join("prometheus-targets-scenario-a.json");
+        assert!(targets.exists(), "missing Prometheus targets dump");
+        let body = std::fs::read_to_string(&targets)
+            .with_context(|| "Failed to read Prometheus targets dump")?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).with_context(|| "Prometheus targets dump is not JSON")?;
+        let step_ca_is_up = parsed["data"]["activeTargets"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .any(|target| target["labels"]["job"] == "step-ca" && target["health"] == "up");
+        assert!(
+            step_ca_is_up,
+            "Prometheus did not report the step-ca scrape target as up: {body}"
+        );
 
         for label in ["scenario-a", "scenario-b"] {
             let directory = artifact_dir.join(format!("acme-directory-{label}.json"));

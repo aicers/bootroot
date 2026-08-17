@@ -29,6 +29,14 @@ set -euo pipefail
 #     connection made to that address)
 #   - `curl --cacert <ca-bundle> https://<ip>:9000/acme/acme/directory`
 #     returns the ACME directory with no hostname-verification error
+#   - `ca.json` and the template it is re-rendered from both carry
+#     `metricsAddress: ":9102"`, and step-ca serves Prometheus
+#     exposition data there to a client on the compose network
+#
+# Scenario A additionally brings Prometheus up and waits for the
+# `step-ca` scrape job the bundled config has always declared to report
+# `up`, which is the claim an operator reads and is not the same as the
+# endpoint answering a direct fetch.
 #
 # Scenario B additionally asserts that the repair is non-destructive:
 # the root and intermediate fingerprints are unchanged across the
@@ -58,6 +66,19 @@ STEPCA_READY_ATTEMPTS="${STEPCA_READY_ATTEMPTS:-40}"
 STEPCA_READY_DELAY_SECS="${STEPCA_READY_DELAY_SECS:-3}"
 CA_JSON_ATTEMPTS="${CA_JSON_ATTEMPTS:-10}"
 CA_JSON_DELAY_SECS="${CA_JSON_DELAY_SECS:-2}"
+# Prometheus scrapes on a 15s interval (`monitoring/prometheus.yml`), so
+# a target that is going to come up does so well inside this window; the
+# budget is generous because the first scrape has to wait for the
+# container to finish starting as well.
+PROMETHEUS_READY_ATTEMPTS="${PROMETHEUS_READY_ATTEMPTS:-40}"
+PROMETHEUS_READY_DELAY_SECS="${PROMETHEUS_READY_DELAY_SECS:-3}"
+# Profile the monitoring services are gated behind in both bundled
+# compose files.  Named on the bring-up of `prometheus` and on every
+# teardown: a `down` that does not name it leaves the container behind
+# on the Compose versions that build their removal list from the model
+# rather than from the project label, and the leftover check that closes
+# the run reports `<instance>-prometheus` as residue.
+MONITORING_PROFILE="${MONITORING_PROFILE:-lan}"
 # Must exceed the OpenBao Agent render interval bootroot writes into the
 # sidecar config (`STATIC_SECRET_RENDER_INTERVAL`, 30s), so at least one
 # full render cycle is observed before the stability re-check.
@@ -140,7 +161,7 @@ compose() {
 # removed everything.  The status is the caller's to decide — the
 # start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  compose down -v --remove-orphans >>"$RUN_LOG" 2>&1
+  compose --profile "$MONITORING_PROFILE" down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 # Stops the stack without touching the named volumes.
@@ -465,6 +486,48 @@ assert_stepca_metrics_endpoint() {
   fail "[$label] step-ca served no Prometheus metrics at http://step-ca:9102/metrics from inside the compose network (see $out)"
 }
 
+# Asserts Prometheus itself reports the `step-ca` scrape job healthy.
+#
+# The endpoint check above proves step-ca answers; this proves the target
+# `monitoring/prometheus.yml` has always declared actually resolves to
+# it.  The two can disagree — a job name, a `metrics_path` or a target
+# host that no longer matches the service would leave the endpoint
+# serving and the target down — and it is the target the operator reads.
+#
+# Prometheus sits behind the `lan`/`public` profiles, so it is brought up
+# by name here rather than by the harness's plain `up`; `grafana` is left
+# alone, because it publishes a host port this harness has no reason to
+# claim.  The API is queried from inside the container for the same
+# reason the metrics fetch is: Prometheus publishes no host port either.
+#
+# `--no-deps` is load-bearing.  Prometheus `depends_on` step-ca and
+# OpenBao, and `compose()` here names only the base and test files —
+# `init` started step-ca with the `--stepca-bind` override on top, so
+# without this flag Compose would find the running container diverging
+# from the model it can see and recreate step-ca *without* the exposed
+# bind, taking the SAN and ACME assertions that follow with it.  Both
+# dependencies are already up: this is the last assertion of a scenario
+# that has been talking to them throughout.
+assert_prometheus_scrapes_stepca() {
+  local label="$1"
+  local out="$ARTIFACT_DIR/prometheus-targets-${label}.json"
+  compose --profile "$MONITORING_PROFILE" up -d --no-deps prometheus \
+    >>"$RUN_LOG" 2>&1 || fail "[$label] could not start prometheus"
+  local attempt
+  for attempt in $(seq 1 "$PROMETHEUS_READY_ATTEMPTS"); do
+    if compose exec -T prometheus wget -qO- \
+        "http://localhost:9090/api/v1/targets" >"$out" 2>>"$RUN_LOG"; then
+      if jq -e '[.data.activeTargets[]
+                 | select(.labels.job == "step-ca" and .health == "up")]
+                | length > 0' "$out" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep "$PROMETHEUS_READY_DELAY_SECS"
+  done
+  fail "[$label] Prometheus never reported the step-ca scrape target as up (see $out)"
+}
+
 # Re-checks the name set after a full agent render interval has elapsed.
 #
 # This is the assertion that actually proves the repair sticks: the
@@ -636,6 +699,11 @@ scenario_a_fresh_install_with_bind() {
   assert_stepca_ip_san "scenario-a"
   build_ca_bundle "$ARTIFACT_DIR/ca-bundle-a.pem"
   assert_acme_directory_reachable "scenario-a" "$ARTIFACT_DIR/ca-bundle-a.pem"
+  # Last, because it is the one assertion here that starts a container:
+  # the scrape job the operator actually reads, on the clean install the
+  # issue's test plan names.  The endpoint answering a direct fetch and
+  # Prometheus resolving its declared target to it are two claims.
+  assert_prometheus_scrapes_stepca "scenario-a"
 }
 
 # ---------------------------------------------------------------------------

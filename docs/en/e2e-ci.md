@@ -72,7 +72,7 @@ PR-critical Docker test set validates:
 - remote-delivery E2E scenario (`hosts`)
 - rotation/recovery matrix (`secret_id,eab,responder_hmac,trust_sync`)
 - reinit recovery
-- step-ca certificate SANs
+- step-ca certificate SANs and the Prometheus metrics listener
 - OpenBao TLS transition with no compose delta
 - OpenBao TLS re-issuance after `secrets/` is re-owned
 - two co-located instances stay independent (install, containers, volumes,
