@@ -1,6 +1,7 @@
 # RFC-F: bootroot — the runtime registrar surface and its non-self-propagation guarantee
 
-Status: accepted; implementation is decomposed from §7. This is an
+Status: accepted, with post-acceptance amendments recorded in §9;
+implementation is decomposed from §7. This is an
 **`aicers/bootroot`** in-repo RFC (its first —
 filing home `docs/rfcs/`). It is the ecosystem install/update set's
 **RFC-F**, the companion that supplies the one **bootroot-owned** change the
@@ -1204,7 +1205,8 @@ argument rests on.
   so it does not throttle. A separate test drains the **`admission`** bucket,
   which is the only check point that throttles, and asserts a **throttled**
   invocation returns the **retryable** `RegistrarBusy { retry_after }`, never
-  one of `RegistrarUnavailable`'s permanent reasons, having written no record
+  one of `RegistrarUnavailable`'s permanent reasons, having written neither
+  intent nor outcome record — its coalesced counter increment still happens —
   and performed no OpenBao work.
 - **Outcome-record failure keeps the teardown owed (§5.6).** A test makes the
   **outcome** write fail after a successful mint and asserts the verb returns
