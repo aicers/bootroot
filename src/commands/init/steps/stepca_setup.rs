@@ -34,15 +34,40 @@ const LOOPBACK_IPV6: &str = "::1";
 /// an IP become `iPAddress` SANs, the rest become `dNSName` SANs.
 const CA_JSON_DNS_NAMES_KEY: &str = "dnsNames";
 
+/// Top-level `ca.json` key naming the address step-ca serves its
+/// Prometheus metrics on.  step-ca starts that listener only when the
+/// key is present, and the pinned image accepts the address through no
+/// command-line flag and no environment variable — so the configuration
+/// file is the only place it can come from, and the fixed Compose
+/// `command` cannot supply it.
+const CA_JSON_METRICS_ADDRESS_KEY: &str = "metricsAddress";
+
+/// The address step-ca serves `/metrics` on.
+///
+/// Fixed rather than operator-selectable: `monitoring/prometheus.yml`
+/// scrapes `step-ca:9102` as a static target and both bundled Compose
+/// files declare `expose: "9102"` on the service, so any other value
+/// here would simply take the listener away from the scraper.
+///
+/// SECURITY: the listener is unauthenticated and plaintext — step-ca
+/// offers no authentication for it — and the empty host part binds it
+/// on every interface *inside the container*, which is what lets
+/// Prometheus reach it as `step-ca:9102`.  The boundary is therefore
+/// the Compose network alone: 9102 is `expose`d and never published as
+/// a host port.  Publishing it, or otherwise widening that boundary,
+/// puts unauthenticated internal telemetry on the host's network.
+const STEPCA_METRICS_ADDRESS: &str = ":9102";
+
 /// Writes the `OpenBao` Agent templates step-ca renders its runtime
 /// configuration from.
 ///
-/// `dns_names` is stamped into the generated `ca.json.ctmpl` rather than
-/// inherited from whatever `ca.json` holds when this runs: the step-ca
-/// agent sidecar re-renders `ca.json` from the *previous* template on
-/// its own schedule, so a render landing between the reconciliation and
-/// this call would otherwise bake the stale name set back into the new
-/// template and make the regression permanent (issue #733).
+/// `dns_names` and the metrics address are stamped into the generated
+/// `ca.json.ctmpl` rather than inherited from whatever `ca.json` holds
+/// when this runs: the step-ca agent sidecar re-renders `ca.json` from
+/// the *previous* template on its own schedule, so a render landing
+/// between the reconciliation and this call would otherwise bake the
+/// stale value back into the new template and make the regression
+/// permanent (issue #733).
 pub(super) async fn write_stepca_templates(
     secrets_dir: &Path,
     kv_mount: &str,
@@ -176,6 +201,7 @@ fn build_ca_json_template(
     let mut value: serde_json::Value =
         serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
     set_ca_json_dns_names(&mut value, dns_names);
+    set_ca_json_metrics_address(&mut value);
     let db = value
         .get_mut("db")
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
@@ -365,27 +391,44 @@ pub(super) fn resolve_stepca_ca_dns_names(
     ))
 }
 
-/// Sets the top-level `dnsNames` array on a parsed `ca.json`, returning
-/// whether the value actually changed.
+/// Sets one top-level key on a parsed `ca.json`, returning whether the
+/// value actually changed.
 ///
-/// Every other key — `db`, `authority.provisioners`, and anything
-/// step-ca or an operator added that bootroot does not model — is left
-/// untouched, so the caller can re-serialise the same document.
-fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) -> bool {
-    let desired = serde_json::Value::Array(
-        dns_names
-            .iter()
-            .map(|name| serde_json::Value::String(name.clone()))
-            .collect(),
-    );
-    if value.get(CA_JSON_DNS_NAMES_KEY) == Some(&desired) {
+/// Inserts into the parsed document rather than rebuilding it: every
+/// other key — `db`, `authority.provisioners`, and anything step-ca or
+/// an operator added that bootroot does not model — is left untouched,
+/// so the caller can re-serialise the same document, and the key ends up
+/// present exactly once whether or not it was there before.
+fn set_ca_json_key(value: &mut serde_json::Value, key: &str, desired: serde_json::Value) -> bool {
+    if value.get(key) == Some(&desired) {
         return false;
     }
     if let Some(object) = value.as_object_mut() {
-        object.insert(CA_JSON_DNS_NAMES_KEY.to_string(), desired);
+        object.insert(key.to_string(), desired);
         return true;
     }
     false
+}
+
+/// Sets the top-level `dnsNames` array on a parsed `ca.json`, returning
+/// whether the value actually changed.
+fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) -> bool {
+    let desired = dns_names
+        .iter()
+        .map(|name| serde_json::Value::String(name.clone()))
+        .collect();
+    set_ca_json_key(value, CA_JSON_DNS_NAMES_KEY, desired)
+}
+
+/// Sets the top-level `metricsAddress` on a parsed `ca.json` to
+/// [`STEPCA_METRICS_ADDRESS`], returning whether the value actually
+/// changed.
+///
+/// Takes no argument for the same reason the constant is fixed: the
+/// scrape target is a compile-time constant on the Prometheus side.
+fn set_ca_json_metrics_address(value: &mut serde_json::Value) -> bool {
+    let desired = serde_json::Value::String(STEPCA_METRICS_ADDRESS.to_string());
+    set_ca_json_key(value, CA_JSON_METRICS_ADDRESS_KEY, desired)
 }
 
 /// Outcome of `update_ca_json_with_backup`.
@@ -397,7 +440,30 @@ pub(super) struct CaJsonUpdate {
     /// The caller restarts step-ca when this is set: step-ca derives its
     /// serving leaf from `dnsNames` at boot and holds it in memory, so
     /// only a restart re-issues it with the new name set.
-    pub(super) dns_names_changed: bool,
+    dns_names_changed: bool,
+    /// Whether the reconciliation moved the top-level `metricsAddress`.
+    ///
+    /// Set on every installation that predates the setting, whose
+    /// `dnsNames` are by definition unchanged — which is why the caller
+    /// gates on [`CaJsonUpdate::stepca_reload_required`] rather than on
+    /// `dns_names_changed` alone.
+    metrics_address_changed: bool,
+}
+
+impl CaJsonUpdate {
+    /// Whether the co-owned `ca.json` has to be carried through the rest
+    /// of the sequence: regenerate the template, restart the sidecar
+    /// onto it, re-assert the file, and restart step-ca.
+    ///
+    /// Both keys are read by step-ca at boot only — the name set decides
+    /// its serving leaf, the metrics address decides whether the
+    /// listener exists at all — so neither takes effect in a running
+    /// container, and a sidecar still holding the previous template
+    /// would render either of them back out.
+    #[must_use]
+    pub(super) fn stepca_reload_required(&self) -> bool {
+        self.dns_names_changed || self.metrics_address_changed
+    }
 }
 
 pub(super) async fn write_password_file_with_backup(
@@ -441,10 +507,12 @@ pub(super) async fn write_password_file_with_backup(
 /// Patches `ca.json` in place, backing the original up for rollback.
 ///
 /// Rewrites the `db` section, the ACME provisioner's
-/// `claims.defaultTLSCertDuration`, and the top-level `dnsNames` — the
-/// last of these is what gives step-ca's own serving certificate the
-/// address `--stepca-bind` publishes it on.  The document is parsed and
-/// re-serialised rather than regenerated, so keys bootroot does not
+/// `claims.defaultTLSCertDuration`, the top-level `dnsNames` — what
+/// gives step-ca's own serving certificate the address
+/// `--stepca-bind` publishes it on — and the top-level
+/// `metricsAddress`, which is what starts the listener
+/// `monitoring/prometheus.yml` already scrapes.  The document is parsed
+/// and re-serialised rather than regenerated, so keys bootroot does not
 /// model survive untouched.
 pub(super) async fn update_ca_json_with_backup(
     secrets_dir: &Path,
@@ -469,6 +537,7 @@ pub(super) async fn update_ca_json_with_backup(
         );
     }
     let dns_names_changed = set_ca_json_dns_names(&mut value, dns_names);
+    let metrics_address_changed = set_ca_json_metrics_address(&mut value);
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     publish_ca_json(&path, &updated, messages).await?;
@@ -478,21 +547,23 @@ pub(super) async fn update_ca_json_with_backup(
             original: Some(contents),
         },
         dns_names_changed,
+        metrics_address_changed,
     })
 }
 
-/// Re-applies `dns_names` to `ca.json`'s top-level `dnsNames`, returning
-/// whether the file had drifted.
+/// Re-applies `dns_names` to `ca.json`'s top-level `dnsNames` and the
+/// fixed metrics address to its `metricsAddress`, returning whether the
+/// file had drifted.
 ///
-/// `update_ca_json_with_backup` already writes the reconciled set, but
-/// the step-ca `OpenBao` Agent sidecar re-renders `ca.json` from its
-/// template on a fixed interval and can clobber that write moments
-/// later.  The orchestrator calls this once the sidecar has been
-/// restarted onto the regenerated template, so the file `init` leaves
-/// behind — and every later render — carries the same name set.  No
-/// backup is taken: the rollback entry from `update_ca_json_with_backup`
-/// already holds the pre-`init` document.
-pub(super) async fn reconcile_ca_json_dns_names(
+/// `update_ca_json_with_backup` already writes both, but the step-ca
+/// `OpenBao` Agent sidecar re-renders `ca.json` from its template on a
+/// fixed interval and can clobber that write moments later.  The
+/// orchestrator calls this once the sidecar has been restarted onto the
+/// regenerated template, so the file `init` leaves behind — and every
+/// later render — carries the same values.  No backup is taken: the
+/// rollback entry from `update_ca_json_with_backup` already holds the
+/// pre-`init` document.
+pub(super) async fn reconcile_ca_json_managed_keys(
     secrets_dir: &Path,
     dns_names: &[String],
     messages: &Messages,
@@ -503,7 +574,12 @@ pub(super) async fn reconcile_ca_json_dns_names(
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
     let mut value: serde_json::Value =
         serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
-    if !set_ca_json_dns_names(&mut value, dns_names) {
+    // Both keys are re-asserted before the early return is decided:
+    // combining the two calls into one `||` would skip the metrics
+    // address on exactly the runs where the name set had drifted.
+    let dns_names_changed = set_ca_json_dns_names(&mut value, dns_names);
+    let metrics_address_changed = set_ca_json_metrics_address(&mut value);
+    if !dns_names_changed && !metrics_address_changed {
         return Ok(false);
     }
     let updated =
@@ -1138,7 +1214,7 @@ mod tests {
         let dns_names =
             build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
-        let changed = reconcile_ca_json_dns_names(&secrets_dir, &dns_names, &messages)
+        let changed = reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &messages)
             .await
             .unwrap();
         assert!(changed);
@@ -1153,7 +1229,7 @@ mod tests {
             serde_json::json!([1, 2, 3])
         );
 
-        let changed_again = reconcile_ca_json_dns_names(&secrets_dir, &dns_names, &messages)
+        let changed_again = reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &messages)
             .await
             .unwrap();
         assert!(
@@ -1161,6 +1237,195 @@ mod tests {
             "an already-reconciled ca.json must not be rewritten"
         );
         assert_eq!(read_ca_json(&secrets_dir), after);
+    }
+
+    /// The direct reconciliation owns `metricsAddress`: step-ca serves
+    /// `/metrics` only when `ca.json` carries it, and
+    /// `monitoring/prometheus.yml` scrapes that listener as a static
+    /// target.
+    #[tokio::test]
+    async fn update_ca_json_writes_one_metrics_address_and_is_idempotent() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+
+        let first = update_ca_json_with_backup(
+            &secrets_dir,
+            "postgresql://step@postgres:5432/stepca",
+            "48h",
+            "acme",
+            &dns_names,
+            &messages,
+        )
+        .await
+        .unwrap();
+        assert!(first.metrics_address_changed);
+        assert!(first.stepca_reload_required());
+        assert_eq!(
+            read_ca_json(&secrets_dir)["metricsAddress"]
+                .as_str()
+                .unwrap(),
+            ":9102"
+        );
+        let raw = fs::read_to_string(secrets_dir.join("config").join("ca.json")).unwrap();
+        assert_eq!(
+            raw.matches("\"metricsAddress\"").count(),
+            1,
+            "ca.json must carry exactly one top-level metricsAddress"
+        );
+
+        let second = update_ca_json_with_backup(
+            &secrets_dir,
+            "postgresql://step@postgres:5432/stepca",
+            "48h",
+            "acme",
+            &dns_names,
+            &messages,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !second.metrics_address_changed,
+            "a settled metricsAddress must not be rewritten"
+        );
+        assert!(
+            !second.stepca_reload_required(),
+            "a repeat init on a settled document must not restart step-ca"
+        );
+        assert_eq!(
+            fs::read_to_string(secrets_dir.join("config").join("ca.json")).unwrap(),
+            raw,
+            "second run must be a no-op"
+        );
+    }
+
+    /// The upgrade path the issue names: an installation whose
+    /// `dnsNames` are already correct and whose `ca.json` predates the
+    /// metrics setting.  Gating the template, sidecar and step-ca
+    /// restart on `dnsNames` alone would leave it without a listener.
+    #[tokio::test]
+    async fn update_ca_json_requires_reload_when_only_the_metrics_address_moves() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        // `dnsNames` already carries exactly what the defaults derive.
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+
+        let update = update_ca_json_with_backup(
+            &secrets_dir,
+            "postgresql://step@postgres:5432/stepca",
+            "48h",
+            "acme",
+            &dns_names,
+            &messages,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !update.dns_names_changed,
+            "the fixture already carries the derived name set"
+        );
+        assert!(update.metrics_address_changed);
+        assert!(update.stepca_reload_required());
+    }
+
+    /// An operator (or a stale render) leaving another address behind
+    /// must not survive: the value has to match the scrape target
+    /// `monitoring/prometheus.yml` declares, so the reconciliation
+    /// overwrites rather than inherits.
+    #[tokio::test]
+    async fn reconcile_ca_json_managed_keys_repairs_a_clobbered_metrics_address() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(
+            &secrets_dir,
+            r#"{
+                "dnsNames": ["localhost", "bootroot-ca", "stepca.internal"],
+                "metricsAddress": ":9999",
+                "db": {"type": "postgresql", "dataSource": "dsn"},
+                "authority": {"provisioners": [{"type": "ACME", "name": "acme"}]}
+            }"#,
+        );
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+
+        let changed = reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &messages)
+            .await
+            .unwrap();
+        assert!(
+            changed,
+            "an unchanged name set must not mask a drifted metrics address"
+        );
+        let after = read_ca_json(&secrets_dir);
+        assert_eq!(after["metricsAddress"].as_str().unwrap(), ":9102");
+        assert_eq!(dns_names_of(&after), dns_names);
+        assert_eq!(after["db"]["dataSource"].as_str().unwrap(), "dsn");
+
+        let changed_again = reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &messages)
+            .await
+            .unwrap();
+        assert!(!changed_again);
+        assert_eq!(read_ca_json(&secrets_dir), after);
+    }
+
+    /// The template is stamped, not inherited: the sidecar can re-render
+    /// `ca.json` from the previous template between the reconciliation
+    /// and the template write, so a `ca.json` without the key must still
+    /// produce a template that carries it (the #733 hazard, applied to
+    /// `metricsAddress`).
+    #[tokio::test]
+    async fn stepca_template_stamps_metrics_address_absent_from_ca_json() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+
+        assert!(
+            read_ca_json(&secrets_dir).get("metricsAddress").is_none(),
+            "the fixture stands in for a pre-metrics ca.json"
+        );
+        let paths =
+            write_stepca_templates(&secrets_dir, "secret", "48h", "acme", &dns_names, &messages)
+                .await
+                .unwrap();
+
+        // The .ctmpl embeds a raw Go directive in place of the DSN, so it
+        // is not valid JSON — match the serialised key/value textually.
+        let template = fs::read_to_string(&paths.ca_json_template_path).unwrap();
+        assert!(
+            template.contains("\"metricsAddress\": \":9102\""),
+            "ca.json.ctmpl must carry the metrics address: {template}"
+        );
+        assert_eq!(
+            template.matches("\"metricsAddress\"").count(),
+            1,
+            "ca.json.ctmpl must carry exactly one metricsAddress"
+        );
+    }
+
+    /// The two halves of the scrape live in different files and different
+    /// languages: `STEPCA_METRICS_ADDRESS` decides where step-ca listens,
+    /// `monitoring/prometheus.yml` decides where Prometheus knocks.  A
+    /// port changed on one side alone leaves the endpoint serving and the
+    /// declared target down, and every other test here would still pass —
+    /// only the Docker-gated E2E would notice, and only when it is run.
+    #[test]
+    fn metrics_address_port_matches_the_declared_scrape_target() {
+        let port = STEPCA_METRICS_ADDRESS
+            .strip_prefix(':')
+            .expect("the metrics address binds every in-container interface, so it is :<port>");
+        let scrape_config = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("monitoring/prometheus.yml"),
+        )
+        .expect("read monitoring/prometheus.yml");
+        assert!(
+            scrape_config.contains(&format!("[\"step-ca:{port}\"]")),
+            "monitoring/prometheus.yml must scrape step-ca:{port}: {scrape_config}"
+        );
     }
 
     /// The snapshot feeding the init rollback must capture the template

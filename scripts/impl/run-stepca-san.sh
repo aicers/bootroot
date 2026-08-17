@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Docker-backed E2E harness for step-ca's certificate SANs (#733).
+# Docker-backed E2E harness for step-ca's certificate SANs (#733) and,
+# alongside them, its metrics listener (#864) — both are top-level keys
+# in the `ca.json` bootroot co-owns with the step-ca OpenBao Agent
+# sidecar, and both are read by step-ca at boot only, so both fail the
+# same way if the template and the sidecar are not carried along.
 #
 # `step ca init` used to be invoked with a compile-time `--dns`
 # constant, so step-ca's own serving certificate carried no SAN for the
@@ -17,19 +21,38 @@ set -euo pipefail
 #   scenario-b  already-initialized path — `init` on loopback first,
 #               then `infra install --stepca-bind <ip>:9000` and a
 #               second `init`
+#   scenario-c  metrics-only upgrade — on the stack scenario B leaves,
+#               `metricsAddress` is stripped and step-ca restarted
+#               without it, then `init` runs with `dnsNames` already
+#               settled, so nothing but the metrics address moves
 #
-# Both assert the same two contracts against the running step-ca:
+# Scenarios A and B assert the same three contracts against the running
+# step-ca:
 #
 #   - the presented certificate carries `IP Address:<ip>` (an IP SAN,
 #     not a `DNS:` entry, which would not satisfy verification of a
 #     connection made to that address)
 #   - `curl --cacert <ca-bundle> https://<ip>:9000/acme/acme/directory`
 #     returns the ACME directory with no hostname-verification error
+#   - `ca.json` and the template it is re-rendered from both carry
+#     `metricsAddress: ":9102"`, and step-ca serves Prometheus
+#     exposition data there to a client on the compose network
+#
+# Scenario A additionally brings Prometheus up and waits for the
+# `step-ca` scrape job the bundled config has always declared to report
+# `up`, which is the claim an operator reads and is not the same as the
+# endpoint answering a direct fetch.
 #
 # Scenario B additionally asserts that the repair is non-destructive:
 # the root and intermediate fingerprints are unchanged across the
 # second `init`, and the CA bundle captured *before* it still validates
 # the chain afterwards.
+#
+# Scenario C isolates the metrics gate.  A and B both move `dnsNames`,
+# so neither can tell an `init` that carried the reload sequence for the
+# name set from one that carried it for the metrics address; C removes
+# the name change and asserts the listener still comes back — with the
+# CA material, and the chain a consumer already trusts, untouched.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +77,19 @@ STEPCA_READY_ATTEMPTS="${STEPCA_READY_ATTEMPTS:-40}"
 STEPCA_READY_DELAY_SECS="${STEPCA_READY_DELAY_SECS:-3}"
 CA_JSON_ATTEMPTS="${CA_JSON_ATTEMPTS:-10}"
 CA_JSON_DELAY_SECS="${CA_JSON_DELAY_SECS:-2}"
+# Prometheus scrapes on a 15s interval (`monitoring/prometheus.yml`), so
+# a target that is going to come up does so well inside this window; the
+# budget is generous because the first scrape has to wait for the
+# container to finish starting as well.
+PROMETHEUS_READY_ATTEMPTS="${PROMETHEUS_READY_ATTEMPTS:-40}"
+PROMETHEUS_READY_DELAY_SECS="${PROMETHEUS_READY_DELAY_SECS:-3}"
+# Profile the monitoring services are gated behind in both bundled
+# compose files.  Named on the bring-up of `prometheus` and on every
+# teardown: a `down` that does not name it leaves the container behind
+# on the Compose versions that build their removal list from the model
+# rather than from the project label, and the leftover check that closes
+# the run reports `<instance>-prometheus` as residue.
+MONITORING_PROFILE="${MONITORING_PROFILE:-lan}"
 # Must exceed the OpenBao Agent render interval bootroot writes into the
 # sidecar config (`STATIC_SECRET_RENDER_INTERVAL`, 30s), so at least one
 # full render cycle is observed before the stability re-check.
@@ -136,7 +172,7 @@ compose() {
 # removed everything.  The status is the caller's to decide — the
 # start-of-run call tolerates a failure, `cleanup` does not.
 compose_down() {
-  compose down -v --remove-orphans >>"$RUN_LOG" 2>&1
+  compose --profile "$MONITORING_PROFILE" down -v --remove-orphans >>"$RUN_LOG" 2>&1
 }
 
 # Stops the stack without touching the named volumes.
@@ -156,6 +192,26 @@ compose_stop() {
 
 run_bootroot() {
   ( cd "$WORKSPACE_DIR" && "$BOOTROOT_BIN" "$@" )
+}
+
+# Prints the step-ca OpenBao Agent sidecar's container name.
+#
+# Named directly rather than driven through `compose`: the sidecar is
+# declared in the agent override file `init` writes under `secrets/`,
+# which this harness's compose file set does not include, so compose
+# does not know the service exists.
+#
+# The name is the recorded instance plus the suffix, resolved through
+# the same helper the leftover check uses — not `COMPOSE_PROJECT_NAME`,
+# which the Rust wrapper sets to a value that is not an instance name,
+# and not a hard-coded `bootroot`, which would quietly name the wrong
+# container the day this harness takes an `--instance-name`.  Resolved
+# per call because `.env` is written by `init`, not by the bring-up.
+stepca_agent_container() {
+  local instance
+  instance="$(resolve_recorded_instance_name "$(dirname "$COMPOSE_FILE")")" \
+    || fail "could not resolve the recorded instance name from $(dirname "$COMPOSE_FILE")/.env"
+  printf '%s-openbao-agent-stepca\n' "$instance"
 }
 
 # Finding *an* `openssl` on PATH is not enough. macOS ships LibreSSL as
@@ -227,7 +283,7 @@ capture_artifacts() {
   compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
   compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   if [ -f "$SECRETS_DIR/config/ca.json" ]; then
-    jq -c '.dnsNames' "$SECRETS_DIR/config/ca.json" \
+    jq -c '{dnsNames, metricsAddress}' "$SECRETS_DIR/config/ca.json" \
       >"$ARTIFACT_DIR/ca-json-dns-names.log" 2>&1 || true
   fi
 }
@@ -402,6 +458,141 @@ assert_ca_json_dns_names() {
   done
 }
 
+# Asserts `ca.json` carries the fixed metrics address, and that the
+# template it is re-rendered from carries it too.
+#
+# `metricsAddress` is what starts step-ca's Prometheus listener at all:
+# the pinned binary takes the address through no flag and no environment
+# variable, so the file is the only place it can come from, and a
+# template missing it hands the next agent render a `ca.json` that
+# silently turns the listener off again (issue #864).  Retries for the
+# same reason `assert_ca_json_dns_names` does — a render can land
+# between `init` returning and this read.
+assert_ca_json_metrics_address() {
+  local label="$1"
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  local expected='":9102"'
+  local actual=""
+  local attempt
+  for attempt in $(seq 1 "$CA_JSON_ATTEMPTS"); do
+    if [ -f "$ca_json" ]; then
+      actual="$(jq -c '.metricsAddress' "$ca_json" 2>/dev/null || true)"
+      [ "$expected" = "$actual" ] && break
+    fi
+    sleep "$CA_JSON_DELAY_SECS"
+  done
+  [ -f "$ca_json" ] || fail "[$label] missing $ca_json"
+  if [ "$expected" != "$actual" ]; then
+    fail "[$label] ca.json metricsAddress mismatch: expected $expected got $actual"
+  fi
+  local ctmpl="$SECRETS_DIR/templates/ca.json.ctmpl"
+  [ -f "$ctmpl" ] || fail "[$label] missing $ctmpl"
+  grep -q '"metricsAddress": ":9102"' "$ctmpl" \
+    || fail "[$label] ca.json.ctmpl does not carry metricsAddress \":9102\""
+}
+
+# Asserts step-ca actually serves Prometheus exposition data on 9102,
+# fetched from *inside* the compose network.
+#
+# The fetch runs in the OpenBao container rather than on the host on
+# purpose: 9102 is `expose`d and deliberately not published, so a probe
+# that succeeded from the host would mean the network boundary this
+# endpoint's only protection rests on had been widened.  OpenBao's image
+# is the same busybox-carrying Alpine the monitoring integration test
+# already fetches through, and `step-ca` is the compose service name
+# Prometheus itself scrapes by.
+assert_stepca_metrics_endpoint() {
+  local label="$1"
+  local out="$ARTIFACT_DIR/stepca-metrics-${label}.txt"
+  local attempt
+  for attempt in $(seq 1 "$STEPCA_READY_ATTEMPTS"); do
+    if compose exec -T openbao wget -qO- "http://step-ca:9102/metrics" \
+        >"$out" 2>>"$RUN_LOG"; then
+      if grep -q '^# HELP ' "$out"; then
+        return 0
+      fi
+    fi
+    sleep "$STEPCA_READY_DELAY_SECS"
+  done
+  fail "[$label] step-ca served no Prometheus metrics at http://step-ca:9102/metrics from inside the compose network (see $out)"
+}
+
+# Asserts step-ca serves nothing on 9102 — the state an installation
+# predating the setting is in, and the baseline scenario C's upgrade is
+# measured against.
+#
+# step-ca is waited for first, on its ACME port.  Without that, a fetch
+# failing because the container is still coming back up reads exactly
+# like one failing because the listener is gone, and the baseline would
+# pass on a step-ca that was simply not there yet — which would make the
+# "it came back" assertion afterwards meaningless.  Past the wait the
+# process is serving, and 9102 answering or not is a statement about the
+# configuration alone.
+#
+# Then polls rather than probing once, because a container that has not
+# finished stopping still answers on the old listener.  The listener
+# exists or it does not, so the first empty fetch is conclusive and only
+# one that never goes away runs the loop out.
+assert_stepca_metrics_endpoint_absent() {
+  local label="$1"
+  local out="$ARTIFACT_DIR/stepca-metrics-${label}.txt"
+  local attempt
+  wait_for_stepca_tls "${STEPCA_BIND_HOST}:${STEPCA_BIND_PORT}"
+  for attempt in $(seq 1 "$STEPCA_READY_ATTEMPTS"); do
+    if ! compose exec -T openbao wget -qO- "http://step-ca:9102/metrics" \
+        >"$out" 2>>"$RUN_LOG"; then
+      return 0
+    fi
+    if ! grep -q '^# HELP ' "$out"; then
+      return 0
+    fi
+    sleep "$STEPCA_READY_DELAY_SECS"
+  done
+  fail "[$label] step-ca still served Prometheus metrics on 9102 after ca.json was stripped of metricsAddress (see $out)"
+}
+
+# Asserts Prometheus itself reports the `step-ca` scrape job healthy.
+#
+# The endpoint check above proves step-ca answers; this proves the target
+# `monitoring/prometheus.yml` has always declared actually resolves to
+# it.  The two can disagree — a job name, a `metrics_path` or a target
+# host that no longer matches the service would leave the endpoint
+# serving and the target down — and it is the target the operator reads.
+#
+# Prometheus sits behind the `lan`/`public` profiles, so it is brought up
+# by name here rather than by the harness's plain `up`; `grafana` is left
+# alone, because it publishes a host port this harness has no reason to
+# claim.  The API is queried from inside the container for the same
+# reason the metrics fetch is: Prometheus publishes no host port either.
+#
+# `--no-deps` is load-bearing.  Prometheus `depends_on` step-ca and
+# OpenBao, and `compose()` here names only the base and test files —
+# `init` started step-ca with the `--stepca-bind` override on top, so
+# without this flag Compose would find the running container diverging
+# from the model it can see and recreate step-ca *without* the exposed
+# bind, taking the SAN and ACME assertions that follow with it.  Both
+# dependencies are already up: this is the last assertion of a scenario
+# that has been talking to them throughout.
+assert_prometheus_scrapes_stepca() {
+  local label="$1"
+  local out="$ARTIFACT_DIR/prometheus-targets-${label}.json"
+  compose --profile "$MONITORING_PROFILE" up -d --no-deps prometheus \
+    >>"$RUN_LOG" 2>&1 || fail "[$label] could not start prometheus"
+  local attempt
+  for attempt in $(seq 1 "$PROMETHEUS_READY_ATTEMPTS"); do
+    if compose exec -T prometheus wget -qO- \
+        "http://localhost:9090/api/v1/targets" >"$out" 2>>"$RUN_LOG"; then
+      if jq -e '[.data.activeTargets[]
+                 | select(.labels.job == "step-ca" and .health == "up")]
+                | length > 0' "$out" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep "$PROMETHEUS_READY_DELAY_SECS"
+  done
+  fail "[$label] Prometheus never reported the step-ca scrape target as up (see $out)"
+}
+
 # Re-checks the name set after a full agent render interval has elapsed.
 #
 # This is the assertion that actually proves the repair sticks: the
@@ -415,6 +606,11 @@ assert_ca_json_dns_names_stable() {
   shift
   sleep "$STEPCA_RENDER_STABILITY_SECS"
   assert_ca_json_dns_names "$label" "$@"
+  # The metrics address is co-owned with the same sidecar and has the
+  # same failure mode: an `init` that wrote it without regenerating the
+  # template and restarting the sidecar would look correct until the
+  # next render took the listener away again (issue #864).
+  assert_ca_json_metrics_address "$label"
 }
 
 snapshot_ca_fingerprints() {
@@ -561,9 +757,18 @@ scenario_a_fresh_install_with_bind() {
   # with the bind IP in `dnsNames` — no reconciliation was needed.
   assert_ca_json_dns_names "scenario-a" \
     "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+  # A fresh `init` configures the metrics listener too: `step ca init`
+  # emits no `metricsAddress`, so this is the reconciliation's work.
+  assert_ca_json_metrics_address "scenario-a"
+  assert_stepca_metrics_endpoint "scenario-a"
   assert_stepca_ip_san "scenario-a"
   build_ca_bundle "$ARTIFACT_DIR/ca-bundle-a.pem"
   assert_acme_directory_reachable "scenario-a" "$ARTIFACT_DIR/ca-bundle-a.pem"
+  # Last, because it is the one assertion here that starts a container:
+  # the scrape job the operator actually reads, on the clean install the
+  # issue's test plan names.  The endpoint answering a direct fetch and
+  # Prometheus resolving its declared target to it are two claims.
+  assert_prometheus_scrapes_stepca "scenario-a"
 }
 
 # ---------------------------------------------------------------------------
@@ -609,6 +814,8 @@ scenario_b_repair_initialized_ca() {
   assert_ca_fingerprints_unchanged "scenario-b"
   assert_ca_json_dns_names "scenario-b-repaired" \
     "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+  assert_ca_json_metrics_address "scenario-b-repaired"
+  assert_stepca_metrics_endpoint "scenario-b"
   assert_stepca_ip_san "scenario-b"
   # The bundle captured before the repair — what an already-provisioned
   # consumer holds — still validates the chain step-ca presents.
@@ -618,6 +825,74 @@ scenario_b_repair_initialized_ca() {
   # The repair must survive the step-ca sidecar's next render: the agent
   # was already running with the pre-repair template when `init` started.
   assert_ca_json_dns_names_stable "scenario-b-stable" \
+    "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+}
+
+# ---------------------------------------------------------------------------
+# Scenario C: an installation that predates the metrics setting
+# ---------------------------------------------------------------------------
+
+# Runs against the stack scenario B leaves behind, so the CA is already
+# initialized and the bind intent is already recorded: this `init` finds
+# `dnsNames` settled and moves nothing but `metricsAddress`.
+#
+# That is the upgrade every existing installation takes, and it is the
+# one case gating the template, the sidecar restart and the step-ca
+# restart on `dnsNames` alone would silently skip — leaving the operator
+# a rewritten `ca.json` and a scrape target still down (issue #864).
+# Scenario B exercises the same sequence, but drives it from a changed
+# name set, so it cannot tell the two gates apart.
+scenario_c_metrics_only_upgrade() {
+  log_phase "scenario-c-strip-metrics"
+  snapshot_ca_fingerprints "scenario-c"
+
+  # The sidecar re-renders `ca.json` from a template that still carries
+  # the key, so it is stopped for the length of the setup: otherwise the
+  # next render decides whether step-ca boots against the stripped
+  # document, and the baseline below becomes a coin toss.  `init`
+  # restarts it as part of the sequence under test.
+  local agent_container
+  agent_container="$(stepca_agent_container)"
+  docker stop "$agent_container" >>"$RUN_LOG" 2>&1 \
+    || fail "[scenario-c] could not stop $agent_container"
+
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  local stripped="$ARTIFACT_DIR/ca-json-scenario-c-stripped.json"
+  jq 'del(.metricsAddress)' "$ca_json" >"$stripped" \
+    || fail "[scenario-c] could not strip metricsAddress from $ca_json"
+  cp "$stripped" "$ca_json"
+  [ "$(jq -c '.metricsAddress' "$ca_json")" = "null" ] \
+    || fail "[scenario-c] metricsAddress survived the strip"
+
+  # step-ca reads the key at boot only, so the listener scenario B left
+  # running outlives the edit until the container is restarted onto it.
+  compose restart step-ca >>"$RUN_LOG" 2>&1 \
+    || fail "[scenario-c] could not restart step-ca onto the stripped ca.json"
+  assert_stepca_metrics_endpoint_absent "scenario-c-baseline"
+
+  log_phase "scenario-c-init-upgrade"
+  run_second_init "$ARTIFACT_DIR/init-summary-b1.json" \
+    "$ARTIFACT_DIR/init-summary-c.json" "$ARTIFACT_DIR/init-c.raw.log"
+
+  log_phase "scenario-c-assert"
+  # The upgrade must not re-run `step ca init`: the root and
+  # intermediate keys an existing deployment is built on stay put.
+  assert_ca_fingerprints_unchanged "scenario-c"
+  # Unchanged, which is the whole point — the reload was driven by the
+  # metrics address alone.
+  assert_ca_json_dns_names "scenario-c" \
+    "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+  assert_ca_json_metrics_address "scenario-c"
+  assert_stepca_metrics_endpoint "scenario-c"
+  # The bundle a consumer provisioned before the upgrade still validates
+  # the chain, so the upgrade is invisible to everything already issued.
+  assert_acme_directory_reachable "scenario-c" "$SNAPSHOT_DIR/scenario-c/ca-bundle.pem"
+
+  log_phase "scenario-c-assert-stable"
+  # And it survives the restarted sidecar's next render, which is what
+  # separates an `init` that regenerated the template from one that only
+  # rewrote the file the sidecar is about to overwrite.
+  assert_ca_json_dns_names_stable "scenario-c-stable" \
     "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
 }
 
@@ -651,6 +926,10 @@ main() {
 
   scenario_a_fresh_install_with_bind
   scenario_b_repair_initialized_ca
+  # Chained onto scenario B's stack rather than given its own: the case
+  # it exercises only exists on a CA that is already initialized and
+  # already carries the recorded bind, which is precisely what B leaves.
+  scenario_c_metrics_only_upgrade
 
   log_phase "done"
 }

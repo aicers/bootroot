@@ -9,6 +9,8 @@ set -euo pipefail
 #
 #   - step-ca root/intermediate fingerprint unchanged before vs. after
 #   - secrets/password.txt not overwritten
+#   - step-ca's `metricsAddress` survives, so the Prometheus target
+#     `init` configured is still live after a reinit (#864)
 #   - non-loopback OpenBao bind survives (compose override survives,
 #     intent persists in rewritten state.json, post-reinit OpenBao
 #     listens on the bind, the second init pass reaches it)
@@ -367,6 +369,27 @@ assert_post_reinit_contracts() {
   # 2. password.txt unchanged (byte-for-byte).
   if ! cmp -s "$dir/password.txt" "$SECRETS_DIR/password.txt"; then
     fail "[$label] secrets/password.txt was overwritten across reinit"
+  fi
+
+  # 2b. step-ca's metrics listener survives (#864).  `reinit` keeps
+  # `config/ca.json` and re-runs the init flow over it, so the address
+  # `monitoring/prometheus.yml` scrapes has to come back out the other
+  # side; a reinit that dropped it would take the declared Prometheus
+  # target down with no other assertion here noticing.  Retried for the
+  # same reason `run-stepca-san.sh` retries: `ca.json` is co-owned with
+  # the OpenBao Agent sidecar, whose render can land between reinit
+  # returning and this read.
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  local metrics_address="" attempt
+  for attempt in $(seq 1 10); do
+    if [ -f "$ca_json" ]; then
+      metrics_address="$(jq -r '.metricsAddress // empty' "$ca_json" 2>/dev/null || true)"
+      [ "$metrics_address" = ":9102" ] && break
+    fi
+    sleep 2
+  done
+  if [ "$metrics_address" != ":9102" ]; then
+    fail "[$label] post-reinit ca.json metricsAddress='$metrics_address' expected ':9102'"
   fi
 
   # 3. Non-loopback bind survives.

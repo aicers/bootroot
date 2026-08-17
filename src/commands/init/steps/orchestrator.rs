@@ -35,7 +35,7 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    ensure_step_ca_initialized, reconcile_ca_json_dns_names, resolve_stepca_ca_dns_names,
+    ensure_step_ca_initialized, reconcile_ca_json_managed_keys, resolve_stepca_ca_dns_names,
     restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
     write_password_file_with_backup, write_stepca_templates,
 };
@@ -622,10 +622,10 @@ async fn run_init_inner(
         fix_secrets_permissions(&secrets_dir).await?;
     }
 
-    // Reconciles the `db` section, the ACME provisioner's cert duration
-    // and the top-level `dnsNames`.  Runs before `write_stepca_templates`
-    // so the generated `ca.json.ctmpl` is built from the patched document
-    // (notably `db.type`).
+    // Reconciles the `db` section, the ACME provisioner's cert duration,
+    // the top-level `dnsNames` and the top-level `metricsAddress`.  Runs
+    // before `write_stepca_templates` so the generated `ca.json.ctmpl`
+    // is built from the patched document (notably `db.type`).
     let ca_json_update = update_ca_json_with_backup(
         &secrets_dir,
         &secrets.db_dsn,
@@ -635,7 +635,11 @@ async fn run_init_inner(
         messages,
     )
     .await?;
-    let stepca_dns_names_changed = ca_json_update.dns_names_changed;
+    // Covers both boot-time keys, not `dnsNames` alone: an installation
+    // predating the metrics setting has an unchanged name set, and
+    // gating on that alone would leave the new template unrendered, the
+    // sidecar on the old one and step-ca without the listener.
+    let stepca_reload_required = ca_json_update.stepca_reload_required();
     rollback.ca_json_backup = Some(ca_json_update.rollback);
 
     // The templates are written here — before step-ca is restarted —
@@ -662,12 +666,12 @@ async fn run_init_inner(
     )
     .await?;
 
-    if stepca_dns_names_changed {
-        // On a fresh install the sidecar does not exist yet (and
-        // `step ca init --dns` already produced the right name set, so
-        // this branch is normally not taken there).  `docker restart`
-        // returns only once the old process is gone, so the re-assert
-        // below cannot race a render from it.
+    if stepca_reload_required {
+        // On a fresh install the sidecar does not exist yet, so the
+        // restart is a no-op there and the re-assert below finds the
+        // document it just wrote.  `docker restart` returns only once
+        // the old process is gone, so the re-assert cannot race a
+        // render from it.
         //
         // Record the restart before performing it so that a rollback
         // triggered by a later failure restarts the sidecar back onto the
@@ -677,22 +681,25 @@ async fn run_init_inner(
             &identity.container(BootrootContainer::OpenBaoAgentStepCa),
             rollback.docker(),
         );
-        reconcile_ca_json_dns_names(&secrets_dir, &stepca_dns_names, messages).await?;
+        reconcile_ca_json_managed_keys(&secrets_dir, &stepca_dns_names, messages).await?;
     }
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized
-        || stepca_dns_names_changed
+        || stepca_reload_required
     {
         // Restart step-ca after ca.json is patched with the DB DSN so it
         // loads the fully configured file on first boot.
         //
-        // The `dnsNames` arm covers the already-initialized CA: step-ca
-        // derives its serving leaf from `dnsNames` at boot and keeps it
-        // in memory, so a restart — not a re-run of `step ca init`,
-        // which would replace the root and intermediate keys — is what
-        // makes `infra install --stepca-bind` followed by `init` repair
-        // an installed system.  Gating on the change keeps a repeat
-        // `init` with the same recorded intent restart-free.
+        // The second arm covers the already-initialized CA: step-ca
+        // reads both `dnsNames` and `metricsAddress` at boot and keeps
+        // the results in memory — the serving leaf in the one case, the
+        // metrics listener's existence in the other — so a restart, not
+        // a re-run of `step ca init` (which would replace the root and
+        // intermediate keys), is what makes `infra install
+        // --stepca-bind` followed by `init` repair an installed system,
+        // and what gives an installation predating the metrics setting
+        // its listener.  Gating on the change keeps a repeat `init` on a
+        // settled document restart-free.
         let compose_str = args.compose.compose_file.to_string_lossy();
         let restart = identity.compose(&[&compose_str], None, &["restart", "step-ca"]);
         let _ = run_compose(&restart, "docker compose restart step-ca", messages);

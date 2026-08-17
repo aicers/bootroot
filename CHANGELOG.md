@@ -145,6 +145,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Prometheus can now scrape step-ca. The bundled monitoring stack has
+  always declared a `step-ca` scrape target, but step-ca serves metrics
+  only when its `ca.json` carries a top-level `metricsAddress`, nothing
+  wrote that key, and the pinned image accepts the address through no
+  command-line flag and no environment variable — so the declared target
+  was permanently down. `bootroot init` now writes the address the
+  existing scrape job already points at, `:9102`, into both
+  `secrets/config/ca.json` and the OpenBao Agent template that file is
+  re-rendered from, so the listener survives the sidecar's next render.
+  An existing installation gains the working target by running
+  `bootroot init` again: the setting is added in place, without
+  re-running `step ca init` and without replacing the root or
+  intermediate CA material. The metrics port remains exposed to the
+  Compose network only and is still not published to the host, so the
+  endpoint — which carries no authentication, step-ca offering none for
+  it — stays reachable to the services on that network and to nothing
+  else.
 - Fixed the files bootroot writes being published by truncating the
   destination and writing over it, so a crash or a concurrent reader
   could see a half-written file at a name that is supposed to hold a
