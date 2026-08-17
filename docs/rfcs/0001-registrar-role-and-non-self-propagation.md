@@ -976,8 +976,8 @@ no guarantee against it.
 `RegistrarBusy { retry_after }`, and the ADMISSION check point is the only one
 that throttles.** With the `admission` bucket empty the invocation is not
 attempted at all and returns **`RegistrarBusy { retry_after }`** (RFC-C §5) — a
-**retryable** error distinct from `RegistrarUnavailable`, whose four reasons
-all mean *permanent until an operator acts*. Without a distinct type it arrives
+**retryable** error distinct from `RegistrarUnavailable`, whose reasons all
+mean *permanent until an operator acts*. Without a distinct type it arrives
 as generic, review classifies generic as transient and retries (RFC-D2 §4b),
 and the retry storm feeds the limiter. With the `predecision_refusal` bucket
 empty the invocation is **limited but not throttled**: its two audit records
@@ -989,9 +989,10 @@ above is this document's own statement of it, setting `RegistrarBusy` against a
 `RegistrarUnavailable` whose every reason means *permanent until an operator
 acts*, and the per-identifier retryable/permanent split behind it is
 transcribed from RFC-C §5 and §8 into
-`docs/reference/registrar-wire-contract.md` (§7), which is where to check it
-identifier by identifier without leaving this repository. What the
-pre-derivation arm refuses is a
+`docs/reference/registrar-wire-contract.md`, whose §6.1 carries the class of
+every identifier so it can be checked one by one without leaving this
+repository, and whose §7 records "exactly one retryable identifier" as a
+property in its own right. What the pre-derivation arm refuses is a
 `service_name` or `host` that is not a DNS label, or a component with no
 multiplicity entry (the arm's own decision above): deterministic faults in the
 request or in the configuration, not conditions that clear on their own.
