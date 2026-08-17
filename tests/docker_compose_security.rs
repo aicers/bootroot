@@ -46,28 +46,139 @@ fn deploy_core_service_host_ports_are_interpolated_with_todays_defaults() {
     }
 }
 
+const METRICS_PORT: &str = "9102";
+
+fn line_indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// Returns the lines nested under `services.<service>.<key>`, or `None`
+/// when the service declares no such key. Compose is read structurally
+/// rather than by substring so a mapping can be judged by the section it
+/// sits in: the same `- "9102"` entry is the wanted exposure under
+/// `expose:` and a host publication under `ports:`.
+fn service_key_block<'a>(compose: &'a str, service: &str, key: &str) -> Option<Vec<&'a str>> {
+    let significant = |line: &&str| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#')
+    };
+    let mut lines = compose.lines().filter(significant).peekable();
+    let mut in_services = false;
+    let mut in_service = false;
+    while let Some(line) = lines.next() {
+        let indent = line_indent(line);
+        let trimmed = line.trim();
+        match indent {
+            0 => in_services = trimmed == "services:",
+            2 if in_services => in_service = trimmed == format!("{service}:"),
+            4 if in_service && trimmed == format!("{key}:") => {
+                let mut block = Vec::new();
+                while let Some(entry) = lines.peek() {
+                    if line_indent(entry) <= 4 {
+                        break;
+                    }
+                    block.push(entry.trim());
+                    lines.next();
+                }
+                return Some(block);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// step-ca's Prometheus metrics listener (issue #864). `bootroot init`
 /// writes `metricsAddress: ":9102"` into `ca.json`, which starts an
 /// unauthenticated, plaintext endpoint; the only boundary it has is the
 /// Compose network. The port is therefore `expose`d — so Prometheus can
-/// reach `step-ca:9102` — and must never appear in a `ports:` mapping,
-/// which would put internal telemetry on the host's network.
+/// reach `step-ca:9102` — and must never appear under `ports:`, which
+/// would put internal telemetry on the host's network.
 ///
-/// A publish is `- "9102:9102"` or `- "127.0.0.1:9102:9102"`; the
-/// expose is the bare `- "9102"`. Any other quoted list entry carrying
-/// the port is therefore a publish, whichever key it sits under.
+/// Every `ports:` syntax is rejected by looking for the port anywhere in
+/// the section: the short `- "9102:9102"` and `- "127.0.0.1:9102:9102"`,
+/// the short `- "9102"` that Compose publishes to an ephemeral host port
+/// on every interface, and the long `- target: 9102` mapping.
 fn assert_metrics_port_exposed_never_published(compose: &str, file_name: &str) {
+    let exposed = service_key_block(compose, "step-ca", "expose")
+        .unwrap_or_else(|| panic!("{file_name} must declare expose: on step-ca"));
     assert!(
-        compose.contains("    expose:\n      - \"9102\"\n"),
-        "{file_name} must expose 9102 on step-ca so Prometheus can scrape it"
+        exposed
+            .iter()
+            .any(|entry| entry.trim_start_matches("- ").trim_matches('"') == METRICS_PORT),
+        "{file_name} must expose {METRICS_PORT} on step-ca so Prometheus can scrape it, found: {exposed:?}"
     );
-    for line in compose.lines() {
-        let entry = line.trim();
+    let published = service_key_block(compose, "step-ca", "ports").unwrap_or_default();
+    for entry in published {
         assert!(
-            !(entry.starts_with("- \"") && entry.contains("9102") && entry != "- \"9102\""),
-            "{file_name} must not publish step-ca's metrics port to the host, found: {line}"
+            !entry.contains(METRICS_PORT),
+            "{file_name} must not publish step-ca's metrics port to the host, \
+             found under step-ca ports: {entry}"
         );
     }
+}
+
+/// The guard above judges a mapping by the section it sits in, so a
+/// reader that silently found the wrong section — or none — would let
+/// every publication pass. Pin it against a document that puts the port
+/// under a neighbouring service's `ports:` and under step-ca's `expose:`.
+const SECTION_FIXTURE: &str = concat!(
+    "services:\n",
+    "  openbao:\n",
+    "    ports:\n",
+    "      # a neighbour publishing 9102 says nothing about step-ca\n",
+    "      - \"127.0.0.1:9102:9102\"\n",
+    "\n",
+    "  step-ca:\n",
+    "    ports:\n",
+    "      - \"127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000\"\n",
+    "    expose:\n",
+    "      - \"9102\"\n",
+    "    volumes:\n",
+    "      - ./secrets:/home/step\n",
+    "volumes:\n",
+    "  openbao-data:\n",
+);
+
+#[test]
+fn service_key_block_reads_the_named_section_only() {
+    assert_eq!(
+        service_key_block(SECTION_FIXTURE, "step-ca", "ports"),
+        Some(vec!["- \"127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000\""])
+    );
+    assert_eq!(
+        service_key_block(SECTION_FIXTURE, "step-ca", "expose"),
+        Some(vec!["- \"9102\""])
+    );
+    assert_eq!(
+        service_key_block(SECTION_FIXTURE, "step-ca", "healthcheck"),
+        None
+    );
+    assert_metrics_port_exposed_never_published(SECTION_FIXTURE, "fixture");
+}
+
+/// Compose publishes a bare `- "9102"` under `ports:` to an ephemeral
+/// host port on every interface — the same entry the exposure needs.
+#[test]
+#[should_panic(expected = "must not publish step-ca's metrics port")]
+fn short_form_publication_of_the_metrics_port_is_rejected() {
+    let published = SECTION_FIXTURE.replace(
+        "    ports:\n      - \"127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000\"\n",
+        "    ports:\n      - \"9102\"\n",
+    );
+    assert_metrics_port_exposed_never_published(&published, "fixture");
+}
+
+/// The long syntax names the container port under `target:`, so nothing
+/// in the entry looks like a `host:container` mapping.
+#[test]
+#[should_panic(expected = "must not publish step-ca's metrics port")]
+fn long_form_publication_of_the_metrics_port_is_rejected() {
+    let published = SECTION_FIXTURE.replace(
+        "      - \"127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000\"\n",
+        "      - target: 9102\n        published: \"19102\"\n",
+    );
+    assert_metrics_port_exposed_never_published(&published, "fixture");
 }
 
 #[test]
