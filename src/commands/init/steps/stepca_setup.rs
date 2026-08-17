@@ -391,27 +391,33 @@ pub(super) fn resolve_stepca_ca_dns_names(
     ))
 }
 
-/// Sets the top-level `dnsNames` array on a parsed `ca.json`, returning
-/// whether the value actually changed.
+/// Sets one top-level key on a parsed `ca.json`, returning whether the
+/// value actually changed.
 ///
-/// Every other key — `db`, `authority.provisioners`, and anything
-/// step-ca or an operator added that bootroot does not model — is left
-/// untouched, so the caller can re-serialise the same document.
-fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) -> bool {
-    let desired = serde_json::Value::Array(
-        dns_names
-            .iter()
-            .map(|name| serde_json::Value::String(name.clone()))
-            .collect(),
-    );
-    if value.get(CA_JSON_DNS_NAMES_KEY) == Some(&desired) {
+/// Inserts into the parsed document rather than rebuilding it: every
+/// other key — `db`, `authority.provisioners`, and anything step-ca or
+/// an operator added that bootroot does not model — is left untouched,
+/// so the caller can re-serialise the same document, and the key ends up
+/// present exactly once whether or not it was there before.
+fn set_ca_json_key(value: &mut serde_json::Value, key: &str, desired: serde_json::Value) -> bool {
+    if value.get(key) == Some(&desired) {
         return false;
     }
     if let Some(object) = value.as_object_mut() {
-        object.insert(CA_JSON_DNS_NAMES_KEY.to_string(), desired);
+        object.insert(key.to_string(), desired);
         return true;
     }
     false
+}
+
+/// Sets the top-level `dnsNames` array on a parsed `ca.json`, returning
+/// whether the value actually changed.
+fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) -> bool {
+    let desired = dns_names
+        .iter()
+        .map(|name| serde_json::Value::String(name.clone()))
+        .collect();
+    set_ca_json_key(value, CA_JSON_DNS_NAMES_KEY, desired)
 }
 
 /// Sets the top-level `metricsAddress` on a parsed `ca.json` to
@@ -420,19 +426,9 @@ fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) ->
 ///
 /// Takes no argument for the same reason the constant is fixed: the
 /// scrape target is a compile-time constant on the Prometheus side.
-/// Like [`set_ca_json_dns_names`] it inserts into the parsed document,
-/// so every other key survives and the document ends up carrying
-/// exactly one `metricsAddress`.
 fn set_ca_json_metrics_address(value: &mut serde_json::Value) -> bool {
     let desired = serde_json::Value::String(STEPCA_METRICS_ADDRESS.to_string());
-    if value.get(CA_JSON_METRICS_ADDRESS_KEY) == Some(&desired) {
-        return false;
-    }
-    if let Some(object) = value.as_object_mut() {
-        object.insert(CA_JSON_METRICS_ADDRESS_KEY.to_string(), desired);
-        return true;
-    }
-    false
+    set_ca_json_key(value, CA_JSON_METRICS_ADDRESS_KEY, desired)
 }
 
 /// Outcome of `update_ca_json_with_backup`.
