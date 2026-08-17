@@ -40,8 +40,9 @@ itself; OpenBao Agent uses it to render the actual secret files.
 OpenBao Agent logs in via AppRole using the `role_id`/`secret_id` files
 under `secrets/openbao/stepca/` and `secrets/openbao/responder/` written by
 `bootroot init`. Services keep their AppRole files under
-`secrets/services/<service>/`; those are read directly by `bootroot-agent`,
-not by an OpenBao Agent. Keep directories `0700` and files `0600`.
+`secrets/services/<registration_id>/`; those are read directly by
+`bootroot-agent`, not by an OpenBao Agent. Keep directories `0700` and
+files `0600`.
 
 Ownership is split as follows:
 

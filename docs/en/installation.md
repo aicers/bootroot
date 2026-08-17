@@ -413,7 +413,7 @@ Recommended deployment policy:
   fast-poll loop is the secret-delivery mechanism.
 
 For the service `bootroot-agent` flow, `role_id`/`secret_id` (and, when
-EAB is configured, `eab.json`) live under `secrets/services/<service>/`.
+EAB is configured, `eab.json`) live under `secrets/services/<registration_id>/`.
 Keep the directory `0700` and the files `0600`.
 
 ## Full reset (dev/test)

@@ -40,7 +40,7 @@ OpenBao Agent가 이 설정을 사용해 실제 시크릿 파일을 생성합니
 OpenBao Agent는 `bootroot init`이 `secrets/openbao/stepca/`,
 `secrets/openbao/responder/`에 기록한 `role_id`/`secret_id` 파일을 사용해
 AppRole로 로그인합니다. 서비스의 AppRole 파일은
-`secrets/services/<service>/` 아래에 있으며, 이는 OpenBao Agent가 아니라
+`secrets/services/<registration_id>/` 아래에 있으며, 이는 OpenBao Agent가 아니라
 `bootroot-agent`가 직접 읽습니다. 디렉터리는 `0700`, 파일은 `0600` 권한을
 유지해야 합니다.
 

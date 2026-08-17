@@ -988,7 +988,7 @@ automation in the following structure.
 
 - Register service metadata in `state.json`
 - Create service-scoped OpenBao policy/AppRole and issue `role_id`/`secret_id`
-- Write `secrets/services/<service>/role_id` and `secret_id`
+- Write `secrets/services/<registration_id>/role_id` and `secret_id`
 - Print execution summary and operator snippets
 
 ### 2) Automation by `--delivery-mode`
@@ -1060,7 +1060,7 @@ automatically as part of onboarding.
 #### 4-1) Trust automation by delivery mode
 
 - `remote-bootstrap` mode: it writes service trust state into the per-service
-  remote bootstrap bundle (`secret/.../services/<service>/trust`), and
+  remote bootstrap bundle (`secret/.../services/<registration_id>/trust`), and
   `bootroot-remote bootstrap` applies the trust settings and CA bundle on the
   service machine before the first `bootroot-agent` run.
 - `local-file` mode: trust settings are auto-merged into `agent.toml`
@@ -1851,7 +1851,7 @@ daemon's config path) so it reissues on the next loop tick.
 For `--delivery-mode remote-bootstrap` services, the control plane has no
 push channel into the remote host, so cert files cannot be deleted
 remotely. Instead the command writes a versioned reissue request to
-`{kv_mount}/data/bootroot/services/<service>/reissue` in OpenBao with
+`{kv_mount}/data/bootroot/services/<registration_id>/reissue` in OpenBao with
 `requested_at` and `requester` fields. The remote bootroot-agent requires
 the `[openbao]` section in its `agent.toml` — `bootroot-remote bootstrap`
 auto-provisions it on every run — and polls this path on its

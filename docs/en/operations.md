@@ -749,11 +749,12 @@ model is one-shot bootstrap; a running agent is then self-sufficient:
    `bootroot-agent` run.
 2. Thereafter the running `bootroot-agent`'s fast-poll loop keeps itself
    current with no per-host operator action: it refreshes its own
-   `secret_id` from `bootroot/services/<service>/secret_id` (surviving past
-   `secret_id_ttl`) and re-renders the `agent.toml` `[trust]` pins +
-   `ca-bundle.pem` from `bootroot/services/<service>/trust` after a
-   `bootroot rotate approle-secret-id` or a CA/trust rotation on the control
-   node. `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
+   `secret_id` from `bootroot/services/<registration_id>/secret_id`
+   (surviving past `secret_id_ttl`) and re-renders the `agent.toml`
+   `[trust]` pins + `ca-bundle.pem` from
+   `bootroot/services/<registration_id>/trust` after a `bootroot rotate
+   approle-secret-id` or a CA/trust rotation on the control node.
+   `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
    bootstrap` are recovery paths only — needed when an agent was offline
    past its `secret_id_ttl` and its credential already expired, so it can no
    longer self-refresh.
@@ -802,13 +803,13 @@ fast-poll loop pulls the updated values from OpenBao KV within
 `fast_poll_interval`, with no per-service process restart or reload.
 
 For `remote-bootstrap` services, the rotated `secret_id` is written to
-the per-service KV path (`bootroot/services/<service>/secret_id`). A
+the per-service KV path (`bootroot/services/<registration_id>/secret_id`). A
 *running* remote `bootroot-agent` needs no operator action: its fast-poll
 loop reads that path with its still-valid credential, writes the rotated
 `secret_id` atomically to the agent's local file, and re-authenticates via
 AppRole on its next re-login — so the loop survives past `secret_id_ttl`
 without any manual step. The same loop reads
-`bootroot/services/<service>/trust` and re-renders the `agent.toml`
+`bootroot/services/<registration_id>/trust` and re-renders the `agent.toml`
 `[trust]` pins + `ca-bundle.pem`, so a CA/trust rotation propagates the
 same way.
 

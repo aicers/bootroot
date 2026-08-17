@@ -964,7 +964,7 @@ bootroot status
 
 - 서비스 메타데이터를 `state.json`에 등록
 - 서비스 전용 OpenBao 정책/AppRole 생성, `role_id`/`secret_id` 발급
-- `secrets/services/<service>/role_id`, `secret_id` 파일 생성
+- `secrets/services/<registration_id>/role_id`, `secret_id` 파일 생성
 - 결과 요약과 운영자용 스니펫 출력
 
 ### 2) 전달 모드(`--delivery-mode`)별 자동 반영
@@ -1032,7 +1032,7 @@ EAB 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히 무시�
 #### 4-1) 전달 모드별 trust 자동 처리
 
 - `remote-bootstrap` 방식: 서비스 trust 상태를 서비스별 원격 bootstrap
-  번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
+  번들(`secret/.../services/<registration_id>/trust`)에 자동 기록하고, 원격 서비스
   머신의 `bootroot-remote bootstrap`이 첫 `bootroot-agent` 실행 전에
   trust 설정과 CA 번들을 반영합니다.
 - `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
@@ -1781,7 +1781,7 @@ bootroot-agent 호스트 데몬에 SIGHUP(데몬 설정 경로에 대한
 
 `--delivery-mode remote-bootstrap` 서비스의 경우 제어 플레인에는 원격
 호스트로의 푸시 채널이 없어 cert 파일을 원격에서 삭제할 수 없습니다.
-대신 OpenBao의 `{kv_mount}/data/bootroot/services/<service>/reissue`
+대신 OpenBao의 `{kv_mount}/data/bootroot/services/<registration_id>/reissue`
 경로에 `requested_at` 및 `requester` 필드를 포함한 버전 관리된 재발급
 요청을 기록합니다. 원격 bootroot-agent에는 `agent.toml`의 `[openbao]`
 섹션이 **필수**이며(`bootroot-remote bootstrap`이 매 실행마다 자동으로

@@ -712,10 +712,10 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
    1회 실행해 첫 `bootroot-agent` 실행 전에 trust 설정과 CA 번들을 포함한
    초기 설정 번들을 반영합니다.
 2. 이후 실행 중인 `bootroot-agent`의 fast-poll 루프가 호스트별 운영자 조치
-   없이 스스로 최신 상태를 유지합니다: `bootroot/services/<service>/secret_id`
+   없이 스스로 최신 상태를 유지합니다: `bootroot/services/<registration_id>/secret_id`
    에서 자신의 `secret_id`를 갱신하고(`secret_id_ttl`을 넘겨서도 유지), control
    node에서 `bootroot rotate approle-secret-id`나 CA/trust 회전이 일어나면
-   `bootroot/services/<service>/trust`에서 `agent.toml`의 `[trust]` 핀과
+   `bootroot/services/<registration_id>/trust`에서 `agent.toml`의 `[trust]` 핀과
    `ca-bundle.pem`을 다시 렌더링합니다. `bootroot-remote apply-secret-id`와
    `bootroot-remote bootstrap` 재실행은 복구 경로일 뿐입니다 — 에이전트가
    `secret_id_ttl`을 넘겨 오프라인 상태였고 자격증명이 이미 만료되어 더 이상
@@ -762,12 +762,12 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
 리로드는 없습니다.
 
 `remote-bootstrap` 서비스의 경우, 회전된 `secret_id`는 서비스별 KV 경로
-(`bootroot/services/<service>/secret_id`)에 기록됩니다. *실행 중인* 원격
+(`bootroot/services/<registration_id>/secret_id`)에 기록됩니다. *실행 중인* 원격
 `bootroot-agent`는 운영자 조치가 필요 없습니다: fast-poll 루프가 아직 유효한
 자격증명으로 그 경로를 읽어 회전된 `secret_id`를 에이전트의 로컬 파일에
 원자적으로 기록하고, 다음 재로그인 시 AppRole로 재인증합니다 — 그래서 루프는
 수동 작업 없이 `secret_id_ttl`을 넘겨서도 유지됩니다. 같은 루프가
-`bootroot/services/<service>/trust`를 읽어 `agent.toml`의 `[trust]` 핀과
+`bootroot/services/<registration_id>/trust`를 읽어 `agent.toml`의 `[trust]` 핀과
 `ca-bundle.pem`을 다시 렌더링하므로 CA/trust 회전도 동일한 방식으로
 전파됩니다.
 

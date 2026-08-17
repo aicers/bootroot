@@ -70,16 +70,16 @@ wrapping is enabled (the default):
 
 | File | Source path (control node) | Purpose |
 | --- | --- | --- |
-| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | Machine-readable artifact containing a `wrap_token` that `bootroot-remote` unwraps to obtain `secret_id` (**sensitive**) |
-| `role_id` | `secrets/services/<service>/role_id` | AppRole identity (long-lived) |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json` | Machine-readable artifact containing a `wrap_token` that `bootroot-remote` unwraps to obtain `secret_id` (**sensitive**) |
+| `role_id` | `secrets/services/<registration_id>/role_id` | AppRole identity (long-lived) |
 
 **Without wrapping (`--no-wrap`):**
 
 | File | Source path (control node) | Purpose |
 | --- | --- | --- |
-| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | Machine-readable artifact consumed by `bootroot-remote bootstrap` |
-| `role_id` | `secrets/services/<service>/role_id` | AppRole identity (long-lived) |
-| `secret_id` | `secrets/services/<service>/secret_id` | AppRole credential (**sensitive**) |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json` | Machine-readable artifact consumed by `bootroot-remote bootstrap` |
+| `role_id` | `secrets/services/<registration_id>/role_id` | AppRole identity (long-lived) |
+| `secret_id` | `secrets/services/<registration_id>/secret_id` | AppRole credential (**sensitive**) |
 
 Response wrapping (the default) works with **every** delivery mechanism
 below — SSH, systemd-credentials, Ansible, and cloud-init all carry the
@@ -139,7 +139,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. Validate schema_version before running bootstrap
-SCHEMA_OK='.schema_version >= 1 and .schema_version <= 4'
+SCHEMA_OK='.schema_version >= 5 and .schema_version <= 5'
 if ! jq -e "$SCHEMA_OK" "$ARTIFACT" > /dev/null; then
   echo "ERROR: unsupported schema_version in $ARTIFACT" >&2
   exit 1
@@ -238,11 +238,11 @@ For larger fleets with existing configuration management.
     - name: Validate schema_version
       ansible.builtin.assert:
         that:
-          - artifact.schema_version >= 1
-          - artifact.schema_version <= 4
+          - artifact.schema_version >= 5
+          - artifact.schema_version <= 5
         fail_msg: >-
           Unsupported schema_version {{ artifact.schema_version }};
-          this playbook supports versions 1 through 4.
+          this playbook supports version 5 only.
 
     - name: Ensure secrets directory
       ansible.builtin.file:
@@ -378,7 +378,7 @@ The control plane has no push channel into the remote host, so
 `bootroot rotate force-reissue` cannot delete the remote's cert files
 directly. Instead, for `--delivery-mode remote-bootstrap` services, the
 command writes a versioned reissue request to OpenBao KV at
-`{kv_mount}/data/bootroot/services/<service>/reissue`:
+`{kv_mount}/data/bootroot/services/<registration_id>/reissue`:
 
 ```json
 {
@@ -506,7 +506,7 @@ Distinct services cannot share one config for two reasons:
   into the same config overwrites the first service's credential. The
   fast-poll loop logs in **once** with that one credential and then reads
   every enumerated service's KV with the resulting token. Because each
-  service's AppRole policy is scoped to `bootroot/services/<service>/*`,
+  service's AppRole policy is scoped to `bootroot/services/<registration_id>/*`,
   one service's token gets `403 permission denied` on another service's
   trust / secret_id / reissue KV paths.
 - Multiple `[[profiles]]` in one config are supported only for *instances
@@ -557,7 +557,7 @@ Treat it as a short-lived credential:
     This keeps wrap tokens out of command lines and `ps` output, and
     shortens the remote-transfer exposure window to seconds. Note that
     the control node still writes a raw `secret_id` to
-    `secrets/services/<service>/secret_id` for local operations —
+    `secrets/services/<registration_id>/secret_id` for local operations —
     protect and delete this file after delivery.
 - **Rotation**: after `bootroot rotate approle-secret-id` on the control
     node, a *running* remote `bootroot-agent` needs no operator action —
@@ -667,17 +667,22 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 ## `RemoteBootstrapArtifact` schema reference
 
 The JSON artifact written to
-`secrets/remote-bootstrap/services/<service>/bootstrap.json` follows a
-versioned schema. Automation should check `schema_version` before parsing.
+`secrets/remote-bootstrap/services/<registration_id>/bootstrap.json`
+follows a versioned schema. Automation should check `schema_version`
+before parsing.
 
-Current version: **4**
+Current version: **5**. `bootroot-remote` accepts version 5 only — an
+artifact written before the `registration_id` split carries no
+registration key, and there is no compatibility shim that would invent
+one. Re-run `bootroot service add` to re-emit the artifact.
 
 | Field | Type | Description | Consumed by |
 | --- | --- | --- | --- |
 | `schema_version` | `u32` | Schema version number. Bumped on breaking changes. | Parser pre-check |
 | `openbao_url` | `string` | OpenBao API URL | `--openbao-url` |
 | `kv_mount` | `string` | OpenBao KV v2 mount path | `--kv-mount` |
-| `service_name` | `string` | Registered service name | `--service-name` |
+| `registration_id` | `string` | Deployment-wide unique registration key. Names the KV subtree, the managed `agent.toml` block, the fast-poll state filename and the default cert/key filenames. Never part of the certificate SAN. | `--registration-id` |
+| `service_name` | `string` | Second label of the certificate SAN | `--service-name` |
 | `role_id_path` | `string` | Path to AppRole `role_id` file on the remote host | `--role-id-path` |
 | `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host | `--secret-id-path` |
 | `eab_file_path` | `string` | Path to EAB credentials JSON file. Bootroot writes this file only when the operator has provisioned EAB credentials in OpenBao KV. When the KV entry is absent, bootroot removes any stale `eab.json` left by a prior bootstrap so `bootroot-agent --eab-file` cannot forward obsolete credentials: the eab apply step reports `applied` when a stale file was removed and `skipped` when no file existed to begin with. | `--eab-file-path` |
@@ -701,6 +706,7 @@ Current version: **4**
 
 | Version | Change |
 | --- | --- |
+| 5 | Added required `registration_id` field, splitting the registry key out of `service_name`. Every namespace the remote agent derives comes from the new key; `service_name` is the SAN label only. |
 | 4 | Removed the `openbao_agent_config_path` / `openbao_agent_template_path` / `openbao_agent_token_path` fields. The remote `bootroot-agent` now self-authenticates and renders trust via its fast-poll loop, so the OpenBao Agent sidecar artifacts are no longer generated. |
 | 3 | Added optional `cert_group_gid` field. |
 | 2 | Added required `ca_bundle_pem` field (inline PEM of the control-plane CA anchor). |
@@ -712,7 +718,9 @@ Current version: **4**
     `schema_version`.
 - **Additive change** (new optional field with `skip_serializing_if`):
     no bump required. Existing parsers ignore unknown keys.
-- **Consumer contract**: check `schema_version >= 1` and
+- **Consumer contract**: check `schema_version >= <min supported>` and
     `schema_version <= <max supported>` before accessing fields. Fail
     explicitly on unsupported versions. `bootroot-remote` enforces this
-    check automatically when using `--artifact`.
+    check automatically when using `--artifact`; both bounds are 5
+    today, because the product ships no compatibility shim and a
+    pre-split artifact carries no `registration_id` to fall back on.
