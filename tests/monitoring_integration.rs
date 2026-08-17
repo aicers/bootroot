@@ -298,25 +298,23 @@ mod unix_integration {
 
     /// Waits until Prometheus reports the `openbao` scrape target healthy.
     ///
-    /// The `step-ca` job is deliberately not asserted. Nothing in this
-    /// repository configures step-ca to serve metrics, so `step-ca:9102`
-    /// — the target `monitoring/prometheus.yml` scrapes — has never had a
-    /// listener, here or in production: step-ca serves metrics only when
-    /// its `ca.json` carries a top-level `metricsAddress`, no code writes
-    /// that key, `step ca init` does not emit it, the patcher in
-    /// `src/commands/init/steps/stepca_setup.rs` touches only `dnsNames`,
-    /// `db` and the ACME provisioner, and the pinned binary accepts the
-    /// address through no flag or environment variable, so compose cannot
-    /// supply it either.
+    /// The `step-ca` job is deliberately not asserted, and that is a
+    /// property of this test's starting point rather than a gap in the
+    /// product. step-ca serves metrics only when its `ca.json` carries a
+    /// top-level `metricsAddress`, and the pinned binary accepts the
+    /// address through no flag and no environment variable, so compose
+    /// cannot supply it. `bootroot init` writes the key — the address
+    /// `monitoring/prometheus.yml` scrapes, `:9102` — into both
+    /// `secrets/config/ca.json` and the `OpenBao` Agent template it is
+    /// re-rendered from, so a production install has the listener from
+    /// its first `init` onwards (issue #864).
     ///
-    /// That is a defect in the monitoring stack rather than in this test,
-    /// and closing it means writing `metricsAddress` from `init` — a
-    /// production change #825 does not authorise, and one this test could
-    /// not benefit from anyway, since the same issue requires it to run
-    /// before any `init`. #825 reserves the call for a human, and the
-    /// reduction to `openbao` alone is that call, taken under its
-    /// escalation clause: the gap is tracked outside this test. Until it
-    /// is closed, step-ca has no runtime monitoring coverage.
+    /// This test deliberately runs before any `init` (it needs the host
+    /// ports free), so the step-ca it brings up is configured by nothing
+    /// and has no metrics listener to scrape. Asserting the job here
+    /// would therefore be asserting something `init` has not yet had the
+    /// chance to configure; the step-ca metrics path is covered where a
+    /// CA actually exists, by `scripts/impl/run-stepca-san.sh`.
     async fn wait_for_prometheus_targets(project: &str, compose_file: &Path) -> Result<()> {
         wait_for(Duration::from_secs(90), || {
             let mut command = docker_compose_command(project, compose_file);

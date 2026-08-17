@@ -20,6 +20,13 @@ mod unix_integration {
     /// additionally re-checks the name set after a full `OpenBao` Agent
     /// render interval, because the step-ca sidecar re-renders `ca.json`
     /// from its template and would otherwise silently regress it.
+    ///
+    /// Also covers #864, which rides on the same co-ownership: `init`
+    /// writes the top-level `metricsAddress` step-ca needs before it
+    /// will serve `/metrics` at all, and the script asserts both that
+    /// the value survives a real sidecar render and that the endpoint
+    /// answers from inside the Compose network — where the port is
+    /// reachable — rather than from the host, where it is not published.
     #[test]
     #[ignore = "Requires local Docker and a non-loopback bind host for step-ca SAN validation"]
     fn docker_stepca_san_bind_and_repair() -> Result<()> {
@@ -79,6 +86,21 @@ mod unix_integration {
             assert!(
                 san.contains("IP Address:"),
                 "{label} step-ca certificate carries no IP SAN: {san}"
+            );
+        }
+
+        // The metrics dumps are the #864 artefact, and asserting them
+        // here is what stops a script that skipped the scrape from
+        // passing: the endpoint is fetched from inside the Compose
+        // network, so nothing on the host can produce this file.
+        for label in ["scenario-a", "scenario-b"] {
+            let metrics = artifact_dir.join(format!("stepca-metrics-{label}.txt"));
+            assert!(metrics.exists(), "missing step-ca metrics dump for {label}");
+            let body = std::fs::read_to_string(&metrics)
+                .with_context(|| format!("Failed to read step-ca metrics for {label}"))?;
+            assert!(
+                body.lines().any(|line| line.starts_with("# HELP ")),
+                "{label} step-ca /metrics returned no Prometheus exposition data: {body}"
             );
         }
 

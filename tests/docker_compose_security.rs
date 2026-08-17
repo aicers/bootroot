@@ -46,6 +46,44 @@ fn deploy_core_service_host_ports_are_interpolated_with_todays_defaults() {
     }
 }
 
+/// step-ca's Prometheus metrics listener (issue #864). `bootroot init`
+/// writes `metricsAddress: ":9102"` into `ca.json`, which starts an
+/// unauthenticated, plaintext endpoint; the only boundary it has is the
+/// Compose network. The port is therefore `expose`d — so Prometheus can
+/// reach `step-ca:9102` — and must never appear in a `ports:` mapping,
+/// which would put internal telemetry on the host's network.
+///
+/// A publish is `- "9102:9102"` or `- "127.0.0.1:9102:9102"`; the
+/// expose is the bare `- "9102"`. Any other quoted list entry carrying
+/// the port is therefore a publish, whichever key it sits under.
+fn assert_metrics_port_exposed_never_published(compose: &str, file_name: &str) {
+    assert!(
+        compose.contains("    expose:\n      - \"9102\"\n"),
+        "{file_name} must expose 9102 on step-ca so Prometheus can scrape it"
+    );
+    for line in compose.lines() {
+        let entry = line.trim();
+        assert!(
+            !(entry.starts_with("- \"") && entry.contains("9102") && entry != "- \"9102\""),
+            "{file_name} must not publish step-ca's metrics port to the host, found: {line}"
+        );
+    }
+}
+
+#[test]
+fn stepca_metrics_port_is_exposed_but_never_published() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.yml");
+    assert_metrics_port_exposed_never_published(&compose, "docker-compose.yml");
+}
+
+#[test]
+fn deploy_stepca_metrics_port_is_exposed_but_never_published() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.deploy.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.deploy.yml");
+    assert_metrics_port_exposed_never_published(&compose, "docker-compose.deploy.yml");
+}
+
 #[test]
 fn postgres_volume_uses_postgresql_root_for_postgres_18() {
     let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");

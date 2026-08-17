@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Docker-backed E2E harness for step-ca's certificate SANs (#733).
+# Docker-backed E2E harness for step-ca's certificate SANs (#733) and,
+# alongside them, its metrics listener (#864) — both are top-level keys
+# in the `ca.json` bootroot co-owns with the step-ca OpenBao Agent
+# sidecar, and both are read by step-ca at boot only, so both fail the
+# same way if the template and the sidecar are not carried along.
 #
 # `step ca init` used to be invoked with a compile-time `--dns`
 # constant, so step-ca's own serving certificate carried no SAN for the
@@ -227,7 +231,7 @@ capture_artifacts() {
   compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
   compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   if [ -f "$SECRETS_DIR/config/ca.json" ]; then
-    jq -c '.dnsNames' "$SECRETS_DIR/config/ca.json" \
+    jq -c '{dnsNames, metricsAddress}' "$SECRETS_DIR/config/ca.json" \
       >"$ARTIFACT_DIR/ca-json-dns-names.log" 2>&1 || true
   fi
 }
@@ -402,6 +406,65 @@ assert_ca_json_dns_names() {
   done
 }
 
+# Asserts `ca.json` carries the fixed metrics address, and that the
+# template it is re-rendered from carries it too.
+#
+# `metricsAddress` is what starts step-ca's Prometheus listener at all:
+# the pinned binary takes the address through no flag and no environment
+# variable, so the file is the only place it can come from, and a
+# template missing it hands the next agent render a `ca.json` that
+# silently turns the listener off again (issue #864).  Retries for the
+# same reason `assert_ca_json_dns_names` does — a render can land
+# between `init` returning and this read.
+assert_ca_json_metrics_address() {
+  local label="$1"
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  local expected='":9102"'
+  local actual=""
+  local attempt
+  for attempt in $(seq 1 "$CA_JSON_ATTEMPTS"); do
+    if [ -f "$ca_json" ]; then
+      actual="$(jq -c '.metricsAddress' "$ca_json" 2>/dev/null || true)"
+      [ "$expected" = "$actual" ] && break
+    fi
+    sleep "$CA_JSON_DELAY_SECS"
+  done
+  [ -f "$ca_json" ] || fail "[$label] missing $ca_json"
+  if [ "$expected" != "$actual" ]; then
+    fail "[$label] ca.json metricsAddress mismatch: expected $expected got $actual"
+  fi
+  local ctmpl="$SECRETS_DIR/templates/ca.json.ctmpl"
+  [ -f "$ctmpl" ] || fail "[$label] missing $ctmpl"
+  grep -q '"metricsAddress": ":9102"' "$ctmpl" \
+    || fail "[$label] ca.json.ctmpl does not carry metricsAddress \":9102\""
+}
+
+# Asserts step-ca actually serves Prometheus exposition data on 9102,
+# fetched from *inside* the compose network.
+#
+# The fetch runs in the OpenBao container rather than on the host on
+# purpose: 9102 is `expose`d and deliberately not published, so a probe
+# that succeeded from the host would mean the network boundary this
+# endpoint's only protection rests on had been widened.  OpenBao's image
+# is the same busybox-carrying Alpine the monitoring integration test
+# already fetches through, and `step-ca` is the compose service name
+# Prometheus itself scrapes by.
+assert_stepca_metrics_endpoint() {
+  local label="$1"
+  local out="$ARTIFACT_DIR/stepca-metrics-${label}.txt"
+  local attempt
+  for attempt in $(seq 1 "$STEPCA_READY_ATTEMPTS"); do
+    if compose exec -T openbao wget -qO- "http://step-ca:9102/metrics" \
+        >"$out" 2>>"$RUN_LOG"; then
+      if grep -q '^# HELP ' "$out"; then
+        return 0
+      fi
+    fi
+    sleep "$STEPCA_READY_DELAY_SECS"
+  done
+  fail "[$label] step-ca served no Prometheus metrics at http://step-ca:9102/metrics from inside the compose network (see $out)"
+}
+
 # Re-checks the name set after a full agent render interval has elapsed.
 #
 # This is the assertion that actually proves the repair sticks: the
@@ -415,6 +478,11 @@ assert_ca_json_dns_names_stable() {
   shift
   sleep "$STEPCA_RENDER_STABILITY_SECS"
   assert_ca_json_dns_names "$label" "$@"
+  # The metrics address is co-owned with the same sidecar and has the
+  # same failure mode: an `init` that wrote it without regenerating the
+  # template and restarting the sidecar would look correct until the
+  # next render took the listener away again (issue #864).
+  assert_ca_json_metrics_address "$label"
 }
 
 snapshot_ca_fingerprints() {
@@ -561,6 +629,10 @@ scenario_a_fresh_install_with_bind() {
   # with the bind IP in `dnsNames` — no reconciliation was needed.
   assert_ca_json_dns_names "scenario-a" \
     "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+  # A fresh `init` configures the metrics listener too: `step ca init`
+  # emits no `metricsAddress`, so this is the reconciliation's work.
+  assert_ca_json_metrics_address "scenario-a"
+  assert_stepca_metrics_endpoint "scenario-a"
   assert_stepca_ip_san "scenario-a"
   build_ca_bundle "$ARTIFACT_DIR/ca-bundle-a.pem"
   assert_acme_directory_reachable "scenario-a" "$ARTIFACT_DIR/ca-bundle-a.pem"
@@ -609,6 +681,8 @@ scenario_b_repair_initialized_ca() {
   assert_ca_fingerprints_unchanged "scenario-b"
   assert_ca_json_dns_names "scenario-b-repaired" \
     "localhost" "bootroot-ca" "stepca.internal" "$STEPCA_BIND_HOST"
+  assert_ca_json_metrics_address "scenario-b-repaired"
+  assert_stepca_metrics_endpoint "scenario-b"
   assert_stepca_ip_san "scenario-b"
   # The bundle captured before the repair — what an already-provisioned
   # consumer holds — still validates the chain step-ca presents.
