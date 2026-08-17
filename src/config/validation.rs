@@ -261,12 +261,17 @@ fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
              (letters, digits, hyphens only; max 63 octets)"
         ),
     })?;
-    if profile.hostname.trim().is_empty() {
-        anyhow::bail!("profiles.hostname must not be empty");
-    }
-    if !profile.hostname.is_ascii() {
-        anyhow::bail!("profiles.hostname must be ASCII");
-    }
+    // `hostname` is the SAN's third label, and every writer of a
+    // `[[profiles]]` block already validates it as one. Only a
+    // hand-edited config can reach here with a dotted or over-long
+    // value, and it is rejected for the same reason `service_name` is.
+    validate_dns_label(&profile.hostname).map_err(|err| match err {
+        ValidationError::Empty => anyhow::anyhow!("profiles.hostname must not be empty"),
+        _ => anyhow::anyhow!(
+            "profiles.hostname must be a DNS label \
+             (letters, digits, hyphens only; max 63 octets)"
+        ),
+    })?;
     if profile.instance_id.trim().is_empty() {
         anyhow::bail!("profiles.instance_id must not be empty");
     }

@@ -44,9 +44,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   key. `bootroot-agent` derives its fast-poll KV paths and its
   per-profile state filename from it, and groups profiles by it when a
   force-reissue request fans out. Config validation also holds
-  `profiles.service_name` to the DNS-label rule now, so an over-long or
-  non-label SAN component is rejected at config load rather than at CSR
-  time.
+  `profiles.service_name` and `profiles.hostname` to the DNS-label rule
+  now, so an over-long or non-label SAN component is rejected at config
+  load rather than at CSR time.
 - The remote bootstrap artifact is at `schema_version` 5 and carries
   `registration_id`. `bootroot-remote` accepts version 5 only.
 

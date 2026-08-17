@@ -377,6 +377,11 @@ to the HTTP-01 responder IP. In Compose environments, `bootroot service add`
 registers the alias on the `bootroot-http01` container automatically; for host
 installs, update `/etc/hosts` or DNS.
 
+`service_name` and `hostname` are each a single DNS label — letters,
+digits and hyphens, at most 63 octets. Config load rejects a profile that
+breaks either rule, so an unusable SAN component is caught there rather
+than surfacing later as a rejected ACME order.
+
 #### Profile Retry Override
 
 ```toml

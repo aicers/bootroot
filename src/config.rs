@@ -1090,6 +1090,31 @@ mod tests {
         assert!(err.to_string().contains("profiles.service_name"), "{err}");
     }
 
+    /// `hostname` is the SAN's third label, held to the same DNS-label
+    /// rule as `service_name` so a dotted or over-long value fails at
+    /// config load rather than at CSR time.
+    #[test]
+    fn validate_rejects_non_dns_label_hostname() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hostname = "a".repeat(64);
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.hostname"), "{err}");
+
+        settings.profiles[0].hostname = "edge.proxy".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.hostname"), "{err}");
+
+        settings.profiles[0].hostname = String::new();
+        let err = settings.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("profiles.hostname must not be empty"),
+            "{err}"
+        );
+    }
+
     /// The SAN keeps reading `service_name`: a `registration_id` that
     /// differs from it must not leak into any name the certificate
     /// carries.
