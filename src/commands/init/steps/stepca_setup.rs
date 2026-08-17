@@ -1407,6 +1407,27 @@ mod tests {
         );
     }
 
+    /// The two halves of the scrape live in different files and different
+    /// languages: `STEPCA_METRICS_ADDRESS` decides where step-ca listens,
+    /// `monitoring/prometheus.yml` decides where Prometheus knocks.  A
+    /// port changed on one side alone leaves the endpoint serving and the
+    /// declared target down, and every other test here would still pass —
+    /// only the Docker-gated E2E would notice, and only when it is run.
+    #[test]
+    fn metrics_address_port_matches_the_declared_scrape_target() {
+        let port = STEPCA_METRICS_ADDRESS
+            .strip_prefix(':')
+            .expect("the metrics address binds every in-container interface, so it is :<port>");
+        let scrape_config = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("monitoring/prometheus.yml"),
+        )
+        .expect("read monitoring/prometheus.yml");
+        assert!(
+            scrape_config.contains(&format!("[\"step-ca:{port}\"]")),
+            "monitoring/prometheus.yml must scrape step-ca:{port}: {scrape_config}"
+        );
+    }
+
     /// The snapshot feeding the init rollback must capture the template
     /// as it stood *before* `write_stepca_templates` regenerates it, and
     /// must report "no template" rather than failing on a fresh install.
