@@ -234,7 +234,16 @@ jobs:
         run: echo "BOOTROOT_SECRETS_DIR=$GITHUB_WORKSPACE/secrets" >> "$GITHUB_ENV"
 
       - name: Monitoring Integration Test (E2E)
-        run: cargo test --test monitoring_integration
+        # `--include-ignored` because `monitoring_stack_is_ready` — the one
+        # test this target holds — is `#[ignore]`, and without it this step
+        # runs zero tests and reports success. The attribute stays: it is
+        # what keeps the Docker stack this test brings up out of the plain
+        # `cargo test` above. Keep the target down to that one test, so this
+        # step's summary reports `1 passed` as #825 requires; a helper test
+        # needing no Docker belongs in the plain run above instead. The step
+        # also stays ahead of `Install Infrastructure`, because the test
+        # needs the host ports that stack would occupy.
+        run: cargo test --test monitoring_integration -- --include-ignored
 
       - name: Build all binaries
         run: cargo build --bins
@@ -389,6 +398,21 @@ jobs:
 
       - name: Cleanup
         if: always()
+        # `down` interpolates the whole compose file, and
+        # docker-compose.yml declares POSTGRES_PASSWORD and
+        # GRAFANA_ADMIN_PASSWORD in the fail-if-unset form. They reach
+        # this step through the `.env` that `Install Infrastructure`
+        # writes, so a job that fails ahead of that step has none and
+        # this teardown dies on the guard having removed nothing. That
+        # became reachable when the monitoring test above started
+        # running: it is the first step in this job that can fail, and
+        # it is the one that brings a stack up. The values are
+        # placeholders, and overriding a real `.env` with them is
+        # harmless: `down` matches containers by project label and reads
+        # neither value.
+        env:
+          POSTGRES_PASSWORD: teardown
+          GRAFANA_ADMIN_PASSWORD: teardown
         run: >-
           docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}"
           -f docker-compose.yml -f docker-compose.test.yml down

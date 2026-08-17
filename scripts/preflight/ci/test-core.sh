@@ -14,7 +14,30 @@ cleanup() {
   # files above, so a plain `down` treats them as orphans and leaves them
   # running.  `-v` is deliberately not passed: the named volumes are not
   # what this teardown is failing to reach.
-  docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>/dev/null || true
+  #
+  # The two variables for the same reason the `Cleanup` step in
+  # .github/workflows/ci.yml carries them: `down` interpolates the whole
+  # compose file, docker-compose.yml declares both in the fail-if-unset
+  # form, and they only arrive with the `.env` that `infra install`
+  # writes further down.  A run that stops before that -- the monitoring
+  # test above is the first that can -- would otherwise have this
+  # teardown die on the guard and remove nothing, silently, because of
+  # the `2>/dev/null || true` this used to end in.  They are
+  # placeholders; `down` reads neither.
+  #
+  # Say so when the teardown fails, for the same reason `ComposeGuard` in
+  # tests/monitoring_integration.rs does: what it leaves behind holds the
+  # host ports the monitoring test needs, so the next run of this script
+  # dies on a port conflict with nothing recording why.  Reported rather
+  # than propagated -- this is an EXIT trap, and it must not overwrite
+  # the status of whatever actually ended the run.
+  local teardown
+  if ! teardown="$(POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-teardown}" \
+    GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-teardown}" \
+    docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" "${COMPOSE_FILES[@]}" down --remove-orphans 2>&1)"; then
+    echo "[test-core] WARNING: compose teardown failed; containers may still be running"
+    echo "$teardown"
+  fi
 }
 trap cleanup EXIT
 
@@ -41,8 +64,16 @@ echo "[test-core] running unit tests"
 cargo test
 
 # --- Monitoring Integration Test ---
+# `--include-ignored` because `monitoring_stack_is_ready` -- the one test
+# this target holds -- is `#[ignore]`; without it this runs zero tests and
+# reports success.  Keep the target down to that one test, so the run
+# reports `1 passed` as #825 requires; a helper test needing no Docker
+# belongs in the plain `cargo test` above instead.  Keep the arguments
+# identical to the `Monitoring Integration Test (E2E)` step in
+# .github/workflows/ci.yml, and keep this ahead of the install below:
+# the test needs 8200, 9000, 8080, 3000 and 5433 free on the host.
 echo "[test-core] monitoring integration test"
-cargo test --test monitoring_integration
+cargo test --test monitoring_integration -- --include-ignored
 
 # --- Install Infrastructure ---
 echo "[test-core] installing infrastructure"
