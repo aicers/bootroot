@@ -985,13 +985,13 @@ empty the invocation is **limited but not throttled**: its two audit records
 are suppressed and it is still given its real, permanent refusal.
 
 **The ground for that split is type-level, not ergonomic.** `RegistrarBusy` is
-the enroll error family's **only** retryable member: the sentence immediately
-above is this document's own statement of it, setting `RegistrarBusy` against a
-`RegistrarUnavailable` whose every reason means *permanent until an operator
-acts*, and the per-identifier retryable/permanent split behind it is
-transcribed from RFC-C §5 and §8 into
-`docs/reference/registrar-wire-contract.md`, whose §6.1 carries the class of
-every identifier so it can be checked one by one without leaving this
+the enroll error family's **only** retryable member. The sentence immediately
+above carries the half this document states itself, setting `RegistrarBusy`
+against a `RegistrarUnavailable` whose every reason means *permanent until an
+operator acts*; that it holds across the whole family rests on the
+per-identifier retryable/permanent split transcribed from RFC-C §5 and §8
+into `docs/reference/registrar-wire-contract.md`, whose §6.1 carries the class
+of every identifier so it can be checked one by one without leaving this
 repository, and whose §7 records the same split as a property in its own
 right — its `retryable identifiers` row reads "Exactly one: `RegistrarBusy`".
 What the pre-derivation arm refuses is a `service_name` or `host` that is not
