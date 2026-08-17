@@ -53,10 +53,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 There is no migration and no compatibility fallback: a `state.json`
 entry, an `agent.toml` profile or a bootstrap artifact without a
 `registration_id` fails to load rather than defaulting to
-`service_name`. Re-create existing registrations by re-installing them —
-`bootroot service remove --registration-id <old-name>` followed by
-`bootroot service add --registration-id <key> --service-name <label> …`,
-then re-run `bootroot-remote bootstrap` on each remote service host.
+`service_name`. That applies to `bootroot` itself: every command reads
+the whole `state.json`, so a file written before the split does not load
+and neither `service remove` nor `reinit` can be used to tear the old
+registrations down. Start from a clean control node instead — take the
+existing `state.json` out of the way, run `bootroot init`, then
+`bootroot service add --registration-id <key> --service-name <label> …`
+per registration and re-run `bootroot-remote bootstrap` on each remote
+service host. For a component installed once per deployment, reusing its
+old `service_name` as the key reproduces every previous path and name
+byte for byte.
 
 ## [0.3.0] - 2026-08-17
 

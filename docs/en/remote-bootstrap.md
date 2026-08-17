@@ -318,7 +318,7 @@ runcmd:
   - >-
     /usr/local/bin/bootroot-remote bootstrap
     --openbao-url https://openbao.internal:8200
-    --registration-id edge-remote \
+    --registration-id edge-remote
     --service-name edge-remote
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id
     --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id

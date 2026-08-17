@@ -1452,6 +1452,91 @@ async fn test_app_add_rejects_invalid_identifier_args() {
     assert!(stderr.contains("service_name must be a DNS label"));
 }
 
+/// An invalid `--registration-id` supplied as a flag is rejected before
+/// anything is registered, and the rejection is localized: an operator
+/// running under `ko` gets the Korean message, not an English fallback.
+/// The values cover each way the path-safe rule can be broken — charset,
+/// shape, and the 131-octet bound — so a validator that checked only one
+/// of them would fail here.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rejects_invalid_registration_id_in_both_locales() {
+    let over_limit = "a".repeat(132);
+    let invalid = [
+        "H1-Piglet",         // uppercase
+        "h1_piglet",         // underscore
+        "-h1-piglet",        // leading hyphen
+        "h1/piglet",         // path separator
+        "..",                // traversal
+        over_limit.as_str(), // one octet past the structural maximum
+    ];
+    // Substrings of the localized messages, chosen to be stable under
+    // rewording of the surrounding sentence.
+    let expected = [
+        ("en", "registration_id must be lowercase"),
+        ("ko", "registration_id는"),
+    ];
+
+    for (lang, needle) in expected {
+        for value in invalid {
+            let temp_dir = tempdir().expect("create temp dir");
+            let agent_config = temp_dir.path().join("agent.toml");
+            let cert_dir = temp_dir.path().join("certs");
+            fs::create_dir_all(&cert_dir).expect("create cert dir");
+            let cert_path = cert_dir.join("edge-proxy.crt");
+            let key_path = cert_dir.join("edge-proxy.key");
+
+            write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+            // `--flag=value`, not `--flag value`: a leading-hyphen value
+            // is otherwise parsed as another flag and never reaches the
+            // validator this asserts on.
+            let registration_id_arg = format!("--registration-id={value}");
+
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+                .current_dir(temp_dir.path())
+                // `--lang` rather than the environment: the process
+                // environment stays untouched, so this cannot race a
+                // concurrently running test.
+                .args([
+                    "--lang",
+                    lang,
+                    "service",
+                    "add",
+                    "--print-only",
+                    registration_id_arg.as_str(),
+                    "--service-name",
+                    "piglet",
+                    "--hostname",
+                    "h1",
+                    "--domain",
+                    "trusted.domain",
+                    "--agent-config",
+                    agent_config.to_string_lossy().as_ref(),
+                    "--cert-path",
+                    cert_path.to_string_lossy().as_ref(),
+                    "--key-path",
+                    key_path.to_string_lossy().as_ref(),
+                    "--instance-id",
+                    "001",
+                ])
+                .output()
+                .expect("run service add");
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{lang}: {value:?} must be rejected"
+            );
+            assert!(
+                stderr.contains(needle),
+                "{lang}: {value:?} must be rejected with the localized \
+                 registration_id message, got: {stderr}"
+            );
+        }
+    }
+}
+
 /// Issue #691: the containerized-consumer story is the consumer-reload
 /// hook, not a per-service agent sidecar. `service add` must keep
 /// accepting `--reload-style docker-restart --reload-target <container>`

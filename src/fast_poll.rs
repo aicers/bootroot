@@ -406,6 +406,29 @@ pub(crate) fn eab_kv_path(registration_id: &str) -> String {
     format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_EAB_KV_SUFFIX}")
 }
 
+/// Groups the configured profiles by `registration_id`, mapping each key
+/// to the SAN of every profile that shares it.
+///
+/// The fast-poll loop reads KV once per registration and fans the result
+/// out across that registration's profiles: the control plane publishes
+/// one request per registration, not per profile, and the registration —
+/// not the `service_name` — is what names the KV subtree. Two profiles
+/// that share a `service_name` but not a key are therefore two poll
+/// targets, not one group of two.
+#[must_use]
+pub(crate) fn group_profiles_by_registration(
+    settings: &config::Settings,
+) -> Vec<(String, Vec<String>)> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for profile in &settings.profiles {
+        grouped
+            .entry(profile.registration_id.clone())
+            .or_default()
+            .push(config::profile_domain(settings, profile));
+    }
+    grouped.into_iter().collect()
+}
+
 /// Reports whether an observed KV version is newer than the last one the
 /// agent acted on. Unlike the reissue path, the `trust` and `secret_id`
 /// paths are only ever written by the control plane (the agent never
@@ -1405,20 +1428,7 @@ pub(crate) async fn run_fast_poll_loop(
         return Ok(());
     }
 
-    // Group profiles by `registration_id` so that a single reissue
-    // request fans out to every profile sharing that registration. The
-    // rotate command publishes one KV request per registration, not per
-    // profile, and the registration — not the `service_name` — is what
-    // names the KV subtree.
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for profile in &settings.profiles {
-        let label = config::profile_domain(&settings, profile);
-        grouped
-            .entry(profile.registration_id.clone())
-            .or_default()
-            .push(label);
-    }
-    let services: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
+    let services = group_profiles_by_registration(&settings);
 
     info!(
         "Fast-poll enabled: interval={:?}, services={}, profiles={}",
@@ -2860,22 +2870,46 @@ mod tests {
         second.instance_id = "002".to_string();
         settings.profiles.push(second);
 
-        let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for profile in &settings.profiles {
-            grouped
-                .entry(profile.registration_id.clone())
-                .or_default()
-                .push(config::profile_domain(&settings, profile));
-        }
+        let grouped = group_profiles_by_registration(&settings);
 
-        assert_eq!(grouped.len(), 2, "two registrations, two poll targets");
         assert_eq!(
-            grouped["h1-piglet-001"],
-            vec!["001.piglet.node-01.example.internal"]
+            grouped,
+            vec![
+                (
+                    "h1-piglet-001".to_string(),
+                    vec!["001.piglet.node-01.example.internal".to_string()]
+                ),
+                (
+                    "h1-piglet-002".to_string(),
+                    vec!["002.piglet.node-01.example.internal".to_string()]
+                ),
+            ],
+            "two registrations sharing a service_name are two poll targets"
         );
+    }
+
+    /// The inverse case: several profiles of one registration are one
+    /// poll target whose fan-out lists every SAN, so a single reissue
+    /// request reaches all of them.
+    #[test]
+    fn profiles_sharing_a_registration_form_one_poll_target() {
+        let mut settings = test_settings("piglet");
+        settings.profiles[0].registration_id = "h1-piglet-001".to_string();
+        let mut second = settings.profiles[0].clone();
+        second.instance_id = "002".to_string();
+        settings.profiles.push(second);
+
+        let grouped = group_profiles_by_registration(&settings);
+
         assert_eq!(
-            grouped["h1-piglet-002"],
-            vec!["002.piglet.node-01.example.internal"]
+            grouped,
+            vec![(
+                "h1-piglet-001".to_string(),
+                vec![
+                    "001.piglet.node-01.example.internal".to_string(),
+                    "002.piglet.node-01.example.internal".to_string(),
+                ]
+            )]
         );
     }
 

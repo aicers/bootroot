@@ -945,19 +945,22 @@ impl Messages {
 
     pub(crate) fn hint_consumer_reload_service_with_hook(
         &self,
-        service_name: &str,
+        registration_id: &str,
         hook: &str,
     ) -> String {
         format_template(
             self.strings().hint_consumer_reload_service_with_hook,
-            &[("service_name", service_name), ("hook", hook)],
+            &[("registration_id", registration_id), ("hook", hook)],
         )
     }
 
-    pub(crate) fn hint_consumer_reload_service_without_hook(&self, service_name: &str) -> String {
+    pub(crate) fn hint_consumer_reload_service_without_hook(
+        &self,
+        registration_id: &str,
+    ) -> String {
         format_template(
             self.strings().hint_consumer_reload_service_without_hook,
-            &[("service_name", service_name)],
+            &[("registration_id", registration_id)],
         )
     }
 
