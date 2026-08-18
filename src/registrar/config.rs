@@ -539,7 +539,20 @@ fn resolve_component(name: &str, raw: RawComponent) -> Result<ComponentEntry, Re
             value: raw.reload.kind.clone(),
         })?;
     let target = raw.reload.target;
-    if kind.takes_target() != target.as_ref().is_some_and(|value| !value.is_empty()) {
+    // `none` must carry no `target` key at all, not merely an empty one:
+    // an empty string is still `Some`, and storing it would break the
+    // "`target` is `None` exactly when `kind` is `None`" invariant that
+    // makes `ReloadSpec::none()` the one value a `none` component's
+    // registrations can present. A request built from that constructor
+    // would then fail the safe-set comparison for every registration of
+    // the component, which is the enrollment outage the loader exists to
+    // turn into one loud failure at load time.
+    let target_agrees = match (kind.takes_target(), target.as_deref()) {
+        (true, Some(value)) => !value.is_empty(),
+        (false, None) => true,
+        (true, None) | (false, Some(_)) => false,
+    };
+    if !target_agrees {
         return Err(RegistrarError::InvalidReloadTarget {
             component: name.to_string(),
             kind,

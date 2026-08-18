@@ -279,9 +279,20 @@ fn every_reload_kind_the_writer_renders_is_accepted() {
     }
 }
 
+/// `target` must be absent for `none` and non-empty for the other three.
+/// An empty string is still `Some`, so accepting one would leave a `none`
+/// component holding `Some("")` — a spec no request built from
+/// [`ReloadSpec::none`] can equal, and therefore every registration of
+/// that component refused one at a time rather than the file refused
+/// once.
 #[test]
 fn a_reload_target_that_contradicts_its_kind_is_refused() {
-    for (kind, target) in [("none", Some("roxyd")), ("systemd", None)] {
+    for (kind, target) in [
+        ("none", Some("roxyd")),
+        ("none", Some("")),
+        ("systemd", None),
+        ("systemd", Some("")),
+    ] {
         let fixture = RegistrarConfigFixture::new().with_raw_component(
             "roxyd",
             ComponentFixture {
@@ -295,9 +306,36 @@ fn a_reload_target_that_contradicts_its_kind_is_refused() {
         let err = loaded.expect_err("a contradictory reload target must not load");
         assert!(
             matches!(err, RegistrarError::InvalidReloadTarget { .. }),
-            "{kind}: {err:?}"
+            "{kind} with {target:?}: {err:?}"
         );
     }
+}
+
+/// The `none` style's whole safe-set is [`ReloadSpec::none`], so a
+/// component the writer renders it for must accept exactly that value
+/// and nothing else.
+#[test]
+fn a_none_reload_component_matches_the_target_free_spec() {
+    let spec = RegistrationSpec {
+        cert_group: None,
+        reload: ReloadSpec::none(),
+    };
+    let (_dir, loaded) = load_fixture(&RegistrarConfigFixture::new().with_spec("roxyd", &spec));
+    let config = loaded.expect("the fixture must load");
+
+    assert_eq!(
+        config
+            .component("roxyd")
+            .expect("roxyd is configured")
+            .spec()
+            .reload,
+        ReloadSpec::none()
+    );
+    assert!(
+        config
+            .validate_spec("roxyd", &RequestedSpec::new(ReloadSpec::none(), None))
+            .is_ok()
+    );
 }
 
 // ---------------------------------------------------------------------

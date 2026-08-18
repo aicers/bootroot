@@ -190,9 +190,9 @@ derived.
 class. The one-per-deployment arm ignores it, but the SAN's third segment still
 needs it, so "not used by the id arm" is not "optional".
 
-### 6.1 The three SAN composition sites
+### 6.1 The SAN composition sites
 
-This repository composes `<instance>.<service>.<host>.<domain>` in **three**
+This repository composes `<instance>.<service>.<host>.<domain>` in **four**
 places, and they must agree byte for byte or the fleet gets certificates whose
 name the verification path rejects.
 
@@ -201,6 +201,11 @@ name the verification path rejects.
 | `bootroot::registrar::identity::compose_san` | the four parts | this table, and the test below |
 | `bootroot::config::profile_domain` | a `Settings` plus a `DaemonProfileSettings` | a test asserting byte-identical output for the same four values |
 | `commands::verify::expected_dns_name` | a `ServiceEntry` | this table alone — it is private to the binary crate and no test here can call it |
+| `commands::dns_alias::dns_alias_for_entry` | a `ServiceEntry` | this table alone, for the same reason |
+
+The last one composes the HTTP-01 DNS alias rather than the certificate SAN,
+but from the same four values and in the same shape, so a change to the shape
+that misses it desynchronises the alias from the name the certificate carries.
 
 `RegistrarConfig::san_for` is the same composer with the domain taken from
 the loaded file, and is what a verb should call: it makes composing under a

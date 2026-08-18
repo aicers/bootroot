@@ -268,13 +268,16 @@ pub fn derive_registration_id(
 /// and not a certificate field. `domain` comes only from the rendered
 /// file.
 ///
-/// This is the repository's third site composing this name, by necessity
-/// rather than choice: [`crate::config::profile_domain`] formats it from
-/// a `Settings` plus a `DaemonProfileSettings`, and
+/// This is a third site composing this name, by necessity rather than
+/// choice: [`crate::config::profile_domain`] formats it from a
+/// `Settings` plus a `DaemonProfileSettings`, and
 /// `commands::verify::expected_dns_name` from a `ServiceEntry`, and
 /// neither takes bare parts. A test pins byte-identical agreement with
-/// the first; the second is private to the binary crate and is named
-/// here as the third site that must stay in step.
+/// the first; the second is private to the binary crate and is named in
+/// `docs/reference/registrar-provisioning-config.md` §6.1 instead, along
+/// with `commands::dns_alias::dns_alias_for_entry`, which composes the
+/// HTTP-01 alias from the same four values and must stay in step for the
+/// same reason.
 #[must_use]
 pub fn compose_san(instance: Option<u32>, service_name: &str, host: &str, domain: &str) -> String {
     let instance = instance.unwrap_or(DEFAULT_SAN_INSTANCE);
