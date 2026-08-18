@@ -694,10 +694,6 @@ fn the_default_instance_reaches_the_san_and_never_the_id() {
     assert!(!review.registration_id.contains("001"));
 }
 
-/// The three sites that compose `<instance>.<service>.<host>.<domain>`
-/// must agree byte for byte. This pins the two that a test in this crate
-/// can reach; `commands::verify::expected_dns_name` is private to the
-/// binary crate and is named in the schema documentation instead.
 /// A loaded config composes under its own domain, never one a caller
 /// could have supplied.
 #[test]
@@ -714,6 +710,11 @@ fn san_for_takes_the_domain_from_the_loaded_file() {
     );
 }
 
+/// The four sites that compose `<instance>.<service>.<host>.<domain>`
+/// must agree byte for byte. This pins the two a test in this crate can
+/// reach; `commands::verify::expected_dns_name` and
+/// `commands::dns_alias::dns_alias_for_entry` are private to the binary
+/// crate and are named in the schema documentation instead.
 #[test]
 fn the_composer_agrees_with_profile_domain() {
     for (instance, service_name, host) in [
