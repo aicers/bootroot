@@ -3,13 +3,26 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
-use bootroot::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX;
+use bootroot::service_material::{
+    ProvisionedServiceRole, ServiceProvisionError, ServiceProvisionStep, ServiceRoleTtls,
+    build_service_policy, provision_service_role, service_policy_name,
+};
 
-use super::{SERVICE_ROLE_PREFIX, ServiceAppRoleMaterialized};
-use crate::commands::constants::SERVICE_KV_BASE;
+use super::ServiceAppRoleMaterialized;
 use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
 use crate::i18n::Messages;
 use crate::state::StateFile;
+
+/// Renders the step-specific diagnostic the CLI reported for each of the
+/// three provisioning calls before that sequence was shared with the
+/// registrar.
+fn provision_message(err: &ServiceProvisionError, messages: &Messages) -> &'static str {
+    match err.step {
+        ServiceProvisionStep::Policy => messages.error_openbao_policy_write_failed(),
+        ServiceProvisionStep::AppRole => messages.error_openbao_approle_create_failed(),
+        ServiceProvisionStep::RoleId => messages.error_openbao_role_id_failed(),
+    }
+}
 
 pub(super) async fn ensure_service_approle(
     client: &OpenBaoClient,
@@ -19,28 +32,30 @@ pub(super) async fn ensure_service_approle(
     wrap_ttl: Option<&str>,
     messages: &Messages,
 ) -> Result<ServiceAppRoleMaterialized> {
-    let policy_name = service_policy_name(registration_id);
-    let policy = build_service_policy(&state.kv_mount, registration_id);
-    client
-        .write_policy(&policy_name, &policy)
-        .await
-        .with_context(|| messages.error_openbao_policy_write_failed())?;
-
-    let role_name = service_role_name(registration_id);
-    client
-        .create_approle(
-            &role_name,
-            &[policy_name.as_str()],
-            TOKEN_TTL,
-            SECRET_ID_TTL,
-            true,
-        )
-        .await
-        .with_context(|| messages.error_openbao_approle_create_failed())?;
-    let role_id = client
-        .read_role_id(&role_name)
-        .await
-        .with_context(|| messages.error_openbao_role_id_failed())?;
+    // The CLI keeps its own role-level TTLs: the shared helper declares
+    // none, so `init`'s constants stay this caller's decision.
+    let provisioned = provision_service_role(
+        client,
+        &state.kv_mount,
+        registration_id,
+        ServiceRoleTtls {
+            token_ttl: TOKEN_TTL,
+            secret_id_ttl: SECRET_ID_TTL,
+        },
+    )
+    .await
+    .map_err(|err| {
+        let message = provision_message(&err, messages);
+        anyhow::Error::new(err).context(message)
+    })?;
+    let ProvisionedServiceRole {
+        role_name,
+        policy_name,
+        role_id,
+    } = provisioned;
+    // Issuance stays here, not in the shared helper: `service add`
+    // delivers the raw `secret_id` to a local file, wrapping only as a
+    // transport hop it immediately unwraps.
     let secret_id = match wrap_ttl {
         Some(ttl) => {
             client
@@ -77,37 +92,6 @@ pub(super) async fn reapply_service_policy(
         .await
         .with_context(|| messages.error_openbao_policy_write_failed())?;
     Ok(())
-}
-
-/// Builds the service `AppRole` policy body. Every path is scoped to the
-/// registration's own KV subtree, so two registrations of one component
-/// on one host never see each other's material.
-fn build_service_policy(kv_mount: &str, registration_id: &str) -> String {
-    let base = format!("{SERVICE_KV_BASE}/{registration_id}");
-    // The service subtree is read-only except for its own reissue object: the
-    // fast-poll loop must write `completed_at`/`completed_version` back so the
-    // control plane's `rotate force-reissue --wait` can observe completion.
-    // Narrowly grant create/update on exactly that one path.
-    format!(
-        r#"path "{kv_mount}/data/{base}/{SERVICE_REISSUE_KV_SUFFIX}" {{
-  capabilities = ["read", "create", "update"]
-}}
-path "{kv_mount}/data/{base}/*" {{
-  capabilities = ["read"]
-}}
-path "{kv_mount}/metadata/{base}/*" {{
-  capabilities = ["list"]
-}}
-"#
-    )
-}
-
-pub(super) fn service_role_name(registration_id: &str) -> String {
-    format!("{SERVICE_ROLE_PREFIX}{registration_id}")
-}
-
-pub(super) fn service_policy_name(registration_id: &str) -> String {
-    format!("{SERVICE_ROLE_PREFIX}{registration_id}")
 }
 
 pub(super) async fn write_secret_id_file(
@@ -239,77 +223,5 @@ mod tests {
             format!("{err:#}").contains("Refusing to overwrite"),
             "override role_id write must be no-clobber, got: {err:#}"
         );
-    }
-
-    #[test]
-    fn service_policy_grants_write_only_on_reissue_path() {
-        let policy = build_service_policy("secret", "edge-proxy");
-
-        assert!(
-            policy.contains(
-                "path \"secret/data/bootroot/services/edge-proxy/reissue\" {\n  capabilities = [\"read\", \"create\", \"update\"]"
-            ),
-            "reissue path must carry create/update, got:\n{policy}"
-        );
-        assert!(
-            policy.contains(
-                "path \"secret/data/bootroot/services/edge-proxy/*\" {\n  capabilities = [\"read\"]"
-            ),
-            "rest of data subtree must stay read-only, got:\n{policy}"
-        );
-        assert!(
-            policy.contains(
-                "path \"secret/metadata/bootroot/services/edge-proxy/*\" {\n  capabilities = [\"list\"]"
-            ),
-            "metadata subtree must stay list-only, got:\n{policy}"
-        );
-    }
-
-    /// The policy body is keyed on `registration_id`, so two
-    /// registrations of one component on one host get disjoint KV
-    /// subtrees even though their `service_name` is identical.
-    #[test]
-    fn service_policy_paths_derive_from_registration_id() {
-        let first = build_service_policy("secret", "h1-piglet-001");
-        let second = build_service_policy("secret", "h1-piglet-002");
-
-        assert!(first.contains("secret/data/bootroot/services/h1-piglet-001/"));
-        assert!(second.contains("secret/data/bootroot/services/h1-piglet-002/"));
-        assert!(!first.contains("h1-piglet-002"));
-        assert!(!second.contains("h1-piglet-001"));
-    }
-
-    /// The role and policy names are one and the same derivation off
-    /// `registration_id`, and a one-per-deployment singleton whose key is
-    /// still the bare component name keeps the exact names it had before
-    /// the split.
-    #[test]
-    fn role_and_policy_names_derive_from_registration_id() {
-        assert_eq!(service_role_name("review"), "bootroot-service-review");
-        assert_eq!(service_policy_name("review"), "bootroot-service-review");
-        assert_eq!(
-            service_role_name("h1-piglet-001"),
-            "bootroot-service-h1-piglet-001"
-        );
-        assert_ne!(
-            service_role_name("h1-piglet-001"),
-            service_role_name("h1-piglet-002")
-        );
-    }
-
-    #[test]
-    fn service_policy_grants_no_broader_write_scope() {
-        let policy = build_service_policy("secret", "edge-proxy");
-
-        // Only the reissue rule may carry create/update; no other rule may.
-        for block in policy.split("path ").filter(|b| !b.is_empty()) {
-            let has_write = block.contains("create") || block.contains("update");
-            let is_reissue =
-                block.starts_with("\"secret/data/bootroot/services/edge-proxy/reissue\"");
-            assert!(
-                !has_write || is_reissue,
-                "unexpected write capability outside the reissue path:\n{block}"
-            );
-        }
     }
 }

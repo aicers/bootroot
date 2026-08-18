@@ -24,6 +24,7 @@ Runs the same Docker E2E matrix steps used in CI:
 8) OpenBao TLS transition with no compose delta
 9) OpenBao TLS re-issuance after secrets/ is re-owned
 10) two co-located instances stay independent
+11) registrar mint/deregister verbs against a live OpenBao
 
 Options:
   --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
@@ -196,6 +197,14 @@ ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}" \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 "$ROOT_DIR/scripts/impl/run-two-instance-isolation.sh"
 
+# The registrar verbs' write-dependent behaviour lives in ignored library
+# tests; this scenario is their only gate. It stands its own OpenBao up on
+# a free loopback port and needs no compose project, no secrets wiring and
+# no bootroot binaries.
+echo "[ci-local-e2e] run registrar verbs (issue #758)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}" \
+"$ROOT_DIR/scripts/impl/run-registrar-verbs-e2e.sh"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -208,3 +217,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-stepca-san-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-no-delta-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-reown-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}"

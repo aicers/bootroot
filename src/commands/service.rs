@@ -24,7 +24,6 @@ use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
 
-pub(super) const SERVICE_ROLE_PREFIX: &str = "bootroot-service-";
 pub(super) const SERVICE_SECRET_DIR: &str = "services";
 pub(super) const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
 pub(super) const SERVICE_SECRET_ID_FILENAME: &str = "secret_id";
@@ -626,7 +625,7 @@ async fn create_artifact_wrap_info(
     let Some(ttl) = wrap_ttl else {
         return Ok(None);
     };
-    let role_name = approle::service_role_name(&resolved.registration_id);
+    let role_name = bootroot::service_material::service_role_name(&resolved.registration_id);
     let secret_id_options = build_secret_id_options(resolved);
     let wrap_info = client
         .create_secret_id_wrap_only(&role_name, &secret_id_options, ttl)
@@ -1232,10 +1231,10 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
     build_service_entry_from_role(
         resolved,
         ServiceRoleEntry {
-            role_name: approle::service_role_name(&resolved.registration_id),
+            role_name: bootroot::service_material::service_role_name(&resolved.registration_id),
             role_id: "dry-run".to_string(),
             secret_id_path: preview_secret_id_path,
-            policy_name: approle::service_policy_name(&resolved.registration_id),
+            policy_name: bootroot::service_material::service_policy_name(&resolved.registration_id),
             secret_id_ttl: resolved.secret_id_ttl.clone(),
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
             token_bound_cidrs: resolved.token_bound_cidrs.clone(),

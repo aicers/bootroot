@@ -4,7 +4,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
-use bootroot::trust_bootstrap::remove_managed_service_profile;
+use bootroot::service_material::{
+    ResourceOutcome, ServiceResource, service_kv_path, teardown_service_material,
+};
+use bootroot::trust_bootstrap::{
+    SERVICE_EAB_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX, SERVICE_SECRET_ID_KV_SUFFIX,
+    SERVICE_TRUST_KV_SUFFIX, remove_managed_service_profile,
+};
 
 use super::{
     REMOTE_BOOTSTRAP_DIR, SERVICE_ROLE_ID_FILENAME, SERVICE_SECRET_DIR, service_eab_file_path,
@@ -12,21 +18,10 @@ use super::{
 use crate::cli::args::ServiceRemoveArgs;
 use crate::cli::prompt::Prompt;
 use crate::commands::compose_project::ComposeIdentity;
-use crate::commands::constants::SERVICE_KV_BASE;
 use crate::commands::dns_alias::reconcile_dns_aliases;
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
-use crate::commands::trust::SERVICE_TRUST_KV_SUFFIX;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, StateFile};
-
-/// KV path suffix for the per-service EAB material. Mirrors
-/// `write_service_kv_secrets` in `service/secrets.rs`.
-const KV_EAB_SUFFIX: &str = "eab";
-/// KV path suffix for the per-service HTTP-01 responder HMAC.
-const KV_HTTP_RESPONDER_HMAC_SUFFIX: &str = "http_responder_hmac";
-/// KV path suffix for the per-service `secret_id` (written only for
-/// `remote-bootstrap` services by `sync_service_kv_bundle`).
-const KV_SECRET_ID_SUFFIX: &str = "secret_id";
 
 /// On-disk artifacts eligible for deletion under `--delete-artifacts`.
 struct ArtifactPlan {
@@ -61,6 +56,34 @@ impl TeardownReport {
             }
         }
     }
+
+    /// Prints and records one attempt made by the shared `OpenBao`
+    /// teardown, preserving the labels and the retention rule this
+    /// command reported before that sequence was shared.
+    fn record_resource(
+        &mut self,
+        resource: &ServiceResource,
+        outcome: &ResourceOutcome,
+        messages: &Messages,
+    ) {
+        let label = match resource {
+            ServiceResource::Kv(path) => format!("KV {path}"),
+            ServiceResource::AppRole(name) => format!("AppRole {name}"),
+            ServiceResource::Policy(name) => format!("policy {name}"),
+        };
+        match outcome {
+            ResourceOutcome::Removed => {
+                println!("{}", messages.service_remove_resource_removed(&label));
+            }
+            ResourceOutcome::AlreadyAbsent => {
+                println!("{}", messages.service_remove_resource_absent(&label));
+            }
+            ResourceOutcome::Failed(err) => {
+                eprintln!("{}", messages.service_remove_resource_failed(&label, err));
+                self.any_failed = true;
+            }
+        }
+    }
 }
 
 /// Deregisters a service: tears down its `OpenBao` `AppRole`, policy, and
@@ -74,7 +97,11 @@ pub(crate) async fn run_service_remove(
     let mut state = load_state_or_missing(&state_path, messages)?;
     let entry = require_service_entry(&state, &args.registration_id, messages)?;
 
-    let kv_paths = service_kv_paths(&entry);
+    let kv_suffixes = service_kv_suffixes(&entry);
+    let kv_paths: Vec<String> = kv_suffixes
+        .iter()
+        .map(|suffix| service_kv_path(&entry.registration_id, suffix))
+        .collect();
     let artifacts = if args.delete_artifacts {
         Some(build_artifact_plan(&state, &entry))
     } else {
@@ -113,23 +140,24 @@ pub(crate) async fn run_service_remove(
 
     // Remote cleanup FIRST — the AppRole, policy, and KV deletions must
     // all complete before the state.json entry is dropped, so a partial
-    // failure leaves the stored role/policy names available for a re-run.
-    for path in &kv_paths {
-        let result = delete_kv_if_present(&client, &state.kv_mount, path).await;
-        report.record(&format!("KV {path}"), result, messages);
+    // failure leaves the entry available for a re-run.
+    //
+    // The shared teardown derives the role and policy names from the
+    // registration id, which is exactly what `service add` persisted into
+    // `entry.approle`, so the plan printed above names the same two
+    // resources this deletes. It attempts every resource and never
+    // short-circuits; this adapter turns the per-resource outcomes back
+    // into the operator-facing lines this command has always printed.
+    let shared = teardown_service_material(
+        &client,
+        &state.kv_mount,
+        &entry.registration_id,
+        &kv_suffixes,
+    )
+    .await;
+    for attempt in shared.attempts() {
+        report.record_resource(&attempt.resource, &attempt.outcome, messages);
     }
-    let approle_result = delete_approle_if_present(&client, &entry.approle.role_name).await;
-    report.record(
-        &format!("AppRole {}", entry.approle.role_name),
-        approle_result,
-        messages,
-    );
-    let policy_result = delete_policy_if_present(&client, &entry.approle.policy_name).await;
-    report.record(
-        &format!("policy {}", entry.approle.policy_name),
-        policy_result,
-        messages,
-    );
 
     // On-disk artifacts (opt-in). These are local, but a failure here
     // also keeps the entry so a re-run can retry.
@@ -244,18 +272,25 @@ async fn finalize_removal(
         .with_context(|| messages.error_serialize_state_failed())
 }
 
-/// Builds the exact per-registration KV paths written by `service add`.
-fn service_kv_paths(entry: &ServiceEntry) -> Vec<String> {
-    let base = format!("{SERVICE_KV_BASE}/{}", entry.registration_id);
-    let mut paths = vec![
-        format!("{base}/{KV_EAB_SUFFIX}"),
-        format!("{base}/{KV_HTTP_RESPONDER_HMAC_SUFFIX}"),
-        format!("{base}/{SERVICE_TRUST_KV_SUFFIX}"),
+/// Returns the exact per-registration KV suffixes `service add` wrote,
+/// as this command's `state.json` entry records them.
+///
+/// This set is deliberately narrower than the registrar's: it is derived
+/// from what the CLI wrote, and it intentionally omits `reissue`, which
+/// this command has never deleted. Widening it here would change what
+/// `service remove` does to an operator's installation; the registrar's
+/// deregister verb, which owns the identities it minted end to end,
+/// sweeps the full set instead.
+fn service_kv_suffixes(entry: &ServiceEntry) -> Vec<&'static str> {
+    let mut suffixes = vec![
+        SERVICE_EAB_KV_SUFFIX,
+        SERVICE_RESPONDER_HMAC_KV_SUFFIX,
+        SERVICE_TRUST_KV_SUFFIX,
     ];
     if matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap) {
-        paths.push(format!("{base}/{KV_SECRET_ID_SUFFIX}"));
+        suffixes.push(SERVICE_SECRET_ID_KV_SUFFIX);
     }
-    paths
+    suffixes
 }
 
 fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan {
@@ -355,33 +390,6 @@ fn confirm_removal(registration_id: &str, messages: &Messages) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
-}
-
-async fn delete_kv_if_present(client: &OpenBaoClient, mount: &str, path: &str) -> Result<bool> {
-    if client.kv_exists(mount, path).await? {
-        client.delete_kv(mount, path).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-async fn delete_approle_if_present(client: &OpenBaoClient, role_name: &str) -> Result<bool> {
-    if client.approle_exists(role_name).await? {
-        client.delete_approle(role_name).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-async fn delete_policy_if_present(client: &OpenBaoClient, policy_name: &str) -> Result<bool> {
-    if client.policy_exists(policy_name).await? {
-        client.delete_policy(policy_name).await?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 fn delete_dir_if_present(path: &Path) -> Result<bool> {
@@ -654,12 +662,18 @@ mod tests {
         assert!(!plan.dirs.contains(&agent_dir));
     }
 
+    fn kv_paths_for(entry: &ServiceEntry) -> Vec<String> {
+        service_kv_suffixes(entry)
+            .iter()
+            .map(|suffix| service_kv_path(&entry.registration_id, suffix))
+            .collect()
+    }
+
     #[test]
     fn service_kv_paths_local_file_omits_secret_id() {
         let entry = sample_entry("svc", DeliveryMode::LocalFile);
-        let paths = service_kv_paths(&entry);
         assert_eq!(
-            paths,
+            kv_paths_for(&entry),
             vec![
                 "bootroot/services/svc/eab".to_string(),
                 "bootroot/services/svc/http_responder_hmac".to_string(),
@@ -671,9 +685,22 @@ mod tests {
     #[test]
     fn service_kv_paths_remote_bootstrap_includes_secret_id() {
         let entry = sample_entry("svc", DeliveryMode::RemoteBootstrap);
-        let paths = service_kv_paths(&entry);
+        let paths = kv_paths_for(&entry);
         assert!(paths.contains(&"bootroot/services/svc/secret_id".to_string()));
         assert_eq!(paths.len(), 4);
+    }
+
+    /// The CLI's set intentionally continues not to delete `reissue`:
+    /// widening it here would change what `service remove` does to an
+    /// operator's installation.
+    #[test]
+    fn service_kv_suffixes_intentionally_exclude_reissue_and_the_binding() {
+        for mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            let entry = sample_entry("svc", mode);
+            let suffixes = service_kv_suffixes(&entry);
+            assert!(!suffixes.contains(&bootroot::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX));
+            assert!(!suffixes.contains(&"registrar_binding"));
+        }
     }
 
     #[test]
