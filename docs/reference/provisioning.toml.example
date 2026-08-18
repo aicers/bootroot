@@ -1,0 +1,28 @@
+fingerprint = "62299a244c4b3833c4cb3a36b4d3da763bd87f664c7d31845f48e53be4170f3e"
+# Rendered by the provisioning tool (bootler) onto BOTH the
+# bootroot/registrar host and the REView host at install, at the same
+# absolute path on each. bootroot only reads this file; nothing in this
+# repository writes it in production.
+#
+# The first line is the fingerprint and is NOT part of the digested body.
+schema_version = 1
+domain = "trusted.domain"
+
+# One table per component, keyed by package-id. A component absent from
+# this file is refused, never defaulted. `bootroot` has no entry: it is
+# the issuer and never enrolls through the registrar.
+[components.review]
+multiplicity = "one-per-deployment"   # | "one-per-host" | "many-per-host"
+cert_group = 3000                     # numeric gid; omit the key to mean
+                                      # "registrations carry no cert-group policy"
+reload = { kind = "docker-restart", target = "review" }
+
+[components.roxyd]
+multiplicity = "one-per-host"
+# cert_group omitted on purpose
+reload = { kind = "systemd", target = "roxyd.service" }
+
+[components.piglet]
+multiplicity = "many-per-host"
+cert_group = 3001
+reload = { kind = "docker-restart", target = "piglet" }
