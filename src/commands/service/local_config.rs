@@ -59,7 +59,7 @@ pub(super) async fn apply_local_service_configs(
     let current = strip_foreign_managed_profiles(
         &current,
         LOCAL_FILE_PROFILE_MARKERS,
-        &resolved.service_name,
+        &resolved.registration_id,
     );
     // Backfill any baseline fields missing from the operator-facing
     // `agent.toml` — both for a fresh file and for an existing file that
@@ -95,7 +95,7 @@ pub(super) async fn apply_local_service_configs(
             &[("http_responder_url", responder_url.to_string())],
         )?;
     }
-    let with_profile = upsert_managed_profile(&next, &resolved.service_name, &profile);
+    let with_profile = upsert_managed_profile(&next, &resolved.registration_id, &profile);
     let mut next = with_profile;
     let trust_updates = build_trust_updates(&sync_material.trusted_ca_sha256, &ca_bundle_path);
     next = bootroot::toml_util::upsert_section_keys(&next, "trust", &trust_updates)?;
@@ -121,7 +121,7 @@ pub(super) async fn apply_local_service_configs(
         secret_id_path,
         ca_bundle_path: &ca_bundle_path,
         agent_config_path: &resolved.agent_config,
-        service_name: &resolved.service_name,
+        registration_id: &resolved.registration_id,
         current_contents: &next,
     })?;
     next = bootroot::toml_util::upsert_section_keys(&next, "openbao", &openbao_updates)?;
@@ -189,16 +189,17 @@ struct LocalOpenBaoUpdateInputs<'a> {
     secret_id_path: &'a Path,
     ca_bundle_path: &'a Path,
     agent_config_path: &'a Path,
-    service_name: &'a str,
+    registration_id: &'a str,
     current_contents: &'a str,
 }
 
 /// Builds the `[openbao]` key-value pairs local `service add` upserts
 /// into `agent.toml`, mirroring what `bootroot-remote bootstrap` writes
 /// on remote hosts (`build_openbao_updates`).  Connection-level fields
-/// are always refreshed.  A stable absolute `state_path` (service-keyed
-/// so per-service agent configs sharing one directory do not contend
-/// over a single state file) is provisioned adjacent to `agent.toml`
+/// are always refreshed.  A stable absolute `state_path` (keyed by
+/// `registration_id` so co-located registrations sharing one directory
+/// do not contend over a single state file) is provisioned adjacent to
+/// `agent.toml`
 /// when the operator has not already set an absolute one — config
 /// validation rejects a relative or defaulted `state_path` because the
 /// daemon cwd is not contracted to be stable under systemd-style
@@ -230,7 +231,7 @@ fn build_local_openbao_updates(
     if needs_absolute_state_path_provisioning(inputs.current_contents) {
         pairs.push((
             "state_path",
-            default_state_path_for(inputs.agent_config_path, inputs.service_name)?,
+            default_state_path_for(inputs.agent_config_path, inputs.registration_id)?,
         ));
     }
     Ok(pairs)
@@ -257,12 +258,12 @@ fn needs_absolute_state_path_provisioning(contents: &str) -> bool {
     !Path::new(value).is_absolute()
 }
 
-/// Returns the absolute, service-keyed fast-poll `state_path` adjacent
-/// to `agent.toml`.  Unlike the remote provisioning (which bails out on
+/// Returns the absolute, registration-keyed fast-poll `state_path`
+/// adjacent to `agent.toml`.  Unlike the remote provisioning (which bails out on
 /// relative agent-config paths), the co-located CLI can resolve a
 /// relative `--agent-config` against its own cwd — the resulting
 /// absolute path names the same file the operator pointed at.
-fn default_state_path_for(agent_config_path: &Path, service_name: &str) -> Result<String> {
+fn default_state_path_for(agent_config_path: &Path, registration_id: &str) -> Result<String> {
     let absolute_config = std::path::absolute(agent_config_path).with_context(|| {
         format!(
             "failed to resolve absolute path for {}",
@@ -274,22 +275,26 @@ fn default_state_path_for(agent_config_path: &Path, service_name: &str) -> Resul
         .unwrap_or_else(|| Path::new("/"))
         .to_path_buf();
     Ok(parent
-        .join(state_path_basename(service_name))
+        .join(state_path_basename(registration_id))
         .display()
         .to_string())
 }
 
-/// Derives the per-service fast-poll state filename.  `service_name` is
-/// a validated DNS label (`validate_service_name` → `validate_dns_label`),
-/// so it can never introduce a path separator or `..`.
-fn state_path_basename(service_name: &str) -> String {
+/// Derives the per-registration fast-poll state filename.
+///
+/// `registration_id` is validated against the shared path-safe rule
+/// (`validate_registration_id`): lowercase alphanumeric and hyphens only,
+/// starting and ending alphanumeric, at most 131 octets — so it can never
+/// introduce a path separator or `..`. It is deliberately not held to the
+/// DNS-label rule, since a registration key may exceed 63 octets.
+fn state_path_basename(registration_id: &str) -> String {
     debug_assert!(
-        !service_name.is_empty()
-            && !service_name.contains(['/', '\\'])
-            && !service_name.contains(".."),
-        "service_name must be a validated DNS label, got {service_name:?}"
+        !registration_id.is_empty()
+            && !registration_id.contains(['/', '\\'])
+            && !registration_id.contains(".."),
+        "registration_id must satisfy the path-safe rule, got {registration_id:?}"
     );
-    format!("bootroot-agent-state-{service_name}.json")
+    format!("bootroot-agent-state-{registration_id}.json")
 }
 
 /// Provisions the service's `eab.json` next to its `secret_id` so the
@@ -392,6 +397,7 @@ fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
     let base = render_managed_profile(
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
+        &args.registration_id,
         &args.service_name,
         args.instance_id.as_deref().unwrap_or_default(),
         &args.hostname,
@@ -439,12 +445,12 @@ fn render_hooks_toml(hooks: &[PostRenewHookEntry]) -> String {
     output
 }
 
-fn upsert_managed_profile(contents: &str, service_name: &str, replacement: &str) -> String {
+fn upsert_managed_profile(contents: &str, registration_id: &str, replacement: &str) -> String {
     upsert_managed_profile_block(
         contents,
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
-        service_name,
+        registration_id,
         replacement,
     )
 }
@@ -463,6 +469,7 @@ mod tests {
 
     fn test_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "edge-node-01".to_string(),
@@ -514,6 +521,7 @@ mod tests {
         let remote_block = render_managed_profile(
             bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
             bootroot::trust_bootstrap::REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
+            &args.registration_id,
             &args.service_name,
             args.instance_id.as_deref().unwrap_or_default(),
             &args.hostname,
@@ -526,10 +534,10 @@ mod tests {
         let stripped = strip_foreign_managed_profiles(
             &existing,
             LOCAL_FILE_PROFILE_MARKERS,
-            &args.service_name,
+            &args.registration_id,
         );
         let local_block = render_managed_profile_block(&args);
-        let updated = upsert_managed_profile(&stripped, &args.service_name, &local_block);
+        let updated = upsert_managed_profile(&stripped, &args.registration_id, &local_block);
 
         assert_eq!(
             updated.matches("[[profiles]]").count(),
@@ -705,7 +713,7 @@ mod tests {
             secret_id_path: Path::new("secrets/services/edge-proxy/secret_id"),
             ca_bundle_path: Path::new("certs/ca-bundle.pem"),
             agent_config_path: Path::new("/etc/bootroot/agent.toml"),
-            service_name: "edge-proxy",
+            registration_id: "edge-proxy",
             current_contents: "",
         })
         .unwrap();
@@ -742,7 +750,7 @@ mod tests {
             secret_id_path: Path::new("secrets/services/edge-proxy/secret_id"),
             ca_bundle_path: Path::new("certs/ca-bundle.pem"),
             agent_config_path: Path::new("/etc/bootroot/agent.toml"),
-            service_name: "edge-proxy",
+            registration_id: "edge-proxy",
             current_contents: "",
         })
         .unwrap()
@@ -789,7 +797,7 @@ mod tests {
             secret_id_path: Path::new("secrets/services/edge-proxy/secret_id"),
             ca_bundle_path: Path::new("certs/ca-bundle.pem"),
             agent_config_path: Path::new("agent.toml"),
-            service_name: "edge-proxy",
+            registration_id: "edge-proxy",
             current_contents: "",
         })
         .unwrap();

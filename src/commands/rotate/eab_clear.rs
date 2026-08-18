@@ -6,13 +6,13 @@ use super::helpers::confirm_action;
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
 
-/// Per-service EAB KV path. The init/service flow writes EAB at
-/// `bootroot/services/<svc>/eab` when an operator opts into per-service
-/// EAB; clearing it requires writing the same shape, not a `delete`,
-/// so consumers observing the path see an explicit empty value instead
-/// of a missing secret.
-fn service_eab_path(service_name: &str) -> String {
-    format!("bootroot/services/{service_name}/eab")
+/// Per-registration EAB KV path. The init/service flow writes EAB at
+/// `bootroot/services/<registration_id>/eab` when an operator opts into
+/// per-service EAB; clearing it requires writing the same shape, not a
+/// `delete`, so consumers observing the path see an explicit empty value
+/// instead of a missing secret.
+fn service_eab_path(registration_id: &str) -> String {
+    format!("bootroot/services/{registration_id}/eab")
 }
 
 /// Companion to the now-removed `rotate eab`. Writes empty
@@ -50,9 +50,9 @@ pub(super) async fn rotate_eab_clear(
     // Per-service EAB. Enumerate from state, not KV listings: a stale
     // KV entry without a state record would be ambiguous to clear
     // silently.
-    let service_names: Vec<String> = ctx.state.services.keys().cloned().collect();
-    for service_name in &service_names {
-        let path = service_eab_path(service_name);
+    let registration_ids: Vec<String> = ctx.state.services.keys().cloned().collect();
+    for registration_id in &registration_ids {
+        let path = service_eab_path(registration_id);
         client
             .write_kv(&kv_mount, &path, empty.clone())
             .await

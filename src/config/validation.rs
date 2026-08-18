@@ -6,6 +6,7 @@ use reqwest::Url;
 
 use super::defaults::default_renew_before;
 use super::{DaemonProfileSettings, HookCommand, OpenBaoSettings, Settings, TrustSettings};
+use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 
 /// Validates that `cert_duration` is strictly greater than the default
 /// daemon `renew_before` interval.
@@ -240,18 +241,37 @@ fn validate_sha256_fingerprint(value: &str) -> Result<()> {
 }
 
 fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
-    if profile.service_name.trim().is_empty() {
-        anyhow::bail!("profiles.service_name must not be empty");
-    }
-    if profile.hostname.trim().is_empty() {
-        anyhow::bail!("profiles.hostname must not be empty");
-    }
-    if !profile.service_name.is_ascii() {
-        anyhow::bail!("profiles.service_name must be ASCII");
-    }
-    if !profile.hostname.is_ascii() {
-        anyhow::bail!("profiles.hostname must be ASCII");
-    }
+    // `registration_id` names the KV subtree the fast-poll loop reads
+    // and the state filename it writes, so it goes through the shared
+    // path-safe rule rather than a local spelling of it.
+    validate_registration_id(&profile.registration_id).map_err(|err| match err {
+        ValidationError::Empty => anyhow::anyhow!("profiles.registration_id must not be empty"),
+        _ => anyhow::anyhow!(
+            "profiles.registration_id must be lowercase alphanumeric and hyphens, \
+             starting and ending alphanumeric, at most 131 octets"
+        ),
+    })?;
+    // `service_name` is the SAN's second label, so it is held to the
+    // DNS-label rule here rather than at CSR time, where the failure
+    // would surface as a rejected order instead of a bad config.
+    validate_dns_label(&profile.service_name).map_err(|err| match err {
+        ValidationError::Empty => anyhow::anyhow!("profiles.service_name must not be empty"),
+        _ => anyhow::anyhow!(
+            "profiles.service_name must be a DNS label \
+             (letters, digits, hyphens only; max 63 octets)"
+        ),
+    })?;
+    // `hostname` is the SAN's third label, and every writer of a
+    // `[[profiles]]` block already validates it as one. Only a
+    // hand-edited config can reach here with a dotted or over-long
+    // value, and it is rejected for the same reason `service_name` is.
+    validate_dns_label(&profile.hostname).map_err(|err| match err {
+        ValidationError::Empty => anyhow::anyhow!("profiles.hostname must not be empty"),
+        _ => anyhow::anyhow!(
+            "profiles.hostname must be a DNS label \
+             (letters, digits, hyphens only; max 63 octets)"
+        ),
+    })?;
     if profile.instance_id.trim().is_empty() {
         anyhow::bail!("profiles.instance_id must not be empty");
     }
@@ -465,5 +485,36 @@ mod tests {
             format!("{err}").contains("ca_bundle_path"),
             "error should require the CA bundle: {err}"
         );
+    }
+
+    /// Every shipped `[[profiles]]` template must deserialize and pass
+    /// `validate_profile`. The templates are what an operator copies, so
+    /// one that omits the now-required `registration_id` would hand them
+    /// a config the agent refuses to load.
+    #[test]
+    fn shipped_agent_config_templates_carry_a_valid_profile() {
+        for name in ["agent.toml.example", "agent.toml.compose"] {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            let contents =
+                std::fs::read_to_string(&source).unwrap_or_else(|err| panic!("read {name}: {err}"));
+            // The templates ship under `.example` / `.compose` suffixes,
+            // which the config loader cannot infer a format from; stage a
+            // byte-identical copy at a `.toml` name so this reads exactly
+            // what an operator would copy into place.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("agent.toml");
+            std::fs::write(&path, &contents).expect("stage template");
+            let settings = crate::config::Settings::from_file(Some(path))
+                .unwrap_or_else(|err| panic!("{name} must deserialize: {err}"));
+            assert!(!settings.profiles.is_empty(), "{name} must ship a profile");
+            for profile in &settings.profiles {
+                assert!(
+                    !profile.registration_id.is_empty(),
+                    "{name} must set registration_id"
+                );
+                validate_profile(profile)
+                    .unwrap_or_else(|err| panic!("{name} profile must validate: {err}"));
+            }
+        }
     }
 }

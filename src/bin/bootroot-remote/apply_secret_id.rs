@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use super::io::{read_required_string, read_secret_file, write_secret_file};
 use super::openbao_client::build_openbao_client;
 use super::summary::{ApplyStatus, status_to_str};
-use super::validation::validate_service_name;
+use super::validation::validate_registration_id_arg;
 use super::{ApplySecretIdArgs, Locale, OutputFormat, SECRET_ID_KEY, SERVICE_KV_BASE, localized};
 
 /// Resolves the CA-bundle PEM for the `AppRole` login transport.
@@ -48,7 +48,7 @@ async fn resolve_ca_bundle_pem(
 // so the single-value variant stays easy to audit and modify separately.
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: Locale) -> Result<i32> {
-    validate_service_name(&args.service_name, lang)?;
+    validate_registration_id_arg(&args.registration_id, lang)?;
     let role_id = read_secret_file(&args.role_id_path, lang)
         .await
         .with_context(|| {
@@ -97,7 +97,7 @@ pub(super) async fn run_apply_secret_id(args: ApplySecretIdArgs, lang: Locale) -
         })?;
     client.set_token(token);
 
-    let kv_path = format!("{SERVICE_KV_BASE}/{}/secret_id", args.service_name);
+    let kv_path = format!("{SERVICE_KV_BASE}/{}/secret_id", args.registration_id);
     let data = client
         .read_kv(&args.kv_mount, &kv_path)
         .await

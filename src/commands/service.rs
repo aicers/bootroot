@@ -52,18 +52,20 @@ pub(crate) fn service_eab_file_path(secret_id_path: &Path) -> std::path::PathBuf
         .join(SERVICE_EAB_FILENAME)
 }
 
-/// Returns the default secrets-tree `secret_id` location for a service,
-/// used when the operator did not pass `--secret-id-path`.
-fn default_service_secret_id_path(secrets_dir: &Path, service_name: &str) -> std::path::PathBuf {
+/// Returns the default secrets-tree `secret_id` location for a
+/// registration, used when the operator did not pass
+/// `--secret-id-path`. Keyed on `registration_id` so two registrations
+/// of one component on one host do not share a credential directory.
+fn default_service_secret_id_path(secrets_dir: &Path, registration_id: &str) -> std::path::PathBuf {
     secrets_dir
         .join(SERVICE_SECRET_DIR)
-        .join(service_name)
+        .join(registration_id)
         .join(SERVICE_SECRET_ID_FILENAME)
 }
 
 /// Resolves the effective `secret_id` path for a service: the operator's
 /// absolute `--secret-id-path` override when supplied, otherwise the
-/// default under `<secrets_dir>/services/<svc>/`. This single value is
+/// default under `<secrets_dir>/services/<registration_id>/`. This single value is
 /// the source of truth persisted to `entry.approle.secret_id_path`.
 fn resolved_secret_id_path(
     resolved: &ResolvedServiceAdd,
@@ -72,7 +74,7 @@ fn resolved_secret_id_path(
     resolved
         .secret_id_path_override
         .clone()
-        .unwrap_or_else(|| default_service_secret_id_path(secrets_dir, &resolved.service_name))
+        .unwrap_or_else(|| default_service_secret_id_path(secrets_dir, &resolved.registration_id))
 }
 
 /// Derives the sibling `role_id` path for a resolved `secret_id` path.
@@ -264,6 +266,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     let cert_path = resolved.cert_path.display().to_string();
     let key_path = resolved.key_path.display().to_string();
     let plan = ServiceAddPlan {
+        registration_id: &resolved.registration_id,
         service_name: &resolved.service_name,
         delivery_mode: resolved.delivery_mode,
         hostname: &resolved.hostname,
@@ -277,22 +280,24 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     };
     print_service_add_plan(&plan, messages);
 
-    if let Some(existing) = state.services.get(&resolved.service_name).cloned() {
+    if let Some(existing) = state.services.get(&resolved.registration_id).cloned() {
         if is_idempotent_remote_rerun(&existing, &resolved) {
             return run_service_add_remote_idempotent(&state, &existing, &resolved, messages).await;
         }
         if is_policy_only_mismatch(&existing, &resolved) {
             anyhow::bail!(messages.error_service_policy_mismatch());
         }
-        anyhow::bail!(messages.error_service_duplicate(&resolved.service_name));
+        anyhow::bail!(messages.error_service_duplicate(&resolved.registration_id));
     }
 
-    // One `agent.toml` serves exactly one distinct local-file service:
-    // the top-level `[openbao]` section holds a single AppRole identity,
-    // so a second service writing the same file would overwrite the
-    // first service's `role_id`/`secret_id`/`state_path` and break its
-    // KV reads under per-service policies. Multiple `[[profiles]]` are
-    // reserved for instances of the *same* service.
+    // One `agent.toml` serves exactly one local-file registration: the
+    // top-level `[openbao]` section holds a single AppRole identity, so a
+    // second registration writing the same file would overwrite the
+    // first's `role_id`/`secret_id`/`state_path` and break its KV reads
+    // under per-registration policies. Multiple `[[profiles]]` are
+    // reserved for instances sharing one `registration_id` — two
+    // registrations of one component, which share a `service_name`, own
+    // separate AppRoles and so need separate configs.
     if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         if let Some(conflict) = state.services.values().find(|entry| {
             matches!(entry.delivery_mode, DeliveryMode::LocalFile)
@@ -300,7 +305,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         }) {
             anyhow::bail!(messages.error_service_agent_config_conflict(
                 &resolved.agent_config.display().to_string(),
-                &conflict.service_name,
+                &conflict.registration_id,
             ));
         }
         // The state check alone misses a service removed without
@@ -313,10 +318,12 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
             let contents = std::fs::read_to_string(&resolved.agent_config).with_context(|| {
                 messages.error_read_file_failed(&resolved.agent_config.display().to_string())
             })?;
-            if let Some(stale) = bootroot::trust_bootstrap::find_foreign_managed_profile_service(
-                &contents,
-                &resolved.service_name,
-            ) {
+            if let Some(stale) =
+                bootroot::trust_bootstrap::find_foreign_managed_profile_registration(
+                    &contents,
+                    &resolved.registration_id,
+                )
+            {
                 anyhow::bail!(messages.error_service_agent_config_stale_profile(
                     &resolved.agent_config.display().to_string(),
                     &stale,
@@ -453,7 +460,7 @@ async fn run_service_add_apply(
     let approle_result = approle::ensure_service_approle(
         &client,
         state,
-        &resolved.service_name,
+        &resolved.registration_id,
         &secret_id_options,
         wrap_ttl,
         messages,
@@ -466,7 +473,7 @@ async fn run_service_add_apply(
     // entry does not exist yet, so nothing reads it "from state"). For an
     // operator `--secret-id-path` override it is the absolute path,
     // agent-owned outside the secrets tree; otherwise the default under
-    // `<secrets_dir>/services/<svc>/`.
+    // `<secrets_dir>/services/<registration_id>/`.
     let is_override = resolved.secret_id_path_override.is_some();
     let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
     let role_id_path = role_id_sibling_path(&secret_id_path);
@@ -535,7 +542,7 @@ async fn run_service_add_apply(
 
     state
         .services
-        .insert(resolved.service_name.clone(), entry.clone());
+        .insert(resolved.registration_id.clone(), entry.clone());
     state
         .save_async(state_path)
         .await
@@ -570,6 +577,7 @@ fn build_service_entry_from_role(
     approle: ServiceRoleEntry,
 ) -> ServiceEntry {
     ServiceEntry {
+        registration_id: resolved.registration_id.clone(),
         service_name: resolved.service_name.clone(),
         delivery_mode: resolved.delivery_mode,
         hostname: resolved.hostname.clone(),
@@ -618,7 +626,7 @@ async fn create_artifact_wrap_info(
     let Some(ttl) = wrap_ttl else {
         return Ok(None);
     };
-    let role_name = approle::service_role_name(&resolved.service_name);
+    let role_name = approle::service_role_name(&resolved.registration_id);
     let secret_id_options = build_secret_id_options(resolved);
     let wrap_info = client
         .create_secret_id_wrap_only(&role_name, &secret_id_options, ttl)
@@ -685,7 +693,7 @@ async fn run_service_add_remote_idempotent(
     crate::commands::openbao_auth::authenticate_openbao_client(&mut client, auth, messages).await?;
     // Re-apply the service policy so pre-existing services pick up the reissue
     // path write grant needed for `rotate force-reissue --wait` completion.
-    approle::reapply_service_policy(&client, state, &entry.service_name, messages).await?;
+    approle::reapply_service_policy(&client, state, &entry.registration_id, messages).await?;
     let ca_bundle_pem = secrets::read_ca_bundle_pem(&client, &state.kv_mount, messages).await?;
     let wrap_ttl = resolve::effective_wrap_ttl(entry.approle.secret_id_wrap_ttl.as_deref());
     let artifact_wrap_info = if let Some(ttl) = wrap_ttl {
@@ -742,8 +750,8 @@ pub(crate) fn run_service_info(args: &ServiceInfoArgs, messages: &Messages) -> R
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
     let entry = state
         .services
-        .get(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
+        .get(&args.registration_id)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.registration_id)))?;
     print_service_info_summary(entry, messages);
     Ok(())
 }
@@ -787,8 +795,8 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
 
     let entry = state
         .services
-        .get_mut(&args.service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.service_name)))?;
+        .get_mut(&args.registration_id)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&args.registration_id)))?;
 
     let mut changes: Vec<String> = Vec::new();
 
@@ -888,7 +896,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         }
         redeploy_hint = Some(CertGroupRedeployHint {
             delivery_mode: entry.delivery_mode,
-            service_name: args.service_name.clone(),
+            registration_id: args.registration_id.clone(),
         });
     }
 
@@ -917,7 +925,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
 
     // Snapshot the entry without holding the borrow on `state` past the
     // re-render / save.
-    let entry_snapshot = state.services.get(&args.service_name).cloned();
+    let entry_snapshot = state.services.get(&args.registration_id).cloned();
 
     // Re-render the managed agent.toml block BEFORE persisting state.
     // If the re-render fails, state.json stays unchanged so a re-run of
@@ -962,7 +970,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
              and re-run `bootroot-remote bootstrap --artifact <path>` on \
              the remote agent host so the new cert_group_gid lands in the \
              remote agent.toml.",
-            hint.service_name,
+            hint.registration_id,
         );
     }
 
@@ -976,7 +984,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
              and re-run `bootroot-remote bootstrap --artifact <path>` on \
              the remote agent host so the new hooks land in the remote \
              agent.toml.",
-            args.service_name,
+            args.registration_id,
         );
     }
 
@@ -989,7 +997,10 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     }
 
     println!("{}", messages.service_update_summary());
-    println!("{}", messages.service_summary_kind(&args.service_name));
+    println!(
+        "{}",
+        messages.service_summary_registration_id(&args.registration_id)
+    );
     for change in &changes {
         println!("{change}");
     }
@@ -1000,7 +1011,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
 
 struct CertGroupRedeployHint {
     delivery_mode: DeliveryMode,
-    service_name: String,
+    registration_id: String,
 }
 
 fn parse_cert_group_for_update(raw: &str, delivery_mode: DeliveryMode) -> Result<Option<u32>> {
@@ -1061,14 +1072,14 @@ where
         if entry.post_renew_hooks.is_empty() {
             println!(
                 "{}",
-                messages.hint_consumer_reload_service_without_hook(&entry.service_name)
+                messages.hint_consumer_reload_service_without_hook(&entry.registration_id)
             );
             any_without_hook = true;
         } else {
             let summary = display_post_renew_hooks(&entry.post_renew_hooks, messages);
             println!(
                 "{}",
-                messages.hint_consumer_reload_service_with_hook(&entry.service_name, &summary)
+                messages.hint_consumer_reload_service_with_hook(&entry.registration_id, &summary)
             );
         }
     }
@@ -1095,6 +1106,7 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     let block = bootroot::trust_bootstrap::render_managed_profile_block(
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
+        &entry.registration_id,
         &entry.service_name,
         entry.instance_id.as_deref().unwrap_or_default(),
         &entry.hostname,
@@ -1116,7 +1128,7 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
         &current,
         MANAGED_PROFILE_BEGIN_PREFIX,
         MANAGED_PROFILE_END_PREFIX,
-        &entry.service_name,
+        &entry.registration_id,
         &block,
     );
     let next = if let Some(pairs) = trust_pairs {
@@ -1220,10 +1232,10 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
     build_service_entry_from_role(
         resolved,
         ServiceRoleEntry {
-            role_name: approle::service_role_name(&resolved.service_name),
+            role_name: approle::service_role_name(&resolved.registration_id),
             role_id: "dry-run".to_string(),
             secret_id_path: preview_secret_id_path,
-            policy_name: approle::service_policy_name(&resolved.service_name),
+            policy_name: approle::service_policy_name(&resolved.registration_id),
             secret_id_ttl: resolved.secret_id_ttl.clone(),
             secret_id_wrap_ttl: resolved.secret_id_wrap_ttl.clone(),
             token_bound_cidrs: resolved.token_bound_cidrs.clone(),
@@ -1234,6 +1246,7 @@ fn build_preview_service_entry(resolved: &ResolvedServiceAdd, state: &StateFile)
 fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
     matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap)
         && matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap)
+        && entry.service_name == resolved.service_name
         && entry.hostname == resolved.hostname
         && entry.domain == resolved.domain
         && entry.agent_config_path == resolved.agent_config
@@ -1392,6 +1405,7 @@ mod tests {
 
     fn sample_resolved() -> ResolvedServiceAdd {
         ResolvedServiceAdd {
+            registration_id: "host1-test-svc-001".to_string(),
             service_name: "test-svc".to_string(),
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "host1".to_string(),
@@ -1439,7 +1453,9 @@ mod tests {
                 .is_symlink(),
             "the rename publishes at the name, as `service add` does"
         );
-        assert!(std::fs::read_to_string(&link).unwrap().contains("test-svc"));
+        let rendered = std::fs::read_to_string(&link).unwrap();
+        assert!(rendered.contains("registration_id = \"host1-test-svc-001\""));
+        assert!(rendered.contains("service_name = \"test-svc\""));
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "# seed\n",
@@ -1448,6 +1464,7 @@ mod tests {
     }
 
     fn assert_common_fields(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) {
+        assert_eq!(entry.registration_id, resolved.registration_id);
         assert_eq!(entry.service_name, resolved.service_name);
         assert_eq!(entry.delivery_mode, resolved.delivery_mode);
         assert_eq!(entry.hostname, resolved.hostname);

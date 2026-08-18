@@ -159,7 +159,11 @@ fn load_service_statuses(messages: &Messages) -> Result<Vec<ServiceStatusEntry>>
     let mut service_statuses = Vec::with_capacity(state.services.len());
     for entry in state.services.values() {
         service_statuses.push(ServiceStatusEntry {
-            service_name: entry.service_name.clone(),
+            // The registration key, not the SAN label: it is what the
+            // operator passes back to `service info --registration-id`,
+            // and two registrations of one component would otherwise
+            // list under one indistinguishable name.
+            registration_id: entry.registration_id.clone(),
             delivery_mode: entry.delivery_mode.to_string(),
         });
     }
@@ -244,7 +248,7 @@ fn secret_id_rotation_warning(
 }
 
 struct ServiceStatusEntry {
-    service_name: String,
+    registration_id: String,
     delivery_mode: String,
 }
 
@@ -372,7 +376,7 @@ fn print_services_section(messages: &Messages, summary: &StatusSummary<'_>) {
             println!(
                 "{}",
                 messages
-                    .status_service_delivery_mode(&service.service_name, &service.delivery_mode)
+                    .status_service_delivery_mode(&service.registration_id, &service.delivery_mode)
             );
         }
     }

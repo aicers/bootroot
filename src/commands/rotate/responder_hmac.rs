@@ -79,16 +79,16 @@ async fn sync_service_responder_hmac_payloads(
     hmac: &str,
     messages: &Messages,
 ) -> Result<()> {
-    for service_name in ctx
+    for registration_id in ctx
         .state
         .services
         .values()
-        .map(|entry| entry.service_name.as_str())
+        .map(|entry| entry.registration_id.as_str())
     {
         client
             .write_kv(
                 &ctx.kv_mount,
-                &format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}"),
+                &format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}"),
                 serde_json::json!({ SERVICE_RESPONDER_HMAC_KEY: hmac }),
             )
             .await

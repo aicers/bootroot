@@ -62,8 +62,8 @@ pub struct Settings {
 /// `OpenBao` connection settings for the remote-agent fast-poll loop.
 ///
 /// The remote `bootroot-agent` authenticates directly via `AppRole` and
-/// polls `{kv_mount}/data/bootroot/services/<service>/reissue` on the
-/// configured `fast_poll_interval` to pick up force-reissue requests
+/// polls `{kv_mount}/data/bootroot/services/<registration_id>/reissue` on
+/// the configured `fast_poll_interval` to pick up force-reissue requests
 /// issued by the control plane.
 #[derive(Debug, Deserialize, Clone)]
 pub struct OpenBaoSettings {
@@ -122,6 +122,14 @@ pub struct Eab {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct DaemonProfileSettings {
+    /// Deployment-wide unique key naming the namespaces this profile
+    /// polls: the `bootroot/services/<key>` KV subtree and the
+    /// per-profile fast-poll state filename. Required — a `[[profiles]]`
+    /// block that omits it is an invalid config and fails to
+    /// deserialize.
+    pub registration_id: String,
+    /// Second label of the certificate SAN this profile requests. Never
+    /// a namespace key; see [`DaemonProfileSettings::registration_id`].
     pub service_name: String,
     pub instance_id: String,
     pub hostname: String,
@@ -349,6 +357,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -407,6 +416,7 @@ mod tests {
             domain = "example.internal"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -455,6 +465,7 @@ mod tests {
             domain = "example.internal"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -562,6 +573,7 @@ mod tests {
             http_responder_url = "http://localhost:8080"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -781,6 +793,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -824,6 +837,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -863,6 +877,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -905,6 +920,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -941,6 +957,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -977,6 +994,7 @@ mod tests {
             http_responder_hmac = "dev-hmac"
 
             [[profiles]]
+            registration_id = "edge-proxy"
             service_name = "edge-proxy"
             instance_id = "001"
             hostname = "edge-node-01"
@@ -998,5 +1016,118 @@ mod tests {
         settings
             .validate()
             .expect("absolute state_path must validate");
+    }
+
+    /// `registration_id` is required, not defaulted: a `[[profiles]]`
+    /// block that omits it is an invalid config and must fail at
+    /// deserialization, before any validation runs. There is no
+    /// fall-back to `service_name` anywhere.
+    #[test]
+    fn settings_reject_profile_without_registration_id() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+
+            [profiles.paths]
+            cert = "certs/edge-proxy-a.pem"
+            key = "certs/edge-proxy-a.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let err = Settings::new(Some(file.path().to_path_buf())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("registration_id"), "{msg}");
+    }
+
+    /// The path-safe rule is enforced at config load, so a bad key never
+    /// reaches the polling loop as a KV path or a state filename.
+    #[test]
+    fn validate_rejects_non_path_safe_registration_id() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].registration_id = "a".repeat(132);
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.registration_id"));
+
+        settings.profiles[0].registration_id = "H1-Piglet".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.registration_id"));
+
+        // The structural maximum is accepted, so the wider key the
+        // derivation rule can compose is not rejected here.
+        settings.profiles[0].registration_id = "a".repeat(131);
+        settings
+            .validate()
+            .expect("a 131-octet registration_id must validate");
+    }
+
+    /// `service_name` is the SAN's second label, so it is held to the
+    /// DNS-label rule at config load rather than at CSR time.
+    #[test]
+    fn validate_rejects_non_dns_label_service_name() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].service_name = "a".repeat(64);
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.service_name"), "{err}");
+
+        settings.profiles[0].service_name = "edge.proxy".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.service_name"), "{err}");
+    }
+
+    /// `hostname` is the SAN's third label, held to the same DNS-label
+    /// rule as `service_name` so a dotted or over-long value fails at
+    /// config load rather than at CSR time.
+    #[test]
+    fn validate_rejects_non_dns_label_hostname() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.profiles[0].hostname = "a".repeat(64);
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.hostname"), "{err}");
+
+        settings.profiles[0].hostname = "edge.proxy".to_string();
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("profiles.hostname"), "{err}");
+
+        settings.profiles[0].hostname = String::new();
+        let err = settings.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("profiles.hostname must not be empty"),
+            "{err}"
+        );
+    }
+
+    /// The SAN keeps reading `service_name`: a `registration_id` that
+    /// differs from it must not leak into any name the certificate
+    /// carries.
+    #[test]
+    fn profile_domain_never_carries_the_registration_id() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings.domain = "example.internal".to_string();
+        settings.profiles[0].registration_id = "edge-node-01-edge-proxy-001".to_string();
+
+        let domain = profile_domain(&settings, &settings.profiles[0]);
+        assert_eq!(domain, "001.edge-proxy.edge-node-01.example.internal");
+        assert!(!domain.contains("edge-node-01-edge-proxy-001"));
     }
 }

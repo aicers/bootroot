@@ -579,6 +579,7 @@ run_bootstrap_init() {
 
   log_phase "bootstrap-service-add"
   run_bootroot service add \
+    --registration-id "$EDGE_SERVICE" \
     --service-name "$EDGE_SERVICE" --delivery-mode local-file \
     --hostname "$EDGE_HOSTNAME" --domain "$DOMAIN" \
     --agent-config "$AGENT_CONFIG_PATH" \

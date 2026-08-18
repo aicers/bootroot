@@ -964,7 +964,7 @@ bootroot status
 
 - 서비스 메타데이터를 `state.json`에 등록
 - 서비스 전용 OpenBao 정책/AppRole 생성, `role_id`/`secret_id` 발급
-- `secrets/services/<service>/role_id`, `secret_id` 파일 생성
+- `secrets/services/<registration_id>/role_id`, `secret_id` 파일 생성
 - 결과 요약과 운영자용 스니펫 출력
 
 ### 2) 전달 모드(`--delivery-mode`)별 자동 반영
@@ -1032,7 +1032,7 @@ EAB 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히 무시�
 #### 4-1) 전달 모드별 trust 자동 처리
 
 - `remote-bootstrap` 방식: 서비스 trust 상태를 서비스별 원격 bootstrap
-  번들(`secret/.../services/<service>/trust`)에 자동 기록하고, 원격 서비스
+  번들(`secret/.../services/<registration_id>/trust`)에 자동 기록하고, 원격 서비스
   머신의 `bootroot-remote bootstrap`이 첫 `bootroot-agent` 실행 전에
   trust 설정과 CA 번들을 반영합니다.
 - `local-file` 방식: trust 설정(`trusted_ca_sha256`, `ca_bundle_path`)이
@@ -1086,7 +1086,17 @@ post-renew 훅이 컨테이너를 리로드합니다
 
 입력 우선순위는 **CLI 옵션 > 환경 변수 > 프롬프트/기본값**입니다.
 
-- `--service-name`: 서비스 이름 식별자
+- `--registration-id`: 배포 전역에서 유일한 등록 키. 이 등록이 소유하는
+  모든 네임스페이스의 이름이 여기에서 파생됩니다 — `state.json` 항목,
+  `AppRole`과 정책, `bootroot/services/<key>` KV 서브트리, 관리 대상
+  `agent.toml` 블록, fast-poll 상태 파일, remote-bootstrap 아티팩트
+  디렉터리.
+  - 영소문자/숫자/하이픈만 허용하며, 영숫자로 시작하고 끝나야 하고,
+    최대 131자입니다.
+  - 인증서 SAN에는 포함되지 않으며, SAN 입력에서 파생하지도 않습니다.
+    한 호스트에서 같은 컴포넌트의 여러 등록이 `--service-name`을 공유할 수
+    있기 때문입니다. 생략하면 프롬프트로 입력받습니다.
+- `--service-name`: SAN의 두 번째 label로 쓰이는 서비스 이름 식별자
   - 단일 DNS label이어야 합니다. 영문자/숫자/하이픈만 허용하며, 최대 63자,
     점(`.`)과 밑줄(`_`)은 허용되지 않습니다.
 - `--delivery-mode`: 전달 모드 (`local-file` 또는 `remote-bootstrap`).
@@ -1323,7 +1333,7 @@ cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니�
 
 ### 입력
 
-- `--service-name`: 서비스 이름 식별자
+- `--registration-id`: 등록된 서비스의 등록 키
 - `--secret-id-ttl`: 생성되는 `secret_id`의 TTL (서비스별 오버라이드를
   지우고 역할 수준 기본값으로 되돌리려면 `"inherit"` 사용). 회전 주기의
   최소 2배 이상이어야 합니다
@@ -1402,21 +1412,21 @@ cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니�
 ### 예시
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
-bootroot service update --service-name edge-proxy --no-wrap
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # 기존 서비스에 갱신 후 훅을 재구성 (이슈 #614).
-bootroot service update --service-name review \
+bootroot service update --registration-id review \
   --reload-style sighup --reload-target review
-bootroot service update --service-name aice-web-next \
+bootroot service update --registration-id aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next
-bootroot service update --service-name edge-proxy --reload-style none
+bootroot service update --registration-id edge-proxy --reload-style none
 
 # 한 번의 업데이트에서 훅 두 개를 등록 (이슈 #702): next-app
 # 컨테이너를 재시작하고 *동시에* 다른 컨테이너 안의 nginx를
 # 리로드합니다. 프리셋이 먼저, 그다음 커스텀 명령 순서로 방출됩니다.
-bootroot service update --service-name aimer-web \
+bootroot service update --registration-id aimer-web \
   --reload-style docker-restart --reload-target aimer-web-next-app-1 \
   --post-renew-command docker --post-renew-arg exec \
     --post-renew-arg aimer-web-nginx-prod-1 \
@@ -1435,7 +1445,7 @@ bootroot service update --service-name aimer-web \
 
 ### 입력
 
-- `--service-name`: 서비스 이름 식별자 (필수)
+- `--registration-id`: 등록된 서비스의 등록 키 (필수)
 - `--yes` (별칭 `--force`): 대화형 확인 프롬프트를 건너뜁니다. 비대화형
   사용(CI/스크립트)에 필요하며, 없으면 stdin이 터미널이 아닐 때 명령이
   진행을 거부합니다.
@@ -1503,21 +1513,21 @@ bootroot service update --service-name aimer-web \
 
 ```bash
 # 제거 계획 미리보기.
-bootroot service remove --service-name edge-proxy --dry-run
+bootroot service remove --registration-id edge-proxy --dry-run
 
 # 서비스 등록 해제(OpenBao AppRole/정책/KV 정리; 인증서/키 및 agent.toml 보존).
-bootroot service remove --service-name edge-proxy --yes
+bootroot service remove --registration-id edge-proxy --yes
 
 # delivery-mode를 local-file에서 remote-bootstrap으로 변경. 재등록과 이어지는
 # 부트스트랩이 낡은 관리 블록을 그 자리에서 교체하므로 agent.toml을 수동으로
 # 편집할 필요가 없습니다. 라이브 전환에서는 remove 단계에 --strip-config를
 # 추가해 (인증서/키는 유지하면서) 블록을 미리 정리할 수 있습니다.
-bootroot service remove --service-name edge-proxy --yes --strip-config
-bootroot service add --service-name edge-proxy \
+bootroot service remove --registration-id edge-proxy --yes --strip-config
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode remote-bootstrap ...
 
 # 디스크 아티팩트와 관리 agent.toml 블록을 포함한 전체 정리.
-bootroot service remove --service-name edge-proxy --yes --delete-artifacts
+bootroot service remove --registration-id edge-proxy --yes --delete-artifacts
 ```
 
 ## bootroot service info
@@ -1526,7 +1536,7 @@ bootroot service remove --service-name edge-proxy --yes --delete-artifacts
 
 ### 입력
 
-- `--service-name`: 서비스 이름 식별자
+- `--registration-id`: 등록된 서비스의 등록 키
 
 ### 출력
 
@@ -1555,7 +1565,7 @@ bootroot-agent를 one-shot으로 실행해 발급을 검증합니다. 서비스 
 
 ### 입력
 
-- `--service-name`: 서비스 이름 식별자
+- `--registration-id`: 등록된 서비스의 등록 키
 - `--agent-config`: bootroot-agent 설정 경로 (선택, 기본은 등록된 값)
 - `--agent-binary`: `bootroot-agent` 바이너리 경로 (선택). 지정하지 않으면
   실행 중인 `bootroot` 바이너리와 같은 디렉터리를 먼저 탐색하고,
@@ -1684,7 +1694,7 @@ AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된
 (`openbao-agent-stepca` / `openbao-agent-responder`)가 사용하는 인프라
 역할 중 하나를 대상으로 하며, 세 선택자 중 정확히 하나가 필요합니다:
 
-- `--service-name`: 대상 서비스 이름. `bootroot-runtime-rotate-role`
+- `--registration-id`: 대상 등록 키. `bootroot-runtime-rotate-role`
   자격증명으로 인증합니다.
 - `--all-services`: `state.json`에 등록된 모든 서비스(`local-file`과
   `remote-bootstrap` 전달 모드 모두)를 한 번의 호출로 회전합니다.
@@ -1771,7 +1781,7 @@ bootroot-agent 호스트 데몬에 SIGHUP(데몬 설정 경로에 대한
 
 `--delivery-mode remote-bootstrap` 서비스의 경우 제어 플레인에는 원격
 호스트로의 푸시 채널이 없어 cert 파일을 원격에서 삭제할 수 없습니다.
-대신 OpenBao의 `{kv_mount}/data/bootroot/services/<service>/reissue`
+대신 OpenBao의 `{kv_mount}/data/bootroot/services/<registration_id>/reissue`
 경로에 `requested_at` 및 `requester` 필드를 포함한 버전 관리된 재발급
 요청을 기록합니다. 원격 bootroot-agent에는 `agent.toml`의 `[openbao]`
 섹션이 **필수**이며(`bootroot-remote bootstrap`이 매 실행마다 자동으로
@@ -1782,7 +1792,7 @@ bootroot-agent 호스트 데몬에 SIGHUP(데몬 설정 경로에 대한
 
 입력:
 
-- `--service-name`: 대상 서비스 이름
+- `--registration-id`: 재발급 대상 등록 키
 - `--requester`: 재발급 KV 페이로드에 기록할 운영자 라벨(선택). 지정하지
   않으면 `$USER` / `$LOGNAME`을 사용하며, 둘 다 없으면 `unknown`이
   사용됩니다.
@@ -2543,6 +2553,10 @@ fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
   `--artifact` 미지정 시 필수.
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
   (기본값 `secret`)
+- `--registration-id`: `--artifact` 미지정 시 필수.
+  - `bootroot service add --registration-id`와 같은 경로 안전 규칙을
+    따릅니다. 영소문자/숫자/하이픈만 허용하며, 영숫자로 시작하고 끝나야
+    하고, 최대 131자입니다.
 - `--service-name`: `--artifact` 미지정 시 필수.
   - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`:
@@ -2558,8 +2572,8 @@ fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
   - `--profile-instance-id`는 숫자만 허용됩니다. `bootroot service add`가
     생성하는 원격 handoff 명령 템플릿은 이 값을 이미 채워 둡니다.
   - `--profile-cert-path`, `--profile-key-path`는 선택입니다.
-    미지정 시 `--agent-config-path` 기준 `certs/<service>.crt`,
-    `certs/<service>.key`를 기본 경로로 사용합니다.
+    미지정 시 `--agent-config-path` 기준 `certs/<registration-id>.crt`,
+    `certs/<registration-id>.key`를 기본 경로로 사용합니다.
   - 기본값:
     - `--agent-email`: `admin@example.com`
     - `--agent-server`: `https://localhost:9000/acme/acme/directory`
@@ -2626,8 +2640,9 @@ fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
 - `--openbao-url`: OpenBao API URL (환경 변수: `OPENBAO_URL`)
 - `--kv-mount`: OpenBao KV v2 마운트 경로 (환경 변수: `OPENBAO_KV_MOUNT`)
   (기본값 `secret`)
-- `--service-name`
-  - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
+- `--registration-id`: 회전된 `secret_id`를 읽어올 KV 서브트리의 등록 키
+  - `bootroot service add --registration-id`와 같은 경로 안전 규칙을
+    따릅니다.
 - `--role-id-path`, `--secret-id-path`
 - `--ca-bundle-path`: `--openbao-url`이 `https://`일 때 TLS를 고정하는 PEM CA
   번들입니다. `bootroot-remote bootstrap`이 기록한 것과 동일한 CA 파일(에이전트의

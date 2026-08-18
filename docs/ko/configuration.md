@@ -40,7 +40,7 @@ OpenBao Agent가 이 설정을 사용해 실제 시크릿 파일을 생성합니
 OpenBao Agent는 `bootroot init`이 `secrets/openbao/stepca/`,
 `secrets/openbao/responder/`에 기록한 `role_id`/`secret_id` 파일을 사용해
 AppRole로 로그인합니다. 서비스의 AppRole 파일은
-`secrets/services/<service>/` 아래에 있으며, 이는 OpenBao Agent가 아니라
+`secrets/services/<registration_id>/` 아래에 있으며, 이는 OpenBao Agent가 아니라
 `bootroot-agent`가 직접 읽습니다. 디렉터리는 `0700`, 파일은 `0600` 권한을
 유지해야 합니다.
 
@@ -304,8 +304,18 @@ CLI에서도 지정 가능합니다(`--eab-kid`, `--eab-hmac`, `--eab-file`).
 최소 1개 이상의 `[[profiles]]`가 필요하며, `instance_id`는 숫자 문자열이어야
 합니다.
 
+`registration_id`는 필수이며, 이 프로필이 폴링하는 모든 네임스페이스의
+이름이 여기에서 파생됩니다 — `bootroot/services/<registration_id>/…` KV
+서브트리와 프로필별 fast-poll 상태 파일 이름입니다. 영소문자/숫자/하이픈만
+허용하며, 영숫자로 시작하고 끝나야 하고, 최대 131자입니다. 이 키를 생략한
+`[[profiles]]` 블록은 로드에 실패합니다. 인증서 필드가 아니라는 점이
+의도적입니다: SAN의 두 번째 label은 계속 `service_name`이므로, 한 호스트에
+있는 같은 컴포넌트의 여러 등록은 `service_name`을 공유하고
+`registration_id`로만 구분됩니다.
+
 ```toml
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
@@ -325,6 +335,11 @@ DNS SAN은 `<instance-id>.<service-name>.<hostname>.<domain>` 형식으로
 HTTP-01 리스폰더 IP로 해석되어야 합니다. Compose 환경에서는 `bootroot service add`가
 `bootroot-http01` 컨테이너에 별칭을 자동 등록합니다. 베어메탈 환경에서는
 `/etc/hosts` 또는 DNS를 수동으로 설정하세요.
+
+`service_name`과 `hostname`은 각각 단일 DNS label입니다. 영문자, 숫자,
+하이픈만 쓸 수 있고 최대 63 옥텟입니다. 둘 중 하나라도 규칙을 어기면
+설정 로드 단계에서 거부되므로, 잘못된 SAN 구성 요소가 나중에 ACME 주문
+거부로 드러나지 않습니다.
 
 #### 프로필 재시도 재정의
 

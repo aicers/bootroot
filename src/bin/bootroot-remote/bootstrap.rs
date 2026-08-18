@@ -10,7 +10,7 @@ use super::openbao_client::build_openbao_client;
 use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
 use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
-    validate_service_name,
+    validate_registration_id_arg, validate_service_name,
 };
 use super::{HookFailurePolicy, Locale, ResolvedBootstrapArgs, localized};
 
@@ -19,10 +19,10 @@ use super::{HookFailurePolicy, Locale, ResolvedBootstrapArgs, localized};
 enum UnwrapError {
     /// The wrap token has expired. Operator must re-run `bootroot service add`
     /// on the control node to mint a fresh wrap token and ship the updated artifact.
-    Expired { service_name: String },
+    Expired { registration_id: String },
     /// The wrap token was already consumed. This indicates the `secret_id`
     /// may have been intercepted by a third party.
-    AlreadyUnwrapped { service_name: String },
+    AlreadyUnwrapped { registration_id: String },
 }
 
 /// Substring present in `OpenBao` API errors returned by `parse_response`.
@@ -66,7 +66,7 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
             wrap_token,
             args.wrap_expires_at.as_deref(),
             &args.secret_id_path,
-            &args.service_name,
+            &args.registration_id,
             args.ca_bundle_pem.as_deref(),
             &args.trusted_ca_sha256,
             lang,
@@ -127,7 +127,7 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
         })?;
     client.set_token(token);
 
-    let pulled = pull_secrets(&client, &args.kv_mount, &args.service_name, lang).await?;
+    let pulled = pull_secrets(&client, &args.kv_mount, &args.registration_id, lang).await?;
     let secret_id_status = match write_secret_file(&args.secret_id_path, &pulled.secret_id).await {
         Ok(status) => ApplyItemSummary::applied(status),
         Err(err) => ApplyItemSummary::failed(localized(
@@ -216,7 +216,7 @@ async fn unwrap_and_write_secret_id(
     wrap_token: &str,
     wrap_expires_at: Option<&str>,
     secret_id_path: &std::path::Path,
-    service_name: &str,
+    registration_id: &str,
     ca_bundle_pem: Option<&str>,
     pins: &[String],
     lang: Locale,
@@ -242,7 +242,7 @@ async fn unwrap_and_write_secret_id(
             Ok(())
         }
         Err(err) => {
-            let Some(unwrap_err) = classify_unwrap_error(&err, wrap_expires_at, service_name)
+            let Some(unwrap_err) = classify_unwrap_error(&err, wrap_expires_at, registration_id)
             else {
                 return Err(err).with_context(|| {
                     localized(
@@ -253,18 +253,18 @@ async fn unwrap_and_write_secret_id(
                 });
             };
             match unwrap_err {
-                UnwrapError::Expired { service_name } => {
+                UnwrapError::Expired { registration_id } => {
                     let msg = localized(
                         lang,
                         &format!(
-                            "Wrap token for service '{service_name}' has expired. To recover:\n\n  \
+                            "Wrap token for registration '{registration_id}' has expired. To recover:\n\n  \
                              1. Re-run `bootroot service add` with the same arguments on the control node.\n     \
                                 The idempotent rerun issues a fresh wrap token.\n  \
                              2. Ship the updated bootstrap.json to this node.\n  \
                              3. Re-run `bootroot-remote bootstrap --artifact <path>`."
                         ),
                         &format!(
-                            "서비스 '{service_name}'의 래핑 토큰이 만료되었습니다. 복구 절차:\n\n  \
+                            "등록 '{registration_id}'의 래핑 토큰이 만료되었습니다. 복구 절차:\n\n  \
                              1. control node에서 동일한 인자로 `bootroot service add`를 다시 실행하세요.\n     \
                                 멱등 재실행으로 새 wrap token을 발급합니다.\n  \
                              2. 갱신된 bootstrap.json을 이 노드로 전송하세요.\n  \
@@ -273,28 +273,28 @@ async fn unwrap_and_write_secret_id(
                     );
                     anyhow::bail!("{msg}");
                 }
-                UnwrapError::AlreadyUnwrapped { service_name } => {
+                UnwrapError::AlreadyUnwrapped { registration_id } => {
                     let msg = localized(
                         lang,
                         &format!(
                             "SECURITY INCIDENT: Wrap token was already unwrapped.\n\
-                             The secret_id for service '{service_name}' may have been \
+                             The secret_id for registration '{registration_id}' may have been \
                              intercepted by a third party.\n\n\
                              Recommended actions:\n  \
                              1. Investigate who or what consumed the token.\n  \
                              2. Rotate the compromised secret_id:\n     \
-                                bootroot rotate approle-secret-id --service-name {service_name}\n  \
+                                bootroot rotate approle-secret-id --registration-id {registration_id}\n  \
                              3. Re-run `bootroot service add` to generate a new wrap token.\n  \
                              4. Ship the updated bootstrap.json and retry bootstrap."
                         ),
                         &format!(
                             "보안 사고: 래핑 토큰이 이미 언래핑되었습니다.\n\
-                             서비스 '{service_name}'의 secret_id가 제3자에 의해 \
+                             등록 '{registration_id}'의 secret_id가 제3자에 의해 \
                              가로채졌을 수 있습니다.\n\n\
                              권장 조치:\n  \
                              1. 토큰을 소비한 주체를 조사하세요.\n  \
                              2. 노출된 secret_id를 교체하세요:\n     \
-                                bootroot rotate approle-secret-id --service-name {service_name}\n  \
+                                bootroot rotate approle-secret-id --registration-id {registration_id}\n  \
                              3. `bootroot service add`를 다시 실행해 새 wrap token을 생성하세요.\n  \
                              4. 갱신된 bootstrap.json을 전송하고 부트스트랩을 재시도하세요."
                         ),
@@ -314,7 +314,7 @@ async fn unwrap_and_write_secret_id(
 fn classify_unwrap_error(
     err: &anyhow::Error,
     wrap_expires_at: Option<&str>,
-    service_name: &str,
+    registration_id: &str,
 ) -> Option<UnwrapError> {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -328,13 +328,13 @@ fn classify_unwrap_error(
         && OffsetDateTime::now_utc() > expires
     {
         return Some(UnwrapError::Expired {
-            service_name: service_name.to_string(),
+            registration_id: registration_id.to_string(),
         });
     }
     // Token hasn't expired but unwrap was rejected — it was already
     // consumed by someone else, a potential security incident.
     Some(UnwrapError::AlreadyUnwrapped {
-        service_name: service_name.to_string(),
+        registration_id: registration_id.to_string(),
     })
 }
 
@@ -419,6 +419,7 @@ fn warn_state_path_collisions(dir: &Path, lang: Locale) {
 }
 
 fn validate_bootstrap_args(args: &ResolvedBootstrapArgs, lang: Locale) -> Result<()> {
+    validate_registration_id_arg(&args.registration_id, lang)?;
     validate_service_name(&args.service_name, lang)?;
     validate_profile_hostname(&args.profile_hostname, lang)?;
     validate_agent_domain(&args.agent_domain, lang)?;
@@ -530,6 +531,7 @@ mod tests {
         ResolvedBootstrapArgs {
             openbao_url: String::new(),
             kv_mount: String::new(),
+            registration_id: String::new(),
             service_name: String::new(),
             role_id_path: PathBuf::new(),
             secret_id_path: PathBuf::new(),
@@ -675,20 +677,20 @@ mod tests {
         let err = openbao_400_error();
         let result = classify_unwrap_error(&err, Some("2020-01-01T00:00:00Z"), "edge-proxy");
         match result {
-            Some(UnwrapError::Expired { service_name }) => {
-                assert_eq!(service_name, "edge-proxy");
+            Some(UnwrapError::Expired { registration_id }) => {
+                assert_eq!(registration_id, "edge-proxy");
             }
             other => panic!("expected Some(Expired), got {other:?}"),
         }
     }
 
     #[test]
-    fn classify_unwrap_already_unwrapped_includes_service_name() {
+    fn classify_unwrap_already_unwrapped_includes_registration_id() {
         let err = openbao_400_error();
         let result = classify_unwrap_error(&err, Some("2099-01-01T00:00:00Z"), "edge-proxy");
         match result {
-            Some(UnwrapError::AlreadyUnwrapped { service_name }) => {
-                assert_eq!(service_name, "edge-proxy");
+            Some(UnwrapError::AlreadyUnwrapped { registration_id }) => {
+                assert_eq!(registration_id, "edge-proxy");
             }
             other => panic!("expected Some(AlreadyUnwrapped), got {other:?}"),
         }
@@ -752,6 +754,7 @@ mod tests {
         std::fs::write(&secret_id_path, "sid").expect("write secret_id");
 
         let mut args = dummy_args();
+        args.registration_id = "svc".to_string();
         args.service_name = "svc".to_string();
         args.profile_hostname = "host".to_string();
         args.agent_domain = "example.com".to_string();
@@ -778,6 +781,7 @@ mod tests {
         std::fs::write(&role_id_path, "rid").expect("write role_id");
 
         let mut args = dummy_args();
+        args.registration_id = "svc".to_string();
         args.service_name = "svc".to_string();
         args.profile_hostname = "host".to_string();
         args.agent_domain = "example.com".to_string();

@@ -767,6 +767,7 @@ register_service() {
   # OpenBao at the `openbao_url` recorded there.  Running it from this
   # instance's own directory is therefore what selects all three.
   run_bootroot "$dir" service add \
+    --registration-id "$service" \
     --service-name "$service" \
     --delivery-mode local-file \
     --hostname "$hostname" \

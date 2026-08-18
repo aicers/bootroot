@@ -163,6 +163,7 @@ EOF
 done
 
 cargo run --bin bootroot -- service add \
+  --registration-id edge-proxy \
   --service-name edge-proxy \
   --hostname edge-node-01 \
   --domain trusted.domain \
@@ -173,6 +174,7 @@ cargo run --bin bootroot -- service add \
   --root-token "$ROOT_TOKEN"
 
 cargo run --bin bootroot -- service add \
+  --registration-id web-app \
   --service-name web-app \
   --hostname web-01 \
   --domain trusted.domain \
@@ -183,6 +185,7 @@ cargo run --bin bootroot -- service add \
   --root-token "$ROOT_TOKEN"
 
 cargo run --bin bootroot -- service add \
+  --registration-id bootroot-agent \
   --service-name bootroot-agent \
   --hostname bootroot-agent \
   --domain trusted.domain \
@@ -211,15 +214,15 @@ cargo build --bin bootroot-agent
 export PATH="$(pwd)/target/debug:$PATH"
 
 cargo run --bin bootroot -- verify \
-  --service-name edge-proxy \
+  --registration-id edge-proxy \
   --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 
 cargo run --bin bootroot -- verify \
-  --service-name web-app \
+  --registration-id web-app \
   --agent-config "$(pwd)/tmp/agent-web-app.toml"
 
 cargo run --bin bootroot -- verify \
-  --service-name bootroot-agent \
+  --registration-id bootroot-agent \
   --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml"
 
 # --- Verify CA Health ---

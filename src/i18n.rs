@@ -11,6 +11,7 @@ pub(crate) mod service;
 pub(crate) mod status;
 
 pub(crate) struct ServiceNextStepsDaemon<'a> {
+    pub(crate) registration_id: &'a str,
     pub(crate) service_name: &'a str,
     pub(crate) instance_id: &'a str,
     pub(crate) hostname: &'a str,
@@ -114,6 +115,7 @@ pub(crate) struct Strings {
     pub(crate) error_service_instance_id_required: &'static str,
     pub(crate) error_value_required: &'static str,
     pub(crate) error_service_name_invalid: &'static str,
+    pub(crate) error_registration_id_invalid: &'static str,
     pub(crate) error_hostname_invalid: &'static str,
     pub(crate) error_domain_invalid: &'static str,
     pub(crate) error_instance_id_invalid: &'static str,
@@ -189,6 +191,7 @@ pub(crate) struct Strings {
     pub(crate) error_ca_trust_empty: &'static str,
     pub(crate) error_parse_state_failed: &'static str,
     pub(crate) error_serialize_state_failed: &'static str,
+    pub(crate) prompt_registration_id: &'static str,
     pub(crate) prompt_service_name: &'static str,
     pub(crate) prompt_hostname: &'static str,
     pub(crate) prompt_domain: &'static str,
@@ -212,6 +215,7 @@ pub(crate) struct Strings {
     pub(crate) service_add_summary: &'static str,
     pub(crate) service_add_plan_title: &'static str,
     pub(crate) service_info_summary: &'static str,
+    pub(crate) service_summary_registration_id: &'static str,
     pub(crate) service_summary_kind: &'static str,
     pub(crate) service_summary_hostname: &'static str,
     pub(crate) service_summary_domain: &'static str,
@@ -256,6 +260,7 @@ pub(crate) struct Strings {
     pub(crate) service_snippet_domain_hint: &'static str,
     pub(crate) verify_plan_title: &'static str,
     pub(crate) verify_summary_title: &'static str,
+    pub(crate) verify_registration_id: &'static str,
     pub(crate) verify_service_name: &'static str,
     pub(crate) verify_agent_config: &'static str,
     pub(crate) verify_cert_path: &'static str,
@@ -709,6 +714,31 @@ mod tests {
                 "{locale}: the compose service name must not be instance-scoped"
             );
         }
+    }
+
+    /// The `registration_id` prompt and its invalid-value message must be
+    /// present, distinct, and localized in both shipped locales — an
+    /// operator who runs `service add` under `ko` gets a Korean prompt and
+    /// a Korean rejection, not an English fallback.
+    #[test]
+    fn registration_id_strings_present_in_both_locales() {
+        let en = Messages::new("en").unwrap();
+        let ko = Messages::new("ko").unwrap();
+
+        for m in [&en, &ko] {
+            assert!(!m.prompt_registration_id().is_empty());
+            assert!(!m.error_registration_id_invalid().is_empty());
+            assert_ne!(
+                m.error_registration_id_invalid(),
+                m.error_service_name_invalid(),
+                "the registration key and the SAN label must not share a message"
+            );
+        }
+        assert_ne!(en.prompt_registration_id(), ko.prompt_registration_id());
+        assert_ne!(
+            en.error_registration_id_invalid(),
+            ko.error_registration_id_invalid()
+        );
     }
 
     #[test]

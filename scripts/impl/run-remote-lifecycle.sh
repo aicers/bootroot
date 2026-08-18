@@ -595,6 +595,7 @@ run_bootstrap_chain() {
 
   log_phase "service-add"
   run_bootroot_control service add \
+    --registration-id "$SERVICE_NAME" \
     --service-name "$SERVICE_NAME" \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME" \
@@ -608,6 +609,7 @@ run_bootstrap_chain() {
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
 
   run_bootroot_control service add \
+    --registration-id "$SERVICE_NAME_2" \
     --service-name "$SERVICE_NAME_2" \
     --delivery-mode remote-bootstrap \
     --hostname "$HOSTNAME_2" \
@@ -690,6 +692,7 @@ run_remote_bootstrap() {
     "$BOOTROOT_REMOTE_BIN" bootstrap \
       --openbao-url "$OPENBAO_URL" \
       --kv-mount "secret" \
+      --registration-id "$service" \
       --service-name "$service" \
       --role-id-path "$role_id_path" \
       --secret-id-path "$secret_id_path" \
@@ -713,7 +716,7 @@ verify_with_retry() {
   local agent_config="$2"
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if run_bootroot_control verify --service-name "$service" --agent-config "$agent_config" --agent-binary "$BOOTROOT_AGENT_BIN" >>"$RUN_LOG" 2>&1; then
+    if run_bootroot_control verify --registration-id "$service" --agent-config "$agent_config" --agent-binary "$BOOTROOT_AGENT_BIN" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
@@ -848,7 +851,7 @@ drive_force_reissue_wait() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     force-reissue \
-    --service-name "$service" \
+    --registration-id "$service" \
     --wait \
     --wait-timeout "$FORCE_REISSUE_WAIT_TIMEOUT" >"$reissue_log" 2>&1 || status=$?
 
@@ -973,7 +976,7 @@ run_rotation_secret_id() {
     --approle-secret-id "$RUNTIME_ROTATE_SECRET_ID" \
     --yes \
     approle-secret-id \
-    --service-name "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
+    --registration-id "$SERVICE_NAME" >>"$RUN_LOG" 2>&1
   # Batch selector (#669): --all-services follows state.json, so this
   # single invocation covers $SERVICE_NAME_2 and re-rotates
   # $SERVICE_NAME, doubling as re-run idempotence coverage.

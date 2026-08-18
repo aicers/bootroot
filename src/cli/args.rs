@@ -653,15 +653,15 @@ pub(crate) struct RotateOpenBaoRecoveryArgs {
     group(
         ArgGroup::new("approle_target")
             .required(true)
-            .args(["service_name", "all_services", "infra"])
+            .args(["registration_id", "all_services", "infra"])
     )
 )]
 pub(crate) struct RotateAppRoleSecretIdArgs {
-    /// App service name to rotate the `AppRole` `secret_id` for.
+    /// Registration key to rotate the `AppRole` `secret_id` for.
     ///
     /// Authenticate with `bootroot-runtime-rotate-role` credentials.
     #[arg(long)]
-    pub(crate) service_name: Option<String>,
+    pub(crate) registration_id: Option<String>,
 
     /// Rotates the `AppRole` `secret_id` of every registered service in
     /// one invocation.
@@ -701,7 +701,7 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// a required `ArgGroup` as satisfied by any group member.
     #[arg(
         long = "rotate-bound-cidrs",
-        conflicts_with_all = ["service_name", "all_services"]
+        conflicts_with_all = ["registration_id", "all_services"]
     )]
     pub(crate) rotate_bound_cidrs: Vec<String>,
 
@@ -714,7 +714,7 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// until a provisioning run records a new binding.
     #[arg(
         long = "clear-rotate-bound-cidrs",
-        conflicts_with_all = ["service_name", "all_services", "rotate_bound_cidrs"]
+        conflicts_with_all = ["registration_id", "all_services", "rotate_bound_cidrs"]
     )]
     pub(crate) clear_rotate_bound_cidrs: bool,
 }
@@ -732,9 +732,9 @@ pub(crate) struct RotateTrustSyncArgs {}
 
 #[derive(Args, Debug)]
 pub(crate) struct RotateForceReissueArgs {
-    /// Service name to force-reissue certificates for
+    /// Registration key to force-reissue certificates for
     #[arg(long)]
-    pub(crate) service_name: String,
+    pub(crate) registration_id: String,
 
     /// Optional label describing the operator that requested the reissue.
     ///
@@ -1331,7 +1331,20 @@ pub(crate) struct StatusArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct ServiceAddArgs {
-    /// Service name identifier
+    /// Deployment-wide unique registration key.
+    ///
+    /// Names every namespace this registration owns: the `state.json`
+    /// entry, the `AppRole` and policy, the `bootroot/services/<key>`
+    /// KV subtree, the managed `agent.toml` block, the fast-poll state
+    /// file. Lowercase alphanumeric and hyphens, starting and ending
+    /// alphanumeric, at most 131 octets. Prompted for when omitted.
+    ///
+    /// Not derived from the SAN inputs: several registrations of one
+    /// component may share a `--service-name` on one host.
+    #[arg(long)]
+    pub(crate) registration_id: Option<String>,
+
+    /// Service name identifier used as the SAN's second label
     #[arg(long)]
     pub(crate) service_name: Option<String>,
 
@@ -1374,7 +1387,7 @@ pub(crate) struct ServiceAddArgs {
     /// `role_id`/`eab.json` and rewrite `secret_id`. The parent
     /// directory must already exist, be agent-owned, and resolve outside
     /// the secrets tree. Omit to keep the default under
-    /// `<secrets_dir>/services/<svc>/`.
+    /// `<secrets_dir>/services/<registration_id>/`.
     #[arg(long)]
     pub(crate) secret_id_path: Option<PathBuf>,
 
@@ -1473,16 +1486,16 @@ pub(crate) struct ServiceAddArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct ServiceInfoArgs {
-    /// Service name identifier
+    /// Registration key of the registered service
     #[arg(long, required = true)]
-    pub(crate) service_name: String,
+    pub(crate) registration_id: String,
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct ServiceUpdateArgs {
-    /// Service name identifier
+    /// Registration key of the registered service
     #[arg(long, required = true)]
-    pub(crate) service_name: String,
+    pub(crate) registration_id: String,
 
     /// TTL for the generated `secret_id` (use "inherit" to clear override).
     /// Should be at least 2× the rotation interval
@@ -1557,9 +1570,9 @@ pub(crate) struct ServiceUpdateArgs {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug)]
 pub(crate) struct ServiceRemoveArgs {
-    /// Service name identifier
+    /// Registration key of the registered service
     #[arg(long, required = true)]
-    pub(crate) service_name: String,
+    pub(crate) registration_id: String,
 
     /// Skips the interactive confirmation prompt.
     ///
@@ -1608,9 +1621,9 @@ pub(crate) struct ServiceRemoveArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct VerifyArgs {
-    /// Service name identifier
+    /// Registration key of the registered service
     #[arg(long)]
-    pub(crate) service_name: Option<String>,
+    pub(crate) registration_id: Option<String>,
 
     /// bootroot-agent config path override
     #[arg(long)]
@@ -1715,13 +1728,13 @@ mod tests {
             "bootroot",
             "rotate",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             "api",
         ]);
         match cli.command {
             CliCommand::Rotate(args) => match args.command {
                 RotateCommand::AppRoleSecretId(approle) => {
-                    assert_eq!(approle.service_name.as_deref(), Some("api"));
+                    assert_eq!(approle.registration_id.as_deref(), Some("api"));
                     assert!(approle.infra.is_none());
                 }
                 _ => panic!("expected AppRoleSecretId subcommand"),
@@ -1741,7 +1754,7 @@ mod tests {
             match cli.command {
                 CliCommand::Rotate(args) => match args.command {
                     RotateCommand::AppRoleSecretId(approle) => {
-                        assert!(approle.service_name.is_none());
+                        assert!(approle.registration_id.is_none());
                         assert_eq!(approle.infra, Some(expected));
                     }
                     _ => panic!("expected AppRoleSecretId subcommand"),
@@ -1758,7 +1771,7 @@ mod tests {
             CliCommand::Rotate(args) => match args.command {
                 RotateCommand::AppRoleSecretId(approle) => {
                     assert!(approle.all_services);
-                    assert!(approle.service_name.is_none());
+                    assert!(approle.registration_id.is_none());
                     assert!(approle.infra.is_none());
                 }
                 _ => panic!("expected AppRoleSecretId subcommand"),
@@ -1778,7 +1791,7 @@ mod tests {
                 "bootroot",
                 "rotate",
                 "approle-secret-id",
-                "--service-name",
+                "--registration-id",
                 "api",
                 "--infra",
                 "stepca",
@@ -1792,7 +1805,7 @@ mod tests {
                 "rotate",
                 "approle-secret-id",
                 "--all-services",
-                "--service-name",
+                "--registration-id",
                 "api",
             ])
             .is_err(),
@@ -2790,7 +2803,7 @@ mod tests {
             "bootroot",
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--cert-group",
             "clear",
@@ -2803,18 +2816,144 @@ mod tests {
         }
     }
 
+    /// `service add` takes the registration key as its own flag,
+    /// alongside — never instead of — the SAN's `--service-name`.
+    #[test]
+    fn test_cli_parses_service_add_registration_id() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--registration-id",
+            "h1-piglet-001",
+            "--service-name",
+            "piglet",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.registration_id.as_deref(), Some("h1-piglet-001"));
+                assert_eq!(args.service_name.as_deref(), Some("piglet"));
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    /// Omitting `--registration-id` still parses: `service add` prompts
+    /// for it, exactly as it does for the other required inputs.
+    #[test]
+    fn test_cli_service_add_registration_id_is_optional_at_parse_time() {
+        let cli = Cli::parse_from(["bootroot", "service", "add", "--service-name", "piglet"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert!(args.registration_id.is_none());
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    /// Every lookup command names a `registration_id`. Each accepts the
+    /// new flag.
+    #[test]
+    fn test_cli_lookup_commands_accept_registration_id() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "info",
+            "--registration-id",
+            "h1-piglet-001",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Info(args)) => {
+                assert_eq!(args.registration_id, "h1-piglet-001");
+            }
+            _ => panic!("expected service info"),
+        }
+
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--registration-id",
+            "h1-piglet-001",
+            "--no-wrap",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.registration_id, "h1-piglet-001");
+            }
+            _ => panic!("expected service update"),
+        }
+
+        let cli = Cli::parse_from(["bootroot", "verify", "--registration-id", "h1-piglet-001"]);
+        match cli.command {
+            CliCommand::Verify(args) => {
+                assert_eq!(args.registration_id.as_deref(), Some("h1-piglet-001"));
+            }
+            _ => panic!("expected verify"),
+        }
+
+        let cli = Cli::parse_from([
+            "bootroot",
+            "rotate",
+            "force-reissue",
+            "--registration-id",
+            "h1-piglet-001",
+        ]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::ForceReissue(reissue) => {
+                    assert_eq!(reissue.registration_id, "h1-piglet-001");
+                }
+                _ => panic!("expected ForceReissue subcommand"),
+            },
+            _ => panic!("expected rotate"),
+        }
+    }
+
+    /// `--service-name` is gone from every lookup command: leaving that
+    /// spelling in place to mean "the registry key" would re-create the
+    /// conflation the split removes, so there is deliberately no alias.
+    #[test]
+    fn test_cli_lookup_commands_reject_service_name() {
+        for argv in [
+            vec!["bootroot", "service", "info", "--service-name", "svc"],
+            vec!["bootroot", "service", "update", "--service-name", "svc"],
+            vec!["bootroot", "service", "remove", "--service-name", "svc"],
+            vec!["bootroot", "verify", "--service-name", "svc"],
+            vec![
+                "bootroot",
+                "rotate",
+                "approle-secret-id",
+                "--service-name",
+                "svc",
+            ],
+            vec![
+                "bootroot",
+                "rotate",
+                "force-reissue",
+                "--service-name",
+                "svc",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_err(),
+                "--service-name must be rejected as a lookup key: {argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_cli_parses_service_remove_defaults() {
         let cli = Cli::parse_from([
             "bootroot",
             "service",
             "remove",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
         ]);
         match cli.command {
             CliCommand::Service(ServiceCommand::Remove(args)) => {
-                assert_eq!(args.service_name, "edge-proxy");
+                assert_eq!(args.registration_id, "edge-proxy");
                 assert!(!args.yes);
                 assert!(!args.dry_run);
                 assert!(!args.delete_artifacts);
@@ -2830,7 +2969,7 @@ mod tests {
             "bootroot",
             "service",
             "remove",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--yes",
             "--dry-run",
@@ -2853,7 +2992,7 @@ mod tests {
             "bootroot",
             "service",
             "remove",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--force",
         ]);
@@ -2871,7 +3010,7 @@ mod tests {
             "bootroot",
             "service",
             "remove",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--strip-config",
         ]);
@@ -2920,7 +3059,7 @@ mod tests {
             "bootroot",
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--rn-cidrs",
             "10.0.0.0/8",
@@ -2939,7 +3078,7 @@ mod tests {
             "bootroot",
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--reload-style",
             "sighup",
@@ -2961,7 +3100,7 @@ mod tests {
             "bootroot",
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--post-renew-command",
             "systemctl",
@@ -2994,7 +3133,7 @@ mod tests {
             "bootroot",
             "service",
             "update",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--rn-cidrs",
             "clear",
@@ -3016,7 +3155,7 @@ mod tests {
             "bootroot",
             "rotate",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "--yes",
         ]);
@@ -3036,7 +3175,7 @@ mod tests {
             "rotate",
             "--yes",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
         ]);
         match cli.command {
@@ -3054,7 +3193,7 @@ mod tests {
             "bootroot",
             "rotate",
             "force-reissue",
-            "--service-name",
+            "--registration-id",
             "edge-proxy",
             "-y",
         ]);

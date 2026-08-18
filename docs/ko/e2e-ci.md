@@ -414,14 +414,14 @@ BOOTROOT_LANG=en bootroot init \
 # 3) service-add
 # 서로 다른 로컬 서비스는 각자 자신의 에이전트 설정을 사용합니다
 # (서비스마다 데몬 하나, [openbao] AppRole 아이덴티티 하나).
-bootroot service add --service-name edge-proxy \
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode local-file --agent-config "$EDGE_AGENT_CONFIG"
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
 # 4) verify-initial / 9) verify-after-responder-hmac
-bootroot verify --service-name edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
-bootroot verify --service-name web-app --agent-config "$WEB_AGENT_CONFIG"
+bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
+bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
 # 5) rotate-infra-secret-id
 # init summary에서
@@ -549,21 +549,22 @@ BOOTROOT_LANG=en bootroot init \
   --confirm-db-provision \
   --db-user "step" --db-name "stepca" \
   --responder-url "$RESPONDER_URL" </dev/null
-bootroot service add --service-name edge-proxy \
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH"
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode remote-bootstrap --agent-config "$REMOTE_AGENT_CONFIG_PATH_2"
 
 # remote node: bootstrap (서비스별)
 bootroot-remote bootstrap --openbao-url "http://127.0.0.1:8200" \
+  --registration-id "$SERVICE_NAME" \
   --service-name "$SERVICE_NAME" \
   --role-id-path "$role_id_path" --secret-id-path "$secret_id_path" \
   --agent-config-path "$REMOTE_AGENT_CONFIG_PATH" \
   --output json
 
 # control node: secret_id 회전 + trust 업데이트를 KV에 게시
-bootroot rotate --yes approle-secret-id --service-name edge-proxy
-bootroot rotate --yes approle-secret-id --service-name web-app
+bootroot rotate --yes approle-secret-id --registration-id edge-proxy
+bootroot rotate --yes approle-secret-id --registration-id web-app
 # remote node: 수동 재반영 없음. 실행 중인 bootroot-agent fast-poll 루프가
 # 자체 secret_id를 갱신하고 trust를 다시 렌더링하며, 이후 force-reissue
 # --wait 왕복으로 갱신된 자격증명으로 동작함을 증명(selfheal-<service> 단계).
@@ -665,9 +666,9 @@ sudo -n cp "$tmp_file" /etc/hosts
 ./scripts/impl/run-rotation-recovery.sh
 
 # 회전/verify 루프에서 사용하는 핵심 명령
-bootroot rotate --yes approle-secret-id --service-name "$service"
-bootroot-remote bootstrap --service-name "$service" ...
-bootroot verify --service-name "$service" --agent-config "$agent_config_path"
+bootroot rotate --yes approle-secret-id --registration-id "$service"
+bootroot-remote bootstrap --registration-id "$service" --service-name "$service" ...
+bootroot verify --registration-id "$service" --agent-config "$agent_config_path"
 ```
 
 ### 6) CA 키 회전 장애/복구

@@ -231,7 +231,7 @@ pub(crate) async fn write_trust_to_openbao(
         write_service_trust(
             client,
             kv_mount,
-            &entry.service_name,
+            &entry.registration_id,
             fingerprints,
             ca_bundle_pem,
             messages,
@@ -246,7 +246,7 @@ pub(crate) async fn write_trust_to_openbao(
 pub(crate) async fn write_service_trust(
     client: &OpenBaoClient,
     kv_mount: &str,
-    service_name: &str,
+    registration_id: &str,
     fingerprints: &[String],
     ca_bundle_pem: &str,
     messages: &Messages,
@@ -254,7 +254,7 @@ pub(crate) async fn write_service_trust(
     client
         .write_kv(
             kv_mount,
-            &format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_TRUST_KV_SUFFIX}"),
+            &format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_TRUST_KV_SUFFIX}"),
             serde_json::json!({
                 CA_TRUST_KEY: fingerprints,
                 CA_BUNDLE_PEM_KEY: ca_bundle_pem,

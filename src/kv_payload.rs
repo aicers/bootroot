@@ -2,7 +2,8 @@
 //!
 //! The `bootroot-remote bootstrap` / `apply-secret-id` paths and the remote
 //! `bootroot-agent` fast-poll loop read the same KV paths
-//! (`{kv_mount}/data/bootroot/services/<service>/{trust,secret_id}`). This
+//! (`{kv_mount}/data/bootroot/services/<registration_id>/{trust,secret_id}`).
+//! This
 //! module owns one implementation of the payload validation so both callers
 //! agree on shape, required fields, and fingerprint formatting. Callers that
 //! need localized error text wrap these errors with their own context.

@@ -88,6 +88,10 @@ impl Messages {
         self.strings().error_service_name_invalid
     }
 
+    pub(crate) fn error_registration_id_invalid(&self) -> &'static str {
+        self.strings().error_registration_id_invalid
+    }
+
     pub(crate) fn error_hostname_invalid(&self) -> &'static str {
         self.strings().error_hostname_invalid
     }
@@ -424,6 +428,10 @@ impl Messages {
         self.strings().error_serialize_state_failed
     }
 
+    pub(crate) fn prompt_registration_id(&self) -> &'static str {
+        self.strings().prompt_registration_id
+    }
+
     pub(crate) fn prompt_service_name(&self) -> &'static str {
         self.strings().prompt_service_name
     }
@@ -509,6 +517,13 @@ impl Messages {
 
     pub(crate) fn service_info_summary(&self) -> &'static str {
         self.strings().service_info_summary
+    }
+
+    pub(crate) fn service_summary_registration_id(&self, value: &str) -> String {
+        format_template(
+            self.strings().service_summary_registration_id,
+            &[("value", value)],
+        )
     }
 
     pub(crate) fn service_summary_kind(&self, value: &str) -> String {
@@ -711,6 +726,7 @@ impl Messages {
         format_template(
             self.strings().service_next_steps_daemon_profile,
             &[
+                ("registration_id", data.registration_id),
                 ("service_name", data.service_name),
                 ("instance_id", data.instance_id),
                 ("hostname", data.hostname),
@@ -929,19 +945,22 @@ impl Messages {
 
     pub(crate) fn hint_consumer_reload_service_with_hook(
         &self,
-        service_name: &str,
+        registration_id: &str,
         hook: &str,
     ) -> String {
         format_template(
             self.strings().hint_consumer_reload_service_with_hook,
-            &[("service_name", service_name), ("hook", hook)],
+            &[("registration_id", registration_id), ("hook", hook)],
         )
     }
 
-    pub(crate) fn hint_consumer_reload_service_without_hook(&self, service_name: &str) -> String {
+    pub(crate) fn hint_consumer_reload_service_without_hook(
+        &self,
+        registration_id: &str,
+    ) -> String {
         format_template(
             self.strings().hint_consumer_reload_service_without_hook,
-            &[("service_name", service_name)],
+            &[("registration_id", registration_id)],
         )
     }
 

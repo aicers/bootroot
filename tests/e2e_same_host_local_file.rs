@@ -226,6 +226,8 @@ async fn test_same_host_trust_change_propagates_to_agent_config() {
             &server.uri(),
             "--kv-mount",
             "secret",
+            "--registration-id",
+            SERVICE_NAME,
             "--service-name",
             SERVICE_NAME,
             "--role-id-path",
@@ -424,6 +426,8 @@ fn run_service_add_local_with_extra_args(
         .args([
             "service",
             "add",
+            "--registration-id",
+            SERVICE_NAME,
             "--service-name",
             SERVICE_NAME,
             "--delivery-mode",
@@ -522,7 +526,7 @@ fn run_rotate_secret_id_with_output(root: &Path, openbao_url: &str) -> std::proc
             RUNTIME_ROTATE_SECRET_ID,
             "--yes",
             "approle-secret-id",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
         ])
         .output()
@@ -535,7 +539,7 @@ fn run_verify(root: &Path, agent_config: &Path) -> anyhow::Result<()> {
         .current_dir(root)
         .args([
             "verify",
-            "--service-name",
+            "--registration-id",
             SERVICE_NAME,
             "--agent-config",
             agent_config.to_string_lossy().as_ref(),

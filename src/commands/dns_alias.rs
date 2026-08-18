@@ -290,6 +290,7 @@ mod tests {
 
     fn sample_entry(name: &str, instance_id: Option<&str>) -> ServiceEntry {
         ServiceEntry {
+            registration_id: name.to_string(),
             service_name: name.to_string(),
             delivery_mode: DeliveryMode::LocalFile,
             hostname: "host1".to_string(),

@@ -22,18 +22,23 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
         anyhow::bail!(messages.error_state_missing());
     }
     let state = StateFile::load(&state_path)?;
-    let service_name = resolve_verify_service_name(args, messages)?;
+    let registration_id = resolve_verify_registration_id(args, messages)?;
     let entry = state
         .services
-        .get(&service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&service_name)))?;
+        .get(&registration_id)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(&registration_id)))?;
 
     let agent_config = args
         .agent_config
         .as_ref()
         .unwrap_or(&entry.agent_config_path);
 
-    print_verify_plan(&entry.service_name, agent_config, messages);
+    print_verify_plan(
+        &entry.registration_id,
+        &entry.service_name,
+        agent_config,
+        messages,
+    );
 
     let search_path = std::env::var_os("PATH");
     let agent_binary = resolve_agent_binary(
@@ -79,6 +84,10 @@ pub(crate) fn run_verify(args: &VerifyArgs, messages: &Messages) -> Result<()> {
     }
 
     println!("{}", messages.verify_summary_title());
+    println!(
+        "{}",
+        messages.verify_registration_id(&entry.registration_id)
+    );
     println!("{}", messages.verify_service_name(&entry.service_name));
     println!(
         "{}",
@@ -242,8 +251,8 @@ fn find_on_path(
     (found, checked)
 }
 
-fn resolve_verify_service_name(args: &VerifyArgs, messages: &Messages) -> Result<String> {
-    if let Some(value) = args.service_name.as_deref() {
+fn resolve_verify_registration_id(args: &VerifyArgs, messages: &Messages) -> Result<String> {
+    if let Some(value) = args.registration_id.as_deref() {
         if value.trim().is_empty() {
             anyhow::bail!(messages.error_value_required());
         }
@@ -252,7 +261,7 @@ fn resolve_verify_service_name(args: &VerifyArgs, messages: &Messages) -> Result
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout().lock();
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
-    prompt.prompt_with_validation(messages.prompt_service_name(), None, |value| {
+    prompt.prompt_with_validation(messages.prompt_registration_id(), None, |value| {
         if value.trim().is_empty() {
             anyhow::bail!(messages.error_value_required());
         }
@@ -421,6 +430,7 @@ mod tests {
 
     fn test_service_entry(delivery_mode: DeliveryMode) -> ServiceEntry {
         ServiceEntry {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             delivery_mode,
             hostname: "host-a".to_string(),

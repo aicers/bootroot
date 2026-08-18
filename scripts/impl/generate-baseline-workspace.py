@@ -108,6 +108,7 @@ def main() -> None:
             ensure_cert_pair(work_dir, service_name, hostname, instance_id)
 
             state_services[service_name] = {
+                "registration_id": service_name,
                 "service_name": service_name,
                 "delivery_mode": "remote-bootstrap",
                 "hostname": hostname,

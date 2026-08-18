@@ -68,16 +68,16 @@ bootroot는 의도적으로 원격 호스트로 파일을 **전송하지 않습�
 
 | 파일 | 소스 경로 (제어 노드) | 용도 |
 | --- | --- | --- |
-| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | `bootroot-remote`가 `wrap_token`을 언래핑하여 `secret_id`를 얻는 머신 판독 가능 아티팩트 (**민감**) |
-| `role_id` | `secrets/services/<service>/role_id` | AppRole 식별자 (장기 유효) |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json` | `bootroot-remote`가 `wrap_token`을 언래핑하여 `secret_id`를 얻는 머신 판독 가능 아티팩트 (**민감**) |
+| `role_id` | `secrets/services/<registration_id>/role_id` | AppRole 식별자 (장기 유효) |
 
 **래핑 비활성 (`--no-wrap`):**
 
 | 파일 | 소스 경로 (제어 노드) | 용도 |
 | --- | --- | --- |
-| `bootstrap.json` | `secrets/remote-bootstrap/services/<service>/bootstrap.json` | `bootroot-remote bootstrap`이 소비하는 머신 판독 가능 아티팩트 |
-| `role_id` | `secrets/services/<service>/role_id` | AppRole 식별자 (장기 유효) |
-| `secret_id` | `secrets/services/<service>/secret_id` | AppRole 자격증명 (**민감**) |
+| `bootstrap.json` | `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json` | `bootroot-remote bootstrap`이 소비하는 머신 판독 가능 아티팩트 |
+| `role_id` | `secrets/services/<registration_id>/role_id` | AppRole 식별자 (장기 유효) |
+| `secret_id` | `secrets/services/<registration_id>/secret_id` | AppRole 자격증명 (**민감**) |
 
 응답 래핑(기본값)은 아래의 **모든** 전송 메커니즘과 함께 동작합니다.
 SSH, systemd-credentials, Ansible, cloud-init 모두 원본 `secret_id`만큼
@@ -115,6 +115,7 @@ ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 
 # 1. 제어 노드에서 서비스 등록
 bootroot service add \
+  --registration-id "$SERVICE" \
   --service-name "$SERVICE" \
   --delivery-mode remote-bootstrap \
   --hostname "$REMOTE_HOST" \
@@ -134,7 +135,7 @@ scp -p \
   "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
 
 # 3. 부트스트랩 전 schema_version 검증
-SCHEMA_OK='.schema_version >= 1 and .schema_version <= 4'
+SCHEMA_OK='.schema_version >= 5 and .schema_version <= 5'
 if ! jq -e "$SCHEMA_OK" "$ARTIFACT" > /dev/null; then
   echo "ERROR: $ARTIFACT 의 schema_version이 지원되지 않습니다" >&2
   exit 1
@@ -177,6 +178,7 @@ Type=oneshot
 LoadCredential=secret_id:/etc/credstore/bootroot-edge-remote-secret-id
 ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     --openbao-url https://openbao.internal:8200 \
+    --registration-id edge-remote \
     --service-name edge-remote \
     --secret-id-path %d/secret_id \
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id \
@@ -230,11 +232,11 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
     - name: schema_version 검증
       ansible.builtin.assert:
         that:
-          - artifact.schema_version >= 1
-          - artifact.schema_version <= 4
+          - artifact.schema_version >= 5
+          - artifact.schema_version <= 5
         fail_msg: >-
           지원되지 않는 schema_version {{ artifact.schema_version }};
-          이 플레이북은 버전 1부터 4까지 지원합니다.
+          이 플레이북은 버전 5만 지원합니다.
 
     - name: 시크릿 디렉터리 생성
       ansible.builtin.file:
@@ -267,6 +269,7 @@ ExecStart=/usr/local/bin/bootroot-remote bootstrap \
           bootroot-remote bootstrap
           --openbao-url {{ artifact.openbao_url }}
           --kv-mount {{ artifact.kv_mount }}
+          --registration-id {{ artifact.registration_id }}
           --service-name {{ artifact.service_name }}
           --role-id-path {{ artifact.role_id_path }}
           --secret-id-path {{ artifact.secret_id_path }}
@@ -309,6 +312,7 @@ runcmd:
   - >-
     /usr/local/bin/bootroot-remote bootstrap
     --openbao-url https://openbao.internal:8200
+    --registration-id edge-remote
     --service-name edge-remote
     --role-id-path /srv/bootroot/secrets/services/edge-remote/role_id
     --secret-id-path /srv/bootroot/secrets/services/edge-remote/secret_id
@@ -354,7 +358,7 @@ runcmd:
 
 1. 누가 또는 무엇이 토큰을 소비했는지 조사합니다.
 2. `secret_id`를 즉시 회전합니다:
-   `bootroot rotate approle-secret-id --service-name <service>`.
+   `bootroot rotate approle-secret-id --registration-id <service>`.
 3. 동일한 인자로 `bootroot service add`를 다시 실행해 새 `wrap_token`을
    생성합니다.
 4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을
@@ -365,7 +369,7 @@ runcmd:
 제어 플레인에는 원격 호스트로의 푸시 채널이 없으므로
 `bootroot rotate force-reissue`가 원격의 cert 파일을 직접 삭제할 수
 없습니다. 대신 `--delivery-mode remote-bootstrap` 서비스의 경우 명령은
-OpenBao KV `{kv_mount}/data/bootroot/services/<service>/reissue`
+OpenBao KV `{kv_mount}/data/bootroot/services/<registration_id>/reissue`
 경로에 버전 관리된 재발급 요청을 기록합니다:
 
 ```json
@@ -423,12 +427,14 @@ state_path = "/etc/bootroot/bootroot-agent-state-giganto.json" # bootstrap이 �
 중에 조용히 취약한 상태 파일을 사용하는 대신 `bootroot-agent` 시작
 시점에 드러납니다.
 
-기본 제공되는 basename은 `service_name`을 키로 사용하므로
-(`bootroot-agent-state-<service_name>.json`), 같은 디렉터리를 공유하는
-서비스별 agent 구성이 하나의 상태 파일을 두고 경합하지 않고 서로 다른
-상태 파일로 분리됩니다. 기존 배포는 이미 절대 경로 `state_path`를
-가지고 있으므로 bootstrap 재실행은 기존 이름을 그대로 보존합니다 —
-새로 기본 제공되는 구성만 service_name 기반 basename을 받습니다.
+기본 제공되는 basename은 `registration_id`를 키로 사용하므로
+(`bootroot-agent-state-<registration-id>.json`), 같은 디렉터리를 공유하는
+등록별 agent 구성이 하나의 상태 파일을 두고 경합하지 않고 서로 다른
+상태 파일로 분리됩니다. 한 호스트에 있는 같은 컴포넌트의 두 등록도
+마찬가지입니다 — `service_name`은 공유하고 등록 키만 다릅니다. 기존
+배포는 이미 절대 경로 `state_path`를 가지고 있으므로 bootstrap 재실행은
+기존 이름을 그대로 보존합니다 — 새로 기본 제공되는 구성만
+registration_id 기반 basename을 받습니다.
 bootstrap이 대상 디렉터리에서 동일한 절대 `state_path`로 해석되는 두
 개의 sibling 구성(직접 작성한 구성 등)을 감지하면 경고를
 출력합니다. 하나의 상태 파일을 공유하는 두 `bootroot-agent` 프로세스는
@@ -446,11 +452,13 @@ remote-bootstrap 서비스의 최악의 force-reissue 지연을 1
 있습니다. `--wait` 타임아웃은 오류가 아닙니다 — 요청은 큐에 남아 있으며
 다음 fast-poll 틱에서 적용됩니다.
 
-원격 호스트에 동일한 `service_name`을 가진 여러 `[[profiles]]`가 있을
-경우(같은 머신에서 한 서비스를 여러 인스턴스로 운영하는 경우 등),
+원격 호스트에 동일한 `registration_id`를 가진 여러 `[[profiles]]`가 있을
+경우(하나의 등록 키 아래에 여러 인스턴스를 운영하는 경우 등),
 fast-poll 틱은 KV 버전을 소비된 것으로 표시하기 전에 일치하는 모든
 프로파일에 갱신 트리거를 펼쳐 보냅니다. 따라서 단일 force-reissue가
-모든 인스턴스를 회전합니다. 펼쳐 보낸 프로파일 중 하나라도 실패하면,
+모든 인스턴스를 회전합니다. `service_name`은 같지만 `registration_id`가
+다른 프로파일은 서로 다른 등록이며, 각자의 KV 서브트리와 재발급 요청을
+가지므로 함께 펼쳐지지 않습니다. 펼쳐 보낸 프로파일 중 하나라도 실패하면,
 같은 요청에 대해 이미 성공한 프로파일은 `state_path`의 서비스별
 `in_flight_renewals` 진행 상황으로 기록됩니다. 다음 틱은 동일한 KV
 버전에 대해 실패한 형제 프로파일*만* 재시도하며, 이미 갱신된 프로파일은
@@ -486,7 +494,7 @@ fast-poll 틱은 KV 버전을 소비된 것으로 표시하기 전에 일치하�
   구성에 bootstrap하면 첫 번째 서비스의 자격증명을 덮어씁니다. fast-poll
   루프는 그 하나의 자격증명으로 **한 번만** 로그인한 뒤, 획득한 토큰으로
   열거된 모든 서비스의 KV를 읽습니다. 각 서비스의 AppRole 정책은
-  `bootroot/services/<service>/*`로 범위가 제한되므로, 한 서비스의 토큰은
+  `bootroot/services/<registration_id>/*`로 범위가 제한되므로, 한 서비스의 토큰은
   다른 서비스의 trust / secret_id / reissue KV 경로에서 `403 permission
   denied`를 받습니다.
 - 하나의 구성에 있는 여러 `[[profiles]]`는 *같은 서비스의 인스턴스*에
@@ -495,8 +503,8 @@ fast-poll 틱은 KV 버전을 소비된 것으로 표시하기 전에 일치하�
 서비스마다 `--agent-config`를 별도로 지정하여 `bootroot-remote
 bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`를
 부여합니다. bootstrap은 새로 기본 제공되는 구성에 대해 basename을
-`service_name` 기반(`bootroot-agent-state-<service_name>.json`)으로
-설정하므로, 서비스별 구성이 한 디렉터리를 안전하게 공유할 수 있습니다.
+`registration_id` 기반(`bootroot-agent-state-<registration-id>.json`)으로
+설정하므로, 등록별 구성이 한 디렉터리를 안전하게 공유할 수 있습니다.
 직접 작성한 `state_path` 값이 있는 구성을 한 디렉터리에 둘
 경우, 두 구성이 같은 파일로 해석되지 않도록 하세요 — bootstrap은 충돌을
 감지하면 경고합니다. 하나의 `state_path`를 공유하는 두 agent는 fast-poll
@@ -532,7 +540,7 @@ bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`�
     대신 일회용 `wrap_token`이 포함되도록 하세요. 이렇게 하면 wrap token이
     명령줄이나 `ps` 출력에 노출되지 않으며, 원격 전송 노출 시간을 초
     단위로 줄입니다. 단, 제어 노드에는 로컬 운영을 위해
-    `secrets/services/<service>/secret_id`에 원본 `secret_id`가 기록되므로,
+    `secrets/services/<registration_id>/secret_id`에 원본 `secret_id`가 기록되므로,
     전달 후 이 파일을 보호하거나 삭제하세요.
 - **회전**: 제어 노드에서 `bootroot rotate approle-secret-id` 실행 후,
     *실행 중인* 원격 `bootroot-agent`에는 운영 조치가 필요하지 않습니다.
@@ -637,18 +645,22 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 
 ## `RemoteBootstrapArtifact` 스키마 참조
 
-`secrets/remote-bootstrap/services/<service>/bootstrap.json`에 기록되는 JSON
-아티팩트는 버전이 지정된 스키마를 따릅니다. 자동화에서는 파싱 전에
-`schema_version`을 확인해야 합니다.
+`secrets/remote-bootstrap/services/<registration_id>/bootstrap.json`에
+기록되는 JSON 아티팩트는 버전이 지정된 스키마를 따릅니다. 자동화에서는
+파싱 전에 `schema_version`을 확인해야 합니다.
 
-현재 버전: **4**
+현재 버전: **5**. `bootroot-remote`는 버전 5만 허용합니다.
+`registration_id` 분리 이전에 작성된 아티팩트에는 등록 키가 없고, 이를
+임의로 만들어내는 호환 계층도 없습니다. `bootroot service add`를 다시
+실행해 아티팩트를 새로 발급하세요.
 
 | 필드 | 타입 | 설명 | 사용처 |
 | --- | --- | --- | --- |
 | `schema_version` | `u32` | 스키마 버전 번호. 호환성을 깨는 변경 시 증가. | 파서 사전 검사 |
 | `openbao_url` | `string` | OpenBao API URL | `--openbao-url` |
 | `kv_mount` | `string` | OpenBao KV v2 마운트 경로 | `--kv-mount` |
-| `service_name` | `string` | 등록된 서비스 이름 | `--service-name` |
+| `registration_id` | `string` | 배포 전체에서 고유한 등록 키. KV 서브트리, 관리 `agent.toml` 블록, fast-poll 상태 파일 이름, 기본 cert/key 파일 이름을 결정합니다. 인증서 SAN에는 포함되지 않습니다. | `--registration-id` |
+| `service_name` | `string` | 인증서 SAN의 두 번째 레이블 | `--service-name` |
 | `role_id_path` | `string` | 원격 호스트의 AppRole `role_id` 파일 경로 | `--role-id-path` |
 | `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로 | `--secret-id-path` |
 | `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. KV 항목이 없는 경우 bootroot는 이전 부트스트랩이 남긴 오래된 `eab.json`을 제거하여 `bootroot-agent --eab-file`이 폐기된 자격증명을 전달하지 못하도록 합니다. 이때 eab 반영 단계는 오래된 파일을 제거한 경우 `applied`로, 애초에 파일이 없었던 경우 `skipped`로 보고합니다. | `--eab-file-path` |
@@ -672,6 +684,7 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 
 | 버전 | 변경사항 |
 | --- | --- |
+| 5 | 필수 필드 `registration_id` 추가. 레지스트리 키를 `service_name`에서 분리했습니다. 원격 에이전트가 파생하는 모든 네임스페이스는 새 키에서 나오며, `service_name`은 SAN 레이블 전용입니다. |
 | 4 | `openbao_agent_config_path` / `openbao_agent_template_path` / `openbao_agent_token_path` 필드 제거. 원격 `bootroot-agent`가 이제 fast-poll 루프를 통해 스스로 인증하고 trust를 렌더링하므로 OpenBao Agent 사이드카 아티팩트가 더 이상 생성되지 않습니다. |
 | 3 | 선택 필드 `cert_group_gid` 추가. |
 | 2 | 필수 필드 `ca_bundle_pem` 추가 (제어 노드 CA 앵커의 인라인 PEM). |
@@ -683,7 +696,9 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
     `schema_version` 증가.
 - **추가적 변경** (`skip_serializing_if`가 있는 새 선택 필드):
     증가 불필요. 기존 파서는 알 수 없는 키를 무시합니다.
-- **소비자 계약**: 필드에 접근하기 전에 `schema_version >= 1` 및
-    `schema_version <= <지원 최대값>`을 확인하세요. 지원되지 않는 버전에서는
-    명시적으로 실패해야 합니다. `bootroot-remote`는 `--artifact` 사용 시
-    이 검사를 자동으로 수행합니다.
+- **소비자 계약**: 필드에 접근하기 전에 `schema_version >= <지원 최소값>`
+    및 `schema_version <= <지원 최대값>`을 확인하세요. 지원되지 않는
+    버전에서는 명시적으로 실패해야 합니다. `bootroot-remote`는 `--artifact`
+    사용 시 이 검사를 자동으로 수행합니다. 현재 두 경계는 모두 5입니다.
+    호환 계층이 없고, 분리 이전 아티팩트에는 되돌아갈 `registration_id`가
+    없기 때문입니다.

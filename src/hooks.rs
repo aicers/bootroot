@@ -301,6 +301,7 @@ mod tests {
         hooks: HookSettings,
     ) -> (Settings, DaemonProfileSettings) {
         let profile = DaemonProfileSettings {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),

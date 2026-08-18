@@ -157,8 +157,10 @@
 추가하세요. `service add`는 기존 항목의 전달 모드 전환을 거부합니다:
 
 ```bash
-bootroot service remove --service-name <name> --yes
-bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
+bootroot service remove --registration-id <name> --yes
+bootroot service add \
+  --registration-id <name> \
+  --service-name <name> --delivery-mode remote-bootstrap ...
 ```
 
 전체 정리 동작과 `--delete-artifacts` 플래그는
@@ -197,7 +199,7 @@ bootroot service add --service-name <name> --delivery-mode remote-bootstrap ...
 
 1. 누가 또는 무엇이 토큰을 소비했는지 조사합니다.
 2. `secret_id`를 회전합니다:
-   `bootroot rotate approle-secret-id --service-name <service>`.
+   `bootroot rotate approle-secret-id --registration-id <service>`.
 3. `bootroot service add`를 다시 실행해 새 `wrap_token`을 생성합니다.
 4. 아티팩트를 전송하고 원격 호스트에서 `bootroot-remote bootstrap`을
    실행합니다.
@@ -329,7 +331,7 @@ Identifier`와 같아야 합니다. DN만 일치하고 키 ID가 다르면 컨�
    `bootroot service update`로 그 자리에서 훅을 재구성할 수 있습니다.
 
    ```bash
-   bootroot service update --service-name <name> \
+   bootroot service update --registration-id <name> \
      --reload-style sighup --reload-target <process-name>
    ```
 

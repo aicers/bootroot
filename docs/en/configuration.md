@@ -40,8 +40,9 @@ itself; OpenBao Agent uses it to render the actual secret files.
 OpenBao Agent logs in via AppRole using the `role_id`/`secret_id` files
 under `secrets/openbao/stepca/` and `secrets/openbao/responder/` written by
 `bootroot init`. Services keep their AppRole files under
-`secrets/services/<service>/`; those are read directly by `bootroot-agent`,
-not by an OpenBao Agent. Keep directories `0700` and files `0600`.
+`secrets/services/<registration_id>/`; those are read directly by
+`bootroot-agent`, not by an OpenBao Agent. Keep directories `0700` and
+files `0600`.
 
 Ownership is split as follows:
 
@@ -342,8 +343,18 @@ Each profile represents one daemon instance (one certificate identity).
 At least one `[[profiles]]` entry is required, and `instance_id` must be a
 numeric string.
 
+`registration_id` is required and names every namespace the profile
+polls — the `bootroot/services/<registration_id>/…` KV subtree and the
+per-profile fast-poll state filename. It is lowercase letters, digits and
+hyphens, starts and ends alphanumeric, and is at most 131 characters. A
+`[[profiles]]` block that omits it fails to load. It is deliberately not a
+certificate field: `service_name` remains the SAN's second label, so
+several registrations of one component on one host share a
+`service_name` and differ only in `registration_id`.
+
 ```toml
 [[profiles]]
+registration_id = "edge-proxy"
 service_name = "edge-proxy"
 instance_id = "001"
 hostname = "edge-node-01"
@@ -359,11 +370,17 @@ check_jitter = "0s"
 ```
 
 The DNS SAN is auto-generated as
-`<instance-id>.<service-name>.<hostname>.<domain>`. This
+`<instance-id>.<service-name>.<hostname>.<domain>` — `registration_id`
+never appears in it. This
 name is also the target for HTTP-01 validation, so it must resolve from step-ca
 to the HTTP-01 responder IP. In Compose environments, `bootroot service add`
 registers the alias on the `bootroot-http01` container automatically; for host
 installs, update `/etc/hosts` or DNS.
+
+`service_name` and `hostname` are each a single DNS label — letters,
+digits and hyphens, at most 63 octets. Config load rejects a profile that
+breaks either rule, so an unusable SAN component is caught there rather
+than surfacing later as a rejected ACME order.
 
 #### Profile Retry Override
 

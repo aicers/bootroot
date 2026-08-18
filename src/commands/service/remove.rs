@@ -72,7 +72,7 @@ pub(crate) async fn run_service_remove(
 ) -> Result<()> {
     let state_path = StateFile::default_path();
     let mut state = load_state_or_missing(&state_path, messages)?;
-    let entry = require_service_entry(&state, &args.service_name, messages)?;
+    let entry = require_service_entry(&state, &args.registration_id, messages)?;
 
     let kv_paths = service_kv_paths(&entry);
     let artifacts = if args.delete_artifacts {
@@ -96,10 +96,10 @@ pub(crate) async fn run_service_remove(
 
     if !args.yes {
         if !std::io::stdin().is_terminal() {
-            anyhow::bail!(messages.service_remove_requires_yes(&args.service_name));
+            anyhow::bail!(messages.service_remove_requires_yes(&args.registration_id));
         }
-        if !confirm_removal(&args.service_name, messages)? {
-            println!("{}", messages.service_remove_aborted(&args.service_name));
+        if !confirm_removal(&args.registration_id, messages)? {
+            println!("{}", messages.service_remove_aborted(&args.registration_id));
             return Ok(());
         }
     }
@@ -150,7 +150,7 @@ pub(crate) async fn run_service_remove(
     // delivery-mode transition). The agent config file itself is never
     // deleted — only bootroot's managed block is removed.
     if args.delete_artifacts || args.strip_config {
-        let strip_result = strip_managed_profile(&entry.agent_config_path, &entry.service_name);
+        let strip_result = strip_managed_profile(&entry.agent_config_path, &entry.registration_id);
         report.record(
             &format!(
                 "managed profile block in {}",
@@ -162,7 +162,7 @@ pub(crate) async fn run_service_remove(
     }
 
     if report.any_failed {
-        anyhow::bail!(messages.service_remove_partial_failure(&args.service_name));
+        anyhow::bail!(messages.service_remove_partial_failure(&args.registration_id));
     }
 
     // Everything torn down cleanly. Drop the entry from the in-memory
@@ -180,7 +180,7 @@ pub(crate) async fn run_service_remove(
     finalize_removal(
         &mut state,
         &state_path,
-        &args.service_name,
+        &args.registration_id,
         // `service remove` reports the alias refresh nowhere, so the
         // outcome is dropped here rather than widening this command's
         // output.
@@ -189,7 +189,7 @@ pub(crate) async fn run_service_remove(
     )
     .await?;
 
-    println!("{}", messages.service_remove_success(&args.service_name));
+    println!("{}", messages.service_remove_success(&args.registration_id));
     Ok(())
 }
 
@@ -202,18 +202,18 @@ fn load_state_or_missing(state_path: &Path, messages: &Messages) -> Result<State
     StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())
 }
 
-/// Returns a clone of the named service entry, bailing with
-/// `error_service_not_found` when it is not registered.
+/// Returns a clone of the registered entry with this `registration_id`,
+/// bailing with `error_service_not_found` when it is not registered.
 fn require_service_entry(
     state: &StateFile,
-    service_name: &str,
+    registration_id: &str,
     messages: &Messages,
 ) -> Result<ServiceEntry> {
     state
         .services
-        .get(service_name)
+        .get(registration_id)
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(service_name)))
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(registration_id)))
 }
 
 /// Finalizes the removal: drops the service entry from the in-memory
@@ -232,11 +232,11 @@ fn require_service_entry(
 async fn finalize_removal(
     state: &mut StateFile,
     state_path: &Path,
-    service_name: &str,
+    registration_id: &str,
     reconcile: impl FnOnce(&StateFile) -> Result<()>,
     messages: &Messages,
 ) -> Result<()> {
-    state.services.remove(service_name);
+    state.services.remove(registration_id);
     reconcile(state)?;
     state
         .save_async(state_path)
@@ -244,9 +244,9 @@ async fn finalize_removal(
         .with_context(|| messages.error_serialize_state_failed())
 }
 
-/// Builds the exact per-service KV paths written by `service add`.
+/// Builds the exact per-registration KV paths written by `service add`.
 fn service_kv_paths(entry: &ServiceEntry) -> Vec<String> {
-    let base = format!("{SERVICE_KV_BASE}/{}", entry.service_name);
+    let base = format!("{SERVICE_KV_BASE}/{}", entry.registration_id);
     let mut paths = vec![
         format!("{base}/{KV_EAB_SUFFIX}"),
         format!("{base}/{KV_HTTP_RESPONDER_HMAC_SUFFIX}"),
@@ -263,15 +263,15 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
     let dirs = vec![
         secrets_dir
             .join(SERVICE_SECRET_DIR)
-            .join(&entry.service_name),
+            .join(&entry.registration_id),
         secrets_dir
             .join(REMOTE_BOOTSTRAP_DIR)
-            .join(&entry.service_name),
+            .join(&entry.registration_id),
     ];
     let mut files = vec![entry.cert_path.clone(), entry.key_path.clone()];
     // A `--secret-id-path` override relocates `secret_id`, its sibling
     // `role_id`, and `eab.json` outside the default `<secrets_dir>/
-    // services/<svc>` directory removed above, so clean those individual
+    // services/<registration_id>` directory removed above, so clean those
     // files up too — otherwise a remove-then-re-add to the same override
     // location hits the no-clobber guard. The operator-owned parent
     // directory (which bootroot did not create) is left in place.
@@ -302,7 +302,7 @@ fn print_remove_plan(
 ) {
     println!(
         "{}",
-        messages.service_remove_plan_header(&entry.service_name)
+        messages.service_remove_plan_header(&entry.registration_id)
     );
     println!(
         "{}",
@@ -345,11 +345,11 @@ fn print_remove_plan(
     }
 }
 
-fn confirm_removal(service_name: &str, messages: &Messages) -> Result<bool> {
+fn confirm_removal(registration_id: &str, messages: &Messages) -> Result<bool> {
     let mut input = std::io::stdin().lock();
     let mut output = std::io::stdout();
     let mut prompt = Prompt::new(&mut input, &mut output, messages);
-    let label = messages.service_remove_confirm_prompt(service_name);
+    let label = messages.service_remove_confirm_prompt(registration_id);
     let answer = prompt.prompt_text(&format!("{label} [y/N]"), Some("N"))?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
@@ -422,7 +422,7 @@ fn delete_file_if_present(path: &Path) -> Result<bool> {
 /// was present and removed, `Ok(false)` when the file is absent or carries
 /// no managed block (idempotent re-run). The operator-owned file itself is
 /// never deleted.
-fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
+fn strip_managed_profile(path: &Path, registration_id: &str) -> Result<bool> {
     let current = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -430,7 +430,7 @@ fn strip_managed_profile(path: &Path, service_name: &str) -> Result<bool> {
             return Err(err).with_context(|| format!("Failed to read {}", path.display()));
         }
     };
-    let next = remove_managed_service_profile(&current, service_name)
+    let next = remove_managed_service_profile(&current, registration_id)
         .with_context(|| format!("Failed to update {}", path.display()))?;
     if next == current {
         return Ok(false);
@@ -486,6 +486,7 @@ mod tests {
 
     fn sample_entry(name: &str, delivery_mode: DeliveryMode) -> ServiceEntry {
         ServiceEntry {
+            registration_id: name.to_string(),
             service_name: name.to_string(),
             delivery_mode,
             hostname: "host1".to_string(),
@@ -538,7 +539,7 @@ mod tests {
             sample_entry("svc", DeliveryMode::LocalFile),
         );
         let entry = require_service_entry(&state, "svc", &messages).expect("found");
-        assert_eq!(entry.service_name, "svc");
+        assert_eq!(entry.registration_id, "svc");
     }
 
     #[tokio::test]
@@ -706,6 +707,7 @@ mod tests {
             LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
             LOCAL_FILE_PROFILE_MARKERS.end_prefix,
             "svc",
+            "svc",
             "001",
             "host1",
             Path::new("/certs/cert.pem"),
@@ -742,6 +744,7 @@ mod tests {
             REMOTE_BOOTSTRAP_PROFILE_MARKERS.begin_prefix,
             REMOTE_BOOTSTRAP_PROFILE_MARKERS.end_prefix,
             "svc",
+            "svc",
             "001",
             "host1",
             Path::new("/certs/cert.pem"),
@@ -771,6 +774,7 @@ mod tests {
         let block = bootroot::trust_bootstrap::render_managed_profile_block(
             LOCAL_FILE_PROFILE_MARKERS.begin_prefix,
             LOCAL_FILE_PROFILE_MARKERS.end_prefix,
+            "svc",
             "svc",
             "001",
             "host1",
@@ -870,6 +874,7 @@ mod tests {
                 markers.begin_prefix,
                 markers.end_prefix,
                 "svc",
+                "svc",
                 "001",
                 "host1",
                 Path::new("/certs/cert.pem"),
@@ -891,7 +896,7 @@ mod tests {
             "profile left behind: {after}"
         );
         assert!(
-            !after.contains("service_name = \"svc\""),
+            !after.contains("registration_id = \"svc\""),
             "orphaned profile left behind: {after}"
         );
         assert!(
@@ -913,7 +918,7 @@ mod tests {
         assert!(!strip_managed_profile(&path, "svc").expect("absent ok"));
     }
 
-    /// An operator-owned `[[profiles]]` entry sharing the `service_name`
+    /// An operator-owned `[[profiles]]` entry sharing the `registration_id`
     /// but carrying no bootroot managed marker must survive `--strip-config`
     /// untouched. Stripping is scoped to bootroot's managed profile, so with
     /// no managed marker present the file is left byte-for-byte unchanged and
@@ -924,6 +929,7 @@ mod tests {
         let path = dir.path().join("agent.toml");
         let contents = "email = \"a@b.c\"\n\n\
 [[profiles]]\n\
+registration_id = \"svc\"\n\
 service_name = \"svc\"\n\
 instance_id = \"001\"\n\n\
 [trust]\nca_bundle_path = \"c\"\n";

@@ -162,10 +162,10 @@ pub(super) struct PulledSecrets {
 pub(super) async fn pull_secrets(
     client: &bootroot::openbao::OpenBaoClient,
     mount: &str,
-    service: &str,
+    registration_id: &str,
     lang: Locale,
 ) -> Result<PulledSecrets> {
-    let base = format!("{}/{service}", super::SERVICE_KV_BASE);
+    let base = format!("{}/{registration_id}", super::SERVICE_KV_BASE);
     let secret_id_data = client
         .read_kv(mount, &format!("{base}/secret_id"))
         .await

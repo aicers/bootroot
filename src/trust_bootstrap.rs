@@ -15,7 +15,7 @@ pub const CA_BUNDLE_PATH_KEY: &str = "ca_bundle_path";
 
 /// KV v2 path suffix carrying the force-reissue request for a service.
 ///
-/// Full path: `{kv_mount}/data/bootroot/services/<service>/reissue`.
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/reissue`.
 /// The control plane writes this on `rotate force-reissue` for
 /// remote-bootstrap services, and the remote `bootroot-agent` polls it on
 /// its fast-poll interval to trigger an immediate renewal.
@@ -23,25 +23,25 @@ pub const SERVICE_REISSUE_KV_SUFFIX: &str = "reissue";
 /// KV v2 path suffix carrying the service trust material
 /// (`trusted_ca_sha256` + `ca_bundle_pem`).
 ///
-/// Full path: `{kv_mount}/data/bootroot/services/<service>/trust`.
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/trust`.
 pub const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 /// KV v2 path suffix carrying the service `AppRole` `secret_id` the remote
 /// fast-poll loop re-authenticates with.
 ///
-/// Full path: `{kv_mount}/data/bootroot/services/<service>/secret_id`.
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/secret_id`.
 pub const SERVICE_SECRET_ID_KV_SUFFIX: &str = "secret_id";
 /// KV v2 path suffix carrying the service HTTP-01 responder shared HMAC
 /// (payload `{ "hmac": <value> }`) the remote fast-poll loop refreshes into
 /// `[acme].http_responder_hmac`.
 ///
-/// Full path: `{kv_mount}/data/bootroot/services/<service>/http_responder_hmac`.
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/http_responder_hmac`.
 pub const SERVICE_RESPONDER_HMAC_KV_SUFFIX: &str = "http_responder_hmac";
 /// KV v2 path suffix carrying the service EAB credentials (payload
 /// `{ "kid": <value>, "hmac": <value> }`, or the explicit clear shape
 /// `{ "kid": "", "hmac": "" }`) the remote fast-poll loop refreshes into the
 /// on-disk `eab.json` + the in-memory `default_eab`.
 ///
-/// Full path: `{kv_mount}/data/bootroot/services/<service>/eab`.
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/eab`.
 pub const SERVICE_EAB_KV_SUFFIX: &str = "eab";
 /// Payload field holding the RFC3339 UTC timestamp of the request.
 pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
@@ -148,7 +148,7 @@ pub fn apply_agent_config_baseline_defaults(
 /// pairs here — and pairing every upsert with a strip of the *other*
 /// path's markers via [`strip_foreign_managed_profiles`] — is what stops a
 /// delivery-mode transition from leaving two profile blocks for the same
-/// service (issue #662).
+/// registration (issue #662).
 #[derive(Clone, Copy)]
 pub struct ManagedProfileMarkers {
     pub begin_prefix: &'static str,
@@ -178,11 +178,16 @@ pub const ALL_MANAGED_PROFILE_MARKERS: [ManagedProfileMarkers; 2] =
 /// `--cert-group` policy on every issuance and rotation. `None`
 /// preserves the host-local default (operator-only mode/owner) and
 /// emits no line.
+/// The marker lines name the `registration_id`, not the `service_name`:
+/// two registrations of one component on one host share a
+/// `service_name`, and markers keyed on it would address one block from
+/// two registrations.
 #[must_use]
-#[allow(clippy::too_many_arguments)] // adding cert_group_gid pushes the count to 8; see issue #593
+#[allow(clippy::too_many_arguments)] // one argument per rendered field; see issues #593 and #756
 pub fn render_managed_profile_block(
     begin_prefix: &str,
     end_prefix: &str,
+    registration_id: &str,
     service_name: &str,
     instance_id: &str,
     hostname: &str,
@@ -195,8 +200,9 @@ pub fn render_managed_profile_block(
         None => String::new(),
     };
     format!(
-        "{begin_prefix} {service_name}\n\
+        "{begin_prefix} {registration_id}\n\
 [[profiles]]\n\
+registration_id = \"{registration_id}\"\n\
 service_name = \"{service_name}\"\n\
 instance_id = \"{instance_id}\"\n\
 hostname = \"{hostname}\"\n\
@@ -204,7 +210,7 @@ hostname = \"{hostname}\"\n\
 [profiles.paths]\n\
 cert = \"{cert}\"\n\
 key = \"{key}\"\n\
-{end_prefix} {service_name}\n",
+{end_prefix} {registration_id}\n",
         cert = cert_path.display(),
         key = key_path.display(),
     )
@@ -252,11 +258,11 @@ pub fn upsert_managed_profile_block(
     contents: &str,
     begin_prefix: &str,
     end_prefix: &str,
-    service_name: &str,
+    registration_id: &str,
     replacement: &str,
 ) -> String {
-    let begin_marker = format!("{begin_prefix} {service_name}");
-    let end_marker = format!("{end_prefix} {service_name}");
+    let begin_marker = format!("{begin_prefix} {registration_id}");
+    let end_marker = format!("{end_prefix} {registration_id}");
     if let Some((begin, end)) = managed_block_span(contents, &begin_marker, &end_marker) {
         let suffix = contents[end..]
             .strip_prefix('\n')
@@ -283,8 +289,8 @@ pub fn upsert_managed_profile_block(
 }
 
 /// Strips every managed profile block written under a marker pair *other*
-/// than `own` for `service_name`, leaving the caller's own block (if any)
-/// untouched.
+/// than `own` for `registration_id`, leaving the caller's own block (if
+/// any) untouched.
 ///
 /// A delivery-mode transition (`service remove` + `service add
 /// --delivery-mode <other>`, then re-bootstrap on the service host) runs
@@ -292,7 +298,7 @@ pub fn upsert_managed_profile_block(
 /// Because each path's upsert recognises only its own markers, without
 /// this strip the pre-existing block is never matched and
 /// [`upsert_managed_profile_block`] falls through to its append branch,
-/// leaving a second `[[profiles]]` for the same service.
+/// leaving a second `[[profiles]]` for the same registration.
 ///
 /// Callers must run this on the **raw** `agent.toml` contents before
 /// applying their own `[trust]`/`[openbao]`/profile sections. The end
@@ -306,7 +312,7 @@ pub fn upsert_managed_profile_block(
 pub fn strip_foreign_managed_profiles(
     contents: &str,
     own: ManagedProfileMarkers,
-    service_name: &str,
+    registration_id: &str,
 ) -> String {
     let mut next = contents.to_string();
     for markers in ALL_MANAGED_PROFILE_MARKERS {
@@ -317,34 +323,37 @@ pub fn strip_foreign_managed_profiles(
             &next,
             markers.begin_prefix,
             markers.end_prefix,
-            service_name,
+            registration_id,
         );
     }
     next
 }
 
 /// Finds the first bootroot-managed profile in `contents` that belongs
-/// to a service other than `service_name`, returning that service's
-/// name.
+/// to a registration other than `registration_id`, returning that
+/// registration's key.
 ///
 /// Scans the begin markers of every marker family
 /// ([`ALL_MANAGED_PROFILE_MARKERS`]), so it sees profiles written by
 /// both the local-file `service add` path and the `bootroot-remote
 /// bootstrap` path. `service add` uses this to reject reusing an
-/// `agent.toml` that still carries another service's managed profile —
-/// the state-based conflict guard cannot see a service whose entry was
-/// dropped by `service remove` without `--strip-config` /
+/// `agent.toml` that still carries another registration's managed profile
+/// — the state-based conflict guard cannot see a registration whose entry
+/// was dropped by `service remove` without `--strip-config` /
 /// `--delete-artifacts`, but its leftover `[[profiles]]` block would
-/// keep being grouped and fast-polled under the new service's single
+/// keep being grouped and fast-polled under the new registration's single
 /// `[openbao]` `AppRole` identity.
 #[must_use]
-pub fn find_foreign_managed_profile_service(contents: &str, service_name: &str) -> Option<String> {
+pub fn find_foreign_managed_profile_registration(
+    contents: &str,
+    registration_id: &str,
+) -> Option<String> {
     for line in contents.lines() {
         let trimmed = line.trim();
         for markers in ALL_MANAGED_PROFILE_MARKERS {
             if let Some(rest) = trimmed.strip_prefix(markers.begin_prefix) {
                 let name = rest.trim();
-                if !name.is_empty() && name != service_name {
+                if !name.is_empty() && name != registration_id {
                     return Some(name.to_string());
                 }
             }
@@ -355,8 +364,8 @@ pub fn find_foreign_managed_profile_service(contents: &str, service_name: &str) 
 
 /// Removes a managed profile block from `agent.toml` contents.
 ///
-/// Deletes the `begin_prefix <service_name> … end_prefix <service_name>`
-/// span, collapsing the surrounding blank lines so the file stays
+/// Deletes the `begin_prefix <registration_id> … end_prefix
+/// <registration_id>` span, collapsing the surrounding blank lines so the file stays
 /// well-formed. Returns the input unchanged when no matching block is
 /// present, so calling it a second time (after the block is already
 /// gone) is a no-op. This is the teardown counterpart to
@@ -368,10 +377,10 @@ pub fn remove_managed_profile_block(
     contents: &str,
     begin_prefix: &str,
     end_prefix: &str,
-    service_name: &str,
+    registration_id: &str,
 ) -> String {
-    let begin_marker = format!("{begin_prefix} {service_name}");
-    let end_marker = format!("{end_prefix} {service_name}");
+    let begin_marker = format!("{begin_prefix} {registration_id}");
+    let end_marker = format!("{end_prefix} {registration_id}");
     let Some((begin, end)) = managed_block_span(contents, &begin_marker, &end_marker) else {
         return contents.to_string();
     };
@@ -385,8 +394,8 @@ pub fn remove_managed_profile_block(
     updated
 }
 
-/// Removes only the managed `[[profiles]]` entry for `service_name` and
-/// its marker comment lines, leaving every other table untouched.
+/// Removes only the managed `[[profiles]]` entry for `registration_id`
+/// and its marker comment lines, leaving every other table untouched.
 ///
 /// Unlike [`remove_managed_profile_block`], which deletes the whole byte
 /// span between the begin and end markers, this preserves global tables
@@ -404,24 +413,24 @@ pub fn remove_managed_profile_block(
 /// begin/end marker comments, which survive as trailing decor. It matches
 /// either code path's markers.
 ///
-/// It removes **every** `[[profiles]]` entry for the service, not just the
-/// first: an already-affected host may carry the exact #662 duplicate (a
-/// local-file block and a remote-bootstrap block for the same service), and
-/// the marker sweep clears both marker pairs, so the profile removal must
+/// It removes **every** `[[profiles]]` entry for the registration, not just
+/// the first: an already-affected host may carry the exact #662 duplicate (a
+/// local-file block and a remote-bootstrap block for the same registration),
+/// and the marker sweep clears both marker pairs, so the profile removal must
 /// be equally exhaustive or a marker-less profile would be orphaned.
 ///
 /// Removal is gated on the presence of a managed begin marker for the
-/// service (under either code path). When no managed marker is present the
-/// input is returned unchanged, so an operator-owned, unmarked
-/// `[[profiles]]` entry that merely shares the `service_name` is never
+/// registration (under either code path). When no managed marker is present
+/// the input is returned unchanged, so an operator-owned, unmarked
+/// `[[profiles]]` entry that merely shares the `registration_id` is never
 /// touched — only bootroot's own managed profile is cleared.
 ///
 /// # Errors
 ///
 /// Returns an error if `contents` is not valid TOML.
-pub fn remove_managed_service_profile(contents: &str, service_name: &str) -> Result<String> {
+pub fn remove_managed_service_profile(contents: &str, registration_id: &str) -> Result<String> {
     let has_managed_marker = ALL_MANAGED_PROFILE_MARKERS.iter().any(|markers| {
-        let begin_marker = format!("{} {service_name}", markers.begin_prefix);
+        let begin_marker = format!("{} {registration_id}", markers.begin_prefix);
         find_marker_line(contents, &begin_marker, 0).is_some()
     });
     if !has_managed_marker {
@@ -430,28 +439,28 @@ pub fn remove_managed_service_profile(contents: &str, service_name: &str) -> Res
     let (rendered, removed) = toml_util::remove_array_of_tables_entries(
         contents,
         "profiles",
-        "service_name",
-        service_name,
+        "registration_id",
+        registration_id,
     )?;
     let base = if removed { &rendered } else { contents };
-    Ok(strip_profile_marker_lines(base, service_name))
+    Ok(strip_profile_marker_lines(base, registration_id))
 }
 
 /// Drops any line that exactly matches a begin/end marker for
-/// `service_name`, under either code path's marker pair.
+/// `registration_id`, under either code path's marker pair.
 ///
 /// Removing the `[[profiles]]` array element leaves its marker comments
 /// behind as document decor, so they must be swept textually. Full-line
-/// equality (mirroring [`find_marker_line`]) keeps a service name that is
-/// a prefix of another from matching the wrong marker.
-fn strip_profile_marker_lines(contents: &str, service_name: &str) -> String {
+/// equality (mirroring [`find_marker_line`]) keeps a registration key that
+/// is a prefix of another from matching the wrong marker.
+fn strip_profile_marker_lines(contents: &str, registration_id: &str) -> String {
     let mut out = String::with_capacity(contents.len());
     for line in contents.split_inclusive('\n') {
         let body = line.strip_suffix('\n').unwrap_or(line);
         let body = body.strip_suffix('\r').unwrap_or(body);
         let is_marker = ALL_MANAGED_PROFILE_MARKERS.iter().any(|markers| {
-            body == format!("{} {service_name}", markers.begin_prefix)
-                || body == format!("{} {service_name}", markers.end_prefix)
+            body == format!("{} {registration_id}", markers.begin_prefix)
+                || body == format!("{} {registration_id}", markers.end_prefix)
         });
         if !is_marker {
             out.push_str(line);
@@ -506,6 +515,7 @@ mod tests {
             BEGIN_PREFIX,
             END_PREFIX,
             "edge-proxy",
+            "edge-proxy",
             "001",
             "edge-node-01",
             Path::new("certs/edge-proxy.crt"),
@@ -522,6 +532,7 @@ mod tests {
         render_managed_profile_block(
             markers.begin_prefix,
             markers.end_prefix,
+            service,
             service,
             "001",
             "node-01",
@@ -576,17 +587,17 @@ mod tests {
     /// cannot see a service removed without `--strip-config`, but its
     /// stale block would be fast-polled under the new `[openbao]` identity.
     #[test]
-    fn find_foreign_managed_profile_service_reports_other_service() {
+    fn find_foreign_managed_profile_registration_reports_other_service() {
         let stale = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "edge-proxy");
         let contents = format!("email = \"a@b.c\"\n\n{stale}\n");
         assert_eq!(
-            find_foreign_managed_profile_service(&contents, "billing-api").as_deref(),
+            find_foreign_managed_profile_registration(&contents, "billing-api").as_deref(),
             Some("edge-proxy")
         );
         let remote_stale = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "edge-proxy");
         let contents = format!("email = \"a@b.c\"\n\n{remote_stale}\n");
         assert_eq!(
-            find_foreign_managed_profile_service(&contents, "billing-api").as_deref(),
+            find_foreign_managed_profile_registration(&contents, "billing-api").as_deref(),
             Some("edge-proxy")
         );
     }
@@ -594,21 +605,21 @@ mod tests {
     /// The own service's block (either marker family) and unmanaged files
     /// are not conflicts — re-adds and delivery-mode transitions must pass.
     #[test]
-    fn find_foreign_managed_profile_service_ignores_own_and_unmanaged() {
+    fn find_foreign_managed_profile_registration_ignores_own_and_unmanaged() {
         let own = render_profile_for(LOCAL_FILE_PROFILE_MARKERS, "edge-proxy");
         let contents = format!("email = \"a@b.c\"\n\n{own}\n");
         assert_eq!(
-            find_foreign_managed_profile_service(&contents, "edge-proxy"),
+            find_foreign_managed_profile_registration(&contents, "edge-proxy"),
             None
         );
         let remote_own = render_profile_for(REMOTE_BOOTSTRAP_PROFILE_MARKERS, "edge-proxy");
         let contents = format!("email = \"a@b.c\"\n\n{remote_own}\n");
         assert_eq!(
-            find_foreign_managed_profile_service(&contents, "edge-proxy"),
+            find_foreign_managed_profile_registration(&contents, "edge-proxy"),
             None
         );
         assert_eq!(
-            find_foreign_managed_profile_service("email = \"a@b.c\"\n", "edge-proxy"),
+            find_foreign_managed_profile_registration("email = \"a@b.c\"\n", "edge-proxy"),
             None
         );
     }
@@ -629,6 +640,7 @@ mod tests {
         let block = render_managed_profile_block(
             BEGIN_PREFIX,
             END_PREFIX,
+            "edge-proxy",
             "edge-proxy",
             "001",
             "edge-node-01",
@@ -764,10 +776,10 @@ mod tests {
         assert_eq!(out, contents);
     }
 
-    /// An operator-owned `[[profiles]]` entry that merely shares the
-    /// `service_name` but carries no bootroot managed marker must survive
+    /// An operator-owned `[[profiles]]` entry that merely names the same
+    /// component but carries no bootroot managed marker must survive
     /// `--strip-config` untouched. Removal is scoped to bootroot's managed
-    /// profile, not "any profile for this service", so with no managed
+    /// profile, not "any profile for this registration", so with no managed
     /// marker present the file is returned verbatim (no reflow).
     #[test]
     fn remove_managed_service_profile_preserves_unmarked_operator_profile() {
@@ -783,16 +795,17 @@ instance_id = \"001\"\n\n\
         );
     }
 
-    /// Service names are DNS labels and can be prefixes of one another
-    /// (`api` vs `api-v2`). Substring marker matching would let a remove
-    /// of `api` strip `api-v2`'s block; full-line matching must target
-    /// only the exact service's block and leave the sibling intact.
+    /// Registration keys can be prefixes of one another (`api` vs
+    /// `api-v2`). Substring marker matching would let a remove of `api`
+    /// strip `api-v2`'s block; full-line matching must target only the
+    /// exact registration's block and leave the sibling intact.
     #[test]
     fn remove_managed_profile_block_ignores_prefix_named_siblings() {
         let make_block = |name: &str| {
             render_managed_profile_block(
                 BEGIN_PREFIX,
                 END_PREFIX,
+                name,
                 name,
                 "001",
                 "node-01",
@@ -828,6 +841,7 @@ instance_id = \"001\"\n\n\
             BEGIN_PREFIX,
             END_PREFIX,
             "edge-proxy",
+            "edge-proxy",
             "001",
             "edge-node-01",
             Path::new("certs/edge-proxy.crt"),
@@ -847,6 +861,7 @@ instance_id = \"001\"\n\n\
             BEGIN_PREFIX,
             END_PREFIX,
             "edge-proxy",
+            "edge-proxy",
             "001",
             "edge-node-01",
             Path::new("certs/edge-proxy.crt"),
@@ -865,6 +880,7 @@ instance_id = \"001\"\n\n\
         let block = render_managed_profile_block(
             BEGIN_PREFIX,
             END_PREFIX,
+            "edge-proxy",
             "edge-proxy",
             "001",
             "edge-node-01",

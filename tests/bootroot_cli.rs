@@ -886,6 +886,7 @@ fn write_state_with_service(root: &std::path::Path) -> anyhow::Result<()> {
         "approles": {},
         "services": {
             "edge-proxy": {
+                "registration_id": "edge-proxy",
                 "service_name": "edge-proxy",
                 "delivery_mode": "local-file",
                 "hostname": "edge-node-01",

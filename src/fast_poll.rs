@@ -288,7 +288,8 @@ pub(crate) trait FastPollHooks: Send + Sync {
 /// extracts the relevant bits (request timestamp, new version) from the
 /// payload. Pure logic, so it is unit-testable without any IO.
 ///
-/// A KV v2 path at `<SERVICE_KV_BASE>/<service>/<SERVICE_REISSUE_KV_SUFFIX>`
+/// A KV v2 path at
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_REISSUE_KV_SUFFIX>`
 /// alternates between two payload shapes: the operator's request
 /// (`requested_at` / `requester`) and the agent's completion ack
 /// (`completed_at` / `completed_version`). Both are writes, and every
@@ -371,34 +372,62 @@ pub(crate) fn build_completed_payload(
     serde_json::Value::Object(payload)
 }
 
-/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_REISSUE_KV_SUFFIX>`.
+/// Builds the KV path
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_REISSUE_KV_SUFFIX>`.
 #[must_use]
-pub(crate) fn reissue_kv_path(service_name: &str) -> String {
-    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_REISSUE_KV_SUFFIX}")
+pub(crate) fn reissue_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_REISSUE_KV_SUFFIX}")
 }
 
-/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_TRUST_KV_SUFFIX>`.
+/// Builds the KV path
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_TRUST_KV_SUFFIX>`.
 #[must_use]
-pub(crate) fn trust_kv_path(service_name: &str) -> String {
-    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_TRUST_KV_SUFFIX}")
+pub(crate) fn trust_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_TRUST_KV_SUFFIX}")
 }
 
-/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_SECRET_ID_KV_SUFFIX>`.
+/// Builds the KV path
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_SECRET_ID_KV_SUFFIX>`.
 #[must_use]
-pub(crate) fn secret_id_kv_path(service_name: &str) -> String {
-    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_SECRET_ID_KV_SUFFIX}")
+pub(crate) fn secret_id_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_SECRET_ID_KV_SUFFIX}")
 }
 
-/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_RESPONDER_HMAC_KV_SUFFIX>`.
+/// Builds the KV path
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_RESPONDER_HMAC_KV_SUFFIX>`.
 #[must_use]
-pub(crate) fn responder_hmac_kv_path(service_name: &str) -> String {
-    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}")
+pub(crate) fn responder_hmac_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_RESPONDER_HMAC_KV_SUFFIX}")
 }
 
-/// Builds the KV path `<SERVICE_KV_BASE>/<service>/<SERVICE_EAB_KV_SUFFIX>`.
+/// Builds the KV path
+/// `<SERVICE_KV_BASE>/<registration_id>/<SERVICE_EAB_KV_SUFFIX>`.
 #[must_use]
-pub(crate) fn eab_kv_path(service_name: &str) -> String {
-    format!("{SERVICE_KV_BASE}/{service_name}/{SERVICE_EAB_KV_SUFFIX}")
+pub(crate) fn eab_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_EAB_KV_SUFFIX}")
+}
+
+/// Groups the configured profiles by `registration_id`, mapping each key
+/// to the SAN of every profile that shares it.
+///
+/// The fast-poll loop reads KV once per registration and fans the result
+/// out across that registration's profiles: the control plane publishes
+/// one request per registration, not per profile, and the registration —
+/// not the `service_name` — is what names the KV subtree. Two profiles
+/// that share a `service_name` but not a key are therefore two poll
+/// targets, not one group of two.
+#[must_use]
+pub(crate) fn group_profiles_by_registration(
+    settings: &config::Settings,
+) -> Vec<(String, Vec<String>)> {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for profile in &settings.profiles {
+        grouped
+            .entry(profile.registration_id.clone())
+            .or_default()
+            .push(config::profile_domain(settings, profile));
+    }
+    grouped.into_iter().collect()
 }
 
 /// Reports whether an observed KV version is newer than the last one the
@@ -454,29 +483,29 @@ pub(crate) async fn run_trust_poll_tick<H: FastPollHooks + ?Sized>(
     let mut outcomes = Vec::with_capacity(services.len());
     let mut state_changed = false;
 
-    for (service_name, _profiles) in services {
-        let kv_path = trust_kv_path(service_name);
+    for (registration_id, _profiles) in services {
+        let kv_path = trust_kv_path(registration_id);
         let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
             Ok(Some(read)) => read,
             Ok(None) => {
                 outcomes.push(PollApplyOutcome::NoData {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                 });
                 continue;
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ReadError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     error: format!("{err:#}"),
                 });
                 continue;
             }
         };
 
-        let last_seen = state.last_trust_seen_version.get(service_name).copied();
+        let last_seen = state.last_trust_seen_version.get(registration_id).copied();
         if !version_advanced(read.version, last_seen) {
             outcomes.push(PollApplyOutcome::UpToDate {
-                service: service_name.clone(),
+                service: registration_id.clone(),
                 version: read.version,
             });
             continue;
@@ -486,7 +515,7 @@ pub(crate) async fn run_trust_poll_tick<H: FastPollHooks + ?Sized>(
             Ok(payload) => payload,
             Err(err) => {
                 outcomes.push(PollApplyOutcome::Malformed {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -494,20 +523,20 @@ pub(crate) async fn run_trust_poll_tick<H: FastPollHooks + ?Sized>(
             }
         };
 
-        match hooks.apply_trust(service_name, &payload).await {
+        match hooks.apply_trust(registration_id, &payload).await {
             Ok(()) => {
                 state
                     .last_trust_seen_version
-                    .insert(service_name.clone(), read.version);
+                    .insert(registration_id.clone(), read.version);
                 state_changed = true;
                 outcomes.push(PollApplyOutcome::Applied {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                 });
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ApplyError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -531,29 +560,32 @@ pub(crate) async fn run_secret_id_poll_tick<H: FastPollHooks + ?Sized>(
     let mut outcomes = Vec::with_capacity(services.len());
     let mut state_changed = false;
 
-    for (service_name, _profiles) in services {
-        let kv_path = secret_id_kv_path(service_name);
+    for (registration_id, _profiles) in services {
+        let kv_path = secret_id_kv_path(registration_id);
         let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
             Ok(Some(read)) => read,
             Ok(None) => {
                 outcomes.push(PollApplyOutcome::NoData {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                 });
                 continue;
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ReadError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     error: format!("{err:#}"),
                 });
                 continue;
             }
         };
 
-        let last_seen = state.last_secret_id_seen_version.get(service_name).copied();
+        let last_seen = state
+            .last_secret_id_seen_version
+            .get(registration_id)
+            .copied();
         if !version_advanced(read.version, last_seen) {
             outcomes.push(PollApplyOutcome::UpToDate {
-                service: service_name.clone(),
+                service: registration_id.clone(),
                 version: read.version,
             });
             continue;
@@ -563,7 +595,7 @@ pub(crate) async fn run_secret_id_poll_tick<H: FastPollHooks + ?Sized>(
             Ok(secret_id) => secret_id,
             Err(err) => {
                 outcomes.push(PollApplyOutcome::Malformed {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -571,20 +603,20 @@ pub(crate) async fn run_secret_id_poll_tick<H: FastPollHooks + ?Sized>(
             }
         };
 
-        match hooks.apply_secret_id(service_name, &secret_id).await {
+        match hooks.apply_secret_id(registration_id, &secret_id).await {
             Ok(()) => {
                 state
                     .last_secret_id_seen_version
-                    .insert(service_name.clone(), read.version);
+                    .insert(registration_id.clone(), read.version);
                 state_changed = true;
                 outcomes.push(PollApplyOutcome::Applied {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                 });
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ApplyError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -609,19 +641,19 @@ pub(crate) async fn run_responder_hmac_poll_tick<H: FastPollHooks + ?Sized>(
     let mut outcomes = Vec::with_capacity(services.len());
     let mut state_changed = false;
 
-    for (service_name, _profiles) in services {
-        let kv_path = responder_hmac_kv_path(service_name);
+    for (registration_id, _profiles) in services {
+        let kv_path = responder_hmac_kv_path(registration_id);
         let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
             Ok(Some(read)) => read,
             Ok(None) => {
                 outcomes.push(PollApplyOutcome::NoData {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                 });
                 continue;
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ReadError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     error: format!("{err:#}"),
                 });
                 continue;
@@ -630,11 +662,11 @@ pub(crate) async fn run_responder_hmac_poll_tick<H: FastPollHooks + ?Sized>(
 
         let last_seen = state
             .last_responder_hmac_seen_version
-            .get(service_name)
+            .get(registration_id)
             .copied();
         if !version_advanced(read.version, last_seen) {
             outcomes.push(PollApplyOutcome::UpToDate {
-                service: service_name.clone(),
+                service: registration_id.clone(),
                 version: read.version,
             });
             continue;
@@ -644,7 +676,7 @@ pub(crate) async fn run_responder_hmac_poll_tick<H: FastPollHooks + ?Sized>(
             Ok(hmac) => hmac,
             Err(err) => {
                 outcomes.push(PollApplyOutcome::Malformed {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -652,20 +684,20 @@ pub(crate) async fn run_responder_hmac_poll_tick<H: FastPollHooks + ?Sized>(
             }
         };
 
-        match hooks.apply_responder_hmac(service_name, &hmac).await {
+        match hooks.apply_responder_hmac(registration_id, &hmac).await {
             Ok(()) => {
                 state
                     .last_responder_hmac_seen_version
-                    .insert(service_name.clone(), read.version);
+                    .insert(registration_id.clone(), read.version);
                 state_changed = true;
                 outcomes.push(PollApplyOutcome::Applied {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                 });
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ApplyError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -694,29 +726,29 @@ pub(crate) async fn run_eab_poll_tick<H: FastPollHooks + ?Sized>(
     let mut outcomes = Vec::with_capacity(services.len());
     let mut state_changed = false;
 
-    for (service_name, _profiles) in services {
-        let kv_path = eab_kv_path(service_name);
+    for (registration_id, _profiles) in services {
+        let kv_path = eab_kv_path(registration_id);
         let read = match hooks.read_kv_version(kv_mount, &kv_path).await {
             Ok(Some(read)) => read,
             Ok(None) => {
                 outcomes.push(PollApplyOutcome::NoData {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                 });
                 continue;
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ReadError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     error: format!("{err:#}"),
                 });
                 continue;
             }
         };
 
-        let last_seen = state.last_eab_seen_version.get(service_name).copied();
+        let last_seen = state.last_eab_seen_version.get(registration_id).copied();
         if !version_advanced(read.version, last_seen) {
             outcomes.push(PollApplyOutcome::UpToDate {
-                service: service_name.clone(),
+                service: registration_id.clone(),
                 version: read.version,
             });
             continue;
@@ -726,7 +758,7 @@ pub(crate) async fn run_eab_poll_tick<H: FastPollHooks + ?Sized>(
             Ok(payload) => payload,
             Err(err) => {
                 outcomes.push(PollApplyOutcome::Malformed {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -734,20 +766,20 @@ pub(crate) async fn run_eab_poll_tick<H: FastPollHooks + ?Sized>(
             }
         };
 
-        match hooks.apply_eab(service_name, &payload).await {
+        match hooks.apply_eab(registration_id, &payload).await {
             Ok(()) => {
                 state
                     .last_eab_seen_version
-                    .insert(service_name.clone(), read.version);
+                    .insert(registration_id.clone(), read.version);
                 state_changed = true;
                 outcomes.push(PollApplyOutcome::Applied {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                 });
             }
             Err(err) => {
                 outcomes.push(PollApplyOutcome::ApplyError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: read.version,
                     error: format!("{err:#}"),
                 });
@@ -772,17 +804,17 @@ pub(crate) async fn run_eab_poll_tick<H: FastPollHooks + ?Sized>(
 /// distinct `cert_group_gid`.
 fn resolve_service_cert_group_policy(
     settings: &config::Settings,
-    service: &str,
+    registration_id: &str,
 ) -> Result<CertGroupPolicy> {
     let mut gids: BTreeSet<Option<u32>> = BTreeSet::new();
     for profile in &settings.profiles {
-        if profile.service_name == service {
+        if profile.registration_id == registration_id {
             gids.insert(profile.cert_group_gid);
         }
     }
     if gids.len() > 1 {
         anyhow::bail!(
-            "Service '{service}' profiles disagree on cert_group_gid; \
+            "Registration '{registration_id}' profiles disagree on cert_group_gid; \
              refusing to pick one for the CA bundle"
         );
     }
@@ -821,29 +853,29 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
     let mut outcomes = Vec::with_capacity(services.len());
     let mut state_changed = false;
 
-    for (service_name, profile_labels) in services {
-        let kv_path = reissue_kv_path(service_name);
+    for (registration_id, profile_labels) in services {
+        let kv_path = reissue_kv_path(registration_id);
         let observation = match hooks.read_kv_version(kv_mount, &kv_path).await {
             Ok(Some(read)) => read,
             Ok(None) => {
                 if state
                     .pending_completion_writes
-                    .remove(service_name)
+                    .remove(registration_id)
                     .is_some()
                 {
                     state_changed = true;
                 }
-                if state.in_flight_renewals.remove(service_name).is_some() {
+                if state.in_flight_renewals.remove(registration_id).is_some() {
                     state_changed = true;
                 }
                 outcomes.push(FastPollTickOutcome::NoRequest {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                 });
                 continue;
             }
             Err(err) => {
                 outcomes.push(FastPollTickOutcome::ReadError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     error: format!("{err:#}"),
                 });
                 continue;
@@ -853,7 +885,11 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
         // Step 1: if a previous tick succeeded the renewal but failed
         // the completion write, retry just the write while the request
         // version in KV still matches what we already applied.
-        if let Some(pending) = state.pending_completion_writes.get(service_name).cloned() {
+        if let Some(pending) = state
+            .pending_completion_writes
+            .get(registration_id)
+            .cloned()
+        {
             if observation.version == pending.version {
                 let pending_obs = ReissueObservation {
                     version: pending.version,
@@ -863,17 +899,17 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
                 let payload = build_completed_payload(&pending_obs, &pending.completed_at);
                 match hooks.write_kv(kv_mount, &kv_path, payload).await {
                     Ok(()) => {
-                        state.pending_completion_writes.remove(service_name);
+                        state.pending_completion_writes.remove(registration_id);
                         state_changed = true;
                         outcomes.push(FastPollTickOutcome::CompletedWriteRetried {
-                            service: service_name.clone(),
+                            service: registration_id.clone(),
                             version: pending.version,
                             completed_at: pending.completed_at,
                         });
                     }
                     Err(err) => {
                         outcomes.push(FastPollTickOutcome::CompletedWriteError {
-                            service: service_name.clone(),
+                            service: registration_id.clone(),
                             version: pending.version,
                             error: format!("{err:#}"),
                         });
@@ -884,23 +920,26 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
             // A newer request superseded the pending one — drop the
             // stale entry. The newer request is processed below and
             // any new write failure will install a fresh pending.
-            state.pending_completion_writes.remove(service_name);
+            state.pending_completion_writes.remove(registration_id);
             state_changed = true;
         }
 
-        let last_seen = state.last_reissue_seen_version.get(service_name).copied();
+        let last_seen = state
+            .last_reissue_seen_version
+            .get(registration_id)
+            .copied();
         let Some(observed) = evaluate_observation(&observation, last_seen) else {
             // No newer request in KV — but an in-flight fan-out from a
             // previous tick is tied to a specific version, so drop it
             // if it does not match what we just read.
-            if let Some(existing) = state.in_flight_renewals.get(service_name)
+            if let Some(existing) = state.in_flight_renewals.get(registration_id)
                 && existing.version != observation.version
             {
-                state.in_flight_renewals.remove(service_name);
+                state.in_flight_renewals.remove(registration_id);
                 state_changed = true;
             }
             outcomes.push(FastPollTickOutcome::UpToDate {
-                service: service_name.clone(),
+                service: registration_id.clone(),
                 version: observation.version,
             });
             continue;
@@ -911,18 +950,18 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
         // profiles that already completed; otherwise drop the stale
         // entry and start a fresh fan-out for the new version.
         let mut completed_profiles: BTreeSet<String> = BTreeSet::new();
-        if let Some(existing) = state.in_flight_renewals.get(service_name) {
+        if let Some(existing) = state.in_flight_renewals.get(registration_id) {
             if existing.version == observed.version {
                 completed_profiles = existing.completed_profiles.clone();
             } else {
-                state.in_flight_renewals.remove(service_name);
+                state.in_flight_renewals.remove(registration_id);
                 state_changed = true;
             }
         }
 
         info!(
             "Service '{}': fast-poll observed reissue version {} (last seen {:?}), fanning out to {} profile(s) ({} already completed)",
-            service_name,
+            registration_id,
             observed.version,
             last_seen,
             profile_labels.len(),
@@ -947,7 +986,7 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
                 Err(err) => {
                     any_failed = true;
                     outcomes.push(FastPollTickOutcome::RenewError {
-                        service: service_name.clone(),
+                        service: registration_id.clone(),
                         profile: profile_label.clone(),
                         error: format!("{err:#}"),
                     });
@@ -960,7 +999,7 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
             // every tick of a service whose only profile keeps failing.
             if !completed_profiles.is_empty() {
                 state.in_flight_renewals.insert(
-                    service_name.clone(),
+                    registration_id.clone(),
                     InFlightRenewal {
                         version: observed.version,
                         completed_profiles,
@@ -976,7 +1015,7 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
         // success paths below all set `state_changed = true` when they
         // advance `last_reissue_seen_version`, so we do not need to
         // set it here just for this removal.
-        state.in_flight_renewals.remove(service_name);
+        state.in_flight_renewals.remove(registration_id);
 
         let completed_at = match OffsetDateTime::now_utc().format(&Rfc3339) {
             Ok(value) => value,
@@ -987,10 +1026,10 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
                 // for this version, but a future request will recover.
                 state
                     .last_reissue_seen_version
-                    .insert(service_name.clone(), observed.version);
+                    .insert(registration_id.clone(), observed.version);
                 state_changed = true;
                 outcomes.push(FastPollTickOutcome::CompletedWriteError {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: observed.version,
                     error: format!("Failed to format completed_at: {err}"),
                 });
@@ -1005,19 +1044,19 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
         // (added on failure) lets the next tick retry just the write.
         state
             .last_reissue_seen_version
-            .insert(service_name.clone(), observed.version);
+            .insert(registration_id.clone(), observed.version);
         state_changed = true;
         match write_result {
             Ok(()) => {
                 outcomes.push(FastPollTickOutcome::Applied {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: observed.version,
                     completed_at,
                 });
             }
             Err(err) => {
                 state.pending_completion_writes.insert(
-                    service_name.clone(),
+                    registration_id.clone(),
                     PendingCompletion {
                         version: observed.version,
                         completed_at: completed_at.clone(),
@@ -1026,7 +1065,7 @@ pub(crate) async fn run_fast_poll_tick<H: FastPollHooks + ?Sized>(
                     },
                 );
                 outcomes.push(FastPollTickOutcome::AppliedPendingWrite {
-                    service: service_name.clone(),
+                    service: registration_id.clone(),
                     version: observed.version,
                     completed_at,
                     error: format!("{err:#}"),
@@ -1390,20 +1429,7 @@ pub(crate) async fn run_fast_poll_loop(
         return Ok(());
     }
 
-    // Group profiles by service so that a single reissue request
-    // fans out to every profile sharing that service. Bootroot allows
-    // multiple instances of the same service on one host (see
-    // docs/en/concepts.md), and the rotate command publishes one KV
-    // request per service, not per profile.
-    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for profile in &settings.profiles {
-        let label = config::profile_domain(&settings, profile);
-        grouped
-            .entry(profile.service_name.clone())
-            .or_default()
-            .push(label);
-    }
-    let services: Vec<(String, Vec<String>)> = grouped.into_iter().collect();
+    let services = group_profiles_by_registration(&settings);
 
     info!(
         "Fast-poll enabled: interval={:?}, services={}, profiles={}",
@@ -2317,13 +2343,13 @@ mod tests {
         assert!(hooks.writes.lock().unwrap().is_empty());
     }
 
-    // Reviewer round 1, item 1: a service with multiple profiles must
-    // fan the renewal out to every matching profile before the version
-    // is marked consumed. The previous implementation deduped by
-    // service_name only, so sibling profiles silently kept their old
+    // Reviewer round 1, item 1: a registration with multiple profiles
+    // must fan the renewal out to every matching profile before the
+    // version is marked consumed. An implementation that renewed only the
+    // first profile of the group left its siblings on their old
     // certificate.
     #[tokio::test]
-    async fn tick_fans_renewal_out_to_all_profiles_sharing_a_service() {
+    async fn tick_fans_renewal_out_to_all_profiles_sharing_a_registration() {
         let hooks = FakeHooks::new(vec![Ok(Some(KvReadWithVersion {
             version: 4,
             data: serde_json::json!({
@@ -2797,6 +2823,94 @@ mod tests {
         assert_eq!(
             eab_kv_path("edge-proxy"),
             "bootroot/services/edge-proxy/eab"
+        );
+    }
+
+    /// Every fast-poll KV path is keyed on the `registration_id`, so two
+    /// registrations of one component on one host — identical
+    /// `service_name`, different keys — poll disjoint subtrees.
+    #[test]
+    fn kv_paths_derive_from_registration_id_not_service_name() {
+        for (first, second) in [
+            (
+                reissue_kv_path("h1-piglet-001"),
+                reissue_kv_path("h1-piglet-002"),
+            ),
+            (
+                trust_kv_path("h1-piglet-001"),
+                trust_kv_path("h1-piglet-002"),
+            ),
+            (
+                secret_id_kv_path("h1-piglet-001"),
+                secret_id_kv_path("h1-piglet-002"),
+            ),
+            (
+                responder_hmac_kv_path("h1-piglet-001"),
+                responder_hmac_kv_path("h1-piglet-002"),
+            ),
+            (eab_kv_path("h1-piglet-001"), eab_kv_path("h1-piglet-002")),
+        ] {
+            assert_ne!(first, second);
+            assert!(
+                first.starts_with("bootroot/services/h1-piglet-001/"),
+                "{first}"
+            );
+            assert!(!first.contains("piglet/"), "{first}");
+        }
+    }
+
+    /// The reissue fan-out groups profiles by `registration_id`. Two
+    /// profiles that share a `service_name` but not a key are two
+    /// separate poll targets, not one group of two.
+    #[test]
+    fn profiles_group_by_registration_id() {
+        let mut settings = test_settings("piglet");
+        settings.profiles[0].registration_id = "h1-piglet-001".to_string();
+        let mut second = settings.profiles[0].clone();
+        second.registration_id = "h1-piglet-002".to_string();
+        second.instance_id = "002".to_string();
+        settings.profiles.push(second);
+
+        let grouped = group_profiles_by_registration(&settings);
+
+        assert_eq!(
+            grouped,
+            vec![
+                (
+                    "h1-piglet-001".to_string(),
+                    vec!["001.piglet.node-01.example.internal".to_string()]
+                ),
+                (
+                    "h1-piglet-002".to_string(),
+                    vec!["002.piglet.node-01.example.internal".to_string()]
+                ),
+            ],
+            "two registrations sharing a service_name are two poll targets"
+        );
+    }
+
+    /// The inverse case: several profiles of one registration are one
+    /// poll target whose fan-out lists every SAN, so a single reissue
+    /// request reaches all of them.
+    #[test]
+    fn profiles_sharing_a_registration_form_one_poll_target() {
+        let mut settings = test_settings("piglet");
+        settings.profiles[0].registration_id = "h1-piglet-001".to_string();
+        let mut second = settings.profiles[0].clone();
+        second.instance_id = "002".to_string();
+        settings.profiles.push(second);
+
+        let grouped = group_profiles_by_registration(&settings);
+
+        assert_eq!(
+            grouped,
+            vec![(
+                "h1-piglet-001".to_string(),
+                vec![
+                    "001.piglet.node-01.example.internal".to_string(),
+                    "002.piglet.node-01.example.internal".to_string(),
+                ]
+            )]
         );
     }
 
@@ -3280,6 +3394,7 @@ mod tests {
 
     fn eab_test_profile() -> config::DaemonProfileSettings {
         config::DaemonProfileSettings {
+            registration_id: "edge-proxy".to_string(),
             service_name: "edge-proxy".to_string(),
             instance_id: "001".to_string(),
             hostname: "edge-node-01".to_string(),
@@ -3770,6 +3885,7 @@ mod tests {
              server = \"https://ca.example/acme/directory\"\n\
              domain = \"example.internal\"\n\n\
              [[profiles]]\n\
+             registration_id = \"{service}\"\n\
              service_name = \"{service}\"\n\
              instance_id = \"001\"\n\
              hostname = \"node-01\"\n\n\

@@ -499,9 +499,10 @@ fn bootstrap_artifact(
         .join("services")
         .join(SERVICE_NAME);
     json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "openbao_url": openbao_url,
         "kv_mount": KV_MOUNT,
+        "registration_id": SERVICE_NAME,
         "service_name": SERVICE_NAME,
         "role_id_path": service_secrets.join("role_id").to_string_lossy(),
         "secret_id_path": service_secrets.join("secret_id").to_string_lossy(),

@@ -427,7 +427,7 @@ openbao agent -config /etc/bootroot/openbao/stepca/agent.hcl
   데몬의 fast-poll 루프가 시크릿 전달 메커니즘입니다.
 
 서비스 `bootroot-agent` 흐름의 `role_id`/`secret_id`(그리고 EAB가 설정된
-경우 `eab.json`)는 `secrets/services/<service>/` 아래에 있으며, 해당
+경우 `eab.json`)는 `secrets/services/<registration_id>/` 아래에 있으며, 해당
 디렉터리는 `0700`, 파일은 `0600` 권한을 유지해야 합니다.
 
 ## 개발/테스트 환경 완전 초기화
@@ -451,12 +451,14 @@ bootroot init
 
 ```bash
 docker compose up -d
-bootroot service add --service-name edge-proxy --hostname edge-node-01 \
+bootroot service add \
+  --registration-id edge-proxy \
+  --service-name edge-proxy --hostname edge-node-01 \
   --domain trusted.domain --instance-id 001 \
   --agent-config "$(pwd)/tmp/agent-edge-proxy.toml" \
   --cert-path "$(pwd)/certs/edge-proxy.crt" \
   --key-path "$(pwd)/certs/edge-proxy.key"
-bootroot verify --service-name edge-proxy \
+bootroot verify --registration-id edge-proxy \
   --agent-config "$(pwd)/tmp/agent-edge-proxy.toml"
 ```
 

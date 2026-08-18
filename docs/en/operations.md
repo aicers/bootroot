@@ -45,15 +45,15 @@ Run these regularly for fast health checks:
 
 ```bash
 bootroot status
-bootroot verify --service-name <service> --db-check
-bootroot service info --service-name <service>
+bootroot verify --registration-id <service> --db-check
+bootroot service info --registration-id <service>
 bootroot monitoring status
 ```
 
 - `bootroot status`: overall state from OpenBao/step-ca/state file perspective
-- `bootroot verify --service-name <service> --db-check`:
+- `bootroot verify --registration-id <service> --db-check`:
   non-interactive issuance/verification/DB/responder checks
-- `bootroot service info --service-name <service>`:
+- `bootroot service info --registration-id <service>`:
   current per-service state including delivery mode
 - `bootroot monitoring status`: Prometheus/Grafana container status
 
@@ -133,7 +133,7 @@ fails. Restore the audit configuration and re-run init.
   services recover after host reboot.
 - Basic triage flow:
   `docker compose ps` -> `docker compose logs --tail=200 <service>`
-  -> `bootroot verify --service-name <service>`.
+  -> `bootroot verify --registration-id <service>`.
 
 ## systemd operations procedure (recommended for bootroot-agent)
 
@@ -172,7 +172,7 @@ A host runs one `bootroot-agent` process plus one agent config per
   the same `state_path`. See `docs/en/remote-bootstrap.md`.
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
-  -> `bootroot verify --service-name <service>`.
+  -> `bootroot verify --registration-id <service>`.
 
 ### Hardened systemd unit example
 
@@ -576,15 +576,17 @@ intervention.
 
 ```bash
 # native daemon under systemd
-bootroot service add --service-name review \
+bootroot service add --registration-id review --service-name review \
   --reload-style systemd --reload-target review.service ...
 
 # native daemon launched directly (uses pkill -HUP <process-name>)
-bootroot service add --service-name review \
+bootroot service add --registration-id review --service-name review \
   --reload-style sighup --reload-target review ...
 
 # containerised consumer (issues `docker restart <container>`)
-bootroot service add --service-name aice-web-next \
+bootroot service add \
+  --registration-id aice-web-next \
+  --service-name aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next ...
 ```
 
@@ -600,7 +602,7 @@ custom command together — both hooks are registered from the single
 renewal, emitted preset-first then custom (issue #702):
 
 ```bash
-bootroot service add --service-name aimer-web \
+bootroot service add --registration-id aimer-web --service-name aimer-web \
   --reload-style docker-restart --reload-target aimer-web-next-app-1 \
   --post-renew-command docker --post-renew-arg exec \
     --post-renew-arg aimer-web-nginx-prod-1 \
@@ -621,7 +623,7 @@ on `service add`, `rotate ca-key`, and `rotate force-reissue` points
 operators at.
 
 ```bash
-bootroot service update --service-name review \
+bootroot service update --registration-id review \
   --reload-style sighup --reload-target review
 ```
 
@@ -717,23 +719,23 @@ Use `bootroot service update` to change per-service `secret_id` policy
 without re-running `service add`:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
-bootroot service update --service-name edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
 ```
 
 The command modifies `state.json` only. To apply the updated policy to
 the actual `secret_id`, run `rotate approle-secret-id` afterward:
 
 ```bash
-bootroot rotate approle-secret-id --service-name edge-proxy
+bootroot rotate approle-secret-id --registration-id edge-proxy
 ```
 
 Use `"inherit"` to clear a per-service override and fall back to the
 role-level default configured on the AppRole in OpenBao:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl inherit
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 ```
 
 ## Remote bootstrap and secret_id handoff operations
@@ -747,11 +749,12 @@ model is one-shot bootstrap; a running agent is then self-sufficient:
    `bootroot-agent` run.
 2. Thereafter the running `bootroot-agent`'s fast-poll loop keeps itself
    current with no per-host operator action: it refreshes its own
-   `secret_id` from `bootroot/services/<service>/secret_id` (surviving past
-   `secret_id_ttl`) and re-renders the `agent.toml` `[trust]` pins +
-   `ca-bundle.pem` from `bootroot/services/<service>/trust` after a
-   `bootroot rotate approle-secret-id` or a CA/trust rotation on the control
-   node. `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
+   `secret_id` from `bootroot/services/<registration_id>/secret_id`
+   (surviving past `secret_id_ttl`) and re-renders the `agent.toml`
+   `[trust]` pins + `ca-bundle.pem` from
+   `bootroot/services/<registration_id>/trust` after a `bootroot rotate
+   approle-secret-id` or a CA/trust rotation on the control node.
+   `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
    bootstrap` are recovery paths only — needed when an agent was offline
    past its `secret_id_ttl` and its credential already expired, so it can no
    longer self-refresh.
@@ -800,13 +803,13 @@ fast-poll loop pulls the updated values from OpenBao KV within
 `fast_poll_interval`, with no per-service process restart or reload.
 
 For `remote-bootstrap` services, the rotated `secret_id` is written to
-the per-service KV path (`bootroot/services/<service>/secret_id`). A
+the per-service KV path (`bootroot/services/<registration_id>/secret_id`). A
 *running* remote `bootroot-agent` needs no operator action: its fast-poll
 loop reads that path with its still-valid credential, writes the rotated
 `secret_id` atomically to the agent's local file, and re-authenticates via
 AppRole on its next re-login — so the loop survives past `secret_id_ttl`
 without any manual step. The same loop reads
-`bootroot/services/<service>/trust` and re-renders the `agent.toml`
+`bootroot/services/<registration_id>/trust` and re-renders the `agent.toml`
 `[trust]` pins + `ca-bundle.pem`, so a CA/trust rotation propagates the
 same way.
 
@@ -817,7 +820,7 @@ self-refresh):
 
 ```bash
 bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
-  --service-name <svc> --role-id-path <dir>/role_id \
+  --registration-id <svc> --role-id-path <dir>/role_id \
   --secret-id-path <dir>/secret_id --ca-bundle-path <dir>/ca-bundle.pem
 ```
 
@@ -991,7 +994,7 @@ To delete a service's certificate and key and trigger bootroot-agent to
 reissue:
 
 ```bash
-bootroot rotate force-reissue --service-name edge-proxy --yes
+bootroot rotate force-reissue --registration-id edge-proxy --yes
 ```
 
 For `local-file` services, the command deletes the recorded cert/key files
@@ -1017,7 +1020,7 @@ pattern:
    auto-discovery.
 
 ```bash
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file \
   --cert-path /opt/web-app-mtls/web-app-cert.pem \
   --key-path /opt/web-app-mtls/web-app-key.pem \

@@ -96,12 +96,13 @@ pub(super) async fn rotate_approle_secret_id(
         rotate_all_service_approle_secret_ids(ctx, client, auto_confirm, messages).await?;
         AppRoleLabel::RuntimeRotate
     } else {
-        let service_name = args.service_name.as_deref().ok_or_else(|| {
+        let registration_id = args.registration_id.as_deref().ok_or_else(|| {
             // clap's ArgGroup guarantees one selector is present; guard for
             // callers that construct the args directly.
             anyhow::anyhow!(messages.error_value_required())
         })?;
-        rotate_service_approle_secret_id(ctx, client, service_name, auto_confirm, messages).await?;
+        rotate_service_approle_secret_id(ctx, client, registration_id, auto_confirm, messages)
+            .await?;
         AppRoleLabel::RuntimeRotate
     };
 
@@ -225,27 +226,30 @@ struct ServiceRotationReport {
 async fn rotate_service_approle_secret_id(
     ctx: &RotateContext,
     client: &OpenBaoClient,
-    service_name: &str,
+    registration_id: &str,
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
     confirm_action(
-        &messages.prompt_rotate_approle_secret_id(service_name),
+        &messages.prompt_rotate_approle_secret_id(registration_id),
         auto_confirm,
         messages,
     )?;
 
-    let report = rotate_service_secret_id_once(ctx, client, service_name, messages).await?;
+    let report = rotate_service_secret_id_once(ctx, client, registration_id, messages).await?;
 
     println!("{}", messages.rotate_summary_title());
     // CodeQL flags this as cleartext-logging, but the second argument is
     // `secret_id_path` (a file path), not the secret_id value. Dismiss as false positive.
     println!(
         "{}",
-        messages.rotate_summary_approle_secret_id(service_name, &report.secret_id_path)
+        messages.rotate_summary_approle_secret_id(registration_id, &report.secret_id_path)
     );
     if report.login_verified {
-        println!("{}", messages.rotate_summary_approle_login_ok(service_name));
+        println!(
+            "{}",
+            messages.rotate_summary_approle_login_ok(registration_id)
+        );
     }
     Ok(())
 }
@@ -261,52 +265,52 @@ async fn rotate_all_service_approle_secret_ids(
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
-    let service_names: Vec<String> = ctx.state.services.keys().cloned().collect();
-    if service_names.is_empty() {
+    let registration_ids: Vec<String> = ctx.state.services.keys().cloned().collect();
+    if registration_ids.is_empty() {
         println!("{}", messages.rotate_all_no_services());
         return Ok(());
     }
     confirm_action(
-        &messages.prompt_rotate_all_approle_secret_ids(service_names.len()),
+        &messages.prompt_rotate_all_approle_secret_ids(registration_ids.len()),
         auto_confirm,
         messages,
     )?;
 
-    let mut outcomes = Vec::with_capacity(service_names.len());
-    for service_name in &service_names {
-        let outcome = rotate_service_secret_id_once(ctx, client, service_name, messages).await;
-        outcomes.push((service_name.as_str(), outcome));
+    let mut outcomes = Vec::with_capacity(registration_ids.len());
+    for registration_id in &registration_ids {
+        let outcome = rotate_service_secret_id_once(ctx, client, registration_id, messages).await;
+        outcomes.push((registration_id.as_str(), outcome));
     }
 
     println!("{}", messages.rotate_summary_title());
-    let mut failed_names = Vec::new();
-    for (service_name, outcome) in &outcomes {
+    let mut failed_ids = Vec::new();
+    for (registration_id, outcome) in &outcomes {
         match outcome {
             // The second argument is the secret_id file path, not the secret value.
             Ok(report) => println!(
                 "{}",
-                messages.rotate_summary_approle_secret_id(service_name, &report.secret_id_path)
+                messages.rotate_summary_approle_secret_id(registration_id, &report.secret_id_path)
             ),
             Err(error) => {
                 println!(
                     "{}",
-                    messages.rotate_all_target_failed(service_name, &format!("{error:#}"))
+                    messages.rotate_all_target_failed(registration_id, &format!("{error:#}"))
                 );
-                failed_names.push(*service_name);
+                failed_ids.push(*registration_id);
             }
         }
     }
     let total = outcomes.len();
-    let failed = failed_names.len();
+    let failed = failed_ids.len();
     println!(
         "{}",
         messages.rotate_all_result(total - failed, failed, total)
     );
-    if !failed_names.is_empty() {
+    if !failed_ids.is_empty() {
         anyhow::bail!(messages.error_rotate_all_partial_failure(
             failed,
             total,
-            &failed_names.join(", ")
+            &failed_ids.join(", ")
         ));
     }
     Ok(())
@@ -315,14 +319,14 @@ async fn rotate_all_service_approle_secret_ids(
 async fn rotate_service_secret_id_once(
     ctx: &RotateContext,
     client: &OpenBaoClient,
-    service_name: &str,
+    registration_id: &str,
     messages: &Messages,
 ) -> Result<ServiceRotationReport> {
     let entry = ctx
         .state
         .services
-        .get(service_name)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(service_name)))?
+        .get(registration_id)
+        .ok_or_else(|| anyhow::anyhow!(messages.error_service_not_found(registration_id)))?
         .clone();
     let is_remote = matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap);
     if !is_remote {
@@ -347,7 +351,7 @@ async fn rotate_service_secret_id_once(
                 .await
         }
     }
-    .with_context(|| messages.error_service_secret_id_mint_failed(service_name))?;
+    .with_context(|| messages.error_service_secret_id_mint_failed(registration_id))?;
     // The direct local `secret_id` file write is all that is needed: the
     // agent's fast-poll loop re-reads the `secret_id` file on every
     // AppRole re-login, so no process signal or sidecar reload follows.
@@ -371,7 +375,7 @@ async fn rotate_service_secret_id_once(
         write_remote_service_secret_id(
             client,
             &ctx.kv_mount,
-            service_name,
+            registration_id,
             &new_secret_id,
             messages,
         )
@@ -792,14 +796,14 @@ async fn write_service_secret_id_file(
 async fn write_remote_service_secret_id(
     client: &OpenBaoClient,
     kv_mount: &str,
-    service_name: &str,
+    registration_id: &str,
     secret_id: &str,
     messages: &Messages,
 ) -> Result<()> {
     client
         .write_kv(
             kv_mount,
-            &format!("{SERVICE_KV_BASE}/{service_name}/secret_id"),
+            &format!("{SERVICE_KV_BASE}/{registration_id}/secret_id"),
             serde_json::json!({ SERVICE_SECRET_ID_KEY: secret_id }),
         )
         .await
@@ -870,6 +874,7 @@ mod tests {
         delivery_mode: DeliveryMode,
     ) -> ServiceEntry {
         ServiceEntry {
+            registration_id: name.to_string(),
             service_name: name.to_string(),
             delivery_mode,
             hostname: "h".to_string(),
@@ -1558,12 +1563,12 @@ mod tests {
     }
 
     fn approle_args(
-        service_name: Option<&str>,
+        registration_id: Option<&str>,
         all_services: bool,
         infra: Option<InfraRoleTarget>,
     ) -> RotateAppRoleSecretIdArgs {
         RotateAppRoleSecretIdArgs {
-            service_name: service_name.map(str::to_string),
+            registration_id: registration_id.map(str::to_string),
             all_services,
             infra,
             rotate_bound_cidrs: Vec::new(),

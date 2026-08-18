@@ -988,7 +988,7 @@ automation in the following structure.
 
 - Register service metadata in `state.json`
 - Create service-scoped OpenBao policy/AppRole and issue `role_id`/`secret_id`
-- Write `secrets/services/<service>/role_id` and `secret_id`
+- Write `secrets/services/<registration_id>/role_id` and `secret_id`
 - Print execution summary and operator snippets
 
 ### 2) Automation by `--delivery-mode`
@@ -1060,7 +1060,7 @@ automatically as part of onboarding.
 #### 4-1) Trust automation by delivery mode
 
 - `remote-bootstrap` mode: it writes service trust state into the per-service
-  remote bootstrap bundle (`secret/.../services/<service>/trust`), and
+  remote bootstrap bundle (`secret/.../services/<registration_id>/trust`), and
   `bootroot-remote bootstrap` applies the trust settings and CA bundle on the
   service machine before the first `bootroot-agent` run.
 - `local-file` mode: trust settings are auto-merged into `agent.toml`
@@ -1113,7 +1113,17 @@ bind-mounts, and the post-renew hook reloads the container (see
 
 Input priority is **CLI flags > environment variables > prompts/defaults**.
 
-- `--service-name`: service name identifier
+- `--registration-id`: deployment-wide unique registration key. Names
+  every namespace this registration owns — the `state.json` entry, the
+  `AppRole` and policy, the `bootroot/services/<key>` KV subtree, the
+  managed `agent.toml` block, the fast-poll state file, the
+  remote-bootstrap artifact directory.
+  - Lowercase letters, digits, and hyphens only; must start and end with a
+    letter or digit; max 131 characters
+  - Not part of the certificate SAN, and not derived from the SAN inputs:
+    several registrations of one component may share a `--service-name`
+    on one host. Prompted for when omitted.
+- `--service-name`: service name identifier, used as the SAN's second label
   - Must be a single DNS label: letters, digits, and hyphens only, max 63
     characters, no dots or underscores
 - `--delivery-mode`: delivery mode (`local-file` or `remote-bootstrap`).
@@ -1365,7 +1375,7 @@ add` flow. At least one update flag is required.
 
 ### Inputs
 
-- `--service-name`: service name identifier
+- `--registration-id`: registration key of the registered service
 - `--secret-id-ttl`: TTL for the generated `secret_id` (use `"inherit"`
   to clear the per-service override and fall back to the role-level
   default). Should be at least 2× the rotation interval
@@ -1451,21 +1461,21 @@ The command is considered failed when:
 ### Examples
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
-bootroot service update --service-name edge-proxy --no-wrap
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # Retrofit a post-renew hook on an existing service (issue #614).
-bootroot service update --service-name review \
+bootroot service update --registration-id review \
   --reload-style sighup --reload-target review
-bootroot service update --service-name aice-web-next \
+bootroot service update --registration-id aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next
-bootroot service update --service-name edge-proxy --reload-style none
+bootroot service update --registration-id edge-proxy --reload-style none
 
 # Arm two hooks in one update (issue #702): restart the next-app
 # container AND reload nginx inside another container. Emitted
 # preset-first, then the custom command.
-bootroot service update --service-name aimer-web \
+bootroot service update --registration-id aimer-web \
   --reload-style docker-restart --reload-target aimer-web-next-app-1 \
   --post-renew-command docker --post-renew-arg exec \
     --post-renew-arg aimer-web-nginx-prod-1 \
@@ -1485,7 +1495,7 @@ regenerates the `secret_id` delivery material regardless, the fresh
 
 ### Inputs
 
-- `--service-name`: service name identifier (required)
+- `--registration-id`: registration key of the registered service (required)
 - `--yes` (alias `--force`): skip the interactive confirmation prompt.
   Required for non-interactive use (CI / scripts); without it, and when
   stdin is not a terminal, the command refuses to proceed.
@@ -1560,24 +1570,24 @@ The command is considered failed when:
 
 ```bash
 # Preview the teardown plan.
-bootroot service remove --service-name edge-proxy --dry-run
+bootroot service remove --registration-id edge-proxy --dry-run
 
 # Deregister a service (OpenBao AppRole/policy/KV torn down; cert/key
 # and agent.toml preserved).
-bootroot service remove --service-name edge-proxy --yes
+bootroot service remove --registration-id edge-proxy --yes
 
 # Change delivery-mode from local-file to remote-bootstrap. The re-add and
 # subsequent bootstrap replace the stale managed block in place, so no
 # manual agent.toml edit is needed; add --strip-config to the remove step
 # to clear the block up front (keeping the cert/key) as a belt-and-braces
 # step for a live transition.
-bootroot service remove --service-name edge-proxy --yes --strip-config
-bootroot service add --service-name edge-proxy \
+bootroot service remove --registration-id edge-proxy --yes --strip-config
+bootroot service add --registration-id edge-proxy --service-name edge-proxy \
   --delivery-mode remote-bootstrap ...
 
 # Full teardown including on-disk artifacts and the managed agent.toml
 # block.
-bootroot service remove --service-name edge-proxy --yes --delete-artifacts
+bootroot service remove --registration-id edge-proxy --yes --delete-artifacts
 ```
 
 ## bootroot service info
@@ -1586,7 +1596,7 @@ Shows onboarding information for a registered service.
 
 ### Inputs
 
-- `--service-name`: service name identifier
+- `--registration-id`: registration key of the registered service
 
 ### Outputs
 
@@ -1617,7 +1627,7 @@ for those flags.
 
 ### Inputs
 
-- `--service-name`: service name identifier
+- `--registration-id`: registration key of the registered service
 - `--agent-config`: bootroot-agent config path override (optional)
 - `--agent-binary`: path to the `bootroot-agent` binary (optional; when
   omitted, bootroot first tries the directory containing the running
@@ -1749,7 +1759,7 @@ long-running infra OpenBao Agents (`openbao-agent-stepca` /
 `openbao-agent-responder`). Exactly one of the three selectors
 is required:
 
-- `--service-name`: target service name. Authenticate with
+- `--registration-id`: target registration key. Authenticate with
   `bootroot-runtime-rotate-role` credentials.
 - `--all-services`: rotates every service registered in `state.json`
   (both `local-file` and `remote-bootstrap` delivery modes) in one
@@ -1841,7 +1851,7 @@ daemon's config path) so it reissues on the next loop tick.
 For `--delivery-mode remote-bootstrap` services, the control plane has no
 push channel into the remote host, so cert files cannot be deleted
 remotely. Instead the command writes a versioned reissue request to
-`{kv_mount}/data/bootroot/services/<service>/reissue` in OpenBao with
+`{kv_mount}/data/bootroot/services/<registration_id>/reissue` in OpenBao with
 `requested_at` and `requester` fields. The remote bootroot-agent requires
 the `[openbao]` section in its `agent.toml` — `bootroot-remote bootstrap`
 auto-provisions it on every run — and polls this path on its
@@ -1852,7 +1862,7 @@ renewal, and after success writes back `completed_at` and
 
 Inputs:
 
-- `--service-name`: target service name
+- `--registration-id`: registration key to force-reissue for
 - `--requester`: optional operator label written to the reissue KV
   payload for observability. Defaults to `$USER` / `$LOGNAME`, or
   `unknown` when neither is set.
@@ -2680,6 +2690,10 @@ Key inputs:
 - `--kv-mount`: OpenBao KV v2 mount path
   (environment variable: `OPENBAO_KV_MOUNT`)
   (default `secret`)
+- `--registration-id`: required unless `--artifact` is provided.
+  - Same path-safe rule as `bootroot service add --registration-id`:
+    lowercase letters, digits and hyphens, starting and ending with a
+    letter or digit, max 131 characters
 - `--service-name`: required unless `--artifact` is provided.
   - Must follow the same single-label DNS rule as `bootroot service add`
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`: required
@@ -2696,7 +2710,7 @@ Key inputs:
     templates from `bootroot service add` already set this value.
   - `--profile-cert-path` and `--profile-key-path` are optional.
     If omitted, defaults are derived from `--agent-config-path` as
-    `certs/<service>.crt` and `certs/<service>.key`.
+    `certs/<registration-id>.crt` and `certs/<registration-id>.key`.
   - defaults:
     - `--agent-email`: `admin@example.com`
     - `--agent-server`: `https://localhost:9000/acme/acme/directory`
@@ -2768,8 +2782,9 @@ Key inputs:
 - `--kv-mount`: OpenBao KV v2 mount path
   (environment variable: `OPENBAO_KV_MOUNT`)
   (default `secret`)
-- `--service-name`
-  - Must follow the same single-label DNS rule as `bootroot service add`
+- `--registration-id`: registration key naming the KV subtree to read the
+  rotated `secret_id` from
+  - Same path-safe rule as `bootroot service add --registration-id`
 - `--role-id-path`, `--secret-id-path`
 - `--ca-bundle-path`: PEM CA bundle that anchors TLS when `--openbao-url` is
   `https://`. Point it at the same CA file `bootroot-remote bootstrap` wrote

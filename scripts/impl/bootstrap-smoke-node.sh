@@ -23,6 +23,7 @@ cat >"$WORK_DIR/state.json" <<JSON
   "approles": {},
   "services": {
     "$SERVICE_NAME": {
+      "registration_id": "$SERVICE_NAME",
       "service_name": "$SERVICE_NAME",
       "delivery_mode": "remote-bootstrap",
       "hostname": "$HOSTNAME",

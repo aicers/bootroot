@@ -522,7 +522,8 @@ pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messag
     let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
     remove_file_if_exists(&agent_override, messages)?;
 
-    // 3. Stale per-service credential files under secrets/services/<svc>/.
+    // 3. Stale per-registration credential files under
+    //    secrets/services/<registration_id>/.
     //    Cleanup is intentionally narrow: only credential-bearing files,
     //    not the whole directory, so non-credential service config
     //    survives operator inspection.
@@ -1129,6 +1130,7 @@ mod tests {
         services.insert("svc".to_string(), {
             use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
             ServiceEntry {
+                registration_id: "svc".to_string(),
                 service_name: "svc".to_string(),
                 delivery_mode: DeliveryMode::LocalFile,
                 hostname: "h".to_string(),

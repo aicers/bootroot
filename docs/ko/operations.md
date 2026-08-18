@@ -35,15 +35,15 @@ bootroot 자동화 범위:
 
 ```bash
 bootroot status
-bootroot verify --service-name <service> --db-check
-bootroot service info --service-name <service>
+bootroot verify --registration-id <service> --db-check
+bootroot service info --registration-id <service>
 bootroot monitoring status
 ```
 
 - `bootroot status`: OpenBao/step-ca/상태 파일 기준의 전체 상태 확인
-- `bootroot verify --service-name <service> --db-check`:
+- `bootroot verify --registration-id <service> --db-check`:
   비대화형으로 발급/검증/DB/리스폰더 연동 점검
-- `bootroot service info --service-name <service>`:
+- `bootroot service info --registration-id <service>`:
   서비스별 전달 모드 등 현재 상태 확인
 - `bootroot monitoring status`: Prometheus/Grafana 컨테이너 상태 확인
 
@@ -125,7 +125,7 @@ OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하�
   systemd 등으로 관리합니다.
 - 기본 점검 순서:
   `docker compose ps` -> `docker compose logs --tail=200 <service>`
-  -> `bootroot verify --service-name <service>`.
+  -> `bootroot verify --registration-id <service>`.
 
 ## systemd 운영 절차(bootroot-agent 권장)
 
@@ -164,7 +164,7 @@ OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하�
   참고하세요.
 - 점검 순서:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
-  -> `bootroot verify --service-name <service>`.
+  -> `bootroot verify --registration-id <service>`.
 
 ### 하드닝된 systemd 유닛 예시
 
@@ -549,15 +549,17 @@ Identifier(AKI)와 신뢰 번들 내 중간 CA의 Subject Key Identifier(SKI)
 
 ```bash
 # systemd 하의 네이티브 데몬
-bootroot service add --service-name review \
+bootroot service add --registration-id review --service-name review \
   --reload-style systemd --reload-target review.service ...
 
 # 직접 실행되는 네이티브 데몬 (pkill -HUP <process-name> 사용)
-bootroot service add --service-name review \
+bootroot service add --registration-id review --service-name review \
   --reload-style sighup --reload-target review ...
 
 # 컨테이너 컨슈머 (`docker restart <container>` 실행)
-bootroot service add --service-name aice-web-next \
+bootroot service add \
+  --registration-id aice-web-next \
+  --service-name aice-web-next \
   --reload-style docker-restart --reload-target aice-web-next ...
 ```
 
@@ -573,7 +575,7 @@ bootroot service add --service-name aice-web-next \
 순서로 방출됩니다 (이슈 #702):
 
 ```bash
-bootroot service add --service-name aimer-web \
+bootroot service add --registration-id aimer-web --service-name aimer-web \
   --reload-style docker-restart --reload-target aimer-web-next-app-1 \
   --post-renew-command docker --post-renew-arg exec \
     --post-renew-arg aimer-web-nginx-prod-1 \
@@ -593,7 +595,7 @@ bootroot service add --service-name aimer-web \
 운영자에게 가리키는 표준 한 줄 복구 명령입니다.
 
 ```bash
-bootroot service update --service-name review \
+bootroot service update --registration-id review \
   --reload-style sighup --reload-target review
 ```
 
@@ -682,23 +684,23 @@ TTL에 대해 2배 이상 불변식을 만족해야 합니다 — 서비스 하�
 서비스별 `secret_id` 정책을 변경할 수 있습니다:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl 12h
-bootroot service update --service-name edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
 ```
 
 이 명령은 `state.json`만 수정합니다. 갱신된 정책을 실제 `secret_id`에
 적용하려면 이후 `rotate approle-secret-id`를 실행합니다:
 
 ```bash
-bootroot rotate approle-secret-id --service-name edge-proxy
+bootroot rotate approle-secret-id --registration-id edge-proxy
 ```
 
 `"inherit"`를 사용하면 서비스별 오버라이드를 지우고 OpenBao의 AppRole에
 설정된 역할 수준 기본값으로 되돌립니다:
 
 ```bash
-bootroot service update --service-name edge-proxy --secret-id-ttl inherit
-bootroot service update --service-name edge-proxy --secret-id-wrap-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-ttl inherit
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 ```
 
 ## 원격 bootstrap 및 secret_id handoff 운영
@@ -710,10 +712,10 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
    1회 실행해 첫 `bootroot-agent` 실행 전에 trust 설정과 CA 번들을 포함한
    초기 설정 번들을 반영합니다.
 2. 이후 실행 중인 `bootroot-agent`의 fast-poll 루프가 호스트별 운영자 조치
-   없이 스스로 최신 상태를 유지합니다: `bootroot/services/<service>/secret_id`
+   없이 스스로 최신 상태를 유지합니다: `bootroot/services/<registration_id>/secret_id`
    에서 자신의 `secret_id`를 갱신하고(`secret_id_ttl`을 넘겨서도 유지), control
    node에서 `bootroot rotate approle-secret-id`나 CA/trust 회전이 일어나면
-   `bootroot/services/<service>/trust`에서 `agent.toml`의 `[trust]` 핀과
+   `bootroot/services/<registration_id>/trust`에서 `agent.toml`의 `[trust]` 핀과
    `ca-bundle.pem`을 다시 렌더링합니다. `bootroot-remote apply-secret-id`와
    `bootroot-remote bootstrap` 재실행은 복구 경로일 뿐입니다 — 에이전트가
    `secret_id_ttl`을 넘겨 오프라인 상태였고 자격증명이 이미 만료되어 더 이상
@@ -760,12 +762,12 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
 리로드는 없습니다.
 
 `remote-bootstrap` 서비스의 경우, 회전된 `secret_id`는 서비스별 KV 경로
-(`bootroot/services/<service>/secret_id`)에 기록됩니다. *실행 중인* 원격
+(`bootroot/services/<registration_id>/secret_id`)에 기록됩니다. *실행 중인* 원격
 `bootroot-agent`는 운영자 조치가 필요 없습니다: fast-poll 루프가 아직 유효한
 자격증명으로 그 경로를 읽어 회전된 `secret_id`를 에이전트의 로컬 파일에
 원자적으로 기록하고, 다음 재로그인 시 AppRole로 재인증합니다 — 그래서 루프는
 수동 작업 없이 `secret_id_ttl`을 넘겨서도 유지됩니다. 같은 루프가
-`bootroot/services/<service>/trust`를 읽어 `agent.toml`의 `[trust]` 핀과
+`bootroot/services/<registration_id>/trust`를 읽어 `agent.toml`의 `[trust]` 핀과
 `ca-bundle.pem`을 다시 렌더링하므로 CA/trust 회전도 동일한 방식으로
 전파됩니다.
 
@@ -775,7 +777,7 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
 
 ```bash
 bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
-  --service-name <svc> --role-id-path <dir>/role_id \
+  --registration-id <svc> --role-id-path <dir>/role_id \
   --secret-id-path <dir>/secret_id --ca-bundle-path <dir>/ca-bundle.pem
 ```
 
@@ -942,7 +944,7 @@ bootroot rotate trust-sync --yes
 서비스의 인증서/키를 삭제하고 bootroot-agent가 재발급하도록 하려면:
 
 ```bash
-bootroot rotate force-reissue --service-name edge-proxy --yes
+bootroot rotate force-reissue --registration-id edge-proxy --yes
 ```
 
 `local-file` 서비스의 경우 기록된 cert/key 파일을 삭제하고 bootroot-agent
@@ -967,7 +969,7 @@ bootroot rotate force-reissue --service-name edge-proxy --yes
    명시적 컨테이너 이름이며, 폴백이나 자동 탐색은 없습니다.
 
 ```bash
-bootroot service add --service-name web-app \
+bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file \
   --cert-path /opt/web-app-mtls/web-app-cert.pem \
   --key-path /opt/web-app-mtls/web-app-key.pem \

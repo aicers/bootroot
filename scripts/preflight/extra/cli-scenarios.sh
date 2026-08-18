@@ -239,6 +239,7 @@ run_service_scenarios() {
   fi
 
   cargo run --bin bootroot -- service add \
+    --registration-id edge-proxy \
     --service-name edge-proxy \
     --hostname edge-node-01 \
     --domain trusted.domain \
@@ -254,6 +255,7 @@ run_service_scenarios() {
   # summary must count two aliases — the same two verify_dns_aliases
   # looks for on the responder.
   BOOTROOT_LANG=en cargo run --bin bootroot -- service add \
+    --registration-id web-app \
     --service-name web-app \
     --hostname web-01 \
     --domain trusted.domain \
@@ -281,7 +283,7 @@ run_verify() {
   local attempt
   for attempt in {1..3}; do
     if cargo run --bin bootroot -- verify \
-      --service-name "$service_name" \
+      --registration-id "$service_name" \
       --agent-config "$ROOT_DIR/tmp/agent-${service_name}.toml"; then
       return 0
     fi
