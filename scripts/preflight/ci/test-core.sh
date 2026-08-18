@@ -186,7 +186,7 @@ cargo run --bin bootroot -- service add \
 
 cargo run --bin bootroot -- service add \
   --registration-id bootroot-agent \
-  --service-name bootroot-agent \
+  --service-name agent-selftest \
   --hostname bootroot-agent \
   --domain trusted.domain \
   --agent-config "$(pwd)/tmp/agent-bootroot-agent.toml" \

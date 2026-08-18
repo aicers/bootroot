@@ -5,6 +5,7 @@ use bootroot::input_validation::{
     ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
     validate_numeric_instance_id, validate_registration_id,
 };
+use bootroot::registrar::{RESERVED_SERVICE_NAME_PREFIX, is_reserved_service_name};
 
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
 use crate::cli::prompt::Prompt;
@@ -367,8 +368,26 @@ fn validate_registration_id_input(value: &str, messages: &Messages) -> Result<St
     Ok(value.to_string())
 }
 
+/// Validates an operator-supplied `service_name`: a DNS label that is
+/// not inside bootroot's own reserved namespace.
+///
+/// The reserved-prefix half is the library's shared predicate
+/// ([`bootroot::registrar::is_reserved_service_name`]), not a list
+/// restated here. It is what makes the registrar identities
+/// unmintable — anyone able to call `service add` could otherwise
+/// produce `<instance>.bootroot-registrar.<host>.<domain>` and be
+/// recognized as the registrar. Reserving the whole `bootroot-` prefix
+/// rather than the individual labels means a later bootroot-internal
+/// identity is covered by this one guard instead of a second list that
+/// can drift from it.
 fn validate_service_name(value: &str, messages: &Messages) -> Result<String> {
     validate_dns_label(value).map_err(|err| service_name_error(err, messages))?;
+    if is_reserved_service_name(value) {
+        return Err(service_name_error(
+            ValidationError::ReservedServiceName,
+            messages,
+        ));
+    }
     Ok(value.to_string())
 }
 
@@ -395,7 +414,8 @@ fn registration_id_error(err: ValidationError, messages: &Messages) -> anyhow::E
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
-        | ValidationError::NonNumeric => {
+        | ValidationError::NonNumeric
+        | ValidationError::ReservedServiceName => {
             anyhow::anyhow!(messages.error_registration_id_invalid())
         }
     }
@@ -404,6 +424,9 @@ fn registration_id_error(err: ValidationError, messages: &Messages) -> anyhow::E
 fn service_name_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
     match err {
         ValidationError::Empty => anyhow::anyhow!(messages.error_value_required()),
+        ValidationError::ReservedServiceName => {
+            anyhow::anyhow!(messages.error_service_name_reserved(RESERVED_SERVICE_NAME_PREFIX))
+        }
         ValidationError::InvalidDnsLabel
         | ValidationError::InvalidDomainName
         | ValidationError::InvalidCidr
@@ -423,7 +446,8 @@ fn hostname_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric
-        | ValidationError::InvalidRegistrationId => {
+        | ValidationError::InvalidRegistrationId
+        | ValidationError::ReservedServiceName => {
             anyhow::anyhow!(messages.error_hostname_invalid())
         }
     }
@@ -437,7 +461,8 @@ fn domain_error(err: ValidationError, messages: &Messages) -> anyhow::Error {
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric
-        | ValidationError::InvalidRegistrationId => {
+        | ValidationError::InvalidRegistrationId
+        | ValidationError::ReservedServiceName => {
             anyhow::anyhow!(messages.error_domain_invalid())
         }
     }
@@ -451,7 +476,8 @@ fn instance_id_error(err: ValidationError, messages: &Messages) -> anyhow::Error
         | ValidationError::InvalidCidr
         | ValidationError::CidrClearConflict
         | ValidationError::NonNumeric
-        | ValidationError::InvalidRegistrationId => {
+        | ValidationError::InvalidRegistrationId
+        | ValidationError::ReservedServiceName => {
             anyhow::anyhow!(messages.error_instance_id_invalid())
         }
     }
@@ -696,6 +722,58 @@ mod tests {
 
     use super::*;
     use crate::cli::args::{AuthMode, RuntimeAuthArgs};
+
+    /// `service add` refuses every name inside bootroot's reserved
+    /// namespace, whatever its case, and leaves ordinary component
+    /// keywords alone. The rule reached here is the library's shared
+    /// predicate — this module defines no reserved name of its own, so
+    /// there is no second list to drift from
+    /// `bootroot::registrar::RESERVED_SERVICE_NAME_PREFIX`.
+    #[test]
+    fn validate_service_name_refuses_the_reserved_bootroot_prefix() {
+        let messages = crate::i18n::test_messages();
+        for value in [
+            "bootroot-registrar",
+            "BOOTROOT-Registrar",
+            "bootroot-registrar-endpoint",
+            "bootroot-anything",
+        ] {
+            let err = validate_service_name(value, &messages)
+                .expect_err(&format!("{value} must be refused"));
+            assert!(
+                err.to_string().contains(RESERVED_SERVICE_NAME_PREFIX),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_service_name_accepts_ordinary_component_keywords() {
+        let messages = crate::i18n::test_messages();
+        for value in ["roxyd", "piglet", "edge-proxy"] {
+            assert_eq!(
+                validate_service_name(value, &messages).expect(value),
+                value.to_string()
+            );
+        }
+    }
+
+    /// The reserved-name refusal is its own message, not the DNS-label
+    /// one: `bootroot-registrar` is a perfectly well-formed label and an
+    /// operator told it is not one would go looking for the wrong
+    /// problem.
+    #[test]
+    fn reserved_and_malformed_service_names_are_refused_differently() {
+        let messages = crate::i18n::test_messages();
+        let reserved = validate_service_name("bootroot-registrar", &messages)
+            .expect_err("reserved name")
+            .to_string();
+        let malformed = validate_service_name("edge_proxy", &messages)
+            .expect_err("malformed label")
+            .to_string();
+        assert_ne!(reserved, malformed);
+        assert_eq!(validate_dns_label("bootroot-registrar"), Ok(()));
+    }
 
     fn empty_args() -> ServiceAddArgs {
         ServiceAddArgs {

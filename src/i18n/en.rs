@@ -94,6 +94,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_instance_id_required: "instance_id is required for all services",
     error_value_required: "Value is required",
     error_service_name_invalid: "service_name must be a DNS label (letters, digits, hyphens only; max 63 chars)",
+    error_service_name_reserved: "service_name must not start with `{value}`: that prefix is reserved for bootroot's own certificate identities",
     error_registration_id_invalid: "registration_id must be lowercase letters, digits and hyphens, starting and ending with a letter or digit (max 131 chars)",
     error_hostname_invalid: "hostname must be a DNS label (letters, digits, hyphens only; max 63 chars)",
     error_domain_invalid: "domain must be a DNS name with dot-separated labels (letters, digits, hyphens only)",

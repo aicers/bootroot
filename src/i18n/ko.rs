@@ -94,6 +94,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_instance_id_required: "모든 서비스에는 instance_id가 필요합니다",
     error_value_required: "값을 입력해야 합니다",
     error_service_name_invalid: "service_name은 DNS label이어야 합니다(영문자, 숫자, 하이픈만 허용, 최대 63자)",
+    error_service_name_reserved: "service_name은 `{value}`로 시작할 수 없습니다. 해당 접두사는 bootroot 자체 인증서 identity 전용으로 예약되어 있습니다",
     error_registration_id_invalid: "registration_id는 영소문자, 숫자, 하이픈만 허용되며 영숫자로 시작하고 끝나야 합니다(최대 131자)",
     error_hostname_invalid: "hostname은 DNS label이어야 합니다(영문자, 숫자, 하이픈만 허용, 최대 63자)",
     error_domain_invalid: "domain은 점으로 구분된 DNS label들로 구성된 DNS 이름이어야 합니다(영문자, 숫자, 하이픈만 허용)",

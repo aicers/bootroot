@@ -349,7 +349,7 @@ backoff_secs = [1, 2, 3]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -660,7 +660,7 @@ backoff_secs = [1, 2, 3]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -707,7 +707,7 @@ backoff_secs = [1, 2, 3]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -756,7 +756,7 @@ backoff_secs = [1, 2, 3]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 
@@ -832,7 +832,7 @@ backoff_secs = [1, 2, 3]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 

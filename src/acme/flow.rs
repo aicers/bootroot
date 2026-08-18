@@ -25,14 +25,63 @@ fn build_csr_params(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
 ) -> Result<rcgen::CertificateParams> {
-    let primary_domain = crate::config::profile_domain(settings, profile);
+    // The ordinary service leaf requests no extended key usage at all,
+    // exactly as it always has. The registrar client identity is an
+    // additive shape beside it, never a widening of this one.
+    build_named_csr_params(crate::config::profile_domain(settings, profile), &[])
+}
+
+/// Builds the CSR parameters for the registrar's client identity,
+/// `<instance>.bootroot-registrar.<host>.<domain>`.
+///
+/// The name is composed exactly like an ordinary service leaf's and
+/// differs in the second label only, which
+/// [`crate::registrar::is_reserved_service_name`] keeps `service add`
+/// from minting. `domain` is the configured `network.domain` and is a
+/// suffix of whatever label count it carries, not a single label.
+///
+/// Unlike the service shape these params request
+/// [`rcgen::ExtendedKeyUsagePurpose::ClientAuth`]. What the *issued*
+/// leaf ends up carrying is step-ca's template's decision, not this
+/// repository's, so nothing here or downstream asserts an issued EKU
+/// set.
+///
+/// # Errors
+///
+/// Returns an error when `instance` is not numeric, `host` is not a DNS
+/// label, `domain` is not a DNS name, or the composed name is not a
+/// valid `rcgen` DNS SAN.
+pub fn build_registrar_client_csr_params(
+    instance: &str,
+    host: &str,
+    domain: &str,
+) -> Result<rcgen::CertificateParams> {
+    crate::input_validation::validate_numeric_instance_id(instance)
+        .map_err(|err| anyhow::anyhow!("registrar client instance label is invalid: {err:?}"))?;
+    crate::input_validation::validate_dns_label(host)
+        .map_err(|err| anyhow::anyhow!("registrar client host label is invalid: {err:?}"))?;
+    crate::input_validation::validate_domain_name(domain)
+        .map_err(|err| anyhow::anyhow!("registrar client domain is invalid: {err:?}"))?;
+    build_named_csr_params(
+        crate::registrar::registrar_client_identity(instance, host, domain),
+        &[rcgen::ExtendedKeyUsagePurpose::ClientAuth],
+    )
+}
+
+/// Builds CSR parameters carrying `dns_name` as the sole DNS SAN and as
+/// the common name, requesting `extended_key_usages`.
+fn build_named_csr_params(
+    dns_name: String,
+    extended_key_usages: &[rcgen::ExtendedKeyUsagePurpose],
+) -> Result<rcgen::CertificateParams> {
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, primary_domain.clone());
+        .push(rcgen::DnType::CommonName, dns_name.clone());
 
-    let dns_name = primary_domain.try_into()?;
+    let dns_name = dns_name.try_into()?;
     params.subject_alt_names = vec![rcgen::SanType::DnsName(dns_name)];
+    params.extended_key_usages = extended_key_usages.to_vec();
     Ok(params)
 }
 
@@ -571,6 +620,188 @@ mod tests {
             None => panic!("Common name missing"),
         };
         assert_eq!(common_name, expected_domain());
+    }
+
+    /// The service path is unchanged by the client path's arrival: one
+    /// DNS SAN, the CN mirroring it, and no extended key usage
+    /// requested at all.
+    #[test]
+    fn test_build_csr_params_requests_no_extended_key_usage() {
+        let settings = test_settings();
+        let profile = test_profile();
+        let params = build_csr_params(&settings, &profile).unwrap();
+        assert_eq!(params.subject_alt_names.len(), 1);
+        assert!(
+            params.extended_key_usages.is_empty(),
+            "the ordinary service shape must request no EKU: {:?}",
+            params.extended_key_usages
+        );
+    }
+
+    /// Every current caller of the service path goes through
+    /// `profile_domain`, so asserting the params for a profile whose
+    /// labels differ from the fixture's is what shows the shape did not
+    /// move for any of them.
+    #[test]
+    fn test_build_csr_params_is_unchanged_for_every_service_caller() {
+        let settings = test_settings();
+        for (service_name, instance_id, hostname) in [
+            ("edge-proxy", "001", "edge-node-01"),
+            ("roxyd", "002", "h1"),
+            ("piglet", "010", "node-7"),
+        ] {
+            let mut profile = test_profile();
+            profile.service_name = service_name.to_string();
+            profile.instance_id = instance_id.to_string();
+            profile.hostname = hostname.to_string();
+            let params = build_csr_params(&settings, &profile).unwrap();
+            let expected = format!("{instance_id}.{service_name}.{hostname}.{TEST_DOMAIN}");
+            assert_eq!(
+                dns_sans(&params),
+                vec![expected.clone()],
+                "{expected} SAN moved"
+            );
+            assert_eq!(common_name(&params), expected);
+            assert!(
+                params.extended_key_usages.is_empty(),
+                "{expected} gained an EKU"
+            );
+        }
+    }
+
+    /// The client path differs from the service path in the second
+    /// label and in requesting `clientAuth`, and in nothing else. No CA
+    /// is in the loop: this is what the CSR asks for, which is the half
+    /// this repository decides.
+    #[test]
+    fn test_build_registrar_client_csr_params_carries_the_reserved_label_and_client_auth() {
+        let params = build_registrar_client_csr_params("001", "h1", TEST_DOMAIN).unwrap();
+        assert_eq!(
+            dns_sans(&params),
+            vec![format!("001.bootroot-registrar.h1.{TEST_DOMAIN}")]
+        );
+        assert_eq!(
+            common_name(&params),
+            format!("001.bootroot-registrar.h1.{TEST_DOMAIN}")
+        );
+        assert_eq!(
+            params.extended_key_usages,
+            vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth]
+        );
+    }
+
+    /// The domain is a suffix of whatever label count it was configured
+    /// with, never a single trailing label, so the composed name has to
+    /// grow with it.
+    #[test]
+    fn test_build_registrar_client_csr_params_treats_the_domain_as_a_suffix() {
+        for domain in ["internal", "example.internal", "corp.example.internal"] {
+            let params = build_registrar_client_csr_params("001", "h1", domain).unwrap();
+            let expected = format!("001.bootroot-registrar.h1.{domain}");
+            assert_eq!(dns_sans(&params), vec![expected.clone()]);
+            assert_eq!(
+                expected.split('.').count(),
+                3 + domain.split('.').count(),
+                "label count must be derived from the configured domain"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_registrar_client_csr_params_rejects_invalid_parts() {
+        assert!(build_registrar_client_csr_params("abc", "h1", TEST_DOMAIN).is_err());
+        assert!(build_registrar_client_csr_params("001", "-h1", TEST_DOMAIN).is_err());
+        assert!(build_registrar_client_csr_params("001", "h1", "bad_domain").is_err());
+    }
+
+    /// A client certificate can be issued from the client path's CSR,
+    /// and the reserved-label name survives issuance: the CSR is
+    /// serialized exactly as `issue_certificate` serializes it, parsed
+    /// back the way a CA does, signed, and the leaf's single DNS SAN
+    /// read off the issued certificate.
+    ///
+    /// The issued **EKU set is deliberately not asserted**. Which
+    /// extended key usages a leaf comes back with is decided by the
+    /// issuing CA's certificate template — step-ca's, in every real
+    /// deployment — and this repository pins no template, so an
+    /// assertion here would be asserting a local test CA's behaviour and
+    /// would say nothing about what step-ca returns. The observed
+    /// step-ca result for both shapes is recorded in
+    /// `docs/reference/registrar-client-identity.md` instead.
+    #[test]
+    fn test_registrar_client_certificate_can_be_issued_with_the_reserved_label_san() {
+        let params = build_registrar_client_csr_params("001", "h1", TEST_DOMAIN).unwrap();
+        let issued = issue_from_csr(&params);
+        assert_eq!(
+            bootroot_single_dns_san(&issued),
+            format!("001.bootroot-registrar.h1.{TEST_DOMAIN}")
+        );
+    }
+
+    /// The same route for the ordinary service shape, so the two are
+    /// compared under one procedure rather than one being asserted and
+    /// the other assumed.
+    #[test]
+    fn test_service_certificate_issued_from_the_unchanged_path_keeps_its_san() {
+        let settings = test_settings();
+        let profile = test_profile();
+        let params = build_csr_params(&settings, &profile).unwrap();
+        let issued = issue_from_csr(&params);
+        assert_eq!(
+            bootroot_single_dns_san(&issued),
+            format!("001.edge-proxy.edge-node-01.{TEST_DOMAIN}")
+        );
+    }
+
+    /// Serializes `params` into a CSR with a fresh key pair — exactly
+    /// what `issue_certificate` does — then parses and signs it with a
+    /// throwaway CA, returning the issued certificate's DER.
+    fn issue_from_csr(params: &rcgen::CertificateParams) -> Vec<u8> {
+        let subject_key = rcgen::KeyPair::generate().expect("generate subject key");
+        let csr_der = params
+            .serialize_request(&subject_key)
+            .expect("serialize CSR");
+
+        let ca_key = rcgen::KeyPair::generate().expect("generate CA key");
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).expect("CA params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-signed CA");
+
+        let request = rcgen::CertificateSigningRequestParams::from_der(csr_der.der())
+            .expect("parse CSR the way a CA does");
+        request
+            .signed_by(&ca)
+            .expect("issue certificate")
+            .der()
+            .to_vec()
+    }
+
+    /// Reads the issued leaf's single DNS SAN through the same library
+    /// helper the registrar's verifiers use.
+    fn bootroot_single_dns_san(der: &[u8]) -> String {
+        crate::registrar::single_dns_san(der).expect("issued leaf carries one DNS SAN")
+    }
+
+    fn dns_sans(params: &rcgen::CertificateParams) -> Vec<String> {
+        params
+            .subject_alt_names
+            .iter()
+            .filter_map(|san| match san {
+                rcgen::SanType::DnsName(dns) => Some(dns.as_str().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn common_name(params: &rcgen::CertificateParams) -> String {
+        match params.distinguished_name.get(&rcgen::DnType::CommonName) {
+            Some(rcgen::DnValue::Utf8String(value)) => value.as_str().to_string(),
+            other => panic!("Unexpected common name value: {other:?}"),
+        }
     }
 
     #[test]

@@ -1099,6 +1099,11 @@ post-renew 훅이 컨테이너를 리로드합니다
 - `--service-name`: SAN의 두 번째 label로 쓰이는 서비스 이름 식별자
   - 단일 DNS label이어야 합니다. 영문자/숫자/하이픈만 허용하며, 최대 63자,
     점(`.`)과 밑줄(`_`)은 허용되지 않습니다.
+  - `bootroot-`로 시작할 수 없습니다(대소문자 구분 없이 비교). 이 접두사는
+    bootroot 자체 인증서 identity 전용으로 예약되어 있으며, bootroot 컴포넌트가
+    자기 것으로 인식하는 이름을 `service add`로 발급받지 못하게 막습니다.
+    `roxyd`, `piglet`, `edge-proxy` 같은 일반 컴포넌트 키워드와 `bootroot`
+    자체는 영향을 받지 않습니다.
 - `--delivery-mode`: 전달 모드 (`local-file` 또는 `remote-bootstrap`).
   참고: `remote-bootstrap`은 실행 파일이 아니라 모드 값이며, 이 모드에서
   사용하는 실행 파일은 `bootroot-remote`입니다.
@@ -2559,6 +2564,11 @@ fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
     하고, 최대 131자입니다.
 - `--service-name`: `--artifact` 미지정 시 필수.
   - `bootroot service add`와 같은 단일 DNS label 규칙을 따릅니다.
+  - 마찬가지로 `bootroot-`로 시작할 수 없으며(대소문자 구분 없이 비교),
+    같은 이유로 별도의 오류 메시지를 냅니다. 이 값은
+    `[[profiles]].service_name`이 되어 agent가 요청하는 SAN의 두 번째
+    label이 되며, `--artifact` 없이 실행하면 `service add`가 이미 검증한
+    artifact가 아니라 명령줄 값이 그대로 쓰입니다.
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`:
   `--artifact` 미지정 시 필수.
 - `--agent-config-path`: `--artifact` 미지정 시 필수.
