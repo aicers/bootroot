@@ -479,25 +479,44 @@ fn an_unknown_key_in_the_body_is_refused() {
     }
 }
 
-/// A `[components.<key>]` that no wire `service_name` could ever select
-/// is a rendering error, not an entry to carry around unreachable.
+/// A `[components.<key>]` that no registration could ever use is a
+/// rendering error, not an entry to carry around unreachable. The key is
+/// spent twice — a wire `service_name` selects the entry, and the same
+/// value is the `<component>` segment of every derived id — so both
+/// rules apply. `Review` is the case only the second rule catches: it is
+/// a legal DNS label, so it *is* selectable, but it is not path-safe, so
+/// every enrollment of it would be refused at the derivation step one
+/// request at a time rather than the file refused once.
 #[test]
-fn a_component_key_that_is_not_a_dns_label_is_refused() {
-    let fixture = RegistrarConfigFixture::empty().with_raw_component(
-        "review_eu",
-        ComponentFixture {
-            multiplicity: "one-per-deployment".to_string(),
-            cert_group: None,
-            reload_kind: "none".to_string(),
-            reload_target: None,
-        },
-    );
-    let (_dir, loaded) = load_fixture(&fixture);
-    let err = loaded.expect_err("an unselectable component key must not load");
-    assert!(
-        matches!(err, RegistrarError::InvalidComponentKey { ref component, .. } if component == "review_eu"),
-        "{err:?}"
-    );
+fn a_component_key_no_registration_could_use_is_refused() {
+    for (key, kind) in [
+        ("review_eu", ValidationError::InvalidDnsLabel),
+        ("-review", ValidationError::InvalidDnsLabel),
+        ("review-", ValidationError::InvalidDnsLabel),
+        ("Review", ValidationError::InvalidRegistrationId),
+    ] {
+        let fixture = RegistrarConfigFixture::empty().with_raw_component(
+            key,
+            ComponentFixture {
+                multiplicity: "one-per-deployment".to_string(),
+                cert_group: None,
+                reload_kind: "none".to_string(),
+                reload_target: None,
+            },
+        );
+        let (_dir, loaded) = load_fixture(&fixture);
+        let err = loaded.expect_err("an unusable component key must not load");
+        match err {
+            RegistrarError::InvalidComponentKey {
+                component,
+                kind: found,
+            } => {
+                assert_eq!(component, key);
+                assert_eq!(found, kind, "{key}");
+            }
+            other => panic!("{key}: expected InvalidComponentKey, got {other:?}"),
+        }
+    }
 }
 
 #[test]

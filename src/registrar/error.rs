@@ -158,8 +158,10 @@ pub enum RegistrarError {
         kind: ValidationError,
     },
 
-    /// A `[components.<key>]` key is not a single DNS label, so no wire
-    /// `service_name` could ever select it.
+    /// A `[components.<key>]` key no registration could ever use: it is
+    /// not a single DNS label, so no wire `service_name` could select
+    /// it, or it is not path-safe, so no id derived for it could pass
+    /// [`RegistrarError::DerivedKeyInvalid`].
     #[error("registrar config declares invalid component key {component:?} ({kind:?})")]
     InvalidComponentKey {
         /// The offending key, verbatim.

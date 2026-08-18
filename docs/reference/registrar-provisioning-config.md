@@ -78,10 +78,19 @@ under a guessed domain would issue a certificate no peer will ever verify.
 
 ## 3. Component entries
 
-`[components.<package-id>]`, one per component. A component **absent** from
-this file is refused, never defaulted — fail-open would let a module whose
-`instance` was wrongly omitted mint a valid-but-phantom two-part identity that
-a later correct request then duplicates. `bootroot` has no entry: it is the
+`[components.<package-id>]`, one per component. The key is spent twice — a
+wire `service_name` selects the entry, and the same value is the
+`<component>` segment of every `registration_id` derived for it — so it must
+be both a single DNS label and path-safe: lowercase letters, digits and
+hyphens, starting and ending alphanumeric, at most 63 octets. A key that is
+not is `RegistrarError::InvalidComponentKey` at load, rather than an entry
+that loads and then refuses every one of its enrollments at the derivation
+step.
+
+A component **absent** from this file is refused, never defaulted — fail-open
+would let a module whose `instance` was wrongly omitted mint a
+valid-but-phantom two-part identity that a later correct request then
+duplicates. `bootroot` has no entry: it is the
 issuer and never enrolls through the registrar.
 
 | Key | Type | Required | Meaning |

@@ -22,7 +22,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
-use crate::input_validation::{validate_dns_label, validate_domain_name};
+use crate::input_validation::{validate_dns_label, validate_domain_name, validate_registration_id};
 use crate::registrar::error::RegistrarError;
 use crate::tls::sha256_hex;
 
@@ -432,10 +432,7 @@ impl RegistrarConfig {
 
         let mut components = BTreeMap::new();
         for (name, entry) in raw.components {
-            validate_dns_label(&name).map_err(|kind| RegistrarError::InvalidComponentKey {
-                component: name.clone(),
-                kind,
-            })?;
+            validate_component_key(&name)?;
             let resolved = resolve_component(&name, entry)?;
             components.insert(name, resolved);
         }
@@ -524,6 +521,29 @@ fn parse_toml<T: serde::de::DeserializeOwned>(
             path: path.to_path_buf(),
             message: err.to_string(),
         })
+}
+
+/// Refuses a `[components.<key>]` key that no registration could ever
+/// use.
+///
+/// Two rules, because the key is spent twice. A wire `service_name`
+/// selects the entry, so the key has to be a single DNS label. And that
+/// same value is the `<component>` segment of every id derived for the
+/// component, so it also has to be path-safe — which is the stricter of
+/// the two, since a DNS label may carry uppercase and a
+/// `registration_id` may not. Without the second rule a key like
+/// `Review` would load and then refuse every one of its enrollments at
+/// the derivation step, one request at a time: the silent
+/// per-component outage this loader's gates exist to turn into one loud
+/// failure.
+fn validate_component_key(name: &str) -> Result<(), RegistrarError> {
+    let refuse = |kind| RegistrarError::InvalidComponentKey {
+        component: name.to_string(),
+        kind,
+    };
+    validate_dns_label(name).map_err(refuse)?;
+    validate_registration_id(name).map_err(refuse)?;
+    Ok(())
 }
 
 fn resolve_component(name: &str, raw: RawComponent) -> Result<ComponentEntry, RegistrarError> {
