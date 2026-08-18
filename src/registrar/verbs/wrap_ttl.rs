@@ -10,6 +10,9 @@
 //! Validation happens **before** any `OpenBao` call, so a request that
 //! cannot produce a usable duration never reaches the wrapping endpoint
 //! and never creates a `secret_id` that would then have to be revoked.
+//! It also runs before the comparison with the maximum, because a
+//! request with no `OpenBao` spelling is refused on its own terms — the
+//! clamp is for durations that could have been granted.
 
 use std::fmt;
 
@@ -32,7 +35,26 @@ pub(crate) enum WrapTtlRefusal {
     /// nobody chose.
     #[error("requested wrap_ttl is not a whole number of seconds")]
     NotWholeSeconds,
+    /// The request's duration is longer than an `OpenBao` duration
+    /// string can carry. `OpenBao` parses `<n>s` as a Go
+    /// `time.Duration`, a signed 64-bit nanosecond count, so the largest
+    /// whole-second value it can hold is
+    /// [`MAX_OPENBAO_WHOLE_SECONDS`]. A larger request is refused
+    /// rather than clamped to the policy maximum: the value has no
+    /// spelling, and clamping a request that could not be written down
+    /// would hide an unrepresentable request behind a lifetime nobody
+    /// asked for.
+    #[error("requested wrap_ttl exceeds the largest OpenBao duration")]
+    ExceedsOpenBaoRange,
 }
+
+/// The largest whole-second value an `OpenBao` duration string can
+/// carry, in seconds.
+///
+/// `OpenBao` hands the string to Go's `time.ParseDuration`, whose result
+/// is a nanosecond count in an `i64`; anything past that is a parse
+/// error on the server rather than a long lifetime.
+const MAX_OPENBAO_WHOLE_SECONDS: i64 = i64::MAX / 1_000_000_000;
 
 /// A validated, clamped wrap TTL and the `OpenBao` duration string it is
 /// spelled with.
@@ -99,11 +121,15 @@ impl WrapTtlPolicy {
     ///
     /// # Errors
     ///
-    /// Returns [`WrapTtlRefusal`] for a zero, negative or
-    /// non-whole-second request. A request *larger* than the maximum is
-    /// not a refusal — it is clamped, which is exactly what the wire
-    /// contract's "the registrar MAY clamp it" means and why the granted
-    /// deadline is computed rather than echoed.
+    /// Returns [`WrapTtlRefusal`] for a zero, negative,
+    /// non-whole-second or out-of-range request. A request *larger* than
+    /// the maximum is not a refusal — it is clamped, which is exactly
+    /// what the wire contract's "the registrar MAY clamp it" means and
+    /// why the granted deadline is computed rather than echoed. That
+    /// clamp applies only to a request that has an `OpenBao` spelling in
+    /// the first place: validation runs before the comparison with the
+    /// maximum, so an unrepresentable request is refused rather than
+    /// silently granted the ceiling.
     pub(crate) fn grant(&self, requested: Duration) -> Result<GrantedWrapTtl, WrapTtlRefusal> {
         let requested_openbao = openbao_duration(requested)?;
         if requested <= self.maximum {
@@ -133,9 +159,10 @@ fn openbao_duration(value: Duration) -> Result<String, WrapTtlRefusal> {
         return Err(WrapTtlRefusal::NotWholeSeconds);
     }
     let seconds = value.whole_seconds();
-    // `is_negative` and `is_zero` above leave only positive values, and
-    // `subsec_nanoseconds` is zero, so the whole-second count is at
-    // least one and the conversion cannot fail.
-    let seconds = u64::try_from(seconds).map_err(|_| WrapTtlRefusal::NotWholeSeconds)?;
+    if seconds > MAX_OPENBAO_WHOLE_SECONDS {
+        return Err(WrapTtlRefusal::ExceedsOpenBaoRange);
+    }
+    // The checks above leave a positive whole-second count within
+    // `OpenBao`'s range, which is what the `<n>s` form spells.
     Ok(format!("{seconds}s"))
 }

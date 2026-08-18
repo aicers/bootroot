@@ -543,6 +543,22 @@ fn wrap_ttl_policy_refuses_zero_negative_and_unrepresentable_requests() {
         policy.grant(Duration::milliseconds(500)),
         Err(WrapTtlRefusal::NotWholeSeconds)
     );
+    // One second past the largest value a Go `time.Duration` holds. It
+    // is a whole number of seconds and it is larger than the maximum,
+    // but it is refused rather than clamped: `OpenBao` cannot parse the
+    // string it would take to ask for it, so the request has no
+    // representation to grant a lesser share of.
+    assert_eq!(
+        policy.grant(Duration::seconds(9_223_372_037)),
+        Err(WrapTtlRefusal::ExceedsOpenBaoRange)
+    );
+    // The boundary itself is representable, so it clamps like any other
+    // over-long request.
+    let granted = policy
+        .grant(Duration::seconds(9_223_372_036))
+        .expect("the largest representable request is clamped, not refused");
+    assert_eq!(granted.duration(), Duration::minutes(30));
+    assert_eq!(granted.as_openbao_str(), "1800s");
 }
 
 #[test]
@@ -575,6 +591,10 @@ fn wrap_ttl_policy_holds_its_own_maximum_to_the_same_rules() {
     assert_eq!(
         WrapTtlPolicy::new(Duration::seconds(-30)),
         Err(WrapTtlRefusal::Negative)
+    );
+    assert_eq!(
+        WrapTtlPolicy::new(Duration::seconds(9_223_372_037)),
+        Err(WrapTtlRefusal::ExceedsOpenBaoRange)
     );
 }
 
@@ -618,6 +638,10 @@ async fn mint_refuses_an_unusable_wrap_ttl_before_touching_openbao() {
         (Duration::ZERO, WrapTtlRefusal::Zero),
         (Duration::seconds(-5), WrapTtlRefusal::Negative),
         (Duration::milliseconds(250), WrapTtlRefusal::NotWholeSeconds),
+        (
+            Duration::seconds(9_223_372_037),
+            WrapTtlRefusal::ExceedsOpenBaoRange,
+        ),
     ] {
         let mut request = mint_request("roxyd", "h1", None);
         request.wrap_ttl = requested;
