@@ -69,7 +69,7 @@ pub(crate) enum BindingState {
 /// The spellings are the same kebab-case words
 /// [`ReloadKind`] uses, and a test pins that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum BindingReloadKind {
     /// `sighup`
     Sighup,

@@ -63,11 +63,21 @@ fail() {
 # shellcheck source=lib/ports.sh
 . "$SCRIPT_DIR/lib/ports.sh"
 
+# Collects the container's output, with the dev root token redacted.
+# `server -dev` prints "Root Token: <value>" on startup, and this log is
+# uploaded as a CI artifact; the token dies with the container a moment
+# later, but a live credential does not belong in a build artifact on the
+# way there.
+collect_openbao_log() {
+  docker logs "$CONTAINER_NAME" 2>&1 |
+    sed "s|${OPENBAO_TOKEN}|<redacted>|g" >>"$OPENBAO_LOG" || true
+}
+
 cleanup() {
   # Best effort, but the logs are collected first: a container removed
   # before its output was read leaves a failure with nothing to read.
   if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-    docker logs "$CONTAINER_NAME" >>"$OPENBAO_LOG" 2>&1 || true
+    collect_openbao_log
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 }
@@ -91,12 +101,12 @@ OPENBAO_URL="http://127.0.0.1:${OPENBAO_HOST_PORT}"
 
 # A throwaway root token for a throwaway container published on loopback
 # only.  Drawn from the system CSPRNG all the same, because a predictable
-# one would be a habit worth not forming.
-if command -v openssl >/dev/null 2>&1; then
-  OPENBAO_TOKEN="root-$(openssl rand -hex 16)"
-else
-  OPENBAO_TOKEN="root-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-fi
+# one would be a habit worth not forming.  Read straight from
+# /dev/urandom rather than through `openssl rand`: this scenario needs no
+# openssl, and a `command -v openssl` here would be the bare
+# existence check `validate-e2e-openssl-compat.sh` exists to keep out of
+# scripts/impl.
+OPENBAO_TOKEN="root-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 [ -n "${OPENBAO_TOKEN#root-}" ] || fail "could not generate a dev root token"
 
 log_phase "openbao-up"
@@ -120,7 +130,7 @@ for _ in $(seq 1 "$READY_ATTEMPTS"); do
   sleep "$READY_DELAY_SECS"
 done
 [ "$ready" -eq 1 ] || {
-  docker logs "$CONTAINER_NAME" >>"$OPENBAO_LOG" 2>&1 || true
+  collect_openbao_log
   fail "OpenBao did not become ready on ${OPENBAO_URL}"
 }
 

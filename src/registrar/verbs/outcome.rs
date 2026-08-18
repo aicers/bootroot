@@ -158,7 +158,13 @@ impl VerbContext {
 /// `#[derive(Debug)]` on any enclosing outcome — which is how these
 /// values reach a log line — cannot leak it, and there is no `Display`
 /// at all.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// It derives nothing else either. `Clone` would let a caller keep a
+/// copy alongside the one it sent, which is what the consuming accessor
+/// on [`MintOutcome`] exists to prevent, and a derived `PartialEq` on a
+/// secret-bearing type is a byte-at-a-time timing oracle. Neither is
+/// needed: the token is moved out once, at the endpoint's serialization
+/// boundary, and never compared.
 pub(crate) struct WrappedSecretIdToken(String);
 
 impl WrappedSecretIdToken {

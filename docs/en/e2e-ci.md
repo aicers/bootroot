@@ -77,6 +77,9 @@ PR-critical Docker test set validates:
 - OpenBao TLS re-issuance after `secrets/` is re-owned
 - two co-located instances stay independent (install, containers, volumes,
   published ports and HTTP-01 responder DNS aliases)
+- the registrar's mint and deregister verbs against a live OpenBao (durable
+  bindings, the KV v2 compare-and-set claim, re-mint, wrong-host refusal, the
+  absent-binding sweep and both concurrency properties)
 
 Primary scripts:
 
@@ -88,6 +91,7 @@ Primary scripts:
 - `scripts/impl/run-openbao-tls-no-delta.sh`
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
+- `scripts/impl/run-registrar-verbs-e2e.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -99,6 +103,13 @@ All three pick run-scoped `--instance-name` values and free host ports
 themselves, and every teardown and leftover check is scoped to those exact
 names — they are safe to run on a host that already has a default `bootroot`
 install.
+
+`run-registrar-verbs-e2e.sh` is outside that discussion entirely: it stands a
+single OpenBao container up on a free loopback port and needs no compose
+project, no secrets wiring and none of the bootroot binaries. It is the gate
+for the `#[ignore]`d `registrar::verbs::tests` library tests, which it runs
+with the container's URL, token and KV mount passed in on the child process's
+environment.
 
 ### Two lifecycle runs can share a host
 

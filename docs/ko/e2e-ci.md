@@ -75,6 +75,9 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `secrets/` 소유자 변경 이후 OpenBao TLS 인증서 재발급
 - 같은 호스트의 두 인스턴스가 서로 독립적으로 유지되는지(설치,
   컨테이너, 볼륨, 게시 포트, HTTP-01 리스폰더 DNS 별칭)
+- 실제 OpenBao를 상대로 한 registrar의 mint/deregister 동사(영속 바인딩,
+  KV v2 compare-and-set 클레임, 재발급, 호스트 불일치 거부, 바인딩 없는
+  정리, 두 가지 동시성 속성)
 
 주요 스크립트:
 
@@ -86,6 +89,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-openbao-tls-no-delta.sh`
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
+- `scripts/impl/run-registrar-verbs-e2e.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -97,6 +101,12 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 스스로 만들고 비어 있는 호스트 포트도 직접 고르며, 모든 정리와 잔여물
 확인이 그 이름들로만 한정되므로 기본 `bootroot` 설치본이 이미 있는
 호스트에서도 안전하게 실행할 수 있습니다.
+
+`run-registrar-verbs-e2e.sh`는 이 논의 바깥에 있습니다. 비어 있는 루프백
+포트에 OpenBao 컨테이너 하나만 띄우므로 compose 프로젝트도, secrets 배선도,
+bootroot 바이너리도 전혀 필요하지 않습니다. 이 스크립트는 `#[ignore]`가 붙은
+`registrar::verbs::tests` 라이브러리 테스트의 게이트이며, 컨테이너의 URL과
+토큰, KV 마운트를 자식 프로세스의 환경 변수로 넘겨 그 테스트들을 실행합니다.
 
 ### 라이프사이클 실행 두 개는 한 호스트를 공유할 수 있습니다
 
