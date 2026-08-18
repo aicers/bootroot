@@ -60,9 +60,10 @@ async fn test_two_node_remote_bootstrap_happy_path() {
     assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
     let agent_contents = fs::read_to_string(&agent_config_path).expect("read agent config");
     let ca_bundle_path = service_dir.join("certs").join("ca-bundle.pem");
-    // schema_version 4: remote bootstrap does not write OpenBao Agent
-    // artifacts (agent.hcl / agent.toml.ctmpl / token) — the remote
-    // agent self-authenticates and renders trust via the fast-poll loop.
+    // The schema-5 artifact carries no OpenBao Agent artifacts
+    // (agent.hcl / agent.toml.ctmpl / token): they were dropped in
+    // schema_version 4, since the remote agent self-authenticates and
+    // renders trust via the fast-poll loop.
     let openbao_agent_dir = service_dir
         .join("secrets")
         .join("openbao")

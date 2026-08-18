@@ -1830,11 +1830,12 @@ fn assert_remote_bootstrap_artifact_shape(bootstrap: &serde_json::Value) {
     assert!(bootstrap["agent_config_path"].is_string());
     assert!(bootstrap["ca_bundle_path"].is_string());
     assert!(bootstrap["ca_bundle_pem"].is_string());
-    // schema_version 4 dropped the OpenBao Agent artifact paths: the
-    // remote agent self-authenticates and renders trust via fast-poll.
+    // The schema-5 artifact carries no OpenBao Agent artifact paths:
+    // they were dropped in schema_version 4, since the remote agent
+    // self-authenticates and renders trust via fast-poll.
     assert!(
         bootstrap.get("openbao_agent_config_path").is_none(),
-        "openbao_agent_config_path must be gone from the schema-4 artifact"
+        "openbao_agent_config_path must be absent from the schema-5 artifact"
     );
     assert!(bootstrap.get("openbao_agent_template_path").is_none());
     assert!(bootstrap.get("openbao_agent_token_path").is_none());
