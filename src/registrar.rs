@@ -16,6 +16,14 @@
 //! - [`error`] declares every refusal the two produce.
 //! - [`fixture`] builds a rendered config for tests.
 //!
+//! The crate-private `verbs` sibling is the layer above: the
+//! transport-free mint and deregister control plane that calls those
+//! steps in the one order they are correct in, interleaving its own
+//! durable-binding checks between them. It is deliberately not part of
+//! the library's public surface — the endpoint that drives it lives in
+//! this crate — so no consumer can reach a verb without going through
+//! the endpoint's authentication.
+//!
 //! Nothing here reads or requires registration state. That is what makes
 //! the durable-binding collision check the caller's step rather than a
 //! missing one here, and it is why no variant in [`error`] refers to a
@@ -49,6 +57,7 @@ pub mod endpoint_pin;
 pub mod error;
 pub mod fixture;
 pub mod identity;
+pub(crate) mod verbs;
 
 #[cfg(test)]
 mod tests;

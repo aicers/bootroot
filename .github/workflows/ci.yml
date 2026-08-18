@@ -470,6 +470,10 @@ jobs:
             script: run-two-instance-isolation.sh
             resolution: ""
             artifact: ci-two-instance
+          - label: registrar-verbs
+            script: run-registrar-verbs-e2e.sh
+            resolution: ""
+            artifact: ci-registrar-verbs
     steps:
       - uses: actions/checkout@v7
 
@@ -486,7 +490,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -639,6 +643,24 @@ jobs:
             for f in "$ARTIFACT_DIR"/snapshots/*.diff; do
               [ -f "$f" ] && { echo "--- $(basename "$f") ---"; cat "$f"; } || true
             done
+            exit 1
+          }
+
+      - name: Run E2E scenario (registrar verbs)
+        if: matrix.scenario.label == 'registrar-verbs'
+        # This scenario stands its own single OpenBao up on a free
+        # loopback port, so it needs no compose project, no secrets
+        # wiring and none of the bootroot binaries. It is the gate for
+        # the ignored `registrar::verbs::tests` library tests.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          ./scripts/impl/run-registrar-verbs-e2e.sh || {
+            echo "registrar-verbs failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
+            [ -f "$ARTIFACT_DIR/openbao.log" ] && tail -n 200 "$ARTIFACT_DIR/openbao.log" || true
             exit 1
           }
 

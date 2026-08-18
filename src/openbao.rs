@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 const VAULT_TOKEN_HEADER: &str = "X-Vault-Token";
 const VAULT_WRAP_TTL_HEADER: &str = "X-Vault-Wrap-TTL";
 const ROOT_POLICY: &str = "root";
+/// The KV v2 `cas` value that admits a write only when the path carries
+/// no version yet.
+const KV_CREATE_IF_ABSENT_CAS: u64 = 0;
+/// The exact substring `OpenBao` puts in the 400 body when a
+/// check-and-set write loses. Matching it — rather than the bare status
+/// — is what keeps an unrelated 400 an error.
+const KV_CAS_MISMATCH_MESSAGE: &str = "check-and-set parameter did not match the current version";
 
 #[derive(Debug, Clone)]
 pub struct OpenBaoClient {
@@ -150,6 +157,25 @@ pub struct RootRotationUpdateResponse {
 #[derive(Debug, Deserialize)]
 struct DataEnvelope<T> {
     data: T,
+}
+
+/// Outcome of an absent-only KV v2 create
+/// ([`OpenBaoClient::create_kv_if_absent`]).
+///
+/// The two arms are the whole result surface: either this call created
+/// the path's first version, or some other writer had already created
+/// one. Everything else — transport, protocol, a 400 that is not the
+/// documented CAS mismatch — stays an `anyhow` error, so a caller that
+/// treats `AlreadyExists` as "another writer won the race" can never
+/// reach that arm through a misconfigured mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvCreateIfAbsent {
+    /// This call wrote the path's first version. Carries the version the
+    /// write produced, or `None` when the response body did not report
+    /// one (older `OpenBao`, or a proxy that stripped it).
+    Created(Option<u64>),
+    /// The path already carried a version, so nothing was written.
+    AlreadyExists,
 }
 
 /// Versioned KV v2 read result.
@@ -852,6 +878,80 @@ impl OpenBaoClient {
         Ok(parsed.data.version)
     }
 
+    /// Creates a KV v2 secret **only if the path carries no version
+    /// yet**, using the KV v2 check-and-set option `cas: 0`.
+    ///
+    /// This is the cross-process claim primitive: two writers racing to
+    /// create the same path both send `{"options":{"cas":0}}`, `OpenBao`
+    /// admits exactly one, and the loser is told so rather than
+    /// overwriting. An in-process mutex cannot provide that guarantee,
+    /// because another process — another registrar instance, an
+    /// operator's CLI — can write the same namespace.
+    ///
+    /// Only the documented CAS-mismatch 400 response is reported as
+    /// [`KvCreateIfAbsent::AlreadyExists`]. Every other 400, and every
+    /// transport, protocol or parse failure, stays an error: a
+    /// misconfigured mount and a lost race must not look alike to a
+    /// caller that treats one of them as "somebody else won".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, if the response is not the
+    /// documented CAS-mismatch body for a 400, or if a successful
+    /// response body is not valid JSON.
+    pub async fn create_kv_if_absent(
+        &self,
+        mount: &str,
+        path: &str,
+        data: serde_json::Value,
+    ) -> Result<KvCreateIfAbsent> {
+        #[derive(Serialize)]
+        struct KvCasRequest {
+            options: KvCasOptions,
+            data: serde_json::Value,
+        }
+        #[derive(Serialize)]
+        struct KvCasOptions {
+            cas: u64,
+        }
+        #[derive(Deserialize)]
+        struct KvWriteResponse {
+            data: KvWriteResponseData,
+        }
+        #[derive(Deserialize)]
+        struct KvWriteResponseData {
+            #[serde(default)]
+            version: Option<u64>,
+        }
+        let full_path = format!("{mount}/data/{path}");
+        let body = KvCasRequest {
+            options: KvCasOptions {
+                cas: KV_CREATE_IF_ABSENT_CAS,
+            },
+            data,
+        };
+        let response = self
+            .send_authed_json(Method::POST, &full_path, &body, None)
+            .await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if status == StatusCode::BAD_REQUEST && text.contains(KV_CAS_MISMATCH_MESSAGE) {
+            return Ok(KvCreateIfAbsent::AlreadyExists);
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        if text.trim().is_empty() {
+            return Ok(KvCreateIfAbsent::Created(None));
+        }
+        let parsed: KvWriteResponse = serde_json::from_str(&text)
+            .context("Failed to parse OpenBao KV create-if-absent response")?;
+        Ok(KvCreateIfAbsent::Created(parsed.data.version))
+    }
+
     /// Reads a KV v2 secret.
     ///
     /// # Errors
@@ -1409,6 +1509,127 @@ mod wrap_tests {
             .await
             .expect("create_secret_id_wrapped should succeed");
         assert_eq!(secret_id, "unwrapped-secret-abc");
+    }
+}
+
+/// Canned-response coverage for the absent-only KV v2 create. Wiremock
+/// keeps no `OpenBao` state here — each mock returns one fixed body, so
+/// what is under test is the request envelope and the classification of
+/// the reply, never a simulated CAS engine.
+#[cfg(test)]
+mod create_if_absent_tests {
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn client_with_token(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client init");
+        client.set_token("root-token".to_string());
+        client
+    }
+
+    #[tokio::test]
+    async fn create_if_absent_sends_cas_zero_envelope_and_reports_the_version() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/secret/data/bootroot/services/h1-piglet-001/registrar_binding",
+            ))
+            .and(header("X-Vault-Token", "root-token"))
+            .and(body_json(json!({
+                "options": { "cas": 0 },
+                "data": { "host": "h1" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "version": 1 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let outcome = client
+            .create_kv_if_absent(
+                "secret",
+                "bootroot/services/h1-piglet-001/registrar_binding",
+                json!({ "host": "h1" }),
+            )
+            .await
+            .expect("an absent-only create should succeed");
+        assert_eq!(outcome, KvCreateIfAbsent::Created(Some(1)));
+    }
+
+    /// A success whose body carries no `data.version` is still a
+    /// creation; the version is simply unknown.
+    #[tokio::test]
+    async fn create_if_absent_reports_created_without_a_version() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/secret/data/claim"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let outcome = client
+            .create_kv_if_absent("secret", "claim", json!({}))
+            .await
+            .expect("an empty success body should still be a creation");
+        assert_eq!(outcome, KvCreateIfAbsent::Created(None));
+    }
+
+    #[tokio::test]
+    async fn create_if_absent_classifies_the_exact_cas_mismatch_as_already_exists() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/secret/data/claim"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "errors": ["check-and-set parameter did not match the current version"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let outcome = client
+            .create_kv_if_absent("secret", "claim", json!({ "host": "h1" }))
+            .await
+            .expect("a CAS mismatch is a result, not an error");
+        assert_eq!(outcome, KvCreateIfAbsent::AlreadyExists);
+    }
+
+    /// Every other 400 stays an error. A mount that is not KV v2 answers
+    /// 400 too, and reading that as "another writer won" would hand a
+    /// caller a claim it never made.
+    #[tokio::test]
+    async fn create_if_absent_preserves_a_different_bad_request_as_an_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/secret/data/claim"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "errors": ["check-and-set parameter required for this call"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_with_token(&server);
+        let err = client
+            .create_kv_if_absent("secret", "claim", json!({}))
+            .await
+            .expect_err("a non-CAS 400 must not be swallowed");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("check-and-set parameter required"),
+            "the underlying 400 must survive, got: {rendered}"
+        );
     }
 }
 
