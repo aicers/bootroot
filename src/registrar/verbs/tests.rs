@@ -22,7 +22,7 @@
 //! one would pass against it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -40,7 +40,7 @@ use super::outcome::{
 };
 use super::wrap_ttl::{WrapTtlPolicy, WrapTtlRefusal};
 use super::{
-    DeregisterRequest, MintRequest, REGISTRAR_TEARDOWN_KV_SUFFIXES, RegistrarVerbs,
+    DeregisterRequest, IdLocks, MintRequest, REGISTRAR_TEARDOWN_KV_SUFFIXES, RegistrarVerbs,
     RegistrarVerbsConfig, granted_deadline,
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions, WrapInfo};
@@ -633,6 +633,106 @@ async fn mint_refuses_an_unusable_wrap_ttl_before_touching_openbao() {
         );
     }
     assert_untouched(&server, &verbs).await;
+}
+
+// ---------------------------------------------------------------------
+// Fast tier: the per-id lock map
+// ---------------------------------------------------------------------
+
+/// A released guard reclaims its entry, so the map does not grow with
+/// every id a caller has ever named.
+///
+/// `assert_untouched` proves only that a refusal *before* stage 3 takes
+/// no lock. This is the other half: an id that did reach stage 3 leaves
+/// nothing behind once its guard is dropped.
+#[tokio::test]
+async fn a_released_id_lock_reclaims_its_map_entry() {
+    let locks = IdLocks::default();
+
+    for id in ["h1-roxyd", "h2-roxyd", "h1-piglet-001"] {
+        let guard = locks.acquire(id).await;
+        assert_eq!(locks.lock_entries().len(), 1, "one live id at a time");
+        drop(guard);
+        assert_eq!(
+            locks.lock_entries().len(),
+            0,
+            "dropping {id}'s guard must reclaim its entry"
+        );
+    }
+}
+
+/// A waiter keeps the entry alive and gets the *same* lock, so the two
+/// holders serialize rather than each taking a private mutex.
+///
+/// This is what makes a mint and a deregister for one id mutually
+/// exclusive, and it is also the case a careless reclaim would break by
+/// removing an entry another caller is queued on.
+#[tokio::test]
+async fn a_contended_id_lock_is_shared_and_survives_the_first_release() {
+    let locks = Arc::new(IdLocks::default());
+    let first = locks.acquire("h1-roxyd").await;
+
+    let acquired = Arc::new(AtomicBool::new(false));
+    let waiter = tokio::spawn({
+        let locks = Arc::clone(&locks);
+        let acquired = Arc::clone(&acquired);
+        async move {
+            let guard = locks.acquire("h1-roxyd").await;
+            acquired.store(true, Ordering::SeqCst);
+            assert_eq!(
+                locks.lock_entries().len(),
+                1,
+                "the waiter must hold the entry it woke on"
+            );
+            drop(guard);
+        }
+    });
+
+    // Give the waiter every chance to run. It cannot acquire, because
+    // the lock it found in the map is the one `first` is holding — had
+    // it been handed a private mutex instead, it would be through by
+    // now and the two verbs would not serialize.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !acquired.load(Ordering::SeqCst),
+        "a second holder of one id must block until the first releases"
+    );
+    assert_eq!(
+        locks.lock_entries().len(),
+        1,
+        "the waiter must be queued on the entry already in the map"
+    );
+
+    drop(first);
+    waiter.await.expect("the waiter must acquire and release");
+    assert!(acquired.load(Ordering::SeqCst));
+
+    assert_eq!(
+        locks.lock_entries().len(),
+        0,
+        "the last holder out reclaims the entry"
+    );
+}
+
+/// Re-acquiring a reclaimed id inserts a fresh entry rather than
+/// resurrecting a dead `Weak`.
+#[tokio::test]
+async fn a_reclaimed_id_is_re_acquirable() {
+    let locks = IdLocks::default();
+
+    drop(locks.acquire("h1-roxyd").await);
+    assert_eq!(locks.lock_entries().len(), 0);
+
+    let guard = locks.acquire("h1-roxyd").await;
+    assert_eq!(
+        locks.lock_entries().len(),
+        1,
+        "the id must be lockable again after its entry was reclaimed"
+    );
+    drop(guard);
+    assert_eq!(locks.lock_entries().len(), 0);
 }
 
 // ---------------------------------------------------------------------
