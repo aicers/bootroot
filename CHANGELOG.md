@@ -8,6 +8,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `bootroot service add` and `bootroot-remote bootstrap` refuse a
+  `--service-name` whose lowercased form starts with `bootroot-`, with
+  its own message rather than the DNS-label one. The prefix is reserved
+  for bootroot's own certificate identities, so a name a bootroot
+  component treats as one of its own cannot be obtained by registering
+  an ordinary service — including through a bootstrap run that supplies
+  the name on the command line instead of through an artifact. Ordinary
+  component keywords are unaffected, and so is the bare name `bootroot` —
+  the reserved prefix includes the hyphen. The `agent.toml.compose` smoke
+  profile that shipped with `service_name = "bootroot-agent"` now uses
+  `agent-selftest`; its `registration_id`, `hostname` and certificate
+  paths are unchanged, since only the SAN's second label is reserved.
 - A registration is now keyed by a new required `registration_id`,
   separate from `service_name`. `service_name` used to do two
   incompatible jobs: it was the certificate SAN's second label, so it

@@ -1540,6 +1540,119 @@ async fn test_app_add_rejects_invalid_registration_id_in_both_locales() {
     }
 }
 
+/// `service add` refuses the whole `bootroot-` namespace, whatever the
+/// case, and leaves ordinary component keywords alone.
+///
+/// This is what makes the registrar's certificate identity unmintable:
+/// without it, anyone able to run `service add` could register
+/// `--service-name bootroot-registrar` and be handed a leaf that
+/// `bootroot::registrar::recognize_registrar_client` accepts. The whole
+/// prefix is reserved rather than the two labels the registrar surface
+/// uses today, so a later bootroot-internal identity needs no second
+/// guard that could drift from this one.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_refuses_the_reserved_bootroot_service_name_prefix() {
+    for value in [
+        "bootroot-registrar",
+        "BOOTROOT-Registrar",
+        "bootroot-registrar-endpoint",
+        "bootroot-anything",
+    ] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let agent_config = temp_dir.path().join("agent.toml");
+        let cert_dir = temp_dir.path().join("certs");
+        fs::create_dir_all(&cert_dir).expect("create cert dir");
+
+        write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "service",
+                "add",
+                "--print-only",
+                "--registration-id",
+                "h1-probe-001",
+                "--service-name",
+                value,
+                "--hostname",
+                "h1",
+                "--domain",
+                "trusted.domain",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+                "--cert-path",
+                cert_dir.join("probe.crt").to_string_lossy().as_ref(),
+                "--key-path",
+                cert_dir.join("probe.key").to_string_lossy().as_ref(),
+                "--instance-id",
+                "001",
+            ])
+            .output()
+            .expect("run service add");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{value} must be refused");
+        assert!(
+            stderr.contains("bootroot-"),
+            "{value} must be refused for the reserved prefix, got: {stderr}"
+        );
+        // A well-formed label refused for what it names, not for how it
+        // is spelled — the DNS-label message would send an operator
+        // after the wrong problem.
+        assert!(!stderr.contains("must be a DNS label"), "{value}: {stderr}");
+    }
+}
+
+/// The guard above must not catch an ordinary component keyword. These
+/// names get past validation and fail later (or not at all), so the
+/// assertion is on the reserved-prefix message never appearing.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_accepts_ordinary_service_names_beside_the_reserved_prefix() {
+    for value in ["roxyd", "piglet", "edge-proxy", "bootroot"] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let agent_config = temp_dir.path().join("agent.toml");
+        let cert_dir = temp_dir.path().join("certs");
+        fs::create_dir_all(&cert_dir).expect("create cert dir");
+
+        write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(temp_dir.path())
+            .args([
+                "service",
+                "add",
+                "--print-only",
+                "--registration-id",
+                "h1-probe-001",
+                "--service-name",
+                value,
+                "--hostname",
+                "h1",
+                "--domain",
+                "trusted.domain",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+                "--cert-path",
+                cert_dir.join("probe.crt").to_string_lossy().as_ref(),
+                "--key-path",
+                cert_dir.join("probe.key").to_string_lossy().as_ref(),
+                "--instance-id",
+                "001",
+            ])
+            .output()
+            .expect("run service add");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("reserved"),
+            "{value} must not be caught by the reserved-prefix guard, got: {stderr}"
+        );
+    }
+}
+
 /// Issue #691: the containerized-consumer story is the consumer-reload
 /// hook, not a per-service agent sidecar. `service add` must keep
 /// accepting `--reload-style docker-restart --reload-target <container>`

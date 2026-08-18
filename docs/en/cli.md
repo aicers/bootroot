@@ -1126,6 +1126,12 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--service-name`: service name identifier, used as the SAN's second label
   - Must be a single DNS label: letters, digits, and hyphens only, max 63
     characters, no dots or underscores
+  - Must not start with `bootroot-` (compared case-insensitively). That
+    prefix is reserved for bootroot's own certificate identities, so that
+    a name a bootroot component recognizes as one of its own cannot be
+    minted through `service add`. Ordinary component keywords such as
+    `roxyd`, `piglet` and `edge-proxy` are unaffected, as is the bare name
+    `bootroot`.
 - `--delivery-mode`: delivery mode (`local-file` or `remote-bootstrap`).
   Note: `remote-bootstrap` is a mode value, not an executable binary, and the
   executable used for this mode is `bootroot-remote`.
@@ -2696,6 +2702,12 @@ Key inputs:
     letter or digit, max 131 characters
 - `--service-name`: required unless `--artifact` is provided.
   - Must follow the same single-label DNS rule as `bootroot service add`
+  - Must not start with `bootroot-` either (compared case-insensitively),
+    for the same reason and with its own error. This flag becomes
+    `[[profiles]].service_name`, hence the second label of the SAN the
+    agent orders, and a run without `--artifact` takes it straight from
+    the command line rather than from an artifact `service add` already
+    vetted.
 - `--role-id-path`, `--secret-id-path`, `--eab-file-path`: required
   unless `--artifact` is provided.
 - `--agent-config-path`: required unless `--artifact` is provided.

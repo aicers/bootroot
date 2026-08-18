@@ -31,7 +31,11 @@ backoff_secs = [5, 10, 30]
 
 [[profiles]]
 registration_id = "bootroot-agent"
-service_name = "bootroot-agent"
+# The SAN's second label may not sit under the reserved `bootroot-`
+# prefix, which names bootroot's own certificate identities and which
+# `service add` refuses. `registration_id` and `hostname` are not the
+# SAN label and keep naming the agent.
+service_name = "agent-selftest"
 instance_id = "001"
 hostname = "bootroot-agent"
 

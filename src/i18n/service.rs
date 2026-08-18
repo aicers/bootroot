@@ -88,6 +88,13 @@ impl Messages {
         self.strings().error_service_name_invalid
     }
 
+    pub(crate) fn error_service_name_reserved(&self, prefix: &str) -> String {
+        format_template(
+            self.strings().error_service_name_reserved,
+            &[("value", prefix)],
+        )
+    }
+
     pub(crate) fn error_registration_id_invalid(&self) -> &'static str {
         self.strings().error_registration_id_invalid
     }

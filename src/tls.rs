@@ -170,7 +170,7 @@ pub fn build_http_client_with_local_and_webpki_roots(pem_content: &str) -> Resul
         .context("Failed to build HTTP client with local+webpki roots")
 }
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
@@ -271,7 +271,7 @@ fn certs_to_root_store(certs: &[CertificateDer<'static>]) -> Result<rustls::Root
 /// accepted as long as its issuer is pinned. When no bundle certificate
 /// matches a pin the verifier is direct-pin only: it accepts a handshake
 /// solely when the server presents a directly pinned CA certificate.
-fn build_pinned_verifier(
+pub(crate) fn build_pinned_verifier(
     certs: &[CertificateDer<'static>],
     pins: &HashSet<String>,
 ) -> Result<Arc<dyn ServerCertVerifier>> {

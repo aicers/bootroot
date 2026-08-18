@@ -25,6 +25,12 @@ pub enum ValidationError {
     /// Distinct from [`ValidationError::InvalidDnsLabel`] because a
     /// registration key may legitimately be longer than a DNS label.
     InvalidRegistrationId,
+    /// The value is a well-formed DNS label but falls inside bootroot's
+    /// own reserved namespace
+    /// ([`crate::registrar::RESERVED_SERVICE_NAME_PREFIX`]).
+    /// Distinct from [`ValidationError::InvalidDnsLabel`] because the
+    /// value is refused for what it names, not for how it is spelled.
+    ReservedServiceName,
 }
 
 /// Validates a DNS label used for service names and hostnames.

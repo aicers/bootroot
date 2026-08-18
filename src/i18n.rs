@@ -115,6 +115,7 @@ pub(crate) struct Strings {
     pub(crate) error_service_instance_id_required: &'static str,
     pub(crate) error_value_required: &'static str,
     pub(crate) error_service_name_invalid: &'static str,
+    pub(crate) error_service_name_reserved: &'static str,
     pub(crate) error_registration_id_invalid: &'static str,
     pub(crate) error_hostname_invalid: &'static str,
     pub(crate) error_domain_invalid: &'static str,
