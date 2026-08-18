@@ -50,7 +50,9 @@ use crate::registrar::config::{
 use crate::registrar::error::{RegistrarError, SpecIdentityField};
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
-use crate::service_material::{service_policy_name, service_role_name};
+use crate::service_material::{
+    ResourceOutcome, ServiceResource, service_policy_name, service_role_name,
+};
 
 /// Environment variable naming the live `OpenBao` the ignored tier runs
 /// against. Read, never written.
@@ -841,6 +843,27 @@ path "{mount}/metadata/bootroot/services/*" {{
         .expect("write the restricted policy");
 }
 
+/// Grants exactly what a teardown needs to sweep the KV material, and
+/// nothing that lets it see or delete the `AppRole` or the policy — so a
+/// deregister's sweep runs to the end and still fails in aggregate.
+async fn install_material_only_policy(backend: &LiveBackend, name: &str) {
+    let mount = &backend.kv_mount;
+    let policy = format!(
+        r#"path "{mount}/data/bootroot/services/*" {{
+  capabilities = ["read"]
+}}
+path "{mount}/metadata/bootroot/services/*" {{
+  capabilities = ["read", "list", "delete"]
+}}
+"#
+    );
+    backend
+        .client()
+        .write_policy(name, &policy)
+        .await
+        .expect("write the material-only policy");
+}
+
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn first_mint_creates_exactly_the_derived_role_and_policy() {
@@ -1360,6 +1383,102 @@ async fn matching_host_deregister_tears_down_before_it_unbinds() {
         .deregister(&deregister_request("piglet", &host, Some(3)))
         .await
         .expect("cleanup");
+}
+
+/// A deregister whose teardown fails in aggregate keeps the binding.
+///
+/// This is the other half of the teardown-before-unbind rule: the sweep
+/// attempts every resource rather than stopping at the first failure, and
+/// the durable claim is what keeps whatever survived it covered until a
+/// re-run can finish the job. Deleting the binding here would manufacture
+/// exactly the unbound orphan the binding exists to prevent.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn a_failed_teardown_retains_the_binding_and_attempts_every_resource() {
+    let backend = LiveBackend::from_env();
+    let stem = unique_label("f");
+    let policy_name = format!("bootroot-test-{stem}");
+    install_material_only_policy(&backend, &policy_name).await;
+    let restricted = backend.scoped_token(&[policy_name.as_str()]).await;
+
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    let verbs = backend.verbs(config);
+    let registration_id = format!("{host}-piglet-004");
+
+    verbs
+        .mint(&mint_request("piglet", &host, Some(4)))
+        .await
+        .expect("mint");
+    for suffix in REGISTRAR_TEARDOWN_KV_SUFFIXES {
+        backend.plant(&registration_id, suffix).await;
+    }
+
+    let (_dir2, config2) = load_fixture(&base_fixture());
+    let crippled = verbs_with(
+        backend.client_with_token(&restricted),
+        &backend.kv_mount,
+        config2,
+    );
+    let refusal = crippled
+        .deregister(&deregister_request("piglet", &host, Some(4)))
+        .await
+        .expect_err("a teardown that could not finish must refuse");
+    assert_eq!(refusal.context().arm(), ProducingArm::Teardown);
+    assert!(
+        matches!(refusal.error(), VerbError::Unavailable { .. }),
+        "expected an unavailable refusal, got {:?}",
+        refusal.error()
+    );
+
+    // The report reaches the caller, and it names every resource: the
+    // sweep did not stop at the role it could not read.
+    let report = refusal.teardown().expect("the partial report is carried");
+    assert!(!report.aggregate_success());
+    assert_eq!(
+        report.attempts().len(),
+        REGISTRAR_TEARDOWN_KV_SUFFIXES.len() + 2,
+        "every KV suffix plus the role and the policy must be attempted"
+    );
+    assert!(
+        report.attempts().iter().any(|attempt| matches!(
+            attempt.resource,
+            ServiceResource::AppRole(_)
+        ) && matches!(
+            attempt.outcome,
+            ResourceOutcome::Failed(_)
+        )),
+        "the AppRole attempt must be the failure, got {:?}",
+        report.attempts()
+    );
+    // What it *could* remove, it did — a retained binding is not a
+    // rolled-back sweep.
+    for suffix in REGISTRAR_TEARDOWN_KV_SUFFIXES {
+        assert!(
+            !backend.kv_exists(&registration_id, suffix).await,
+            "{suffix} was deletable and must have been swept"
+        );
+    }
+
+    assert!(
+        backend.binding_of(&registration_id).await.is_some(),
+        "the binding must outlive a teardown that did not finish"
+    );
+    assert!(
+        backend
+            .read_role(&service_role_name(&registration_id))
+            .await
+            .is_some(),
+        "the role the sweep could not touch is still there, and still bound"
+    );
+
+    // A privileged re-run finishes the job, binding included.
+    let outcome = verbs
+        .deregister(&deregister_request("piglet", &host, Some(4)))
+        .await
+        .expect("the re-run completes the teardown");
+    assert_eq!(outcome.kind(), DeregisterKind::IdentityRemoved);
+    assert!(backend.binding_of(&registration_id).await.is_none());
 }
 
 /// With no binding at all, deregister still sweeps the full five-suffix
