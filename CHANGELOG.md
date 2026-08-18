@@ -76,6 +76,12 @@ service host. For a component installed once per deployment, reusing its
 old `service_name` as the key reproduces every previous path and name
 byte for byte.
 
+### Security
+
+- Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258
+  (unbounded buffering of empty HTTP/2 DATA frames, which lets a peer
+  drive a connection's memory use without bound).
+
 ## [0.3.0] - 2026-08-17
 
 ### Security
