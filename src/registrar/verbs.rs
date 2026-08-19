@@ -30,12 +30,12 @@
 //! Both verbs run the same three stages, and the order is a correctness
 //! requirement rather than a preference:
 //!
-//! 1. **Pre-derivation**, under a process-wide [`tokio::sync::Mutex`]
-//!    released before any `.await`: validate the two labels, refuse a
-//!    reserved `service_name`, resolve the component's multiplicity from
-//!    the rendered config, and check the instance shape. Mint also checks
-//!    the spec's identity restatement here. Every refusal on this arm
-//!    carries **no** `registration_id`, because none has been computed.
+//! 1. **Pre-derivation**, **stateless and unsynchronized**: validate the
+//!    two labels, refuse a reserved `service_name`, resolve the
+//!    component's multiplicity from the rendered config, and check the
+//!    instance shape. Mint also checks the spec's identity restatement
+//!    here. Every refusal on this arm carries **no** `registration_id`,
+//!    because none has been computed.
 //! 2. **Derivation** of the `registration_id` and the SAN. Fallible even
 //!    after the labels validated — the ≤131-octet bound is enforced on
 //!    the derived string — and a derivation failure takes no per-id lock
@@ -43,6 +43,17 @@
 //! 3. **Per-id work**, under the `registration_id`'s own
 //!    [`tokio::sync::Mutex`], shared by both verbs so a mint and a
 //!    deregister for one identity can never interleave.
+//!
+//! Stage 3's per-id lock is the **only** in-process serialization
+//! boundary either verb has. Its map is owned by this module rather than
+//! by a service instance, so two [`RegistrarVerbs`] in one process
+//! serialize against each other on one derived id instead of each
+//! holding a private lock for it. Stages 1 and 2 read only immutable
+//! per-instance configuration and call pure functions, so nothing there
+//! needs guarding and independent validations run concurrently; a future
+//! entry-stage feature that does introduce shared state — a rate limiter,
+//! say — synchronizes that state itself rather than reinstating a
+//! blanket entry lock over everything before derivation.
 //!
 //! Inside stage 3 the binding is consulted **before** the safe-set:
 //! a different stored host is a collision, a same-host different spec is
@@ -93,7 +104,7 @@ pub(crate) mod wrap_ttl;
 mod tests;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError, Weak};
 
 use anyhow::Context as _;
 use time::OffsetDateTime;
@@ -137,6 +148,19 @@ pub(crate) const REGISTRAR_TEARDOWN_KV_SUFFIXES: [&str; 5] = [
     SERVICE_SECRET_ID_KV_SUFFIX,
     SERVICE_REISSUE_KV_SUFFIX,
 ];
+
+/// The one per-`registration_id` lock map the whole process shares.
+///
+/// Ownership is deliberately the module's rather than a service
+/// instance's. Two [`RegistrarVerbs`] built over one `OpenBao` namespace
+/// — a re-rendered config, a second endpoint — derive the same
+/// `registration_id` from the same parts, and a per-instance map would
+/// hand each of them a private lock for it, letting one instance's mint
+/// interleave with another's deregister. The absent-only compare-and-set
+/// is the *cross-process* ownership primitive and stays exactly that; it
+/// cannot serialize a mint against a deregister inside one process, and
+/// this map cannot serialize anything outside it.
+static ID_LOCKS: LazyLock<IdLocks> = LazyLock::new(IdLocks::default);
 
 /// How many times a mint re-reads the binding after losing the
 /// compare-and-set race before giving up as unavailable.
@@ -215,11 +239,6 @@ pub(crate) struct RegistrarVerbs {
     token_ttl: String,
     secret_id_ttl: String,
     wrap_ttl_policy: WrapTtlPolicy,
-    /// Serializes the pre-derivation stage of every invocation. Held
-    /// across no `.await`.
-    entry_lock: TokioMutex<()>,
-    /// The per-`registration_id` locks.
-    id_locks: IdLocks,
 }
 
 impl RegistrarVerbs {
@@ -233,8 +252,6 @@ impl RegistrarVerbs {
             token_ttl: config.token_ttl,
             secret_id_ttl: config.secret_id_ttl,
             wrap_ttl_policy: config.wrap_ttl_policy,
-            entry_lock: TokioMutex::new(()),
-            id_locks: IdLocks::default(),
         }
     }
 
@@ -250,17 +267,15 @@ impl RegistrarVerbs {
             )
         };
 
-        // Stage 1. No `.await` inside the guard's scope.
-        let multiplicity = {
-            let _entry = self.entry_lock.lock().await;
-            self.pre_derivation(
+        // Stage 1. Stateless, so it runs unsynchronized.
+        let multiplicity = self
+            .pre_derivation(
                 &request.service_name,
                 &request.host,
                 request.instance,
                 Some(&request.spec),
             )
-        }
-        .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
+            .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
 
         // Still stage 1: the wrap TTL is a purely local property of the
         // request, checked under the construction-supplied policy well
@@ -291,7 +306,7 @@ impl RegistrarVerbs {
             .san_for(request.instance, &request.service_name, &request.host);
 
         // Stage 3.
-        let _id_guard = self.id_locks.acquire(&registration_id).await;
+        let _id_guard = self.id_locks().acquire(&registration_id).await;
         self.mint_locked(request, &request_id, &registration_id, &san, &granted)
             .await
     }
@@ -307,11 +322,9 @@ impl RegistrarVerbs {
             )
         };
 
-        let multiplicity = {
-            let _entry = self.entry_lock.lock().await;
-            self.pre_derivation(&request.service_name, &request.host, request.instance, None)
-        }
-        .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
+        let multiplicity = self
+            .pre_derivation(&request.service_name, &request.host, request.instance, None)
+            .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
 
         let registration_id = derive_registration_id(
             multiplicity,
@@ -321,13 +334,23 @@ impl RegistrarVerbs {
         )
         .map_err(|err| refuse(ProducingArm::Derivation, None, VerbError::Registrar(err)))?;
 
-        let _id_guard = self.id_locks.acquire(&registration_id).await;
+        let _id_guard = self.id_locks().acquire(&registration_id).await;
         self.deregister_locked(request, &request_id, &registration_id)
             .await
     }
 
-    /// Stage 1, shared by both verbs. Entirely synchronous, so the
-    /// process-wide guard around it is never held across an `.await`.
+    /// Stage 1, shared by both verbs: stateless, synchronous, and
+    /// **unsynchronized**.
+    ///
+    /// It reads only this instance's immutable construction dependencies
+    /// and calls pure validators, so there is no shared mutable state to
+    /// guard and independent requests validate concurrently. The only
+    /// in-process serialization boundary either verb has is the shared
+    /// per-`registration_id` lock taken in stage 3, and fallible
+    /// derivation completes before that lock is acquired. Anything added
+    /// here that *does* carry shared state brings its own
+    /// synchronization for that state; it does not reintroduce a lock
+    /// over the whole stage.
     ///
     /// `spec` is `Some` only for a mint: the spec's identity restatement
     /// is a mint-only pre-derivation refusal, because a deregister
@@ -796,12 +819,30 @@ impl RegistrarVerbs {
         ))
     }
 
-    /// Returns how many per-id lock entries the map is currently
-    /// holding, so a test can assert that a refusal before stage 3 took
-    /// no lock at all.
+    /// Returns the process-wide per-`registration_id` lock map both
+    /// verbs take their stage 3 lock from.
+    ///
+    /// Every acquisition goes through here, so no instance can end up
+    /// locking against a map of its own.
+    // The receiver is not read, and that is the point: routing every
+    // instance's lock selection through a method on `&self` is what lets
+    // the cross-instance contention test drive this path per service and
+    // observe that both land on one map. An associated function would
+    // make that assertion untestable, so the lint's suggestion is
+    // declined here and nowhere wider.
+    #[allow(clippy::unused_self)]
+    fn id_locks(&self) -> &'static IdLocks {
+        &ID_LOCKS
+    }
+
+    /// The lock map this instance would take a per-id lock from.
+    ///
+    /// Test-only, and deliberately a delegation rather than a second
+    /// path to the static: what the contention test has to exercise is
+    /// the production lock selection, once per instance.
     #[cfg(test)]
-    fn tracked_lock_count(&self) -> usize {
-        self.id_locks.lock_entries().len()
+    fn id_locks_for_test(&self) -> &'static IdLocks {
+        self.id_locks()
     }
 
     fn binding_path(registration_id: &str) -> String {
@@ -909,6 +950,11 @@ fn granted_deadline(wrap_info: &WrapInfo) -> anyhow::Result<OffsetDateTime> {
 /// all, and reclaiming a dead entry has to happen in `Drop` — which runs
 /// when a verb's future is cancelled as well as when it returns, where an
 /// explicit async reclaim would not.
+///
+/// Production has exactly one of these, the module's [`ID_LOCKS`]. The
+/// type stays independently constructible so the reclamation tests can
+/// assert entry counts on a map of their own, where no other test in the
+/// binary can be holding an id.
 #[derive(Default)]
 struct IdLocks {
     entries: StdMutex<HashMap<String, Weak<TokioMutex<()>>>>,
