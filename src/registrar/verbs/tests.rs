@@ -187,20 +187,27 @@ fn assert_envelope(refusal: &VerbRefusal, arm: ProducingArm) {
 // Fast tier: pre-derivation control flow
 // ---------------------------------------------------------------------
 
+/// A client pointed at a Wiremock with **no** mounted responses, so any
+/// request at all is visible in the server's recorded requests.
+fn mock_client(server: &MockServer) -> OpenBaoClient {
+    let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+    client.set_token("test-token".to_string());
+    client
+}
+
 /// A verb service over a Wiremock with **no** mounted responses: any
 /// request at all fails the mock, and the count is asserted directly.
 async fn refusal_harness(
     fixture: &RegistrarConfigFixture,
 ) -> (MockServer, TempDir, RegistrarVerbs) {
     let server = MockServer::start().await;
-    let mut client = OpenBaoClient::new(&server.uri()).expect("client");
-    client.set_token("test-token".to_string());
+    let client = mock_client(&server);
     let (dir, config) = load_fixture(fixture);
     let verbs = verbs_with(client, "secret", config);
     (server, dir, verbs)
 }
 
-async fn assert_untouched(server: &MockServer, verbs: &RegistrarVerbs) {
+async fn assert_untouched(server: &MockServer) {
     let requests = server
         .received_requests()
         .await
@@ -209,11 +216,6 @@ async fn assert_untouched(server: &MockServer, verbs: &RegistrarVerbs) {
         requests.is_empty(),
         "a pre-derivation refusal must reach OpenBao not at all, saw {} request(s)",
         requests.len()
-    );
-    assert_eq!(
-        verbs.tracked_lock_count(),
-        0,
-        "a refusal before the per-id stage must take no per-id lock"
     );
 }
 
@@ -247,7 +249,7 @@ async fn both_verbs_refuse_a_reserved_service_name_before_the_component_lookup()
             VerbError::ReservedServiceName { .. }
         ));
     }
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 #[tokio::test]
@@ -274,7 +276,7 @@ async fn both_verbs_refuse_an_invalid_label() {
         VerbError::Registrar(RegistrarError::InvalidHost { .. })
     ));
 
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 #[tokio::test]
@@ -301,7 +303,7 @@ async fn both_verbs_refuse_an_absent_component() {
         VerbError::Registrar(RegistrarError::ComponentNotConfigured { .. })
     ));
 
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 #[tokio::test]
@@ -330,7 +332,7 @@ async fn both_verbs_refuse_an_instance_shape_mismatch() {
         VerbError::Registrar(RegistrarError::ServiceInstanceMismatch { .. })
     ));
 
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 /// A mint-only refusal: a deregister carries no spec to restate an
@@ -354,14 +356,17 @@ async fn mint_refuses_a_spec_identity_disagreement_before_derivation() {
         })
     ));
 
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 /// Both named derivation failures: the derived key exceeds the 131-octet
-/// bound, and an uppercase host makes it non-path-safe. Neither takes a
-/// per-id lock, and neither reaches `OpenBao`.
+/// bound, and an uppercase host makes it non-path-safe. Neither reaches
+/// `OpenBao`, which is what a refusal short of stage 3 is observable by:
+/// the per-id map is process-wide, so a count over it would be shared
+/// mutable state across this whole test binary rather than a statement
+/// about this request.
 #[tokio::test]
-async fn derivation_failures_take_no_lock_and_no_openbao_work() {
+async fn derivation_failures_reach_no_openbao_work() {
     let long_component = "c".repeat(63);
     let long_host = "h".repeat(63);
     let fixture =
@@ -391,7 +396,7 @@ async fn derivation_failures_take_no_lock_and_no_openbao_work() {
         VerbError::Registrar(RegistrarError::DerivedKeyInvalid { .. })
     ));
 
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 // ---------------------------------------------------------------------
@@ -656,7 +661,7 @@ async fn mint_refuses_an_unusable_wrap_ttl_before_touching_openbao() {
             refusal.error()
         );
     }
-    assert_untouched(&server, &verbs).await;
+    assert_untouched(&server).await;
 }
 
 // ---------------------------------------------------------------------
@@ -666,9 +671,10 @@ async fn mint_refuses_an_unusable_wrap_ttl_before_touching_openbao() {
 /// A released guard reclaims its entry, so the map does not grow with
 /// every id a caller has ever named.
 ///
-/// `assert_untouched` proves only that a refusal *before* stage 3 takes
-/// no lock. This is the other half: an id that did reach stage 3 leaves
-/// nothing behind once its guard is dropped.
+/// The three reclamation tests below run against locally constructed
+/// maps rather than the process-wide static, so what they assert about
+/// entry counts is theirs alone and cannot be perturbed by another test
+/// holding a lock for the same id.
 #[tokio::test]
 async fn a_released_id_lock_reclaims_its_map_entry() {
     let locks = IdLocks::default();
@@ -757,6 +763,58 @@ async fn a_reclaimed_id_is_re_acquirable() {
     );
     drop(guard);
     assert_eq!(locks.lock_entries().len(), 0);
+}
+
+/// Two separately constructed services must serialize on one derived id.
+///
+/// This is the defect the shared map exists to close: a mint driven
+/// through one service and a deregister driven through another derive
+/// the same `registration_id`, and with a map per instance each would
+/// take a private lock for it and their binding and `OpenBao` work would
+/// interleave. Both acquisitions go through the services' own
+/// lock-selection path rather than naming the static, so an
+/// implementation that handed each instance its own map would let the
+/// waiter through immediately and fail the blocking assertion below.
+///
+/// The id is unique because the map is process-wide: a fixed label would
+/// queue behind any other test in this binary that happened to use it.
+#[tokio::test]
+async fn two_instances_share_one_per_id_lock() {
+    let server = MockServer::start().await;
+    let (_dir_one, config_one) = load_fixture(&base_fixture());
+    let (_dir_two, config_two) = load_fixture(&base_fixture());
+    let first = verbs_with(mock_client(&server), "secret", config_one);
+    let second = Arc::new(verbs_with(mock_client(&server), "secret", config_two));
+
+    let registration_id = unique_label("lk");
+    let held = first.id_locks_for_test().acquire(&registration_id).await;
+
+    let acquired = Arc::new(AtomicBool::new(false));
+    let waiter = tokio::spawn({
+        let second = Arc::clone(&second);
+        let acquired = Arc::clone(&acquired);
+        let registration_id = registration_id.clone();
+        async move {
+            let guard = second.id_locks_for_test().acquire(&registration_id).await;
+            acquired.store(true, Ordering::SeqCst);
+            drop(guard);
+        }
+    });
+
+    // Give the second service every chance to run.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !acquired.load(Ordering::SeqCst),
+        "a second service instance must queue on the lock the first is holding for {registration_id}"
+    );
+
+    drop(held);
+    waiter
+        .await
+        .expect("the second service must acquire and release");
+    assert!(acquired.load(Ordering::SeqCst));
 }
 
 // ---------------------------------------------------------------------
@@ -1746,10 +1804,21 @@ async fn deregister_is_refused_when_the_component_left_the_configuration() {
         .expect("cleanup once the entry is back");
 }
 
-/// Two verb services sharing one live `OpenBao` — the in-process stand-in
-/// for two processes — race the compare-and-set for one derived id from
-/// two different hosts. Exactly one gets material; the other is refused
-/// through the CAS conflict path.
+/// Two verb services sharing one live `OpenBao` race one derived id from
+/// two different hosts. Exactly one gets material; the other is refused.
+///
+/// The two services share the process-wide per-id lock, so the race is
+/// resolved in-process: the loser runs after the winner has persisted
+/// the binding, reads it, and is refused for the host collision. It does
+/// **not** reach the compare-and-set conflict. The verb layer's
+/// `KvCreateIfAbsent::AlreadyExists` re-read branch is by construction
+/// only reachable from another process writing the same namespace, and
+/// nothing in this suite exercises it; `src/openbao.rs` covers the
+/// client-level distinction between `OpenBao`'s documented CAS mismatch
+/// and other HTTP 400 responses against canned responses. What is
+/// asserted here remains worth asserting: concurrent requests for one
+/// derived id from two hosts produce exactly one winner and one durable
+/// binding, whichever of them gets there first.
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn two_instances_racing_one_id_produce_exactly_one_claimant() {
@@ -1791,25 +1860,32 @@ async fn two_instances_racing_one_id_produce_exactly_one_claimant() {
         .expect("cleanup");
 }
 
-/// A mint and a deregister for one identity, issued concurrently against
-/// one service, are serialized: the result is one of the two clean
-/// orderings, never a half-existing identity.
+/// A mint and a deregister for one identity, issued concurrently through
+/// two **separately constructed** services, are serialized: the result is
+/// one of the two clean orderings, never a half-existing identity.
+///
+/// The two services are what makes this a test of the shared lock rather
+/// than of one instance's private map. Each loads the fixture into its
+/// own directory, and both `TempDir` guards stay alive for the whole
+/// body so neither rendered config is removed underneath its service.
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_concurrent_mint_and_deregister_never_interleave() {
     let backend = LiveBackend::from_env();
     let host = unique_label("h");
-    let (_dir, config) = load_fixture(&base_fixture());
-    let verbs = Arc::new(backend.verbs(config));
+    let (_dir_one, config_one) = load_fixture(&base_fixture());
+    let (_dir_two, config_two) = load_fixture(&base_fixture());
+    let minting = Arc::new(backend.verbs(config_one));
+    let deregistering = Arc::new(backend.verbs(config_two));
     let registration_id = format!("{host}-roxyd");
 
-    verbs
+    minting
         .mint(&mint_request("roxyd", &host, None))
         .await
         .expect("seed the identity");
 
-    let for_mint = Arc::clone(&verbs);
-    let for_deregister = Arc::clone(&verbs);
+    let for_mint = Arc::clone(&minting);
+    let for_deregister = Arc::clone(&deregistering);
     let mint_host = host.clone();
     let remove_host = host.clone();
     let mint_task = tokio::spawn(async move {
@@ -1842,7 +1918,7 @@ async fn a_concurrent_mint_and_deregister_never_interleave() {
     );
 
     if binding_present {
-        verbs
+        deregistering
             .deregister(&deregister_request("roxyd", &host, None))
             .await
             .expect("cleanup");
