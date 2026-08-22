@@ -1,0 +1,33 @@
+# The host-local registrar endpoint's socket.
+#
+# systemd creates, owns and holds the pathname; bootroot-agent never
+# binds, unlinks or chmods it. Install as
+# /etc/systemd/system/bootroot-registrar.socket, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now bootroot-registrar.socket
+#
+# The socket is root-owned and 0700, and the runtime directory is
+# root-owned with neither group-write nor other-write permission. The
+# daemon refuses to serve on anything else.
+
+[Unit]
+Description=bootroot registrar endpoint socket
+
+[Socket]
+ListenStream=/run/bootroot/registrar.sock
+SocketMode=0700
+SocketUser=root
+SocketGroup=root
+# One inherited listening descriptor, never one connected socket per
+# connection: the daemon owns its own accept loop and its own
+# concurrency bound.
+Accept=no
+RuntimeDirectory=bootroot
+RuntimeDirectoryMode=0755
+# The directory outlives a service restart, so a reload or a crash-restart
+# does not take the pathname with it.
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=sockets.target

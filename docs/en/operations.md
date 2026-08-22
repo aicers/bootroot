@@ -244,6 +244,125 @@ Notes:
   [Containerized consumer applications](#containerized-consumer-applications)
   for the `docker-restart` interaction.
 
+### Registrar endpoint (Linux only)
+
+A **bootroot-host** deployment — the host that runs the registrar's own
+control plane — can have `bootroot-agent` serve the registrar's `mint`
+and `deregister` verbs on a host-local socket. This is Linux only, it is
+`AF_UNIX` only, and it is systemd socket activation only. Every other
+deployment leaves it off, which is the default.
+
+**Enabling it is unsupported until the registrar protocol work lands.**
+This build registers no request handler, so `registrar_endpoint.enabled
+= true` makes the daemon refuse to start.
+
+#### The socket, and who owns it
+
+`systemd` creates `/run/bootroot/registrar.sock`, owns its name and its
+mode, and hands the already-listening descriptor to the daemon as fd 3.
+`bootroot-agent` never binds, unlinks, renames or `chmod`s it, and no
+configuration key names a path — a daemon that could be pointed at a
+path of its own could be pointed at an unprotected one.
+
+At startup the daemon checks the pathname `getsockname()` reports:
+
+- the socket's mode must be exactly `0700`;
+- the socket's owner must be the daemon's effective uid;
+- the directory holding it must have the same owner, and must be neither
+  group-writable nor other-writable. That check is a bitmask, so both
+  `0700` and the shipped unit's `RuntimeDirectoryMode=0755` pass.
+
+Under the shipped units that uid is 0. Anything else — a different mode,
+a different owner, a writable parent, a descriptor that is not a
+listening `AF_UNIX` stream, or an address that is not a filesystem
+pathname — refuses startup with a diagnostic instead of serving.
+
+Each accepted connection is then authenticated by the *connected
+socket's* peer credentials, never by the pathname's metadata: only a
+peer whose uid equals the daemon's effective uid reaches a verb. The
+peer's pid and gid are logged as connection diagnostics and are not part
+of the caller identity.
+
+#### Installing the units
+
+Both units are checked in under `systemd/` in this repository. Copy them
+to `/etc/systemd/system/` and enable them:
+
+```sh
+install -m 0644 systemd/bootroot-registrar.socket /etc/systemd/system/
+install -m 0644 systemd/bootroot-registrar.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now bootroot-registrar.socket
+systemctl enable --now bootroot-registrar.service
+```
+
+The socket unit uses `ListenStream=/run/bootroot/registrar.sock`,
+`SocketMode=0700`, `SocketUser=root`, `SocketGroup=root`, `Accept=no`,
+`RuntimeDirectory=bootroot`, `RuntimeDirectoryMode=0755`,
+`RuntimeDirectoryPreserve=yes` and `WantedBy=sockets.target`.
+`RuntimeDirectoryPreserve=yes` is what keeps a service restart from
+taking the runtime directory with it.
+
+The service unit uses `Requires=bootroot-registrar.socket`,
+`After=bootroot-registrar.socket`, `User=root`, `Group=root`,
+`Restart=on-failure`, `WantedBy=multi-user.target` and
+
+```ini
+ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
+```
+
+It is **enabled at boot** rather than started lazily by a connection.
+The renewal and fast-poll loops have to run whether or not a registrar
+ever connects; the socket unit is a dependency purely so the listening
+descriptor exists before the daemon starts and is inherited by it.
+
+As with every other agent unit, a deployment whose EAB credentials
+rotate must add the real provisioned `--eab-file` path to `ExecStart`.
+Without it, EAB KV updates and `rotate eab-clear` are silent no-ops for
+that agent — see the
+[systemd operations procedure](#systemd-operations-procedure-recommended-for-bootroot-agent)
+above.
+
+#### How this differs from the hardened non-root unit
+
+The [hardened systemd unit example](#hardened-systemd-unit-example)
+above runs the daemon as a dedicated unprivileged account with a
+locked-down filesystem view, and that is still the right shape for an
+ordinary service host. The registrar unit is deliberately not that: it
+runs as root, because `mint` and `deregister` need the privileged
+internal credential. An enabled endpoint running unprivileged starts and
+warns that the two verbs cannot succeed; it does not silently look
+healthy. The two units are alternatives, not layers — a host runs the
+hardened one or the registrar one, not both against the same config.
+
+#### Ordering the out-of-tree registrar unit
+
+The registrar process itself lives in another repository and is not
+managed here. Whatever unit runs it must order itself after the socket:
+
+```ini
+[Unit]
+After=bootroot-registrar.socket
+Requires=bootroot-registrar.socket
+```
+
+Ordering after the *service* is not enough and not what you want. The
+socket unit is what creates the pathname, so ordering after it is what
+guarantees the registrar has something to connect to; ordering after the
+daemon would additionally tie the registrar's start to a unit that may
+restart under it.
+
+#### The setting
+
+`registrar_endpoint.enabled` in `agent.toml` is fixed for the process
+lifetime. The listening descriptor is inherited once, before the reload
+loop, so a `SIGHUP` whose reloaded value differs from the running one is
+rejected: the running daemon keeps serving under its current setting and
+the refusal is logged. Changing the value takes `systemctl restart`. A
+reload that leaves the value alone behaves as it always has — and the
+endpoint keeps the same socket inode across it, because the listener is
+held above the reload rather than reacquired by it.
+
 ## Rotation scheduling
 
 Run `bootroot rotate ...` on a schedule (cron/systemd timer). Keep secrets out

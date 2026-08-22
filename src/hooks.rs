@@ -345,6 +345,7 @@ mod tests {
             },
             profiles: vec![profile.clone()],
             openbao: None,
+            registrar_endpoint: crate::config::RegistrarEndpointSettings::default(),
         };
 
         (settings, profile)

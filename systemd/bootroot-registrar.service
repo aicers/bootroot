@@ -1,0 +1,36 @@
+# The bootroot-agent daemon that serves the registrar endpoint.
+#
+# It is a boot-time service, not a socket-activated one: the renewal and
+# fast-poll loops must run whether or not a registrar ever connects. The
+# socket unit is a Requires/After dependency purely so the listening
+# descriptor exists before this starts and is inherited as fd 3.
+#
+# Install as /etc/systemd/system/bootroot-registrar.service, then:
+#
+#   systemctl daemon-reload
+#   systemctl enable --now bootroot-registrar.socket
+#   systemctl enable --now bootroot-registrar.service
+#
+# Deployments whose EAB credentials rotate must add the real provisioned
+# --eab-file path to ExecStart, exactly as the existing agent guidance
+# requires: without it, EAB KV updates and `rotate eab-clear` are silent
+# no-ops for this agent.
+
+[Unit]
+Description=bootroot agent with the registrar endpoint
+Requires=bootroot-registrar.socket
+After=bootroot-registrar.socket
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Root, because mint and deregister need the privileged internal
+# credential. An unprivileged daemon starts, warns, and cannot complete
+# either verb.
+User=root
+Group=root
+ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

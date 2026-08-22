@@ -24,6 +24,15 @@
 //! this crate — so no consumer can reach a verb without going through
 //! the endpoint's authentication.
 //!
+//! That endpoint is the crate-private, Linux-only `endpoint` sibling:
+//! the systemd-socket-activated `AF_UNIX` listener, its envelope, its
+//! peer-credential check and the handler seam the registrar protocol
+//! plugs into. [`RegistrarEndpoint`] is the one thing of it the daemon
+//! sees — an opaque handle held for the process lifetime and cloned into
+//! each daemon invocation, so a `SIGHUP` reload resumes on the same
+//! socket inode rather than re-consuming an activation contract that has
+//! already been consumed.
+//!
 //! Nothing here reads or requires registration state. That is what makes
 //! the durable-binding collision check the caller's step rather than a
 //! missing one here, and it is why no variant in [`error`] refers to a
@@ -53,6 +62,8 @@
 //! reserved names.
 
 pub mod config;
+#[cfg(target_os = "linux")]
+pub(crate) mod endpoint;
 pub mod endpoint_pin;
 pub mod error;
 pub mod fixture;
@@ -336,6 +347,92 @@ pub fn recognize_registrar_client_name(
         host: (*host).to_string(),
         domain,
     })
+}
+
+/// A handle to the host-local registrar endpoint, held for the process
+/// lifetime and cloned into each daemon invocation.
+///
+/// Opaque, and empty unless the endpoint is enabled *and* this is a
+/// Linux build. The listening socket is inherited from `systemd` exactly
+/// once, above the `SIGHUP` loop, so this handle — not a reload — is
+/// what carries it across a restart of the daemon task, and what keeps
+/// the socket inode the same on the other side.
+///
+/// It exists on every target so the daemon has one signature to call.
+/// On anything but Linux it holds nothing at all, and the endpoint's
+/// machinery is not compiled: an enabled setting is refused by
+/// [`crate::config::Settings::validate`] before activation is ever
+/// looked at.
+#[derive(Clone, Default)]
+pub struct RegistrarEndpoint {
+    #[cfg(target_os = "linux")]
+    inner: Option<std::sync::Arc<endpoint::ActivatedEndpoint>>,
+}
+
+impl RegistrarEndpoint {
+    /// Consumes the systemd socket-activation contract once and adopts
+    /// the inherited listening socket.
+    ///
+    /// A disabled endpoint reads no activation variable, touches no
+    /// descriptor and returns an empty handle, so a deployment that
+    /// never asked for the endpoint behaves exactly as it did before it
+    /// existed. This process's environment is never mutated, in either
+    /// case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint is enabled and cannot be
+    /// served: no registered request handler, a missing or misaddressed
+    /// activation contract, a descriptor that is not a listening
+    /// `AF_UNIX` stream socket or whose address is not a pathname, or a
+    /// socket pathname whose mode, owner or parent directory fails
+    /// policy. On a non-Linux target an enabled endpoint is an error in
+    /// itself.
+    pub fn activate(enabled: bool) -> anyhow::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                inner: endpoint::activate(enabled)?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            if enabled {
+                anyhow::bail!(
+                    "the registrar endpoint is supported on Linux only; \
+                     set registrar_endpoint.enabled = false"
+                );
+            }
+            Ok(Self::default())
+        }
+    }
+
+    /// Reports whether this handle carries a listening socket.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Returns the adopted endpoint, for the daemon's accept task.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn activated(&self) -> Option<std::sync::Arc<endpoint::ActivatedEndpoint>> {
+        self.inner.clone()
+    }
+}
+
+impl std::fmt::Debug for RegistrarEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistrarEndpoint")
+            .field("active", &self.is_active())
+            .finish()
+    }
 }
 
 /// Tests for the reserved-prefix guard and the registrar name rules.

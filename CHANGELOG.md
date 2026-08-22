@@ -8,6 +8,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- A `SIGHUP` reload of `bootroot-agent` now stops the running daemon
+  gracefully instead of aborting it. A reload used to cancel the daemon
+  task outright, dropping whatever each renewal, hook or fast-poll step
+  was in the middle of; it now asks every loop to stop, waits for them,
+  and only then starts the daemon again under the reloaded
+  configuration. A reload that arrives during an issuance therefore
+  takes as long as that issuance has left to run, where it used to
+  abandon it part-way, and the outcome of the invocation the reload
+  ended is logged rather than discarded.
 - `bootroot service add` and `bootroot-remote bootstrap` refuse a
   `--service-name` whose lowercased form starts with `bootroot-`, with
   its own message rather than the DNS-label one. The prefix is reserved
