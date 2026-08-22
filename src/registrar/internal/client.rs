@@ -110,23 +110,29 @@ impl InternalCredential {
     /// `secrets_dir` and builds the client-authenticated transport for
     /// it.
     ///
-    /// Performs no network request: the login happens on first use, so
-    /// a caller that only wants to know whether the credential is
-    /// loadable does not have to reach `OpenBao` to find out.
+    /// The three refusals happen in cost order, and each one is reached
+    /// before the work the next would do: a plaintext URL before the
+    /// credential is read, an absent or partial set before the root is
+    /// compared, and a superseded root before a transport is built.
+    /// Performs no network request at all — the login happens on first
+    /// use — so none of them costs a request either.
     ///
     /// # Errors
     ///
     /// Returns [`InternalCredentialError::PlaintextOpenBaoUrl`] when
-    /// `openbao_url` is not `https://`, and the loader's own errors when
-    /// the material is absent, partial or invalid.
-    pub fn load(secrets_dir: &Path, openbao_url: &str) -> Result<Self, InternalCredentialError> {
-        // The plaintext refusal comes first, before the credential is
-        // even read: a host whose recorded URL is `http://` has nothing
-        // this client can safely do, and reading the key material to
-        // discover that would be work done for a refusal.
+    /// `openbao_url` is not `https://`, the loader's own errors when the
+    /// material is absent, partial or invalid, and
+    /// [`InternalCredentialError::RepairRequired`] when the stored root
+    /// fingerprint is not `active_root_fingerprint`.
+    pub fn load(
+        secrets_dir: &Path,
+        openbao_url: &str,
+        active_root_fingerprint: &str,
+    ) -> Result<Self, InternalCredentialError> {
         require_https(openbao_url)?;
         let paths = InternalPaths::new(secrets_dir);
         let material = load_material(&paths)?;
+        compare_root(&material.root_fingerprint, active_root_fingerprint)?;
         let bundle = std::fs::read_to_string(paths.ca_bundle()).map_err(|source| {
             InternalCredentialError::Io {
                 operation: "reading",
@@ -209,16 +215,7 @@ impl InternalCredential {
         &self,
         active_fingerprint: &str,
     ) -> Result<(), InternalCredentialError> {
-        if self
-            .root_fingerprint
-            .eq_ignore_ascii_case(active_fingerprint)
-        {
-            return Ok(());
-        }
-        Err(InternalCredentialError::RepairRequired {
-            stored: self.root_fingerprint.clone(),
-            active: active_fingerprint.to_ascii_lowercase(),
-        })
+        compare_root(&self.root_fingerprint, active_fingerprint)
     }
 
     /// Returns an `OpenBao` client carrying a live token, logging in
@@ -308,6 +305,22 @@ pub async fn require_root_authority(
         return Ok(RootAuthority(()));
     }
     Err(InternalCredentialError::RootAuthorityRequired { policies })
+}
+
+/// The one root-comparison rule, shared by the loader and by
+/// [`InternalCredential::check_active_root`].
+///
+/// Case-insensitive because a fingerprint is hex and both spellings name
+/// the same certificate; a second implementation of that would be a
+/// second chance to get it wrong.
+fn compare_root(stored: &str, active: &str) -> Result<(), InternalCredentialError> {
+    if stored.eq_ignore_ascii_case(active) {
+        return Ok(());
+    }
+    Err(InternalCredentialError::RepairRequired {
+        stored: stored.to_string(),
+        active: active.to_ascii_lowercase(),
+    })
 }
 
 /// Refuses a non-HTTPS `OpenBao` URL.

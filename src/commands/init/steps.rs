@@ -103,12 +103,21 @@ pub(super) struct InitRollback {
     /// restores the pre-TLS `state.json` so it does not keep pointing at
     /// an HTTPS URL / TLS certs after `OpenBao` is recreated on plaintext.
     pub(super) state_backup: Option<RollbackFile>,
-    /// The bootroot-internal credential's layout directory, when this
-    /// run created it.  Rollback removes it whole — staging included —
-    /// so a failure anywhere in the provisioning sequence leaves no
-    /// half-provisioned credential, no dedicated config and no private
-    /// bundle behind.
+    /// The bootroot-internal credential's layout directory, set only
+    /// when this run is what created it.  Rollback then removes it whole
+    /// — staging included — so a failure anywhere in the provisioning
+    /// sequence leaves no half-provisioned credential, no dedicated
+    /// config and no private bundle behind.
+    ///
+    /// Left `None` when the host already carried a credential, so a
+    /// failed re-run of `init` does not delete a working one; the
+    /// staging directory below is removed either way.
     pub(super) registrar_internal_dir: Option<PathBuf>,
+    /// The staging directory the internal leaf is issued into before it
+    /// is proved and published.  Removed on rollback whether or not the
+    /// layout directory around it is, because it is this run's alone and
+    /// holds a private key that was never published.
+    pub(super) registrar_internal_staging: Option<PathBuf>,
     /// The `auth/cert` entry this run created, by name.  Deleted on
     /// rollback so a rolled-back host trusts no internal certificate.
     pub(super) registrar_internal_cert_auth_entry: Option<String>,
@@ -264,14 +273,21 @@ impl InitRollback {
         // The bootroot-internal artifacts, innermost first: the files,
         // then the entry that trusts them, then the mount — and the
         // mount only when this run is what created it.
-        if let Some(dir) = &self.registrar_internal_dir
-            && dir.exists()
-            && let Err(err) = std::fs::remove_dir_all(dir)
+        for dir in [
+            &self.registrar_internal_dir,
+            &self.registrar_internal_staging,
+        ]
+        .into_iter()
+        .flatten()
         {
-            eprintln!(
-                "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
-                dir.display()
-            );
+            if dir.exists()
+                && let Err(err) = std::fs::remove_dir_all(dir)
+            {
+                eprintln!(
+                    "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
+                    dir.display()
+                );
+            }
         }
         if let Some(name) = &self.registrar_internal_cert_auth_entry
             && let Err(err) = client
@@ -559,6 +575,71 @@ mod rollback_tests {
             "TLS cert must be removed after rollback"
         );
         assert!(!key_path.exists(), "TLS key must be removed after rollback");
+    }
+
+    /// A first provisioning either publishes a complete
+    /// bootroot-internal credential or leaves nothing behind: rollback
+    /// removes the layout directory whole, staging and all.
+    #[tokio::test]
+    async fn rollback_removes_a_freshly_provisioned_internal_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+        let paths = bootroot::registrar::internal::InternalPaths::new(dir.path());
+        let staging = paths.dir().join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(paths.key(), "KEY").unwrap();
+        std::fs::write(paths.chain(), "CHAIN").unwrap();
+        std::fs::write(staging.join("key.pem"), "STAGED KEY").unwrap();
+
+        let rollback = InitRollback {
+            registrar_internal_dir: Some(paths.dir().to_path_buf()),
+            registrar_internal_staging: Some(staging.clone()),
+            registrar_internal_cert_auth_entry: Some("bootroot-registrar-internal".to_string()),
+            registrar_internal_cert_auth_mount_created: true,
+            compose_file: None,
+            ..Default::default()
+        };
+        // Unreachable: the two OpenBao teardown calls report and continue,
+        // which is what keeps the file teardown from being skipped.
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(
+            !paths.dir().exists(),
+            "the layout directory must be gone after rollback"
+        );
+    }
+
+    /// A re-run of `init` over a host that already carried a credential
+    /// must not have its rollback delete the working one. Only this
+    /// run's staging directory — which holds a private key that was
+    /// never published — is swept.
+    #[tokio::test]
+    async fn rollback_keeps_a_pre_existing_internal_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+        let paths = bootroot::registrar::internal::InternalPaths::new(dir.path());
+        let staging = paths.dir().join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(paths.key(), "EXISTING KEY").unwrap();
+        std::fs::write(staging.join("key.pem"), "STAGED KEY").unwrap();
+
+        let rollback = InitRollback {
+            // Left `None` exactly because the host already had one.
+            registrar_internal_dir: None,
+            registrar_internal_staging: Some(staging.clone()),
+            compose_file: None,
+            ..Default::default()
+        };
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(!staging.exists(), "staging must be swept");
+        assert_eq!(
+            std::fs::read_to_string(paths.key()).unwrap(),
+            "EXISTING KEY",
+            "the pre-existing credential must survive"
+        );
     }
 
     /// Rollback with `hcl_backup` that has `original: None` removes the

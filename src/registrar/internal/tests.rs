@@ -301,7 +301,7 @@ fn a_plaintext_openbao_url_is_refused() {
 #[tokio::test]
 async fn loading_over_plaintext_never_reaches_the_material() {
     let (dir, _paths) = provisioned_host().await;
-    let err = InternalCredential::load(dir.path(), "http://localhost:8200")
+    let err = InternalCredential::load(dir.path(), "http://localhost:8200", ROOT_FP)
         .expect_err("plaintext must be refused");
     assert!(
         matches!(err, InternalCredentialError::PlaintextOpenBaoUrl { .. }),

@@ -402,7 +402,15 @@ pub(super) async fn rotate_ca_key(
         // passed and before Phase 6 is recorded. A run that skips
         // finalization never reaches this line and keeps the additive
         // internal trust set, exactly as it keeps the additive KV set.
-        if registrar_internal::internal_credential_present(ctx.paths.secrets_dir()) {
+        //
+        // Full rotations only, matching Phase 3 and the Phase-4 tail: an
+        // intermediate-only rotation never widened the internal trust
+        // set, so there is nothing here for it to narrow, and rewriting
+        // the bundle would be a change to artifacts that rotation is
+        // specified to leave alone.
+        if rot_state.mode == RotationMode::Full
+            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
+        {
             registrar_internal::publish_internal_trust(
                 ctx.paths.secrets_dir(),
                 &registrar_internal::InternalTrustState {

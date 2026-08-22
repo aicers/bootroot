@@ -209,6 +209,14 @@ pub(crate) struct InternalVerbsSource<'a> {
     pub(crate) secrets_dir: &'a std::path::Path,
     /// The recorded `OpenBao` URL. Must be `https://`.
     pub(crate) openbao_url: &'a str,
+    /// Hex SHA-256 of the deployment's **active** root.
+    ///
+    /// Compared with the fingerprint stored beside the credential before
+    /// anything is built. A mismatch means the `auth/cert` entry no
+    /// longer trusts this leaf, so the factory returns repair-required
+    /// and the verbs never exist — no ACME request, no login and no
+    /// write is made on a credential that cannot work.
+    pub(crate) active_root_fingerprint: &'a str,
     /// The KV v2 mount every path is written under.
     pub(crate) kv_mount: &'a str,
     /// The loaded, digest-verified registrar config.
@@ -339,13 +347,19 @@ impl RegistrarVerbs {
     /// # Errors
     ///
     /// Returns [`InternalCredentialError`] when the recorded `OpenBao`
-    /// URL is plaintext, or when the credential is absent, partial or
-    /// invalid. No network request is made: the certificate login
-    /// happens on the first verb.
+    /// URL is plaintext, when the credential is absent, partial or
+    /// invalid, or when the root it was issued under is no longer the
+    /// deployment's active one. No network request is made in any of
+    /// those cases, and none is made on success either: the certificate
+    /// login happens on the first verb.
     pub(crate) fn internal(
         source: &InternalVerbsSource<'_>,
     ) -> Result<Self, InternalCredentialError> {
-        let credential = InternalCredential::load(source.secrets_dir, source.openbao_url)?;
+        let credential = InternalCredential::load(
+            source.secrets_dir,
+            source.openbao_url,
+            source.active_root_fingerprint,
+        )?;
         Ok(Self {
             client: VerbClientSource::Internal(credential),
             kv_mount: source.kv_mount.to_string(),

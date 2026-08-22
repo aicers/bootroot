@@ -1959,6 +1959,8 @@ mod internal_factory {
     use crate::registrar::verbs::InternalVerbsSource;
     use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 
+    const ACTIVE_ROOT_FP: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
+
     fn source<'a>(
         secrets_dir: &'a std::path::Path,
         openbao_url: &'a str,
@@ -1969,6 +1971,7 @@ mod internal_factory {
         InternalVerbsSource {
             secrets_dir,
             openbao_url,
+            active_root_fingerprint: ACTIVE_ROOT_FP,
             kv_mount: "secret",
             config,
             secret_id_options: options,
@@ -2019,5 +2022,86 @@ mod internal_factory {
             panic!("an unprovisioned host must be refused");
         };
         assert!(matches!(err, InternalCredentialError::Absent(_)), "{err:?}");
+    }
+}
+
+/// A credential issued under a superseded root makes no request at all.
+#[tokio::test]
+async fn the_factory_returns_repair_required_on_a_root_mismatch() {
+    use tempfile::TempDir;
+    use time::Duration;
+
+    use crate::openbao::SecretIdOptions;
+    use crate::registrar::internal::{
+        AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, InternalPaths, PrivateKeyPem,
+        publish_material, render_internal_agent_config,
+    };
+    use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
+    use crate::registrar::verbs::{InternalVerbsSource, RegistrarVerbs};
+
+    const STORED_ROOT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const ACTIVE_ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    publish_material(
+        &paths,
+        &InternalMaterial {
+            key: PrivateKeyPem::new(
+                "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
+            ),
+            chain: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+            acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+            root_fingerprint: STORED_ROOT.to_string(),
+        },
+    )
+    .await
+    .expect("publish");
+    std::fs::write(
+        paths.ca_bundle(),
+        "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+    )
+    .expect("bundle");
+    std::fs::write(
+        paths.agent_config(),
+        render_internal_agent_config(
+            &paths,
+            &InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: "example.internal",
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: "hmac",
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[STORED_ROOT.to_string()],
+            },
+        ),
+    )
+    .expect("config");
+
+    let (_config_dir, config) = load_fixture(&base_fixture());
+    let options = SecretIdOptions::default();
+    let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+    let Err(err) = RegistrarVerbs::internal(&InternalVerbsSource {
+        secrets_dir: dir.path(),
+        openbao_url: "https://localhost:8200",
+        active_root_fingerprint: ACTIVE_ROOT,
+        kv_mount: "secret",
+        config: &config,
+        secret_id_options: &options,
+        token_ttl: "1h",
+        secret_id_ttl: "24h",
+        wrap_ttl_policy: &policy,
+    }) else {
+        panic!("a superseded root must be refused");
+    };
+    match err {
+        crate::registrar::internal::InternalCredentialError::RepairRequired { stored, active } => {
+            assert_eq!(stored, STORED_ROOT);
+            assert_eq!(active, ACTIVE_ROOT);
+        }
+        other => panic!("{other:?}"),
     }
 }

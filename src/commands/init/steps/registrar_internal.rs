@@ -153,6 +153,15 @@ impl RegistrarInternalContext {
     }
 }
 
+/// The staging directory the internal leaf is issued into.
+///
+/// A sibling of the published names rather than a temporary elsewhere:
+/// the publish is a rename, and a rename is only atomic within one
+/// filesystem.
+pub(crate) fn staging_dir(paths: &InternalPaths) -> PathBuf {
+    paths.dir().join(STAGING_DIR)
+}
+
 /// Everything provisioning needs, all of it already resolved by `init`.
 pub(crate) struct RegistrarInternalInputs<'a> {
     /// The identity's two parts.
@@ -183,6 +192,25 @@ pub(crate) struct StagedInternal {
     fingerprints: Vec<String>,
 }
 
+impl StagedInternal {
+    /// Replaces the trust set the publication writes into the private
+    /// bundle and the config's pins.
+    ///
+    /// `init` publishes the active generation, which is what
+    /// [`issue_internal_material`] staged. A rotation repair does not:
+    /// the mandatory tail after Phase 4 replaces the credential while
+    /// the fleet is still on the *additive* set, and publishing the
+    /// narrowed set there would take this identity off a generation
+    /// everything else still trusts. Applied before publication, so the
+    /// bundle and the config are written once, together, on one set.
+    #[must_use]
+    pub(crate) fn with_trust(mut self, fingerprints: Vec<String>, bundle_pem: String) -> Self {
+        self.fingerprints = fingerprints;
+        self.bundle_pem = bundle_pem;
+        self
+    }
+}
+
 /// Creates the `auth/cert` mount, the exact-allowlist policy and the one
 /// trusted entry, under the init root token.
 ///
@@ -201,8 +229,19 @@ pub(super) async fn provision_internal_auth(
     messages: &Messages,
 ) -> Result<()> {
     // Registered before the write, not after: a failure between the two
-    // must still be undone.
-    rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string());
+    // must still be undone. Each artifact is registered only when this
+    // run is what creates it — a re-run of `init` over an
+    // already-provisioned host must not have its rollback delete the
+    // working entry and policy it found, which is the one way this
+    // teardown could take a healthy deployment down.
+    if client
+        .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+        .await
+        .unwrap_or(None)
+        .is_none()
+    {
+        rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string());
+    }
     if !client
         .policy_exists(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
         .await
@@ -276,7 +315,7 @@ pub(crate) async fn issue_internal_material(
     messages: &Messages,
 ) -> Result<StagedInternal> {
     let paths = InternalPaths::new(inputs.secrets_dir);
-    let staging = paths.dir().join(STAGING_DIR);
+    let staging = staging_dir(&paths);
 
     fs_util::ensure_secrets_dir(&staging)
         .await
@@ -634,6 +673,127 @@ mod tests {
         assert_eq!(
             material_status(&InternalPaths::new(dir.path())),
             MaterialStatus::Absent
+        );
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use bootroot::registrar::internal::{
+        AcmeAccountKey, InternalMaterial, InternalPaths, PrivateKeyPem, load_material,
+    };
+    use tempfile::TempDir;
+
+    use super::{
+        RegistrarInternalContext, RegistrarInternalIntent, StagedInternal, publish_internal_set,
+        staging_dir,
+    };
+    use crate::i18n::test_messages;
+
+    const ACTIVE_ROOT: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
+    const ACTIVE_INT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OLD_ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const OLD_INT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn bundle(label: &str) -> String {
+        format!("-----BEGIN CERTIFICATE-----\n{label}\n-----END CERTIFICATE-----\n")
+    }
+
+    fn context(dir: &std::path::Path) -> RegistrarInternalContext {
+        RegistrarInternalContext {
+            intent: RegistrarInternalIntent {
+                domain: "example.internal".to_string(),
+                host: "bootroot-01".to_string(),
+            },
+            secrets_dir: dir.to_path_buf(),
+            kv_mount: "secret".to_string(),
+            acme_server: "https://localhost:9000/acme/acme/directory".to_string(),
+            email: "ops@example.internal".to_string(),
+            responder_url: "http://127.0.0.1:8080".to_string(),
+            responder_hmac: "hmac".to_string(),
+            eab: None,
+        }
+    }
+
+    fn staged(dir: &std::path::Path) -> StagedInternal {
+        let paths = InternalPaths::new(dir);
+        StagedInternal {
+            staging: staging_dir(&paths),
+            paths,
+            material: InternalMaterial {
+                key: PrivateKeyPem::new(
+                    "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
+                ),
+                chain: bundle("TEVBRg"),
+                acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+                root_fingerprint: ACTIVE_ROOT.to_string(),
+            },
+            bundle_pem: bundle("QUNUSVZF"),
+            fingerprints: vec![ACTIVE_ROOT.to_string(), ACTIVE_INT.to_string()],
+        }
+    }
+
+    /// `init` publishes the active generation: the bundle and the pins
+    /// are what the issuance staged.
+    #[tokio::test]
+    async fn publication_writes_the_staged_trust_set() {
+        let dir = TempDir::new().expect("tempdir");
+        let context = context(dir.path());
+        let staged = staged(dir.path());
+        publish_internal_set(&staged, &context.inputs(), &test_messages())
+            .await
+            .expect("publish");
+
+        let paths = InternalPaths::new(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
+            bundle("QUNUSVZF")
+        );
+        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
+            .expect("the generated config must parse");
+        assert_eq!(
+            settings.trust.trusted_ca_sha256,
+            [ACTIVE_ROOT.to_string(), ACTIVE_INT.to_string()]
+        );
+        let material = load_material(&paths).expect("the published set must load");
+        assert_eq!(material.root_fingerprint, ACTIVE_ROOT);
+    }
+
+    /// A repair overrides the trust set before publishing, so the
+    /// Phase-4 tail replaces the credential while leaving the additive
+    /// set in place. Narrowing here would take this identity off a
+    /// generation the rest of the fleet still trusts.
+    #[tokio::test]
+    async fn a_repair_publishes_the_trust_set_it_was_given() {
+        let dir = TempDir::new().expect("tempdir");
+        let context = context(dir.path());
+        let additive = vec![
+            OLD_ROOT.to_string(),
+            OLD_INT.to_string(),
+            ACTIVE_ROOT.to_string(),
+            ACTIVE_INT.to_string(),
+        ];
+        let staged = staged(dir.path()).with_trust(additive.clone(), bundle("QURESVRJVkU"));
+        publish_internal_set(&staged, &context.inputs(), &test_messages())
+            .await
+            .expect("publish");
+
+        let paths = InternalPaths::new(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
+            bundle("QURESVRJVkU")
+        );
+        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
+            .expect("the generated config must parse");
+        assert_eq!(settings.trust.trusted_ca_sha256, additive);
+        // The credential itself is still replaced: the stored root
+        // fingerprint is the freshly issued one, not a trust-set member
+        // chosen for the bundle.
+        assert_eq!(
+            load_material(&paths)
+                .expect("the published set must load")
+                .root_fingerprint,
+            ACTIVE_ROOT
         );
     }
 }

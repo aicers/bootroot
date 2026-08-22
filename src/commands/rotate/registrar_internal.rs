@@ -189,11 +189,17 @@ pub(super) async fn repair_internal_credential(
 ) -> Result<()> {
     require_root_authority(client).await?;
 
-    let context = repair_context(ctx, client, trust, messages).await?;
+    let context = repair_context(ctx, client).await?;
     let inputs = context.inputs();
 
     converge_internal_auth(client, &inputs, messages).await?;
-    let staged = issue_internal_material(&inputs, messages).await?;
+    // The publication carries `trust`, not the active generation the
+    // issuance staged: the Phase-4 tail replaces the credential while
+    // the fleet is still on the additive set, and a repair mid-rotation
+    // has to restore that same set.
+    let staged = issue_internal_material(&inputs, messages)
+        .await?
+        .with_trust(trust.fingerprints.clone(), trust.bundle_pem.clone());
     publish_internal_set(&staged, &inputs, messages).await?;
     signal_internal_registrar_agent(&context.secrets_dir, messages)
 }
@@ -210,8 +216,6 @@ pub(super) async fn repair_internal_credential(
 async fn repair_context(
     ctx: &RotateContext,
     client: &OpenBaoClient,
-    trust: &InternalTrustState,
-    messages: &Messages,
 ) -> Result<RegistrarInternalContext> {
     let recorded = ctx.state.registrar_endpoint.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -243,8 +247,6 @@ async fn repair_context(
 
     let eab = read_eab(client, &ctx.kv_mount).await?;
 
-    let _ = trust;
-    let _ = messages;
     Ok(RegistrarInternalContext {
         intent,
         secrets_dir,
@@ -460,7 +462,6 @@ pub(super) async fn rotate_registrar_internal_credential(
 
     let trust = trust_state_for_repair(ctx, messages).await?;
     repair_internal_credential(ctx, client, &trust, messages).await?;
-    publish_internal_trust(&secrets_dir, &trust, messages).await?;
     println!("{}", messages.rotate_registrar_internal_complete());
     Ok(())
 }
