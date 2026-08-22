@@ -217,12 +217,17 @@ async fn repair_context(
     ctx: &RotateContext,
     client: &OpenBaoClient,
 ) -> Result<RegistrarInternalContext> {
-    let recorded = ctx.state.registrar_endpoint.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "state.json records no enabled registrar endpoint, so this host has no \
-             bootroot-internal credential to repair"
-        )
-    })?;
+    let recorded = ctx
+        .state
+        .registrar_endpoint
+        .as_ref()
+        .filter(|recorded| recorded.enabled)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "state.json records no enabled registrar endpoint, so this host has no \
+                 bootroot-internal credential to repair"
+            )
+        })?;
     let intent = RegistrarInternalIntent {
         domain: recorded.domain.clone(),
         host: recorded.host.clone(),

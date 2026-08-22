@@ -76,11 +76,18 @@ and the four would drift.
 | File | Holds | Mode |
 | --- | --- | --- |
 | `registrar-internal/key.pem` | the internal leaf's private key | root-owned, `0600` |
-| `registrar-internal/chain.pem` | the leaf and the chain it was issued with | public certificate data |
+| `registrar-internal/chain.pem` | the leaf and the chain it was issued with | root-owned, `0600` |
 | `registrar-internal/acme-account.json` | the persistent ACME account signing key | root-owned, `0600` |
-| `registrar-internal/root-fingerprint` | SHA-256 of the root the `auth/cert` entry trusts | public |
+| `registrar-internal/root-fingerprint` | SHA-256 of the root the `auth/cert` entry trusts | root-owned, `0600` |
 | `registrar-internal/agent.toml` | the dedicated `bootroot-agent` config | root-owned, `0600` |
-| `registrar-internal/ca-bundle.pem` | this identity's **private** CA bundle | public certificate data |
+| `registrar-internal/ca-bundle.pem` | this identity's **private** CA bundle | `0644` |
+
+The chain and the stored fingerprint are public certificate data — they
+are never redacted in a log or an error — but they are still written
+`0600`, because the one process that reads them runs as root and a
+narrower mode costs nothing. The private bundle takes `0644` from
+`fs_util::write_ca_bundle`, the same writer every other bundle goes
+through.
 
 The six are an **all-or-none** set on an endpoint-enabled host. Missing, partial
 or invalid material, config or bundle is a typed failure, never a
