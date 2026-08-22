@@ -174,6 +174,16 @@ grant, no step-ca password or database path, and no grant over the internal
 policy itself. The prefix confinement is what stops the credential from
 authoring a policy under a name it did not derive, or binding a role to one.
 
+`token_no_default_policy` means the table above is the *whole* grant, and one
+consequence is worth stating because it looks like a fault: the minted token
+cannot call `auth/token/lookup-self`. That path is granted by `default`, which
+this token deliberately does not carry, so a `403` there is the mechanism
+working rather than a misconfigured entry. Nothing in bootroot looks this token
+up — the root-authority check in §11 runs against the operator's root token, not
+this one — and `scripts/impl/run-registrar-internal-e2e.sh` asserts the denial
+against a live backend precisely because it is the clearest available proof
+that `default` is absent.
+
 ## 6. Provisioning order
 
 `bootroot init` performs the sequence below on an endpoint-enabled host, entirely

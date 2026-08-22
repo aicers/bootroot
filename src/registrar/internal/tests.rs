@@ -726,3 +726,337 @@ mod authority {
         }
     }
 }
+
+/// Live tier: the `auth/cert` contract, against a real `OpenBao`.
+///
+/// The mocked tests above prove the request *shapes* — which fields go
+/// out, and that no token rides along with the login. They cannot prove
+/// what the backend does with those fields: a misspelt
+/// `allowed_dns_sans`, a `token_no_default_policy` the backend ignores,
+/// or a policy body whose paths do not mean what they look like would
+/// satisfy every one of them and still leave the daemon with a
+/// credential that either cannot log in or can do more than it should.
+/// That is what this tier is for, and it is why it needs a real backend
+/// rather than a second implementation of `OpenBao`'s ACL engine here.
+///
+/// The connection details arrive on the environment from
+/// `scripts/impl/run-registrar-internal-e2e.sh` and are read, never
+/// written.
+///
+/// Server trust and client trust are separate anchors here, exactly as
+/// they are in a deployment: the scenario's `OpenBao` serves its own dev
+/// TLS certificate, while the leaves these tests present are signed by a
+/// CA the test mints and registers in the entry.
+mod live {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{DOMAIN, HOST, ROOT_FP, account_json};
+    use crate::openbao::OpenBaoClient;
+    use crate::registrar::internal::{
+        AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredential, InternalMaterial,
+        PrivateKeyPem, build_registrar_internal_policy,
+    };
+    use crate::registrar::{registrar_endpoint_identity, registrar_internal_identity};
+
+    /// Environment variable naming the live `OpenBao`'s HTTPS URL.
+    const ENV_URL: &str = "BOOTROOT_INTERNAL_TEST_OPENBAO_URL";
+    /// Environment variable carrying that `OpenBao`'s privileged token.
+    const ENV_TOKEN: &str = "BOOTROOT_INTERNAL_TEST_OPENBAO_TOKEN";
+    /// Environment variable naming the PEM that verifies its **server**
+    /// certificate. Unrelated to the CA the entry trusts.
+    const ENV_SERVER_CA: &str = "BOOTROOT_INTERNAL_TEST_SERVER_CA";
+    /// Environment variable naming the KV v2 mount the policy is scoped
+    /// to.
+    const ENV_KV_MOUNT: &str = "BOOTROOT_INTERNAL_TEST_KV_MOUNT";
+
+    /// A policy body a derived per-registration write can carry. Its
+    /// contents are irrelevant: what is under test is whether the ACL
+    /// engine lets the write happen at all.
+    const TRIVIAL_POLICY: &str = "path \"secret/data/nothing\" {\n  capabilities = [\"read\"]\n}\n";
+
+    /// The scenario's backend, read out of the environment once per test.
+    struct LiveBackend {
+        url: String,
+        token: String,
+        server_ca_pem: String,
+        kv_mount: String,
+    }
+
+    impl LiveBackend {
+        fn from_env() -> Self {
+            let read = |name: &str| {
+                std::env::var(name).unwrap_or_else(|_| {
+                    panic!("{name} must be set; run scripts/impl/run-registrar-internal-e2e.sh")
+                })
+            };
+            let ca_path = read(ENV_SERVER_CA);
+            Self {
+                url: read(ENV_URL),
+                token: read(ENV_TOKEN),
+                server_ca_pem: std::fs::read_to_string(&ca_path)
+                    .unwrap_or_else(|err| panic!("reading the server CA at {ca_path}: {err}")),
+                kv_mount: read(ENV_KV_MOUNT),
+            }
+        }
+
+        /// A root-token client over the ordinary token-authenticated
+        /// transport: server trust only, no client certificate.
+        fn root_client(&self) -> OpenBaoClient {
+            let http = crate::tls::build_http_client_from_pem(&self.server_ca_pem, &[])
+                .expect("a server-trusting transport");
+            let mut client = OpenBaoClient::with_client(&self.url, http);
+            client.set_token(self.token.clone());
+            client
+        }
+
+        /// A client-authenticated transport presenting `material`.
+        fn cert_client(&self, material: &InternalMaterial) -> OpenBaoClient {
+            let http = crate::tls::build_http_client_with_identity(
+                &self.server_ca_pem,
+                &material.chain,
+                material.key.expose(),
+            )
+            .expect("a client-authenticated transport");
+            OpenBaoClient::with_client(&self.url, http)
+        }
+
+        /// Mounts `auth/cert` if needed and writes one entry trusting
+        /// `ca`, bound to the fixed internal SAN, carrying one freshly
+        /// written copy of the real policy body.
+        ///
+        /// Returns the policy's name, for a caller that needs to name
+        /// it again.
+        async fn provision_entry(&self, ca: &TestCa, entry: &str) -> String {
+            let root = self.root_client();
+            root.ensure_cert_auth(CERT_AUTH_MOUNT)
+                .await
+                .expect("the cert backend must mount");
+            let policy = unique("bootroot-internal-policy");
+            root.write_policy(&policy, &build_registrar_internal_policy(&self.kv_mount))
+                .await
+                .expect("the policy must be written");
+            root.write_cert_auth_entry(
+                CERT_AUTH_MOUNT,
+                entry,
+                &ca.pem,
+                &registrar_internal_identity(HOST, DOMAIN),
+                &[policy.as_str()],
+                "1h",
+            )
+            .await
+            .expect("the entry must be written");
+            policy
+        }
+    }
+
+    /// Discriminates one test's `OpenBao` artifacts from another's, so
+    /// the tests can run in parallel against one backend.
+    fn unique(prefix: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{}-{n}", std::process::id())
+    }
+
+    /// One CA, and the leaves signed under it.
+    struct TestCa {
+        pem: String,
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+    }
+
+    impl TestCa {
+        fn new() -> Self {
+            let key = rcgen::KeyPair::generate().expect("ca key");
+            let mut params = rcgen::CertificateParams::new(vec!["bootroot-test-ca".to_string()])
+                .expect("params");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let cert = params.self_signed(&key).expect("self-signed ca");
+            Self {
+                pem: cert.pem(),
+                params,
+                key,
+            }
+        }
+
+        /// Material carrying a leaf whose only DNS SAN is `san`.
+        fn leaf(&self, san: &str) -> InternalMaterial {
+            let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+            let leaf_params =
+                rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
+            let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+            let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
+            InternalMaterial {
+                key: PrivateKeyPem::new(leaf_key.serialize_pem()),
+                chain: format!("{}{}", leaf.pem(), self.pem),
+                acme_account: AcmeAccountKey::new(account_json()),
+                root_fingerprint: ROOT_FP.to_string(),
+            }
+        }
+    }
+
+    /// The credential type itself authenticates at the **fixed** entry
+    /// name, over TLS, with no `role_id` and no `secret_id` anywhere —
+    /// the acceptance criterion, end to end against a real backend.
+    ///
+    /// The one test that uses [`CERT_AUTH_ROLE`]; the rest name their
+    /// own entries so they can run beside it.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn the_credential_logs_in_at_the_fixed_entry() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        backend.provision_entry(&ca, CERT_AUTH_ROLE).await;
+
+        let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        let credential =
+            InternalCredential::from_parts(&backend.url, &material, &backend.server_ca_pem)
+                .expect("the credential must build over the scenario's server trust");
+        let client = credential
+            .authenticated()
+            .await
+            .expect("the certificate login must succeed");
+        // Live, not merely issued: the token carries out an operation
+        // the allowlist grants.
+        client
+            .write_policy(&unique("bootroot-service-fixed"), TRIVIAL_POLICY)
+            .await
+            .expect("the minted token must carry the derived-policy grant");
+
+        // The cached login serves the second acquisition too: the lease
+        // window has barely opened, so no second login is made.
+        credential
+            .authenticated()
+            .await
+            .expect("the cached login must still serve");
+    }
+
+    /// The entry accepts the one fixed SAN and nothing else.
+    ///
+    /// The refused leaves carry the deployment's *other* registrar name
+    /// and an ordinary service name, and both are signed by the very CA
+    /// the entry trusts — so what is proved is that the SAN allowlist is
+    /// doing the work, not the chain check.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn the_entry_accepts_only_the_fixed_internal_san() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let entry = unique("internal-san");
+        backend.provision_entry(&ca, &entry).await;
+
+        backend
+            .cert_client(&ca.leaf(&registrar_internal_identity(HOST, DOMAIN)))
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the fixed internal SAN must authenticate");
+
+        for refused in [
+            registrar_endpoint_identity("001", HOST, DOMAIN),
+            format!("001.piglet.{HOST}.{DOMAIN}"),
+        ] {
+            let err = backend
+                .cert_client(&ca.leaf(&refused))
+                .login_cert(CERT_AUTH_MOUNT, &entry)
+                .await
+                .expect_err("only the fixed internal SAN may authenticate");
+            assert!(
+                format!("{err:#}").contains("OpenBao API error"),
+                "{refused}: {err:#}"
+            );
+        }
+    }
+
+    /// `token_no_default_policy` is not decoration: without it the
+    /// minted token would also carry `default`, and the exact allowlist
+    /// is only exact if it is the whole grant.
+    ///
+    /// The proof is `auth/token/lookup-self`. Nothing in the allowlist
+    /// grants it and `default` does, so a token that could look itself
+    /// up would be a token carrying `default` — and a token that cannot,
+    /// while still exercising an allowlisted path, is one carrying the
+    /// allowlist and nothing else. Reading the policy list back would be
+    /// the weaker check: it needs the very grant whose absence is the
+    /// point.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn the_minted_token_carries_the_allowlist_and_nothing_else() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let entry = unique("internal-policies");
+        backend.provision_entry(&ca, &entry).await;
+
+        let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        let mut client = backend.cert_client(&material);
+        let login = client
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the login must succeed");
+        client.set_token(login.client_token);
+
+        let err = client
+            .token_self_policies()
+            .await
+            .expect_err("`default` grants lookup-self, and this token must not carry it");
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+
+        // The same token still does what the allowlist grants, so the
+        // refusal above is the absence of `default` rather than a token
+        // that never worked.
+        client
+            .write_policy(&unique("bootroot-service-nodefault"), TRIVIAL_POLICY)
+            .await
+            .expect("the minted token must carry the derived-policy grant");
+    }
+
+    /// The policy body means, to the real ACL engine, what it is meant
+    /// to mean: the derived per-registration prefix and the deployment
+    /// reads, and nothing beyond them.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn the_policy_permits_the_verb_paths_and_denies_the_rest() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let entry = unique("internal-acl");
+        backend.provision_entry(&ca, &entry).await;
+
+        let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        let mut client = backend.cert_client(&material);
+        let login = client
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the login must succeed");
+        client.set_token(login.client_token);
+
+        // Permitted: a derived per-registration policy, under the
+        // confined prefix the verbs write beneath.
+        let derived = unique("bootroot-service-live");
+        client
+            .write_policy(&derived, TRIVIAL_POLICY)
+            .await
+            .expect("the derived per-registration policy must be writable");
+
+        // Denied: the same operation just outside that prefix.
+        let err = client
+            .write_policy(&unique("bootroot-elsewhere"), TRIVIAL_POLICY)
+            .await
+            .expect_err("a policy outside the derived prefix must be denied");
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
+
+        // Permitted: the CA trust record. It is absent on this
+        // scenario's backend, so the answer is "not found" rather than
+        // "denied" — which is exactly the distinction being asserted.
+        client
+            .try_read_kv(&backend.kv_mount, "bootroot/ca")
+            .await
+            .expect("the CA trust record must be readable");
+
+        // Denied: the CA core secrets a verb has no business reading.
+        for denied in ["bootroot/stepca/password", "bootroot/stepca/db_admin"] {
+            let err = client
+                .try_read_kv(&backend.kv_mount, denied)
+                .await
+                .expect_err("a path outside the allowlist must be denied");
+            assert!(format!("{err:#}").contains("403"), "{denied}: {err:#}");
+        }
+    }
+}

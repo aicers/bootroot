@@ -268,6 +268,15 @@ fn is_not_found(status: StatusCode, text: &str) -> bool {
         || (status == StatusCode::BAD_REQUEST && text.contains("No secret engine mount"))
 }
 
+/// Whether an enable-mount response says the mount is already there.
+///
+/// `OpenBao` answers 400 rather than a conflict status, so the body is
+/// what distinguishes "someone else mounted it first" from a real
+/// rejection.
+fn is_mount_already_in_use(status: StatusCode, text: &str) -> bool {
+    status == StatusCode::BAD_REQUEST && text.contains("path is already in use")
+}
+
 impl OpenBaoClient {
     /// Creates a new `OpenBao` client targeting the provided base URL.
     ///
@@ -1195,9 +1204,17 @@ impl OpenBaoClient {
     /// enabled the mount must be able to disable it again, while one
     /// that found it already there must leave it alone.
     ///
+    /// The check and the enable cannot be one operation, so something
+    /// else can mount the backend in between. That is not a failure —
+    /// the postcondition is "mounted", and it holds — so the lost race
+    /// converges to `false`: the mount is there, and this call is not
+    /// what put it there, which is exactly what a rollback needs to be
+    /// told.
+    ///
     /// # Errors
-    /// Returns an error if auth backends cannot be queried or enabling
-    /// `cert` fails.
+    /// Returns an error if auth backends cannot be queried, or if
+    /// enabling `cert` fails for any reason other than its already being
+    /// mounted.
     pub async fn ensure_cert_auth(&self, mount: &str) -> Result<bool> {
         #[derive(Serialize)]
         struct AuthRequest<'a> {
@@ -1213,12 +1230,27 @@ impl OpenBaoClient {
         if present {
             return Ok(false);
         }
-        self.post_action(
-            &format!("sys/auth/{mount}"),
-            &AuthRequest { auth_type: "cert" },
-        )
-        .await?;
-        Ok(true)
+        let path = format!("sys/auth/{mount}");
+        let response = self
+            .send_authed_json(
+                Method::POST,
+                &path,
+                &AuthRequest { auth_type: "cert" },
+                None,
+            )
+            .await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if status.is_success() {
+            return Ok(true);
+        }
+        if is_mount_already_in_use(status, &text) {
+            return Ok(false);
+        }
+        anyhow::bail!("OpenBao response failed: {path}: ({status}): {text}")
     }
 
     /// Disables an auth backend mount.
@@ -2492,6 +2524,63 @@ mod cert_auth_tests {
                 .await
                 .expect("already mounted")
         );
+    }
+
+    /// The check and the enable are two requests, so another actor can
+    /// mount the backend in between. The postcondition — that `cert` is
+    /// mounted — still holds, so the lost race converges to `false`
+    /// rather than aborting a provisioning run: the mount is there, and
+    /// this call is not what put it there, which is what a rollback has
+    /// to be told so it leaves the backend alone.
+    #[tokio::test]
+    async fn a_lost_mount_race_converges_rather_than_failing() {
+        let server = MockServer::start().await;
+        // The listing this call sees is the one taken before the other
+        // actor mounted it.
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "approle/": { "type": "approle" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "errors": ["path is already in use at cert/"]
+            })))
+            .mount(&server)
+            .await;
+        assert!(
+            !root_client(&server)
+                .ensure_cert_auth(MOUNT)
+                .await
+                .expect("a lost race is not a failure")
+        );
+    }
+
+    /// Any other rejection is still a failure: only the already-mounted
+    /// body is tolerated, so a genuine refusal is not read as success.
+    #[tokio::test]
+    async fn another_enable_rejection_still_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "errors": ["permission denied"]
+            })))
+            .mount(&server)
+            .await;
+        let err = root_client(&server)
+            .ensure_cert_auth(MOUNT)
+            .await
+            .expect_err("a refused enable must fail");
+        assert!(format!("{err:#}").contains("403"), "{err:#}");
     }
 
     /// The login carries no bearer token: the credential is the TLS

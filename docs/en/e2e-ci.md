@@ -92,6 +92,7 @@ Primary scripts:
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
 - `scripts/impl/run-registrar-verbs-e2e.sh`
+- `scripts/impl/run-registrar-internal-e2e.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -104,12 +105,24 @@ themselves, and every teardown and leftover check is scoped to those exact
 names — they are safe to run on a host that already has a default `bootroot`
 install.
 
-`run-registrar-verbs-e2e.sh` is outside that discussion entirely: it stands a
+The two registrar scenarios are outside that discussion entirely: each stands a
 single OpenBao container up on a free loopback port and needs no compose
-project, no secrets wiring and none of the bootroot binaries. It is the gate
-for the `#[ignore]`d `registrar::verbs::tests` library tests, which it runs
-with the container's URL, token and KV mount passed in on the child process's
-environment.
+project, no secrets wiring and none of the bootroot binaries.
+`run-registrar-verbs-e2e.sh` is the gate for the `#[ignore]`d
+`registrar::verbs::tests` library tests, and `run-registrar-internal-e2e.sh`
+for the `#[ignore]`d `registrar::internal::tests::live` ones. Both pass the
+container's connection details in on the child process's environment.
+
+The internal-credential scenario differs in one respect: its container serves
+TLS. `auth/cert` authenticates a *client certificate*, so there has to be a
+handshake to present one in. The container generates its own server
+certificate into a mounted directory (`-dev-tls`), which keeps the two trust
+anchors as separate as they are in a deployment — that certificate's CA
+verifies the server, and a CA each test mints is what the `auth/cert` entry
+trusts for clients. Those tests assert what a mock cannot: that the SAN
+allowlist really refuses the deployment's other registrar names, that
+`token_no_default_policy` really keeps `default` off the minted token, and
+that the policy body means to the real ACL engine what it looks like it means.
 
 ### Two lifecycle runs can share a host
 

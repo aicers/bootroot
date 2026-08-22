@@ -474,6 +474,10 @@ jobs:
             script: run-registrar-verbs-e2e.sh
             resolution: ""
             artifact: ci-registrar-verbs
+          - label: registrar-internal
+            script: run-registrar-internal-e2e.sh
+            resolution: ""
+            artifact: ci-registrar-internal
     steps:
       - uses: actions/checkout@v7
 
@@ -490,7 +494,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -657,6 +661,26 @@ jobs:
           ARTIFACT_DIR="$ARTIFACT_DIR" \
           ./scripts/impl/run-registrar-verbs-e2e.sh || {
             echo "registrar-verbs failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
+            [ -f "$ARTIFACT_DIR/openbao.log" ] && tail -n 200 "$ARTIFACT_DIR/openbao.log" || true
+            exit 1
+          }
+
+      - name: Run E2E scenario (registrar internal credential)
+        if: matrix.scenario.label == 'registrar-internal'
+        # Like the verbs arm, this stands its own single OpenBao up on a
+        # free loopback port and needs no compose project and none of the
+        # bootroot binaries — but it serves TLS, because `auth/cert`
+        # authenticates a client certificate and there has to be a
+        # handshake to present it in. It is the gate for the ignored
+        # `registrar::internal::tests::live` library tests.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          ./scripts/impl/run-registrar-internal-e2e.sh || {
+            echo "registrar-internal failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
             [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
