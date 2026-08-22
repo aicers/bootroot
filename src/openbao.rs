@@ -208,6 +208,57 @@ struct TokenCreateResponse {
     auth: AppRoleAuth,
 }
 
+/// The `auth/cert/login` response envelope.
+///
+/// `lease_duration` is what a certificate-authenticated client refreshes
+/// against: the backend decides the token's lifetime, so the client
+/// never assumes one.
+#[derive(Debug, Deserialize)]
+struct CertLoginResponse {
+    auth: CertAuth,
+}
+
+#[derive(Debug, Deserialize)]
+struct CertAuth {
+    client_token: String,
+    #[serde(default)]
+    lease_duration: u64,
+}
+
+/// The `auth/token/lookup-self` response envelope, narrowed to the one
+/// field an authority check reads.
+#[derive(Debug, Deserialize)]
+struct TokenLookupResponse {
+    data: TokenLookupData,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenLookupData {
+    #[serde(default)]
+    policies: Vec<String>,
+}
+
+/// A certificate login's result: the token and the lifetime `OpenBao`
+/// granted it.
+///
+/// The token is not `Debug`-printed anywhere: callers wrap it in a
+/// redacting newtype at the boundary it enters the program.
+pub struct CertLogin {
+    /// The issued client token.
+    pub client_token: String,
+    /// The token's lease duration in seconds, as reported by `OpenBao`.
+    pub lease_duration_secs: u64,
+}
+
+impl std::fmt::Debug for CertLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertLogin")
+            .field("client_token", &"<redacted>")
+            .field("lease_duration_secs", &self.lease_duration_secs)
+            .finish()
+    }
+}
+
 /// Checks whether a response status and body indicate a missing resource.
 ///
 /// `OpenBao` returns 404 for most missing resources but some endpoints
@@ -1135,6 +1186,186 @@ impl OpenBaoClient {
         Self::parse_response(response)
             .await
             .with_context(|| format!("OpenBao response parse failed: {path}"))
+    }
+
+    /// Ensures the `cert` auth backend is mounted, and reports whether
+    /// this call is what mounted it.
+    ///
+    /// The boolean is the rollback signal: a provisioning run that
+    /// enabled the mount must be able to disable it again, while one
+    /// that found it already there must leave it alone.
+    ///
+    /// # Errors
+    /// Returns an error if auth backends cannot be queried or enabling
+    /// `cert` fails.
+    pub async fn ensure_cert_auth(&self, mount: &str) -> Result<bool> {
+        #[derive(Serialize)]
+        struct AuthRequest<'a> {
+            #[serde(rename = "type")]
+            auth_type: &'a str,
+        }
+        let auths: AuthListResponse = self.get_json("sys/auth", true, None).await?;
+        let prefix = format!("{mount}/");
+        let present = auths
+            .data
+            .as_object()
+            .is_some_and(|map| map.keys().any(|key| key == &prefix));
+        if present {
+            return Ok(false);
+        }
+        self.post_action(
+            &format!("sys/auth/{mount}"),
+            &AuthRequest { auth_type: "cert" },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Disables an auth backend mount.
+    ///
+    /// # Errors
+    /// Returns an error if the disable request fails.
+    pub async fn disable_auth(&self, mount: &str) -> Result<()> {
+        self.delete_action(&format!("sys/auth/{mount}")).await
+    }
+
+    /// Creates or converges the one trusted `auth/cert` entry.
+    ///
+    /// `ca_pem` is the deployment root the entry trusts, `allowed_dns`
+    /// the single DNS SAN it accepts, and `policies` the exact token
+    /// policy set. `token_no_default_policy` is set, so the issued token
+    /// carries the allowlist and nothing else.
+    ///
+    /// # Errors
+    /// Returns an error if the entry cannot be written.
+    pub async fn write_cert_auth_entry(
+        &self,
+        mount: &str,
+        name: &str,
+        ca_pem: &str,
+        allowed_dns: &str,
+        policies: &[&str],
+        token_ttl: &str,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct CertEntryRequest<'a> {
+            certificate: &'a str,
+            allowed_dns_sans: &'a str,
+            token_policies: &'a [&'a str],
+            token_no_default_policy: bool,
+            token_ttl: &'a str,
+            token_max_ttl: &'a str,
+            display_name: &'a str,
+        }
+        self.post_action(
+            &format!("auth/{mount}/certs/{name}"),
+            &CertEntryRequest {
+                certificate: ca_pem,
+                allowed_dns_sans: allowed_dns,
+                token_policies: policies,
+                token_no_default_policy: true,
+                token_ttl,
+                token_max_ttl: token_ttl,
+                display_name: name,
+            },
+        )
+        .await
+    }
+
+    /// Reads back one `auth/cert` entry's configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails for reasons other than a
+    /// clean not-found.
+    pub async fn read_cert_auth_entry(
+        &self,
+        mount: &str,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let path = format!("auth/{mount}/certs/{name}");
+        let response = self.send_authed(Method::GET, &path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if is_not_found(status, &text) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).context("Failed to parse OpenBao response")?;
+        Ok(parsed.get("data").cloned())
+    }
+
+    /// Deletes one `auth/cert` entry.
+    ///
+    /// # Errors
+    /// Returns an error if the delete request fails.
+    pub async fn delete_cert_auth_entry(&self, mount: &str, name: &str) -> Result<()> {
+        self.delete_action(&format!("auth/{mount}/certs/{name}"))
+            .await
+    }
+
+    /// Authenticates with the client certificate this client presents.
+    ///
+    /// No token is required to make this call and none is sent: the
+    /// credential is the TLS client certificate itself, which is why
+    /// this is the one login in the crate that reads neither a `role_id`
+    /// nor a `secret_id`.
+    ///
+    /// # Errors
+    /// Returns an error if the login request fails or `OpenBao` rejects
+    /// the presented certificate.
+    pub async fn login_cert(&self, mount: &str, name: &str) -> Result<CertLogin> {
+        #[derive(Serialize)]
+        struct CertLoginRequest<'a> {
+            name: &'a str,
+        }
+        let path = format!("auth/{mount}/login");
+        let request = self
+            .request_builder(Method::POST, &path)
+            .json(&CertLoginRequest { name });
+        let response = self.send_request(request, &path).await?;
+        let parsed: CertLoginResponse = Self::parse_response(response)
+            .await
+            .with_context(|| format!("OpenBao certificate login failed: {path}"))?;
+        Ok(CertLogin {
+            client_token: parsed.auth.client_token,
+            lease_duration_secs: parsed.auth.lease_duration,
+        })
+    }
+
+    /// Returns the policies the currently-set token carries.
+    ///
+    /// The authority check every mutation of the internal credential
+    /// runs first: a token that does not carry `root` is refused before
+    /// anything is written, rather than discovered half-way through by a
+    /// 403.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
+    pub async fn token_self_policies(&self) -> Result<Vec<String>> {
+        let parsed: TokenLookupResponse = self
+            .get_json("auth/token/lookup-self", true, None)
+            .await
+            .context("OpenBao token self-lookup failed")?;
+        Ok(parsed.data.policies)
+    }
+
+    /// Reports whether the currently-set token carries the `root`
+    /// policy.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails.
+    pub async fn token_has_root_policy(&self) -> Result<bool> {
+        Ok(self
+            .token_self_policies()
+            .await?
+            .iter()
+            .any(|policy| policy == ROOT_POLICY))
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -2155,5 +2386,141 @@ mod timeout_tests {
             elapsed <= crate::tls::OPENBAO_REQUEST_TIMEOUT + Duration::from_secs(1),
             "read should time out within the request bound, took {elapsed:?}"
         );
+    }
+}
+
+/// The `auth/cert` surface the bootroot-internal registrar credential
+/// authenticates through.
+#[cfg(test)]
+mod cert_auth_tests {
+    use serde_json::json;
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    use super::{OpenBaoClient, VAULT_TOKEN_HEADER};
+
+    const MOUNT: &str = "cert";
+    const ENTRY: &str = "bootroot-registrar-internal";
+    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
+    const SAN: &str = "001.bootroot-registrar-internal.h1.example.internal";
+
+    fn root_client(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        client
+    }
+
+    /// The entry binds the deployment root, the one fixed SAN and the
+    /// one exact-allowlist policy — and nothing else. `token_no_default_policy`
+    /// is what keeps the issued token off `default`, so the allowlist
+    /// really is the whole grant.
+    #[tokio::test]
+    async fn the_entry_binds_the_root_the_san_and_one_policy() {
+        let server = MockServer::start().await;
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&captured);
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/{MOUNT}/certs/{ENTRY}")))
+            .respond_with(move |request: &Request| {
+                *sink.lock().expect("capture") =
+                    Some(serde_json::from_slice::<serde_json::Value>(&request.body).expect("json"));
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+
+        root_client(&server)
+            .write_cert_auth_entry(MOUNT, ENTRY, ROOT_PEM, SAN, &[ENTRY], "1h")
+            .await
+            .expect("the entry must be written");
+
+        let body = captured.lock().expect("capture").clone().expect("a body");
+        assert_eq!(body["certificate"], ROOT_PEM);
+        assert_eq!(body["allowed_dns_sans"], SAN);
+        assert_eq!(body["token_policies"], json!([ENTRY]));
+        assert_eq!(body["token_no_default_policy"], json!(true));
+        assert_eq!(body["token_ttl"], "1h");
+        assert_eq!(body["token_max_ttl"], "1h");
+        // Nothing that would widen the entry beyond the one name.
+        for widened in [
+            "allowed_common_names",
+            "allowed_organizational_units",
+            "allowed_uri_sans",
+            "allowed_email_sans",
+            "required_extensions",
+        ] {
+            assert!(body.get(widened).is_none(), "{widened}");
+        }
+    }
+
+    /// The mount is enabled only when it is absent, and the return value
+    /// is what tells a rollback whether it may disable it again.
+    #[tokio::test]
+    async fn the_mount_is_enabled_only_when_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "approle/": { "type": "approle" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            root_client(&server)
+                .ensure_cert_auth(MOUNT)
+                .await
+                .expect("enable")
+        );
+
+        let present = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "cert/": { "type": "cert" } }
+            })))
+            .mount(&present)
+            .await;
+        assert!(
+            !root_client(&present)
+                .ensure_cert_auth(MOUNT)
+                .await
+                .expect("already mounted")
+        );
+    }
+
+    /// The login carries no bearer token: the credential is the TLS
+    /// client certificate, and sending a token here would defeat the
+    /// point of the whole mechanism.
+    #[tokio::test]
+    async fn the_certificate_login_sends_no_token_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/{MOUNT}/login")))
+            .and(header_exists(VAULT_TOKEN_HEADER))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/{MOUNT}/login")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": "s.tok", "lease_duration": 900 }
+            })))
+            .mount(&server)
+            .await;
+
+        // A client that *does* hold a token still must not send it.
+        let login = root_client(&server)
+            .login_cert(MOUNT, ENTRY)
+            .await
+            .expect("certificate login");
+        assert_eq!(login.client_token, "s.tok");
+        assert_eq!(login.lease_duration_secs, 900);
+        assert!(!format!("{login:?}").contains("s.tok"));
     }
 }

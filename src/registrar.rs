@@ -52,7 +52,12 @@
 //!   with;
 //! - the **endpoint server identity**, [`REGISTRAR_ENDPOINT_LABEL`], is
 //!   the leaf the daemon's endpoint presents, and the name a client pins
-//!   ([`endpoint_pin`]).
+//!   ([`endpoint_pin`]);
+//! - the **bootroot-internal identity**, [`REGISTRAR_INTERNAL_LABEL`],
+//!   is the leaf bootroot's own daemon authenticates to `OpenBao` with
+//!   at `auth/cert` in order to run the verbs ([`internal`]). It is the
+//!   one name of the three that never crosses a wire a caller can
+//!   reach.
 //!
 //! Those items are `pub` on purpose. `service add` lives in the binary
 //! crate and reaches the reserved-prefix guard through
@@ -68,6 +73,7 @@ pub mod endpoint_pin;
 pub mod error;
 pub mod fixture;
 pub mod identity;
+pub mod internal;
 pub(crate) mod verbs;
 
 #[cfg(test)]
@@ -103,6 +109,24 @@ pub const REGISTRAR_CLIENT_LABEL: &str = "bootroot-registrar";
 /// The reserved second label of the host-local endpoint's server
 /// identity.
 pub const REGISTRAR_ENDPOINT_LABEL: &str = "bootroot-registrar-endpoint";
+
+/// The reserved second label of the bootroot-internal privileged
+/// identity.
+///
+/// This is the leaf bootroot's own daemon presents to `OpenBao` at
+/// `auth/cert`, and the only name the deployment's trusted auth entry
+/// accepts. Unlike the two names above it never appears on a
+/// caller-facing wire: nothing outside this process reads it, and no
+/// request selects it.
+pub const REGISTRAR_INTERNAL_LABEL: &str = "bootroot-registrar-internal";
+
+/// The one instance the bootroot-internal identity is ever composed at.
+///
+/// There is exactly one internal credential per bootroot host, so the
+/// instance label is fixed rather than derived. Spelled as a constant so
+/// the SAN composed at provisioning time and the SAN the auth entry
+/// allows cannot drift.
+const REGISTRAR_INTERNAL_INSTANCE: u32 = 1;
 
 /// Number of labels a registrar identity carries in front of the
 /// configured domain suffix: instance, reserved service label, host.
@@ -150,6 +174,24 @@ pub fn registrar_client_identity(instance: &str, host: &str, domain: &str) -> St
 #[must_use]
 pub fn registrar_endpoint_identity(instance: &str, host: &str, domain: &str) -> String {
     format!("{instance}.{REGISTRAR_ENDPOINT_LABEL}.{host}.{domain}")
+}
+
+/// Composes the bootroot-internal identity name
+/// `001.bootroot-registrar-internal.<host>.<domain>`.
+///
+/// Built through [`compose_san`], the same composition every ordinary
+/// service leaf goes through, so the internal identity is a name of the
+/// deployment's own shape rather than a second naming scheme. `domain`
+/// is the configured `network.domain` and is a *suffix* of whatever
+/// label count it was configured with, not a single label.
+#[must_use]
+pub fn registrar_internal_identity(host: &str, domain: &str) -> String {
+    compose_san(
+        Some(REGISTRAR_INTERNAL_INSTANCE),
+        REGISTRAR_INTERNAL_LABEL,
+        host,
+        domain,
+    )
 }
 
 /// Why a presented certificate does not carry the one DNS SAN both

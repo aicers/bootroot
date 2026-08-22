@@ -1,0 +1,639 @@
+//! Provisioning the bootroot-internal privileged credential, inside
+//! `init`'s existing rollback transaction.
+//!
+//! The order below is a correctness requirement, not a preference:
+//!
+//! 1. **Prerequisites.** `OpenBao` is bootstrapped, step-ca is
+//!    initialized and the agent EAB (if the deployment has one) has been
+//!    acquired. Nothing here runs before them, because the leaf is
+//!    issued through the ordinary outbound ACME path to step-ca and the
+//!    `auth/cert` entry trusts the deployment root those steps created.
+//! 2. **Authority.** Under the init root token: enable `auth/cert` if it
+//!    is absent, write the exact-allowlist policy, and create the one
+//!    trusted entry.
+//! 3. **Material.** Under the same root token: create or load the
+//!    persistent ACME account key and issue the internal leaf — into a
+//!    staging directory, so nothing is published yet.
+//! 4. **Listener.** The existing `OpenBao` TLS transition runs, and the
+//!    HTTPS URL is recorded.
+//! 5. **Proof.** A real `auth/cert/login` over that HTTPS URL, with the
+//!    staged material, must succeed.
+//! 6. **Publication.** Only then are the four credential files, the
+//!    dedicated config and the private CA bundle moved into place.
+//!
+//! Every step registers its undo with [`InitRollback`] *before* it acts,
+//! so a failure at any point restores the prior listener, the prior
+//! state URL, the `OpenBao` artifacts this run created, and leaves no
+//! file behind. A host whose endpoint predicate is false performs none
+//! of it.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use bootroot::openbao::OpenBaoClient;
+use bootroot::registrar::internal::{
+    AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalAgentConfigParams, InternalCredential,
+    InternalMaterial, InternalPaths, PrivateKeyPem, build_registrar_internal_policy,
+    internal_registration_id, publish_material, render_internal_agent_config,
+};
+use bootroot::registrar::registrar_internal_identity;
+use bootroot::{cert_group, config, fs_util};
+
+use super::InitRollback;
+use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
+use crate::commands::init::constants::openbao_constants::{
+    POLICY_BOOTROOT_REGISTRAR_INTERNAL, TOKEN_TTL,
+};
+use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
+use crate::i18n::Messages;
+use crate::state::StateFile;
+
+/// The staging directory the leaf is issued into before it is proven and
+/// published.
+///
+/// A sibling of the published names rather than a temporary elsewhere:
+/// the publish is a rename, and a rename is only atomic within one
+/// filesystem.
+const STAGING_DIR: &str = ".staging";
+
+/// The bootroot-internal identity's two parts, taken from the recorded
+/// endpoint predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegistrarInternalIntent {
+    /// The deployment domain the SAN is composed under.
+    pub(crate) domain: String,
+    /// The host label the SAN is composed with.
+    pub(crate) host: String,
+}
+
+impl RegistrarInternalIntent {
+    /// The one SAN this host's internal credential ever carries.
+    pub(crate) fn san(&self) -> String {
+        registrar_internal_identity(&self.host, &self.domain)
+    }
+}
+
+/// Consumes the registrar endpoint-enablement predicate recorded in
+/// `state.json`.
+///
+/// **This issue consumes the predicate; it does not define, store or
+/// switch it.** An absent or disabled entry means the endpoint is off,
+/// and `init` then alters no listener and creates no internal artifact.
+///
+/// # Errors
+///
+/// Returns an error when the state file exists but cannot be read or
+/// parsed, or when an enabled entry names an empty host or domain — a
+/// SAN cannot be composed from either, and guessing one would compose a
+/// name the deployment's CA never issues.
+pub(crate) fn registrar_endpoint_intent(
+    state_path: &Path,
+) -> Result<Option<RegistrarInternalIntent>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let state = StateFile::load(state_path)?;
+    let Some(recorded) = state.registrar_endpoint else {
+        return Ok(None);
+    };
+    if !recorded.enabled {
+        return Ok(None);
+    }
+    if recorded.host.trim().is_empty() || recorded.domain.trim().is_empty() {
+        anyhow::bail!(
+            "state.json enables the registrar endpoint but records an empty \
+             `registrar_endpoint.host` or `registrar_endpoint.domain`; the \
+             bootroot-internal SAN cannot be composed without both"
+        );
+    }
+    Ok(Some(RegistrarInternalIntent {
+        domain: recorded.domain,
+        host: recorded.host,
+    }))
+}
+
+/// The owned form of [`RegistrarInternalInputs`], built once by `init`
+/// and borrowed at each of the two provisioning stages.
+///
+/// Owned because the two stages sit on either side of the `OpenBao` TLS
+/// transition, and the values they share — the responder HMAC, the EAB
+/// — are consumed by unrelated `init` steps in between.
+pub(crate) struct RegistrarInternalContext {
+    /// The identity's two parts.
+    pub(crate) intent: RegistrarInternalIntent,
+    /// The state-recorded secrets directory.
+    pub(crate) secrets_dir: PathBuf,
+    /// The KV v2 mount the exact-allowlist policy is scoped to.
+    pub(crate) kv_mount: String,
+    /// The step-ca ACME directory URL.
+    pub(crate) acme_server: String,
+    /// The deployment contact email.
+    pub(crate) email: String,
+    /// The HTTP-01 responder admin URL.
+    pub(crate) responder_url: String,
+    /// The HTTP-01 responder shared HMAC.
+    pub(crate) responder_hmac: String,
+    /// The EAB credentials, when the deployment registered any.
+    pub(crate) eab: Option<crate::commands::init::types::EabCredentials>,
+}
+
+impl RegistrarInternalContext {
+    /// Borrows the context as the inputs both stages take.
+    pub(crate) fn inputs(&self) -> RegistrarInternalInputs<'_> {
+        RegistrarInternalInputs {
+            intent: &self.intent,
+            secrets_dir: &self.secrets_dir,
+            kv_mount: &self.kv_mount,
+            acme_server: &self.acme_server,
+            email: &self.email,
+            responder_url: &self.responder_url,
+            responder_hmac: &self.responder_hmac,
+            eab: self.eab.as_ref(),
+        }
+    }
+}
+
+/// Everything provisioning needs, all of it already resolved by `init`.
+pub(crate) struct RegistrarInternalInputs<'a> {
+    /// The identity's two parts.
+    pub(crate) intent: &'a RegistrarInternalIntent,
+    /// The state-recorded secrets directory.
+    pub(crate) secrets_dir: &'a Path,
+    /// The KV v2 mount the exact-allowlist policy is scoped to.
+    pub(crate) kv_mount: &'a str,
+    /// The step-ca ACME directory URL.
+    pub(crate) acme_server: &'a str,
+    /// The deployment contact email.
+    pub(crate) email: &'a str,
+    /// The HTTP-01 responder admin URL.
+    pub(crate) responder_url: &'a str,
+    /// The HTTP-01 responder shared HMAC.
+    pub(crate) responder_hmac: &'a str,
+    /// The EAB credentials, when the deployment registered any.
+    pub(crate) eab: Option<&'a crate::commands::init::types::EabCredentials>,
+}
+
+/// Material issued into the staging directory, plus the trust state it
+/// was issued against.
+pub(crate) struct StagedInternal {
+    paths: InternalPaths,
+    staging: PathBuf,
+    material: InternalMaterial,
+    bundle_pem: String,
+    fingerprints: Vec<String>,
+}
+
+/// Creates the `auth/cert` mount, the exact-allowlist policy and the one
+/// trusted entry, under the init root token.
+///
+/// Every artifact is registered for rollback before it is created, so a
+/// later failure removes exactly what this run added and leaves an
+/// `auth/cert` mount the deployment already had alone.
+///
+/// # Errors
+///
+/// Returns an error if any `OpenBao` write fails or the deployment root
+/// certificate cannot be read.
+pub(super) async fn provision_internal_auth(
+    client: &OpenBaoClient,
+    inputs: &RegistrarInternalInputs<'_>,
+    rollback: &mut InitRollback,
+    messages: &Messages,
+) -> Result<()> {
+    // Registered before the write, not after: a failure between the two
+    // must still be undone.
+    rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string());
+    if !client
+        .policy_exists(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
+        .await
+        .unwrap_or(false)
+    {
+        rollback
+            .created_policies
+            .push(POLICY_BOOTROOT_REGISTRAR_INTERNAL.to_string());
+    }
+    let mounted_now = converge_internal_auth(client, inputs, messages).await?;
+    rollback.registrar_internal_cert_auth_mount_created = mounted_now;
+    Ok(())
+}
+
+/// Converges the `auth/cert` mount, the exact-allowlist policy and the
+/// one trusted entry, and reports whether this call mounted the backend.
+///
+/// Shared by `init`'s provisioning and by the rotation and recovery
+/// repairs, so the entry the three write cannot drift: one root, one
+/// SAN, one policy.
+///
+/// # Errors
+///
+/// Returns an error if any `OpenBao` write fails or the deployment root
+/// certificate cannot be read.
+pub(crate) async fn converge_internal_auth(
+    client: &OpenBaoClient,
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+) -> Result<bool> {
+    let root_pem = read_root_ca_pem(inputs.secrets_dir, messages).await?;
+    let mounted_now = client
+        .ensure_cert_auth(CERT_AUTH_MOUNT)
+        .await
+        .context("enabling the OpenBao cert auth backend")?;
+    client
+        .write_policy(
+            POLICY_BOOTROOT_REGISTRAR_INTERNAL,
+            &build_registrar_internal_policy(inputs.kv_mount),
+        )
+        .await
+        .context("writing the bootroot-registrar-internal policy")?;
+
+    client
+        .write_cert_auth_entry(
+            CERT_AUTH_MOUNT,
+            CERT_AUTH_ROLE,
+            &root_pem,
+            &inputs.intent.san(),
+            &[POLICY_BOOTROOT_REGISTRAR_INTERNAL],
+            TOKEN_TTL,
+        )
+        .await
+        .context("creating the bootroot-registrar-internal cert auth entry")?;
+    Ok(mounted_now)
+}
+
+/// Issues the internal leaf and its persistent ACME account key into the
+/// staging directory.
+///
+/// Nothing is published: the staged files sit under
+/// [`STAGING_DIR`], registered for rollback, until a real certificate
+/// login over the TLS listener has proved they work.
+///
+/// # Errors
+///
+/// Returns an error if the CA material cannot be read, the staging
+/// directory cannot be created, or ACME issuance fails.
+pub(crate) async fn issue_internal_material(
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+) -> Result<StagedInternal> {
+    let paths = InternalPaths::new(inputs.secrets_dir);
+    let staging = paths.dir().join(STAGING_DIR);
+
+    fs_util::ensure_secrets_dir(&staging)
+        .await
+        .with_context(|| messages.error_write_file_failed(&staging.display().to_string()))?;
+
+    let fingerprints = compute_ca_fingerprints(inputs.secrets_dir, messages).await?;
+    let bundle_pem = compute_ca_bundle_pem(inputs.secrets_dir, messages).await?;
+    let staged_bundle = staging.join("ca-bundle.pem");
+    fs_util::write_ca_bundle(
+        &staged_bundle,
+        &bundle_pem,
+        cert_group::CertGroupPolicy::none(),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&staged_bundle.display().to_string()))?;
+
+    let staged_cert = staging.join("leaf.pem");
+    let staged_key = staging.join("key.pem");
+    let staged_account = staging.join("acme-account.json");
+
+    let settings = issuance_settings(
+        inputs,
+        &staged_bundle,
+        &staged_account,
+        &fingerprints,
+        &staged_cert,
+        &staged_key,
+    );
+    let profile = settings
+        .profiles
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the internal issuance profile was not built"))?;
+    let eab = inputs.eab.map(|creds| bootroot::eab::EabCredentials {
+        kid: creds.kid.clone(),
+        hmac: creds.hmac.clone(),
+    });
+    bootroot::acme::issue_certificate(&settings, profile, eab, false)
+        .await
+        .context("issuing the bootroot-internal leaf through step-ca's ACME endpoint")?;
+
+    let leaf_pem = tokio::fs::read_to_string(&staged_cert)
+        .await
+        .with_context(|| messages.error_read_file_failed(&staged_cert.display().to_string()))?;
+    let intermediate_pem = read_ca_file(
+        &inputs
+            .secrets_dir
+            .join(CA_CERTS_DIR)
+            .join(CA_INTERMEDIATE_CERT_FILENAME),
+        messages,
+    )
+    .await?;
+    let key_pem = tokio::fs::read_to_string(&staged_key)
+        .await
+        .with_context(|| messages.error_read_file_failed(&staged_key.display().to_string()))?;
+    let account = tokio::fs::read_to_string(&staged_account)
+        .await
+        .with_context(|| messages.error_read_file_failed(&staged_account.display().to_string()))?;
+    let root_fingerprint = fingerprints
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("the deployment root fingerprint was not computed"))?;
+
+    Ok(StagedInternal {
+        paths,
+        staging,
+        material: InternalMaterial {
+            key: PrivateKeyPem::new(key_pem),
+            chain: format!("{leaf_pem}{intermediate_pem}"),
+            acme_account: AcmeAccountKey::new(account),
+            root_fingerprint,
+        },
+        bundle_pem,
+        fingerprints,
+    })
+}
+
+/// Proves a certificate login works over the recorded HTTPS URL and then
+/// publishes the material, the dedicated config and the private bundle.
+///
+/// The login happens **before** the first byte is published: a
+/// credential that cannot authenticate must not be left on disk looking
+/// as though it could.
+///
+/// # Errors
+///
+/// Returns an error when the recorded URL is plaintext, when the
+/// certificate login fails, or when any file cannot be published.
+pub(super) async fn verify_and_publish_internal(
+    staged: &StagedInternal,
+    inputs: &RegistrarInternalInputs<'_>,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    verify_internal_login(staged, openbao_url).await?;
+    publish_internal_set(staged, inputs, messages).await
+}
+
+/// Proves the staged credential can authenticate at `auth/cert` over
+/// the recorded HTTPS URL.
+///
+/// # Errors
+///
+/// Returns an error when the URL is plaintext, when the transport
+/// cannot be built, or when `OpenBao` rejects the certificate.
+pub(crate) async fn verify_internal_login(
+    staged: &StagedInternal,
+    openbao_url: &str,
+) -> Result<()> {
+    let credential =
+        InternalCredential::from_parts(openbao_url, &staged.material, &staged.bundle_pem)?;
+    credential
+        .authenticated()
+        .await
+        .context("proving the bootroot-internal certificate login over the TLS listener")?;
+    Ok(())
+}
+
+/// Publishes the private bundle, the four credential files and the
+/// dedicated config, then removes the staging copies.
+///
+/// # Errors
+///
+/// Returns an error when any file cannot be published.
+pub(crate) async fn publish_internal_set(
+    staged: &StagedInternal,
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+) -> Result<()> {
+    fs_util::write_ca_bundle(
+        &staged.paths.ca_bundle(),
+        &staged.bundle_pem,
+        cert_group::CertGroupPolicy::none(),
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&staged.paths.ca_bundle().display().to_string())
+    })?;
+
+    publish_material(&staged.paths, &staged.material).await?;
+
+    let config = render_internal_agent_config(
+        &staged.paths,
+        &InternalAgentConfigParams {
+            email: inputs.email,
+            server: inputs.acme_server,
+            domain: &inputs.intent.domain,
+            hostname: &inputs.intent.host,
+            responder_url: inputs.responder_url,
+            responder_hmac: inputs.responder_hmac,
+            eab_kid: inputs.eab.map(|creds| creds.kid.as_str()),
+            eab_hmac: inputs.eab.map(|creds| creds.hmac.as_str()),
+            trusted_ca_sha256: &staged.fingerprints,
+        },
+    );
+    fs_util::atomic_write(
+        fs_util::Destination::bootroot_owned(&staged.paths.agent_config()),
+        config.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+    )
+    .await
+    .with_context(|| {
+        messages.error_write_file_failed(&staged.paths.agent_config().display().to_string())
+    })?;
+
+    // The staging copies are the only thing left that holds the key at a
+    // second path; remove them once the published set is complete.
+    if let Err(err) = tokio::fs::remove_dir_all(&staged.staging).await {
+        eprintln!(
+            "Warning: failed to remove the staging directory {}: {err}",
+            staged.staging.display()
+        );
+    }
+    Ok(())
+}
+
+/// Builds the in-memory `Settings` the staged ACME issuance runs under.
+///
+/// Deliberately not the generated `agent.toml`: that file points at the
+/// *published* paths, which do not exist yet. The two agree on
+/// everything the CA sees — the SAN, the account key, the EAB and the
+/// trust anchors — and differ only in where the bytes land.
+fn issuance_settings(
+    inputs: &RegistrarInternalInputs<'_>,
+    bundle: &Path,
+    account_key: &Path,
+    fingerprints: &[String],
+    cert: &Path,
+    key: &Path,
+) -> config::Settings {
+    config::Settings {
+        email: inputs.email.to_string(),
+        server: inputs.acme_server.to_string(),
+        domain: inputs.intent.domain.clone(),
+        eab: inputs.eab.map(|creds| config::Eab {
+            kid: creds.kid.clone(),
+            hmac: creds.hmac.clone(),
+        }),
+        acme: config::AcmeSettings {
+            http_responder_url: inputs.responder_url.to_string(),
+            http_responder_hmac: inputs.responder_hmac.to_string(),
+            http_responder_timeout_secs: 5,
+            http_responder_token_ttl_secs: 300,
+            directory_fetch_attempts: 10,
+            directory_fetch_base_delay_secs: 1,
+            directory_fetch_max_delay_secs: 10,
+            poll_attempts: 15,
+            poll_interval_secs: 2,
+            account_key_path: Some(account_key.to_path_buf()),
+        },
+        retry: config::RetrySettings {
+            backoff_secs: vec![5, 15, 60],
+        },
+        trust: config::TrustSettings {
+            ca_bundle_path: Some(bundle.to_path_buf()),
+            trusted_ca_sha256: fingerprints.to_vec(),
+        },
+        scheduler: config::SchedulerSettings {
+            max_concurrent_issuances: 1,
+        },
+        profiles: vec![config::DaemonProfileSettings {
+            registration_id: internal_registration_id(&inputs.intent.host),
+            service_name: bootroot::registrar::REGISTRAR_INTERNAL_LABEL.to_string(),
+            instance_id: bootroot::registrar::internal::agent_config::INTERNAL_INSTANCE_ID
+                .to_string(),
+            hostname: inputs.intent.host.clone(),
+            paths: config::Paths {
+                cert: cert.to_path_buf(),
+                key: key.to_path_buf(),
+            },
+            daemon: config::DaemonRuntimeSettings::default(),
+            retry: None,
+            hooks: config::HookSettings::default(),
+            eab: None,
+            cert_group_gid: None,
+        }],
+        openbao: None,
+        registrar_endpoint: config::RegistrarEndpointSettings::default(),
+    }
+}
+
+async fn read_root_ca_pem(secrets_dir: &Path, messages: &Messages) -> Result<String> {
+    read_ca_file(
+        &secrets_dir.join(CA_CERTS_DIR).join(CA_ROOT_CERT_FILENAME),
+        messages,
+    )
+    .await
+}
+
+async fn read_ca_file(path: &Path, messages: &Messages) -> Result<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use bootroot::registrar::internal::{InternalPaths, MaterialStatus, material_status};
+    use tempfile::TempDir;
+
+    use super::{RegistrarInternalIntent, registrar_endpoint_intent};
+    use crate::state::{RegistrarEndpointState, StateFile};
+
+    const DOMAIN: &str = "example.internal";
+    const HOST: &str = "bootroot-01";
+
+    fn state_with(endpoint: Option<RegistrarEndpointState>) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            registrar_endpoint: endpoint,
+            ..StateFile::default()
+        };
+        state.save(&path).expect("write state");
+        (dir, path)
+    }
+
+    /// No state file at all — the very first `init` — reads as
+    /// endpoint-disabled rather than as an error.
+    #[test]
+    fn a_missing_state_file_reads_as_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(
+            registrar_endpoint_intent(&dir.path().join("state.json")).expect("read"),
+            None
+        );
+    }
+
+    /// The two disabled shapes — no entry, and an entry that says
+    /// `false` — both leave the host untouched.
+    #[test]
+    fn an_absent_or_disabled_entry_reads_as_disabled() {
+        let (_dir, path) = state_with(None);
+        assert_eq!(registrar_endpoint_intent(&path).expect("read"), None);
+
+        let (_dir, path) = state_with(Some(RegistrarEndpointState {
+            enabled: false,
+            domain: DOMAIN.to_string(),
+            host: HOST.to_string(),
+        }));
+        assert_eq!(registrar_endpoint_intent(&path).expect("read"), None);
+    }
+
+    #[test]
+    fn an_enabled_entry_yields_the_fixed_san() {
+        let (_dir, path) = state_with(Some(RegistrarEndpointState {
+            enabled: true,
+            domain: DOMAIN.to_string(),
+            host: HOST.to_string(),
+        }));
+        let intent = registrar_endpoint_intent(&path)
+            .expect("read")
+            .expect("an enabled endpoint");
+        assert_eq!(
+            intent,
+            RegistrarInternalIntent {
+                domain: DOMAIN.to_string(),
+                host: HOST.to_string(),
+            }
+        );
+        assert_eq!(
+            intent.san(),
+            "001.bootroot-registrar-internal.bootroot-01.example.internal"
+        );
+    }
+
+    /// An enabled endpoint with no host or no domain cannot compose a
+    /// SAN. Guessing one would compose a name the deployment's CA never
+    /// issues, so this fails the run instead.
+    #[test]
+    fn an_enabled_entry_missing_an_identity_part_is_an_error() {
+        for (domain, host) in [("", HOST), (DOMAIN, ""), ("  ", "  ")] {
+            let (_dir, path) = state_with(Some(RegistrarEndpointState {
+                enabled: true,
+                domain: domain.to_string(),
+                host: host.to_string(),
+            }));
+            let err = registrar_endpoint_intent(&path)
+                .expect_err("an incomplete identity must fail the run");
+            assert!(
+                err.to_string().contains("registrar_endpoint"),
+                "{err} for ({domain:?}, {host:?})"
+            );
+        }
+    }
+
+    /// A host that reads as disabled creates none of the internal
+    /// artifacts, because nothing below the predicate ever runs. The
+    /// layout check is what a later assertion in the E2E suite reduces
+    /// to, stated here against the same predicate.
+    #[test]
+    fn a_disabled_host_has_no_internal_layout() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(
+            material_status(&InternalPaths::new(dir.path())),
+            MaterialStatus::Absent
+        );
+    }
+}

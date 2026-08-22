@@ -176,13 +176,21 @@ fn read_prepared_keys(path: &Path, messages: &Messages) -> Result<PreparedUnseal
 fn openbao_recreate_invocation(
     identity: &ComposeIdentity,
     compose_file: &Path,
-    override_path: &Path,
+    override_path: Option<&Path>,
 ) -> ComposeInvocation {
+    // An endpoint-enabled loopback host transitions to TLS with no
+    // exposed-port override at all: the listener stays on loopback and
+    // only its scheme changes. Passing a `-f` for a file that does not
+    // exist would fail the recreate, so the override is optional here
+    // rather than assumed.
+    let compose_file = compose_file.to_string_lossy();
+    let override_file = override_path.map(|path| path.to_string_lossy());
+    let mut files: Vec<&str> = vec![&compose_file];
+    if let Some(override_file) = override_file.as_deref() {
+        files.push(override_file);
+    }
     identity.compose(
-        &[
-            &compose_file.to_string_lossy(),
-            &override_path.to_string_lossy(),
-        ],
+        &files,
         None,
         &["up", "-d", "--force-recreate", OPENBAO_SERVICE_NAME],
     )
@@ -191,7 +199,10 @@ fn openbao_recreate_invocation(
 /// The plaintext → TLS transition of the `OpenBao` listener.
 pub(super) struct OpenBaoTlsTransition<'a> {
     compose_file: &'a Path,
-    override_path: &'a Path,
+    /// The exposed-port override, when this install has a non-loopback
+    /// bind intent. `None` for an endpoint-enabled loopback host, which
+    /// transitions the same listener to TLS without publishing a port.
+    override_path: Option<&'a Path>,
     /// The URL that is about to be written to `state.openbao_url`, i.e.
     /// `client_url_from_bind_addr(&bind_addr)` — never the advertise
     /// address, which local commands must not depend on.
@@ -210,7 +221,7 @@ pub(super) struct OpenBaoTlsTransition<'a> {
 impl<'a> OpenBaoTlsTransition<'a> {
     pub(super) fn new(
         compose_file: &'a Path,
-        override_path: &'a Path,
+        override_path: Option<&'a Path>,
         https_url: &'a str,
         secrets_dir: &'a Path,
     ) -> Self {
@@ -367,14 +378,23 @@ mod tests {
         let compose = dir.path().join("docker-compose.yml");
         let override_path = dir.path().join("docker-compose.openbao-exposed.yml");
 
-        let default =
-            OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path());
+        let default = OpenBaoTlsTransition::new(
+            &compose,
+            Some(&override_path),
+            UNREACHABLE_HTTPS_URL,
+            dir.path(),
+        );
         assert_eq!(default.docker, Path::new("docker"));
 
         let fake = dir.path().join("fake-docker");
         let named = OpenBaoTlsTransition {
             docker: &fake,
-            ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
+            ..OpenBaoTlsTransition::new(
+                &compose,
+                Some(&override_path),
+                UNREACHABLE_HTTPS_URL,
+                dir.path(),
+            )
         };
         assert_eq!(named.docker, fake);
     }
@@ -401,7 +421,8 @@ mod tests {
         let compose = PathBuf::from("docker-compose.yml");
         let override_path = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
         let identity = ComposeIdentity::for_instance("bootroot");
-        let command = openbao_recreate_invocation(&identity, &compose, &override_path).command(&[]);
+        let command =
+            openbao_recreate_invocation(&identity, &compose, Some(&override_path)).command(&[]);
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -591,7 +612,12 @@ mod tests {
             docker: &fake,
             probe_attempts: PROBE_ATTEMPTS,
             probe_delay: PROBE_DELAY,
-            ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
+            ..OpenBaoTlsTransition::new(
+                &compose,
+                Some(&override_path),
+                UNREACHABLE_HTTPS_URL,
+                dir.path(),
+            )
         };
         let mut recreated = false;
         let err = transition
@@ -795,7 +821,12 @@ mod tests {
             docker: &fake,
             probe_attempts: PROBE_ATTEMPTS,
             probe_delay: PROBE_DELAY,
-            ..OpenBaoTlsTransition::new(&compose, &override_path, UNREACHABLE_HTTPS_URL, dir.path())
+            ..OpenBaoTlsTransition::new(
+                &compose,
+                Some(&override_path),
+                UNREACHABLE_HTTPS_URL,
+                dir.path(),
+            )
         };
         let mut recreated = false;
         let err = transition

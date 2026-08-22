@@ -458,6 +458,22 @@ impl Messages {
         self.strings().rotate_ca_key_phase_trust_additive
     }
 
+    pub(crate) fn rotate_ca_key_registrar_internal_repair(&self) -> &'static str {
+        self.strings().rotate_ca_key_registrar_internal_repair
+    }
+
+    pub(crate) fn rotate_registrar_internal_complete(&self) -> &'static str {
+        self.strings().rotate_registrar_internal_complete
+    }
+
+    pub(crate) fn rotate_registrar_internal_up_to_date(&self) -> &'static str {
+        self.strings().rotate_registrar_internal_up_to_date
+    }
+
+    pub(crate) fn prompt_rotate_registrar_internal(&self) -> &'static str {
+        self.strings().prompt_rotate_registrar_internal
+    }
+
     pub(crate) fn rotate_ca_key_phase_restart_stepca(&self) -> &'static str {
         self.strings().rotate_ca_key_phase_restart_stepca
     }

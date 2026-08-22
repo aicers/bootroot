@@ -311,6 +311,56 @@ ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 무시됩니다. 위의
 [systemd 운영 절차](#systemd-운영-절차bootroot-agent-권장)를 참고하세요.
 
+#### bootroot 내부 자격 증명
+
+두 동사는 bootroot가 직접 보유한 자격 증명으로 실행됩니다. 데몬이 `auth/cert`로
+`OpenBao`에 제시하는 `001.bootroot-registrar-internal.<host>.<domain>` 리프
+인증서입니다. 호출자에게 전달되지도, 응답에 언급되지도, 요청으로 선택되지도
+않습니다. 레지스트라는 신원의 구성 요소만 제공합니다.
+
+인증서 인증에는 TLS가 필요하므로, 엔드포인트가 활성화된 호스트는 **루프백에서도**
+`OpenBao`의 `:8200`에서 TLS를 종단하며 기록된 `state.openbao_url`이 `https://`가
+됩니다. 엔드포인트를 쓰지 않는 호스트는 평문 루프백 리스너와 `http://` URL을 그대로
+유지합니다. 어느 쪽에서도 리스너 측 클라이언트 인증서 옵션은 도입하지 않습니다.
+TLS 리스너는 이미 클라이언트 인증서를 요청하며, 여기서 이를 강제하면 인증서가 없는
+`AppRole` 에이전트와 토큰 인증 명령이 모두 깨집니다.
+
+`bootroot init`이 자격 증명을 프로비저닝하고 상태에 기록된 secrets 디렉터리 아래에
+전용 `registrar-internal/agent.toml`과 전용 CA 번들을 작성합니다. 다른 에이전트와
+마찬가지로 갱신 프로세스는 시작하지 않으므로 운영자가 직접 시작합니다.
+
+```sh
+bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
+```
+
+그때부터 해당 설정의 `daemon`/`retry` 값과 다른 모든 프로파일이 사용하는 동일한
+판정 로직으로 일상적인 갱신이 이뤄집니다. 시작하기 전에는 갱신할 것도, 신호를 보낼
+대상도 없습니다. 회전이 `HUP`을 보냈는데 프로세스가 없으면 성공으로 처리합니다.
+
+**회전.** 중간 CA만 교체하는 회전은 자격 증명, 인증 항목, 설정, 전용 번들을 모두
+그대로 둡니다. 인증 항목이 신뢰하는 대상은 루트이고, 그 회전은 루트를 교체하지
+않기 때문입니다. 전체 회전은 3단계에서 누적 신뢰 집합을 전용 번들과 설정 핀에
+게시하고, 4단계 뒤의 필수 후속 단계에서 인증 항목·리프·저장된 루트 지문을 교체하며
+(`--skip reissue`로 건너뛸 수 없습니다), 6단계에서 마무리를 건너뛰지 않은 경우에만
+번들과 핀을 최종 세대로 좁힙니다.
+
+**복구.** 자격 증명이 만료되었거나 회전이 중단되었거나 자료가 유실·부분 기록된
+경우, 데몬은 ACME 요청·로그인·쓰기를 시도하지 않고 복구 필요 오류로 즉시
+실패합니다. 다음 명령으로 복구합니다.
+
+```sh
+bootroot rotate registrar-internal-credential
+```
+
+이 명령은 `root` 정책을 가진 `OpenBao` 토큰을 요구하며 `AppRole` 토큰은 거부합니다.
+설치를 다시 실행하지 않고 서비스 자격 증명도 변경하지 않습니다. 기록된 회전 상태가
+가리키는 신뢰 상태를 복원하고, 자료와 저장된 지문을 교체한 뒤 내부 에이전트를
+재로드합니다.
+
+자격 증명이 부여받는 정확한 `OpenBao` 정책을 포함한 전체 계약은
+[`docs/reference/registrar-internal-credential.md`](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md)에
+있습니다.
+
 #### 하드닝된 비루트 유닛과의 차이
 
 위의 [하드닝된 systemd 유닛 예시](#하드닝된-systemd-유닛-예시)는 데몬을

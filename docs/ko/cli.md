@@ -1617,6 +1617,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate force-reissue`
 - `rotate ca-key`
 - `rotate openbao-recovery`
+- `rotate registrar-internal-credential`
 - `rotate eab-clear`
 - `rotate infra-cert`
 
@@ -1889,6 +1890,31 @@ secret_id를 변경하지 않습니다.
   이 경우 현실적인 복구 경로는 OpenBao 재초기화이며, 결과적으로
   `bootroot init` 재실행과 서비스 재bootstrap이 필요합니다.
 - `--rotate-root-token`은 언실 키 입력 없이 실행할 수 있습니다.
+
+#### `rotate registrar-internal-credential`
+
+bootroot 내부 registrar 자격 증명을 복구합니다. 이 자격 증명은 registrar의
+`mint`/`deregister` 동사를 실행하기 위해 bootroot 데몬이 `auth/cert`로
+OpenBao에 인증할 때 사용하는 것으로, registrar 엔드포인트를 제공하는
+호스트에만 존재합니다.
+
+신뢰되는 `auth/cert` 항목, 리프 인증서와 개인 키, 지속 ACME 계정 키, 저장된
+루트 지문을 교체하고, 전용 `registrar-internal/agent.toml`의 신뢰 핀과 전용
+CA 번들을 기록된 회전 상태가 가리키는 신뢰 상태로 되돌립니다. 전체 CA 회전이
+진행 중이면 누적 집합, 그렇지 않으면 최종 집합입니다. 그런 다음 내부
+에이전트에 재로드 신호를 보냅니다.
+
+- `--force`: 자료가 완전하고 저장된 루트 지문이 현재 루트와 이미 일치해도
+  복구를 수행합니다. 이 옵션이 없으면 해당 호스트는 최신 상태로 보고되고 아무
+  것도 변경되지 않으므로, 모든 호스트에서 스크립트로 실행해도 안전합니다.
+
+`root` 정책을 가진 OpenBao 토큰이 필요하며, 변경 이전에 토큰 self-lookup으로
+확인합니다. AppRole 토큰은 타입이 지정된 오류로 거부됩니다. 설치를 다시
+실행하지 않고 서비스 자격 증명도 변경하지 않습니다.
+
+중단된 CA 회전, 만료된 내부 리프, 유실되거나 부분적으로 기록된 자격 증명이
+있을 때 사용합니다. 저장된 루트 지문이 현재 루트와 다르면 데몬은 ACME 요청,
+로그인, 쓰기를 전혀 시도하지 않고 즉시 실패하며 이 명령을 안내합니다.
 
 #### `rotate eab-clear`
 

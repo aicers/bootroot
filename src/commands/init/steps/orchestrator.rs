@@ -13,6 +13,7 @@ use super::super::types::{
     AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, OpenBaoConfigResult,
 };
 use super::InitRollback;
+use super::InitSecrets;
 use super::RollbackFile;
 use super::database::{PostgresEnv, check_db_connectivity, resolve_db_dsn_for_init};
 use super::http01_admin_tls::{
@@ -29,6 +30,7 @@ use super::openbao_tls::{
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
 use super::prompts::{confirm_overwrite, should_confirm};
+use super::registrar_internal::{self, RegistrarInternalIntent};
 use super::responder_setup::{
     apply_responder_compose_override, verify_responder, write_responder_compose_override,
     write_responder_files,
@@ -54,6 +56,7 @@ use crate::commands::infra::{
     ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent,
     resolve_stepca_exposed_override, run_compose,
 };
+use crate::commands::init::constants::OPENBAO_CONTAINER_PORT;
 use crate::commands::init::{
     HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_KEY_REL_PATH,
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
@@ -63,6 +66,69 @@ use crate::commands::openbao_unseal::unseal_keys_path;
 use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
 use crate::state::StateFile;
+
+/// Assembles the inputs the bootroot-internal provisioning runs under.
+///
+/// Every value is one `init` already resolved. The ACME server and the
+/// responder URL are the *host-side* ones the internal agent will use —
+/// the same defaults a local-file `service add` bakes into an operator's
+/// `agent.toml` — because the internal profile is an ordinary host
+/// daemon and not a container on the compose network.
+fn registrar_internal_context(
+    intent: &RegistrarInternalIntent,
+    args: &InitArgs,
+    secrets: &InitSecrets,
+) -> registrar_internal::RegistrarInternalContext {
+    registrar_internal::RegistrarInternalContext {
+        intent: intent.clone(),
+        secrets_dir: args.secrets_dir.secrets_dir.clone(),
+        kv_mount: args.openbao.kv_mount.clone(),
+        acme_server: internal_acme_server(&args.stepca_provisioner),
+        email: crate::commands::service::DEFAULT_AGENT_EMAIL.to_string(),
+        responder_url: crate::commands::service::DEFAULT_AGENT_RESPONDER_URL.to_string(),
+        responder_hmac: secrets.http_hmac.clone(),
+        eab: secrets.eab.clone(),
+    }
+}
+
+/// The step-ca ACME directory URL the internal profile enrols against.
+///
+/// Follows the configured provisioner name rather than hard-coding
+/// `acme`: an install that renamed the ACME provisioner would otherwise
+/// have `init` enrol against a directory step-ca does not serve.
+fn internal_acme_server(provisioner: &str) -> String {
+    format!("https://localhost:9000/acme/{provisioner}/directory")
+}
+
+/// The loopback bind address an endpoint-enabled install issues its
+/// server certificate for.
+///
+/// Only the port follows the plaintext URL: an `--openbao-host-port`
+/// the operator moved has to end up in the SAN list, while the address
+/// is always loopback because a non-loopback install takes the
+/// bind-intent branch instead.
+fn loopback_tls_bind_addr(plaintext_url: &str) -> String {
+    format!("127.0.0.1:{}", url_port(plaintext_url))
+}
+
+/// The HTTPS form of a plaintext loopback `OpenBao` URL.
+///
+/// Host and port are carried through unchanged; only the scheme moves.
+/// A URL that is already `https://` is returned as it is, so a re-run
+/// over an already-transitioned listener records the same value.
+fn https_from_plaintext_url(url: &str) -> String {
+    match url.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    }
+}
+
+/// The port an `OpenBao` URL names, defaulting to the container port.
+fn url_port(url: &str) -> u16 {
+    url.rsplit_once(':')
+        .and_then(|(_, port)| port.trim_end_matches('/').parse().ok())
+        .unwrap_or(OPENBAO_CONTAINER_PORT)
+}
 
 /// Mode for the two operator-facing secret files `init` can be asked to
 /// write, `--summary-json` and `--root-token-output`. Both carry root
@@ -150,6 +216,12 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let state_path = StateFile::default_path();
     let bind_intent = has_openbao_bind_intent(&state_path)?;
 
+    // The registrar endpoint-enablement predicate this run *consumes*.
+    // Absent or disabled — every host but a bootroot registrar host —
+    // and nothing below provisions the internal credential or touches
+    // the plaintext loopback listener.
+    let registrar_intent = registrar_internal::registrar_endpoint_intent(&state_path)?;
+
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
@@ -170,7 +242,15 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     diagnose_partial_init(&client, args, messages).await?;
 
     let mut rollback = InitRollback::default();
-    let result = run_init_inner(&mut client, args, messages, &mut rollback, bind_intent).await;
+    let result = run_init_inner(
+        &mut client,
+        args,
+        messages,
+        &mut rollback,
+        bind_intent,
+        registrar_intent.as_ref(),
+    )
+    .await;
 
     match result {
         Ok(summary) => {
@@ -479,6 +559,7 @@ async fn run_init_inner(
     messages: &Messages,
     rollback: &mut InitRollback,
     bind_intent: bool,
+    registrar_intent: Option<&RegistrarInternalIntent>,
 ) -> Result<InitSummary> {
     let bootstrap = bootstrap_openbao(client, args, messages).await?;
     let overwrite_password = args.secrets_dir.secrets_dir.join("password.txt").exists();
@@ -874,6 +955,34 @@ async fn run_init_inner(
         secrets.eab = Some(eab);
     }
 
+    // The bootroot-internal registrar credential, stages 2 and 3. Both
+    // run under the init root token, after `OpenBao` bootstrap, step-ca
+    // initialization and EAB acquisition, and both are inside the
+    // rollback envelope: the `auth/cert` mount, the policy, the entry
+    // and the whole staged directory are registered before they are
+    // created. Nothing is published here — the credential is proved over
+    // the TLS listener first, below.
+    let internal_context =
+        registrar_intent.map(|intent| registrar_internal_context(intent, args, &secrets));
+    let staged_internal = match internal_context.as_ref() {
+        Some(context) => {
+            let inputs = context.inputs();
+            println!("{}", messages.init_registrar_internal_provisioning());
+            registrar_internal::provision_internal_auth(client, &inputs, rollback, messages)
+                .await?;
+            // The whole layout directory is the rollback unit, staging
+            // included: this run either publishes a complete credential
+            // or leaves nothing behind.
+            rollback.registrar_internal_dir = Some(
+                bootroot::registrar::internal::InternalPaths::new(&args.secrets_dir.secrets_dir)
+                    .dir()
+                    .to_path_buf(),
+            );
+            Some(registrar_internal::issue_internal_material(&inputs, messages).await?)
+        }
+        None => None,
+    };
+
     write_state_file(
         &args.openbao.openbao_url,
         &args.openbao.kv_mount,
@@ -906,20 +1015,37 @@ async fn run_init_inner(
     //
     // Validation is keyed off `StateFile` intent, not override file
     // existence — a missing override with recorded intent is an error.
-    let effective_openbao_url = if bind_intent {
+    //
+    // The gate is `bind_intent || registrar_endpoint_enabled`: an
+    // endpoint-enabled host terminates TLS on `:8200` even on loopback,
+    // because the bootroot-internal credential authenticates at
+    // `auth/cert` and certificate authentication requires TLS. The two
+    // cases share every step below and differ only in whether an
+    // exposed-port override is applied and in which SANs the server
+    // certificate carries.
+    let tls_required = bind_intent || registrar_intent.is_some();
+    let effective_openbao_url = if tls_required {
         let state_path = StateFile::default_path();
-        let override_path = compose_dir
-            .join("secrets")
-            .join("openbao")
-            .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
-        if !override_path.exists() {
+        let override_path = bind_intent.then(|| {
+            compose_dir
+                .join("secrets")
+                .join("openbao")
+                .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME)
+        });
+        if let Some(override_path) = override_path.as_ref()
+            && !override_path.exists()
+        {
             anyhow::bail!(messages.error_openbao_override_file_missing());
         }
         let mut state = StateFile::load(&state_path)?;
-        let bind_addr = state
-            .openbao_bind_addr
-            .clone()
-            .expect("bind_intent is true so openbao_bind_addr must be Some");
+        // A non-loopback install binds where the operator said; an
+        // endpoint-enabled loopback install keeps the loopback address
+        // the plaintext listener already answered on, so the recorded
+        // URL changes scheme and nothing else.
+        let bind_addr = match state.openbao_bind_addr.clone() {
+            Some(bind_addr) => bind_addr,
+            None => loopback_tls_bind_addr(&args.openbao.openbao_url),
+        };
 
         // Backup openbao.hcl and record the compose file so that
         // rollback can restore plaintext HCL and restart OpenBao.
@@ -964,8 +1090,10 @@ async fn run_init_inner(
         // pipeline can renew it.
         record_openbao_infra_cert(&mut state, compose_dir, sans, &openbao_container);
 
-        validate_openbao_override_scope(&override_path, messages)?;
-        validate_openbao_override_binding(&override_path, &bind_addr, messages)?;
+        if let Some(override_path) = override_path.as_ref() {
+            validate_openbao_override_scope(override_path, messages)?;
+            validate_openbao_override_binding(override_path, &bind_addr, messages)?;
+        }
         validate_openbao_tls(compose_dir, &args.secrets_dir.secrets_dir, messages)?;
 
         // The URL that is about to be recorded, and therefore the URL
@@ -976,7 +1104,14 @@ async fn run_init_inner(
         // advertise address being hairpin-reachable.  The advertise
         // address is consumed separately by remote bootstrap artifact
         // generation.
-        let https_url = client_url_from_bind_addr(&bind_addr);
+        let https_url = if bind_intent {
+            client_url_from_bind_addr(&bind_addr)
+        } else {
+            // Loopback: the same host and port the plaintext URL named,
+            // over HTTPS. Deriving it from `bind_addr` instead would
+            // discard an `--openbao-host-port` the operator moved.
+            https_from_plaintext_url(&args.openbao.openbao_url)
+        };
 
         // Recreate OpenBao onto the rewritten HCL, confirm the listener
         // really answers over TLS at that URL, and unseal it.  All three
@@ -995,7 +1130,7 @@ async fn run_init_inner(
         // must leave the running OpenBao alone.
         let transition = OpenBaoTlsTransition::new(
             &args.compose.compose_file,
-            &override_path,
+            override_path.as_deref(),
             &https_url,
             &args.secrets_dir.secrets_dir,
         );
@@ -1037,6 +1172,30 @@ async fn run_init_inner(
             .save_async(&state_path)
             .await
             .with_context(|| messages.error_serialize_state_failed())?;
+
+        // Reconnect through the URL that was just recorded and prove a
+        // real `auth/cert/login` succeeds before a single byte of the
+        // credential, its config or its private bundle is published.
+        if let (Some(staged), Some(context)) = (staged_internal.as_ref(), internal_context.as_ref())
+        {
+            registrar_internal::verify_and_publish_internal(
+                staged,
+                &context.inputs(),
+                &state.openbao_url,
+                messages,
+            )
+            .await?;
+            println!(
+                "{}",
+                messages.init_registrar_internal_ready(
+                    &bootroot::registrar::internal::internal_agent_invocation(
+                        &bootroot::registrar::internal::InternalPaths::new(
+                            &args.secrets_dir.secrets_dir,
+                        ),
+                    )
+                )
+            );
+        }
 
         // Phase 2 of the infra-agent bring-up: OpenBao now serves TLS,
         // so apply the deferred agent override to start (and let the two
@@ -1510,6 +1669,7 @@ async fn write_state_file_to(
         existing_stepca_advertise_addr,
         existing_infra_certs,
         existing_last_secret_id_rotation,
+        existing_registrar_endpoint,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
         (
@@ -1522,6 +1682,7 @@ async fn write_state_file_to(
             state.stepca_advertise_addr,
             state.infra_certs,
             state.last_secret_id_rotation,
+            state.registrar_endpoint,
         )
     } else {
         (
@@ -1533,6 +1694,7 @@ async fn write_state_file_to(
             None,
             None,
             BTreeMap::new(),
+            None,
             None,
         )
     };
@@ -1565,6 +1727,9 @@ async fn write_state_file_to(
         rotate_bound_cidrs: rotate_bound_cidrs_map,
         rotate_secret_id_ttl: Some(rotate_secret_id_ttl.to_string()),
         last_secret_id_rotation: existing_last_secret_id_rotation,
+        // Preserved verbatim: this predicate is the registrar endpoint
+        // work's to write, and `init` only reads it.
+        registrar_endpoint: existing_registrar_endpoint,
     };
     state
         .save_async(state_path)
@@ -2929,5 +3094,66 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, SECRET_OUTPUT_FILE_MODE);
+    }
+}
+
+/// The TLS gate an endpoint-enabled host takes, and the two derivations
+/// it needs that a non-loopback bind does not.
+#[cfg(test)]
+mod registrar_tls_gate_tests {
+    use super::{https_from_plaintext_url, loopback_tls_bind_addr};
+    use crate::commands::init::steps::openbao_tls::build_openbao_tls_sans;
+
+    /// Only the scheme moves: an `--openbao-host-port` the operator
+    /// chose survives the transition, so the recorded URL keeps naming
+    /// the port the listener actually publishes.
+    #[test]
+    fn the_loopback_https_url_keeps_host_and_port() {
+        assert_eq!(
+            https_from_plaintext_url("http://localhost:8200"),
+            "https://localhost:8200"
+        );
+        assert_eq!(
+            https_from_plaintext_url("http://127.0.0.1:18200"),
+            "https://127.0.0.1:18200"
+        );
+        // An already-transitioned listener records the same value, so a
+        // re-run is idempotent.
+        assert_eq!(
+            https_from_plaintext_url("https://localhost:8200"),
+            "https://localhost:8200"
+        );
+    }
+
+    /// The certificate an endpoint-enabled loopback host issues carries
+    /// the loopback names the recorded URL is reached by, and no
+    /// non-loopback address at all.
+    #[test]
+    fn the_loopback_certificate_covers_the_recorded_url() {
+        let bind = loopback_tls_bind_addr("http://localhost:18200");
+        assert_eq!(bind, "127.0.0.1:18200");
+        let sans = build_openbao_tls_sans(&bind, None, "bootroot-openbao");
+        for expected in [
+            "localhost",
+            "127.0.0.1",
+            "bootroot-openbao",
+            "openbao.internal",
+        ] {
+            assert!(
+                sans.iter().any(|san| san == expected),
+                "{expected}: {sans:?}"
+            );
+        }
+        assert!(
+            !sans.iter().any(|san| san == "0.0.0.0"),
+            "a loopback transition must not carry a wildcard SAN: {sans:?}"
+        );
+    }
+
+    /// A URL with no port falls back to the container port rather than
+    /// composing a SAN for a port nothing serves.
+    #[test]
+    fn a_portless_url_falls_back_to_the_container_port() {
+        assert_eq!(loopback_tls_bind_addr("http://localhost"), "127.0.0.1:8200");
     }
 }

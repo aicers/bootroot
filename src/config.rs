@@ -222,6 +222,17 @@ pub struct AcmeSettings {
     pub directory_fetch_max_delay_secs: u64,
     pub poll_attempts: u64,
     pub poll_interval_secs: u64,
+    /// Where the ACME **account** signing key is persisted.
+    ///
+    /// Absent — the default, and what every existing configuration has
+    /// — keeps the historical behaviour: a fresh account key is
+    /// generated per issuance and the account is re-registered under it.
+    /// Set, the key is loaded from that path, or created there once with
+    /// restrictive permissions, so the profile keeps one stable ACME
+    /// account across renewals. The bootroot-internal registrar
+    /// credential is the one profile that sets it.
+    #[serde(default)]
+    pub account_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

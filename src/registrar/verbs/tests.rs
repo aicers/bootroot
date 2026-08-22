@@ -1945,3 +1945,79 @@ async fn the_scenario_environment_is_read_only_and_complete() {
         Some(backend.url.as_str())
     );
 }
+
+/// The parameterless factory: it takes no client and no caller, builds
+/// its own privileged client from the credential on disk, and refuses
+/// fail-closed rather than falling back to anything.
+mod internal_factory {
+    use tempfile::TempDir;
+    use time::Duration;
+
+    use super::{RegistrarVerbs, base_fixture, load_fixture};
+    use crate::openbao::SecretIdOptions;
+    use crate::registrar::internal::InternalCredentialError;
+    use crate::registrar::verbs::InternalVerbsSource;
+    use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
+
+    fn source<'a>(
+        secrets_dir: &'a std::path::Path,
+        openbao_url: &'a str,
+        config: &'a crate::registrar::config::RegistrarConfig,
+        options: &'a SecretIdOptions,
+        policy: &'a crate::registrar::verbs::wrap_ttl::WrapTtlPolicy,
+    ) -> InternalVerbsSource<'a> {
+        InternalVerbsSource {
+            secrets_dir,
+            openbao_url,
+            kv_mount: "secret",
+            config,
+            secret_id_options: options,
+            token_ttl: "1h",
+            secret_id_ttl: "24h",
+            wrap_ttl_policy: policy,
+        }
+    }
+
+    /// Certificate login is never attempted over plaintext, and the
+    /// refusal happens before the credential is even read.
+    #[test]
+    fn the_factory_refuses_a_plaintext_openbao_url() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "http://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("plaintext must be refused");
+        };
+        assert!(
+            matches!(err, InternalCredentialError::PlaintextOpenBaoUrl { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A host with no internal credential gets a typed absence, never a
+    /// verb service over some other client.
+    #[test]
+    fn the_factory_refuses_an_unprovisioned_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "https://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("an unprovisioned host must be refused");
+        };
+        assert!(matches!(err, InternalCredentialError::Absent(_)), "{err:?}");
+    }
+}

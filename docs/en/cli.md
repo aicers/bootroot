@@ -1680,6 +1680,7 @@ Supported subcommands:
 - `rotate force-reissue`
 - `rotate ca-key`
 - `rotate openbao-recovery`
+- `rotate registrar-internal-credential`
 - `rotate eab-clear`
 - `rotate infra-cert`
 
@@ -1971,6 +1972,35 @@ Important behavior:
   In that case, the practical recovery path is re-initializing OpenBao, which
   implies re-running `bootroot init` and re-bootstrapping services.
 - `--rotate-root-token` can be executed without unseal-key input.
+
+#### `rotate registrar-internal-credential`
+
+Repairs the bootroot-internal registrar credential — the credential
+bootroot's own daemon authenticates to OpenBao with, at `auth/cert`, in
+order to run the registrar's `mint` and `deregister` verbs. Only a host
+that serves the registrar endpoint has one.
+
+Replaces the trusted `auth/cert` entry, the leaf and its private key, the
+persistent ACME account key and the stored root fingerprint, and brings
+the dedicated `registrar-internal/agent.toml` trust pins and private CA
+bundle back onto the trust state the recorded rotation says is current —
+the additive set while a full CA rotation is unfinished, the finalized
+set otherwise. Then signals the internal agent to reload.
+
+- `--force`: repair even when the material is complete and the stored
+  root fingerprint already matches the active root. Without it, such a
+  host is reported as up to date and nothing is changed, which is what
+  makes the command safe to run from a script on every host.
+
+Requires an OpenBao token carrying the `root` policy, confirmed by token
+self-lookup **before** anything is mutated; an AppRole token is refused
+with a typed error. It never re-runs install and never changes a service
+credential.
+
+Use it after an interrupted CA rotation, an expired internal leaf, or a
+credential that was lost or partially written. A daemon whose stored root
+fingerprint disagrees with the active root fails closed — it makes no
+ACME request, no login and no write — and names this command.
 
 #### `rotate eab-clear`
 

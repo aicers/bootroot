@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `bootroot-agent` takes a new optional `[acme].account_key_path`. When
+  it is set, the ACME **account** signing key is loaded from that path,
+  or created there once with `0600` permissions, so the profile keeps one
+  stable ACME account across renewals instead of registering a fresh one
+  per issuance. Leaving it unset — which every existing configuration
+  does — keeps the ephemeral-key behaviour unchanged.
+
 ### Changed
 
 - A `SIGHUP` reload of `bootroot-agent` now stops the running daemon

@@ -6,6 +6,7 @@ pub(crate) mod openbao_tls;
 mod openbao_transition;
 mod orchestrator;
 mod prompts;
+pub(crate) mod registrar_internal;
 mod responder_setup;
 mod secrets;
 pub(crate) mod stepca_setup;
@@ -102,6 +103,19 @@ pub(super) struct InitRollback {
     /// restores the pre-TLS `state.json` so it does not keep pointing at
     /// an HTTPS URL / TLS certs after `OpenBao` is recreated on plaintext.
     pub(super) state_backup: Option<RollbackFile>,
+    /// The bootroot-internal credential's layout directory, when this
+    /// run created it.  Rollback removes it whole — staging included —
+    /// so a failure anywhere in the provisioning sequence leaves no
+    /// half-provisioned credential, no dedicated config and no private
+    /// bundle behind.
+    pub(super) registrar_internal_dir: Option<PathBuf>,
+    /// The `auth/cert` entry this run created, by name.  Deleted on
+    /// rollback so a rolled-back host trusts no internal certificate.
+    pub(super) registrar_internal_cert_auth_entry: Option<String>,
+    /// Whether this run is what mounted `auth/cert`.  Only then does
+    /// rollback disable it: a deployment that already had the backend
+    /// keeps it, along with every other entry under it.
+    pub(super) registrar_internal_cert_auth_mount_created: bool,
     /// The `docker` executable every spawn in the `init` flow runs.
     ///
     /// `None` *is* `docker`: this value comes straight from the derived
@@ -245,6 +259,33 @@ impl InitRollback {
             ) {
                 eprintln!("Rollback: failed to recreate responder: {err}");
             }
+        }
+
+        // The bootroot-internal artifacts, innermost first: the files,
+        // then the entry that trusts them, then the mount — and the
+        // mount only when this run is what created it.
+        if let Some(dir) = &self.registrar_internal_dir
+            && dir.exists()
+            && let Err(err) = std::fs::remove_dir_all(dir)
+        {
+            eprintln!(
+                "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
+                dir.display()
+            );
+        }
+        if let Some(name) = &self.registrar_internal_cert_auth_entry
+            && let Err(err) = client
+                .delete_cert_auth_entry(bootroot::registrar::internal::CERT_AUTH_MOUNT, name)
+                .await
+        {
+            eprintln!("Rollback: failed to delete cert auth entry {name}: {err}");
+        }
+        if self.registrar_internal_cert_auth_mount_created
+            && let Err(err) = client
+                .disable_auth(bootroot::registrar::internal::CERT_AUTH_MOUNT)
+                .await
+        {
+            eprintln!("Rollback: failed to disable the cert auth backend: {err}");
         }
 
         for path in &self.written_kv_paths {

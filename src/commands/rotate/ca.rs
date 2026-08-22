@@ -9,6 +9,7 @@ use super::helpers::{
     confirm_action, ensure_file_exists, restart_compose_service, signal_bootroot_agent,
     try_restart_container,
 };
+use super::registrar_internal;
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
     STEP_CA_HELPER_IMAGE,
@@ -232,6 +233,26 @@ pub(super) async fn rotate_ca_key(
 
         restart_infra_openbao_agents(ctx, messages);
 
+        // The bootroot-internal credential's private trust moves with
+        // the fleet's, and only in a full rotation: the `auth/cert`
+        // entry trusts the *root*, which an intermediate-only rotation
+        // does not replace, so nothing internal changes there. The
+        // bundle and the config's pins take exactly the additive set
+        // published to KV above, then the internal agent is reloaded.
+        if rot_state.mode == RotationMode::Full
+            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
+        {
+            registrar_internal::publish_internal_trust(
+                ctx.paths.secrets_dir(),
+                &registrar_internal::InternalTrustState {
+                    fingerprints: transitional_fps.clone(),
+                    bundle_pem: ca_bundle_pem.clone(),
+                },
+                messages,
+            )
+            .await?;
+        }
+
         rot_state.phase = 3;
         update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else {
@@ -242,6 +263,37 @@ pub(super) async fn rotate_ca_key(
     if start_phase < 4 {
         println!("{}", messages.rotate_ca_key_phase_restart_stepca());
         restart_compose_service(&ctx.compose_file, "step-ca", messages)?;
+
+        // The mandatory tail. Unnumbered on purpose — renumbering the
+        // phases would break every operator runbook and every resume of
+        // a rotation started on an older build — and unskippable:
+        // `--skip reissue` skips Phase 5, not this. It runs *after*
+        // step-ca is back (the new root has to be able to sign) and
+        // *before* Phase 4 is recorded, so a failure retains the
+        // pre-Phase-4 state and a resume repeats the restart and the
+        // repair together.
+        if rot_state.mode == RotationMode::Full
+            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
+        {
+            println!("{}", messages.rotate_ca_key_registrar_internal_repair());
+            let transitional_fps = transitional_fingerprints(&rot_state);
+            registrar_internal::ensure_internal_trust_is(
+                ctx.paths.secrets_dir(),
+                &transitional_fps,
+                messages,
+            )?;
+            let bundle_pem = transitional_bundle_pem(ctx, &rot_state, messages).await?;
+            registrar_internal::repair_internal_credential(
+                ctx,
+                client,
+                &registrar_internal::InternalTrustState {
+                    fingerprints: transitional_fps,
+                    bundle_pem,
+                },
+                messages,
+            )
+            .await?;
+        }
 
         rot_state.phase = 4;
         update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
@@ -346,6 +398,22 @@ pub(super) async fn rotate_ca_key(
         // interval. Service agents converge on their own via fast-poll.
         restart_infra_openbao_agents(ctx, messages);
 
+        // Narrowed only here, after the finalization checks above have
+        // passed and before Phase 6 is recorded. A run that skips
+        // finalization never reaches this line and keeps the additive
+        // internal trust set, exactly as it keeps the additive KV set.
+        if registrar_internal::internal_credential_present(ctx.paths.secrets_dir()) {
+            registrar_internal::publish_internal_trust(
+                ctx.paths.secrets_dir(),
+                &registrar_internal::InternalTrustState {
+                    fingerprints: final_fps.clone(),
+                    bundle_pem: ca_bundle_pem.clone(),
+                },
+                messages,
+            )
+            .await?;
+        }
+
         rot_state.phase = 6;
         update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else if start_phase < 6 {
@@ -385,6 +453,65 @@ pub(super) async fn rotate_ca_key(
     }
 
     Ok(())
+}
+
+/// The additive PEM bundle a repair republishes mid-rotation.
+///
+/// Exactly the sources Phase 3 concatenated, so a recovery run and the
+/// rotation that preceded it cannot publish different bytes for the same
+/// generation pair.
+pub(super) async fn concat_unique_ca_certs_for_repair(
+    ctx: &RotateContext,
+    messages: &Messages,
+) -> Result<String> {
+    concat_unique_ca_certs(
+        &[
+            ctx.paths.root_cert(),
+            ctx.paths.root_cert_bak(),
+            ctx.paths.intermediate_cert_bak(),
+            ctx.paths.intermediate_cert(),
+        ],
+        messages,
+    )
+    .await
+}
+
+/// The additive trust set a full rotation publishes in Phase 3 and
+/// keeps through the Phase-4 tail.
+///
+/// Derived from the rotation state rather than recomputed from disk, so
+/// a resumed rotation reaches exactly the set the original Phase 3
+/// published.
+fn transitional_fingerprints(state: &RotationState) -> Vec<String> {
+    vec![
+        state.old_root_fp.clone(),
+        state.old_intermediate_fp.clone(),
+        state.new_root_fp.clone(),
+        state.new_intermediate_fp.clone(),
+    ]
+}
+
+/// The PEM bundle covering [`transitional_fingerprints`].
+///
+/// The live certificates already hold the new generation, so the
+/// Phase-1 backups are what carry the old one — the same sources Phase 3
+/// concatenated.
+async fn transitional_bundle_pem(
+    ctx: &RotateContext,
+    state: &RotationState,
+    messages: &Messages,
+) -> Result<String> {
+    let _ = state;
+    concat_unique_ca_certs(
+        &[
+            ctx.paths.root_cert(),
+            ctx.paths.root_cert_bak(),
+            ctx.paths.intermediate_cert_bak(),
+            ctx.paths.intermediate_cert(),
+        ],
+        messages,
+    )
+    .await
 }
 
 /// Concatenates the given CA certificate files into a PEM bundle,

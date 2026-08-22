@@ -220,6 +220,13 @@ that misses it desynchronises the alias from the name the certificate carries.
 the loaded file, and is what a verb should call: it makes composing under a
 wire-supplied domain structurally impossible.
 
+`bootroot::registrar::registrar_internal_identity` is a fifth caller rather than
+a fifth site: it is `compose_san` with the instance fixed at `1` and the service
+label fixed at `bootroot-registrar-internal`, so it inherits this shape instead
+of restating it. It composes the bootroot-internal credential's one SAN, which
+never crosses a caller-facing wire — see
+`docs/reference/registrar-internal-credential.md`.
+
 ## 7. The example
 
 `docs/reference/provisioning.toml.example` is the shipped example, and a test

@@ -506,6 +506,47 @@ bootroot verify --registration-id edge-proxy \
   <container>` 훅으로 리로드합니다
   ([운영 > 컨테이너화된 소비 애플리케이션](operations.md) 참고).
 
+### bootroot 내부 registrar 에이전트
+
+[registrar 엔드포인트](operations.md#registrar-endpoint-linux-only)를 제공하는 **bootroot
+호스트** 배포에서는 해당 호스트의 서비스 에이전트와 별개로 **두 번째**
+`bootroot-agent` 프로세스를 함께 운영합니다. 이 프로세스가 갱신하는 인증서는
+하나뿐입니다. 데몬이 registrar의 `mint`/`deregister` 동사를 실행하기 위해
+`OpenBao`에 인증할 때 사용하는 bootroot 내부 자격 증명입니다.
+
+`bootroot init`은 이 설정 파일과 전용 CA 번들을 작성할 뿐, 프로세스를 시작하거나
+감독자(supervisor)를 설치하지 않습니다. 서비스 에이전트와 마찬가지로 운영자가
+같은 감독자 아래에서 시작합니다.
+
+```sh
+bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
+```
+
+`<secrets-directory>`는 `state.json`에 기록된 `secrets_dir`입니다. 이 경로는
+고정이며 설정으로 바꿀 수 없습니다. 회전(rotation)과 복구도 같은 경로를 패턴으로
+사용해 프로세스에 신호를 보냅니다.
+
+**일상적인 갱신은 이 프로세스를 시작한 뒤에야 시작됩니다.** 그전까지 자격 증명은
+`init`이 발급한 상태 그대로이며, 회전이 신호를 보내도 대상 프로세스가 없습니다.
+이 경우는 성공으로 처리하므로, 프로세스가 없는 것은 오류가 아니라 조용한 결과입니다.
+
+서비스 에이전트 설정과 다른 점이 두 가지 있습니다.
+
+- `[trust]`가 공유 `secrets/certs/ca-bundle.pem`이 아니라 **전용**
+  `registrar-internal/ca-bundle.pem`을 가리킵니다. 덕분에 CA 회전이 서비스가 읽는
+  파일을 건드리지 않고 이 신원의 신뢰 범위만 좁힐 수 있습니다.
+- `[acme].account_key_path`가 `registrar-internal/acme-account.json`을 가리켜,
+  갱신을 거듭해도 하나의 ACME 계정을 유지합니다. 이 키를 설정하지 않은 기존
+  설정은 발급마다 새 계정 키를 만드는 기존 동작을 그대로 유지합니다.
+
+registrar 엔드포인트를 사용하지 않는 호스트에는 이 파일들이 없으며, 이 절도
+필요하지 않습니다.
+
+자격 증명의 권한 경계, 부여되는 정확한 `OpenBao` 정책, 프로비저닝 순서, 회전
+단계, 복구 명령은
+[`docs/reference/registrar-internal-credential.md`](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md)에
+정리되어 있습니다.
+
 ### 바이너리
 
 소스에서 빌드:

@@ -1271,6 +1271,7 @@ fn settings_with_domain(domain: &str) -> Settings {
             directory_fetch_max_delay_secs: 1,
             poll_attempts: 1,
             poll_interval_secs: 1,
+            account_key_path: None,
         },
         retry: RetrySettings {
             backoff_secs: vec![1],

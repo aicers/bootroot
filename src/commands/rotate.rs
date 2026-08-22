@@ -5,6 +5,7 @@ mod eab_clear;
 mod helpers;
 mod infra_cert;
 mod openbao_recovery;
+mod registrar_internal;
 mod responder_hmac;
 mod stepca_password;
 
@@ -227,6 +228,12 @@ async fn run_rotate_with_exec(
                 args.yes,
                 args.show_secrets,
                 messages,
+            )
+            .await?;
+        }
+        RotateCommand::RegistrarInternalCredential(step_args) => {
+            registrar_internal::rotate_registrar_internal_credential(
+                &ctx, &client, step_args, args.yes, messages,
             )
             .await?;
         }

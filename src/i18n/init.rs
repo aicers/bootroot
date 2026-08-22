@@ -103,6 +103,17 @@ impl Messages {
         format_template(self.strings().init_openbao_tls_verified, &[("url", url)])
     }
 
+    pub(crate) fn init_registrar_internal_provisioning(&self) -> &'static str {
+        self.strings().init_registrar_internal_provisioning
+    }
+
+    pub(crate) fn init_registrar_internal_ready(&self, invocation: &str) -> String {
+        format_template(
+            self.strings().init_registrar_internal_ready,
+            &[("invocation", invocation)],
+        )
+    }
+
     pub(crate) fn init_openbao_already_unsealed(&self) -> &'static str {
         self.strings().init_openbao_already_unsealed
     }

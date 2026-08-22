@@ -905,6 +905,7 @@ mod tests {
                 directory_fetch_max_delay_secs: 10,
                 poll_attempts: 15,
                 poll_interval_secs: 2,
+                account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
                 http_responder_hmac: "dev-hmac".to_string(),
                 http_responder_timeout_secs: 5,
@@ -992,6 +993,152 @@ mod tests {
 
     fn test_bundle_pem(ca: &TestCa) -> String {
         format!("{}{}", ca.root_cert.pem(), ca.intermediate_cert.pem())
+    }
+
+    /// The bootroot-internal profile is renewed by the **ordinary**
+    /// loop. A second, test-only profile in the same generated config
+    /// proves it: both are enumerated, both resolve the same configured
+    /// tick, lead time and jitter, both select the same retry backoff
+    /// through `select_retry_backoff`, and both carry the same
+    /// failure-hook set. Nothing here is registrar-specific, and that is
+    /// the assertion.
+    #[test]
+    fn the_generated_internal_config_gives_both_profiles_one_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, internal_config_with_second_profile(dir.path())).unwrap();
+        let settings = config::Settings::from_file(Some(path)).unwrap();
+
+        assert_eq!(settings.profiles.len(), 2);
+        let internal = &settings.profiles[0];
+        let companion = &settings.profiles[1];
+        assert_eq!(internal.service_name, "bootroot-registrar-internal");
+        assert_ne!(internal.registration_id, companion.registration_id);
+
+        for profile in &settings.profiles {
+            assert_eq!(profile.daemon.check_interval, Duration::from_hours(2));
+            assert_eq!(profile.daemon.renew_before, Duration::from_hours(24));
+            assert_eq!(profile.daemon.check_jitter, Duration::from_secs(30));
+            // The generated `[retry]` is the deployment's; neither
+            // profile overrides it, so both resolve the same backoff
+            // through the one selector the daemon uses.
+            assert_eq!(profile.retry.as_ref().map(|r| r.backoff_secs.clone()), None);
+            assert_eq!(
+                select_retry_backoff(&settings, profile),
+                settings.retry.backoff_secs.as_slice()
+            );
+            let failure = &profile.hooks.post_renew.failure;
+            assert_eq!(failure.len(), 1);
+            assert_eq!(failure[0].command, "/bin/true");
+        }
+    }
+
+    /// The internal profile renews on expiry **and** on private-bundle
+    /// drift, because the generated config always sets
+    /// `[trust].ca_bundle_path`. The second profile in the same config
+    /// reaches the same answer through the same predicate.
+    #[tokio::test]
+    async fn both_profiles_renew_on_expiry_and_on_private_bundle_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let generation = build_test_ca("gen1");
+        fs::write(&bundle_path, test_bundle_pem(&generation)).unwrap();
+        let trust = config::TrustSettings {
+            ca_bundle_path: Some(bundle_path.clone()),
+            trusted_ca_sha256: Vec::new(),
+        };
+        let lead = Duration::from_secs(THIRTY_DAYS_SECS);
+
+        for (index, name) in ["internal", "companion"].iter().enumerate() {
+            let cert_path = dir.path().join(format!("{name}.pem"));
+
+            // Fresh leaf under the bundle's own CA: no renewal.
+            fs::write(&cert_path, sign_test_leaf(name, &generation)).unwrap();
+            let profile = build_profile(cert_path.clone());
+            assert!(
+                !should_renew(&profile, &trust, lead).await.unwrap(),
+                "{name} ({index}) should not renew while current"
+            );
+
+            // Expiry.
+            write_cert(
+                &cert_path,
+                time::OffsetDateTime::now_utc() + time::Duration::days(1),
+            );
+            assert!(
+                should_renew(&profile, &trust, lead).await.unwrap(),
+                "{name} ({index}) should renew on expiry"
+            );
+
+            // Private-bundle drift: the bundle moved to a generation the
+            // leaf does not chain to.
+            fs::write(&cert_path, sign_test_leaf(name, &generation)).unwrap();
+            fs::write(&bundle_path, test_bundle_pem(&build_test_ca("gen2"))).unwrap();
+            assert!(
+                should_renew(&profile, &trust, lead).await.unwrap(),
+                "{name} ({index}) should renew on private-bundle drift"
+            );
+            fs::write(&bundle_path, test_bundle_pem(&generation)).unwrap();
+        }
+    }
+
+    /// A fixture that removes `ca_bundle_path` stays expiry-only: the
+    /// drift arm of the generic predicate is reached only when a bundle
+    /// is configured, which is why the internal config always sets one.
+    #[tokio::test]
+    async fn an_unconfigured_bundle_leaves_the_predicate_expiry_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let generation = build_test_ca("gen1");
+        fs::write(&cert_path, sign_test_leaf("svc", &generation)).unwrap();
+        let profile = build_profile(cert_path.clone());
+        let trust = config::TrustSettings::default();
+        assert!(trust.ca_bundle_path.is_none());
+        let lead = Duration::from_secs(THIRTY_DAYS_SECS);
+
+        // A drifted bundle exists on disk but is not configured, so it
+        // cannot make the predicate fire.
+        fs::write(
+            dir.path().join("ca-bundle.pem"),
+            test_bundle_pem(&build_test_ca("gen2")),
+        )
+        .unwrap();
+        assert!(!should_renew(&profile, &trust, lead).await.unwrap());
+
+        write_cert(
+            &cert_path,
+            time::OffsetDateTime::now_utc() + time::Duration::days(1),
+        );
+        assert!(should_renew(&profile, &trust, lead).await.unwrap());
+    }
+
+    /// The generated internal config with a second, test-only profile
+    /// appended — the fixture the two tests above share.
+    fn internal_config_with_second_profile(dir: &std::path::Path) -> String {
+        let paths = crate::registrar::internal::InternalPaths::new(dir);
+        let base = crate::registrar::internal::render_internal_agent_config(
+            &paths,
+            &crate::registrar::internal::InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: TEST_DOMAIN,
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: "hmac",
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[],
+            },
+        );
+        let loop_settings = "\n[profiles.daemon]\ncheck_interval = \"2h\"\nrenew_before = \"24h\"\ncheck_jitter = \"30s\"\n\n[[profiles.hooks.post_renew.failure]]\ncommand = \"/bin/true\"\n";
+        format!(
+            "{base}{loop_settings}\n\
+             [[profiles]]\nregistration_id = \"companion\"\nservice_name = \"companion\"\n\
+             instance_id = \"001\"\nhostname = \"bootroot-01\"\n\
+             \n[profiles.paths]\ncert = \"{cert}\"\nkey = \"{key}\"\n{loop_settings}",
+            cert = dir.join("companion.pem").display(),
+            key = dir.join("companion.key").display(),
+        )
     }
 
     #[test]

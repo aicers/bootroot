@@ -504,6 +504,7 @@ mod tests {
                 directory_fetch_max_delay_secs: 10,
                 poll_attempts: 15,
                 poll_interval_secs: 2,
+                account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
                 http_responder_hmac: "dev-hmac".to_string(),
                 http_responder_timeout_secs: 5,

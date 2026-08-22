@@ -730,6 +730,29 @@ mod tests {
         assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
     }
 
+    /// The bootroot-internal registrar credential authenticates at
+    /// `auth/cert`, which validates the presented chain against its own
+    /// trusted entry. The *listener* therefore stays as it is: a TLS
+    /// listener already requests client certificates by default, and
+    /// requiring or forbidding them here would break the
+    /// certificate-less `AppRole` agents and every token-authenticated
+    /// command against the same port.
+    #[test]
+    fn the_tls_listener_introduces_no_client_certificate_option() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let messages = crate::i18n::test_messages();
+        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
+        for option in [
+            "tls_client_ca_file",
+            "tls_require_and_verify_client_cert",
+            "tls_disable_client_certs",
+        ] {
+            assert!(!content.contains(option), "{option} must not be set");
+        }
+    }
+
     #[test]
     fn write_openbao_hcl_plaintext_restores_tls_disable() {
         let dir = tempfile::tempdir().unwrap();
