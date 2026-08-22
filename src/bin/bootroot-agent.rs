@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use bootroot::config::CliOverrides;
-use bootroot::{Args, config, eab, profile, run_daemon, run_oneshot};
+use bootroot::{
+    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint, config, eab, profile, run_daemon,
+    run_oneshot,
+};
 use clap::Parser;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -46,9 +49,22 @@ async fn main() -> anyhow::Result<()> {
     } else {
         args.eab_file.clone()
     };
-    let mut pending = None;
     #[cfg(unix)]
     let mut hup = signal(SignalKind::hangup())?;
+
+    // The activation contract is consumed here, once, above the reload
+    // loop and before any daemon task exists. `LISTEN_PID` and
+    // `LISTEN_FDS` are read exactly once and never again; the process
+    // environment is not mutated, not even to clear them, because a
+    // Tokio runtime is already running and `set_var`/`remove_var` are
+    // unsound the moment another thread may read. The endpoint's
+    // enablement is therefore fixed for the process lifetime, and every
+    // later reload is held to the value captured here.
+    let (initial_settings, initial_eab) = load_settings(&args).await?;
+    let registrar_endpoint_enabled = initial_settings.registrar_endpoint.enabled;
+    let registrar_endpoint = RegistrarEndpoint::activate(registrar_endpoint_enabled)?;
+    let mut pending = Some((initial_settings, initial_eab));
+
     loop {
         let (settings, final_eab) = match pending.take() {
             Some(value) => value,
@@ -56,14 +72,17 @@ async fn main() -> anyhow::Result<()> {
         };
         log_settings(&settings, final_eab.as_ref());
         let settings = Arc::new(settings);
-        let mut task = tokio::spawn(run_daemon(
-            Arc::clone(&settings),
-            final_eab,
-            eab_refresh_path.clone(),
-            args.config.clone(),
-            args.insecure,
-            cli_overrides.clone(),
-        ));
+        let shutdown = DaemonShutdown::new();
+        let mut task = tokio::spawn(run_daemon(DaemonInvocation {
+            settings: Arc::clone(&settings),
+            default_eab: final_eab,
+            eab_refresh_path: eab_refresh_path.clone(),
+            config_path: args.config.clone(),
+            insecure_mode: args.insecure,
+            cli_overrides: cli_overrides.clone(),
+            shutdown: shutdown.clone(),
+            registrar_endpoint: registrar_endpoint.clone(),
+        }));
         #[cfg(unix)]
         loop {
             tokio::select! {
@@ -71,10 +90,22 @@ async fn main() -> anyhow::Result<()> {
                 _ = hup.recv() => {
                     match load_settings(&args).await {
                         Ok((settings, final_eab)) => {
+                            if let Err(err) = config::check_registrar_endpoint_reload(
+                                registrar_endpoint_enabled,
+                                settings.registrar_endpoint.enabled,
+                            ) {
+                                error!("Reload rejected: {err}");
+                                continue;
+                            }
                             info!("Reload signal received. Restarting daemon with new config.");
                             pending = Some((settings, final_eab));
-                            task.abort();
-                            let _ = task.await;
+                            // A coordinated stop, never an abort: the
+                            // daemon may own the registrar endpoint,
+                            // whose accept task and connection fleet
+                            // have to stop accepting, drain and be
+                            // joined before this invocation is joined.
+                            shutdown.stop();
+                            report_stopped_invocation((&mut task).await);
                             break;
                         }
                         Err(err) => {
@@ -116,6 +147,19 @@ fn log_settings(settings: &config::Settings, final_eab: Option<&eab::EabCredenti
         info!("Using EAB Credentials for Key ID: {}", creds.kid);
     } else {
         info!("No EAB credentials provided. Attempting open enrollment.");
+    }
+}
+
+/// Reports how the invocation a reload stopped actually ended.
+///
+/// The reload now *joins* that invocation instead of aborting it, so its
+/// result is a real one: a profile that failed on the way out, or a task
+/// that panicked, says so here instead of vanishing into the restart.
+fn report_stopped_invocation(result: Result<anyhow::Result<()>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => error!("The daemon invocation being reloaded ended with an error: {err}"),
+        Err(err) => error!("The daemon invocation being reloaded failed to join: {err}"),
     }
 }
 
@@ -191,6 +235,7 @@ mod tests {
             },
             profiles,
             openbao: None,
+            registrar_endpoint: config::RegistrarEndpointSettings::default(),
         }
     }
 

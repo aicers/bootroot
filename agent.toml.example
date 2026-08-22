@@ -31,6 +31,27 @@ http_responder_hmac = "change-me"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 
+# Host-local registrar endpoint (Linux only).
+#
+# When enabled, bootroot-agent serves the registrar's mint and
+# deregister verbs on a systemd-activated AF_UNIX socket inherited as
+# fd 3.  The daemon never creates the socket: systemd owns
+# /run/bootroot/registrar.sock, its 0700 mode and its root ownership,
+# through the checked-in systemd/bootroot-registrar.socket unit.  There
+# is deliberately no socket path here, and no TCP option.
+#
+# Enabling it is UNSUPPORTED for now: this build registers no registrar
+# request handler, so an enabled endpoint refuses to start.  The
+# registrar protocol work supplies the handler.
+#
+# The value is fixed for the process lifetime.  The listening descriptor
+# is inherited once, before the reload loop, so a SIGHUP whose value
+# differs from the running one is rejected and the running daemon is
+# left as it is; changing it takes a service restart.  On a non-Linux
+# target an enabled endpoint fails config validation.
+[registrar_endpoint]
+enabled = false
+
 # Trust settings for CA bundle verification/storage
 [trust]
 # Path to save the CA bundle (intermediate/root)

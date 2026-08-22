@@ -13,8 +13,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use crate::config::{
-    AcmeSettings, DaemonProfileSettings, DaemonRuntimeSettings, HookSettings, Paths, RetrySettings,
-    SchedulerSettings, Settings, TrustSettings, profile_domain,
+    AcmeSettings, DaemonProfileSettings, DaemonRuntimeSettings, HookSettings, Paths,
+    RegistrarEndpointSettings, RetrySettings, SchedulerSettings, Settings, TrustSettings,
+    profile_domain,
 };
 use crate::input_validation::ValidationError;
 use crate::registrar::config::{
@@ -1278,6 +1279,7 @@ fn settings_with_domain(domain: &str) -> Settings {
         scheduler: SchedulerSettings::default(),
         profiles: Vec::new(),
         openbao: None,
+        registrar_endpoint: RegistrarEndpointSettings::default(),
     }
 }
 

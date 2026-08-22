@@ -26,7 +26,11 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 time = "0.3"
-tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "time"] }
+# `io-util` and `net` are the registrar endpoint's: it serves an
+# AF_UNIX stream listener (`net`) and frames one request per connection
+# over `AsyncReadExt`/`AsyncWriteExt` (`io-util`). Both are features of
+# a dependency this crate already has, not a new dependency.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-rustls = "0.26"
 toml_edit = "0.25"
 tracing = "0.1"
