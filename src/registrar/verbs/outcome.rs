@@ -423,7 +423,12 @@ impl VerbError {
 #[derive(Debug)]
 pub(crate) struct VerbRefusal {
     context: VerbContext,
-    error: VerbError,
+    /// Boxed because this is the `Err` half of every verb's `Result`,
+    /// and the enum is wide enough that carrying it inline made the
+    /// whole `Result` bigger than the success path warrants — the cost
+    /// is one allocation on the cold refusal path instead of a fatter
+    /// return value on every call.
+    error: Box<VerbError>,
     teardown: Option<TeardownReport>,
 }
 
@@ -431,7 +436,7 @@ impl VerbRefusal {
     pub(crate) fn new(context: VerbContext, error: VerbError) -> Self {
         Self {
             context,
-            error,
+            error: Box::new(error),
             teardown: None,
         }
     }
