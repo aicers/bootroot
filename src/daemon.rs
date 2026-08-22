@@ -7,9 +7,80 @@ use std::time::Duration;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
 
+use crate::registrar::RegistrarEndpoint;
 use crate::{acme, cert_chain, config, eab, fast_poll, hooks, profile, utils};
 
 const DEFAULT_AGENT_CONFIG_PATH: &str = "agent.toml";
+
+/// The watch-based stop signal one daemon invocation is shut down
+/// through.
+///
+/// It exists because a `SIGHUP` reload used to be an `abort()` on the
+/// daemon task, and an abort is not a shutdown: it drops whatever the
+/// task owned at whichever `.await` each part of it had reached. That
+/// was survivable while the daemon owned only renewal loops. It is not
+/// survivable now that it may own the registrar endpoint, whose accept
+/// task and connection fleet have to stop accepting, drain, and be
+/// joined — in that order — before the invocation they belong to is
+/// joined.
+///
+/// So the signal is the caller's, not the daemon's. `bootroot-agent`
+/// holds it across the reload loop and asks for a stop; the daemon's own
+/// `SIGTERM`/`Ctrl-C` handler feeds the same channel, so process
+/// shutdown and reload are one path with one set of guarantees rather
+/// than two.
+#[derive(Clone, Debug)]
+pub struct DaemonShutdown {
+    sender: Arc<watch::Sender<bool>>,
+    receiver: watch::Receiver<bool>,
+}
+
+impl DaemonShutdown {
+    /// Creates a fresh, un-triggered stop signal.
+    #[must_use]
+    pub fn new() -> Self {
+        let (sender, receiver) = watch::channel(false);
+        Self {
+            sender: Arc::new(sender),
+            receiver,
+        }
+    }
+
+    /// Asks every task holding a receiver to stop.
+    ///
+    /// Idempotent, and safe to call after the daemon has already
+    /// finished: the sender is held alive by this handle, so there is no
+    /// closed-channel case to handle.
+    pub fn stop(&self) {
+        let _ = self.sender.send(true);
+    }
+
+    /// Returns a receiver for a task that wants to watch the signal.
+    #[must_use]
+    pub fn receiver(&self) -> watch::Receiver<bool> {
+        self.receiver.clone()
+    }
+
+    /// Resolves once a stop has been asked for, including when it was
+    /// asked for before this call.
+    pub async fn stopped(&self) {
+        let mut receiver = self.receiver.clone();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for DaemonShutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone)]
 struct IssuanceRuntime {
@@ -61,22 +132,53 @@ impl Default for ProfileLocks {
     }
 }
 
+/// Everything one daemon invocation is given.
+///
+/// A struct rather than an argument list because the reload loop builds
+/// most of it afresh per invocation and carries two members —
+/// [`DaemonInvocation::shutdown`] and
+/// [`DaemonInvocation::registrar_endpoint`] — *across* invocations
+/// unchanged. Naming them at the call site is what makes that split
+/// visible.
+pub struct DaemonInvocation {
+    /// The settings this invocation runs under.
+    pub settings: Arc<config::Settings>,
+    /// The EAB credentials in force at startup, if any.
+    pub default_eab: Option<eab::EabCredentials>,
+    /// The `--eab-file` path the fast-poll loop refreshes EAB through.
+    pub eab_refresh_path: Option<PathBuf>,
+    /// The agent config path, for reload-driven rewrites.
+    pub config_path: Option<PathBuf>,
+    /// Whether certificate verification is relaxed for local testing.
+    pub insecure_mode: bool,
+    /// CLI overrides that must survive a config reload.
+    pub cli_overrides: config::CliOverrides,
+    /// The stop signal, held by the caller across reloads.
+    pub shutdown: DaemonShutdown,
+    /// The activated registrar endpoint, held by the caller across
+    /// reloads so its socket inode survives one.
+    pub registrar_endpoint: RegistrarEndpoint,
+}
+
 /// Runs the agent daemon loop for all profiles.
 ///
 /// # Errors
 /// Returns an error if issuance or shutdown handling fails.
-pub(crate) async fn run_daemon(
-    settings: Arc<config::Settings>,
-    default_eab: Option<eab::EabCredentials>,
-    eab_refresh_path: Option<PathBuf>,
-    config_path: Option<PathBuf>,
-    insecure_mode: bool,
-    cli_overrides: config::CliOverrides,
-) -> anyhow::Result<()> {
+pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
+    let DaemonInvocation {
+        settings,
+        default_eab,
+        eab_refresh_path,
+        config_path,
+        insecure_mode,
+        cli_overrides,
+        shutdown,
+        registrar_endpoint,
+    } = invocation;
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let profile_locks = Arc::new(ProfileLocks::new());
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_rx = shutdown.receiver();
     let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
         insecure_mode,
@@ -92,14 +194,11 @@ pub(crate) async fn run_daemon(
     let (eab_tx, eab_rx) = watch::channel(default_eab);
     let shared_eab = eab::SharedEab::from_receiver(eab_rx);
 
-    let shutdown_handle = tokio::spawn(async move {
-        if let Err(err) = wait_for_shutdown().await {
-            error!("Shutdown signal handler error: {err}");
-        }
-        let _ = shutdown_tx.send(true);
-    });
+    let shutdown_handle = spawn_shutdown_watcher(shutdown);
 
     let mut handles = Vec::new();
+
+    spawn_registrar_endpoint(&mut handles, &registrar_endpoint, &shutdown_rx);
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
@@ -169,6 +268,54 @@ pub(crate) async fn run_daemon(
 
     let _ = shutdown_handle.await;
     collect_task_results(handles, "daemon").await
+}
+
+/// Spawns the task that ends this invocation.
+///
+/// The process signal and the caller's stop are the same stop: either
+/// one arriving ends this task, which then sets the watch, so a
+/// `SIGHUP`-driven reload and a `SIGTERM` converge on one shutdown path
+/// with one set of guarantees rather than two.
+fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            result = wait_for_shutdown() => {
+                if let Err(err) = result {
+                    error!("Shutdown signal handler error: {err}");
+                }
+            }
+            () = shutdown.stopped() => {}
+        }
+        shutdown.stop();
+    })
+}
+
+/// Spawns the registrar endpoint's accept task, when one is active.
+///
+/// The handle joins the same `handles` vector every profile task does,
+/// and [`collect_task_results`] awaits all of them before the daemon
+/// invocation returns. That ordering is the guarantee: the endpoint has
+/// stopped accepting, drained or aborted its connections and joined
+/// every one of them by the time the reload loop joins the invocation.
+///
+/// On a non-Linux target the endpoint is not compiled at all, and an
+/// enabled setting has already been refused by configuration validation.
+fn spawn_registrar_endpoint(
+    handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    registrar_endpoint: &RegistrarEndpoint,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    #[cfg(target_os = "linux")]
+    if let Some(endpoint) = registrar_endpoint.activated() {
+        let shutdown_rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            crate::registrar::endpoint::serve::run(endpoint, shutdown_rx).await
+        }));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (handles, registrar_endpoint, shutdown_rx);
+    }
 }
 
 async fn run_profile_daemon(
@@ -772,6 +919,7 @@ mod tests {
             },
             profiles: Vec::new(),
             openbao: None,
+            registrar_endpoint: config::RegistrarEndpointSettings::default(),
         }
     }
 

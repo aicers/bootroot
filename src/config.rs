@@ -57,6 +57,58 @@ pub struct Settings {
     /// requests on the KV v2 `reissue` path for each registered service.
     #[serde(default)]
     pub openbao: Option<OpenBaoSettings>,
+    /// The host-local registrar endpoint. An absent `[registrar_endpoint]`
+    /// table leaves it disabled, which is what every deployment but a
+    /// bootroot-host wants.
+    #[serde(default)]
+    pub registrar_endpoint: RegistrarEndpointSettings,
+}
+
+/// The host-local registrar endpoint's only setting.
+///
+/// The endpoint is a Linux-only, systemd-socket-activated `AF_UNIX`
+/// listener. There is deliberately no socket path here: the pathname is
+/// the socket unit's, and a daemon that could be pointed at a path of
+/// its own would be a daemon that could be pointed at an unprotected
+/// one.
+///
+/// `enabled` is fixed for a process lifetime. The listening descriptor is
+/// inherited once, before the reload loop, so a `SIGHUP` cannot conjure
+/// one that was never passed in, and cannot drop one whose socket unit
+/// still holds the pathname open. A reload whose value differs from the
+/// running one is rejected outright and the running daemon is left
+/// undisturbed; changing it takes a service restart.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrarEndpointSettings {
+    /// Whether the daemon serves the registrar verbs on the activated
+    /// socket. Defaults to `false`, including when the table is absent.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Checks that a reloaded configuration keeps `[registrar_endpoint]
+/// enabled` at the value the running process started with.
+///
+/// The activation contract is consumed once, above the reload loop, so
+/// this value is not a reloadable one: enabling it on a `SIGHUP` would
+/// have no descriptor to serve, and disabling it would leave the socket
+/// unit holding a pathname nothing accepts on. Both are rejected here
+/// rather than half-applied.
+///
+/// # Errors
+///
+/// Returns an error naming both values when they differ.
+pub fn check_registrar_endpoint_reload(running: bool, reloaded: bool) -> Result<()> {
+    if running == reloaded {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "registrar_endpoint.enabled changed from {running} to {reloaded}; \
+         it is fixed for the process lifetime because the listening socket is \
+         inherited once at startup, so this reload is rejected and the running \
+         daemon is left as it is. Restart the service to apply the change"
+    )
 }
 
 /// `OpenBao` connection settings for the remote-agent fast-poll loop.
@@ -1129,5 +1181,112 @@ mod tests {
         let domain = profile_domain(&settings, &settings.profiles[0]);
         assert_eq!(domain, "001.edge-proxy.edge-node-01.example.internal");
         assert!(!domain.contains("edge-node-01-edge-proxy-001"));
+    }
+
+    /// An absent `[registrar_endpoint]` table leaves the endpoint
+    /// disabled. That is what keeps every deployment that never asked
+    /// for it from inspecting an activation variable or opening a
+    /// listener.
+    #[test]
+    fn an_absent_registrar_endpoint_table_leaves_the_endpoint_disabled() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert!(!settings.registrar_endpoint.enabled);
+        assert_eq!(
+            settings.registrar_endpoint,
+            RegistrarEndpointSettings::default()
+        );
+    }
+
+    /// An empty table is the same as an absent one: `enabled` defaults
+    /// to `false` on its own, not only through the table's default.
+    #[test]
+    fn an_empty_registrar_endpoint_table_leaves_the_endpoint_disabled() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar_endpoint]").unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert!(!settings.registrar_endpoint.enabled);
+    }
+
+    #[test]
+    fn the_registrar_endpoint_table_reads_an_explicit_value() {
+        for (rendered, expected) in [("true", true), ("false", false)] {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(file, "\n[registrar_endpoint]\nenabled = {rendered}").unwrap();
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            assert_eq!(settings.registrar_endpoint.enabled, expected, "{rendered}");
+        }
+    }
+
+    /// The table takes exactly one key, so a misspelled one is a config
+    /// error rather than a setting that silently does nothing.
+    #[test]
+    fn the_registrar_endpoint_table_rejects_an_unknown_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar_endpoint]\nenable = true").unwrap();
+        file.flush().unwrap();
+        assert!(Settings::from_file(Some(file.path().to_path_buf())).is_err());
+    }
+
+    /// A reload may not change the endpoint's enablement in either
+    /// direction: the listening descriptor is inherited once, above the
+    /// reload loop.
+    #[test]
+    fn a_reload_that_changes_the_endpoints_enablement_is_rejected() {
+        assert!(check_registrar_endpoint_reload(false, false).is_ok());
+        assert!(check_registrar_endpoint_reload(true, true).is_ok());
+
+        let err = check_registrar_endpoint_reload(false, true).unwrap_err();
+        assert!(
+            err.to_string().contains("registrar_endpoint.enabled"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("Restart the service"), "{err}");
+
+        let err = check_registrar_endpoint_reload(true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("registrar_endpoint.enabled"),
+            "{err}"
+        );
+    }
+
+    /// The endpoint is Linux-only, and an enabled setting is refused
+    /// where it cannot be served — before anything looks at an
+    /// activation variable.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn an_enabled_endpoint_is_refused_on_a_non_linux_target() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar_endpoint]\nenabled = true").unwrap();
+        file.flush().unwrap();
+        // The table still parses: only validation refuses it.
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert!(settings.registrar_endpoint.enabled);
+
+        let err = settings.validate().unwrap_err();
+        assert!(err.to_string().contains("Linux only"), "{err}");
+        assert!(
+            !err.to_string().contains("LISTEN_PID"),
+            "the refusal must be about the platform, not the contract: {err}"
+        );
+    }
+
+    /// A disabled endpoint validates everywhere, including where it
+    /// could not be served.
+    #[test]
+    fn a_disabled_endpoint_validates_on_every_target() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar_endpoint]\nenabled = false").unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        settings.validate().unwrap();
     }
 }

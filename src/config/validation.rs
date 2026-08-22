@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use reqwest::Url;
 
 use super::defaults::default_renew_before;
-use super::{DaemonProfileSettings, HookCommand, OpenBaoSettings, Settings, TrustSettings};
+use super::{
+    DaemonProfileSettings, HookCommand, OpenBaoSettings, RegistrarEndpointSettings, Settings,
+    TrustSettings,
+};
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 
 /// Validates that `cert_duration` is strictly greater than the default
@@ -100,6 +103,32 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     if let Some(openbao) = &settings.openbao {
         validate_openbao_settings(openbao)?;
     }
+    validate_registrar_endpoint_settings(settings.registrar_endpoint)?;
+    Ok(())
+}
+
+/// Rejects an enabled registrar endpoint on a target that cannot serve
+/// one.
+///
+/// The endpoint is systemd socket activation and nothing else: there is
+/// no bind path, so there is no degraded mode to fall back to on a
+/// platform without it. Refusing here — before the composition boundary
+/// looks at `LISTEN_PID` or `LISTEN_FDS` at all — is what keeps the
+/// diagnostic "this platform has no such endpoint" rather than "no
+/// descriptor was passed", which would send an operator looking for a
+/// unit file that could never have run.
+#[cfg_attr(target_os = "linux", allow(clippy::unnecessary_wraps))]
+fn validate_registrar_endpoint_settings(settings: RegistrarEndpointSettings) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    if settings.enabled {
+        anyhow::bail!(
+            "registrar_endpoint.enabled is true, but the registrar endpoint is \
+             supported on Linux only: it is served on a systemd-activated \
+             AF_UNIX socket and the daemon never creates one itself"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let _ = settings;
     Ok(())
 }
 

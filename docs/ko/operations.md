@@ -233,6 +233,122 @@ WantedBy=multi-user.target
   [컨테이너화된 소비 애플리케이션](#컨테이너화된-소비-애플리케이션)을
   참고하세요.
 
+### 레지스트라 엔드포인트 (Linux 전용) {#registrar-endpoint-linux-only}
+
+레지스트라 자체 컨트롤 플레인을 운영하는 호스트, 즉 **bootroot-host**
+배포에서는 `bootroot-agent`가 레지스트라의 `mint`/`deregister` 동사를
+호스트 로컬 소켓으로 제공하게 할 수 있습니다. Linux 전용이고, `AF_UNIX`
+전용이며, systemd 소켓 활성화 전용입니다. 그 밖의 모든 배포는 기본값
+그대로 비활성 상태로 둡니다.
+
+**레지스트라 프로토콜 작업이 완료되기 전까지 활성화는 지원되지
+않습니다.** 이 빌드에는 요청 핸들러가 등록되어 있지 않으므로
+`registrar_endpoint.enabled = true`이면 데몬이 기동을 거부합니다.
+
+#### 소켓과 그 소유자
+
+`systemd`가 `/run/bootroot/registrar.sock`을 만들고 이름과 모드를
+소유하며, 이미 listen 상태인 디스크립터를 fd 3으로 데몬에 넘깁니다.
+`bootroot-agent`는 소켓을 bind·unlink·rename·`chmod`하지 않고, 경로를
+지정하는 설정 키도 없습니다. 스스로 경로를 정할 수 있는 데몬은 보호되지
+않은 경로를 향하게 만들 수도 있는 데몬이기 때문입니다.
+
+기동 시 데몬은 `getsockname()`이 알려준 경로명을 검사합니다.
+
+- 소켓 모드는 정확히 `0700`이어야 합니다.
+- 소켓 소유자는 데몬의 실효 uid와 같아야 합니다.
+- 소켓이 들어 있는 디렉터리도 같은 소유자여야 하고, group-write도
+  other-write도 없어야 합니다. 이 검사는 비트마스크이므로 `0700`과
+  배포 유닛의 `RuntimeDirectoryMode=0755`가 모두 통과합니다.
+
+배포 유닛에서 그 uid는 0입니다. 모드가 다르거나, 소유자가 다르거나,
+상위 디렉터리에 쓰기 권한이 열려 있거나, 디스크립터가 listen 중인
+`AF_UNIX` 스트림이 아니거나, 주소가 파일시스템 경로명이 아니면 서비스를
+시작하지 않고 진단 메시지와 함께 거부합니다.
+
+이후 각 연결은 경로 메타데이터가 아니라 *연결된 소켓*의 피어 자격증명으로
+인증합니다. 데몬의 실효 uid와 같은 uid를 가진 피어만 동사에 도달합니다.
+피어의 pid와 gid는 연결 진단 로그로만 남고 호출자 신원에는 포함되지
+않습니다.
+
+#### 유닛 설치
+
+두 유닛 모두 이 저장소의 `systemd/` 아래에 포함되어 있습니다.
+`/etc/systemd/system/`에 복사한 뒤 활성화합니다.
+
+```sh
+install -m 0644 systemd/bootroot-registrar.socket /etc/systemd/system/
+install -m 0644 systemd/bootroot-registrar.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now bootroot-registrar.socket
+systemctl enable --now bootroot-registrar.service
+```
+
+소켓 유닛은 `ListenStream=/run/bootroot/registrar.sock`,
+`SocketMode=0700`, `SocketUser=root`, `SocketGroup=root`, `Accept=no`,
+`RuntimeDirectory=bootroot`, `RuntimeDirectoryMode=0755`,
+`RuntimeDirectoryPreserve=yes`, `WantedBy=sockets.target`를 사용합니다.
+`RuntimeDirectoryPreserve=yes`가 있어야 서비스 재시작이 런타임 디렉터리를
+함께 없애지 않습니다.
+
+서비스 유닛은 `Requires=bootroot-registrar.socket`,
+`After=bootroot-registrar.socket`, `User=root`, `Group=root`,
+`Restart=on-failure`, `WantedBy=multi-user.target`과 다음 `ExecStart`를
+사용합니다.
+
+```ini
+ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
+```
+
+이 서비스는 연결이 들어올 때 지연 기동되는 것이 아니라 **부팅 시
+시작**됩니다. 레지스트라가 접속하든 하지 않든 갱신 루프와 fast-poll
+루프는 돌아야 하기 때문입니다. 소켓 유닛은 데몬이 시작되기 전에 listen
+디스크립터가 존재하고 그것을 상속받게 하기 위한 의존성일 뿐입니다.
+
+다른 에이전트 유닛과 마찬가지로, EAB 자격증명을 회전하는 배포는 실제로
+프로비저닝된 `--eab-file` 경로를 `ExecStart`에 추가해야 합니다. 그렇지
+않으면 EAB KV 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히
+무시됩니다. 위의
+[systemd 운영 절차](#systemd-운영-절차bootroot-agent-권장)를 참고하세요.
+
+#### 하드닝된 비루트 유닛과의 차이
+
+위의 [하드닝된 systemd 유닛 예시](#하드닝된-systemd-유닛-예시)는 데몬을
+전용 비특권 계정으로, 제한된 파일시스템 뷰에서 실행합니다. 일반 서비스
+호스트에는 여전히 그 형태가 맞습니다. 레지스트라 유닛은 의도적으로 그와
+다릅니다. `mint`와 `deregister`가 특권 내부 자격증명을 필요로 하므로
+root로 실행합니다. 비특권으로 활성화된 엔드포인트는 기동은 하되 두 동사가
+성공할 수 없다는 경고를 남깁니다. 조용히 정상인 척하지 않습니다. 두
+유닛은 계층이 아니라 택일 관계이며, 한 호스트에서 같은 설정으로 둘을 함께
+쓰지 않습니다.
+
+#### 저장소 밖 레지스트라 유닛의 순서
+
+레지스트라 프로세스 자체는 다른 저장소에 있으며 여기서 관리하지 않습니다.
+그것을 실행하는 유닛은 반드시 소켓 뒤로 순서를 잡아야 합니다.
+
+```ini
+[Unit]
+After=bootroot-registrar.socket
+Requires=bootroot-registrar.socket
+```
+
+*서비스* 뒤로 잡는 것으로는 부족하고, 그것이 원하는 바도 아닙니다.
+경로명을 만드는 것은 소켓 유닛이므로, 소켓 뒤로 잡아야 레지스트라가 접속할
+대상이 존재함이 보장됩니다. 데몬 뒤로 잡으면 레지스트라의 기동이 재시작될
+수 있는 유닛에 묶이기까지 합니다.
+
+#### 설정 값
+
+`agent.toml`의 `registrar_endpoint.enabled`는 프로세스 수명 동안
+고정됩니다. listen 디스크립터는 리로드 루프보다 앞에서 한 번만
+상속되므로, 실행 중인 값과 다른 값으로 `SIGHUP`이 들어오면 그 리로드는
+거부됩니다. 실행 중인 데몬은 현재 설정 그대로 계속 동작하고 거부 사실이
+로그에 남습니다. 값을 바꾸려면 `systemctl restart`가 필요합니다. 값을
+바꾸지 않는 리로드는 종전과 동일하게 동작하며, 리스너를 리로드 위쪽에서
+유지하고 리로드가 다시 획득하지 않기 때문에 엔드포인트는 같은 소켓 inode를
+그대로 유지합니다.
+
 ## 회전 스케줄링
 
 `bootroot rotate ...`는 크론/systemd 타이머로 주기 실행합니다. 토큰 등

@@ -299,6 +299,41 @@ backoff_secs = [5, 10, 30]
 
 Used when issuance or renewal fails. Profiles can override this.
 
+### Registrar endpoint (Linux only)
+
+```toml
+[registrar_endpoint]
+enabled = false
+```
+
+Serves the registrar's `mint` and `deregister` verbs on a host-local
+`AF_UNIX` stream socket. Defaults to `false`, including when the
+`[registrar_endpoint]` table is absent — the setting exists for
+bootroot-host deployments and nothing else. The only key is `enabled`;
+an unknown key is a configuration error.
+
+**Enabling it is unsupported until the registrar protocol work lands.**
+This build registers no request handler, so an enabled endpoint refuses
+to start rather than accepting requests it cannot answer.
+
+There is no socket path here, and no TCP option, by design. systemd
+creates and owns `/run/bootroot/registrar.sock` through the checked-in
+`systemd/bootroot-registrar.socket` unit, and the daemon inherits the
+already-listening descriptor as fd 3; it never binds, unlinks or
+re-permissions a socket itself. See
+[Registrar endpoint (Linux only)](operations.md#registrar-endpoint-linux-only)
+in the operations guide for the units and the ownership requirements.
+
+`enabled` is fixed for the process lifetime. The listening descriptor is
+inherited once, before the reload loop, so a `SIGHUP` whose reloaded
+value differs from the running one is **rejected**: the running daemon
+keeps serving under its current setting and the reload is logged as
+refused. Changing the value takes a service restart.
+
+On a target that is not Linux the table still parses, but an enabled
+endpoint fails configuration validation with an explicit
+unsupported-platform error, before any activation variable is looked at.
+
 ### EAB (Optional)
 
 ```toml
