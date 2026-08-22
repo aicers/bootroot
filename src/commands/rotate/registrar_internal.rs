@@ -36,8 +36,8 @@ use anyhow::{Context, Result};
 use bootroot::eab::EabCredentials;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
-    InternalPaths, MaterialStatus, load_material, material_status, require_root_authority,
-    upsert_internal_trust,
+    InternalPaths, MaterialStatus, load_material, material_status, require_https,
+    require_root_authority, upsert_internal_trust,
 };
 use bootroot::{cert_group, fs_util};
 
@@ -179,8 +179,9 @@ pub(super) fn ensure_internal_trust_is(
 /// # Errors
 ///
 /// Returns an error when the token does not carry `root`, when the
-/// endpoint predicate is absent, when the ACME issuance fails, or when
-/// any file cannot be published.
+/// recorded `OpenBao` URL is plaintext, when the endpoint predicate is
+/// absent, when the ACME issuance fails, or when any file cannot be
+/// published.
 pub(super) async fn repair_internal_credential(
     ctx: &RotateContext,
     client: &OpenBaoClient,
@@ -188,6 +189,13 @@ pub(super) async fn repair_internal_credential(
     messages: &Messages,
 ) -> Result<()> {
     require_root_authority(client).await?;
+    // A host that carries this credential runs `OpenBao` over TLS, because
+    // the credential authenticates at `auth/cert` and nothing else can.
+    // A recorded `http://` URL means the listener transition never
+    // completed, and republishing material against it would leave a
+    // credential that cannot log in — so refuse before anything is
+    // written, with the same typed error the load path uses.
+    require_https(&ctx.openbao_url)?;
 
     let context = repair_context(ctx, client).await?;
     let inputs = context.inputs();
@@ -481,7 +489,7 @@ mod tests {
 
     use super::{
         InternalPaths, InternalTrustState, ensure_internal_trust_is, internal_credential_present,
-        write_internal_trust,
+        repair_internal_credential, write_internal_trust,
     };
     use crate::i18n::test_messages;
 
@@ -591,6 +599,62 @@ mod tests {
                 .expect("fingerprint")
                 .trim(),
             ROOT_FP
+        );
+    }
+
+    /// A repair never runs against a plaintext `OpenBao` URL. A host
+    /// that carries this credential runs `OpenBao` over TLS, so an
+    /// `http://` URL means the listener transition never completed;
+    /// republishing material against it would leave a credential that
+    /// cannot log in. The refusal is typed, names TLS, and lands before
+    /// a single file is rewritten.
+    #[tokio::test]
+    async fn a_repair_over_plaintext_is_refused_before_anything_is_written() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/token/lookup-self"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "policies": ["root"] }
+            })))
+            .mount(&server)
+            .await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let (dir, paths) = provisioned_host().await;
+        let before = std::fs::read_to_string(paths.agent_config()).expect("config");
+        let ctx = super::RotateContext {
+            openbao_url: "http://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            compose_file: dir.path().join("docker-compose.yml"),
+            state: crate::state::StateFile::default(),
+            paths: crate::commands::rotate::StatePaths::new(dir.path().to_path_buf()),
+            state_dir: dir.path().to_path_buf(),
+            state_file: dir.path().join("state.json"),
+            docker: std::path::PathBuf::from(crate::commands::compose_project::DOCKER_BIN),
+        };
+        let err = repair_internal_credential(
+            &ctx,
+            &client,
+            &InternalTrustState {
+                fingerprints: vec![ROOT_FP.to_string()],
+                bundle_pem: bundle_pem("Uk9PVA"),
+            },
+            &test_messages(),
+        )
+        .await
+        .expect_err("a plaintext OpenBao URL must be refused");
+        assert!(
+            err.to_string().contains("certificate login requires TLS"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_config()).expect("config"),
+            before,
+            "nothing may be rewritten before the refusal"
         );
     }
 

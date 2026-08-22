@@ -33,8 +33,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalAgentConfigParams, InternalCredential,
-    InternalMaterial, InternalPaths, PrivateKeyPem, build_registrar_internal_policy,
-    internal_registration_id, publish_material, render_internal_agent_config,
+    InternalMaterial, InternalPaths, MaterialStatus, PrivateKeyPem,
+    build_registrar_internal_policy, internal_registration_id, material_status, publish_material,
+    render_internal_agent_config,
 };
 use bootroot::registrar::registrar_internal_identity;
 use bootroot::{cert_group, config, fs_util};
@@ -209,6 +210,27 @@ impl StagedInternal {
         self.bundle_pem = bundle_pem;
         self
     }
+}
+
+/// Registers this run's bootroot-internal teardown with the `init`
+/// rollback envelope.
+///
+/// The layout directory is the rollback unit of a *first* provisioning:
+/// this run then either publishes a complete credential or leaves
+/// nothing behind. `init` is re-runnable, though, and a re-run that
+/// fails must not have its rollback delete the working credential it
+/// found — that would turn a retryable failure into an outage on the one
+/// host the registrar depends on. So the directory is registered only
+/// when nothing is there yet.
+///
+/// The staging directory is registered either way: it is this run's
+/// alone and holds a private key that was never published.
+pub(super) fn register_internal_rollback(rollback: &mut InitRollback, secrets_dir: &Path) {
+    let paths = InternalPaths::new(secrets_dir);
+    if matches!(material_status(&paths), MaterialStatus::Absent) {
+        rollback.registrar_internal_dir = Some(paths.dir().to_path_buf());
+    }
+    rollback.registrar_internal_staging = Some(staging_dir(&paths));
 }
 
 /// Creates the `auth/cert` mount, the exact-allowlist policy and the one
@@ -575,7 +597,10 @@ mod tests {
     use bootroot::registrar::internal::{InternalPaths, MaterialStatus, material_status};
     use tempfile::TempDir;
 
-    use super::{RegistrarInternalIntent, registrar_endpoint_intent};
+    use super::{
+        RegistrarInternalIntent, register_internal_rollback, registrar_endpoint_intent, staging_dir,
+    };
+    use crate::commands::init::steps::InitRollback;
     use crate::state::{RegistrarEndpointState, StateFile};
 
     const DOMAIN: &str = "example.internal";
@@ -661,6 +686,66 @@ mod tests {
                 "{err} for ({domain:?}, {host:?})"
             );
         }
+    }
+
+    /// A first provisioning owns the layout directory, so a failure
+    /// anywhere after this point removes it whole and leaves nothing
+    /// half-provisioned behind.
+    #[test]
+    fn a_first_provisioning_registers_the_layout_directory() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        let mut rollback = InitRollback::default();
+        register_internal_rollback(&mut rollback, dir.path());
+        assert_eq!(
+            rollback.registrar_internal_dir.as_deref(),
+            Some(paths.dir())
+        );
+        assert_eq!(
+            rollback.registrar_internal_staging,
+            Some(staging_dir(&paths))
+        );
+    }
+
+    /// `init` is re-runnable. A re-run over a host that already carries
+    /// a credential must not register that credential for teardown: a
+    /// failure later in the run would then delete a working credential
+    /// and turn a retryable failure into an outage. Staging is still
+    /// registered — it is this run's alone and holds an unpublished
+    /// private key.
+    #[test]
+    fn a_re_run_leaves_an_existing_credential_out_of_the_teardown() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(paths.dir()).expect("layout dir");
+        for path in paths.all() {
+            std::fs::write(&path, "EXISTING").expect("existing artifact");
+        }
+        let mut rollback = InitRollback::default();
+        register_internal_rollback(&mut rollback, dir.path());
+        assert_eq!(rollback.registrar_internal_dir, None);
+        assert_eq!(
+            rollback.registrar_internal_staging,
+            Some(staging_dir(&paths))
+        );
+    }
+
+    /// A half-written set left by an earlier failed run is the prior
+    /// state too, and rollback restores prior state rather than
+    /// improving on it.
+    #[test]
+    fn a_partial_set_is_also_left_out_of_the_teardown() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(paths.dir()).expect("layout dir");
+        std::fs::write(paths.key(), "EXISTING KEY").expect("key");
+        assert!(matches!(
+            material_status(&paths),
+            MaterialStatus::Partial(_)
+        ));
+        let mut rollback = InitRollback::default();
+        register_internal_rollback(&mut rollback, dir.path());
+        assert_eq!(rollback.registrar_internal_dir, None);
     }
 
     /// A host that reads as disabled creates none of the internal

@@ -139,7 +139,10 @@ token-authenticated command against the same port.
 
 Certificate login is **never** attempted over plaintext. A recorded
 `http://` URL is a typed refusal (`InternalCredentialError::PlaintextOpenBaoUrl`)
-raised before the credential is even read.
+raised before the credential is even read. A repair — the Phase-4 tail or
+`bootroot rotate registrar-internal-credential` — raises the same refusal before
+it writes anything, because material republished against a plaintext URL would
+be a credential that cannot log in.
 
 ## 5. The `auth/cert` entry and the policy
 

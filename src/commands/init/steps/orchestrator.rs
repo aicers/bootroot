@@ -970,14 +970,7 @@ async fn run_init_inner(
             println!("{}", messages.init_registrar_internal_provisioning());
             registrar_internal::provision_internal_auth(client, &inputs, rollback, messages)
                 .await?;
-            // The whole layout directory is the rollback unit, staging
-            // included: this run either publishes a complete credential
-            // or leaves nothing behind.
-            rollback.registrar_internal_dir = Some(
-                bootroot::registrar::internal::InternalPaths::new(&args.secrets_dir.secrets_dir)
-                    .dir()
-                    .to_path_buf(),
-            );
+            registrar_internal::register_internal_rollback(rollback, &args.secrets_dir.secrets_dir);
             Some(registrar_internal::issue_internal_material(&inputs, messages).await?)
         }
         None => None,

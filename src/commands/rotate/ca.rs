@@ -282,7 +282,10 @@ pub(super) async fn rotate_ca_key(
                 &transitional_fps,
                 messages,
             )?;
-            let bundle_pem = transitional_bundle_pem(ctx, &rot_state, messages).await?;
+            // The live certificates already hold the new generation, so
+            // the Phase-1 backups are what carry the old one — the same
+            // sources Phase 3 concatenated.
+            let bundle_pem = concat_unique_ca_certs_for_repair(ctx, messages).await?;
             registrar_internal::repair_internal_credential(
                 ctx,
                 client,
@@ -497,29 +500,6 @@ fn transitional_fingerprints(state: &RotationState) -> Vec<String> {
         state.new_root_fp.clone(),
         state.new_intermediate_fp.clone(),
     ]
-}
-
-/// The PEM bundle covering [`transitional_fingerprints`].
-///
-/// The live certificates already hold the new generation, so the
-/// Phase-1 backups are what carry the old one — the same sources Phase 3
-/// concatenated.
-async fn transitional_bundle_pem(
-    ctx: &RotateContext,
-    state: &RotationState,
-    messages: &Messages,
-) -> Result<String> {
-    let _ = state;
-    concat_unique_ca_certs(
-        &[
-            ctx.paths.root_cert(),
-            ctx.paths.root_cert_bak(),
-            ctx.paths.intermediate_cert_bak(),
-            ctx.paths.intermediate_cert(),
-        ],
-        messages,
-    )
-    .await
 }
 
 /// Concatenates the given CA certificate files into a PEM bundle,
