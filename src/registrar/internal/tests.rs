@@ -13,8 +13,8 @@ use super::agent_config::{
     internal_signal_pattern, load_internal_config, upsert_internal_trust,
 };
 use super::material::{
-    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, load_material,
-    material_status, publish_material,
+    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SET_FILES, is_protected,
+    load_material, material_status, publish_material,
 };
 use super::{
     ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_ROLE, CHAIN_FILE, INTERNAL_DIR,
@@ -439,6 +439,31 @@ async fn secret_members_are_published_at_0600() {
     let (_dir, paths) = provisioned_host().await;
     assert_eq!(mode_of(&paths.key()), 0o600);
     assert_eq!(mode_of(&paths.acme_account()), 0o600);
+}
+
+/// Every member of the all-or-none set is classified, and the private
+/// CA bundle is the only one that is not protected.
+///
+/// The ownership split is a second list beside [`SET_FILES`], and a
+/// name that reaches the set without reaching that list publishes
+/// owner-preserving without anything failing — a credential file left
+/// to whoever ran the command, which is the whole defect the protected
+/// writer exists to close. Asserted over the set rather than over the
+/// five names on their own, so a seventh member cannot be added without
+/// deciding which side of the split it falls on.
+#[test]
+fn every_member_of_the_set_is_protected_or_is_the_private_bundle() {
+    for name in SET_FILES {
+        assert_eq!(
+            is_protected(name),
+            name != CA_BUNDLE_FILE,
+            "{name} is on the wrong side of the ownership split"
+        );
+    }
+    assert!(
+        SET_FILES.contains(&CA_BUNDLE_FILE),
+        "the bundle is still the sixth member of the all-or-none set"
+    );
 }
 
 /// The four credential files carry the protected owner, on a first

@@ -115,7 +115,7 @@ pub enum MaterialStatus {
 }
 
 /// Every file name the all-or-none set covers, in layout order.
-const SET_FILES: [&str; 6] = [
+pub(super) const SET_FILES: [&str; 6] = [
     KEY_FILE,
     CHAIN_FILE,
     ACME_ACCOUNT_FILE,
@@ -147,7 +147,7 @@ const PROTECTED_FILES: [&str; 5] = [
 
 /// Whether `name` is one of the five files that must be published
 /// `root:root`, rather than the private CA bundle beside them.
-fn is_protected(name: &str) -> bool {
+pub(super) fn is_protected(name: &str) -> bool {
     PROTECTED_FILES.contains(&name)
 }
 
