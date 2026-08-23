@@ -9,7 +9,7 @@ use tempfile::TempDir;
 
 use super::agent_config::{
     INTERNAL_INSTANCE_ID, internal_agent_invocation, internal_registration_id,
-    internal_signal_pattern, upsert_internal_trust,
+    internal_signal_pattern, load_internal_config, upsert_internal_trust,
 };
 use super::material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, load_material,
@@ -54,12 +54,34 @@ fn material() -> InternalMaterial {
     }
 }
 
+/// The generated config, exactly as `init` renders it for this layout.
+///
+/// The loader holds the config to the generator's invariants, so a
+/// fixture that stands in for a provisioned host has to be the real
+/// thing rather than a placeholder.
+fn generated_config(paths: &InternalPaths) -> String {
+    render_internal_agent_config(
+        paths,
+        &InternalAgentConfigParams {
+            email: "ops@example.internal",
+            server: "https://localhost:9000/acme/acme/directory",
+            domain: DOMAIN,
+            hostname: HOST,
+            responder_url: "http://127.0.0.1:8080",
+            responder_hmac: "responder-hmac",
+            eab_kid: None,
+            eab_hmac: None,
+            trusted_ca_sha256: &[ROOT_FP.to_string()],
+        },
+    )
+}
+
 /// Writes the two non-credential members of the all-or-none set so a
 /// test that only cares about the four credential files still presents a
 /// complete host.
 fn write_companions(paths: &InternalPaths) {
     std::fs::create_dir_all(paths.dir()).expect("create the internal directory");
-    std::fs::write(paths.agent_config(), "email = \"a@b\"\n").expect("write the config");
+    std::fs::write(paths.agent_config(), generated_config(paths)).expect("write the config");
     std::fs::write(paths.ca_bundle(), chain_pem()).expect("write the bundle");
 }
 
@@ -264,6 +286,101 @@ async fn invalid_members_fail_with_a_typed_error() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The generated config is a member of the all-or-none set, so the
+/// shared loader holds it to every invariant the generator gives it.
+///
+/// A host whose config no longer describes this identity is a host whose
+/// renewal daemon cannot start. Reporting it as provisioned would let
+/// the privileged verbs run over a certificate nothing renews, so each
+/// drift below is a typed refusal naming the config rather than a silent
+/// pass.
+#[tokio::test]
+async fn a_config_that_drifted_from_the_generator_fails_the_shared_loader() {
+    // Not TOML at all.
+    let (_dir, paths) = provisioned_host().await;
+    std::fs::write(paths.agent_config(), "email = \n").expect("write");
+    let err = load_material(&paths).expect_err("an unparseable config must not load");
+    match err {
+        InternalCredentialError::Invalid { path, reason } => {
+            assert_eq!(path, paths.agent_config());
+            assert!(reason.contains("does not parse"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Parses, but describes no profile at all.
+    let (_dir, paths) = provisioned_host().await;
+    std::fs::write(paths.agent_config(), "email = \"a@b\"\n").expect("write");
+    let err = load_material(&paths).expect_err("a config with no profile must not load");
+    assert!(
+        matches!(&err, InternalCredentialError::Invalid { path, reason }
+            if path == &paths.agent_config() && reason.contains("exactly one profile")),
+        "{err:?}"
+    );
+
+    // Parses and carries one profile, but points it at another
+    // identity's key.
+    let (_dir, paths) = provisioned_host().await;
+    let hijacked = generated_config(&paths).replace(
+        &paths.key().display().to_string(),
+        "/srv/secrets/services/other/key.pem",
+    );
+    std::fs::write(paths.agent_config(), hijacked).expect("write");
+    let err = load_material(&paths).expect_err("a redirected key path must not load");
+    assert!(
+        matches!(&err, InternalCredentialError::Invalid { reason, .. }
+            if reason.contains("profiles.paths.key")),
+        "{err:?}"
+    );
+
+    // Parses, but a rotation left the pins empty, so nothing anchors the
+    // private bundle.
+    let (_dir, paths) = provisioned_host().await;
+    let unpinned = upsert_internal_trust(&generated_config(&paths), &paths, &[]).expect("upsert");
+    std::fs::write(paths.agent_config(), unpinned).expect("write");
+    let err = load_material(&paths).expect_err("an unpinned config must not load");
+    assert!(
+        matches!(&err, InternalCredentialError::Invalid { reason, .. }
+            if reason.contains("trusted_ca_sha256")),
+        "{err:?}"
+    );
+}
+
+/// The private bundle is a member of the set too: a file that holds no
+/// certificate fails every trust check the daemon makes, so it fails the
+/// loader rather than the renewal.
+#[tokio::test]
+async fn a_bundle_holding_no_certificate_fails_the_shared_loader() {
+    let (_dir, paths) = provisioned_host().await;
+    std::fs::write(paths.ca_bundle(), "# no certificates here\n").expect("write");
+    let err = load_material(&paths).expect_err("an empty bundle must not load");
+    match err {
+        InternalCredentialError::Invalid { path, .. } => assert_eq!(path, paths.ca_bundle()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The generated config is what the loader accepts, unchanged, and after
+/// a rotation has rewritten its `[trust]` table.
+#[tokio::test]
+async fn the_generated_config_and_its_rotated_form_both_load() {
+    let (_dir, paths) = provisioned_host().await;
+    load_internal_config(&paths).expect("the generated config must load");
+
+    let rotated = upsert_internal_trust(
+        &generated_config(&paths),
+        &paths,
+        &[ROOT_FP.to_string(), OTHER_FP.to_string()],
+    )
+    .expect("upsert");
+    std::fs::write(paths.agent_config(), rotated).expect("write");
+    let settings = load_internal_config(&paths).expect("a rotated config must still load");
+    assert_eq!(
+        settings.trust.trusted_ca_sha256,
+        vec![ROOT_FP.to_string(), OTHER_FP.to_string()]
+    );
 }
 
 /// The two secret-bearing files land at `0600`, and are never observable

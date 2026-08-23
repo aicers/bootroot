@@ -147,7 +147,17 @@ pub fn material_status(paths: &InternalPaths) -> MaterialStatus {
     }
 }
 
-/// Loads the four credential files as one set.
+/// Loads the four credential files, after proving the whole six-file
+/// set is usable.
+///
+/// The shared loader every caller reaches the credential through — the
+/// verb factory, the rotation's up-to-date check and the repair — so
+/// the all-or-none rule is enforced in one place. Presence alone is not
+/// enough: the two members this function does not return are validated
+/// here too, because a private bundle that holds no certificate and a
+/// generated config that no longer describes this identity both leave a
+/// host whose credential cannot be renewed, and neither is something a
+/// caller should have to remember to check for itself.
 ///
 /// # Errors
 ///
@@ -182,6 +192,10 @@ pub fn load_material(paths: &InternalPaths) -> Result<InternalMaterial, Internal
         });
     }
     let root_fingerprint = normalize_fingerprint(&paths.root_fingerprint(), &root_fingerprint)?;
+
+    let bundle = read_file(&paths.ca_bundle(), "reading")?;
+    validate_pem_label(&paths.ca_bundle(), &bundle, "CERTIFICATE")?;
+    crate::registrar::internal::load_internal_config(paths)?;
 
     Ok(InternalMaterial {
         key: PrivateKeyPem::new(key),
@@ -290,6 +304,24 @@ pub struct SetSnapshot {
 /// snapshot cannot be written. A publication that cannot be undone does
 /// not start.
 pub async fn capture_set(paths: &InternalPaths) -> Result<SetSnapshot, InternalCredentialError> {
+    capture_members(paths, &SET_FILES).await
+}
+
+/// Captures the prior state of `names`, a subset of the set.
+///
+/// The same guarantee [`capture_set`] gives, for a caller that replaces
+/// part of the set rather than all of it: a rotation rewrites only the
+/// private bundle and the config's pins, and copying the private key
+/// beside them would put a second copy of it on disk for no reason.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Io`] under the same conditions as
+/// [`capture_set`].
+pub async fn capture_members(
+    paths: &InternalPaths,
+    names: &[&'static str],
+) -> Result<SetSnapshot, InternalCredentialError> {
     let prior = paths.dir().join(PRIOR_DIR);
     if prior.exists() {
         // A snapshot that survived is one an earlier run could not
@@ -303,9 +335,9 @@ pub async fn capture_set(paths: &InternalPaths) -> Result<SetSnapshot, InternalC
             })?;
     }
 
-    let mut members = Vec::with_capacity(SET_FILES.len());
+    let mut members = Vec::with_capacity(names.len());
     let mut prior_dir_ready = false;
-    for name in SET_FILES {
+    for name in names.iter().copied() {
         let path = paths.dir().join(name);
         let state = match std::fs::metadata(&path) {
             Ok(meta) if meta.is_file() => {

@@ -2004,6 +2004,79 @@ mod internal_factory {
         );
     }
 
+    /// A host whose generated config drifted is refused too.
+    ///
+    /// Every one of the six files is there, so the presence check alone
+    /// would call this host provisioned — but the config it would renew
+    /// under names another identity's key, so the daemon that keeps this
+    /// certificate alive cannot start. The verbs must not be served over
+    /// a credential nothing renews.
+    #[tokio::test]
+    async fn the_factory_refuses_a_host_whose_generated_config_is_invalid() {
+        use crate::registrar::internal::{
+            AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, InternalPaths,
+            PrivateKeyPem, publish_material, render_internal_agent_config,
+        };
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        publish_material(
+            &paths,
+            &InternalMaterial {
+                key: PrivateKeyPem::new(
+                    "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
+                ),
+                chain: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+                acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+                root_fingerprint: ACTIVE_ROOT_FP.to_string(),
+            },
+        )
+        .await
+        .expect("publish");
+        std::fs::write(
+            paths.ca_bundle(),
+            "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+        )
+        .expect("bundle");
+        let hijacked = render_internal_agent_config(
+            &paths,
+            &InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: "example.internal",
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: "hmac",
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[ACTIVE_ROOT_FP.to_string()],
+            },
+        )
+        .replace(
+            &paths.chain().display().to_string(),
+            "/srv/secrets/services/other/chain.pem",
+        );
+        std::fs::write(paths.agent_config(), hijacked).expect("config");
+
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "https://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("a drifted config must be refused");
+        };
+        assert!(
+            matches!(&err, InternalCredentialError::Invalid { path, .. }
+                if path == &paths.agent_config()),
+            "{err:?}"
+        );
+    }
+
     /// A host with no internal credential gets a typed absence, never a
     /// verb service over some other client.
     #[test]

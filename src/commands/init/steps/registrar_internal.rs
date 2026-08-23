@@ -539,7 +539,7 @@ pub(crate) async fn publish_internal_set(
 /// a directory that survives costs an operator a stale copy rather than
 /// the credential, and the error it would raise would displace the one
 /// that matters.
-async fn discard_snapshot(snapshot: SetSnapshot) {
+pub(crate) async fn discard_snapshot(snapshot: SetSnapshot) {
     if let Err(err) = snapshot.discard().await {
         eprintln!("Warning: {err}");
     }

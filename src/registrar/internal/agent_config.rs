@@ -24,8 +24,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::config::Settings;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
-use crate::registrar::internal::InternalPaths;
+use crate::registrar::internal::{InternalCredentialError, InternalPaths};
 use crate::toml_util::{toml_encode_string, upsert_section_keys};
 
 /// The instance label the internal identity is always composed at.
@@ -152,6 +153,87 @@ pub fn render_internal_agent_config(
         cert = toml_encode_string(&paths.chain().display().to_string()),
         key = toml_encode_string(&paths.key().display().to_string()),
     )
+}
+
+/// Loads the dedicated config and holds it to every invariant the
+/// generator gives it.
+///
+/// The config is a member of the all-or-none set, so "present" is not
+/// the same question as "usable": a file that no longer parses, or that
+/// has been pointed at another identity's key, describes a renewal
+/// daemon that cannot start. Treating that as a provisioned credential
+/// would let the privileged verbs run on a host where nothing renews
+/// the certificate they authenticate with — which is precisely the
+/// state the typed failure exists to name.
+///
+/// What is checked is what the generator fixes and a rotation is
+/// allowed to change: the identity and the three file paths are
+/// invariants, the pin list and the bundle path are rewritten by
+/// Phases 3 and 6 and so are checked for shape rather than for value.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Invalid`] when the file does not
+/// parse, when it does not carry exactly the one internal profile, or
+/// when any fixed path or the trust table has drifted.
+pub fn load_internal_config(paths: &InternalPaths) -> Result<Settings, InternalCredentialError> {
+    let path = paths.agent_config();
+    let invalid = |reason: String| InternalCredentialError::Invalid {
+        path: path.clone(),
+        reason,
+    };
+    let settings = Settings::from_file(Some(path.clone()))
+        .map_err(|err| invalid(format!("the generated config does not parse: {err}")))?;
+
+    let [profile] = settings.profiles.as_slice() else {
+        return Err(invalid(format!(
+            "expected exactly one profile, found {}",
+            settings.profiles.len()
+        )));
+    };
+    if profile.service_name != REGISTRAR_INTERNAL_LABEL {
+        return Err(invalid(format!(
+            "the profile names service `{}` rather than `{REGISTRAR_INTERNAL_LABEL}`",
+            profile.service_name
+        )));
+    }
+    if profile.instance_id != INTERNAL_INSTANCE_ID {
+        return Err(invalid(format!(
+            "the profile names instance `{}` rather than `{INTERNAL_INSTANCE_ID}`",
+            profile.instance_id
+        )));
+    }
+    expect_path("profiles.paths.cert", &profile.paths.cert, &paths.chain()).map_err(&invalid)?;
+    expect_path("profiles.paths.key", &profile.paths.key, &paths.key()).map_err(&invalid)?;
+    let account_key = settings
+        .acme
+        .account_key_path
+        .as_deref()
+        .ok_or_else(|| invalid("acme.account_key_path is unset".to_string()))?;
+    expect_path("acme.account_key_path", account_key, &paths.acme_account()).map_err(&invalid)?;
+    let bundle = settings
+        .trust
+        .ca_bundle_path
+        .as_deref()
+        .ok_or_else(|| invalid("trust.ca_bundle_path is unset".to_string()))?;
+    expect_path("trust.ca_bundle_path", bundle, &paths.ca_bundle()).map_err(&invalid)?;
+    if settings.trust.trusted_ca_sha256.is_empty() {
+        return Err(invalid("trust.trusted_ca_sha256 is empty".to_string()));
+    }
+    Ok(settings)
+}
+
+/// Reports a configured path that is not the fixed one the layout gives
+/// it.
+fn expect_path(field: &str, found: &Path, expected: &Path) -> Result<(), String> {
+    if found == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "{field} points at {} rather than {}",
+        found.display(),
+        expected.display()
+    ))
 }
 
 /// Builds the `[trust]` pairs a rotation upserts into the internal

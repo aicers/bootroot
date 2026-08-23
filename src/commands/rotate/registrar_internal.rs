@@ -36,7 +36,8 @@ use anyhow::{Context, Result};
 use bootroot::eab::EabCredentials;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
-    InternalPaths, MaterialStatus, load_material, material_status, require_https,
+    AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths,
+    MaterialStatus, capture_members, load_material, material_status, require_https,
     require_root_authority, upsert_internal_trust,
 };
 use bootroot::{cert_group, fs_util};
@@ -44,8 +45,9 @@ use bootroot::{cert_group, fs_util};
 use super::RotateContext;
 use super::helpers::signal_internal_registrar_agent;
 use crate::commands::init::registrar_internal::{
-    RegistrarInternalContext, RegistrarInternalIntent, converge_internal_auth,
-    issue_internal_material, publish_internal_set, staging_dir,
+    RegistrarInternalContext, RegistrarInternalInputs, RegistrarInternalIntent, StagedInternal,
+    converge_internal_auth, discard_snapshot, issue_internal_material, publish_internal_set,
+    staging_dir, verify_internal_login,
 };
 use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, compute_ca_bundle_pem,
@@ -121,37 +123,79 @@ pub(super) async fn publish_internal_trust(
 /// the write is what a test can assert, and the signal is a `pkill` that
 /// has nothing to match in one.
 ///
+/// The bundle and the pins are **one** update. Each file publishes
+/// atomically on its own, but a Phase-3 or Phase-6 run that replaced one
+/// and failed on the other would leave the pair describing two different
+/// generations — a bundle the pins do not cover — with the phase
+/// unrecorded and nothing registered to undo it. So the pair is captured
+/// first and put back on any failure, exactly as the credential set's
+/// publication does, and the rewritten config is computed before either
+/// file is touched so an unparseable one fails with the pair still
+/// intact.
+///
 /// # Errors
 ///
-/// Returns an error when the config is missing or unparseable, or when
-/// either file cannot be published.
+/// Returns an error when the config is missing or unparseable, when the
+/// pair cannot be captured, or when either file cannot be published. In
+/// the last case the previous pair has been restored, or the failure to
+/// restore it is reported beside the failure that caused it.
 async fn write_internal_trust(
     secrets_dir: &Path,
     trust: &InternalTrustState,
     messages: &Messages,
 ) -> Result<()> {
     let paths = InternalPaths::new(secrets_dir);
-    fs_util::write_ca_bundle(
-        &paths.ca_bundle(),
-        &trust.bundle_pem,
-        cert_group::CertGroupPolicy::none(),
-    )
-    .await
-    .with_context(|| messages.error_write_file_failed(&paths.ca_bundle().display().to_string()))?;
-
     let config_path = paths.agent_config();
     let current = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| messages.error_read_file_failed(&config_path.display().to_string()))?;
     let next = upsert_internal_trust(&current, &paths, &trust.fingerprints)?;
+
+    let snapshot = capture_members(&paths, &[AGENT_CONFIG_FILE, CA_BUNDLE_FILE])
+        .await
+        .context("capturing the bootroot-internal trust pair the rotation replaces")?;
+    if let Err(err) = write_trust_pair(&paths, &trust.bundle_pem, &next, messages).await {
+        if let Err(restore_err) = snapshot.restore().await {
+            eprintln!(
+                "Warning: the bootroot-internal trust pair could not be fully restored after \
+                 a failed rotation: {restore_err}; the previous files are kept at {}",
+                snapshot.dir().display()
+            );
+            return Err(err);
+        }
+        discard_snapshot(snapshot).await;
+        return Err(err);
+    }
+    discard_snapshot(snapshot).await;
+    Ok(())
+}
+
+/// Publishes the config and then the bundle, with no undo of its own.
+///
+/// Split out so [`write_internal_trust`] can hold the prior pair around
+/// both renames rather than around each one.
+async fn write_trust_pair(
+    paths: &InternalPaths,
+    bundle_pem: &str,
+    config: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let config_path = paths.agent_config();
     fs_util::atomic_write(
         fs_util::Destination::bootroot_owned(&config_path),
-        next.as_bytes(),
+        config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .await
     .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
-    Ok(())
+
+    fs_util::write_ca_bundle(
+        &paths.ca_bundle(),
+        bundle_pem,
+        cert_group::CertGroupPolicy::none(),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&paths.ca_bundle().display().to_string()))
 }
 
 /// Confirms the internal bundle and config still carry `expected`.
@@ -213,14 +257,39 @@ pub(super) async fn repair_internal_credential(
     require_https(&ctx.openbao_url)?;
 
     let context = repair_context(ctx, client).await?;
+    replace_internal_credential(client, &context, &ctx.openbao_url, trust, messages).await
+}
+
+/// The body of a repair, past the two refusals.
+///
+/// Separated from [`repair_internal_credential`] so the ordering below
+/// can be driven in a test without a TLS listener: everything up to the
+/// convergence is reachable over a plain-HTTP mock, because none of it
+/// authenticates with the credential.
+///
+/// # Errors
+///
+/// Returns an error when the ACME issuance fails, when the `auth/cert`
+/// entry cannot be converged, when the replacement cannot log in, or
+/// when any file cannot be published.
+async fn replace_internal_credential(
+    client: &OpenBaoClient,
+    context: &RegistrarInternalContext,
+    openbao_url: &str,
+    trust: &InternalTrustState,
+    messages: &Messages,
+) -> Result<()> {
     let inputs = context.inputs();
 
-    // A repair runs outside a rollback envelope, so the mount flag has
-    // nothing to undo by: an `auth/cert` backend a repair enables is
-    // left enabled, which is the state a working credential needs and
-    // the state the next repair converges on regardless.
-    let mut mounted_now = false;
-    converge_internal_auth(client, &inputs, messages, &mut mounted_now).await?;
+    // The replacement is staged **before** anything in `OpenBao`
+    // changes. The convergence below rewrites the entry to trust the
+    // active root, and during a full rotation that is the *new* root:
+    // an entry replaced ahead of a leaf that is then never issued
+    // rejects the on-disk credential the internal daemon is still using,
+    // turning a retryable ACME failure into a host that cannot
+    // authenticate. Issuance needs no `auth/cert` entry — it runs over
+    // ACME against step-ca — so it costs nothing to prove it first.
+    //
     // The publication carries `trust`, not the active generation the
     // issuance staged: the Phase-4 tail replaces the credential while
     // the fleet is still on the additive set, and a repair mid-rotation
@@ -238,11 +307,91 @@ pub(super) async fn repair_internal_credential(
             return Err(err);
         }
     };
-    if let Err(err) = publish_internal_set(&staged, &inputs, messages).await {
+
+    // Captured before the convergence and put back if anything after it
+    // fails, so the entry and the material move together: either the
+    // host ends on the new pair, or it ends on the pair it started with.
+    // A lookup that does not answer is not read as "no entry" — that
+    // would register a deletion for an entry the host depends on — so
+    // it fails the repair here, with nothing yet changed.
+    let prior_entry = client
+        .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+        .await
+        .context("reading the bootroot-registrar-internal cert auth entry")?;
+
+    if let Err(err) = converge_and_publish(client, &staged, &inputs, openbao_url, messages).await {
+        restore_cert_auth_entry(client, prior_entry.as_ref()).await;
         sweep_staging(&context.secrets_dir).await;
         return Err(err);
     }
     signal_internal_registrar_agent(&context.secrets_dir, messages)
+}
+
+/// Rewrites the `auth/cert` entry to the active root, proves the staged
+/// leaf logs in against it, and publishes the set.
+///
+/// One unit, because its caller undoes it as one: the login is what
+/// makes the new entry and the new leaf provably a pair, and the
+/// publication is what makes that pair the host's.
+///
+/// # Errors
+///
+/// Returns an error when the convergence, the login or the publication
+/// fails.
+async fn converge_and_publish(
+    client: &OpenBaoClient,
+    staged: &StagedInternal,
+    inputs: &RegistrarInternalInputs<'_>,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    // A repair runs outside a rollback envelope, so the mount flag has
+    // nothing to undo by: an `auth/cert` backend a repair enables is
+    // left enabled, which is the state a working credential needs and
+    // the state the next repair converges on regardless.
+    let mut mounted_now = false;
+    converge_internal_auth(client, inputs, messages, &mut mounted_now).await?;
+    verify_internal_login(staged, openbao_url).await?;
+    publish_internal_set(staged, inputs, messages).await
+}
+
+/// Puts the `auth/cert` entry back the way a failed repair found it.
+///
+/// Best effort and never fatal: the repair has already failed, and an
+/// error raised here would displace the one that matters. What it must
+/// not do is stay silent — an entry left trusting a root no on-disk leaf
+/// chains to is exactly the state that stops the internal daemon
+/// authenticating, so a restore that does not land is reported with the
+/// command that repairs it.
+async fn restore_cert_auth_entry(client: &OpenBaoClient, prior: Option<&serde_json::Value>) {
+    let outcome = match prior {
+        Some(entry) => {
+            client
+                .write_cert_auth_entry_raw(CERT_AUTH_MOUNT, CERT_AUTH_ROLE, entry)
+                .await
+        }
+        // Nothing was there, so nothing is left behind: a repair on a
+        // host whose entry had been removed puts it back to removed.
+        None => client
+            .delete_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+            .await
+            .or_else(|err| {
+                // A delete of an entry the convergence never got as far
+                // as creating is not a failure to report.
+                if err.to_string().contains("404") {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }),
+    };
+    if let Err(err) = outcome {
+        eprintln!(
+            "Warning: the bootroot-registrar-internal cert auth entry could not be restored \
+             after a failed repair: {err}; re-run \
+             `bootroot rotate registrar-internal-credential --force`"
+        );
+    }
 }
 
 /// Removes the staging directory a failed repair left behind.
@@ -555,7 +704,8 @@ mod tests {
     use super::{
         InternalPaths, InternalTrustState, RotationMode, ensure_internal_trust_is,
         internal_credential_present, internal_rotation_applies, repair_internal_credential,
-        staging_dir, sweep_staging, write_internal_trust,
+        replace_internal_credential, restore_cert_auth_entry, staging_dir, sweep_staging,
+        write_internal_trust,
     };
     use crate::i18n::test_messages;
 
@@ -780,6 +930,217 @@ mod tests {
         // A host that never reached the staging stage is a no-op.
         sweep_staging(dir.path()).await;
         assert!(!staging.exists());
+    }
+
+    /// A trust publication that cannot complete leaves the pair as it
+    /// found it.
+    ///
+    /// Phase 3 and Phase 6 move the private bundle and the config's pins
+    /// together. Each file publishes atomically on its own, so the state
+    /// worth guarding against is the one *between* them: a bundle on the
+    /// new generation with pins that still name the old one, with the
+    /// phase unrecorded and nothing registered to undo it. Here the
+    /// bundle is a directory, so its publication fails after the config's
+    /// succeeded — and the config comes back.
+    #[tokio::test]
+    async fn a_half_written_trust_pair_is_restored() {
+        let (dir, paths) = provisioned_host().await;
+        let before = std::fs::read_to_string(paths.agent_config()).expect("config");
+
+        // A bundle name that cannot be published over: the rename at the
+        // end of the publication has a directory in its way.
+        std::fs::remove_file(paths.ca_bundle()).expect("remove the bundle");
+        std::fs::create_dir(paths.ca_bundle()).expect("a directory at the bundle name");
+
+        let additive = InternalTrustState {
+            fingerprints: vec![
+                OLD_ROOT_FP.to_string(),
+                OLD_INT_FP.to_string(),
+                ROOT_FP.to_string(),
+                NEW_INT_FP.to_string(),
+            ],
+            bundle_pem: bundle_pem("QURESVRJVkU"),
+        };
+        write_internal_trust(dir.path(), &additive, &test_messages())
+            .await
+            .expect_err("the bundle cannot be published over a directory");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_config()).expect("config"),
+            before,
+            "the pins must not be left on a generation the bundle is not on"
+        );
+        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
+            .expect("the restored config must parse");
+        assert_eq!(settings.trust.trusted_ca_sha256, vec![ROOT_FP.to_string()]);
+        assert!(
+            !paths.dir().join(".prior").exists(),
+            "the snapshot is discarded once the pair is settled"
+        );
+    }
+
+    /// A config that cannot be rewritten fails before the bundle is
+    /// touched at all.
+    ///
+    /// The cheapest half of the same guarantee: the rewritten config is
+    /// computed first, so an unparseable one costs nothing and leaves
+    /// both members exactly as they were.
+    #[tokio::test]
+    async fn an_unparseable_config_fails_before_the_bundle_moves() {
+        let (dir, paths) = provisioned_host().await;
+        std::fs::write(paths.agent_config(), "trust = [[[\n").expect("write");
+        let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
+
+        write_internal_trust(
+            dir.path(),
+            &InternalTrustState {
+                fingerprints: vec![OLD_ROOT_FP.to_string()],
+                bundle_pem: bundle_pem("QURESVRJVkU"),
+            },
+            &test_messages(),
+        )
+        .await
+        .expect_err("an unparseable config must fail the publication");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
+            bundle_before,
+            "the bundle must not move ahead of the pins"
+        );
+    }
+
+    /// A repair proves its replacement before it touches the entry the
+    /// running credential authenticates against.
+    ///
+    /// The convergence rewrites the `auth/cert` entry to trust the
+    /// *active* root, which during a full rotation is the new one. Doing
+    /// that ahead of a leaf that is then never issued would leave the
+    /// on-disk credential chained to a root the entry no longer trusts —
+    /// a retryable ACME failure turned into a host that cannot log in.
+    /// So an issuance failure must reach no `auth/` write at all.
+    #[tokio::test]
+    async fn an_issuance_failure_reaches_no_cert_auth_write() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        // No CA material below the secrets directory, so the issuance
+        // fails at its first step — before ACME, and long before any
+        // `OpenBao` write.
+        let (dir, paths) = provisioned_host().await;
+        let context = crate::commands::init::registrar_internal::RegistrarInternalContext {
+            intent: super::RegistrarInternalIntent {
+                domain: "example.internal".to_string(),
+                host: "bootroot-01".to_string(),
+            },
+            secrets_dir: dir.path().to_path_buf(),
+            kv_mount: "secret".to_string(),
+            acme_server: "https://127.0.0.1:1/acme/acme/directory".to_string(),
+            email: "ops@example.internal".to_string(),
+            responder_url: "http://127.0.0.1:1".to_string(),
+            responder_hmac: "hmac".to_string(),
+            eab: None,
+        };
+
+        replace_internal_credential(
+            &client,
+            &context,
+            &server.uri(),
+            &InternalTrustState {
+                fingerprints: vec![ROOT_FP.to_string()],
+                bundle_pem: bundle_pem("Uk9PVA"),
+            },
+            &test_messages(),
+        )
+        .await
+        .expect_err("issuance must fail without CA material");
+
+        let seen = server
+            .received_requests()
+            .await
+            .expect("the mock records every request");
+        assert!(
+            seen.iter()
+                .all(|request| !request.url.path().contains("/auth/")),
+            "no auth surface may be touched before the replacement exists: {:?}",
+            seen.iter()
+                .map(|request| request.url.path().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !staging_dir(&paths).exists(),
+            "the unpublished key must not survive a failed repair"
+        );
+    }
+
+    /// A repair that fails after the entry changed puts the entry back.
+    ///
+    /// The entry and the material move as one: either the host ends on
+    /// the new pair, or on the pair it started with. An entry left
+    /// trusting a root no on-disk leaf chains to is the one state that
+    /// stops the internal daemon authenticating, so the captured body
+    /// goes back verbatim — and a host whose entry did not exist before
+    /// gets it removed again.
+    #[tokio::test]
+    async fn a_failed_repair_puts_the_previous_cert_auth_entry_back() {
+        use std::sync::{Arc, Mutex};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let entry_path = format!(
+            "/v1/auth/{}/certs/{}",
+            bootroot::registrar::internal::CERT_AUTH_MOUNT,
+            bootroot::registrar::internal::CERT_AUTH_ROLE
+        );
+
+        let server = MockServer::start().await;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        Mock::given(method("POST"))
+            .and(path(entry_path.clone()))
+            .respond_with(move |request: &Request| {
+                *sink.lock().expect("capture") =
+                    Some(serde_json::from_slice(&request.body).expect("json"));
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(entry_path))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let prior = serde_json::json!({
+            "certificate": "-----BEGIN CERTIFICATE-----\nT0xE\n-----END CERTIFICATE-----\n",
+            "allowed_dns_sans": ["001.bootroot-registrar-internal.bootroot-01.example.internal"],
+            "token_policies": ["bootroot-registrar-internal"],
+            "token_no_default_policy": true,
+            "token_ttl": 3600,
+        });
+        restore_cert_auth_entry(&client, Some(&prior)).await;
+        assert_eq!(
+            captured.lock().expect("capture").clone().expect("a body"),
+            prior,
+            "the captured entry goes back exactly as it was read"
+        );
+
+        // A host that had no entry before ends with none.
+        restore_cert_auth_entry(&client, None).await;
+        let deletes = server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .into_iter()
+            .filter(|request| request.method == wiremock::http::Method::DELETE)
+            .count();
+        assert_eq!(deletes, 1, "an absent entry is restored by removing it");
     }
 
     /// The Phase-4 tail refuses to replace anything on a host whose

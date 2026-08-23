@@ -1332,6 +1332,31 @@ impl OpenBaoClient {
         Ok(parsed.get("data").cloned())
     }
 
+    /// Writes one `auth/cert` entry back from a body read off the
+    /// server.
+    ///
+    /// The undo half of [`OpenBaoClient::write_cert_auth_entry`]: a
+    /// caller that captured an entry with
+    /// [`OpenBaoClient::read_cert_auth_entry`] before replacing it puts
+    /// exactly that body back when the replacement could not be
+    /// completed. The read surface and the write surface of this
+    /// endpoint carry the same parameter names, so the captured object
+    /// is posted as it was read rather than reassembled field by field
+    /// — an entry that carried a setting this crate does not write
+    /// still comes back with it.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub async fn write_cert_auth_entry_raw(
+        &self,
+        mount: &str,
+        name: &str,
+        entry: &serde_json::Value,
+    ) -> Result<()> {
+        self.post_action(&format!("auth/{mount}/certs/{name}"), entry)
+            .await
+    }
+
     /// Deletes one `auth/cert` entry.
     ///
     /// # Errors

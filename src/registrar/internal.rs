@@ -66,16 +66,16 @@ use std::path::{Path, PathBuf};
 
 pub use agent_config::{
     InternalAgentConfigParams, build_internal_trust_updates, internal_agent_invocation,
-    internal_registration_id, internal_signal_pattern, render_internal_agent_config,
-    upsert_internal_trust,
+    internal_registration_id, internal_signal_pattern, load_internal_config,
+    render_internal_agent_config, upsert_internal_trust,
 };
 pub use client::{
     InternalCredential, RootAuthority, is_expired_token_error, require_https,
     require_root_authority,
 };
 pub use material::{
-    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_set,
-    load_material, material_status, publish_material,
+    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_members,
+    capture_set, load_material, material_status, publish_material,
 };
 
 /// The fixed subdirectory, below the state-recorded secrets directory,

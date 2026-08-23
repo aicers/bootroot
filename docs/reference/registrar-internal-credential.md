@@ -95,6 +95,22 @@ half-usable credential. Every secret file is published by writing a temporary in
 the same directory at `0600` and renaming it into place, so none of them is ever
 observable at its final path under a wider mode.
 
+"Invalid" covers the two non-credential members as well, and it is checked by the
+one shared loader every caller reaches the credential through — the verb factory,
+the rotation's up-to-date check and the repair — rather than by each of them in
+turn. The private bundle has to hold at least one certificate, and the generated
+config has to parse and still describe *this* identity: exactly one profile,
+named `bootroot-registrar-internal` at instance `001`, with
+`profiles.paths.cert`, `profiles.paths.key` and `acme.account_key_path` on the
+fixed paths above, `[trust].ca_bundle_path` on the private bundle beside them,
+and a non-empty `[trust].trusted_ca_sha256`. A host that fails any of those is
+refused with `InternalCredentialError::Invalid` naming the file: the six files
+are all present, but the second `bootroot-agent` process that renews this
+certificate cannot start, and serving the privileged verbs over a credential
+nothing renews is exactly what the all-or-none rule exists to prevent. The pin
+list and the bundle path are what Phases 3 and 6 rewrite, so they are held to
+their shape rather than to a particular value.
+
 Each file publishes atomically, but so does the **set**. A publication over a
 host that already carries a credential first copies every existing member into a
 `registrar-internal/.prior` snapshot, and puts the whole set back if any member
@@ -321,6 +337,17 @@ numbers are unchanged; nothing is renumbered.
 | **The tail after Phase 4** | An unnumbered, mandatory step that runs after step-ca restarts and **before** Phase 4 is recorded, under explicit root-token authority. It verifies the bundle and config are still on the Phase-3 additive set, replaces the `auth/cert` entry, the leaf material and the stored root fingerprint, and notifies the daemon. `--skip reissue` skips Phase 5, not this. A failure retains the pre-Phase-4 state, so a resume repeats the restart and the repair together. |
 | **Phase 6** | Only when finalization is not skipped, and only after its existing migration checks pass: the private bundle and `[trust].trusted_ca_sha256` are atomically narrowed to the finalized new-root / new-intermediate pair and the daemon is reloaded, before Phase 6 is recorded. A run that skips finalization keeps the additive internal trust set, exactly as it keeps the additive KV set. |
 
+The bundle and the pins move as **one** update in both Phase 3 and Phase 6. Each
+file publishes atomically on its own, which is not enough: a run that replaced
+one and failed on the other would leave the pair describing two different
+generations — a bundle the pins do not cover — with the phase unrecorded and
+nothing registered to undo it. So the rewritten config is computed before either
+file is touched, the existing pair is captured into the same
+`registrar-internal/.prior` snapshot the credential publication uses, and any
+failure puts both members back. Only the reload is outside that: a signal that
+fails leaves a pair that is already consistent, and the resume repeats the whole
+phase anyway.
+
 ## 10. Signalling
 
 Reloading the internal agent is its own helper. It takes no `ServiceEntry` — the
@@ -363,6 +390,17 @@ repairs it. The command:
   active-generation bundle and pins otherwise;
 - atomically updates the private bundle and the config before reloading, then
   replaces the material and the stored fingerprint and resumes the daemon;
+- issues and proves the replacement **before** it touches the `auth/cert` entry.
+  The convergence rewrites that entry to trust the *active* root, which during a
+  full rotation is the new one, so an entry replaced ahead of a leaf that is then
+  never issued would leave the on-disk credential chained to a root the entry no
+  longer trusts — a retryable ACME failure turned into a host whose internal
+  daemon cannot log in. Issuance runs over ACME against step-ca and needs no
+  entry, so it goes first; the entry is then converged, the staged leaf is proved
+  with a real `auth/cert/login`, and only then is the set published. The entry
+  read before the convergence is put back verbatim if the login or the
+  publication fails, so the entry and the material move together: the host ends
+  either on the new pair or on the pair it started with;
 - never re-runs install and never changes a service credential;
 - is a no-op that says so when the set is complete and the stored root already
   matches the active one, unless `--force` is passed.
