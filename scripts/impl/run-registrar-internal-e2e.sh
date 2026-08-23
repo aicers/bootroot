@@ -49,7 +49,17 @@ PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_LOG="$ARTIFACT_DIR/run.log"
 TEST_LOG="$ARTIFACT_DIR/cargo-test.log"
 OPENBAO_LOG="$ARTIFACT_DIR/openbao.log"
-TLS_DIR="$ARTIFACT_DIR/tls"
+
+# Scratch, deliberately *outside* the artifact directory.  The container
+# generates its server certificate and key into this mount as its own
+# uid, and on a Linux runner those files are then unreadable by the user
+# that zips the artifact -- which fails the upload with EACCES even
+# though the scenario itself passed.  A Docker Desktop VM maps the
+# ownership back and hides it, so this is only visible in CI.  Nothing
+# in here is a diagnostic worth keeping, and one of the two files is a
+# private key, so it does not belong under an uploaded path at all.
+SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bootroot-registrar-internal-XXXXXX")"
+TLS_DIR="$SCRATCH_DIR/tls"
 
 CURRENT_PHASE="startup"
 CONTAINER_NAME="bootroot-registrar-internal-${RUN_ID}"
@@ -89,9 +99,10 @@ cleanup() {
     collect_openbao_log
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
-  # The server key the container generated is the one secret this
-  # scenario writes to disk, and the artifact directory is uploaded.
-  rm -f "$TLS_DIR"/*-key.pem 2>/dev/null || true
+  # The whole scratch mount goes, the server key the container generated
+  # with it.  The directory is ours and world-writable, so the unlink
+  # succeeds whichever uid inside the container owns the files.
+  rm -rf "$SCRATCH_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -123,7 +134,7 @@ OPENBAO_TOKEN="root-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
 # The container writes its generated certificate here as its own uid, so
 # the directory has to be writable by it.  Nothing secret of ours goes in
-# it, and the server key it does write is removed on the way out.
+# it, and the whole scratch root is removed on the way out.
 log_phase "tls-dir"
 rm -rf "$TLS_DIR"
 mkdir -p "$TLS_DIR"
