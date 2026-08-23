@@ -9,7 +9,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::cert_group::CertGroupPolicy;
-use crate::fs_util::{self, Destination, KEY_FILE_MODE, StagedMode};
+use crate::fs_util::{self, Destination, FixedOwner, KEY_FILE_MODE, StagedMode};
 use crate::registrar::internal::{
     ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CHAIN_FILE, InternalCredentialError,
     InternalPaths, KEY_FILE, ROOT_FINGERPRINT_FILE,
@@ -124,6 +124,53 @@ const SET_FILES: [&str; 6] = [
     CA_BUNDLE_FILE,
 ];
 
+/// The five members of the set that are published `root:root`.
+///
+/// Four of them authenticate this host to `OpenBao` — the leaf's key,
+/// its chain, the ACME account key that renews it and the fingerprint
+/// of the root the `auth/cert` entry trusts — and the fifth configures
+/// the agent that performs that renewal, including the trust pins it
+/// checks the CA against. Every one of them is a file the invoking user
+/// must not be able to read or rewrite, so the owner is asserted on
+/// each publish exactly as [`KEY_FILE_MODE`] is.
+///
+/// The sixth member of the set, [`CA_BUNDLE_FILE`], is public trust
+/// material published under the `--cert-group` policy's ownership and
+/// is deliberately absent here.
+const PROTECTED_FILES: [&str; 5] = [
+    KEY_FILE,
+    CHAIN_FILE,
+    ACME_ACCOUNT_FILE,
+    ROOT_FINGERPRINT_FILE,
+    AGENT_CONFIG_FILE,
+];
+
+/// Whether `name` is one of the five files that must be published
+/// `root:root`, rather than the private CA bundle beside them.
+fn is_protected(name: &str) -> bool {
+    PROTECTED_FILES.contains(&name)
+}
+
+/// The owner every protected publication establishes.
+///
+/// Production has one answer and it is not configurable: uid 0, gid 0.
+/// Under `cfg(test)` this crate's own tests take the test process's
+/// effective ids instead, which drives the same staging, chown and
+/// rename path against ids an unprivileged process is allowed to
+/// establish — the writers below are otherwise unreachable outside a
+/// root-run host. The endpoint-enabled publication a *binary* command
+/// performs is not gated by this: those call sites name
+/// [`FixedOwner::root`] themselves.
+#[cfg(not(test))]
+fn protected_owner() -> FixedOwner {
+    FixedOwner::root()
+}
+
+#[cfg(test)]
+fn protected_owner() -> FixedOwner {
+    FixedOwner::current_process()
+}
+
 /// Reports whether the six-file set is absent, partial or complete.
 ///
 /// The config and the private bundle are in the set with the four
@@ -229,14 +276,14 @@ pub async fn publish_material(
             source: std::io::Error::other(err.to_string()),
         })?;
 
-    write_atomic(&paths.key(), material.key.expose().as_bytes()).await?;
-    write_atomic(&paths.chain(), material.chain.as_bytes()).await?;
-    write_atomic(
+    write_atomic_root(&paths.key(), material.key.expose().as_bytes()).await?;
+    write_atomic_root(&paths.chain(), material.chain.as_bytes()).await?;
+    write_atomic_root(
         &paths.acme_account(),
         material.acme_account.expose().as_bytes(),
     )
     .await?;
-    write_atomic(
+    write_atomic_root(
         &paths.root_fingerprint(),
         format!("{}\n", material.root_fingerprint).as_bytes(),
     )
@@ -335,6 +382,37 @@ pub async fn capture_members(
             })?;
     }
 
+    let members = match capture_into(paths, names, &prior).await {
+        Ok(members) => members,
+        Err(err) => {
+            // A snapshot that stopped part-way through is not a
+            // snapshot: the publication it would have protected never
+            // starts, so the bytes it did copy are a stray second copy
+            // of the credential and nothing else. Best effort, because
+            // the capture failure is the error worth reporting.
+            let _ = tokio::fs::remove_dir_all(&prior).await;
+            return Err(err);
+        }
+    };
+
+    Ok(SetSnapshot {
+        paths: paths.clone(),
+        prior,
+        members,
+    })
+}
+
+/// Copies each of `names` into `prior`, reporting what was found at
+/// each published name.
+///
+/// Split out so [`capture_members`] can remove a partial snapshot on
+/// any failure without threading that cleanup through every early
+/// return.
+async fn capture_into(
+    paths: &InternalPaths,
+    names: &[&'static str],
+    prior: &Path,
+) -> Result<Vec<(&'static str, PriorMember)>, InternalCredentialError> {
     let mut members = Vec::with_capacity(names.len());
     let mut prior_dir_ready = false;
     for name in names.iter().copied() {
@@ -342,10 +420,10 @@ pub async fn capture_members(
         let state = match std::fs::metadata(&path) {
             Ok(meta) if meta.is_file() => {
                 if !prior_dir_ready {
-                    fs_util::ensure_secrets_dir(&prior).await.map_err(|err| {
+                    fs_util::ensure_secrets_dir(prior).await.map_err(|err| {
                         InternalCredentialError::Io {
                             operation: "creating",
-                            path: prior.clone(),
+                            path: prior.to_path_buf(),
                             source: std::io::Error::other(err.to_string()),
                         }
                     })?;
@@ -359,7 +437,10 @@ pub async fn capture_members(
                             path: path.clone(),
                             source,
                         })?;
-                write_atomic(&prior.join(name), &contents).await?;
+                // The copy of a protected member is the protected file:
+                // it holds the same bytes, so it is published under the
+                // same owner and the same mode the original has.
+                write_member(name, &prior.join(name), &contents).await?;
                 PriorMember::Snapshotted
             }
             Ok(_) => PriorMember::Irregular,
@@ -374,12 +455,7 @@ pub async fn capture_members(
         };
         members.push((name, state));
     }
-
-    Ok(SetSnapshot {
-        paths: paths.clone(),
-        prior,
-        members,
-    })
+    Ok(members)
 }
 
 impl SetSnapshot {
@@ -471,7 +547,7 @@ impl SetSnapshot {
                     path: backup,
                     source,
                 })?;
-        write_atomic(path, &contents).await
+        write_member(name, path, &contents).await
     }
 }
 
@@ -488,6 +564,25 @@ async fn remove_if_present(path: &Path) -> Result<(), InternalCredentialError> {
     }
 }
 
+/// Publishes one member of the set at `path`, under the ownership that
+/// member's name carries.
+///
+/// The one place the split is decided, so a snapshot copy and a restore
+/// cannot drift from the publication they mirror: the five protected
+/// names go through [`write_atomic_root`], and the private CA bundle
+/// keeps the owner-preserving writer it has always had.
+async fn write_member(
+    name: &str,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), InternalCredentialError> {
+    if is_protected(name) {
+        write_atomic_root(path, contents).await
+    } else {
+        write_atomic(path, contents).await
+    }
+}
+
 /// Publishes one internal file by rename at `0600`.
 ///
 /// `Destination::bootroot_owned` because every path here is one bootroot
@@ -501,6 +596,39 @@ pub(crate) async fn write_atomic(
         Destination::bootroot_owned(path),
         contents,
         StagedMode::Policy(KEY_FILE_MODE),
+    )
+    .await
+    .map_err(|err| InternalCredentialError::Io {
+        operation: "writing",
+        path: path.to_path_buf(),
+        source: std::io::Error::other(err.to_string()),
+    })
+}
+
+/// Publishes one protected internal file by rename, `root:root` and
+/// `0600`.
+///
+/// [`write_atomic`] with the ownership the four credential files and
+/// the generated config require. The chown runs on the staged inode
+/// before the rename, so a process that cannot establish `root:root`
+/// leaves the destination exactly as it found it — including a
+/// destination some earlier non-root run left owned by an ordinary
+/// user, which a root-run replacement converges rather than preserves.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Io`] when the file cannot be
+/// published, which includes a publication that could not establish the
+/// required ownership.
+pub(crate) async fn write_atomic_root(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), InternalCredentialError> {
+    fs_util::atomic_write_fixed_owner(
+        Destination::bootroot_owned(path),
+        contents,
+        StagedMode::Policy(KEY_FILE_MODE),
+        protected_owner(),
     )
     .await
     .map_err(|err| InternalCredentialError::Io {

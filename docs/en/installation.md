@@ -504,6 +504,21 @@ It renews one certificate: the bootroot-internal credential the daemon
 authenticates to `OpenBao` with in order to run the registrar's `mint` and
 `deregister` verbs.
 
+**Run `bootroot init` as root on this host.** The five files that make up the
+credential — `registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
+`root-fingerprint` and `agent.toml` — are published `0600` and owned by `root`,
+and `init` refuses to publish any of them if it cannot establish that ownership.
+An endpoint-enabled `init` run as an ordinary user fails without writing them
+rather than leaving the key readable to that user; nothing about the run is
+best-effort, and no flag or configuration key relaxes it.
+
+That makes the whole installation root-operated. The files `init` creates on this
+host are root's, so every later `bootroot` command that modifies this
+installation — `rotate`, `service add`, `reinit`, `clean` — must run as root too.
+Reading commands that only report state need no privilege beyond access to what
+they read. This applies to the host serving the registrar endpoint; a host
+without it is unchanged and needs no root.
+
 `bootroot init` writes its config and its private CA bundle and neither starts it
 nor installs a supervisor for it, exactly as it does not for the service agents.
 Start it under the same supervisor you use for those:

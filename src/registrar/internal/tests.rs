@@ -2,7 +2,7 @@
 //! all-or-none material set, redaction, the exact-allowlist policy, the
 //! generated config and the fail-closed refusals.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -22,6 +22,7 @@ use super::{
     KEY_FILE, ROOT_FINGERPRINT_FILE, active_root_cert_path, active_root_fingerprint,
     build_registrar_internal_policy, render_internal_agent_config, require_https,
 };
+use crate::fs_util::KEY_FILE_MODE;
 use crate::registrar::{
     REGISTRAR_INTERNAL_LABEL, RESERVED_SERVICE_NAME_PREFIX, is_reserved_service_name,
     registrar_internal_identity,
@@ -126,6 +127,21 @@ fn secrets_dir_with_active_root() -> (TempDir, String) {
     let dir = TempDir::new().expect("tempdir");
     let fingerprint = write_active_root(dir.path(), &self_signed_root("bootroot-active-root"));
     (dir, fingerprint)
+}
+
+/// The uid and gid a published file ended up with.
+fn owner_of(path: &Path) -> (u32, u32) {
+    let meta = std::fs::metadata(path).expect("stat the published file");
+    (meta.uid(), meta.gid())
+}
+
+/// The ids the protected writers establish under `cfg(test)`: this
+/// process's own, standing in for the uid 0 / gid 0 production asks for.
+fn protected_test_owner() -> (u32, u32) {
+    (
+        crate::fs_util::current_process_euid(),
+        crate::cert_group::current_process_egid(),
+    )
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -423,6 +439,48 @@ async fn secret_members_are_published_at_0600() {
     let (_dir, paths) = provisioned_host().await;
     assert_eq!(mode_of(&paths.key()), 0o600);
     assert_eq!(mode_of(&paths.acme_account()), 0o600);
+}
+
+/// The four credential files carry the protected owner, on a first
+/// publication and on the replacement a repair performs.
+///
+/// Production asks for uid 0 and gid 0; this asks for the test process's
+/// own ids through the same writer, the same chown on the same staged
+/// inode and the same rename — the ownership an unprivileged process is
+/// allowed to establish is the only thing that differs. The
+/// already-provisioned case is the one that matters most: a rename
+/// installs a fresh inode, so a replacement that did not re-assert the
+/// owner would silently hand the credential to whoever ran the command.
+#[tokio::test]
+async fn the_credential_files_are_published_under_the_protected_owner() {
+    let (_dir, paths) = provisioned_host().await;
+    let owner = protected_test_owner();
+    for path in [
+        paths.key(),
+        paths.chain(),
+        paths.acme_account(),
+        paths.root_fingerprint(),
+    ] {
+        assert_eq!(
+            owner_of(&path),
+            owner,
+            "first publication: {}",
+            path.display()
+        );
+    }
+
+    publish_material(&paths, &material())
+        .await
+        .expect("republish the material");
+    for path in [
+        paths.key(),
+        paths.chain(),
+        paths.acme_account(),
+        paths.root_fingerprint(),
+    ] {
+        assert_eq!(owner_of(&path), owner, "replacement: {}", path.display());
+        assert_eq!(mode_of(&path), KEY_FILE_MODE, "{}", path.display());
+    }
 }
 
 /// A `#[derive(Debug)]` on anything holding the material cannot leak the
@@ -893,7 +951,9 @@ mod snapshot {
 
     use tempfile::TempDir;
 
-    use super::{account_json, chain_pem, key_pem, mode_of, provisioned_host};
+    use super::{
+        account_json, chain_pem, key_pem, mode_of, owner_of, protected_test_owner, provisioned_host,
+    };
     use crate::cert_group::CA_BUNDLE_FILE_MODE;
     use crate::fs_util::KEY_FILE_MODE;
     use crate::registrar::internal::material::{PRIOR_DIR, capture_set};
@@ -1013,6 +1073,92 @@ mod snapshot {
         assert_eq!(
             std::fs::read_to_string(paths.key()).expect("key"),
             key_pem()
+        );
+    }
+
+    /// A snapshot copy of a protected member is that member: same
+    /// bytes, so the same owner and the same mode, and the restore that
+    /// puts it back publishes it under them again.
+    ///
+    /// The private bundle beside them is public trust material and stays
+    /// on the ownership policy it has always had — it is the sixth
+    /// member of the all-or-none set, not a sixth protected file.
+    #[tokio::test]
+    async fn the_protected_snapshot_and_restore_carry_the_protected_owner() {
+        let (_dir, paths) = provisioned_host().await;
+        let owner = protected_test_owner();
+        let snapshot = capture_set(&paths).await.expect("capture");
+        let prior = paths.dir().join(PRIOR_DIR);
+
+        for name in [
+            "key.pem",
+            "chain.pem",
+            "acme-account.json",
+            "root-fingerprint",
+            "agent.toml",
+        ] {
+            let copy = prior.join(name);
+            assert_eq!(owner_of(&copy), owner, "the snapshot of {name}");
+            assert_eq!(mode_of(&copy), KEY_FILE_MODE, "the snapshot of {name}");
+        }
+        assert!(
+            prior.join("ca-bundle.pem").exists(),
+            "the bundle is still captured with the rest of the all-or-none set"
+        );
+
+        // A publication that replaced two members and then failed.
+        std::fs::write(paths.key(), "NEW KEY").expect("new key");
+        std::fs::write(paths.agent_config(), "email = \"new@example.internal\"\n")
+            .expect("new config");
+        snapshot.restore().await.expect("restore");
+
+        for path in [paths.key(), paths.agent_config()] {
+            assert_eq!(owner_of(&path), owner, "the restore of {}", path.display());
+            assert_eq!(
+                mode_of(&path),
+                KEY_FILE_MODE,
+                "the restore of {}",
+                path.display()
+            );
+        }
+    }
+
+    /// A capture that cannot complete removes what it had copied.
+    ///
+    /// The publication it would have protected never starts, so a
+    /// half-written `.prior` is a second copy of the credential and
+    /// nothing else — including, on a host whose capture failed while
+    /// establishing ownership, a copy under an owner the publication was
+    /// refused for. The published names are untouched either way: a
+    /// capture only reads them.
+    #[tokio::test]
+    async fn a_capture_that_cannot_complete_leaves_no_partial_snapshot() {
+        assert_ne!(
+            crate::fs_util::current_process_euid(),
+            0,
+            "an unreadable member is only unreadable to a process that is not root"
+        );
+        let (_dir, paths) = provisioned_host().await;
+        // The key is captured first and the chain second, so this fails
+        // the capture with one member already copied.
+        std::fs::set_permissions(paths.chain(), std::fs::Permissions::from_mode(0o000))
+            .expect("make the chain unreadable");
+
+        let Err(err) = capture_set(&paths).await else {
+            panic!("a member that cannot be read must fail the capture");
+        };
+        assert!(
+            format!("{err}").contains("chain.pem"),
+            "the failure must name the member it could not capture: {err}"
+        );
+        assert!(
+            !paths.dir().join(PRIOR_DIR).exists(),
+            "a partial snapshot must not survive the capture that failed"
+        );
+        assert_eq!(
+            material_status(&paths),
+            MaterialStatus::Present,
+            "a capture reads the published names and never writes them"
         );
     }
 

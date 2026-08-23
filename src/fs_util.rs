@@ -653,6 +653,55 @@ pub fn atomic_write_blocking(
     )
 }
 
+/// Writes `contents` to `dest` exactly as [`atomic_write`] does, and
+/// establishes `owner` on the staged inode before the rename.
+///
+/// The opt-in counterpart of [`atomic_write`], for the five protected
+/// registrar-internal files. Where [`atomic_write`] preserves an
+/// existing destination's owner and leaves a fresh one to the writing
+/// process, this asks for a stated uid and gid and *fails* if it cannot
+/// get them: an unprivileged process publishes nothing rather than a
+/// credential it owns itself. See [`FixedOwner`] for why that is the
+/// right answer for those files and the wrong one for everything else,
+/// and [`StagedOwner::Fixed`] for where in the sequence the chown runs.
+///
+/// A pre-existing destination owned by somebody else is converged, not
+/// preserved: the published file carries `owner` whatever was there
+/// before. That is deliberate for a protected file — the prior owner is
+/// the misconfiguration being corrected.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`], and
+/// additionally when the staged file cannot be given `owner` — the
+/// `EPERM` a process without `CAP_CHOWN` gets. The destination is
+/// untouched in that case, since the chown precedes the rename.
+pub async fn atomic_write_fixed_owner(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+    owner: FixedOwner,
+) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let (path, symlink) = dest.to_owned_parts();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        publish_staged_blocking(
+            &Destination {
+                path: &path,
+                symlink,
+            }
+            .publish_path()?,
+            &payload,
+            mode,
+            StagedOwner::Fixed(owner),
+            StagedDurability::FlushDirectory,
+        )
+    })
+    .await
+    .context("Fixed-owner atomic write task panicked")?
+}
+
 /// Publishes `contents` at `dest` by rename, **without** flushing the
 /// containing directory.
 ///
@@ -834,6 +883,82 @@ pub enum StagedOwner {
     /// group-readable by the policy, so no consumer loses access to a
     /// file it could read before.
     PolicyGroup(Option<u32>),
+    /// Establish exactly this uid and gid on the new inode, whatever the
+    /// destination carried and whatever the writing process is.
+    ///
+    /// Opt-in, and the only arm that can fail a publish on ownership
+    /// alone: the chown runs before the rename and its error is
+    /// returned, so a process without the authority to create the file
+    /// under that owner publishes nothing at all rather than a
+    /// best-effort file under its own uid. That is the requirement the
+    /// registrar-internal credential set has — see [`FixedOwner`].
+    Fixed(FixedOwner),
+}
+
+/// The uid and gid a [`StagedOwner::Fixed`] publish establishes on the
+/// inode it renames into place.
+///
+/// The five protected registrar-internal files —
+/// `registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
+/// `root-fingerprint` and `agent.toml` — authenticate a host to
+/// `OpenBao` or configure the agent that renews that credential, and
+/// they are `0600` root-owned or they are not that credential: a file
+/// the invoking user owns is one that user can read the key out of and
+/// one they can rewrite the trust pins of. Their mode has always been a
+/// policy; this type is the same statement about their owner.
+///
+/// The owner is an input rather than a constant so the real staging,
+/// chown and rename path can be driven in a test that is not root. It
+/// is not an input an operator can reach: [`FixedOwner::root`] is the
+/// only constructor outside `cfg(test)`, so no configuration key,
+/// environment variable or public API can move a protected file off
+/// uid 0 / gid 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl FixedOwner {
+    /// The owner every protected file is published under: uid 0, gid 0.
+    #[must_use]
+    pub fn root() -> Self {
+        Self { uid: 0, gid: 0 }
+    }
+
+    /// The test process's own effective uid and gid.
+    ///
+    /// The one way a protected publish is driven under an owner other
+    /// than root, and `cfg(test)`-gated so it exists in no build an
+    /// operator runs. A test taking it drives the production staging,
+    /// chown and rename path unchanged — the chown is the same call
+    /// against the same staged inode, asking for ids the unprivileged
+    /// test process is allowed to establish.
+    #[cfg(test)]
+    pub(crate) fn current_process() -> Self {
+        Self {
+            uid: current_process_euid(),
+            gid: crate::cert_group::current_process_egid(),
+        }
+    }
+
+    /// Whether this owner is `root:root`, which is what every
+    /// production caller asks for and what the failure message names.
+    fn is_root(self) -> bool {
+        self.uid == 0 && self.gid == 0
+    }
+}
+
+/// Returns this process's effective uid.
+///
+/// Reported by the failure of a fixed-owner publish, and asserted as a
+/// precondition by the tests that prove an unprivileged process cannot
+/// publish a protected file.
+#[must_use]
+pub fn current_process_euid() -> u32 {
+    // SAFETY: `geteuid` takes no argument, touches no memory the caller
+    // owns, and is documented as always succeeding.
+    unsafe { libc::geteuid() }
 }
 
 /// Whether the directory entry a staged publish creates is flushed
@@ -898,6 +1023,27 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
         "Failed to preserve existing uid={uid} gid={gid} on {}: re-owning the staged file \
          needs CAP_CHOWN (run as root), so either run this command as the destination's \
          owner or chown the destination to the user running it",
+        path.display()
+    )
+}
+
+/// The context a failed chown of a [`StagedOwner::Fixed`] publish
+/// carries: the owner the file must have, and the file it was being
+/// published as.
+///
+/// Both are named because either one is what an operator has to act
+/// on. The failure is `EPERM` — establishing an owner the writer does
+/// not hold needs `CAP_CHOWN` — and it is reached before the rename, so
+/// the message describes a publish that did not happen rather than one
+/// that half did.
+fn chown_fixed_context(owner: FixedOwner, path: &Path) -> String {
+    let requirement = if owner.is_root() {
+        "root-owned (uid 0, gid 0)".to_string()
+    } else {
+        format!("owned by uid {} gid {}", owner.uid, owner.gid)
+    };
+    format!(
+        "{} must be published {requirement}: the staged file could not be given that owner,          which needs CAP_CHOWN, so nothing was published — run this command as root",
         path.display()
     )
 }
@@ -1037,6 +1183,15 @@ pub fn publish_staged_blocking(
             })?;
         }
         StagedOwner::PolicyGroup(None) => {}
+        StagedOwner::Fixed(fixed) => {
+            // Unconditional, unlike the `Destination` arm's
+            // change-nothing skip: this owner is a policy re-asserted on
+            // every publish, and the call is the authority check. A
+            // process that cannot make the staged inode `root:root`
+            // must not go on to rename it into place under its own uid.
+            std::os::unix::fs::chown(tmp.path(), Some(fixed.uid), Some(fixed.gid))
+                .with_context(|| chown_fixed_context(fixed, path))?;
+        }
     }
     if let Some(final_mode) = final_mode {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(final_mode))
@@ -2624,6 +2779,161 @@ mod tests {
             "fresh file must be chowned to the parent gid"
         );
         assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_MODE);
+    }
+
+    /// A fixed-owner publish establishes the owner it was given on the
+    /// inode it renames into place — on a fresh create and on a
+    /// replacement alike.
+    ///
+    /// Driven through [`FixedOwner::current_process`] rather than
+    /// [`FixedOwner::root`], because the ids an unprivileged test
+    /// process can establish are its own. Everything else is the
+    /// production path: the same staging in the destination's
+    /// directory, the same `chown` on the staged inode, the same
+    /// `chmod` after it and the same rename.
+    #[tokio::test]
+    async fn a_fixed_owner_publish_owns_a_create_and_a_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = FixedOwner::current_process();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"FIRST",
+            StagedMode::Policy(KEY_FILE_MODE),
+            owner,
+        )
+        .await
+        .unwrap();
+        let created = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "FIRST");
+        assert_eq!((created.uid(), created.gid()), (owner.uid, owner.gid));
+        assert_eq!(created.permissions().mode() & 0o7777, KEY_FILE_MODE);
+
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"SECOND",
+            StagedMode::Policy(KEY_FILE_MODE),
+            owner,
+        )
+        .await
+        .unwrap();
+        let replaced = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "SECOND");
+        assert_eq!((replaced.uid(), replaced.gid()), (owner.uid, owner.gid));
+        assert_eq!(replaced.permissions().mode() & 0o7777, KEY_FILE_MODE);
+        assert_ne!(
+            replaced.ino(),
+            created.ino(),
+            "the replacement is a fresh inode, so its owner was established rather than inherited"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("key.pem")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// A process that cannot establish the required owner publishes
+    /// nothing: the chown is on the staged inode, before the rename, so
+    /// its failure leaves the destination exactly as it was.
+    ///
+    /// This is the ordering guarantee stated as a test. An unprivileged
+    /// process asking for `root:root` gets `EPERM` from the kernel — no
+    /// check in this crate decides it — and what matters is where in the
+    /// sequence that answer arrives: an old credential still readable
+    /// and a new one not published, rather than a protected file left
+    /// owned by whoever ran the command.
+    #[tokio::test]
+    async fn a_fixed_owner_publish_that_cannot_own_the_file_publishes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        std::fs::write(&path, "PRIOR").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let err = atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"NEXT",
+            StagedMode::Policy(KEY_FILE_MODE),
+            FixedOwner::root(),
+        )
+        .await
+        .unwrap_err();
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("root-owned") && report.contains(&path.display().to_string()),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "PRIOR");
+        assert_eq!(after.ino(), before.ino(), "the rename must not have run");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("key.pem")],
+            "the staged temporary is removed with the failed publish"
+        );
+
+        let absent = dir.path().join("absent.pem");
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&absent),
+            b"NEXT",
+            StagedMode::Policy(KEY_FILE_MODE),
+            FixedOwner::root(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !absent.exists(),
+            "a refused publication must not create the destination either"
+        );
+    }
+
+    /// The general wrappers are untouched by the fixed-owner arm: they
+    /// still leave a fresh create to the writing process, which is what
+    /// every file without an ownership policy of its own depends on.
+    #[tokio::test]
+    async fn atomic_write_still_leaves_a_fresh_create_to_the_writer() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        atomic_write(
+            Destination::bootroot_owned(&path),
+            b"{}",
+            StagedMode::Policy(0o644),
+        )
+        .await
+        .unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (
+                current_process_euid(),
+                crate::cert_group::current_process_egid()
+            )
+        );
     }
 
     /// Under an active `--cert-group` policy, the bundle file must be

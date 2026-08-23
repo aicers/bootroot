@@ -514,6 +514,21 @@ bootroot verify --registration-id edge-proxy \
 하나뿐입니다. 데몬이 registrar의 `mint`/`deregister` 동사를 실행하기 위해
 `OpenBao`에 인증할 때 사용하는 bootroot 내부 자격 증명입니다.
 
+**이 호스트에서는 `bootroot init`을 root로 실행하세요.** 자격 증명을 구성하는
+다섯 개 파일(`registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
+`root-fingerprint`, `agent.toml`)은 `0600`에 소유자가 `root`인 상태로 게시되며,
+`init`은 그 소유권을 확보하지 못하면 어느 파일도 게시하지 않고 실패합니다.
+일반 사용자로 실행한 엔드포인트 활성 `init`은 키를 그 사용자가 읽을 수 있는
+상태로 남기는 대신 아무것도 쓰지 않고 실패합니다. 이 동작은 최선 노력(best
+effort)이 아니며, 이를 완화하는 플래그나 설정 키도 없습니다.
+
+따라서 이 설치 전체가 root로 운영됩니다. `init`이 이 호스트에 만든 파일은 root의
+것이므로, 이 설치를 변경하는 이후의 모든 `bootroot` 명령(`rotate`,
+`service add`, `reinit`, `clean`)도 root로 실행해야 합니다. 상태만 보고하는
+읽기 전용 명령은 읽을 대상에 접근할 권한만 있으면 됩니다. 이는 registrar
+엔드포인트를 제공하는 호스트에 해당하며, 그렇지 않은 호스트는 변경 사항이 없고
+root도 필요 없습니다.
+
 `bootroot init`은 이 설정 파일과 전용 CA 번들을 작성할 뿐, 프로세스를 시작하거나
 감독자(supervisor)를 설치하지 않습니다. 서비스 에이전트와 마찬가지로 운영자가
 같은 감독자 아래에서 시작합니다.
