@@ -199,14 +199,35 @@ fn loopback_tls_bind_addr(plaintext_url: &str) -> String {
 
 /// The HTTPS form of a plaintext loopback `OpenBao` URL.
 ///
-/// Host and port are carried through unchanged; only the scheme moves.
-/// A URL that is already `https://` is returned as it is, so a re-run
-/// over an already-transitioned listener records the same value.
+/// The host is carried through unchanged and so is an explicit port; a
+/// URL that is already `https://` is returned as it is, so a re-run over
+/// an already-transitioned listener records the same value.
+///
+/// A URL that names *no* port is the one case where the scheme cannot
+/// move on its own: `http://localhost` implies 80 and `https://localhost`
+/// implies 443, and the listener answers on neither. The port
+/// [`loopback_tls_bind_addr`] bound is spelled out instead, so the
+/// recorded URL and the certificate's bind address cannot name different
+/// ports.
 fn https_from_plaintext_url(url: &str) -> String {
-    match url.strip_prefix("http://") {
-        Some(rest) => format!("https://{rest}"),
-        None => url.to_string(),
+    let Some(rest) = url.strip_prefix("http://") else {
+        return url.to_string();
+    };
+    if has_explicit_port(rest) {
+        return format!("https://{rest}");
     }
+    format!("https://{rest}:{}", url_port(url))
+}
+
+/// Whether an authority ends in an explicit port.
+///
+/// The same parse [`url_port`] performs, so the two cannot disagree
+/// about which URLs carry one — including a bracketed IPv6 host, whose
+/// trailing `:1]` is not a port.
+fn has_explicit_port(authority: &str) -> bool {
+    authority
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.trim_end_matches('/').parse::<u16>().is_ok())
 }
 
 /// The port an `OpenBao` URL names, defaulting to the container port.
@@ -3237,10 +3258,45 @@ mod registrar_tls_gate_tests {
     }
 
     /// A URL with no port falls back to the container port rather than
-    /// composing a SAN for a port nothing serves.
+    /// composing a SAN for a port nothing serves — and the recorded URL
+    /// falls back with it. Moving only the scheme would turn an implied
+    /// 80 into an implied 443, which is neither the port the listener
+    /// binds nor the port the certificate covers, so the login proof
+    /// that gates publication would dial nothing.
     #[test]
     fn a_portless_url_falls_back_to_the_container_port() {
         assert_eq!(loopback_tls_bind_addr("http://localhost"), "127.0.0.1:8200");
+        assert_eq!(
+            https_from_plaintext_url("http://localhost"),
+            "https://localhost:8200"
+        );
+    }
+
+    /// The bind address and the recorded URL are derived separately but
+    /// must never name different ports, so every shape is checked
+    /// against both — including a bracketed IPv6 host, whose trailing
+    /// `:1]` is not a port.
+    #[test]
+    fn the_recorded_url_always_names_the_port_that_was_bound() {
+        for url in [
+            "http://localhost",
+            "http://localhost:8200",
+            "http://127.0.0.1:18200",
+            "http://localhost:8200/",
+            "http://[::1]",
+            "http://[::1]:18200",
+        ] {
+            let bound = loopback_tls_bind_addr(url);
+            let recorded = https_from_plaintext_url(url);
+            let port = bound
+                .rsplit_once(':')
+                .map(|(_, port)| port.to_string())
+                .expect("the bind address always carries a port");
+            assert!(
+                recorded.contains(&format!(":{port}")),
+                "{url}: recorded {recorded} does not name the bound port {port}"
+            );
+        }
     }
 }
 
