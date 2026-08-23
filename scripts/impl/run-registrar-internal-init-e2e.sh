@@ -197,14 +197,25 @@ run_bootroot() {
 
 # `bootroot` as root, for the one command that has to be.
 #
-# `env` rather than `sudo -E`: only the two variables named here cross
+# `env` rather than `sudo -E`: only the three variables named here cross
 # the boundary.  `BOOTROOT_LANG` keeps the run on the English strings
 # every assertion below matches on, and `HOME` stays the invoking user's
 # because `init` drives the Docker CLI, which reads its client
 # configuration — the daemon endpoint and any credential helper — out of
 # `$HOME/.docker`.  Root's own `HOME` has none of that.
+#
+# `BOOTROOT_HTTP01_IMAGE` is the run-scoped responder tag this scenario
+# built locally, and the compose file interpolates it with a default of
+# the *untagged* repository name.  Dropping it at the sudo boundary does
+# not fall back to the image on this host: it names one that exists in
+# no registry, and the `docker compose up` `init` performs for the
+# responder override fails on a pull nobody can satisfy.
 run_bootroot_as_root() {
-  (cd "$WORK_DIR" && sudo -n env BOOTROOT_LANG=en HOME="$HOME" "$BOOTROOT_BIN" "$@")
+  (cd "$WORK_DIR" && sudo -n env \
+    BOOTROOT_LANG=en \
+    HOME="$HOME" \
+    BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" \
+    "$BOOTROOT_BIN" "$@")
 }
 
 instance_compose() {

@@ -982,11 +982,12 @@ pub enum StagedOwner {
     /// as that tree's owner rather than as bootroot. `secrets/` is such
     /// a tree: `infra install` pins `BOOTROOT_STEPCA_USER` to its owner,
     /// every `step` helper container is launched `--user <that uid>`,
-    /// and the step-ca server runs as it too, so a file published there
-    /// under a *different* uid is one none of them can open. That was
-    /// invisible while bootroot always ran as that owner; an
-    /// endpoint-enabled `init`, which must run as root, is the first
-    /// writer for which it is not.
+    /// the step-ca server runs as it too, and the generated compose
+    /// override starts both `OpenBao` Agent sidecars under it — so a
+    /// file published there under a *different* uid is one none of them
+    /// can open. That was invisible while bootroot always ran as that
+    /// owner; an endpoint-enabled `init`, which must run as root, is
+    /// the first writer for which it is not.
     ///
     /// The in-process counterpart of the root-container `chown` that
     /// `openbao/tls` takes before its issuance. A chown that would
@@ -1139,9 +1140,9 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
 /// rename, so the message describes a publish that did not happen.
 fn chown_containing_dir_context(uid: u32, gid: u32, parent: &Path, path: &Path) -> String {
     format!(
-        "{} must be published under the owner of {} (uid {uid}, gid {gid}) \u{2014} the uid the \
-         step-ca container and every `step` helper are launched as. The staged file could not be \
-         given that owner, so nothing was published",
+        "{} must be published under the owner of {} (uid {uid}, gid {gid}) \u{2014} the uid \
+         step-ca, the `step` helpers and the OpenBao Agent sidecars are launched as. The staged \
+         file could not be given that owner, so nothing was published",
         path.display(),
         parent.display()
     )
