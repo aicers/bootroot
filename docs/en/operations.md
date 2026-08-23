@@ -353,6 +353,16 @@ settings and through the same predicate every other profile uses. Until it is
 started there is nothing to renew and nothing to signal — a rotation that
 `HUP`s it and finds no process treats that as success.
 
+Renewal has one precondition: before it issues, the daemon checks that the root
+recorded beside the credential is still the deployment's active root, and
+refuses without making an ACME request, a login or a write when it is not. A
+full CA rotation opens exactly that gap between its Phase 3 and the repair step
+after Phase 4, so a leaf that falls due inside it is left alone rather than
+reissued under a root the `auth/cert` entry does not yet trust. The refusal is
+reported through the profile's ordinary post-renew failure hooks, the daemon
+keeps ticking, and the tick after the repair renews normally — there is nothing
+to restart.
+
 **Rotation.** An intermediate-only CA rotation leaves the credential, its entry,
 its config and its private bundle untouched: the entry trusts the root, which
 that rotation does not replace. A full rotation publishes the additive trust set

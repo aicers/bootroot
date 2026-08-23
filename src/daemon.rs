@@ -437,6 +437,37 @@ async fn collect_task_results(
     first_error.map_or(Ok(()), Err)
 }
 
+/// The bootroot-internal profile's fail-closed precondition, checked
+/// before every issuance the daemon starts.
+///
+/// A no-op for every other profile. For the internal one it compares the
+/// stored root fingerprint with the deployment's active root and refuses
+/// on a mismatch, so a leaf that falls due between a full rotation's
+/// Phase 3 and its post-Phase-4 repair is not reissued under a root the
+/// `auth/cert` entry no longer trusts. Nothing about it is a second
+/// scheduler: the refusal is reported through the same post-renew
+/// failure hooks an issuance failure takes, and the caller decides
+/// whether that ends the run or only this tick.
+async fn refuse_stale_internal_root(
+    settings: &config::Settings,
+    profile: &config::DaemonProfileSettings,
+    profile_label: &str,
+) -> Option<anyhow::Error> {
+    let err = crate::registrar::internal::check_renewal_allowed(profile).err()?;
+    error!(
+        "Profile '{}' issuance refused before any ACME request: {err}",
+        profile_label
+    );
+    let result = Err(anyhow::Error::new(err));
+    if let Err(hook_err) = handle_issuance_result(&result, settings, profile, profile_label).await {
+        error!(
+            "Post-renew failure hooks failed for '{}': {hook_err}",
+            profile_label
+        );
+    }
+    result.err()
+}
+
 async fn run_profile_oneshot(
     settings: Arc<config::Settings>,
     profile: config::DaemonProfileSettings,
@@ -444,9 +475,13 @@ async fn run_profile_oneshot(
     semaphore: Arc<Semaphore>,
     runtime: IssuanceRuntime,
 ) -> anyhow::Result<()> {
+    let profile_label = config::profile_domain(&settings, &profile);
+    if let Some(err) = refuse_stale_internal_root(&settings, &profile, &profile_label).await {
+        return Err(err);
+    }
+
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
-    let profile_label = config::profile_domain(&settings, &profile);
 
     let result =
         acme::issue_certificate(&settings, &profile, profile_eab, runtime.insecure_mode).await;
@@ -753,6 +788,9 @@ async fn force_renew_profile(
     let profile_label = config::profile_domain(settings, profile);
     let lock = profile_locks.for_profile(&profile_label);
     let _profile_guard = lock.lock().await;
+    if let Some(err) = refuse_stale_internal_root(settings, profile, &profile_label).await {
+        return Err(err);
+    }
     info!(
         "Profile '{}' force-reissue requested. Starting ACME issuance...",
         profile_label
@@ -800,6 +838,18 @@ async fn check_and_renew_profile(
 
     if !needs_renewal {
         tracing::debug!("Profile '{}' certificate still valid.", profile_label);
+        return Ok(());
+    }
+
+    if refuse_stale_internal_root(settings, profile, &profile_label)
+        .await
+        .is_some()
+    {
+        // The credential is repairable and the repair is another
+        // process's job, so the loop keeps ticking rather than ending:
+        // the tick after `bootroot rotate registrar-internal-credential`
+        // — or after a full rotation's post-Phase-4 tail — renews
+        // normally.
         return Ok(());
     }
 
@@ -1110,6 +1160,165 @@ mod tests {
             time::OffsetDateTime::now_utc() + time::Duration::days(1),
         );
         assert!(should_renew(&profile, &trust, lead).await.unwrap());
+    }
+
+    /// Writes a host caught in a full rotation's Phase-3 window: the
+    /// deployment root is already the new one, the private bundle
+    /// carries the additive set so the leaf still chains to it, and the
+    /// stored fingerprint deliberately still names the old root, as it
+    /// does until the tail after Phase 4. The leaf is a day from expiry,
+    /// so the ordinary predicate says renew.
+    ///
+    /// Returns the stale fingerprint and the file the profile's
+    /// post-renew failure hook records its reason in.
+    fn write_mid_rotation_internal_host(
+        secrets: &std::path::Path,
+        paths: &crate::registrar::internal::InternalPaths,
+        acme_url: &str,
+    ) -> (String, PathBuf) {
+        let old = build_test_ca("old");
+        let new = build_test_ca("new");
+        let certs = secrets.join("certs");
+        fs::create_dir_all(&certs).unwrap();
+        fs::write(certs.join("root_ca.crt"), new.root_cert.pem()).unwrap();
+        let stale_fp = crate::tls::sha256_hex(old.root_cert.der().as_ref());
+        let active_fp = crate::tls::sha256_hex(new.root_cert.der().as_ref());
+        assert_ne!(stale_fp, active_fp);
+
+        fs::create_dir_all(paths.dir()).unwrap();
+        let signing_key = rcgen::KeyPair::generate().unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["001.bootroot-registrar-internal".to_string()])
+                .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(80);
+        params.not_after = now + time::Duration::days(1);
+        let leaf = params
+            .signed_by(&signing_key, &old.intermediate_issuer)
+            .unwrap();
+        fs::write(paths.chain(), leaf.pem()).unwrap();
+        fs::write(paths.key(), signing_key.serialize_pem()).unwrap();
+
+        // A real account key: a placeholder is rejected before the first
+        // request is made, which would let the "no ACME request"
+        // assertion pass even with the guard gone.
+        let account_pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &ring::rand::SystemRandom::new(),
+        )
+        .unwrap();
+        fs::write(
+            paths.acme_account(),
+            serde_json::to_vec(&serde_json::json!({
+                "account_key_pkcs8": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    account_pkcs8.as_ref(),
+                ),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(paths.root_fingerprint(), format!("{stale_fp}\n")).unwrap();
+        fs::write(
+            paths.ca_bundle(),
+            format!("{}{}", test_bundle_pem(&old), test_bundle_pem(&new)),
+        )
+        .unwrap();
+
+        // The profile's ordinary post-renew failure hook is the only
+        // reporting path a refusal takes, and what it is handed is what
+        // separates "refused before ACME" from "tried ACME and failed".
+        let reason_path = secrets.join("failure-reason");
+        let hook = format!(
+            "\n[[profiles.hooks.post_renew.failure]]\ncommand = \"/bin/sh\"\n\
+             args = [\"-c\", \"printf %s \\\"$RENEW_ERROR\\\" > {}\"]\n",
+            reason_path.display()
+        );
+        let config = crate::registrar::internal::render_internal_agent_config(
+            paths,
+            &crate::registrar::internal::InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: acme_url,
+                domain: TEST_DOMAIN,
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: "hmac",
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[stale_fp.clone(), active_fp],
+            },
+        );
+        fs::write(paths.agent_config(), format!("{config}{hook}")).unwrap();
+        (stale_fp, reason_path)
+    }
+
+    /// The fail-closed guard, end to end through the ordinary loop.
+    ///
+    /// The tick is due — `should_renew` says so — and must still make no
+    /// ACME request and leave the chain and the key exactly as it found
+    /// them, because a leaf reissued inside the Phase-3 window would be
+    /// chained to a root the `auth/cert` entry does not yet trust.
+    #[tokio::test]
+    async fn a_stale_stored_root_stops_the_internal_tick_before_any_acme_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path();
+        let paths = crate::registrar::internal::InternalPaths::new(secrets);
+
+        // A stand-in for step-ca that never answers: the assertion is
+        // that nothing ever *connects* to it, and a non-blocking accept
+        // says so without waiting. The URL is `https://` because the
+        // ACME client refuses a plaintext directory before it dials,
+        // which would make the assertion pass for the wrong reason.
+        let acme = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        acme.set_nonblocking(true).unwrap();
+        let acme_url = format!("https://{}/acme/acme/directory", acme.local_addr().unwrap());
+
+        let (stale_fp, reason_path) = write_mid_rotation_internal_host(secrets, &paths, &acme_url);
+
+        let settings = config::Settings::from_file(Some(paths.agent_config())).unwrap();
+        let profile = settings.profiles.first().unwrap();
+        let lead = Duration::from_secs(THIRTY_DAYS_SECS);
+        assert!(
+            should_renew(profile, &settings.trust, lead).await.unwrap(),
+            "the fixture must actually be due for renewal"
+        );
+
+        let chain_before = fs::read(paths.chain()).unwrap();
+        let key_before = fs::read(paths.key()).unwrap();
+
+        check_and_renew_profile(
+            &settings,
+            profile,
+            None,
+            Arc::new(Semaphore::new(1)),
+            &ProfileLocks::new(),
+            lead,
+            &IssuanceRuntime {
+                config_path: paths.agent_config(),
+                insecure_mode: false,
+                cli_overrides: config::CliOverrides::default(),
+            },
+        )
+        .await
+        .expect("a refused tick is not a daemon failure; the loop keeps ticking");
+
+        assert!(
+            matches!(
+                acme.accept().map_err(|err| err.kind()),
+                Err(std::io::ErrorKind::WouldBlock)
+            ),
+            "the tick must not have reached the ACME directory"
+        );
+        assert_eq!(fs::read(paths.chain()).unwrap(), chain_before);
+        assert_eq!(fs::read(paths.key()).unwrap(), key_before);
+
+        let reason = fs::read_to_string(&reason_path)
+            .expect("the ordinary failure hook must have reported the refusal");
+        assert!(
+            reason.contains(&stale_fp)
+                && reason.contains("bootroot rotate registrar-internal-credential"),
+            "the refusal must be the typed repair-required one, got: {reason}"
+        );
     }
 
     /// The generated internal config with a second, test-only profile

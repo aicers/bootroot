@@ -54,10 +54,20 @@
 //! `daemon` and `retry` settings, through the same renewal predicate
 //! every other profile uses. The operator supervises that process;
 //! `init` does not start it.
+//!
+//! That loop has one precondition, and it is not a scheduler:
+//! [`check_renewal_allowed`] compares the stored root fingerprint with
+//! the deployment's active root before any issuance the daemon starts,
+//! and refuses with [`InternalCredentialError::RepairRequired`] on a
+//! mismatch. Between a full rotation's Phase 3 and the tail after Phase
+//! 4 the stored fingerprint deliberately still names the old root, and a
+//! leaf reissued in that window would be chained to a root the
+//! `auth/cert` entry does not yet trust.
 
 pub mod agent_config;
 pub mod client;
 pub mod material;
+pub mod renewal;
 
 #[cfg(test)]
 mod tests;
@@ -77,6 +87,7 @@ pub use material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_members,
     capture_set, load_material, material_status, publish_material,
 };
+pub use renewal::{active_root_fingerprint, check_renewal_allowed, internal_profile_paths};
 
 /// The fixed subdirectory, below the state-recorded secrets directory,
 /// that every bootroot-internal artifact lives in.

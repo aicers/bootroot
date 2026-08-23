@@ -1331,3 +1331,145 @@ mod live {
         }
     }
 }
+
+/// The fail-closed guard the ordinary renewal loop runs before it
+/// issues. The window it exists for is between a full rotation's Phase
+/// 3, which publishes the additive trust set and reloads this daemon,
+/// and the tail after Phase 4, which is the only place the entry, the
+/// leaf and the stored fingerprint move.
+mod renewal_guard {
+    use tempfile::TempDir;
+
+    use super::{account_json, chain_pem, generated_config, key_pem};
+    use crate::config::{DaemonProfileSettings, Settings};
+    use crate::registrar::internal::{
+        InternalCredentialError, InternalPaths, check_renewal_allowed, internal_profile_paths,
+    };
+
+    /// A self-signed root and its hex SHA-256, as the deployment's
+    /// `certs/root_ca.crt` and as the fingerprint recorded beside the
+    /// credential.
+    fn root_ca(label: &str) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("generate a root key");
+        let mut params =
+            rcgen::CertificateParams::new(Vec::<String>::new()).expect("root parameters");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, label);
+        let cert = params.self_signed(&key).expect("self-sign the root");
+        let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
+        (cert.pem(), fingerprint)
+    }
+
+    /// A provisioned host whose active root is `active_pem` and whose
+    /// credential records `stored_fp`.
+    fn host(active_pem: &str, stored_fp: &str) -> (TempDir, InternalPaths) {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(dir.path().join("certs")).expect("create the CA directory");
+        std::fs::write(dir.path().join("certs").join("root_ca.crt"), active_pem)
+            .expect("write the active root");
+        std::fs::create_dir_all(paths.dir()).expect("create the internal directory");
+        std::fs::write(paths.key(), key_pem()).expect("key");
+        std::fs::write(paths.chain(), chain_pem()).expect("chain");
+        std::fs::write(paths.acme_account(), account_json()).expect("account key");
+        std::fs::write(paths.root_fingerprint(), format!("{stored_fp}\n")).expect("fingerprint");
+        std::fs::write(paths.ca_bundle(), chain_pem()).expect("bundle");
+        std::fs::write(paths.agent_config(), generated_config(&paths)).expect("config");
+        (dir, paths)
+    }
+
+    /// The one profile the generated config carries, read the way
+    /// `bootroot-agent` reads it.
+    fn internal_profile(paths: &InternalPaths) -> DaemonProfileSettings {
+        let settings =
+            Settings::from_file(Some(paths.agent_config())).expect("the generated config parses");
+        settings
+            .profiles
+            .into_iter()
+            .next()
+            .expect("the generated config carries one profile")
+    }
+
+    /// The ordinary case: the stored root is the active one, so the
+    /// guard is invisible and the loop renews as it always did.
+    #[test]
+    fn a_current_root_lets_the_ordinary_loop_renew() {
+        let (root_pem, root_fp) = root_ca("current");
+        let (_dir, paths) = host(&root_pem, &root_fp);
+        check_renewal_allowed(&internal_profile(&paths)).expect("a matching root renews normally");
+    }
+
+    /// The window itself: the root moved and the fingerprint has not
+    /// caught up, so the refusal is the typed repair-required one and
+    /// it names the command that fixes it.
+    #[test]
+    fn a_stale_stored_root_refuses_with_repair_required() {
+        let (_old_pem, old_fp) = root_ca("old");
+        let (new_pem, new_fp) = root_ca("new");
+        let (_dir, paths) = host(&new_pem, &old_fp);
+
+        let err = check_renewal_allowed(&internal_profile(&paths))
+            .expect_err("a superseded root must refuse renewal");
+        match &err {
+            InternalCredentialError::RepairRequired { stored, active } => {
+                assert_eq!(stored, &old_fp);
+                assert_eq!(active, &new_fp);
+            }
+            other => panic!("expected repair-required, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains("bootroot rotate registrar-internal-credential")
+        );
+    }
+
+    /// An ordinary service profile is not guarded at all. It is not
+    /// bound to an `auth/cert` entry, and renewing it across a rotation
+    /// is exactly what the rotation wants — so the guard must not even
+    /// look for a credential beside it.
+    #[test]
+    fn an_ordinary_service_profile_is_not_guarded() {
+        let (new_pem, _new_fp) = root_ca("new");
+        let (_old_pem, old_fp) = root_ca("old");
+        let (_dir, paths) = host(&new_pem, &old_fp);
+        let mut profile = internal_profile(&paths);
+        profile.service_name = "edge-proxy".to_string();
+        check_renewal_allowed(&profile).expect("a service profile is never guarded");
+        assert!(internal_profile_paths(&profile).is_none());
+    }
+
+    /// The staging profile a provisioning or a repair issues through
+    /// carries the internal identity but writes into
+    /// `registrar-internal/staging`. It must not be matched: a repair
+    /// issues its replacement leaf precisely when the stored root no
+    /// longer matches, so a guard that caught it there could never be
+    /// satisfied.
+    #[test]
+    fn the_staging_profile_a_repair_issues_through_is_not_guarded() {
+        let (new_pem, _new_fp) = root_ca("new");
+        let (_old_pem, old_fp) = root_ca("old");
+        let (_dir, paths) = host(&new_pem, &old_fp);
+        let mut profile = internal_profile(&paths);
+        let staging = paths.dir().join("staging");
+        profile.paths.cert = staging.join("leaf.pem");
+        profile.paths.key = staging.join("key.pem");
+        assert!(internal_profile_paths(&profile).is_none());
+        check_renewal_allowed(&profile).expect("the staging issuance is not the guarded one");
+    }
+
+    /// Fail closed rather than open: a host whose active root cannot be
+    /// read refuses too, because "cannot tell" and "does not match" have
+    /// the same consequence for a leaf about to be reissued.
+    #[test]
+    fn an_unreadable_active_root_refuses_as_well() {
+        let (root_pem, root_fp) = root_ca("current");
+        let (dir, paths) = host(&root_pem, &root_fp);
+        std::fs::remove_file(dir.path().join("certs").join("root_ca.crt"))
+            .expect("remove the active root");
+        let err = check_renewal_allowed(&internal_profile(&paths))
+            .expect_err("an unreadable active root must refuse renewal");
+        assert!(matches!(err, InternalCredentialError::Io { .. }), "{err:?}");
+    }
+}

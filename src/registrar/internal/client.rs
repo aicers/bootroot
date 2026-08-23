@@ -313,7 +313,7 @@ pub async fn require_root_authority(
 /// Case-insensitive because a fingerprint is hex and both spellings name
 /// the same certificate; a second implementation of that would be a
 /// second chance to get it wrong.
-fn compare_root(stored: &str, active: &str) -> Result<(), InternalCredentialError> {
+pub(crate) fn compare_root(stored: &str, active: &str) -> Result<(), InternalCredentialError> {
     if stored.eq_ignore_ascii_case(active) {
         return Ok(());
     }

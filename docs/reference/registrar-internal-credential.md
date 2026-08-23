@@ -322,6 +322,22 @@ every other profile uses:
   A configuration that leaves `ca_bundle_path` unset stays expiry-only in the
   generic predicate — that is the predicate's behaviour, not a special case.
 
+That loop has one precondition, and it is a precondition rather than a second
+scheduler: before any issuance it starts, the daemon compares the stored root
+fingerprint with the deployment's active root and refuses on a mismatch with the
+typed repair-required error of §11, having made no ACME request, no login and no
+write. It is needed because the two do not move together on purpose. A full
+rotation replaces the root in Phase 2 and reloads this daemon in Phase 3, but the
+`auth/cert` entry, the leaf and the stored fingerprint are only replaced in the
+tail after Phase 4 — so inside that window a leaf that fell due would otherwise
+be reissued under a root the entry does not yet trust, and the repair would then
+have to unpick a credential it could have simply replaced.
+
+The refusal travels out through the same post-renew failure hooks any other
+issuance failure takes, and the daemon keeps ticking. The tick after the repair
+— whether the rotation's own tail or `bootroot rotate
+registrar-internal-credential` — renews normally, with no restart.
+
 ## 9. Rotation
 
 **An intermediate-only rotation changes nothing here.** The `auth/cert` entry
