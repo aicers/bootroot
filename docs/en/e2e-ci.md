@@ -867,7 +867,8 @@ RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 
 ## Local preflight standard
 
-Before pushing code, run all preflight checks:
+Before pushing code, run the standard preflight checks, which exclude
+extended E2E:
 
 ```bash
 ./scripts/preflight/run-all.sh
@@ -886,7 +887,7 @@ Or run individual scripts:
 | `./scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` Deploy Compose No-Build Smoke |
 | `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
-| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
+| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended (optional/manual scheduled coverage; `run-all.sh` does not invoke it) |
 
 `deploy-no-build-smoke.sh` is the one entry that is not a mirror: the
 `Deploy Compose No-Build Smoke` step runs this same file, so it cannot

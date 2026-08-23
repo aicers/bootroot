@@ -853,7 +853,7 @@ RUNNER_MODE=cron ./scripts/impl/run-harness-smoke.sh
 
 ## 로컬 사전검증 표준
 
-푸시 전 `scripts/preflight/` 스크립트를 실행합니다.
+푸시 전 확장 E2E를 제외한 기본 사전검증을 실행합니다.
 
 CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 
@@ -868,7 +868,7 @@ CI 워크플로 동등 스크립트(`scripts/preflight/ci/`):
 | `scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` → Deploy Compose No-Build Smoke |
 | `scripts/preflight/ci/test-core.sh` | `ci.yml` → test-core |
 | `scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` → test-docker-e2e-matrix |
-| `scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` → run-extended |
+| `scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` → run-extended (선택/수동 예약 커버리지, 기본 실행기가 호출하지 않음) |
 
 `deploy-no-build-smoke.sh`만은 CI를 흉내 낸 스크립트가 아닙니다.
 `Deploy Compose No-Build Smoke` 단계가 이 파일을 그대로 실행하므로 CI와

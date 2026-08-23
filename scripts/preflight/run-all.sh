@@ -32,9 +32,6 @@ echo "--- ci/test-core.sh ---"
 echo "--- ci/e2e-matrix.sh ---"
 "$SCRIPT_DIR/ci/e2e-matrix.sh" "$@"
 
-echo "--- ci/e2e-extended.sh ---"
-"$SCRIPT_DIR/ci/e2e-extended.sh"
-
 echo "=== Preflight: Extra local-only checks ==="
 
 echo "--- extra/agent-scenarios.sh ---"
