@@ -27,6 +27,7 @@ use anyhow::Result;
 use crate::config::Settings;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
 use crate::registrar::internal::{InternalCredentialError, InternalPaths};
+use crate::secret::HmacSecret;
 use crate::toml_util::{toml_encode_string, upsert_section_keys};
 
 /// The instance label the internal identity is always composed at.
@@ -52,11 +53,11 @@ pub struct InternalAgentConfigParams<'a> {
     /// The HTTP-01 responder URL.
     pub responder_url: &'a str,
     /// The HTTP-01 responder shared HMAC.
-    pub responder_hmac: &'a str,
+    pub responder_hmac: &'a HmacSecret,
     /// The EAB key identifier, when the deployment registered one.
     pub eab_kid: Option<&'a str>,
     /// The EAB HMAC, when the deployment registered one.
-    pub eab_hmac: Option<&'a str>,
+    pub eab_hmac: Option<&'a HmacSecret>,
     /// Fingerprints covering every certificate in the private bundle.
     pub trusted_ca_sha256: &'a [String],
 }
@@ -90,7 +91,7 @@ pub fn render_internal_agent_config(
         (Some(kid), Some(hmac)) if !kid.is_empty() && !hmac.is_empty() => format!(
             "\n[eab]\nkid = {kid}\nhmac = {hmac}\n",
             kid = toml_encode_string(kid),
-            hmac = toml_encode_string(hmac),
+            hmac = toml_encode_string(hmac.expose()),
         ),
         _ => String::new(),
     };
@@ -143,7 +144,7 @@ pub fn render_internal_agent_config(
         server = toml_encode_string(params.server),
         domain = toml_encode_string(params.domain),
         responder_url = toml_encode_string(params.responder_url),
-        responder_hmac = toml_encode_string(params.responder_hmac),
+        responder_hmac = toml_encode_string(params.responder_hmac.expose()),
         account_key = toml_encode_string(&paths.acme_account().display().to_string()),
         bundle = toml_encode_string(&paths.ca_bundle().display().to_string()),
         registration_id = toml_encode_string(&internal_registration_id(params.hostname)),

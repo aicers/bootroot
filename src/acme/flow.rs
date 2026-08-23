@@ -506,7 +506,7 @@ mod tests {
                 poll_interval_secs: 2,
                 account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
-                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_hmac: "dev-hmac".into(),
                 http_responder_timeout_secs: 5,
                 http_responder_token_ttl_secs: 300,
             },

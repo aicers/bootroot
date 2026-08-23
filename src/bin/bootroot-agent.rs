@@ -223,7 +223,7 @@ mod tests {
                 poll_interval_secs: 2,
                 account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
-                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_hmac: "dev-hmac".into(),
                 http_responder_timeout_secs: 5,
                 http_responder_token_ttl_secs: 300,
             },
@@ -244,7 +244,7 @@ mod tests {
     fn test_resolve_profile_eab_prefers_profile() {
         let profile_eab = config::Eab {
             kid: "profile".to_string(),
-            hmac: "profile-hmac".to_string(),
+            hmac: "profile-hmac".into(),
         };
         let profile = config::DaemonProfileSettings {
             eab: Some(profile_eab),
@@ -253,7 +253,7 @@ mod tests {
 
         let default_eab = Some(eab::EabCredentials {
             kid: "default".to_string(),
-            hmac: "default-hmac".to_string(),
+            hmac: "default-hmac".into(),
         });
 
         let resolved = profile::resolve_profile_eab(&profile, default_eab).unwrap();

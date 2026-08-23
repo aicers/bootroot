@@ -4,6 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use tempfile::TempDir;
 
@@ -25,6 +26,7 @@ use crate::registrar::{
     REGISTRAR_INTERNAL_LABEL, RESERVED_SERVICE_NAME_PREFIX, is_reserved_service_name,
     registrar_internal_identity,
 };
+use crate::secret::HmacSecret;
 
 const KV_MOUNT: &str = "secret";
 const DOMAIN: &str = "example.internal";
@@ -68,7 +70,7 @@ fn generated_config(paths: &InternalPaths) -> String {
             domain: DOMAIN,
             hostname: HOST,
             responder_url: "http://127.0.0.1:8080",
-            responder_hmac: "responder-hmac",
+            responder_hmac: &"responder-hmac".into(),
             eab_kid: None,
             eab_hmac: None,
             trusted_ca_sha256: &[ROOT_FP.to_string()],
@@ -658,6 +660,13 @@ fn the_policy_follows_the_configured_kv_mount() {
     assert!(!policy.contains("secret/data/"), "{policy}");
 }
 
+/// The two secrets `config_params` lends out. Owned by a `static` rather
+/// than built inline, because the params borrow them and a temporary
+/// cannot outlive the function that returns the borrow.
+static CONFIG_RESPONDER_HMAC: LazyLock<HmacSecret> =
+    LazyLock::new(|| HmacSecret::from("hmac-value"));
+static CONFIG_EAB_HMAC: LazyLock<HmacSecret> = LazyLock::new(|| HmacSecret::from("hmac-1"));
+
 fn config_params(pins: &[String]) -> InternalAgentConfigParams<'_> {
     InternalAgentConfigParams {
         email: "ops@example.internal",
@@ -665,9 +674,9 @@ fn config_params(pins: &[String]) -> InternalAgentConfigParams<'_> {
         domain: DOMAIN,
         hostname: HOST,
         responder_url: "http://bootroot-http01:8080",
-        responder_hmac: "hmac-value",
+        responder_hmac: &CONFIG_RESPONDER_HMAC,
         eab_kid: Some("kid-1"),
-        eab_hmac: Some("hmac-1"),
+        eab_hmac: Some(&CONFIG_EAB_HMAC),
         trusted_ca_sha256: pins,
     }
 }
@@ -705,12 +714,12 @@ fn the_generated_config_names_the_fixed_identity_and_private_trust() {
     );
     let eab = settings.eab.expect("the config carries EAB credentials");
     assert_eq!(eab.kid, "kid-1");
-    assert_eq!(eab.hmac, "hmac-1");
+    assert_eq!(eab.hmac.expose(), "hmac-1");
     assert_eq!(
         settings.server,
         "https://bootroot-ca:9000/acme/acme/directory"
     );
-    assert_eq!(settings.acme.http_responder_hmac, "hmac-value");
+    assert_eq!(settings.acme.http_responder_hmac.expose(), "hmac-value");
     // No `[openbao]` section: the internal profile polls nothing.
     assert!(settings.openbao.is_none());
     // The documented invocation is in the file the operator reads.
@@ -718,6 +727,96 @@ fn the_generated_config_names_the_fixed_identity_and_private_trust() {
         rendered.contains(&internal_agent_invocation(&paths)),
         "{rendered}"
     );
+}
+
+/// The generated config carries two bearer secrets — the HTTP-01
+/// responder HMAC and, where the deployment registered one, the EAB HMAC
+/// — so the `Settings` it deserializes into must not print them.
+///
+/// This is the leak the redaction exists for: nothing has to *decide* to
+/// log a secret for one to escape. A `tracing` field, a `{:?}` in an
+/// error context or an `anyhow` chain over anything holding these
+/// settings renders the whole tree, and before [`HmacSecret`] both HMACs
+/// were bare `String`s under a `#[derive(Debug)]`. The assertion is on
+/// the *loaded* value rather than on the wrapper alone, because the file
+/// is the one place the raw bytes legitimately live: the point is that
+/// they stop being renderable the moment they are read back.
+#[test]
+fn the_loaded_internal_config_never_renders_its_secrets() {
+    const RESPONDER: &str = "responder-hmac-that-must-not-appear";
+    const EAB: &str = "eab-hmac-that-must-not-appear";
+
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let responder_hmac = HmacSecret::from(RESPONDER);
+    let eab_hmac = HmacSecret::from(EAB);
+    let pins = vec![ROOT_FP.to_string()];
+    let rendered = render_internal_agent_config(
+        &paths,
+        &InternalAgentConfigParams {
+            responder_hmac: &responder_hmac,
+            eab_kid: Some("kid-1"),
+            eab_hmac: Some(&eab_hmac),
+            ..config_params(&pins)
+        },
+    );
+
+    // The file itself still carries the real values: the daemon has to
+    // authenticate with them.
+    assert!(rendered.contains(RESPONDER), "{rendered}");
+    assert!(rendered.contains(EAB), "{rendered}");
+
+    // Load through the production loader, not just the deserializer, so
+    // the regression covers the path every caller reaches the config by.
+    std::fs::create_dir_all(paths.dir()).expect("create the credential directory");
+    std::fs::write(paths.agent_config(), &rendered).expect("write the generated config");
+    let settings = load_internal_config(&paths).expect("the generated config must load");
+
+    let rendered_debug = format!("{settings:?}");
+    assert!(!rendered_debug.contains(RESPONDER), "{rendered_debug}");
+    assert!(!rendered_debug.contains(EAB), "{rendered_debug}");
+    assert!(rendered_debug.contains("<redacted>"), "{rendered_debug}");
+
+    // The same holds one level down, where a narrower `{:?}` would land.
+    assert_eq!(
+        format!("{:?}", settings.acme.http_responder_hmac),
+        "<redacted>"
+    );
+    let eab = settings.eab.expect("the config carries EAB credentials");
+    assert_eq!(format!("{:?}", eab.hmac), "<redacted>");
+    assert!(!format!("{eab:?}").contains(EAB), "{eab:?}");
+
+    // And the values are still the ones the daemon needs.
+    assert_eq!(settings.acme.http_responder_hmac.expose(), RESPONDER);
+    assert_eq!(eab.hmac.expose(), EAB);
+}
+
+/// The same redaction over the values that reach `Settings` from the
+/// command line and from `eab.json`, which are the other two doors these
+/// secrets come in by.
+#[test]
+fn cli_and_file_supplied_secrets_are_redacted_too() {
+    let overrides = crate::config::CliOverrides {
+        http_responder_hmac: Some(HmacSecret::from("cli-hmac-must-not-appear")),
+        ..crate::config::CliOverrides::default()
+    };
+    let rendered = format!("{overrides:?}");
+    assert!(!rendered.contains("cli-hmac-must-not-appear"), "{rendered}");
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+
+    let creds = crate::eab::EabCredentials {
+        kid: "kid-1".to_string(),
+        hmac: HmacSecret::from("file-hmac-must-not-appear"),
+    };
+    let rendered = format!("{creds:?}");
+    assert!(
+        !rendered.contains("file-hmac-must-not-appear"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("<redacted>"), "{rendered}");
+    // The kid is not a secret and stays legible: it is how an operator
+    // tells which account a refusal is about.
+    assert!(rendered.contains("kid-1"), "{rendered}");
 }
 
 /// A deployment with no EAB renders no `[eab]` table rather than an

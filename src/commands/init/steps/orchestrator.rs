@@ -92,7 +92,7 @@ fn registrar_internal_context(
         acme_server: internal_acme_server(&args.stepca_provisioner, compose_dir),
         email: crate::commands::service::DEFAULT_AGENT_EMAIL.to_string(),
         responder_url: internal_responder_url(compose_dir),
-        responder_hmac: secrets.http_hmac.clone(),
+        responder_hmac: bootroot::secret::HmacSecret::new(secrets.http_hmac.clone()),
         eab: secrets.eab.clone(),
     }
 }

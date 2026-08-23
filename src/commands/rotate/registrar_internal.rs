@@ -40,6 +40,7 @@ use bootroot::registrar::internal::{
     MaterialStatus, capture_members, load_material, material_status, require_https,
     require_root_authority, upsert_internal_trust,
 };
+use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, fs_util};
 
 use super::RotateContext;
@@ -556,6 +557,7 @@ async fn repair_context(
 
     let responder_hmac = read_kv_string(client, &ctx.kv_mount, PATH_RESPONDER_HMAC, "value")
         .await?
+        .map(HmacSecret::new)
         .or_else(|| {
             existing
                 .as_ref()
@@ -634,7 +636,7 @@ async fn read_eab(client: &OpenBaoClient, kv_mount: &str) -> Result<Option<EabCr
         (Some(kid), Some(hmac)) if !kid.is_empty() && !hmac.is_empty() => {
             Ok(Some(EabCredentials {
                 kid: kid.to_string(),
-                hmac: hmac.to_string(),
+                hmac: HmacSecret::new(hmac.to_string()),
             }))
         }
         _ => Ok(None),
@@ -853,7 +855,7 @@ mod tests {
                     domain: "example.internal",
                     hostname: "bootroot-01",
                     responder_url: "http://127.0.0.1:8080",
-                    responder_hmac: "hmac",
+                    responder_hmac: &"hmac".into(),
                     eab_kid: None,
                     eab_hmac: None,
                     trusted_ca_sha256: &[ROOT_FP.to_string()],
@@ -881,7 +883,7 @@ mod tests {
             acme_server: "https://127.0.0.1:1/acme/acme/directory".to_string(),
             email: "ops@example.internal".to_string(),
             responder_url: "http://127.0.0.1:1".to_string(),
-            responder_hmac: "hmac".to_string(),
+            responder_hmac: "hmac".into(),
             eab: None,
         }
     }

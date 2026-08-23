@@ -428,7 +428,7 @@ impl AcmeClient {
         let protected_b64 = Self::b64(protected_json.as_bytes());
         let payload_b64 = Self::b64(payload_json.as_bytes());
 
-        let key_bytes = decode_eab_key(&creds.hmac)?;
+        let key_bytes = decode_eab_key(creds.hmac.expose())?;
         let signing_input = format!("{protected_b64}.{payload_b64}");
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
         let signature = hmac::sign(&key, signing_input.as_bytes());
@@ -599,7 +599,7 @@ mod tests {
             poll_interval_secs: 2,
             account_key_path: None,
             http_responder_url: "http://localhost:8080".to_string(),
-            http_responder_hmac: "dev-hmac".to_string(),
+            http_responder_hmac: "dev-hmac".into(),
             http_responder_timeout_secs: 5,
             http_responder_token_ttl_secs: 300,
         }
@@ -657,7 +657,7 @@ mod tests {
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
         let creds = EabCredentials {
             kid: "kid-123".to_string(),
-            hmac: key,
+            hmac: key.into(),
         };
 
         let binding = client
@@ -1161,7 +1161,7 @@ mod tests {
                 poll_interval_secs: 1,
                 account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
-                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_hmac: "dev-hmac".into(),
                 http_responder_timeout_secs: 5,
                 http_responder_token_ttl_secs: 300,
             }

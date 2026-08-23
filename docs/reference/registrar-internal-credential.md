@@ -302,6 +302,19 @@ plus:
   `paths.cert = registrar-internal/chain.pem` and
   `paths.key = registrar-internal/key.pem`.
 
+Two of those values are bearer secrets: the HTTP-01 responder HMAC, which
+authenticates a token placement at the responder, and the `[eab]` HMAC, which
+authorises account creation at the CA. The file has to carry them — the daemon
+authenticates with them — so the mode is what protects them there, and the
+redaction is what protects them once they are read back. Both are held in memory
+as `bootroot::secret::HmacSecret`, whose `Debug` prints `<redacted>`, so a
+`#[derive(Debug)]` on anything holding the loaded `Settings` — a `tracing`
+field, a `{:?}` in an error context, an `anyhow` chain — cannot render either
+one. The raw bytes are reachable only through the explicit `expose()` the
+responder signer and the account binder call. That type is not specific to this
+credential: it is the same wrapper every `bootroot-agent` config's responder and
+EAB HMACs now live in.
+
 The internal profile runs in a **dedicated second `bootroot-agent` host
 process**. It is not added to a service agent config and requires no
 `ServiceEntry`. As with every other `bootroot-agent` host daemon, the operator

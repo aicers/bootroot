@@ -59,7 +59,7 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     if settings.acme.http_responder_url.trim().is_empty() {
         anyhow::bail!("acme.http_responder_url must not be empty");
     }
-    if settings.acme.http_responder_hmac.trim().is_empty() {
+    if settings.acme.http_responder_hmac.is_blank() {
         anyhow::bail!("acme.http_responder_hmac must not be empty");
     }
     if settings.acme.http_responder_timeout_secs == 0 {

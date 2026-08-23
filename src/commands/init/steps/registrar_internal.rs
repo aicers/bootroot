@@ -39,6 +39,7 @@ use bootroot::registrar::internal::{
     publish_material, render_internal_agent_config,
 };
 use bootroot::registrar::registrar_internal_identity;
+use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, config, fs_util};
 
 use super::InitRollback;
@@ -134,7 +135,7 @@ pub(crate) struct RegistrarInternalContext {
     /// The HTTP-01 responder admin URL.
     pub(crate) responder_url: String,
     /// The HTTP-01 responder shared HMAC.
-    pub(crate) responder_hmac: String,
+    pub(crate) responder_hmac: HmacSecret,
     /// The EAB credentials, when the deployment registered any.
     pub(crate) eab: Option<crate::commands::init::types::EabCredentials>,
 }
@@ -179,7 +180,7 @@ pub(crate) struct RegistrarInternalInputs<'a> {
     /// The HTTP-01 responder admin URL.
     pub(crate) responder_url: &'a str,
     /// The HTTP-01 responder shared HMAC.
-    pub(crate) responder_hmac: &'a str,
+    pub(crate) responder_hmac: &'a HmacSecret,
     /// The EAB credentials, when the deployment registered any.
     pub(crate) eab: Option<&'a crate::commands::init::types::EabCredentials>,
 }
@@ -600,7 +601,7 @@ async fn publish_internal_files(
             responder_url: inputs.responder_url,
             responder_hmac: inputs.responder_hmac,
             eab_kid: inputs.eab.map(|creds| creds.kid.as_str()),
-            eab_hmac: inputs.eab.map(|creds| creds.hmac.as_str()),
+            eab_hmac: inputs.eab.map(|creds| &creds.hmac),
             trusted_ca_sha256: &staged.fingerprints,
         },
     );
@@ -640,7 +641,7 @@ fn issuance_settings(
         }),
         acme: config::AcmeSettings {
             http_responder_url: inputs.responder_url.to_string(),
-            http_responder_hmac: inputs.responder_hmac.to_string(),
+            http_responder_hmac: inputs.responder_hmac.clone(),
             http_responder_timeout_secs: 5,
             http_responder_token_ttl_secs: 300,
             directory_fetch_attempts: 10,
@@ -910,7 +911,7 @@ mod auth_provisioning_tests {
             acme_server: "https://localhost:9000/acme/acme/directory".to_string(),
             email: "ops@example.internal".to_string(),
             responder_url: "http://127.0.0.1:8080".to_string(),
-            responder_hmac: "hmac".to_string(),
+            responder_hmac: "hmac".into(),
             eab: None,
         }
     }
@@ -1322,7 +1323,7 @@ mod publication_tests {
             acme_server: "https://localhost:9000/acme/acme/directory".to_string(),
             email: "ops@example.internal".to_string(),
             responder_url: "http://127.0.0.1:8080".to_string(),
-            responder_hmac: "hmac".to_string(),
+            responder_hmac: "hmac".into(),
             eab: None,
         }
     }

@@ -1287,7 +1287,7 @@ async fn apply_eab_to_state(handle: &EabRefreshHandle, payload: &EabPayload) -> 
                 })?;
             handle.sender.send_replace(Some(eab::EabCredentials {
                 kid: kid.clone(),
-                hmac: hmac.clone(),
+                hmac: crate::secret::HmacSecret::new(hmac.clone()),
             }));
         }
         EabPayload::Clear => {
@@ -3381,7 +3381,7 @@ mod tests {
         assert_eq!(on_disk.kid, "kid-1");
         let resolved = resolve_profile_eab(&profile, shared.current()).expect("resolved eab");
         assert_eq!(resolved.kid, "kid-1");
-        assert_eq!(resolved.hmac, "hmac-1");
+        assert_eq!(resolved.hmac.expose(), "hmac-1");
 
         apply_eab_to_state(&handle, &EabPayload::Clear)
             .await

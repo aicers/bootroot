@@ -862,7 +862,7 @@ mod tests {
             .unwrap()
             .expect("credentials must round-trip");
         assert_eq!(creds.kid, "kid-1");
-        assert_eq!(creds.hmac, "hmac-1");
+        assert_eq!(creds.hmac.expose(), "hmac-1");
 
         let cleared = test_sync_material();
         provision_local_eab_file(secrets_dir, &secret_id_path, false, &cleared, &messages)
@@ -921,7 +921,7 @@ mod tests {
             .unwrap()
             .expect("credentials must round-trip");
         assert_eq!(creds.kid, "kid-1");
-        assert_eq!(creds.hmac, "hmac-1");
+        assert_eq!(creds.hmac.expose(), "hmac-1");
     }
 
     /// Empty-string EAB values (the KV "cleared" shape written by

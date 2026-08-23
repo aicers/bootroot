@@ -203,7 +203,7 @@ fn validate_eab(kid: &str, hmac: &str) -> Result<EabCredentials> {
     }
     Ok(EabCredentials {
         kid: kid.to_string(),
-        hmac: hmac.to_string(),
+        hmac: bootroot::secret::HmacSecret::new(hmac.to_string()),
     })
 }
 
@@ -446,7 +446,7 @@ mod tests {
         let creds = prompt_eab_with_validation(&mut Cursor::new(script), &messages)
             .expect("a rejected attempt must be retried, not fatal");
         assert_eq!(creds.kid, "kid-2");
-        assert_eq!(creds.hmac, hmac);
+        assert_eq!(creds.hmac.expose(), hmac);
     }
 
     #[test]
@@ -456,6 +456,6 @@ mod tests {
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let creds = validate_eab("kid-1", &encoded).expect("valid EAB");
         assert_eq!(creds.kid, "kid-1");
-        assert_eq!(creds.hmac, encoded);
+        assert_eq!(creds.hmac.expose(), encoded);
     }
 }

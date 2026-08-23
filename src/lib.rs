@@ -17,6 +17,7 @@ pub mod locale;
 pub mod openbao;
 pub mod profile;
 pub mod registrar;
+pub mod secret;
 pub mod service_material;
 pub mod tls;
 pub mod toml_util;
