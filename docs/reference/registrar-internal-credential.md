@@ -201,15 +201,36 @@ inside its existing rollback transaction:
    existing steps, unchanged.
 2. Under the init **root token**: enable `auth/cert` if absent, write the policy,
    create the entry.
-3. Under the same root token: create or load the persistent ACME account key and
+3. The internal SAN is attached to the running HTTP-01 responder as a Docker
+   network alias. step-ca validates a challenge by fetching
+   `http://<identifier>/.well-known/acme-challenge/…`, and inside the compose
+   network that name resolves only if the responder answers to it. Every
+   service leaf gets this from `service add`; the internal identity has no
+   `ServiceEntry`, so `init` attaches it from the recorded predicate. A
+   responder it cannot be attached to fails the run here rather than as a
+   challenge timeout in the next step.
+4. Under the same root token: create or load the persistent ACME account key and
    issue the internal leaf through the ordinary outbound ACME path to step-ca —
    never with step-ca signing-key material. Everything lands in a staging
    directory; nothing is published.
-4. The listener TLS transition, and the resulting `https://` URL is recorded.
-5. Reconnect through that recorded URL and prove `auth/cert/login` succeeds with
+5. The listener TLS transition, and the resulting `https://` URL is recorded.
+6. Reconnect through that recorded URL and prove `auth/cert/login` succeeds with
    the staged material.
-6. Only then publish the private bundle, the four credential files and the
+7. Only then publish the private bundle, the four credential files and the
    dedicated config.
+
+The alias is part of the shared set `state.json` drives, not a one-off: `infra
+up` replays it and `service remove` reconciles it, so a responder restart or an
+unrelated deregistration cannot leave the internal identity unresolvable and
+break its next renewal.
+
+The step-ca ACME directory and the responder admin URL the internal profile is
+issued and configured against both follow **this install's own published
+ports** (`STEPCA_HOST_PORT` and `HTTP01_ADMIN_HOST_PORT`, from the process
+environment, then the compose directory's `.env`, then the compose default),
+never a fixed `:9000`/`:8080`. On a host that moved those ports a fixed value
+reaches nothing; on a host co-located with a second instance it reaches that
+instance.
 
 Every artifact is registered for undo **before** it is created. A failure at any
 point restores the prior listener, the prior state URL and the `OpenBao`

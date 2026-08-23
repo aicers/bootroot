@@ -91,6 +91,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-two-instance-isolation.sh`
 - `scripts/impl/run-registrar-verbs-e2e.sh`
 - `scripts/impl/run-registrar-internal-e2e.sh`
+- `scripts/impl/run-registrar-internal-init-e2e.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -121,6 +122,24 @@ bootroot 바이너리도 전혀 필요하지 않습니다. `run-registrar-verbs-
 실제로 거부하는지, `token_no_default_policy`가 발급된 토큰에서 `default`를
 정말로 제외하는지, 그리고 정책 본문이 실제 ACL 엔진에게 보이는 그대로를
 뜻하는지입니다.
+
+`run-registrar-internal-init-e2e.sh`는 프로비저닝 쪽을 담당하며 컨테이너 하나가
+아니라 배포 전체가 필요합니다. 엔드포인트가 활성화된 루프백 호스트에서
+`bootroot init`을 실행하되, 그 전에 엔드포인트 술어를 `state.json`에 직접
+기록합니다(아직 이 값을 쓰는 명령은 없으며, 이는 registrar 엔드포인트 작업의
+몫입니다). 실행마다 고유한 인스턴스 이름으로 임시 디렉터리에 설치하고 비어 있는
+포트 네 개를 새로 할당하므로 기본 설치본이 있는 호스트에서도 안전합니다. 포트를
+옮기는 것은 타협이 아니라 핵심입니다. compose 기본값에서는 하드코딩된 step-ca /
+리스폰더 주소와 실제로 유도한 주소를 구분할 수 없기 때문입니다. 이 시나리오는
+리스너 전환, 기록된 `https://` URL, 여섯 개 파일과 그 권한, 내부 SAN이 해석되는
+리스폰더 별칭, 그리고 `init`이 방금 발급한 자격 증명으로 수행하는 실제
+`auth/cert/login`을 확인하며, 클라이언트 인증서 없이 같은 로그인을 시도하면
+거부되는지도 함께 확인합니다.
+
+엔드포인트를 *사용하지 않는* 경우는 별도 시나리오로 두지 않았습니다. 나머지 모든
+시나리오가 엔드포인트 비활성 호스트이며 `init`이 기록한 평문 `http://` URL로 실행
+전체를 진행하므로, 전환되지 말아야 할 리스너가 전환되면 그 시나리오들이 곧바로
+실패합니다.
 
 ### 라이프사이클 실행 두 개는 한 호스트를 공유할 수 있습니다
 

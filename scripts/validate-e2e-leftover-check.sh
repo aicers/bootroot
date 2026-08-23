@@ -615,8 +615,16 @@ DEFAULT_IDENTITY_SCRIPTS=(
   run-stepca-san.sh
 )
 
-# The one harness installing under run-scoped instance names of its own,
-# which checks by Compose project label instead.
+# The harnesses installing under run-scoped instance names of their
+# own, which check by Compose project label instead.
+RUN_SCOPED_SCRIPTS=(
+  run-registrar-internal-init-e2e.sh
+  run-two-instance-isolation.sh
+)
+
+# The one whose `teardown_instance` the behavioural check below runs.
+# The wiring greps cover every script above; this deeper check evals one
+# function out of one file, so it names that file.
 RUN_SCOPED_SCRIPT="run-two-instance-isolation.sh"
 
 check_harness_wiring() {
@@ -640,22 +648,26 @@ check_harness_wiring() {
   ok "every default-identity harness tears down and checks at the start, and reports at the end"
   ok "every teardown reaches the run log, and a failed one at the end fails the run"
 
-  grep -q 'assert_no_project_leftovers ' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
-    || die "${RUN_SCOPED_SCRIPT} does not use the shared label-scoped check"
-  grep -q 'report_project_leftovers ' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
-    || die "${RUN_SCOPED_SCRIPT} does not report project leftovers at the end of a run"
-  # Its containers are named after its own per-run instances, so the
-  # container-name check would be both wrong and redundant there.
-  ! grep -q 'assert_no_leftover_containers' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
-    || die "${RUN_SCOPED_SCRIPT} must not run the default-identity container check"
-  grep -q 'exit_with_cleanup_status ' "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
-    || die "${RUN_SCOPED_SCRIPT} does not end its cleanup with the run's own status"
-  # Its teardown is `teardown_instance` rather than a `compose_down`, so
-  # the `/dev/null` sweep below does not reach it.
-  ! grep -q 'docker \(rm -f\|volume rm -f\|network rm\) "\$id" >/dev/null' \
-    "$IMPL_DIR/$RUN_SCOPED_SCRIPT" \
-    || die "${RUN_SCOPED_SCRIPT}'s teardown still discards its output"
-  ok "the run-scoped harness uses the label-scoped check and only that one"
+  for script in "${RUN_SCOPED_SCRIPTS[@]}"; do
+    grep -q 'lib/leftovers.sh' "$IMPL_DIR/$script" \
+      || die "${script} does not source lib/leftovers.sh"
+    grep -q 'assert_no_project_leftovers ' "$IMPL_DIR/$script" \
+      || die "${script} does not use the shared label-scoped check"
+    grep -q 'report_project_leftovers ' "$IMPL_DIR/$script" \
+      || die "${script} does not report project leftovers at the end of a run"
+    # Its containers are named after its own per-run instances, so the
+    # container-name check would be both wrong and redundant there.
+    ! grep -q 'assert_no_leftover_containers' "$IMPL_DIR/$script" \
+      || die "${script} must not run the default-identity container check"
+    grep -q 'exit_with_cleanup_status ' "$IMPL_DIR/$script" \
+      || die "${script} does not end its cleanup with the run's own status"
+    # Its teardown is `teardown_instance` rather than a `compose_down`,
+    # so the `/dev/null` sweep below does not reach it.
+    ! grep -q 'docker \(rm -f\|volume rm -f\|network rm\) "\$id" >/dev/null' \
+      "$IMPL_DIR/$script" \
+      || die "${script}'s teardown still discards its output"
+  done
+  ok "every run-scoped harness uses the label-scoped check and only that one"
 
   # A teardown that removed nothing has to be distinguishable from one
   # that removed everything, which is what discarding its output loses.

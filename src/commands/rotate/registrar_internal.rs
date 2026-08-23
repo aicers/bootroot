@@ -243,6 +243,13 @@ async fn repair_context(
     let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     let paths = InternalPaths::new(&secrets_dir);
     let existing = bootroot::config::Settings::from_file(Some(paths.agent_config())).ok();
+    // Only reached when the generated config is gone: the config is the
+    // record of what `init` chose, and a repair keeps it. The fallbacks
+    // below rebuild those endpoints the same way `init` derived them —
+    // from this install's own published ports — rather than from the
+    // compose defaults, which on a host that moved its ports name
+    // nothing, and on a co-located host name another instance.
+    let compose_dir = crate::commands::compose_file::compose_file_dir(&ctx.compose_file);
 
     let responder_hmac = read_kv_string(client, &ctx.kv_mount, PATH_RESPONDER_HMAC, "value")
         .await?
@@ -265,7 +272,10 @@ async fn repair_context(
         secrets_dir,
         kv_mount: ctx.kv_mount.clone(),
         acme_server: existing.as_ref().map_or_else(
-            || format!("https://localhost:9000/acme/{DEFAULT_STEPCA_PROVISIONER}/directory"),
+            || {
+                let port = bootroot::host_port::resolve_stepca_host_port(&compose_dir);
+                format!("https://localhost:{port}/acme/{DEFAULT_STEPCA_PROVISIONER}/directory")
+            },
             |settings| settings.server.clone(),
         ),
         email: existing.as_ref().map_or_else(
@@ -273,7 +283,10 @@ async fn repair_context(
             |settings| settings.email.clone(),
         ),
         responder_url: existing.as_ref().map_or_else(
-            || crate::commands::service::DEFAULT_AGENT_RESPONDER_URL.to_string(),
+            || {
+                let port = bootroot::host_port::resolve_http01_admin_host_port(&compose_dir);
+                format!("http://127.0.0.1:{port}")
+            },
             |settings| settings.acme.http_responder_url.clone(),
         ),
         responder_hmac,

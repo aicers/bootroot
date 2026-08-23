@@ -478,6 +478,10 @@ jobs:
             script: run-registrar-internal-e2e.sh
             resolution: ""
             artifact: ci-registrar-internal
+          - label: registrar-internal-init
+            script: run-registrar-internal-init-e2e.sh
+            resolution: ""
+            artifact: ci-registrar-internal-init
     steps:
       - uses: actions/checkout@v7
 
@@ -494,7 +498,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -685,6 +689,27 @@ jobs:
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
             [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
             [ -f "$ARTIFACT_DIR/openbao.log" ] && tail -n 200 "$ARTIFACT_DIR/openbao.log" || true
+            exit 1
+          }
+
+      - name: Run E2E scenario (registrar internal credential, init)
+        if: matrix.scenario.label == 'registrar-internal-init'
+        # The other half of the internal-credential coverage: a whole
+        # deployment, installed under a run-scoped instance name on four
+        # freshly allocated ports, with the endpoint predicate seeded
+        # into `state.json` before `init`. Moved ports are the point —
+        # they are what makes a derived step-ca/responder endpoint
+        # distinguishable from a hard-coded one.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          ./scripts/impl/run-registrar-internal-init-e2e.sh || {
+            echo "registrar-internal-init failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/step-ca.log" ] && tail -n 100 "$ARTIFACT_DIR/step-ca.log" || true
+            [ -f "$ARTIFACT_DIR/http01.log" ] && tail -n 100 "$ARTIFACT_DIR/http01.log" || true
             exit 1
           }
 
