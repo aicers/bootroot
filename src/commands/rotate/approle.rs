@@ -512,11 +512,15 @@ async fn ensure_infra_role_id_file(
         .read_role_id(role_name)
         .await
         .with_context(|| messages.error_openbao_role_id_failed())?;
-    fs_util::ensure_secrets_dir(agent_dir).await?;
-    // Published by rename at the policy's `0600`. The `OpenBao` Agent
-    // sidecar re-reads this file on every `AppRole` re-login, so a
-    // backfill racing one handed it a truncated `role_id` and a failed
-    // login; the rename leaves the previous file or the whole new one.
+    fs_util::ensure_shared_secrets_dir(agent_dir).await?;
+    // Published by rename at the policy's `0600`, under the owner of
+    // the directory it lands in. The `OpenBao` Agent sidecar re-reads
+    // this file on every `AppRole` re-login, so a backfill racing one
+    // handed it a truncated `role_id` and a failed login; the rename
+    // leaves the previous file or the whole new one. That sidecar runs
+    // as the uid owning the secrets tree, and this branch only ever
+    // *creates* — a `rotate` run as root would otherwise backfill a
+    // `role_id` the agent it is repairing cannot read.
     //
     // It takes the directory flush, like the `secret_id` written beside
     // it. `role_id` is not a secret and is re-readable from `OpenBao` —
@@ -524,7 +528,7 @@ async fn ensure_infra_role_id_file(
     // run, and until then a lost directory entry is a sidecar that
     // cannot log in. The early return above means this writes only on a
     // backfill, so the round trip is not on any repeated path.
-    fs_util::atomic_write(
+    fs_util::atomic_write_dir_owner(
         fs_util::Destination::bootroot_owned(&role_id_path),
         role_id.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),

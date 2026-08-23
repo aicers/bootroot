@@ -313,9 +313,7 @@ pub(crate) fn adopt(
 
 /// Returns this process's effective uid.
 pub(crate) fn current_effective_uid() -> u32 {
-    // SAFETY: `geteuid` takes no argument, touches no memory the caller
-    // owns, and is documented as always succeeding.
-    unsafe { libc::geteuid() }
+    crate::fs_util::current_process_euid()
 }
 
 /// Returns this process's id.

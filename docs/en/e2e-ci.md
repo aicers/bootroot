@@ -134,9 +134,30 @@ freshly allocated ports, so it is safe beside a default install — and the move
 ports are the point rather than a concession: on the compose defaults a
 hard-coded step-ca or responder endpoint is indistinguishable from a derived
 one. It asserts the listener transition, the recorded `https://` URL, the
-six-file credential set and its modes, the responder alias the internal SAN
+six-file credential set — the five protected members as uid 0, gid 0 and `0600`,
+the private CA bundle beside them — the responder alias the internal SAN
 resolves through, and a real `auth/cert/login` with the credential `init` just
 published — plus that the same login without the client certificate is refused.
+It also asserts the other side of that split: the `OpenBao` Agent sidecars'
+configuration, `AppRole` pair, templates and the directories holding them still
+belong to the owner of `secrets/`, which a root-run `init` must not take over.
+
+`init` runs as root here, through `sudo -n env`, because an endpoint-enabled
+`init` publishes those five files `root:root` and refuses to publish any of them
+otherwise. **Passwordless sudo is therefore a prerequisite of this scenario**,
+checked in its prerequisite block before anything is installed; the reads that
+touch the root-owned `0700` internal directory afterwards go through `sudo -n`
+one call at a time rather than the whole run being elevated.
+
+It then runs `bootroot infra up` over the deployment it just provisioned and
+asserts both ownership checks a second time. `infra up` ends in a recursive
+ownership sweep — a one-shot root container that chowns everything below
+`secrets/` to that directory's own owner — so it is the routine command that
+could undo the root ownership without republishing anything. The bootroot-internal
+directory is held back from that sweep, and this is where that holds: the
+protected five are still `0:0:600` afterwards, and the sidecar tree is still the
+sweep's to repair. `reinit` and the CA and step-ca-password rotations reach the
+same sweep.
 
 The endpoint-*disabled* case is not a scenario of its own. Every other arm is an
 endpoint-disabled host and drives its whole run over the plaintext `http://` URL
@@ -884,6 +905,13 @@ When local `sudo -n` is unavailable:
 - Reason: `hosts` cases add and restore host-machine `/etc/hosts` during
   the run, and that operation requires non-interactive admin privileges
   (`sudo -n`).
+- This no longer makes the whole matrix runnable. The
+  `registrar-internal-init` step runs `bootroot init` as root, because an
+  endpoint-enabled `init` publishes the five protected credential files
+  `root:root` and refuses to publish any of them otherwise, so that step has no
+  unprivileged form to skip to. It fails in its prerequisite block, before
+  anything is installed, and `scripts/preflight/run-all.sh` fails with it. A
+  machine without passwordless sudo cannot run that scenario at all.
 
 Use this only as a local constraint workaround. CI still executes
 `hosts` variants.

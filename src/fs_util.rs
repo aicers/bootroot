@@ -653,6 +653,137 @@ pub fn atomic_write_blocking(
     )
 }
 
+/// Writes `contents` to `dest` exactly as [`atomic_write`] does, and
+/// establishes `owner` on the staged inode before the rename.
+///
+/// The opt-in counterpart of [`atomic_write`], for the five protected
+/// registrar-internal files. Where [`atomic_write`] preserves an
+/// existing destination's owner and leaves a fresh one to the writing
+/// process, this asks for a stated uid and gid and *fails* if it cannot
+/// get them: an unprivileged process publishes nothing rather than a
+/// credential it owns itself. See [`FixedOwner`] for why that is the
+/// right answer for those files and the wrong one for everything else,
+/// and [`StagedOwner::Fixed`] for where in the sequence the chown runs.
+///
+/// A pre-existing destination owned by somebody else is converged, not
+/// preserved: the published file carries `owner` whatever was there
+/// before. That is deliberate for a protected file — the prior owner is
+/// the misconfiguration being corrected.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`], and
+/// additionally when the staged file cannot be given `owner` — the
+/// `EPERM` a process without `CAP_CHOWN` gets. The destination is
+/// untouched in that case, since the chown precedes the rename.
+pub async fn atomic_write_fixed_owner(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+    owner: FixedOwner,
+) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let (path, symlink) = dest.to_owned_parts();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        publish_staged_blocking(
+            &Destination {
+                path: &path,
+                symlink,
+            }
+            .publish_path()?,
+            &payload,
+            mode,
+            StagedOwner::Fixed(owner),
+            StagedDurability::FlushDirectory,
+        )
+    })
+    .await
+    .context("Fixed-owner atomic write task panicked")?
+}
+
+/// Writes `contents` to `dest` exactly as [`atomic_write`] does, and
+/// establishes the containing directory's owner on the staged inode
+/// before the rename.
+///
+/// For a file bootroot writes into the secrets tree that an infra
+/// container reads: step-ca, every `step` helper and both `OpenBao`
+/// Agent sidecars are launched as the uid that owns that tree, so a
+/// file they have to open carries it too. See
+/// [`StagedOwner::ContainingDir`] for why this is a policy rather than
+/// the destination-preserving default, and why it is a no-op whenever
+/// bootroot is already that owner.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`atomic_write`], and
+/// additionally when the directory cannot be stat'd or the staged file
+/// cannot be given its owner. The destination is untouched in that
+/// case, since the chown precedes the rename.
+pub async fn atomic_write_dir_owner(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let (path, symlink) = dest.to_owned_parts();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        publish_staged_blocking(
+            &Destination {
+                path: &path,
+                symlink,
+            }
+            .publish_path()?,
+            &payload,
+            mode,
+            StagedOwner::ContainingDir,
+            StagedDurability::FlushDirectory,
+        )
+    })
+    .await
+    .context("Directory-owner atomic write task panicked")?
+}
+
+/// Publishes `contents` at `dest` by rename under the containing
+/// directory's owner, **without** flushing the containing directory.
+///
+/// [`atomic_replace`]'s pairing of decisions with
+/// [`atomic_write_dir_owner`]'s ownership: the writer for regenerable
+/// configuration that an infra container reads — an `OpenBao` Agent
+/// template, an `agent.hcl`, the responder's rendered config — where a
+/// torn read matters and a lost directory entry costs a re-run.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`atomic_write_dir_owner`], except that no directory flush is
+/// attempted.
+pub async fn atomic_replace_dir_owner(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
+    // Owned once, to move into the blocking task, exactly as
+    // `atomic_write` does.
+    let (path, symlink) = dest.to_owned_parts();
+    let payload = contents.to_vec();
+    tokio::task::spawn_blocking(move || {
+        publish_staged_blocking(
+            &Destination {
+                path: &path,
+                symlink,
+            }
+            .publish_path()?,
+            &payload,
+            mode,
+            StagedOwner::ContainingDir,
+            StagedDurability::RenameOnly,
+        )
+    })
+    .await
+    .context("Directory-owner atomic replace task panicked")?
+}
+
 /// Publishes `contents` at `dest` by rename, **without** flushing the
 /// containing directory.
 ///
@@ -834,6 +965,103 @@ pub enum StagedOwner {
     /// group-readable by the policy, so no consumer loses access to a
     /// file it could read before.
     PolicyGroup(Option<u32>),
+    /// Establish exactly this uid and gid on the new inode, whatever the
+    /// destination carried and whatever the writing process is.
+    ///
+    /// Opt-in, and the only arm that can fail a publish on ownership
+    /// alone: the chown runs before the rename and its error is
+    /// returned, so a process without the authority to create the file
+    /// under that owner publishes nothing at all rather than a
+    /// best-effort file under its own uid. That is the requirement the
+    /// registrar-internal credential set has — see [`FixedOwner`].
+    Fixed(FixedOwner),
+    /// Carry the *containing directory's* uid and gid onto the new
+    /// inode, whatever the writing process is.
+    ///
+    /// For a file the host process writes into a tree whose readers run
+    /// as that tree's owner rather than as bootroot. `secrets/` is such
+    /// a tree: `infra install` pins `BOOTROOT_STEPCA_USER` to its owner,
+    /// every `step` helper container is launched `--user <that uid>`,
+    /// the step-ca server runs as it too, and the generated compose
+    /// override starts both `OpenBao` Agent sidecars under it — so a
+    /// file published there under a *different* uid is one none of them
+    /// can open. That was invisible while bootroot always ran as that
+    /// owner; an endpoint-enabled `init`, which must run as root, is
+    /// the first writer for which it is not.
+    ///
+    /// The in-process counterpart of the root-container `chown` that
+    /// `openbao/tls` takes before its issuance. A chown that would
+    /// change nothing is skipped, so the ordinary case — bootroot
+    /// running as the tree's owner — makes no privileged call at all
+    /// and this arm leaves exactly what [`StagedOwner::Destination`]
+    /// left.
+    ContainingDir,
+}
+
+/// The uid and gid a [`StagedOwner::Fixed`] publish establishes on the
+/// inode it renames into place.
+///
+/// The five protected registrar-internal files —
+/// `registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
+/// `root-fingerprint` and `agent.toml` — authenticate a host to
+/// `OpenBao` or configure the agent that renews that credential, and
+/// they are `0600` root-owned or they are not that credential: a file
+/// the invoking user owns is one that user can read the key out of and
+/// one they can rewrite the trust pins of. Their mode has always been a
+/// policy; this type is the same statement about their owner.
+///
+/// The owner is an input rather than a constant so the real staging,
+/// chown and rename path can be driven in a test that is not root. It
+/// is not an input an operator can reach: [`FixedOwner::root`] is the
+/// only constructor outside `cfg(test)`, so no configuration key,
+/// environment variable or public API can move a protected file off
+/// uid 0 / gid 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl FixedOwner {
+    /// The owner every protected file is published under: uid 0, gid 0.
+    #[must_use]
+    pub fn root() -> Self {
+        Self { uid: 0, gid: 0 }
+    }
+
+    /// The test process's own effective uid and gid.
+    ///
+    /// The one way a protected publish is driven under an owner other
+    /// than root, and `cfg(test)`-gated so it exists in no build an
+    /// operator runs. A test taking it drives the production staging,
+    /// chown and rename path unchanged — the chown is the same call
+    /// against the same staged inode, asking for ids the unprivileged
+    /// test process is allowed to establish.
+    #[cfg(test)]
+    pub(crate) fn current_process() -> Self {
+        Self {
+            uid: current_process_euid(),
+            gid: crate::cert_group::current_process_egid(),
+        }
+    }
+
+    /// Whether this owner is `root:root`, which is what every
+    /// production caller asks for and what the failure message names.
+    fn is_root(self) -> bool {
+        self.uid == 0 && self.gid == 0
+    }
+}
+
+/// Returns this process's effective uid.
+///
+/// Reported by the failure of a fixed-owner publish, and asserted as a
+/// precondition by the tests that prove an unprivileged process cannot
+/// publish a protected file.
+#[must_use]
+pub fn current_process_euid() -> u32 {
+    // SAFETY: `geteuid` takes no argument, touches no memory the caller
+    // owns, and is documented as always succeeding.
+    unsafe { libc::geteuid() }
 }
 
 /// Whether the directory entry a staged publish creates is flushed
@@ -898,6 +1126,46 @@ fn chown_preserve_context(uid: u32, gid: u32, path: &Path) -> String {
         "Failed to preserve existing uid={uid} gid={gid} on {}: re-owning the staged file \
          needs CAP_CHOWN (run as root), so either run this command as the destination's \
          owner or chown the destination to the user running it",
+        path.display()
+    )
+}
+
+/// The context a failed chown of a [`StagedOwner::ContainingDir`]
+/// publish carries: the owner the tree has, the directory that owner
+/// was read from, and the file being published into it.
+///
+/// Reached only when the writing process is neither that owner nor
+/// root — a case in which it can neither adopt the tree nor be trusted
+/// to leave a file the tree's readers can open. The chown precedes the
+/// rename, so the message describes a publish that did not happen.
+fn chown_containing_dir_context(uid: u32, gid: u32, parent: &Path, path: &Path) -> String {
+    format!(
+        "{} must be published under the owner of {} (uid {uid}, gid {gid}) \u{2014} the uid \
+         step-ca, the `step` helpers and the OpenBao Agent sidecars are launched as. The staged \
+         file could not be given that owner, so nothing was published",
+        path.display(),
+        parent.display()
+    )
+}
+
+/// The context a failed chown of a [`StagedOwner::Fixed`] publish
+/// carries: the owner the file must have, and the file it was being
+/// published as.
+///
+/// Both are named because either one is what an operator has to act
+/// on. The failure is `EPERM` — establishing an owner the writer does
+/// not hold needs `CAP_CHOWN` — and it is reached before the rename, so
+/// the message describes a publish that did not happen rather than one
+/// that half did.
+fn chown_fixed_context(owner: FixedOwner, path: &Path) -> String {
+    let requirement = if owner.is_root() {
+        "root-owned (uid 0, gid 0)".to_string()
+    } else {
+        format!("owned by uid {} gid {}", owner.uid, owner.gid)
+    };
+    format!(
+        "{} must be published {requirement}: the staged file could not be given that owner, \
+         which needs CAP_CHOWN, so nothing was published — run this command as root",
         path.display()
     )
 }
@@ -1037,6 +1305,33 @@ pub fn publish_staged_blocking(
             })?;
         }
         StagedOwner::PolicyGroup(None) => {}
+        StagedOwner::ContainingDir => {
+            // The directory is guaranteed to exist: the temporary was
+            // just staged inside it. Its owner is the uid every reader
+            // of this tree runs as.
+            let owner = std::fs::metadata(&parent)
+                .map(|meta| (meta.uid(), meta.gid()))
+                .with_context(|| format!("Failed to stat {}", parent.display()))?;
+            let staged = std::fs::metadata(tmp.path())
+                .map(|meta| (meta.uid(), meta.gid()))
+                .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
+            // Skipping a chown that would change nothing keeps the
+            // ordinary non-root writer off a call it does not need.
+            if staged != owner {
+                std::os::unix::fs::chown(tmp.path(), Some(owner.0), Some(owner.1)).with_context(
+                    || chown_containing_dir_context(owner.0, owner.1, &parent, path),
+                )?;
+            }
+        }
+        StagedOwner::Fixed(fixed) => {
+            // Unconditional, unlike the `Destination` arm's
+            // change-nothing skip: this owner is a policy re-asserted on
+            // every publish, and the call is the authority check. A
+            // process that cannot make the staged inode `root:root`
+            // must not go on to rename it into place under its own uid.
+            std::os::unix::fs::chown(tmp.path(), Some(fixed.uid), Some(fixed.gid))
+                .with_context(|| chown_fixed_context(fixed, path))?;
+        }
     }
     if let Some(final_mode) = final_mode {
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(final_mode))
@@ -1096,11 +1391,101 @@ pub fn publish_staged_blocking(
 /// # Errors
 /// Returns an error if the directory cannot be created or permissions cannot be set.
 pub async fn ensure_secrets_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
+    let target = path.to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_secrets_dir_blocking(&target))
         .await
+        .context("Secrets dir task panicked")?
+}
+
+/// Ensures a secrets directory an infra container reads exists, at the
+/// same mode [`ensure_secrets_dir`] applies and under the owner of the
+/// tree it is created in.
+///
+/// `0700` is what makes ownership decide the question: step-ca, the
+/// `step` helpers and both `OpenBao` Agent sidecars run as the uid that
+/// owns `secrets/`, so a directory root created there is one they
+/// cannot even traverse — and the files inside it, whatever their own
+/// owner, become unreachable with it. Ownership is not inherited from
+/// the parent by the kernel, so it is established here, on each level
+/// this call actually creates.
+///
+/// The owner is read from the nearest ancestor that already exists,
+/// which is the tree's, and an already-present directory is left on its
+/// own owner: this never re-owns what somebody else made. For a
+/// bootroot running as that owner — every non-root run — the chown is
+/// skipped and this is [`ensure_secrets_dir`] exactly.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created, its permissions
+/// cannot be set, the tree's owner cannot be read, or a level this call
+/// created cannot be given that owner.
+pub async fn ensure_shared_secrets_dir(path: &Path) -> Result<()> {
+    let target = path.to_path_buf();
+    // One blocking task, like every other ownership-establishing write
+    // here: `chown` has no async spelling, and splitting the stat that
+    // reads the owner from the chown that applies it across await
+    // points buys nothing.
+    tokio::task::spawn_blocking(move || ensure_shared_secrets_dir_blocking(&target))
+        .await
+        .context("Shared secrets dir task panicked")?
+}
+
+/// The blocking half of [`ensure_shared_secrets_dir`].
+fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
+    // The levels that do not exist yet, and the owner of the nearest
+    // one that does. Collected before the create, because afterwards
+    // nothing distinguishes them from the directories the operator or a
+    // container made.
+    let mut created = Vec::new();
+    let mut cursor = Some(path);
+    let owner = loop {
+        // No ancestor exists at all, or one of them is not a directory:
+        // both are `create_dir_all`'s to report, with a better message
+        // than this loop could give.
+        let Some(current) = cursor else {
+            return ensure_secrets_dir_blocking(path);
+        };
+        match std::fs::metadata(current) {
+            Ok(meta) if meta.is_dir() => break (meta.uid(), meta.gid()),
+            Ok(_) => return ensure_secrets_dir_blocking(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                created.push(current.to_path_buf());
+                cursor = current.parent();
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to stat {}", current.display()));
+            }
+        }
+    };
+
+    ensure_secrets_dir_blocking(path)?;
+    for dir in created {
+        let meta =
+            std::fs::metadata(&dir).with_context(|| format!("Failed to stat {}", dir.display()))?;
+        // Skipping a chown that would change nothing keeps the ordinary
+        // non-root writer off a call it does not need.
+        if (meta.uid(), meta.gid()) == owner {
+            continue;
+        }
+        std::os::unix::fs::chown(&dir, Some(owner.0), Some(owner.1)).with_context(|| {
+            format!(
+                "{} must be owned by the secrets tree (uid {}, gid {}) \u{2014} the uid the \
+                 step-ca container and the OpenBao Agent sidecars are launched as, and a \
+                 directory they cannot traverse hides every file inside it",
+                dir.display(),
+                owner.0,
+                owner.1
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The blocking half of [`ensure_secrets_dir`].
+fn ensure_secrets_dir_blocking(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
         .with_context(|| format!("Failed to create secrets dir {}", path.display()))?;
-    fs::set_permissions(path, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
-        .await
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
         .context("Failed to set secrets dir permissions")?;
     Ok(())
 }
@@ -2624,6 +3009,304 @@ mod tests {
             "fresh file must be chowned to the parent gid"
         );
         assert_eq!(meta.permissions().mode() & 0o777, KEY_FILE_MODE);
+    }
+
+    /// A fixed-owner publish establishes the owner it was given on the
+    /// inode it renames into place — on a fresh create and on a
+    /// replacement alike.
+    ///
+    /// Driven through [`FixedOwner::current_process`] rather than
+    /// [`FixedOwner::root`], because the ids an unprivileged test
+    /// process can establish are its own. Everything else is the
+    /// production path: the same staging in the destination's
+    /// directory, the same `chown` on the staged inode, the same
+    /// `chmod` after it and the same rename.
+    #[tokio::test]
+    async fn a_fixed_owner_publish_owns_a_create_and_a_replacement() {
+        use std::os::unix::fs::MetadataExt;
+
+        let owner = FixedOwner::current_process();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"FIRST",
+            StagedMode::Policy(KEY_FILE_MODE),
+            owner,
+        )
+        .await
+        .unwrap();
+        let created = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "FIRST");
+        assert_eq!((created.uid(), created.gid()), (owner.uid, owner.gid));
+        assert_eq!(created.permissions().mode() & 0o7777, KEY_FILE_MODE);
+
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"SECOND",
+            StagedMode::Policy(KEY_FILE_MODE),
+            owner,
+        )
+        .await
+        .unwrap();
+        let replaced = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "SECOND");
+        assert_eq!((replaced.uid(), replaced.gid()), (owner.uid, owner.gid));
+        assert_eq!(replaced.permissions().mode() & 0o7777, KEY_FILE_MODE);
+        assert_ne!(
+            replaced.ino(),
+            created.ino(),
+            "the replacement is a fresh inode, so its owner was established rather than inherited"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("key.pem")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// A process that cannot establish the required owner publishes
+    /// nothing: the chown is on the staged inode, before the rename, so
+    /// its failure leaves the destination exactly as it was.
+    ///
+    /// This is the ordering guarantee stated as a test. An unprivileged
+    /// process asking for `root:root` gets `EPERM` from the kernel — no
+    /// check in this crate decides it — and what matters is where in the
+    /// sequence that answer arrives: an old credential still readable
+    /// and a new one not published, rather than a protected file left
+    /// owned by whoever ran the command.
+    #[tokio::test]
+    async fn a_fixed_owner_publish_that_cannot_own_the_file_publishes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        std::fs::write(&path, "PRIOR").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let err = atomic_write_fixed_owner(
+            Destination::bootroot_owned(&path),
+            b"NEXT",
+            StagedMode::Policy(KEY_FILE_MODE),
+            FixedOwner::root(),
+        )
+        .await
+        .unwrap_err();
+        let report = format!("{err:#}");
+        assert!(
+            report.contains("root-owned") && report.contains(&path.display().to_string()),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "PRIOR");
+        assert_eq!(after.ino(), before.ino(), "the rename must not have run");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("key.pem")],
+            "the staged temporary is removed with the failed publish"
+        );
+
+        let absent = dir.path().join("absent.pem");
+        atomic_write_fixed_owner(
+            Destination::bootroot_owned(&absent),
+            b"NEXT",
+            StagedMode::Policy(KEY_FILE_MODE),
+            FixedOwner::root(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !absent.exists(),
+            "a refused publication must not create the destination either"
+        );
+    }
+
+    /// A directory-owner publish takes the containing directory's uid
+    /// and gid, on a fresh create and on a replacement alike.
+    ///
+    /// An unprivileged test process owns the directory it just made, so
+    /// what this pins is the *rule* — the published file matches the
+    /// directory rather than whatever the destination happened to carry
+    /// — and that the skip path leaves a correct result. The case the
+    /// rule exists for, a root `init` publishing into a `secrets/` some
+    /// other uid owns, needs a privilege this suite deliberately does
+    /// not have; the registrar-internal init E2E is where it is
+    /// observed.
+    #[tokio::test]
+    async fn a_dir_owner_publish_takes_the_directory_it_lands_in() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let dir_meta = std::fs::metadata(dir.path()).unwrap();
+        let path = dir.path().join("password.txt");
+
+        atomic_write_dir_owner(
+            Destination::bootroot_owned(&path),
+            b"FIRST",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
+        let created = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "FIRST");
+        assert_eq!(
+            (created.uid(), created.gid()),
+            (dir_meta.uid(), dir_meta.gid())
+        );
+        assert_eq!(created.permissions().mode() & 0o7777, KEY_FILE_MODE);
+
+        atomic_write_dir_owner(
+            Destination::bootroot_owned(&path),
+            b"SECOND",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
+        let replaced = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "SECOND");
+        assert_eq!(
+            (replaced.uid(), replaced.gid()),
+            (dir_meta.uid(), dir_meta.gid())
+        );
+        assert_ne!(
+            replaced.ino(),
+            created.ino(),
+            "the replacement is a fresh inode, so its owner was established rather than inherited"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("password.txt")],
+            "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// The no-flush spelling makes the same ownership decision, and
+    /// keeps [`atomic_replace`]'s: it replaces without a directory
+    /// flush.
+    ///
+    /// This is the writer the `OpenBao` Agent templates, the two
+    /// `agent.hcl` files and the responder's config go through, so what
+    /// it must not do is leave one of them behind under a uid the
+    /// sidecar reading it does not have.
+    #[tokio::test]
+    async fn a_dir_owner_replace_takes_the_directory_and_leaves_no_temporary() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let dir_meta = std::fs::metadata(dir.path()).unwrap();
+        let path = dir.path().join("agent.hcl");
+        std::fs::write(&path, "PRIOR").unwrap();
+
+        atomic_replace_dir_owner(
+            Destination::operator_named(&path),
+            b"NEXT",
+            StagedMode::Policy(KEY_FILE_MODE),
+        )
+        .await
+        .unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "NEXT");
+        assert_eq!((meta.uid(), meta.gid()), (dir_meta.uid(), dir_meta.gid()));
+        assert_eq!(meta.permissions().mode() & 0o7777, KEY_FILE_MODE);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("agent.hcl")]);
+    }
+
+    /// A shared secrets directory is created at `0700` under the owner
+    /// of the tree it lands in, every level of it, and an existing
+    /// directory keeps the owner it already had.
+    ///
+    /// The mode is what makes the owner load-bearing: `0700` under a
+    /// uid the sidecar does not have hides every file inside it,
+    /// however those files are themselves owned. An unprivileged test
+    /// owns the tree it just made, so what is pinned here is the rule
+    /// and the levels it reaches; a root `init` writing into a
+    /// `secrets/` somebody else owns is the registrar-internal init
+    /// E2E's to observe.
+    #[tokio::test]
+    async fn a_shared_secrets_dir_takes_the_owner_of_the_tree_at_every_level() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempdir().unwrap();
+        let tree = std::fs::metadata(root.path()).unwrap();
+        let nested = root.path().join("openbao").join("stepca");
+
+        ensure_shared_secrets_dir(&nested).await.unwrap();
+
+        for level in [root.path().join("openbao"), nested.clone()] {
+            let meta = std::fs::metadata(&level).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (tree.uid(), tree.gid()),
+                "{}",
+                level.display()
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o7777,
+            SECRETS_DIR_MODE
+        );
+
+        // Idempotent, and not a re-own: a second call finds the
+        // directory present and leaves it alone.
+        let before = std::fs::metadata(&nested).unwrap();
+        ensure_shared_secrets_dir(&nested).await.unwrap();
+        let after = std::fs::metadata(&nested).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.ino(), before.ino());
+    }
+
+    /// The general wrappers are untouched by the fixed-owner arm: they
+    /// still leave a fresh create to the writing process, which is what
+    /// every file without an ownership policy of its own depends on.
+    #[tokio::test]
+    async fn atomic_write_still_leaves_a_fresh_create_to_the_writer() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        atomic_write(
+            Destination::bootroot_owned(&path),
+            b"{}",
+            StagedMode::Policy(0o644),
+        )
+        .await
+        .unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (
+                current_process_euid(),
+                crate::cert_group::current_process_egid()
+            )
+        );
     }
 
     /// Under an active `--cert-group` policy, the bundle file must be

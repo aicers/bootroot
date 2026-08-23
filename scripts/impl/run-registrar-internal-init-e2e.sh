@@ -46,6 +46,18 @@ set -euo pipefail
 # The predicate is seeded into `state.json` by hand between `install`
 # and `init`.  Defining and writing it belongs to the registrar endpoint
 # work; `init` only consumes it, and consuming it is what is under test.
+#
+# `init` itself runs as root here (#880).  The five protected artifacts
+# below the internal directory are published uid 0 / gid 0, and a
+# process that cannot establish that ownership publishes none of them,
+# so an endpoint-enabled `init` is a privileged command and this
+# scenario is the only place that is observable end to end.  Everything
+# else still runs as the invoking user; the reads that touch the
+# root-owned `0700` internal directory go through `sudo -n` one call at
+# a time rather than the whole run being elevated.  Passwordless sudo is
+# therefore a prerequisite, and a machine without it cannot run this
+# scenario at all — `ensure_prerequisites` says so rather than letting
+# `init` fail with a permission error two minutes in.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,6 +114,8 @@ INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-60}"
 INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-2}"
 
 CURRENT_PHASE="startup"
+CURL_BIN=""
+PYTHON_BIN=""
 RUN_ROOT=""
 WORK_DIR=""
 SECRETS_DIR=""
@@ -139,8 +153,11 @@ assert_equal() {
   pass "$what"
 }
 
-file_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1"
+# uid, gid and mode of a file below the root-owned internal directory,
+# in one probe.  GNU and BSD `stat` spell the format differently and
+# both are tried, as the mode probe this replaces did.
+file_owner_mode() {
+  sudo -n stat -c '%u:%g:%a' "$1" 2>/dev/null || sudo -n stat -f '%u:%g:%OLp' "$1"
 }
 
 ensure_prerequisites() {
@@ -154,6 +171,20 @@ ensure_prerequisites() {
   # python3's `ssl`, which takes the PEM pair directly on every platform
   # this runs on.
   command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+  # Resolved here and invoked by absolute path under `sudo`: sudo's
+  # `secure_path` is not this shell's `PATH`, and a python3 or curl from
+  # a package manager prefix is exactly what it drops.
+  CURL_BIN="$(command -v curl)"
+  PYTHON_BIN="$(command -v python3)"
+  # Endpoint-enabled `init` publishes the five protected artifacts uid 0
+  # / gid 0 and refuses to publish any of them otherwise, so this
+  # scenario cannot run unprivileged.  Probed before anything is
+  # installed: a prompt-free failure now beats a permission error after
+  # a deployment has been brought up, and `sudo -n` is what keeps this
+  # from blocking on a password nobody is there to type.
+  sudo -n true >/dev/null 2>&1 ||
+    fail "passwordless sudo is required: endpoint-enabled 'bootroot init' publishes the \
+bootroot-internal credential as root, and this scenario runs it through 'sudo -n'"
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
   [ -n "$RUN_TOKEN" ] || fail "RUN_TOKEN reduced to the empty string; supply a token of [a-z0-9]"
   [ "${#INSTANCE}" -le "$MAX_INSTANCE_NAME_LEN" ] ||
@@ -162,6 +193,29 @@ ensure_prerequisites() {
 
 run_bootroot() {
   (cd "$WORK_DIR" && BOOTROOT_LANG=en "$BOOTROOT_BIN" "$@")
+}
+
+# `bootroot` as root, for the one command that has to be.
+#
+# `env` rather than `sudo -E`: only the three variables named here cross
+# the boundary.  `BOOTROOT_LANG` keeps the run on the English strings
+# every assertion below matches on, and `HOME` stays the invoking user's
+# because `init` drives the Docker CLI, which reads its client
+# configuration — the daemon endpoint and any credential helper — out of
+# `$HOME/.docker`.  Root's own `HOME` has none of that.
+#
+# `BOOTROOT_HTTP01_IMAGE` is the run-scoped responder tag this scenario
+# built locally, and the compose file interpolates it with a default of
+# the *untagged* repository name.  Dropping it at the sudo boundary does
+# not fall back to the image on this host: it names one that exists in
+# no registry, and the `docker compose up` `init` performs for the
+# responder override fails on a pull nobody can satisfy.
+run_bootroot_as_root() {
+  (cd "$WORK_DIR" && sudo -n env \
+    BOOTROOT_LANG=en \
+    HOME="$HOME" \
+    BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" \
+    "$BOOTROOT_BIN" "$@")
 }
 
 instance_compose() {
@@ -293,7 +347,7 @@ seed_registrar_endpoint_predicate() {
 
 run_init() {
   log "initialising instance ${INSTANCE}"
-  if ! run_bootroot init \
+  if ! run_bootroot_as_root init \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
     --secrets-dir "$SECRETS_DIR" \
     --enable auto-generate,show-secrets,db-provision \
@@ -336,8 +390,11 @@ assert_state_url_moved_to_https() {
 # does anchor the listener the credential has to log in over.
 assert_listener_serves_tls() {
   local bundle="$INTERNAL_DIR/ca-bundle.pem" code
-  [ -s "$bundle" ] || fail "the internal private CA bundle is missing at $bundle"
-  code="$(curl -sS -o /dev/null -w '%{http_code}' -m 10 --cacert "$bundle" \
+  # Every read below is elevated because the directory these files sit
+  # in is `0700` root-owned once a root-run `init` has created it — not
+  # because the bundle itself is protected material, which it is not.
+  sudo -n test -s "$bundle" || fail "the internal private CA bundle is missing at $bundle"
+  code="$(sudo -n "$CURL_BIN" -sS -o /dev/null -w '%{http_code}' -m 10 --cacert "$bundle" \
     "https://localhost:${PORT_OPENBAO}/v1/sys/seal-status" 2>>"$RUN_LOG" || true)"
   [ "$code" = "200" ] || fail "the TLS listener did not answer 200 (got '${code}')"
   pass "the listener answers over TLS, verified against the credential's private bundle"
@@ -366,57 +423,67 @@ assert_no_listener_client_cert_options() {
 }
 
 assert_material_is_complete_and_restrictive() {
-  local name mode
+  local name probe
   for name in key.pem chain.pem acme-account.json root-fingerprint agent.toml; do
-    [ -s "$INTERNAL_DIR/$name" ] || fail "missing or empty: $INTERNAL_DIR/$name"
-    mode="$(file_mode "$INTERNAL_DIR/$name")"
-    [ "$mode" = "600" ] || fail "${name} is mode ${mode}, expected 600"
+    sudo -n test -s "$INTERNAL_DIR/$name" || fail "missing or empty: $INTERNAL_DIR/$name"
+    # uid 0 and gid 0 are the criterion this run exists to prove: the
+    # key and the ACME account key are unreadable to anyone but root,
+    # and the config carrying the trust pins is unwritable to them.  The
+    # mode is asserted alongside as the regression guard it has been
+    # since #766.
+    probe="$(file_owner_mode "$INTERNAL_DIR/$name")"
+    [ "$probe" = "0:0:600" ] ||
+      fail "${name} is uid:gid:mode ${probe}, expected 0:0:600"
   done
-  pass "the five secret-side artifacts exist at 0600"
+  pass "the five protected artifacts are root-owned at 0600"
 
-  [ -s "$INTERNAL_DIR/ca-bundle.pem" ] || fail "missing the private CA bundle"
+  sudo -n test -s "$INTERNAL_DIR/ca-bundle.pem" || fail "missing the private CA bundle"
   pass "the private CA bundle exists"
 
-  [ ! -d "$INTERNAL_DIR/.staging" ] ||
+  sudo -n test ! -d "$INTERNAL_DIR/.staging" ||
     fail "the staging directory survived a successful publication"
   pass "the staging directory was swept"
 
   # The prior-set snapshot the publication holds the old credential in.
   # A completed publication discards it; one that survives means the
   # publication (or the restore after it) did not finish.
-  [ ! -d "$INTERNAL_DIR/.prior" ] ||
+  sudo -n test ! -d "$INTERNAL_DIR/.prior" ||
     fail "the prior-set snapshot survived a successful publication"
   pass "the prior-set snapshot was discarded"
 }
 
 assert_generated_config_is_the_internal_one() {
-  local config="$INTERNAL_DIR/agent.toml"
-  grep -q "service_name = \"${INTERNAL_ENTRY}\"" "$config" ||
+  local config="$INTERNAL_DIR/agent.toml" text
+  # Read once, elevated, and matched in the shell: the config is
+  # root-owned `0600` and holds the responder HMAC, so it is neither
+  # readable here nor worth copying anywhere.
+  text="$(sudo -n cat "$config")" || fail "the generated config could not be read at $config"
+  grep -q "service_name = \"${INTERNAL_ENTRY}\"" <<<"$text" ||
     fail "the generated config does not name the fixed identity"
-  grep -q "account_key_path = \"${INTERNAL_DIR}/acme-account.json\"" "$config" ||
+  grep -q "account_key_path = \"${INTERNAL_DIR}/acme-account.json\"" <<<"$text" ||
     fail "the generated config does not point at the persistent ACME account key"
-  grep -q "ca_bundle_path = \"${INTERNAL_DIR}/ca-bundle.pem\"" "$config" ||
+  grep -q "ca_bundle_path = \"${INTERNAL_DIR}/ca-bundle.pem\"" <<<"$text" ||
     fail "the generated config does not point at the private CA bundle"
   # The endpoints follow this install's published ports.  On the compose
   # defaults a hard-coded value looks identical, which is why the ports
   # were moved.
-  grep -q "server = \"https://localhost:${PORT_STEPCA}/acme/acme/directory\"" "$config" ||
+  grep -q "server = \"https://localhost:${PORT_STEPCA}/acme/acme/directory\"" <<<"$text" ||
     fail "the generated config does not use this install's step-ca port"
-  grep -q "http_responder_url = \"http://127.0.0.1:${PORT_HTTP01}\"" "$config" ||
+  grep -q "http_responder_url = \"http://127.0.0.1:${PORT_HTTP01}\"" <<<"$text" ||
     fail "the generated config does not use this install's responder port"
   pass "the generated config names the fixed identity, its private trust and this install's ports"
 }
 
 assert_leaf_carries_the_fixed_san() {
   local san
-  san="$(python3 - "$INTERNAL_DIR/chain.pem" <<'PY'
+  san="$(sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR/chain.pem" <<'PY'
 import re, ssl, sys, tempfile
 pem = open(sys.argv[1]).read()
 first = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, re.S).group(0)
-with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as handle:
+with tempfile.NamedTemporaryFile("w", suffix=".pem") as handle:
     handle.write(first + "\n")
-    path = handle.name
-names = ssl._ssl._test_decode_cert(path)
+    handle.flush()
+    names = ssl._ssl._test_decode_cert(handle.name)
 print(",".join(value for key, value in names.get("subjectAltName", ()) if key == "DNS"))
 PY
   )" || fail "could not read the issued leaf"
@@ -429,7 +496,7 @@ PY
 # `ssl`, which every platform this runs on supports.
 assert_certificate_login_succeeds() {
   local out
-  out="$(python3 - "$INTERNAL_DIR" "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
+  out="$(sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR" "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
 import http.client, json, ssl, sys
 cred, host, port, entry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 context = ssl.create_default_context(cafile=f"{cred}/ca-bundle.pem")
@@ -460,7 +527,7 @@ PY
 # would mean the entry is not the gate.
 assert_login_without_the_certificate_is_refused() {
   local status
-  status="$(python3 - "$INTERNAL_DIR" "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
+  status="$(sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR" "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
 import http.client, json, ssl, sys
 cred, host, port, entry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 context = ssl.create_default_context(cafile=f"{cred}/ca-bundle.pem")
@@ -472,6 +539,81 @@ PY
   )" || fail "the certificate-less login raised"
   [ "$status" != "200" ] || fail "a login with no client certificate was accepted"
   pass "a login with no client certificate is refused (${status})"
+}
+
+# Everything the OpenBao Agent sidecars open still belongs to the tree
+# they run in, after a root-run `init` wrote all of it.
+#
+# They are the only containers `init` both configures and starts that
+# run as an ordinary uid: the generated override launches each one as
+# the owner of `secrets/`, which on this host is the invoking user and
+# not the root that ran `init`.  Their `agent.hcl`, their `AppRole`
+# pair, the `.ctmpl` files they render from and the `0700` directories
+# all of those sit in must therefore carry that owner rather than the
+# writing process's — a `0700` directory owned by root hides every file
+# inside it whatever the file itself is owned by.
+#
+# Asserted on the tree rather than on container state, because a
+# regression here is quiet from the outside: the containers still
+# start, `init` still succeeds, and the renewals the sidecars exist to
+# perform simply stop.
+assert_the_infra_agent_tree_belongs_to_its_sidecars() {
+  local owner probe path
+  probe="$(file_owner_mode "$SECRETS_DIR")"
+  owner="${probe%:*}"
+  for path in \
+    openbao \
+    openbao/stepca \
+    openbao/responder \
+    openbao/stepca/agent.hcl \
+    openbao/stepca/role_id \
+    openbao/stepca/secret_id \
+    openbao/responder/agent.hcl \
+    openbao/responder/role_id \
+    openbao/responder/secret_id \
+    templates \
+    templates/password.txt.ctmpl \
+    templates/ca.json.ctmpl \
+    templates/responder.toml.ctmpl \
+    responder \
+    responder/responder.toml \
+    password.txt; do
+    sudo -n test -e "$SECRETS_DIR/$path" || fail "missing: $SECRETS_DIR/$path"
+    probe="$(file_owner_mode "$SECRETS_DIR/$path")"
+    [ "${probe%:*}" = "$owner" ] ||
+      fail "${path} is owned by ${probe%:*}, not by the secrets tree (${owner}) the sidecars run as"
+  done
+  pass "the sidecars' configuration, credentials and templates belong to the secrets tree"
+}
+
+# `bootroot infra up` over the deployment `init` just provisioned.
+#
+# `infra up` ends in a recursive ownership sweep: a one-shot root
+# container that chowns everything below `secrets/` to that directory's
+# own owner, so a `--user root` step helper cannot leave CA material
+# step-ca and the sidecars are unable to read.  It is therefore the one
+# routine command that could quietly undo everything asserted above —
+# without any protected file being republished, and on a host where the
+# operator did nothing more than restart the stack.  The same sweep is
+# reached by `reinit` and by the CA and step-ca-password rotations, so
+# covering it once here covers the shape of all of them.
+#
+# Run as the invoking user rather than through `sudo -n`, because that
+# is the case that used to regress: the sweep's root container can chown
+# the root-owned files whatever the invoking process could.
+#
+# `--openbao-url` is passed explicitly.  `init` transitioned the
+# listener to TLS on this port, and `infra up`'s own derivation only
+# ever replaces the port in the `http://` default, so the unseal probe
+# would open a plaintext request against a TLS listener and never get an
+# answer.
+run_infra_up_over_the_initialised_deployment() {
+  log "running 'infra up' over the initialised deployment"
+  run_bootroot infra up \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --openbao-url "https://localhost:${PORT_OPENBAO}" \
+    >>"$RUN_LOG" 2>&1 || fail "infra up failed after init"
+  pass "'infra up' completed over the initialised deployment"
 }
 
 # The alias is why the ACME challenge above could resolve at all.
@@ -497,8 +639,17 @@ capture_artifacts() {
     docker logs "${INSTANCE}-${service}" >"$ARTIFACT_DIR/${service}.log" 2>&1 || true
   done
   [ -f "$WORK_DIR/state.json" ] && cp "$WORK_DIR/state.json" "$ARTIFACT_DIR/state.json" || true
-  [ -f "$INTERNAL_DIR/agent.toml" ] &&
-    cp "$INTERNAL_DIR/agent.toml" "$ARTIFACT_DIR/registrar-internal-agent.toml" || true
+  # Elevated, and re-owned to the invoking user afterwards: a root-owned
+  # file left in the artifact directory outlives this run and the user
+  # who has to read it cannot remove it.
+  # Reached by the cleanup of a run that failed its prerequisites too,
+  # where sudo has already been established as unavailable; its
+  # complaint goes to the run log rather than on top of the refusal that
+  # already explained itself.
+  if sudo -n test -f "$INTERNAL_DIR/agent.toml" 2>>"$RUN_LOG"; then
+    sudo -n cp "$INTERNAL_DIR/agent.toml" "$ARTIFACT_DIR/registrar-internal-agent.toml" &&
+      sudo -n chown "$(id -u):$(id -g)" "$ARTIFACT_DIR/registrar-internal-agent.toml" || true
+  fi
   return 0
 }
 
@@ -546,6 +697,13 @@ remove_run_root() {
       -c "chown -R $(id -u):$(id -g) /mnt" >/dev/null 2>&1 || true
   fi
   rm -rf "$RUN_ROOT" 2>/dev/null || true
+  [ -d "$RUN_ROOT" ] || return 0
+  # What is left is this run's own root-owned output: the `0700`
+  # internal directory and the five protected files a root `init`
+  # published there.  The path is this run's `mktemp -d`, never an
+  # operator's, and the containers that could still be holding it open
+  # are gone by the time cleanup reaches here.
+  sudo -n rm -rf "$RUN_ROOT" 2>>"$RUN_LOG" || true
 }
 
 cleanup() {
@@ -604,6 +762,7 @@ main() {
   assert_generated_config_is_the_internal_one
   assert_leaf_carries_the_fixed_san
   assert_the_responder_answers_to_the_internal_san
+  assert_the_infra_agent_tree_belongs_to_its_sidecars
 
   log_phase "assert-listener"
   assert_state_url_moved_to_https
@@ -613,6 +772,16 @@ main() {
   log_phase "assert-login"
   assert_certificate_login_succeeds
   assert_login_without_the_certificate_is_refused
+
+  # Last, because it re-runs the two ownership assertions against a
+  # deployment a later command has passed over: the protected five must
+  # still be root's, and the sidecar tree must still be the sweep's to
+  # repair.  A sweep that swept everything would fail the first; a
+  # sweep narrowed too far would fail the second.
+  log_phase "assert-sweep"
+  run_infra_up_over_the_initialised_deployment
+  assert_material_is_complete_and_restrictive
+  assert_the_infra_agent_tree_belongs_to_its_sidecars
 
   log_phase "done"
   log "endpoint-enabled init checks passed"

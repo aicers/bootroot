@@ -514,6 +514,28 @@ bootroot verify --registration-id edge-proxy \
 하나뿐입니다. 데몬이 registrar의 `mint`/`deregister` 동사를 실행하기 위해
 `OpenBao`에 인증할 때 사용하는 bootroot 내부 자격 증명입니다.
 
+**이 호스트에서는 `bootroot init`을 root로 실행하세요.** 자격 증명을 구성하는
+다섯 개 파일(`registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
+`root-fingerprint`, `agent.toml`)은 `0600`에 소유자가 `root`인 상태로 게시되며,
+`init`은 그 소유권을 확보하지 못하면 어느 파일도 게시하지 않고 실패합니다.
+일반 사용자로 실행한 엔드포인트 활성 `init`은 키를 그 사용자가 읽을 수 있는
+상태로 남기는 대신 아무것도 쓰지 않고 실패합니다. 이 동작은 최선 노력(best
+effort)이 아니며, 이를 완화하는 플래그나 설정 키도 없습니다.
+
+따라서 이 설치 전체가 root로 운영됩니다. `init`이 이 호스트에 만든 파일은 root의
+것이므로, 이 설치를 변경하는 이후의 모든 `bootroot` 명령(`rotate`,
+`service add`, `reinit`, `clean`)도 root로 실행해야 합니다. 상태만 보고하는
+읽기 전용 명령은 읽을 대상에 접근할 권한만 있으면 됩니다. 이는 registrar
+엔드포인트를 제공하는 호스트에 해당하며, 그렇지 않은 호스트는 변경 사항이 없고
+root도 필요 없습니다.
+
+배포 자체는 영향을 받지 않습니다. step-ca, HTTP-01 응답기, 두 개의 `OpenBao`
+Agent 사이드카는 계속 설치 트리의 소유자로 실행되며, root로 실행한 `init`도
+이들이 읽는 대상(설정 파일, `AppRole` 자격 증명, 렌더링 원본 템플릿, 그리고
+이들을 담은 디렉터리)을 `root`가 아니라 그 소유자로 게시합니다. 소유자가 바뀌는
+것은 위에 나열한 다섯 개 파일뿐이며, 엔드포인트를 활성화하기 위해 기존 설치의
+소유권을 다시 지정할 필요는 없습니다.
+
 `bootroot init`은 이 설정 파일과 전용 CA 번들을 작성할 뿐, 프로세스를 시작하거나
 감독자(supervisor)를 설치하지 않습니다. 서비스 에이전트와 마찬가지로 운영자가
 같은 감독자 아래에서 시작합니다.
@@ -525,6 +547,11 @@ bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 `<secrets-directory>`는 `state.json`에 기록된 `secrets_dir`입니다. 이 경로는
 고정이며 설정으로 바꿀 수 없습니다. 회전(rotation)과 복구도 같은 경로를 패턴으로
 사용해 프로세스에 신호를 보냅니다.
+
+**이 프로세스도 root로 실행하세요.** 서비스 에이전트와 달리 위 설정 파일, 리프
+키, ACME 계정 키를 읽습니다. 셋 모두 `0700` root 소유 디렉터리 안에 `0600`
+root 소유로 있으며, 갱신할 때마다 리프를 그 디렉터리에 다시 게시합니다. 서비스
+에이전트를 실행하는 일반 사용자로 시작하면 자기 설정 파일조차 열 수 없습니다.
 
 **일상적인 갱신은 이 프로세스를 시작한 뒤에야 시작됩니다.** 그전까지 자격 증명은
 `init`이 발급한 상태 그대로이며, 회전이 신호를 보내도 대상 프로세스가 없습니다.

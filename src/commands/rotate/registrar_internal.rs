@@ -182,10 +182,16 @@ async fn write_trust_pair(
     messages: &Messages,
 ) -> Result<()> {
     let config_path = paths.agent_config();
-    fs_util::atomic_write(
+    // Root-owned unconditionally: this writer is reached only where the
+    // internal credential set is present, and that set is what makes a
+    // host a registrar host. There is no endpoint-enabled conditional
+    // to consult here, and a rotation must not be the publication that
+    // hands the config's trust pins to the invoking user.
+    fs_util::atomic_write_fixed_owner(
         fs_util::Destination::bootroot_owned(&config_path),
         config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::FixedOwner::root(),
     )
     .await
     .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
@@ -801,9 +807,9 @@ pub(super) async fn rotate_registrar_internal_credential(
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use bootroot::fs_util::current_process_euid;
     use bootroot::registrar::internal::{
-        AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, PrivateKeyPem,
-        publish_material, render_internal_agent_config,
+        AGENT_CONFIG_FILE, InternalAgentConfigParams, render_internal_agent_config,
     };
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
@@ -815,7 +821,7 @@ mod tests {
         RotationMode, converge_internal_auth, ensure_internal_trust_is,
         internal_credential_present, internal_rotation_applies, repair_internal_credential,
         replace_internal_credential, restore_cert_auth_entry, staging_dir, sweep_staging,
-        write_internal_trust,
+        upsert_internal_trust, write_internal_trust, write_trust_pair,
     };
     use crate::i18n::test_messages;
 
@@ -828,22 +834,27 @@ mod tests {
         format!("-----BEGIN CERTIFICATE-----\n{label}\n-----END CERTIFICATE-----\n")
     }
 
-    async fn provisioned_host() -> (TempDir, InternalPaths) {
+    /// A host carrying the whole set, written directly rather than
+    /// through `publish_material`.
+    ///
+    /// The production publisher establishes `root:root` on every
+    /// protected file and fails when it cannot, which is the subject of
+    /// the tests below rather than something a fixture running as an
+    /// ordinary user can drive. The bytes are what the rotation reads,
+    /// so writing them here changes nothing the tests assert on.
+    fn provisioned_host() -> (TempDir, InternalPaths) {
         let dir = TempDir::new().expect("tempdir");
         let paths = InternalPaths::new(dir.path());
-        publish_material(
-            &paths,
-            &InternalMaterial {
-                key: PrivateKeyPem::new(
-                    "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
-                ),
-                chain: bundle_pem("TEVBRg"),
-                acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
-                root_fingerprint: ROOT_FP.to_string(),
-            },
+        std::fs::create_dir_all(paths.dir()).expect("the internal directory");
+        std::fs::write(
+            paths.key(),
+            "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n",
         )
-        .await
-        .expect("publish");
+        .expect("key");
+        std::fs::write(paths.chain(), bundle_pem("TEVBRg")).expect("chain");
+        std::fs::write(paths.acme_account(), "{\"account_key_pkcs8\":\"QUJD\"}")
+            .expect("account key");
+        std::fs::write(paths.root_fingerprint(), format!("{ROOT_FP}\n")).expect("fingerprint");
         std::fs::write(paths.ca_bundle(), bundle_pem("Uk9PVA")).expect("bundle");
         std::fs::write(
             paths.agent_config(),
@@ -980,7 +991,7 @@ mod tests {
         let empty = TempDir::new().expect("tempdir");
         assert!(!internal_credential_present(empty.path()));
 
-        let (dir, paths) = provisioned_host().await;
+        let (dir, paths) = provisioned_host();
         assert!(internal_credential_present(dir.path()));
 
         // A partial set counts as present, so a rotation repairs it
@@ -1000,7 +1011,7 @@ mod tests {
     /// credential must still select no internal work in that mode.
     #[tokio::test]
     async fn an_intermediate_only_rotation_selects_no_internal_work() {
-        let (dir, _paths) = provisioned_host().await;
+        let (dir, _paths) = provisioned_host();
         assert!(
             internal_credential_present(dir.path()),
             "the fixture must be a provisioned host, or this proves nothing"
@@ -1025,11 +1036,26 @@ mod tests {
         ));
     }
 
-    /// Phase 3 publishes the additive set into the private bundle and
-    /// the config's pins, and leaves the identity and the paths alone.
+    /// Phase 3 is root-only, and a host it cannot publish on keeps the
+    /// pair it was carrying.
+    ///
+    /// The config is one of the five protected files, so the phase
+    /// establishes `root:root` on it or publishes nothing: an
+    /// unprivileged process must not be able to leave the trust pins —
+    /// the CA every later renewal is checked against — in a file it
+    /// owns. The refusal is reached while capturing the pair, which is
+    /// before either final name is touched.
     #[tokio::test]
-    async fn publishing_trust_rewrites_the_private_bundle_and_the_pins() {
-        let (dir, paths) = provisioned_host().await;
+    async fn publishing_trust_is_root_only_and_leaves_the_pair_it_found() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let (dir, paths) = provisioned_host();
+        let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
+        let config_before = std::fs::read_to_string(paths.agent_config()).expect("config");
+
         let additive = InternalTrustState {
             fingerprints: vec![
                 OLD_ROOT_FP.to_string(),
@@ -1039,35 +1065,28 @@ mod tests {
             ],
             bundle_pem: bundle_pem("QURESVRJVkU"),
         };
-        write_internal_trust(dir.path(), &additive, &test_messages())
+        let err = write_internal_trust(dir.path(), &additive, &test_messages())
             .await
-            .expect("publish the additive trust set");
+            .expect_err("an unprivileged process cannot publish the protected config");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(AGENT_CONFIG_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
 
         assert_eq!(
             std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
-            additive.bundle_pem
+            bundle_before,
+            "neither member moves when the pair cannot be published"
         );
-        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
-            .expect("the rewritten config must still parse");
-        assert_eq!(settings.trust.trusted_ca_sha256, additive.fingerprints);
         assert_eq!(
-            settings.trust.ca_bundle_path.as_deref(),
-            Some(paths.ca_bundle().as_path())
+            std::fs::read_to_string(paths.agent_config()).expect("config"),
+            config_before,
+            "the pins must not be left on a generation the bundle is not on"
         );
-        // Untouched by a trust publication.
-        let profile = settings.profiles.first().expect("one profile");
-        assert_eq!(profile.service_name, "bootroot-registrar-internal");
-        assert_eq!(profile.paths.cert, paths.chain());
-        assert_eq!(
-            settings.acme.account_key_path.as_deref(),
-            Some(paths.acme_account().as_path())
-        );
-        // The stored root fingerprint is *not* a Phase-3 concern.
-        assert_eq!(
-            std::fs::read_to_string(paths.root_fingerprint())
-                .expect("fingerprint")
-                .trim(),
-            ROOT_FP
+        assert!(
+            !paths.dir().join(".prior").exists(),
+            "a capture that could not complete leaves no partial snapshot"
         );
     }
 
@@ -1093,7 +1112,7 @@ mod tests {
         let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
 
-        let (dir, paths) = provisioned_host().await;
+        let (dir, paths) = provisioned_host();
         let before = std::fs::read_to_string(paths.agent_config()).expect("config");
         let ctx = super::RotateContext {
             openbao_url: "http://127.0.0.1:8200".to_string(),
@@ -1133,7 +1152,7 @@ mod tests {
     /// sweeps it itself rather than leaving it beside the credential.
     #[tokio::test]
     async fn a_failed_repair_sweeps_its_staging_directory() {
-        let (dir, paths) = provisioned_host().await;
+        let (dir, paths) = provisioned_host();
         let staging = staging_dir(&paths);
         std::fs::create_dir_all(&staging).expect("staging");
         std::fs::write(staging.join("key.pem"), "STAGED KEY").expect("staged key");
@@ -1149,50 +1168,51 @@ mod tests {
         assert!(!staging.exists());
     }
 
-    /// A trust publication that cannot complete leaves the pair as it
-    /// found it.
+    /// The trust-pair writer selects the root-owned config writer
+    /// itself, independently of the material publisher `init` reaches.
     ///
-    /// Phase 3 and Phase 6 move the private bundle and the config's pins
-    /// together. Each file publishes atomically on its own, so the state
-    /// worth guarding against is the one *between* them: a bundle on the
-    /// new generation with pins that still name the old one, with the
-    /// phase unrecorded and nothing registered to undo it. Here the
-    /// bundle is a directory, so its publication fails after the config's
-    /// succeeded — and the config comes back.
+    /// Called directly, past the capture Phase 3 takes first, so the
+    /// selection this writer makes is what fails rather than the
+    /// snapshot's. It is unconditional: this writer is reached only
+    /// where the internal credential set is present, and that set is
+    /// what makes the host a registrar host.
+    ///
+    /// The config publishes before the bundle, so the refusal also
+    /// leaves the bundle on the generation the pins still name.
     #[tokio::test]
-    async fn a_half_written_trust_pair_is_restored() {
-        let (dir, paths) = provisioned_host().await;
-        let before = std::fs::read_to_string(paths.agent_config()).expect("config");
+    async fn the_trust_pair_writer_selects_the_root_owned_config_writer() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let (_dir, paths) = provisioned_host();
+        let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
+        let config_before = std::fs::read_to_string(paths.agent_config()).expect("config");
 
-        // A bundle name that cannot be published over: the rename at the
-        // end of the publication has a directory in its way.
-        std::fs::remove_file(paths.ca_bundle()).expect("remove the bundle");
-        std::fs::create_dir(paths.ca_bundle()).expect("a directory at the bundle name");
-
-        let additive = InternalTrustState {
-            fingerprints: vec![
-                OLD_ROOT_FP.to_string(),
-                OLD_INT_FP.to_string(),
-                ROOT_FP.to_string(),
-                NEW_INT_FP.to_string(),
-            ],
-            bundle_pem: bundle_pem("QURESVRJVkU"),
-        };
-        write_internal_trust(dir.path(), &additive, &test_messages())
-            .await
-            .expect_err("the bundle cannot be published over a directory");
+        let err = write_trust_pair(
+            &paths,
+            &bundle_pem("QURESVRJVkU"),
+            "email = \"ops@example.internal\"\n",
+            &test_messages(),
+        )
+        .await
+        .expect_err("the config cannot be published by an unprivileged process");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(AGENT_CONFIG_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
 
         assert_eq!(
             std::fs::read_to_string(paths.agent_config()).expect("config"),
-            before,
-            "the pins must not be left on a generation the bundle is not on"
+            config_before,
+            "the config must be left exactly as it was found"
         );
-        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
-            .expect("the restored config must parse");
-        assert_eq!(settings.trust.trusted_ca_sha256, vec![ROOT_FP.to_string()]);
-        assert!(
-            !paths.dir().join(".prior").exists(),
-            "the snapshot is discarded once the pair is settled"
+        assert_eq!(
+            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
+            bundle_before,
+            "the bundle must not move ahead of the pins"
         );
     }
 
@@ -1204,7 +1224,7 @@ mod tests {
     /// both members exactly as they were.
     #[tokio::test]
     async fn an_unparseable_config_fails_before_the_bundle_moves() {
-        let (dir, paths) = provisioned_host().await;
+        let (dir, paths) = provisioned_host();
         std::fs::write(paths.agent_config(), "trust = [[[\n").expect("write");
         let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
 
@@ -1246,7 +1266,7 @@ mod tests {
         // No CA material below the secrets directory, so the issuance
         // fails at its first step — before ACME, and long before any
         // `OpenBao` write.
-        let (dir, paths) = provisioned_host().await;
+        let (dir, paths) = provisioned_host();
         let context = repair_inputs(dir.path());
 
         replace_internal_credential(
@@ -1365,7 +1385,7 @@ mod tests {
         let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
 
-        let (dir, _paths) = provisioned_host().await;
+        let (dir, _paths) = provisioned_host();
         std::fs::create_dir_all(dir.path().join("certs")).expect("ca dir");
         std::fs::write(
             dir.path().join("certs").join("root_ca.crt"),
@@ -1417,7 +1437,7 @@ mod tests {
     /// Phase-3 publication did not land.
     #[tokio::test]
     async fn the_tail_refuses_a_host_that_is_not_on_the_additive_set() {
-        let (dir, _paths) = provisioned_host().await;
+        let (dir, _paths) = provisioned_host();
         let additive = vec![
             OLD_ROOT_FP.to_string(),
             OLD_INT_FP.to_string(),
@@ -1428,16 +1448,20 @@ mod tests {
             .expect_err("a stale config must be refused");
         assert!(err.to_string().contains("Phase 3"), "{err}");
 
-        write_internal_trust(
-            dir.path(),
-            &InternalTrustState {
-                fingerprints: additive.clone(),
-                bundle_pem: bundle_pem("QURESVRJVkU"),
-            },
-            &test_messages(),
+        // Written directly, because the publication Phase 3 performs is
+        // root-only: what this half asserts is the *reader*, which is
+        // what the tail gates on.
+        let paths = InternalPaths::new(dir.path());
+        std::fs::write(
+            paths.agent_config(),
+            upsert_internal_trust(
+                &std::fs::read_to_string(paths.agent_config()).expect("config"),
+                &paths,
+                &additive,
+            )
+            .expect("the additive pins"),
         )
-        .await
-        .expect("publish");
+        .expect("config");
         ensure_internal_trust_is(dir.path(), &additive, &test_messages())
             .expect("the additive set is now in place");
     }

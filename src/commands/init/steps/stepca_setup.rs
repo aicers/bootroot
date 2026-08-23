@@ -77,7 +77,10 @@ pub(super) async fn write_stepca_templates(
     messages: &Messages,
 ) -> Result<StepCaTemplatePaths> {
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
-    fs_util::ensure_secrets_dir(&templates_dir).await?;
+    // Under the tree's owner: the `OpenBao` Agent sidecar that renders
+    // both templates below runs as that uid, and a `0700` directory a
+    // root-run `init` created is one it cannot open them through.
+    fs_util::ensure_shared_secrets_dir(&templates_dir).await?;
 
     let password_template_path = templates_dir.join(STEPCA_PASSWORD_TEMPLATE_NAME);
     let password_template = build_password_template(kv_mount);
@@ -88,7 +91,11 @@ pub(super) async fn write_stepca_templates(
     // container — but the templates are themselves regenerated in full
     // by this function on the next `init`, so losing a directory entry
     // to a crash costs that re-run and nothing more.
-    fs_util::atomic_replace(
+    //
+    // That sidecar is also why both carry the tree's owner rather than
+    // the writing process's: `0600` under a root-run `init` would leave
+    // it re-rendering nothing.
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&password_template_path),
         password_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -111,7 +118,7 @@ pub(super) async fn write_stepca_templates(
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&ca_json_template_path),
         ca_json_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -491,7 +498,16 @@ pub(super) async fn write_password_file_with_backup(
     // intermediate CA keys sitting beside it; a crash that loses the
     // directory entry after step-ca has been handed it leaves keys
     // nobody can open, which no re-run of `init` reconstructs.
-    fs_util::atomic_write(
+    //
+    // Owned by `secrets/` rather than by the writing process, because
+    // this file is read by neither: `ensure_step_ca_initialized` hands
+    // it to a `step` helper launched `--user <secrets owner>`, and the
+    // step-ca server reads it again through `--password-file` under the
+    // same uid, which `infra install` pinned into `BOOTROOT_STEPCA_USER`
+    // from this very directory. While bootroot itself ran as that owner
+    // the distinction was invisible; an endpoint-enabled `init` runs as
+    // root, and a `0600` root-owned password is one step-ca cannot open.
+    fs_util::atomic_write_dir_owner(
         fs_util::Destination::bootroot_owned(&password_path),
         password.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -725,6 +741,47 @@ mod tests {
         assert_eq!(
             logged.lines().collect::<Vec<&str>>(),
             vec!["restart insight-openbao-agent-stepca "]
+        );
+    }
+
+    /// The CA password is published under the owner of `secrets/`, not
+    /// under the process that wrote it.
+    ///
+    /// `ensure_step_ca_initialized` hands this file to a `step` helper
+    /// launched `--user <secrets owner>`, and the step-ca server opens
+    /// it again through `--password-file` under the uid `infra install`
+    /// pinned into `BOOTROOT_STEPCA_USER` from this same directory. An
+    /// endpoint-enabled `init` runs as root, so a password left to the
+    /// writing process is one neither of them can open — the `0600`
+    /// mode that protects it is exactly what makes the mismatch fatal.
+    ///
+    /// An unprivileged test owns the directory it made, so this pins
+    /// the rule and the `0600` policy rather than the privileged case;
+    /// the registrar-internal init E2E is where a root writer meets a
+    /// `secrets/` owned by somebody else.
+    #[tokio::test]
+    async fn the_ca_password_is_owned_by_the_secrets_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        let messages = test_messages();
+
+        write_password_file_with_backup(&secrets_dir, "s3cret", &messages)
+            .await
+            .expect("publish the CA password");
+
+        let dir_meta = fs::metadata(&secrets_dir).unwrap();
+        let file_meta = fs::metadata(secrets_dir.join("password.txt")).unwrap();
+        assert_eq!(
+            (file_meta.uid(), file_meta.gid()),
+            (dir_meta.uid(), dir_meta.gid()),
+            "the password must carry the uid every step-ca container runs as"
+        );
+        assert_eq!(file_meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::read_to_string(secrets_dir.join("password.txt")).unwrap(),
+            "s3cret"
         );
     }
 

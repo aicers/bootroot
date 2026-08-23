@@ -591,7 +591,18 @@ async fn publish_internal_files(
 
     publish_material(&staged.paths, &staged.material).await?;
 
-    let config = render_internal_agent_config(
+    let config = internal_agent_config(staged, inputs);
+    publish_internal_agent_config(&staged.paths, &config, messages).await
+}
+
+/// Renders the `agent.toml` the publication writes.
+///
+/// Split from the writer so the composition is assertable on its own:
+/// publishing the file needs the root authority
+/// [`publish_internal_agent_config`] requires, and the trust set the
+/// pins are taken from is decided here rather than there.
+fn internal_agent_config(staged: &StagedInternal, inputs: &RegistrarInternalInputs<'_>) -> String {
+    render_internal_agent_config(
         &staged.paths,
         &InternalAgentConfigParams {
             email: inputs.email,
@@ -604,17 +615,30 @@ async fn publish_internal_files(
             eab_hmac: inputs.eab.map(|creds| &creds.hmac),
             trusted_ca_sha256: &staged.fingerprints,
         },
-    );
-    fs_util::atomic_write(
-        fs_util::Destination::bootroot_owned(&staged.paths.agent_config()),
+    )
+}
+
+/// Publishes the generated `agent.toml`, `root:root` and `0600`.
+///
+/// Root-owned like the four credential files [`publish_material`] wrote
+/// just above: this config carries the trust pins the internal profile
+/// renews against, and a host whose invoking user can rewrite them is a
+/// host whose credential can be reissued against a CA nobody chose. The
+/// ownership is selected here rather than inherited from the material
+/// writer, so neither publication can lose it by way of the other.
+async fn publish_internal_agent_config(
+    paths: &InternalPaths,
+    config: &str,
+    messages: &Messages,
+) -> Result<()> {
+    fs_util::atomic_write_fixed_owner(
+        fs_util::Destination::bootroot_owned(&paths.agent_config()),
         config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::FixedOwner::root(),
     )
     .await
-    .with_context(|| {
-        messages.error_write_file_failed(&staged.paths.agent_config().display().to_string())
-    })?;
-    Ok(())
+    .with_context(|| messages.error_write_file_failed(&paths.agent_config().display().to_string()))
 }
 
 /// Builds the in-memory `Settings` the staged ACME issuance runs under.
@@ -1291,16 +1315,16 @@ mod auth_provisioning_tests {
 
 #[cfg(test)]
 mod publication_tests {
+    use bootroot::fs_util::current_process_euid;
     use bootroot::registrar::internal::material::PRIOR_DIR;
     use bootroot::registrar::internal::{
-        AcmeAccountKey, InternalMaterial, InternalPaths, PrivateKeyPem, load_material,
-        publish_material,
+        AGENT_CONFIG_FILE, AcmeAccountKey, InternalMaterial, InternalPaths, KEY_FILE, PrivateKeyPem,
     };
     use tempfile::TempDir;
 
     use super::{
-        RegistrarInternalContext, RegistrarInternalIntent, StagedInternal, publish_internal_set,
-        staging_dir,
+        RegistrarInternalContext, RegistrarInternalIntent, StagedInternal, internal_agent_config,
+        publish_internal_agent_config, publish_internal_set, staging_dir,
     };
     use crate::i18n::test_messages;
 
@@ -1350,157 +1374,217 @@ mod publication_tests {
     /// A host that already carries a complete set, under bytes no
     /// publication below writes, so a member left on its prior contents
     /// is distinguishable from one that was rewritten.
-    async fn provisioned_host(paths: &InternalPaths) {
-        publish_material(
-            paths,
-            &InternalMaterial {
-                key: PrivateKeyPem::new(
-                    "-----BEGIN PRIVATE KEY-----\nUFJJT1I\n-----END PRIVATE KEY-----\n".to_string(),
-                ),
-                chain: bundle("UFJJT1JMRUFG"),
-                acme_account: AcmeAccountKey::new(
-                    "{\"account_key_pkcs8\":\"UFJJT1I\"}".to_string(),
-                ),
-                root_fingerprint: OLD_ROOT.to_string(),
-            },
+    ///
+    /// Written directly rather than through `publish_material`: that
+    /// publisher establishes `root:root` on every protected file and
+    /// refuses when it cannot, which is what the tests below are about
+    /// and not something an unprivileged fixture can drive.
+    fn provisioned_host(paths: &InternalPaths) {
+        std::fs::create_dir_all(paths.dir()).expect("the internal directory");
+        std::fs::write(
+            paths.key(),
+            "-----BEGIN PRIVATE KEY-----\nUFJJT1I\n-----END PRIVATE KEY-----\n",
         )
-        .await
-        .expect("the prior material");
+        .expect("the prior key");
+        std::fs::write(paths.chain(), bundle("UFJJT1JMRUFG")).expect("the prior chain");
+        std::fs::write(paths.acme_account(), "{\"account_key_pkcs8\":\"UFJJT1I\"}")
+            .expect("the prior account key");
+        std::fs::write(paths.root_fingerprint(), format!("{OLD_ROOT}\n"))
+            .expect("the prior fingerprint");
         std::fs::write(paths.ca_bundle(), bundle("UFJJT1JCVU5ETEU")).expect("the prior bundle");
         std::fs::write(paths.agent_config(), "email = \"prior@example.internal\"\n")
             .expect("the prior config");
     }
 
-    /// `init` publishes the active generation: the bundle and the pins
-    /// are what the issuance staged.
+    /// Publishing the set is root-only, and a bare host it cannot
+    /// publish on is left bare.
+    ///
+    /// The four credential files and the generated config are `0600`
+    /// `root:root` or they are not this host's credential: an
+    /// unprivileged `init` must not leave a key the invoking user can
+    /// read behind a set that reads as complete. The private bundle is
+    /// published before them and is public trust material, so the proof
+    /// that nothing survives is the rollback putting the host back as it
+    /// found it.
     #[tokio::test]
-    async fn publication_writes_the_staged_trust_set() {
+    async fn a_publication_is_refused_without_the_authority_to_own_the_set() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
         let dir = TempDir::new().expect("tempdir");
         let context = context(dir.path());
         let staged = staged(dir.path());
-        publish_internal_set(&staged, &context.inputs(), &test_messages())
+        let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
             .await
-            .expect("publish");
+            .expect_err("an unprivileged process cannot publish the protected set");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(KEY_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
 
         let paths = InternalPaths::new(dir.path());
-        assert_eq!(
-            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
-            bundle("QUNUSVZF")
-        );
-        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
-            .expect("the generated config must parse");
-        assert_eq!(
-            settings.trust.trusted_ca_sha256,
-            [ACTIVE_ROOT.to_string(), ACTIVE_INT.to_string()]
-        );
-        let material = load_material(&paths).expect("the published set must load");
-        assert_eq!(material.root_fingerprint, ACTIVE_ROOT);
+        for path in paths.all() {
+            assert!(
+                !path.exists(),
+                "a refused publication leaves no member behind: {}",
+                path.display()
+            );
+        }
         assert!(
             !paths.dir().join(PRIOR_DIR).exists(),
-            "a completed publication discards its snapshot"
+            "a settled publication leaves no snapshot"
         );
     }
 
+    /// A publication over a host that already carries a set touches no
+    /// member of it unless it can own every one.
+    ///
     /// The six files publish one at a time, so a failure part-way
     /// through an already-provisioned host would otherwise leave a new
     /// key beside the previous chain — a set that still reads as
     /// complete and can no longer log in — and `init`'s rollback would
     /// not repair it, because a re-run deliberately does not register
-    /// the credential it found for teardown.
-    ///
-    /// One case per published member, each failing at that member: a
-    /// directory at a credential name is something no rename can
-    /// replace. What survives is what the run started with.
+    /// the credential it found for teardown. The capture that guards
+    /// against that runs first and snapshots the protected members under
+    /// the ownership they are published with, so an unprivileged run is
+    /// refused there: before a final name has been touched, and with no
+    /// half-written snapshot left behind either.
     #[tokio::test]
-    async fn a_failed_publication_restores_the_set_it_found() {
-        for member in [
-            "ca-bundle.pem",
-            "key.pem",
-            "chain.pem",
-            "acme-account.json",
-            "root-fingerprint",
-            "agent.toml",
-        ] {
-            let dir = TempDir::new().expect("tempdir");
-            let paths = InternalPaths::new(dir.path());
-            provisioned_host(&paths).await;
-            let failing = paths.dir().join(member);
-            let untouched: Vec<(std::path::PathBuf, String)> = paths
-                .all()
-                .into_iter()
-                .filter(|path| path != &failing)
-                .map(|path| {
-                    let contents = std::fs::read_to_string(&path).expect("prior member");
-                    (path, contents)
-                })
-                .collect();
-            std::fs::remove_file(&failing).expect("remove the member");
-            std::fs::create_dir_all(failing.join("nested")).expect("a directory at the member");
+    async fn a_refused_publication_leaves_the_set_it_found() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        provisioned_host(&paths);
+        let before: Vec<(std::path::PathBuf, String)> = paths
+            .all()
+            .into_iter()
+            .map(|path| {
+                let contents = std::fs::read_to_string(&path).expect("prior member");
+                (path, contents)
+            })
+            .collect();
 
-            let context = context(dir.path());
-            let staged = staged(dir.path());
-            let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
-                .await
-                .expect_err("a member that cannot be written must fail the publication");
-            assert!(
-                err.to_string().contains(member) || format!("{err:#}").contains(member),
-                "the failure must name the member it could not publish: {err:#}"
-            );
+        let context = context(dir.path());
+        let staged = staged(dir.path());
+        let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
+            .await
+            .expect_err("an unprivileged process cannot publish the protected set");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(KEY_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
 
-            for (path, contents) in untouched {
-                assert_eq!(
-                    std::fs::read_to_string(&path).expect("member after the failure"),
-                    contents,
-                    "publishing over {member} must leave {} on its prior bytes",
-                    path.display()
-                );
-            }
-            assert!(
-                failing.join("nested").is_dir(),
-                "the restore must not delete what it could not capture"
-            );
-            assert!(
-                !paths.dir().join(PRIOR_DIR).exists(),
-                "a completed restore discards its snapshot"
+        for (path, contents) in before {
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("member after the refusal"),
+                contents,
+                "a refused publication must leave {} on its prior bytes",
+                path.display()
             );
         }
+        assert!(
+            !paths.dir().join(PRIOR_DIR).exists(),
+            "a capture that could not complete leaves no partial snapshot"
+        );
     }
 
-    /// A repair overrides the trust set before publishing, so the
-    /// Phase-4 tail replaces the credential while leaving the additive
-    /// set in place. Narrowing here would take this identity off a
-    /// generation the rest of the fleet still trusts.
+    /// `init` selects the root-owned writer for the generated config
+    /// itself, independently of the material publisher beside it.
+    ///
+    /// Called directly, past the four credential files that would
+    /// otherwise be refused first, so what fails here is this writer's
+    /// own selection. The config carries the trust pins, so a host whose
+    /// invoking user owns it is a host whose credential can be reissued
+    /// against a CA nobody chose.
     #[tokio::test]
-    async fn a_repair_publishes_the_trust_set_it_was_given() {
+    async fn the_config_writer_is_root_owned_independently_of_the_material() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(paths.dir()).expect("the internal directory");
+
+        let err = publish_internal_agent_config(
+            &paths,
+            "email = \"ops@example.internal\"\n",
+            &test_messages(),
+        )
+        .await
+        .expect_err("an unprivileged process cannot publish the protected config");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(AGENT_CONFIG_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
+        assert!(
+            !paths.agent_config().exists(),
+            "a refused publication must not create the config"
+        );
+    }
+
+    /// The pins the publication writes are the trust set it was given:
+    /// the active generation `init` staged, or the additive set a repair
+    /// overrides it with.
+    ///
+    /// Asserted on the rendered config rather than on a published one,
+    /// because publishing it takes the root authority the tests above
+    /// prove an ordinary user does not have — and the composition is
+    /// what would otherwise go unchecked outside a privileged E2E.
+    /// Narrowing the repair case to the active generation would take
+    /// this identity off a set the rest of the fleet still trusts.
+    #[test]
+    fn the_generated_config_carries_the_trust_set_the_publication_was_given() {
         let dir = TempDir::new().expect("tempdir");
         let context = context(dir.path());
+        let paths = InternalPaths::new(dir.path());
+
+        let active = settings_of(&internal_agent_config(
+            &staged(dir.path()),
+            &context.inputs(),
+        ));
+        assert_eq!(
+            active.trust.trusted_ca_sha256,
+            [ACTIVE_ROOT.to_string(), ACTIVE_INT.to_string()]
+        );
+        assert_eq!(
+            active.trust.ca_bundle_path.as_deref(),
+            Some(paths.ca_bundle().as_path())
+        );
+        assert_eq!(
+            active.profiles.first().expect("one profile").paths.cert,
+            paths.chain()
+        );
+
         let additive = vec![
             OLD_ROOT.to_string(),
             OLD_INT.to_string(),
             ACTIVE_ROOT.to_string(),
             ACTIVE_INT.to_string(),
         ];
-        let staged = staged(dir.path()).with_trust(additive.clone(), bundle("QURESVRJVkU"));
-        publish_internal_set(&staged, &context.inputs(), &test_messages())
-            .await
-            .expect("publish");
+        let repaired = settings_of(&internal_agent_config(
+            &staged(dir.path()).with_trust(additive.clone(), bundle("QURESVRJVkU")),
+            &context.inputs(),
+        ));
+        assert_eq!(repaired.trust.trusted_ca_sha256, additive);
+    }
 
-        let paths = InternalPaths::new(dir.path());
-        assert_eq!(
-            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
-            bundle("QURESVRJVkU")
-        );
-        let settings = bootroot::config::Settings::from_file(Some(paths.agent_config()))
-            .expect("the generated config must parse");
-        assert_eq!(settings.trust.trusted_ca_sha256, additive);
-        // The credential itself is still replaced: the stored root
-        // fingerprint is the freshly issued one, not a trust-set member
-        // chosen for the bundle.
-        assert_eq!(
-            load_material(&paths)
-                .expect("the published set must load")
-                .root_fingerprint,
-            ACTIVE_ROOT
-        );
+    /// Parses a rendered config the way `bootroot-agent` does.
+    fn settings_of(rendered: &str) -> bootroot::config::Settings {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(AGENT_CONFIG_FILE);
+        std::fs::write(&path, rendered).expect("write the rendered config");
+        bootroot::config::Settings::from_file(Some(path))
+            .expect("the generated config must deserialize")
     }
 }
