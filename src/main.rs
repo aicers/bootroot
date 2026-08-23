@@ -170,4 +170,111 @@ mod tests {
         let result = with_runtime("test", &messages, |rt| rt.block_on(async { 1 + 1 })).unwrap();
         assert_eq!(result, 2);
     }
+
+    /// The registrar audit format is reachable — and complete — from
+    /// outside the library, through `bootroot::registrar::audit` and
+    /// nothing else.
+    ///
+    /// This binary crate is the nearest stand-in for the reader the
+    /// format exists for: it links the library the same way any other
+    /// consumer does, so a record type, a field, an append API or the
+    /// error type that stopped being public fails to compile here rather
+    /// than in somebody else's tree. It writes nothing — opening a store
+    /// is deliberately not public — and asserts only that the whole
+    /// format can be named and round-tripped.
+    #[test]
+    fn the_registrar_audit_format_is_reachable_from_the_binary_crate() {
+        // Named so the handle type itself stays public; constructing one
+        // is not part of the public surface.
+        fn _names_the_handle(_: &AuditRecordStore) {}
+
+        use bootroot::registrar::audit::{
+            ACTIVE_FILE_NAME, AUDIT_RECORD_VERSION, AuditOutcome, AuditPhase, AuditRecord,
+            AuditRecordStore, AuditStoreError, AuditVerb, MAX_RECORD_FIELD_BYTES,
+            MAX_SERIALIZED_RECORD_BYTES, MIN_AUDIT_MAX_FILE_BYTES, PathCondition, RefusalReason,
+            RequestedIdentity, TruncationDigest, Truncations, canonical_timestamp,
+            format_millisecond_rfc3339,
+        };
+        use time::format_description::well_known::Rfc3339;
+        use time::{OffsetDateTime, UtcOffset};
+
+        let ts = OffsetDateTime::parse("2026-08-23T12:34:56.789Z", &Rfc3339).expect("a timestamp");
+        let record: AuditRecord = AuditRecord::outcome(
+            ts,
+            "req-1".to_string(),
+            AuditVerb::Mint,
+            "spiffe://review/manager#7f3a".to_string(),
+            RequestedIdentity {
+                service_name: "review".to_string(),
+                host: "h1".to_string(),
+                instance: Some(7),
+            },
+            Some("review-h1-007".to_string()),
+            AuditOutcome::Refused {
+                reason: RefusalReason::ComponentNotConfigured,
+                detail: Some("component review has no entry".to_string()),
+            },
+        );
+        assert_eq!(record.record_version, AUDIT_RECORD_VERSION);
+        assert_eq!(record.phase, AuditPhase::Outcome);
+        assert_eq!(record.phase.as_str(), "outcome");
+        assert_eq!(
+            format_millisecond_rfc3339(record.ts),
+            "2026-08-23T12:34:56.789Z"
+        );
+
+        // Appending refuses a `ts` that is not already a UTC
+        // millisecond rather than dropping the remainder or converting
+        // the offset, so the helper that canonicalizes a clock reading
+        // is public too — and the builders already apply it.
+        let ragged = ts
+            .replace_nanosecond(789_654_321)
+            .expect("a nanosecond")
+            .to_offset(UtcOffset::from_hms(9, 0, 0).expect("an offset"));
+        assert_eq!(canonical_timestamp(ragged), ts);
+        assert_eq!(canonical_timestamp(ragged).offset(), UtcOffset::UTC);
+        let built = AuditRecord::intent(
+            ragged,
+            "req-2".to_string(),
+            AuditVerb::Mint,
+            "spiffe://review/manager#7f3a".to_string(),
+            RequestedIdentity {
+                service_name: "review".to_string(),
+                host: "h1".to_string(),
+                instance: None,
+            },
+        );
+        assert_eq!(built.ts, ts);
+        assert_eq!(built.ts.offset(), UtcOffset::UTC);
+
+        let line: Vec<u8> = record.clone().into_bounded().to_line().expect("a line");
+        assert_eq!(line.last().copied(), Some(b'\n'));
+        assert!(line.len() <= MAX_SERIALIZED_RECORD_BYTES);
+        let parsed: AuditRecord =
+            serde_json::from_slice(&line[..line.len() - 1]).expect("a line round-trips");
+        assert_eq!(parsed, record);
+
+        // The names a reader needs to find the files, size them, and
+        // report what a truncated field really was.
+        assert_eq!(ACTIVE_FILE_NAME, "registrar-audit.jsonl");
+        assert_eq!(MAX_RECORD_FIELD_BYTES, 512);
+        assert_eq!(MIN_AUDIT_MAX_FILE_BYTES, 65_536);
+        let digest = TruncationDigest {
+            full_sha256: "0".repeat(64),
+            full_bytes: 600,
+        };
+        let truncations = Truncations {
+            caller_identity: Some(digest),
+            ..Truncations::default()
+        };
+        assert!(!truncations.is_empty());
+
+        // The typed error and its path condition are public too, so a
+        // consumer can report a rejection rather than a string.
+        let error: AuditStoreError = AuditStoreError::UnsafePath {
+            path: std::path::PathBuf::from("/var/lib/bootroot/registrar-audit"),
+            condition: PathCondition::Symlink,
+        };
+        assert!(error.to_string().contains("symbolic link"));
+    }
 }

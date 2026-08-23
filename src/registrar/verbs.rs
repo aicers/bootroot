@@ -118,6 +118,7 @@ use self::outcome::{
 };
 use self::wrap_ttl::{GrantedWrapTtl, WrapTtlPolicy};
 use crate::openbao::{KvCreateIfAbsent, OpenBaoClient, SecretIdOptions, WrapInfo};
+use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::{Multiplicity, RegistrarConfig};
 use crate::registrar::identity::{RequestedSpec, check_instance_shape, derive_registration_id};
 use crate::registrar::internal::{InternalCredential, InternalCredentialError};
@@ -195,6 +196,20 @@ pub(crate) struct RegistrarVerbsConfig {
     /// The bounded wrap-TTL policy: the maximum, and the rules a
     /// requested value is validated under.
     pub(crate) wrap_ttl_policy: WrapTtlPolicy,
+    /// The daemon-owned audit record store, already opened.
+    ///
+    /// A fixed dependency like every other field here: the verb layer
+    /// receives a handle and can neither choose the path it writes to
+    /// nor decline to have one. Whatever provisions the registrar
+    /// surface opens the store first, so an unsafe or unusable store
+    /// fails that surface closed rather than leaving the verbs running
+    /// with no trail.
+    ///
+    /// No verb arm calls its append API yet. The sibling issue that
+    /// writes intent and outcome records owns the call sites, their
+    /// ordering around the `OpenBao` work, and what a failed write
+    /// returns to a caller; this field is the seam it consumes.
+    pub(crate) audit_store: AuditRecordStore,
 }
 
 /// The fixed, client-free dependencies [`RegistrarVerbs::internal`] is
@@ -235,6 +250,15 @@ pub(crate) struct InternalVerbsSource<'a> {
     pub(crate) secret_id_ttl: &'a str,
     /// The bounded wrap-TTL policy.
     pub(crate) wrap_ttl_policy: &'a WrapTtlPolicy,
+    /// The daemon-owned audit record store, already opened.
+    ///
+    /// Borrowed and cloned into the service, as every clone shares one
+    /// serialization lock: whatever provisions the registrar surface
+    /// opens the store and keeps its own handle. Like every other
+    /// member here it is a fixed dependency, so the client-free factory
+    /// no more chooses where the trail is written than it chooses which
+    /// credential it logs in with.
+    pub(crate) audit_store: &'a AuditRecordStore,
 }
 
 /// A mint request: an opaque caller plus the identity's parts.
@@ -325,6 +349,7 @@ pub(crate) struct RegistrarVerbs {
     token_ttl: String,
     secret_id_ttl: String,
     wrap_ttl_policy: WrapTtlPolicy,
+    audit_store: AuditRecordStore,
 }
 
 impl RegistrarVerbs {
@@ -343,6 +368,7 @@ impl RegistrarVerbs {
             token_ttl: config.token_ttl,
             secret_id_ttl: config.secret_id_ttl,
             wrap_ttl_policy: config.wrap_ttl_policy,
+            audit_store: config.audit_store,
         }
     }
 
@@ -380,12 +406,19 @@ impl RegistrarVerbs {
             token_ttl: source.token_ttl.to_string(),
             secret_id_ttl: source.secret_id_ttl.to_string(),
             wrap_ttl_policy: source.wrap_ttl_policy.clone(),
+            audit_store: source.audit_store.clone(),
         })
     }
 
     /// Returns a privileged client carrying a live token.
     async fn client(&self) -> Result<OpenBaoClient, VerbError> {
         self.client.live().await
+    }
+
+    /// Returns the audit record store this service was constructed
+    /// with.
+    pub(crate) fn audit_store(&self) -> &AuditRecordStore {
+        &self.audit_store
     }
 
     /// Mints — or idempotently re-mints — one service identity and

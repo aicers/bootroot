@@ -6,10 +6,11 @@ use reqwest::Url;
 
 use super::defaults::default_renew_before;
 use super::{
-    DaemonProfileSettings, HookCommand, OpenBaoSettings, RegistrarEndpointSettings, Settings,
-    TrustSettings,
+    DaemonProfileSettings, HookCommand, OpenBaoSettings, RegistrarEndpointSettings,
+    RegistrarSettings, Settings, TrustSettings,
 };
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
+use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
 
 /// Validates that `cert_duration` is strictly greater than the default
 /// daemon `renew_before` interval.
@@ -104,6 +105,43 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
         validate_openbao_settings(openbao)?;
     }
     validate_registrar_endpoint_settings(settings.registrar_endpoint)?;
+    validate_registrar_settings(&settings.registrar)?;
+    Ok(())
+}
+
+/// Rejects a `[registrar]` table that could not open a usable audit
+/// record store.
+///
+/// Refused here, at load time, rather than at the first append: an
+/// audit artifact whose directory turns out to be unusable after the
+/// registrar surface is already answering requests is a hole in the
+/// trail nobody notices until they go looking for a record that was
+/// never written.
+fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
+    if !settings.audit_record_dir.is_absolute() {
+        anyhow::bail!(
+            "registrar.audit_record_dir ({}) must be an absolute path; the daemon's working \
+             directory is not contracted to be stable under a service supervisor",
+            settings.audit_record_dir.display()
+        );
+    }
+    if settings.audit_max_file_bytes < MIN_AUDIT_MAX_FILE_BYTES {
+        anyhow::bail!(
+            "registrar.audit_max_file_bytes ({}) must be at least {MIN_AUDIT_MAX_FILE_BYTES}, \
+             which is what guarantees one maximum-size audit record fits in a freshly \
+             rotated file",
+            settings.audit_max_file_bytes
+        );
+    }
+    if settings.audit_max_retained_files == 0 {
+        anyhow::bail!(
+            "registrar.audit_max_retained_files must be greater than 0; retaining no rotated \
+             generation would discard the whole trail at every rotation"
+        );
+    }
+    if settings.audit_min_retain_days == 0 {
+        anyhow::bail!("registrar.audit_min_retain_days must be greater than 0");
+    }
     Ok(())
 }
 

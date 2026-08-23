@@ -679,6 +679,7 @@ fn issuance_settings(
         }],
         openbao: None,
         registrar_endpoint: config::RegistrarEndpointSettings::default(),
+        registrar: config::RegistrarSettings::default(),
     }
 }
 

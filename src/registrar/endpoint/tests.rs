@@ -57,6 +57,7 @@ use super::{
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::ReloadSpec;
+use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
@@ -882,6 +883,7 @@ fn verb_handler(server: &MockServer) -> (TempDir, Arc<dyn RegistrarRequestHandle
         token_ttl: "1h".to_string(),
         secret_id_ttl: "24h".to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
+        audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
     });
     (dir, Arc::new(VerbHandler { verbs }))
 }

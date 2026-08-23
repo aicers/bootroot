@@ -237,6 +237,7 @@ mod tests {
             profiles,
             openbao: None,
             registrar_endpoint: config::RegistrarEndpointSettings::default(),
+            registrar: config::RegistrarSettings::default(),
         }
     }
 

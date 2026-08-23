@@ -520,6 +520,7 @@ mod tests {
             profiles: Vec::new(),
             openbao: None,
             registrar_endpoint: crate::config::RegistrarEndpointSettings::default(),
+            registrar: crate::config::RegistrarSettings::default(),
         }
     }
 
