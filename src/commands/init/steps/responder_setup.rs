@@ -32,10 +32,14 @@ pub(super) async fn write_responder_files(
     tls_enabled: bool,
     messages: &Messages,
 ) -> Result<ResponderPaths> {
+    // Both directories are the sidecar's: it reads the template out of
+    // one and renders the config into the other, as the uid that owns
+    // the tree. A `0700` level a root-run `init` created under its own
+    // uid stops both, so each is created under the tree's owner.
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
-    fs_util::ensure_secrets_dir(&templates_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&templates_dir).await?;
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
-    fs_util::ensure_secrets_dir(&responder_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
 
     // Both files publish by rename at the policy's `0600`, applied to
     // the staged temporary — the config carries the responder HMAC, so
@@ -47,9 +51,13 @@ pub(super) async fn write_responder_files(
     // from the template, so a torn read matters; but both are rebuilt in
     // full by this function on the next `init`, so a crash that loses a
     // directory entry costs that re-run.
+    //
+    // Both carry the tree's owner rather than the writing process's:
+    // the sidecar that reads one and rewrites the other runs as that
+    // uid, and `0600` under a root-run `init` locks it out of both.
     let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
     let template = build_responder_template(kv_mount, tls_enabled);
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&template_path),
         template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -59,7 +67,7 @@ pub(super) async fn write_responder_files(
 
     let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
     let config = build_responder_config(hmac, tls_enabled);
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&config_path),
         config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -138,7 +146,7 @@ pub(super) async fn write_responder_compose_override(
         return Ok(None);
     }
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
-    fs_util::ensure_secrets_dir(&responder_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
     let override_path = responder_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
     let config_dir = config_path
         .parent()

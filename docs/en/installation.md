@@ -519,6 +519,14 @@ Reading commands that only report state need no privilege beyond access to what
 they read. This applies to the host serving the registrar endpoint; a host
 without it is unchanged and needs no root.
 
+The deployment itself is unaffected. step-ca, the HTTP-01 responder and the two
+`OpenBao` Agent sidecars keep running as the owner of the install tree, and a
+root-run `init` keeps publishing everything they read — their configuration,
+their `AppRole` credentials, the templates they render from and the directories
+holding those — under that owner rather than under `root`. Only the five files
+listed above change hands, and no existing installation has to be re-owned to
+enable the endpoint.
+
 `bootroot init` writes its config and its private CA bundle and neither starts it
 nor installs a supervisor for it, exactly as it does not for the service agents.
 Start it under the same supervisor you use for those:

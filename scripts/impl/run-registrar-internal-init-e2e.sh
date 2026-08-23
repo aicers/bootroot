@@ -530,6 +530,51 @@ PY
   pass "a login with no client certificate is refused (${status})"
 }
 
+# Everything the OpenBao Agent sidecars open still belongs to the tree
+# they run in, after a root-run `init` wrote all of it.
+#
+# They are the only containers `init` both configures and starts that
+# run as an ordinary uid: the generated override launches each one as
+# the owner of `secrets/`, which on this host is the invoking user and
+# not the root that ran `init`.  Their `agent.hcl`, their `AppRole`
+# pair, the `.ctmpl` files they render from and the `0700` directories
+# all of those sit in must therefore carry that owner rather than the
+# writing process's — a `0700` directory owned by root hides every file
+# inside it whatever the file itself is owned by.
+#
+# Asserted on the tree rather than on container state, because a
+# regression here is quiet from the outside: the containers still
+# start, `init` still succeeds, and the renewals the sidecars exist to
+# perform simply stop.
+assert_the_infra_agent_tree_belongs_to_its_sidecars() {
+  local owner probe path
+  probe="$(file_owner_mode "$SECRETS_DIR")"
+  owner="${probe%:*}"
+  for path in \
+    openbao \
+    openbao/stepca \
+    openbao/responder \
+    openbao/stepca/agent.hcl \
+    openbao/stepca/role_id \
+    openbao/stepca/secret_id \
+    openbao/responder/agent.hcl \
+    openbao/responder/role_id \
+    openbao/responder/secret_id \
+    templates \
+    templates/password.txt.ctmpl \
+    templates/ca.json.ctmpl \
+    templates/responder.toml.ctmpl \
+    responder \
+    responder/responder.toml \
+    password.txt; do
+    sudo -n test -e "$SECRETS_DIR/$path" || fail "missing: $SECRETS_DIR/$path"
+    probe="$(file_owner_mode "$SECRETS_DIR/$path")"
+    [ "${probe%:*}" = "$owner" ] ||
+      fail "${path} is owned by ${probe%:*}, not by the secrets tree (${owner}) the sidecars run as"
+  done
+  pass "the sidecars' configuration, credentials and templates belong to the secrets tree"
+}
+
 # The alias is why the ACME challenge above could resolve at all.
 # Asserted directly so a future change that drops it fails with the
 # reason rather than as an unexplained issuance timeout.
@@ -672,6 +717,7 @@ main() {
   assert_generated_config_is_the_internal_one
   assert_leaf_carries_the_fixed_san
   assert_the_responder_answers_to_the_internal_san
+  assert_the_infra_agent_tree_belongs_to_its_sidecars
 
   log_phase "assert-listener"
   assert_state_url_moved_to_https

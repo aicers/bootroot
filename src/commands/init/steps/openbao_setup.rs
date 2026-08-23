@@ -716,12 +716,17 @@ async fn write_openbao_agent_files(
     ca_cert: Option<&str>,
     messages: &Messages,
 ) -> Result<OpenBaoAgentPaths> {
+    // Each sidecar reads its whole configuration out of the directory
+    // named after it, running as the uid that owns the secrets tree —
+    // the value `write_openbao_agent_compose_override` puts in `user:`
+    // below. A `0700` level a root-run `init` created under its own uid
+    // is one neither can traverse, so all three carry the tree's owner.
     let base_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
-    fs_util::ensure_secrets_dir(&base_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&base_dir).await?;
     let stepca_dir = base_dir.join(OPENBAO_AGENT_STEPCA_DIR);
     let responder_dir = base_dir.join(OPENBAO_AGENT_RESPONDER_DIR);
-    fs_util::ensure_secrets_dir(&stepca_dir).await?;
-    fs_util::ensure_secrets_dir(&responder_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&stepca_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
 
     let stepca_role = find_role_output(role_outputs, AppRoleLabel::Stepca, messages)?;
     let responder_role = find_role_output(role_outputs, AppRoleLabel::Responder, messages)?;
@@ -793,8 +798,9 @@ async fn write_openbao_agent_files(
     // the flush: each sidecar reads its config at start and on restart,
     // so a torn read is a container that will not come up, but the file
     // is regenerated in full from `state.json` and the template paths on
-    // the next `init`.
-    fs_util::atomic_replace(
+    // the next `init`. Both carry the tree's owner, which is the uid
+    // the sidecar reading them runs as.
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&stepca_agent_config),
         stepca_config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -803,7 +809,7 @@ async fn write_openbao_agent_files(
     .with_context(|| {
         messages.error_write_file_failed(&stepca_agent_config.display().to_string())
     })?;
-    fs_util::atomic_replace(
+    fs_util::atomic_replace_dir_owner(
         fs_util::Destination::operator_named(&responder_agent_config),
         responder_config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
@@ -857,7 +863,7 @@ async fn write_openbao_agent_compose_override(
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
     let agent_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
-    fs_util::ensure_secrets_dir(&agent_dir).await?;
+    fs_util::ensure_shared_secrets_dir(&agent_dir).await?;
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let override_path = agent_dir.join(OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME);
@@ -920,11 +926,16 @@ services:
 }
 
 /// Publishes one `OpenBao` Agent `AppRole` credential by rename at
-/// `0600`, flushing the containing directory.
+/// `0600`, flushing the containing directory, under the owner of the
+/// directory it lands in.
 ///
-/// See the call site for why both decisions go this way.
+/// See the call site for why the first two decisions go this way. The
+/// third is the sidecar that logs in with this credential: it runs as
+/// the uid that owns the secrets tree, so a `0600` file a root-run
+/// `init` left under its own uid is one that sidecar cannot read — and
+/// an `AppRole` it cannot read is an agent that never authenticates.
 async fn write_agent_credential(path: &Path, value: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_write(
+    fs_util::atomic_write_dir_owner(
         fs_util::Destination::bootroot_owned(path),
         value.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
