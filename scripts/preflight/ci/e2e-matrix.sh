@@ -28,8 +28,14 @@ Runs the same Docker E2E matrix steps used in CI:
 12) the bootroot-internal credential's auth/cert contract against a live TLS OpenBao
 13) bootroot init on an endpoint-enabled loopback host, end to end
 
+Step 13 runs `bootroot init` as root through `sudo -n`, because an
+endpoint-enabled `init` publishes the bootroot-internal credential root-owned
+and refuses to publish it otherwise. Passwordless sudo is a prerequisite of
+this matrix; --skip-hosts does not stand in for it.
+
 Options:
-  --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
+  --skip-hosts  Skip hosts steps (they alone need write access to /etc/hosts;
+                step 13 still needs sudo -n)
   --fresh-secrets   Temporarily replace ./secrets with a clean directory and restore it on exit
 EOF
 }

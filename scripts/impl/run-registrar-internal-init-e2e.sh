@@ -612,7 +612,11 @@ capture_artifacts() {
   # Elevated, and re-owned to the invoking user afterwards: a root-owned
   # file left in the artifact directory outlives this run and the user
   # who has to read it cannot remove it.
-  if sudo -n test -f "$INTERNAL_DIR/agent.toml"; then
+  # Reached by the cleanup of a run that failed its prerequisites too,
+  # where sudo has already been established as unavailable; its
+  # complaint goes to the run log rather than on top of the refusal that
+  # already explained itself.
+  if sudo -n test -f "$INTERNAL_DIR/agent.toml" 2>>"$RUN_LOG"; then
     sudo -n cp "$INTERNAL_DIR/agent.toml" "$ARTIFACT_DIR/registrar-internal-agent.toml" &&
       sudo -n chown "$(id -u):$(id -g)" "$ARTIFACT_DIR/registrar-internal-agent.toml" || true
   fi
