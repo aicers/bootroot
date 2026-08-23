@@ -74,8 +74,8 @@ pub use client::{
     require_root_authority,
 };
 pub use material::{
-    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, load_material,
-    material_status, publish_material,
+    AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_set,
+    load_material, material_status, publish_material,
 };
 
 /// The fixed subdirectory, below the state-recorded secrets directory,

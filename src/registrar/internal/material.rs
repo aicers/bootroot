@@ -6,8 +6,9 @@
 //! to look as though it might.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::cert_group::CertGroupPolicy;
 use crate::fs_util::{self, Destination, KEY_FILE_MODE, StagedMode};
 use crate::registrar::internal::{
     ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CHAIN_FILE, InternalCredentialError,
@@ -227,6 +228,232 @@ pub async fn publish_material(
     )
     .await?;
     Ok(())
+}
+
+/// The directory a publication snapshots the prior set into.
+///
+/// A sibling of the published names, like the staging directory: the
+/// snapshot of a secret stays inside the directory whose permissions
+/// already protect it, and a restore is a rename within one filesystem.
+pub const PRIOR_DIR: &str = ".prior";
+
+/// What a publication found at one member of the set before it wrote
+/// over it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriorMember {
+    /// Nothing was there. A restore removes whatever the failed
+    /// publication managed to write, leaving the host as bare as it
+    /// found it.
+    Missing,
+    /// A regular file, whose bytes are in the snapshot directory.
+    Snapshotted,
+    /// Something that is not a regular file — a directory a broken host
+    /// left at a credential name. It cannot be copied, and it is not
+    /// this publication's to delete, so a restore leaves it exactly as
+    /// found.
+    Irregular,
+}
+
+/// The prior state of the six-file set, held while a publication
+/// replaces it.
+///
+/// Each of the six files publishes atomically on its own, but the *set*
+/// does not: a failure part-way through leaves some members replaced and
+/// the rest as they were, and a new key beside an old chain is a
+/// credential that still reads as complete and can no longer log in.
+/// That is exactly the state a re-run of `init` must not create, since
+/// its rollback deliberately leaves an already-provisioned directory
+/// alone rather than deleting the working credential it found.
+///
+/// So a publication captures the prior set first, writes, and on any
+/// failure puts back what it captured: every member that existed
+/// returns to its own bytes and its own mode, and every member that did
+/// not is removed again. Only a publication that completed discards the
+/// snapshot.
+pub struct SetSnapshot {
+    paths: InternalPaths,
+    prior: PathBuf,
+    members: Vec<(&'static str, PriorMember)>,
+}
+
+/// Captures the prior state of the whole set, before a publication
+/// begins replacing it.
+///
+/// Copies rather than moves: the published names keep their current
+/// contents until the publication overwrites them, so a concurrent
+/// reader never sees a member vanish.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Io`] when a stale snapshot cannot
+/// be cleared, when a member cannot be inspected or read, or when the
+/// snapshot cannot be written. A publication that cannot be undone does
+/// not start.
+pub async fn capture_set(paths: &InternalPaths) -> Result<SetSnapshot, InternalCredentialError> {
+    let prior = paths.dir().join(PRIOR_DIR);
+    if prior.exists() {
+        // A snapshot that survived is one an earlier run could not
+        // clear; the set beside it is the state to preserve now.
+        tokio::fs::remove_dir_all(&prior)
+            .await
+            .map_err(|source| InternalCredentialError::Io {
+                operation: "removing",
+                path: prior.clone(),
+                source,
+            })?;
+    }
+
+    let mut members = Vec::with_capacity(SET_FILES.len());
+    let mut prior_dir_ready = false;
+    for name in SET_FILES {
+        let path = paths.dir().join(name);
+        let state = match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                if !prior_dir_ready {
+                    fs_util::ensure_secrets_dir(&prior).await.map_err(|err| {
+                        InternalCredentialError::Io {
+                            operation: "creating",
+                            path: prior.clone(),
+                            source: std::io::Error::other(err.to_string()),
+                        }
+                    })?;
+                    prior_dir_ready = true;
+                }
+                let contents =
+                    tokio::fs::read(&path)
+                        .await
+                        .map_err(|source| InternalCredentialError::Io {
+                            operation: "reading",
+                            path: path.clone(),
+                            source,
+                        })?;
+                write_atomic(&prior.join(name), &contents).await?;
+                PriorMember::Snapshotted
+            }
+            Ok(_) => PriorMember::Irregular,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => PriorMember::Missing,
+            Err(source) => {
+                return Err(InternalCredentialError::Io {
+                    operation: "inspecting",
+                    path,
+                    source,
+                });
+            }
+        };
+        members.push((name, state));
+    }
+
+    Ok(SetSnapshot {
+        paths: paths.clone(),
+        prior,
+        members,
+    })
+}
+
+impl SetSnapshot {
+    /// The directory the captured bytes are held in, for a caller that
+    /// has to name it after a restore failed.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.prior
+    }
+
+    /// Puts the captured set back, member by member.
+    ///
+    /// Every member is attempted even after one fails, so a restore that
+    /// cannot repair one file still repairs the other five, and the
+    /// first failure is what it reports. The snapshot is kept on
+    /// failure — see [`SetSnapshot::discard`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`InternalCredentialError::Io`] a member's
+    /// restore produced.
+    pub async fn restore(&self) -> Result<(), InternalCredentialError> {
+        let mut first_error = None;
+        for (name, state) in &self.members {
+            let path = self.paths.dir().join(name);
+            let outcome = match state {
+                PriorMember::Snapshotted => self.restore_member(name, &path).await,
+                PriorMember::Missing => remove_if_present(&path).await,
+                PriorMember::Irregular => Ok(()),
+            };
+            if let Err(err) = outcome
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Removes the captured bytes.
+    ///
+    /// Called once the set is either published whole or restored whole —
+    /// never while the snapshot is still the only copy of the prior
+    /// credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InternalCredentialError::Io`] when the snapshot
+    /// directory cannot be removed.
+    pub async fn discard(self) -> Result<(), InternalCredentialError> {
+        if !self.prior.exists() {
+            return Ok(());
+        }
+        tokio::fs::remove_dir_all(&self.prior)
+            .await
+            .map_err(|source| InternalCredentialError::Io {
+                operation: "removing",
+                path: self.prior.clone(),
+                source,
+            })
+    }
+
+    /// Republishes one captured member through the same writer that
+    /// publishes it normally, so the restored file carries the mode the
+    /// layout gives it rather than the snapshot's.
+    async fn restore_member(&self, name: &str, path: &Path) -> Result<(), InternalCredentialError> {
+        let backup = self.prior.join(name);
+        if name == CA_BUNDLE_FILE {
+            let pem = tokio::fs::read_to_string(&backup).await.map_err(|source| {
+                InternalCredentialError::Io {
+                    operation: "reading",
+                    path: backup.clone(),
+                    source,
+                }
+            })?;
+            return fs_util::write_ca_bundle(path, &pem, CertGroupPolicy::none())
+                .await
+                .map_err(|err| InternalCredentialError::Io {
+                    operation: "writing",
+                    path: path.to_path_buf(),
+                    source: std::io::Error::other(err.to_string()),
+                });
+        }
+        let contents =
+            tokio::fs::read(&backup)
+                .await
+                .map_err(|source| InternalCredentialError::Io {
+                    operation: "reading",
+                    path: backup,
+                    source,
+                })?;
+        write_atomic(path, &contents).await
+    }
+}
+
+/// Removes a member a failed publication created where nothing was.
+async fn remove_if_present(path: &Path) -> Result<(), InternalCredentialError> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(InternalCredentialError::Io {
+            operation: "removing",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Publishes one internal file by rename at `0600`.

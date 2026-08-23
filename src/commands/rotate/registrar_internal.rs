@@ -215,7 +215,12 @@ pub(super) async fn repair_internal_credential(
     let context = repair_context(ctx, client).await?;
     let inputs = context.inputs();
 
-    converge_internal_auth(client, &inputs, messages).await?;
+    // A repair runs outside a rollback envelope, so the mount flag has
+    // nothing to undo by: an `auth/cert` backend a repair enables is
+    // left enabled, which is the state a working credential needs and
+    // the state the next repair converges on regardless.
+    let mut mounted_now = false;
+    converge_internal_auth(client, &inputs, messages, &mut mounted_now).await?;
     // The publication carries `trust`, not the active generation the
     // issuance staged: the Phase-4 tail replaces the credential while
     // the fleet is still on the additive set, and a repair mid-rotation

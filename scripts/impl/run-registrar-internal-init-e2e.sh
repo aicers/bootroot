@@ -380,6 +380,13 @@ assert_material_is_complete_and_restrictive() {
   [ ! -d "$INTERNAL_DIR/.staging" ] ||
     fail "the staging directory survived a successful publication"
   pass "the staging directory was swept"
+
+  # The prior-set snapshot the publication holds the old credential in.
+  # A completed publication discards it; one that survives means the
+  # publication (or the restore after it) did not finish.
+  [ ! -d "$INTERNAL_DIR/.prior" ] ||
+    fail "the prior-set snapshot survived a successful publication"
+  pass "the prior-set snapshot was discarded"
 }
 
 assert_generated_config_is_the_internal_one() {

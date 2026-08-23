@@ -95,6 +95,17 @@ half-usable credential. Every secret file is published by writing a temporary in
 the same directory at `0600` and renaming it into place, so none of them is ever
 observable at its final path under a wider mode.
 
+Each file publishes atomically, but so does the **set**. A publication over a
+host that already carries a credential first copies every existing member into a
+`registrar-internal/.prior` snapshot, and puts the whole set back if any member
+fails to publish — otherwise a failure part-way through would leave a new key
+beside the previous chain, which still reads as complete and can no longer log
+in. Members that were not there before are removed again instead, which is the
+bare host a first provisioning started from. The snapshot is discarded once the
+set is settled either way; a snapshot that outlives a crash is cleared by the
+next publication before it captures, so a restore can never reinstate bytes from
+an older run.
+
 The bundle is **this identity's alone**. It is never the shared
 `secrets/certs/ca-bundle.pem` and never a KV-rendered service bundle, which is
 what lets a rotation narrow this identity's trust without touching anything a
@@ -217,7 +228,8 @@ inside its existing rollback transaction:
 6. Reconnect through that recorded URL and prove `auth/cert/login` succeeds with
    the staged material.
 7. Only then publish the private bundle, the four credential files and the
-   dedicated config.
+   dedicated config — as one set, over a snapshot of whatever was there, so a
+   failure mid-publication leaves the previous credential intact.
 
 The alias is part of the shared set `state.json` drives, not a one-off: `infra
 up` replays it and `service remove` reconciles it, so a responder restart or an
@@ -232,12 +244,22 @@ never a fixed `:9000`/`:8080`. On a host that moved those ports a fixed value
 reaches nothing; on a host co-located with a second instance it reaches that
 instance.
 
-Every artifact is registered for undo **before** it is created. A failure at any
-point restores the prior listener, the prior state URL and the `OpenBao`
-artifacts this run created, and removes the layout directory whole — staging
-included. There is no half-provisioned credential and no TLS-upgraded state URL
-after a rollback. An `auth/cert` mount the deployment already had is left alone;
-only a mount this run enabled is disabled again.
+Every artifact is registered for undo **before** it is created — the `auth/cert`
+mount the moment it is enabled, which is before the policy and the entry are
+written over it. A failure at any point restores the prior listener, the prior
+state URL and the `OpenBao` artifacts this run created, and removes the layout
+directory whole — staging included. There is no half-provisioned credential and
+no TLS-upgraded state URL after a rollback. An `auth/cert` mount the deployment
+already had is left alone; only a mount this run enabled is disabled again.
+
+What a run found is not a run's to undo, so ownership is decided by a lookup
+that answered. A read that fails — a transient error against the entry or the
+policy — fails the run before anything is created, rather than being read as
+"absent" and registering the deletion of an artifact the deployment already
+depends on. For the same reason a re-run over an already-provisioned host
+registers neither the entry, nor the policy, nor the layout directory it found:
+its rollback sweeps only its own staging directory, and its publication restores
+the credential from the snapshot above.
 
 ## 7. The generated config, and starting its daemon
 

@@ -33,9 +33,9 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalAgentConfigParams, InternalCredential,
-    InternalMaterial, InternalPaths, MaterialStatus, PrivateKeyPem,
-    build_registrar_internal_policy, internal_registration_id, material_status, publish_material,
-    render_internal_agent_config,
+    InternalMaterial, InternalPaths, MaterialStatus, PrivateKeyPem, SetSnapshot,
+    build_registrar_internal_policy, capture_set, internal_registration_id, material_status,
+    publish_material, render_internal_agent_config,
 };
 use bootroot::registrar::registrar_internal_identity;
 use bootroot::{cert_group, config, fs_util};
@@ -256,34 +256,56 @@ pub(super) async fn provision_internal_auth(
     // already-provisioned host must not have its rollback delete the
     // working entry and policy it found, which is the one way this
     // teardown could take a healthy deployment down.
-    if client
+    //
+    // Which is why neither lookup may be read as "absent" when it did
+    // not answer. A transient read failure against a host that already
+    // carries the entry would register a deletion for it, and a later
+    // failure anywhere in the run would then take that host down.
+    // Only a definitive not-found registers a destructive undo, so a
+    // lookup that fails fails the run instead — before anything has
+    // been created.
+    let existing_entry = client
         .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
         .await
-        .unwrap_or(None)
-        .is_none()
-    {
+        .context("reading the bootroot-registrar-internal cert auth entry")?;
+    if existing_entry.is_none() {
         rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string());
     }
     if !client
         .policy_exists(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
         .await
-        .unwrap_or(false)
+        .context("reading the bootroot-registrar-internal policy")?
     {
         rollback
             .created_policies
             .push(POLICY_BOOTROOT_REGISTRAR_INTERNAL.to_string());
     }
-    let mounted_now = converge_internal_auth(client, inputs, messages).await?;
-    rollback.registrar_internal_cert_auth_mount_created = mounted_now;
-    Ok(())
+    // The mount registers itself the moment it exists, from inside
+    // `converge_internal_auth`: the policy and the entry are written
+    // after it, and a failure at either would otherwise leave a backend
+    // this run enabled with nothing recorded to disable it.
+    converge_internal_auth(
+        client,
+        inputs,
+        messages,
+        &mut rollback.registrar_internal_cert_auth_mount_created,
+    )
+    .await
 }
 
 /// Converges the `auth/cert` mount, the exact-allowlist policy and the
-/// one trusted entry, and reports whether this call mounted the backend.
+/// one trusted entry.
 ///
 /// Shared by `init`'s provisioning and by the rotation and recovery
 /// repairs, so the entry the three write cannot drift: one root, one
 /// SAN, one policy.
+///
+/// `mounted_now` is set — never cleared — as soon as this call is what
+/// enabled the backend, which is before the policy and the entry are
+/// written. A caller inside a rollback envelope passes the flag it will
+/// undo by, so a failure at either write still disables a backend this
+/// run created; a caller outside one passes a local flag and reads it,
+/// or ignores it, itself.
 ///
 /// # Errors
 ///
@@ -293,12 +315,16 @@ pub(crate) async fn converge_internal_auth(
     client: &OpenBaoClient,
     inputs: &RegistrarInternalInputs<'_>,
     messages: &Messages,
-) -> Result<bool> {
+    mounted_now: &mut bool,
+) -> Result<()> {
     let root_pem = read_root_ca_pem(inputs.secrets_dir, messages).await?;
-    let mounted_now = client
+    if client
         .ensure_cert_auth(CERT_AUTH_MOUNT)
         .await
-        .context("enabling the OpenBao cert auth backend")?;
+        .context("enabling the OpenBao cert auth backend")?
+    {
+        *mounted_now = true;
+    }
     client
         .write_policy(
             POLICY_BOOTROOT_REGISTRAR_INTERNAL,
@@ -318,7 +344,7 @@ pub(crate) async fn converge_internal_auth(
         )
         .await
         .context("creating the bootroot-registrar-internal cert auth entry")?;
-    Ok(mounted_now)
+    Ok(())
 }
 
 /// Issues the internal leaf and its persistent ACME account key into the
@@ -458,10 +484,72 @@ pub(crate) async fn verify_internal_login(
 /// Publishes the private bundle, the four credential files and the
 /// dedicated config, then removes the staging copies.
 ///
+/// The six files publish atomically one by one, but the set does not: a
+/// failure part-way through would leave a re-run's new key beside the
+/// previous chain, which still reads as a complete set and can no longer
+/// log in. `init`'s rollback cannot repair that either — it deliberately
+/// leaves an already-provisioned directory alone rather than deleting
+/// the working credential it found. So the prior set is captured first
+/// and put back on any failure, and the snapshot is discarded only once
+/// the publication has completed.
+///
 /// # Errors
 ///
-/// Returns an error when any file cannot be published.
+/// Returns an error when the prior set cannot be captured or when any
+/// file cannot be published. In the latter case the prior set has been
+/// restored, or the failure to restore it is reported beside the
+/// failure that caused it.
 pub(crate) async fn publish_internal_set(
+    staged: &StagedInternal,
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+) -> Result<()> {
+    let snapshot = capture_set(&staged.paths)
+        .await
+        .context("capturing the bootroot-internal set the publication replaces")?;
+    if let Err(err) = publish_internal_files(staged, inputs, messages).await {
+        if let Err(restore_err) = snapshot.restore().await {
+            eprintln!(
+                "Warning: the bootroot-internal set could not be fully restored after a \
+                 failed publication: {restore_err}; the previous files are kept at {}",
+                snapshot.dir().display()
+            );
+            return Err(err);
+        }
+        discard_snapshot(snapshot).await;
+        return Err(err);
+    }
+    discard_snapshot(snapshot).await;
+
+    // The staging copies are the only thing left that holds the key at a
+    // second path; remove them once the published set is complete.
+    if let Err(err) = tokio::fs::remove_dir_all(&staged.staging).await {
+        eprintln!(
+            "Warning: failed to remove the staging directory {}: {err}",
+            staged.staging.display()
+        );
+    }
+    Ok(())
+}
+
+/// Drops a snapshot whose set is settled — published whole, or restored
+/// whole.
+///
+/// Best effort: the bytes it holds are a copy of what is now on disk, so
+/// a directory that survives costs an operator a stale copy rather than
+/// the credential, and the error it would raise would displace the one
+/// that matters.
+async fn discard_snapshot(snapshot: SetSnapshot) {
+    if let Err(err) = snapshot.discard().await {
+        eprintln!("Warning: {err}");
+    }
+}
+
+/// Writes the six files, in layout order, with no undo of its own.
+///
+/// Split out so that [`publish_internal_set`] can hold the prior set
+/// around the whole sequence rather than around each file.
+async fn publish_internal_files(
     staged: &StagedInternal,
     inputs: &RegistrarInternalInputs<'_>,
     messages: &Messages,
@@ -501,15 +589,6 @@ pub(crate) async fn publish_internal_set(
     .with_context(|| {
         messages.error_write_file_failed(&staged.paths.agent_config().display().to_string())
     })?;
-
-    // The staging copies are the only thing left that holds the key at a
-    // second path; remove them once the published set is complete.
-    if let Err(err) = tokio::fs::remove_dir_all(&staged.staging).await {
-        eprintln!(
-            "Warning: failed to remove the staging directory {}: {err}",
-            staged.staging.display()
-        );
-    }
     Ok(())
 }
 
@@ -763,9 +842,286 @@ mod tests {
 }
 
 #[cfg(test)]
+mod auth_provisioning_tests {
+    use bootroot::openbao::OpenBaoClient;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{RegistrarInternalContext, RegistrarInternalIntent, provision_internal_auth};
+    use crate::commands::init::steps::InitRollback;
+    use crate::commands::init::{CA_CERTS_DIR, CA_ROOT_CERT_FILENAME};
+    use crate::i18n::test_messages;
+
+    const ENTRY_PATH: &str = "/v1/auth/cert/certs/bootroot-registrar-internal";
+    const POLICY_PATH: &str = "/v1/sys/policies/acl/bootroot-registrar-internal";
+
+    /// A secrets directory carrying the deployment root the entry
+    /// trusts, which `converge_internal_auth` reads before it mounts
+    /// anything.
+    fn secrets_dir() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        let certs = dir.path().join(CA_CERTS_DIR);
+        std::fs::create_dir_all(&certs).expect("certs dir");
+        std::fs::write(
+            certs.join(CA_ROOT_CERT_FILENAME),
+            "-----BEGIN CERTIFICATE-----\nUk9PVA\n-----END CERTIFICATE-----\n",
+        )
+        .expect("root CA");
+        dir
+    }
+
+    fn context(dir: &std::path::Path) -> RegistrarInternalContext {
+        RegistrarInternalContext {
+            intent: RegistrarInternalIntent {
+                domain: "example.internal".to_string(),
+                host: "bootroot-01".to_string(),
+            },
+            secrets_dir: dir.to_path_buf(),
+            kv_mount: "secret".to_string(),
+            acme_server: "https://localhost:9000/acme/acme/directory".to_string(),
+            email: "ops@example.internal".to_string(),
+            responder_url: "http://127.0.0.1:8080".to_string(),
+            responder_hmac: "hmac".to_string(),
+            eab: None,
+        }
+    }
+
+    fn client(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        client
+    }
+
+    /// The mount is registered the moment it exists, not once the whole
+    /// convergence has returned. The policy write is the first thing
+    /// after it, and a failure there used to leave an `auth/cert`
+    /// backend this run enabled with nothing recorded to disable it —
+    /// `OpenBao` altered after a failed `init`.
+    #[tokio::test]
+    async fn a_mount_this_run_enabled_is_registered_before_the_policy_write() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .mount(&server)
+            .await;
+
+        let dir = secrets_dir();
+        let context = context(dir.path());
+        let mut rollback = InitRollback::default();
+        let err = provision_internal_auth(
+            &client(&server),
+            &context.inputs(),
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect_err("a failing policy write must fail the run");
+        assert!(format!("{err:#}").contains("policy"), "{err:#}");
+
+        assert!(
+            rollback.registrar_internal_cert_auth_mount_created,
+            "a backend this run enabled must be registered for teardown even when the \
+             writes after it fail"
+        );
+        assert_eq!(
+            rollback.registrar_internal_cert_auth_entry.as_deref(),
+            Some("bootroot-registrar-internal")
+        );
+        assert!(
+            rollback
+                .created_policies
+                .iter()
+                .any(|name| name == "bootroot-registrar-internal")
+        );
+    }
+
+    /// A lookup that did not answer is not an absent artifact. Reading
+    /// it as one on a host that already carries the entry would register
+    /// a deletion for it, and any later failure in the run would then
+    /// take the credential down. The run fails instead — before
+    /// anything has been created, and with nothing registered to
+    /// destroy.
+    #[tokio::test]
+    async fn an_entry_lookup_failure_registers_no_destructive_undo() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "name": "bootroot-registrar-internal" }
+            })))
+            .mount(&server)
+            .await;
+        // A run that cannot tell what is already there does not start
+        // mounting either.
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = secrets_dir();
+        let context = context(dir.path());
+        let mut rollback = InitRollback::default();
+        let err = provision_internal_auth(
+            &client(&server),
+            &context.inputs(),
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect_err("a lookup failure must fail the run");
+        assert!(
+            format!("{err:#}").contains("cert auth entry"),
+            "the refusal must name what could not be read: {err:#}"
+        );
+        assert_eq!(rollback.registrar_internal_cert_auth_entry, None);
+        assert!(rollback.created_policies.is_empty());
+        assert!(!rollback.registrar_internal_cert_auth_mount_created);
+    }
+
+    /// The same rule one lookup later: a policy read that did not answer
+    /// registers no deletion for a policy the deployment may already
+    /// carry. The entry lookup before it answered a definitive
+    /// not-found, so its undo stands — deleting an entry that was never
+    /// created is a no-op, and the entry is what a later stage would
+    /// have created.
+    #[tokio::test]
+    async fn a_policy_lookup_failure_registers_no_policy_undo() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = secrets_dir();
+        let context = context(dir.path());
+        let mut rollback = InitRollback::default();
+        let err = provision_internal_auth(
+            &client(&server),
+            &context.inputs(),
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect_err("a lookup failure must fail the run");
+        assert!(
+            format!("{err:#}").contains("policy"),
+            "the refusal must name what could not be read: {err:#}"
+        );
+        assert!(rollback.created_policies.is_empty());
+        assert!(!rollback.registrar_internal_cert_auth_mount_created);
+    }
+
+    /// A re-run over a host that already carries the entry, the policy
+    /// and the mount registers none of the three: rollback restores the
+    /// prior state, and the prior state is a working credential.
+    #[tokio::test]
+    async fn a_re_run_registers_none_of_the_artifacts_it_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "display_name": "bootroot-registrar-internal" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "name": "bootroot-registrar-internal" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "cert/": { "type": "cert" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let dir = secrets_dir();
+        let context = context(dir.path());
+        let mut rollback = InitRollback::default();
+        provision_internal_auth(
+            &client(&server),
+            &context.inputs(),
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect("converging what is already there must succeed");
+
+        assert_eq!(rollback.registrar_internal_cert_auth_entry, None);
+        assert!(rollback.created_policies.is_empty());
+        assert!(!rollback.registrar_internal_cert_auth_mount_created);
+    }
+}
+
+#[cfg(test)]
 mod publication_tests {
+    use bootroot::registrar::internal::material::PRIOR_DIR;
     use bootroot::registrar::internal::{
         AcmeAccountKey, InternalMaterial, InternalPaths, PrivateKeyPem, load_material,
+        publish_material,
     };
     use tempfile::TempDir;
 
@@ -818,6 +1174,30 @@ mod publication_tests {
         }
     }
 
+    /// A host that already carries a complete set, under bytes no
+    /// publication below writes, so a member left on its prior contents
+    /// is distinguishable from one that was rewritten.
+    async fn provisioned_host(paths: &InternalPaths) {
+        publish_material(
+            paths,
+            &InternalMaterial {
+                key: PrivateKeyPem::new(
+                    "-----BEGIN PRIVATE KEY-----\nUFJJT1I\n-----END PRIVATE KEY-----\n".to_string(),
+                ),
+                chain: bundle("UFJJT1JMRUFG"),
+                acme_account: AcmeAccountKey::new(
+                    "{\"account_key_pkcs8\":\"UFJJT1I\"}".to_string(),
+                ),
+                root_fingerprint: OLD_ROOT.to_string(),
+            },
+        )
+        .await
+        .expect("the prior material");
+        std::fs::write(paths.ca_bundle(), bundle("UFJJT1JCVU5ETEU")).expect("the prior bundle");
+        std::fs::write(paths.agent_config(), "email = \"prior@example.internal\"\n")
+            .expect("the prior config");
+    }
+
     /// `init` publishes the active generation: the bundle and the pins
     /// are what the issuance staged.
     #[tokio::test]
@@ -842,6 +1222,75 @@ mod publication_tests {
         );
         let material = load_material(&paths).expect("the published set must load");
         assert_eq!(material.root_fingerprint, ACTIVE_ROOT);
+        assert!(
+            !paths.dir().join(PRIOR_DIR).exists(),
+            "a completed publication discards its snapshot"
+        );
+    }
+
+    /// The six files publish one at a time, so a failure part-way
+    /// through an already-provisioned host would otherwise leave a new
+    /// key beside the previous chain — a set that still reads as
+    /// complete and can no longer log in — and `init`'s rollback would
+    /// not repair it, because a re-run deliberately does not register
+    /// the credential it found for teardown.
+    ///
+    /// One case per published member, each failing at that member: a
+    /// directory at a credential name is something no rename can
+    /// replace. What survives is what the run started with.
+    #[tokio::test]
+    async fn a_failed_publication_restores_the_set_it_found() {
+        for member in [
+            "ca-bundle.pem",
+            "key.pem",
+            "chain.pem",
+            "acme-account.json",
+            "root-fingerprint",
+            "agent.toml",
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            let paths = InternalPaths::new(dir.path());
+            provisioned_host(&paths).await;
+            let failing = paths.dir().join(member);
+            let untouched: Vec<(std::path::PathBuf, String)> = paths
+                .all()
+                .into_iter()
+                .filter(|path| path != &failing)
+                .map(|path| {
+                    let contents = std::fs::read_to_string(&path).expect("prior member");
+                    (path, contents)
+                })
+                .collect();
+            std::fs::remove_file(&failing).expect("remove the member");
+            std::fs::create_dir_all(failing.join("nested")).expect("a directory at the member");
+
+            let context = context(dir.path());
+            let staged = staged(dir.path());
+            let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
+                .await
+                .expect_err("a member that cannot be written must fail the publication");
+            assert!(
+                err.to_string().contains(member) || format!("{err:#}").contains(member),
+                "the failure must name the member it could not publish: {err:#}"
+            );
+
+            for (path, contents) in untouched {
+                assert_eq!(
+                    std::fs::read_to_string(&path).expect("member after the failure"),
+                    contents,
+                    "publishing over {member} must leave {} on its prior bytes",
+                    path.display()
+                );
+            }
+            assert!(
+                failing.join("nested").is_dir(),
+                "the restore must not delete what it could not capture"
+            );
+            assert!(
+                !paths.dir().join(PRIOR_DIR).exists(),
+                "a completed restore discards its snapshot"
+            );
+        }
     }
 
     /// A repair overrides the trust set before publishing, so the

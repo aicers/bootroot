@@ -577,6 +577,153 @@ fn toml_settings(rendered: &str) -> crate::config::Settings {
     crate::config::Settings::from_file(Some(path)).expect("the rendered config must deserialize")
 }
 
+/// The prior-set snapshot a publication is held to: what it captures,
+/// what it puts back, and what it refuses to touch.
+mod snapshot {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::{account_json, chain_pem, key_pem, mode_of, provisioned_host};
+    use crate::cert_group::CA_BUNDLE_FILE_MODE;
+    use crate::fs_util::KEY_FILE_MODE;
+    use crate::registrar::internal::material::{PRIOR_DIR, capture_set};
+    use crate::registrar::internal::{InternalPaths, MaterialStatus, material_status};
+
+    /// The failure the snapshot exists for: a publication over an
+    /// already-provisioned host that dies part-way through. Every member
+    /// goes back to its own bytes — not just the ones the failure
+    /// reached — and each goes back at the mode the layout gives it,
+    /// which is what a restore that merely copied the backup would lose.
+    #[tokio::test]
+    async fn a_restore_puts_every_member_back_at_its_own_mode() {
+        let (dir, paths) = provisioned_host().await;
+        let config_before = std::fs::read_to_string(paths.agent_config()).expect("config");
+        let snapshot = capture_set(&paths).await.expect("capture");
+
+        // A publication that replaced the bundle and the key and then
+        // failed on the chain.
+        std::fs::write(paths.ca_bundle(), "NEW BUNDLE").expect("new bundle");
+        std::fs::write(paths.key(), "NEW KEY").expect("new key");
+        std::fs::set_permissions(paths.key(), std::fs::Permissions::from_mode(0o644))
+            .expect("widen the new key");
+
+        snapshot.restore().await.expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.key()).expect("key"),
+            key_pem()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.chain()).expect("chain"),
+            chain_pem()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.acme_account()).expect("account"),
+            account_json()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.ca_bundle()).expect("bundle"),
+            chain_pem()
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.agent_config()).expect("config"),
+            config_before
+        );
+        assert_eq!(mode_of(&paths.key()), KEY_FILE_MODE);
+        assert_eq!(mode_of(&paths.acme_account()), KEY_FILE_MODE);
+        assert_eq!(mode_of(&paths.agent_config()), KEY_FILE_MODE);
+        assert_eq!(mode_of(&paths.ca_bundle()), CA_BUNDLE_FILE_MODE);
+
+        snapshot.discard().await.expect("discard");
+        assert!(!paths.dir().join(PRIOR_DIR).exists());
+        drop(dir);
+    }
+
+    /// A first provisioning has nothing to put back, so a restore takes
+    /// the host back to bare rather than leaving the half-set the failed
+    /// publication wrote. That is the same end state `init`'s rollback
+    /// reaches by removing the layout directory it registered.
+    #[tokio::test]
+    async fn a_restore_removes_members_that_were_not_there_before() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(paths.dir()).expect("layout dir");
+        let snapshot = capture_set(&paths).await.expect("capture");
+
+        std::fs::write(paths.ca_bundle(), "NEW BUNDLE").expect("new bundle");
+        std::fs::write(paths.key(), "NEW KEY").expect("new key");
+
+        snapshot.restore().await.expect("restore");
+        assert_eq!(material_status(&paths), MaterialStatus::Absent);
+    }
+
+    /// A member that is not a regular file cannot be copied, and it is
+    /// not the publication's to delete: it belongs to whatever left it
+    /// there. The restore repairs the five members around it and reports
+    /// success, so the publication failure — not a restore failure — is
+    /// what reaches the operator.
+    #[tokio::test]
+    async fn an_irregular_member_is_left_exactly_as_found() {
+        let (_dir, paths) = provisioned_host().await;
+        std::fs::remove_file(paths.chain()).expect("remove the chain");
+        std::fs::create_dir_all(paths.chain().join("nested")).expect("a directory at the chain");
+
+        let snapshot = capture_set(&paths).await.expect("capture");
+        std::fs::write(paths.key(), "NEW KEY").expect("new key");
+        snapshot.restore().await.expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(paths.key()).expect("key"),
+            key_pem()
+        );
+        assert!(
+            paths.chain().join("nested").is_dir(),
+            "the restore must not delete what it could not capture"
+        );
+    }
+
+    /// A snapshot that survived a crash is not the prior state any
+    /// longer — the set beside it is. Capturing clears it first, so a
+    /// restore can never put back bytes from a run that ended long ago.
+    #[tokio::test]
+    async fn a_stale_snapshot_is_cleared_before_the_next_capture() {
+        let (_dir, paths) = provisioned_host().await;
+        let prior = paths.dir().join(PRIOR_DIR);
+        std::fs::create_dir_all(&prior).expect("stale snapshot");
+        std::fs::write(prior.join("key.pem"), "ANCIENT KEY").expect("stale key");
+
+        let snapshot = capture_set(&paths).await.expect("capture");
+        assert_eq!(
+            std::fs::read_to_string(prior.join("key.pem")).expect("captured key"),
+            key_pem()
+        );
+
+        std::fs::write(paths.key(), "NEW KEY").expect("new key");
+        snapshot.restore().await.expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(paths.key()).expect("key"),
+            key_pem()
+        );
+    }
+
+    /// The captured bytes are a copy of the credential, so they are held
+    /// at the credential's own mode and inside the directory whose
+    /// permissions already protect it.
+    #[tokio::test]
+    async fn the_capture_holds_the_secrets_at_0600_beside_the_credential() {
+        let (_dir, paths) = provisioned_host().await;
+        let snapshot = capture_set(&paths).await.expect("capture");
+        let prior = paths.dir().join(PRIOR_DIR);
+        assert_eq!(snapshot.dir(), prior);
+        assert_eq!(mode_of(&prior.join("key.pem")), KEY_FILE_MODE);
+        assert_eq!(mode_of(&prior.join("acme-account.json")), KEY_FILE_MODE);
+        // The layout status is unchanged by a capture: the snapshot
+        // directory is not one of the six names.
+        assert_eq!(material_status(&paths), MaterialStatus::Present);
+    }
+}
+
 /// Certificate-login behaviour: one login per lease window, a fresh one
 /// once the cache is dropped, and no `role_id`/`secret_id` anywhere.
 mod login {
