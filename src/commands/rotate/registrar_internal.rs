@@ -51,6 +51,7 @@ use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, compute_ca_bundle_pem,
     read_ca_cert_fingerprint,
 };
+use crate::commands::trust::RotationMode;
 use crate::i18n::Messages;
 
 /// The trust set the internal bundle and the internal config's pins must
@@ -78,6 +79,20 @@ pub(super) fn internal_credential_present(secrets_dir: &Path) -> bool {
         material_status(&InternalPaths::new(secrets_dir)),
         MaterialStatus::Absent
     )
+}
+
+/// Reports whether a rotation in `mode` has internal work to do on this
+/// host.
+///
+/// The gate every internal rotation call site is written behind, so the
+/// two halves of the condition are stated once. An intermediate-only
+/// rotation is excluded whatever the host carries: the `auth/cert` entry
+/// trusts the *root*, which that rotation does not replace, so the
+/// entry, the leaf, the config and the bundle are all still correct and
+/// rewriting them would be a change to artifacts the rotation is
+/// specified to leave alone.
+pub(super) fn internal_rotation_applies(mode: &RotationMode, secrets_dir: &Path) -> bool {
+    *mode == RotationMode::Full && internal_credential_present(secrets_dir)
 }
 
 /// Publishes a trust set into the dedicated bundle and the internal
@@ -533,8 +548,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        InternalPaths, InternalTrustState, ensure_internal_trust_is, internal_credential_present,
-        repair_internal_credential, staging_dir, sweep_staging, write_internal_trust,
+        InternalPaths, InternalTrustState, RotationMode, ensure_internal_trust_is,
+        internal_credential_present, internal_rotation_applies, repair_internal_credential,
+        staging_dir, sweep_staging, write_internal_trust,
     };
     use crate::i18n::test_messages;
 
@@ -599,6 +615,42 @@ mod tests {
         // rather than silently skipping the host.
         std::fs::remove_file(paths.key()).expect("remove");
         assert!(internal_credential_present(dir.path()));
+    }
+
+    /// An intermediate-only rotation leaves every internal artifact
+    /// alone, on a provisioned host as much as on a bare one.
+    ///
+    /// The `auth/cert` entry trusts the *root*, and an intermediate-only
+    /// rotation does not replace it — so the entry, the leaf, the stored
+    /// fingerprint, the config's pins and the private bundle are all
+    /// still correct. Phase 3, the Phase-4 tail and Phase 6 are each
+    /// written behind this predicate, so a host that carries a working
+    /// credential must still select no internal work in that mode.
+    #[tokio::test]
+    async fn an_intermediate_only_rotation_selects_no_internal_work() {
+        let (dir, _paths) = provisioned_host().await;
+        assert!(
+            internal_credential_present(dir.path()),
+            "the fixture must be a provisioned host, or this proves nothing"
+        );
+
+        assert!(
+            !internal_rotation_applies(&RotationMode::IntermediateOnly, dir.path()),
+            "an intermediate-only rotation must not touch internal artifacts"
+        );
+        assert!(
+            internal_rotation_applies(&RotationMode::Full, dir.path()),
+            "a full rotation on a provisioned host must select the internal work"
+        );
+
+        // The other half of the gate: a full rotation on an ordinary
+        // host still selects nothing.
+        let bare = TempDir::new().expect("tempdir");
+        assert!(!internal_rotation_applies(&RotationMode::Full, bare.path()));
+        assert!(!internal_rotation_applies(
+            &RotationMode::IntermediateOnly,
+            bare.path()
+        ));
     }
 
     /// Phase 3 publishes the additive set into the private bundle and

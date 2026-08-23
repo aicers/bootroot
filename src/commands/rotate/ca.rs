@@ -239,9 +239,7 @@ pub(super) async fn rotate_ca_key(
         // does not replace, so nothing internal changes there. The
         // bundle and the config's pins take exactly the additive set
         // published to KV above, then the internal agent is reloaded.
-        if rot_state.mode == RotationMode::Full
-            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
-        {
+        if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
             registrar_internal::publish_internal_trust(
                 ctx.paths.secrets_dir(),
                 &registrar_internal::InternalTrustState {
@@ -272,9 +270,7 @@ pub(super) async fn rotate_ca_key(
         // *before* Phase 4 is recorded, so a failure retains the
         // pre-Phase-4 state and a resume repeats the restart and the
         // repair together.
-        if rot_state.mode == RotationMode::Full
-            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
-        {
+        if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
             println!("{}", messages.rotate_ca_key_registrar_internal_repair());
             let transitional_fps = transitional_fingerprints(&rot_state);
             registrar_internal::ensure_internal_trust_is(
@@ -411,9 +407,7 @@ pub(super) async fn rotate_ca_key(
         // set, so there is nothing here for it to narrow, and rewriting
         // the bundle would be a change to artifacts that rotation is
         // specified to leave alone.
-        if rot_state.mode == RotationMode::Full
-            && registrar_internal::internal_credential_present(ctx.paths.secrets_dir())
-        {
+        if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
             registrar_internal::publish_internal_trust(
                 ctx.paths.secrets_dir(),
                 &registrar_internal::InternalTrustState {
