@@ -44,6 +44,7 @@ use super::{
     RegistrarVerbsConfig, granted_deadline,
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions, WrapInfo};
+use crate::registrar::audit::{AuditRecordStore, AuditStoreSettings, MIN_AUDIT_MAX_FILE_BYTES};
 use crate::registrar::config::{
     Multiplicity, RegistrarConfig, RegistrationSpec, ReloadKind, ReloadSpec,
 };
@@ -143,6 +144,10 @@ fn verbs_with(client: OpenBaoClient, kv_mount: &str, config: RegistrarConfig) ->
         token_ttl: TOKEN_TTL.to_string(),
         secret_id_ttl: SECRET_ID_TTL.to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
+        // Every fixture gets its own throwaway store, so a test can
+        // assert nothing was written without another test's records
+        // showing up in it.
+        audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
     })
 }
 
@@ -186,6 +191,115 @@ fn assert_envelope(refusal: &VerbRefusal, arm: ProducingArm) {
 // ---------------------------------------------------------------------
 // Fast tier: pre-derivation control flow
 // ---------------------------------------------------------------------
+
+/// The verb layer holds the audit record store as a fixed construction
+/// dependency, and **no** verb arm writes to it.
+///
+/// Both halves matter. The dependency has to be here already, so the
+/// sibling issue that writes intent and outcome records can add its call
+/// sites without another visibility or wiring change; and nothing may be
+/// written yet, because that sibling owns the ordering of those writes
+/// around the `OpenBao` work and a stray append here would decide it.
+///
+/// Driven over every refusal arm that reaches a decision without
+/// `OpenBao`, so a call site added to any of them would show up as a
+/// record in a store that must stay empty.
+#[tokio::test]
+async fn the_verbs_hold_an_audit_store_and_write_nothing_to_it() {
+    let audit_root = tempfile::tempdir().expect("tempdir");
+    // The store audits its immediate parent, which is this directory.
+    // `tempfile` creates it under the ambient umask — `002` on a
+    // Debian-style account — so state the mode rather than inherit a
+    // group-writable one the store would rightly refuse.
+    std::fs::set_permissions(
+        audit_root.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("chmod");
+    let store = AuditRecordStore::open_for_tests(AuditStoreSettings {
+        dir: audit_root.path().join("registrar-audit"),
+        max_file_bytes: MIN_AUDIT_MAX_FILE_BYTES,
+        max_retained_files: 4,
+    })
+    .await
+    .expect("a store opens over a temporary directory");
+
+    let server = MockServer::start().await;
+    let (_dir, config) = load_fixture(&base_fixture());
+    let verbs = RegistrarVerbs::new(RegistrarVerbsConfig {
+        client: mock_client(&server),
+        kv_mount: "secret".to_string(),
+        config,
+        secret_id_options: SecretIdOptions {
+            ttl: Some("10m".to_string()),
+            num_uses: Some(1),
+            ..Default::default()
+        },
+        token_ttl: TOKEN_TTL.to_string(),
+        secret_id_ttl: SECRET_ID_TTL.to_string(),
+        wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
+        audit_store: store.clone(),
+    });
+
+    assert_eq!(
+        verbs.audit_store().active_path(),
+        store.active_path(),
+        "the verb service must retain the store it was constructed with"
+    );
+
+    // A reserved name, an unconfigured component, an invalid label and
+    // an instance-shape mismatch: one refusal per pre-derivation arm.
+    for (service_name, host, instance) in [
+        ("bootroot-decoy", "h1", None),
+        ("absent", "h1", None),
+        ("not a label", "h1", None),
+        ("roxyd", "h1", Some(4)),
+    ] {
+        verbs
+            .mint(&mint_request(service_name, host, instance))
+            .await
+            .expect_err("every one of these must refuse");
+        verbs
+            .deregister(&deregister_request(service_name, host, instance))
+            .await
+            .expect_err("every one of these must refuse");
+    }
+    // A wrap TTL no credential could be issued under, refused on the
+    // same arm but through a different enum.
+    let mut unusable = mint_request("roxyd", "h1", None);
+    unusable.wrap_ttl = Duration::ZERO;
+    verbs
+        .mint(&unusable)
+        .await
+        .expect_err("a zero wrap_ttl must refuse");
+
+    assert_untouched(&server).await;
+    assert_no_audit_records(&verbs);
+}
+
+/// Asserts the verb service wrote no audit record.
+///
+/// The store is a construction dependency in this issue and nothing
+/// more: the sibling that writes intent and outcome records owns where
+/// they go relative to the `OpenBao` work, so an append from any arm
+/// here would decide that ordering by accident. Read through
+/// `RegistrarVerbs::audit_store` rather than from a path the test
+/// happens to know, so it also holds for a service built by the live
+/// backend's own fixture.
+fn assert_no_audit_records(verbs: &RegistrarVerbs) {
+    let path = verbs.audit_store().active_path();
+    let written = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(err) => panic!("stat {}: {err}", path.display()),
+    };
+    assert_eq!(
+        written,
+        0,
+        "no verb arm may write an audit record in this issue's scope, but {} is {written} bytes",
+        path.display()
+    );
+}
 
 /// A client pointed at a Wiremock with **no** mounted responses, so any
 /// request at all is visible in the server's recorded requests.
@@ -1116,6 +1230,10 @@ async fn first_mint_creates_exactly_the_derived_role_and_policy() {
         .deregister(&deregister_request("piglet", &host, Some(1)))
         .await
         .expect("cleanup");
+    // The success arms are only reachable with a live backend, so this
+    // is where a first mint and an identity removal are held to the
+    // same "writes nothing yet" rule the refusal arms are.
+    assert_no_audit_records(&verbs);
 }
 
 /// A same-host, same-spec re-mint returns fresh material and leaves the
@@ -1178,6 +1296,7 @@ async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
         .deregister(&deregister_request("roxyd", &host, None))
         .await
         .expect("cleanup");
+    assert_no_audit_records(&verbs);
 }
 
 /// A request larger than the registrar's maximum is clamped, and the
@@ -1343,6 +1462,9 @@ async fn safe_set_refusal_and_stored_spec_conflict_are_distinct_no_change_outcom
         .deregister(&deregister_request(&component, &host, Some(1)))
         .await
         .expect("cleanup");
+    // Post-derivation refusals reach further into the verb than any
+    // arm the mock-server tier can drive, and still write nothing.
+    assert_no_audit_records(&verbs);
 }
 
 /// A failed convergence retains its `creating` binding. The matching host
@@ -1721,6 +1843,7 @@ async fn absent_binding_deregister_sweeps_planted_orphans() {
             .is_none()
     );
     assert!(backend.binding_of(&registration_id).await.is_none());
+    assert_no_audit_records(&verbs);
 }
 
 /// An already-absent role, policy and material is a successful idempotent
@@ -1953,7 +2076,7 @@ mod internal_factory {
     use tempfile::TempDir;
     use time::Duration;
 
-    use super::{RegistrarVerbs, base_fixture, load_fixture, mint_request};
+    use super::{AuditRecordStore, RegistrarVerbs, base_fixture, load_fixture, mint_request};
     use crate::openbao::SecretIdOptions;
     use crate::registrar::internal::InternalCredentialError;
     use crate::registrar::verbs::InternalVerbsSource;
@@ -1968,6 +2091,7 @@ mod internal_factory {
         config: &'a crate::registrar::config::RegistrarConfig,
         options: &'a SecretIdOptions,
         policy: &'a crate::registrar::verbs::wrap_ttl::WrapTtlPolicy,
+        audit_store: &'a AuditRecordStore,
     ) -> InternalVerbsSource<'a> {
         InternalVerbsSource {
             secrets_dir,
@@ -1979,6 +2103,7 @@ mod internal_factory {
             token_ttl: "1h",
             secret_id_ttl: "24h",
             wrap_ttl_policy: policy,
+            audit_store,
         }
     }
 
@@ -1990,12 +2115,14 @@ mod internal_factory {
         let (_config_dir, config) = load_fixture(&base_fixture());
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "http://localhost:8200",
             &config,
             &options,
             &policy,
+            &store,
         )) else {
             panic!("plaintext must be refused");
         };
@@ -2062,12 +2189,14 @@ mod internal_factory {
         let (_config_dir, config) = load_fixture(&base_fixture());
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "https://localhost:8200",
             &config,
             &options,
             &policy,
+            &store,
         )) else {
             panic!("a drifted config must be refused");
         };
@@ -2099,6 +2228,7 @@ mod internal_factory {
         let (_config_dir, config) = load_fixture(&base_fixture());
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
         let url = dead_https_url();
         let verbs = RegistrarVerbs::internal(&InternalVerbsSource {
             secrets_dir: host.dir.path(),
@@ -2110,6 +2240,7 @@ mod internal_factory {
             token_ttl: "1h",
             secret_id_ttl: "24h",
             wrap_ttl_policy: &policy,
+            audit_store: &store,
         })
         .expect("a provisioned host on its own root must build the verbs");
 
@@ -2257,12 +2388,14 @@ mod internal_factory {
         let (_config_dir, config) = load_fixture(&base_fixture());
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "https://localhost:8200",
             &config,
             &options,
             &policy,
+            &store,
         )) else {
             panic!("an unprovisioned host must be refused");
         };
@@ -2329,6 +2462,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
     let (_config_dir, config) = load_fixture(&base_fixture());
     let options = SecretIdOptions::default();
     let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+    let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
     let Err(err) = RegistrarVerbs::internal(&InternalVerbsSource {
         secrets_dir: dir.path(),
         openbao_url: "https://localhost:8200",
@@ -2339,6 +2473,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
         token_ttl: "1h",
         secret_id_ttl: "24h",
         wrap_ttl_policy: &policy,
+        audit_store: &store,
     }) else {
         panic!("a superseded root must be refused");
     };

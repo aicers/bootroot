@@ -1281,6 +1281,7 @@ fn settings_with_domain(domain: &str) -> Settings {
         profiles: Vec::new(),
         openbao: None,
         registrar_endpoint: RegistrarEndpointSettings::default(),
+        registrar: crate::config::RegistrarSettings::default(),
     }
 }
 

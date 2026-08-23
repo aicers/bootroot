@@ -52,6 +52,31 @@ http_responder_token_ttl_secs = 300
 [registrar_endpoint]
 enabled = false
 
+# Registrar audit records (daemon-owned).
+#
+# bootroot writes its own append-only audit trail for the registrar's
+# mint and deregister verbs, beside — never instead of — OpenBao's
+# mandatory file audit device.  The registrar cannot read, append to,
+# delete or redirect it, and no request field reaches any value here.
+#
+# audit_record_dir must be absolute and is created root-owned 0700, with
+# any missing ancestor created root-owned 0755; existing entries are
+# left exactly as they are.  A symlink, a wrong owner or a group- or
+# world-writable directory or immediate parent is refused outright.
+#
+# The active file is registrar-audit.jsonl.  It is rotated before an
+# append would take it past audit_max_file_bytes (minimum 65536, which
+# is what guarantees one maximum-size record fits a freshly rotated
+# file), and at most audit_max_retained_files rotated generations are
+# kept beside it.  The defaults are a hard ceiling of 8 MiB x 17 =
+# ~136 MiB.  audit_min_retain_days records the retention target; where
+# the two disagree, the file count wins.
+[registrar]
+audit_record_dir = "/var/lib/bootroot/registrar-audit"
+audit_max_file_bytes = 8388608
+audit_max_retained_files = 16
+audit_min_retain_days = 90
+
 # Trust settings for CA bundle verification/storage
 [trust]
 # Path to save the CA bundle (intermediate/root)

@@ -971,6 +971,7 @@ mod tests {
             profiles: Vec::new(),
             openbao: None,
             registrar_endpoint: config::RegistrarEndpointSettings::default(),
+            registrar: config::RegistrarSettings::default(),
         }
     }
 

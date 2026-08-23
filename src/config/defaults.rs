@@ -3,6 +3,11 @@ use std::time::Duration;
 
 use config::{ConfigBuilder, ConfigError, builder::DefaultState};
 
+use crate::registrar::audit::{
+    DEFAULT_AUDIT_MAX_FILE_BYTES, DEFAULT_AUDIT_MAX_RETAINED_FILES, DEFAULT_AUDIT_MIN_RETAIN_DAYS,
+    DEFAULT_AUDIT_RECORD_DIR,
+};
+
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
 const DEFAULT_DOMAIN: &str = "trusted.domain";
@@ -93,4 +98,24 @@ pub(crate) fn default_kv_mount() -> String {
 
 pub(crate) fn default_fast_poll_state_path() -> PathBuf {
     PathBuf::from(DEFAULT_FAST_POLL_STATE_PATH)
+}
+
+// The registrar audit defaults live beside the store that enforces
+// them, so a change to the on-disk contract cannot leave the daemon's
+// defaults describing an older one.
+
+pub(crate) fn default_audit_record_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_AUDIT_RECORD_DIR)
+}
+
+pub(crate) fn default_audit_max_file_bytes() -> u64 {
+    DEFAULT_AUDIT_MAX_FILE_BYTES
+}
+
+pub(crate) fn default_audit_max_retained_files() -> u32 {
+    DEFAULT_AUDIT_MAX_RETAINED_FILES
+}
+
+pub(crate) fn default_audit_min_retain_days() -> u32 {
+    DEFAULT_AUDIT_MIN_RETAIN_DAYS
 }

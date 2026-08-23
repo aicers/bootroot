@@ -15,6 +15,10 @@
 //!   because the verb layer interleaves its own checks between them.
 //! - [`error`] declares every refusal the two produce.
 //! - [`fixture`] builds a rendered config for tests.
+//! - [`audit`] is the daemon-owned, append-only record store the
+//!   registrar's own audit trail is written to, and the versioned JSON
+//!   Lines format it writes. It is public because a reader of the
+//!   format needs the record types; the store's construction is not.
 //!
 //! The crate-private `verbs` sibling is the layer above: the
 //! transport-free mint and deregister control plane that calls those
@@ -66,6 +70,7 @@
 //! and the sibling that cannot reach it would grow a second list of
 //! reserved names.
 
+pub mod audit;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub(crate) mod endpoint;

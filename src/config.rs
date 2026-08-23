@@ -64,6 +64,58 @@ pub struct Settings {
     /// bootroot-host wants.
     #[serde(default)]
     pub registrar_endpoint: RegistrarEndpointSettings,
+    /// The daemon-owned registrar audit record store. An absent
+    /// `[registrar]` table leaves every key at its documented default.
+    #[serde(default)]
+    pub registrar: RegistrarSettings,
+}
+
+/// The daemon's own settings for the registrar audit record store.
+///
+/// These are deliberately **not** in the bootler-rendered
+/// `/etc/clumit-security/provisioning.toml`
+/// ([`crate::registrar::RegistrarConfig`]). That file is a
+/// cross-repository contract bootroot only reads; where this host keeps
+/// its audit records, how large they grow and how many it retains are
+/// this daemon's operational choices, and putting them there would make
+/// every change to them a change to another repository's renderer.
+///
+/// Nothing here is reachable from a registrar request. The store is
+/// opened from these values once, by whatever provisions the registrar
+/// surface, and the verbs receive an already-opened handle.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrarSettings {
+    /// Absolute directory the `registrar-audit.jsonl` family lives in.
+    /// A relative path is rejected: the daemon's cwd is not contracted
+    /// to be stable under a systemd-style supervisor, so a relative
+    /// path would scatter the audit trail across whatever directory the
+    /// unit happened to start in.
+    #[serde(default = "defaults::default_audit_record_dir")]
+    pub audit_record_dir: PathBuf,
+    /// Size at which the active file is rotated. Held to a floor large
+    /// enough for one maximum-size record.
+    #[serde(default = "defaults::default_audit_max_file_bytes")]
+    pub audit_max_file_bytes: u64,
+    /// How many rotated generations are retained beside the active
+    /// file. This is the hard capacity ceiling.
+    #[serde(default = "defaults::default_audit_max_retained_files")]
+    pub audit_max_retained_files: u32,
+    /// The retention target in days. Recorded for later reporting work;
+    /// where the two disagree, `audit_max_retained_files` wins.
+    #[serde(default = "defaults::default_audit_min_retain_days")]
+    pub audit_min_retain_days: u32,
+}
+
+impl Default for RegistrarSettings {
+    fn default() -> Self {
+        Self {
+            audit_record_dir: defaults::default_audit_record_dir(),
+            audit_max_file_bytes: defaults::default_audit_max_file_bytes(),
+            audit_max_retained_files: defaults::default_audit_max_retained_files(),
+            audit_min_retain_days: defaults::default_audit_min_retain_days(),
+        }
+    }
 }
 
 /// The host-local registrar endpoint's only setting.
@@ -1245,6 +1297,113 @@ mod tests {
         writeln!(file, "\n[registrar_endpoint]\nenable = true").unwrap();
         file.flush().unwrap();
         assert!(Settings::from_file(Some(file.path().to_path_buf())).is_err());
+    }
+
+    /// An absent `[registrar]` table gives every audit-store key the
+    /// value the documentation states.
+    #[test]
+    fn an_absent_registrar_table_loads_the_documented_audit_defaults() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(
+            settings.registrar.audit_record_dir,
+            PathBuf::from("/var/lib/bootroot/registrar-audit")
+        );
+        assert_eq!(settings.registrar.audit_max_file_bytes, 8_388_608);
+        assert_eq!(settings.registrar.audit_max_retained_files, 16);
+        assert_eq!(settings.registrar.audit_min_retain_days, 90);
+        assert_eq!(settings.registrar, RegistrarSettings::default());
+        settings.validate().unwrap();
+    }
+
+    /// An empty table is the same as an absent one: every key defaults
+    /// on its own, not only through the table's default.
+    #[test]
+    fn an_empty_registrar_table_loads_the_documented_audit_defaults() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]").unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(settings.registrar, RegistrarSettings::default());
+    }
+
+    #[test]
+    fn the_registrar_table_reads_explicit_audit_values() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+[registrar]
+audit_record_dir = "/srv/bootroot/audit"
+audit_max_file_bytes = 131072
+audit_max_retained_files = 4
+audit_min_retain_days = 30
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(
+            settings.registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/audit")
+        );
+        assert_eq!(settings.registrar.audit_max_file_bytes, 131_072);
+        assert_eq!(settings.registrar.audit_max_retained_files, 4);
+        assert_eq!(settings.registrar.audit_min_retain_days, 30);
+        settings.validate().unwrap();
+    }
+
+    /// A misspelled key is a configuration error rather than a setting
+    /// that silently does nothing.
+    #[test]
+    fn the_registrar_table_rejects_an_unknown_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\naudit_record_directory = \"/srv\"").unwrap();
+        file.flush().unwrap();
+        assert!(Settings::from_file(Some(file.path().to_path_buf())).is_err());
+    }
+
+    /// Every audit-store value a store could not be opened from is
+    /// refused at load time, naming the key at fault.
+    #[test]
+    fn validation_rejects_every_unusable_audit_setting() {
+        for (mutate, expected) in [
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_record_dir = PathBuf::from("registrar-audit");
+                }) as Box<dyn Fn(&mut Settings)>,
+                "registrar.audit_record_dir",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_max_file_bytes = 65_535;
+                }),
+                "registrar.audit_max_file_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_max_retained_files = 0;
+                }),
+                "registrar.audit_max_retained_files",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_min_retain_days = 0;
+                }),
+                "registrar.audit_min_retain_days",
+            ),
+        ] {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            let mut settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+            mutate(&mut settings);
+            let err = settings.validate().unwrap_err();
+            assert!(err.to_string().contains(expected), "{expected}: {err}");
+        }
     }
 
     /// A reload may not change the endpoint's enablement in either

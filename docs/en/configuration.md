@@ -342,6 +342,183 @@ On a target that is not Linux the table still parses, but an enabled
 endpoint fails configuration validation with an explicit
 unsupported-platform error, before any activation variable is looked at.
 
+### Registrar audit records
+
+```toml
+[registrar]
+audit_record_dir = "/var/lib/bootroot/registrar-audit"
+audit_max_file_bytes = 8388608
+audit_max_retained_files = 16
+audit_min_retain_days = 90
+```
+
+bootroot writes its own append-only audit trail for the registrar's
+`mint` and `deregister` verbs. It sits **beside** OpenBao's mandatory
+file audit device and replaces nothing: the OpenBao device records what
+OpenBao was asked to do, and this one records who asked, for which
+`(service_name, host, instance)`, and what the answer was — including a
+request refused before any OpenBao write ever happened. The OpenBao
+audit check `bootroot init` performs is unchanged.
+
+The daemon owns the artifact. The registrar cannot read, append to,
+delete, redirect or select it, and no field of a request reaches the
+path, the modes, the rotation policy or the retention policy. An absent
+`[registrar]` table leaves every key at the default above; an unknown
+key is a configuration error.
+
+- `audit_record_dir` (default `/var/lib/bootroot/registrar-audit`) —
+  the absolute directory the record files live in. A relative path is
+  rejected: the daemon's working directory is not contracted to be
+  stable under a service supervisor.
+- `audit_max_file_bytes` (default `8388608`, 8 MiB) — the size at which
+  the active file is rotated. Must be at least `65536`.
+- `audit_max_retained_files` (default `16`) — how many rotated
+  generations are retained beside the active file. Must be greater
+  than 0.
+- `audit_min_retain_days` (default `90`) — the retention **target** in
+  days. Must be greater than 0.
+
+`audit_max_file_bytes` has a 64 KiB floor because one record has a
+bounded worst-case size and a freshly rotated file must be able to hold
+it. Every attacker-influenced string in a record — the caller identity,
+the requested `service_name` and `host`, and a refusal detail — is
+capped at 512 bytes, and a control byte can become a six-byte `\u0000`
+escape, so the floor is computed from the escaped lengths rather than
+from the 512-byte source caps. A record that could still not fit an
+empty file at the configured limit is refused from its serialized length
+alone, before the store opens or creates anything, so that refusal
+leaves the trail and its directory exactly as they were.
+
+`audit_min_retain_days` records the retention *target* for later
+reporting work. Where the two disagree, `audit_max_retained_files` wins:
+the file count is a hard capacity constraint and the day count is not.
+
+#### Ownership and permissions
+
+The store is opened before the registrar surface serves anything, and it
+fails closed rather than degrading:
+
+- Missing path components are created root-owned mode `0755`; the store
+  directory itself is created root-owned mode `0700`; the active file is
+  created mode `0600`. An existing entry's owner and mode are never
+  changed.
+- In production every audited path must be owned by uid 0.
+- The store directory, its immediate parent, the active file and every
+  rotated generation are rejected if any of them is a symbolic link or
+  is owned by another uid. The store directory and its immediate parent
+  are also rejected if they are group- or world-writable.
+- Nothing above the immediate parent is audited, and nothing above it is
+  modified.
+
+Point `audit_record_dir` at a directory on the bootroot host's own
+storage, not at a shared or user-writable path. `/var/lib/bootroot` is
+the default parent for exactly that reason.
+
+#### The record format
+
+One versioned JSON Lines family. The active file is
+`registrar-audit.jsonl` and each line is one complete JSON object
+followed by a newline. Hostile quotes, backslashes, control characters
+and newlines are JSON-escaped, so one record is always exactly one line.
+
+```json
+{"record_version":1,"phase":"intent","ts":"2026-08-23T12:34:56.789Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7}}
+{"record_version":1,"phase":"outcome","ts":"2026-08-23T12:34:56.930Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7},"registration_id":"review-h1-007","outcome":{"class":"first_mint"}}
+```
+
+- `record_version` is `1` for every record this build writes. The
+  daemon refuses to write a record at any other version, so a file in
+  this family never mixes format versions.
+- `phase` is exactly `intent` or `outcome`. Both phases carry the full
+  identity fields, so a line stays readable after its counterpart has
+  rotated out.
+- `ts` is an RFC 3339 UTC timestamp at millisecond precision, always
+  three subsecond digits and always the `Z` zone designator. That is
+  the format's only spelling. The daemon refuses to write a record
+  whose timestamp is finer than a millisecond, or at any offset other
+  than UTC, rather than dropping the remainder or rewriting the offset
+  on the way to disk — so a stored line always reads back as exactly
+  the value it was written for, and a reader of this format accepts
+  only what the daemon writes.
+- `verb` is exactly `mint` or `deregister`.
+- `caller_identity` is the caller's identity carried through verbatim.
+- `requested` carries `service_name`, `host`, and `instance` — a JSON
+  number, omitted entirely when the request carried none.
+- `registration_id` is omitted until derivation has produced one. It is
+  never `null` and never an empty string.
+- `outcome` is present on an `outcome` line and absent on an `intent`
+  one; the daemon refuses to write a record that pairs them the other
+  way, so the two never disagree in a file. It is an object tagged by
+  `class`: `first_mint`, `idempotent_remint`, `identity_removed`,
+  `idempotent_already_absent`, or `refused`. A refusal adds `reason`
+  and, when there is one, `detail`.
+- `truncated` is present only when something was shortened. Its keys are
+  the field paths `caller_identity`, `requested.service_name`,
+  `requested.host` and `outcome.detail`; each value is
+  `{"full_sha256":"<64 lowercase hex>","full_bytes":<integer>}` for the
+  complete original bytes, so an over-long value can still be matched
+  and its real length reported.
+
+#### Rotation and retention
+
+The active file is rotated **before** an append that would take it past
+`audit_max_file_bytes`, and a file already at or above the limit when
+the store is opened is rotated before the store is usable. Every rotated
+generation is named:
+
+```text
+registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl
+```
+
+The timestamp is UTC at second precision, and the zero-padded six-digit
+sequence starts at `000000` for every timestamp and increments for
+same-second collisions — for example
+`registrar-audit-20260823T123456Z-000000.jsonl` followed by
+`registrar-audit-20260823T123456Z-000001.jsonl`. Both halves are fixed
+width, so the names sort lexicographically from oldest to newest.
+
+On opening and after each rotation, the lexically oldest generations are
+deleted until at most `audit_max_retained_files` remain. Creating or
+rotating a file flushes both the file data and the containing directory,
+so a new name is not lost to a power failure; an ordinary append flushes
+the data only.
+
+A rotation the pending record required and that did not complete is an
+error, and no record is written — including when it is the directory
+flush at the end of that rotation that failed, which is reported as the
+rotation failure it is rather than as a write that did reach the disk. A
+failed retention trim is logged through `tracing` and does **not** fail
+an append that otherwise fits.
+
+A directory flush that fails stays owed: the next append flushes the
+directory again rather than concluding, from the file already being
+there, that its name is durable. Nothing on disk distinguishes a flushed
+directory entry from an unflushed one, so a daemon that exits still
+owing one hands the debt to the next start: opening the store flushes
+the directory once, before any record can be appended. A store whose
+directory cannot be flushed does not open.
+
+#### Sizing the defaults
+
+The defaults are a hard ceiling of 8 MiB × 17 files (the active file
+plus 16 rotated generations) ≈ **136 MiB**.
+
+Sizing the reference deployment uses an ordinary-record assumption of
+**400 bytes** per line. Each invocation writes two lines, one `intent`
+and one `outcome`:
+
+```text
+2 × (2,000 initial invocations + 90 × 200 daily invocations) = 40,000 records
+40,000 × 400 bytes = 16,000,000 bytes ≈ 16 MB (≈ 15.3 MiB)
+```
+
+So a fleet doing 2,000 initial enrolments and 200 invocations a day fits
+its whole 90-day target inside about an eighth of the default ceiling.
+That sizes **ordinary installation and reinstallation activity**, not a
+refusal flood: a caller retrying a refused request in a loop writes
+records at whatever rate it retries, and the file-count ceiling — not
+`audit_min_retain_days` — is what bounds the disk it can consume.
+
 ### EAB (Optional)
 
 ```toml
