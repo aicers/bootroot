@@ -209,7 +209,14 @@ async fn a_complete_set_round_trips() {
     let (_dir, paths) = provisioned_host().await;
     assert_eq!(material_status(&paths), MaterialStatus::Present);
     let loaded = load_material(&paths).expect("load the material");
-    assert_eq!(loaded, material());
+    // Compared member by member rather than through a derived
+    // `PartialEq`: the two secret members deliberately do not carry one,
+    // so a comparison has to be spelled out where it is wanted.
+    let expected = material();
+    assert_eq!(loaded.key.expose(), expected.key.expose());
+    assert_eq!(loaded.chain, expected.chain);
+    assert_eq!(loaded.acme_account.expose(), expected.acme_account.expose());
+    assert_eq!(loaded.root_fingerprint, expected.root_fingerprint);
 }
 
 /// The set is all-or-none in both directions: removing any one of the

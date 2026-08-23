@@ -25,7 +25,12 @@ const PEM_OPENING: &str = "-----BEGIN ";
 /// A newtype whose `Debug` prints `<redacted>`, following the verb
 /// layer's `WrappedSecretIdToken`: a `#[derive(Debug)]` on anything that
 /// holds one cannot leak it into a log line, a trace field or an error.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// It derives no `PartialEq` either, for the same reason that one does
+/// not: a derived comparison on a secret-bearing type is a
+/// byte-at-a-time timing oracle. Nothing compares two private keys —
+/// the credential is proved by using it, not by matching it.
+#[derive(Clone)]
 pub struct PrivateKeyPem(String);
 
 impl PrivateKeyPem {
@@ -51,9 +56,10 @@ impl fmt::Debug for PrivateKeyPem {
 
 /// The internal profile's persistent ACME account signing key.
 ///
-/// Redacted for the same reason as [`PrivateKeyPem`]: an ACME account
-/// key is the credential the CA identifies the account by.
-#[derive(Clone, PartialEq, Eq)]
+/// Redacted, and un-comparable, for the same reasons as
+/// [`PrivateKeyPem`]: an ACME account key is the credential the CA
+/// identifies the account by.
+#[derive(Clone)]
 pub struct AcmeAccountKey(String);
 
 impl AcmeAccountKey {
@@ -80,8 +86,9 @@ impl fmt::Debug for AcmeAccountKey {
 ///
 /// `Debug` is derivable precisely because both secret members redact
 /// themselves; the chain and the fingerprint are public certificate
-/// data and are printed as they are.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// data and are printed as they are. `PartialEq` is not derivable, and
+/// deliberately: it would reach the secret members' bytes.
+#[derive(Debug, Clone)]
 pub struct InternalMaterial {
     /// The leaf's private key.
     pub key: PrivateKeyPem,
