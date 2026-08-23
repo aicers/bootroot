@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use bootroot::host_port::{
     resolve_stepca_host_port_with_env,
 };
 use bootroot::openbao::OpenBaoClient;
+use bootroot::registrar::internal::INTERNAL_DIR;
 
 use crate::cli::args::{InfraInstallArgs, InfraUpArgs};
 use crate::commands::compose_project::{
@@ -687,6 +688,54 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
 /// else in the tree is reachable from inside the sweep.
 const OWNERSHIP_SWEEP_MOUNT: &str = "/secrets";
 
+/// Builds the list of paths, inside the sweep container, the `chown`
+/// recurses over: every immediate entry below `secrets/` except the
+/// bootroot-internal directory.
+///
+/// The sweep exists to repair CA material a `--user root` step helper
+/// left root-owned, so that step-ca and the `OpenBao` Agent sidecars —
+/// all of which run as the owner of `secrets/` — can read it again. The
+/// bootroot-internal directory is the one subtree where root ownership
+/// is the intended end state rather than the damage: its five protected
+/// files are published `root:root` `0600` on purpose, no container
+/// mounts or reads them, and a recursive sweep over the whole tree would
+/// hand the leaf's private key, the ACME account key and the agent
+/// config carrying the trust pins straight back to the invoking user on
+/// the next `infra up` — without any protected publication having run.
+///
+/// Excluded as a whole directory rather than by naming the five files:
+/// everything beside them under that directory is either a copy of them
+/// (the `.prior` snapshot a publication holds) or material only a
+/// root-run bootroot writes and reads (the staging leaf, the private CA
+/// bundle). None of it is what the sweep repairs, and a seventh name
+/// added there later inherits the exclusion instead of silently falling
+/// out of it.
+///
+/// Enumerating host-side and passing explicit operands, rather than
+/// masking the directory inside the container, is deliberate: a mistake
+/// here sweeps *less* than intended, never more.
+fn ownership_sweep_targets(secrets_dir: &Path, messages: &Messages) -> Result<Vec<PathBuf>> {
+    let mount = Path::new(OWNERSHIP_SWEEP_MOUNT);
+    let entries = std::fs::read_dir(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let mut targets = Vec::new();
+    for entry in entries {
+        let name = entry
+            .with_context(|| {
+                messages.error_resolve_path_failed(&secrets_dir.display().to_string())
+            })?
+            .file_name();
+        if name == OsStr::new(INTERNAL_DIR) {
+            continue;
+        }
+        targets.push(mount.join(name));
+    }
+    // Sorted so the argv is a function of the directory's contents
+    // alone, not of the order the filesystem happened to return them in.
+    targets.sort_unstable();
+    Ok(targets)
+}
+
 /// Returns whether the secrets-ownership sweep should run for an `infra`
 /// flow.
 ///
@@ -708,15 +757,18 @@ fn should_sweep_secrets_ownership(
 
 /// Builds the `docker run` argv for the ownership sweep.
 ///
-/// Kept pure so tests can assert it mounts ONLY the secrets directory and
-/// uses `--no-dereference`, so `chown -R` never follows a symlink out of
-/// that mount.
-fn build_ownership_sweep_args<'a>(
-    mount: &'a str,
-    user_arg: &'a str,
-    image: &'a str,
-) -> Vec<&'a str> {
-    vec![
+/// Kept pure so tests can assert it mounts ONLY the secrets directory,
+/// uses `--no-dereference` so `chown -R` never follows a symlink out of
+/// that mount, and recurses over the operands
+/// [`ownership_sweep_targets`] chose rather than over the mount point
+/// itself.
+fn build_ownership_sweep_args(
+    mount: &str,
+    user_arg: &str,
+    image: &str,
+    targets: &[PathBuf],
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
         "run",
         "--rm",
         // Intentional root: this container runs `chown`, NOT a `step`
@@ -745,8 +797,15 @@ fn build_ownership_sweep_args<'a>(
         // sweep never follows a link out of the mounted secrets tree.
         "--no-dereference",
         user_arg,
-        OWNERSHIP_SWEEP_MOUNT,
     ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    // The chown targets are the enumerated entries below the mount, not
+    // the mount point itself: the bootroot-internal directory is
+    // deliberately absent from them.
+    args.extend(targets.iter().map(|t| t.clone().into_os_string()));
+    args
 }
 
 /// Resolves the image the compose stack uses for its `step-ca` service by
@@ -793,6 +852,12 @@ fn resolve_stepca_image(
 /// via a one-shot root container, repairing files a prior `--user root`
 /// step helper (rotation or the documented manual init) left root-owned.
 ///
+/// Every entry except the bootroot-internal directory, which
+/// [`ownership_sweep_targets`] holds back: those files are root-owned by
+/// policy rather than by accident, and sweeping them would undo the
+/// invariant an endpoint-enabled `init` established. A tree that holds
+/// nothing else runs no container at all.
+///
 /// This is the single intentional root container in the CA tooling: it
 /// runs `chown`, so it needs root, whereas every `step` helper runs as
 /// the secrets-directory owner. See [`build_ownership_sweep_args`] for
@@ -811,6 +876,10 @@ pub(crate) fn sweep_secrets_ownership(
     image: &str,
     messages: &Messages,
 ) -> Result<()> {
+    let targets = ownership_sweep_targets(secrets_dir, messages)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let mount = format!("{}:{OWNERSHIP_SWEEP_MOUNT}", mount_root.display());
@@ -819,7 +888,7 @@ pub(crate) fn sweep_secrets_ownership(
     let meta = std::fs::metadata(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
-    let args = build_ownership_sweep_args(&mount, &user_arg, image);
+    let args = build_ownership_sweep_args(&mount, &user_arg, image, &targets);
     run_docker(&args, "docker secrets ownership sweep", messages)?;
     Ok(())
 }
@@ -2294,6 +2363,14 @@ mod tests {
         );
     }
 
+    /// Renders a sweep argv as `String`s so the assertions below read as
+    /// the command line they are.
+    fn sweep_argv(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// The sweep container must mount ONLY the secrets directory and chown
     /// with `--no-dereference` so it never follows a symlink out of the
     /// mount. It is also the one deliberately-root container.
@@ -2301,18 +2378,27 @@ mod tests {
     fn build_ownership_sweep_args_scoped_and_no_symlink_following() {
         let mount = "/host/secrets:/secrets";
         let image = "smallstep/step-ca:0.30.2";
-        let args = build_ownership_sweep_args(mount, "1000:1000", image);
-        let image_pos = args.iter().position(|a| *a == image).expect("image");
+        let targets = [
+            PathBuf::from("/secrets/certs"),
+            PathBuf::from("/secrets/ca"),
+        ];
+        let args = sweep_argv(&build_ownership_sweep_args(
+            mount,
+            "1000:1000",
+            image,
+            &targets,
+        ));
+        let image_pos = args.iter().position(|a| a == image).expect("image");
 
         // Exactly one bind mount, and it is the secrets directory.
-        let mounts: Vec<&&str> = args
+        let mounts: Vec<&String> = args
             .iter()
             .zip(args.iter().skip(1))
-            .filter_map(|(a, b)| (*a == "-v").then_some(b))
+            .filter_map(|(a, b)| (a == "-v").then_some(b))
             .collect();
-        assert_eq!(mounts, vec![&mount]);
+        assert_eq!(mounts, vec![mount]);
         assert!(
-            !args.iter().any(|a| a.contains(":/host") || *a == "/"),
+            !args.iter().any(|a| a.contains(":/host") || a == "/"),
             "no host-root or extra mounts"
         );
 
@@ -2321,22 +2407,78 @@ mod tests {
         // missing ca.json under the (deliberately unmounted) /home/step.
         let ep_pos = args
             .iter()
-            .position(|a| *a == "--entrypoint")
+            .position(|a| a == "--entrypoint")
             .expect("--entrypoint");
-        assert_eq!(args.get(ep_pos + 1), Some(&"chown"));
+        assert_eq!(args.get(ep_pos + 1).map(String::as_str), Some("chown"));
         assert!(ep_pos < image_pos, "--entrypoint precedes the image");
 
         // chown recurses but does not dereference symlinks.
-        assert!(args.contains(&"-R"));
-        assert!(args.contains(&"--no-dereference"));
-        assert!(args.contains(&"1000:1000"));
+        assert!(args.iter().any(|a| a == "-R"));
+        assert!(args.iter().any(|a| a == "--no-dereference"));
+        assert!(args.iter().any(|a| a == "1000:1000"));
 
         // The sweep is the intentional root container.
-        let user_pos = args.iter().position(|a| *a == "--user").expect("--user");
-        assert_eq!(args.get(user_pos + 1), Some(&"root"));
+        let user_pos = args.iter().position(|a| a == "--user").expect("--user");
+        assert_eq!(args.get(user_pos + 1).map(String::as_str), Some("root"));
 
-        // The chown target is the mount point, nothing outside it.
-        assert_eq!(args.last(), Some(&OWNERSHIP_SWEEP_MOUNT));
+        // The chown operands are the enumerated entries, in order, and
+        // the mount point itself is no longer one of them: passing
+        // `/secrets` would recurse into every exclusion.
+        assert_eq!(
+            args[args.len() - targets.len()..],
+            ["/secrets/certs", "/secrets/ca"]
+        );
+        assert!(
+            !args.iter().any(|a| a == OWNERSHIP_SWEEP_MOUNT),
+            "the mount point is not a chown operand: {args:?}"
+        );
+    }
+
+    /// The bootroot-internal directory is root-owned by policy, so the
+    /// sweep must never be handed it: an `infra up` (or a CA/password
+    /// rotation) after an endpoint-enabled `init` would otherwise chown
+    /// the five protected files back to the invoking user.
+    #[test]
+    fn ownership_sweep_targets_exclude_the_internal_directory() {
+        let messages = test_messages();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["certs", "openbao", INTERNAL_DIR] {
+            std::fs::create_dir(dir.path().join(name)).expect("subdirectory");
+        }
+        std::fs::write(dir.path().join("ca-password.txt"), b"pw").expect("file");
+
+        let targets = ownership_sweep_targets(dir.path(), &messages).expect("targets");
+
+        assert_eq!(
+            targets,
+            [
+                PathBuf::from("/secrets/ca-password.txt"),
+                PathBuf::from("/secrets/certs"),
+                PathBuf::from("/secrets/openbao"),
+            ],
+            "every entry but the bootroot-internal directory, sorted"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|t| t.to_string_lossy().contains(INTERNAL_DIR)),
+            "the bootroot-internal directory is not a chown operand"
+        );
+    }
+
+    /// No operands means no container: `chown` with none is a usage
+    /// error, and there is nothing left to repair anyway.
+    #[test]
+    fn ownership_sweep_targets_are_empty_when_only_the_internal_directory_exists() {
+        let messages = test_messages();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(INTERNAL_DIR)).expect("subdirectory");
+
+        assert!(
+            ownership_sweep_targets(dir.path(), &messages)
+                .expect("targets")
+                .is_empty()
+        );
     }
 
     /// Builds the identity a compose test acts under without touching

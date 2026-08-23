@@ -586,6 +586,36 @@ assert_the_infra_agent_tree_belongs_to_its_sidecars() {
   pass "the sidecars' configuration, credentials and templates belong to the secrets tree"
 }
 
+# `bootroot infra up` over the deployment `init` just provisioned.
+#
+# `infra up` ends in a recursive ownership sweep: a one-shot root
+# container that chowns everything below `secrets/` to that directory's
+# own owner, so a `--user root` step helper cannot leave CA material
+# step-ca and the sidecars are unable to read.  It is therefore the one
+# routine command that could quietly undo everything asserted above —
+# without any protected file being republished, and on a host where the
+# operator did nothing more than restart the stack.  The same sweep is
+# reached by `reinit` and by the CA and step-ca-password rotations, so
+# covering it once here covers the shape of all of them.
+#
+# Run as the invoking user rather than through `sudo -n`, because that
+# is the case that used to regress: the sweep's root container can chown
+# the root-owned files whatever the invoking process could.
+#
+# `--openbao-url` is passed explicitly.  `init` transitioned the
+# listener to TLS on this port, and `infra up`'s own derivation only
+# ever replaces the port in the `http://` default, so the unseal probe
+# would open a plaintext request against a TLS listener and never get an
+# answer.
+run_infra_up_over_the_initialised_deployment() {
+  log "running 'infra up' over the initialised deployment"
+  run_bootroot infra up \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --openbao-url "https://localhost:${PORT_OPENBAO}" \
+    >>"$RUN_LOG" 2>&1 || fail "infra up failed after init"
+  pass "'infra up' completed over the initialised deployment"
+}
+
 # The alias is why the ACME challenge above could resolve at all.
 # Asserted directly so a future change that drops it fails with the
 # reason rather than as an unexplained issuance timeout.
@@ -742,6 +772,16 @@ main() {
   log_phase "assert-login"
   assert_certificate_login_succeeds
   assert_login_without_the_certificate_is_refused
+
+  # Last, because it re-runs the two ownership assertions against a
+  # deployment a later command has passed over: the protected five must
+  # still be root's, and the sidecar tree must still be the sweep's to
+  # repair.  A sweep that swept everything would fail the first; a
+  # sweep narrowed too far would fail the second.
+  log_phase "assert-sweep"
+  run_infra_up_over_the_initialised_deployment
+  assert_material_is_complete_and_restrictive
+  assert_the_infra_agent_tree_belongs_to_its_sidecars
 
   log_phase "done"
   log "endpoint-enabled init checks passed"

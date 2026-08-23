@@ -149,6 +149,16 @@ checked in its prerequisite block before anything is installed; the reads that
 touch the root-owned `0700` internal directory afterwards go through `sudo -n`
 one call at a time rather than the whole run being elevated.
 
+It then runs `bootroot infra up` over the deployment it just provisioned and
+asserts both ownership checks a second time. `infra up` ends in a recursive
+ownership sweep — a one-shot root container that chowns everything below
+`secrets/` to that directory's own owner — so it is the routine command that
+could undo the root ownership without republishing anything. The bootroot-internal
+directory is held back from that sweep, and this is where that holds: the
+protected five are still `0:0:600` afterwards, and the sidecar tree is still the
+sweep's to repair. `reinit` and the CA and step-ca-password rotations reach the
+same sweep.
+
 The endpoint-*disabled* case is not a scenario of its own. Every other arm is an
 endpoint-disabled host and drives its whole run over the plaintext `http://` URL
 `init` recorded, so a listener that transitioned when it should not have fails
