@@ -1045,7 +1045,8 @@ async fn test_multi_host_tls_control_plane_happy_path() {
         "agent.toml must carry the bootstrap-supplied responder URL"
     );
     assert_eq!(
-        settings.acme.http_responder_hmac, HMAC_SECRET,
+        settings.acme.http_responder_hmac.expose(),
+        HMAC_SECRET,
         "agent.toml must carry the bootstrap-supplied responder HMAC"
     );
     assert_eq!(

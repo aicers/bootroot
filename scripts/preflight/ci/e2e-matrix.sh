@@ -25,6 +25,8 @@ Runs the same Docker E2E matrix steps used in CI:
 9) OpenBao TLS re-issuance after secrets/ is re-owned
 10) two co-located instances stay independent
 11) registrar mint/deregister verbs against a live OpenBao
+12) the bootroot-internal credential's auth/cert contract against a live TLS OpenBao
+13) bootroot init on an endpoint-enabled loopback host, end to end
 
 Options:
   --skip-hosts  Skip hosts steps (useful when sudo -n is unavailable locally)
@@ -205,6 +207,23 @@ echo "[ci-local-e2e] run registrar verbs (issue #758)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}" \
 "$ROOT_DIR/scripts/impl/run-registrar-verbs-e2e.sh"
 
+# The bootroot-internal credential's auth/cert contract — the SAN
+# allowlist, the absent `default` policy and the exact-allowlist ACL —
+# can only be asserted against a real backend, and only over TLS, since
+# `auth/cert` authenticates a client certificate.
+echo "[ci-local-e2e] run registrar internal credential (issue #766)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-internal-${RUN_ID}" \
+"$ROOT_DIR/scripts/impl/run-registrar-internal-e2e.sh"
+
+# The provisioning half: a whole deployment on freshly allocated ports,
+# with the endpoint predicate seeded before `init`. The moved ports are
+# what make a derived step-ca/responder endpoint distinguishable from a
+# hard-coded one, and the run-scoped instance name is what makes this
+# safe beside a default install.
+echo "[ci-local-e2e] run registrar internal credential init (issue #766)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-internal-init-${RUN_ID}" \
+"$ROOT_DIR/scripts/impl/run-registrar-internal-init-e2e.sh"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -218,3 +237,5 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-no-delta-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-openbao-tls-reown-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-init-${RUN_ID}"

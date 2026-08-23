@@ -170,6 +170,59 @@ pub fn build_http_client_with_local_and_webpki_roots(pem_content: &str) -> Resul
         .context("Failed to build HTTP client with local+webpki roots")
 }
 
+/// Builds a [`reqwest::Client`] that verifies the server against
+/// `ca_pem` **and presents `cert_pem`/`key_pem` as a client
+/// certificate**.
+///
+/// This is the bootroot-internal registrar credential's transport, and
+/// the only client-authenticated one in the crate. `OpenBao`'s
+/// `auth/cert` backend validates the presented chain against its own
+/// trusted entry, so the listener is left requesting client
+/// certificates without requiring them — which is what keeps the
+/// certificate-less `AppRole` agents and the token-authenticated CLI
+/// working against the same listener.
+///
+/// The trust store is `ca_pem` alone rather than the webpki union: this
+/// client only ever talks to the deployment's own `OpenBao`, and a
+/// public root has no business verifying it.
+///
+/// # Errors
+///
+/// Returns an error if either PEM cannot be parsed, if the key is not a
+/// supported private key, or if the HTTP client fails to build.
+pub fn build_http_client_with_identity(
+    ca_pem: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<Client> {
+    install_crypto_provider();
+    let root_store = certs_to_root_store(&parse_pem_to_cert_list(ca_pem.as_bytes())?)?;
+    let chain = parse_pem_to_cert_list(cert_pem.as_bytes())?;
+    let key = parse_pem_private_key(key_pem)?;
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(chain, key)
+        .context("Failed to configure the client certificate")?;
+    Client::builder()
+        .use_preconfigured_tls(config)
+        .connect_timeout(OPENBAO_CONNECT_TIMEOUT)
+        .timeout(OPENBAO_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build client-authenticated HTTP client")
+}
+
+/// Parses the first private key in `key_pem`, accepting PKCS#8, PKCS#1
+/// and SEC1 encodings.
+///
+/// The error names none of the bytes it failed on: this input is key
+/// material, and a parse failure that quoted it would put it in a log.
+fn parse_pem_private_key(key_pem: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let mut reader = std::io::BufReader::new(key_pem.as_bytes());
+    rustls_pemfile::private_key(&mut reader)
+        .context("Failed to parse the client private key")?
+        .ok_or_else(|| anyhow::anyhow!("the client private key PEM contained no private key"))
+}
+
 pub(crate) fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }

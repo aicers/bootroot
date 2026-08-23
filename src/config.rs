@@ -6,6 +6,8 @@ use config::builder::DefaultState;
 use config::{Config, ConfigBuilder, ConfigError, Environment, File};
 use serde::Deserialize;
 
+use crate::secret::HmacSecret;
+
 mod defaults;
 mod validation;
 
@@ -24,7 +26,7 @@ pub struct CliOverrides {
     pub email: Option<String>,
     pub ca_url: Option<String>,
     pub http_responder_url: Option<String>,
-    pub http_responder_hmac: Option<String>,
+    pub http_responder_hmac: Option<HmacSecret>,
 }
 
 impl From<&crate::Args> for CliOverrides {
@@ -169,7 +171,7 @@ pub struct Paths {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Eab {
     pub kid: String,
-    pub hmac: String,
+    pub hmac: HmacSecret,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -214,7 +216,7 @@ pub struct DaemonRuntimeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AcmeSettings {
     pub http_responder_url: String,
-    pub http_responder_hmac: String,
+    pub http_responder_hmac: HmacSecret,
     pub http_responder_timeout_secs: u64,
     pub http_responder_token_ttl_secs: u64,
     pub directory_fetch_attempts: u64,
@@ -222,6 +224,17 @@ pub struct AcmeSettings {
     pub directory_fetch_max_delay_secs: u64,
     pub poll_attempts: u64,
     pub poll_interval_secs: u64,
+    /// Where the ACME **account** signing key is persisted.
+    ///
+    /// Absent — the default, and what every existing configuration has
+    /// — keeps the historical behaviour: a fresh account key is
+    /// generated per issuance and the account is re-registered under it.
+    /// Set, the key is loaded from that path, or created there once with
+    /// restrictive permissions, so the profile keeps one stable ACME
+    /// account across renewals. The bootroot-internal registrar
+    /// credential is the one profile that sets it.
+    #[serde(default)]
+    pub account_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -379,7 +392,7 @@ impl Settings {
             responder_url.clone_into(&mut self.acme.http_responder_url);
         }
         if let Some(responder_hmac) = &overrides.http_responder_hmac {
-            responder_hmac.clone_into(&mut self.acme.http_responder_hmac);
+            self.acme.http_responder_hmac = responder_hmac.clone();
         }
     }
 
@@ -436,7 +449,7 @@ mod tests {
         );
         assert_eq!(settings.domain, "trusted.domain");
         assert_eq!(settings.acme.http_responder_url, "http://localhost:8080");
-        assert_eq!(settings.acme.http_responder_hmac, "dev-hmac");
+        assert_eq!(settings.acme.http_responder_hmac.expose(), "dev-hmac");
         assert_eq!(settings.acme.http_responder_timeout_secs, 5);
         assert_eq!(settings.acme.http_responder_token_ttl_secs, 300);
         assert_eq!(settings.acme.directory_fetch_attempts, 10);
@@ -579,7 +592,7 @@ mod tests {
             email: Some("override@example.com".to_string()),
             ca_url: Some("https://override-ca".to_string()),
             http_responder_url: Some("http://override-responder".to_string()),
-            http_responder_hmac: Some("override-hmac".to_string()),
+            http_responder_hmac: Some("override-hmac".into()),
         };
 
         settings.apply_overrides(&overrides);
@@ -590,7 +603,7 @@ mod tests {
             settings.acme.http_responder_url,
             "http://override-responder"
         );
-        assert_eq!(settings.acme.http_responder_hmac, "override-hmac");
+        assert_eq!(settings.acme.http_responder_hmac.expose(), "override-hmac");
     }
 
     #[test]
@@ -642,7 +655,7 @@ mod tests {
             email: None,
             ca_url: Some("https://cli-ca".to_string()),
             http_responder_url: None,
-            http_responder_hmac: Some("cli-hmac-secret".to_string()),
+            http_responder_hmac: Some("cli-hmac-secret".into()),
         };
 
         // Simulate the daemon retry path: reload from disk, then apply overrides.
@@ -651,7 +664,7 @@ mod tests {
 
         // CLI-provided values must win.
         assert_eq!(fresh.server, "https://cli-ca");
-        assert_eq!(fresh.acme.http_responder_hmac, "cli-hmac-secret");
+        assert_eq!(fresh.acme.http_responder_hmac.expose(), "cli-hmac-secret");
         // File-provided values stay when CLI has no override.
         assert_eq!(fresh.email, "file@example.com");
         assert_eq!(fresh.acme.http_responder_url, "http://localhost:8080");
@@ -771,7 +784,7 @@ mod tests {
     #[test]
     fn test_validate_rejects_empty_profiles() {
         let mut settings = Settings::new(None).unwrap();
-        settings.acme.http_responder_hmac = "test".to_string();
+        settings.acme.http_responder_hmac = "test".into();
         let err = settings.validate().unwrap_err();
         assert!(err.to_string().contains("profiles must not be empty"));
     }

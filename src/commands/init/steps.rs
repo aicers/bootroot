@@ -6,6 +6,7 @@ pub(crate) mod openbao_tls;
 mod openbao_transition;
 mod orchestrator;
 mod prompts;
+pub(crate) mod registrar_internal;
 mod responder_setup;
 mod secrets;
 pub(crate) mod stepca_setup;
@@ -102,6 +103,42 @@ pub(super) struct InitRollback {
     /// restores the pre-TLS `state.json` so it does not keep pointing at
     /// an HTTPS URL / TLS certs after `OpenBao` is recreated on plaintext.
     pub(super) state_backup: Option<RollbackFile>,
+    /// The bootroot-internal credential's layout directory, set only
+    /// when this run is what created it.  Rollback then removes it whole
+    /// — staging included — so a failure anywhere in the provisioning
+    /// sequence leaves no half-provisioned credential, no dedicated
+    /// config and no private bundle behind.
+    ///
+    /// Left `None` when the host already carried a credential, so a
+    /// failed re-run of `init` does not delete a working one; the
+    /// staging directory below is removed either way.
+    pub(super) registrar_internal_dir: Option<PathBuf>,
+    /// The staging directory the internal leaf is issued into before it
+    /// is proved and published.  Removed on rollback whether or not the
+    /// layout directory around it is, because it is this run's alone and
+    /// holds a private key that was never published.
+    pub(super) registrar_internal_staging: Option<PathBuf>,
+    /// The `auth/cert` entry this run created, by name.  Deleted on
+    /// rollback so a rolled-back host trusts no internal certificate.
+    pub(super) registrar_internal_cert_auth_entry: Option<String>,
+    /// The `auth/cert` entry this run found already there, captured
+    /// verbatim before it was rewritten.  A re-run over an established
+    /// credential converges the entry onto the recorded predicate's SAN
+    /// and the active root *before* the leaf that matches it is issued,
+    /// so a failure after that point would otherwise leave the host
+    /// trusting a certificate it does not have.  Written back on
+    /// rollback, byte for byte.
+    pub(super) registrar_internal_cert_auth_entry_backup: Option<serde_json::Value>,
+    /// The `bootroot-registrar-internal` policy this run found already
+    /// there, captured before it was rewritten.  Restored on rollback
+    /// for the same reason as the entry above: the convergence replaces
+    /// it unconditionally, and deleting a policy this run did not create
+    /// is not the undo of having replaced it.
+    pub(super) registrar_internal_policy_backup: Option<String>,
+    /// Whether this run is what mounted `auth/cert`.  Only then does
+    /// rollback disable it: a deployment that already had the backend
+    /// keeps it, along with every other entry under it.
+    pub(super) registrar_internal_cert_auth_mount_created: bool,
     /// The `docker` executable every spawn in the `init` flow runs.
     ///
     /// `None` *is* `docker`: this value comes straight from the derived
@@ -245,6 +282,72 @@ impl InitRollback {
             ) {
                 eprintln!("Rollback: failed to recreate responder: {err}");
             }
+        }
+
+        // The bootroot-internal artifacts, innermost first: the files,
+        // then the entry that trusts them, then the policy that entry
+        // names, then the mount — and the mount only when this run is
+        // what created it.  Each of the two `OpenBao` artifacts is
+        // deleted when this run created it and put back verbatim when
+        // this run merely rewrote one it found, so a re-run that fails
+        // after convergence leaves the established credential working.
+        for dir in [
+            &self.registrar_internal_dir,
+            &self.registrar_internal_staging,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if dir.exists()
+                && let Err(err) = std::fs::remove_dir_all(dir)
+            {
+                eprintln!(
+                    "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
+                    dir.display()
+                );
+            }
+        }
+        // Restored before deleted, and never both: an entry this run
+        // created has no prior body and is removed, while one it found
+        // and rewrote is put back exactly as it was read.
+        if let Some(entry) = &self.registrar_internal_cert_auth_entry_backup {
+            if let Err(err) = client
+                .write_cert_auth_entry_raw(
+                    bootroot::registrar::internal::CERT_AUTH_MOUNT,
+                    bootroot::registrar::internal::CERT_AUTH_ROLE,
+                    entry,
+                )
+                .await
+            {
+                eprintln!(
+                    "Rollback: failed to restore the bootroot-registrar-internal cert auth                      entry: {err}; re-run                      `bootroot rotate registrar-internal-credential --force`"
+                );
+            }
+        } else if let Some(name) = &self.registrar_internal_cert_auth_entry
+            && let Err(err) = client
+                .delete_cert_auth_entry(bootroot::registrar::internal::CERT_AUTH_MOUNT, name)
+                .await
+        {
+            eprintln!("Rollback: failed to delete cert auth entry {name}: {err}");
+        }
+        if let Some(policy) = &self.registrar_internal_policy_backup
+            && let Err(err) = client
+                .write_policy(
+                    crate::commands::init::constants::openbao_constants::POLICY_BOOTROOT_REGISTRAR_INTERNAL,
+                    policy,
+                )
+                .await
+        {
+            eprintln!(
+                "Rollback: failed to restore the bootroot-registrar-internal policy: {err}"
+            );
+        }
+        if self.registrar_internal_cert_auth_mount_created
+            && let Err(err) = client
+                .disable_auth(bootroot::registrar::internal::CERT_AUTH_MOUNT)
+                .await
+        {
+            eprintln!("Rollback: failed to disable the cert auth backend: {err}");
         }
 
         for path in &self.written_kv_paths {
@@ -518,6 +621,71 @@ mod rollback_tests {
             "TLS cert must be removed after rollback"
         );
         assert!(!key_path.exists(), "TLS key must be removed after rollback");
+    }
+
+    /// A first provisioning either publishes a complete
+    /// bootroot-internal credential or leaves nothing behind: rollback
+    /// removes the layout directory whole, staging and all.
+    #[tokio::test]
+    async fn rollback_removes_a_freshly_provisioned_internal_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+        let paths = bootroot::registrar::internal::InternalPaths::new(dir.path());
+        let staging = paths.dir().join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(paths.key(), "KEY").unwrap();
+        std::fs::write(paths.chain(), "CHAIN").unwrap();
+        std::fs::write(staging.join("key.pem"), "STAGED KEY").unwrap();
+
+        let rollback = InitRollback {
+            registrar_internal_dir: Some(paths.dir().to_path_buf()),
+            registrar_internal_staging: Some(staging.clone()),
+            registrar_internal_cert_auth_entry: Some("bootroot-registrar-internal".to_string()),
+            registrar_internal_cert_auth_mount_created: true,
+            compose_file: None,
+            ..Default::default()
+        };
+        // Unreachable: the two OpenBao teardown calls report and continue,
+        // which is what keeps the file teardown from being skipped.
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(
+            !paths.dir().exists(),
+            "the layout directory must be gone after rollback"
+        );
+    }
+
+    /// A re-run of `init` over a host that already carried a credential
+    /// must not have its rollback delete the working one. Only this
+    /// run's staging directory — which holds a private key that was
+    /// never published — is swept.
+    #[tokio::test]
+    async fn rollback_keeps_a_pre_existing_internal_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = crate::i18n::test_messages();
+        let paths = bootroot::registrar::internal::InternalPaths::new(dir.path());
+        let staging = paths.dir().join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(paths.key(), "EXISTING KEY").unwrap();
+        std::fs::write(staging.join("key.pem"), "STAGED KEY").unwrap();
+
+        let rollback = InitRollback {
+            // Left `None` exactly because the host already had one.
+            registrar_internal_dir: None,
+            registrar_internal_staging: Some(staging.clone()),
+            compose_file: None,
+            ..Default::default()
+        };
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert!(!staging.exists(), "staging must be swept");
+        assert_eq!(
+            std::fs::read_to_string(paths.key()).unwrap(),
+            "EXISTING KEY",
+            "the pre-existing credential must survive"
+        );
     }
 
     /// Rollback with `hcl_backup` that has `original: None` removes the

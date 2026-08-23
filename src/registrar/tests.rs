@@ -1263,7 +1263,7 @@ fn settings_with_domain(domain: &str) -> Settings {
         eab: None,
         acme: AcmeSettings {
             http_responder_url: "http://127.0.0.1:0".to_string(),
-            http_responder_hmac: "hmac".to_string(),
+            http_responder_hmac: "hmac".into(),
             http_responder_timeout_secs: 5,
             http_responder_token_ttl_secs: 5,
             directory_fetch_attempts: 1,
@@ -1271,6 +1271,7 @@ fn settings_with_domain(domain: &str) -> Settings {
             directory_fetch_max_delay_secs: 1,
             poll_attempts: 1,
             poll_interval_secs: 1,
+            account_key_path: None,
         },
         retry: RetrySettings {
             backoff_secs: vec![1],

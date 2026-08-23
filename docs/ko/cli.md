@@ -1617,6 +1617,7 @@ OpenBao와 통신해 값을 갱신합니다.
 - `rotate force-reissue`
 - `rotate ca-key`
 - `rotate openbao-recovery`
+- `rotate registrar-internal-credential`
 - `rotate eab-clear`
 - `rotate infra-cert`
 
@@ -1853,6 +1854,19 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 신규 중간)를 사용합니다. 전체 모드는 4-fingerprint 전이 trust(기존 루트,
 기존 중간, 신규 루트, 신규 중간)를 사용합니다.
 
+[registrar 엔드포인트](operations.md#bootroot-내부-자격-증명)를 제공하는
+호스트에서는 **전체** 모드가 Phase 4 직후, Phase 4가 기록되기 전에 번호가
+없는 필수 단계를 하나 더 실행합니다. 이 단계는 bootroot 내부 자격증명의
+`auth/cert` 항목, 리프 자료, 저장된 루트 fingerprint를 교체합니다.
+`--skip reissue`는 Phase 5만 건너뛰며 이 단계는 건너뛸 수 없고, 이
+단계에는 `root` 정책을 가진 OpenBao 토큰이 필요합니다. 따라서 이런
+호스트에서는 전체 모드를 `--auth-mode approle`로 실행할 수 없습니다.
+Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각각 확장하고
+축소합니다. 중간 CA만 교체하는 모드는 이 자산을 전혀 건드리지 않으며,
+엔드포인트가 없는 호스트에는 이 자산 자체가 없습니다.
+[bootroot 내부 registrar 자격증명](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md)을
+참고하세요.
+
 입력:
 
 - `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
@@ -1889,6 +1903,31 @@ secret_id를 변경하지 않습니다.
   이 경우 현실적인 복구 경로는 OpenBao 재초기화이며, 결과적으로
   `bootroot init` 재실행과 서비스 재bootstrap이 필요합니다.
 - `--rotate-root-token`은 언실 키 입력 없이 실행할 수 있습니다.
+
+#### `rotate registrar-internal-credential`
+
+bootroot 내부 registrar 자격 증명을 복구합니다. 이 자격 증명은 registrar의
+`mint`/`deregister` 동사를 실행하기 위해 bootroot 데몬이 `auth/cert`로
+OpenBao에 인증할 때 사용하는 것으로, registrar 엔드포인트를 제공하는
+호스트에만 존재합니다.
+
+신뢰되는 `auth/cert` 항목, 리프 인증서와 개인 키, 지속 ACME 계정 키, 저장된
+루트 지문을 교체하고, 전용 `registrar-internal/agent.toml`의 신뢰 핀과 전용
+CA 번들을 기록된 회전 상태가 가리키는 신뢰 상태로 되돌립니다. 전체 CA 회전이
+진행 중이면 누적 집합, 그렇지 않으면 최종 집합입니다. 그런 다음 내부
+에이전트에 재로드 신호를 보냅니다.
+
+- `--force`: 자료가 완전하고 저장된 루트 지문이 현재 루트와 이미 일치해도
+  복구를 수행합니다. 이 옵션이 없으면 해당 호스트는 최신 상태로 보고되고 아무
+  것도 변경되지 않으므로, 모든 호스트에서 스크립트로 실행해도 안전합니다.
+
+`root` 정책을 가진 OpenBao 토큰이 필요하며, 변경 이전에 토큰 self-lookup으로
+확인합니다. AppRole 토큰은 타입이 지정된 오류로 거부됩니다. 설치를 다시
+실행하지 않고 서비스 자격 증명도 변경하지 않습니다.
+
+중단된 CA 회전, 만료된 내부 리프, 유실되거나 부분적으로 기록된 자격 증명이
+있을 때 사용합니다. 저장된 루트 지문이 현재 루트와 다르면 데몬은 ACME 요청,
+로그인, 쓰기를 전혀 시도하지 않고 즉시 실패하며 이 명령을 안내합니다.
 
 #### `rotate eab-clear`
 

@@ -208,6 +208,71 @@ pub(super) fn signal_bootroot_agent(_entry: &ServiceEntry, messages: &Messages) 
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
 }
 
+/// Exit status `pkill` reports when no process matched the pattern.
+#[cfg(unix)]
+const PKILL_NO_PROCESS_MATCHED: i32 = 1;
+
+/// Reloads the bootroot-internal registrar agent.
+///
+/// Deliberately **not** [`signal_bootroot_agent`]: the internal profile
+/// has no [`ServiceEntry`] and never will — it is not a registered
+/// service — so its only address is the fixed
+/// `registrar-internal/agent.toml` path below the state-recorded
+/// secrets directory, which is what distinguishes its command line from
+/// every other `bootroot-agent` on the host.
+///
+/// `pkill` status 1 means *no process matched*, and that is a success
+/// here. The operator supervises the internal agent, `init` does not
+/// start it, and a host where it has not been started yet is a host with
+/// nothing to reload — not a failed rotation. Any other non-zero status
+/// is a real failure and aborts the phase that sent the signal.
+///
+/// # Errors
+///
+/// Returns an error when `pkill` cannot be run, or when it exits with a
+/// status other than success or [`PKILL_NO_PROCESS_MATCHED`].
+#[cfg(unix)]
+pub(super) fn signal_internal_registrar_agent(
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let pattern = bootroot::registrar::internal::internal_signal_pattern(secrets_dir);
+    let status = std::process::Command::new("pkill")
+        .args(["-HUP", "-f", &pattern])
+        .status()
+        .with_context(|| messages.error_command_run_failed("pkill -HUP"))?;
+    classify_internal_signal_status(status, messages)
+}
+
+/// Turns a `pkill` exit status into the internal reload's outcome.
+///
+/// Split out from the spawn so the "no process matched is success" rule
+/// is testable without a process to signal — which is exactly the state
+/// the rule exists for.
+///
+/// # Errors
+///
+/// Returns an error for any status that is neither success nor
+/// [`PKILL_NO_PROCESS_MATCHED`].
+#[cfg(unix)]
+fn classify_internal_signal_status(
+    status: std::process::ExitStatus,
+    messages: &Messages,
+) -> Result<()> {
+    if status.success() || status.code() == Some(PKILL_NO_PROCESS_MATCHED) {
+        return Ok(());
+    }
+    anyhow::bail!(messages.error_command_failed_status("pkill -HUP", &status.to_string()))
+}
+
+#[cfg(not(unix))]
+pub(super) fn signal_internal_registrar_agent(
+    _secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
+}
+
 pub(super) fn try_restart_container(container: &str) -> Result<()> {
     let status = std::process::Command::new("docker")
         .args(["restart", container])
@@ -218,6 +283,48 @@ pub(super) fn try_restart_container(container: &str) -> Result<()> {
         anyhow::bail!("container {container} not found or restart failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod internal_signal_tests {
+    use std::process::Command;
+
+    use super::classify_internal_signal_status;
+    use crate::i18n::test_messages;
+
+    /// Runs `/bin/sh -c "exit <code>"` and returns its status, so the
+    /// classifier is exercised against a real `ExitStatus` rather than a
+    /// hand-built one.
+    fn status_for(code: i32) -> std::process::ExitStatus {
+        Command::new("/bin/sh")
+            .args(["-c", &format!("exit {code}")])
+            .status()
+            .expect("the shell must run")
+    }
+
+    /// `pkill` status 1 is "no process matched". The operator supervises
+    /// the internal agent and `init` never starts it, so a host where it
+    /// is not running has nothing to reload — that is a successful HUP
+    /// outcome, not a failed rotation phase.
+    #[test]
+    fn no_process_matched_is_a_successful_reload() {
+        let messages = test_messages();
+        assert!(classify_internal_signal_status(status_for(0), &messages).is_ok());
+        assert!(classify_internal_signal_status(status_for(1), &messages).is_ok());
+    }
+
+    /// Any other status is a real failure and aborts the phase that sent
+    /// the signal.
+    #[test]
+    fn any_other_status_aborts_the_phase() {
+        let messages = test_messages();
+        for code in [2, 3, 127] {
+            assert!(
+                classify_internal_signal_status(status_for(code), &messages).is_err(),
+                "exit {code} must abort"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use tracing::warn;
 
 use crate::fs_util::{self, KEY_FILE_MODE, StagedMode};
+use crate::secret::HmacSecret;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EabCredentials {
@@ -14,7 +15,7 @@ pub struct EabCredentials {
     // `key` is step-ca's native EAB field name; accept it for interop with
     // step-ca-produced files, not as an older bootroot spelling of `hmac`.
     #[serde(alias = "key")]
-    pub hmac: String,
+    pub hmac: HmacSecret,
 }
 
 /// Live, shared view of the daemon's `default_eab`.
@@ -159,7 +160,7 @@ pub async fn remove_eab_file(path: &Path) -> anyhow::Result<bool> {
 /// - The file content is not valid JSON.
 pub async fn load_credentials(
     cli_kid: Option<String>,
-    cli_hmac: Option<String>,
+    cli_hmac: Option<HmacSecret>,
     file_path: Option<PathBuf>,
 ) -> anyhow::Result<Option<EabCredentials>> {
     // 1. CLI args take precedence
@@ -210,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_credentials_cli_precedence() {
         let cli_kid = Some("cli-kid".to_string());
-        let cli_hmac = Some("cli-hmac".to_string());
+        let cli_hmac = Some(HmacSecret::from("cli-hmac"));
         // Create a dummy file that has DIFFERENT credentials
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, r#"{{"kid": "file-kid", "key": "file-hmac"}}"#).unwrap();
@@ -220,7 +221,7 @@ mod tests {
         // Assert
         let creds = result.unwrap().unwrap();
         assert_eq!(creds.kid, "cli-kid");
-        assert_eq!(creds.hmac, "cli-hmac");
+        assert_eq!(creds.hmac.expose(), "cli-hmac");
     }
     #[tokio::test]
     async fn test_load_credentials_from_file_valid() {
@@ -230,7 +231,7 @@ mod tests {
         let result = load_credentials(None, None, Some(path)).await;
         let creds = result.unwrap().unwrap();
         assert_eq!(creds.kid, "test-kid");
-        assert_eq!(creds.hmac, "test-hmac");
+        assert_eq!(creds.hmac.expose(), "test-hmac");
     }
     #[tokio::test]
     async fn test_load_credentials_file_malformed() {
@@ -300,7 +301,7 @@ mod tests {
             .unwrap()
             .expect("credentials present");
         assert_eq!(creds.kid, "kid-1");
-        assert_eq!(creds.hmac, "hmac-1");
+        assert_eq!(creds.hmac.expose(), "hmac-1");
 
         // An identical payload does not rewrite the bytes, but still repairs
         // the mode of a file this writer did not create.
@@ -440,7 +441,7 @@ mod tests {
 
         tx.send_replace(Some(EabCredentials {
             kid: "kid-1".to_string(),
-            hmac: "hmac-1".to_string(),
+            hmac: "hmac-1".into(),
         }));
         let current = shared.current().expect("value present after update");
         assert_eq!(current.kid, "kid-1");

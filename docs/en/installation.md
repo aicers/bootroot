@@ -495,6 +495,50 @@ Recommended deployment policy:
   <container>` hook reloads it (see
   [Operations > Containerized consumer applications](operations.md#containerized-consumer-applications)).
 
+### The bootroot-internal registrar agent
+
+A **bootroot-host** deployment that serves the
+[registrar endpoint](operations.md#registrar-endpoint-linux-only) also runs a
+**second** `bootroot-agent` process, alongside any service agent on that host.
+It renews one certificate: the bootroot-internal credential the daemon
+authenticates to `OpenBao` with in order to run the registrar's `mint` and
+`deregister` verbs.
+
+`bootroot init` writes its config and its private CA bundle and neither starts it
+nor installs a supervisor for it, exactly as it does not for the service agents.
+Start it under the same supervisor you use for those:
+
+```sh
+bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
+```
+
+`<secrets-directory>` is the `secrets_dir` recorded in `state.json`. The path is
+fixed — it is not configurable, and it is also the pattern rotation and recovery
+signal the process by.
+
+**Ordinary renewal begins only once you start it.** Until then the credential
+stays whatever `init` issued, and a rotation that signals the process finds
+nothing to signal — which it treats as success, so a missing process is silent
+rather than an error.
+
+Two things about this config that differ from a service agent's:
+
+- its `[trust]` points at a **private** `registrar-internal/ca-bundle.pem`, not
+  the shared `secrets/certs/ca-bundle.pem`, so a CA rotation can narrow this
+  identity's trust without touching what a service reads;
+- its `[acme].account_key_path` points at `registrar-internal/acme-account.json`,
+  so it keeps one stable ACME account across renewals. Configurations that do
+  not set that key keep the existing behaviour of a fresh account key per
+  issuance.
+
+A host without the registrar endpoint has none of these files and needs none of
+this.
+
+Everything about the credential — the authority boundary, the exact `OpenBao`
+policy it carries, the provisioning order, the rotation phases and the recovery
+command — is in
+[`docs/reference/registrar-internal-credential.md`](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md).
+
 ### Binary
 
 Build from source:

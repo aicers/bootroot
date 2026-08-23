@@ -499,6 +499,25 @@ pub(crate) enum RotateCommand {
     /// `--rotate-root-token` can run without unseal key input.
     #[command(name = "openbao-recovery")]
     OpenBaoRecovery(RotateOpenBaoRecoveryArgs),
+    /// Repairs the bootroot-internal registrar credential.
+    ///
+    /// The credential bootroot's own daemon authenticates to `OpenBao`
+    /// with at `auth/cert` in order to run the registrar's mint and
+    /// deregister verbs. Replaces the trusted `auth/cert` entry, the
+    /// leaf and its private key, the persistent ACME account key and
+    /// the stored root fingerprint, and brings the dedicated config's
+    /// trust pins and private CA bundle back onto the trust state the
+    /// recorded rotation says is current — the additive set while a
+    /// full rotation is unfinished, the finalized set otherwise. Then
+    /// signals the internal agent to reload.
+    ///
+    /// Requires an `OpenBao` token carrying the `root` policy; an
+    /// `AppRole` token is refused. Never re-runs install and never
+    /// touches a service credential. Use it after an interrupted
+    /// rotation, an expired internal leaf, or a credential that was
+    /// lost or partially written.
+    #[command(name = "registrar-internal-credential")]
+    RegistrarInternalCredential(RotateRegistrarInternalArgs),
     /// Rotates the `OpenBao` `AppRole` `secret_id` for one registered
     /// service or one infra role (`--infra stepca|responder`).
     ///
@@ -605,6 +624,18 @@ pub(crate) struct RotateResponderHmacArgs {
     /// New responder HMAC
     #[arg(long)]
     pub(crate) hmac: Option<String>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub(crate) struct RotateRegistrarInternalArgs {
+    /// Repairs even when the stored root fingerprint already matches the
+    /// active root.
+    ///
+    /// Without it, a credential whose material loads and whose root
+    /// still matches is left alone and the command reports so, which is
+    /// what makes the command safe to run from a script on every host.
+    #[arg(long)]
+    pub(crate) force: bool,
 }
 
 #[derive(Args, Debug)]

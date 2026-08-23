@@ -144,7 +144,7 @@ pub async fn register_http01_token(
     });
     register_http01_token_with(
         url,
-        &settings.acme.http_responder_hmac,
+        settings.acme.http_responder_hmac.expose(),
         settings.acme.http_responder_timeout_secs,
         token,
         key_authorization,
@@ -586,7 +586,7 @@ mod tests {
     fn test_settings(base_url: &str, secret: &str) -> Settings {
         let mut settings = Settings::new(None).expect("settings must load");
         settings.acme.http_responder_url = base_url.to_string();
-        settings.acme.http_responder_hmac = secret.to_string();
+        settings.acme.http_responder_hmac = secret.into();
         settings.acme.http_responder_timeout_secs = 5;
         settings.acme.http_responder_token_ttl_secs = 60;
         settings

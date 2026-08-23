@@ -29,6 +29,63 @@ const EC_P256_UNCOMPRESSED_LEN: usize = 65;
 const EC_UNCOMPRESSED_PREFIX: u8 = 0x04;
 /// Length of a single P-256 coordinate (32 bytes for a 256-bit curve).
 const EC_P256_COORD_LEN: usize = 32;
+/// JSON field the persisted ACME account key is stored under.
+const ACCOUNT_KEY_FIELD: &str = "account_key_pkcs8";
+
+/// Loads the persistent ACME account key at `path`, creating it once if
+/// it is not there yet.
+///
+/// The file is written atomically at `0600` before it is ever read back,
+/// so the key is never observable at the final path under a wider mode.
+/// A profile that sets `account_key_path` keeps one ACME account across
+/// renewals; one that does not keeps the ephemeral-key behaviour it has
+/// always had.
+///
+/// # Errors
+///
+/// Returns an error if the key cannot be generated, written, read, or
+/// decoded. The error never quotes the file's contents.
+fn load_or_create_account_key(path: &std::path::Path, rng: &SystemRandom) -> Result<Vec<u8>> {
+    if path.exists() {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading the ACME account key at {}", path.display()))?;
+        let parsed: serde_json::Value = serde_json::from_str(&contents)
+            .with_context(|| format!("parsing the ACME account key at {}", path.display()))?;
+        let encoded = parsed
+            .get(ACCOUNT_KEY_FIELD)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the ACME account key at {} carries no `{ACCOUNT_KEY_FIELD}` field",
+                    path.display()
+                )
+            })?;
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("decoding the ACME account key at {}", path.display()));
+    }
+
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng)
+        .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
+    let payload = serde_json::to_vec_pretty(&serde_json::json!({
+        ACCOUNT_KEY_FIELD: base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref()),
+    }))
+    .context("serializing the ACME account key")?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    crate::fs_util::atomic_write_blocking(
+        crate::fs_util::Destination::bootroot_owned(path),
+        &payload,
+        crate::fs_util::StagedMode::Policy(crate::fs_util::KEY_FILE_MODE),
+    )
+    .with_context(|| format!("writing the ACME account key at {}", path.display()))?;
+    Ok(pkcs8.as_ref().to_vec())
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct Directory {
     #[serde(rename = "newNonce")]
@@ -63,11 +120,15 @@ impl AcmeClient {
         insecure_mode: bool,
     ) -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-            .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
-        let key_pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
-                .map_err(|_| anyhow::anyhow!("Failed to parse generated key pair"))?;
+        let pkcs8 = match settings.account_key_path.as_deref() {
+            Some(path) => load_or_create_account_key(path, &rng)?,
+            None => EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?
+                .as_ref()
+                .to_vec(),
+        };
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
+            .map_err(|_| anyhow::anyhow!("Failed to parse the ACME account key"))?;
         let client = build_http_client(trust, insecure_mode)?;
 
         Ok(Self {
@@ -367,7 +428,7 @@ impl AcmeClient {
         let protected_b64 = Self::b64(protected_json.as_bytes());
         let payload_b64 = Self::b64(payload_json.as_bytes());
 
-        let key_bytes = decode_eab_key(&creds.hmac)?;
+        let key_bytes = decode_eab_key(creds.hmac.expose())?;
         let signing_input = format!("{protected_b64}.{payload_b64}");
         let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
         let signature = hmac::sign(&key, signing_input.as_bytes());
@@ -536,8 +597,9 @@ mod tests {
             directory_fetch_max_delay_secs: 0,
             poll_attempts: 15,
             poll_interval_secs: 2,
+            account_key_path: None,
             http_responder_url: "http://localhost:8080".to_string(),
-            http_responder_hmac: "dev-hmac".to_string(),
+            http_responder_hmac: "dev-hmac".into(),
             http_responder_timeout_secs: 5,
             http_responder_token_ttl_secs: 300,
         }
@@ -595,7 +657,7 @@ mod tests {
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
         let creds = EabCredentials {
             kid: "kid-123".to_string(),
-            hmac: key,
+            hmac: key.into(),
         };
 
         let binding = client
@@ -1097,8 +1159,9 @@ mod tests {
                 directory_fetch_max_delay_secs: 0,
                 poll_attempts: 1,
                 poll_interval_secs: 1,
+                account_key_path: None,
                 http_responder_url: "http://localhost:8080".to_string(),
-                http_responder_hmac: "dev-hmac".to_string(),
+                http_responder_hmac: "dev-hmac".into(),
                 http_responder_timeout_secs: 5,
                 http_responder_token_ttl_secs: 300,
             }

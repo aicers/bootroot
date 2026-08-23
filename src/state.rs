@@ -109,6 +109,35 @@ pub(crate) struct StateFile {
     /// `bootroot status` warns when this timestamp goes stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_secret_id_rotation: Option<String>,
+    /// The registrar endpoint's enablement, as recorded on this host.
+    ///
+    /// **Read, never written here.** Defining, storing and switching
+    /// this predicate belongs to the registrar endpoint work; this
+    /// repository's internal-credential provisioning only *consumes*
+    /// it. An absent entry means the endpoint is disabled, which is
+    /// what every host but a bootroot registrar host wants: `init`
+    /// then leaves the plaintext loopback listener and the `http://`
+    /// URL exactly as they were and creates none of the internal
+    /// material, config or private bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) registrar_endpoint: Option<RegistrarEndpointState>,
+}
+
+/// The recorded registrar-endpoint predicate, and the two identity
+/// parts the bootroot-internal credential is composed from.
+///
+/// The SAN is `001.bootroot-registrar-internal.<host>.<domain>`, so an
+/// enabled endpoint has to say which host label and which deployment
+/// domain that is. Neither is derived: a name guessed from the machine's
+/// hostname would be a name the deployment's CA never issues.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RegistrarEndpointState {
+    /// Whether this host serves the registrar endpoint.
+    pub(crate) enabled: bool,
+    /// The deployment domain the internal SAN is composed under.
+    pub(crate) domain: String,
+    /// The host label the internal SAN is composed with.
+    pub(crate) host: String,
 }
 
 impl StateFile {

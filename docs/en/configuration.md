@@ -195,6 +195,14 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
   If empty, validation fails and the agent does not start.
 - `http_responder_timeout_secs`: request timeout to the responder
 - `http_responder_token_ttl_secs`: token TTL in seconds
+- `account_key_path` (optional): where the ACME **account** signing key is
+  persisted. Unset — the default, and what every existing configuration has —
+  keeps the historical behaviour: a fresh account key is generated per issuance
+  and the account is re-registered under it. Set it, and the key is loaded from
+  that path or created there once at `0600`, so the profile keeps one stable
+  ACME account across renewals. `bootroot init` sets it for the
+  bootroot-internal registrar credential's generated config; nothing else sets
+  it for you.
 
 ### Trust
 

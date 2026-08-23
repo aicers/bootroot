@@ -510,7 +510,7 @@ fn print_init_secrets(summary: &InitSummary, messages: &Messages) {
         );
         println!(
             "{}",
-            messages.summary_eab_hmac(&display_secret(&eab.hmac, summary.show_secrets))
+            messages.summary_eab_hmac(&display_secret(eab.hmac.expose(), summary.show_secrets))
         );
     } else {
         println!("{}", messages.summary_eab_missing());

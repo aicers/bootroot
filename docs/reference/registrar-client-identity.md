@@ -26,6 +26,15 @@ only**:
 | Registrar client — the leaf the registrar authenticates to the host-local endpoint with | `<instance>.bootroot-registrar.<host>.<domain>` | `bootroot::registrar::REGISTRAR_CLIENT_LABEL` |
 | Endpoint server — the leaf the daemon's endpoint presents, and the name a client pins | `<instance>.bootroot-registrar-endpoint.<host>.<domain>` | `bootroot::registrar::REGISTRAR_ENDPOINT_LABEL` |
 
+A **third** reserved name shares the same composition and the same prefix guard
+but is not part of this contract, because nothing outside bootroot ever sees it:
+`<instance>.bootroot-registrar-internal.<host>.<domain>`
+(`bootroot::registrar::REGISTRAR_INTERNAL_LABEL`) is the leaf bootroot's own
+daemon presents to `OpenBao` at `auth/cert` in order to run the verbs. Its
+instance label is fixed at `001`, it appears on no caller-facing wire, and no
+provisioning tool writes or reads anything about it. See
+`docs/reference/registrar-internal-credential.md`.
+
 For the v1 single registrar per bootroot host, `<instance>` is `001` and
 `<host>` is that host's single DNS label. With `domain = example.internal` the
 two names are:

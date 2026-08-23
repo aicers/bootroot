@@ -36,12 +36,43 @@ pub(crate) fn dns_alias_for_entry(entry: &ServiceEntry) -> Option<String> {
     ))
 }
 
-/// Collects DNS aliases for all registered services.
+/// Builds the HTTP-01 DNS alias the bootroot-internal registrar
+/// credential is issued under, when this host serves the registrar
+/// endpoint.
+///
+/// The internal identity deliberately has no [`ServiceEntry`] — it is
+/// not a registered service — so it cannot come out of the loop above.
+/// It still needs the alias for exactly the same reason every service
+/// does: step-ca validates an HTTP-01 challenge by fetching
+/// `http://<identifier>/.well-known/acme-challenge/…`, and inside the
+/// compose network that name resolves only if the responder answers to
+/// it.
+pub(crate) fn registrar_internal_alias(state: &StateFile) -> Option<String> {
+    let recorded = state.registrar_endpoint.as_ref().filter(|it| it.enabled)?;
+    if recorded.host.trim().is_empty() || recorded.domain.trim().is_empty() {
+        return None;
+    }
+    Some(bootroot::registrar::registrar_internal_identity(
+        &recorded.host,
+        &recorded.domain,
+    ))
+}
+
+/// Collects DNS aliases for all registered services, plus the
+/// bootroot-internal registrar identity on a host that serves the
+/// endpoint.
+///
+/// The internal alias belongs in the *shared* collection rather than
+/// beside one call site: `service remove` reconciles the set and `infra
+/// up` replays it, and either rebuilding it from `state.services` alone
+/// would silently drop the internal alias off a running responder and
+/// break the next internal renewal.
 pub(crate) fn collect_dns_aliases(state: &StateFile) -> Vec<String> {
     state
         .services
         .values()
         .filter_map(dns_alias_for_entry)
+        .chain(registrar_internal_alias(state))
         .collect()
 }
 
@@ -315,6 +346,86 @@ mod tests {
             agent_responder_url: None,
             cert_group_gid: None,
         }
+    }
+
+    fn state_with(services: Vec<ServiceEntry>) -> StateFile {
+        let mut map = BTreeMap::new();
+        for entry in services {
+            map.insert(entry.registration_id.clone(), entry);
+        }
+        StateFile {
+            openbao_url: "https://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            services: map,
+            ..StateFile::default()
+        }
+    }
+
+    /// step-ca resolves an HTTP-01 identifier through the responder's
+    /// Docker network aliases. The bootroot-internal identity has no
+    /// `ServiceEntry` to carry one, so without this it would be the one
+    /// name in the deployment that step-ca cannot reach — and `init`
+    /// would fail issuing its leaf.
+    #[test]
+    fn the_internal_identity_is_aliased_alongside_the_services() {
+        let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
+        state.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "test.local".to_string(),
+            host: "bootroot-01".to_string(),
+        });
+        assert_eq!(
+            collect_dns_aliases(&state),
+            vec![
+                "001.edge-proxy.host1.test.local".to_string(),
+                "001.bootroot-registrar-internal.bootroot-01.test.local".to_string(),
+            ]
+        );
+    }
+
+    /// A host without the endpoint gets exactly the alias set it always
+    /// got, so nothing about an ordinary deployment changes.
+    #[test]
+    fn a_host_without_the_endpoint_is_unchanged() {
+        let state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
+        assert_eq!(registrar_internal_alias(&state), None);
+        assert_eq!(
+            collect_dns_aliases(&state),
+            vec!["001.edge-proxy.host1.test.local".to_string()]
+        );
+    }
+
+    /// A recorded-but-disabled endpoint is the same as an absent one,
+    /// matching how `init` and the repair path read the predicate.
+    #[test]
+    fn a_disabled_endpoint_contributes_no_alias() {
+        let mut state = state_with(Vec::new());
+        state.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
+            enabled: false,
+            domain: "test.local".to_string(),
+            host: "bootroot-01".to_string(),
+        });
+        assert_eq!(registrar_internal_alias(&state), None);
+        assert!(collect_dns_aliases(&state).is_empty());
+    }
+
+    /// The alias survives the two rebuilds that do not go through
+    /// `service add`: `service remove` reconciles the set and `infra up`
+    /// replays it, and either dropping the internal alias would leave a
+    /// running responder unable to answer the next internal renewal.
+    #[test]
+    fn the_internal_alias_survives_a_rebuild_from_state() {
+        let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
+        state.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "test.local".to_string(),
+            host: "bootroot-01".to_string(),
+        });
+        let internal = "001.bootroot-registrar-internal.bootroot-01.test.local".to_string();
+        // Every rebuild path derives its set from this one function.
+        assert!(collect_dns_aliases(&state).contains(&internal));
+        state.services.clear();
+        assert_eq!(collect_dns_aliases(&state), vec![internal]);
     }
 
     /// The lookup must filter on the compose project as well as the

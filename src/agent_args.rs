@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 
+use crate::secret::HmacSecret;
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -28,7 +30,7 @@ pub struct Args {
 
     /// HTTP-01 responder HMAC secret
     #[arg(long, env = "BOOTROOT_HTTP_RESPONDER_HMAC")]
-    pub http_responder_hmac: Option<String>,
+    pub http_responder_hmac: Option<HmacSecret>,
 
     /// EAB Key ID (optional, overrides file/config)
     #[arg(long = "eab-kid")]
@@ -36,7 +38,7 @@ pub struct Args {
 
     /// EAB HMAC Key (optional, overrides file/config)
     #[arg(long = "eab-hmac")]
-    pub eab_hmac: Option<String>,
+    pub eab_hmac: Option<HmacSecret>,
 
     /// Path to EAB JSON file (optional)
     #[arg(long = "eab-file")]

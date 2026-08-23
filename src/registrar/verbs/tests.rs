@@ -1945,3 +1945,408 @@ async fn the_scenario_environment_is_read_only_and_complete() {
         Some(backend.url.as_str())
     );
 }
+
+/// The parameterless factory: it takes no client and no caller, builds
+/// its own privileged client from the credential on disk, and refuses
+/// fail-closed rather than falling back to anything.
+mod internal_factory {
+    use tempfile::TempDir;
+    use time::Duration;
+
+    use super::{RegistrarVerbs, base_fixture, load_fixture, mint_request};
+    use crate::openbao::SecretIdOptions;
+    use crate::registrar::internal::InternalCredentialError;
+    use crate::registrar::verbs::InternalVerbsSource;
+    use crate::registrar::verbs::outcome::VerbError;
+    use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
+
+    const ACTIVE_ROOT_FP: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
+
+    fn source<'a>(
+        secrets_dir: &'a std::path::Path,
+        openbao_url: &'a str,
+        config: &'a crate::registrar::config::RegistrarConfig,
+        options: &'a SecretIdOptions,
+        policy: &'a crate::registrar::verbs::wrap_ttl::WrapTtlPolicy,
+    ) -> InternalVerbsSource<'a> {
+        InternalVerbsSource {
+            secrets_dir,
+            openbao_url,
+            active_root_fingerprint: ACTIVE_ROOT_FP,
+            kv_mount: "secret",
+            config,
+            secret_id_options: options,
+            token_ttl: "1h",
+            secret_id_ttl: "24h",
+            wrap_ttl_policy: policy,
+        }
+    }
+
+    /// Certificate login is never attempted over plaintext, and the
+    /// refusal happens before the credential is even read.
+    #[test]
+    fn the_factory_refuses_a_plaintext_openbao_url() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "http://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("plaintext must be refused");
+        };
+        assert!(
+            matches!(err, InternalCredentialError::PlaintextOpenBaoUrl { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// A host whose generated config drifted is refused too.
+    ///
+    /// Every one of the six files is there, so the presence check alone
+    /// would call this host provisioned — but the config it would renew
+    /// under names another identity's key, so the daemon that keeps this
+    /// certificate alive cannot start. The verbs must not be served over
+    /// a credential nothing renews.
+    #[tokio::test]
+    async fn the_factory_refuses_a_host_whose_generated_config_is_invalid() {
+        use crate::registrar::internal::{
+            AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, InternalPaths,
+            PrivateKeyPem, publish_material, render_internal_agent_config,
+        };
+
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        publish_material(
+            &paths,
+            &InternalMaterial {
+                key: PrivateKeyPem::new(
+                    "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
+                ),
+                chain: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+                acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+                root_fingerprint: ACTIVE_ROOT_FP.to_string(),
+            },
+        )
+        .await
+        .expect("publish");
+        std::fs::write(
+            paths.ca_bundle(),
+            "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+        )
+        .expect("bundle");
+        let hijacked = render_internal_agent_config(
+            &paths,
+            &InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: "example.internal",
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: &"hmac".into(),
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[ACTIVE_ROOT_FP.to_string()],
+            },
+        )
+        .replace(
+            &paths.chain().display().to_string(),
+            "/srv/secrets/services/other/chain.pem",
+        );
+        std::fs::write(paths.agent_config(), hijacked).expect("config");
+
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "https://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("a drifted config must be refused");
+        };
+        assert!(
+            matches!(&err, InternalCredentialError::Invalid { path, .. }
+                if path == &paths.agent_config()),
+            "{err:?}"
+        );
+    }
+
+    /// The root can be replaced *after* the factory has handed out a
+    /// verbs object, and the very next verb refuses.
+    ///
+    /// A rotation does exactly this: Phase 2 replaces the deployment
+    /// root and the mandatory tail after Phase 4 replaces this
+    /// credential, so anything holding a verbs object across that window
+    /// holds one whose leaf the `auth/cert` entry has stopped trusting.
+    /// Comparing the roots only in the factory would leave that object
+    /// logging in — or serving a still-valid cached token, which is
+    /// worse, because that is a *write* under a superseded credential.
+    ///
+    /// `OpenBao` is pointed at a port nothing listens on, so the
+    /// assertion is not merely that the verb failed: a login or a write
+    /// that was attempted would fail as a transport error, and what is
+    /// asserted is the typed repair-required refusal instead.
+    #[tokio::test]
+    async fn a_root_replaced_after_construction_refuses_every_verb() {
+        let host = ProvisionedHost::new().await;
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let url = dead_https_url();
+        let verbs = RegistrarVerbs::internal(&InternalVerbsSource {
+            secrets_dir: host.dir.path(),
+            openbao_url: &url,
+            active_root_fingerprint: &host.root_fingerprint,
+            kv_mount: "secret",
+            config: &config,
+            secret_id_options: &options,
+            token_ttl: "1h",
+            secret_id_ttl: "24h",
+            wrap_ttl_policy: &policy,
+        })
+        .expect("a provisioned host on its own root must build the verbs");
+
+        host.replace_active_root();
+
+        let refusal = verbs
+            .mint(&mint_request("roxyd", "h1", None))
+            .await
+            .expect_err("a verb under a superseded root must be refused");
+        let VerbError::Unavailable { source, .. } = refusal.error() else {
+            panic!("{:?}", refusal.error());
+        };
+        let rendered = format!("{source:#}");
+        assert!(
+            rendered.contains("bootroot rotate registrar-internal-credential"),
+            "expected repair-required, got {rendered}"
+        );
+
+        let refusal = verbs
+            .deregister(&super::deregister_request("roxyd", "h1", None))
+            .await
+            .expect_err("the other verb must be refused too");
+        assert!(
+            matches!(refusal.error(), VerbError::Unavailable { source, .. }
+                if format!("{source:#}").contains("bootroot rotate registrar-internal-credential")),
+            "{:?}",
+            refusal.error()
+        );
+    }
+
+    /// An `https://` URL whose port nothing listens on.
+    ///
+    /// Bound and dropped, so the port was free at the moment it was
+    /// chosen and nothing in the test hard-codes one.
+    fn dead_https_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+        format!("https://127.0.0.1:{port}")
+    }
+
+    /// A secrets directory carrying a complete, valid internal
+    /// credential issued under a real root.
+    ///
+    /// Real key material, because the factory builds a
+    /// client-authenticated transport out of it and a placeholder would
+    /// fail there rather than reaching the root comparison this test is
+    /// about.
+    struct ProvisionedHost {
+        dir: TempDir,
+        root_fingerprint: String,
+    }
+
+    impl ProvisionedHost {
+        async fn new() -> Self {
+            use crate::registrar::internal::{
+                AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, InternalPaths,
+                PrivateKeyPem, render_internal_agent_config,
+            };
+
+            let dir = TempDir::new().expect("tempdir");
+            let paths = InternalPaths::new(dir.path());
+            let (root_pem, root_key, root_params) = self_signed_root("bootroot-active-root");
+            let root_fingerprint = write_active_root(dir.path(), &root_pem);
+
+            let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+            let leaf =
+                rcgen::CertificateParams::new(vec![crate::registrar::registrar_internal_identity(
+                    "bootroot-01",
+                    "example.internal",
+                )])
+                .expect("leaf params")
+                .signed_by(
+                    &leaf_key,
+                    &rcgen::Issuer::from_params(&root_params, &root_key),
+                )
+                .expect("leaf");
+
+            let material = InternalMaterial {
+                key: PrivateKeyPem::new(leaf_key.serialize_pem()),
+                chain: format!("{}{root_pem}", leaf.pem()),
+                acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+                root_fingerprint: root_fingerprint.clone(),
+            };
+            crate::registrar::internal::publish_material(&paths, &material)
+                .await
+                .expect("publish");
+            std::fs::write(paths.ca_bundle(), &root_pem).expect("bundle");
+            std::fs::write(
+                paths.agent_config(),
+                render_internal_agent_config(
+                    &paths,
+                    &InternalAgentConfigParams {
+                        email: "ops@example.internal",
+                        server: "https://localhost:9000/acme/acme/directory",
+                        domain: "example.internal",
+                        hostname: "bootroot-01",
+                        responder_url: "http://127.0.0.1:8080",
+                        responder_hmac: &"hmac".into(),
+                        eab_kid: None,
+                        eab_hmac: None,
+                        trusted_ca_sha256: std::slice::from_ref(&root_fingerprint),
+                    },
+                ),
+            )
+            .expect("config");
+
+            Self {
+                dir,
+                root_fingerprint,
+            }
+        }
+
+        /// What a full rotation's Phase 2 does to this host: a different
+        /// root, in the same file, with nothing told to the credential.
+        fn replace_active_root(&self) {
+            let (pem, _, _) = self_signed_root("bootroot-new-root");
+            write_active_root(self.dir.path(), &pem);
+        }
+    }
+
+    fn self_signed_root(common_name: &str) -> (String, rcgen::KeyPair, rcgen::CertificateParams) {
+        let key = rcgen::KeyPair::generate().expect("ca key");
+        let mut params =
+            rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("ca params");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let pem = params.self_signed(&key).expect("self-signed ca").pem();
+        (pem, key, params)
+    }
+
+    fn write_active_root(secrets_dir: &std::path::Path, pem: &str) -> String {
+        let path = crate::registrar::internal::active_root_cert_path(secrets_dir);
+        std::fs::create_dir_all(path.parent().expect("the certs directory"))
+            .expect("create the certs directory");
+        std::fs::write(&path, pem).expect("write the active root");
+        crate::registrar::internal::active_root_fingerprint(secrets_dir)
+            .expect("the written root must hash")
+    }
+
+    /// A host with no internal credential gets a typed absence, never a
+    /// verb service over some other client.
+    #[test]
+    fn the_factory_refuses_an_unprovisioned_host() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_config_dir, config) = load_fixture(&base_fixture());
+        let options = SecretIdOptions::default();
+        let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+        let Err(err) = RegistrarVerbs::internal(&source(
+            dir.path(),
+            "https://localhost:8200",
+            &config,
+            &options,
+            &policy,
+        )) else {
+            panic!("an unprovisioned host must be refused");
+        };
+        assert!(matches!(err, InternalCredentialError::Absent(_)), "{err:?}");
+    }
+}
+
+/// A credential issued under a superseded root makes no request at all.
+#[tokio::test]
+async fn the_factory_returns_repair_required_on_a_root_mismatch() {
+    use tempfile::TempDir;
+    use time::Duration;
+
+    use crate::openbao::SecretIdOptions;
+    use crate::registrar::internal::{
+        AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, InternalPaths, PrivateKeyPem,
+        publish_material, render_internal_agent_config,
+    };
+    use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
+    use crate::registrar::verbs::{InternalVerbsSource, RegistrarVerbs};
+
+    const STORED_ROOT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const ACTIVE_ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    publish_material(
+        &paths,
+        &InternalMaterial {
+            key: PrivateKeyPem::new(
+                "-----BEGIN PRIVATE KEY-----\nQUJD\n-----END PRIVATE KEY-----\n".to_string(),
+            ),
+            chain: "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string(),
+            acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
+            root_fingerprint: STORED_ROOT.to_string(),
+        },
+    )
+    .await
+    .expect("publish");
+    std::fs::write(
+        paths.ca_bundle(),
+        "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+    )
+    .expect("bundle");
+    std::fs::write(
+        paths.agent_config(),
+        render_internal_agent_config(
+            &paths,
+            &InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: "example.internal",
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: &"hmac".into(),
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[STORED_ROOT.to_string()],
+            },
+        ),
+    )
+    .expect("config");
+
+    let (_config_dir, config) = load_fixture(&base_fixture());
+    let options = SecretIdOptions::default();
+    let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
+    let Err(err) = RegistrarVerbs::internal(&InternalVerbsSource {
+        secrets_dir: dir.path(),
+        openbao_url: "https://localhost:8200",
+        active_root_fingerprint: ACTIVE_ROOT,
+        kv_mount: "secret",
+        config: &config,
+        secret_id_options: &options,
+        token_ttl: "1h",
+        secret_id_ttl: "24h",
+        wrap_ttl_policy: &policy,
+    }) else {
+        panic!("a superseded root must be refused");
+    };
+    match err {
+        crate::registrar::internal::InternalCredentialError::RepairRequired { stored, active } => {
+            assert_eq!(stored, STORED_ROOT);
+            assert_eq!(active, ACTIVE_ROOT);
+        }
+        other => panic!("{other:?}"),
+    }
+}

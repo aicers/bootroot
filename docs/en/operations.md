@@ -323,6 +323,77 @@ that agent — see the
 [systemd operations procedure](#systemd-operations-procedure-recommended-for-bootroot-agent)
 above.
 
+#### The bootroot-internal credential
+
+The two verbs run under a credential bootroot holds itself: a leaf named
+`001.bootroot-registrar-internal.<host>.<domain>` that the daemon presents to
+`OpenBao` at `auth/cert`. It is never handed to a caller, never named in a
+response, and never selected by a request; a registrar supplies an identity's
+parts and nothing else.
+
+Because certificate authentication requires TLS, an endpoint-enabled host
+terminates TLS on `OpenBao`'s `:8200` **even on loopback**, and its recorded
+`state.openbao_url` becomes `https://`. A host without the endpoint keeps its
+plaintext loopback listener and its `http://` URL untouched. No listener-side
+client-certificate option is introduced in either case — the listener already
+requests client certificates, and requiring them there would break the
+certificate-less `AppRole` agents and every token-authenticated command.
+
+`bootroot init` provisions it, writes its dedicated
+`registrar-internal/agent.toml` and its private CA bundle below the
+state-recorded secrets directory, and — as with every other agent — does not
+start the process that renews it. Start it yourself:
+
+```sh
+bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
+```
+
+Ordinary renewal begins then, on that config's own `daemon` and `retry`
+settings and through the same predicate every other profile uses. Until it is
+started there is nothing to renew and nothing to signal — a rotation that
+`HUP`s it and finds no process treats that as success.
+
+Renewal has one precondition: before it issues, the daemon checks that the root
+recorded beside the credential is still the deployment's active root, and
+refuses without making an ACME request, a login or a write when it is not. A
+full CA rotation opens exactly that gap between its Phase 3 and the repair step
+after Phase 4, so a leaf that falls due inside it is left alone rather than
+reissued under a root the `auth/cert` entry does not yet trust. The refusal is
+reported through the profile's ordinary post-renew failure hooks, the daemon
+keeps ticking, and the tick after the repair renews normally — there is nothing
+to restart.
+
+The same comparison guards the credential's privileged `OpenBao` login, not only
+renewal, and it re-reads the active root each time rather than trusting a value
+read at start-up. A registrar verb reached after the root changed therefore
+refuses with the same repair-required error instead of logging in — or continuing
+to write under a token it acquired before the change.
+
+**Rotation.** An intermediate-only CA rotation leaves the credential, its entry,
+its config and its private bundle untouched: the entry trusts the root, which
+that rotation does not replace. A full rotation publishes the additive trust set
+into the private bundle and the config's pins in Phase 3, replaces the entry, the
+leaf and the stored root fingerprint in a mandatory step after Phase 4 (which
+`--skip reissue` does not skip), and narrows the bundle and pins to the finalized
+generation in Phase 6 — only when finalization is not skipped.
+
+**Repair.** If the credential expires, a rotation is interrupted, or the material
+is lost or partially written, the daemon fails closed with a repair-required
+error rather than attempting an ACME request, a login or a write. Repair it with
+
+```sh
+bootroot rotate registrar-internal-credential
+```
+
+which needs an `OpenBao` token carrying the `root` policy — an `AppRole` token is
+refused — and which never re-runs install and never changes a service
+credential. It restores the trust state the recorded rotation says is current,
+replaces the material and the stored fingerprint, and reloads the internal agent.
+
+The whole contract, including the exact `OpenBao` policy the credential carries,
+is in
+[`docs/reference/registrar-internal-credential.md`](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md).
+
 #### How this differs from the hardened non-root unit
 
 The [hardened systemd unit example](#hardened-systemd-unit-example)

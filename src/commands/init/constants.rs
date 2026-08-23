@@ -143,6 +143,21 @@ pub(crate) mod openbao_constants {
     /// a separate role confines that blast radius.
     pub(crate) const POLICY_BOOTROOT_INFRA_ROTATE: &str = "bootroot-infra-rotate";
 
+    /// The exact-allowlist policy the bootroot-internal registrar
+    /// credential's `auth/cert` token carries.
+    ///
+    /// The same string as the credential's reserved SAN label and its
+    /// `auth/cert` entry name, so the policy, the entry and the
+    /// certificate are one name in three places rather than three names
+    /// that can drift. Its body is
+    /// [`bootroot::registrar::internal::build_registrar_internal_policy`],
+    /// which is where the allowlist is stated and tested.
+    ///
+    /// It is never attached to an `AppRole` and never handed to a
+    /// caller: the only token that carries it is the one a certificate
+    /// login mints for bootroot's own daemon.
+    pub(crate) const POLICY_BOOTROOT_REGISTRAR_INTERNAL: &str = "bootroot-registrar-internal";
+
     /// Deterministic logins that consume one of a self-minted rotate
     /// credential's uses within a single re-mint cycle. Self-mint is
     /// per-invocation, so a credential's cycle spans exactly one

@@ -90,6 +90,8 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-openbao-tls-reown.sh`
 - `scripts/impl/run-two-instance-isolation.sh`
 - `scripts/impl/run-registrar-verbs-e2e.sh`
+- `scripts/impl/run-registrar-internal-e2e.sh`
+- `scripts/impl/run-registrar-internal-init-e2e.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -102,11 +104,42 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 확인이 그 이름들로만 한정되므로 기본 `bootroot` 설치본이 이미 있는
 호스트에서도 안전하게 실행할 수 있습니다.
 
-`run-registrar-verbs-e2e.sh`는 이 논의 바깥에 있습니다. 비어 있는 루프백
+registrar 시나리오 두 개는 이 논의 바깥에 있습니다. 둘 다 비어 있는 루프백
 포트에 OpenBao 컨테이너 하나만 띄우므로 compose 프로젝트도, secrets 배선도,
-bootroot 바이너리도 전혀 필요하지 않습니다. 이 스크립트는 `#[ignore]`가 붙은
-`registrar::verbs::tests` 라이브러리 테스트의 게이트이며, 컨테이너의 URL과
-토큰, KV 마운트를 자식 프로세스의 환경 변수로 넘겨 그 테스트들을 실행합니다.
+bootroot 바이너리도 전혀 필요하지 않습니다. `run-registrar-verbs-e2e.sh`는
+`#[ignore]`가 붙은 `registrar::verbs::tests` 라이브러리 테스트의 게이트이고,
+`run-registrar-internal-e2e.sh`는 `registrar::internal::tests::live`의
+게이트입니다. 둘 다 컨테이너의 접속 정보를 자식 프로세스의 환경 변수로
+넘겨 테스트를 실행합니다.
+
+내부 자격 증명 시나리오는 한 가지가 다릅니다. 컨테이너가 TLS를 제공합니다.
+`auth/cert`는 *클라이언트 인증서*를 인증하므로 그것을 제시할 핸드셰이크가
+있어야 하기 때문입니다. 컨테이너는 마운트된 디렉터리에 자신의 서버 인증서를
+직접 생성하며(`-dev-tls`), 그 덕분에 두 신뢰 앵커가 실제 배포에서와 똑같이
+분리됩니다. 그 인증서의 CA는 서버를 검증하고, `auth/cert` 항목이 클라이언트
+쪽에서 신뢰하는 것은 각 테스트가 직접 만든 CA입니다. 이 테스트들은 목으로는
+증명할 수 없는 것을 확인합니다. SAN 허용 목록이 배포의 다른 registrar 이름을
+실제로 거부하는지, `token_no_default_policy`가 발급된 토큰에서 `default`를
+정말로 제외하는지, 그리고 정책 본문이 실제 ACL 엔진에게 보이는 그대로를
+뜻하는지입니다.
+
+`run-registrar-internal-init-e2e.sh`는 프로비저닝 쪽을 담당하며 컨테이너 하나가
+아니라 배포 전체가 필요합니다. 엔드포인트가 활성화된 루프백 호스트에서
+`bootroot init`을 실행하되, 그 전에 엔드포인트 술어를 `state.json`에 직접
+기록합니다(아직 이 값을 쓰는 명령은 없으며, 이는 registrar 엔드포인트 작업의
+몫입니다). 실행마다 고유한 인스턴스 이름으로 임시 디렉터리에 설치하고 비어 있는
+포트 네 개를 새로 할당하므로 기본 설치본이 있는 호스트에서도 안전합니다. 포트를
+옮기는 것은 타협이 아니라 핵심입니다. compose 기본값에서는 하드코딩된 step-ca /
+리스폰더 주소와 실제로 유도한 주소를 구분할 수 없기 때문입니다. 이 시나리오는
+리스너 전환, 기록된 `https://` URL, 여섯 개 파일과 그 권한, 내부 SAN이 해석되는
+리스폰더 별칭, 그리고 `init`이 방금 발급한 자격 증명으로 수행하는 실제
+`auth/cert/login`을 확인하며, 클라이언트 인증서 없이 같은 로그인을 시도하면
+거부되는지도 함께 확인합니다.
+
+엔드포인트를 *사용하지 않는* 경우는 별도 시나리오로 두지 않았습니다. 나머지 모든
+시나리오가 엔드포인트 비활성 호스트이며 `init`이 기록한 평문 `http://` URL로 실행
+전체를 진행하므로, 전환되지 말아야 할 리스너가 전환되면 그 시나리오들이 곧바로
+실패합니다.
 
 ### 라이프사이클 실행 두 개는 한 호스트를 공유할 수 있습니다
 

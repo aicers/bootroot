@@ -120,6 +120,7 @@ use self::wrap_ttl::{GrantedWrapTtl, WrapTtlPolicy};
 use crate::openbao::{KvCreateIfAbsent, OpenBaoClient, SecretIdOptions, WrapInfo};
 use crate::registrar::config::{Multiplicity, RegistrarConfig};
 use crate::registrar::identity::{RequestedSpec, check_instance_shape, derive_registration_id};
+use crate::registrar::internal::{InternalCredential, InternalCredentialError};
 use crate::registrar::{check_spec_identity, is_reserved_service_name, validate_request_labels};
 use crate::service_material::{
     ProvisionedServiceRole, ServiceRoleTtls, provision_service_role, service_kv_path,
@@ -196,6 +197,46 @@ pub(crate) struct RegistrarVerbsConfig {
     pub(crate) wrap_ttl_policy: WrapTtlPolicy,
 }
 
+/// The fixed, client-free dependencies [`RegistrarVerbs::internal`] is
+/// built from.
+///
+/// Every member is a location or a policy the deployment already fixed.
+/// There is deliberately no `client` here and no caller: the privileged
+/// client is constructed inside the factory from the credential on
+/// disk, which is what makes it unreachable from a request.
+pub(crate) struct InternalVerbsSource<'a> {
+    /// The state-recorded secrets directory the credential lives below.
+    pub(crate) secrets_dir: &'a std::path::Path,
+    /// The recorded `OpenBao` URL. Must be `https://`.
+    pub(crate) openbao_url: &'a str,
+    /// Hex SHA-256 of the deployment's **active** root.
+    ///
+    /// Compared with the fingerprint stored beside the credential before
+    /// anything is built. A mismatch means the `auth/cert` entry no
+    /// longer trusts this leaf, so the factory returns repair-required
+    /// and the verbs never exist — no ACME request, no login and no
+    /// write is made on a credential that cannot work.
+    ///
+    /// This is the fail-fast, not the guarantee. A verbs object outlives
+    /// its construction, and a full rotation replaces the root while one
+    /// is in hand, so the credential re-reads the active root from
+    /// `secrets_dir` before every acquisition of its login and refuses
+    /// there too.
+    pub(crate) active_root_fingerprint: &'a str,
+    /// The KV v2 mount every path is written under.
+    pub(crate) kv_mount: &'a str,
+    /// The loaded, digest-verified registrar config.
+    pub(crate) config: &'a RegistrarConfig,
+    /// The fixed per-issuance `secret_id` options.
+    pub(crate) secret_id_options: &'a SecretIdOptions,
+    /// Role-level `token_ttl`.
+    pub(crate) token_ttl: &'a str,
+    /// Role-level `secret_id_ttl`.
+    pub(crate) secret_id_ttl: &'a str,
+    /// The bounded wrap-TTL policy.
+    pub(crate) wrap_ttl_policy: &'a WrapTtlPolicy,
+}
+
 /// A mint request: an opaque caller plus the identity's parts.
 #[derive(Debug, Clone)]
 pub(crate) struct MintRequest {
@@ -230,9 +271,54 @@ pub(crate) struct DeregisterRequest {
     pub(crate) instance: Option<u32>,
 }
 
+/// Where a verb's privileged `OpenBao` client comes from.
+///
+/// Two arms, and the asymmetry is the point. Production takes
+/// [`VerbClientSource::Internal`], which builds its own
+/// certificate-authenticated client from the bootroot-internal
+/// credential, re-reads the active root before every acquisition, and
+/// re-authenticates before expiry — no caller supplies it, and no
+/// request can select it. Tests take
+/// [`VerbClientSource::Injected`], which is the pre-existing
+/// construction and keeps the transport-free tests transport-free.
+pub(crate) enum VerbClientSource {
+    /// A client the constructor was handed. Test-only in practice: the
+    /// production factory never takes this arm.
+    Injected(OpenBaoClient),
+    /// The bootroot-internal credential, which mints its own client.
+    Internal(InternalCredential),
+}
+
+impl VerbClientSource {
+    /// Returns a client carrying a live token.
+    ///
+    /// For the internal arm this is where the active root is compared
+    /// again: a verb reached after the deployment root changed refuses
+    /// with repair-required, having made no login and no write.
+    async fn live(&self) -> Result<OpenBaoClient, VerbError> {
+        match self {
+            Self::Injected(client) => Ok(client.clone()),
+            Self::Internal(credential) => credential.authenticated().await.map_err(|err| {
+                VerbError::unavailable(
+                    "authenticating with the bootroot-internal credential",
+                    anyhow::Error::new(err),
+                )
+            }),
+        }
+    }
+
+    /// Reports a failed request so an expired token is dropped from the
+    /// cache and the next verb authenticates again.
+    async fn note_failure(&self, error: &anyhow::Error) {
+        if let Self::Internal(credential) = self {
+            credential.note_failure(error).await;
+        }
+    }
+}
+
 /// The registrar's restricted verb service.
 pub(crate) struct RegistrarVerbs {
-    client: OpenBaoClient,
+    client: VerbClientSource,
     kv_mount: String,
     config: RegistrarConfig,
     secret_id_options: SecretIdOptions,
@@ -242,10 +328,15 @@ pub(crate) struct RegistrarVerbs {
 }
 
 impl RegistrarVerbs {
-    /// Creates the verb service from its fixed dependencies.
+    /// Creates the verb service from its fixed dependencies, over a
+    /// client the caller supplies.
+    ///
+    /// Retained for the tests, which drive the decision procedure
+    /// against a mock `OpenBao`. Production uses
+    /// [`RegistrarVerbs::internal`], which takes no client at all.
     pub(crate) fn new(config: RegistrarVerbsConfig) -> Self {
         Self {
-            client: config.client,
+            client: VerbClientSource::Injected(config.client),
             kv_mount: config.kv_mount,
             config: config.config,
             secret_id_options: config.secret_id_options,
@@ -253,6 +344,48 @@ impl RegistrarVerbs {
             secret_id_ttl: config.secret_id_ttl,
             wrap_ttl_policy: config.wrap_ttl_policy,
         }
+    }
+
+    /// Creates the verb service over the bootroot-internal credential.
+    ///
+    /// **Takes no client and no caller.** Everything it needs is a
+    /// location or a fixed policy: where the secrets tree is, which URL
+    /// `OpenBao` answers on, which KV mount the deployment uses, and the
+    /// rendered registrar config. The privileged client is built here,
+    /// from the credential on disk, and cannot be reached, replaced or
+    /// selected from a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InternalCredentialError`] when the recorded `OpenBao`
+    /// URL is plaintext, when the credential is absent, partial or
+    /// invalid, or when the root it was issued under is no longer the
+    /// deployment's active one. No network request is made in any of
+    /// those cases, and none is made on success either: the certificate
+    /// login happens on the first verb, behind a second comparison of
+    /// the stored root with the one then on disk.
+    pub(crate) fn internal(
+        source: &InternalVerbsSource<'_>,
+    ) -> Result<Self, InternalCredentialError> {
+        let credential = InternalCredential::load(
+            source.secrets_dir,
+            source.openbao_url,
+            source.active_root_fingerprint,
+        )?;
+        Ok(Self {
+            client: VerbClientSource::Internal(credential),
+            kv_mount: source.kv_mount.to_string(),
+            config: source.config.clone(),
+            secret_id_options: source.secret_id_options.clone(),
+            token_ttl: source.token_ttl.to_string(),
+            secret_id_ttl: source.secret_id_ttl.to_string(),
+            wrap_ttl_policy: source.wrap_ttl_policy.clone(),
+        })
+    }
+
+    /// Returns a privileged client carrying a live token.
+    async fn client(&self) -> Result<OpenBaoClient, VerbError> {
+        self.client.live().await
     }
 
     /// Mints — or idempotently re-mints — one service identity and
@@ -566,17 +699,23 @@ impl RegistrarVerbs {
                 // The role and policy are reused untouched; only the
                 // credential is fresh.
                 let role_name = service_role_name(registration_id);
-                let role_id = self
-                    .client
-                    .read_role_id(&role_name)
+                let client = self
+                    .client()
                     .await
-                    .with_context(|| format!("reading role_id for {role_name}"))
-                    .map_err(|err| {
-                        refuse(
+                    .map_err(|err| refuse(ProducingArm::Issuance, err))?;
+                let role_id = match client.read_role_id(&role_name).await {
+                    Ok(role_id) => role_id,
+                    Err(err) => {
+                        self.client.note_failure(&err).await;
+                        return Err(refuse(
                             ProducingArm::Issuance,
-                            VerbError::unavailable("reusing the derived role", err),
-                        )
-                    })?;
+                            VerbError::unavailable(
+                                "reusing the derived role",
+                                err.context(format!("reading role_id for {role_name}")),
+                            ),
+                        ));
+                    }
+                };
                 self.issue(
                     request,
                     request_id,
@@ -638,10 +777,12 @@ impl RegistrarVerbs {
             )
         };
 
-        let ProvisionedServiceRole {
-            role_name, role_id, ..
-        } = provision_service_role(
-            &self.client,
+        let client = self
+            .client()
+            .await
+            .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
+        let provisioned = provision_service_role(
+            &client,
             &self.kv_mount,
             registration_id,
             ServiceRoleTtls {
@@ -649,13 +790,20 @@ impl RegistrarVerbs {
                 secret_id_ttl: &self.secret_id_ttl,
             },
         )
-        .await
-        .map_err(|err| {
-            refuse(
-                ProducingArm::Provisioning,
-                VerbError::unavailable("converging the derived role and policy", err.into()),
-            )
-        })?;
+        .await;
+        let ProvisionedServiceRole {
+            role_name, role_id, ..
+        } = match provisioned {
+            Ok(provisioned) => provisioned,
+            Err(err) => {
+                let err = anyhow::Error::new(err);
+                self.client.note_failure(&err).await;
+                return Err(refuse(
+                    ProducingArm::Provisioning,
+                    VerbError::unavailable("converging the derived role and policy", err),
+                ));
+            }
+        };
 
         let active = claim.activated(&request.spec);
         self.write_binding(registration_id, &active)
@@ -705,16 +853,24 @@ impl RegistrarVerbs {
             )
         };
 
-        let wrap_info = self
-            .client
+        let client = self.client().await.map_err(refuse)?;
+        let wrap_info = match client
             .create_secret_id_wrap_only(
                 role_name,
                 &self.secret_id_options,
                 granted.as_openbao_str(),
             )
             .await
-            .with_context(|| format!("issuing wrap-only material for {role_name}"))
-            .map_err(|err| refuse(VerbError::unavailable("issuing wrapped material", err)))?;
+        {
+            Ok(wrap_info) => wrap_info,
+            Err(err) => {
+                self.client.note_failure(&err).await;
+                return Err(refuse(VerbError::unavailable(
+                    "issuing wrapped material",
+                    err.context(format!("issuing wrap-only material for {role_name}")),
+                )));
+            }
+        };
 
         let expires_at = granted_deadline(&wrap_info).map_err(|err| {
             refuse(VerbError::unavailable(
@@ -777,8 +933,12 @@ impl RegistrarVerbs {
         // same sequence as an `active` one: it is the durable
         // registration claim, and removing it is what "identity removed"
         // means whether or not the role material was ever completed.
+        let client = self
+            .client()
+            .await
+            .map_err(|err| VerbRefusal::new(context(ProducingArm::Teardown), err))?;
         let teardown = teardown_service_material(
-            &self.client,
+            &client,
             &self.kv_mount,
             registration_id,
             &REGISTRAR_TEARDOWN_KV_SUFFIXES,
@@ -854,12 +1014,17 @@ impl RegistrarVerbs {
         registration_id: &str,
     ) -> Result<Option<BindingRecord>, VerbError> {
         let path = Self::binding_path(registration_id);
-        let stored = self
-            .client
-            .try_read_kv(&self.kv_mount, &path)
-            .await
-            .with_context(|| format!("reading the registrar binding at {path}"))
-            .map_err(|err| VerbError::unavailable("reading the durable binding", err))?;
+        let client = self.client().await?;
+        let stored = match client.try_read_kv(&self.kv_mount, &path).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                self.client.note_failure(&err).await;
+                return Err(VerbError::unavailable(
+                    "reading the durable binding",
+                    err.context(format!("reading the registrar binding at {path}")),
+                ));
+            }
+        };
         let Some(value) = stored else {
             return Ok(None);
         };
@@ -882,11 +1047,20 @@ impl RegistrarVerbs {
         let body = record
             .encode()
             .map_err(|err| VerbError::unavailable("encoding the durable binding", err.into()))?;
-        self.client
+        let client = self.client().await?;
+        match client
             .create_kv_if_absent(&self.kv_mount, &path, body)
             .await
-            .with_context(|| format!("claiming the registrar binding at {path}"))
-            .map_err(|err| VerbError::unavailable("claiming the durable binding", err))
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                self.client.note_failure(&err).await;
+                Err(VerbError::unavailable(
+                    "claiming the durable binding",
+                    err.context(format!("claiming the registrar binding at {path}")),
+                ))
+            }
+        }
     }
 
     async fn write_binding(
@@ -898,20 +1072,32 @@ impl RegistrarVerbs {
         let body = record
             .encode()
             .map_err(|err| VerbError::unavailable("encoding the durable binding", err.into()))?;
-        self.client
-            .write_kv(&self.kv_mount, &path, body)
-            .await
-            .with_context(|| format!("writing the registrar binding at {path}"))
-            .map_err(|err| VerbError::unavailable("activating the durable binding", err))
+        let client = self.client().await?;
+        match client.write_kv(&self.kv_mount, &path, body).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.client.note_failure(&err).await;
+                Err(VerbError::unavailable(
+                    "activating the durable binding",
+                    err.context(format!("writing the registrar binding at {path}")),
+                ))
+            }
+        }
     }
 
     async fn delete_binding(&self, registration_id: &str) -> Result<(), VerbError> {
         let path = Self::binding_path(registration_id);
-        self.client
-            .delete_kv(&self.kv_mount, &path)
-            .await
-            .with_context(|| format!("deleting the registrar binding at {path}"))
-            .map_err(|err| VerbError::unavailable("removing the durable binding", err))
+        let client = self.client().await?;
+        match client.delete_kv(&self.kv_mount, &path).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.client.note_failure(&err).await;
+                Err(VerbError::unavailable(
+                    "removing the durable binding",
+                    err.context(format!("deleting the registrar binding at {path}")),
+                ))
+            }
+        }
     }
 }
 
