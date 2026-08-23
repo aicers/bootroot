@@ -1935,6 +1935,19 @@ old intermediate, new intermediate). Full mode uses 4-fingerprint
 transitional trust (old root, old intermediate, new root, new
 intermediate).
 
+On a host that serves the [registrar
+endpoint](operations.md#the-bootroot-internal-credential), a **full**
+rotation additionally runs one unnumbered, mandatory step between Phase 4
+and the point Phase 4 is recorded: it replaces the bootroot-internal
+credential's `auth/cert` entry, leaf material and stored root
+fingerprint. `--skip reissue` skips Phase 5, not this step, and the step
+requires an OpenBao token carrying the `root` policy — so a full rotation
+on such a host cannot be driven with `--auth-mode approle`. Phases 3 and
+6 also publish and then narrow that credential's private trust bundle and
+pins. An intermediate-only rotation touches none of it, and a host
+without the endpoint has none of it. See
+[the bootroot-internal registrar credential](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md).
+
 Inputs:
 
 - `--full`: rotate both root and intermediate CA keys (default:

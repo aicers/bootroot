@@ -1854,6 +1854,19 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 신규 중간)를 사용합니다. 전체 모드는 4-fingerprint 전이 trust(기존 루트,
 기존 중간, 신규 루트, 신규 중간)를 사용합니다.
 
+[registrar 엔드포인트](operations.md#bootroot-내부-자격-증명)를 제공하는
+호스트에서는 **전체** 모드가 Phase 4 직후, Phase 4가 기록되기 전에 번호가
+없는 필수 단계를 하나 더 실행합니다. 이 단계는 bootroot 내부 자격증명의
+`auth/cert` 항목, 리프 자료, 저장된 루트 fingerprint를 교체합니다.
+`--skip reissue`는 Phase 5만 건너뛰며 이 단계는 건너뛸 수 없고, 이
+단계에는 `root` 정책을 가진 OpenBao 토큰이 필요합니다. 따라서 이런
+호스트에서는 전체 모드를 `--auth-mode approle`로 실행할 수 없습니다.
+Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각각 확장하고
+축소합니다. 중간 CA만 교체하는 모드는 이 자산을 전혀 건드리지 않으며,
+엔드포인트가 없는 호스트에는 이 자산 자체가 없습니다.
+[bootroot 내부 registrar 자격증명](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md)을
+참고하세요.
+
 입력:
 
 - `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
