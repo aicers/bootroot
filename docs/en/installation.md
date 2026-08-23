@@ -539,6 +539,12 @@ bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 fixed — it is not configurable, and it is also the pattern rotation and recovery
 signal the process by.
 
+**Run this process as root as well.** Unlike a service agent, it reads the config
+above, the leaf key and the ACME account key — all `0600` and owned by `root` in
+a `0700` root-owned directory — and republishes the leaf back into it on every
+renewal. Started under the unprivileged user your service agents run as, it
+cannot even open its own config.
+
 **Ordinary renewal begins only once you start it.** Until then the credential
 stays whatever `init` issued, and a rotation that signals the process finds
 nothing to signal — which it treats as success, so a missing process is silent
