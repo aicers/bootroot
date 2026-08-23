@@ -22,6 +22,7 @@ use crate::registrar::internal::renewal::active_root_fingerprint_async;
 use crate::registrar::internal::{
     CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredentialError, InternalPaths,
 };
+use crate::secret::ClientToken;
 
 /// How long before a token's reported expiry the client re-authenticates.
 ///
@@ -37,21 +38,15 @@ const REFRESH_LEAD: time::Duration = time::Duration::seconds(60);
 /// as "no scheduled refresh" instead.
 const NO_EXPIRY: u64 = 0;
 
-/// A certificate-login token, redacted in every rendering.
-#[derive(Clone)]
-struct CertLoginToken(String);
-
-impl fmt::Debug for CertLoginToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
 /// A cached login: the token and, when the backend gave it one, the
 /// moment it stops being usable.
+///
+/// The token is a [`ClientToken`], the same redacting type
+/// `login_cert` returns, so `Debug` is derived here rather than
+/// hand-written: nothing in this file ever holds the bytes.
 #[derive(Clone, Debug)]
 struct CachedLogin {
-    token: CertLoginToken,
+    token: ClientToken,
     expires_at: Option<OffsetDateTime>,
 }
 
@@ -287,7 +282,7 @@ impl InternalCredential {
                     })
                     .flatten();
                 let cached = CachedLogin {
-                    token: CertLoginToken(login.client_token),
+                    token: login.client_token,
                     expires_at,
                 };
                 *guard = Some(cached.clone());
@@ -295,7 +290,7 @@ impl InternalCredential {
             }
         };
         let mut client = self.client.clone();
-        client.set_token(fresh.token.0);
+        client.set_token(fresh.token);
         Ok(client)
     }
 

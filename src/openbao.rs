@@ -5,6 +5,8 @@ use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::secret::ClientToken;
+
 const VAULT_TOKEN_HEADER: &str = "X-Vault-Token";
 const VAULT_WRAP_TTL_HEADER: &str = "X-Vault-Wrap-TTL";
 const ROOT_POLICY: &str = "root";
@@ -20,7 +22,13 @@ const KV_CAS_MISMATCH_MESSAGE: &str = "check-and-set parameter did not match the
 pub struct OpenBaoClient {
     base_url: String,
     client: Client,
-    token: Option<String>,
+    /// The bearer token every authenticated request carries.
+    ///
+    /// Held as a [`ClientToken`] rather than a `String` so that the
+    /// `#[derive(Debug)]` above cannot render it: a client is exactly
+    /// the sort of value that ends up in a `tracing` field or an
+    /// `anyhow` context.
+    token: Option<ClientToken>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,7 +228,7 @@ struct CertLoginResponse {
 
 #[derive(Debug, Deserialize)]
 struct CertAuth {
-    client_token: String,
+    client_token: ClientToken,
     #[serde(default)]
     lease_duration: u64,
 }
@@ -241,22 +249,16 @@ struct TokenLookupData {
 /// A certificate login's result: the token and the lifetime `OpenBao`
 /// granted it.
 ///
-/// The token is not `Debug`-printed anywhere: callers wrap it in a
-/// redacting newtype at the boundary it enters the program.
+/// The token is a [`ClientToken`], so it is already redacting by the
+/// time it leaves the deserializer: `Debug` here is derived precisely
+/// because the field cannot render itself, and no enclosing type has to
+/// remember to hide it.
+#[derive(Debug)]
 pub struct CertLogin {
     /// The issued client token.
-    pub client_token: String,
+    pub client_token: ClientToken,
     /// The token's lease duration in seconds, as reported by `OpenBao`.
     pub lease_duration_secs: u64,
-}
-
-impl std::fmt::Debug for CertLogin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CertLogin")
-            .field("client_token", &"<redacted>")
-            .field("lease_duration_secs", &self.lease_duration_secs)
-            .finish()
-    }
 }
 
 /// Checks whether a response status and body indicate a missing resource.
@@ -401,8 +403,14 @@ impl OpenBaoClient {
         }
     }
 
-    pub fn set_token(&mut self, token: String) {
-        self.token = Some(token);
+    /// Sets the bearer token this client sends.
+    ///
+    /// This is the one place a token's bytes are handed over, which is
+    /// why it takes anything convertible into a [`ClientToken`]: a
+    /// caller holding a wrapped token passes it through without ever
+    /// unwrapping it.
+    pub fn set_token(&mut self, token: impl Into<ClientToken>) {
+        self.token = Some(token.into());
     }
 
     /// Checks the `OpenBao` health endpoint.
@@ -1459,7 +1467,8 @@ impl OpenBaoClient {
 
     fn require_token(&self) -> Result<&str> {
         self.token
-            .as_deref()
+            .as_ref()
+            .map(ClientToken::expose)
             .ok_or_else(|| anyhow::anyhow!("OpenBao token is not set"))
     }
 
@@ -1515,7 +1524,7 @@ impl OpenBaoClient {
         let url = self.endpoint(&format!("sys/mounts/{mount}"));
         let mut request = self.client.get(url);
         if let Some(token) = &self.token {
-            request = request.header(VAULT_TOKEN_HEADER, token);
+            request = request.header(VAULT_TOKEN_HEADER, token.expose());
         }
         let response = request
             .send()
@@ -2482,7 +2491,7 @@ mod cert_auth_tests {
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-    use super::{OpenBaoClient, VAULT_TOKEN_HEADER};
+    use super::{CertLogin, OpenBaoClient, VAULT_TOKEN_HEADER};
 
     const MOUNT: &str = "cert";
     const ENTRY: &str = "bootroot-registrar-internal";
@@ -2661,8 +2670,49 @@ mod cert_auth_tests {
             .login_cert(MOUNT, ENTRY)
             .await
             .expect("certificate login");
-        assert_eq!(login.client_token, "s.tok");
+        assert_eq!(login.client_token.expose(), "s.tok");
         assert_eq!(login.lease_duration_secs, 900);
         assert!(!format!("{login:?}").contains("s.tok"));
+    }
+
+    /// The token never becomes a bare `String` between the wire and
+    /// `set_token`, so a derived `Debug` on anything holding the login —
+    /// or on the client the token was set into — cannot print it.
+    #[tokio::test]
+    async fn a_derived_debug_cannot_reveal_a_certificate_login_token() {
+        #[derive(Debug)]
+        struct Holder {
+            // Read only through the `Debug` this test is about.
+            #[allow(dead_code)]
+            login: CertLogin,
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/{MOUNT}/login")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": "s.secret-cert-token", "lease_duration": 900 }
+            })))
+            .mount(&server)
+            .await;
+
+        let login = OpenBaoClient::new(&server.uri())
+            .expect("client")
+            .login_cert(MOUNT, ENTRY)
+            .await
+            .expect("certificate login");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token(login.client_token.clone());
+        let client_rendered = format!("{client:?}");
+        assert!(
+            !client_rendered.contains("s.secret-cert-token"),
+            "{client_rendered}"
+        );
+        assert!(client_rendered.contains("<redacted>"), "{client_rendered}");
+
+        let rendered = format!("{:?}", Holder { login });
+        assert!(!rendered.contains("s.secret-cert-token"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }

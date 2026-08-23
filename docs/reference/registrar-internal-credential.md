@@ -179,6 +179,16 @@ raised before the credential is even read. A repair — the Phase-4 tail or
 it writes anything, because material republished against a plaintext URL would
 be a credential that cannot log in.
 
+The token that login mints is a bearer secret in its own right, and it is
+wrapped as one at the boundary it arrives on. The `auth/cert/login` response body
+deserializes straight into `bootroot::secret::ClientToken`, whose `Debug` prints
+`<redacted>` and which derives no `PartialEq`, so it is never a bare `String` at
+any point between the wire and `OpenBaoClient::set_token` — the one call that
+takes its bytes. The client holds it in that form too, which is why a `{:?}` on
+an `OpenBaoClient`, on the login result, or on any type that a
+`#[derive(Debug)]` encloses either one in cannot render a token. It is the
+same reasoning, and the same module, as the `HmacSecret` wrapper in §7.
+
 ## 5. The `auth/cert` entry and the policy
 
 `bootroot init` enables the `cert` auth backend when it is absent and creates one

@@ -13,6 +13,13 @@
 //! that might print one: a `#[derive(Debug)]` on anything holding a
 //! [`HmacSecret`] renders `<redacted>`, and the raw bytes are reachable
 //! only through the deliberate [`HmacSecret::expose`].
+//!
+//! [`ClientToken`] applies the same reasoning to the other bearer secret
+//! that moves through this crate: an `OpenBao` token. It is what the
+//! certificate login returns and what every authenticated request sends,
+//! so it is wrapped where it is deserialized rather than after some
+//! caller has already had a chance to put a bare `String` inside a
+//! derived `Debug`.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -96,6 +103,58 @@ impl FromStr for HmacSecret {
     }
 }
 
+/// An `OpenBao` client token.
+///
+/// A token is a bearer credential: whoever holds the bytes is the
+/// authenticated party until it expires. It is wrapped at the boundary
+/// it enters the program — the `auth/cert/login` response body
+/// deserializes straight into this type — so that no stage between the
+/// wire and [`crate::openbao::OpenBaoClient::set_token`] holds it as a
+/// bare `String` that an enclosing `#[derive(Debug)]`, an error context
+/// or a `tracing` field could render verbatim.
+///
+/// Like [`HmacSecret`] it derives no `PartialEq`: a derived comparison
+/// on a bearer token is a byte-at-a-time timing oracle, and nothing here
+/// compares two tokens — a token is proved by `OpenBao` accepting it.
+/// It derives no `Serialize` either, because no artifact this crate
+/// writes carries one.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct ClientToken(String);
+
+impl ClientToken {
+    /// Wraps a token at the boundary it enters the program.
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Borrows the raw token, for the one place that has to put it on
+    /// the wire: the `X-Vault-Token` header.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ClientToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for ClientToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ClientToken {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +208,39 @@ mod tests {
         assert!(HmacSecret::from("   ").is_blank());
         assert!(!HmacSecret::from("   ").is_empty());
         assert!(!HmacSecret::from("value").is_blank());
+    }
+
+    #[test]
+    fn client_token_debug_redacts() {
+        let token = ClientToken::new("s.certificate-login-token".to_string());
+        assert_eq!(format!("{token:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn client_token_debug_of_an_enclosing_derive_redacts_too() {
+        #[derive(Debug)]
+        struct Holder {
+            // Read only through the `Debug` this test is about.
+            #[allow(dead_code)]
+            token: ClientToken,
+        }
+
+        let rendered = format!(
+            "{:?}",
+            Holder {
+                token: ClientToken::from("s.certificate-login-token"),
+            }
+        );
+        assert!(
+            !rendered.contains("s.certificate-login-token"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn client_token_deserializes_transparently_and_exposes_its_bytes() {
+        let token: ClientToken = serde_json::from_str("\"s.wire-token\"").unwrap();
+        assert_eq!(token.expose(), "s.wire-token");
     }
 }
