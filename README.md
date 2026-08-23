@@ -1,3 +1,7 @@
+<!-- markdownlint-configure-file {
+  "MD013": { "tables": false }
+} -->
+
 # bootroot
 
 [![CI](https://github.com/aicers/bootroot/actions/workflows/ci.yml/badge.svg)](https://github.com/aicers/bootroot/actions/workflows/ci.yml)
@@ -174,15 +178,14 @@ Docs PR quick checklist:
 
 ## Preflight (required before push)
 
-Run all preflight checks before pushing:
+Run the standard preflight checks before pushing:
 
 ```bash
 ./scripts/preflight/run-all.sh
 ```
 
-Or run individual scripts. Scripts under `preflight/ci/` cover CI workflow
-jobs — `deploy-no-build-smoke.sh` is the file CI itself runs, the rest mirror
-what CI runs; scripts under `preflight/extra/` are local-only checks not in CI.
+<!-- markdownlint-disable-next-line MD013 -->
+For individual CI-equivalent scripts, use the table below. The default runner does not invoke extended E2E; it is scheduled/manual coverage for investigation or an explicitly requested run. `deploy-no-build-smoke.sh` is the file CI itself runs; the other CI-equivalent scripts mirror what CI runs.
 
 ### CI-equivalent (`preflight/ci/`)
 
@@ -192,7 +195,9 @@ what CI runs; scripts under `preflight/extra/` are local-only checks not in CI.
 | `./scripts/preflight/ci/deploy-no-build-smoke.sh` | `ci.yml` No-Build Smoke |
 | `./scripts/preflight/ci/test-core.sh` | `ci.yml` Unit & CLI Smoke |
 | `./scripts/preflight/ci/e2e-matrix.sh` | `ci.yml` Docker E2E Matrix |
-| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended |
+| `./scripts/preflight/ci/e2e-extended.sh` | `e2e-extended.yml` Run Extended (scheduled/manual; not run by `run-all.sh`) |
+
+Scripts under `preflight/extra/` are local-only checks not in CI.
 
 ### Local-only (`preflight/extra/`)
 

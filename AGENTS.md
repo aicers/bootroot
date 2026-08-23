@@ -474,14 +474,16 @@ Where the crate handles key material or secrets:
 - Before committing, ensure the `check` job (Quality Check) in `.github/workflows/ci.yml`
   would pass for the changed files.
 - Before pushing or opening a PR, ensure all CI jobs pass (`check`,
-  `test-core`, `test-docker-e2e-matrix` from `ci.yml`, and
-  `run-extended` from `e2e-extended.yml`).
+  `test-core`, and `test-docker-e2e-matrix` from `ci.yml`).
 - **Local preflight verification**: Run `scripts/preflight/run-all.sh`
-  before pushing. At minimum, run `scripts/preflight/ci/e2e-matrix.sh`
-  and `scripts/preflight/ci/e2e-extended.sh`. These may be skipped only
-  when your changes do not affect the Docker lifecycle, E2E scripts, or
-  any code paths exercised by the E2E tests (rotation, service add/verify,
-  daemon, config, etc.).
+  before pushing. At minimum, run `scripts/preflight/ci/e2e-matrix.sh`.
+  It may be skipped only when your changes do not affect the Docker
+  lifecycle, E2E scripts, or any code paths exercised by the E2E tests
+  (rotation, service add/verify, daemon, config, etc.).
+- The extended E2E suite is scheduled CI coverage in
+  `e2e-extended.yml`, not a per-pull-request requirement. Run
+  `scripts/preflight/ci/e2e-extended.sh` only for investigation or when
+  a run is explicitly requested.
 
 ## Documentation Build
 
