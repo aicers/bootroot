@@ -1387,19 +1387,6 @@ impl OpenBaoClient {
         Ok(parsed.data.policies)
     }
 
-    /// Reports whether the currently-set token carries the `root`
-    /// policy.
-    ///
-    /// # Errors
-    /// Returns an error if the lookup fails.
-    pub async fn token_has_root_policy(&self) -> Result<bool> {
-        Ok(self
-            .token_self_policies()
-            .await?
-            .iter()
-            .any(|policy| policy == ROOT_POLICY))
-    }
-
     fn endpoint(&self, path: &str) -> String {
         format!("{}/v1/{path}", self.base_url)
     }

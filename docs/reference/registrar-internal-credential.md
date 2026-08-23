@@ -122,6 +122,14 @@ were and creates none of the six files. An `enabled` entry that omits `host` or
 `domain` fails the run rather than guessing a SAN the deployment's CA never
 issues.
 
+The entry is deployment intent, so it survives the rewrites of `state.json` that
+preserve intent: `bootroot init` carries it through verbatim, and `bootroot
+reinit` snapshots it into the minimal state it writes. A host that lost it would
+be re-initialized as an ordinary one — plaintext listener, `http://` URL — while
+the previous run's credential files were still on disk, and
+`bootroot rotate registrar-internal-credential` would refuse to repair that,
+because it reads the same predicate.
+
 `auth/cert` requires TLS, so `bootroot init`'s TLS gate is
 `bind_intent || registrar_endpoint_enabled`. An endpoint-enabled **loopback**
 host therefore terminates TLS on `:8200` too. It reuses the same server

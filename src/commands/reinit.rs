@@ -427,6 +427,15 @@ pub(crate) struct DeploymentIntent {
     pub(crate) stepca_advertise_addr: Option<String>,
     pub(crate) secrets_dir: Option<PathBuf>,
     pub(crate) infra_certs: BTreeMap<String, crate::state::InfraCertEntry>,
+    /// The recorded registrar endpoint-enablement predicate.
+    ///
+    /// Deployment intent like every field above it: it says what this
+    /// host *is*, not what a run discovered.  Dropping it would leave
+    /// the follow-up `init` provisioning no bootroot-internal
+    /// credential and leaving the plaintext loopback listener in place,
+    /// on a host whose credential files are still on disk — a registrar
+    /// that cannot log in, and no command that would repair it.
+    pub(crate) registrar_endpoint: Option<crate::state::RegistrarEndpointState>,
 }
 
 /// Snapshots intent fields from `state.json` if present, otherwise
@@ -445,6 +454,7 @@ pub(crate) fn snapshot_deployment_intent(state_path: &Path) -> Result<Deployment
         stepca_advertise_addr: state.stepca_advertise_addr,
         secrets_dir: state.secrets_dir,
         infra_certs: state.infra_certs,
+        registrar_endpoint: state.registrar_endpoint,
     })
 }
 
@@ -478,6 +488,7 @@ pub(crate) async fn write_minimal_state(
         stepca_bind_addr: snapshot.stepca_bind_addr.clone(),
         stepca_advertise_addr: snapshot.stepca_advertise_addr.clone(),
         infra_certs: snapshot.infra_certs.clone(),
+        registrar_endpoint: snapshot.registrar_endpoint.clone(),
         ..Default::default()
     };
     state
@@ -2271,6 +2282,7 @@ mod tests {
                 );
                 m
             },
+            registrar_endpoint: None,
         };
         write_reinit_plan(
             &mut buf,
@@ -3130,6 +3142,82 @@ mod tests {
             rewritten.secrets_dir.as_deref(),
             Some(Path::new("secrets-custom")),
             "minimal state.json must record the snapshotted secrets_dir"
+        );
+    }
+
+    /// The registrar endpoint-enablement predicate is deployment intent
+    /// and survives a reinit.  Dropping it would leave the follow-up
+    /// `init` treating a registrar host as an ordinary one: no
+    /// bootroot-internal credential, the plaintext loopback listener
+    /// left in place, and the previous run's credential files still on
+    /// disk beside an `http://` URL that `auth/cert` can never be used
+    /// over — with `rotate registrar-internal-credential` refusing to
+    /// repair it, because it reads the same predicate.
+    #[tokio::test]
+    async fn write_minimal_state_preserves_the_registrar_endpoint_predicate() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut original = state_with_intent();
+        original.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "example.internal".to_string(),
+            host: "bootroot-01".to_string(),
+        });
+        original.save(&state_path).unwrap();
+
+        let snapshot = snapshot_deployment_intent(&state_path).expect("snapshot");
+        assert_eq!(
+            snapshot.registrar_endpoint, original.registrar_endpoint,
+            "the snapshot must carry the predicate"
+        );
+
+        let openbao = OpenBaoArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+        };
+        let messages = test_messages();
+        write_minimal_state(
+            &state_path,
+            &snapshot,
+            &openbao,
+            Path::new("secrets"),
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        let rewritten = StateFile::load(&state_path).unwrap();
+        assert_eq!(rewritten.registrar_endpoint, original.registrar_endpoint);
+    }
+
+    /// A host that never recorded the predicate still records none: the
+    /// preservation carries what was there and invents nothing.
+    #[tokio::test]
+    async fn write_minimal_state_records_no_predicate_when_there_was_none() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        state_with_intent().save(&state_path).unwrap();
+        let snapshot = snapshot_deployment_intent(&state_path).expect("snapshot");
+        assert!(snapshot.registrar_endpoint.is_none());
+
+        let openbao = OpenBaoArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+        };
+        write_minimal_state(
+            &state_path,
+            &snapshot,
+            &openbao,
+            Path::new("secrets"),
+            &test_messages(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            StateFile::load(&state_path)
+                .unwrap()
+                .registrar_endpoint
+                .is_none()
         );
     }
 }
