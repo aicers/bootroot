@@ -23,7 +23,8 @@
 //!
 //! Every step registers its undo with [`InitRollback`] *before* it acts,
 //! so a failure at any point restores the prior listener, the prior
-//! state URL, the `OpenBao` artifacts this run created, and leaves no
+//! state URL and the prior `OpenBao` artifacts — removing what this run
+//! created and writing back verbatim what it rewrote — and leaves no
 //! file behind. A host whose endpoint predicate is false performs none
 //! of it.
 
@@ -236,9 +237,10 @@ pub(super) fn register_internal_rollback(rollback: &mut InitRollback, secrets_di
 /// Creates the `auth/cert` mount, the exact-allowlist policy and the one
 /// trusted entry, under the init root token.
 ///
-/// Every artifact is registered for rollback before it is created, so a
-/// later failure removes exactly what this run added and leaves an
-/// `auth/cert` mount the deployment already had alone.
+/// Every artifact is registered for rollback before it is written, so a
+/// later failure removes exactly what this run added, puts back exactly
+/// what it rewrote, and leaves an `auth/cert` mount the deployment
+/// already had alone.
 ///
 /// # Errors
 ///
@@ -251,11 +253,19 @@ pub(super) async fn provision_internal_auth(
     messages: &Messages,
 ) -> Result<()> {
     // Registered before the write, not after: a failure between the two
-    // must still be undone. Each artifact is registered only when this
-    // run is what creates it — a re-run of `init` over an
-    // already-provisioned host must not have its rollback delete the
-    // working entry and policy it found, which is the one way this
-    // teardown could take a healthy deployment down.
+    // must still be undone. Which undo is registered depends on what
+    // this run finds. An artifact this run creates is registered for
+    // deletion; one it finds is captured verbatim and registered for
+    // restoration, because `converge_internal_auth` below rewrites both
+    // unconditionally. A re-run of `init` over an already-provisioned
+    // host therefore neither has its rollback delete the working entry
+    // and policy it found — the one way this teardown could take a
+    // healthy deployment down — nor leaves them on this run's values
+    // after a later failure. The entry matters most: the convergence
+    // points it at the recorded predicate's SAN and the active root
+    // before the matching leaf is issued, so a rollback that left it
+    // there would leave the host trusting a certificate it does not
+    // have.
     //
     // Which is why neither lookup may be read as "absent" when it did
     // not answer. A transient read failure against a host that already
@@ -268,17 +278,19 @@ pub(super) async fn provision_internal_auth(
         .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
         .await
         .context("reading the bootroot-registrar-internal cert auth entry")?;
-    if existing_entry.is_none() {
-        rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string());
+    match existing_entry {
+        Some(entry) => rollback.registrar_internal_cert_auth_entry_backup = Some(entry),
+        None => rollback.registrar_internal_cert_auth_entry = Some(CERT_AUTH_ROLE.to_string()),
     }
-    if !client
-        .policy_exists(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
+    match client
+        .read_policy(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
         .await
         .context("reading the bootroot-registrar-internal policy")?
     {
-        rollback
+        Some(policy) => rollback.registrar_internal_policy_backup = Some(policy),
+        None => rollback
             .created_policies
-            .push(POLICY_BOOTROOT_REGISTRAR_INTERNAL.to_string());
+            .push(POLICY_BOOTROOT_REGISTRAR_INTERNAL.to_string()),
     }
     // The mount registers itself the moment it exists, from inside
     // `converge_internal_auth`: the policy and the entry are written
@@ -855,6 +867,10 @@ mod auth_provisioning_tests {
 
     const ENTRY_PATH: &str = "/v1/auth/cert/certs/bootroot-registrar-internal";
     const POLICY_PATH: &str = "/v1/sys/policies/acl/bootroot-registrar-internal";
+    /// A policy body deliberately unlike the one this crate writes, so a
+    /// restore that reproduces it cannot be a convergence that happened
+    /// to land on the same text.
+    const PRIOR_POLICY: &str = "path \"secret/data/legacy\" {\n  capabilities = [\"read\"]\n}\n";
 
     /// A secrets directory carrying the deployment root the entry
     /// trusts, which `converge_internal_auth` reads before it mounts
@@ -976,7 +992,7 @@ mod auth_provisioning_tests {
         Mock::given(method("GET"))
             .and(path(POLICY_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "name": "bootroot-registrar-internal" }
+                "data": { "name": "bootroot-registrar-internal", "policy": PRIOR_POLICY }
             })))
             .mount(&server)
             .await;
@@ -1055,8 +1071,9 @@ mod auth_provisioning_tests {
     }
 
     /// A re-run over a host that already carries the entry, the policy
-    /// and the mount registers none of the three: rollback restores the
-    /// prior state, and the prior state is a working credential.
+    /// and the mount registers no *destructive* undo for any of the
+    /// three: rollback restores the prior state, and the prior state is
+    /// a working credential.
     #[tokio::test]
     async fn a_re_run_registers_none_of_the_artifacts_it_found() {
         let server = MockServer::start().await;
@@ -1070,7 +1087,7 @@ mod auth_provisioning_tests {
         Mock::given(method("GET"))
             .and(path(POLICY_PATH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "name": "bootroot-registrar-internal" }
+                "data": { "name": "bootroot-registrar-internal", "policy": PRIOR_POLICY }
             })))
             .mount(&server)
             .await;
@@ -1113,6 +1130,148 @@ mod auth_provisioning_tests {
         assert_eq!(rollback.registrar_internal_cert_auth_entry, None);
         assert!(rollback.created_policies.is_empty());
         assert!(!rollback.registrar_internal_cert_auth_mount_created);
+        // What it registers instead: the bodies it is about to replace.
+        assert!(rollback.registrar_internal_cert_auth_entry_backup.is_some());
+        assert_eq!(
+            rollback.registrar_internal_policy_backup.as_deref(),
+            Some(PRIOR_POLICY)
+        );
+    }
+
+    /// A mock `OpenBao` that already carries the mount, the entry and
+    /// the policy, and accepts every write against them — the shape of
+    /// a host `init` is re-run over. Every delete is refused, because a
+    /// run that created none of the three may remove none of them.
+    async fn established_host(prior_entry: &serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(ENTRY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": prior_entry.clone()
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(POLICY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "name": "bootroot-registrar-internal", "policy": PRIOR_POLICY }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "cert/": { "type": "cert" } }
+            })))
+            .mount(&server)
+            .await;
+        for target in [ENTRY_PATH, POLICY_PATH] {
+            Mock::given(method("POST"))
+                .and(path(target))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(target))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .and(path("/v1/sys/auth/cert"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The convergence rewrites the entry and the policy whether or not
+    /// this run created them, so "delete only what this run created" is
+    /// not the whole undo: a re-run that fails after convergence — the
+    /// ACME issuance right after it is the likeliest place — would
+    /// otherwise leave the host's `auth/cert` entry pointing at this
+    /// run's SAN and root while the on-disk leaf is still the old one,
+    /// which is precisely the state in which nothing can authenticate.
+    /// Both bodies go back exactly as they were read.
+    #[tokio::test]
+    async fn a_failure_after_convergence_restores_the_entry_and_policy_it_replaced() {
+        let prior_entry = serde_json::json!({
+            "certificate": "-----BEGIN CERTIFICATE-----\nT0xE\n-----END CERTIFICATE-----\n",
+            "allowed_dns_sans": "001.bootroot-registrar-internal.old-host.old.internal",
+            "token_policies": ["bootroot-registrar-internal"],
+            "token_no_default_policy": true,
+            "token_ttl": 3600,
+            "display_name": "bootroot-registrar-internal",
+        });
+        let server = established_host(&prior_entry).await;
+
+        let dir = secrets_dir();
+        let context = context(dir.path());
+        let mut rollback = InitRollback::default();
+        let client = client(&server);
+        provision_internal_auth(&client, &context.inputs(), &mut rollback, &test_messages())
+            .await
+            .expect("converging over an established credential must succeed");
+
+        // The failure the transaction exists for: everything after the
+        // convergence gives up, and the envelope unwinds.
+        rollback.rollback(&client, "secret", &test_messages()).await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("the mock server records its requests");
+        let posted = |target: &str| -> Vec<serde_json::Value> {
+            requests
+                .iter()
+                .filter(|req| {
+                    req.method == wiremock::http::Method::POST && req.url.path() == target
+                })
+                .map(|req| serde_json::from_slice(&req.body).expect("a JSON request body"))
+                .collect()
+        };
+
+        let entries = posted(ENTRY_PATH);
+        assert_eq!(
+            entries.len(),
+            2,
+            "the entry is written once by the convergence and once by the restore"
+        );
+        assert_ne!(
+            entries.first(),
+            Some(&prior_entry),
+            "the convergence must actually have replaced the entry, or the restore              below proves nothing"
+        );
+        assert_eq!(
+            entries.get(1),
+            Some(&prior_entry),
+            "rollback must put the prior entry back byte for byte"
+        );
+
+        let policies = posted(POLICY_PATH);
+        assert_eq!(
+            policies.len(),
+            2,
+            "the policy is written once by the convergence and once by the restore"
+        );
+        assert_ne!(
+            policies
+                .first()
+                .and_then(|body| body.get("policy"))
+                .and_then(serde_json::Value::as_str),
+            Some(PRIOR_POLICY),
+            "the convergence must actually have replaced the policy"
+        );
+        assert_eq!(
+            policies
+                .get(1)
+                .and_then(|body| body.get("policy"))
+                .and_then(serde_json::Value::as_str),
+            Some(PRIOR_POLICY),
+            "rollback must put the prior policy body back byte for byte"
+        );
     }
 }
 

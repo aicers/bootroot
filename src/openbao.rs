@@ -712,6 +712,47 @@ impl OpenBaoClient {
             .await
     }
 
+    /// Reads an ACL policy's body back, or `None` when it does not
+    /// exist.
+    ///
+    /// The capture half of [`OpenBaoClient::write_policy`]: a caller
+    /// about to overwrite a policy it did not create records the body it
+    /// found here and writes exactly that back if the run it belongs to
+    /// fails.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup fails for reasons other than a
+    /// clean not-found, or if the policy exists but the response carries
+    /// no body to restore from — a caller that cannot capture what it is
+    /// about to replace must stop before replacing it, not proceed with
+    /// no way back.
+    pub async fn read_policy(&self, name: &str) -> Result<Option<String>> {
+        let path = format!("sys/policies/acl/{name}");
+        let response = self.send_authed(Method::GET, &path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if is_not_found(status, &text) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).context("Failed to parse OpenBao response")?;
+        let body = parsed
+            .get("data")
+            .and_then(|data| data.get("policy"))
+            .or_else(|| parsed.get("policy"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("OpenBao returned policy {name} without a `policy` body")
+            })?;
+        Ok(Some(body.to_string()))
+    }
+
     /// Deletes an ACL policy.
     ///
     /// # Errors

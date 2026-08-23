@@ -121,6 +121,20 @@ pub(super) struct InitRollback {
     /// The `auth/cert` entry this run created, by name.  Deleted on
     /// rollback so a rolled-back host trusts no internal certificate.
     pub(super) registrar_internal_cert_auth_entry: Option<String>,
+    /// The `auth/cert` entry this run found already there, captured
+    /// verbatim before it was rewritten.  A re-run over an established
+    /// credential converges the entry onto the recorded predicate's SAN
+    /// and the active root *before* the leaf that matches it is issued,
+    /// so a failure after that point would otherwise leave the host
+    /// trusting a certificate it does not have.  Written back on
+    /// rollback, byte for byte.
+    pub(super) registrar_internal_cert_auth_entry_backup: Option<serde_json::Value>,
+    /// The `bootroot-registrar-internal` policy this run found already
+    /// there, captured before it was rewritten.  Restored on rollback
+    /// for the same reason as the entry above: the convergence replaces
+    /// it unconditionally, and deleting a policy this run did not create
+    /// is not the undo of having replaced it.
+    pub(super) registrar_internal_policy_backup: Option<String>,
     /// Whether this run is what mounted `auth/cert`.  Only then does
     /// rollback disable it: a deployment that already had the backend
     /// keeps it, along with every other entry under it.
@@ -271,8 +285,12 @@ impl InitRollback {
         }
 
         // The bootroot-internal artifacts, innermost first: the files,
-        // then the entry that trusts them, then the mount — and the
-        // mount only when this run is what created it.
+        // then the entry that trusts them, then the policy that entry
+        // names, then the mount — and the mount only when this run is
+        // what created it.  Each of the two `OpenBao` artifacts is
+        // deleted when this run created it and put back verbatim when
+        // this run merely rewrote one it found, so a re-run that fails
+        // after convergence leaves the established credential working.
         for dir in [
             &self.registrar_internal_dir,
             &self.registrar_internal_staging,
@@ -289,12 +307,40 @@ impl InitRollback {
                 );
             }
         }
-        if let Some(name) = &self.registrar_internal_cert_auth_entry
+        // Restored before deleted, and never both: an entry this run
+        // created has no prior body and is removed, while one it found
+        // and rewrote is put back exactly as it was read.
+        if let Some(entry) = &self.registrar_internal_cert_auth_entry_backup {
+            if let Err(err) = client
+                .write_cert_auth_entry_raw(
+                    bootroot::registrar::internal::CERT_AUTH_MOUNT,
+                    bootroot::registrar::internal::CERT_AUTH_ROLE,
+                    entry,
+                )
+                .await
+            {
+                eprintln!(
+                    "Rollback: failed to restore the bootroot-registrar-internal cert auth                      entry: {err}; re-run                      `bootroot rotate registrar-internal-credential --force`"
+                );
+            }
+        } else if let Some(name) = &self.registrar_internal_cert_auth_entry
             && let Err(err) = client
                 .delete_cert_auth_entry(bootroot::registrar::internal::CERT_AUTH_MOUNT, name)
                 .await
         {
             eprintln!("Rollback: failed to delete cert auth entry {name}: {err}");
+        }
+        if let Some(policy) = &self.registrar_internal_policy_backup
+            && let Err(err) = client
+                .write_policy(
+                    crate::commands::init::constants::openbao_constants::POLICY_BOOTROOT_REGISTRAR_INTERNAL,
+                    policy,
+                )
+                .await
+        {
+            eprintln!(
+                "Rollback: failed to restore the bootroot-registrar-internal policy: {err}"
+            );
         }
         if self.registrar_internal_cert_auth_mount_created
             && let Err(err) = client
