@@ -10,7 +10,7 @@
 //! exists to make impossible.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use time::OffsetDateTime;
@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 use crate::openbao::OpenBaoClient;
 use crate::registrar::internal::material::{InternalMaterial, load_material};
+use crate::registrar::internal::renewal::active_root_fingerprint_async;
 use crate::registrar::internal::{
     CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredentialError, InternalPaths,
 };
@@ -84,16 +85,29 @@ pub struct RootAuthority(());
 
 /// The bootroot-internal privileged credential, live.
 ///
-/// Holds the material, the transport that presents it, and the cached
-/// login. Cloning shares one cache — the `reqwest` client underneath is
-/// an `Arc` and so is the cache — so two holders never log in twice for
-/// the same window.
+/// Holds the material, the transport that presents it, the cached login
+/// and the one piece of fixed deployment state the credential needs to
+/// stay honest: the secrets directory it re-reads the *active* root from
+/// before every use. Cloning shares one cache — the `reqwest` client
+/// underneath is an `Arc` and so is the cache — so two holders never log
+/// in twice for the same window.
+///
+/// A credential is long-lived; the root under it is not. A full CA
+/// rotation replaces the root in Phase 2 and only replaces this
+/// credential in the mandatory tail after Phase 4, so a verbs object
+/// built before that window is still in hand after the root has changed
+/// beneath it. Comparing the roots once, at construction, would leave
+/// that object logging in — or worse, writing under a still-valid
+/// cached token — against an `auth/cert` entry that no longer trusts its
+/// leaf. So the comparison is a precondition of *use*, not of
+/// construction.
 #[derive(Clone)]
 pub struct InternalCredential {
     base_url: String,
     client: OpenBaoClient,
     login: Arc<Mutex<Option<CachedLogin>>>,
     root_fingerprint: String,
+    secrets_dir: PathBuf,
 }
 
 impl fmt::Debug for InternalCredential {
@@ -101,6 +115,7 @@ impl fmt::Debug for InternalCredential {
         f.debug_struct("InternalCredential")
             .field("base_url", &self.base_url)
             .field("root_fingerprint", &self.root_fingerprint)
+            .field("secrets_dir", &self.secrets_dir)
             .finish_non_exhaustive()
     }
 }
@@ -123,7 +138,9 @@ impl InternalCredential {
     /// `openbao_url` is not `https://`, the loader's own errors when the
     /// material is absent, partial or invalid, and
     /// [`InternalCredentialError::RepairRequired`] when the stored root
-    /// fingerprint is not `active_root_fingerprint`.
+    /// fingerprint is not `active_root_fingerprint`. That comparison is
+    /// a fail-fast, not the enduring one: every acquisition of the login
+    /// re-reads the active root from `secrets_dir` and compares again.
     pub fn load(
         secrets_dir: &Path,
         openbao_url: &str,
@@ -140,14 +157,18 @@ impl InternalCredential {
                 source,
             }
         })?;
-        Self::from_parts(openbao_url, &material, &bundle)
+        Self::from_parts(secrets_dir, openbao_url, &material, &bundle)
     }
 
     /// Builds the credential from already-loaded parts.
     ///
     /// The provisioning path takes this: it holds the freshly issued
     /// material in memory and must prove a certificate login works
-    /// *before* any of it is published.
+    /// *before* any of it is published. `secrets_dir` is the same fixed
+    /// location the published credential will sit below, so the staged
+    /// credential is held to the same active-root comparison as a loaded
+    /// one — a leaf staged against a root that has since been replaced
+    /// is refused rather than proved.
     ///
     /// # Errors
     ///
@@ -155,6 +176,7 @@ impl InternalCredential {
     /// non-HTTPS URL, and [`InternalCredentialError::OpenBao`] when the
     /// transport cannot be built from the supplied PEMs.
     pub fn from_parts(
+        secrets_dir: &Path,
         openbao_url: &str,
         material: &InternalMaterial,
         ca_bundle_pem: &str,
@@ -174,6 +196,7 @@ impl InternalCredential {
             client: OpenBaoClient::with_client(openbao_url, http),
             login: Arc::new(Mutex::new(None)),
             root_fingerprint: material.root_fingerprint.clone(),
+            secrets_dir: secrets_dir.to_path_buf(),
         })
     }
 
@@ -184,12 +207,17 @@ impl InternalCredential {
     /// plain-HTTP mock. Production has no path to it: the two public
     /// constructors both go through the TLS refusal.
     #[cfg(test)]
-    pub(crate) fn for_test(openbao_url: &str, root_fingerprint: &str) -> anyhow::Result<Self> {
+    pub(crate) fn for_test(
+        openbao_url: &str,
+        secrets_dir: &Path,
+        root_fingerprint: &str,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             base_url: openbao_url.to_string(),
             client: OpenBaoClient::new(openbao_url)?,
             login: Arc::new(Mutex::new(None)),
             root_fingerprint: root_fingerprint.to_string(),
+            secrets_dir: secrets_dir.to_path_buf(),
         })
     }
 
@@ -199,33 +227,45 @@ impl InternalCredential {
         &self.root_fingerprint
     }
 
-    /// Refuses to proceed when the active root is not the one the
-    /// `auth/cert` entry trusts.
+    /// Refuses to proceed when the root on disk is no longer the one
+    /// the `auth/cert` entry trusts.
     ///
-    /// Called *before* any ACME, login or write: a mismatched root means
-    /// the entry no longer trusts this leaf, so every one of those would
-    /// fail anyway, and attempting them would turn a clean
+    /// Re-reads the deployment root from the fixed path below the
+    /// state-recorded secrets directory rather than trusting a value
+    /// captured earlier, because "earlier" is exactly when it was still
+    /// right. Called *before* any login or write: a mismatched root
+    /// means the entry no longer trusts this leaf, so every one of those
+    /// would fail anyway, and attempting them would turn a clean
     /// repair-required into a partial change.
     ///
     /// # Errors
     ///
     /// Returns [`InternalCredentialError::RepairRequired`] on a
-    /// mismatch.
-    pub fn check_active_root(
-        &self,
-        active_fingerprint: &str,
-    ) -> Result<(), InternalCredentialError> {
-        compare_root(&self.root_fingerprint, active_fingerprint)
+    /// mismatch, and the reader's own `Io`/`Invalid` errors when the
+    /// active root cannot be read — an unreadable root is a refusal too,
+    /// never an assumption that it still matches.
+    pub async fn check_active_root(&self) -> Result<(), InternalCredentialError> {
+        let active = active_root_fingerprint_async(&self.secrets_dir).await?;
+        compare_root(&self.root_fingerprint, &active)
     }
 
     /// Returns an `OpenBao` client carrying a live token, logging in
     /// again when the cached one is absent, stale or was invalidated.
     ///
+    /// The active-root comparison runs first, ahead of the cache: a
+    /// mismatch must stop a *cached* token being handed out just as
+    /// firmly as it stops a fresh login, or the window between a root
+    /// change and a lease expiry would be one in which verb writes
+    /// continue unchecked.
+    ///
     /// # Errors
     ///
-    /// Returns [`InternalCredentialError::OpenBao`] when the
+    /// Returns [`InternalCredentialError::RepairRequired`] when the
+    /// active root is no longer the one this credential was issued
+    /// under, and [`InternalCredentialError::OpenBao`] when the
     /// certificate login fails.
     pub async fn authenticated(&self) -> Result<OpenBaoClient, InternalCredentialError> {
+        self.check_active_root().await?;
         let mut guard = self.login.lock().await;
         let now = OffsetDateTime::now_utc();
         let fresh = match guard.as_ref() {

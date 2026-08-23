@@ -400,6 +400,17 @@ ACME request, no login and no write — a mismatched root means the entry no lon
 trusts this leaf, so attempting any of them would turn a clean refusal into a
 partial change.
 
+The active root is re-read from `<secrets>/certs/root_ca.crt` at each of those
+points rather than captured once. The credential is long-lived and the root under
+it is not: a full rotation replaces the root in Phase 2 and this credential only
+in the tail after Phase 4, so anything holding a verb service across that window
+holds one whose leaf the entry has stopped trusting. The comparison is therefore
+a precondition of *use*. It runs ahead of the cached login too, so a token still
+inside its lease is not handed out after the root changed — that would be a write
+under a superseded credential, which is worse than a login that would have been
+refused. A root certificate that cannot be read is itself a refusal, never an
+assumption that the stored one still matches.
+
 ```sh
 bootroot rotate registrar-internal-credential
 ```

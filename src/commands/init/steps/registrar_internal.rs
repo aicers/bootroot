@@ -484,8 +484,20 @@ pub(crate) async fn verify_internal_login(
     staged: &StagedInternal,
     openbao_url: &str,
 ) -> Result<()> {
-    let credential =
-        InternalCredential::from_parts(openbao_url, &staged.material, &staged.bundle_pem)?;
+    // The layout's own parent, so the login proof re-reads the active
+    // root from the very directory the published credential will sit
+    // below. A staged leaf issued under a root that has since been
+    // replaced is refused here rather than published.
+    let secrets_dir =
+        staged.paths.dir().parent().ok_or_else(|| {
+            anyhow::anyhow!("the internal layout has no parent secrets directory")
+        })?;
+    let credential = InternalCredential::from_parts(
+        secrets_dir,
+        openbao_url,
+        &staged.material,
+        &staged.bundle_pem,
+    )?;
     credential
         .authenticated()
         .await

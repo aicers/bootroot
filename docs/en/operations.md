@@ -363,6 +363,12 @@ reported through the profile's ordinary post-renew failure hooks, the daemon
 keeps ticking, and the tick after the repair renews normally — there is nothing
 to restart.
 
+The same comparison guards the credential's privileged `OpenBao` login, not only
+renewal, and it re-reads the active root each time rather than trusting a value
+read at start-up. A registrar verb reached after the root changed therefore
+refuses with the same repair-required error instead of logging in — or continuing
+to write under a token it acquired before the change.
+
 **Rotation.** An intermediate-only CA rotation leaves the credential, its entry,
 its config and its private bundle untouched: the entry trusts the root, which
 that rotation does not replace. A full rotation publishes the additive trust set

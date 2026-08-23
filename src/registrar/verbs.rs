@@ -216,6 +216,12 @@ pub(crate) struct InternalVerbsSource<'a> {
     /// longer trusts this leaf, so the factory returns repair-required
     /// and the verbs never exist — no ACME request, no login and no
     /// write is made on a credential that cannot work.
+    ///
+    /// This is the fail-fast, not the guarantee. A verbs object outlives
+    /// its construction, and a full rotation replaces the root while one
+    /// is in hand, so the credential re-reads the active root from
+    /// `secrets_dir` before every acquisition of its login and refuses
+    /// there too.
     pub(crate) active_root_fingerprint: &'a str,
     /// The KV v2 mount every path is written under.
     pub(crate) kv_mount: &'a str,
@@ -270,8 +276,9 @@ pub(crate) struct DeregisterRequest {
 /// Two arms, and the asymmetry is the point. Production takes
 /// [`VerbClientSource::Internal`], which builds its own
 /// certificate-authenticated client from the bootroot-internal
-/// credential and re-authenticates it before expiry — no caller supplies
-/// it, and no request can select it. Tests take
+/// credential, re-reads the active root before every acquisition, and
+/// re-authenticates before expiry — no caller supplies it, and no
+/// request can select it. Tests take
 /// [`VerbClientSource::Injected`], which is the pre-existing
 /// construction and keeps the transport-free tests transport-free.
 pub(crate) enum VerbClientSource {
@@ -284,6 +291,10 @@ pub(crate) enum VerbClientSource {
 
 impl VerbClientSource {
     /// Returns a client carrying a live token.
+    ///
+    /// For the internal arm this is where the active root is compared
+    /// again: a verb reached after the deployment root changed refuses
+    /// with repair-required, having made no login and no write.
     async fn live(&self) -> Result<OpenBaoClient, VerbError> {
         match self {
             Self::Injected(client) => Ok(client.clone()),
@@ -351,7 +362,8 @@ impl RegistrarVerbs {
     /// invalid, or when the root it was issued under is no longer the
     /// deployment's active one. No network request is made in any of
     /// those cases, and none is made on success either: the certificate
-    /// login happens on the first verb.
+    /// login happens on the first verb, behind a second comparison of
+    /// the stored root with the one then on disk.
     pub(crate) fn internal(
         source: &InternalVerbsSource<'_>,
     ) -> Result<Self, InternalCredentialError> {

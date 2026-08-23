@@ -18,8 +18,8 @@ use super::material::{
 use super::{
     ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_ROLE, CHAIN_FILE, INTERNAL_DIR,
     InternalAgentConfigParams, InternalCredential, InternalCredentialError, InternalPaths,
-    KEY_FILE, ROOT_FINGERPRINT_FILE, build_registrar_internal_policy, render_internal_agent_config,
-    require_https,
+    KEY_FILE, ROOT_FINGERPRINT_FILE, active_root_cert_path, active_root_fingerprint,
+    build_registrar_internal_policy, render_internal_agent_config, require_https,
 };
 use crate::registrar::{
     REGISTRAR_INTERNAL_LABEL, RESERVED_SERVICE_NAME_PREFIX, is_reserved_service_name,
@@ -93,6 +93,37 @@ async fn provisioned_host() -> (TempDir, InternalPaths) {
         .expect("publish the material");
     write_companions(&paths);
     (dir, paths)
+}
+
+/// Writes `pem` into the fixed active-root path below `secrets_dir` and
+/// returns its fingerprint.
+///
+/// The credential re-reads that file before every login, so a test that
+/// wants a login to happen has to give it a real root to read, and a
+/// test that wants one refused changes the file rather than a variable.
+fn write_active_root(secrets_dir: &Path, pem: &str) -> String {
+    let path = active_root_cert_path(secrets_dir);
+    std::fs::create_dir_all(path.parent().expect("the certs directory"))
+        .expect("create the certs directory");
+    std::fs::write(&path, pem).expect("write the active root");
+    active_root_fingerprint(secrets_dir).expect("the written root must hash")
+}
+
+/// A self-signed CA, as PEM.
+fn self_signed_root(common_name: &str) -> String {
+    let key = rcgen::KeyPair::generate().expect("ca key");
+    let mut params =
+        rcgen::CertificateParams::new(vec![common_name.to_string()]).expect("ca params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.self_signed(&key).expect("self-signed ca").pem()
+}
+
+/// A fresh secrets directory carrying a real active root, with that
+/// root's fingerprint.
+fn secrets_dir_with_active_root() -> (TempDir, String) {
+    let dir = TempDir::new().expect("tempdir");
+    let fingerprint = write_active_root(dir.path(), &self_signed_root("bootroot-active-root"));
+    (dir, fingerprint)
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -435,23 +466,46 @@ async fn loading_over_plaintext_never_reaches_the_material() {
 
 /// A root mismatch is reported before any ACME, login or write, and
 /// names the repair command.
-#[test]
-fn a_root_mismatch_returns_repair_required() {
+///
+/// The comparison is against the root *on disk*, re-read each time, so
+/// the mismatch is produced by replacing the deployment's root
+/// certificate rather than by passing a different string — which is the
+/// only form the rotation actually takes.
+#[tokio::test]
+async fn a_root_mismatch_returns_repair_required() {
+    let dir = TempDir::new().expect("tempdir");
     let (bundle, leaf_material) = real_credential();
-    let credential =
-        InternalCredential::from_parts("https://localhost:8200", &leaf_material, &bundle)
-            .expect("a real leaf and bundle must build the transport");
-    assert_eq!(credential.root_fingerprint(), ROOT_FP);
+    let stored = write_active_root(dir.path(), &bundle);
+    let credential = InternalCredential::from_parts(
+        dir.path(),
+        "https://localhost:8200",
+        &InternalMaterial {
+            root_fingerprint: stored.clone(),
+            ..clone_material(&leaf_material)
+        },
+        &bundle,
+    )
+    .expect("a real leaf and bundle must build the transport");
+    assert_eq!(credential.root_fingerprint(), stored);
     credential
-        .check_active_root(ROOT_FP)
+        .check_active_root()
+        .await
         .expect("the matching root is accepted");
+
+    // The rotation replaces the file; nothing tells the long-lived
+    // credential about it.
+    let active = write_active_root(dir.path(), &self_signed_root("bootroot-new-root"));
     let err = credential
-        .check_active_root(OTHER_FP)
+        .check_active_root()
+        .await
         .expect_err("a mismatched root must be refused");
     match err {
-        InternalCredentialError::RepairRequired { stored, active } => {
-            assert_eq!(stored, ROOT_FP);
-            assert_eq!(active, OTHER_FP);
+        InternalCredentialError::RepairRequired {
+            stored: reported,
+            active: reported_active,
+        } => {
+            assert_eq!(reported, stored);
+            assert_eq!(reported_active, active);
         }
         other => panic!("{other:?}"),
     }
@@ -460,6 +514,43 @@ fn a_root_mismatch_returns_repair_required() {
         "{}",
         err_repair_message()
     );
+}
+
+/// An active root that cannot be read is a refusal, not an assumption
+/// that the stored one still matches.
+#[tokio::test]
+async fn an_unreadable_active_root_refuses_the_login() {
+    let dir = TempDir::new().expect("tempdir");
+    let (bundle, leaf_material) = real_credential();
+    let stored = write_active_root(dir.path(), &bundle);
+    let credential = InternalCredential::from_parts(
+        dir.path(),
+        "https://localhost:8200",
+        &InternalMaterial {
+            root_fingerprint: stored,
+            ..clone_material(&leaf_material)
+        },
+        &bundle,
+    )
+    .expect("the credential must build");
+    std::fs::remove_file(active_root_cert_path(dir.path())).expect("remove the active root");
+    let err = credential
+        .authenticated()
+        .await
+        .expect_err("an unreadable active root must refuse");
+    assert!(matches!(err, InternalCredentialError::Io { .. }), "{err:?}");
+}
+
+/// `InternalMaterial` is deliberately not `Clone` — the key inside it
+/// is not a value to copy around casually — so the tests that need a
+/// second copy under a different root fingerprint say so here.
+fn clone_material(material: &InternalMaterial) -> InternalMaterial {
+    InternalMaterial {
+        key: PrivateKeyPem::new(material.key.expose().to_string()),
+        chain: material.chain.clone(),
+        acme_account: AcmeAccountKey::new(material.acme_account.expose().to_string()),
+        root_fingerprint: material.root_fingerprint.clone(),
+    }
 }
 
 fn err_repair_message() -> String {
@@ -475,8 +566,10 @@ fn err_repair_message() -> String {
 #[test]
 fn an_unparseable_key_fails_the_transport() {
     let (bundle, _) = real_credential();
-    let err = InternalCredential::from_parts("https://localhost:8200", &material(), &bundle)
-        .expect_err("a synthetic key must not build a transport");
+    let dir = TempDir::new().expect("tempdir");
+    let err =
+        InternalCredential::from_parts(dir.path(), "https://localhost:8200", &material(), &bundle)
+            .expect_err("a synthetic key must not build a transport");
     assert!(
         matches!(err, InternalCredentialError::OpenBao { .. }),
         "{err:?}"
@@ -845,13 +938,26 @@ mod snapshot {
 /// once the cache is dropped, and no `role_id`/`secret_id` anywhere.
 mod login {
     use serde_json::json;
+    use tempfile::TempDir;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{OTHER_FP, ROOT_FP};
-    use crate::registrar::internal::{CERT_AUTH_ROLE, InternalCredential, is_expired_token_error};
+    use super::{OTHER_FP, secrets_dir_with_active_root, self_signed_root, write_active_root};
+    use crate::registrar::internal::{
+        CERT_AUTH_ROLE, InternalCredential, InternalCredentialError, is_expired_token_error,
+    };
 
     const TOKEN: &str = "s.internal-token";
+
+    /// A credential over the mock, holding the real root the fixture
+    /// wrote — the one the login boundary re-reads on every
+    /// acquisition.
+    fn credential_over(server: &MockServer) -> (TempDir, InternalCredential) {
+        let (dir, fingerprint) = secrets_dir_with_active_root();
+        let credential = InternalCredential::for_test(&server.uri(), dir.path(), &fingerprint)
+            .expect("credential");
+        (dir, credential)
+    }
 
     async fn mock_login(server: &MockServer, lease_secs: u64, expect: u64) {
         Mock::given(method("POST"))
@@ -871,7 +977,7 @@ mod login {
     async fn one_login_serves_a_whole_lease_window() {
         let server = MockServer::start().await;
         mock_login(&server, 3600, 1).await;
-        let credential = InternalCredential::for_test(&server.uri(), ROOT_FP).expect("credential");
+        let (_dir, credential) = credential_over(&server);
 
         for _ in 0..3 {
             credential.authenticated().await.expect("authenticated");
@@ -885,7 +991,7 @@ mod login {
     async fn an_expired_token_response_forces_a_fresh_login() {
         let server = MockServer::start().await;
         mock_login(&server, 3600, 2).await;
-        let credential = InternalCredential::for_test(&server.uri(), ROOT_FP).expect("credential");
+        let (_dir, credential) = credential_over(&server);
 
         credential.authenticated().await.expect("first login");
         credential
@@ -903,7 +1009,7 @@ mod login {
     async fn an_unrelated_failure_keeps_the_cached_login() {
         let server = MockServer::start().await;
         mock_login(&server, 3600, 1).await;
-        let credential = InternalCredential::for_test(&server.uri(), ROOT_FP).expect("credential");
+        let (_dir, credential) = credential_over(&server);
 
         credential.authenticated().await.expect("first login");
         credential
@@ -921,10 +1027,46 @@ mod login {
     async fn a_lease_inside_the_refresh_lead_is_refreshed_every_time() {
         let server = MockServer::start().await;
         mock_login(&server, 5, 2).await;
-        let credential = InternalCredential::for_test(&server.uri(), ROOT_FP).expect("credential");
+        let (_dir, credential) = credential_over(&server);
 
         credential.authenticated().await.expect("first login");
         credential.authenticated().await.expect("refreshed login");
+    }
+
+    /// The root can change under a credential that is already built,
+    /// and when it does neither a cached token nor a fresh login is
+    /// handed out.
+    ///
+    /// The mock expects exactly one login: the one made before the
+    /// rotation. The token it returned is well inside its lease, so a
+    /// credential that compared roots only at construction would go on
+    /// serving it — which is the worse half of the failure, because it
+    /// is a *write* under a superseded credential rather than a login
+    /// that would have been refused anyway.
+    #[tokio::test]
+    async fn a_root_replaced_after_construction_stops_the_login_and_the_cache() {
+        let server = MockServer::start().await;
+        mock_login(&server, 3600, 1).await;
+        let (dir, credential) = credential_over(&server);
+        credential
+            .authenticated()
+            .await
+            .expect("the login before the rotation must succeed");
+
+        write_active_root(dir.path(), &self_signed_root("bootroot-rotated-root"));
+
+        for attempt in 0..2 {
+            let err = credential
+                .authenticated()
+                .await
+                .expect_err("a superseded root must refuse");
+            assert!(
+                matches!(err, InternalCredentialError::RepairRequired { .. }),
+                "attempt {attempt}: {err:?}"
+            );
+        }
+        // `expect(1)` is asserted when the server drops: the refusals
+        // above made no second login.
     }
 
     #[test]
@@ -1021,7 +1163,9 @@ mod authority {
 mod live {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{DOMAIN, HOST, ROOT_FP, account_json};
+    use tempfile::TempDir;
+
+    use super::{DOMAIN, HOST, ROOT_FP, account_json, write_active_root};
     use crate::openbao::OpenBaoClient;
     use crate::registrar::internal::{
         AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredential, InternalMaterial,
@@ -1178,10 +1322,19 @@ mod live {
         let ca = TestCa::new();
         backend.provision_entry(&ca, CERT_AUTH_ROLE).await;
 
-        let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
-        let credential =
-            InternalCredential::from_parts(&backend.url, &material, &backend.server_ca_pem)
-                .expect("the credential must build over the scenario's server trust");
+        // The CA the entry trusts is also this scenario's deployment
+        // root, written where the credential re-reads it from before
+        // every login.
+        let dir = TempDir::new().expect("tempdir");
+        let mut material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        material.root_fingerprint = write_active_root(dir.path(), &ca.pem);
+        let credential = InternalCredential::from_parts(
+            dir.path(),
+            &backend.url,
+            &material,
+            &backend.server_ca_pem,
+        )
+        .expect("the credential must build over the scenario's server trust");
         let client = credential
             .authenticated()
             .await

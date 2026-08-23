@@ -87,7 +87,10 @@ pub use material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_members,
     capture_set, load_material, material_status, publish_material,
 };
-pub use renewal::{active_root_fingerprint, check_renewal_allowed, internal_profile_paths};
+pub use renewal::{
+    active_root_cert_path, active_root_fingerprint, active_root_fingerprint_async,
+    check_renewal_allowed, internal_profile_paths,
+};
 
 /// The fixed subdirectory, below the state-recorded secrets directory,
 /// that every bootroot-internal artifact lives in.

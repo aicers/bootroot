@@ -25,7 +25,7 @@
 //! and the daemon keeps ticking, so the tick after the repair renews
 //! normally.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use x509_parser::pem::parse_x509_pem;
 
@@ -73,6 +73,18 @@ pub fn internal_profile_paths(profile: &DaemonProfileSettings) -> Option<Interna
     (paths.chain() == profile.paths.cert && paths.key() == profile.paths.key).then_some(paths)
 }
 
+/// The one file the deployment's active root is read from.
+///
+/// Named in one place because three callers now re-read it — this
+/// guard, the rotation's own root-fingerprint helper, and the
+/// certificate-login boundary in [`crate::registrar::internal::client`]
+/// — and a second spelling of the path would be a second thing to keep
+/// in step.
+#[must_use]
+pub fn active_root_cert_path(secrets_dir: &Path) -> PathBuf {
+    secrets_dir.join(CA_CERTS_DIR).join(CA_ROOT_CERT_FILENAME)
+}
+
 /// Reads the fingerprint of the deployment root currently on disk.
 ///
 /// # Errors
@@ -81,19 +93,51 @@ pub fn internal_profile_paths(profile: &DaemonProfileSettings) -> Option<Interna
 /// be read and [`InternalCredentialError::Invalid`] when it is not a
 /// PEM certificate.
 pub fn active_root_fingerprint(secrets_dir: &Path) -> Result<String, InternalCredentialError> {
-    let path = secrets_dir.join(CA_CERTS_DIR).join(CA_ROOT_CERT_FILENAME);
+    let path = active_root_cert_path(secrets_dir);
     let contents = std::fs::read(&path).map_err(|source| InternalCredentialError::Io {
         operation: "reading",
         path: path.clone(),
         source,
     })?;
-    let (_, pem) = parse_x509_pem(&contents).map_err(|_| InternalCredentialError::Invalid {
-        path: path.clone(),
+    fingerprint_of_root_pem(&path, &contents)
+}
+
+/// The same read, without blocking the runtime.
+///
+/// The certificate-login boundary re-reads the active root on every
+/// acquisition of the internal token, and that boundary is async: a
+/// synchronous read there would block a worker thread on every verb.
+///
+/// # Errors
+///
+/// The same two as [`active_root_fingerprint`].
+pub async fn active_root_fingerprint_async(
+    secrets_dir: &Path,
+) -> Result<String, InternalCredentialError> {
+    let path = active_root_cert_path(secrets_dir);
+    let contents = tokio::fs::read(&path)
+        .await
+        .map_err(|source| InternalCredentialError::Io {
+            operation: "reading",
+            path: path.clone(),
+            source,
+        })?;
+    fingerprint_of_root_pem(&path, &contents)
+}
+
+/// Hashes the DER inside a root certificate's PEM, refusing anything
+/// that is not one.
+fn fingerprint_of_root_pem(
+    path: &Path,
+    contents: &[u8],
+) -> Result<String, InternalCredentialError> {
+    let (_, pem) = parse_x509_pem(contents).map_err(|_| InternalCredentialError::Invalid {
+        path: path.to_path_buf(),
         reason: "the active root certificate is not a PEM certificate".to_string(),
     })?;
     if pem.label != "CERTIFICATE" {
         return Err(InternalCredentialError::Invalid {
-            path,
+            path: path.to_path_buf(),
             reason: format!("expected a CERTIFICATE PEM block, found {}", pem.label),
         });
     }
