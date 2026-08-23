@@ -45,7 +45,7 @@ use super::RotateContext;
 use super::helpers::signal_internal_registrar_agent;
 use crate::commands::init::registrar_internal::{
     RegistrarInternalContext, RegistrarInternalIntent, converge_internal_auth,
-    issue_internal_material, publish_internal_set,
+    issue_internal_material, publish_internal_set, staging_dir,
 };
 use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, compute_ca_bundle_pem,
@@ -205,11 +205,43 @@ pub(super) async fn repair_internal_credential(
     // issuance staged: the Phase-4 tail replaces the credential while
     // the fleet is still on the additive set, and a repair mid-rotation
     // has to restore that same set.
-    let staged = issue_internal_material(&inputs, messages)
-        .await?
-        .with_trust(trust.fingerprints.clone(), trust.bundle_pem.clone());
-    publish_internal_set(&staged, &inputs, messages).await?;
+    //
+    // A repair runs outside `init`'s rollback envelope, so the staging
+    // directory has no undo registered for it. It holds an unpublished
+    // private key, so a failed repair sweeps it here rather than leaving
+    // it beside the credential until the next successful run happens to
+    // overwrite it.
+    let staged = match issue_internal_material(&inputs, messages).await {
+        Ok(staged) => staged.with_trust(trust.fingerprints.clone(), trust.bundle_pem.clone()),
+        Err(err) => {
+            sweep_staging(&context.secrets_dir).await;
+            return Err(err);
+        }
+    };
+    if let Err(err) = publish_internal_set(&staged, &inputs, messages).await {
+        sweep_staging(&context.secrets_dir).await;
+        return Err(err);
+    }
     signal_internal_registrar_agent(&context.secrets_dir, messages)
+}
+
+/// Removes the staging directory a failed repair left behind.
+///
+/// Best effort and never fatal: the repair has already failed, and the
+/// error a sweep would add would displace the one that matters. A
+/// directory that survives is reported so the unpublished key it holds
+/// is not silent.
+async fn sweep_staging(secrets_dir: &Path) {
+    let staging = staging_dir(&InternalPaths::new(secrets_dir));
+    if !staging.exists() {
+        return;
+    }
+    if let Err(err) = tokio::fs::remove_dir_all(&staging).await {
+        eprintln!(
+            "Warning: failed to remove the staging directory {}: {err}",
+            staging.display()
+        );
+    }
 }
 
 /// Builds the repair's context from the recorded state, the existing
@@ -502,7 +534,7 @@ mod tests {
 
     use super::{
         InternalPaths, InternalTrustState, ensure_internal_trust_is, internal_credential_present,
-        repair_internal_credential, write_internal_trust,
+        repair_internal_credential, staging_dir, sweep_staging, write_internal_trust,
     };
     use crate::i18n::test_messages;
 
@@ -669,6 +701,28 @@ mod tests {
             before,
             "nothing may be rewritten before the refusal"
         );
+    }
+
+    /// A repair runs outside `init`'s rollback envelope, so a failure
+    /// after the leaf was staged has nothing registered to undo it. The
+    /// staging directory holds an unpublished private key, so the repair
+    /// sweeps it itself rather than leaving it beside the credential.
+    #[tokio::test]
+    async fn a_failed_repair_sweeps_its_staging_directory() {
+        let (dir, paths) = provisioned_host().await;
+        let staging = staging_dir(&paths);
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::write(staging.join("key.pem"), "STAGED KEY").expect("staged key");
+
+        sweep_staging(dir.path()).await;
+        assert!(!staging.exists(), "the staged key must not survive");
+        // The published credential is untouched by the sweep.
+        assert!(paths.key().exists());
+        assert!(paths.agent_config().exists());
+
+        // A host that never reached the staging stage is a no-op.
+        sweep_staging(dir.path()).await;
+        assert!(!staging.exists());
     }
 
     /// The Phase-4 tail refuses to replace anything on a host whose
