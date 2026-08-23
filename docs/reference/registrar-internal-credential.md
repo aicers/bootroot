@@ -422,9 +422,16 @@ repairs it. The command:
   daemon cannot log in. Issuance runs over ACME against step-ca and needs no
   entry, so it goes first; the entry is then converged, the staged leaf is proved
   with a real `auth/cert/login`, and only then is the set published. The entry
-  read before the convergence is put back verbatim if the login or the
-  publication fails, so the entry and the material move together: the host ends
-  either on the new pair or on the pair it started with;
+  **and the policy** read before the convergence are put back verbatim if the
+  login or the publication fails, so the auth artifacts and the material move
+  together: the host ends either on the new set or on the set it started with.
+  Both are captured, because the convergence rewrites both — an undo covering
+  only the entry would leave a host whose policy this run did not create, an
+  older release's body or one widened by hand, permanently on this run's body,
+  with nothing recording the change. A repair runs outside `init`'s rollback
+  envelope, so this capture is the whole undo. As there, a lookup that does not
+  answer fails the repair before anything is written rather than being read as
+  "absent";
 - never re-runs install and never changes a service credential;
 - is a no-op that says so when the set is complete and the stored root already
   matches the active one, unless `--force` is passed.

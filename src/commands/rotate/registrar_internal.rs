@@ -50,8 +50,8 @@ use crate::commands::init::registrar_internal::{
     staging_dir, verify_internal_login,
 };
 use crate::commands::init::{
-    DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC, compute_ca_bundle_pem,
-    read_ca_cert_fingerprint,
+    DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC,
+    POLICY_BOOTROOT_REGISTRAR_INTERNAL, compute_ca_bundle_pem, read_ca_cert_fingerprint,
 };
 use crate::commands::trust::RotationMode;
 use crate::i18n::Messages;
@@ -309,18 +309,22 @@ async fn replace_internal_credential(
     };
 
     // Captured before the convergence and put back if anything after it
-    // fails, so the entry and the material move together: either the
-    // host ends on the new pair, or it ends on the pair it started with.
-    // A lookup that does not answer is not read as "no entry" — that
-    // would register a deletion for an entry the host depends on — so
-    // it fails the repair here, with nothing yet changed.
-    let prior_entry = client
-        .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
-        .await
-        .context("reading the bootroot-registrar-internal cert auth entry")?;
+    // fails, so the auth artifacts and the material move together:
+    // either the host ends on the new set, or it ends on the set it
+    // started with. Both members are captured, because the convergence
+    // rewrites both: `init` puts both back and a repair needs the same
+    // symmetry, or a failed `--force` run would restore the entry and
+    // leave a policy it replaced.
+    let prior = match PriorInternalAuth::capture(client).await {
+        Ok(prior) => prior,
+        Err(err) => {
+            sweep_staging(&context.secrets_dir).await;
+            return Err(err);
+        }
+    };
 
     if let Err(err) = converge_and_publish(client, &staged, &inputs, openbao_url, messages).await {
-        restore_cert_auth_entry(client, prior_entry.as_ref()).await;
+        prior.restore(client).await;
         sweep_staging(&context.secrets_dir).await;
         return Err(err);
     }
@@ -353,6 +357,64 @@ async fn converge_and_publish(
     converge_internal_auth(client, inputs, messages, &mut mounted_now).await?;
     verify_internal_login(staged, openbao_url).await?;
     publish_internal_set(staged, inputs, messages).await
+}
+
+/// The `auth/cert` artifacts a repair is about to rewrite, exactly as
+/// it found them.
+///
+/// `converge_internal_auth` rewrites the policy *and* the entry
+/// unconditionally, so a repair that captures only one of them puts only
+/// one of them back. On a host whose policy this repair did not create —
+/// one written by an older release, or widened by hand — a failed
+/// `bootroot rotate registrar-internal-credential --force` would then
+/// restore the entry and leave that policy permanently replaced. Both
+/// members are captured together and restored together for that reason.
+///
+/// A repair runs outside `init`'s rollback envelope, so this is the
+/// whole undo: there is no `InitRollback` behind it to catch what is
+/// missed here.
+struct PriorInternalAuth {
+    /// The trusted entry's body, or `None` when the host had none.
+    entry: Option<serde_json::Value>,
+    /// The exact-allowlist policy's body, or `None` when the host had
+    /// none.
+    policy: Option<String>,
+}
+
+impl PriorInternalAuth {
+    /// Reads both artifacts before anything is written.
+    ///
+    /// A lookup that does not answer is not read as "absent" — that
+    /// would register a deletion for an artifact the host depends on —
+    /// so it fails the repair here, with nothing yet changed in
+    /// `OpenBao`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either lookup fails for a reason other than
+    /// a clean not-found.
+    async fn capture(client: &OpenBaoClient) -> Result<Self> {
+        let entry = client
+            .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+            .await
+            .context("reading the bootroot-registrar-internal cert auth entry")?;
+        let policy = client
+            .read_policy(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
+            .await
+            .context("reading the bootroot-registrar-internal policy")?;
+        Ok(Self { entry, policy })
+    }
+
+    /// Puts both artifacts back the way a failed repair found them.
+    ///
+    /// In the reverse of the order the convergence writes them — entry
+    /// first, then the policy it names — so the window in which the
+    /// entry points at a policy body this run wrote is closed before the
+    /// policy itself moves.
+    async fn restore(&self, client: &OpenBaoClient) {
+        restore_cert_auth_entry(client, self.entry.as_ref()).await;
+        restore_internal_policy(client, self.policy.as_deref()).await;
+    }
 }
 
 /// Puts the `auth/cert` entry back the way a failed repair found it.
@@ -389,6 +451,46 @@ async fn restore_cert_auth_entry(client: &OpenBaoClient, prior: Option<&serde_js
         eprintln!(
             "Warning: the bootroot-registrar-internal cert auth entry could not be restored \
              after a failed repair: {err}; re-run \
+             `bootroot rotate registrar-internal-credential --force`"
+        );
+    }
+}
+
+/// Puts the exact-allowlist policy back the way a failed repair found
+/// it.
+///
+/// Best effort and never fatal, for the same reason as the entry above:
+/// the repair has already failed, and an error raised here would
+/// displace the one that matters. Silence is what it must not be — a
+/// policy left on this run's body is an authority change nothing
+/// recorded, so a restore that does not land is reported with the
+/// command that repairs it.
+async fn restore_internal_policy(client: &OpenBaoClient, prior: Option<&str>) {
+    let outcome = match prior {
+        Some(body) => {
+            client
+                .write_policy(POLICY_BOOTROOT_REGISTRAR_INTERNAL, body)
+                .await
+        }
+        // Nothing was there, so nothing is left behind: a repair on a
+        // host whose policy had been removed puts it back to removed.
+        None => client
+            .delete_policy(POLICY_BOOTROOT_REGISTRAR_INTERNAL)
+            .await
+            .or_else(|err| {
+                // A delete of a policy the convergence never got as far
+                // as writing is not a failure to report.
+                if err.to_string().contains("404") {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }),
+    };
+    if let Err(err) = outcome {
+        eprintln!(
+            "Warning: the bootroot-registrar-internal policy could not be restored after a \
+             failed repair: {err}; re-run \
              `bootroot rotate registrar-internal-credential --force`"
         );
     }
@@ -695,14 +797,20 @@ pub(super) async fn rotate_registrar_internal_credential(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use bootroot::registrar::internal::{
         AcmeAccountKey, InternalAgentConfigParams, InternalMaterial, PrivateKeyPem,
         publish_material, render_internal_agent_config,
     };
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        InternalPaths, InternalTrustState, RotationMode, ensure_internal_trust_is,
+        CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths, InternalTrustState,
+        POLICY_BOOTROOT_REGISTRAR_INTERNAL, PriorInternalAuth, RegistrarInternalContext,
+        RotationMode, converge_internal_auth, ensure_internal_trust_is,
         internal_credential_present, internal_rotation_applies, repair_internal_credential,
         replace_internal_credential, restore_cert_auth_entry, staging_dir, sweep_staging,
         write_internal_trust,
@@ -754,6 +862,113 @@ mod tests {
         )
         .expect("config");
         (dir, paths)
+    }
+
+    /// The repair inputs every test below drives, pointed at a
+    /// provisioned host's secrets directory.
+    ///
+    /// The ACME and responder endpoints are unreachable on purpose: no
+    /// test here gets as far as issuing, and one that did would be
+    /// reaching the network rather than asserting anything.
+    fn repair_inputs(secrets_dir: &std::path::Path) -> RegistrarInternalContext {
+        RegistrarInternalContext {
+            intent: super::RegistrarInternalIntent {
+                domain: "example.internal".to_string(),
+                host: "bootroot-01".to_string(),
+            },
+            secrets_dir: secrets_dir.to_path_buf(),
+            kv_mount: "secret".to_string(),
+            acme_server: "https://127.0.0.1:1/acme/acme/directory".to_string(),
+            email: "ops@example.internal".to_string(),
+            responder_url: "http://127.0.0.1:1".to_string(),
+            responder_hmac: "hmac".to_string(),
+            eab: None,
+        }
+    }
+
+    /// A policy body deliberately unlike the one this crate writes, so
+    /// a restore that reproduces it cannot be a convergence that
+    /// happened to land on the same text.
+    const PRIOR_POLICY: &str = "path \"secret/data/legacy\" {\n  capabilities = [\"read\"]\n}\n";
+
+    /// The `auth/cert` entry a host is carrying before a repair runs.
+    fn prior_entry() -> serde_json::Value {
+        serde_json::json!({
+            "certificate": "-----BEGIN CERTIFICATE-----\nT0xE\n-----END CERTIFICATE-----\n",
+            "allowed_dns_sans": ["001.bootroot-registrar-internal.bootroot-01.example.internal"],
+            "token_policies": ["bootroot-registrar-internal"],
+            "token_no_default_policy": true,
+            "token_ttl": 3600,
+        })
+    }
+
+    /// Every body written to the policy and the entry, in order.
+    struct ConvergeWrites {
+        policies: Arc<Mutex<Vec<String>>>,
+        entries: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    /// An `OpenBao` already carrying the cert backend, a distinct policy
+    /// and a distinct entry, recording every write over them.
+    async fn converge_mock_server() -> (MockServer, ConvergeWrites) {
+        let policy_path = format!("/v1/sys/policies/acl/{POLICY_BOOTROOT_REGISTRAR_INTERNAL}");
+        let entry_path = format!("/v1/auth/{CERT_AUTH_MOUNT}/certs/{CERT_AUTH_ROLE}");
+        let server = MockServer::start().await;
+        // The backend is already enabled, so the convergence goes
+        // straight to the two writes this fixture is about.
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/auth"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "cert/": { "type": "cert" } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(policy_path.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "policy": PRIOR_POLICY }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(entry_path.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "data": prior_entry() })),
+            )
+            .mount(&server)
+            .await;
+
+        let policies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let policy_sink = Arc::clone(&policies);
+        Mock::given(method("POST"))
+            .and(path(policy_path))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json");
+                policy_sink.lock().expect("capture").push(
+                    body.get("policy")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("a policy body")
+                        .to_string(),
+                );
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+        let entries: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let entry_sink = Arc::clone(&entries);
+        Mock::given(method("POST"))
+            .and(path(entry_path))
+            .respond_with(move |request: &Request| {
+                entry_sink
+                    .lock()
+                    .expect("capture")
+                    .push(serde_json::from_slice(&request.body).expect("json"));
+                ResponseTemplate::new(204)
+            })
+            .mount(&server)
+            .await;
+        (server, ConvergeWrites { policies, entries })
     }
 
     /// Every host but a bootroot registrar host has no internal
@@ -1030,19 +1245,7 @@ mod tests {
         // fails at its first step — before ACME, and long before any
         // `OpenBao` write.
         let (dir, paths) = provisioned_host().await;
-        let context = crate::commands::init::registrar_internal::RegistrarInternalContext {
-            intent: super::RegistrarInternalIntent {
-                domain: "example.internal".to_string(),
-                host: "bootroot-01".to_string(),
-            },
-            secrets_dir: dir.path().to_path_buf(),
-            kv_mount: "secret".to_string(),
-            acme_server: "https://127.0.0.1:1/acme/acme/directory".to_string(),
-            email: "ops@example.internal".to_string(),
-            responder_url: "http://127.0.0.1:1".to_string(),
-            responder_hmac: "hmac".to_string(),
-            eab: None,
-        };
+        let context = repair_inputs(dir.path());
 
         replace_internal_credential(
             &client,
@@ -1141,6 +1344,71 @@ mod tests {
             .filter(|request| request.method == wiremock::http::Method::DELETE)
             .count();
         assert_eq!(deletes, 1, "an absent entry is restored by removing it");
+    }
+
+    /// A repair that fails after the convergence puts the *policy* back
+    /// too, not just the entry.
+    ///
+    /// `converge_internal_auth` rewrites the exact-allowlist policy and
+    /// the trusted entry in one breath, so an undo covering only the
+    /// entry leaves an authority change nothing recorded: a host whose
+    /// policy this run did not create — an older release's body, or one
+    /// widened by hand — would come out of a failed `--force` repair
+    /// permanently on this run's body. `init` puts both back; this
+    /// proves the repair, which runs outside `init`'s rollback envelope
+    /// and is therefore its own whole undo, does too.
+    #[tokio::test]
+    async fn a_failed_repair_puts_the_previous_policy_back_as_well() {
+        let (server, writes) = converge_mock_server().await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let (dir, _paths) = provisioned_host().await;
+        std::fs::create_dir_all(dir.path().join("certs")).expect("ca dir");
+        std::fs::write(
+            dir.path().join("certs").join("root_ca.crt"),
+            bundle_pem("Uk9PVA"),
+        )
+        .expect("root CA");
+        let context = repair_inputs(dir.path());
+
+        // What a repair does around a login or a publication that
+        // failed: capture, converge, put back what it found.
+        let prior = PriorInternalAuth::capture(&client)
+            .await
+            .expect("both artifacts are readable");
+        let mut mounted_now = false;
+        converge_internal_auth(
+            &client,
+            &context.inputs(),
+            &test_messages(),
+            &mut mounted_now,
+        )
+        .await
+        .expect("the convergence writes both artifacts");
+        prior.restore(&client).await;
+
+        let policies = writes.policies.lock().expect("capture").clone();
+        assert_eq!(
+            policies.len(),
+            2,
+            "the convergence writes the policy and the restore puts it back: {policies:?}"
+        );
+        assert_ne!(
+            policies.first().expect("the converged body"),
+            PRIOR_POLICY,
+            "the convergence really does replace the pre-existing policy"
+        );
+        assert_eq!(
+            policies.last().expect("the restored body"),
+            PRIOR_POLICY,
+            "the policy the repair found goes back exactly as it was read"
+        );
+        assert_eq!(
+            writes.entries.lock().expect("capture").last(),
+            Some(&prior_entry()),
+            "the entry is still restored alongside it"
+        );
     }
 
     /// The Phase-4 tail refuses to replace anything on a host whose
