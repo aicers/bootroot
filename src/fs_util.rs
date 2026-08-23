@@ -1043,7 +1043,8 @@ fn chown_fixed_context(owner: FixedOwner, path: &Path) -> String {
         format!("owned by uid {} gid {}", owner.uid, owner.gid)
     };
     format!(
-        "{} must be published {requirement}: the staged file could not be given that owner,          which needs CAP_CHOWN, so nothing was published — run this command as root",
+        "{} must be published {requirement}: the staged file could not be given that owner, \
+         which needs CAP_CHOWN, so nothing was published — run this command as root",
         path.display()
     )
 }

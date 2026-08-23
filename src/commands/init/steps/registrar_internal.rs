@@ -591,7 +591,18 @@ async fn publish_internal_files(
 
     publish_material(&staged.paths, &staged.material).await?;
 
-    let config = render_internal_agent_config(
+    let config = internal_agent_config(staged, inputs);
+    publish_internal_agent_config(&staged.paths, &config, messages).await
+}
+
+/// Renders the `agent.toml` the publication writes.
+///
+/// Split from the writer so the composition is assertable on its own:
+/// publishing the file needs the root authority
+/// [`publish_internal_agent_config`] requires, and the trust set the
+/// pins are taken from is decided here rather than there.
+fn internal_agent_config(staged: &StagedInternal, inputs: &RegistrarInternalInputs<'_>) -> String {
+    render_internal_agent_config(
         &staged.paths,
         &InternalAgentConfigParams {
             email: inputs.email,
@@ -604,8 +615,7 @@ async fn publish_internal_files(
             eab_hmac: inputs.eab.map(|creds| &creds.hmac),
             trusted_ca_sha256: &staged.fingerprints,
         },
-    );
-    publish_internal_agent_config(&staged.paths, &config, messages).await
+    )
 }
 
 /// Publishes the generated `agent.toml`, `root:root` and `0600`.
@@ -1313,7 +1323,7 @@ mod publication_tests {
     use tempfile::TempDir;
 
     use super::{
-        RegistrarInternalContext, RegistrarInternalIntent, StagedInternal,
+        RegistrarInternalContext, RegistrarInternalIntent, StagedInternal, internal_agent_config,
         publish_internal_agent_config, publish_internal_set, staging_dir,
     };
     use crate::i18n::test_messages;
@@ -1321,6 +1331,7 @@ mod publication_tests {
     const ACTIVE_ROOT: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
     const ACTIVE_INT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const OLD_ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const OLD_INT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
     fn bundle(label: &str) -> String {
         format!("-----BEGIN CERTIFICATE-----\n{label}\n-----END CERTIFICATE-----\n")
@@ -1520,5 +1531,60 @@ mod publication_tests {
             !paths.agent_config().exists(),
             "a refused publication must not create the config"
         );
+    }
+
+    /// The pins the publication writes are the trust set it was given:
+    /// the active generation `init` staged, or the additive set a repair
+    /// overrides it with.
+    ///
+    /// Asserted on the rendered config rather than on a published one,
+    /// because publishing it takes the root authority the tests above
+    /// prove an ordinary user does not have — and the composition is
+    /// what would otherwise go unchecked outside a privileged E2E.
+    /// Narrowing the repair case to the active generation would take
+    /// this identity off a set the rest of the fleet still trusts.
+    #[test]
+    fn the_generated_config_carries_the_trust_set_the_publication_was_given() {
+        let dir = TempDir::new().expect("tempdir");
+        let context = context(dir.path());
+        let paths = InternalPaths::new(dir.path());
+
+        let active = settings_of(&internal_agent_config(
+            &staged(dir.path()),
+            &context.inputs(),
+        ));
+        assert_eq!(
+            active.trust.trusted_ca_sha256,
+            [ACTIVE_ROOT.to_string(), ACTIVE_INT.to_string()]
+        );
+        assert_eq!(
+            active.trust.ca_bundle_path.as_deref(),
+            Some(paths.ca_bundle().as_path())
+        );
+        assert_eq!(
+            active.profiles.first().expect("one profile").paths.cert,
+            paths.chain()
+        );
+
+        let additive = vec![
+            OLD_ROOT.to_string(),
+            OLD_INT.to_string(),
+            ACTIVE_ROOT.to_string(),
+            ACTIVE_INT.to_string(),
+        ];
+        let repaired = settings_of(&internal_agent_config(
+            &staged(dir.path()).with_trust(additive.clone(), bundle("QURESVRJVkU")),
+            &context.inputs(),
+        ));
+        assert_eq!(repaired.trust.trusted_ca_sha256, additive);
+    }
+
+    /// Parses a rendered config the way `bootroot-agent` does.
+    fn settings_of(rendered: &str) -> bootroot::config::Settings {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(AGENT_CONFIG_FILE);
+        std::fs::write(&path, rendered).expect("write the rendered config");
+        bootroot::config::Settings::from_file(Some(path))
+            .expect("the generated config must deserialize")
     }
 }
