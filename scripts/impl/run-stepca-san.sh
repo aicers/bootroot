@@ -73,6 +73,7 @@ INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-40}"
 INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-3}"
 OPENBAO_READY_ATTEMPTS="${OPENBAO_READY_ATTEMPTS:-40}"
 OPENBAO_READY_DELAY_SECS="${OPENBAO_READY_DELAY_SECS:-2}"
+OPENBAO_LOCAL_URL="http://127.0.0.1:${OPENBAO_HOST_PORT:-8200}"
 STEPCA_READY_ATTEMPTS="${STEPCA_READY_ATTEMPTS:-40}"
 STEPCA_READY_DELAY_SECS="${STEPCA_READY_DELAY_SECS:-3}"
 CA_JSON_ATTEMPTS="${CA_JSON_ATTEMPTS:-10}"
@@ -675,7 +676,7 @@ run_first_init() {
   local summary_json="$1"
   local raw_log="$2"
   wait_for_postgres_admin
-  wait_for_openbao_listening "http://127.0.0.1:8200"
+  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
   # `infra install` writes state.json (to record the bind intent) before
   # init runs, so init's overwrite-state prompt fires; ca.json and
   # password.txt prompt too on a rerun, and `db-provision` adds its own
@@ -725,7 +726,7 @@ run_second_init() {
   [ -n "$db_dsn" ] || fail "failed to parse db.dataSource from ca.json"
 
   wait_for_postgres_admin
-  wait_for_openbao_listening "http://127.0.0.1:8200"
+  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
   # `db-provision` is off here, so `--confirm-db-provision` is
   # deliberately not passed: the three overwrite flags are enough to run
   # with stdin closed, which also shows the confirmation flag is
