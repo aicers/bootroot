@@ -485,6 +485,35 @@ cd /var/lib/bootroot/audit-store/records &&
   jq -c --arg id "$REQUEST_ID" 'select(.request_id == $id)'
 ```
 
+`bootroot status --agent-config /path/to/agent.toml` also scans the
+store on demand. It reports unpaired intents (an intent more than 60
+seconds old with no outcome in the scanned generations), malformed
+lines, and whether a full retained generation set appears younger than
+the configured retention target. The scanner uses a 30-day lookback for
+unpaired intents, but still reads the immediately preceding generation
+so an outcome across a rotation boundary pairs correctly. Malformed
+lines, duplicate request IDs, unsupported record versions, phase/outcome
+disagreements, oversized lines, and an unterminated final line are
+signals; a malformed line never aborts the rest of the scan.
+
+The retention warning is derived only when all configured rotated
+generations are present: it compares the oldest parseable record
+timestamp in the oldest retained generation (falling forward across
+generations with no parseable records) with the configured retention
+floor. Generation filenames and malformed lines never stand in for that
+timestamp.
+
+The status section has three distinct states: a missing store is “not
+configured”; a quiet, provisioned store (including one with no active
+file yet) prints zero/zero/no; and an unreadable or unsafe store prints
+a failed-scan warning rather than a false all-clear. The reader verifies
+the store directory and its immediate parent are non-symlink directories
+owned by root or the invoking user and not group- or world-writable.
+Ancestors above that parent are trusted provisioning properties, not
+verified by this command; the checks bound a directory-substitution race
+to principals already trusted to read the store, rather than eliminating
+the race.
+
 A line is either a whole record or not there at all. Once a writer is wired
 in, a write that fails
 partway through one takes its bytes back off the file — and flushes that

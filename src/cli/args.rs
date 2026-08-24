@@ -1350,6 +1350,10 @@ pub(crate) struct ReinitArgs {
 
 #[derive(Args, Debug)]
 pub(crate) struct StatusArgs {
+    /// Optional bootroot-agent configuration used to locate the registrar audit store.
+    #[arg(long)]
+    pub(crate) agent_config: Option<PathBuf>,
+
     #[command(flatten)]
     pub(crate) compose: ComposeFileArgs,
 

@@ -306,6 +306,18 @@ pub(crate) struct Strings {
     pub(crate) status_error_openbao_unreachable: &'static str,
     pub(crate) status_last_secret_id_rotation: &'static str,
     pub(crate) status_warning_secret_id_rotation_stale: &'static str,
+    pub(crate) status_section_registrar_audit: &'static str,
+    pub(crate) status_audit_not_configured: &'static str,
+    pub(crate) status_audit_unpaired_intents: &'static str,
+    pub(crate) status_audit_malformed_records: &'static str,
+    pub(crate) status_audit_retention_shortfall: &'static str,
+    pub(crate) status_audit_yes: &'static str,
+    pub(crate) status_audit_no: &'static str,
+    pub(crate) status_warning_audit_unpaired_intents: &'static str,
+    pub(crate) status_warning_audit_malformed_records: &'static str,
+    pub(crate) status_warning_audit_retention_shortfall: &'static str,
+    pub(crate) status_warning_audit_scan_failed: &'static str,
+    pub(crate) status_error_agent_config_missing: &'static str,
     pub(crate) summary_title: &'static str,
     pub(crate) summary_openbao_url: &'static str,
     pub(crate) summary_kv_mount: &'static str,
@@ -811,6 +823,29 @@ mod tests {
         assert_eq!(
             messages.status_entry_without_health("nginx", "running"),
             "  - nginx: running"
+        );
+    }
+
+    #[test]
+    fn audit_retention_shortfall_uses_the_active_locale() {
+        let en = Messages::new("en").expect("load English messages");
+        let ko = Messages::new("ko").expect("load Korean messages");
+
+        assert_eq!(
+            en.status_audit_retention_shortfall(true),
+            "  - retention shortfall: yes"
+        );
+        assert_eq!(
+            en.status_audit_retention_shortfall(false),
+            "  - retention shortfall: no"
+        );
+        assert_eq!(
+            ko.status_audit_retention_shortfall(true),
+            "  - 보존 기간 부족: 예"
+        );
+        assert_eq!(
+            ko.status_audit_retention_shortfall(false),
+            "  - 보존 기간 부족: 아니요"
         );
     }
 

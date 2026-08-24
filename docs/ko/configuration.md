@@ -389,7 +389,7 @@ OpenBao 감사 장치 확인은 그대로입니다.
 직렬화된 길이만으로 거부되며, 저장소가 무엇도 열거나 만들기 전에
 거부되므로 기록과 그 디렉터리는 있던 그대로 남습니다.
 
-`audit_min_retain_days`는 이후 보고 작업을 위한 보존 *목표*를 기록합니다.
+`audit_min_retain_days`는 `bootroot status`가 보고하는 보존 *목표*입니다.
 둘이 어긋나면 `audit_max_retained_files`가 이깁니다. 파일 개수는 하드
 용량 제약이고 일수는 그렇지 않기 때문입니다.
 
