@@ -35,6 +35,11 @@ use crate::service_material::TeardownReport;
 /// The sole payload version this daemon implements.
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
+// These v1 members make a request a mint rather than a deregistration. They
+// stay rejected on a deregistration frame so a mint body cannot be interpreted
+// as a request to remove the same identity.
+const REGISTER_ONLY_REQUEST_MEMBERS: [&str; 3] = ["delivery_mode", "spec", "wrap_ttl"];
+
 /// A payload protocol version accepted by this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProtocolVersion;
@@ -163,6 +168,9 @@ pub(crate) enum CodecError {
     /// JSON did not match the selected payload shape.
     #[error("registrar protocol JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    /// A frame carried a member reserved for the other request operation.
+    #[error("registrar deregister request contains a register-only member: {0}")]
+    RegisterOnlyRequestMember(&'static str),
     /// `ca_anchor` was not standard base64.
     #[error("registrar ca_anchor is not standard base64: {0}")]
     Base64(#[from] base64::DecodeError),
@@ -186,9 +194,19 @@ pub(crate) fn decode_request(operation: Operation, payload: &[u8]) -> Result<Req
         Operation::Mint => serde_json::from_slice(payload)
             .map(Request::Register)
             .map_err(Into::into),
-        Operation::Deregister => serde_json::from_slice(payload)
-            .map(Request::Deregister)
-            .map_err(Into::into),
+        Operation::Deregister => {
+            let value: serde_json::Value = serde_json::from_slice(payload)?;
+            if let Some(members) = value.as_object()
+                && let Some(member) = REGISTER_ONLY_REQUEST_MEMBERS
+                    .iter()
+                    .find(|member| members.contains_key(**member))
+            {
+                return Err(CodecError::RegisterOnlyRequestMember(member));
+            }
+            serde_json::from_slice(payload)
+                .map(Request::Deregister)
+                .map_err(Into::into)
+        }
     }
 }
 
@@ -917,6 +935,43 @@ mod tests {
             br#"{"protocol_version":1,"service_name":"api","delivery_mode":"LocalFile","host":"node","spec":{"component":"api","service_name":"api","reload":"opaque"},"wrap_ttl":1.5,"idempotency_key":"key"}"#,
         ] {
             assert!(decode_request(Operation::Mint, payload).is_err());
+        }
+    }
+
+    #[test]
+    fn deregister_rejects_each_register_only_member() {
+        let register = RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "api".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "node".to_string(),
+            instance: None,
+            spec: WireServiceSpec {
+                component: "api".to_string(),
+                service_name: "api".to_string(),
+                reload: "opaque".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 60,
+            idempotency_key: "key".to_string(),
+        };
+
+        for member in REGISTER_ONLY_REQUEST_MEMBERS {
+            let mut value = serde_json::to_value(&register).expect("register serializes");
+            let members = value
+                .as_object_mut()
+                .expect("register serializes as an object");
+            for candidate in REGISTER_ONLY_REQUEST_MEMBERS {
+                if candidate != member {
+                    members.remove(candidate);
+                }
+            }
+
+            let payload = serde_json::to_vec(&value).expect("register payload serializes");
+            assert!(matches!(
+                decode_request(Operation::Deregister, &payload),
+                Err(CodecError::RegisterOnlyRequestMember(rejected)) if rejected == member
+            ));
         }
     }
 
@@ -1714,6 +1769,64 @@ mod tests {
         }
     }
 
+    fn decode_and_reencode_fixture(name: &str, fixture: &[u8]) -> Vec<u8> {
+        match name {
+            "register-request.json" | "deregister-request.json" => encode_request(
+                &decode_request(
+                    if name == "register-request.json" {
+                        Operation::Mint
+                    } else {
+                        Operation::Deregister
+                    },
+                    fixture,
+                )
+                .expect("request fixture decodes"),
+            )
+            .expect("request fixture reencodes"),
+            "mint-success.json" => {
+                serde_json::to_vec(&decode_mint_response(fixture).expect("mint fixture decodes"))
+                    .expect("mint fixture reencodes")
+            }
+            "deregister-success.json" => serde_json::to_vec(
+                &decode_deregister_response(fixture).expect("deregister fixture decodes"),
+            )
+            .expect("deregister fixture reencodes"),
+            _ => serde_json::to_vec(
+                &decode_refusal_response(fixture).expect("refusal fixture decodes"),
+            )
+            .expect("refusal fixture reencodes"),
+        }
+    }
+
+    fn shuffled_json(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(shuffled_json)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            serde_json::Value::Object(members) => format!(
+                "{{{}}}",
+                members
+                    .iter()
+                    .rev()
+                    .map(|(member, value)| {
+                        format!(
+                            "{}:{}",
+                            serde_json::to_string(member).expect("member name serializes"),
+                            shuffled_json(value)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            _ => serde_json::to_string(value).expect("JSON value serializes"),
+        }
+    }
+
     #[test]
     fn golden_fixtures_match_the_production_codec() {
         for (name, generated) in generated_fixtures() {
@@ -1728,33 +1841,22 @@ mod tests {
     #[test]
     fn golden_fixtures_decode_and_reencode_byte_for_byte() {
         for (name, fixture) in generated_fixtures() {
-            let reencoded = match name {
-                "register-request.json" | "deregister-request.json" => encode_request(
-                    &decode_request(
-                        if name == "register-request.json" {
-                            Operation::Mint
-                        } else {
-                            Operation::Deregister
-                        },
-                        &fixture,
-                    )
-                    .expect("request fixture decodes"),
-                )
-                .expect("request fixture reencodes"),
-                "mint-success.json" => serde_json::to_vec(
-                    &decode_mint_response(&fixture).expect("mint fixture decodes"),
-                )
-                .expect("mint fixture reencodes"),
-                "deregister-success.json" => serde_json::to_vec(
-                    &decode_deregister_response(&fixture).expect("deregister fixture decodes"),
-                )
-                .expect("deregister fixture reencodes"),
-                _ => serde_json::to_vec(
-                    &decode_refusal_response(&fixture).expect("refusal fixture decodes"),
-                )
-                .expect("refusal fixture reencodes"),
-            };
+            let reencoded = decode_and_reencode_fixture(name, &fixture);
             assert_eq!(reencoded, fixture, "fixture {name} did not round-trip");
+
+            let fixture_value: serde_json::Value =
+                serde_json::from_slice(&fixture).expect("fixture is JSON");
+            let shuffled = shuffled_json(&fixture_value);
+            assert_ne!(
+                shuffled.as_bytes(),
+                fixture,
+                "fixture {name} did not shuffle"
+            );
+            assert_eq!(
+                decode_and_reencode_fixture(name, shuffled.as_bytes()),
+                fixture,
+                "shuffled fixture {name} did not decode to the canonical value"
+            );
         }
     }
 
