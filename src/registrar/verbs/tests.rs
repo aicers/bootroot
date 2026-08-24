@@ -1421,6 +1421,62 @@ async fn a_registration_id_collision_writes_a_complete_pair() {
     assert_eq!(requests[0].method, wiremock::http::Method::GET);
 }
 
+/// A mint the store *can* record returns its material and leaves a
+/// complete pair behind, on both mint arms.
+///
+/// Every other mint test in this section injects a write failure and so
+/// stops short of the recorded-and-returned path. This is what holds it:
+/// an outcome write that succeeded must hand back the wrapped
+/// `secret_id` that a failed one drops, and the two arms must land under
+/// their two different classes.
+#[tokio::test]
+async fn a_recorded_mint_returns_its_material_on_both_arms() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let first = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a mint against a writable store succeeds");
+    assert_eq!(first.kind(), MintKind::FirstMint);
+    let minted = assert_pair(
+        &verbs,
+        first.context().request_id().as_str(),
+        &Asked::new("mint", "roxyd", "h1", None),
+    );
+    assert_eq!(minted["outcome"]["class"], json!("first_mint"));
+    assert_eq!(minted["registration_id"], json!("h1-roxyd"));
+    assert!(
+        !first.into_wrapped_secret_id().is_empty(),
+        "a recorded mint still hands its material back"
+    );
+
+    // The same identity, answered by an active binding: the re-mint arm,
+    // through the same outcome write.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &active).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let again = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a re-mint against a writable store succeeds");
+    assert_eq!(again.kind(), MintKind::IdempotentReMint);
+    let reminted = assert_pair(
+        &verbs,
+        again.context().request_id().as_str(),
+        &Asked::new("mint", "roxyd", "h1", None),
+    );
+    assert_eq!(reminted["outcome"]["class"], json!("idempotent_remint"));
+    assert_eq!(reminted["registration_id"], json!("h1-roxyd"));
+    assert!(
+        !again.into_wrapped_secret_id().is_empty(),
+        "a recorded re-mint still hands its material back"
+    );
+}
+
 /// With the store failing the intent write, the invocation is refused
 /// having made **no** `OpenBao` request at all.
 ///
