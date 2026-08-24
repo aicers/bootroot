@@ -119,10 +119,6 @@ const ACTIVE_FILE_MODE: u32 = 0o600;
 /// The uid production requires every audited path to be owned by.
 const PRODUCTION_UID: u32 = 0;
 
-/// Directory the daemon writes registrar audit records to unless
-/// `agent.toml` says otherwise.
-pub const DEFAULT_AUDIT_RECORD_DIR: &str = "/var/lib/bootroot/registrar-audit";
-
 /// Default size at which the active file is rotated, in bytes (8 MiB).
 pub const DEFAULT_AUDIT_MAX_FILE_BYTES: u64 = 8_388_608;
 

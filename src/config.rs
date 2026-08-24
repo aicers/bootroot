@@ -13,7 +13,7 @@ mod validation;
 
 pub use validation::{
     openbao_url_is_https, openbao_url_is_non_loopback_plaintext, parse_cert_duration,
-    validate_cert_duration_vs_default_renew_before,
+    validate_cert_duration_vs_default_renew_before, validate_registrar_settings,
 };
 
 /// CLI-provided overrides that must survive config reloads in daemon mode.
@@ -80,18 +80,18 @@ pub struct Settings {
 /// this daemon's operational choices, and putting them there would make
 /// every change to them a change to another repository's renderer.
 ///
-/// Nothing here is reachable from a registrar request. The store is
-/// opened from these values once, by whatever provisions the registrar
-/// surface, and the verbs receive an already-opened handle.
+/// Nothing here is reachable from a registrar request. Once a writer is
+/// wired in, it will open the store from these values and pass the verbs
+/// an already-opened handle.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawRegistrarSettings")]
 pub struct RegistrarSettings {
-    /// Absolute directory the `registrar-audit.jsonl` family lives in.
+    /// Absolute directory the `registrar-audit.jsonl` family lives in,
+    /// defaulting to `<audit_store_dir>/records`.
     /// A relative path is rejected: the daemon's cwd is not contracted
     /// to be stable under a systemd-style supervisor, so a relative
     /// path would scatter the audit trail across whatever directory the
     /// unit happened to start in.
-    #[serde(default = "defaults::default_audit_record_dir")]
     pub audit_record_dir: PathBuf,
     /// Size at which the active file is rotated. Held to a floor large
     /// enough for one maximum-size record.
@@ -105,15 +105,97 @@ pub struct RegistrarSettings {
     /// where the two disagree, `audit_max_retained_files` wins.
     #[serde(default = "defaults::default_audit_min_retain_days")]
     pub audit_min_retain_days: u32,
+    /// Absolute directory containing the daemon's records and `OpenBao`'s
+    /// file audit output.
+    pub audit_store_dir: PathBuf,
+    /// Bytes reserved for the shared audit store.
+    pub audit_store_reserve_bytes: u64,
+    /// Remaining bytes at which a future capacity alarm fires.
+    pub audit_store_low_water_bytes: u64,
+    /// Operator-selected enforcement for the audit store reserve.
+    pub audit_store_enforcement: AuditStoreEnforcement,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRegistrarSettings {
+    #[serde(default, rename = "audit_record_dir")]
+    record_dir: Option<PathBuf>,
+    #[serde(
+        default = "defaults::default_audit_max_file_bytes",
+        rename = "audit_max_file_bytes"
+    )]
+    max_file_bytes: u64,
+    #[serde(
+        default = "defaults::default_audit_max_retained_files",
+        rename = "audit_max_retained_files"
+    )]
+    max_retained_files: u32,
+    #[serde(
+        default = "defaults::default_audit_min_retain_days",
+        rename = "audit_min_retain_days"
+    )]
+    min_retain_days: u32,
+    #[serde(
+        default = "defaults::default_audit_store_dir",
+        rename = "audit_store_dir"
+    )]
+    store_dir: PathBuf,
+    #[serde(
+        default = "defaults::default_audit_store_reserve_bytes",
+        rename = "audit_store_reserve_bytes"
+    )]
+    store_reserve_bytes: u64,
+    #[serde(
+        default = "defaults::default_audit_store_low_water_bytes",
+        rename = "audit_store_low_water_bytes"
+    )]
+    store_low_water_bytes: u64,
+    #[serde(default, rename = "audit_store_enforcement")]
+    store_enforcement: AuditStoreEnforcement,
+}
+
+impl From<RawRegistrarSettings> for RegistrarSettings {
+    fn from(raw: RawRegistrarSettings) -> Self {
+        let audit_record_dir = raw
+            .record_dir
+            .unwrap_or_else(|| raw.store_dir.join("records"));
+        Self {
+            audit_record_dir,
+            audit_max_file_bytes: raw.max_file_bytes,
+            audit_max_retained_files: raw.max_retained_files,
+            audit_min_retain_days: raw.min_retain_days,
+            audit_store_dir: raw.store_dir,
+            audit_store_reserve_bytes: raw.store_reserve_bytes,
+            audit_store_low_water_bytes: raw.store_low_water_bytes,
+            audit_store_enforcement: raw.store_enforcement,
+        }
+    }
+}
+
+/// An audit store reserve enforcement mode.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStoreEnforcement {
+    /// A filesystem-provided ceiling, supplied by separate work and not
+    /// yet in place in this build.
+    #[default]
+    Filesystem,
+    /// A plain directory with an unenforced configured reserve.
+    Directory,
 }
 
 impl Default for RegistrarSettings {
     fn default() -> Self {
         Self {
-            audit_record_dir: defaults::default_audit_record_dir(),
+            audit_record_dir: defaults::default_audit_store_dir().join("records"),
             audit_max_file_bytes: defaults::default_audit_max_file_bytes(),
             audit_max_retained_files: defaults::default_audit_max_retained_files(),
             audit_min_retain_days: defaults::default_audit_min_retain_days(),
+            audit_store_dir: defaults::default_audit_store_dir(),
+            audit_store_reserve_bytes: defaults::default_audit_store_reserve_bytes(),
+            audit_store_low_water_bytes: defaults::default_audit_store_low_water_bytes(),
+            audit_store_enforcement: AuditStoreEnforcement::default(),
         }
     }
 }
@@ -1308,7 +1390,17 @@ mod tests {
         let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
         assert_eq!(
             settings.registrar.audit_record_dir,
-            PathBuf::from("/var/lib/bootroot/registrar-audit")
+            PathBuf::from("/var/lib/bootroot/audit-store/records")
+        );
+        assert_eq!(
+            settings.registrar.audit_store_dir,
+            PathBuf::from("/var/lib/bootroot/audit-store")
+        );
+        assert_eq!(settings.registrar.audit_store_reserve_bytes, 2_147_483_648);
+        assert_eq!(settings.registrar.audit_store_low_water_bytes, 536_870_912);
+        assert_eq!(
+            settings.registrar.audit_store_enforcement,
+            AuditStoreEnforcement::Filesystem
         );
         assert_eq!(settings.registrar.audit_max_file_bytes, 8_388_608);
         assert_eq!(settings.registrar.audit_max_retained_files, 16);
@@ -1337,10 +1429,14 @@ mod tests {
             file,
             r#"
 [registrar]
-audit_record_dir = "/srv/bootroot/audit"
+audit_store_dir = "/srv/bootroot/audit-store"
+audit_record_dir = "/srv/bootroot/audit-store/records"
 audit_max_file_bytes = 131072
 audit_max_retained_files = 4
 audit_min_retain_days = 30
+audit_store_reserve_bytes = 4294967296
+audit_store_low_water_bytes = 1073741824
+audit_store_enforcement = "directory"
 "#
         )
         .unwrap();
@@ -1348,11 +1444,74 @@ audit_min_retain_days = 30
         let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
         assert_eq!(
             settings.registrar.audit_record_dir,
-            PathBuf::from("/srv/bootroot/audit")
+            PathBuf::from("/srv/bootroot/audit-store/records")
         );
         assert_eq!(settings.registrar.audit_max_file_bytes, 131_072);
         assert_eq!(settings.registrar.audit_max_retained_files, 4);
         assert_eq!(settings.registrar.audit_min_retain_days, 30);
+        assert_eq!(
+            settings.registrar.audit_store_dir,
+            PathBuf::from("/srv/bootroot/audit-store")
+        );
+        assert_eq!(settings.registrar.audit_store_reserve_bytes, 4_294_967_296);
+        assert_eq!(
+            settings.registrar.audit_store_low_water_bytes,
+            1_073_741_824
+        );
+        assert_eq!(
+            settings.registrar.audit_store_enforcement,
+            AuditStoreEnforcement::Directory
+        );
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn an_omitted_audit_record_dir_derives_from_a_custom_store() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "\n[registrar]\naudit_store_dir = \"/srv/bootroot/audit-store\""
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(
+            settings.registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/audit-store/records")
+        );
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn an_explicit_derived_audit_record_dir_is_accepted() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "\n[registrar]\naudit_store_dir = \"/srv/bootroot/audit-store\"\naudit_record_dir = \"/srv/bootroot/audit-store/records\""
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn an_explicit_audit_record_dir_inside_the_store_is_accepted() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "\n[registrar]\naudit_store_dir = \"/srv/bootroot/audit-store\"\naudit_record_dir = \"/srv/bootroot/audit-store/alternate-records\""
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(
+            settings.registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/audit-store/alternate-records")
+        );
         settings.validate().unwrap();
     }
 
@@ -1380,6 +1539,33 @@ audit_min_retain_days = 30
             ),
             (
                 Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_store_dir = PathBuf::from("audit-store");
+                }),
+                "registrar.audit_store_dir",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_store_reserve_bytes =
+                        u64::try_from(i64::MAX).expect("i64::MAX fits in u64") + 1;
+                }),
+                "registrar.audit_store_reserve_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_store_low_water_bytes =
+                        settings.registrar.audit_store_reserve_bytes;
+                }),
+                "registrar.audit_store_low_water_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_store_low_water_bytes =
+                        settings.registrar.audit_store_reserve_bytes + 1;
+                }),
+                "registrar.audit_store_low_water_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
                     settings.registrar.audit_max_file_bytes = 65_535;
                 }),
                 "registrar.audit_max_file_bytes",
@@ -1404,6 +1590,107 @@ audit_min_retain_days = 30
             let err = settings.validate().unwrap_err();
             assert!(err.to_string().contains(expected), "{expected}: {err}");
         }
+    }
+
+    #[test]
+    fn validation_rejects_an_audit_record_dir_outside_the_store() {
+        for audit_record_dir in [
+            "/srv/bootroot/other/records",
+            "/var/lib/bootroot/audit-store/records/../../other/records",
+            "/var/lib/bootroot/registrar-audit",
+        ] {
+            let settings = RegistrarSettings {
+                audit_record_dir: PathBuf::from(audit_record_dir),
+                ..RegistrarSettings::default()
+            };
+            let err = validate_registrar_settings(&settings).unwrap_err();
+            assert!(
+                err.to_string().contains("registrar.audit_record_dir"),
+                "{err}"
+            );
+            assert!(
+                err.to_string().contains("registrar.audit_store_dir"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_audit_record_dir_is_rejected_before_containment() {
+        let settings = RegistrarSettings {
+            audit_record_dir: PathBuf::from("registrar-audit"),
+            ..RegistrarSettings::default()
+        };
+        let err = validate_registrar_settings(&settings).unwrap_err();
+        assert!(
+            err.to_string().contains("must be an absolute path"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("registrar.audit_store_dir"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_audit_store_enforcement_string_fails_to_load() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\naudit_store_enforcement = \"quota\"").unwrap();
+        file.flush().unwrap();
+        let err = Settings::from_file(Some(file.path().to_path_buf())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("registrar.audit_store_enforcement"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("quota"), "{err}");
+    }
+
+    #[test]
+    fn a_non_enum_representation_for_audit_store_enforcement_fails_to_load() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\naudit_store_enforcement = 1").unwrap();
+        file.flush().unwrap();
+        let err = Settings::from_file(Some(file.path().to_path_buf())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("registrar.audit_store_enforcement"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("represented by either string or table with exactly one key"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains(" 1"), "{err}");
+    }
+
+    #[test]
+    fn a_single_key_audit_store_enforcement_table_loads() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "\n[registrar]\naudit_store_enforcement = {{ filesystem = 1 }}"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(
+            settings.registrar.audit_store_enforcement,
+            AuditStoreEnforcement::Filesystem
+        );
+    }
+
+    #[test]
+    fn validation_accepts_an_audit_store_reserve_at_i64_max() {
+        let settings = RegistrarSettings {
+            audit_store_reserve_bytes: u64::try_from(i64::MAX).expect("i64::MAX fits in u64"),
+            ..RegistrarSettings::default()
+        };
+        validate_registrar_settings(&settings).expect("i64::MAX is an accepted reserve");
     }
 
     /// A reload may not change the endpoint's enablement in either

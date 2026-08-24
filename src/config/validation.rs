@@ -9,8 +9,12 @@ use super::{
     DaemonProfileSettings, HookCommand, OpenBaoSettings, RegistrarEndpointSettings,
     RegistrarSettings, Settings, TrustSettings,
 };
+use crate::fs_util::path_is_within;
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
+
+// `i64::MAX` is non-negative, so this signed-to-unsigned conversion is lossless.
+const MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES: u64 = i64::MAX as u64;
 
 /// Validates that `cert_duration` is strictly greater than the default
 /// daemon `renew_before` interval.
@@ -117,12 +121,49 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
 /// registrar surface is already answering requests is a hole in the
 /// trail nobody notices until they go looking for a record that was
 /// never written.
-fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
+/// This is public because the binary crate validates the same settings
+/// before install-side work consumes them.
+///
+/// # Errors
+///
+/// Returns an error when an audit path is invalid, the record directory
+/// escapes the store, or a reserve or retention setting is out of range.
+pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
     if !settings.audit_record_dir.is_absolute() {
         anyhow::bail!(
             "registrar.audit_record_dir ({}) must be an absolute path; the daemon's working \
              directory is not contracted to be stable under a service supervisor",
             settings.audit_record_dir.display()
+        );
+    }
+    if !settings.audit_store_dir.is_absolute() {
+        anyhow::bail!(
+            "registrar.audit_store_dir ({}) must be an absolute path; the daemon's working \
+             directory is not contracted to be stable under a service supervisor",
+            settings.audit_store_dir.display()
+        );
+    }
+    if !path_is_within(&settings.audit_record_dir, &settings.audit_store_dir).with_context(
+        || "checking whether registrar.audit_record_dir is inside registrar.audit_store_dir",
+    )? {
+        anyhow::bail!(
+            "registrar.audit_record_dir ({}) must resolve inside registrar.audit_store_dir ({})",
+            settings.audit_record_dir.display(),
+            settings.audit_store_dir.display()
+        );
+    }
+    if settings.audit_store_reserve_bytes > MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES {
+        anyhow::bail!(
+            "registrar.audit_store_reserve_bytes ({}) must not exceed i64::MAX",
+            settings.audit_store_reserve_bytes
+        );
+    }
+    if settings.audit_store_low_water_bytes >= settings.audit_store_reserve_bytes {
+        anyhow::bail!(
+            "registrar.audit_store_low_water_bytes ({}) must be less than \
+             registrar.audit_store_reserve_bytes ({})",
+            settings.audit_store_low_water_bytes,
+            settings.audit_store_reserve_bytes
         );
     }
     if settings.audit_max_file_bytes < MIN_AUDIT_MAX_FILE_BYTES {

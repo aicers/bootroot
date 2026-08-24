@@ -5,7 +5,6 @@ use config::{ConfigBuilder, ConfigError, builder::DefaultState};
 
 use crate::registrar::audit::{
     DEFAULT_AUDIT_MAX_FILE_BYTES, DEFAULT_AUDIT_MAX_RETAINED_FILES, DEFAULT_AUDIT_MIN_RETAIN_DAYS,
-    DEFAULT_AUDIT_RECORD_DIR,
 };
 
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
@@ -29,6 +28,9 @@ const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
 const DEFAULT_FAST_POLL_INTERVAL_SECS: u64 = 30;
 const DEFAULT_KV_MOUNT: &str = "secret";
 const DEFAULT_FAST_POLL_STATE_PATH: &str = "bootroot-agent-state.json";
+pub(crate) const DEFAULT_AUDIT_STORE_DIR: &str = "/var/lib/bootroot/audit-store";
+const DEFAULT_AUDIT_STORE_RESERVE_BYTES: u64 = 2_147_483_648;
+const DEFAULT_AUDIT_STORE_LOW_WATER_BYTES: u64 = 536_870_912;
 
 pub(crate) fn apply_defaults(
     builder: ConfigBuilder<DefaultState>,
@@ -100,12 +102,16 @@ pub(crate) fn default_fast_poll_state_path() -> PathBuf {
     PathBuf::from(DEFAULT_FAST_POLL_STATE_PATH)
 }
 
-// The registrar audit defaults live beside the store that enforces
-// them, so a change to the on-disk contract cannot leave the daemon's
-// defaults describing an older one.
+pub(crate) fn default_audit_store_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_AUDIT_STORE_DIR)
+}
 
-pub(crate) fn default_audit_record_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_AUDIT_RECORD_DIR)
+pub(crate) fn default_audit_store_reserve_bytes() -> u64 {
+    DEFAULT_AUDIT_STORE_RESERVE_BYTES
+}
+
+pub(crate) fn default_audit_store_low_water_bytes() -> u64 {
+    DEFAULT_AUDIT_STORE_LOW_WATER_BYTES
 }
 
 pub(crate) fn default_audit_max_file_bytes() -> u64 {

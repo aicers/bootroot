@@ -436,46 +436,52 @@ held above the reload rather than reacquired by it.
 
 #### Audit records
 
-The daemon keeps its own append-only audit trail for the two verbs, in
-`audit_record_dir` (`/var/lib/bootroot/registrar-audit` by default).
+bootroot does not create the audit store in this build. It does not write
+registrar verb records in this build.
+
+Once a writer is wired in, the daemon keeps its own append-only audit trail
+for the two verbs, in `audit_record_dir` (`<audit_store_dir>/records`, or
+`/var/lib/bootroot/audit-store/records` by default).
 It is **not** a replacement for OpenBao's file audit device, which stays
 mandatory and is still verified by `bootroot init`. It records what that
 device cannot: who asked, for which `(service_name, host, instance)`,
 and requests refused before any OpenBao write happened.
 
-The daemon owns the artifact end to end. The registrar cannot read,
-append to, delete or redirect it, and no request field selects the path
+Once a writer is wired in, the daemon owns the artifact end to end. The
+registrar cannot read, append to, delete or redirect it, and no request
+field selects the path
 or the policy. The settings are in `agent.toml`'s `[registrar]` table —
 see
 [Registrar audit records](configuration.md#registrar-audit-records)
-for the four keys and the record shape.
+for the eight keys and the record shape.
 
 What an operator needs on the host:
 
 - `audit_record_dir` and its immediate parent must be root-owned and not
   group- or world-writable, and neither may be a symbolic link. The
-  daemon creates missing components itself — ancestors root-owned
+  future writer creates missing components itself — ancestors root-owned
   `0755`, the store directory root-owned `0700` — and never changes an
   existing entry's owner or mode.
-- The store is opened before the registrar surface serves anything, so
-  an unsafe or unusable directory fails that surface closed instead of
+- Once a writer is wired in, the store is opened before the registrar
+  surface serves anything, so an unsafe or unusable directory fails that
+  surface closed instead of
   leaving the verbs running with no trail. It does not stop the daemon's
   unrelated renewal or fast-poll work.
 - Provision disk for the hard ceiling, not for the retention target:
   `audit_max_file_bytes` × (`audit_max_retained_files` + 1), which at
   the defaults is 8 MiB × 17 ≈ **136 MiB**.
 
-Reading the trail is ordinary line-oriented work — the format is JSON
-Lines, one complete record per line:
+Once records exist, reading the trail is ordinary line-oriented work — the
+format is JSON Lines, one complete record per line:
 
 ```sh
 # The most recent refusals, newest last.
-cat /var/lib/bootroot/registrar-audit/registrar-audit.jsonl |
+cat /var/lib/bootroot/audit-store/records/registrar-audit.jsonl |
   jq -c 'select(.outcome.class == "refused")'
 
 # Everything for one correlation handle, across the rotated generations
 # as well as the active file.  The names sort oldest to newest.
-cd /var/lib/bootroot/registrar-audit &&
+cd /var/lib/bootroot/audit-store/records &&
   cat $(ls registrar-audit-*.jsonl) registrar-audit.jsonl |
   jq -c --arg id "$REQUEST_ID" 'select(.request_id == $id)'
 ```

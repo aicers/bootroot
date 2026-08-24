@@ -346,30 +346,49 @@ unsupported-platform error, before any activation variable is looked at.
 
 ```toml
 [registrar]
-audit_record_dir = "/var/lib/bootroot/registrar-audit"
+audit_store_dir = "/var/lib/bootroot/audit-store"
+audit_store_reserve_bytes = 2147483648
+audit_store_low_water_bytes = 536870912
+audit_store_enforcement = "filesystem"
+audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
 ```
 
-bootroot writes its own append-only audit trail for the registrar's
-`mint` and `deregister` verbs. It sits **beside** OpenBao's mandatory
+bootroot does not create the audit store in this build. It does not write
+registrar verb records in this build.
+
+Once a writer is wired in, bootroot writes its own append-only audit
+trail for the registrar's `mint` and `deregister` verbs. It sits
+**beside** OpenBao's mandatory
 file audit device and replaces nothing: the OpenBao device records what
 OpenBao was asked to do, and this one records who asked, for which
 `(service_name, host, instance)`, and what the answer was — including a
 request refused before any OpenBao write ever happened. The OpenBao
 audit check `bootroot init` performs is unchanged.
 
-The daemon owns the artifact. The registrar cannot read, append to,
-delete, redirect or select it, and no field of a request reaches the
+Once a writer is wired in, the daemon owns the artifact. The registrar
+cannot read, append to, delete, redirect or select it, and no field of a
+request reaches the
 path, the modes, the rotation policy or the retention policy. An absent
 `[registrar]` table leaves every key at the default above; an unknown
 key is a configuration error.
 
-- `audit_record_dir` (default `/var/lib/bootroot/registrar-audit`) —
-  the absolute directory the record files live in. A relative path is
-  rejected: the daemon's working directory is not contracted to be
-  stable under a service supervisor.
+- `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
+  absolute directory that holds `records/` for daemon records and
+  `openbao/` for OpenBao's file audit output. A relative path is refused.
+- `audit_store_reserve_bytes` (default `2147483648`, 2 GiB) — the
+  configured shared-store budget. It must not exceed `i64::MAX`; this
+  build records the value but does not enforce the budget.
+- `audit_store_low_water_bytes` (default `536870912`, 512 MiB) — the
+  future capacity-alarm threshold. It must be less than the reserve.
+- `audit_store_enforcement` (default `filesystem`) — selects a future
+  filesystem-backed ceiling or an unenforced `directory` budget. Neither
+  mode is implemented in this build.
+- `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
+  directory the record files live in. A relative path is rejected, and
+  the resolved directory must stay inside `audit_store_dir`.
 - `audit_max_file_bytes` (default `8388608`, 8 MiB) — the size at which
   the active file is rotated. Must be at least `65536`.
 - `audit_max_retained_files` (default `16`) — how many rotated
@@ -395,8 +414,8 @@ the file count is a hard capacity constraint and the day count is not.
 
 #### Ownership and permissions
 
-The store is opened before the registrar surface serves anything, and it
-fails closed rather than degrading:
+Once a writer is wired in, the store is opened before the registrar surface
+serves anything, and it fails closed rather than degrading:
 
 - Missing path components are created root-owned mode `0755`; the store
   directory itself is created root-owned mode `0700`; the active file is
@@ -410,9 +429,8 @@ fails closed rather than degrading:
 - Nothing above the immediate parent is audited, and nothing above it is
   modified.
 
-Point `audit_record_dir` at a directory on the bootroot host's own
-storage, not at a shared or user-writable path. `/var/lib/bootroot` is
-the default parent for exactly that reason.
+Point `audit_record_dir` inside `audit_store_dir` on the bootroot host's
+own storage, not at a shared or user-writable path.
 
 #### The record format
 

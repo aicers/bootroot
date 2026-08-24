@@ -332,13 +332,20 @@ Linux가 아닌 대상에서는 테이블 자체는 파싱되지만, 활성화�
 
 ```toml
 [registrar]
-audit_record_dir = "/var/lib/bootroot/registrar-audit"
+audit_store_dir = "/var/lib/bootroot/audit-store"
+audit_store_reserve_bytes = 2147483648
+audit_store_low_water_bytes = 536870912
+audit_store_enforcement = "filesystem"
+audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
 ```
 
-bootroot는 레지스트라의 `mint`/`deregister` 동사에 대해 자체 추가 전용
+이 빌드에서 bootroot는 감사 저장소를 만들지 않습니다. 이 빌드에서 레지스트라
+동사 레코드를 쓰지 않습니다.
+
+작성기가 연결되면 bootroot는 레지스트라의 `mint`/`deregister` 동사에 대해 자체 추가 전용
 감사 기록을 남깁니다. 이는 OpenBao의 필수 파일 감사 장치를 대체하지
 않고 **함께** 동작합니다. OpenBao 장치는 OpenBao가 무엇을 하라는 요청을
 받았는지 기록하고, 이 기록은 누가 어떤 `(service_name, host, instance)`
@@ -346,15 +353,25 @@ bootroot는 레지스트라의 `mint`/`deregister` 동사에 대해 자체 추�
 일어나기 전에 거부된 요청도 여기에 남습니다. `bootroot init`이 수행하는
 OpenBao 감사 장치 확인은 그대로입니다.
 
-이 산출물의 소유자는 데몬입니다. 레지스트라는 이 파일을 읽거나, 추가하거나,
+작성기가 연결되면 이 산출물의 소유자는 데몬입니다. 레지스트라는 이 파일을 읽거나, 추가하거나,
 삭제하거나, 다른 경로로 돌리거나, 선택할 수 없으며, 요청의 어떤 필드도
 경로·권한·회전 정책·보존 정책에 닿지 않습니다. `[registrar]` 테이블이 아예
 없으면 모든 키가 위 기본값을 사용하고, 알 수 없는 키는 설정 오류입니다.
 
-- `audit_record_dir` (기본값 `/var/lib/bootroot/registrar-audit`) —
-  레코드 파일이 놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부됩니다.
-  데몬의 작업 디렉터리는 서비스 관리자 아래에서 안정적이라고 보장되지
-  않기 때문입니다.
+- `audit_store_dir` (기본값 `/var/lib/bootroot/audit-store`) — 데몬 레코드용
+  `records/`와 OpenBao 파일 감사 출력용 `openbao/`를 담는 절대 경로입니다.
+  상대 경로는 거부됩니다.
+- `audit_store_reserve_bytes` (기본값 `2147483648`, 2 GiB) — 공유 저장소의
+  구성된 예산입니다. `i64::MAX`를 넘을 수 없으며, 이 빌드에서는 예산을
+  기록할 뿐 강제하지 않습니다.
+- `audit_store_low_water_bytes` (기본값 `536870912`, 512 MiB) — 향후 용량
+  경보 임계값입니다. reserve보다 작아야 합니다.
+- `audit_store_enforcement` (기본값 `filesystem`) — 향후 파일시스템 기반
+  상한 또는 강제되지 않는 `directory` 예산을 선택합니다. 이 빌드에서는 두
+  모드 모두 구현되지 않았습니다.
+- `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
+  놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
+  `audit_store_dir` 안에 있어야 합니다.
 - `audit_max_file_bytes` (기본값 `8388608`, 8 MiB) — 활성 파일을
   회전시키는 크기입니다. 최소 `65536`이어야 합니다.
 - `audit_max_retained_files` (기본값 `16`) — 활성 파일 옆에 보관하는
@@ -378,7 +395,7 @@ OpenBao 감사 장치 확인은 그대로입니다.
 
 #### 소유권과 권한
 
-저장소는 레지스트라 표면이 요청을 받기 전에 열리며, 성능을 낮춰 계속
+작성기가 연결되면 저장소는 레지스트라 표면이 요청을 받기 전에 열리며, 성능을 낮춰 계속
 동작하는 대신 닫힌 상태로 실패합니다.
 
 - 없는 경로 구성 요소는 root 소유 `0755`로 만들고, 저장소 디렉터리 자체는
@@ -390,9 +407,8 @@ OpenBao 감사 장치 확인은 그대로입니다.
   상위 디렉터리는 그룹 또는 다른 사용자에게 쓰기 가능해도 거부됩니다.
 - 직속 상위 디렉터리보다 위쪽은 검사하지도, 변경하지도 않습니다.
 
-`audit_record_dir`는 공유되거나 사용자가 쓸 수 있는 경로가 아니라
-bootroot 호스트 자체 저장소의 디렉터리를 가리켜야 합니다. 기본 상위
-경로가 `/var/lib/bootroot`인 이유가 바로 그것입니다.
+`audit_record_dir`는 공유되거나 사용자가 쓸 수 있는 경로가 아니라 bootroot
+호스트 자체 저장소의 `audit_store_dir` 안을 가리켜야 합니다.
 
 #### 레코드 형식
 
