@@ -1477,6 +1477,22 @@ audit_store_enforcement = "directory"
     }
 
     #[test]
+    fn a_file_supplied_relative_audit_store_dir_names_the_store_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\naudit_store_dir = \"audit-store\"").unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        let err = settings
+            .validate()
+            .expect_err("relative audit stores are refused");
+        assert!(
+            err.to_string().contains("registrar.audit_store_dir"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_explicit_derived_audit_record_dir_is_accepted() {
         let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         write_minimal_profile_config(&mut file);

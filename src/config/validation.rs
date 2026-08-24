@@ -128,18 +128,18 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
 /// Returns an error when an audit path is invalid, the record directory
 /// escapes the store, or a reserve or retention setting is out of range.
 pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
-    if !settings.audit_record_dir.is_absolute() {
-        anyhow::bail!(
-            "registrar.audit_record_dir ({}) must be an absolute path; the daemon's working \
-             directory is not contracted to be stable under a service supervisor",
-            settings.audit_record_dir.display()
-        );
-    }
     if !settings.audit_store_dir.is_absolute() {
         anyhow::bail!(
             "registrar.audit_store_dir ({}) must be an absolute path; the daemon's working \
              directory is not contracted to be stable under a service supervisor",
             settings.audit_store_dir.display()
+        );
+    }
+    if !settings.audit_record_dir.is_absolute() {
+        anyhow::bail!(
+            "registrar.audit_record_dir ({}) must be an absolute path; the daemon's working \
+             directory is not contracted to be stable under a service supervisor",
+            settings.audit_record_dir.display()
         );
     }
     if !path_is_within(&settings.audit_record_dir, &settings.audit_store_dir).with_context(
