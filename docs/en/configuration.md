@@ -376,11 +376,11 @@ default above; an unknown key is a configuration error.
 - `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
   absolute directory that holds `records/` for daemon records and
   `openbao/` for OpenBao's file audit output. A relative path is refused.
-- `audit_store_reserve_bytes` (default `2147483648`, 2 GiB) — the
+- `audit_store_reserve_bytes` (`u64`, default `2147483648`, 2 GiB) — the
   configured shared-store budget. It must not exceed `i64::MAX`; this
   build records the value but does not enforce the budget.
-- `audit_store_low_water_bytes` (default `536870912`, 512 MiB) — the
-  future capacity-alarm threshold. It must be less than the reserve.
+- `audit_store_low_water_bytes` (`u64`, default `536870912`, 512 MiB) —
+  the future capacity-alarm threshold. It must be less than the reserve.
 - `audit_store_enforcement` (default `filesystem`) — selects a future
   filesystem-backed ceiling or an unenforced `directory` budget. Neither
   mode is implemented in this build.
@@ -520,9 +520,9 @@ directory cannot be flushed does not open.
 The defaults are a hard ceiling of 8 MiB × 17 files (the active file
 plus 16 rotated generations) ≈ **136 MiB**.
 
-Sizing the reference deployment uses an ordinary-record assumption of
-**400 bytes** per line. Each invocation writes two lines, one `intent`
-and one `outcome`:
+Once a writer is wired in, sizing the reference deployment uses an
+ordinary-record assumption of **400 bytes** per line. Each invocation then
+writes two lines, one `intent` and one `outcome`:
 
 ```text
 2 × (2,000 initial invocations + 90 × 200 daily invocations) = 40,000 records
@@ -532,9 +532,10 @@ and one `outcome`:
 So a fleet doing 2,000 initial enrolments and 200 invocations a day fits
 its whole 90-day target inside about an eighth of the default ceiling.
 That sizes **ordinary installation and reinstallation activity**, not a
-refusal flood: a caller retrying a refused request in a loop writes
-records at whatever rate it retries, and the file-count ceiling — not
-`audit_min_retain_days` — is what bounds the disk it can consume.
+refusal flood: once a writer is wired in, a caller retrying a refused
+request in a loop writes records at whatever rate it retries, and the
+file-count ceiling — not `audit_min_retain_days` — is what bounds the disk
+it can consume.
 
 ### EAB (Optional)
 
