@@ -18,6 +18,10 @@ BOOTROOT_HTTP01_IMAGE="${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:$BOOTR
 # `COMPOSE_PROJECT_NAME` when exported and falls back to the literal
 # `bootroot`, so mirror that order here rather than hard-coding one side.
 COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-bootroot}"
+OPENBAO_HOST_PORT="${OPENBAO_HOST_PORT:-8200}"
+POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5433}"
+STEPCA_HOST_PORT="${STEPCA_HOST_PORT:-9000}"
+HTTP01_ADMIN_HOST_PORT="${HTTP01_ADMIN_HOST_PORT:-8080}"
 
 STAGE_DIR="$(mktemp -d)"
 ARCHIVE_DIR="$STAGE_DIR/images"
@@ -75,7 +79,7 @@ reset_existing_stack() {
 
 ensure_install_ports_free() {
   local port
-  for port in 8200 9000 8080 5433; do
+  for port in "$OPENBAO_HOST_PORT" "$STEPCA_HOST_PORT" "$HTTP01_ADMIN_HOST_PORT" "$POSTGRES_HOST_PORT"; do
     if bash -c ": >/dev/tcp/127.0.0.1/$port" >/dev/null 2>&1; then
       fail "host port 127.0.0.1:$port is already in use; stop the listener first"
     fi
