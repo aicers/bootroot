@@ -188,6 +188,29 @@ compose_down() {
 # already-initialized CA path depends on.
 compose_stop() {
   compose stop >/dev/null 2>&1 || true
+  wait_for_core_ports_to_be_released
+}
+
+# Docker Desktop can report a service stopped before its host-side port
+# forwarders have been released.  The next `infra install` pre-binds these
+# ports, so wait for the previous stack's forwarders to disappear rather than
+# racing the reinstall.
+wait_for_core_ports_to_be_released() {
+  local ports=("${POSTGRES_HOST_PORT:-5432}" "${OPENBAO_HOST_PORT:-8200}"
+    "${STEPCA_HOST_PORT:-9000}" "${HTTP01_ADMIN_HOST_PORT:-8080}")
+  local attempt port busy
+  for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
+    busy=0
+    for port in "${ports[@]}"; do
+      if bash -lc ": >/dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+        busy=1
+        break
+      fi
+    done
+    [ "$busy" -eq 0 ] && return 0
+    sleep "$INFRA_READY_DELAY_SECS"
+  done
+  fail "timed out waiting for stopped infrastructure ports to be released"
 }
 
 run_bootroot() {
