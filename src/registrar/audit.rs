@@ -55,11 +55,11 @@
 //! There is no best-effort mode, no buffering, no fire-and-forget path
 //! and no caller-selectable suppression: [`AuditRecordStore::append`]
 //! either durably wrote one line or returns a typed
-//! [`AuditStoreError`]. Writing records around the two verbs — where
-//! the intent and outcome lines go relative to the `OpenBao` work, and
-//! what a failed write returns to a caller — is not here either. The
-//! verb layer holds the store as a fixed dependency and the sibling
-//! issue that adds those call sites owns that ordering.
+//! [`AuditStoreError`]. Where the intent and outcome lines go relative
+//! to the `OpenBao` work, and what a failed write returns to a caller,
+//! is not here either: `crate::registrar::verbs` owns those call sites
+//! and their ordering, and every failure this module reports reaches it
+//! as one of the two audit-failure refusals.
 
 use std::fs::{DirBuilder, File, OpenOptions, Permissions};
 use std::io::Write as _;
@@ -756,14 +756,6 @@ mod millisecond_rfc3339 {
 /// is one definition of "which reason is this" in the repository and a
 /// second copy in `verbs.rs` would drift from the format it is supposed
 /// to spell.
-// Transitional. The sibling issue that writes intent and outcome
-// records around the two verbs is the first production caller of every
-// function here; until it lands nothing but this module's own tests
-// calls them. Widening them to `pub` to silence the lint would put a
-// crate-private control plane's refusal taxonomy on the library's
-// public surface, which is the opposite of what the visibility rule
-// asks for.
-#[allow(dead_code)]
 pub(crate) mod bridge {
     use super::{AuditOutcome, RefusalReason};
     use crate::registrar::RegistrarError;
@@ -787,7 +779,19 @@ pub(crate) mod bridge {
     }
 
     /// Returns the record outcome for a refusal: its flattened reason
-    /// and the operator-facing detail that goes with it.
+    /// and the operator-facing detail that goes with it, or `None` for a
+    /// refusal that can never reach the trail.
+    ///
+    /// The two audit-failure variants are the whole of that `None`.
+    /// `VerbError::AuditUnwritable` and `VerbError::PostMintUnrecordable`
+    /// are produced *by* a failed record write, so the record that would
+    /// carry one is the record whose write just failed. Saying so in the
+    /// return type rather than in prose is what keeps a call site from
+    /// answering a failed write with a second one: where this returns
+    /// `None`, no outcome record is written and the refusal is returned
+    /// unchanged. [`RefusalReason`] therefore gains no member for either,
+    /// and the reason table stays a total, one-to-one mapping of the
+    /// refusals a durable line can hold.
     ///
     /// The detail is the refusal's *own* message and never a formatted
     /// error chain. `VerbError::Unavailable` is taken from its explicit
@@ -795,8 +799,11 @@ pub(crate) mod bridge {
     /// source — which can carry anything at all, including values from
     /// other systems — cannot reach a durable record even if that
     /// `Display` were later changed to interpolate it.
-    pub(crate) fn refusal_outcome(error: &VerbError) -> AuditOutcome {
+    pub(crate) fn refusal_outcome(error: &VerbError) -> Option<AuditOutcome> {
         let (reason, detail) = match error {
+            VerbError::AuditUnwritable { .. } | VerbError::PostMintUnrecordable { .. } => {
+                return None;
+            }
             VerbError::ReservedServiceName { .. } => {
                 (RefusalReason::ReservedServiceName, Some(error.to_string()))
             }
@@ -816,7 +823,7 @@ pub(crate) mod bridge {
                 (RefusalReason::Unavailable, Some(activity.clone()))
             }
         };
-        AuditOutcome::Refused { reason, detail }
+        Some(AuditOutcome::Refused { reason, detail })
     }
 
     /// Flattens every refusal the config loader and the derivation

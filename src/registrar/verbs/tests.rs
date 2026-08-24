@@ -28,7 +28,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
-use wiremock::MockServer;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::binding::{
     BINDING_SCHEMA_VERSION, BindingRecord, BindingReloadKind, BindingSpec, BindingState,
@@ -44,7 +45,10 @@ use super::{
     RegistrarVerbsConfig, granted_deadline,
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions, WrapInfo};
-use crate::registrar::audit::{AuditRecordStore, AuditStoreSettings, MIN_AUDIT_MAX_FILE_BYTES};
+use crate::registrar::audit::{
+    AppendGate, AuditPhase, AuditRecordStore, AuditStoreSettings, FaultInjection,
+    MIN_AUDIT_MAX_FILE_BYTES,
+};
 use crate::registrar::config::{
     Multiplicity, RegistrarConfig, RegistrationSpec, ReloadKind, ReloadSpec,
 };
@@ -52,7 +56,7 @@ use crate::registrar::error::{RegistrarError, SpecIdentityField};
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
 use crate::service_material::{
-    ResourceOutcome, ServiceResource, service_policy_name, service_role_name,
+    ResourceOutcome, ServiceResource, service_kv_path, service_policy_name, service_role_name,
 };
 
 /// Environment variable naming the live `OpenBao` the ignored tier runs
@@ -132,6 +136,22 @@ fn base_fixture() -> RegistrarConfigFixture {
 }
 
 fn verbs_with(client: OpenBaoClient, kv_mount: &str, config: RegistrarConfig) -> RegistrarVerbs {
+    // Every fixture gets its own throwaway store, so what a test reads
+    // back out of the trail is only what its own invocations wrote.
+    verbs_with_store(
+        client,
+        kv_mount,
+        config,
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+    )
+}
+
+fn verbs_with_store(
+    client: OpenBaoClient,
+    kv_mount: &str,
+    config: RegistrarConfig,
+    audit_store: AuditRecordStore,
+) -> RegistrarVerbs {
     RegistrarVerbs::new(RegistrarVerbsConfig {
         client,
         kv_mount: kv_mount.to_string(),
@@ -144,10 +164,7 @@ fn verbs_with(client: OpenBaoClient, kv_mount: &str, config: RegistrarConfig) ->
         token_ttl: TOKEN_TTL.to_string(),
         secret_id_ttl: SECRET_ID_TTL.to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
-        // Every fixture gets its own throwaway store, so a test can
-        // assert nothing was written without another test's records
-        // showing up in it.
-        audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        audit_store,
     })
 }
 
@@ -189,117 +206,225 @@ fn assert_envelope(refusal: &VerbRefusal, arm: ProducingArm) {
 }
 
 // ---------------------------------------------------------------------
-// Fast tier: pre-derivation control flow
+// Reading the audit trail back
 // ---------------------------------------------------------------------
 
-/// The verb layer holds the audit record store as a fixed construction
-/// dependency, and **no** verb arm writes to it.
+/// Every line the verb service's trail holds, as raw JSON, in file
+/// order.
 ///
-/// Both halves matter. The dependency has to be here already, so the
-/// sibling issue that writes intent and outcome records can add its call
-/// sites without another visibility or wiring change; and nothing may be
-/// written yet, because that sibling owns the ordering of those writes
-/// around the `OpenBao` work and a stray append here would decide it.
+/// Raw `Value`s rather than `AuditRecord`s on purpose: several
+/// assertions here are about a key being **absent** from the object,
+/// which a `serde` round trip through an `Option` field cannot tell
+/// from `null`. Every line is still required to parse.
+fn trail(verbs: &RegistrarVerbs) -> Vec<serde_json::Value> {
+    let path = verbs.audit_store().active_path();
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => panic!("read {}: {err}", path.display()),
+    };
+    contents
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|err| panic!("every trail line must parse: {err}: {line}"))
+        })
+        .collect()
+}
+
+/// The lines one invocation wrote, selected by `request_id`.
+fn lines_for(verbs: &RegistrarVerbs, request_id: &str) -> Vec<serde_json::Value> {
+    trail(verbs)
+        .into_iter()
+        .filter(|line| line["request_id"] == json!(request_id))
+        .collect()
+}
+
+/// What one invocation asked for, as the record spells it.
+struct Asked<'a> {
+    verb: &'a str,
+    caller: &'a str,
+    service_name: &'a str,
+    host: &'a str,
+    instance: Option<u32>,
+}
+
+impl<'a> Asked<'a> {
+    fn new(verb: &'a str, service_name: &'a str, host: &'a str, instance: Option<u32>) -> Self {
+        Self {
+            verb,
+            caller: CALLER,
+            service_name,
+            host,
+            instance,
+        }
+    }
+
+    /// Names a caller other than the suite's default one.
+    fn by(mut self, caller: &'a str) -> Self {
+        self.caller = caller;
+        self
+    }
+}
+
+/// Asserts that `request_id` produced one complete intent/outcome pair
+/// and returns the outcome line.
 ///
-/// Driven over every refusal arm that reaches a decision without
-/// `OpenBao`, so a call site added to any of them would show up as a
-/// record in a store that must stay empty.
-#[tokio::test]
-async fn the_verbs_hold_an_audit_store_and_write_nothing_to_it() {
-    let audit_root = tempfile::tempdir().expect("tempdir");
+/// This is the shape every invocation owes, so it is asserted in one
+/// place: the two lines share the request id, the intent line comes
+/// first and **omits** the `registration_id` key entirely rather than
+/// carrying `null` or `""`, both carry a timestamp, the verb, the caller
+/// identity verbatim and the requested parts, and the outcome line
+/// carries an outcome while the intent line does not.
+fn assert_pair(verbs: &RegistrarVerbs, request_id: &str, asked: &Asked<'_>) -> serde_json::Value {
+    let lines = lines_for(verbs, request_id);
+    assert_eq!(
+        lines.len(),
+        2,
+        "one invocation owes exactly one intent line and one outcome line, got {lines:#?}"
+    );
+    let (intent, outcome) = (&lines[0], &lines[1]);
+
+    assert_eq!(intent["phase"], json!("intent"), "{intent}");
+    assert_eq!(outcome["phase"], json!("outcome"), "{outcome}");
+    assert!(
+        !intent
+            .as_object()
+            .expect("a record is a JSON object")
+            .contains_key("registration_id"),
+        "an intent line must omit the registration_id key entirely, got {intent}"
+    );
+    assert!(intent.get("outcome").is_none(), "{intent}");
+    assert!(outcome.get("outcome").is_some(), "{outcome}");
+
+    for line in &lines {
+        assert_eq!(line["request_id"], json!(request_id));
+        assert_eq!(line["verb"], json!(asked.verb), "{line}");
+        assert_eq!(line["caller_identity"], json!(asked.caller), "{line}");
+        assert_eq!(line["requested"]["service_name"], json!(asked.service_name));
+        assert_eq!(line["requested"]["host"], json!(asked.host));
+        assert_eq!(
+            line["requested"]
+                .get("instance")
+                .and_then(serde_json::Value::as_u64),
+            asked.instance.map(u64::from),
+            "{line}"
+        );
+        assert!(
+            line["ts"].as_str().is_some_and(|ts| ts.ends_with('Z')),
+            "every line carries a UTC timestamp: {line}"
+        );
+        assert_eq!(line["record_version"], json!(1), "{line}");
+    }
+    outcome.clone()
+}
+
+/// Asserts the pair a refused invocation owes, and returns its
+/// `outcome.reason`.
+fn assert_refusal_pair(verbs: &RegistrarVerbs, refusal: &VerbRefusal, asked: &Asked<'_>) -> String {
+    let outcome = assert_pair(verbs, refusal.context().request_id().as_str(), asked);
+    assert_eq!(outcome["outcome"]["class"], json!("refused"), "{outcome}");
+    outcome["outcome"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refusal outcome names a reason: {outcome}"))
+        .to_string()
+}
+
+/// A store over a directory the caller keeps alive, so a test can pick
+/// its size limit and reach its fault switches.
+///
+/// [`AuditRecordStore::open_temporary`] owns its directory and fixes the
+/// defaults; this is for the tests that need neither.
+async fn open_store(root: &std::path::Path, max_file_bytes: u64) -> AuditRecordStore {
     // The store audits its immediate parent, which is this directory.
     // `tempfile` creates it under the ambient umask — `002` on a
     // Debian-style account — so state the mode rather than inherit a
     // group-writable one the store would rightly refuse.
-    std::fs::set_permissions(
-        audit_root.path(),
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .expect("chmod");
-    let store = AuditRecordStore::open_for_tests(AuditStoreSettings {
-        dir: audit_root.path().join("registrar-audit"),
-        max_file_bytes: MIN_AUDIT_MAX_FILE_BYTES,
+    std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod");
+    AuditRecordStore::open_for_tests(AuditStoreSettings {
+        dir: root.join("registrar-audit"),
+        max_file_bytes,
         max_retained_files: 4,
     })
     .await
-    .expect("a store opens over a temporary directory");
-
-    let server = MockServer::start().await;
-    let (_dir, config) = load_fixture(&base_fixture());
-    let verbs = RegistrarVerbs::new(RegistrarVerbsConfig {
-        client: mock_client(&server),
-        kv_mount: "secret".to_string(),
-        config,
-        secret_id_options: SecretIdOptions {
-            ttl: Some("10m".to_string()),
-            num_uses: Some(1),
-            ..Default::default()
-        },
-        token_ttl: TOKEN_TTL.to_string(),
-        secret_id_ttl: SECRET_ID_TTL.to_string(),
-        wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
-        audit_store: store.clone(),
-    });
-
-    assert_eq!(
-        verbs.audit_store().active_path(),
-        store.active_path(),
-        "the verb service must retain the store it was constructed with"
-    );
-
-    // A reserved name, an unconfigured component, an invalid label and
-    // an instance-shape mismatch: one refusal per pre-derivation arm.
-    for (service_name, host, instance) in [
-        ("bootroot-decoy", "h1", None),
-        ("absent", "h1", None),
-        ("not a label", "h1", None),
-        ("roxyd", "h1", Some(4)),
-    ] {
-        verbs
-            .mint(&mint_request(service_name, host, instance))
-            .await
-            .expect_err("every one of these must refuse");
-        verbs
-            .deregister(&deregister_request(service_name, host, instance))
-            .await
-            .expect_err("every one of these must refuse");
-    }
-    // A wrap TTL no credential could be issued under, refused on the
-    // same arm but through a different enum.
-    let mut unusable = mint_request("roxyd", "h1", None);
-    unusable.wrap_ttl = Duration::ZERO;
-    verbs
-        .mint(&unusable)
-        .await
-        .expect_err("a zero wrap_ttl must refuse");
-
-    assert_untouched(&server).await;
-    assert_no_audit_records(&verbs);
+    .expect("a store opens over a temporary directory")
 }
 
-/// Asserts the verb service wrote no audit record.
+/// A verb service whose store's faults a test can arm, over a Wiremock
+/// with no mounted responses.
 ///
-/// The store is a construction dependency in this issue and nothing
-/// more: the sibling that writes intent and outcome records owns where
-/// they go relative to the `OpenBao` work, so an append from any arm
-/// here would decide that ordering by accident. Read through
-/// `RegistrarVerbs::audit_store` rather than from a path the test
-/// happens to know, so it also holds for a service built by the live
-/// backend's own fixture.
-fn assert_no_audit_records(verbs: &RegistrarVerbs) {
-    let path = verbs.audit_store().active_path();
-    let written = match std::fs::metadata(path) {
-        Ok(meta) => meta.len(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(err) => panic!("stat {}: {err}", path.display()),
-    };
-    assert_eq!(
-        written,
-        0,
-        "no verb arm may write an audit record in this issue's scope, but {} is {written} bytes",
-        path.display()
-    );
+/// The `TempDir` is returned so the caller keeps the store's directory
+/// alive for the whole test.
+async fn audit_harness(
+    fixture: &RegistrarConfigFixture,
+) -> (MockServer, TempDir, TempDir, RegistrarVerbs) {
+    let server = MockServer::start().await;
+    let store_root = tempfile::tempdir().expect("tempdir");
+    let store = open_store(store_root.path(), MIN_AUDIT_MAX_FILE_BYTES).await;
+    let (dir, config) = load_fixture(fixture);
+    let verbs = verbs_with_store(mock_client(&server), "secret", config, store);
+    (server, dir, store_root, verbs)
 }
+
+/// Drives `verb` with the store's `append` fault armed for the
+/// **outcome** write only.
+///
+/// The gate parks each blocking append at its entry and notifies here,
+/// so the fault can be armed in the window between the two: the intent
+/// append is released before it is set, and the outcome append is
+/// already parked when it is. This is the only way to fail one specific
+/// append rather than all of them, and it needs no production branch.
+async fn with_outcome_append_failure<F, T>(verbs: &RegistrarVerbs, verb: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    fail_the_outcome_write(verbs, verb, |faults| {
+        faults.append.store(true, Ordering::SeqCst);
+    })
+    .await
+}
+
+/// As [`with_outcome_append_failure`], with the store step the caller
+/// names failed instead.
+async fn fail_the_outcome_write<F, T>(
+    verbs: &RegistrarVerbs,
+    verb: F,
+    arm: impl FnOnce(&FaultInjection),
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let store = verbs.audit_store().clone();
+    let (gate, mut entries, releases) = AppendGate::new();
+    *store.faults().gate.lock().expect("arm the gate") = Some(gate);
+
+    let mut driven = Box::pin(verb);
+    // The intent append, released before anything is armed.
+    tokio::select! {
+        () = async { (&mut driven).await; } => {
+            panic!("a gated invocation cannot have finished its verb")
+        }
+        entered = entries.recv() => entered.expect("the intent append reaches the gate"),
+    }
+    releases.send(()).expect("release the intent append");
+
+    // The outcome append, parked at the gate before it has opened the
+    // file — which is the window the fault is armed in.
+    tokio::select! {
+        () = async { (&mut driven).await; } => {
+            panic!("the invocation finished without attempting its outcome write")
+        }
+        entered = entries.recv() => entered.expect("the outcome append reaches the gate"),
+    }
+    arm(store.faults());
+    releases.send(()).expect("release the outcome append");
+    driven.await
+}
+
+// ---------------------------------------------------------------------
+// Fast tier: pre-derivation control flow
+// ---------------------------------------------------------------------
 
 /// A client pointed at a Wiremock with **no** mounted responses, so any
 /// request at all is visible in the server's recorded requests.
@@ -1001,6 +1126,985 @@ fn the_registrar_teardown_set_is_the_five_material_suffixes_and_not_the_binding(
 }
 
 // ---------------------------------------------------------------------
+// Fast tier: the audit trail around both verbs
+// ---------------------------------------------------------------------
+
+/// The URL path a registrar binding's KV data lives at.
+fn binding_data_url(registration_id: &str) -> String {
+    format!(
+        "/v1/secret/data/{}",
+        service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX)
+    )
+}
+
+/// The URL path a registrar binding's KV metadata lives at, which is
+/// what a delete addresses.
+fn binding_metadata_url(registration_id: &str) -> String {
+    format!(
+        "/v1/secret/metadata/{}",
+        service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX)
+    )
+}
+
+/// Answers the binding read with `record`.
+///
+/// Everything this suite leaves unmounted answers 404, which the client
+/// reads as absent — so a resource is "not there" by saying nothing
+/// about it.
+async fn mock_binding_read(server: &MockServer, registration_id: &str, record: &BindingRecord) {
+    Mock::given(method("GET"))
+        .and(path(binding_data_url(registration_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": record.encode().expect("the record encodes") }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Answers both binding writes — the absent-only claim and the
+/// activation, which address one path — as accepted.
+async fn mock_binding_writes(server: &MockServer, registration_id: &str) {
+    Mock::given(method("POST"))
+        .and(path(binding_data_url(registration_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "version": 1 }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Answers the binding delete as done.
+async fn mock_binding_delete(server: &MockServer, registration_id: &str) {
+    Mock::given(method("DELETE"))
+        .and(path(binding_metadata_url(registration_id)))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+}
+
+/// Answers every service-material read as present and every delete as
+/// done, which is the planted-orphan sweep.
+async fn mock_material_present(server: &MockServer, registration_id: &str) {
+    for suffix in REGISTRAR_TEARDOWN_KV_SUFFIXES {
+        let url = format!(
+            "/v1/secret/metadata/{}",
+            service_kv_path(registration_id, suffix)
+        );
+        Mock::given(method("GET"))
+            .and(path(url.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(url))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Answers everything a first mint needs, through to wrapped material.
+async fn mock_first_mint(server: &MockServer, registration_id: &str) {
+    mock_binding_writes(server, registration_id).await;
+    let role_name = service_role_name(registration_id);
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/sys/policies/acl/{}",
+            service_policy_name(registration_id)
+        )))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}/role-id")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "role_id": "role-id-1" } })),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{role_name}/secret-id")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "wrap_info": {
+                "token": "hvs.wrap-token",
+                "ttl": 300,
+                "creation_time": "2026-08-23T12:00:00Z",
+                "creation_path": format!("auth/approle/role/{role_name}/secret-id"),
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Reports whether the mock server was asked to write a `creating`
+/// binding and never asked to delete one.
+async fn creating_binding_left_behind(server: &MockServer, registration_id: &str) -> bool {
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    let claimed = requests.iter().any(|request| {
+        request.url.path() == binding_data_url(registration_id)
+            && serde_json::from_slice::<serde_json::Value>(&request.body)
+                .is_ok_and(|body| body["data"]["state"] == json!("creating"))
+    });
+    let deleted = requests
+        .iter()
+        .any(|request| request.url.path() == binding_metadata_url(registration_id));
+    claimed && !deleted
+}
+
+/// Every refusal decided before the per-id lock owes a complete pair,
+/// and neither of its lines carries a `registration_id` — nothing has
+/// derived one.
+///
+/// One case per pre-lock arm, driven through both verbs, each against
+/// its own store and its own mock so what is read back is only what
+/// these two invocations wrote.
+#[tokio::test]
+async fn every_pre_lock_refusal_writes_a_pair_with_no_registration_id() {
+    let long_component = "c".repeat(63);
+    let long_host = "h".repeat(63);
+    let cases: Vec<(RegistrarConfigFixture, &str, String, String, Option<u32>)> = vec![
+        // A `service_name` that is not a DNS label.
+        (
+            base_fixture(),
+            "invalid_service_name",
+            "not a label".to_string(),
+            "h1".to_string(),
+            None,
+        ),
+        // A reserved `bootroot-` name, declared as an ordinary
+        // component so the reserved guard is what refuses it.
+        (
+            base_fixture(),
+            "reserved_service_name",
+            "bootroot-decoy".to_string(),
+            "h1".to_string(),
+            None,
+        ),
+        // A component with no multiplicity entry.
+        (
+            base_fixture().without_component("roxyd"),
+            "component_not_configured",
+            "roxyd".to_string(),
+            "h1".to_string(),
+            None,
+        ),
+        // An instance where the component is one-per-host.
+        (
+            base_fixture(),
+            "service_instance_mismatch",
+            "roxyd".to_string(),
+            "h1".to_string(),
+            Some(4),
+        ),
+        // A derived key one octet past the 131-octet bound.
+        (
+            base_fixture().with_component(
+                &long_component,
+                Multiplicity::ManyPerHost,
+                &sample_spec(),
+            ),
+            "derived_key_invalid",
+            long_component.clone(),
+            long_host.clone(),
+            Some(1000),
+        ),
+    ];
+
+    for (fixture, expected_reason, service_name, host, instance) in cases {
+        let (server, _dir, _store_root, verbs) = audit_harness(&fixture).await;
+
+        for verb in ["mint", "deregister"] {
+            let refusal = if verb == "mint" {
+                verbs
+                    .mint(&mint_request(&service_name, &host, instance))
+                    .await
+                    .expect_err("every one of these must refuse")
+            } else {
+                verbs
+                    .deregister(&deregister_request(&service_name, &host, instance))
+                    .await
+                    .expect_err("every one of these must refuse")
+            };
+            let asked = Asked::new(verb, &service_name, &host, instance);
+            let reason = assert_refusal_pair(&verbs, &refusal, &asked);
+            assert_eq!(reason, expected_reason, "{service_name}/{host} as a {verb}");
+            for line in lines_for(&verbs, refusal.context().request_id().as_str()) {
+                assert!(
+                    !line
+                        .as_object()
+                        .expect("a record is a JSON object")
+                        .contains_key("registration_id"),
+                    "a refusal before the lock carries no registration_id: {line}"
+                );
+            }
+        }
+        assert_untouched(&server).await;
+    }
+}
+
+/// The two mint-only pre-lock refusals: a spec that restates a
+/// different identity, and a `wrap_ttl` no credential could be issued
+/// under.
+#[tokio::test]
+async fn the_mint_only_pre_lock_refusals_write_their_pairs() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+
+    let mut disagreeing = mint_request("roxyd", "h1", None);
+    disagreeing.spec = requested(&sample_spec()).with_service_name("roxyd-h1");
+    let refusal = verbs
+        .mint(&disagreeing)
+        .await
+        .expect_err("a restated identity that disagrees must be refused");
+    assert_eq!(
+        assert_refusal_pair(&verbs, &refusal, &Asked::new("mint", "roxyd", "h1", None)),
+        "spec_identity_disagreement"
+    );
+
+    let mut unusable = mint_request("roxyd", "h1", None);
+    unusable.wrap_ttl = Duration::ZERO;
+    let refusal = verbs
+        .mint(&unusable)
+        .await
+        .expect_err("a zero wrap_ttl must be refused");
+    assert_eq!(
+        assert_refusal_pair(&verbs, &refusal, &Asked::new("mint", "roxyd", "h1", None)),
+        "zero"
+    );
+
+    assert_untouched(&server).await;
+}
+
+/// A `RegistrationIdCollision` is decided by *reading* the binding and
+/// writes nothing, so the `OpenBao` audit device cannot see it. This
+/// trail can, and the pair proves it.
+#[tokio::test]
+async fn a_registration_id_collision_writes_a_complete_pair() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let registration_id = "h1-roxyd";
+    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, registration_id, &bound).await;
+
+    let refusal = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("a binding bound to another host must be refused");
+    assert!(matches!(
+        refusal.error(),
+        VerbError::RegistrationIdCollision { .. }
+    ));
+
+    let outcome = assert_pair(
+        &verbs,
+        refusal.context().request_id().as_str(),
+        &Asked::new("mint", "roxyd", "h1", None),
+    );
+    assert_eq!(
+        outcome["outcome"]["reason"],
+        json!("registration_id_collision")
+    );
+    assert_eq!(outcome["registration_id"], json!(registration_id));
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert_eq!(requests.len(), 1, "the binding read and nothing else");
+    assert_eq!(requests[0].method, wiremock::http::Method::GET);
+}
+
+/// With the store failing the intent write, the invocation is refused
+/// having made **no** `OpenBao` request at all.
+///
+/// This is the direct test that the intent write precedes every
+/// `OpenBao` write: an implementation that wrote one record after the
+/// fact and refused on failure would have reached the mock by now.
+/// The trail is then empty — a property of *this* fault mode, which
+/// fails before any byte reaches the file, not of failed intent writes
+/// in general.
+#[tokio::test]
+async fn an_intent_write_failure_refuses_before_any_openbao_call() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    verbs
+        .audit_store()
+        .faults()
+        .append
+        .store(true, Ordering::SeqCst);
+
+    let refusal = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("a mint whose intent record cannot be written must refuse");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Intent,
+                ..
+            }
+        ),
+        "expected an intent-phase audit failure, got {:?}",
+        refusal.error()
+    );
+    assert_envelope(&refusal, ProducingArm::PreDerivation);
+
+    let refusal = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect_err("a deregister whose intent record cannot be written must refuse");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Intent,
+                ..
+            }
+        ),
+        "expected an intent-phase audit failure, got {:?}",
+        refusal.error()
+    );
+    assert_envelope(&refusal, ProducingArm::PreDerivation);
+
+    assert_untouched(&server).await;
+    assert!(
+        trail(&verbs).is_empty(),
+        "this fault fails before any byte reaches the file"
+    );
+}
+
+/// **The mint discriminating pair**, over one injected outcome-phase
+/// failure.
+///
+/// A `StoredSpecConflict` is decided from a read and must not arm a
+/// teardown obligation — a caller told one was owed there would
+/// deregister a live identity this invocation did not create. A
+/// provisioning failure that followed a successful claim must arm it,
+/// and its `creating` binding is still in `OpenBao`. Asserting the two
+/// together is what catches an implementation that classifies from
+/// success-versus-refusal: both of these are refusals.
+#[tokio::test]
+async fn a_failed_outcome_write_tells_a_read_refusal_from_one_that_wrote() {
+    let conflicting = RegistrationSpec {
+        cert_group: Some(4242),
+        reload: spec_for("roxyd").reload.clone(),
+    };
+
+    // Decided from a read: the binding exists, is bound to this host,
+    // and carries a different spec.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let stored =
+        BindingRecord::creating("h1", &requested(&conflicting)).activated(&requested(&conflicting));
+    mock_binding_read(&server, "h1-roxyd", &stored).await;
+    let refusal =
+        with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+            .await
+            .expect_err("a stored-spec conflict is a refusal");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "a refusal decided from a read owes no teardown, got {:?}",
+        refusal.error()
+    );
+
+    // Wrote first: the claim landed, and the convergence then failed.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_binding_writes(&server, "h1-roxyd").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/sys/policies/acl/{}",
+            service_policy_name("h1-roxyd")
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let refusal =
+        with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+            .await
+            .expect_err("a failed convergence is a refusal");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "a refusal that followed a durable write owes a teardown, got {:?}",
+        refusal.error()
+    );
+    assert!(
+        creating_binding_left_behind(&server, "h1-roxyd").await,
+        "the claim is retained through a failed convergence"
+    );
+}
+
+/// **The deregister discriminating pair**, over one injected
+/// outcome-phase failure.
+///
+/// Both invocations produce `DeregisterKind::AlreadyAbsent`. One swept
+/// a planted orphan and is the only trace that the orphan is gone; the
+/// other found nothing at all and changed nothing. An implementation
+/// that classified from the outcome class fails one of them.
+#[tokio::test]
+async fn a_failed_outcome_write_tells_a_sweeping_already_absent_from_an_empty_one() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_material_present(&server, "h1-roxyd").await;
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&deregister_request("roxyd", "h1", None)),
+    )
+    .await
+    .expect_err("a failed outcome write refuses");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "a sweep that removed material owes a teardown, got {:?}",
+        refusal.error()
+    );
+
+    // Nothing mounted at all: every resource reads absent, so the sweep
+    // deleted nothing.
+    let (_server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&deregister_request("roxyd", "h1", None)),
+    )
+    .await
+    .expect_err("a failed outcome write refuses");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "an all-already-absent sweep changed nothing, got {:?}",
+        refusal.error()
+    );
+}
+
+/// A failed outcome write after a successful mint returns
+/// `PostMintUnrecordable`, and the mint's `OpenBao` state is exactly
+/// where the verb left it.
+#[tokio::test]
+async fn a_failed_outcome_write_after_a_first_mint_owes_a_teardown() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let refusal =
+        with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+            .await
+            .expect_err("a mint whose outcome cannot be recorded does not return its material");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        requests.iter().any(|request| request.url.path()
+            == format!("/v1/auth/approle/role/{}", service_role_name("h1-roxyd"))),
+        "the role the mint created is where it left it"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != binding_metadata_url("h1-roxyd")),
+        "nothing rolls the binding back"
+    );
+
+    // A property of *this* fault mode, which fails before any byte
+    // reaches the file — not a general consequence of a failed outcome
+    // write, several of which leave the line complete and readable.
+    let lines = trail(&verbs);
+    assert_eq!(lines.len(), 1, "the intent line and no outcome line");
+    assert_eq!(lines[0]["phase"], json!("intent"));
+}
+
+/// A mint that lost the compare-and-set on every attempt wrote nothing,
+/// so its failed outcome write owes no teardown.
+///
+/// `Ok(KvCreateIfAbsent::AlreadyExists)` is the one result of the six
+/// call sites that leaves the disposition clear: the claim was refused
+/// and nothing at all reached `OpenBao`. Exhausting the bounded retry is
+/// what drives it, and it is a refusal like the mutating ones above —
+/// which is again why the class cannot be read off success versus
+/// refusal.
+#[tokio::test]
+async fn a_lost_claim_race_leaves_the_disposition_clear() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    // The binding read finds nothing every time, and the claim is
+    // refused by the absent-only compare-and-set every time — which is
+    // another writer creating and removing it under this mint.
+    Mock::given(method("POST"))
+        .and(path(binding_data_url("h1-roxyd")))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errors": ["check-and-set parameter did not match the current version"]
+        })))
+        .mount(&server)
+        .await;
+
+    let refusal =
+        with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+            .await
+            .expect_err("an exhausted claim retry refuses");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "a lost compare-and-set wrote nothing, got {:?}",
+        refusal.error()
+    );
+}
+
+/// A failed outcome write after an idempotent re-mint owes a teardown
+/// too: the re-mint issued fresh material, which is a state change even
+/// though the role and the policy were reused untouched.
+#[tokio::test]
+async fn a_failed_outcome_write_after_a_remint_owes_a_teardown() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &active).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let refusal =
+        with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+            .await
+            .expect_err("a re-mint whose outcome cannot be recorded does not return its material");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        requests.iter().any(|request| request.url.path()
+            == format!(
+                "/v1/auth/approle/role/{}/secret-id",
+                service_role_name("h1-roxyd")
+            )),
+        "the re-mint issued fresh material before the record could be written"
+    );
+    assert!(
+        requests.iter().all(|request| {
+            request.url.path() != binding_data_url("h1-roxyd")
+                || request.method == wiremock::http::Method::GET
+        }),
+        "a re-mint against an active binding rewrites nothing"
+    );
+}
+
+/// A failed outcome write after a deregister that removed a bound
+/// identity owes a teardown, still reports what the sweep managed, and
+/// re-drives cleanly once the store recovers.
+#[tokio::test]
+async fn a_failed_outcome_write_after_an_identity_removal_re_drives() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &bound).await;
+    mock_material_present(&server, "h1-roxyd").await;
+    mock_binding_delete(&server, "h1-roxyd").await;
+
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&deregister_request("roxyd", "h1", None)),
+    )
+    .await
+    .expect_err("a failed outcome write refuses");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+    let report = refusal
+        .teardown()
+        .expect("the sweep's report still reaches the caller");
+    assert!(report.aggregate_success());
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        requests.iter().any(|request| {
+            request.url.path() == binding_metadata_url("h1-roxyd")
+                && request.method == wiremock::http::Method::DELETE
+        }),
+        "the binding was deleted before the record could be written"
+    );
+
+    // The store recovers, and the re-drive writes its own pair.
+    verbs
+        .audit_store()
+        .faults()
+        .append
+        .store(false, Ordering::SeqCst);
+    let outcome = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect("a re-drive against a working store succeeds");
+    assert_eq!(outcome.kind(), DeregisterKind::IdentityRemoved);
+    let line = assert_pair(
+        &verbs,
+        outcome.context().request_id().as_str(),
+        &Asked::new("deregister", "roxyd", "h1", None),
+    );
+    assert_eq!(line["outcome"]["class"], json!("identity_removed"));
+    assert_eq!(line["registration_id"], json!("h1-roxyd"));
+}
+
+/// A failed outcome write on a refusal decided before anything was
+/// touched carries `AuditPhase::Outcome` and never a teardown
+/// obligation.
+///
+/// Paired with the intent-failure test above, this is what pins both
+/// phase values: a variant that hard-coded `Intent` would satisfy that
+/// one and fail here, and one that hard-coded `Outcome` the reverse.
+#[tokio::test]
+async fn a_failed_outcome_write_on_a_no_change_refusal_carries_the_outcome_phase() {
+    // Decided from a read, before the sweep.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &bound).await;
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&deregister_request("roxyd", "h1", None)),
+    )
+    .await
+    .expect_err("a wrong-host deregister is refused");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "a host mismatch changes nothing, got {:?}",
+        refusal.error()
+    );
+    assert!(
+        !matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "a host mismatch owes no teardown"
+    );
+
+    // Decided before derivation, with no `OpenBao` call at all.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.mint(&mint_request("bootroot-decoy", "h1", None)),
+    )
+    .await
+    .expect_err("a reserved name is refused");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "a pre-derivation refusal changes nothing, got {:?}",
+        refusal.error()
+    );
+    assert_untouched(&server).await;
+}
+
+/// A failed outcome write after a teardown whose report shows a
+/// resource `Removed` or `Failed` owes a teardown, even though the
+/// invocation was refused.
+#[tokio::test]
+async fn a_failed_outcome_write_after_a_failed_teardown_owes_a_teardown() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &bound).await;
+    mock_material_present(&server, "h1-roxyd").await;
+    // The role read fails outright, so the sweep records a `Failed`
+    // attempt and refuses in aggregate having already removed the KV
+    // material.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v1/auth/approle/role/{}",
+            service_role_name("h1-roxyd")
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&deregister_request("roxyd", "h1", None)),
+    )
+    .await
+    .expect_err("a teardown that could not finish must refuse");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+    let report = refusal.teardown().expect("the partial report is carried");
+    assert!(!report.aggregate_success());
+    assert!(
+        report
+            .attempts()
+            .iter()
+            .any(|attempt| matches!(attempt.outcome, ResourceOutcome::Removed)),
+        "the KV material was removed before the role read failed: {:?}",
+        report.attempts()
+    );
+}
+
+/// A `sync_data` failure is a write failure for its phase like any
+/// other, and the disposition still decides what it returns.
+///
+/// It is the one failure mode that leaves a complete, newline-terminated
+/// line already in the file, so the trail is asserted only for JSONL
+/// integrity: whether the unflushed line is there is the store's
+/// business and this issue neither promises nor removes it.
+#[tokio::test]
+async fn a_sync_failure_is_a_write_failure_for_its_phase() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    verbs
+        .audit_store()
+        .faults()
+        .sync
+        .store(true, Ordering::SeqCst);
+    let refusal = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("an unflushed intent record is not a written one");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Intent,
+                ..
+            }
+        ),
+        "expected an intent-phase audit failure, got {:?}",
+        refusal.error()
+    );
+    assert_untouched(&server).await;
+
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+    let refusal = fail_the_outcome_write(
+        &verbs,
+        verbs.mint(&mint_request("roxyd", "h1", None)),
+        |faults| faults.sync.store(true, Ordering::SeqCst),
+    )
+    .await
+    .expect_err("an unflushed outcome record is not a written one");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        requests.iter().any(|request| request.url.path()
+            == format!("/v1/auth/approle/role/{}", service_role_name("h1-roxyd"))),
+        "the mint's state is where the verb left it"
+    );
+    // Every line parses, whether or not the unflushed one is there.
+    let lines = trail(&verbs);
+    assert!((1..=2).contains(&lines.len()), "got {lines:#?}");
+}
+
+/// A rotation the pending record required, and that failed, is a write
+/// failure for its phase too.
+#[tokio::test]
+async fn a_failed_rotation_is_a_write_failure_for_its_phase() {
+    /// Fills the active file to one byte short of the limit, so the very
+    /// next record genuinely requires a rotation.
+    fn fill_to_limit(store: &AuditRecordStore) {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store.active_path())
+            .expect("open the active file");
+        let existing = file.metadata().expect("stat").len();
+        let padding = MIN_AUDIT_MAX_FILE_BYTES - existing - 1;
+        let line = "{\"filler\":\"x\"}\n";
+        let step = u64::try_from(line.len()).expect("the filler line fits a u64");
+        let mut written = 0u64;
+        while written + step <= padding {
+            file.write_all(line.as_bytes()).expect("pad");
+            written += step;
+        }
+    }
+
+    // Intent phase: the very first append has to rotate, and cannot.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    fill_to_limit(verbs.audit_store());
+    verbs
+        .audit_store()
+        .faults()
+        .rotate
+        .store(true, Ordering::SeqCst);
+    let refusal = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("a record that cannot be rotated into place is not written");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Intent,
+                ..
+            }
+        ),
+        "expected an intent-phase audit failure, got {:?}",
+        refusal.error()
+    );
+    assert_untouched(&server).await;
+
+    // Outcome phase, after a mint that changed `OpenBao`. The file is
+    // filled while the outcome append is parked at the gate — it has
+    // not opened the file yet — so the rotation it then needs is the
+    // one that fails.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+    let store = verbs.audit_store().clone();
+    let refusal = fail_the_outcome_write(
+        &verbs,
+        verbs.mint(&mint_request("roxyd", "h1", None)),
+        |faults| {
+            fill_to_limit(&store);
+            faults.rotate.store(true, Ordering::SeqCst);
+        },
+    )
+    .await
+    .expect_err("a record that cannot be rotated into place is not written");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "expected a teardown obligation, got {:?}",
+        refusal.error()
+    );
+}
+
+/// The record carries the verb layer's own refusal variant, not a
+/// coarser wire grouping: three refusals a wire contract would collapse
+/// produce three different `outcome.reason` values.
+#[tokio::test]
+async fn three_close_refusals_produce_three_distinct_reasons() {
+    let widened = RegistrationSpec {
+        cert_group: Some(4242),
+        reload: spec_for("roxyd").reload.clone(),
+    };
+
+    // Outside the rendered safe-set, with no binding at all.
+    let (_server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let mut outside = mint_request("roxyd", "h1", None);
+    outside.spec = requested(&widened);
+    let refusal = verbs
+        .mint(&outside)
+        .await
+        .expect_err("a spec outside the safe-set must be refused");
+    let outside_reason =
+        assert_refusal_pair(&verbs, &refusal, &Asked::new("mint", "roxyd", "h1", None));
+
+    // Inside the safe-set, and disagreeing with what the identity
+    // already carries.
+    let (server, _dir, _store_root, verbs) =
+        audit_harness(&base_fixture().with_component("roxyd", Multiplicity::OnePerHost, &widened))
+            .await;
+    let stored = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &stored).await;
+    let mut conflicting = mint_request("roxyd", "h1", None);
+    conflicting.spec = requested(&widened);
+    let refusal = verbs
+        .mint(&conflicting)
+        .await
+        .expect_err("a stored-spec disagreement must be refused");
+    let conflict_reason =
+        assert_refusal_pair(&verbs, &refusal, &Asked::new("mint", "roxyd", "h1", None));
+
+    // A spec that restates a different identity, refused before
+    // derivation.
+    let (_server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let mut disagreeing = mint_request("roxyd", "h1", None);
+    disagreeing.spec = requested(&sample_spec()).with_service_name("roxyd-h1");
+    let refusal = verbs
+        .mint(&disagreeing)
+        .await
+        .expect_err("a restated identity that disagrees must be refused");
+    let identity_reason =
+        assert_refusal_pair(&verbs, &refusal, &Asked::new("mint", "roxyd", "h1", None));
+
+    assert_eq!(outside_reason, "service_spec_outside_safe_set");
+    assert_eq!(conflict_reason, "stored_spec_conflict");
+    assert_eq!(identity_reason, "spec_identity_disagreement");
+    let mut all = vec![outside_reason, conflict_reason, identity_reason];
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), 3, "the trail must tell the three apart");
+}
+
+/// The caller identity reaches the record unchanged and uninterpreted.
+///
+/// A distinctive value **within** the store's field cap, so what is
+/// asserted is that the verb layer passes it through — the bounding of
+/// an over-long one is the store's own, and is tested there.
+#[tokio::test]
+async fn the_caller_identity_reaches_the_record_unchanged() {
+    const DISTINCTIVE: &str = "spiffe://review/manager#7f3a \"quoted\" \\ and a tab\t";
+
+    let (_server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+
+    let mut request = mint_request("bootroot-decoy", "h1", None);
+    request.caller = CallerIdentity::new(DISTINCTIVE);
+    let refusal = verbs
+        .mint(&request)
+        .await
+        .expect_err("a reserved name is refused");
+
+    let lines = lines_for(&verbs, refusal.context().request_id().as_str());
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        assert_eq!(line["caller_identity"], json!(DISTINCTIVE), "{line}");
+        assert!(
+            line.get("truncated").is_none(),
+            "a value inside the cap is not shortened: {line}"
+        );
+    }
+    assert_eq!(
+        refusal.context().caller().as_str(),
+        DISTINCTIVE,
+        "and the outcome carries it too"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Ignored tier: everything that depends on a prior OpenBao write
 // ---------------------------------------------------------------------
 
@@ -1173,6 +2277,7 @@ async fn first_mint_creates_exactly_the_derived_role_and_policy() {
         .await
         .expect("the first mint must succeed");
     let registration_id = format!("{host}-piglet-001");
+    let mint_id = outcome.context().request_id().as_str().to_string();
 
     assert_eq!(outcome.kind(), MintKind::FirstMint);
     assert_eq!(outcome.context().caller().as_str(), CALLER);
@@ -1226,14 +2331,29 @@ async fn first_mint_creates_exactly_the_derived_role_and_policy() {
         "the construction-fixed secret-id options must be what was applied"
     );
 
-    verbs
+    let removal = verbs
         .deregister(&deregister_request("piglet", &host, Some(1)))
         .await
         .expect("cleanup");
+
     // The success arms are only reachable with a live backend, so this
     // is where a first mint and an identity removal are held to the
-    // same "writes nothing yet" rule the refusal arms are.
-    assert_no_audit_records(&verbs);
+    // pairing rule the refusal arms are held to in the fast tier.
+    let minted = assert_pair(
+        &verbs,
+        &mint_id,
+        &Asked::new("mint", "piglet", &host, Some(1)),
+    );
+    assert_eq!(minted["outcome"]["class"], json!("first_mint"));
+    assert_eq!(minted["registration_id"], json!(registration_id));
+
+    let removed = assert_pair(
+        &verbs,
+        removal.context().request_id().as_str(),
+        &Asked::new("deregister", "piglet", &host, Some(1)),
+    );
+    assert_eq!(removed["outcome"]["class"], json!("identity_removed"));
+    assert_eq!(removed["registration_id"], json!(registration_id));
 }
 
 /// A same-host, same-spec re-mint returns fresh material and leaves the
@@ -1251,6 +2371,7 @@ async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
     let request = mint_request("roxyd", &host, None);
     let first = verbs.mint(&request).await.expect("first mint");
     assert_eq!(first.kind(), MintKind::FirstMint);
+    let first_id = first.context().request_id().as_str().to_string();
     let first_role_id = first.role_id().to_string();
     let first_token = first.into_wrapped_secret_id();
 
@@ -1274,6 +2395,7 @@ async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
         first_role_id,
         "a re-mint must not replace the role"
     );
+    let second_id = second.context().request_id().as_str().to_string();
     let second_token = second.into_wrapped_secret_id();
     assert_ne!(first_token, second_token, "the material must be fresh");
 
@@ -1292,11 +2414,28 @@ async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
         .await
         .expect("the second token is unused");
 
-    verbs
+    let removal = verbs
         .deregister(&deregister_request("roxyd", &host, None))
         .await
         .expect("cleanup");
-    assert_no_audit_records(&verbs);
+
+    // Three invocations, three pairs — and the second one's line names
+    // the caller that drove it, not the one before it.
+    let minted = assert_pair(&verbs, &first_id, &Asked::new("mint", "roxyd", &host, None));
+    assert_eq!(minted["outcome"]["class"], json!("first_mint"));
+    let reminted = assert_pair(
+        &verbs,
+        &second_id,
+        &Asked::new("mint", "roxyd", &host, None).by("spiffe://review/other#0001"),
+    );
+    assert_eq!(reminted["outcome"]["class"], json!("idempotent_remint"));
+    assert_eq!(reminted["registration_id"], json!(registration_id));
+    let removed = assert_pair(
+        &verbs,
+        removal.context().request_id().as_str(),
+        &Asked::new("deregister", "roxyd", &host, None),
+    );
+    assert_eq!(removed["outcome"]["class"], json!("identity_removed"));
 }
 
 /// A request larger than the registrar's maximum is clamped, and the
@@ -1427,10 +2566,12 @@ async fn safe_set_refusal_and_stored_spec_conflict_are_distinct_no_change_outcom
         "a safe-set refusal must claim nothing"
     );
 
-    verbs
+    let outside_id = refusal.context().request_id().as_str().to_string();
+    let accepted = verbs
         .mint(&mint_request(&component, &host, Some(1)))
         .await
         .expect("the in-safe-set mint succeeds");
+    let accepted_id = accepted.context().request_id().as_str().to_string();
 
     // Now re-render the config so a different spec is inside the
     // safe-set, and re-mint: the *stored* spec is what disagrees.
@@ -1458,13 +2599,38 @@ async fn safe_set_refusal_and_stored_spec_conflict_are_distinct_no_change_outcom
     let binding = backend.binding_of(&registration_id).await.expect("binding");
     assert_eq!(binding["applied_spec"]["cert_group"], json!(3001));
 
-    verbs
+    let conflict_id = refusal.context().request_id().as_str().to_string();
+    let removal = verbs
         .deregister(&deregister_request(&component, &host, Some(1)))
         .await
         .expect("cleanup");
-    // Post-derivation refusals reach further into the verb than any
-    // arm the mock-server tier can drive, and still write nothing.
-    assert_no_audit_records(&verbs);
+
+    // Post-derivation refusals reach further into the verb than any arm
+    // the mock-server tier can drive, and each still owes its pair. The
+    // stored-spec conflict was driven through a second service, so its
+    // line is in that service's own trail.
+    let asked = Asked::new("mint", &component, &host, Some(1));
+    let outside_line = assert_pair(&verbs, &outside_id, &asked);
+    assert_eq!(
+        outside_line["outcome"]["reason"],
+        json!("service_spec_outside_safe_set")
+    );
+    assert_eq!(outside_line["registration_id"], json!(registration_id));
+    let minted = assert_pair(&verbs, &accepted_id, &asked);
+    assert_eq!(minted["outcome"]["class"], json!("first_mint"));
+    assert_eq!(minted["registration_id"], json!(registration_id));
+    let conflicted = assert_pair(&rewidened, &conflict_id, &asked);
+    assert_eq!(
+        conflicted["outcome"]["reason"],
+        json!("stored_spec_conflict")
+    );
+    assert_eq!(conflicted["registration_id"], json!(registration_id));
+    let removed = assert_pair(
+        &verbs,
+        removal.context().request_id().as_str(),
+        &Asked::new("deregister", &component, &host, Some(1)),
+    );
+    assert_eq!(removed["outcome"]["class"], json!("identity_removed"));
 }
 
 /// A failed convergence retains its `creating` binding. The matching host
@@ -1843,7 +3009,18 @@ async fn absent_binding_deregister_sweeps_planted_orphans() {
             .is_none()
     );
     assert!(backend.binding_of(&registration_id).await.is_none());
-    assert_no_audit_records(&verbs);
+
+    let swept = assert_pair(
+        &verbs,
+        outcome.context().request_id().as_str(),
+        &Asked::new("deregister", "roxyd", &host, None),
+    );
+    assert_eq!(
+        swept["outcome"]["class"],
+        json!("idempotent_already_absent"),
+        "an absent-binding sweep is recorded as the idempotent class it is"
+    );
+    assert_eq!(swept["registration_id"], json!(registration_id));
 }
 
 /// An already-absent role, policy and material is a successful idempotent
@@ -1979,6 +3156,95 @@ async fn two_instances_racing_one_id_produce_exactly_one_claimant() {
     let winner = if bound == host_a { &first } else { &second };
     winner
         .deregister(&deregister_request(&component, &bound, None))
+        .await
+        .expect("cleanup");
+}
+
+/// Concurrent mints for one identity each produce a correctly paired
+/// intent and outcome, and the `first_mint` outcome line precedes every
+/// `idempotent_remint` outcome line in the file.
+///
+/// That ordering is what writing the outcome record **inside** the
+/// per-id guard buys: releasing the guard first would let a re-mint
+/// change `OpenBao` and land its line ahead of the line describing the
+/// claim it superseded. It is a property test rather than a
+/// discriminator — an implementation that wrote outside the guard races
+/// and may still pass — so the in-guard placement is a code-review
+/// criterion as well.
+///
+/// Intent lines are deliberately **not** ordered here. They are written
+/// before stage 1, so concurrent invocations interleave them freely;
+/// the trail is paired by `request_id`, not by adjacency.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn concurrent_mints_for_one_identity_write_ordered_outcome_lines() {
+    const MINTS: usize = 4;
+
+    let backend = LiveBackend::from_env();
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    let verbs = Arc::new(backend.verbs(config));
+
+    let mut handles = Vec::new();
+    for _ in 0..MINTS {
+        let verbs = Arc::clone(&verbs);
+        let host = host.clone();
+        handles.push(tokio::spawn(async move {
+            let outcome = verbs
+                .mint(&mint_request("roxyd", &host, None))
+                .await
+                .expect("every concurrent mint for one identity must succeed");
+            (
+                outcome.context().request_id().as_str().to_string(),
+                outcome.kind(),
+            )
+        }));
+    }
+    let mut minted = Vec::new();
+    for handle in handles {
+        minted.push(handle.await.expect("a mint task must not panic"));
+    }
+
+    let firsts = minted
+        .iter()
+        .filter(|(_, kind)| *kind == MintKind::FirstMint)
+        .count();
+    assert_eq!(firsts, 1, "exactly one invocation may claim the identity");
+
+    // Every invocation owes a complete pair, whichever arm produced it.
+    for (request_id, kind) in &minted {
+        let outcome = assert_pair(
+            &verbs,
+            request_id,
+            &Asked::new("mint", "roxyd", &host, None),
+        );
+        let expected = match kind {
+            MintKind::FirstMint => "first_mint",
+            MintKind::IdempotentReMint => "idempotent_remint",
+        };
+        assert_eq!(outcome["outcome"]["class"], json!(expected));
+        assert_eq!(outcome["registration_id"], json!(format!("{host}-roxyd")));
+    }
+
+    let outcome_classes: Vec<String> = trail(&verbs)
+        .into_iter()
+        .filter(|line| line["phase"] == json!("outcome"))
+        .map(|line| {
+            line["outcome"]["class"]
+                .as_str()
+                .expect("an outcome line names a class")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(outcome_classes.len(), MINTS);
+    assert_eq!(
+        outcome_classes.first().map(String::as_str),
+        Some("first_mint"),
+        "the claim's outcome line must precede every re-mint's, got {outcome_classes:?}"
+    );
+
+    verbs
+        .deregister(&deregister_request("roxyd", &host, None))
         .await
         .expect("cleanup");
 }
