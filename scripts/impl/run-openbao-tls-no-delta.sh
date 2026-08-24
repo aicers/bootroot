@@ -75,6 +75,7 @@ OPENBAO_CONTAINER_NAME="bootroot-openbao"
 OPENBAO_BIND_HOST_DEFAULT="172.17.0.1"
 OPENBAO_BIND_HOST="${OPENBAO_BIND_HOST:-$OPENBAO_BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:8200}"
+OPENBAO_LOCAL_URL="http://127.0.0.1:${OPENBAO_HOST_PORT:-8200}"
 EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
@@ -545,7 +546,7 @@ main() {
   install_infra_with_bind
   # `infra install` brings the stack up on the base compose file, so
   # OpenBao is still published on loopback at this point.
-  wait_for_openbao_listening "http://127.0.0.1:8200"
+  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
 
   apply_exposed_override_by_hand
   run_init
