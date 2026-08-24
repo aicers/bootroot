@@ -414,17 +414,21 @@ Requires=bootroot-registrar.socket
 
 #### 감사 레코드
 
-데몬은 두 동사에 대한 자체 추가 전용 감사 기록을 `audit_record_dir`
-(기본값 `/var/lib/bootroot/registrar-audit`)에 남깁니다. 이는 OpenBao의
+이 빌드에서 bootroot는 감사 저장소를 만들지 않습니다. 이 빌드에서 레지스트라
+동사 레코드를 쓰지 않습니다.
+
+작성기가 연결되면 데몬은 두 동사에 대한 자체 추가 전용 감사 기록을
+`audit_record_dir`(`<audit_store_dir>/records`, 기본값
+`/var/lib/bootroot/audit-store/records`)에 남깁니다. 이는 OpenBao의
 파일 감사 장치를 대체하지 **않습니다**. 그 장치는 여전히 필수이고
 `bootroot init`이 계속 확인합니다. 이 기록은 그 장치가 남길 수 없는
 것을 남깁니다. 누가 요청했는지, 어떤 `(service_name, host, instance)`
 조합이었는지, 그리고 OpenBao 쓰기가 일어나기 전에 거부된 요청까지입니다.
 
-산출물의 소유자는 처음부터 끝까지 데몬입니다. 레지스트라는 이 파일을
+작성기가 연결되면 산출물의 소유자는 처음부터 끝까지 데몬입니다. 레지스트라는 이 파일을
 읽거나, 추가하거나, 삭제하거나, 다른 경로로 돌릴 수 없고, 요청의 어떤
 필드도 경로나 정책을 고르지 못합니다. 설정은 `agent.toml`의
-`[registrar]` 테이블에 있습니다. 네 개의 키와 레코드 형식은
+`[registrar]` 테이블에 있습니다. 여덟 개의 키와 레코드 형식은
 [레지스트라 감사 레코드](configuration.md#registrar-audit-records)를
 참고하십시오.
 
@@ -432,10 +436,10 @@ Requires=bootroot-registrar.socket
 
 - `audit_record_dir`와 그 직속 상위 디렉터리는 root 소유여야 하고,
   그룹이나 다른 사용자에게 쓰기 가능해서는 안 되며, 둘 다 심볼릭 링크가
-  아니어야 합니다. 없는 구성 요소는 데몬이 직접 만듭니다. 상위 경로는
+  아니어야 합니다. 작성기가 연결되면 없는 구성 요소는 데몬이 직접 만듭니다. 상위 경로는
   root 소유 `0755`, 저장소 디렉터리는 root 소유 `0700`이며, 이미 존재하는
   항목의 소유자나 권한은 절대 바꾸지 않습니다.
-- 저장소는 레지스트라 표면이 요청을 받기 전에 열립니다. 따라서 안전하지
+- 작성기가 연결되면 저장소는 레지스트라 표면이 요청을 받기 전에 열립니다. 따라서 안전하지
   않거나 사용할 수 없는 디렉터리는 기록 없이 동사를 계속 서비스하는 대신
   그 표면을 닫힌 상태로 실패시킵니다. 데몬의 갱신이나 fast-poll 작업은
   그대로 계속됩니다.
@@ -443,22 +447,23 @@ Requires=bootroot-registrar.socket
   `audit_max_file_bytes` × (`audit_max_retained_files` + 1)이며,
   기본값에서는 8 MiB × 17 ≈ **136 MiB**입니다.
 
-기록을 읽는 일은 평범한 줄 단위 작업입니다. 형식이 JSON Lines라서 한 줄이
-완전한 레코드 하나입니다.
+작성기가 연결되어 레코드가 생긴 뒤에는 기록을 읽는 일이 평범한 줄 단위
+작업입니다. 형식이 JSON Lines라서 한 줄이 완전한 레코드 하나입니다.
 
 ```sh
 # 최근 거부 기록. 아래쪽이 최신입니다.
-cat /var/lib/bootroot/registrar-audit/registrar-audit.jsonl |
+cat /var/lib/bootroot/audit-store/records/registrar-audit.jsonl |
   jq -c 'select(.outcome.class == "refused")'
 
 # 하나의 상관 관계 핸들에 해당하는 모든 기록. 활성 파일뿐 아니라 회전
 # 세대까지 포함합니다. 이름은 오래된 것부터 정렬됩니다.
-cd /var/lib/bootroot/registrar-audit &&
+cd /var/lib/bootroot/audit-store/records &&
   cat $(ls registrar-audit-*.jsonl) registrar-audit.jsonl |
   jq -c --arg id "$REQUEST_ID" 'select(.request_id == $id)'
 ```
 
-한 줄은 완전한 레코드이거나 아예 없거나 둘 중 하나입니다. 레코드를 쓰다가
+한 줄은 완전한 레코드이거나 아예 없거나 둘 중 하나입니다. 작성기가 연결된
+뒤 레코드를 쓰다가
 중간에 실패한 경우 데몬은 실패를 보고하기 전에 이미 기록된 바이트를 파일에서
 다시 걷어내고, 그 되돌림까지 디스크에 반영하므로 정전이 나도 그 바이트가
 되살아나지 않습니다. 따라서 위와 같은 조회가 잘린 줄을 건너뛸 일이 없습니다.
@@ -466,8 +471,8 @@ cd /var/lib/bootroot/registrar-audit &&
 디스크에 반영하지 못하면 데몬은 평범한 쓰기 실패가 아니라 바로 그 사실을
 보고하며, 잘린 줄이 남아 있다면 그것은 활성 파일의 마지막 줄입니다.
 
-이 파일들을 `logrotate`나 다른 외부 도구로 회전시키지 마십시오. 데몬이
-직접 회전과 정리를 수행하며, 이름 형식
+이 파일들을 `logrotate`나 다른 외부 도구로 회전시키지 마십시오. 작성기가
+연결되면 데몬이 직접 회전과 정리를 수행하며, 이름 형식
 `registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl`의 고정 너비가 바로
 오래된 것부터 정렬되게 하는 근거입니다. 다른 회전 도구가 데몬 아래에서
 활성 파일을 옮기면 기록이 사라집니다.

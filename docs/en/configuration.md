@@ -346,30 +346,47 @@ unsupported-platform error, before any activation variable is looked at.
 
 ```toml
 [registrar]
-audit_record_dir = "/var/lib/bootroot/registrar-audit"
+audit_store_dir = "/var/lib/bootroot/audit-store"
+audit_store_reserve_bytes = 2147483648
+audit_store_low_water_bytes = 536870912
+audit_store_enforcement = "filesystem"
+audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
 ```
 
-bootroot writes its own append-only audit trail for the registrar's
-`mint` and `deregister` verbs. It sits **beside** OpenBao's mandatory
-file audit device and replaces nothing: the OpenBao device records what
-OpenBao was asked to do, and this one records who asked, for which
-`(service_name, host, instance)`, and what the answer was — including a
-request refused before any OpenBao write ever happened. The OpenBao
-audit check `bootroot init` performs is unchanged.
+bootroot does not create the audit store in this build. It does not write
+registrar verb records in this build.
 
-The daemon owns the artifact. The registrar cannot read, append to,
-delete, redirect or select it, and no field of a request reaches the
-path, the modes, the rotation policy or the retention policy. An absent
-`[registrar]` table leaves every key at the default above; an unknown
-key is a configuration error.
+Once a writer is wired in, bootroot writes its own append-only audit trail
+for the registrar's `mint` and `deregister` verbs. It sits **beside**
+OpenBao's mandatory file audit device and replaces nothing: the OpenBao
+device records what OpenBao was asked to do, and this one records who
+asked, for which `(service_name, host, instance)`, and what the answer
+was — including a request refused before any OpenBao write ever
+happened. The OpenBao audit check `bootroot init` performs is unchanged.
 
-- `audit_record_dir` (default `/var/lib/bootroot/registrar-audit`) —
-  the absolute directory the record files live in. A relative path is
-  rejected: the daemon's working directory is not contracted to be
-  stable under a service supervisor.
+Once a writer is wired in, the daemon owns the artifact. The registrar
+cannot read, append to, delete, redirect or select it, and no field of a
+request reaches the path, the modes, the rotation policy or the
+retention policy. An absent `[registrar]` table leaves every key at the
+default above; an unknown key is a configuration error.
+
+- `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
+  absolute directory that holds `records/` for daemon records and
+  `openbao/` for OpenBao's file audit output. A relative path is refused.
+- `audit_store_reserve_bytes` (`u64`, default `2147483648`, 2 GiB) — the
+  configured shared-store budget. It must not exceed `i64::MAX`; this
+  build records the value but does not enforce the budget.
+- `audit_store_low_water_bytes` (`u64`, default `536870912`, 512 MiB) —
+  the future capacity-alarm threshold. It must be less than the reserve.
+- `audit_store_enforcement` (default `filesystem`) — selects a future
+  filesystem-backed ceiling or an unenforced `directory` budget. Neither
+  mode is implemented in this build.
+- `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
+  directory the record files live in. A relative path is rejected, and
+  the resolved directory must stay inside `audit_store_dir`.
 - `audit_max_file_bytes` (default `8388608`, 8 MiB) — the size at which
   the active file is rotated. Must be at least `65536`.
 - `audit_max_retained_files` (default `16`) — how many rotated
@@ -395,8 +412,8 @@ the file count is a hard capacity constraint and the day count is not.
 
 #### Ownership and permissions
 
-The store is opened before the registrar surface serves anything, and it
-fails closed rather than degrading:
+Once a writer is wired in, the store is opened before the registrar surface
+serves anything, and it fails closed rather than degrading:
 
 - Missing path components are created root-owned mode `0755`; the store
   directory itself is created root-owned mode `0700`; the active file is
@@ -410,23 +427,23 @@ fails closed rather than degrading:
 - Nothing above the immediate parent is audited, and nothing above it is
   modified.
 
-Point `audit_record_dir` at a directory on the bootroot host's own
-storage, not at a shared or user-writable path. `/var/lib/bootroot` is
-the default parent for exactly that reason.
+Point `audit_record_dir` inside `audit_store_dir` on the bootroot host's
+own storage, not at a shared or user-writable path.
 
 #### The record format
 
-One versioned JSON Lines family. The active file is
-`registrar-audit.jsonl` and each line is one complete JSON object
-followed by a newline. Hostile quotes, backslashes, control characters
-and newlines are JSON-escaped, so one record is always exactly one line.
+Once a writer is wired in, it uses one versioned JSON Lines family. The
+active file is `registrar-audit.jsonl` and each line is one complete JSON
+object followed by a newline. Hostile quotes, backslashes, control
+characters and newlines are JSON-escaped, so one record is always exactly
+one line.
 
 ```json
 {"record_version":1,"phase":"intent","ts":"2026-08-23T12:34:56.789Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7}}
 {"record_version":1,"phase":"outcome","ts":"2026-08-23T12:34:56.930Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7},"registration_id":"review-h1-007","outcome":{"class":"first_mint"}}
 ```
 
-- `record_version` is `1` for every record this build writes. The
+- `record_version` is `1` for every record in this format. The
   daemon refuses to write a record at any other version, so a file in
   this family never mixes format versions.
 - `phase` is exactly `intent` or `outcome`. Both phases carry the full
@@ -461,10 +478,10 @@ and newlines are JSON-escaped, so one record is always exactly one line.
 
 #### Rotation and retention
 
-The active file is rotated **before** an append that would take it past
-`audit_max_file_bytes`, and a file already at or above the limit when
-the store is opened is rotated before the store is usable. Every rotated
-generation is named:
+Once a writer is wired in, the active file is rotated **before** an append
+that would take it past `audit_max_file_bytes`, and a file already at or
+above the limit when the store is opened is rotated before the store is
+usable. Every rotated generation is named:
 
 ```text
 registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl
@@ -503,9 +520,9 @@ directory cannot be flushed does not open.
 The defaults are a hard ceiling of 8 MiB × 17 files (the active file
 plus 16 rotated generations) ≈ **136 MiB**.
 
-Sizing the reference deployment uses an ordinary-record assumption of
-**400 bytes** per line. Each invocation writes two lines, one `intent`
-and one `outcome`:
+Once a writer is wired in, sizing the reference deployment uses an
+ordinary-record assumption of **400 bytes** per line. Each invocation then
+writes two lines, one `intent` and one `outcome`:
 
 ```text
 2 × (2,000 initial invocations + 90 × 200 daily invocations) = 40,000 records
@@ -515,9 +532,10 @@ and one `outcome`:
 So a fleet doing 2,000 initial enrolments and 200 invocations a day fits
 its whole 90-day target inside about an eighth of the default ceiling.
 That sizes **ordinary installation and reinstallation activity**, not a
-refusal flood: a caller retrying a refused request in a loop writes
-records at whatever rate it retries, and the file-count ceiling — not
-`audit_min_retain_days` — is what bounds the disk it can consume.
+refusal flood: once a writer is wired in, a caller retrying a refused
+request in a loop writes records at whatever rate it retries, and the
+file-count ceiling — not `audit_min_retain_days` — is what bounds the disk
+it can consume.
 
 ### EAB (Optional)
 
