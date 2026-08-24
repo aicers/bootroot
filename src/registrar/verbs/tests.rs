@@ -1477,6 +1477,60 @@ async fn a_recorded_mint_returns_its_material_on_both_arms() {
     );
 }
 
+/// An already-absent deregister the store *can* record leaves a
+/// complete pair behind, under the idempotent class that arm owes.
+///
+/// Every other already-absent test in this section injects a write
+/// failure — that is how a sweeping deregister is told from an empty
+/// one — and so asserts the returned variant rather than the line. This
+/// is what holds the line itself: `idempotent_already_absent` is
+/// otherwise the one outcome class whose record is asserted only in the
+/// ignored live tier, where CI's `test-core` job never reaches it.
+#[tokio::test]
+async fn a_recorded_already_absent_deregister_records_its_idempotent_class() {
+    // Nothing mounted at all: no binding, and every resource reads
+    // absent, so the sweep deletes nothing.
+    let (_server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    let outcome = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect("an absent-binding deregister is idempotent");
+    assert_eq!(outcome.kind(), DeregisterKind::AlreadyAbsent);
+    let swept_nothing = assert_pair(
+        &verbs,
+        outcome.context().request_id().as_str(),
+        &Asked::new("deregister", "roxyd", "h1", None),
+    );
+    assert_eq!(
+        swept_nothing["outcome"]["class"],
+        json!("idempotent_already_absent")
+    );
+    assert_eq!(swept_nothing["registration_id"], json!("h1-roxyd"));
+
+    // The same class, reached by a sweep that removed a planted orphan.
+    // The two are one class in the record — what tells them apart is the
+    // mutation disposition, and only when a write fails — so the line is
+    // the trail's only trace that the orphan is gone.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_material_present(&server, "h1-roxyd").await;
+    let outcome = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect("a sweeping absent-binding deregister is idempotent too");
+    assert_eq!(outcome.kind(), DeregisterKind::AlreadyAbsent);
+    assert!(outcome.teardown().aggregate_success());
+    let swept = assert_pair(
+        &verbs,
+        outcome.context().request_id().as_str(),
+        &Asked::new("deregister", "roxyd", "h1", None),
+    );
+    assert_eq!(
+        swept["outcome"]["class"],
+        json!("idempotent_already_absent")
+    );
+    assert_eq!(swept["registration_id"], json!("h1-roxyd"));
+}
+
 /// With the store failing the intent write, the invocation is refused
 /// having made **no** `OpenBao` request at all.
 ///
