@@ -470,8 +470,8 @@ What an operator needs on the host:
   `audit_max_file_bytes` × (`audit_max_retained_files` + 1), which at
   the defaults is 8 MiB × 17 ≈ **136 MiB**.
 
-Once records exist, reading the trail is ordinary line-oriented work — the
-format is JSON Lines, one complete record per line:
+Once a writer is wired in and records exist, reading the trail is ordinary
+line-oriented work — the format is JSON Lines, one complete record per line:
 
 ```sh
 # The most recent refusals, newest last.
@@ -485,7 +485,8 @@ cd /var/lib/bootroot/audit-store/records &&
   jq -c --arg id "$REQUEST_ID" 'select(.request_id == $id)'
 ```
 
-A line is either a whole record or not there at all. A write that fails
+A line is either a whole record or not there at all. Once a writer is wired
+in, a write that fails
 partway through one takes its bytes back off the file — and flushes that
 removal, so a power failure cannot bring them back — before it reports
 the failure, so a pass like the ones above never has to step over a torn
@@ -495,7 +496,7 @@ that instead of reporting an ordinary write failure, and the incomplete
 line, if it is there at all, is the last one in the active file.
 
 Do not rotate these files with `logrotate` or any other external tool.
-The daemon rotates and trims them itself, at
+Once a writer is wired in, the daemon rotates and trims them itself, at
 `registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl` names whose fixed
 widths are what make them sort oldest first; a second rotator moving the
 active file out from under the daemon costs records.

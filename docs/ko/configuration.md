@@ -412,10 +412,10 @@ OpenBao 감사 장치 확인은 그대로입니다.
 
 #### 레코드 형식
 
-버전이 붙은 JSON Lines 계열 하나뿐입니다. 활성 파일은
-`registrar-audit.jsonl`이고, 각 줄은 완전한 JSON 객체 하나 뒤에 개행이
-붙은 형태입니다. 따옴표·역슬래시·제어 문자·개행은 JSON 이스케이프되므로
-레코드 하나는 언제나 정확히 한 줄입니다.
+작성기가 연결되면 버전이 붙은 JSON Lines 계열 하나를 사용합니다. 활성
+파일은 `registrar-audit.jsonl`이고, 각 줄은 완전한 JSON 객체 하나 뒤에
+개행이 붙은 형태입니다. 따옴표·역슬래시·제어 문자·개행은 JSON
+이스케이프되므로 레코드 하나는 언제나 정확히 한 줄입니다.
 
 ```json
 {"record_version":1,"phase":"intent","ts":"2026-08-23T12:34:56.789Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7}}
@@ -454,9 +454,10 @@ OpenBao 감사 장치 확인은 그대로입니다.
 
 #### 회전과 보존
 
-활성 파일은 `audit_max_file_bytes`를 넘기게 될 추가 쓰기 **직전에**
-회전하며, 저장소를 열 때 이미 한계에 도달했거나 넘긴 파일은 저장소를 쓸
-수 있게 되기 전에 회전합니다. 회전 세대의 이름은 다음과 같습니다.
+작성기가 연결되면 활성 파일은 `audit_max_file_bytes`를 넘기게 될 추가
+쓰기 **직전에** 회전하며, 저장소를 열 때 이미 한계에 도달했거나 넘긴
+파일은 저장소를 쓸 수 있게 되기 전에 회전합니다. 회전 세대의 이름은
+다음과 같습니다.
 
 ```text
 registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl

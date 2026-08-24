@@ -432,10 +432,11 @@ own storage, not at a shared or user-writable path.
 
 #### The record format
 
-One versioned JSON Lines family. The active file is
-`registrar-audit.jsonl` and each line is one complete JSON object
-followed by a newline. Hostile quotes, backslashes, control characters
-and newlines are JSON-escaped, so one record is always exactly one line.
+Once a writer is wired in, it uses one versioned JSON Lines family. The
+active file is `registrar-audit.jsonl` and each line is one complete JSON
+object followed by a newline. Hostile quotes, backslashes, control
+characters and newlines are JSON-escaped, so one record is always exactly
+one line.
 
 ```json
 {"record_version":1,"phase":"intent","ts":"2026-08-23T12:34:56.789Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7}}
@@ -477,10 +478,10 @@ and newlines are JSON-escaped, so one record is always exactly one line.
 
 #### Rotation and retention
 
-The active file is rotated **before** an append that would take it past
-`audit_max_file_bytes`, and a file already at or above the limit when
-the store is opened is rotated before the store is usable. Every rotated
-generation is named:
+Once a writer is wired in, the active file is rotated **before** an append
+that would take it past `audit_max_file_bytes`, and a file already at or
+above the limit when the store is opened is rotated before the store is
+usable. Every rotated generation is named:
 
 ```text
 registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl
