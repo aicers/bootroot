@@ -359,21 +359,19 @@ audit_min_retain_days = 90
 bootroot does not create the audit store in this build. It does not write
 registrar verb records in this build.
 
-Once a writer is wired in, bootroot writes its own append-only audit
-trail for the registrar's `mint` and `deregister` verbs. It sits
-**beside** OpenBao's mandatory
-file audit device and replaces nothing: the OpenBao device records what
-OpenBao was asked to do, and this one records who asked, for which
-`(service_name, host, instance)`, and what the answer was — including a
-request refused before any OpenBao write ever happened. The OpenBao
-audit check `bootroot init` performs is unchanged.
+Once a writer is wired in, bootroot writes its own append-only audit trail
+for the registrar's `mint` and `deregister` verbs. It sits **beside**
+OpenBao's mandatory file audit device and replaces nothing: the OpenBao
+device records what OpenBao was asked to do, and this one records who
+asked, for which `(service_name, host, instance)`, and what the answer
+was — including a request refused before any OpenBao write ever
+happened. The OpenBao audit check `bootroot init` performs is unchanged.
 
 Once a writer is wired in, the daemon owns the artifact. The registrar
 cannot read, append to, delete, redirect or select it, and no field of a
-request reaches the
-path, the modes, the rotation policy or the retention policy. An absent
-`[registrar]` table leaves every key at the default above; an unknown
-key is a configuration error.
+request reaches the path, the modes, the rotation policy or the
+retention policy. An absent `[registrar]` table leaves every key at the
+default above; an unknown key is a configuration error.
 
 - `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
   absolute directory that holds `records/` for daemon records and
@@ -444,7 +442,7 @@ and newlines are JSON-escaped, so one record is always exactly one line.
 {"record_version":1,"phase":"outcome","ts":"2026-08-23T12:34:56.930Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7},"registration_id":"review-h1-007","outcome":{"class":"first_mint"}}
 ```
 
-- `record_version` is `1` for every record this build writes. The
+- `record_version` is `1` for every record in this format. The
   daemon refuses to write a record at any other version, so a file in
   this family never mixes format versions.
 - `phase` is exactly `intent` or `outcome`. Both phases carry the full

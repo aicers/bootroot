@@ -13,8 +13,7 @@ use crate::fs_util::path_is_within;
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
 
-// `i64::MAX` is non-negative, so this signed-to-unsigned conversion is lossless.
-const MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES: u64 = i64::MAX as u64;
+const MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES: u64 = i64::MAX.unsigned_abs();
 
 /// Validates that `cert_duration` is strictly greater than the default
 /// daemon `renew_before` interval.

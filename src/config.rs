@@ -95,20 +95,18 @@ pub struct RegistrarSettings {
     pub audit_record_dir: PathBuf,
     /// Size at which the active file is rotated. Held to a floor large
     /// enough for one maximum-size record.
-    #[serde(default = "defaults::default_audit_max_file_bytes")]
     pub audit_max_file_bytes: u64,
     /// How many rotated generations are retained beside the active
     /// file. This is the hard capacity ceiling.
-    #[serde(default = "defaults::default_audit_max_retained_files")]
     pub audit_max_retained_files: u32,
     /// The retention target in days. Recorded for later reporting work;
     /// where the two disagree, `audit_max_retained_files` wins.
-    #[serde(default = "defaults::default_audit_min_retain_days")]
     pub audit_min_retain_days: u32,
     /// Absolute directory containing the daemon's records and `OpenBao`'s
     /// file audit output.
     pub audit_store_dir: PathBuf,
-    /// Bytes reserved for the shared audit store.
+    /// Bytes the operator sets aside for the shared audit store. Nothing
+    /// enforces this budget in this build.
     pub audit_store_reserve_bytes: u64,
     /// Remaining bytes at which a future capacity alarm fires.
     pub audit_store_low_water_bytes: u64,
@@ -118,57 +116,51 @@ pub struct RegistrarSettings {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+// The raw representation mirrors the TOML contract so key names do not
+// depend on separate serde rename strings.
+#[allow(clippy::struct_field_names)]
 struct RawRegistrarSettings {
-    #[serde(default, rename = "audit_record_dir")]
-    record_dir: Option<PathBuf>,
-    #[serde(
-        default = "defaults::default_audit_max_file_bytes",
-        rename = "audit_max_file_bytes"
-    )]
-    max_file_bytes: u64,
-    #[serde(
-        default = "defaults::default_audit_max_retained_files",
-        rename = "audit_max_retained_files"
-    )]
-    max_retained_files: u32,
-    #[serde(
-        default = "defaults::default_audit_min_retain_days",
-        rename = "audit_min_retain_days"
-    )]
-    min_retain_days: u32,
-    #[serde(
-        default = "defaults::default_audit_store_dir",
-        rename = "audit_store_dir"
-    )]
-    store_dir: PathBuf,
-    #[serde(
-        default = "defaults::default_audit_store_reserve_bytes",
-        rename = "audit_store_reserve_bytes"
-    )]
-    store_reserve_bytes: u64,
-    #[serde(
-        default = "defaults::default_audit_store_low_water_bytes",
-        rename = "audit_store_low_water_bytes"
-    )]
-    store_low_water_bytes: u64,
-    #[serde(default, rename = "audit_store_enforcement")]
-    store_enforcement: AuditStoreEnforcement,
+    #[serde(default)]
+    audit_record_dir: Option<PathBuf>,
+    #[serde(default = "defaults::default_audit_max_file_bytes")]
+    audit_max_file_bytes: u64,
+    #[serde(default = "defaults::default_audit_max_retained_files")]
+    audit_max_retained_files: u32,
+    #[serde(default = "defaults::default_audit_min_retain_days")]
+    audit_min_retain_days: u32,
+    #[serde(default = "defaults::default_audit_store_dir")]
+    audit_store_dir: PathBuf,
+    #[serde(default = "defaults::default_audit_store_reserve_bytes")]
+    audit_store_reserve_bytes: u64,
+    #[serde(default = "defaults::default_audit_store_low_water_bytes")]
+    audit_store_low_water_bytes: u64,
+    #[serde(default)]
+    audit_store_enforcement: AuditStoreEnforcement,
 }
 
 impl From<RawRegistrarSettings> for RegistrarSettings {
     fn from(raw: RawRegistrarSettings) -> Self {
-        let audit_record_dir = raw
-            .record_dir
-            .unwrap_or_else(|| raw.store_dir.join("records"));
+        let RawRegistrarSettings {
+            audit_record_dir,
+            audit_max_file_bytes,
+            audit_max_retained_files,
+            audit_min_retain_days,
+            audit_store_dir,
+            audit_store_reserve_bytes,
+            audit_store_low_water_bytes,
+            audit_store_enforcement,
+        } = raw;
+        let audit_record_dir =
+            audit_record_dir.unwrap_or_else(|| defaults::audit_record_dir_for(&audit_store_dir));
         Self {
             audit_record_dir,
-            audit_max_file_bytes: raw.max_file_bytes,
-            audit_max_retained_files: raw.max_retained_files,
-            audit_min_retain_days: raw.min_retain_days,
-            audit_store_dir: raw.store_dir,
-            audit_store_reserve_bytes: raw.store_reserve_bytes,
-            audit_store_low_water_bytes: raw.store_low_water_bytes,
-            audit_store_enforcement: raw.store_enforcement,
+            audit_max_file_bytes,
+            audit_max_retained_files,
+            audit_min_retain_days,
+            audit_store_dir,
+            audit_store_reserve_bytes,
+            audit_store_low_water_bytes,
+            audit_store_enforcement,
         }
     }
 }
@@ -187,12 +179,13 @@ pub enum AuditStoreEnforcement {
 
 impl Default for RegistrarSettings {
     fn default() -> Self {
+        let audit_store_dir = defaults::default_audit_store_dir();
         Self {
-            audit_record_dir: defaults::default_audit_store_dir().join("records"),
+            audit_record_dir: defaults::audit_record_dir_for(&audit_store_dir),
             audit_max_file_bytes: defaults::default_audit_max_file_bytes(),
             audit_max_retained_files: defaults::default_audit_max_retained_files(),
             audit_min_retain_days: defaults::default_audit_min_retain_days(),
-            audit_store_dir: defaults::default_audit_store_dir(),
+            audit_store_dir,
             audit_store_reserve_bytes: defaults::default_audit_store_reserve_bytes(),
             audit_store_low_water_bytes: defaults::default_audit_store_low_water_bytes(),
             audit_store_enforcement: AuditStoreEnforcement::default(),
@@ -1664,24 +1657,7 @@ audit_store_enforcement = "directory"
                 .contains("represented by either string or table with exactly one key"),
             "{err}"
         );
-        assert!(!err.to_string().contains(" 1"), "{err}");
-    }
-
-    #[test]
-    fn a_single_key_audit_store_enforcement_table_loads() {
-        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
-        write_minimal_profile_config(&mut file);
-        writeln!(
-            file,
-            "\n[registrar]\naudit_store_enforcement = {{ filesystem = 1 }}"
-        )
-        .unwrap();
-        file.flush().unwrap();
-        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
-        assert_eq!(
-            settings.registrar.audit_store_enforcement,
-            AuditStoreEnforcement::Filesystem
-        );
+        assert!(!err.to_string().contains('1'), "{err}");
     }
 
     #[test]

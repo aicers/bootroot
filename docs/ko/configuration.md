@@ -422,7 +422,7 @@ OpenBao 감사 장치 확인은 그대로입니다.
 {"record_version":1,"phase":"outcome","ts":"2026-08-23T12:34:56.930Z","request_id":"9RmA…0","verb":"mint","caller_identity":"spiffe://review/manager#7f3a","requested":{"service_name":"review","host":"h1","instance":7},"registration_id":"review-h1-007","outcome":{"class":"first_mint"}}
 ```
 
-- `record_version`은 이 빌드가 쓰는 모든 레코드에서 `1`입니다. 데몬은
+- `record_version`은 이 형식의 모든 레코드에서 `1`입니다. 데몬은
   다른 버전의 레코드를 아예 기록하지 않으므로, 이 파일 계열 안에서
   형식 버전이 섞이는 일은 없습니다.
 - `phase`는 정확히 `intent` 또는 `outcome`입니다. 두 단계 모두 신원

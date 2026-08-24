@@ -449,19 +449,18 @@ and requests refused before any OpenBao write happened.
 
 Once a writer is wired in, the daemon owns the artifact end to end. The
 registrar cannot read, append to, delete or redirect it, and no request
-field selects the path
-or the policy. The settings are in `agent.toml`'s `[registrar]` table —
-see
-[Registrar audit records](configuration.md#registrar-audit-records)
-for the eight keys and the record shape.
+field selects the path or the policy. The settings are in
+`agent.toml`'s `[registrar]` table. See
+[Registrar audit records](configuration.md#registrar-audit-records) for
+the eight keys and the record shape.
 
 What an operator needs on the host:
 
 - `audit_record_dir` and its immediate parent must be root-owned and not
-  group- or world-writable, and neither may be a symbolic link. The
-  future writer creates missing components itself — ancestors root-owned
-  `0755`, the store directory root-owned `0700` — and never changes an
-  existing entry's owner or mode.
+  group- or world-writable, and neither may be a symbolic link. Once a
+  writer is wired in, it creates missing components itself — ancestors
+  root-owned `0755`, the store directory root-owned `0700` — and never
+  changes an existing entry's owner or mode.
 - Once a writer is wired in, the store is opened before the registrar
   surface serves anything, so an unsafe or unusable directory fails that
   surface closed instead of

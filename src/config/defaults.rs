@@ -28,7 +28,8 @@ const DEFAULT_MAX_CONCURRENT_ISSUANCES: u64 = 3;
 const DEFAULT_FAST_POLL_INTERVAL_SECS: u64 = 30;
 const DEFAULT_KV_MOUNT: &str = "secret";
 const DEFAULT_FAST_POLL_STATE_PATH: &str = "bootroot-agent-state.json";
-pub(crate) const DEFAULT_AUDIT_STORE_DIR: &str = "/var/lib/bootroot/audit-store";
+const DEFAULT_AUDIT_STORE_DIR: &str = "/var/lib/bootroot/audit-store";
+const AUDIT_RECORDS_SUBDIR: &str = "records";
 const DEFAULT_AUDIT_STORE_RESERVE_BYTES: u64 = 2_147_483_648;
 const DEFAULT_AUDIT_STORE_LOW_WATER_BYTES: u64 = 536_870_912;
 
@@ -104,6 +105,10 @@ pub(crate) fn default_fast_poll_state_path() -> PathBuf {
 
 pub(crate) fn default_audit_store_dir() -> PathBuf {
     PathBuf::from(DEFAULT_AUDIT_STORE_DIR)
+}
+
+pub(crate) fn audit_record_dir_for(audit_store_dir: &std::path::Path) -> PathBuf {
+    audit_store_dir.join(AUDIT_RECORDS_SUBDIR)
 }
 
 pub(crate) fn default_audit_store_reserve_bytes() -> u64 {
