@@ -485,6 +485,22 @@ impl Settings {
         Self::file_builder(config_path)?.build()?.try_deserialize()
     }
 
+    /// Creates settings from one required configuration file without an
+    /// environment overlay.
+    ///
+    /// Unlike [`Settings::from_file`], this refuses an absent or unreadable
+    /// file instead of silently deserializing the defaults.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read, its format is unsupported,
+    /// or its configuration cannot be deserialized.
+    pub fn from_required_file(config_path: PathBuf) -> Result<Self, ConfigError> {
+        defaults::apply_defaults(Config::builder())?
+            .add_source(File::from(config_path).required(true))
+            .build()?
+            .try_deserialize()
+    }
+
     /// Builds the defaults-plus-file layers both constructors share.
     fn file_builder(
         config_path: Option<PathBuf>,
@@ -595,6 +611,26 @@ mod tests {
         assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
         assert!(profile.hooks.post_renew.failure.is_empty());
+    }
+
+    #[test]
+    fn optional_file_loading_accepts_a_missing_path_but_required_loading_rejects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-agent.toml");
+
+        let optional = Settings::from_file(Some(missing.clone())).unwrap();
+        assert_eq!(optional.email, "admin@example.com");
+        assert!(Settings::from_required_file(missing).is_err());
+    }
+
+    #[test]
+    fn required_file_loading_rejects_an_unsupported_existing_file() {
+        let file = tempfile::Builder::new()
+            .suffix(".unsupported")
+            .tempfile()
+            .unwrap();
+
+        assert!(Settings::from_required_file(file.path().to_path_buf()).is_err());
     }
 
     #[test]

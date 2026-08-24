@@ -305,6 +305,7 @@ pub(super) static STRINGS: Strings = Strings {
     status_warning_audit_malformed_records: "WARNING: registrar audit contains malformed records.",
     status_warning_audit_retention_shortfall: "WARNING: registrar audit retention is shorter than configured.",
     status_warning_audit_scan_failed: "WARNING: registrar audit scan failed for {path}: {reason}",
+    status_warning_audit_config_not_regular_file: "agent configuration path is not a regular file",
     status_error_agent_config_missing: "Agent config path does not exist: {path}",
     summary_title: "bootroot init: summary",
     summary_openbao_url: "- OpenBao URL: {value}",
