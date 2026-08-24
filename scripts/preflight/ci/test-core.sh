@@ -6,10 +6,6 @@ cd "$ROOT_DIR"
 
 COMPOSE_FILES=(-f docker-compose.yml -f docker-compose.test.yml)
 BOOTROOT_SECRETS_DIR="$ROOT_DIR/secrets"
-STEPCA_HOST_PORT="${STEPCA_HOST_PORT:-9000}"
-HTTP01_ADMIN_HOST_PORT="${HTTP01_ADMIN_HOST_PORT:-8080}"
-STEPCA_URL="https://localhost:${STEPCA_HOST_PORT}"
-RESPONDER_URL="http://localhost:${HTTP01_ADMIN_HOST_PORT}"
 
 cleanup() {
   echo "[test-core] cleanup"
@@ -75,8 +71,7 @@ cargo test
 # belongs in the plain `cargo test` above instead.  Keep the arguments
 # identical to the `Monitoring Integration Test (E2E)` step in
 # .github/workflows/ci.yml, and keep this ahead of the install below:
-# the test needs its configured infrastructure ports and 3000 free on the
-# host.
+# the test needs 8200, 9000, 8080, 3000 and 5433 free on the host.
 echo "[test-core] monitoring integration test"
 cargo test --test monitoring_integration -- --include-ignored
 
@@ -102,7 +97,7 @@ printf "n\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --overwrite-password \
   --overwrite-ca-json \
   --overwrite-state \
-  --responder-url "$RESPONDER_URL" \
+  --responder-url "http://localhost:8080" \
   --skip responder-check 2>&1 | tee zero-config-init.log
 
 if ! grep -q "unseal key" zero-config-init.log; then
@@ -132,7 +127,7 @@ printf "n\n" | BOOTROOT_LANG=en cargo run --bin bootroot -- init \
   --overwrite-password \
   --overwrite-ca-json \
   --overwrite-state \
-  --responder-url "$RESPONDER_URL" \
+  --responder-url "http://localhost:8080" \
   --skip responder-check | tee cli-init.log
 
 ROOT_TOKEN="$(awk -F': ' '/root token:/ {print $2; exit}' cli-init.log)"
@@ -148,9 +143,9 @@ mkdir -p tmp certs
 # single AppRole identity, so `service add` rejects a config path
 # shared across services.
 for svc in edge-proxy web-app bootroot-agent; do
-  cat > "tmp/agent-${svc}.toml" <<EOF
+  cat > "tmp/agent-${svc}.toml" <<'EOF'
 email = "admin@example.com"
-server = "${STEPCA_URL}/acme/acme/directory"
+server = "https://localhost:9000/acme/acme/directory"
 domain = "trusted.domain"
 
 [acme]
@@ -159,7 +154,7 @@ directory_fetch_base_delay_secs = 1
 directory_fetch_max_delay_secs = 10
 poll_attempts = 15
 poll_interval_secs = 2
-http_responder_url = "${RESPONDER_URL}"
+http_responder_url = "http://localhost:8080"
 http_responder_hmac = "dev-hmac"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
@@ -233,7 +228,7 @@ cargo run --bin bootroot -- verify \
 # --- Verify CA Health ---
 echo "[test-core] verifying CA health"
 for i in {1..10}; do
-  if curl -k --fail "$STEPCA_URL/health"; then
+  if curl -k --fail https://localhost:9000/health; then
     break
   fi
   echo "Waiting for CA health..."

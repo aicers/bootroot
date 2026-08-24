@@ -68,10 +68,6 @@ const STEPCA_USER_ENV_KEY: &str = "BOOTROOT_STEPCA_USER";
 /// `scripts/impl/run-reinit-recovery.sh`'s `wait_for_openbao_listening`.
 const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
 const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
-/// Compose attempts before surfacing an infrastructure startup failure.
-const COMPOSE_UP_ATTEMPTS: u8 = 3;
-/// Delay between infrastructure startup attempts.
-const COMPOSE_UP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Assembles the `docker compose up` argv for `infra install`.
 ///
@@ -620,7 +616,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     } else {
         "docker compose up --build"
     };
-    run_compose_up_with_retry(&up, &host_port_env_refs, up_label, messages)?;
+    run_compose_with_env(&up, &host_port_env_refs, up_label, messages)?;
 
     // Converge secrets ownership before returning so the stack this
     // command brings up has no root-owned CA material left by an earlier
@@ -2206,26 +2202,6 @@ pub(crate) fn run_compose_with_env(
     messages: &Messages,
 ) -> Result<()> {
     run_compose_with_env_and_exec(invocation, env, context, Path::new(DOCKER_BIN), messages)
-}
-
-/// Runs an infrastructure `docker compose up` invocation, retrying Docker
-/// Desktop's short-lived container-removal race.
-fn run_compose_up_with_retry(
-    invocation: &ComposeInvocation,
-    env: &[(&str, &str)],
-    context: &str,
-    messages: &Messages,
-) -> Result<()> {
-    // Docker Desktop can report a container stopped before its name is
-    // released. A following `up` can then reject the recreation with a
-    // name conflict, although no operator action is needed.
-    for _ in 1..COMPOSE_UP_ATTEMPTS {
-        if run_compose_with_env(invocation, env, context, messages).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(COMPOSE_UP_RETRY_DELAY);
-    }
-    run_compose_with_env(invocation, env, context, messages)
 }
 
 /// Runs a `docker compose` invocation with additional child-environment

@@ -70,9 +70,7 @@ OPENBAO_CONTAINER_NAME="bootroot-openbao"
 # preserved compose override publishes on.
 OPENBAO_BIND_HOST_DEFAULT="172.17.0.1"
 OPENBAO_BIND_HOST="${OPENBAO_BIND_HOST:-$OPENBAO_BIND_HOST_DEFAULT}"
-OPENBAO_HOST_PORT="${OPENBAO_HOST_PORT:-8200}"
-OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:${OPENBAO_HOST_PORT}}"
-OPENBAO_LOCAL_URL="http://127.0.0.1:${OPENBAO_HOST_PORT}"
+OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:8200}"
 EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
@@ -527,7 +525,7 @@ run_bootstrap_init() {
   # not been issued for the bind yet.  `infra install --openbao-bind`
   # writes openbao.hcl as plaintext; `init` will switch it to TLS after
   # issuing the OpenBao server cert.
-  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
+  wait_for_openbao_listening "http://127.0.0.1:8200"
 
   log_phase "bootstrap-init"
   # `infra install` writes state.json (to capture the openbao_bind_addr

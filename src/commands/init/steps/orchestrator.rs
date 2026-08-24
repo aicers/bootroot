@@ -1033,8 +1033,7 @@ async fn run_init_inner(
                 messages,
             )?;
         } else {
-            apply_responder_compose_override(&args.compose.compose_file, override_path, messages)
-                .await?;
+            apply_responder_compose_override(&args.compose.compose_file, override_path, messages)?;
         }
     }
     let _trust_changed = write_ca_trust_fingerprints_with_retry(

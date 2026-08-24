@@ -24,10 +24,6 @@ use crate::i18n::Messages;
 const RESPONDER_CHECK_TOKEN: &str = "bootroot-init-check";
 /// Key authorization served for [`RESPONDER_CHECK_TOKEN`].
 const RESPONDER_CHECK_KEY_AUTHORIZATION: &str = "bootroot-init-check.key";
-/// Compose attempts before surfacing a responder recreation failure.
-const RESPONDER_OVERRIDE_ATTEMPTS: u8 = 3;
-/// Delay between responder recreation attempts.
-const RESPONDER_OVERRIDE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) async fn write_responder_files(
     secrets_dir: &Path,
@@ -203,7 +199,7 @@ services:
     Ok(Some(override_path))
 }
 
-pub(super) async fn apply_responder_compose_override(
+pub(super) fn apply_responder_compose_override(
     compose_file: &Path,
     override_path: &Path,
     messages: &Messages,
@@ -223,17 +219,8 @@ pub(super) async fn apply_responder_compose_override(
         None,
         &["up", "-d", "--no-deps", RESPONDER_SERVICE_NAME],
     );
-    // Docker Desktop can acknowledge the base container stop before its
-    // removal has completed. Compose then rejects this recreate with
-    // "removal ... is already in progress"; retrying covers that transient
-    // state while preserving the final error for non-transient failures.
-    for _ in 1..RESPONDER_OVERRIDE_ATTEMPTS {
-        if run_compose(&invocation, "docker compose responder override", messages).is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(RESPONDER_OVERRIDE_RETRY_DELAY).await;
-    }
-    run_compose(&invocation, "docker compose responder override", messages)
+    run_compose(&invocation, "docker compose responder override", messages)?;
+    Ok(())
 }
 
 pub(super) async fn verify_responder(

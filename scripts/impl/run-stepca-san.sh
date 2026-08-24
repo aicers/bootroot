@@ -73,7 +73,6 @@ INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-40}"
 INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-3}"
 OPENBAO_READY_ATTEMPTS="${OPENBAO_READY_ATTEMPTS:-40}"
 OPENBAO_READY_DELAY_SECS="${OPENBAO_READY_DELAY_SECS:-2}"
-OPENBAO_LOCAL_URL="http://127.0.0.1:${OPENBAO_HOST_PORT:-8200}"
 STEPCA_READY_ATTEMPTS="${STEPCA_READY_ATTEMPTS:-40}"
 STEPCA_READY_DELAY_SECS="${STEPCA_READY_DELAY_SECS:-3}"
 CA_JSON_ATTEMPTS="${CA_JSON_ATTEMPTS:-10}"
@@ -189,29 +188,6 @@ compose_down() {
 # already-initialized CA path depends on.
 compose_stop() {
   compose stop >/dev/null 2>&1 || true
-  wait_for_core_ports_to_be_released
-}
-
-# Docker Desktop can report a service stopped before its host-side port
-# forwarders have been released.  The next `infra install` pre-binds these
-# ports, so wait for the previous stack's forwarders to disappear rather than
-# racing the reinstall.
-wait_for_core_ports_to_be_released() {
-  local ports=("${POSTGRES_HOST_PORT:-5432}" "${OPENBAO_HOST_PORT:-8200}"
-    "${STEPCA_HOST_PORT:-9000}" "${HTTP01_ADMIN_HOST_PORT:-8080}")
-  local attempt port busy
-  for attempt in $(seq 1 "$INFRA_READY_ATTEMPTS"); do
-    busy=0
-    for port in "${ports[@]}"; do
-      if bash -lc ": >/dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
-        busy=1
-        break
-      fi
-    done
-    [ "$busy" -eq 0 ] && return 0
-    sleep "$INFRA_READY_DELAY_SECS"
-  done
-  fail "timed out waiting for stopped infrastructure ports to be released"
 }
 
 run_bootroot() {
@@ -676,7 +652,7 @@ run_first_init() {
   local summary_json="$1"
   local raw_log="$2"
   wait_for_postgres_admin
-  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
+  wait_for_openbao_listening "http://127.0.0.1:8200"
   # `infra install` writes state.json (to record the bind intent) before
   # init runs, so init's overwrite-state prompt fires; ca.json and
   # password.txt prompt too on a rerun, and `db-provision` adds its own
@@ -726,7 +702,7 @@ run_second_init() {
   [ -n "$db_dsn" ] || fail "failed to parse db.dataSource from ca.json"
 
   wait_for_postgres_admin
-  wait_for_openbao_listening "$OPENBAO_LOCAL_URL"
+  wait_for_openbao_listening "http://127.0.0.1:8200"
   # `db-provision` is off here, so `--confirm-db-provision` is
   # deliberately not passed: the three overwrite flags are enough to run
   # with stdin closed, which also shows the confirmation flag is

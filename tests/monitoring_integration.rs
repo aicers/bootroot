@@ -15,31 +15,10 @@ mod unix_integration {
 
     use crate::support::polling::wait_for;
 
-    /// Resolves a Compose host port from an explicit override or its
-    /// repository default.
-    fn monitoring_host_port(variable: &str, default: u16) -> Result<u16> {
-        match std::env::var(variable) {
-            Ok(value) if !value.is_empty() => value
-                .parse()
-                .with_context(|| format!("{variable} must be a valid host port")),
-            Ok(_) | Err(std::env::VarError::NotPresent) => Ok(default),
-            Err(std::env::VarError::NotUnicode(_)) => {
-                anyhow::bail!("{variable} must be valid Unicode")
-            }
-        }
-    }
-
-    /// Returns the host ports the monitoring stack publishes on
-    /// `127.0.0.1`, including explicit Compose overrides.
-    fn monitoring_ports() -> Result<[u16; 5]> {
-        Ok([
-            monitoring_host_port("OPENBAO_HOST_PORT", 8200)?,
-            monitoring_host_port("STEPCA_HOST_PORT", 9000)?,
-            monitoring_host_port("HTTP01_ADMIN_HOST_PORT", 8080)?,
-            3000,
-            monitoring_host_port("POSTGRES_HOST_PORT", 5433)?,
-        ])
-    }
+    /// Host ports the stack this test brings up publishes on `127.0.0.1`:
+    /// `OpenBao` (8200), step-ca (9000), the HTTP-01 responder (8080),
+    /// Grafana under the `lan` profile (3000) and `PostgreSQL` (5433).
+    const MONITORING_PORTS: [u16; 5] = [8200, 9000, 8080, 3000, 5433];
 
     /// Grafana admin password given to `monitoring up`, injected into
     /// compose, and used to authenticate against the Grafana API. One
@@ -526,7 +505,7 @@ mod unix_integration {
     }
 
     #[tokio::test]
-    #[ignore = "Brings the Docker monitoring stack up on configured host ports; run with --include-ignored and the selected ports free"]
+    #[ignore = "Brings the Docker monitoring stack up on fixed host ports; run with --include-ignored and 8200, 9000, 8080, 3000 and 5433 free"]
     async fn monitoring_stack_is_ready() -> Result<()> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -537,8 +516,7 @@ mod unix_integration {
         // 127.0.0.1 from the repo compose file, so there is no port left to
         // fall back to, and reporting success here is how this test spent
         // its life being green without running.
-        let monitoring_ports = monitoring_ports()?;
-        let bound = bound_ports(&monitoring_ports);
+        let bound = bound_ports(&MONITORING_PORTS);
         if !bound.is_empty() {
             let ports = bound
                 .iter()
