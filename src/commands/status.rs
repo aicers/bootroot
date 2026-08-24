@@ -1,7 +1,12 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bootroot::config::{Settings, validate_registrar_settings};
 use bootroot::openbao::{KvMountStatus, OpenBaoClient};
+use bootroot::registrar::audit::scan::{
+    AUDIT_SCAN_WINDOW, AuditScan, AuditScanError, scan_audit_store_off_runtime,
+};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -21,6 +26,7 @@ use crate::i18n::Messages;
 use crate::state::StateFile;
 
 pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result<()> {
+    let audit_status = load_audit_status(args, messages).await?;
     let services = default_infra_services();
     let compose_file = &args.compose.compose_file;
     let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
@@ -115,6 +121,7 @@ pub(crate) async fn run_status(args: &StatusArgs, messages: &Messages) -> Result
         service_statuses: &service_statuses,
         last_secret_id_rotation: last_secret_id_rotation.as_deref(),
         secret_id_rotation_warning,
+        audit_status: &audit_status,
     };
     print_status_summary(messages, &summary);
 
@@ -214,6 +221,110 @@ struct StatusSummary<'a> {
     service_statuses: &'a [ServiceStatusEntry],
     last_secret_id_rotation: Option<&'a str>,
     secret_id_rotation_warning: Option<String>,
+    audit_status: &'a AuditStatus,
+}
+
+enum AuditStatus {
+    Absent,
+    Scan(AuditScan),
+    Failed {
+        path: std::path::PathBuf,
+        error: String,
+    },
+}
+
+struct AuditScanSettings {
+    directory: PathBuf,
+    max_retained_files: u32,
+    min_retain_days: u32,
+}
+
+enum AuditSettingsLoad {
+    Ready(AuditScanSettings),
+    Failed { path: PathBuf, error: String },
+    MissingExplicitConfig { path: PathBuf },
+}
+
+async fn load_audit_status(args: &StatusArgs, messages: &Messages) -> Result<AuditStatus> {
+    let settings = tokio::task::spawn_blocking({
+        let agent_config = args.agent_config.clone();
+        move || load_audit_settings(agent_config)
+    })
+    .await
+    .context("loading registrar audit settings off runtime")?;
+
+    let settings = match settings {
+        AuditSettingsLoad::Ready(settings) => settings,
+        AuditSettingsLoad::Failed { path, error } => {
+            return Ok(AuditStatus::Failed { path, error });
+        }
+        AuditSettingsLoad::MissingExplicitConfig { path } => {
+            anyhow::bail!(messages.status_error_agent_config_missing(&path.display().to_string()));
+        }
+    };
+
+    match scan_audit_store_off_runtime(
+        &settings.directory,
+        OffsetDateTime::now_utc(),
+        AUDIT_SCAN_WINDOW,
+        settings.max_retained_files,
+        settings.min_retain_days,
+    )
+    .await
+    {
+        Ok(scan) => Ok(AuditStatus::Scan(scan)),
+        Err(AuditScanError::StoreAbsent { .. }) => Ok(AuditStatus::Absent),
+        Err(error) => Ok(AuditStatus::Failed {
+            path: settings.directory,
+            error: error.to_string(),
+        }),
+    }
+}
+
+fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
+    if let Some(path) = agent_config.as_ref() {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return AuditSettingsLoad::Failed {
+                    path: path.clone(),
+                    error: "agent configuration path is not a regular file".to_string(),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return AuditSettingsLoad::MissingExplicitConfig { path: path.clone() };
+            }
+            Err(error) => {
+                return AuditSettingsLoad::Failed {
+                    path: path.clone(),
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+    let settings_path = agent_config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("agent.toml"));
+    let settings = match Settings::from_file(agent_config) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return AuditSettingsLoad::Failed {
+                path: settings_path,
+                error: error.to_string(),
+            };
+        }
+    };
+    if let Err(error) = validate_registrar_settings(&settings.registrar) {
+        return AuditSettingsLoad::Failed {
+            path: settings_path,
+            error: error.to_string(),
+        };
+    }
+    AuditSettingsLoad::Ready(AuditScanSettings {
+        directory: settings.registrar.audit_record_dir,
+        max_retained_files: settings.registrar.audit_max_retained_files,
+        min_retain_days: settings.registrar.audit_min_retain_days,
+    })
 }
 
 /// Dead-man check for the scheduled `secret_id` rotation job (#672):
@@ -274,9 +385,48 @@ fn print_status_summary(messages: &Messages, summary: &StatusSummary<'_>) {
         println!("{}", messages.status_last_secret_id_rotation(value));
     }
     print_services_section(messages, summary);
+    print_audit_section(messages, summary.audit_status);
     if let Some(warning) = &summary.secret_id_rotation_warning {
         println!("{warning}");
     }
+}
+
+fn print_audit_section(messages: &Messages, audit_status: &AuditStatus) {
+    for line in audit_section_lines(messages, audit_status) {
+        println!("{line}");
+    }
+}
+
+fn audit_section_lines(messages: &Messages, audit_status: &AuditStatus) -> Vec<String> {
+    let mut lines = vec![messages.status_section_registrar_audit().to_string()];
+    match audit_status {
+        AuditStatus::Absent => lines.push(messages.status_audit_not_configured().to_string()),
+        AuditStatus::Scan(scan) => {
+            lines.push(messages.status_audit_unpaired_intents(scan.intent_without_outcome));
+            lines.push(messages.status_audit_malformed_records(scan.malformed_records));
+            lines.push(messages.status_audit_retention_shortfall(scan.retention_short));
+            if scan.intent_without_outcome > 0 {
+                lines.push(messages.status_warning_audit_unpaired_intents().to_string());
+            }
+            if scan.malformed_records > 0 {
+                lines.push(
+                    messages
+                        .status_warning_audit_malformed_records()
+                        .to_string(),
+                );
+            }
+            if scan.retention_short {
+                lines.push(
+                    messages
+                        .status_warning_audit_retention_shortfall()
+                        .to_string(),
+                );
+            }
+        }
+        AuditStatus::Failed { path, error } => lines
+            .push(messages.status_warning_audit_scan_failed(&path.display().to_string(), error)),
+    }
+    lines
 }
 
 fn print_openbao_section(messages: &Messages, summary: &StatusSummary<'_>) {
@@ -384,6 +534,8 @@ fn print_services_section(messages: &Messages, summary: &StatusSummary<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use time::Duration as TimeDuration;
 
     use super::*;
@@ -404,12 +556,255 @@ mod tests {
 
     fn status_args(compose_file: std::path::PathBuf, openbao_url: &str) -> StatusArgs {
         StatusArgs {
+            agent_config: None,
             compose: crate::cli::args::ComposeFileArgs { compose_file },
             openbao: crate::cli::args::OpenBaoArgs {
                 openbao_url: openbao_url.to_string(),
                 kv_mount: "secret".to_string(),
             },
             root_token: crate::cli::args::RootTokenArgs { root_token: None },
+        }
+    }
+
+    fn status_args_with_agent_config(agent_config: PathBuf) -> StatusArgs {
+        // The audit-status loader does not read the compose file.
+        let mut args = status_args(
+            PathBuf::from("unused-by-audit-status.yml"),
+            crate::commands::init::DEFAULT_OPENBAO_URL,
+        );
+        args.agent_config = Some(agent_config);
+        args
+    }
+
+    #[tokio::test]
+    async fn supplied_agent_config_scans_a_clean_store() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let audit_dir = dir.path().join("registrar-audit");
+        std::fs::create_dir(&audit_dir).expect("create audit directory");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config");
+
+        let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
+            .await
+            .expect("load audit status");
+        let AuditStatus::Scan(scan) = status else {
+            panic!("a clean configured store must be scanned");
+        };
+        assert_eq!(
+            scan,
+            AuditScan {
+                intent_without_outcome: 0,
+                malformed_records: 0,
+                retention_short: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn supplied_agent_config_maps_a_missing_store_to_absent() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let audit_dir = dir.path().join("missing-registrar-audit");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config");
+
+        let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
+            .await
+            .expect("a missing audit store does not abort status");
+        assert!(matches!(status, AuditStatus::Absent));
+    }
+
+    #[tokio::test]
+    async fn no_agent_config_scans_the_default_store_and_maps_absence() {
+        assert!(
+            !Path::new("agent.toml").exists(),
+            "this test requires the workspace to have no default agent configuration"
+        );
+
+        let status = load_audit_status(
+            &status_args(
+                PathBuf::from("unused-by-audit-status.yml"),
+                crate::commands::init::DEFAULT_OPENBAO_URL,
+            ),
+            &test_messages(),
+        )
+        .await
+        .expect("a missing default store does not abort status");
+        assert!(matches!(status, AuditStatus::Absent));
+    }
+
+    #[tokio::test]
+    async fn supplied_missing_agent_config_refuses_status() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("missing-agent.toml");
+        let Err(error) = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
+        else {
+            panic!("an explicitly named missing config is an error");
+        };
+        assert!(error.to_string().contains(&config.display().to_string()));
+    }
+
+    #[tokio::test]
+    async fn unreadable_agent_config_path_is_a_failed_scan() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("agent-config-directory");
+        std::fs::create_dir(&config).expect("create config directory");
+
+        let status = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("an unreadable config must not abort status");
+        let AuditStatus::Failed { path, error } = status else {
+            panic!("an unreadable config must report a failed scan");
+        };
+        assert_eq!(path, config);
+        assert!(!error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_agent_config_is_a_failed_scan() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(&config, "[registrar\n").expect("write malformed config");
+
+        let status = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("a malformed config does not abort status");
+        let AuditStatus::Failed { path, error } = status else {
+            panic!("a malformed config must report a failed scan");
+        };
+        assert_eq!(path, config);
+        assert!(!error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_registrar_settings_are_a_failed_scan() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(&config, "[registrar]\naudit_max_retained_files = 0\n")
+            .expect("write invalid agent config");
+
+        let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
+            .await
+            .expect("invalid settings must not abort status");
+        let AuditStatus::Failed { error, .. } = status else {
+            panic!("invalid registrar settings must report a failed scan");
+        };
+        assert!(error.contains("audit_max_retained_files"));
+    }
+
+    #[tokio::test]
+    async fn invalid_registrar_settings_each_leave_status_in_the_failed_scan_state() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        for (name, setting) in [
+            (
+                "relative-directory",
+                "audit_record_dir = \"relative-audit\"",
+            ),
+            ("small-file", "audit_max_file_bytes = 1"),
+            ("zero-retained", "audit_max_retained_files = 0"),
+            ("zero-days", "audit_min_retain_days = 0"),
+        ] {
+            let config = dir.path().join(format!("{name}.toml"));
+            std::fs::write(&config, format!("[registrar]\n{setting}\n"))
+                .expect("write invalid registrar config");
+
+            let status = load_audit_status(
+                &status_args_with_agent_config(config.clone()),
+                &test_messages(),
+            )
+            .await
+            .expect("invalid registrar settings do not abort status");
+            let AuditStatus::Failed { path, error } = status else {
+                panic!("{name} must report a failed scan");
+            };
+            assert_eq!(path, config);
+            assert!(error.contains("audit_"), "{name}: {error}");
+        }
+        assert!(
+            !dir.path().join("relative-audit").exists(),
+            "relative audit paths must not be opened or created"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_invalid_settings_do_not_hide_audit_status() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let audit_dir = dir.path().join("registrar-audit");
+        std::fs::create_dir(&audit_dir).expect("create audit directory");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "domain = \"\"\n[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config with unrelated invalid setting");
+
+        let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
+            .await
+            .expect("the audit loader does not run whole-settings validation");
+        assert!(matches!(status, AuditStatus::Scan(_)));
+    }
+
+    #[test]
+    fn audit_section_renders_each_state_in_both_locales() {
+        let scan = AuditStatus::Scan(AuditScan {
+            intent_without_outcome: 2,
+            malformed_records: 3,
+            retention_short: true,
+        });
+        let failure = AuditStatus::Failed {
+            path: PathBuf::from("/var/lib/bootroot/registrar-audit"),
+            error: "permission denied".to_string(),
+        };
+
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).expect("load test locale");
+            let absent = audit_section_lines(&messages, &AuditStatus::Absent);
+            assert_eq!(absent.len(), 2, "{locale} absent state");
+            assert!(
+                !absent
+                    .iter()
+                    .any(|line| line.contains("WARNING") || line.contains("경고"))
+            );
+
+            let succeeded = audit_section_lines(&messages, &scan);
+            assert_eq!(succeeded.len(), 7, "{locale} successful state");
+            assert!(succeeded.iter().any(|line| line.contains('2')));
+            assert!(succeeded.iter().any(|line| line.contains('3')));
+
+            let failed = audit_section_lines(&messages, &failure);
+            assert_eq!(failed.len(), 2, "{locale} failed state");
+            let warning = failed.get(1).expect("failed audit section has a warning");
+            assert!(warning.contains("/var/lib/bootroot/registrar-audit"));
+            assert!(warning.contains("permission denied"));
         }
     }
 

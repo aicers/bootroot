@@ -949,6 +949,10 @@ Checks infra status (including containers) and OpenBao KV/AppRole status.
   (optional, environment variable: `OPENBAO_ROOT_TOKEN`)
   Without a token, checks are limited to infra/container-level status and do
   not include full KV/AppRole verification.
+- `--agent-config`: optional `bootroot-agent` configuration that selects the
+  settings used to locate and scan the registrar audit store. When omitted,
+  `status` uses `agent.toml` when present and otherwise scans the documented
+  default store location.
 
 ### Outputs
 
@@ -960,6 +964,9 @@ Checks infra status (including containers) and OpenBao KV/AppRole status.
   warns past `12h`) — the scheduled rotation job may have silently
   stopped. See
   [Operations > Dead-man monitoring and break-glass recovery](operations.md#dead-man-monitoring-and-break-glass-recovery).
+- Registrar audit-store status: unpaired intents, malformed records, and a
+  retention-shortfall indication. This section is always shown; a missing store
+  is reported as not configured, and a failed scan is a warning.
 
 ### Failure conditions
 
@@ -967,6 +974,7 @@ The command is considered failed when:
 
 - Missing/unhealthy containers
 - OpenBao API unavailable
+- A supplied `--agent-config` path that does not exist
 
 The dead-man warning does not fail the command; it is informational
 output to act on.

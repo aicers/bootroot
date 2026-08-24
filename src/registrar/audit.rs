@@ -80,6 +80,9 @@ use tokio::task::JoinHandle;
 use crate::fs_util::sync_parent_dir;
 use crate::tls::sha256_hex;
 
+/// Read-only anomaly detection for the audit-record file family.
+pub mod scan;
+
 /// The version every record this build writes declares.
 ///
 /// [`AuditRecordStore::append`] refuses a record carrying any other
@@ -126,8 +129,8 @@ pub const DEFAULT_AUDIT_MAX_FILE_BYTES: u64 = 8_388_608;
 /// file.
 pub const DEFAULT_AUDIT_MAX_RETAINED_FILES: u32 = 16;
 
-/// Default retention target in days. Recorded for later reporting work;
-/// the hard [`DEFAULT_AUDIT_MAX_RETAINED_FILES`] capacity wins over it.
+/// Default retention target in days reported by `bootroot status`; the hard
+/// [`DEFAULT_AUDIT_MAX_RETAINED_FILES`] capacity wins over it.
 pub const DEFAULT_AUDIT_MIN_RETAIN_DAYS: u32 = 90;
 
 /// The smallest `audit_max_file_bytes` a configuration may declare
@@ -2453,25 +2456,22 @@ fn parse_rotated_name(name: &str) -> Option<(&str, u32)> {
     if sequence.len() != SEQUENCE_DIGITS || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    if !is_rotation_stamp(stamp) {
-        return None;
-    }
+    parse_rotation_stamp(stamp)?;
     Some((stamp, sequence.parse().ok()?))
 }
 
-/// Answers whether `stamp` is the exact `YYYYMMDDTHHMMSSZ` UTC form
-/// [`rotation_stamp`] writes, naming a real instant.
+/// Parses the exact `YYYYMMDDTHHMMSSZ` UTC form [`rotation_stamp`] writes.
 ///
 /// The shape carries the lexical ordering the retention policy depends
 /// on: fixed-width fields in most-significant-first order. Checking the
 /// calendar too costs nothing here and rejects a name that sorts where
 /// no such instant ever fell.
-fn is_rotation_stamp(stamp: &str) -> bool {
+fn parse_rotation_stamp(stamp: &str) -> Option<OffsetDateTime> {
     if stamp.len() != ROTATION_STAMP_LEN
         || stamp.get(8..9) != Some("T")
         || stamp.get(15..16) != Some("Z")
     {
-        return false;
+        return None;
     }
     let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
         stamp.get(0..4).and_then(decimal::<i32>),
@@ -2481,13 +2481,14 @@ fn is_rotation_stamp(stamp: &str) -> bool {
         stamp.get(11..13).and_then(decimal::<u8>),
         stamp.get(13..15).and_then(decimal::<u8>),
     ) else {
-        return false;
+        return None;
     };
     let Ok(month) = Month::try_from(month) else {
-        return false;
+        return None;
     };
-    Date::from_calendar_date(year, month, day).is_ok()
-        && Time::from_hms(hour, minute, second).is_ok()
+    let date = Date::from_calendar_date(year, month, day).ok()?;
+    let time = Time::from_hms(hour, minute, second).ok()?;
+    Some(time::PrimitiveDateTime::new(date, time).assume_offset(UtcOffset::UTC))
 }
 
 /// Parses `text` when it is nothing but ASCII digits.

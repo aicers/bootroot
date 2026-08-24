@@ -224,6 +224,66 @@ impl Messages {
         )
     }
 
+    pub(crate) fn status_section_registrar_audit(&self) -> &'static str {
+        self.strings().status_section_registrar_audit
+    }
+
+    pub(crate) fn status_audit_not_configured(&self) -> &'static str {
+        self.strings().status_audit_not_configured
+    }
+
+    pub(crate) fn status_audit_unpaired_intents(&self, value: u64) -> String {
+        format_template(
+            self.strings().status_audit_unpaired_intents,
+            &[("value", &value.to_string())],
+        )
+    }
+
+    pub(crate) fn status_audit_malformed_records(&self, value: u64) -> String {
+        format_template(
+            self.strings().status_audit_malformed_records,
+            &[("value", &value.to_string())],
+        )
+    }
+
+    pub(crate) fn status_audit_retention_shortfall(&self, value: bool) -> String {
+        let value = if value {
+            self.strings().status_audit_yes
+        } else {
+            self.strings().status_audit_no
+        };
+        format_template(
+            self.strings().status_audit_retention_shortfall,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn status_warning_audit_unpaired_intents(&self) -> &'static str {
+        self.strings().status_warning_audit_unpaired_intents
+    }
+
+    pub(crate) fn status_warning_audit_malformed_records(&self) -> &'static str {
+        self.strings().status_warning_audit_malformed_records
+    }
+
+    pub(crate) fn status_warning_audit_retention_shortfall(&self) -> &'static str {
+        self.strings().status_warning_audit_retention_shortfall
+    }
+
+    pub(crate) fn status_warning_audit_scan_failed(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().status_warning_audit_scan_failed,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn status_error_agent_config_missing(&self, path: &str) -> String {
+        format_template(
+            self.strings().status_error_agent_config_missing,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn status_error_openbao_unreachable(&self) -> &'static str {
         self.strings().status_error_openbao_unreachable
     }

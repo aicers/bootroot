@@ -99,8 +99,8 @@ pub struct RegistrarSettings {
     /// How many rotated generations are retained beside the active
     /// file. This is the hard capacity ceiling.
     pub audit_max_retained_files: u32,
-    /// The retention target in days. Recorded for later reporting work;
-    /// where the two disagree, `audit_max_retained_files` wins.
+    /// The retention target in days reported by `bootroot status`.
+    /// Where the two disagree, `audit_max_retained_files` wins.
     pub audit_min_retain_days: u32,
     /// Absolute directory containing the daemon's records and `OpenBao`'s
     /// file audit output.

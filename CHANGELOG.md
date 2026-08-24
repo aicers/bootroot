@@ -8,6 +8,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot status --agent-config` now scans the registrar audit store and
+  reports unpaired intents, malformed records, and retention shortfalls. It
+  distinguishes a store that is not configured from a provisioned empty store
+  and from a scan that failed, so an unreadable audit trail cannot appear
+  healthy.
 - `bootroot-agent` takes a new optional `[acme].account_key_path`. When
   it is set, the ACME **account** signing key is loaded from that path,
   or created there once with `0600` permissions, so the profile keeps one

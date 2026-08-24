@@ -406,8 +406,8 @@ empty file at the configured limit is refused from its serialized length
 alone, before the store opens or creates anything, so that refusal
 leaves the trail and its directory exactly as they were.
 
-`audit_min_retain_days` records the retention *target* for later
-reporting work. Where the two disagree, `audit_max_retained_files` wins:
+`audit_min_retain_days` is the retention *target* reported by `bootroot
+status`. Where the two disagree, `audit_max_retained_files` wins:
 the file count is a hard capacity constraint and the day count is not.
 
 #### Ownership and permissions
