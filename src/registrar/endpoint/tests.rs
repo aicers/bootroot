@@ -786,8 +786,8 @@ impl RegistrarRequestHandler for BlockingHandler {
 /// Its payload shape is internal to these tests and is deliberately not
 /// a protocol: `service_name|host|instance`, with an empty instance
 /// meaning none. The versioned request and response schemas belong to
-/// the protocol sibling, and inventing one here would be inventing the
-/// very thing this issue leaves to it.
+/// the protocol module, and this transport-focused test handler must not
+/// invent a second wire format.
 struct VerbHandler {
     verbs: RegistrarVerbs,
 }

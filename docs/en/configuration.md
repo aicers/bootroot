@@ -320,9 +320,10 @@ Serves the registrar's `mint` and `deregister` verbs on a host-local
 bootroot-host deployments and nothing else. The only key is `enabled`;
 an unknown key is a configuration error.
 
-**Enabling it is unsupported until the registrar protocol work lands.**
-This build registers no request handler, so an enabled endpoint refuses
-to start rather than accepting requests it cannot answer.
+**Enabling it remains unsupported until a production request handler lands.**
+This build includes the versioned registrar payload codec, but registers no
+handler that invokes the verbs. An enabled endpoint therefore refuses to start
+rather than accepting requests it cannot answer.
 
 There is no socket path here, and no TCP option, by design. systemd
 creates and owns `/run/bootroot/registrar.sock` through the checked-in

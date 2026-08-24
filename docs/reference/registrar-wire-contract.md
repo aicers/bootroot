@@ -381,20 +381,107 @@ the control plane's. Only the registrar populates it.
 Nothing in this repository writes or decodes that tail, so the discrepancy is
 recorded rather than resolved; resolving it is `aicers/review-protocol`'s.
 
-## 10. Open items
+## 10. Resolved local item
 
-Exactly one, and it is **not** obtainable from the pinned source: the source
-types `ca_anchor` as `Vec<u8>` and delegates its contents to this repository,
-and nothing in this repository emits a single `ca_anchor` byte string today —
-the only consumer is the endpoint that has not been written yet.
+The pinned source types `ca_anchor` as `Vec<u8>` and delegates its contents to
+this repository. The registrar endpoint's v1 codec resolves that byte framing.
 
 | Item | State | Owner | Where it is decided |
 | --- | --- | --- | --- |
-| `ca_anchor` byte framing | unresolved — the two values in §8.1 are pinned, the container that packs them into one `Vec<u8>` is not yet chosen | `aicers/bootroot` | the endpoint transport/codec issue, which must reproduce both values with the encodings in §8.1 |
+| `ca_anchor` byte framing | resolved — compact UTF-8 JSON `{"trusted_ca_sha256":[...],"ca_bundle_pem":"..."}` in that member order, standard padded RFC 4648 base64 encoded for the wire | `aicers/bootroot` | `src/registrar/endpoint/protocol.rs` |
 
-Nothing obtainable from the pinned source is left unresolved. An unresolved
-entry never satisfies an acceptance criterion; it is what this file looks like
-while an item is still being chased.
+The JSON requires both non-empty members, one lowercase SHA-256 DER digest per
+PEM certificate in the same order, LF-only PEM with one trailing LF, and no
+additional member. The codec decodes the base64 bytes to `serde_json::Value`
+and validates them with `parse_trust_payload` before applying these stricter
+framing checks.
+
+## 10.1 Bootroot endpoint protocol v1
+
+The endpoint uses one `serde_json` object per framed payload. Every request
+and response carries the required integer `protocol_version: 1`; unknown
+members are accepted when decoding, but absent or unsupported versions are
+rejected. Data-carrying errors use an internally tagged object with `id` as
+the tag, while fieldless enums retain their exact externally owned spelling.
+
+The version rule belongs to the `ProtocolVersion` value type, not to a
+direction-specific decoder: both requests and responses reject an absent or
+unsupported version. An unsupported version is a meaning this build does not
+implement, whereas an unknown member is an additive extension. The canonical
+version is the `PROTOCOL_VERSION` constant, currently `1`.
+
+Requests carry `protocol_version` followed by the members of §§4.2 and 4.3 in
+their table order, and no bootroot-owned member beyond the version. The
+externally owned request strings remain strings in JSON; `instance` is an
+unquoted unsigned `u32`, and the lifetime is an unquoted non-negative whole
+second integer. Optional `instance` and `spec.cert_group` are omitted rather
+than `null`. The delivery-mode spelling and every member name remain the
+transcribed source vocabulary in §4; this endpoint does not recase or
+interpret them. In particular, the idempotency key is opaque and the reload
+and certificate-group strings are passed through without validation.
+
+The canonical response member orders are:
+
+| Shape | Member order |
+| --- | --- |
+| Mint success | `protocol_version`, `request_id`, `registration_id`, `outcome`, `material`, `registrar_health` |
+| Deregister success | `protocol_version`, `request_id`, `registration_id`, `outcome`, `registrar_health` |
+| Refusal | `protocol_version`, `request_id`, optional `registration_id`, `class`, optional `error`, `registrar_health` |
+
+`request_id` and `registration_id` are JSON strings. The mint and deregister
+`outcome` values and the refusal `class` values are the bootroot-owned
+snake-case vocabulary. `material` contains exactly the §5.2 members in that
+table's order. Its deadline is the granted `MintOutcome::expires_at` instant,
+formatted by `time`'s `Rfc3339` formatter as a UTC `Z` string, not the
+requested lifetime. The optional response members are omitted rather than
+serialized as `null`. An `error` is omitted for an unclassified refusal; when
+present it is the internally tagged object whose `id` and payload members come
+from §6.1. A retry-after value is an unquoted non-negative whole-second
+integer.
+
+The encoder emits those orders byte-stably, while decoders are
+order-insensitive. Serialization emits no members outside the listed shapes;
+deserialization tolerates an unknown member at the implemented version. A
+request payload that cannot be decoded into its selected typed shape returns a
+typed codec error only: it does not construct a refusal or emit response bytes,
+because no verb invocation or request id exists yet. Request shapes carry no
+caller identity, request id, registration id, composed name, domain, token
+policy, or policy body; the authenticated caller identity stays on the
+transport seam.
+
+`ca_anchor` is a standard padded RFC 4648 base64 JSON string. Its decoded
+bytes are the compact UTF-8 object `{"trusted_ca_sha256":[...],"ca_bundle_pem":"..."}`
+in that member order, with no BOM, insignificant whitespace, trailing newline,
+or additional member. Both members are non-empty; the fingerprints are
+lowercase SHA-256 digests of DER certificate bytes, positionally aligned with
+the LF-only PEM bundle, which has exactly one trailing LF. The codec owns both
+directions: it serializes `TrustPayload` to compact JSON and base64, and it
+base64-decodes, parses a `serde_json::Value`, passes it to
+`parse_trust_payload`, and then applies the stricter canonical framing checks.
+Any failure in that path is a decode error, never a wire refusal.
+
+`registrar_health` is the endpoint-local, snapshot-supplied container for
+future `certificates`, `limiter`, and `audit_capacity` members. It is `{}` in
+v1 and appears on mint success, deregister success, and refusal responses.
+It is distinct from the registrar ecosystem's `audit_health` tail in §9. A
+response encoder receives an explicit `RegistrarHealth` snapshot and has no
+other source for it; the protocol module does not read audit, limiter, or
+certificate state. This keeps the container's placement common to all response
+forms and makes each future member addition additive.
+
+The refusal mapping is exhaustive over the current bootroot verb errors:
+label failures map to `ServiceLabelInvalid`; component and instance failures
+map to `ServiceInstanceMismatch`; all three spec conflicts map to
+`ServiceSpecConflict`; collisions and host mismatches map to their matching
+identifiers; the ten configuration failures map to
+`RegistrarUnavailable { reason: NotProvisioned }`; and unavailable, derived
+key, reserved-name, and wrap-TTL failures carry no `error` with retryable
+class. Future post-mint audit, intent-audit, and rate-limit errors are assigned
+respectively to permanent `RegistrarUnavailable` reasons
+`PostMintUnrecordable` and `AuditUnwritable`, and retryable `RegistrarBusy`
+with a whole-second `retry_after` payload. These future internal variants still
+need explicit mapping arms when they are added; identical words on either side
+of the boundary do not imply a name-based shortcut.
 
 ## 11. Counts
 

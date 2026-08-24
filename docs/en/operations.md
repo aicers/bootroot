@@ -252,9 +252,10 @@ and `deregister` verbs on a host-local socket. This is Linux only, it is
 `AF_UNIX` only, and it is systemd socket activation only. Every other
 deployment leaves it off, which is the default.
 
-**Enabling it is unsupported until the registrar protocol work lands.**
-This build registers no request handler, so `registrar_endpoint.enabled
-= true` makes the daemon refuse to start.
+**Enabling it remains unsupported until a production request handler lands.**
+This build includes the versioned registrar payload codec, but registers no
+handler that invokes the verbs, so `registrar_endpoint.enabled = true` makes
+the daemon refuse to start.
 
 #### The socket, and who owns it
 

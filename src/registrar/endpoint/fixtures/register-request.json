@@ -1,0 +1,1 @@
+{"protocol_version":1,"service_name":"api","delivery_mode":"RemoteBootstrap","host":"node","instance":7,"spec":{"component":"api","service_name":"api","reload":"opaque reload","cert_group":"opaque group"},"wrap_ttl":60,"idempotency_key":"opaque-key"}
