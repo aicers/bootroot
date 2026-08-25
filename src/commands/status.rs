@@ -349,9 +349,9 @@ fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
 /// Loads one explicit configuration after its caller has confirmed it is a
 /// regular file.
 ///
-/// Keeping this step separate from the metadata gate ensures a file that
-/// disappears in between is reported as an audit failure instead of falling
-/// back to a discovered sibling configuration file.
+/// This seam lets tests drive the load-after-gate step without constructing
+/// [`StatusArgs`]. [`Settings::from_required_file`] provides the exact-path
+/// guarantee that prevents fallback to a discovered sibling configuration.
 fn load_explicit_audit_settings_after_metadata_gate(path: PathBuf) -> AuditSettingsLoad {
     let settings_result = Settings::from_required_file(&path);
     load_audit_settings_from_result(path, settings_result)
@@ -747,6 +747,33 @@ mod tests {
         .expect("a strict-load failure must not abort status");
         let AuditStatus::Failed { path, reason } = status else {
             panic!("the vanished supplied config must not load its TOML sibling");
+        };
+        assert_eq!(path, supplied);
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
+    }
+
+    #[tokio::test]
+    async fn vanished_toml_agent_config_is_a_failed_scan_after_metadata_gate() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let supplied = dir.path().join("agent.toml");
+        std::fs::write(&supplied, "[registrar]\n").expect("write supplied config");
+
+        assert!(
+            std::fs::metadata(&supplied)
+                .expect("inspect supplied config")
+                .is_file(),
+            "the explicit metadata gate must pass before the file disappears"
+        );
+        std::fs::remove_file(&supplied).expect("remove supplied config after metadata gate");
+
+        let status = load_audit_status_from_settings_load(
+            load_explicit_audit_settings_after_metadata_gate(supplied.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("a strict-load failure must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("a supplied config that vanishes after the gate must fail the audit status");
         };
         assert_eq!(path, supplied);
         assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));

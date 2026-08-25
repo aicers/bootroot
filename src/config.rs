@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use config::builder::DefaultState;
-use config::{Config, ConfigBuilder, ConfigError, Environment, File, FileFormat};
+use config::{Config, ConfigBuilder, ConfigError, Environment, File, FileFormat, FileStoredFormat};
 use serde::Deserialize;
 
 use crate::secret::HmacSecret;
@@ -498,6 +498,8 @@ impl Settings {
         let format = required_file_format(config_path)?;
         let contents =
             std::fs::read(config_path).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
+        // Match `config::File`'s lossy decoding so invalid UTF-8 retains its
+        // previous behavior instead of becoming a new load failure.
         let contents = String::from_utf8_lossy(strip_utf8_bom(&contents));
 
         defaults::apply_defaults(Config::builder())?
@@ -554,17 +556,22 @@ impl Settings {
     }
 }
 
-/// Returns the only configuration format compiled into this application.
+/// Returns the supported format for one strict configuration path.
 ///
 /// This deliberately examines only the exact supplied path. `config::File`
 /// performs filename discovery when its source path is absent, which is useful
 /// for optional configuration but unsafe for an explicitly selected file.
 fn required_file_format(config_path: &Path) -> Result<FileFormat, ConfigError> {
+    // `Cargo.toml` enables only config's `toml` feature. Add a branch for
+    // each subsequently enabled file format so strict and optional sources
+    // continue to accept the same extensions.
+    let format = FileFormat::Toml;
     if config_path
         .extension()
-        .is_some_and(|extension| extension == "toml")
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| format.file_extensions().contains(&extension))
     {
-        Ok(FileFormat::Toml)
+        Ok(format)
     } else {
         Err(ConfigError::Message(format!(
             "configuration file \"{}\" is not of a supported file format",
@@ -573,7 +580,10 @@ fn required_file_format(config_path: &Path) -> Result<FileFormat, ConfigError> {
     }
 }
 
-/// Removes the UTF-8 byte-order mark accepted by `config::File` sources.
+/// Removes a UTF-8 byte-order mark before parsing.
+///
+/// This retains `config::File` source behavior should a future supported
+/// format not tolerate a byte-order mark itself.
 fn strip_utf8_bom(contents: &[u8]) -> &[u8] {
     const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -666,7 +676,14 @@ mod tests {
         let sibling = dir.path().join("agent.toml");
         std::fs::write(&sibling, "email = \"sibling@example.com\"\n").unwrap();
 
-        assert!(Settings::from_required_file(&supplied).is_err());
+        let error = Settings::from_required_file(&supplied).expect_err(
+            "an extension-less supplied path must be rejected before reading a sibling",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("is not of a supported file format")
+        );
     }
 
     #[test]
@@ -679,6 +696,18 @@ mod tests {
 
         assert!(Settings::from_required_file(&unsupported).is_err());
         assert!(Settings::from_required_file(&extensionless).is_err());
+    }
+
+    #[test]
+    fn strip_utf8_bom_removes_only_a_leading_marker() {
+        assert_eq!(
+            strip_utf8_bom(b"\xEF\xBB\xBFemail = \"admin@example.com\""),
+            b"email = \"admin@example.com\""
+        );
+        assert_eq!(
+            strip_utf8_bom(b"email = \"admin@example.com\""),
+            b"email = \"admin@example.com\""
+        );
     }
 
     #[test]
