@@ -276,6 +276,24 @@ pub struct RegistrarClientIdentity {
     pub domain: String,
 }
 
+/// The parsed parts of a recognized endpoint server identity, each
+/// ASCII-lowercased.
+///
+/// The mirror image of [`RegistrarClientIdentity`]: the same three
+/// labels under [`REGISTRAR_ENDPOINT_LABEL`] instead of
+/// [`REGISTRAR_CLIENT_LABEL`]. It is a distinct type because the two
+/// names authenticate opposite ends of the same connection, and a
+/// value of one is never a value of the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrarEndpointIdentity {
+    /// The leading instance label, e.g. `001`.
+    pub instance: String,
+    /// The host label the endpoint serves on.
+    pub host: String,
+    /// The configured domain suffix the name was matched against.
+    pub domain: String,
+}
+
 /// Why a presented certificate is not a registrar client identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RegistrarIdentityError {
@@ -297,6 +315,9 @@ pub enum RegistrarIdentityError {
     /// The SAN's second label is not [`REGISTRAR_CLIENT_LABEL`].
     #[error("subject alternative name's service label is not the registrar client label")]
     NotRegistrarClient,
+    /// The SAN's second label is not [`REGISTRAR_ENDPOINT_LABEL`].
+    #[error("subject alternative name's service label is not the registrar endpoint label")]
+    NotRegistrarEndpoint,
     /// The SAN's first label is not a numeric instance identifier.
     #[error("subject alternative name's instance label is not numeric")]
     InvalidInstanceLabel,
@@ -347,6 +368,87 @@ pub fn recognize_registrar_client_name(
     dns_name: &str,
     domain: &str,
 ) -> Result<RegistrarClientIdentity, RegistrarIdentityError> {
+    let parts = recognize_registrar_name(
+        dns_name,
+        domain,
+        REGISTRAR_CLIENT_LABEL,
+        RegistrarIdentityError::NotRegistrarClient,
+    )?;
+    Ok(RegistrarClientIdentity {
+        instance: parts.instance,
+        host: parts.host,
+        domain: parts.domain,
+    })
+}
+
+/// Recognizes the endpoint server identity on a presented certificate.
+///
+/// The mirror image of [`recognize_registrar_client`], over
+/// [`REGISTRAR_ENDPOINT_LABEL`]. It is the rule the daemon holds its
+/// *own* endpoint leaf to at startup: the daemon knows only the
+/// configured domain — no instance and no host label — so it cannot
+/// compose the expected name and compare, and checks the shape instead.
+///
+/// Like the client rule it builds no chain, checks no validity window
+/// and makes no authorization decision.
+///
+/// # Errors
+///
+/// Returns the [`RegistrarIdentityError`] naming the first rule the
+/// certificate failed.
+pub fn recognize_registrar_endpoint(
+    end_entity_der: &[u8],
+    domain: &str,
+) -> Result<RegistrarEndpointIdentity, RegistrarIdentityError> {
+    let dns_name = single_dns_san(end_entity_der)?;
+    recognize_registrar_endpoint_name(&dns_name, domain)
+}
+
+/// Applies the endpoint server name rule to an already-extracted DNS
+/// name.
+///
+/// # Errors
+///
+/// Returns the [`RegistrarIdentityError`] naming the first rule the name
+/// failed.
+pub fn recognize_registrar_endpoint_name(
+    dns_name: &str,
+    domain: &str,
+) -> Result<RegistrarEndpointIdentity, RegistrarIdentityError> {
+    let parts = recognize_registrar_name(
+        dns_name,
+        domain,
+        REGISTRAR_ENDPOINT_LABEL,
+        RegistrarIdentityError::NotRegistrarEndpoint,
+    )?;
+    Ok(RegistrarEndpointIdentity {
+        instance: parts.instance,
+        host: parts.host,
+        domain: parts.domain,
+    })
+}
+
+/// The three labels a registrar name carries in front of the configured
+/// domain suffix, once the shared rule has accepted them.
+struct RegistrarNameParts {
+    instance: String,
+    host: String,
+    domain: String,
+}
+
+/// The one name rule both registrar identities are recognized by,
+/// parameterized by the reserved service label it requires and the
+/// refusal a different label produces.
+///
+/// Factored rather than duplicated: the client leaf and the endpoint
+/// leaf authenticate the two ends of the same connection, so a rule that
+/// drifted between them would be a rule only one end enforced.
+fn recognize_registrar_name(
+    dns_name: &str,
+    domain: &str,
+    expected_label: &str,
+    label_mismatch: RegistrarIdentityError,
+) -> Result<RegistrarNameParts, RegistrarIdentityError> {
     if validate_domain_name(domain).is_err() {
         return Err(RegistrarIdentityError::InvalidConfiguredDomain);
     }
@@ -380,8 +482,8 @@ pub fn recognize_registrar_client_name(
     else {
         return Err(RegistrarIdentityError::LabelCount);
     };
-    if !service.eq_ignore_ascii_case(REGISTRAR_CLIENT_LABEL) {
-        return Err(RegistrarIdentityError::NotRegistrarClient);
+    if !service.eq_ignore_ascii_case(expected_label) {
+        return Err(label_mismatch);
     }
     if validate_numeric_instance_id(instance).is_err() {
         return Err(RegistrarIdentityError::InvalidInstanceLabel);
@@ -389,7 +491,7 @@ pub fn recognize_registrar_client_name(
     if validate_dns_label(host).is_err() {
         return Err(RegistrarIdentityError::InvalidHostLabel);
     }
-    Ok(RegistrarClientIdentity {
+    Ok(RegistrarNameParts {
         instance: (*instance).to_string(),
         host: (*host).to_string(),
         domain,
@@ -421,10 +523,10 @@ impl RegistrarEndpoint {
     /// the inherited listening socket.
     ///
     /// A disabled endpoint reads no activation variable, touches no
-    /// descriptor and returns an empty handle, so a deployment that
-    /// never asked for the endpoint behaves exactly as it did before it
-    /// existed. This process's environment is never mutated, in either
-    /// case.
+    /// descriptor, loads no certificate material and returns an empty
+    /// handle, so a deployment that never asked for the endpoint behaves
+    /// exactly as it did before it existed. This process's environment
+    /// is never mutated, in either case.
     ///
     /// # Errors
     ///
@@ -433,18 +535,19 @@ impl RegistrarEndpoint {
     /// activation contract, a descriptor that is not a listening
     /// `AF_UNIX` stream socket or whose address is not a pathname, or a
     /// socket pathname whose mode, owner or parent directory fails
-    /// policy. On a non-Linux target an enabled endpoint is an error in
-    /// itself.
-    pub fn activate(enabled: bool) -> anyhow::Result<Self> {
+    /// policy, or server or client TLS material that is absent,
+    /// unusable or not what a pinned caller would accept. On a
+    /// non-Linux target an enabled endpoint is an error in itself.
+    pub fn activate(settings: &crate::config::Settings) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             Ok(Self {
-                inner: endpoint::activate(enabled)?,
+                inner: endpoint::activate(settings)?,
             })
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if enabled {
+            if settings.registrar_endpoint.enabled {
                 anyhow::bail!(
                     "the registrar endpoint is supported on Linux only; \
                      set registrar_endpoint.enabled = false"
@@ -736,5 +839,125 @@ mod recognition_tests {
             recognize_registrar_client_name("001.bootroot-registrar.h1.bad_domain", "bad_domain"),
             Err(RegistrarIdentityError::InvalidConfiguredDomain)
         );
+    }
+
+    /// The endpoint rule is the same rule under the other reserved
+    /// label, so an endpoint name is accepted and its parts come back
+    /// lowercased.
+    #[test]
+    fn recognizes_the_endpoint_server_identity() {
+        let name = registrar_endpoint_identity("007", "H1", TWO_LABEL_DOMAIN);
+        assert_eq!(
+            recognize_registrar_endpoint_name(&name, TWO_LABEL_DOMAIN),
+            Ok(RegistrarEndpointIdentity {
+                instance: "007".to_string(),
+                host: "h1".to_string(),
+                domain: TWO_LABEL_DOMAIN.to_string(),
+            })
+        );
+        let der = certificate_with_dns_san(&name);
+        assert_eq!(
+            recognize_registrar_endpoint(&der, TWO_LABEL_DOMAIN),
+            Ok(RegistrarEndpointIdentity {
+                instance: "007".to_string(),
+                host: "h1".to_string(),
+                domain: TWO_LABEL_DOMAIN.to_string(),
+            })
+        );
+    }
+
+    /// The two rules are mirror images and neither accepts the other's
+    /// name — which is what keeps a client leaf from serving as the
+    /// endpoint's, and the reverse.
+    #[test]
+    fn the_two_registrar_rules_do_not_accept_each_others_names() {
+        let client = registrar_client_identity("001", "h1", TWO_LABEL_DOMAIN);
+        let endpoint = registrar_endpoint_identity("001", "h1", TWO_LABEL_DOMAIN);
+        assert_eq!(
+            recognize_registrar_endpoint_name(&client, TWO_LABEL_DOMAIN),
+            Err(RegistrarIdentityError::NotRegistrarEndpoint)
+        );
+        assert_eq!(
+            recognize_registrar_client_name(&endpoint, TWO_LABEL_DOMAIN),
+            Err(RegistrarIdentityError::NotRegistrarClient)
+        );
+    }
+
+    /// Every rule the shared helper applies still applies under the
+    /// endpoint label: the domain is a label-boundary suffix, the label
+    /// count is exact, and the instance and host labels are checked.
+    #[test]
+    fn endpoint_recognition_rejects_each_near_miss_distinguishably() {
+        for (name, domain, expected) in [
+            (
+                "001.bootroot-registrar-endpoint.h1.evil-example.internal",
+                TWO_LABEL_DOMAIN,
+                RegistrarIdentityError::DomainMismatch,
+            ),
+            (
+                "extra.001.bootroot-registrar-endpoint.h1.example.internal",
+                TWO_LABEL_DOMAIN,
+                RegistrarIdentityError::LabelCount,
+            ),
+            (
+                "001.bootroot-registrar-endpointer.h1.example.internal",
+                TWO_LABEL_DOMAIN,
+                RegistrarIdentityError::NotRegistrarEndpoint,
+            ),
+            (
+                "abc.bootroot-registrar-endpoint.h1.example.internal",
+                TWO_LABEL_DOMAIN,
+                RegistrarIdentityError::InvalidInstanceLabel,
+            ),
+            (
+                "001.bootroot-registrar-endpoint.-h1.example.internal",
+                TWO_LABEL_DOMAIN,
+                RegistrarIdentityError::InvalidHostLabel,
+            ),
+            (
+                "001.bootroot-registrar-endpoint.h1.bad_domain",
+                "bad_domain",
+                RegistrarIdentityError::InvalidConfiguredDomain,
+            ),
+        ] {
+            assert_eq!(
+                recognize_registrar_endpoint_name(name, domain),
+                Err(expected),
+                "{name} under {domain}"
+            );
+        }
+    }
+
+    /// The endpoint rule holds the same one-DNS-SAN requirement, so a
+    /// certificate carrying a second name is refused rather than
+    /// searched.
+    #[test]
+    fn endpoint_recognition_requires_exactly_one_dns_san() {
+        let der = certificate_with_sans(vec![
+            SanType::DnsName(
+                registrar_endpoint_identity("001", "h1", TWO_LABEL_DOMAIN)
+                    .try_into()
+                    .expect("valid DNS SAN"),
+            ),
+            SanType::DnsName("other.example.internal".try_into().expect("valid DNS SAN")),
+        ]);
+        assert_eq!(
+            recognize_registrar_endpoint(&der, TWO_LABEL_DOMAIN),
+            Err(RegistrarIdentityError::San(SanShapeError::Multiple))
+        );
+    }
+
+    /// A one-label and a three-label domain both work here too: the
+    /// suffix is matched at whatever label count it was configured
+    /// with.
+    #[test]
+    fn recognizes_the_endpoint_under_domains_of_differing_label_counts() {
+        for domain in [ONE_LABEL_DOMAIN, TWO_LABEL_DOMAIN, THREE_LABEL_DOMAIN] {
+            let name = registrar_endpoint_identity("001", "h1", domain);
+            let identity = recognize_registrar_endpoint_name(&name, domain)
+                .unwrap_or_else(|err| panic!("{name} under {domain}: {err}"));
+            assert_eq!(identity.domain, domain);
+            assert_eq!(identity.host, "h1");
+        }
     }
 }

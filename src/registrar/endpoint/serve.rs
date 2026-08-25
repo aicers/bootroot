@@ -22,10 +22,17 @@
 //!
 //! Accept, stamp the acceptance instant, assign a diagnostic id and take
 //! a capacity permit — all three on the accept loop's own task, before
-//! anything is spawned — then authenticate the peer, read one frame
-//! under cumulative deadlines, dispatch it, and write one response.
-//! Every exit before the verb runs goes through [`refusal::refuse`];
-//! every exit at all closes the stream.
+//! anything is spawned — then authenticate the peer, complete the TLS
+//! handshake, recognize the certificate identity, read one frame under
+//! cumulative deadlines, dispatch it, and write one response. That order
+//! is the contract, and the peer check stays first: it costs one syscall
+//! and no handshake, and it answers a different question from the
+//! certificate's.
+//!
+//! Every exit before the verb runs goes through [`refusal::refuse`], and
+//! every exit at all closes the stream — except a handshake that never
+//! completed, which has no application stream to close and is dropped
+//! after being logged.
 //!
 //! Taking the permit before the spawn is what makes
 //! [`MAX_CONCURRENT_CONNECTIONS`] a bound on the daemon and not only on
@@ -48,13 +55,17 @@ use super::frame::{
     check_operation_name_length,
 };
 use super::handler::RegistrarRequestHandler;
-use super::refusal::{self, ConnectionId, FrameEnd, PartialStage, Refusal, TransportRefusalReason};
+use super::refusal::{
+    self, CallerIdentityRefusal, ConnectionId, FrameEnd, PartialStage, Refusal,
+    TransportRefusalReason,
+};
 use super::{
-    ActivatedEndpoint, BODY_READ_TIMEOUT, CONNECTION_DRAIN_TIMEOUT, HEADER_IDLE_TIMEOUT,
-    MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES, MAX_RESPONSE_PAYLOAD_BYTES,
-    RESPONSE_WRITE_TIMEOUT,
+    ActivatedEndpoint, BODY_READ_TIMEOUT, CONNECTION_DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT,
+    HEADER_IDLE_TIMEOUT, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
+    MAX_RESPONSE_PAYLOAD_BYTES, RESPONSE_WRITE_TIMEOUT,
 };
 use crate::registrar::verbs::outcome::CallerIdentity;
+use crate::registrar::{recognize_registrar_client_name, single_dns_san};
 
 /// How long the accept loop pauses after a failed `accept`.
 ///
@@ -65,18 +76,26 @@ use crate::registrar::verbs::outcome::CallerIdentity;
 /// and only when an accept has just failed.
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// The one site the transport-authenticated caller identity is rendered
-/// at.
+/// The one site the authenticated caller identity is rendered at.
 ///
-/// `unix-peer:uid=<uid>` and nothing else. It is a function of the
-/// kernel-reported peer uid alone, so it is stable for a given uid and
-/// carries no caller input. The peer's pid is deliberately absent — it
-/// is reused, and it races the credential it was read alongside — and so
-/// is the gid, which is not the subject. Both are logged as connection
-/// diagnostics instead.
+/// `registrar-client:<san>` and nothing else, where `<san>` is the
+/// ASCII-lowercased single DNS SAN of the leaf the caller completed the
+/// handshake with. The prefix mirrors the `unix-peer:` convention this
+/// replaced.
+///
+/// It is a function of the presented certificate and nothing else, and
+/// the certificate reached this point only by verifying against the
+/// deployment's pinned CA material, so the value carries no unchecked
+/// caller input. This is the caller of record the verb layer receives
+/// and the value an audit record carries.
+///
+/// The peer's uid, pid and gid are deliberately absent. A uid names root
+/// on this host rather than the registrar, a pid is reused and races the
+/// credential it was read alongside, and a gid is not the subject; all
+/// three are logged as connection diagnostics instead.
 #[must_use]
-pub(crate) fn caller_identity(peer_uid: u32) -> CallerIdentity {
-    CallerIdentity::new(&format!("unix-peer:uid={peer_uid}"))
+pub(crate) fn caller_identity(san: &str) -> CallerIdentity {
+    CallerIdentity::new(&format!("registrar-client:{}", san.to_ascii_lowercase()))
 }
 
 /// Reports whether a peer may reach a handler.
@@ -194,8 +213,7 @@ async fn admit(
     };
     let endpoint = Arc::clone(endpoint);
     connections.spawn(async move {
-        let mut stream = stream;
-        handle_connection(&endpoint, &mut stream, &connection, accepted_at).await;
+        handle_connection(&endpoint, stream, &connection, accepted_at).await;
         drop(permit);
     });
 }
@@ -236,11 +254,23 @@ pub(crate) async fn drain(mut connections: JoinSet<()>) {
     }
 }
 
-/// Authenticates the peer and, if it is this daemon, serves its one
-/// request.
+/// Authenticates the peer, terminates mTLS, recognizes the caller and,
+/// if all three hold, serves its one request.
+///
+/// The order is the contract: peer credentials, then the handshake, then
+/// the identity, then the first request byte. The peer check stays first
+/// and stays a gate of its own — certificate authentication and
+/// socket-level authentication answer different questions, the peer
+/// check costs one syscall and no handshake, and a connection failing it
+/// is refused even when its client certificate is the registrar's.
+///
+/// This is the only function in the serving path concrete over
+/// [`UnixStream`]; everything below it is generic over the stream, so
+/// the wrap is one change at one place and nothing under it knows the
+/// difference.
 async fn handle_connection(
     endpoint: &ActivatedEndpoint,
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     connection: &ConnectionId,
     accepted_at: Instant,
 ) {
@@ -253,7 +283,7 @@ async fn handle_connection(
                 connection = connection.as_str(),
                 "Registrar endpoint could not read peer credentials: {err}"
             );
-            refusal::close(stream, connection).await;
+            refusal::close(&mut stream, connection).await;
             return;
         }
     };
@@ -267,7 +297,7 @@ async fn handle_connection(
     );
     if !authorize_peer(peer_uid, endpoint.daemon_uid()) {
         refusal::refuse(
-            stream,
+            &mut stream,
             connection,
             &Refusal::transport(TransportRefusalReason::UnauthorizedPeer {
                 peer_uid,
@@ -277,15 +307,125 @@ async fn handle_connection(
         .await;
         return;
     }
-    let caller = caller_identity(peer_uid);
-    serve_request(
-        stream,
-        connection,
-        &caller,
-        endpoint.handler().as_ref(),
-        accepted_at,
-    )
-    .await;
+
+    let Some(mut tls) = handshake(endpoint, stream, connection, accepted_at).await else {
+        return;
+    };
+    // The header budget restarts here rather than continuing from
+    // acceptance: the handshake had a budget of its own, and a slow one
+    // must not leave a caller with no time left to send a header.
+    let handshaken_at = Instant::now();
+
+    // The identity is decided here, after the handshake, rather than
+    // inside a `ClientCertVerifier` — see [`CallerIdentityRefusal`].
+    // Nothing has been read from the caller yet, so "refused before any
+    // request byte" still holds.
+    match recognize_caller(&tls, endpoint.domain()) {
+        Ok(caller) => {
+            serve_request(
+                &mut tls,
+                connection,
+                &caller,
+                endpoint.handler().as_ref(),
+                handshaken_at,
+            )
+            .await;
+        }
+        Err(refusal) => {
+            refusal::refuse(&mut tls, connection, &Refusal::caller_identity(refusal)).await;
+        }
+    }
+}
+
+/// Runs the TLS handshake under its cumulative deadline, or logs why it
+/// did not complete.
+///
+/// A failed handshake reaches the caller only as a TLS alert, so the
+/// daemon's log is the only diagnosis there is and the typed label is a
+/// requirement rather than a nicety. Nothing is written and the stream
+/// is dropped: there is no application stream yet to close cleanly.
+async fn handshake(
+    endpoint: &ActivatedEndpoint,
+    stream: UnixStream,
+    connection: &ConnectionId,
+    accepted_at: Instant,
+) -> Option<tokio_rustls::server::TlsStream<UnixStream>> {
+    let deadline = accepted_at + HANDSHAKE_TIMEOUT;
+    match timeout_at(deadline, endpoint.tls_acceptor().accept(stream)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(err)) => {
+            warn!(
+                connection = connection.as_str(),
+                reason = handshake_failure_label(&err),
+                "Registrar endpoint could not complete a TLS handshake: {err}"
+            );
+            None
+        }
+        Err(_elapsed) => {
+            warn!(
+                connection = connection.as_str(),
+                reason = HANDSHAKE_TIMED_OUT,
+                "Registrar endpoint dropped a connection that did not complete a TLS handshake \
+                 within the handshake timeout."
+            );
+            None
+        }
+    }
+}
+
+/// The label a handshake that never completed is logged under.
+const HANDSHAKE_TIMED_OUT: &str = "handshake-timeout";
+
+/// The label a caller that presented no client certificate is logged
+/// under.
+const NO_CLIENT_CERTIFICATE: &str = "no-client-certificate";
+
+/// The label a caller whose chain did not verify is logged under.
+const CLIENT_CHAIN_REJECTED: &str = "client-chain-rejected";
+
+/// The label every other handshake failure is logged under.
+const HANDSHAKE_FAILED: &str = "handshake-failed";
+
+/// Recovers the typed reason a handshake failed from the `io::Error`
+/// `tokio_rustls` wrapped it in.
+///
+/// The three that matter are distinguished because they send an operator
+/// to three different places: a caller that authenticates with nothing,
+/// a caller whose certificate does not build to a pinned anchor, and
+/// everything else.
+fn handshake_failure_label(err: &std::io::Error) -> &'static str {
+    match err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::NoCertificatesPresented) => NO_CLIENT_CERTIFICATE,
+        Some(rustls::Error::InvalidCertificate(_)) => CLIENT_CHAIN_REJECTED,
+        _ => HANDSHAKE_FAILED,
+    }
+}
+
+/// Recognizes the identity that completed the handshake.
+///
+/// Chain verification already happened inside `WebPkiClientVerifier`, so
+/// what is decided here is exclusively the *name*: either the caller of
+/// record, or the typed refusal to log.
+fn recognize_caller(
+    tls: &tokio_rustls::server::TlsStream<UnixStream>,
+    domain: &str,
+) -> Result<CallerIdentity, CallerIdentityRefusal> {
+    let (_, session) = tls.get_ref();
+    let leaf = session
+        .peer_certificates()
+        .and_then(<[rustls::pki_types::CertificateDer<'_>]>::first)
+        .ok_or(CallerIdentityRefusal::NoPeerCertificate)?;
+    let san = single_dns_san(leaf.as_ref()).map_err(|source| {
+        CallerIdentityRefusal::NotRegistrarClient {
+            source: source.into(),
+        }
+    })?;
+    recognize_registrar_client_name(&san, domain)
+        .map_err(|source| CallerIdentityRefusal::NotRegistrarClient { source })?;
+    Ok(caller_identity(&san))
 }
 
 /// Reads one framed request, dispatches it and writes one response.
@@ -294,9 +434,11 @@ async fn handle_connection(
 /// an in-memory duplex — including every deadline, with `tokio::time`
 /// paused — without a socket, a peer or a uid.
 ///
-/// `accepted_at` starts the header deadline, which is cumulative from
-/// acceptance through both the five-byte prefix and the declared
-/// operation-name bytes.
+/// `accepted_at` starts the header deadline, which is cumulative
+/// through both the five-byte prefix and the declared operation-name
+/// bytes. On the real serving path it is the instant the TLS handshake
+/// completed, not the instant the connection was accepted: the handshake
+/// has a budget of its own.
 pub(crate) async fn serve_request<S>(
     stream: &mut S,
     connection: &ConnectionId,

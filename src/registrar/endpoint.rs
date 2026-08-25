@@ -31,25 +31,45 @@
 //!   transport; [`protocol`] owns the payload schema, its codec and the
 //!   mapping of verb outcomes onto caller-visible responses. Supplying the
 //!   production [`handler::RegistrarRequestHandler`] remains separate work.
+//! - [`tls`] is the mutually-authenticated transport the connection is
+//!   wrapped in: the server material the endpoint presents, the
+//!   verifier every client certificate is built against, and the
+//!   resolver a renewal swaps new material through.
 //! - [`serve`] is the accept loop, the bounded connection fleet and the
 //!   drain-then-abort shutdown.
 //!
 //! # What authenticates a caller
 //!
-//! The connected socket's peer credentials, and nothing else. The
-//! pathname's mode and owner are a *precondition* on the listener, not a
-//! statement about who connected: a check on the path cannot tell one
-//! connection from another. Only a peer whose uid equals this daemon's
-//! effective uid reaches a handler, which under the shipped units means
-//! root talking to root. A full root compromise is outside this
-//! endpoint's boundary and always was.
+//! Two checks, in this order, answering two different questions.
 //!
-//! The peer's pid and gid are logged as connection diagnostics and are
-//! deliberately not part of the identity: a pid is reused and races
-//! against the credential it was read with, and a gid is not the
-//! subject. The identity is [`serve::caller_identity`]'s
-//! `unix-peer:uid=<uid>`, rendered at that one site and passed to the
-//! handler unchanged.
+//! First the connected socket's peer credentials. The pathname's mode
+//! and owner are a *precondition* on the listener, not a statement about
+//! who connected: a check on the path cannot tell one connection from
+//! another. Only a peer whose uid equals this daemon's effective uid
+//! goes any further, which under the shipped units means root talking to
+//! root. It stays first and stays a gate of its own — it costs one
+//! syscall and no handshake, and a connection failing it is refused even
+//! when its client certificate is the registrar's. A full root
+//! compromise is outside this endpoint's boundary and always was.
+//!
+//! Then the client certificate. The connection is wrapped in mTLS
+//! ([`tls`]): a caller presenting no certificate, or one whose chain
+//! does not verify against the pinned subset of the deployment's own CA
+//! bundle, fails the handshake before a request byte is read. What
+//! verified is not yet what is *accepted* — the endpoint admits exactly
+//! one identity, the registrar client name
+//! `<instance>.bootroot-registrar.<host>.<domain>`, and a leaf that
+//! verified but carries any other name is refused through the same
+//! [`refusal`] path every other pre-verb refusal uses. An ordinary
+//! service leaf issued for the registrar's own host is refused there.
+//!
+//! The identity is [`serve::caller_identity`]'s
+//! `registrar-client:<san>`, rendered at that one site from the
+//! presented leaf's single DNS SAN and passed to the handler unchanged.
+//! The peer's uid, pid and gid are logged as connection diagnostics and
+//! are deliberately not part of it: a pid is reused and races against
+//! the credential it was read with, a gid is not the subject, and a uid
+//! names root on this host rather than the registrar.
 //!
 //! # Production wiring
 //!
@@ -65,6 +85,7 @@ pub(crate) mod policy;
 pub(crate) mod protocol;
 pub(crate) mod refusal;
 pub(crate) mod serve;
+pub(crate) mod tls;
 
 #[cfg(test)]
 mod tests;
@@ -76,10 +97,13 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::net::UnixListener;
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use self::activation::{ActivationContract, ActivationValues};
 use self::handler::RegistrarRequestHandler;
+use self::tls::EndpointCertResolver;
+use crate::config::Settings;
 
 /// Largest declared request payload the endpoint will read.
 pub(crate) const MAX_FRAME_PAYLOAD_BYTES: usize = 65_536;
@@ -87,8 +111,20 @@ pub(crate) const MAX_FRAME_PAYLOAD_BYTES: usize = 65_536;
 /// Largest handler response the endpoint will write.
 pub(crate) const MAX_RESPONSE_PAYLOAD_BYTES: usize = 65_536;
 
-/// Cumulative deadline from acceptance through the five-byte prefix
-/// *and* the declared operation-name bytes.
+/// Cumulative deadline from acceptance through a completed TLS
+/// handshake.
+///
+/// A peer that opens a connection and never sends a `ClientHello` holds
+/// one of [`MAX_CONCURRENT_CONNECTIONS`] slots for as long as it likes
+/// without this, and it has not authenticated itself with anything yet.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cumulative deadline from *handshake completion* through the
+/// five-byte prefix *and* the declared operation-name bytes.
+///
+/// Measured from the handshake rather than from acceptance: a slow
+/// handshake has its own budget above, and must not also consume the
+/// budget for sending a header.
 pub(crate) const HEADER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Cumulative deadline from header completion through payload
@@ -130,6 +166,16 @@ pub(crate) struct ActivatedEndpoint {
     socket_path: PathBuf,
     daemon_uid: u32,
     handler: Arc<dyn RegistrarRequestHandler>,
+    acceptor: TlsAcceptor,
+    // The certificate resolver is retained for exactly one consumer,
+    // and that consumer — renewal for the endpoint leaf — is a sibling
+    // issue. It has to be retained now because there is no way back to
+    // the concrete resolver from a built `ServerConfig`, so a build
+    // that dropped it would leave renewal with nothing to swap
+    // through. Reachability is asserted through `cert_resolver`.
+    #[allow(dead_code)]
+    resolver: Arc<EndpointCertResolver>,
+    domain: String,
 }
 
 impl ActivatedEndpoint {
@@ -152,6 +198,33 @@ impl ActivatedEndpoint {
     pub(crate) fn handler(&self) -> &Arc<dyn RegistrarRequestHandler> {
         &self.handler
     }
+
+    /// Returns the acceptor every accepted connection is handed to.
+    pub(crate) fn tls_acceptor(&self) -> &TlsAcceptor {
+        &self.acceptor
+    }
+
+    /// Returns the resolver that decides which certificate the next
+    /// handshake presents.
+    ///
+    /// This is the whole of the renewal seam. [`rustls::ServerConfig`]
+    /// keeps only an `Arc<dyn ResolvesServerCert>`, and the trait does
+    /// not extend `Any`, so code holding the configuration or the
+    /// acceptor cannot reach the concrete resolver at all — it survives
+    /// here or nowhere.
+    // Same reason as the field: the renewal work that calls this is a
+    // sibling issue, and the accessor exists so that work needs nothing
+    // from this one.
+    #[allow(dead_code)]
+    pub(crate) fn cert_resolver(&self) -> &Arc<EndpointCertResolver> {
+        &self.resolver
+    }
+
+    /// Returns the configured `network.domain` the presented client
+    /// identity is recognized against.
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
 }
 
 impl std::fmt::Debug for ActivatedEndpoint {
@@ -159,6 +232,7 @@ impl std::fmt::Debug for ActivatedEndpoint {
         f.debug_struct("ActivatedEndpoint")
             .field("socket_path", &self.socket_path)
             .field("daemon_uid", &self.daemon_uid)
+            .field("domain", &self.domain)
             .finish_non_exhaustive()
     }
 }
@@ -206,7 +280,14 @@ pub(crate) const UNPRIVILEGED_DAEMON_WARNING: &str = concat!(
 ///    serve, and finding that out before inspecting the environment
 ///    keeps the diagnostic about the missing handler rather than about a
 ///    descriptor that was never going to be used.
-/// 4. Only then are `LISTEN_PID` and `LISTEN_FDS` read — once — and the
+/// 4. The TLS material comes next: the endpoint's own certificate chain
+///    and key, and the client verifier built over the pinned subset of
+///    the deployment's CA bundle. It goes here so a build that *has* a
+///    handler fails on unusable certificate material before it touches
+///    the inherited descriptor, and so an operator on a build with none
+///    still reads the handler diagnostic first — an endpoint that
+///    cannot serve is not made more serviceable by a certificate.
+/// 5. Only then are `LISTEN_PID` and `LISTEN_FDS` read — once — and the
 ///    descriptor validated and adopted.
 ///
 /// This process's environment is never mutated, not even to clear the
@@ -220,13 +301,16 @@ pub(crate) const UNPRIVILEGED_DAEMON_WARNING: &str = concat!(
 /// # Errors
 ///
 /// Returns an error when the endpoint is enabled and no handler is
-/// registered, when the activation contract is missing, addressed to
+/// registered, when the server certificate material or the client trust
+/// material is absent, unusable or not what a pinned caller would
+/// accept, when the activation contract is missing, addressed to
 /// another process or announces anything but one descriptor, when
 /// `FD_CLOEXEC` cannot be set, when the descriptor is not a listening
 /// `AF_UNIX` stream socket, when its address is not a pathname, or when
 /// the pathname or its parent directory fails the ownership and
 /// permission policy.
-pub(crate) fn activate(enabled: bool) -> anyhow::Result<Option<Arc<ActivatedEndpoint>>> {
+pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<ActivatedEndpoint>>> {
+    let enabled = settings.registrar_endpoint.enabled;
     if !enabled {
         return Ok(None);
     }
@@ -241,19 +325,37 @@ pub(crate) fn activate(enabled: bool) -> anyhow::Result<Option<Arc<ActivatedEndp
              handler is added; set registrar_endpoint.enabled = false"
         );
     };
+    let (server_config, resolver) = tls::build_server_config(
+        settings.registrar_endpoint.server_cert_path.as_deref(),
+        settings.registrar_endpoint.server_key_path.as_deref(),
+        settings.trust.ca_bundle_path.as_deref(),
+        &settings.trust.trusted_ca_sha256,
+        &settings.domain,
+    )
+    .context("loading the registrar endpoint's TLS material")?;
     let contract =
         ActivationContract::consume(&ActivationValues::from_environment(), current_pid())
             .context("consuming the systemd socket-activation contract")?;
-    adopt(contract, effective_uid, handler).map(Some)
+    adopt(
+        contract,
+        effective_uid,
+        handler,
+        server_config,
+        resolver,
+        settings.domain.clone(),
+    )
+    .map(Some)
 }
 
 /// Adopts an already-validated activation contract as a serving
 /// endpoint.
 ///
 /// Split from [`activate`] so a test can drive the whole descriptor,
-/// address and filesystem-policy path against a listener its own harness
-/// bound, through the very code production runs. Nothing below this
-/// point binds, unlinks or chmods anything.
+/// address and filesystem-policy path — and the whole TLS serving path —
+/// against a listener its own harness bound, through the very code
+/// production runs. Nothing below this point binds, unlinks or chmods
+/// anything, and nothing below it reads certificate material: the
+/// already-built configuration and its resolver arrive as values.
 ///
 /// # Errors
 ///
@@ -263,6 +365,9 @@ pub(crate) fn adopt(
     contract: ActivationContract,
     effective_uid: u32,
     handler: Arc<dyn RegistrarRequestHandler>,
+    server_config: Arc<rustls::ServerConfig>,
+    resolver: Arc<EndpointCertResolver>,
+    domain: String,
 ) -> anyhow::Result<Arc<ActivatedEndpoint>> {
     let fd = contract.into_descriptor();
 
@@ -308,6 +413,9 @@ pub(crate) fn adopt(
         socket_path,
         daemon_uid: effective_uid,
         handler,
+        acceptor: TlsAcceptor::from(server_config),
+        resolver,
+        domain,
     }))
 }
 

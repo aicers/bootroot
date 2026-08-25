@@ -61,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
     // enablement is therefore fixed for the process lifetime, and every
     // later reload is held to the value captured here.
     let (initial_settings, initial_eab) = load_settings(&args).await?;
-    let registrar_endpoint_enabled = initial_settings.registrar_endpoint.enabled;
-    let registrar_endpoint = RegistrarEndpoint::activate(registrar_endpoint_enabled)?;
+    let registrar_endpoint_settings = initial_settings.registrar_endpoint.clone();
+    let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
 
     loop {
@@ -91,8 +91,8 @@ async fn main() -> anyhow::Result<()> {
                     match load_settings(&args).await {
                         Ok((settings, final_eab)) => {
                             if let Err(err) = config::check_registrar_endpoint_reload(
-                                registrar_endpoint_enabled,
-                                settings.registrar_endpoint.enabled,
+                                &registrar_endpoint_settings,
+                                &settings.registrar_endpoint,
                             ) {
                                 error!("Reload rejected: {err}");
                                 continue;

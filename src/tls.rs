@@ -305,7 +305,9 @@ fn load_ca_bundle(
 }
 
 /// Builds a [`rustls::RootCertStore`] from an already-parsed certificate list.
-fn certs_to_root_store(certs: &[CertificateDer<'static>]) -> Result<rustls::RootCertStore> {
+pub(crate) fn certs_to_root_store(
+    certs: &[CertificateDer<'static>],
+) -> Result<rustls::RootCertStore> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in certs {
         root_store

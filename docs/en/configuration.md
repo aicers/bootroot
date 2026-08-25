@@ -312,13 +312,15 @@ Used when issuance or renewal fails. Profiles can override this.
 ```toml
 [registrar_endpoint]
 enabled = false
+# server_cert_path = "/etc/bootroot/certs/registrar-endpoint.crt"
+# server_key_path = "/etc/bootroot/certs/registrar-endpoint.key"
 ```
 
 Serves the registrar's `mint` and `deregister` verbs on a host-local
 `AF_UNIX` stream socket. Defaults to `false`, including when the
 `[registrar_endpoint]` table is absent — the setting exists for
-bootroot-host deployments and nothing else. The only key is `enabled`;
-an unknown key is a configuration error.
+bootroot-host deployments and nothing else. The table takes exactly
+three keys; an unknown key is a configuration error.
 
 **Enabling it remains unsupported until a production request handler lands.**
 This build includes the versioned registrar payload codec, but registers no
@@ -333,11 +335,63 @@ re-permissions a socket itself. See
 [Registrar endpoint (Linux only)](operations.md#registrar-endpoint-linux-only)
 in the operations guide for the units and the ownership requirements.
 
+#### The endpoint's TLS material
+
+The endpoint terminates mTLS on every accepted connection, so an enabled
+endpoint needs a server certificate of its own and needs the deployment's
+CA material to verify callers with.
+
+- **`server_cert_path`** is the PEM holding the endpoint's leaf
+  **followed by its issuer chain**, up to a certificate whose DER SHA-256
+  appears in `trust.trusted_ca_sha256`. The leaf's single DNS subject
+  alternative name must be
+  `<instance>.bootroot-registrar-endpoint.<host>.<network.domain>`.
+- **`server_key_path`** is the PEM holding that leaf's private key. The
+  daemon proves the two are a pair at startup by signing with the key and
+  verifying against the leaf.
+- **`trust.ca_bundle_path` and `trust.trusted_ca_sha256` must both be
+  configured** when the endpoint is enabled. Callers are verified against
+  the *pinned subset* of the bundle — the certificates in it whose
+  SHA-256 is listed — so a bundle that gains a certificate does not
+  silently widen who may connect, and a bundle in which nothing is pinned
+  is a startup refusal rather than an endpoint that trusts everything.
+
+The chain requirement is not a formality. A caller verifies this endpoint
+by pinning trust anchors and selecting them **from the certificates the
+server actually presents**, so a file holding the leaf alone loads
+cleanly, matches its key, carries the right name — and is then rejected
+by every correctly configured caller, with no symptom on the daemon at
+all. The daemon therefore runs the caller's own rule against its own
+material at startup and refuses to start on a bare leaf, on a chain that
+does not build to a configured anchor, and on an anchor that is expired,
+not yet valid or not CA-capable.
+
+**The server material is supplied out of band.** Until certificate
+issuance for this leaf lands, nothing in bootroot creates it: put the
+files in place yourself, or let a fixture do it in a test. The daemon
+never generates a self-signed certificate, never falls back to the host's
+ordinary service leaf and never issues one for itself.
+
+With the endpoint enabled, each of the following is a **startup
+refusal**, naming the setting at fault and — where the setting has a
+value — the configured path: an absent `server_cert_path` or
+`server_key_path`; material at a configured path that is missing,
+unreadable, unparseable, key-mismatched or SAN-mismatched; material the
+self-check above rejects; and an absent, unreadable, unparseable or
+unpinned `trust.ca_bundle_path`.
+
 `enabled` is fixed for the process lifetime. The listening descriptor is
 inherited once, before the reload loop, so a `SIGHUP` whose reloaded
 value differs from the running one is **rejected**: the running daemon
 keeps serving under its current setting and the reload is logged as
 refused. Changing the value takes a service restart.
+
+**The two certificate paths are fixed for the same reason**, and a
+reload that changes either is rejected with a diagnostic naming the key
+that changed. The material is loaded once, above the reload loop, so a
+path a reload changed would be read by nothing. The *contents* at those
+paths are not frozen — certificate renewal replaces the presented
+material without a restart — only the paths are.
 
 On a target that is not Linux the table still parses, but an enabled
 endpoint fails configuration validation with an explicit

@@ -280,9 +280,88 @@ pathname — refuses startup with a diagnostic instead of serving.
 
 Each accepted connection is then authenticated by the *connected
 socket's* peer credentials, never by the pathname's metadata: only a
-peer whose uid equals the daemon's effective uid reaches a verb. The
+peer whose uid equals the daemon's effective uid goes any further. The
 peer's pid and gid are logged as connection diagnostics and are not part
 of the caller identity.
+
+#### Who may call, and what the endpoint presents
+
+The peer check answers "root on this host". It is not the identity a verb
+is invoked under, and it is not the last check. Every accepted connection
+is then wrapped in mutual TLS.
+
+- **The endpoint presents** the chain at `[registrar_endpoint]
+  server_cert_path`, with the key at `server_key_path`. A caller pins the
+  deployment's trust anchor and requires the presented leaf's single DNS
+  SAN to be exactly
+  `<instance>.bootroot-registrar-endpoint.<host>.<network.domain>`.
+- **A client certificate is mandatory.** It is verified against the
+  pinned subset of `trust.ca_bundle_path` — the certificates in the
+  bundle whose SHA-256 appears in `trust.trusted_ca_sha256`. A connection
+  presenting no certificate, or one whose chain does not verify, **fails
+  the handshake** before a single request byte is read.
+- **Exactly one identity is accepted.** After the handshake the presented
+  leaf's single DNS SAN must be the registrar client identity,
+  `<instance>.bootroot-registrar.<host>.<network.domain>`. Both labels
+  sit under the `bootroot-` prefix that `bootroot service add` refuses,
+  so no operator-authored issuance can produce either name. A certificate
+  that verified against the deployment CA and is *not* that identity — an
+  ordinary service leaf issued for the registrar's own host, for
+  instance — is refused: zero response bytes and a clean close, exactly
+  like every other pre-verb refusal.
+- **The verbs see `registrar-client:<san>`** as the caller of record, and
+  never a peer-credential value.
+
+A connection that opens and never sends a `ClientHello` is dropped after
+five seconds, so an unauthenticated peer cannot hold one of the sixteen
+connection slots open.
+
+#### Reading a refused connection in the log
+
+**A caller learns nothing about why it was refused, so the daemon's log
+is the only diagnosis there is.** A failed handshake reaches the caller
+only as a TLS alert, and a post-handshake refusal reaches it as a clean
+close with no bytes. Every line carries the connection id that correlates
+the rest of that connection's lines, and a `reason` field:
+
+| `reason` | What happened |
+| --- | --- |
+| `no-client-certificate` | The caller presented no client certificate. |
+| `client-chain-rejected` | Chain did not verify against the pinned anchors. |
+| `handshake-timeout` | No handshake completed within the deadline. |
+| `handshake-failed` | The handshake failed for any other reason. |
+| `no-peer-certificate` | Handshake completed but carried no certificate. |
+| `not-registrar-client` | Verified, but not the registrar client identity. |
+| `unauthorized-peer` | The peer's uid is not the daemon's effective uid. |
+
+#### Startup refusals for the TLS material
+
+With the endpoint enabled, the daemon refuses to start — naming the
+setting at fault, and the configured path where there is one — when
+`server_cert_path` or `server_key_path` is absent; when the material at
+either is missing, unreadable, unparseable, key-mismatched or
+SAN-mismatched; when the certificate file holds the leaf without its
+issuer chain, or a chain that does not build to a certificate pinned in
+`trust.trusted_ca_sha256`, or one whose anchor is expired, not yet valid
+or not CA-capable; and when `trust.ca_bundle_path` is absent, unreadable,
+unparseable, or holds nothing that is pinned.
+
+The chain requirement catches a failure that would otherwise have no
+local symptom at all: a caller selects its trust anchors from the
+certificates the server presents, so a bare leaf is refused by every
+correctly configured caller while the daemon looks healthy. The daemon
+runs the caller's own rule against its own material instead.
+
+**The server material is supplied out of band** until certificate
+issuance for this leaf lands. bootroot does not create it, does not
+generate a self-signed substitute, and does not fall back to the host's
+ordinary service leaf.
+
+Neither certificate path is reloadable. A `SIGHUP` that changes
+`enabled`, `server_cert_path` or `server_key_path` is rejected with a
+diagnostic naming the key that changed, and the running daemon is left as
+it is. Only the *contents* at those paths can change under a running
+daemon.
 
 #### Installing the units
 
