@@ -1855,6 +1855,37 @@ rate_limit_admission_burst = {rendered}"
         }
     }
 
+    /// A whole number too large for the key's `u32` is the same kind of
+    /// load error, naming the key and the bound it passed.
+    ///
+    /// It is a digit's slip away from a sizing an operator meant, and
+    /// the configuration layer's own conversion would have taken it
+    /// silently, so the bound is asserted rather than assumed.
+    #[test]
+    fn a_rate_limit_value_past_u32_max_fails_the_load_naming_the_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "
+[registrar]
+rate_limit_admission_burst = 4294967296"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let error = Settings::from_file(Some(file.path().to_path_buf()))
+            .expect_err("a burst past u32::MAX must not load");
+        let rendered_error = format!("{error:#}");
+        assert!(
+            rendered_error.contains("registrar.rate_limit_admission_burst"),
+            "the failure must name registrar.rate_limit_admission_burst: {rendered_error}"
+        );
+        assert!(
+            rendered_error.contains("4294967296 exceeds 4294967295"),
+            "the failure must say which bound was passed: {rendered_error}"
+        );
+    }
+
     /// An empty table is the same as an absent one: every key defaults
     /// on its own, not only through the table's default.
     #[test]
