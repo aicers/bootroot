@@ -510,9 +510,10 @@ unclassified form, with no `error` member and class `retryable`.
 | `InvalidWrapTtl(Negative)` | none | `retryable` |
 | `InvalidWrapTtl(NotWholeSeconds)` | none | `retryable` |
 | `InvalidWrapTtl(ExceedsOpenBaoRange)` | none | `retryable` |
+| `AuditUnwritable { phase: Intent }` | `RegistrarUnavailable { reason: AuditUnwritable }` | `permanent` |
+| `AuditUnwritable { phase: Outcome }` | `RegistrarUnavailable { reason: AuditUnwritable }` | `permanent` |
+| `PostMintUnrecordable` | `RegistrarUnavailable { reason: PostMintUnrecordable }` | `permanent` |
 | `Unavailable` | none | `retryable` |
-| Future outcome-audit write failure | `RegistrarUnavailable { reason: PostMintUnrecordable }` | `permanent` |
-| Future intent-audit write failure (`AuditUnwritable` when introduced) | `RegistrarUnavailable { reason: AuditUnwritable }` | `permanent` |
 | Future registrar rate-limit refusal | `RegistrarBusy { retry_after }` | `retryable` |
 
 The two named collapses are deliberate: `ServiceSpecConflict` carries
@@ -524,8 +525,21 @@ a ten-digit instance with 63-octet service and host labels produces a 138-octet
 candidate, beyond the 131-octet registration-id limit. Its response omits both
 `registration_id` and `error`.
 
-The final three rows describe variants that do not exist yet. Their introducing
-changes must add explicit mapping arms; matching coincident internal and
+Both `AuditUnwritable` phases map onto the one transcribed `AuditUnwritable`
+reason. The §6.5 row transcribes the source's intent-phase condition and is
+not edited here; that this endpoint also produces the reason for an
+outcome-phase failure on an invocation that changed no `OpenBao` state is
+this repository's own expectation, not transcribed from the source. The
+caller-visible facts are the intent case's — nothing minted, no teardown
+owed, the audit store unwritable — where `PostMintUnrecordable` would
+falsely owe a teardown and the unclassified form would drop the audit-store
+signal. `PostMintUnrecordable` itself carries every outcome-write failure
+whose invocation did, or may have, changed `OpenBao` state — refusals and
+completed removals included — which is wider than the reason's name; the
+variant's own documentation records that width.
+
+The final row describes a refusal that does not exist yet. Its introducing
+change must add an explicit mapping arm; matching coincident internal and
 external names is not permitted. The rate-limit payload is whole seconds.
 
 ## 11. Counts

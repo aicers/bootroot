@@ -414,14 +414,11 @@ pub(crate) enum VerbError {
     /// §6.5 records for the closed `RegistrarUnavailable` reason set, and
     /// is adopted rather than coined here. That set describes it as
     /// "intent phase only", which is narrower than the condition above;
-    /// the divergence is deliberate and is not resolved here, because
-    /// narrowing the condition to fit the name would leave a
-    /// non-mutating outcome-write failure unreported. This variant is
-    /// internal to the verb layer and nothing more — there is no
-    /// verb-to-wire mapping in this repository, and carrying the phase
-    /// is what lets a later endpoint map [`AuditPhase::Intent`] onto the
-    /// transcribed reason and decide on its own terms what an
-    /// [`AuditPhase::Outcome`] failure tells a caller.
+    /// the divergence is deliberate, because narrowing the condition to
+    /// fit the name would leave a non-mutating outcome-write failure
+    /// unreported. The endpoint's `map_refusal` maps both phases onto
+    /// the transcribed reason; the locally owned half of the wire
+    /// reference records that decision and why.
     #[error("the registrar could not write the {phase} audit record")]
     AuditUnwritable {
         /// The write that failed. Reused from the record format rather
