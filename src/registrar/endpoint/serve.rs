@@ -151,13 +151,15 @@ pub(crate) async fn run(
             accepted = endpoint.listener().accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
-                        // The header deadline is cumulative *from
-                        // acceptance*, so the clock starts here rather
-                        // than wherever the connection task is
+                        // The TLS handshake deadline is cumulative
+                        // *from acceptance*, so the clock starts here
+                        // rather than wherever the connection task is
                         // eventually scheduled: under executor
                         // contention those are not the same instant,
                         // and only this one is the one the contract
-                        // names.
+                        // names. The header deadline is a separate
+                        // budget that starts once the handshake has
+                        // completed.
                         let accepted_at = Instant::now();
                         admit(
                             &mut connections,
@@ -342,6 +344,14 @@ async fn handle_connection(
     // acceptance: the handshake had a budget of its own, and a slow one
     // must not leave a caller with no time left to send a header.
     let handshaken_at = Instant::now();
+    // Logged because this instant is the origin of the header deadline:
+    // without it the log shows a connection accepted and then refused
+    // for a missing header, with nothing to say which of the two
+    // budgets the caller actually spent.
+    debug!(
+        connection = connection.as_str(),
+        "Registrar endpoint completed a TLS handshake."
+    );
 
     // The identity is decided here, after the handshake, rather than
     // inside a `ClientCertVerifier` — see [`CallerIdentityRefusal`].
