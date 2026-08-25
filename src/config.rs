@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use config::builder::DefaultState;
-use config::{Config, ConfigBuilder, ConfigError, Environment, File};
+use config::{Config, ConfigBuilder, ConfigError, Environment, File, FileFormat, FileStoredFormat};
 use serde::Deserialize;
 
 use crate::secret::HmacSecret;
@@ -494,9 +494,16 @@ impl Settings {
     /// # Errors
     /// Returns an error if the file cannot be read, its format is unsupported,
     /// or its configuration cannot be deserialized.
-    pub fn from_required_file(config_path: PathBuf) -> Result<Self, ConfigError> {
+    pub fn from_required_file(config_path: &Path) -> Result<Self, ConfigError> {
+        let format = required_file_format(config_path)?;
+        let contents =
+            std::fs::read(config_path).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
+        // Match `config::File`'s lossy decoding so invalid UTF-8 retains its
+        // previous behavior instead of becoming a new load failure.
+        let contents = String::from_utf8_lossy(strip_utf8_bom(&contents));
+
         defaults::apply_defaults(Config::builder())?
-            .add_source(File::from(config_path).required(true))
+            .add_source(File::from_str(&contents, format))
             .build()?
             .try_deserialize()
     }
@@ -546,6 +553,44 @@ impl Settings {
     /// Returns error if any setting is invalid or out of range.
     pub fn validate(&self) -> Result<()> {
         validation::validate_settings(self)
+    }
+}
+
+/// Returns the supported format for one strict configuration path.
+///
+/// This deliberately examines only the exact supplied path. `config::File`
+/// performs filename discovery when its source path is absent, which is useful
+/// for optional configuration but unsafe for an explicitly selected file.
+fn required_file_format(config_path: &Path) -> Result<FileFormat, ConfigError> {
+    // `Cargo.toml` enables only config's `toml` feature. Add a branch for
+    // each subsequently enabled file format so strict and optional sources
+    // continue to accept the same extensions.
+    let format = FileFormat::Toml;
+    if config_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| format.file_extensions().contains(&extension))
+    {
+        Ok(format)
+    } else {
+        Err(ConfigError::Message(format!(
+            "configuration file \"{}\" is not of a supported file format",
+            config_path.display()
+        )))
+    }
+}
+
+/// Removes a UTF-8 byte-order mark before parsing.
+///
+/// This retains `config::File` source behavior should a future supported
+/// format not tolerate a byte-order mark itself.
+fn strip_utf8_bom(contents: &[u8]) -> &[u8] {
+    const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+    if contents.starts_with(UTF8_BOM) {
+        &contents[UTF8_BOM.len()..]
+    } else {
+        contents
     }
 }
 
@@ -621,17 +666,48 @@ mod tests {
 
         let optional = Settings::from_file(Some(missing.clone())).unwrap();
         assert_eq!(optional.email, "admin@example.com");
-        assert!(Settings::from_required_file(missing).is_err());
+        assert!(Settings::from_required_file(&missing).is_err());
     }
 
     #[test]
-    fn required_file_loading_rejects_an_unsupported_existing_file() {
-        let file = tempfile::Builder::new()
-            .suffix(".unsupported")
-            .tempfile()
-            .unwrap();
+    fn required_file_loading_never_discovers_a_toml_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let supplied = dir.path().join("agent");
+        let sibling = dir.path().join("agent.toml");
+        std::fs::write(&sibling, "email = \"sibling@example.com\"\n").unwrap();
 
-        assert!(Settings::from_required_file(file.path().to_path_buf()).is_err());
+        let error = Settings::from_required_file(&supplied).expect_err(
+            "an extension-less supplied path must be rejected before reading a sibling",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("is not of a supported file format")
+        );
+    }
+
+    #[test]
+    fn required_file_loading_rejects_unsupported_and_extensionless_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsupported = dir.path().join("agent.unsupported");
+        let extensionless = dir.path().join("agent-config");
+        std::fs::write(&unsupported, "[registrar]\n").unwrap();
+        std::fs::write(&extensionless, "[registrar]\n").unwrap();
+
+        assert!(Settings::from_required_file(&unsupported).is_err());
+        assert!(Settings::from_required_file(&extensionless).is_err());
+    }
+
+    #[test]
+    fn strip_utf8_bom_removes_only_a_leading_marker() {
+        assert_eq!(
+            strip_utf8_bom(b"\xEF\xBB\xBFemail = \"admin@example.com\""),
+            b"email = \"admin@example.com\""
+        );
+        assert_eq!(
+            strip_utf8_bom(b"email = \"admin@example.com\""),
+            b"email = \"admin@example.com\""
+        );
     }
 
     #[test]

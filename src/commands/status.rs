@@ -265,7 +265,13 @@ async fn load_audit_status(args: &StatusArgs, messages: &Messages) -> Result<Aud
         })
         .await,
     );
+    load_audit_status_from_settings_load(settings, messages).await
+}
 
+async fn load_audit_status_from_settings_load(
+    settings: AuditSettingsLoad,
+    messages: &Messages,
+) -> Result<AuditStatus> {
     let settings = match settings {
         AuditSettingsLoad::Ready(settings) => settings,
         AuditSettingsLoad::Failed { path, reason } => {
@@ -331,11 +337,30 @@ fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
             }
         }
     }
-    let settings_path = audit_settings_path(agent_config.as_ref());
-    let settings_result = match agent_config {
-        Some(path) => Settings::from_required_file(path),
-        None => Settings::from_file(None),
-    };
+
+    match agent_config {
+        Some(path) => load_explicit_audit_settings_after_metadata_gate(path),
+        None => {
+            load_audit_settings_from_result(audit_settings_path(None), Settings::from_file(None))
+        }
+    }
+}
+
+/// Loads one explicit configuration after its caller has confirmed it is a
+/// regular file.
+///
+/// This seam lets tests drive the load-after-gate step without constructing
+/// [`StatusArgs`]. [`Settings::from_required_file`] provides the exact-path
+/// guarantee that prevents fallback to a discovered sibling configuration.
+fn load_explicit_audit_settings_after_metadata_gate(path: PathBuf) -> AuditSettingsLoad {
+    let settings_result = Settings::from_required_file(&path);
+    load_audit_settings_from_result(path, settings_result)
+}
+
+fn load_audit_settings_from_result(
+    settings_path: PathBuf,
+    settings_result: Result<Settings, config::ConfigError>,
+) -> AuditSettingsLoad {
     let settings = match settings_result {
         Ok(settings) => settings,
         Err(error) => {
@@ -686,6 +711,72 @@ mod tests {
         .await
         .expect("a missing default store does not abort status");
         assert!(matches!(status, AuditStatus::Absent));
+    }
+
+    #[tokio::test]
+    async fn vanished_extensionless_agent_config_does_not_load_a_toml_sibling() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let supplied = dir.path().join("agent");
+        let audit_dir = dir.path().join("sibling-registrar-audit");
+        let sibling = dir.path().join("agent.toml");
+        std::fs::create_dir(&audit_dir).expect("create sibling audit directory");
+        std::fs::write(&supplied, "[registrar]\n").expect("write supplied config");
+        std::fs::write(
+            &sibling,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write sibling config");
+
+        assert!(
+            std::fs::metadata(&supplied)
+                .expect("inspect supplied config")
+                .is_file(),
+            "the explicit metadata gate must pass before the file disappears"
+        );
+        std::fs::remove_file(&supplied).expect("remove supplied config after metadata gate");
+
+        let status = load_audit_status_from_settings_load(
+            load_explicit_audit_settings_after_metadata_gate(supplied.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("a strict-load failure must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("the vanished supplied config must not load its TOML sibling");
+        };
+        assert_eq!(path, supplied);
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
+    }
+
+    #[tokio::test]
+    async fn vanished_toml_agent_config_is_a_failed_scan_after_metadata_gate() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let supplied = dir.path().join("agent.toml");
+        std::fs::write(&supplied, "[registrar]\n").expect("write supplied config");
+
+        assert!(
+            std::fs::metadata(&supplied)
+                .expect("inspect supplied config")
+                .is_file(),
+            "the explicit metadata gate must pass before the file disappears"
+        );
+        std::fs::remove_file(&supplied).expect("remove supplied config after metadata gate");
+
+        let status = load_audit_status_from_settings_load(
+            load_explicit_audit_settings_after_metadata_gate(supplied.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("a strict-load failure must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("a supplied config that vanishes after the gate must fail the audit status");
+        };
+        assert_eq!(path, supplied);
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
     }
 
     #[tokio::test]
