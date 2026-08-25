@@ -2477,51 +2477,56 @@ fn identity_pre_decision_cases() -> Vec<PreDecisionCase> {
 
 /// One case per [`WrapTtlRefusal`] variant, because each is a distinct
 /// answer the caller earned and the limiter must hand back unchanged.
+///
+/// The set is built by matching over the variants rather than by
+/// listing four cases, so "one per variant" is what the compiler
+/// enforces rather than what this comment asserts: a fifth variant
+/// fails to build here until it is given the request that provokes it.
 fn wrap_ttl_pre_decision_cases() -> Vec<PreDecisionCase> {
-    let wrap_ttl_request = |requested: Duration| {
+    [
+        WrapTtlRefusal::Zero,
+        WrapTtlRefusal::Negative,
+        WrapTtlRefusal::NotWholeSeconds,
+        WrapTtlRefusal::ExceedsOpenBaoRange,
+    ]
+    .into_iter()
+    .map(|refusal| {
+        let (name, requested, expects): (_, _, fn(&VerbError) -> bool) = match refusal {
+            WrapTtlRefusal::Zero => ("a zero wrap_ttl", Duration::ZERO, |error| {
+                matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Zero))
+            }),
+            WrapTtlRefusal::Negative => ("a negative wrap_ttl", Duration::seconds(-5), |error| {
+                matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Negative))
+            }),
+            WrapTtlRefusal::NotWholeSeconds => (
+                "a sub-second wrap_ttl",
+                Duration::milliseconds(250),
+                |error| {
+                    matches!(
+                        error,
+                        VerbError::InvalidWrapTtl(WrapTtlRefusal::NotWholeSeconds)
+                    )
+                },
+            ),
+            WrapTtlRefusal::ExceedsOpenBaoRange => (
+                "a wrap_ttl past the OpenBao range",
+                // One second past the largest whole-second value an
+                // `OpenBao` duration string can carry, so it is refused
+                // rather than clamped.
+                Duration::seconds(9_223_372_037),
+                |error| {
+                    matches!(
+                        error,
+                        VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange)
+                    )
+                },
+            ),
+        };
         let mut request = mint_request("roxyd", "h1", None);
         request.wrap_ttl = requested;
-        request
-    };
-    vec![
-        pre_decision_case(
-            "a zero wrap_ttl",
-            base_fixture(),
-            wrap_ttl_request(Duration::ZERO),
-            |error| matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Zero)),
-        ),
-        pre_decision_case(
-            "a negative wrap_ttl",
-            base_fixture(),
-            wrap_ttl_request(Duration::seconds(-5)),
-            |error| matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Negative)),
-        ),
-        pre_decision_case(
-            "a sub-second wrap_ttl",
-            base_fixture(),
-            wrap_ttl_request(Duration::milliseconds(250)),
-            |error| {
-                matches!(
-                    error,
-                    VerbError::InvalidWrapTtl(WrapTtlRefusal::NotWholeSeconds)
-                )
-            },
-        ),
-        pre_decision_case(
-            "a wrap_ttl past the OpenBao range",
-            base_fixture(),
-            // One second past the largest whole-second value an
-            // `OpenBao` duration string can carry, so it is refused
-            // rather than clamped.
-            wrap_ttl_request(Duration::seconds(9_223_372_037)),
-            |error| {
-                matches!(
-                    error,
-                    VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange)
-                )
-            },
-        ),
-    ]
+        pre_decision_case(name, base_fixture(), request, expects)
+    })
+    .collect()
 }
 
 /// A flood of invocations the pure checks refuse is limited: past the
