@@ -107,7 +107,7 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     if let Some(openbao) = &settings.openbao {
         validate_openbao_settings(openbao)?;
     }
-    validate_registrar_endpoint_settings(settings.registrar_endpoint)?;
+    validate_registrar_endpoint_settings(&settings.registrar_endpoint)?;
     validate_registrar_settings(&settings.registrar)?;
     Ok(())
 }
@@ -196,7 +196,7 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
 /// descriptor was passed", which would send an operator looking for a
 /// unit file that could never have run.
 #[cfg_attr(target_os = "linux", allow(clippy::unnecessary_wraps))]
-fn validate_registrar_endpoint_settings(settings: RegistrarEndpointSettings) -> Result<()> {
+fn validate_registrar_endpoint_settings(settings: &RegistrarEndpointSettings) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     if settings.enabled {
         anyhow::bail!(

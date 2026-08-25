@@ -1,7 +1,11 @@
 //! The one path a request takes when it is refused before a verb runs.
 //!
 //! Every refusal does exactly the same three things: it logs, it writes
-//! **zero** response bytes, and it closes the stream cleanly. There is no
+//! **zero** response bytes, and it closes the stream cleanly. That holds
+//! whether the stream is a bare `AF_UNIX` socket or the TLS stream on
+//! top of one: `close()` is `shutdown()`, which on a
+//! `tokio_rustls::server::TlsStream` emits `close_notify`, so a refused
+//! caller reads an orderly end of stream and not a truncation. There is no
 //! wire error, no empty frame and no status code, so a caller learns
 //! that it was refused and nothing whatever about which of the daemon's
 //! checks it tripped. The operator learns all of it, from the log.
@@ -224,6 +228,17 @@ impl<'a> Refusal<'a> {
         }
     }
 
+    /// A refusal of the identity that completed the handshake. No
+    /// request byte has been read at this point, so there is no
+    /// operation and no received name to attach.
+    pub(crate) fn caller_identity(refusal: CallerIdentityRefusal) -> Self {
+        Self {
+            cause: RefusalCause::CallerIdentity(refusal),
+            operation: None,
+            received_name: None,
+        }
+    }
+
     /// Attaches the operation-name bytes that were read.
     #[must_use]
     pub(crate) fn with_received_name(mut self, bytes: &'a [u8]) -> Self {
@@ -249,16 +264,77 @@ impl<'a> Refusal<'a> {
     }
 }
 
-/// What is being refused: one of the seven transport reasons, or a
-/// handler's rejection of the payload.
+/// Why the caller that completed a handshake is not one this endpoint
+/// serves.
 ///
-/// Two variants rather than eight: the handler's rejection shares this
-/// path — the same zero response bytes, the same clean close, the same
-/// connection id — without joining the transport taxonomy.
+/// Decided *after* the handshake rather than inside a
+/// `ClientCertVerifier`, for two reasons that both matter. A verifier
+/// lives in the `ServerConfig` and is shared by every connection, so it
+/// cannot log under the connection diagnostic id that correlates the
+/// rest of that connection's lines; and a rejection from inside it is a
+/// TLS alert, which would be a second refusal shape beside the silent
+/// clean close every other pre-verb refusal uses. Nothing is read from
+/// the caller before this check, so "refused before any request is
+/// read" still holds.
+///
+/// Chain verification is not in here at all — that is
+/// `WebPkiClientVerifier`'s, and a chain that does not build never
+/// reaches this point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallerIdentityRefusal {
+    /// The handshake completed but the session carries no peer
+    /// certificate to recognize. The verifier makes a client
+    /// certificate mandatory, so this is a contradiction rather than an
+    /// expected arm — and it is refused rather than assumed away.
+    NoPeerCertificate,
+    /// The peer's certificate verified against the deployment CA but is
+    /// not the registrar client identity.
+    NotRegistrarClient {
+        /// Which rule of the name the presented leaf broke.
+        source: crate::registrar::RegistrarIdentityError,
+    },
+}
+
+impl CallerIdentityRefusal {
+    /// A stable, lowercase label for the log's `reason` field.
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoPeerCertificate => "no-peer-certificate",
+            Self::NotRegistrarClient { .. } => "not-registrar-client",
+        }
+    }
+}
+
+impl fmt::Display for CallerIdentityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPeerCertificate => f.write_str(
+                "the completed handshake carries no peer certificate to recognize an identity from",
+            ),
+            Self::NotRegistrarClient { source } => write!(
+                f,
+                "the peer's certificate is not the registrar client identity: {source}"
+            ),
+        }
+    }
+}
+
+/// What is being refused: one of the seven transport reasons, a
+/// handshake that verified as the wrong identity, or a handler's
+/// rejection of the payload.
+///
+/// Three variants rather than nine: neither the identity refusal nor
+/// the handler's rejection joins the transport taxonomy — each of those
+/// seven reasons is something *the transport* observed about the frame
+/// — but both share this path, with the same zero response bytes, the
+/// same clean close and the same connection id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RefusalCause {
     /// One of the seven transport reasons.
     Transport(TransportRefusalReason),
+    /// The handshake completed, but not as the one identity this
+    /// endpoint serves.
+    CallerIdentity(CallerIdentityRefusal),
     /// The handler rejected the payload bytes before a verb ran.
     HandlerRejectedPayload,
 }
@@ -268,6 +344,7 @@ impl RefusalCause {
     fn label(&self) -> &'static str {
         match self {
             Self::Transport(reason) => reason.label(),
+            Self::CallerIdentity(refusal) => refusal.label(),
             Self::HandlerRejectedPayload => "handler-rejected-payload",
         }
     }
@@ -276,6 +353,7 @@ impl RefusalCause {
     fn describe(&self) -> String {
         match self {
             Self::Transport(reason) => reason.to_string(),
+            Self::CallerIdentity(refusal) => refusal.to_string(),
             Self::HandlerRejectedPayload => HANDLER_REJECTED_PAYLOAD.to_string(),
         }
     }

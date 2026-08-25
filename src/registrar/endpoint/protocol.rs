@@ -2593,7 +2593,7 @@ mod tests {
     fn fixture_context(registration_id: Option<&str>, arm: ProducingArm) -> VerbContext {
         VerbContext::new(
             RequestId::for_fixture("request-0001"),
-            CallerIdentity::new("unix-peer:uid=0"),
+            CallerIdentity::new("registrar-client:001.bootroot-registrar.h1.example.internal"),
             registration_id.map(str::to_string),
             arm,
         )

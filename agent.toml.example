@@ -44,13 +44,30 @@ http_responder_token_ttl_secs = 300
 # request handler, so an enabled endpoint refuses to start.  The
 # registrar protocol work supplies the handler.
 #
-# The value is fixed for the process lifetime.  The listening descriptor
-# is inherited once, before the reload loop, so a SIGHUP whose value
-# differs from the running one is rejected and the running daemon is
-# left as it is; changing it takes a service restart.  On a non-Linux
-# target an enabled endpoint fails config validation.
+# Every key here is fixed for the process lifetime.  The listening
+# descriptor is inherited, and the server certificate material is read,
+# once before the reload loop, so a SIGHUP that changes any of the three
+# is rejected and the running daemon is left as it is; changing one takes
+# a service restart.  On a non-Linux target an enabled endpoint fails
+# config validation.
+#
+# The endpoint terminates mTLS.  It presents the material below and
+# accepts exactly one client identity,
+# <instance>.bootroot-registrar.<host>.<network.domain>.  A caller
+# presenting no client certificate, or one that does not verify against
+# the pinned subset of trust.ca_bundle_path, fails the handshake;
+# trust.ca_bundle_path and trust.trusted_ca_sha256 must therefore both
+# be configured when the endpoint is enabled.
+#
+# server_cert_path must hold the endpoint's leaf FOLLOWED BY its issuer
+# chain, up to a certificate pinned in trust.trusted_ca_sha256.  A
+# leaf-only file loads cleanly and is then rejected by every correctly
+# pinned caller, so the daemon refuses to start on one instead.  Until
+# issuance for this leaf lands, both files are supplied out of band.
 [registrar_endpoint]
 enabled = false
+# server_cert_path = "/etc/bootroot/certs/registrar-endpoint.crt"
+# server_key_path = "/etc/bootroot/certs/registrar-endpoint.key"
 
 # Registrar audit records (daemon-owned).
 #
