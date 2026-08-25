@@ -146,6 +146,20 @@ applied to a peer certificate something else has already verified. It also
 leaf this CA issues carries the same EKU set, so that attribute cannot
 discriminate. Recognition is by name.
 
+The **same rule under the other reserved label** recognizes the endpoint server
+name: `recognize_registrar_endpoint(end_entity_der, domain)` and
+`recognize_registrar_endpoint_name(dns_name, domain)` apply conditions 1, 2, 3
+and 5 unchanged, require `bootroot-registrar-endpoint` at condition 4, and
+return a `RegistrarEndpointIdentity` — or
+`RegistrarIdentityError::NotRegistrarEndpoint` when the label is something else.
+One implementation carries both, so the rule cannot drift between the two ends
+of the same connection, and neither accepts the other's name.
+
+The endpoint rule is not applied to a peer. The daemon runs it over **its own**
+leaf at startup: it holds the configured `domain` and neither the instance nor
+the host label, so it cannot compose the expected name and compare, and checks
+the shape instead. A caller *can* compose that name, and pins it — see §4.
+
 ## 4. The endpoint pin file
 
 ### 4.1 What is pinned
