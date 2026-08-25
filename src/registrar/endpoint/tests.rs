@@ -1536,9 +1536,10 @@ fn connection_ids_are_distinct_and_shaped_unlike_a_verb_request_id() {
 // Cumulative deadlines
 // ---------------------------------------------------------------------
 
-/// The header deadline is cumulative from acceptance: a caller that
-/// holds the connection open without sending a byte is refused as
-/// no-header when it expires.
+/// The header deadline is cumulative from handshake completion — the
+/// instant `serve_request` is handed here, and the instant the serving
+/// path stamps after its handshake: a caller that holds the connection
+/// open without sending a byte is refused as no-header when it expires.
 #[tokio::test(start_paused = true)]
 async fn the_header_deadline_expires_with_no_header_when_no_byte_arrives() {
     let (logs, _guard) = capture_logs();
