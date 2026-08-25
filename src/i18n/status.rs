@@ -277,6 +277,10 @@ impl Messages {
         )
     }
 
+    pub(crate) fn status_warning_audit_config_not_regular_file(&self) -> &'static str {
+        self.strings().status_warning_audit_config_not_regular_file
+    }
+
     pub(crate) fn status_error_agent_config_missing(&self, path: &str) -> String {
         format_template(
             self.strings().status_error_agent_config_missing,

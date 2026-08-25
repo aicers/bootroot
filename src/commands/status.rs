@@ -229,8 +229,13 @@ enum AuditStatus {
     Scan(AuditScan),
     Failed {
         path: std::path::PathBuf,
-        error: String,
+        reason: AuditFailureReason,
     },
+}
+
+enum AuditFailureReason {
+    ExplicitConfigNotRegularFile,
+    Diagnostic(String),
 }
 
 struct AuditScanSettings {
@@ -241,22 +246,30 @@ struct AuditScanSettings {
 
 enum AuditSettingsLoad {
     Ready(AuditScanSettings),
-    Failed { path: PathBuf, error: String },
-    MissingExplicitConfig { path: PathBuf },
+    Failed {
+        path: PathBuf,
+        reason: AuditFailureReason,
+    },
+    MissingExplicitConfig {
+        path: PathBuf,
+    },
 }
 
 async fn load_audit_status(args: &StatusArgs, messages: &Messages) -> Result<AuditStatus> {
-    let settings = tokio::task::spawn_blocking({
-        let agent_config = args.agent_config.clone();
-        move || load_audit_settings(agent_config)
-    })
-    .await
-    .context("loading registrar audit settings off runtime")?;
+    let settings_path = audit_settings_path(args.agent_config.as_ref());
+    let settings = map_audit_settings_join_result(
+        settings_path,
+        tokio::task::spawn_blocking({
+            let agent_config = args.agent_config.clone();
+            move || load_audit_settings(agent_config)
+        })
+        .await,
+    );
 
     let settings = match settings {
         AuditSettingsLoad::Ready(settings) => settings,
-        AuditSettingsLoad::Failed { path, error } => {
-            return Ok(AuditStatus::Failed { path, error });
+        AuditSettingsLoad::Failed { path, reason } => {
+            return Ok(AuditStatus::Failed { path, reason });
         }
         AuditSettingsLoad::MissingExplicitConfig { path } => {
             anyhow::bail!(messages.status_error_agent_config_missing(&path.display().to_string()));
@@ -276,9 +289,25 @@ async fn load_audit_status(args: &StatusArgs, messages: &Messages) -> Result<Aud
         Err(AuditScanError::StoreAbsent { .. }) => Ok(AuditStatus::Absent),
         Err(error) => Ok(AuditStatus::Failed {
             path: settings.directory,
-            error: error.to_string(),
+            reason: AuditFailureReason::Diagnostic(error.to_string()),
         }),
     }
+}
+
+fn audit_settings_path(agent_config: Option<&PathBuf>) -> PathBuf {
+    agent_config
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("agent.toml"))
+}
+
+fn map_audit_settings_join_result(
+    settings_path: PathBuf,
+    result: std::result::Result<AuditSettingsLoad, tokio::task::JoinError>,
+) -> AuditSettingsLoad {
+    result.unwrap_or_else(|error| AuditSettingsLoad::Failed {
+        path: settings_path,
+        reason: AuditFailureReason::Diagnostic(error.to_string()),
+    })
 }
 
 fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
@@ -288,7 +317,7 @@ fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
             Ok(_) => {
                 return AuditSettingsLoad::Failed {
                     path: path.clone(),
-                    error: "agent configuration path is not a regular file".to_string(),
+                    reason: AuditFailureReason::ExplicitConfigNotRegularFile,
                 };
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -297,27 +326,29 @@ fn load_audit_settings(agent_config: Option<PathBuf>) -> AuditSettingsLoad {
             Err(error) => {
                 return AuditSettingsLoad::Failed {
                     path: path.clone(),
-                    error: error.to_string(),
+                    reason: AuditFailureReason::Diagnostic(error.to_string()),
                 };
             }
         }
     }
-    let settings_path = agent_config
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("agent.toml"));
-    let settings = match Settings::from_file(agent_config) {
+    let settings_path = audit_settings_path(agent_config.as_ref());
+    let settings_result = match agent_config {
+        Some(path) => Settings::from_required_file(path),
+        None => Settings::from_file(None),
+    };
+    let settings = match settings_result {
         Ok(settings) => settings,
         Err(error) => {
             return AuditSettingsLoad::Failed {
                 path: settings_path,
-                error: error.to_string(),
+                reason: AuditFailureReason::Diagnostic(error.to_string()),
             };
         }
     };
     if let Err(error) = validate_registrar_settings(&settings.registrar) {
         return AuditSettingsLoad::Failed {
             path: settings_path,
-            error: error.to_string(),
+            reason: AuditFailureReason::Diagnostic(error.to_string()),
         };
     }
     AuditSettingsLoad::Ready(AuditScanSettings {
@@ -423,8 +454,17 @@ fn audit_section_lines(messages: &Messages, audit_status: &AuditStatus) -> Vec<S
                 );
             }
         }
-        AuditStatus::Failed { path, error } => lines
-            .push(messages.status_warning_audit_scan_failed(&path.display().to_string(), error)),
+        AuditStatus::Failed { path, reason } => {
+            let reason = match reason {
+                AuditFailureReason::ExplicitConfigNotRegularFile => {
+                    messages.status_warning_audit_config_not_regular_file()
+                }
+                AuditFailureReason::Diagnostic(error) => error,
+            };
+            lines.push(
+                messages.status_warning_audit_scan_failed(&path.display().to_string(), reason),
+            );
+        }
     }
     lines
 }
@@ -664,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unreadable_agent_config_path_is_a_failed_scan() {
+    async fn supplied_directory_agent_config_is_a_failed_scan() {
         let dir = tempfile::tempdir().expect("create test directory");
         let config = dir.path().join("agent-config-directory");
         std::fs::create_dir(&config).expect("create config directory");
@@ -674,12 +714,82 @@ mod tests {
             &test_messages(),
         )
         .await
+        .expect("a directory config must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("a directory config must report a failed scan");
+        };
+        assert_eq!(path, config);
+        assert!(matches!(
+            reason,
+            AuditFailureReason::ExplicitConfigNotRegularFile
+        ));
+    }
+
+    #[tokio::test]
+    async fn supplied_unsupported_agent_config_is_a_failed_scan() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("agent.unsupported");
+        std::fs::write(&config, "[registrar]\n").expect("write unsupported config");
+
+        let status = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("an unsupported config must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("an unsupported config must report a failed scan");
+        };
+        assert_eq!(path, config);
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
+    }
+
+    #[tokio::test]
+    async fn supplied_agent_config_metadata_error_is_a_failed_scan() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "blocker").expect("write metadata blocker");
+        let config = blocker.join("agent.toml");
+
+        let status = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
+        .expect("a metadata error must not abort status");
+        let AuditStatus::Failed { path, reason } = status else {
+            panic!("a metadata error must report a failed scan");
+        };
+        assert_eq!(path, config);
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_regular_agent_config_is_a_failed_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if bootroot::fs_util::current_process_euid() == 0 {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(&config, "[registrar]\n").expect("write agent config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+            .expect("remove config read permission");
+
+        let status = load_audit_status(
+            &status_args_with_agent_config(config.clone()),
+            &test_messages(),
+        )
+        .await
         .expect("an unreadable config must not abort status");
-        let AuditStatus::Failed { path, error } = status else {
+        let AuditStatus::Failed { path, reason } = status else {
             panic!("an unreadable config must report a failed scan");
         };
         assert_eq!(path, config);
-        assert!(!error.is_empty());
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
     }
 
     #[tokio::test]
@@ -694,11 +804,11 @@ mod tests {
         )
         .await
         .expect("a malformed config does not abort status");
-        let AuditStatus::Failed { path, error } = status else {
+        let AuditStatus::Failed { path, reason } = status else {
             panic!("a malformed config must report a failed scan");
         };
         assert_eq!(path, config);
-        assert!(!error.is_empty());
+        assert!(matches!(reason, AuditFailureReason::Diagnostic(_)));
     }
 
     #[tokio::test]
@@ -711,8 +821,11 @@ mod tests {
         let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
             .await
             .expect("invalid settings must not abort status");
-        let AuditStatus::Failed { error, .. } = status else {
+        let AuditStatus::Failed { reason, .. } = status else {
             panic!("invalid registrar settings must report a failed scan");
+        };
+        let AuditFailureReason::Diagnostic(error) = reason else {
+            panic!("invalid registrar settings are diagnostic failures");
         };
         assert!(error.contains("audit_max_retained_files"));
     }
@@ -739,10 +852,13 @@ mod tests {
             )
             .await
             .expect("invalid registrar settings do not abort status");
-            let AuditStatus::Failed { path, error } = status else {
+            let AuditStatus::Failed { path, reason } = status else {
                 panic!("{name} must report a failed scan");
             };
             assert_eq!(path, config);
+            let AuditFailureReason::Diagnostic(error) = reason else {
+                panic!("{name} must be a diagnostic failure");
+            };
             assert!(error.contains("audit_"), "{name}: {error}");
         }
         assert!(
@@ -773,6 +889,30 @@ mod tests {
         assert!(matches!(status, AuditStatus::Scan(_)));
     }
 
+    #[tokio::test]
+    async fn settings_task_join_failure_is_a_failed_audit_status() {
+        let join_result = tokio::task::spawn_blocking(|| panic!("deliberate settings panic")).await;
+        let join_error = join_result
+            .as_ref()
+            .err()
+            .expect("the blocking task must panic")
+            .to_string();
+        let path = PathBuf::from("selected-agent.toml");
+
+        let AuditSettingsLoad::Failed {
+            path: failed_path,
+            reason,
+        } = map_audit_settings_join_result(path.clone(), join_result)
+        else {
+            panic!("the join failure must return failed audit settings");
+        };
+        assert_eq!(failed_path, path);
+        let AuditFailureReason::Diagnostic(reason) = reason else {
+            panic!("a join error is diagnostic text");
+        };
+        assert_eq!(reason, join_error);
+    }
+
     #[test]
     fn audit_section_renders_each_state_in_both_locales() {
         let scan = AuditStatus::Scan(AuditScan {
@@ -782,7 +922,11 @@ mod tests {
         });
         let failure = AuditStatus::Failed {
             path: PathBuf::from("/var/lib/bootroot/registrar-audit"),
-            error: "permission denied".to_string(),
+            reason: AuditFailureReason::Diagnostic("permission denied".to_string()),
+        };
+        let non_regular_file_failure = AuditStatus::Failed {
+            path: PathBuf::from("/etc/bootroot/agent.toml"),
+            reason: AuditFailureReason::ExplicitConfigNotRegularFile,
         };
 
         for locale in ["en", "ko"] {
@@ -805,6 +949,18 @@ mod tests {
             let warning = failed.get(1).expect("failed audit section has a warning");
             assert!(warning.contains("/var/lib/bootroot/registrar-audit"));
             assert!(warning.contains("permission denied"));
+
+            let non_regular_file = audit_section_lines(&messages, &non_regular_file_failure);
+            let warning = non_regular_file
+                .get(1)
+                .expect("non-regular-file failure has a warning");
+            assert!(warning.contains("/etc/bootroot/agent.toml"));
+            let explanation = match locale {
+                "en" => "agent configuration path is not a regular file",
+                "ko" => "agent 구성 경로가 일반 파일이 아닙니다",
+                _ => unreachable!("the test provides only known locales"),
+            };
+            assert!(warning.contains(explanation), "{locale}: {warning}");
         }
     }
 

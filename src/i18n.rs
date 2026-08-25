@@ -317,6 +317,7 @@ pub(crate) struct Strings {
     pub(crate) status_warning_audit_malformed_records: &'static str,
     pub(crate) status_warning_audit_retention_shortfall: &'static str,
     pub(crate) status_warning_audit_scan_failed: &'static str,
+    pub(crate) status_warning_audit_config_not_regular_file: &'static str,
     pub(crate) status_error_agent_config_missing: &'static str,
     pub(crate) summary_title: &'static str,
     pub(crate) summary_openbao_url: &'static str,

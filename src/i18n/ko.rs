@@ -305,6 +305,7 @@ pub(super) static STRINGS: Strings = Strings {
     status_warning_audit_malformed_records: "경고: 레지스트라 감사에 잘못된 레코드가 있습니다.",
     status_warning_audit_retention_shortfall: "경고: 레지스트라 감사 보존 기간이 설정보다 짧습니다.",
     status_warning_audit_scan_failed: "경고: {path}의 레지스트라 감사 스캔에 실패했습니다: {reason}",
+    status_warning_audit_config_not_regular_file: "agent 구성 경로가 일반 파일이 아닙니다",
     status_error_agent_config_missing: "agent 구성 경로가 존재하지 않습니다: {path}",
     summary_title: "bootroot init: 요약",
     summary_openbao_url: "- OpenBao URL: {value}",
