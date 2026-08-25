@@ -171,6 +171,13 @@ while those callers still got their real answers, and a rising
 `admission` count says legitimate traffic is being held back and a
 bring-up may be stalling.
 
+Those counters are all a limited invocation leaves behind: nothing is
+written per limited invocation, the daemon's journal included. A log
+line each would be one unbounded write per flooded request, handing the
+flood back the disk pressure the buckets took away from it. Do not
+expect the journal to show a flood in progress; that visibility arrives
+with the counters' operator-facing surface.
+
 **The four keys**, in `agent.toml`'s `[registrar]` table. Every one is
 an unsigned integer; rates are expressed as milliseconds per token
 rather than as a fractional rate, so the configuration surface carries

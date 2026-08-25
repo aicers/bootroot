@@ -2700,6 +2700,97 @@ async fn the_throttle_is_its_own_variant_rather_than_an_unavailability() {
     );
 }
 
+/// Counts every `tracing` event emitted on the thread it is installed
+/// on, and does nothing else.
+#[derive(Debug)]
+struct EventCounter {
+    events: Arc<AtomicU64>,
+}
+
+impl EventCounter {
+    fn new() -> (Self, Arc<AtomicU64>) {
+        let events = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                events: events.clone(),
+            },
+            events,
+        )
+    }
+}
+
+impl tracing::Subscriber for EventCounter {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A limited invocation writes nothing per invocation anywhere, the
+/// daemon log included. One `tracing` line per limited invocation would
+/// be one unbounded write per flooded request — the disk pressure the
+/// buckets exist to remove, handed back on the cheapest path a caller
+/// has. The evidence a flood leaves is the sink's per-bucket count.
+#[tokio::test]
+async fn a_limited_invocation_emits_no_daemon_log_line() {
+    const FLOOD: u32 = 8;
+    let settings = VerbRateLimiterSettings {
+        admission_burst: 1,
+        admission_refill_interval_ms: 600_000,
+        predecision_refusal_burst: 1,
+        predecision_refusal_refill_interval_ms: 600_000,
+    };
+    let (_server, _dir, verbs, sink) = limited_harness(&base_fixture(), settings).await;
+
+    // Spend both tokens before the counter is watching: an admitted
+    // invocation logs whatever it logs, and that is not what this pins.
+    let _refusal = verbs
+        .mint(&mint_request("bootroot-decoy", "h1", None))
+        .await;
+    let _admitted = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await;
+
+    let (counter, events) = EventCounter::new();
+    let _guard = tracing::subscriber::set_default(counter);
+    for _ in 0..FLOOD {
+        verbs
+            .mint(&mint_request("bootroot-decoy", "h1", None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+        verbs
+            .deregister(&deregister_request("roxyd", "h1", None))
+            .await
+            .expect_err("a drained admission bucket throttles");
+    }
+
+    assert_eq!(
+        events.load(Ordering::Relaxed),
+        0,
+        "a limited invocation must leave the daemon log untouched"
+    );
+    assert_eq!(
+        sink.count(LimiterBucket::PredecisionRefusal) + sink.count(LimiterBucket::Admission),
+        u64::from(FLOOD) * 2,
+        "the sink counted every limited invocation the log did not"
+    );
+}
+
 /// Each invocation charges its bucket exactly once. The pure checks run
 /// once per invocation and what they produced is carried forward, so an
 /// invocation never pays two tokens for one request.

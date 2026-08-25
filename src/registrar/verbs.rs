@@ -801,22 +801,22 @@ impl RegistrarVerbs {
     /// that value into a caller-facing throttle; on the pre-decision
     /// path it is discarded and the caller keeps its own refusal.
     ///
+    /// **A limited invocation writes nothing per invocation anywhere,
+    /// the daemon log included.** The sink event is in-process and
+    /// counted; a `tracing` line per limited invocation would be one
+    /// unbounded write per flooded request, which is the disk pressure
+    /// the buckets exist to remove — reintroduced on the very path they
+    /// were meant to make cheap. What a flood leaves behind is the
+    /// sink's per-bucket count, and coalescing that into a record
+    /// belongs to the sibling record issue.
+    ///
     /// Synchronous, and the bucket lock is taken and released inside the
     /// limiter, so nothing here holds it across an `OpenBao` call or a
     /// record write.
     fn charge(&self, audit: &AuditContext, bucket: LimiterBucket) -> Option<u64> {
         match self.limiter.charge(&audit.caller, audit.verb, bucket) {
             ChargeOutcome::Admitted => None,
-            ChargeOutcome::Limited { retry_after } => {
-                tracing::warn!(
-                    caller = audit.caller.as_str(),
-                    verb = ?audit.verb,
-                    bucket = bucket.as_str(),
-                    request_id = audit.request_id.as_str(),
-                    "the registrar limited an invocation; its audit records are suppressed"
-                );
-                Some(retry_after)
-            }
+            ChargeOutcome::Limited { retry_after } => Some(retry_after),
         }
     }
 

@@ -217,6 +217,13 @@ impl LimitedInvocation {
 /// and forwards to it — which is how the sibling record work installs a
 /// coalescing sink around [`CountingLimitedInvocationSink`] while leaving
 /// its two counters the single implementation in the tree.
+///
+/// An implementation must not turn one event into one unbounded write —
+/// a log line, a record, an appended file. A limited invocation is
+/// precisely a flooded one, so a per-event write hands the flood back
+/// the disk pressure the buckets took away from it, on the cheapest
+/// path a caller has. Count in memory, as the shipped sink does, or
+/// coalesce before writing.
 pub(crate) trait LimitedInvocationSink: fmt::Debug + Send + Sync {
     /// Publishes one limited invocation.
     ///
