@@ -6,6 +6,11 @@ use config::{ConfigBuilder, ConfigError, builder::DefaultState};
 use crate::registrar::audit::{
     DEFAULT_AUDIT_MAX_FILE_BYTES, DEFAULT_AUDIT_MAX_RETAINED_FILES, DEFAULT_AUDIT_MIN_RETAIN_DAYS,
 };
+use crate::registrar::verbs::limiter::{
+    DEFAULT_RATE_LIMIT_ADMISSION_BURST, DEFAULT_RATE_LIMIT_ADMISSION_REFILL_INTERVAL_MS,
+    DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_BURST,
+    DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_REFILL_INTERVAL_MS,
+};
 
 const DEFAULT_SERVER: &str = "https://localhost:9000/acme/acme/directory";
 const DEFAULT_EMAIL: &str = "admin@example.com";
@@ -117,6 +122,22 @@ pub(crate) fn default_audit_store_reserve_bytes() -> u64 {
 
 pub(crate) fn default_audit_store_low_water_bytes() -> u64 {
     DEFAULT_AUDIT_STORE_LOW_WATER_BYTES
+}
+
+pub(crate) fn default_rate_limit_admission_burst() -> u32 {
+    DEFAULT_RATE_LIMIT_ADMISSION_BURST
+}
+
+pub(crate) fn default_rate_limit_admission_refill_interval_ms() -> u32 {
+    DEFAULT_RATE_LIMIT_ADMISSION_REFILL_INTERVAL_MS
+}
+
+pub(crate) fn default_rate_limit_predecision_refusal_burst() -> u32 {
+    DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_BURST
+}
+
+pub(crate) fn default_rate_limit_predecision_refusal_refill_interval_ms() -> u32 {
+    DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_REFILL_INTERVAL_MS
 }
 
 pub(crate) fn default_audit_max_file_bytes() -> u64 {

@@ -72,7 +72,7 @@ impl fmt::Display for RequestId {
 /// an identity from it — the derived `registration_id` and the SAN come
 /// from the request's parts and the rendered config alone. It exists so
 /// an outcome says who asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallerIdentity(String);
 
 impl CallerIdentity {
@@ -453,6 +453,36 @@ pub(crate) enum VerbError {
         /// The store's own typed failure.
         #[source]
         source: AuditStoreError,
+    },
+
+    /// The invocation was **throttled**: its `admission` bucket held no
+    /// token, so the verb was not attempted at all.
+    ///
+    /// Its own variant rather than a boolean on an existing one, and
+    /// deliberately distinguishable from every permanent unavailability
+    /// variant above, whose reasons all mean *until an operator acts*.
+    /// This one clears on its own after
+    /// [`VerbError::Throttled::retry_after`], which is what the wire's
+    /// `RegistrarBusy` identifier promises a caller.
+    ///
+    /// It is produced at the **admission** check point and nowhere else.
+    /// Limiting suppresses the *record*, never the *answer*: an
+    /// invocation limited on the pre-decision path returns exactly the
+    /// refusal, identifier and class it would have returned unlimited,
+    /// because none of the pure checks' refusals clear on their own and
+    /// promising a caller that a reserved `service_name` or a malformed
+    /// label will start working would feed the very traffic the limiter
+    /// was added to damp. At admission the daemon has determined
+    /// nothing, so a throttle adds an answer rather than replacing one.
+    #[error("the registrar is rate-limiting this caller; retry in {retry_after}s")]
+    Throttled {
+        /// Whole seconds until the charged `admission` bucket holds one
+        /// token, floored at `1`. A duration, never an absolute
+        /// timestamp, so it does not depend on the caller's clock
+        /// agreeing with the daemon's. It is deterministic, so a caller
+        /// with several outstanding requests should jitter its own
+        /// retries.
+        retry_after: u64,
     },
 
     /// A fail-closed failure: `OpenBao` was unreachable or answered

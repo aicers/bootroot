@@ -61,6 +61,7 @@ use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
+use crate::registrar::verbs::limiter::{VerbRateLimiter, VerbRateLimiterSettings};
 use crate::registrar::verbs::outcome::CallerIdentity;
 use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 use crate::registrar::verbs::{
@@ -884,6 +885,7 @@ fn verb_handler(server: &MockServer) -> (TempDir, Arc<dyn RegistrarRequestHandle
         secret_id_ttl: "24h".to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
         audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        limiter: VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0,
     });
     (dir, Arc::new(VerbHandler { verbs }))
 }

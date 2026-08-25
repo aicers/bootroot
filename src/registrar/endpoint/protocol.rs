@@ -494,13 +494,15 @@ fn validate_refusal_class(
 // Each internal variant has its own arm so additions cannot silently inherit
 // the unclassified wire form, even where two current arms return the same form.
 //
-// One wire form is still assigned to a refusal no internal variant produces
-// yet, and the change that introduces it adds its own arm here rather than
-// reaching this mapping through a wildcard: the registrar's own rate-limit
-// refusal maps to retryable `RegistrarBusy { retry_after }`, in whole
-// seconds. No internal variant is added for it here: an arm without a
-// variant to match would be unreachable, and a variant without a producer
-// would be dead.
+// The registrar's own rate-limit refusal is the row the reference records as
+// the future assignment: `VerbError::Throttled` maps to retryable
+// `RegistrarBusy { retry_after }`, in whole seconds, carrying the value the
+// limiter's admission bucket produced. The variant and this arm landed
+// together, because neither builds without the other — the mapping is
+// exhaustive and wildcard-free, so an arm ahead of the variant would be
+// unreachable and a variant ahead of the arm would not compile. It routes to
+// an identifier, class and fixture that already existed and introduces none
+// of its own.
 //
 // Both `AuditUnwritable` phases map onto the one transcribed
 // `AuditUnwritable` reason. The reference's §6.5 row transcribes the
@@ -644,6 +646,12 @@ fn map_refusal(error: &VerbError) -> (RefusalClass, Option<EnrollError>) {
             RefusalClass::Permanent,
             Some(EnrollError::RegistrarUnavailable {
                 reason: RegistrarUnavailableReason::PostMintUnrecordable,
+            }),
+        ),
+        VerbError::Throttled { retry_after } => (
+            RefusalClass::Retryable,
+            Some(EnrollError::RegistrarBusy {
+                retry_after: *retry_after,
             }),
         ),
         VerbError::Unavailable { .. } => (RefusalClass::Retryable, None),
@@ -1350,6 +1358,40 @@ mod tests {
             assert_eq!(decoded.class, RefusalClass::Retryable);
             assert_eq!(decoded.error, None);
             assert_eq!(decoded.registration_id, None);
+        }
+    }
+
+    /// The one refusal this family routes to `RegistrarBusy`. The
+    /// variant carries the whole-second duration the limiter's admission
+    /// bucket produced, and the arm changes nothing else: the identifier,
+    /// its payload spelling, its retryable class and its golden fixture
+    /// were all already here.
+    #[test]
+    fn a_throttled_refusal_encodes_as_a_retryable_registrar_busy() {
+        for retry_after in [1_u64, 30, 3_600] {
+            let refusal = VerbRefusal::new(
+                fixture_context(None, ProducingArm::PreDerivation),
+                VerbError::Throttled { retry_after },
+            );
+            let (class, error) = map_refusal(refusal.error());
+            assert_eq!(class, RefusalClass::Retryable);
+            assert_eq!(error, Some(EnrollError::RegistrarBusy { retry_after }));
+
+            let encoded = encode_refusal_response(&refusal, &RegistrarHealth::default())
+                .expect("a throttle encodes");
+            let decoded = decode_refusal_response(&encoded).expect("a throttle decodes");
+            assert_eq!(decoded.class, RefusalClass::Retryable);
+            assert_eq!(
+                decoded.error,
+                Some(EnrollError::RegistrarBusy { retry_after })
+            );
+            assert_eq!(decoded.registration_id, None);
+            assert!(
+                String::from_utf8(encoded)
+                    .expect("response is UTF-8 JSON")
+                    .contains("\"retry_after\""),
+                "the payload is spelled retry_after"
+            );
         }
     }
 

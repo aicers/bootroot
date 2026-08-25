@@ -415,14 +415,17 @@ fn appending_preserves_the_caller_supplied_timestamp() {
 /// failing to compile, and adding it here without adding a reason fails
 /// the distinctness assertion below.
 ///
-/// The two audit-failure variants — `VerbError::AuditUnwritable` and
-/// `VerbError::PostMintUnrecordable` — are deliberately **not** in this
-/// table and have no [`RefusalReason`]. They are produced by a failed
-/// record write, so the record that would carry one is the record whose
-/// write just failed, and `refusal_outcome` returns `None` for exactly
-/// them. That is covered by
-/// [`the_two_audit_failures_are_the_only_unrecordable_refusals`] rather
-/// than here.
+/// Three variants are deliberately **not** in this table and have no
+/// [`RefusalReason`]. `VerbError::AuditUnwritable` and
+/// `VerbError::PostMintUnrecordable` are produced by a failed record
+/// write, so the record that would carry one is the record whose write
+/// just failed. `VerbError::Throttled` is produced by the limiter
+/// *before* the intent write, on an invocation whose records are
+/// suppressed by construction, so it never reaches an outcome write at
+/// all. `refusal_outcome` returns `None` for exactly those three, which
+/// is covered by
+/// [`the_audit_failures_and_the_throttle_are_the_only_unrecordable_refusals`]
+/// rather than here.
 // One entry per source variant; the exhaustiveness is the point.
 #[allow(clippy::too_many_lines)]
 fn every_refusal() -> Vec<(VerbError, RefusalReason, &'static str)> {
@@ -667,16 +670,19 @@ fn every_source_refusal_maps_to_one_distinct_record_reason() {
     assert_eq!(sorted.len(), seen.len(), "every reason must be distinct");
 }
 
-/// The two audit-failure refusals can never reach the trail, and that
-/// is enforced by the return type rather than by prose.
+/// Three refusals can never reach the trail, and that is enforced by
+/// the return type rather than by prose.
 ///
-/// The record that would carry one of them is the record whose write
-/// just failed, so a call site that met a `Some` here would answer a
-/// failed write with a second write of the same kind. Both halves are
-/// asserted together: `None` for exactly these two, and `Some` for every
-/// other refusal the verb layer produces.
+/// For the two audit failures, the record that would carry one of them
+/// is the record whose write just failed, so a call site that met a
+/// `Some` here would answer a failed write with a second write of the
+/// same kind. `Throttled` is `None` for the opposite reason: the
+/// limiter produces it before the intent write, on an invocation whose
+/// records are suppressed by construction, so no outcome write is ever
+/// reached. Both halves are asserted together: `None` for exactly these
+/// three, and `Some` for every other refusal the verb layer produces.
 #[test]
-fn the_two_audit_failures_are_the_only_unrecordable_refusals() {
+fn the_audit_failures_and_the_throttle_are_the_only_unrecordable_refusals() {
     let unrecordable = [
         VerbError::AuditUnwritable {
             phase: AuditPhase::Intent,
@@ -698,6 +704,7 @@ fn the_two_audit_failures_are_the_only_unrecordable_refusals() {
                 source: std::io::Error::from(std::io::ErrorKind::StorageFull),
             },
         },
+        VerbError::Throttled { retry_after: 1 },
     ];
     for error in &unrecordable {
         assert!(
