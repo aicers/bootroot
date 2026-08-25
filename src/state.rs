@@ -395,6 +395,37 @@ mod tests {
         }
     }
 
+    /// `openbao_url`, `kv_mount` and `secrets_dir` are a contract
+    /// between this binary and `bootroot-agent`, whose
+    /// `RegistrarStateProjection` reads exactly these three member names
+    /// out of the file this type writes and knows nothing else about it.
+    /// Renaming one here without renaming it there would leave the
+    /// daemon reading an absent member and refusing to serve the
+    /// registrar endpoint, and nothing else in either crate would say
+    /// so.
+    #[test]
+    fn the_three_members_the_daemon_reads_keep_their_names() {
+        let state = StateFile {
+            openbao_url: "https://openbao.example:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: Some(PathBuf::from("/srv/secrets")),
+            ..StateFile::default()
+        };
+        let value = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(
+            value.get("openbao_url").and_then(serde_json::Value::as_str),
+            Some("https://openbao.example:8200")
+        );
+        assert_eq!(
+            value.get("kv_mount").and_then(serde_json::Value::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            value.get("secrets_dir").and_then(serde_json::Value::as_str),
+            Some("/srv/secrets")
+        );
+    }
+
     /// The save replaces the destination name rather than truncating
     /// the file behind it, so a reader holding the old path sees the
     /// whole previous version. A changed inode is what distinguishes

@@ -70,12 +70,17 @@ use super::{
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
+use crate::registrar::endpoint::production::ProductionHandler;
+use crate::registrar::endpoint::protocol;
 use crate::registrar::endpoint_pin::{
     EndpointVerifyRejection, REGISTRAR_ENDPOINT_ANCHORS_FILE, endpoint_server_verifier,
 };
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
-use crate::registrar::verbs::limiter::{VerbRateLimiter, VerbRateLimiterSettings};
+use crate::registrar::internal::InternalCredential;
+use crate::registrar::verbs::limiter::{
+    NoopLimitedInvocationSink, VerbRateLimiter, VerbRateLimiterSettings,
+};
 use crate::registrar::verbs::outcome::CallerIdentity;
 use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 use crate::registrar::verbs::{
@@ -919,6 +924,135 @@ fn verb_handler(server: &MockServer) -> (TempDir, Arc<dyn RegistrarRequestHandle
         limiter: VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0,
     });
     (dir, Arc::new(VerbHandler { verbs }))
+}
+
+// ---------------------------------------------------------------------
+// The production handler over real verbs
+// ---------------------------------------------------------------------
+
+/// The mount the production-handler harness resolves for its verbs and
+/// its anchor read. The daemon resolves it one level up and passes it
+/// down; nothing in this layer knows where it was recorded.
+const HARNESS_KV_MOUNT: &str = "secret";
+
+/// Builds the **production** handler over **real** verbs pointed at a
+/// `wiremock::MockServer`, with a real internal credential over the same
+/// server.
+///
+/// No trait double, no injection slot and no `#[cfg(test)]` branch in
+/// the production type: the seam is the handler's constructor taking
+/// built dependencies, which is production's own construction path.
+/// What differs from the daemon's build is only where the two clients
+/// come from — `RegistrarVerbs::new` and `InternalCredential::for_test`
+/// rather than the credential on disk.
+fn production_handler(
+    server: &MockServer,
+) -> (TempDir, AuditRecordStore, Arc<dyn RegistrarRequestHandler>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = RegistrarConfigFixture::new()
+        .write_to(dir.path())
+        .expect("write the rendered registrar config");
+    let config = RegistrarConfig::load(&path).expect("the fixture must load");
+    let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+    client.set_token("test-token".to_string());
+    let audit_store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+    let verbs = RegistrarVerbs::new(RegistrarVerbsConfig {
+        client,
+        kv_mount: HARNESS_KV_MOUNT.to_string(),
+        config,
+        secret_id_options: SecretIdOptions {
+            num_uses: Some(0),
+            ..Default::default()
+        },
+        token_ttl: "3600s".to_string(),
+        secret_id_ttl: "86400s".to_string(),
+        wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
+        audit_store: audit_store.clone(),
+        // The shipped sizing, publishing nothing: these tests drive a
+        // handful of requests, so the default burst never binds and
+        // what is under test is the socket path rather than the bound.
+        limiter: VerbRateLimiter::new(
+            VerbRateLimiterSettings::default(),
+            Arc::new(NoopLimitedInvocationSink),
+        ),
+    });
+
+    let secrets_dir = dir.path().join("secrets");
+    let fingerprint = write_harness_root(&secrets_dir);
+    let credential = InternalCredential::for_test(&server.uri(), &secrets_dir, &fingerprint)
+        .expect("the harness credential");
+
+    (
+        dir,
+        audit_store,
+        Arc::new(ProductionHandler::new(
+            verbs,
+            credential,
+            HARNESS_KV_MOUNT.to_string(),
+        )),
+    )
+}
+
+/// The audit trail one invocation wrote, which is where the caller
+/// identity the verbs were handed is observable.
+fn audit_trail(store: &AuditRecordStore) -> Vec<serde_json::Value> {
+    let path = store.active_path();
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => panic!("read {}: {err}", path.display()),
+    };
+    contents
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("every trail line parses"))
+        .collect()
+}
+
+/// Writes the one deployment-root certificate the credential re-reads
+/// before every acquisition, and returns its fingerprint.
+fn write_harness_root(secrets_dir: &Path) -> String {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    let key = KeyPair::generate().expect("generate the root key");
+    let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Bootroot Endpoint Test Root");
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let cert = params.self_signed(&key).expect("self-signed root");
+    let path = crate::registrar::internal::active_root_cert_path(secrets_dir);
+    std::fs::create_dir_all(path.parent().expect("the certs directory")).expect("mkdir certs");
+    std::fs::write(&path, cert.pem()).expect("write the root certificate");
+    crate::tls::sha256_hex(cert.der().as_ref())
+}
+
+/// Builds one register payload at the endpoint's v1 protocol.
+fn register_payload(service_name: &str, host: &str, idempotency_key: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "protocol_version": 1,
+        "service_name": service_name,
+        "delivery_mode": "RemoteBootstrap",
+        "host": host,
+        "spec": {
+            "component": service_name,
+            "service_name": service_name,
+            "reload": "any-form-at-all",
+        },
+        "wrap_ttl": 300,
+        "idempotency_key": idempotency_key,
+    }))
+    .expect("the payload encodes")
+}
+
+/// Builds one deregister payload at the endpoint's v1 protocol.
+fn deregister_payload(service_name: &str, host: &str, idempotency_key: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "protocol_version": 1,
+        "service_name": service_name,
+        "host": host,
+        "idempotency_key": idempotency_key,
+    }))
+    .expect("the payload encodes")
 }
 
 // ---------------------------------------------------------------------
@@ -1865,17 +1999,16 @@ impl Harness {
     /// are all the harness's. Nothing under test creates, unlinks or
     /// re-permissions a socket, and nothing under `adopt` reads a
     /// certificate file: the configuration arrives as a value.
-    fn bind(handler: Arc<dyn RegistrarRequestHandler>) -> anyhow::Result<Self> {
-        Self::bind_over(handler, Pki::new())
+    fn bind() -> anyhow::Result<Self> {
+        Self::bind_over(Pki::new())
     }
 
-    fn bind_over(handler: Arc<dyn RegistrarRequestHandler>, pki: Pki) -> anyhow::Result<Self> {
+    fn bind_over(pki: Pki) -> anyhow::Result<Self> {
         let (config, resolver) = pki.conforming();
-        Self::bind_with(handler, pki, config, resolver)
+        Self::bind_with(pki, config, resolver)
     }
 
     fn bind_with(
-        handler: Arc<dyn RegistrarRequestHandler>,
         pki: Pki,
         config: Arc<rustls::ServerConfig>,
         resolver: Arc<EndpointCertResolver>,
@@ -1890,7 +2023,6 @@ impl Harness {
         let endpoint = super::adopt(
             activation_descriptor(listener),
             current_effective_uid(),
-            handler,
             config,
             resolver,
             TEST_DOMAIN.to_string(),
@@ -1930,14 +2062,12 @@ impl Harness {
 fn adopt_for_test(
     contract: ActivationContract,
     effective_uid: u32,
-    handler: Arc<dyn RegistrarRequestHandler>,
 ) -> anyhow::Result<Arc<ActivatedEndpoint>> {
     let pki = Pki::new();
     let (config, resolver) = pki.conforming();
     super::adopt(
         contract,
         effective_uid,
-        handler,
         config,
         resolver,
         TEST_DOMAIN.to_string(),
@@ -1952,10 +2082,10 @@ struct RunningEndpoint {
 }
 
 impl RunningEndpoint {
-    fn start(endpoint: &Arc<ActivatedEndpoint>) -> Self {
+    fn start(endpoint: &Arc<ActivatedEndpoint>, handler: Arc<dyn RegistrarRequestHandler>) -> Self {
         let (shutdown, receiver) = watch::channel(false);
         let endpoint = Arc::clone(endpoint);
-        let handle = tokio::spawn(async move { serve::run(endpoint, receiver).await });
+        let handle = tokio::spawn(async move { serve::run(endpoint, handler, receiver).await });
         Self { shutdown, handle }
     }
 
@@ -2012,10 +2142,7 @@ where
 /// was retained.
 #[tokio::test]
 async fn the_adopted_descriptor_is_close_on_exec_before_it_is_served() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: Vec::new(),
-    }))
-    .expect("the harness listener must be adoptable");
+    let harness = Harness::bind().expect("the harness listener must be adoptable");
     let fd = std::os::fd::AsRawFd::as_raw_fd(harness.endpoint.listener());
     assert!(
         is_cloexec(fd).expect("F_GETFD"),
@@ -2035,10 +2162,7 @@ async fn the_adopted_descriptor_is_close_on_exec_before_it_is_served() {
 /// accept on the registrar socket.
 #[tokio::test]
 async fn a_hook_child_cannot_inherit_the_adopted_descriptor() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: Vec::new(),
-    }))
-    .expect("the harness listener must be adoptable");
+    let harness = Harness::bind().expect("the harness listener must be adoptable");
     let fd = std::os::fd::AsRawFd::as_raw_fd(harness.endpoint.listener());
 
     let status = tokio::process::Command::new("/bin/sh")
@@ -2078,14 +2202,8 @@ async fn adoption_rejects_a_socket_whose_mode_is_not_0700() {
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let contract = activation_descriptor(listener);
-    let error = adopt_for_test(
-        contract,
-        current_effective_uid(),
-        Arc::new(EchoHandler {
-            response: Vec::new(),
-        }),
-    )
-    .expect_err("a 0755 socket must be refused");
+    let error = adopt_for_test(contract, current_effective_uid())
+        .expect_err("a 0755 socket must be refused");
     assert!(
         error.to_string().contains("0755") || format!("{error:#}").contains("0755"),
         "the refusal must name the mode it found: {error:#}"
@@ -2105,14 +2223,8 @@ async fn adoption_rejects_a_socket_owned_by_another_account() {
     let contract = activation_descriptor(listener);
     // The socket belongs to this account, so claiming to be another one
     // is the same refusal a socket owned by somebody else produces.
-    let error = adopt_for_test(
-        contract,
-        current_effective_uid().wrapping_add(1),
-        Arc::new(EchoHandler {
-            response: Vec::new(),
-        }),
-    )
-    .expect_err("a socket owned by another account must be refused");
+    let error = adopt_for_test(contract, current_effective_uid().wrapping_add(1))
+        .expect_err("a socket owned by another account must be refused");
     assert!(
         format!("{error:#}").contains("owned by uid"),
         "the refusal must name the ownership mismatch: {error:#}"
@@ -2126,14 +2238,8 @@ async fn adoption_rejects_a_descriptor_that_is_not_a_listening_unix_stream() {
     let contract = ActivationContract::from_test_descriptor(
         std::os::unix::io::IntoRawFd::into_raw_fd(connected),
     );
-    let error = adopt_for_test(
-        contract,
-        current_effective_uid(),
-        Arc::new(EchoHandler {
-            response: Vec::new(),
-        }),
-    )
-    .expect_err("a connected socket must be refused");
+    let error = adopt_for_test(contract, current_effective_uid())
+        .expect_err("a connected socket must be refused");
     assert!(
         format!("{error:#}").contains("listening"),
         "the refusal must name the listening state: {error:#}"
@@ -2155,14 +2261,8 @@ async fn adoption_rejects_a_non_pathname_address() {
     )
     .expect("bind an abstract listener");
     let contract = activation_descriptor(listener);
-    let error = adopt_for_test(
-        contract,
-        current_effective_uid(),
-        Arc::new(EchoHandler {
-            response: Vec::new(),
-        }),
-    )
-    .expect_err("an abstract-namespace socket must be refused");
+    let error = adopt_for_test(contract, current_effective_uid())
+        .expect_err("an abstract-namespace socket must be refused");
     assert!(
         format!("{error:#}").contains("pathname"),
         "the refusal must say a pathname is required: {error:#}"
@@ -2171,11 +2271,13 @@ async fn adoption_rejects_a_non_pathname_address() {
 
 #[tokio::test]
 async fn one_connection_serves_exactly_one_request() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"one".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"one".to_vec(),
+        }),
+    );
 
     let mut stream = tls_connect(&harness.socket_path, harness.pki.registrar_client_config())
         .await
@@ -2202,19 +2304,29 @@ async fn one_connection_serves_exactly_one_request() {
 /// accepting on the very same socket inode.
 #[tokio::test]
 async fn the_listener_survives_a_reload_with_its_inode_unchanged() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
+    let harness = Harness::bind().expect("harness");
     let inode_before = harness.inode();
 
-    let first = RunningEndpoint::start(&harness.endpoint);
+    // Each invocation builds its own handler: the endpoint carries none,
+    // so a reload cannot be a handler swap under a live accept loop.
+    let first = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
     let observed = harness.round_trip(&frame_of(b"mint", b"")).await;
     assert!(!observed.is_empty(), "the first invocation must answer");
     first.stop().await;
 
-    // The reload: a new invocation over the retained listener.
-    let second = RunningEndpoint::start(&harness.endpoint);
+    // The reload: a new invocation over the retained listener, with a
+    // freshly built handler of its own.
+    let second = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"reloaded".to_vec(),
+        }),
+    );
     let observed = harness.round_trip(&frame_of(b"deregister", b"")).await;
     let body = decode_response(&observed);
     assert!(
@@ -2251,12 +2363,14 @@ const OVER_CAPACITY_ATTEMPTS: usize = 3 * MAX_CONCURRENT_CONNECTIONS;
 async fn the_endpoint_refuses_every_connection_over_capacity_without_accumulating() {
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));
-    let harness = Harness::bind(Arc::new(BlockingHandler {
-        entered: entered_tx,
-        release: Arc::clone(&release),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(BlockingHandler {
+            entered: entered_tx,
+            release: Arc::clone(&release),
+        }),
+    );
 
     // Fill every permit, and wait until each connection is inside the
     // handler so the permits are certainly held.
@@ -2317,11 +2431,13 @@ async fn the_endpoint_refuses_every_connection_over_capacity_without_accumulatin
 #[tokio::test(start_paused = true)]
 async fn a_connection_that_never_handshakes_is_dropped_at_the_handshake_timeout() {
     let (logs, _guard) = capture_logs();
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let started = Instant::now();
     let mut stream = UnixStream::connect(&harness.socket_path)
@@ -2360,11 +2476,13 @@ async fn a_connection_that_never_handshakes_is_dropped_at_the_handshake_timeout(
 #[tokio::test]
 async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion() {
     let (logs, _guard) = capture_logs();
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let mut stream = tls_connect(&harness.socket_path, harness.pki.registrar_client_config())
         .await
@@ -2391,11 +2509,13 @@ async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion
 /// reports success rather than being torn down under it.
 #[tokio::test]
 async fn shutdown_stops_accepting_and_joins_every_task() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
     let observed = harness.round_trip(&frame_of(b"mint", b"")).await;
     assert!(!observed.is_empty());
     running.stop().await;
@@ -2419,8 +2539,8 @@ async fn shutdown_stops_accepting_and_joins_every_task() {
 async fn both_operation_arms_reach_the_real_verbs_with_the_transport_identity() {
     let server = MockServer::start().await;
     let (_config_dir, handler) = verb_handler(&server);
-    let harness = Harness::bind(handler).expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
     let expected_caller = format!("registrar-client:{}", registrar_client_name());
 
     for operation in [b"mint".as_slice(), b"deregister".as_slice()] {
@@ -2462,8 +2582,8 @@ async fn both_operation_arms_reach_the_real_verbs_with_the_transport_identity() 
 async fn the_verb_handler_accepts_a_zero_length_payload() {
     let server = MockServer::start().await;
     let (_config_dir, handler) = verb_handler(&server);
-    let harness = Harness::bind(handler).expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
 
     let observed = harness.round_trip(&frame_of(b"mint", b"")).await;
     assert_eq!(decode_response(&observed), b"empty");
@@ -2477,8 +2597,8 @@ async fn the_verb_handler_accepts_a_zero_length_payload() {
 async fn a_payload_the_handler_rejects_closes_with_no_bytes() {
     let server = MockServer::start().await;
     let (_config_dir, handler) = verb_handler(&server);
-    let harness = Harness::bind(handler).expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
 
     let observed = harness
         .round_trip(&frame_of(b"mint", b"not-the-shape"))
@@ -2486,6 +2606,420 @@ async fn a_payload_the_handler_rejects_closes_with_no_bytes() {
     assert!(observed.is_empty(), "{observed:?}");
 
     running.stop().await;
+}
+
+// ---------------------------------------------------------------------
+// The production handler over the socket
+// ---------------------------------------------------------------------
+
+/// A deregistration driven over the real socket, through the real
+/// framing, the real production handler and the real codec, over real
+/// verbs pointed at a `wiremock` with nothing mounted — which is how a
+/// deployment with no such binding answers.
+#[tokio::test]
+async fn a_socket_carried_deregister_returns_a_framed_codec_response() {
+    let server = MockServer::start().await;
+    let (_dir, _audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(
+            b"deregister",
+            &deregister_payload("roxyd", "h1", "key-1"),
+        ))
+        .await;
+    let body = decode_response(&observed);
+    let response = protocol::decode_deregister_response(&body)
+        .expect("the response is the codec's own deregister shape");
+    assert_eq!(response.registration_id, "h1-roxyd");
+    assert_eq!(
+        response.outcome,
+        protocol::DeregisterWireOutcome::AlreadyAbsent
+    );
+    assert_eq!(
+        response.registrar_health,
+        protocol::RegistrarHealth::default()
+    );
+
+    running.stop().await;
+}
+
+/// A typed verb refusal is framed as a wire refusal carrying its
+/// identifier and its class, and the health container rides it. The
+/// refusal is produced by the verbs themselves — a pre-derivation arm
+/// needs no mounted response at all — never by substituting something
+/// else behind the handler.
+#[tokio::test]
+async fn a_verb_refusal_is_framed_as_a_wire_refusal_with_its_identifier_and_class() {
+    let server = MockServer::start().await;
+    let (_dir, _audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(
+            b"deregister",
+            &deregister_payload(UNCONFIGURED_COMPONENT, "h1", "key-1"),
+        ))
+        .await;
+    let body = decode_response(&observed);
+    let response = protocol::decode_refusal_response(&body)
+        .expect("the response is the codec's own refusal shape");
+    assert_eq!(
+        response.error,
+        Some(protocol::EnrollError::ServiceInstanceMismatch),
+        "the wire identifier is the one the codec maps this verb refusal onto"
+    );
+    assert_eq!(response.class, protocol::RefusalClass::Permanent);
+    assert!(
+        response.registration_id.is_none(),
+        "a pre-derivation refusal carries no registration_id"
+    );
+    assert_eq!(
+        response.registrar_health,
+        protocol::RegistrarHealth::default()
+    );
+
+    running.stop().await;
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock records requests")
+            .is_empty(),
+        "a pre-derivation refusal must reach OpenBao not at all"
+    );
+}
+
+/// The identity that reaches the verb layer is the one the transport
+/// supplied, and no payload member naming an identity influences it.
+/// Asserted on what the verbs carried into the audit trail — which
+/// records the caller unchanged — rather than on a recording double.
+#[tokio::test]
+async fn the_verb_sees_the_transport_identity_and_not_a_payload_field() {
+    let server = MockServer::start().await;
+    let (_dir, audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    // The payload names an identity of its own, which must reach
+    // nothing: the transport takes the caller from the presented client
+    // certificate and this seam passes that value through unchanged.
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&deregister_payload("roxyd", "h1", "key-1")).expect("json");
+    payload["caller"] = serde_json::json!("registrar-client:impostor.example.com");
+    let encoded = serde_json::to_vec(&payload).expect("re-encode");
+
+    let observed = harness.round_trip(&frame_of(b"deregister", &encoded)).await;
+    let body = decode_response(&observed);
+    let response =
+        protocol::decode_deregister_response(&body).expect("a framed deregister response");
+    running.stop().await;
+
+    let expected = caller_identity(&registrar_client_name());
+    let lines: Vec<serde_json::Value> = audit_trail(&audit)
+        .into_iter()
+        .filter(|line| line["request_id"] == serde_json::json!(response.request_id))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one invocation owes an intent and an outcome"
+    );
+    for line in &lines {
+        assert_eq!(
+            line["caller_identity"],
+            serde_json::json!(expected.as_str()),
+            "the verb must see the transport identity verbatim: {line}"
+        );
+    }
+}
+
+/// Two requests differing only in `idempotency_key` produce identical
+/// verb inputs: the same entry point, the same arguments and the same
+/// recorded request, differing in nothing but the per-invocation request
+/// id the verb layer generates.
+#[tokio::test]
+async fn the_idempotency_key_reaches_nothing_downstream() {
+    let server = MockServer::start().await;
+    let (_dir, audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let mut responses = Vec::new();
+    for key in ["key-one", "a-completely-different-key"] {
+        let observed = harness
+            .round_trip(&frame_of(
+                b"deregister",
+                &deregister_payload("roxyd", "h1", key),
+            ))
+            .await;
+        let body = decode_response(&observed);
+        responses.push(
+            protocol::decode_deregister_response(&body).expect("a framed deregister response"),
+        );
+    }
+    running.stop().await;
+
+    let (first, second) = (&responses[0], &responses[1]);
+    assert_eq!(first.registration_id, second.registration_id);
+    assert_eq!(first.outcome, second.outcome);
+    assert_ne!(
+        first.request_id, second.request_id,
+        "the request id is per invocation and is not the idempotency key"
+    );
+
+    // The intent line is what the verb was handed. Blanking the one
+    // per-invocation member leaves two records that must be identical:
+    // the difference between the two requests survived in nothing the
+    // handler built.
+    let normalized: Vec<serde_json::Value> = [first, second]
+        .iter()
+        .map(|response| {
+            let mut line = audit_trail(&audit)
+                .into_iter()
+                .find(|line| {
+                    line["request_id"] == serde_json::json!(response.request_id)
+                        && line["phase"] == serde_json::json!("intent")
+                })
+                .expect("every invocation writes an intent line");
+            line["request_id"] = serde_json::json!("");
+            line["ts"] = serde_json::json!("");
+            line
+        })
+        .collect();
+    assert_eq!(
+        normalized[0], normalized[1],
+        "two requests differing only in idempotency_key produce identical verb inputs"
+    );
+
+    let bodies: Vec<String> = server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !body.contains("key-one") && !body.contains("a-completely-different-key")),
+        "no idempotency key may reach OpenBao: {bodies:?}"
+    );
+}
+
+/// A payload the codec cannot decode is a [`HandlerRefusal`]: zero
+/// response bytes, the transport's own fixed line, a clean close, and no
+/// wire error identifier of any kind.
+#[tokio::test]
+async fn an_undecodable_payload_is_zero_bytes_and_the_fixed_transport_line() {
+    let cases: [(&str, Vec<u8>); 3] = [
+        (
+            "an absent protocol_version",
+            serde_json::to_vec(&serde_json::json!({
+                "service_name": "roxyd",
+                "host": "h1",
+                "idempotency_key": "key-1",
+            }))
+            .expect("json"),
+        ),
+        (
+            "a version this daemon does not implement",
+            serde_json::to_vec(&serde_json::json!({
+                "protocol_version": 2,
+                "service_name": "roxyd",
+                "host": "h1",
+                "idempotency_key": "key-1",
+            }))
+            .expect("json"),
+        ),
+        ("bytes that are not JSON at all", b"not-json".to_vec()),
+    ];
+
+    for (what, payload) in cases {
+        let (logs, _guard) = capture_logs();
+        let server = MockServer::start().await;
+        let (_dir, _audit, handler) = production_handler(&server);
+        let harness = Harness::bind().expect("harness");
+        let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+        let observed = harness.round_trip(&frame_of(b"deregister", &payload)).await;
+        assert!(observed.is_empty(), "{what} must write zero bytes");
+        running.stop().await;
+
+        let event = logs.refusal();
+        assert_eq!(event.field("reason"), "handler-rejected-payload");
+        assert!(
+            event.message.contains(HANDLER_REJECTED_PAYLOAD),
+            "{what} takes the transport's unchanged fixed line: {event:?}"
+        );
+    }
+}
+
+/// The mint path stops at the wire `spec`, because the grammar its two
+/// strings are spelled under is settled nowhere. What the caller sees is
+/// the ordinary undecodable-payload answer; what the handler logs is its
+/// own line saying which conversion failed, on its own side of the call.
+#[tokio::test]
+async fn a_mint_refuses_until_the_wire_spec_grammar_is_settled() {
+    let (logs, _guard) = capture_logs();
+    let server = MockServer::start().await;
+    let (_dir, _audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(
+            b"mint",
+            &register_payload("roxyd", "h1", "key-1"),
+        ))
+        .await;
+    assert!(observed.is_empty(), "a refused mint writes no bytes");
+    running.stop().await;
+
+    // The transport's line is the unchanged fixed one, and the
+    // handler's own line — which carries no connection id — is separate.
+    let transport = logs.refusal();
+    assert_eq!(transport.field("reason"), "handler-rejected-payload");
+    assert!(
+        transport.message.contains(HANDLER_REJECTED_PAYLOAD),
+        "the transport's line is byte-for-byte the fixed one: {transport:?}"
+    );
+    assert!(
+        !transport.message.contains("registrar-wire-contract.md"),
+        "nothing the handler knows reaches the transport's line: {transport:?}"
+    );
+    let handler_line = logs
+        .events()
+        .iter()
+        .find(|event| event.message.contains("could not convert the wire spec"))
+        .expect("the handler logs what it knows on its own side of the call")
+        .clone();
+    assert!(
+        handler_line.message.contains("registrar-wire-contract.md"),
+        "the handler's line must point at the settlement: {}",
+        handler_line.message
+    );
+    assert!(
+        handler_line.field("connection").is_empty(),
+        "no connection diagnostic id crosses the trait"
+    );
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock records requests")
+            .is_empty(),
+        "a mint refused before the verb creates nothing"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Signatures: what carries a handler, and what cannot be built without
+// one
+// ---------------------------------------------------------------------
+
+/// [`ActivatedEndpoint`] carries what has to outlive a `SIGHUP` and
+/// nothing else: the socket, its path, the daemon uid and the TLS
+/// material consumed once above the reload loop. A handler among them
+/// would be a value replaced under a live accept loop, which is the
+/// coupling this endpoint deliberately does not have.
+#[test]
+fn the_activated_endpoint_carries_no_handler() {
+    let source = include_str!("../endpoint.rs");
+    let declaration = source
+        .split("pub(crate) struct ActivatedEndpoint {")
+        .nth(1)
+        .expect("the struct is declared in this file")
+        .split('}')
+        .next()
+        .expect("the struct body ends");
+    let fields: Vec<&str> = declaration
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(','))
+        .collect();
+    assert!(
+        !fields.iter().any(|field| field.contains("handler")),
+        "the adopted endpoint holds no handler: {fields:?}"
+    );
+    assert_eq!(
+        fields,
+        vec![
+            "listener: UnixListener,",
+            "socket_path: PathBuf,",
+            "daemon_uid: u32,",
+            "acceptor: TlsAcceptor,",
+            "// The certificate resolver is retained for exactly one consumer,",
+            "resolver: Arc<EndpointCertResolver>,",
+            "domain: String,",
+        ],
+        "the adopted endpoint holds the socket, its path, the daemon uid and the TLS material — \
+         and no handler"
+    );
+    assert!(
+        !source.contains("fn production_handler"),
+        "the missing-handler refusal is gone, not relocated"
+    );
+    assert!(
+        !source.contains("handler: Arc<dyn RegistrarRequestHandler>"),
+        "no construction field and no `adopt` parameter carries a handler"
+    );
+}
+
+/// The accept task cannot be spawned without a handler, because
+/// [`serve::run`] takes one. That is a signature rather than a runtime
+/// invariant, so it needs no slot, no lock and no interior mutability.
+#[test]
+fn the_accept_task_cannot_be_spawned_without_a_handler() {
+    let source = include_str!("serve.rs");
+    let signature = source
+        .split("pub(crate) async fn run(")
+        .nth(1)
+        .expect("the accept loop is declared in this file")
+        .split(')')
+        .next()
+        .expect("the parameter list ends");
+    assert!(
+        signature.contains("handler: Arc<dyn RegistrarRequestHandler>"),
+        "the accept loop takes its handler as an argument: {signature}"
+    );
+    for forbidden in ["Mutex", "RwLock", "OnceCell", "RefCell", "OnceLock"] {
+        assert!(
+            !source.contains(forbidden),
+            "the transport grew no {forbidden} to hold a handler in"
+        );
+    }
+}
+
+/// The trait's whole contract is unchanged: [`HandlerRefusal`] is still
+/// a zero-data marker, `handle` still takes exactly the operation, the
+/// payload and the caller, and no connection diagnostic id crosses it.
+#[test]
+fn the_handler_seam_gained_nothing() {
+    // A unit struct: this line would not compile against a payload.
+    let refusal = HandlerRefusal;
+    assert_eq!(refusal, HandlerRefusal);
+
+    let source = include_str!("handler.rs");
+    let signature = source
+        .split("fn handle<'a>(")
+        .nth(1)
+        .expect("the trait method is declared in this file")
+        .split("-> Pin<")
+        .next()
+        .expect("the parameter list ends at the return type");
+    assert!(
+        !signature.contains("connection"),
+        "no connection diagnostic id crosses the trait: {signature}"
+    );
+    assert_eq!(
+        signature.matches(':').count(),
+        3,
+        "handle takes exactly the operation, the payload and the caller: {signature}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -2540,42 +3074,38 @@ fn a_disabled_endpoint_activates_to_nothing() {
     assert!(activated.is_none());
 }
 
-/// There is no production handler, so an enabled endpoint refuses to
-/// start — and it refuses on the handler, before any activation
-/// variable is looked at, so the diagnostic is about the missing handler
-/// rather than about a descriptor that was never going to be used.
+/// The missing-handler refusal is gone. An enabled endpoint now goes
+/// straight to the certificate material, so what it fails on under
+/// settings that name none is the material — and nothing anywhere is
+/// about a handler.
 #[test]
-fn an_enabled_endpoint_without_a_handler_refuses_startup() {
-    let error =
-        super::activate(&endpoint_settings(true)).expect_err("there is no production handler");
+fn an_enabled_endpoint_no_longer_refuses_for_a_missing_handler() {
+    let error = super::activate(&endpoint_settings(true))
+        .expect_err("these settings name no server certificate material");
     let rendered = format!("{error:#}");
     assert!(
-        rendered.contains("no registrar request handler is registered"),
-        "the refusal must name the missing handler: {rendered}"
+        rendered.contains(SERVER_CERT_SETTING),
+        "the refusal must be the certificate material's: {rendered}"
     );
     assert!(
-        rendered.contains("unsupported"),
-        "the refusal must say enabling the endpoint is unsupported: {rendered}"
+        !rendered.contains("handler"),
+        "no refusal mentions a handler any more: {rendered}"
     );
     assert!(
-        !rendered.contains("LISTEN_PID") && !rendered.contains("LISTEN_FDS"),
-        "the handler check must come before the activation contract: {rendered}"
-    );
-    assert!(
-        !rendered.contains(SERVER_CERT_SETTING) && !rendered.contains(SERVER_KEY_SETTING),
-        "the handler check must come before the certificate material, so an endpoint that \
-         cannot serve is not diagnosed as a certificate problem: {rendered}"
+        !rendered.contains("unsupported"),
+        "enabling the endpoint is no longer unsupported: {rendered}"
     );
 }
 
-/// The two halves an unprivileged start produces: the consequence-focused
-/// warning first, then the refusal for the missing handler.
+/// The unprivileged-daemon warning still comes before every other
+/// endpoint check, so an operator sees *why* the verbs would fail even
+/// when the startup then stops for a different reason.
 #[test]
-fn a_non_root_enabled_start_warns_and_then_refuses() {
+fn a_non_root_enabled_start_warns_before_the_certificate_material_is_read() {
     let (logs, _guard) = capture_logs();
-    let error =
-        super::activate(&endpoint_settings(true)).expect_err("there is no production handler");
-    assert!(format!("{error:#}").contains("no registrar request handler is registered"));
+    let error = super::activate(&endpoint_settings(true))
+        .expect_err("these settings name no server certificate material");
+    assert!(format!("{error:#}").contains(SERVER_CERT_SETTING));
 
     let warned = logs
         .events()
@@ -2630,11 +3160,13 @@ fn handshake_reason(logs: &CapturedLogs) -> String {
 #[tokio::test]
 async fn a_caller_presenting_no_client_certificate_fails_the_handshake() {
     let (logs, _guard) = capture_logs();
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let outcome = tls_exchange(
         &harness.socket_path,
@@ -2656,11 +3188,13 @@ async fn a_caller_presenting_no_client_certificate_fails_the_handshake() {
 #[tokio::test]
 async fn a_client_leaf_from_a_foreign_ca_fails_the_handshake() {
     let (logs, _guard) = capture_logs();
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let foreign = valid_ca();
     let material = client_material_from(&foreign, vec![dns_san(&registrar_client_name())]);
@@ -2688,14 +3222,13 @@ async fn a_client_leaf_from_an_unpinned_bundle_ca_fails_the_handshake() {
     let unpinned = valid_ca();
     let mut pki = Pki::new();
     pki.add_unpinned(&unpinned);
-    let harness = Harness::bind_over(
+    let harness = Harness::bind_over(pki).expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
         Arc::new(EchoHandler {
             response: b"served".to_vec(),
         }),
-        pki,
-    )
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    );
 
     let material = client_material_from(&unpinned, vec![dns_san(&registrar_client_name())]);
     let outcome = tls_exchange(
@@ -2758,11 +3291,13 @@ async fn a_verified_leaf_that_is_not_the_registrar_client_is_refused() {
         ),
     ] {
         let (logs, _guard) = capture_logs();
-        let harness = Harness::bind(Arc::new(EchoHandler {
-            response: b"served".to_vec(),
-        }))
-        .expect("harness");
-        let running = RunningEndpoint::start(&harness.endpoint);
+        let harness = Harness::bind().expect("harness");
+        let running = RunningEndpoint::start(
+            &harness.endpoint,
+            Arc::new(EchoHandler {
+                response: b"served".to_vec(),
+            }),
+        );
 
         let material = client_material_from(&harness.pki.ca, sans);
         let mut stream = tls_connect(
@@ -2808,9 +3343,6 @@ async fn a_mismatched_peer_is_refused_even_with_the_registrar_certificate() {
     let endpoint = super::adopt(
         activation_descriptor(listener),
         current_effective_uid(),
-        Arc::new(EchoHandler {
-            response: b"served".to_vec(),
-        }),
         config,
         resolver,
         TEST_DOMAIN.to_string(),
@@ -2824,7 +3356,12 @@ async fn a_mismatched_peer_is_refused_even_with_the_registrar_certificate() {
     let mut endpoint = Arc::into_inner(endpoint).expect("the adopted endpoint is solely owned");
     endpoint.daemon_uid = current_effective_uid().wrapping_add(1);
     let endpoint = Arc::new(endpoint);
-    let running = RunningEndpoint::start(&endpoint);
+    let running = RunningEndpoint::start(
+        &endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let outcome = tls_connect(&socket_path, pki.registrar_client_config()).await;
     assert!(
@@ -2848,11 +3385,13 @@ async fn a_mismatched_peer_is_refused_even_with_the_registrar_certificate() {
 #[tokio::test]
 async fn the_pre_verb_refusal_shape_survives_the_tls_wrap() {
     let (logs, _guard) = capture_logs();
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let mut stream = tls_connect(&harness.socket_path, harness.pki.registrar_client_config())
         .await
@@ -2888,8 +3427,8 @@ async fn the_pre_verb_refusal_shape_survives_the_tls_wrap() {
 async fn a_pinned_caller_is_served_and_an_unpinned_one_refuses_before_a_request() {
     let server = MockServer::start().await;
     let (_config_dir, handler) = verb_handler(&server);
-    let harness = Harness::bind(handler).expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
 
     for operation in [b"mint".as_slice(), b"deregister".as_slice()] {
         let payload = format!("{UNCONFIGURED_COMPONENT}|{TEST_HOST}|");
@@ -2932,11 +3471,13 @@ async fn a_pinned_caller_is_served_and_an_unpinned_one_refuses_before_a_request(
 /// with no restart in between.
 #[tokio::test]
 async fn swapping_the_resolver_through_the_activated_endpoint_changes_the_presented_chain() {
-    let harness = Harness::bind(Arc::new(EchoHandler {
-        response: b"served".to_vec(),
-    }))
-    .expect("harness");
-    let running = RunningEndpoint::start(&harness.endpoint);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
 
     let first = harness.round_trip(&frame_of(b"mint", b"")).await;
     assert!(!first.is_empty(), "the original leaf must serve: {first:?}");

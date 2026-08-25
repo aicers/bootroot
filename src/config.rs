@@ -140,6 +140,37 @@ pub struct RegistrarSettings {
     /// Milliseconds per token accrued into a registrar
     /// `predecision_refusal` bucket.
     pub rate_limit_predecision_refusal_refill_interval_ms: u32,
+    /// Absolute path to the provisioning tool's rendered registrar
+    /// config. Only read; nothing in this repository writes it.
+    pub provisioning_config_path: PathBuf,
+    /// Ceiling a requested `wrap_ttl` is granted under. Held to the
+    /// same rules a request is, by `WrapTtlPolicy::new`.
+    pub max_wrap_ttl: Duration,
+    /// Role-level `token_ttl` the minted `AppRole` carries.
+    pub role_token_ttl: Duration,
+    /// Role-level `secret_id_ttl` the minted `AppRole` carries.
+    pub role_secret_id_ttl: Duration,
+    /// Uses one issued `secret_id` is good for. `0` is unlimited
+    /// within the TTL, which is what an enrolled host needs: it logs in
+    /// again on every renewal and every fast-poll cycle.
+    pub secret_id_num_uses: u32,
+    /// Per-issuance `secret_id` TTL. Absent leaves the role-level
+    /// [`RegistrarSettings::role_secret_id_ttl`] governing.
+    pub secret_id_ttl: Option<Duration>,
+    /// Per-issuance `token_bound_cidrs`. Absent binds the issued
+    /// credential to no CIDR.
+    pub secret_id_token_bound_cidrs: Option<Vec<String>>,
+    /// Absolute path to the deployment's `state.json`, where `bootroot
+    /// init` recorded the `OpenBao` URL, the KV mount and the secrets
+    /// directory.
+    ///
+    /// It has no default: no absolute path is a defensible guess at
+    /// where a deployment keeps its state, and a host that serves no
+    /// verbs must not be made to name one. Required exactly when
+    /// `[registrar_endpoint] enabled` is true, which the settings-level
+    /// validation enforces because it is the one level that sees both
+    /// tables.
+    pub state_file: Option<PathBuf>,
 }
 
 /// A `[registrar]` rate-limit value: an unsigned integer, and nothing a
@@ -249,6 +280,25 @@ struct RawRegistrarSettings {
     rate_limit_predecision_refusal_burst: RateLimitValue,
     #[serde(default = "default_rate_limit_predecision_refusal_refill_interval_ms")]
     rate_limit_predecision_refusal_refill_interval_ms: RateLimitValue,
+    #[serde(default = "defaults::default_provisioning_config_path")]
+    provisioning_config_path: PathBuf,
+    #[serde(default = "defaults::default_max_wrap_ttl", with = "duration_serde")]
+    max_wrap_ttl: Duration,
+    #[serde(default = "defaults::default_role_token_ttl", with = "duration_serde")]
+    role_token_ttl: Duration,
+    #[serde(
+        default = "defaults::default_role_secret_id_ttl",
+        with = "duration_serde"
+    )]
+    role_secret_id_ttl: Duration,
+    #[serde(default = "defaults::default_secret_id_num_uses")]
+    secret_id_num_uses: u32,
+    #[serde(default, with = "optional_duration_serde")]
+    secret_id_ttl: Option<Duration>,
+    #[serde(default)]
+    secret_id_token_bound_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    state_file: Option<PathBuf>,
 }
 
 impl From<RawRegistrarSettings> for RegistrarSettings {
@@ -266,6 +316,14 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             rate_limit_admission_refill_interval_ms,
             rate_limit_predecision_refusal_burst,
             rate_limit_predecision_refusal_refill_interval_ms,
+            provisioning_config_path,
+            max_wrap_ttl,
+            role_token_ttl,
+            role_secret_id_ttl,
+            secret_id_num_uses,
+            secret_id_ttl,
+            secret_id_token_bound_cidrs,
+            state_file,
         } = raw;
         let audit_record_dir =
             audit_record_dir.unwrap_or_else(|| defaults::audit_record_dir_for(&audit_store_dir));
@@ -283,6 +341,14 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             rate_limit_predecision_refusal_burst: rate_limit_predecision_refusal_burst.0,
             rate_limit_predecision_refusal_refill_interval_ms:
                 rate_limit_predecision_refusal_refill_interval_ms.0,
+            provisioning_config_path,
+            max_wrap_ttl,
+            role_token_ttl,
+            role_secret_id_ttl,
+            secret_id_num_uses,
+            secret_id_ttl,
+            secret_id_token_bound_cidrs,
+            state_file,
         }
     }
 }
@@ -318,6 +384,14 @@ impl Default for RegistrarSettings {
                 defaults::default_rate_limit_predecision_refusal_burst(),
             rate_limit_predecision_refusal_refill_interval_ms:
                 defaults::default_rate_limit_predecision_refusal_refill_interval_ms(),
+            provisioning_config_path: defaults::default_provisioning_config_path(),
+            max_wrap_ttl: defaults::default_max_wrap_ttl(),
+            role_token_ttl: defaults::default_role_token_ttl(),
+            role_secret_id_ttl: defaults::default_role_secret_id_ttl(),
+            secret_id_num_uses: defaults::default_secret_id_num_uses(),
+            secret_id_ttl: None,
+            secret_id_token_bound_cidrs: None,
+            state_file: None,
         }
     }
 }
@@ -639,6 +713,30 @@ mod duration_serde {
     }
 }
 
+/// The [`duration_serde`] spelling for a key that may be absent.
+///
+/// An absent key stays `None`; a present one is the same humantime
+/// string every other duration key takes, never a bare integer and never
+/// `OpenBao`'s own spelling. It exists because `serde`'s `with` cannot
+/// lift a `Duration` deserializer through `Option` on its own.
+mod optional_duration_serde {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let Some(value) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        humantime::parse_duration(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl Settings {
     /// Creates a new `Settings` instance.
     ///
@@ -849,6 +947,150 @@ mod tests {
         assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
         assert!(profile.hooks.post_renew.failure.is_empty());
+    }
+
+    /// Every `[registrar]` key but `state_file` carries a default, and
+    /// the two ways of reaching it — `#[serde(default = ...)]` on the raw
+    /// shape and the hand-written `Default` impl — must agree, or a table
+    /// that is absent and a table that is empty would load differently.
+    #[test]
+    fn the_registrar_defaults_agree_between_serde_and_the_default_impl() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\n").unwrap();
+        file.flush().unwrap();
+
+        let with_empty_table = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(with_empty_table.registrar, RegistrarSettings::default());
+    }
+
+    /// An absent `[registrar]` table leaves every key at its documented
+    /// default, `state_file` included — which has none and stays `None`.
+    #[test]
+    fn an_absent_registrar_table_leaves_every_key_at_its_default() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+
+        let registrar = &settings.registrar;
+        assert_eq!(
+            registrar.provisioning_config_path,
+            PathBuf::from("/etc/clumit-security/provisioning.toml")
+        );
+        assert_eq!(registrar.max_wrap_ttl, Duration::from_mins(30));
+        assert_eq!(registrar.role_token_ttl, Duration::from_hours(1));
+        assert_eq!(registrar.role_secret_id_ttl, Duration::from_hours(24));
+        assert_eq!(registrar.secret_id_num_uses, 0);
+        assert!(registrar.secret_id_ttl.is_none());
+        assert!(registrar.secret_id_token_bound_cidrs.is_none());
+        assert!(
+            registrar.state_file.is_none(),
+            "state_file has no default, so an absent key stays absent"
+        );
+        settings
+            .validate()
+            .expect("a disabled endpoint with no state_file loads cleanly");
+    }
+
+    /// Every key is read at the spelling the documented table fixes:
+    /// humantime duration strings, never bare integers and never
+    /// `OpenBao`'s own spelling.
+    #[test]
+    fn every_registrar_key_is_read_at_its_documented_spelling() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+            [registrar]
+            provisioning_config_path = "/etc/clumit-security/other.toml"
+            max_wrap_ttl = "45m"
+            role_token_ttl = "2h"
+            role_secret_id_ttl = "36h"
+            secret_id_num_uses = 7
+            secret_id_ttl = "90m"
+            secret_id_token_bound_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]
+            state_file = "/var/lib/bootroot/state.json"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        let registrar = &settings.registrar;
+        assert_eq!(
+            registrar.provisioning_config_path,
+            PathBuf::from("/etc/clumit-security/other.toml")
+        );
+        assert_eq!(registrar.max_wrap_ttl, Duration::from_mins(45));
+        assert_eq!(registrar.role_token_ttl, Duration::from_hours(2));
+        assert_eq!(registrar.role_secret_id_ttl, Duration::from_hours(36));
+        assert_eq!(registrar.secret_id_num_uses, 7);
+        assert_eq!(registrar.secret_id_ttl, Some(Duration::from_mins(90)));
+        assert_eq!(
+            registrar.secret_id_token_bound_cidrs.as_deref(),
+            Some(["10.0.0.0/8".to_string(), "192.168.1.0/24".to_string()].as_slice())
+        );
+        assert_eq!(
+            registrar.state_file,
+            Some(PathBuf::from("/var/lib/bootroot/state.json"))
+        );
+    }
+
+    /// A duration key is a humantime string, never a bare integer of
+    /// seconds — which is how `OpenBao` itself would take it, and is
+    /// exactly the spelling a reader would then have to guess the unit
+    /// of.
+    ///
+    /// Both keys, because they are two deserializers rather than one:
+    /// `serde`'s `with` cannot lift a `Duration` deserializer through
+    /// `Option`, so the optional key goes through
+    /// [`optional_duration_serde`] and would not be covered by a case
+    /// over `max_wrap_ttl` alone.
+    #[test]
+    fn a_registrar_duration_is_never_a_bare_integer_of_seconds() {
+        for key in ["max_wrap_ttl", "secret_id_ttl"] {
+            for value in ["1800", "\"1800\"", "\"half an hour\"", "true"] {
+                let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+                write_minimal_profile_config(&mut file);
+                writeln!(file, "\n[registrar]\n{key} = {value}\n").unwrap();
+                file.flush().unwrap();
+                assert!(
+                    Settings::from_file(Some(file.path().to_path_buf())).is_err(),
+                    "{key} = {value} must not deserialize"
+                );
+            }
+        }
+    }
+
+    /// `[registrar]` already carries `deny_unknown_fields`, so this
+    /// asserts the mechanism rather than adding one.
+    #[test]
+    fn an_unknown_registrar_key_is_rejected() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\nwrap_ttl_maximum = \"30m\"\n").unwrap();
+        file.flush().unwrap();
+
+        let error = Settings::from_file(Some(file.path().to_path_buf()))
+            .expect_err("an unknown [registrar] key is a configuration error");
+        assert!(
+            format!("{error}").contains("wrap_ttl_maximum"),
+            "the error must name the key it did not know: {error}"
+        );
+    }
+
+    /// No configuration key can set `SecretIdOptions::metadata`.
+    #[test]
+    fn no_registrar_key_sets_secret_id_metadata() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(file, "\n[registrar]\nsecret_id_metadata = \"who=me\"\n").unwrap();
+        file.flush().unwrap();
+        assert!(
+            Settings::from_file(Some(file.path().to_path_buf())).is_err(),
+            "metadata is fixed to None and has no key"
+        );
     }
 
     #[test]

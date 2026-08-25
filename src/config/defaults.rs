@@ -37,6 +37,35 @@ const DEFAULT_AUDIT_STORE_DIR: &str = "/var/lib/bootroot/audit-store";
 const AUDIT_RECORDS_SUBDIR: &str = "records";
 const DEFAULT_AUDIT_STORE_RESERVE_BYTES: u64 = 2_147_483_648;
 const DEFAULT_AUDIT_STORE_LOW_WATER_BYTES: u64 = 536_870_912;
+/// Ceiling the registrar grants a requested `wrap_ttl` under.
+///
+/// The same 30 minutes the rest of bootroot already wraps a `secret_id`
+/// for — `DEFAULT_SECRET_ID_WRAP_TTL` in `src/commands/constants.rs`.
+/// That constant is in the binary crate and this one is in the library,
+/// so the value is restated here rather than imported across the crate
+/// boundary. A test in that crate, over `RegistrarSettings::default()`,
+/// fails if the two ever disagree.
+const DEFAULT_REGISTRAR_MAX_WRAP_TTL_SECS: u64 = 30 * 60;
+/// Role-level `token_ttl` the registrar creates its `AppRole`s with.
+///
+/// The same hour `openbao_constants::TOKEN_TTL`
+/// (`src/commands/init/constants.rs`) issues under, restated for the
+/// same crate-boundary reason as the wrap TTL above.
+const DEFAULT_REGISTRAR_ROLE_TOKEN_TTL_SECS: u64 = 60 * 60;
+/// Role-level `secret_id_ttl` the registrar creates its `AppRole`s with.
+///
+/// The same day `openbao_constants::SECRET_ID_TTL`
+/// (`src/commands/init/constants.rs`) issues under, restated for the
+/// same crate-boundary reason as the wrap TTL above.
+const DEFAULT_REGISTRAR_ROLE_SECRET_ID_TTL_SECS: u64 = 24 * 60 * 60;
+/// Uses a registrar-minted `secret_id` is good for.
+///
+/// Zero means unlimited within the TTL, which is what
+/// `build_secret_id_options` (`src/commands/service.rs`) already sets
+/// for a service `AppRole`: the enrolled host re-authenticates by
+/// `AppRole` login on every renewal and every fast-poll cycle, so a
+/// single-use credential would work once and then strand the service.
+const DEFAULT_REGISTRAR_SECRET_ID_NUM_USES: u32 = 0;
 
 pub(crate) fn apply_defaults(
     builder: ConfigBuilder<DefaultState>,
@@ -150,4 +179,24 @@ pub(crate) fn default_audit_max_retained_files() -> u32 {
 
 pub(crate) fn default_audit_min_retain_days() -> u32 {
     DEFAULT_AUDIT_MIN_RETAIN_DAYS
+}
+
+pub(crate) fn default_provisioning_config_path() -> PathBuf {
+    PathBuf::from(crate::registrar::config::DEFAULT_CONFIG_PATH)
+}
+
+pub(crate) fn default_max_wrap_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_REGISTRAR_MAX_WRAP_TTL_SECS)
+}
+
+pub(crate) fn default_role_token_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_REGISTRAR_ROLE_TOKEN_TTL_SECS)
+}
+
+pub(crate) fn default_role_secret_id_ttl() -> Duration {
+    Duration::from_secs(DEFAULT_REGISTRAR_ROLE_SECRET_ID_TTL_SECS)
+}
+
+pub(crate) fn default_secret_id_num_uses() -> u32 {
+    DEFAULT_REGISTRAR_SECRET_ID_NUM_USES
 }

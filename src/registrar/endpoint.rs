@@ -29,8 +29,9 @@
 //!   response bytes and a clean close.
 //! - [`handler`] is the seam this module stops at. The endpoint owns the
 //!   transport; [`protocol`] owns the payload schema, its codec and the
-//!   mapping of verb outcomes onto caller-visible responses. Supplying the
-//!   production [`handler::RegistrarRequestHandler`] remains separate work.
+//!   mapping of verb outcomes onto caller-visible responses, and
+//!   [`production`] is the implementation that joins the two to the verb
+//!   layer.
 //! - [`tls`] is the mutually-authenticated transport the connection is
 //!   wrapped in: the server material the endpoint presents, the
 //!   verifier every client certificate is built against, and the
@@ -73,15 +74,20 @@
 //!
 //! # Production wiring
 //!
-//! There is no production handler yet, so an enabled endpoint refuses
-//! startup ([`production_handler`]). That is deliberate: a listener that
-//! accepted requests and had nowhere to send them would be a worse
-//! answer than a daemon that will not start.
+//! The handler is **not** part of the activated endpoint. Activation
+//! consumes the socket-activation contract once, above the `SIGHUP`
+//! loop; the handler is built per invocation from that invocation's
+//! settings and handed to [`serve::run`] as an argument. The accept task
+//! therefore cannot be spawned without one, which is a signature rather
+//! than a runtime invariant — no slot, no lock and no interior
+//! mutability. A reload rebuilds the handler from the reloaded settings
+//! while the socket inode stays exactly as it was.
 
 pub(crate) mod activation;
 pub(crate) mod frame;
 pub(crate) mod handler;
 pub(crate) mod policy;
+pub(crate) mod production;
 pub(crate) mod protocol;
 pub(crate) mod refusal;
 pub(crate) mod serve;
@@ -101,7 +107,6 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use self::activation::{ActivationContract, ActivationValues};
-use self::handler::RegistrarRequestHandler;
 use self::tls::EndpointCertResolver;
 use crate::config::Settings;
 
@@ -161,11 +166,15 @@ pub(crate) const REQUIRED_SOCKET_MODE: u32 = 0o700;
 /// daemon invocation, so a reload resumes accepting on the same socket
 /// inode rather than re-consuming an activation contract that has
 /// already been consumed.
+///
+/// It carries no handler. What answers a request is built per
+/// invocation, from that invocation's settings, and reaches the accept
+/// loop as an argument to [`serve::run`] — so the three things here are
+/// exactly the three that have to outlive a reload.
 pub(crate) struct ActivatedEndpoint {
     listener: UnixListener,
     socket_path: PathBuf,
     daemon_uid: u32,
-    handler: Arc<dyn RegistrarRequestHandler>,
     acceptor: TlsAcceptor,
     // The certificate resolver is retained for exactly one consumer,
     // and that consumer — renewal for the endpoint leaf — is a sibling
@@ -191,11 +200,6 @@ impl ActivatedEndpoint {
     /// Returns the effective uid a peer must match to reach a handler.
     pub(crate) fn daemon_uid(&self) -> u32 {
         self.daemon_uid
-    }
-
-    /// Returns the injected request handler.
-    pub(crate) fn handler(&self) -> &Arc<dyn RegistrarRequestHandler> {
-        &self.handler
     }
 
     /// Returns the acceptor every accepted connection is handed to.
@@ -236,16 +240,6 @@ impl std::fmt::Debug for ActivatedEndpoint {
     }
 }
 
-/// The production request handler, of which there is none.
-///
-/// The versioned request and response payloads, their codec and the mapping
-/// of verb outcomes onto caller-visible responses live in [`protocol`]. A
-/// production handler that invokes the verbs remains pending, so an enabled
-/// endpoint refuses to start rather than accepting requests it cannot answer.
-fn production_handler() -> Option<Arc<dyn RegistrarRequestHandler>> {
-    None
-}
-
 /// Reports whether an enabled endpoint must warn that the privileged
 /// internal credential is out of reach.
 ///
@@ -275,18 +269,12 @@ pub(crate) const UNPRIVILEGED_DAEMON_WARNING: &str = concat!(
 /// 2. The unprivileged-daemon warning comes before every other endpoint
 ///    check, so an operator sees *why* the verbs will fail even when the
 ///    startup then stops for a different reason.
-/// 3. The handler is required next. Without one there is nothing to
-///    serve, and finding that out before inspecting the environment
-///    keeps the diagnostic about the missing handler rather than about a
-///    descriptor that was never going to be used.
-/// 4. The TLS material comes next: the endpoint's own certificate chain
+/// 3. The TLS material comes next: the endpoint's own certificate chain
 ///    and key, and the client verifier built over the pinned subset of
-///    the deployment's CA bundle. It goes here so a build that *has* a
-///    handler fails on unusable certificate material before it touches
-///    the inherited descriptor, and so an operator on a build with none
-///    still reads the handler diagnostic first — an endpoint that
-///    cannot serve is not made more serviceable by a certificate.
-/// 5. Only then are `LISTEN_PID` and `LISTEN_FDS` read — once — and the
+///    the deployment's CA bundle. It goes here so an endpoint fails on
+///    unusable certificate material before it touches the inherited
+///    descriptor.
+/// 4. Only then are `LISTEN_PID` and `LISTEN_FDS` read — once — and the
 ///    descriptor validated and adopted.
 ///
 /// This process's environment is never mutated, not even to clear the
@@ -299,9 +287,8 @@ pub(crate) const UNPRIVILEGED_DAEMON_WARNING: &str = concat!(
 ///
 /// # Errors
 ///
-/// Returns an error when the endpoint is enabled and no handler is
-/// registered, when the server certificate material or the client trust
-/// material is absent, unusable or not what a pinned caller would
+/// Returns an error when the server certificate material or the client
+/// trust material is absent, unusable or not what a pinned caller would
 /// accept, when the activation contract is missing, addressed to
 /// another process or announces anything but one descriptor, when
 /// `FD_CLOEXEC` cannot be set, when the descriptor is not a listening
@@ -317,13 +304,6 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
     if warns_about_unprivileged_daemon(enabled, effective_uid) {
         warn!("{UNPRIVILEGED_DAEMON_WARNING}");
     }
-    let Some(handler) = production_handler() else {
-        anyhow::bail!(
-            "registrar_endpoint.enabled is true, but no registrar request handler is registered \
-             in this build. Enabling the endpoint is unsupported until a production request \
-             handler is added; set registrar_endpoint.enabled = false"
-        );
-    };
     let (server_config, resolver) = tls::build_server_config(
         settings.registrar_endpoint.server_cert_path.as_deref(),
         settings.registrar_endpoint.server_key_path.as_deref(),
@@ -338,7 +318,6 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
     adopt(
         contract,
         effective_uid,
-        handler,
         server_config,
         resolver,
         settings.domain.clone(),
@@ -363,7 +342,6 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
 pub(crate) fn adopt(
     contract: ActivationContract,
     effective_uid: u32,
-    handler: Arc<dyn RegistrarRequestHandler>,
     server_config: Arc<rustls::ServerConfig>,
     resolver: Arc<EndpointCertResolver>,
     domain: String,
@@ -411,7 +389,6 @@ pub(crate) fn adopt(
         listener,
         socket_path,
         daemon_uid: effective_uid,
-        handler,
         acceptor: TlsAcceptor::from(server_config),
         resolver,
         domain,

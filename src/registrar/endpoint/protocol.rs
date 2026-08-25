@@ -5,9 +5,16 @@
 //! callers decode a request before invoking a verb and hand a health snapshot
 //! back when encoding a response.
 
-// The production handler that calls this codec is deliberately a sibling
-// issue. Until it lands, these crate-private protocol types are necessarily
-// unused outside their focused tests.
+// This module is the codec for *both* ends of the wire, and this daemon
+// is only one of them: it decodes a request and encodes a response. The
+// caller's half — `encode_request`, the three response decoders and the
+// `ca_anchor` decode behind the mint one — has no production consumer
+// in this crate, because the enrolling agent that speaks this protocol
+// is separate work. Keeping both halves in one module is what lets a
+// test round-trip a payload through the exact bytes the endpoint
+// writes, so the caller's half is allowed to be unreached rather than
+// deleted and written again against the same reference when that agent
+// lands.
 #![allow(dead_code)]
 
 use std::fmt;

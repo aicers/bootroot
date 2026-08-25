@@ -192,7 +192,9 @@ pub(crate) mod openbao_constants {
     pub(crate) const PATH_STEPCA_DB_ADMIN: &str = "bootroot/stepca/db_admin";
     pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
     pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
-    pub(crate) const PATH_CA_TRUST: &str = "bootroot/ca";
+    /// The library's one spelling of the CA anchor's KV path, re-exported
+    /// under the name the binary's other `PATH_*` constants use.
+    pub(crate) use bootroot::trust_bootstrap::CA_TRUST_KV_PATH as PATH_CA_TRUST;
 }
 
 #[cfg(test)]
@@ -327,6 +329,58 @@ mod tests {
         assert_eq!(
             default_responder_admin_url(&BootrootContainer::Http01.name("insight")),
             "http://insight-http01:8080"
+        );
+    }
+
+    /// The library restates four of this crate's values, because
+    /// `[registrar]` lives in the library and these constants do not
+    /// cross the crate boundary. Each restatement carries a comment
+    /// naming its counterpart here, and nothing but this test makes a
+    /// change to one side fail on the other.
+    ///
+    /// The library's own tests pin its half — `RegistrarSettings`'s
+    /// documented defaults and the `secrets` the daemon resolves an
+    /// absent recorded member to. What is asserted here is that this
+    /// side still spells them the same way.
+    #[test]
+    fn the_registrar_defaults_still_match_the_values_this_crate_issues_under() {
+        use bootroot::config::RegistrarSettings;
+
+        let defaults = RegistrarSettings::default();
+        for (constant, name, configured) in [
+            (
+                crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL,
+                "DEFAULT_SECRET_ID_WRAP_TTL",
+                defaults.max_wrap_ttl,
+            ),
+            (
+                super::openbao_constants::TOKEN_TTL,
+                "openbao_constants::TOKEN_TTL",
+                defaults.role_token_ttl,
+            ),
+            (
+                super::openbao_constants::SECRET_ID_TTL,
+                "openbao_constants::SECRET_ID_TTL",
+                defaults.role_secret_id_ttl,
+            ),
+        ] {
+            let parsed = humantime::parse_duration(constant)
+                .unwrap_or_else(|err| panic!("{name} must be a humantime duration: {err}"));
+            assert_eq!(
+                parsed, configured,
+                "{name} and the [registrar] default it is restated as have drifted"
+            );
+        }
+
+        assert_eq!(
+            super::DEFAULT_SECRETS_DIR,
+            "secrets",
+            "the daemon resolves an absent state.json `secrets_dir` to this same name"
+        );
+        assert_eq!(
+            crate::state::StateFile::default().secrets_dir(),
+            std::path::Path::new(super::DEFAULT_SECRETS_DIR),
+            "the CLI's fallback is what the daemon's restatement was copied from"
         );
     }
 }

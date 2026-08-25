@@ -139,12 +139,18 @@
 //! divergence problem one layer up. The hazard is documented rather than
 //! masked.
 
-// The endpoint that drives these verbs is separate work — this issue is
-// deliberately transport-free — so no production code path reaches them
-// yet and every item here would be reported dead. The alternatives are
-// worse: publishing the module would put a privileged control plane on
-// the library's public surface, and sprinkling per-item allows would
-// have to be undone item by item when the endpoint lands.
+// Two separate things here are unreached from production code, and
+// neither is worth a per-item allow. The endpoint that drives these
+// verbs is served off a systemd-activated socket and so is Linux-only:
+// on any other host nothing constructs a `RegistrarVerbs` at all, which
+// makes the whole layer dead and takes the parts of
+// `crate::registrar::audit` only these verbs call down with it. And on
+// Linux the daemon reaches them through `RegistrarVerbs::internal`
+// alone, which leaves the injectable constructor and the accessors only
+// tests read behind. The alternatives are worse: publishing the module
+// would put a privileged control plane on the library's public surface,
+// and per-item allows would have to be undone one at a time as the
+// remaining wire grammar lands.
 #![allow(dead_code)]
 
 pub(crate) mod binding;
