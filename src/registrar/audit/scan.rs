@@ -131,10 +131,10 @@ pub fn scan_audit_store(
     let mut files = HashMap::new();
     let mut state = ScanState::default();
     for path in &scan_paths {
-        let data = read_file(path, Some(&mut state))?;
+        let data = read_file(path, Some(&mut state), euid)?;
         files.insert(path.clone(), data);
     }
-    let data = read_file(&active, Some(&mut state))?;
+    let data = read_file(&active, Some(&mut state), euid)?;
     files.insert(active.clone(), data);
 
     let mut malformed = state.duplicate_lines;
@@ -153,7 +153,7 @@ pub fn scan_audit_store(
         let mut oldest = None;
         for (path, _) in retained {
             if !files.contains_key(path) {
-                let data = read_file(path, None)?;
+                let data = read_file(path, None, euid)?;
                 files.insert(path.clone(), data);
             }
             if let Some(timestamp) = files
@@ -304,6 +304,7 @@ fn rotated_generations(dir: &Path) -> Result<Vec<(PathBuf, OffsetDateTime)>, Aud
 fn read_file(
     path: &Path,
     scan_state: Option<&mut ScanState>,
+    euid: u32,
 ) -> Result<Option<FileData>, AuditScanError> {
     #[cfg(test)]
     observe_open(path);
@@ -340,15 +341,34 @@ fn read_file(
             path: path.to_path_buf(),
             source,
         })?;
-    if !metadata.is_file() {
+    // The descriptor decides the kind, so a path swapped between the
+    // check above and the open is judged as what was actually opened.
+    // That does not make either symlink refusal above redundant: this
+    // one runs on a descriptor `O_NOFOLLOW` already refused to open a
+    // symlink through, so it can never report `Symlink` itself, and only
+    // the pre-open guard and the `ELOOP` mapping name that condition.
+    if let Some(condition) = path_condition(
+        metadata.file_type().is_symlink(),
+        metadata.is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        false,
+        euid,
+    ) {
         return Err(AuditScanError::UnsafePath {
             path: path.to_path_buf(),
-            condition: PathCondition::NotARegularFile,
+            condition,
         });
     }
     read_lines(&mut file, path, scan_state).map(Some)
 }
 
+/// Classifies one path's metadata against the store's trust contract.
+///
+/// `directory` selects the arm: the store directory and its immediate
+/// parent are judged on kind, owner and mode, while an entry inside the
+/// store is judged on kind alone. `euid` is passed as a value so the
+/// classification is testable without the invoking process's identity.
 fn path_condition(
     is_symlink: bool,
     has_expected_kind: bool,
@@ -367,16 +387,25 @@ fn path_condition(
             PathCondition::NotARegularFile
         });
     }
-    if uid != 0 && uid != euid {
-        return Some(PathCondition::Owner {
-            expected: euid,
-            found: uid,
-        });
-    }
-    if directory && mode & 0o022 != 0 {
-        return Some(PathCondition::GroupOrWorldWritable {
-            mode: mode & 0o7777,
-        });
+    // Both remaining rules are directory-only. The store's trust
+    // contract places them on the store directory and its immediate
+    // parent, and deliberately not on the entries inside: a directory
+    // owned by root or the invoking user and writable by nobody else
+    // already bounds who can create an entry in it, so a per-file owner
+    // or mode check would refuse stores the contract accepts without
+    // narrowing what can reach them.
+    if directory {
+        if uid != 0 && uid != euid {
+            return Some(PathCondition::Owner {
+                expected: euid,
+                found: uid,
+            });
+        }
+        if mode & 0o022 != 0 {
+            return Some(PathCondition::GroupOrWorldWritable {
+                mode: mode & 0o7777,
+            });
+        }
     }
     None
 }
@@ -712,8 +741,8 @@ mod tests {
         bytes.extend(b"not json\n");
         fs::write(&active, bytes).expect("add malformed line");
 
-        let scan = scan_audit_store(dir.path(), now, Duration::days(30), 16, 90)
-            .expect("scan audit store");
+        let scan =
+            scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90).expect("scan audit store");
         assert_eq!(scan.intent_without_outcome, 1);
         assert_eq!(scan.malformed_records, 1);
         assert!(!scan.retention_short);
@@ -822,7 +851,7 @@ mod tests {
         let scan = scan_audit_store(
             dir.path(),
             OffsetDateTime::now_utc(),
-            Duration::days(30),
+            AUDIT_SCAN_WINDOW,
             16,
             90,
         )
@@ -1133,10 +1162,15 @@ mod tests {
 
     #[test]
     fn refuses_invalid_arguments_before_opening_the_store() {
+        // A relative store path is its own rejected argument, so it
+        // cannot name a populated store the way the value table in
+        // `rejects_public_arguments_that_cannot_define_a_scan` does.
+        let relative = Path::new("relative");
+        let observer = observe_opens(relative, None);
         let error = scan_audit_store(
-            Path::new("relative"),
+            relative,
             OffsetDateTime::now_utc(),
-            Duration::days(30),
+            AUDIT_SCAN_WINDOW,
             16,
             90,
         )
@@ -1148,6 +1182,14 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            observer.counts().is_empty(),
+            "a relative store path must fail before any audit file is opened"
+        );
+        assert!(
+            observer.directory_checks().is_empty(),
+            "a relative store path must fail before the directory is inspected"
+        );
     }
 
     #[test]
@@ -1338,6 +1380,43 @@ mod tests {
         let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
             .expect("scan paired records");
         assert_eq!(scan.intent_without_outcome, 0);
+        assert_eq!(scan.malformed_records, 0);
+    }
+
+    #[test]
+    fn outcome_after_now_pairs_an_in_window_intent() {
+        let dir = audit_store();
+        let now = OffsetDateTime::now_utc();
+        let request_id = "outcome-after-now".to_string();
+        append_record(
+            dir.path(),
+            &AuditRecord::intent(
+                now - Duration::minutes(2),
+                request_id.clone(),
+                AuditVerb::Mint,
+                "caller".to_string(),
+                identity(),
+            ),
+        );
+        append_record(
+            dir.path(),
+            &AuditRecord::outcome(
+                now + Duration::minutes(5),
+                request_id,
+                AuditVerb::Mint,
+                "caller".to_string(),
+                identity(),
+                None,
+                AuditOutcome::FirstMint,
+            ),
+        );
+
+        let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect("scan an outcome dated after now");
+        assert_eq!(
+            scan.intent_without_outcome, 0,
+            "an outcome dated after now still pairs its in-window intent"
+        );
         assert_eq!(scan.malformed_records, 0);
     }
 
@@ -1566,6 +1645,19 @@ mod tests {
                 ..
             }
         ));
+
+        let directory_dir = audit_store();
+        let directory_path = directory_dir.path().join(ACTIVE_FILE_NAME);
+        fs::create_dir(&directory_path).expect("create active-file directory entry");
+        let error = scan_audit_store(directory_dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect_err("directory must be refused");
+        assert!(matches!(
+            error,
+            AuditScanError::UnsafePath {
+                condition: PathCondition::NotARegularFile,
+                path,
+            } if path == directory_path
+        ));
     }
 
     #[test]
@@ -1585,6 +1677,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Pins the deliberate limit of the store's trust contract at the
+    /// scanner's own surface: the entries inside a safe store are judged
+    /// on kind alone, so a permissive mode on one of them is not a
+    /// refusal. The classifier's file arm is asserted directly by
+    /// [`path_trust_accepts_root_or_the_invoking_user_only`]; this is
+    /// the end-to-end half, so re-gating that rule on the entries could
+    /// not pass unnoticed.
+    #[test]
+    fn reads_a_group_or_world_writable_entry_inside_a_safe_store() {
+        let dir = audit_store();
+        let now = OffsetDateTime::now_utc();
+        append_record(dir.path(), &old_intent(now, "permissive-mode"));
+        let active = dir.path().join(ACTIVE_FILE_NAME);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o666))
+            .expect("make the active file group- and world-writable");
+
+        let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect("a permissive mode on an entry is not a refusal");
+        assert_eq!(scan.intent_without_outcome, 1);
+        assert_eq!(scan.malformed_records, 0);
     }
 
     #[test]
@@ -1820,6 +1934,9 @@ mod tests {
         }
     }
 
+    /// Drives the classifier as a value table, so every trust condition
+    /// the scanner can refuse — the foreign owner included — is asserted
+    /// whatever effective UID the run happens to have.
     #[test]
     fn path_trust_accepts_root_or_the_invoking_user_only() {
         let euid = 41;
@@ -1846,8 +1963,61 @@ mod tests {
             path_condition(false, true, euid, 0o770, true, euid),
             Some(PathCondition::GroupOrWorldWritable { mode: 0o770 })
         );
+        assert_eq!(
+            path_condition(false, true, foreign_uid, 0o777, true, euid),
+            Some(PathCondition::Owner {
+                expected: euid,
+                found: foreign_uid,
+            }),
+            "a foreign owner outranks the writable mode it is also refused for"
+        );
+
+        // The file arm, which `read_file` reaches for every entry it
+        // opens. A symlink and a non-regular kind are refused; nothing
+        // else is.
+        assert_eq!(
+            path_condition(true, true, 0, 0o600, false, euid),
+            Some(PathCondition::Symlink)
+        );
+        assert_eq!(
+            path_condition(true, false, foreign_uid, 0o777, false, euid),
+            Some(PathCondition::Symlink),
+            "a symlink outranks the non-regular kind it is also refused for"
+        );
+        assert_eq!(
+            path_condition(false, false, 0, 0o600, false, euid),
+            Some(PathCondition::NotARegularFile)
+        );
+        assert_eq!(path_condition(false, true, 0, 0o600, false, euid), None);
+        assert_eq!(path_condition(false, true, euid, 0o600, false, euid), None);
+        // The store's trust contract bounds who may create an entry by
+        // the directory's owner and mode, so neither a foreign owner nor
+        // a group- or world-writable mode refuses an entry inside it.
+        // These are deliberate limits, not missing checks.
+        assert_eq!(
+            path_condition(false, true, foreign_uid, 0o600, false, euid),
+            None,
+            "the file arm carries no ownership check"
+        );
+        for mode in [0o620, 0o602, 0o666, 0o777] {
+            assert_eq!(
+                path_condition(false, true, euid, mode, false, euid),
+                None,
+                "the file arm carries no mode check ({mode:o})"
+            );
+        }
+        assert_eq!(
+            path_condition(false, false, foreign_uid, 0o777, false, euid),
+            Some(PathCondition::NotARegularFile),
+            "a non-regular kind outranks the conditions the file arm ignores"
+        );
     }
 
+    /// Exercises the foreign-owner refusal end to end, which needs the
+    /// privilege to `chown` away from the invoking user. The refusal
+    /// itself is asserted unconditionally by
+    /// [`path_trust_accepts_root_or_the_invoking_user_only`], so the
+    /// coverage does not depend on this test running.
     #[test]
     fn refuses_foreign_owned_directories_when_running_as_root() {
         if crate::fs_util::current_process_euid() != 0 {
@@ -1887,37 +2057,27 @@ mod tests {
 
     #[test]
     fn rejects_public_arguments_that_cannot_define_a_scan() {
-        let absent = tempfile::tempdir()
-            .expect("create absent-store parent")
-            .path()
-            .join("must-not-be-opened");
-        let now = OffsetDateTime::UNIX_EPOCH;
-        for (window, retained, days, setting) in [
-            (Duration::ZERO, 16, 90, "window"),
-            (Duration::seconds(-1), 16, 90, "window"),
-            (AUDIT_SCAN_WINDOW, 0, 90, "audit_max_retained_files"),
-            (AUDIT_SCAN_WINDOW, 16, 0, "audit_min_retain_days"),
-            (Duration::MAX, 16, 90, "window"),
-            (AUDIT_SCAN_WINDOW, 16, u32::MAX, "audit_min_retain_days"),
-        ] {
-            let error = scan_audit_store(&absent, now, window, retained, days)
-                .expect_err("invalid scanner arguments must fail");
-            assert!(matches!(
-                error,
-                AuditScanError::InvalidSetting {
-                    setting: found,
-                    ..
-                } if found == setting
-            ));
-        }
+        // The store is real and holds a record, so a rejection that
+        // precedes any filesystem work is distinguishable from one that
+        // merely coincides with a store the scanner could not have read.
+        let populated = audit_store();
+        append_record(
+            populated.path(),
+            &old_intent(OffsetDateTime::now_utc(), "must-not-be-read"),
+        );
 
+        let observer = observe_opens(populated.path(), None);
         for now in [OffsetDateTime::UNIX_EPOCH, OffsetDateTime::now_utc()] {
-            for (window, days, setting) in [
-                (Duration::MAX, 90, "window"),
-                (AUDIT_SCAN_WINDOW, u32::MAX, "audit_min_retain_days"),
+            for (window, retained, days, setting) in [
+                (Duration::ZERO, 16, 90, "window"),
+                (Duration::seconds(-1), 16, 90, "window"),
+                (AUDIT_SCAN_WINDOW, 0, 90, "audit_max_retained_files"),
+                (AUDIT_SCAN_WINDOW, 16, 0, "audit_min_retain_days"),
+                (Duration::MAX, 16, 90, "window"),
+                (AUDIT_SCAN_WINDOW, 16, u32::MAX, "audit_min_retain_days"),
             ] {
-                let error = scan_audit_store(&absent, now, window, 16, days)
-                    .expect_err("an out-of-range lookback must fail before opening the store");
+                let error = scan_audit_store(populated.path(), now, window, retained, days)
+                    .expect_err("invalid scanner arguments must fail");
                 assert!(matches!(
                     error,
                     AuditScanError::InvalidSetting {
@@ -1925,9 +2085,30 @@ mod tests {
                         ..
                     } if found == setting
                 ));
+                assert!(
+                    observer.counts().is_empty(),
+                    "{setting} must be rejected before any audit file is opened"
+                );
+                assert!(
+                    observer.directory_checks().is_empty(),
+                    "{setting} must be rejected before the store directory is inspected"
+                );
             }
         }
+        drop(observer);
 
+        let scan = scan_audit_store(
+            populated.path(),
+            OffsetDateTime::now_utc(),
+            AUDIT_SCAN_WINDOW,
+            16,
+            90,
+        )
+        .expect("the same store scans cleanly once its arguments are valid");
+        assert_eq!(scan.intent_without_outcome, 1);
+
+        // The parentless root is its own rejected argument, so like the
+        // relative path it cannot name the populated store.
         let root = Path::new("/");
         let observer = observe_opens(root, None);
         let error = scan_audit_store(root, OffsetDateTime::now_utc(), AUDIT_SCAN_WINDOW, 16, 90)
@@ -1939,6 +2120,10 @@ mod tests {
                 ..
             }
         ));
+        assert!(
+            observer.counts().is_empty(),
+            "invalid root configuration must fail before opening any audit file"
+        );
         assert!(
             observer.directory_checks().is_empty(),
             "invalid root configuration must fail before inspecting the filesystem"
