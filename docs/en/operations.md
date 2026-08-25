@@ -105,9 +105,20 @@ audit device is found (e.g. the audit stanza was removed from
 fails. Restore the audit configuration and re-run init.
 
 - **Log location (inside container):** `/openbao/audit/audit.log`
-- **Host access:** the log is persisted on the `openbao-audit` Docker
-  volume. Inspect it with
+- **Host access:** on an ordinary host the log is persisted on the
+  `openbao-audit` Docker volume. Inspect it with
   `docker compose exec openbao cat /openbao/audit/audit.log`.
+- **Host access on a provisioned registrar endpoint host:** the device
+  writes into the shared audit store instead, at
+  `<audit_store_dir>/openbao/audit.log` on the host — a bind mount of the
+  same container path, so the `docker compose exec` recipe above is
+  unchanged. This requires `state.json`'s `registrar_endpoint.enabled`
+  and the daemon configuration's `[registrar_endpoint] enabled` to
+  **agree**: when they disagree `bootroot init` refuses to proceed and
+  the audit log stays exactly where it was. Records written before the
+  store was provisioned remain on the `openbao-audit` volume and are
+  read as before; nothing migrates them. See
+  [The shared audit store](#the-shared-audit-store) below.
 - **Rotation:** OpenBao does not rotate the audit log itself. Use an
   external log rotation tool (e.g. `logrotate` on a bind-mount, or a
   sidecar that tails the volume) and send `SIGHUP` to the OpenBao
@@ -234,6 +245,83 @@ Buckets are held in memory only and start full, so a restarted daemon
 absorbs a full wave immediately and no limiter state survives a restart.
 The buckets are keyed on the caller identity as it arrives, so a caller
 cannot reset its budget by reconnecting.
+
+### The shared audit store
+
+The daemon's registrar verb records and OpenBao's file audit device share
+one directory on the bootroot host. `[registrar] audit_store_dir` in the
+`bootroot-agent` configuration file is the **single definition** of where
+that directory is: nothing records a second copy of it — not `state.json`,
+not a flag, not an environment variable — because two values that can
+drift are two directories waiting to happen.
+
+Nothing enforces `audit_store_reserve_bytes` in this build. A configured
+reserve is a recorded number and not a guarantee the filesystem is
+holding space for you.
+
+**How the install side reads it.** `bootroot init --agent-config <path>`
+names the operator's `bootroot-agent` configuration file — not the
+bootroot-internal `agent.toml` that `init` generates under the internal
+credential directory. `init` reads exactly two tables from it,
+`[registrar]` for the store's location and `[registrar_endpoint]` for the
+enablement value it cross-checks against `state.json`. The flag is
+**required** on any run whose `state.json` records an enabled registrar
+endpoint, and on any run that finds a rendered audit compose override on
+disk; omitting it there is an error and nothing is created, rendered or
+deleted. The daemon's configuration file must therefore exist before such
+a run.
+
+**What `bootroot init` does.** On an endpoint-enabled host it creates
+`audit_store_dir` with `records/` and `openbao/` beneath it, renders a
+Compose override binding `<audit_store_dir>/openbao` at
+`/openbao/audit`, and recreates OpenBao onto it. It **must run as root**:
+`audit_store_dir` and `records/` are owned by uid 0 at mode `0700`, which
+is what keeps an unprivileged process from reading the trail. A run
+that would provision the store and is not running as uid 0 is refused
+before anything is created or rendered, and named as such: the
+directories would otherwise be created owned by the caller, and the
+later root run would refuse them as foreign-owned and not repair them.
+`openbao/` is left to the OpenBao container's entrypoint, which takes
+ownership of it on the first start.
+
+**Every directory above the store must be world-traversable.** `bootroot
+init` requires each existing component above `audit_store_dir` to be a
+directory — not a symbolic link — carrying the world-execute bit, and
+creates missing ones at `0755`. That is what lets the unprivileged
+`bootroot infra up` reach `audit_store_dir` to check it without being
+able to descend into it. An ancestor without `o+x` is an error naming
+that directory, and nothing is created or rendered on such a run.
+
+**Neither command repairs the store.** `bootroot init` checks an existing
+`audit_store_dir` and `records/` against that contract and fails naming
+the path, what it found, and the `chown 0:0` / `chmod 0700` that fixes
+it. `bootroot infra up` checks `audit_store_dir` alone, creates nothing
+and repairs nothing.
+
+**Moving a provisioned store** is a manual procedure, because re-pointing
+the mount would leave the old audit history behind:
+
+1. Stop the stack.
+2. Relocate the directory to the new path.
+3. Update `[registrar] audit_store_dir` and delete the rendered override
+   at `secrets/openbao/docker-compose.openbao-audit.yml`.
+4. Re-run `bootroot init` as root with `--agent-config`.
+
+**Switching a registrar endpoint host off** takes two edits, and until
+both agree `bootroot init` refuses:
+
+1. Set `[registrar_endpoint] enabled = false` in the daemon's
+   configuration file.
+2. Set `registrar_endpoint.enabled` to `false` in `state.json`.
+
+A bring-up stops applying the audit override as soon as the recorded
+predicate is `false`, so OpenBao returns to the `openbao-audit` volume on
+its next recreate; the rendered override stays on disk, inert, until an
+`init` sees the two sources agree on `false` and deletes it. That final
+run still needs `--agent-config`, since a rendered override keeps the
+flag mandatory. **The store's directories and their contents are never
+touched** by any of this — switching a host off changes what is mounted,
+never what is stored. Removing them is manual.
 
 ## Monitoring operations
 
@@ -679,6 +767,12 @@ endpoint keeps the same socket inode across it, because the listener is
 held above the reload rather than reacquired by it.
 
 #### Audit records
+
+On a host whose `state.json` records `registrar_endpoint.enabled = true`,
+a root-run `bootroot init` creates `audit_store_dir` with `records/` and
+`openbao/` beneath it. It must run as root there, because the store is
+owned by uid 0 at mode `0700`. A host whose registrar endpoint is not
+enabled still has no store.
 
 The daemon keeps its own append-only audit trail for the two verbs, in
 `audit_record_dir` (`<audit_store_dir>/records`, or

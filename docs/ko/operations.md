@@ -97,9 +97,20 @@ OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하�
 감사 설정을 복원한 후 init을 다시 실행하세요.
 
 - **로그 위치 (컨테이너 내부):** `/openbao/audit/audit.log`
-- **호스트 접근:** 로그는 `openbao-audit` Docker 볼륨에 저장됩니다.
-  `docker compose exec openbao cat /openbao/audit/audit.log`으로
+- **호스트 접근:** 일반 호스트에서 로그는 `openbao-audit` Docker 볼륨에
+  저장됩니다. `docker compose exec openbao cat /openbao/audit/audit.log`으로
   확인할 수 있습니다.
+- **프로비저닝된 레지스트라 엔드포인트 호스트에서의 호스트 접근:** 감사
+  장치는 대신 공용 감사 저장소에 기록하며, 호스트 경로는
+  `<audit_store_dir>/openbao/audit.log`입니다. 컨테이너 경로는 동일한
+  경로의 bind mount이므로 위의 `docker compose exec` 방법은 그대로
+  동작합니다. 이는 `state.json`의 `registrar_endpoint.enabled`와 데몬
+  설정의 `[registrar_endpoint] enabled`가 **일치**할 때만 적용됩니다.
+  두 값이 다르면 `bootroot init`이 진행을 거부하고 감사 로그는 있던
+  자리에 그대로 남습니다. 저장소가 프로비저닝되기 전에 기록된 항목은
+  `openbao-audit` 볼륨에 그대로 남아 이전과 같이 읽을 수 있으며, 무엇도
+  이를 옮기지 않습니다. 아래 [공용 감사 저장소](#공용-감사-저장소)를
+  참고하세요.
 - **로테이션:** OpenBao는 감사 로그를 자체적으로 로테이션하지 않습니다.
   외부 로그 로테이션 도구(예: bind-mount의 `logrotate` 또는 볼륨을
   tail하는 사이드카)를 사용하고, 로테이션 후 OpenBao 프로세스에
@@ -223,6 +234,81 @@ rate_limit_admission_burst >= wave_hosts × modules_per_host
 곧바로 한 파도를 전부 흡수하며 제한 상태는 재시작을 넘어 남지 않습니다.
 버킷의 키는 도착한 그대로의 호출자 신원이므로, 재접속으로 예산을
 되돌릴 수 없습니다.
+
+### 공용 감사 저장소
+
+데몬의 레지스트라 동사 레코드와 OpenBao의 파일 감사 장치는 bootroot
+호스트의 한 디렉터리를 공유합니다. `bootroot-agent` 설정 파일의
+`[registrar] audit_store_dir`이 그 디렉터리 위치에 대한 **유일한
+정의**입니다. `state.json`도, 플래그도, 환경 변수도 그 값을 따로
+기록하지 않습니다. 서로 어긋날 수 있는 두 값은 결국 두 개의 디렉터리가
+되기 때문입니다.
+
+이 빌드에서는 `audit_store_reserve_bytes`를 강제하는 것이 없습니다.
+설정된 예약량은 기록된 숫자일 뿐, 파일 시스템이 공간을 확보해 준다는
+보장이 아닙니다.
+
+**설치 측에서 값을 읽는 방법.** `bootroot init --agent-config <path>`는
+운영자의 `bootroot-agent` 설정 파일을 지정합니다. `init`이 내부 자격
+증명 디렉터리에 생성하는 bootroot 내부용 `agent.toml`이 아닙니다.
+`init`은 이 파일에서 정확히 두 테이블만 읽습니다. 저장소 위치를 위한
+`[registrar]`와, `state.json`과 교차 확인할 활성화 값을 위한
+`[registrar_endpoint]`입니다. 이 플래그는 `state.json`이 레지스트라
+엔드포인트를 활성으로 기록한 실행과, 렌더링된 audit compose 오버라이드가
+디스크에 존재하는 실행에서 **필수**입니다. 그런 실행에서 플래그를
+생략하면 오류이며 아무것도 생성·렌더링·삭제되지 않습니다. 따라서 데몬의
+설정 파일이 그런 실행보다 먼저 존재해야 합니다.
+
+**`bootroot init`이 하는 일.** 엔드포인트가 활성인 호스트에서
+`audit_store_dir`과 그 아래의 `records/`, `openbao/`를 생성하고,
+`<audit_store_dir>/openbao`를 `/openbao/audit`에 바인딩하는 Compose
+오버라이드를 렌더링한 뒤 OpenBao를 그 위로 재생성합니다. 이 실행은
+**반드시 root여야 합니다.** `audit_store_dir`과 `records/`는 uid 0
+소유에 모드 `0700`이며, 그것이 권한 없는 프로세스가 기록을 읽지 못하게
+하는 장치입니다. 저장소를 프로비저닝할 실행이 uid 0이 아니면, 아무것도
+생성하거나 렌더링하기 전에 그 사실을 지목하며 거부합니다. 그러지 않으면
+디렉터리가 실행한 사용자 소유로 만들어지고, 나중의 root 실행이 그것을
+다른 소유자의 것이라며 거부하되 고치지는 않기 때문입니다. `openbao/`는
+OpenBao 컨테이너의 entrypoint에 맡겨지며, 첫 기동 시 그 소유권을
+가져갑니다.
+
+**저장소 위의 모든 디렉터리는 world-traversable해야 합니다.** `bootroot
+init`은 `audit_store_dir` 위의 기존 경로 구성요소가 모두 심볼릭 링크가
+아닌 디렉터리이고 world-execute 비트를 가질 것을 요구하며, 없는 것은
+`0755`로 생성합니다. 그래야 권한 없는 `bootroot infra up`이 저장소
+내부로 들어가지 않고도 `audit_store_dir`에 도달해 검사할 수 있습니다.
+`o+x`가 없는 상위 디렉터리는 그 디렉터리를 지목하는 오류이며, 그런
+실행에서는 아무것도 생성되거나 렌더링되지 않습니다.
+
+**두 명령 모두 저장소를 고치지 않습니다.** `bootroot init`은 기존
+`audit_store_dir`과 `records/`를 위 계약에 비추어 검사하고, 경로와 발견한
+상태, 그리고 이를 고치는 `chown 0:0` / `chmod 0700`을 알리며 실패합니다.
+`bootroot infra up`은 `audit_store_dir`만 검사하며, 아무것도 만들지 않고
+아무것도 고치지 않습니다.
+
+**프로비저닝된 저장소를 옮기는 절차**는 수동입니다. 마운트를 조용히 다시
+가리키면 이전 감사 기록이 남겨지기 때문입니다.
+
+1. 스택을 중지합니다.
+2. 디렉터리를 새 경로로 옮깁니다.
+3. `[registrar] audit_store_dir`을 갱신하고 렌더링된 오버라이드
+   `secrets/openbao/docker-compose.openbao-audit.yml`을 삭제합니다.
+4. root로 `bootroot init`을 `--agent-config`와 함께 다시 실행합니다.
+
+**레지스트라 엔드포인트 호스트를 끄는 절차**는 두 번의 수정이 필요하며,
+두 값이 일치하기 전까지 `bootroot init`은 거부합니다.
+
+1. 데몬 설정 파일에서 `[registrar_endpoint] enabled = false`로 설정합니다.
+2. `state.json`의 `registrar_endpoint.enabled`를 `false`로 설정합니다.
+
+기록된 술어가 `false`가 되는 즉시 bring-up은 audit 오버라이드를 적용하지
+않으므로, OpenBao는 다음 재생성 때 `openbao-audit` 볼륨으로 돌아갑니다.
+렌더링된 오버라이드는 두 출처가 `false`로 일치하는 것을 확인한 `init`이
+삭제할 때까지 디스크에 비활성 상태로 남습니다. 그 마지막 실행에도
+`--agent-config`가 필요합니다. 렌더링된 오버라이드가 있는 한 플래그는
+필수이기 때문입니다. **저장소의 디렉터리와 그 내용은 이 과정에서 결코
+건드리지 않습니다.** 호스트를 끄는 것은 무엇이 마운트되는지를 바꿀 뿐,
+무엇이 저장되어 있는지를 바꾸지 않습니다. 삭제는 수동입니다.
 
 ## 모니터링 운영
 
@@ -649,6 +735,12 @@ Requires=bootroot-registrar.socket
 그대로 유지합니다.
 
 #### 감사 레코드
+
+`state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
+root로 실행한 `bootroot init`이 `audit_store_dir`과 그 아래의 `records/`,
+`openbao/`를 생성합니다. 저장소는 uid 0 소유에 모드 `0700`이므로 이 실행은
+반드시 root여야 합니다. 레지스트라 엔드포인트가 활성화되지 않은 호스트에는
+여전히 저장소가 없습니다.
 
 데몬은 두 동사에 대한 자체 추가 전용 감사 기록을
 `audit_record_dir`(`<audit_store_dir>/records`, 기본값

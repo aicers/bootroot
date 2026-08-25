@@ -1,6 +1,7 @@
 use anyhow::Result;
 use bootroot::locale::Locale;
 
+pub(crate) mod audit_store;
 pub(crate) mod en;
 pub(crate) mod infra;
 pub(crate) mod init;
@@ -600,6 +601,27 @@ pub(crate) struct Strings {
     pub(crate) error_reinit_summary_json_unsafe: &'static str,
     pub(crate) error_reinit_explicit_openbao_url: &'static str,
     pub(crate) error_reinit_stepca_password_missing_with_ca_material: &'static str,
+    pub(crate) error_audit_store_agent_config_required: &'static str,
+    pub(crate) error_audit_store_agent_config_unreadable: &'static str,
+    pub(crate) error_audit_store_agent_config_malformed: &'static str,
+    pub(crate) error_audit_store_agent_config_undeserializable: &'static str,
+    pub(crate) error_audit_store_agent_config_rejected: &'static str,
+    pub(crate) error_audit_store_enablement_mismatch: &'static str,
+    pub(crate) error_audit_store_not_privileged: &'static str,
+    pub(crate) error_audit_store_override_stale: &'static str,
+    pub(crate) error_audit_store_override_unreadable: &'static str,
+    pub(crate) error_audit_store_override_missing: &'static str,
+    pub(crate) error_audit_store_dir_invalid: &'static str,
+    pub(crate) error_audit_store_dir_unusable: &'static str,
+    pub(crate) error_audit_store_ancestor_invalid: &'static str,
+    pub(crate) error_audit_store_openbao_invalid: &'static str,
+    pub(crate) error_audit_store_layout_failed: &'static str,
+    pub(crate) error_audit_store_dir_unrenderable: &'static str,
+    pub(crate) audit_store_fault_symlink: &'static str,
+    pub(crate) audit_store_fault_not_directory: &'static str,
+    pub(crate) audit_store_fault_not_traversable: &'static str,
+    pub(crate) audit_store_fault_owner: &'static str,
+    pub(crate) audit_store_fault_mode: &'static str,
 }
 
 /// `Clone` so a message bundle can cross into a `spawn_blocking`

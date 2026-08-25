@@ -784,6 +784,30 @@ pub async fn atomic_replace_dir_owner(
     .context("Directory-owner atomic replace task panicked")?
 }
 
+/// The blocking half of [`atomic_replace_dir_owner`], for callers that
+/// are not async.
+///
+/// One spelling of [`publish_staged_blocking`] — see there for the two
+/// decisions this one makes ([`StagedOwner::ContainingDir`] and
+/// [`StagedDurability::RenameOnly`]) and why.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`atomic_replace_dir_owner`].
+pub fn atomic_replace_dir_owner_blocking(
+    dest: Destination<'_>,
+    contents: &[u8],
+    mode: StagedMode,
+) -> Result<()> {
+    publish_staged_blocking(
+        &dest.publish_path()?,
+        contents,
+        mode,
+        StagedOwner::ContainingDir,
+        StagedDurability::RenameOnly,
+    )
+}
+
 /// Publishes `contents` at `dest` by rename, **without** flushing the
 /// containing directory.
 ///
@@ -1430,8 +1454,17 @@ pub async fn ensure_shared_secrets_dir(path: &Path) -> Result<()> {
         .context("Shared secrets dir task panicked")?
 }
 
-/// The blocking half of [`ensure_shared_secrets_dir`].
-fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
+/// The blocking half of [`ensure_shared_secrets_dir`], for callers that
+/// are not async.
+///
+/// The `OpenBao` audit compose override's renderer is synchronous, and
+/// that override lands in the very directory the sidecars run out of,
+/// so it needs the same tree ownership by the same means.
+///
+/// # Errors
+/// Returns an error under the same conditions as
+/// [`ensure_shared_secrets_dir`].
+pub fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
     // The levels that do not exist yet, and the owner of the nearest
     // one that does. Collected before the create, because afterwards
     // nothing distinguishes them from the directories the operator or a

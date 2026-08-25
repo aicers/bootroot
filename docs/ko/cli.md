@@ -734,6 +734,20 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   것과 동등합니다. 이 플래그가 기능을 켜지는 않으므로
   `--enable db-provision`을 함께 주지 않으면 아무 일도 하지
   않습니다(#735).
+- `--agent-config <path>`: 운영자의 `bootroot-agent` 설정 파일입니다.
+  `init`이 내부 자격 증명 디렉터리에 생성하는 bootroot 내부용
+  `agent.toml`이 아닙니다. `init`은 이 파일에서 정확히 두 테이블만
+  읽습니다. 공용 감사 저장소 위치의 유일한 정의인 `audit_store_dir`을
+  위한 `[registrar]`와, `state.json`의 `registrar_endpoint.enabled`와
+  교차 확인할 `enabled` 값을 위한 `[registrar_endpoint]`입니다. 두 값이
+  다르면 하드 오류이며 아무것도 생성·렌더링·삭제되지 않습니다.
+  `state.json`이 레지스트라 엔드포인트를 활성으로 기록한 실행과,
+  렌더링된 audit compose 오버라이드가 디스크에 있는 실행에서는 **필수**
+  이므로 데몬의 설정 파일이 먼저 존재해야 합니다. 저장소를 프로비저닝할
+  실행은 root여야 합니다. 권한 없는 실행은 아무것도 생성하거나
+  렌더링하기 전에 거부되는데, 그러지 않으면 저장소가 실행한 사용자 소유로
+  만들어져 다음 root 실행이 다른 소유자의 것이라며 거부하기 때문입니다.
+  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 
 위 네 플래그는 서로 독립적입니다. 각 플래그는 자기 프롬프트만
 억제하며 다른 플래그를 함의하지 않고, 플래그가 없으면 프롬프트는
@@ -2413,6 +2427,21 @@ bootroot clean --openbao-only --yes
   순간도 없습니다. 기존 대상은 여전히 교체본이 만들어지기 전에
   `0600`으로 좁힙니다 — rename은 새 파일을 공개할 뿐, 그때까지 이전
   파일은 그대로 읽히기 때문입니다.
+- `--agent-config <path>`: `init`으로 그대로 전달되며, `init`은 이
+  파일에서 `[registrar] audit_store_dir`과 `[registrar_endpoint]
+  enabled`를 읽습니다. `init`과 동일한 요구 조건을 가집니다 —
+  `state.json`이 registrar endpoint를 enabled로 기록한 호스트, 그리고
+  렌더링된 audit compose 오버라이드를 가진 호스트에서 필수입니다.
+  reinit은 이 요구 조건과 활성화 교차 확인을 **파괴적 동작 시작 전에**
+  검사합니다. 두 번째 init 패스에서야 거부하면 OpenBao가 이미 wipe된
+  뒤가 되어, reinit이 복구하려는 partial-init 트랩을 그대로 재현하기
+  때문입니다. 이 사전 검사는 아무것도 생성·렌더링·삭제하지 않습니다.
+  같은 이유로, 렌더링된 audit 오버라이드가 아직 없는 엔드포인트 활성
+  호스트도 거부합니다. reinit은 `init`을 다시 실행하기 전에 스택을
+  다시 올리는데, 그 bring-up이 init 패스가 아직 쓰지 않은 오버라이드를
+  요구하기 때문입니다. 그런 호스트는 reinit 전에 root로 `bootroot init`을
+  한 번 실행하세요.
+  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 
 ### 동작
 

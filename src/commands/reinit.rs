@@ -9,6 +9,7 @@ use crate::cli::args::{
     ComposeFileArgs, DbAdminDsnArgs, DbTimeoutArgs, InfraUpArgs, InitArgs, OpenBaoArgs, ReinitArgs,
     RootTokenArgs, SecretsDirArgs,
 };
+use crate::commands::audit_store::{AuditStoreInitInputs, preflight_audit_store, production_uid};
 use crate::commands::clean::{
     COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL, container_exists_via_docker,
     inspect_label_via_docker, remove_openbao_container_and_volumes,
@@ -20,6 +21,7 @@ use crate::commands::compose_project::{
 use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
+use crate::commands::init::registrar_internal::registrar_endpoint_intent;
 use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init};
 use crate::commands::openbao_url::{
     OPENBAO_HOST_PORT_ENV, effective_openbao_url, effective_openbao_url_with_env,
@@ -129,6 +131,27 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     if let Some(out) = args.summary_json.as_deref() {
         validate_summary_json_output_path(out, messages)?;
     }
+
+    // 4.5. Same preflight for the audit store.  The init pass below
+    //      requires `--agent-config` on a host whose `state.json`
+    //      records an enabled registrar endpoint, or which carries a
+    //      rendered audit compose override, and refuses when that
+    //      file's `[registrar_endpoint] enabled` disagrees with the
+    //      recorded predicate.  `write_minimal_state` preserves that
+    //      predicate, so the answer here is the answer the init pass
+    //      gets — and raising it there would land after the OpenBao
+    //      wipe, recreating the partial-init trap.  Every check is a
+    //      read: nothing is created, rendered or deleted by it.
+    preflight_audit_store(
+        &AuditStoreInitInputs {
+            compose_dir: &compose_dir,
+            agent_config: args.agent_config.as_deref(),
+            state_path: &state_path,
+            endpoint_recorded: registrar_endpoint_intent(&state_path)?.is_some(),
+            expected_uid: production_uid(),
+        },
+        messages,
+    )?;
 
     // 5. Snapshot deployment intent (if state.json exists).
     let snapshot = snapshot_deployment_intent(&state_path)?;
@@ -1099,6 +1122,10 @@ fn init_args_for_reinit(
         overwrite_ca_json: false,
         overwrite_state: false,
         confirm_db_provision: false,
+        // Reinit re-runs `init`, which needs the operator's
+        // configuration on an endpoint-enabled host for exactly the
+        // same reason a direct `init` does.
+        agent_config: args.agent_config.clone(),
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })
@@ -2358,6 +2385,7 @@ mod tests {
             },
             yes: true,
             root_token_output: Some(PathBuf::from("/tmp/root.token")),
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2375,6 +2403,82 @@ mod tests {
             "reinit must thread root_token_output into init"
         );
         assert!(init_args.reinit_mode, "reinit_mode must be set");
+    }
+
+    /// `--agent-config` has to reach the init pass, or the flag is a
+    /// no-op on the one command that re-runs `init` — and the init pass
+    /// would then fail naming it, after the `OpenBao` wipe.
+    #[test]
+    fn init_args_for_reinit_threads_the_agent_config() {
+        let reinit_args = ReinitArgs {
+            openbao: OpenBaoArgs {
+                openbao_url: crate::commands::init::DEFAULT_OPENBAO_URL.to_string(),
+                kv_mount: "secret".to_string(),
+            },
+            secrets_dir: SecretsDirArgs {
+                secrets_dir: PathBuf::from("secrets"),
+            },
+            compose: ComposeFileArgs {
+                compose_file: PathBuf::from("docker-compose.yml"),
+            },
+            yes: true,
+            root_token_output: None,
+            agent_config: Some(PathBuf::from("/etc/bootroot/agent.toml")),
+            enable: Vec::new(),
+            skip: Vec::new(),
+            summary_json: None,
+            no_eab: true,
+        };
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &DeploymentIntent::default(),
+            &reinit_args.secrets_dir.secrets_dir,
+            None,
+        );
+        assert_eq!(
+            init_args.agent_config,
+            Some(PathBuf::from("/etc/bootroot/agent.toml")),
+            "reinit must thread agent_config into init"
+        );
+    }
+
+    /// The audit-store preflight runs before the destructive sequence,
+    /// beside the root-token and summary-json ones, so a run that the
+    /// init pass would refuse is refused while `OpenBao` is still
+    /// intact.
+    ///
+    /// Driven through the same function `run_reinit` calls, over a
+    /// `state.json` recording an enabled registrar endpoint and no
+    /// `--agent-config`: the exact combination whose refusal would
+    /// otherwise land after the wipe.
+    #[test]
+    fn the_audit_store_preflight_refuses_before_the_wipe() {
+        let dir = tempdir().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            registrar_endpoint: Some(crate::state::RegistrarEndpointState {
+                enabled: true,
+                domain: "example.com".to_string(),
+                host: "host".to_string(),
+            }),
+            ..StateFile::default()
+        };
+        state.save(&state_path).expect("state.json");
+
+        let err = preflight_audit_store(
+            &AuditStoreInitInputs {
+                compose_dir: dir.path(),
+                agent_config: None,
+                state_path: &state_path,
+                endpoint_recorded: registrar_endpoint_intent(&state_path)
+                    .expect("predicate")
+                    .is_some(),
+                expected_uid: production_uid(),
+            },
+            &crate::i18n::test_messages(),
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("--agent-config"), "{err}");
     }
 
     /// Regression for the Round 2 reviewer finding: when the snapshot
@@ -2398,6 +2502,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2439,6 +2544,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2485,6 +2591,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2550,6 +2657,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2590,6 +2698,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2657,6 +2766,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2703,6 +2813,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2814,6 +2925,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,
@@ -2867,6 +2979,7 @@ mod tests {
             },
             yes: true,
             root_token_output: None,
+            agent_config: None,
             enable: Vec::new(),
             skip: Vec::new(),
             summary_json: None,

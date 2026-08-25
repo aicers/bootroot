@@ -64,6 +64,10 @@ pub(crate) const CA_INTERMEDIATE_CERT_FILENAME: &str = "intermediate_ca.crt";
 pub(crate) const CA_BUNDLE_FILENAME: &str = "ca-bundle.pem";
 
 pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-exposed.yml";
+/// The audit override's own name, beside the exposed-port override.
+/// That one rewrites `ports:` and this one rewrites `volumes:`, so both
+/// may be passed with `-f` in one invocation.
+pub(crate) const OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-audit.yml";
 pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
 pub(crate) const STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.stepca-exposed.yml";
 

@@ -76,6 +76,8 @@ unset POSTGRES_HOST POSTGRES_PORT POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
 . "$SCRIPT_DIR/lib/leftovers.sh"
 # shellcheck source=lib/ports.sh
 . "$SCRIPT_DIR/lib/ports.sh"
+# shellcheck source=lib/audit-log.sh
+. "$SCRIPT_DIR/lib/audit-log.sh"
 
 RUN_ID="${GITHUB_RUN_ID:-local-$(date +%s)-$$}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/registrar-internal-init-${RUN_ID}}"
@@ -124,6 +126,16 @@ PORT_POSTGRES=0
 PORT_OPENBAO=0
 PORT_STEPCA=0
 PORT_HTTP01=0
+# The shared audit store this run provisions, and the operator
+# configuration file that is its only definition.
+AUDIT_STORE_BASE=""
+AUDIT_STORE_DIR=""
+AGENT_CONFIG_FILE=""
+# The container path `openbao/openbao.hcl` writes its file audit device
+# to.  Unchanged by the override this run renders — only what backs it
+# moves.
+OPENBAO_AUDIT_CONTAINER_DIR="/openbao/audit"
+OPENBAO_AUDIT_CONTAINER_LOG="${OPENBAO_AUDIT_CONTAINER_DIR}/audit.log"
 
 log_phase() {
   CURRENT_PHASE="$1"
@@ -248,6 +260,53 @@ create_run_root() {
   log "run root: $RUN_ROOT"
 }
 
+# The audit store's parent.
+#
+# Every obvious location fails the ancestor rule `bootroot init`
+# enforces, which requires each existing component above the store to be
+# a non-symlink directory carrying `o+x`: `RUN_ROOT` is a `mktemp -d`
+# and so `0700`, and loosening it is not the answer since it holds the
+# run's secrets tree; `$TMPDIR` is a `0700` per-user directory on macOS;
+# the logical `/tmp` is a symbolic link to `private/tmp` there; and
+# anywhere under the checkout inherits a developer home that is often
+# `0750`.
+#
+# So `/tmp` is resolved *physically* and the directory is created from an
+# explicit `mktemp -d` template under that resolved base, which is what
+# keeps `$TMPDIR` from being consulted at all.
+create_audit_store_base() {
+  local physical_tmp
+  physical_tmp="$(cd -P /tmp && pwd -P)" ||
+    fail "could not resolve the physical /tmp"
+  AUDIT_STORE_BASE="$(mktemp -d "${physical_tmp}/bootroot-audit-store-XXXXXX")" ||
+    fail "could not create the audit store base under ${physical_tmp}"
+  chmod 0755 "$AUDIT_STORE_BASE" ||
+    fail "could not make ${AUDIT_STORE_BASE} world-traversable"
+  AUDIT_STORE_DIR="$AUDIT_STORE_BASE/audit-store"
+  log "audit store base: $AUDIT_STORE_BASE"
+  assert_audit_store_base_is_traversable
+}
+
+# Asserts the harness's own precondition before `init` sees it, so a
+# drifting temporary-directory layout fails here with its own message
+# rather than through `init`'s ancestor error.
+assert_audit_store_base_is_traversable() {
+  local component="" part mode
+  local -a parts=()
+  IFS='/' read -r -a parts <<<"${AUDIT_STORE_BASE#/}"
+  for part in "${parts[@]}"; do
+    component="${component}/${part}"
+    [ ! -L "$component" ] || fail "${component} is a symbolic link"
+    [ -d "$component" ] || fail "${component} is not a directory"
+    mode="$(stat -c '%a' "$component" 2>/dev/null || stat -f '%OLp' "$component")"
+    case "$((8#${mode} & 1))" in
+      1) ;;
+      *) fail "${component} is at mode ${mode} and is not world-traversable" ;;
+    esac
+  done
+  pass "every component above the audit store is a world-traversable directory"
+}
+
 build_responder_image() {
   if docker image inspect "$HTTP01_IMAGE" >/dev/null 2>&1; then
     log "reusing $HTTP01_IMAGE"
@@ -345,6 +404,68 @@ seed_registrar_endpoint_predicate() {
   esac
 }
 
+# The operator's `bootroot-agent` configuration file, which `init` reads
+# through `--agent-config`.
+#
+# `[registrar] audit_store_dir` is the only definition of where the
+# shared audit store lives, and `[registrar_endpoint] enabled` is
+# cross-checked against the predicate seeded above — `init` refuses to
+# proceed when the two disagree, so both say `true` here.
+#
+# Nothing in this scenario starts a `bootroot-agent` daemon, so an
+# enabled `[registrar_endpoint]` in a file only the installer reads
+# starts nothing and refuses nothing.
+seed_agent_configuration() {
+  AGENT_CONFIG_FILE="$WORK_DIR/operator-agent.toml"
+  cat >"$AGENT_CONFIG_FILE" <<EOF
+[registrar]
+audit_store_dir = "${AUDIT_STORE_DIR}"
+
+[registrar_endpoint]
+enabled = true
+EOF
+  [ -s "$AGENT_CONFIG_FILE" ] || fail "could not write $AGENT_CONFIG_FILE"
+  pass "the operator configuration names the audit store and agrees with the predicate"
+}
+
+# The store's directories are created owned by whoever creates them, so
+# an unprivileged `init` on this host has to be refused before it makes
+# one.  A user-owned store is exactly what the root run afterwards
+# refuses as foreign-owned and, by contract, does not repair — so the
+# refusal here is what keeps a mistaken `bootroot init` from locking the
+# host out of provisioning without manual `chown`.
+#
+# Run through `run_bootroot` rather than `run_bootroot_as_root`, and
+# before `run_init`, so the store it must not create is one nothing has
+# created yet.
+assert_an_unprivileged_init_is_refused() {
+  local log="$ARTIFACT_DIR/init-unprivileged.log"
+  local override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  if run_bootroot init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --enable auto-generate,show-secrets \
+    --stepca-password "registrar-internal-${RUN_TOKEN}" \
+    --http-hmac "dev-hmac-${RUN_TOKEN}" \
+    --no-eab \
+    --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --responder-url "http://127.0.0.1:${PORT_HTTP01}" \
+    --agent-config "$AGENT_CONFIG_FILE" \
+    </dev/null >"$log" 2>&1; then
+    fail "an unprivileged 'bootroot init' was accepted on an endpoint-enabled host"
+  fi
+  grep -q "requires running as uid 0" "$log" ||
+    fail "the unprivileged run failed for another reason; see $log"
+  [ ! -e "$AUDIT_STORE_DIR" ] ||
+    fail "the refused run created $AUDIT_STORE_DIR"
+  [ ! -e "$override" ] ||
+    fail "the refused run rendered $override"
+  pass "an unprivileged init is refused before it creates a store or renders an override"
+}
+
 run_init() {
   log "initialising instance ${INSTANCE}"
   if ! run_bootroot_as_root init \
@@ -362,6 +483,7 @@ run_init() {
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "http://127.0.0.1:${PORT_HTTP01}" \
+    --agent-config "$AGENT_CONFIG_FILE" \
     </dev/null >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
@@ -586,6 +708,34 @@ assert_the_infra_agent_tree_belongs_to_its_sidecars() {
   pass "the sidecars' configuration, credentials and templates belong to the secrets tree"
 }
 
+# The two infra sidecars are generated before the TLS transition and
+# started after it, so what they must be generated *for* is the listener
+# the transition leaves behind: an `https://` address on the OpenBao
+# container name, and the CA bundle that verifies its step-ca-signed
+# leaf.  Generating them for the plaintext listener instead is invisible
+# at bring-up — the containers start, `init` succeeds, and the two
+# agents spend the rest of the deployment speaking HTTP to a TLS port,
+# renewing nothing.  Asserted on the generated files so that regression
+# fails here, with its reason, rather than as an audit log three phases
+# later that carries no `auth/approle/login`.
+assert_the_infra_agents_are_generated_for_tls() {
+  local addr="https://${INSTANCE}-openbao:8200" agent config
+  local override="$SECRETS_DIR/openbao/docker-compose.openbao-agent.override.yml"
+  [ -f "$override" ] || fail "no infra agent compose override was rendered at $override"
+  grep -qF "VAULT_ADDR=${addr}" "$override" ||
+    fail "the agent override does not point the sidecars at ${addr}"
+  for agent in stepca responder; do
+    config="$SECRETS_DIR/openbao/${agent}/agent.hcl"
+    grep -qF "address = \"${addr}\"" "$config" ||
+      fail "the ${agent} agent config does not address ${addr}"
+    grep -qF 'ca_cert = "/openbao/secrets/certs/ca-bundle.pem"' "$config" ||
+      fail "the ${agent} agent config carries no CA bundle to verify the TLS leaf"
+  done
+  [ -f "$SECRETS_DIR/certs/ca-bundle.pem" ] ||
+    fail "the CA bundle the sidecars verify the listener with is missing"
+  pass "the infra sidecars are generated for the TLS listener the transition leaves behind"
+}
+
 # `bootroot infra up` over the deployment `init` just provisioned.
 #
 # `infra up` ends in a recursive ownership sweep: a one-shot root
@@ -616,6 +766,98 @@ run_infra_up_over_the_initialised_deployment() {
   pass "'infra up' completed over the initialised deployment"
 }
 
+# The shared audit store, and the OpenBao file audit device now bound
+# into it.
+#
+# Every read below goes through `sudo -n`: the store is root-owned
+# `0700`, which is the whole point of the contract `init` holds it to.
+assert_audit_store_is_provisioned() {
+  local probe path
+  sudo -n test -d "$AUDIT_STORE_DIR" || fail "the audit store is missing at $AUDIT_STORE_DIR"
+  sudo -n test -d "$AUDIT_STORE_DIR/records" || fail "the store has no records/ directory"
+  sudo -n test -d "$AUDIT_STORE_DIR/openbao" || fail "the store has no openbao/ directory"
+  pass "the audit store exists with records/ and openbao/ beneath it"
+
+  for probe in "" records; do
+    path="$AUDIT_STORE_DIR${probe:+/$probe}"
+    assert_equal "${path} is root-owned and 0700" "0:0:700" "$(file_owner_mode "$path")"
+  done
+
+  # The container's entrypoint chowns `/openbao/audit` on every start,
+  # and against a bind mount that operates on the host directory.  So
+  # `openbao/` belongs to the container's user by the time the stack is
+  # up — which is exactly what `init` must not assert, repair or reject
+  # on a re-run.
+  probe="$(file_owner_mode "$AUDIT_STORE_DIR/openbao")"
+  [ "${probe%%:*}" != "0" ] ||
+    fail "openbao/ is still root-owned (${probe}); the container's entrypoint did not run against the bind mount"
+  pass "openbao/ belongs to the container's user while the store and records/ stay root's"
+}
+
+# The rendered override is what moved the device, and it is the record
+# `bootroot infra up` reads the bind source back out of.
+assert_the_audit_override_binds_the_store() {
+  local override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  [ -f "$override" ] || fail "no audit compose override was rendered at $override"
+  grep -q "volumes: !override" "$override" ||
+    fail "the audit override does not replace the volumes list"
+  grep -qF "${AUDIT_STORE_DIR}/openbao:${OPENBAO_AUDIT_CONTAINER_DIR}" "$override" ||
+    fail "the audit override does not bind ${AUDIT_STORE_DIR}/openbao"
+  grep -qF "openbao-data:/openbao/file" "$override" ||
+    fail "the audit override dropped OpenBao's storage mount"
+  grep -qF "./openbao:/openbao/config:ro" "$override" ||
+    fail "the audit override dropped OpenBao's configuration mount"
+  pass "the rendered override binds the store and re-declares the other two mounts"
+}
+
+# The criterion this whole scenario exists for on this side: the running
+# container's audit directory is backed by the store on the host.
+assert_the_container_audit_dir_is_backed_by_the_store() {
+  local mount
+  mount="$(docker inspect "${INSTANCE}-openbao" \
+    --format "{{range .Mounts}}{{if eq .Destination \"${OPENBAO_AUDIT_CONTAINER_DIR}\"}}{{.Type}} {{.Source}}{{end}}{{end}}" \
+    2>>"$RUN_LOG" || true)"
+  assert_equal "the container's ${OPENBAO_AUDIT_CONTAINER_DIR} is a bind mount of the store" \
+    "bind ${AUDIT_STORE_DIR}/openbao" "$mount"
+
+  # `verify_audit_file` passed at init — the run would have aborted with
+  # the audit-setup failure otherwise — and the device is writing into
+  # the store now that the recreate has moved it.
+  if grep -q "OpenBao audit backend setup failed" "$INIT_RAW_LOG"; then
+    fail "init reported an OpenBao audit backend setup failure"
+  fi
+  pass "init's mandatory file audit device check passed"
+
+  docker exec "${INSTANCE}-openbao" test -s "$OPENBAO_AUDIT_CONTAINER_LOG" ||
+    fail "the OpenBao audit log is missing or empty at ${OPENBAO_AUDIT_CONTAINER_LOG}"
+  sudo -n test -s "$AUDIT_STORE_DIR/openbao/audit.log" ||
+    fail "the OpenBao audit log did not land in the store on the host"
+  sudo -n grep -q '"type":"response"' "$AUDIT_STORE_DIR/openbao/audit.log" ||
+    fail "the audit log in the store carries no OpenBao response entry"
+  pass "the audit log OpenBao writes in the container is the file in the store on the host"
+}
+
+# The shared file-audit assertion every other lifecycle harness runs,
+# unchanged, against a deployment whose audit device is on the store.
+#
+# That is the point of running it here: the helper reads the *container*
+# path through `docker exec`, so a correct bind mount is transparent to
+# it and it has to pass exactly as it does on a host still using the
+# `openbao-audit` named volume.  A regression that moved the device
+# somewhere the container does not see would fail here even though the
+# host-side reads above still found a file.
+#
+# The entries it looks for — an `auth/approle/login` response and a
+# `secret/data/...` read — are the two infra OpenBao Agent sidecars'.
+# `init` starts them *after* the TLS recreate that moves the device
+# (`apply_openbao_agent_compose_override`, phase 2 of the agent
+# bring-up), so their traffic lands in the store rather than in the
+# volume the device wrote to beforehand.
+assert_the_shared_audit_log_assertion_still_passes() {
+  assert_openbao_audit_log "${INSTANCE}-openbao" "$OPENBAO_AUDIT_CONTAINER_LOG"
+  pass "the shared OpenBao file-audit assertion passes over the store-backed device"
+}
+
 # The alias is why the ACME challenge above could resolve at all.
 # Asserted directly so a future change that drops it fails with the
 # reason rather than as an unexplained issuance timeout.
@@ -633,10 +875,29 @@ assert_the_responder_answers_to_the_internal_san() {
 # Teardown
 # ---------------------------------------------------------------------------
 
+# The left-hand name is the artifact this scenario's CI step reads back
+# on failure; the right-hand one is the container the compose file
+# actually names.  They differ for step-ca — the service is `step-ca`
+# and its `container_name` is `${INSTANCE}-ca` — and a log named after
+# the service alone collected nothing but docker's `No such container`
+# for exactly the run that needed it.
+#
+# The two infra OpenBao Agent sidecars are here because their failures
+# are silent from the outside: the containers stay up and retry, and
+# only their logs say whether the auto-auth login and the template
+# renders they exist to perform are landing.
 capture_artifacts() {
-  local service
-  for service in openbao step-ca http01 postgres; do
-    docker logs "${INSTANCE}-${service}" >"$ARTIFACT_DIR/${service}.log" 2>&1 || true
+  local pair name container
+  for pair in \
+    openbao:openbao \
+    step-ca:ca \
+    http01:http01 \
+    postgres:postgres \
+    openbao-agent-stepca:openbao-agent-stepca \
+    openbao-agent-responder:openbao-agent-responder; do
+    name="${pair%%:*}"
+    container="${INSTANCE}-${pair#*:}"
+    docker logs "$container" >"$ARTIFACT_DIR/${name}.log" 2>&1 || true
   done
   [ -f "$WORK_DIR/state.json" ] && cp "$WORK_DIR/state.json" "$ARTIFACT_DIR/state.json" || true
   # Elevated, and re-owned to the invoking user afterwards: a root-owned
@@ -706,6 +967,18 @@ remove_run_root() {
   sudo -n rm -rf "$RUN_ROOT" 2>>"$RUN_LOG" || true
 }
 
+# The store is root-owned `0700`, so its removal goes through the same
+# `sudo -n` the rest of this scenario already requires.
+remove_audit_store_base() {
+  [ -n "$AUDIT_STORE_BASE" ] && [ -d "$AUDIT_STORE_BASE" ] || return 0
+  if rm -rf "$AUDIT_STORE_BASE" 2>/dev/null; then
+    return 0
+  fi
+  # What is left is this run's own root-owned store.  The path is this
+  # run's `mktemp -d`, never an operator's.
+  sudo -n rm -rf "$AUDIT_STORE_BASE" 2>>"$RUN_LOG" || true
+}
+
 cleanup() {
   local status=$?
   local cleanup_status=0
@@ -718,9 +991,14 @@ cleanup() {
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] &&
     { docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true; }
   remove_run_root
+  remove_audit_store_base
   report_project_leftovers "$INSTANCE" "registrar-internal-init cleanup" || cleanup_status=1
   if [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ]; then
     echo "[registrar-internal-init][cleanup] run root survived: ${RUN_ROOT}" >&2
+    cleanup_status=1
+  fi
+  if [ -n "$AUDIT_STORE_BASE" ] && [ -d "$AUDIT_STORE_BASE" ]; then
+    echo "[registrar-internal-init][cleanup] audit store base survived: ${AUDIT_STORE_BASE}" >&2
     cleanup_status=1
   fi
   exit_with_cleanup_status "$status" "$cleanup_status"
@@ -742,6 +1020,7 @@ main() {
 
   log_phase "prepare"
   create_run_root
+  create_audit_store_base
   build_responder_image
   prepull_third_party_images
 
@@ -753,6 +1032,10 @@ main() {
 
   log_phase "seed-predicate"
   seed_registrar_endpoint_predicate
+  seed_agent_configuration
+
+  log_phase "refuse-unprivileged"
+  assert_an_unprivileged_init_is_refused
 
   log_phase "init"
   run_init
@@ -763,6 +1046,12 @@ main() {
   assert_leaf_carries_the_fixed_san
   assert_the_responder_answers_to_the_internal_san
   assert_the_infra_agent_tree_belongs_to_its_sidecars
+  assert_the_infra_agents_are_generated_for_tls
+
+  log_phase "assert-audit-store"
+  assert_audit_store_is_provisioned
+  assert_the_audit_override_binds_the_store
+  assert_the_container_audit_dir_is_backed_by_the_store
 
   log_phase "assert-listener"
   assert_state_url_moved_to_https
@@ -782,6 +1071,18 @@ main() {
   run_infra_up_over_the_initialised_deployment
   assert_material_is_complete_and_restrictive
   assert_the_infra_agent_tree_belongs_to_its_sidecars
+  # The unprivileged bring-up selected the audit override and checked
+  # the store directory it names — the one check a process that cannot
+  # descend into a root-owned `0700` store can make — so the device is
+  # still on the store afterwards.
+  assert_audit_store_is_provisioned
+  assert_the_container_audit_dir_is_backed_by_the_store
+  # Last of all, and deliberately: the shared assertion wants traffic
+  # from both infra agents in the log, and this is the point in the run
+  # with the most of it behind us — the bring-up above recreated the
+  # stack and both sidecars re-authenticated against the store-backed
+  # device.
+  assert_the_shared_audit_log_assertion_still_passes
 
   log_phase "done"
   log "endpoint-enabled init checks passed"
