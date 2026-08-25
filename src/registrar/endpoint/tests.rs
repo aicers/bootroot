@@ -2576,6 +2576,19 @@ async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion
     // The remainder, measured from the pause rather than from an origin
     // only the endpoint knows, so the deadline is certainly crossed.
     tokio::time::advance(HEADER_IDLE_TIMEOUT).await;
+    // Asserted here, before the close is awaited, because this is the
+    // only point at which the budget is bounded from above. The read
+    // below parks the runtime under a paused clock, so auto-advance
+    // carries it to whatever the next timer is: a header deadline an
+    // order of magnitude too far away would still be reached there, and
+    // still be reported as no-header.
+    settle().await;
+    assert_eq!(
+        logs.refusals().len(),
+        1,
+        "the header deadline must end the connection inside the budget \
+         advanced here"
+    );
 
     let observed = read_tls_until_closed(&mut stream).await;
     assert!(
