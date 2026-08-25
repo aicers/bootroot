@@ -464,21 +464,22 @@ fn recognize_caller(
 /// an in-memory duplex — including every deadline, with `tokio::time`
 /// paused — without a socket, a peer or a uid.
 ///
-/// `accepted_at` starts the header deadline, which is cumulative
+/// `handshaken_at` starts the header deadline, which is cumulative
 /// through both the five-byte prefix and the declared operation-name
-/// bytes. On the real serving path it is the instant the TLS handshake
-/// completed, not the instant the connection was accepted: the handshake
-/// has a budget of its own.
+/// bytes. It is the instant the TLS handshake completed, not the
+/// instant the connection was accepted: the handshake has a budget of
+/// its own, and a slow one must not leave a caller with no time left to
+/// send a header.
 pub(crate) async fn serve_request<S>(
     stream: &mut S,
     connection: &ConnectionId,
     caller: &CallerIdentity,
     handler: &dyn RegistrarRequestHandler,
-    accepted_at: Instant,
+    handshaken_at: Instant,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some((operation, payload_length)) = read_header(stream, connection, accepted_at).await
+    let Some((operation, payload_length)) = read_header(stream, connection, handshaken_at).await
     else {
         return;
     };
@@ -516,12 +517,12 @@ pub(crate) async fn serve_request<S>(
 async fn read_header<S>(
     stream: &mut S,
     connection: &ConnectionId,
-    accepted_at: Instant,
+    handshaken_at: Instant,
 ) -> Option<(Operation, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let header_deadline = accepted_at + HEADER_IDLE_TIMEOUT;
+    let header_deadline = handshaken_at + HEADER_IDLE_TIMEOUT;
 
     let mut prefix = [0u8; REQUEST_PREFIX_BYTES];
     if let Err(stop) = read_exactly(stream, &mut prefix, header_deadline, connection).await {
