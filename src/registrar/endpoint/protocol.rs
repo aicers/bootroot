@@ -37,11 +37,6 @@ use crate::service_material::TeardownReport;
 /// The sole payload version this daemon implements.
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
-// These v1 members make a request a mint rather than a deregistration. They
-// stay rejected on a deregistration frame so a mint body cannot be interpreted
-// as a request to remove the same identity.
-const REGISTER_ONLY_REQUEST_MEMBERS: [&str; 3] = ["delivery_mode", "spec", "wrap_ttl"];
-
 /// A payload protocol version accepted by this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProtocolVersion;
@@ -170,9 +165,6 @@ pub(crate) enum CodecError {
     /// JSON did not match the selected payload shape.
     #[error("registrar protocol JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
-    /// A frame carried a member reserved for the other request operation.
-    #[error("registrar deregister request contains a register-only member: {0}")]
-    RegisterOnlyRequestMember(&'static str),
     /// `ca_anchor` was not standard base64.
     #[error("registrar ca_anchor is not standard base64: {0}")]
     Base64(#[from] base64::DecodeError),
@@ -191,24 +183,21 @@ pub(crate) enum CodecError {
 }
 
 /// Decodes an endpoint request after its operation has been authenticated.
+///
+/// The frame's operation, not the payload's members, selects the shape: a mint
+/// frame decodes only as a [`RegisterRequest`] and a deregistration frame only
+/// as a [`DeregisterRequest`].  Every member the selected shape does not name
+/// is an unknown member and is ignored, including one the other operation
+/// knows, so an additive extension on either shape cannot make the other
+/// shape's decoder fail.
 pub(crate) fn decode_request(operation: Operation, payload: &[u8]) -> Result<Request, CodecError> {
     match operation {
         Operation::Mint => serde_json::from_slice(payload)
             .map(Request::Register)
             .map_err(Into::into),
-        Operation::Deregister => {
-            let value: serde_json::Value = serde_json::from_slice(payload)?;
-            if let Some(members) = value.as_object()
-                && let Some(member) = REGISTER_ONLY_REQUEST_MEMBERS
-                    .iter()
-                    .find(|member| members.contains_key(**member))
-            {
-                return Err(CodecError::RegisterOnlyRequestMember(member));
-            }
-            serde_json::from_slice(payload)
-                .map(Request::Deregister)
-                .map_err(Into::into)
-        }
+        Operation::Deregister => serde_json::from_slice(payload)
+            .map(Request::Deregister)
+            .map_err(Into::into),
     }
 }
 
@@ -257,9 +246,12 @@ pub(crate) enum EnrollError {
 
 /// A snapshot of registrar health supplied by the response caller.
 ///
-/// This container is the single place future endpoint signals are added:
-/// `certificates`, `limiter`, and `audit_capacity` belong to their respective
-/// owner issues.  It is intentionally empty until those owners add members.
+/// This container is the single place future endpoint signals are added.
+/// Three members are reserved and each already has an owner: `certificates`
+/// is populated by #769, `limiter` by #787, and `audit_capacity` by #774.
+/// Recording the owners fixes neither a member schema nor a value; the
+/// container is intentionally empty, and serializes as `{}`, until each owner
+/// adds its own member.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistrarHealth {
     // Kept private and skipped so `Default` is the only in-crate way to create
@@ -498,6 +490,20 @@ fn validate_refusal_class(
 /// Maps every verb-layer refusal onto its caller-visible representation.
 // Each internal variant has its own arm so additions cannot silently inherit
 // the unclassified wire form, even where two current arms return the same form.
+//
+// Three wire forms are already assigned to refusals no internal variant
+// produces yet, and the change that introduces each one adds its own arm here
+// rather than reaching this mapping through a wildcard:
+//
+// - a post-mint outcome-audit write failure maps to permanent
+//   `RegistrarUnavailable { reason: PostMintUnrecordable }`;
+// - an intent-audit write failure maps to permanent
+//   `RegistrarUnavailable { reason: AuditUnwritable }`;
+// - the registrar's own rate-limit refusal maps to retryable
+//   `RegistrarBusy { retry_after }`, in whole seconds.
+//
+// No internal variant is added for them here: an arm without a variant to
+// match would be unreachable, and a variant without a producer would be dead.
 #[allow(clippy::match_same_arms)]
 #[allow(clippy::too_many_lines)]
 fn map_refusal(error: &VerbError) -> (RefusalClass, Option<EnrollError>) {
@@ -794,12 +800,26 @@ mod reject_null_option {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
 
     use super::*;
     use crate::input_validation::ValidationError;
     use crate::registrar::config::{Multiplicity, ReloadKind};
     use crate::registrar::error::SpecIdentityField;
+
+    // Names the registrar's own authority vocabulary carries. No request shape
+    // declares one, so each stays an ignored unknown member: caller identity
+    // reaches a verb from the transport seam, never from the payload.
+    const PROTOCOL_ONLY_AUTHORITY_MEMBERS: [&str; 7] = [
+        "caller_identity",
+        "request_id",
+        "composed_name",
+        "registration_id",
+        "domain",
+        "token_policies",
+        "policy_body",
+    ];
 
     const WIRE_REFERENCE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -918,6 +938,24 @@ mod tests {
         }
     }
 
+    fn register_request(cert_group: Option<&str>) -> RegisterRequest {
+        RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "api".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "node".to_string(),
+            instance: None,
+            spec: WireServiceSpec {
+                component: "api".to_string(),
+                service_name: "api".to_string(),
+                reload: "opaque reload".to_string(),
+                cert_group: cert_group.map(str::to_string),
+            },
+            wrap_ttl: 60,
+            idempotency_key: "opaque-key".to_string(),
+        }
+    }
+
     fn trust_payload() -> TrustPayload {
         let ca_bundle_pem =
             "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string();
@@ -1003,21 +1041,7 @@ mod tests {
             );
         }
 
-        let register = RegisterRequest {
-            protocol_version: ProtocolVersion::current(),
-            service_name: "api".to_string(),
-            delivery_mode: WireDeliveryMode::LocalFile,
-            host: "node".to_string(),
-            instance: None,
-            spec: WireServiceSpec {
-                component: "api".to_string(),
-                service_name: "api".to_string(),
-                reload: "opaque".to_string(),
-                cert_group: None,
-            },
-            wrap_ttl: 60,
-            idempotency_key: "key".to_string(),
-        };
+        let register = register_request(None);
 
         let mut invalid_delivery_mode =
             serde_json::to_value(&register).expect("register serializes");
@@ -1049,40 +1073,217 @@ mod tests {
     }
 
     #[test]
-    fn deregister_rejects_each_register_only_member() {
-        let register = RegisterRequest {
-            protocol_version: ProtocolVersion::current(),
-            service_name: "api".to_string(),
-            delivery_mode: WireDeliveryMode::LocalFile,
-            host: "node".to_string(),
-            instance: None,
-            spec: WireServiceSpec {
-                component: "api".to_string(),
-                service_name: "api".to_string(),
-                reload: "opaque".to_string(),
-                cert_group: None,
-            },
-            wrap_ttl: 60,
-            idempotency_key: "key".to_string(),
-        };
+    fn deregister_ignores_members_named_only_by_the_mint_shape() {
+        let expected = deregister_request(Some(7));
+        let canonical =
+            encode_request(&Request::Deregister(expected.clone())).expect("deregister encodes");
 
-        for member in REGISTER_ONLY_REQUEST_MEMBERS {
-            let mut value = serde_json::to_value(&register).expect("register serializes");
-            let members = value
-                .as_object_mut()
-                .expect("register serializes as an object");
-            for candidate in REGISTER_ONLY_REQUEST_MEMBERS {
-                if candidate != member {
-                    members.remove(candidate);
+        let mint_shape = serde_json::to_value(register_request(Some("opaque group")))
+            .expect("register serializes");
+        let mint_shape = mint_shape.as_object().expect("register is an object");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&canonical).expect("deregister is JSON");
+        let members = value.as_object_mut().expect("deregister is an object");
+        for member in ["delivery_mode", "spec", "wrap_ttl"] {
+            members.insert(
+                member.to_string(),
+                mint_shape
+                    .get(member)
+                    .expect("the mint shape names the member")
+                    .clone(),
+            );
+        }
+        members.insert(
+            "future".to_string(),
+            serde_json::json!({"nested": [1, 2, 3]}),
+        );
+
+        let payload = serde_json::to_vec(&value).expect("payload serializes");
+        let decoded = decode_request(Operation::Deregister, &payload)
+            .expect("members of the other operation are unknown members");
+        assert_eq!(decoded, Request::Deregister(expected));
+
+        let reencoded = encode_request(&decoded).expect("deregister re-encodes");
+        assert_eq!(reencoded, canonical);
+        let mut reencoded_value: serde_json::Value =
+            serde_json::from_slice(&reencoded).expect("re-encoded deregister is JSON");
+        reencoded_value
+            .as_object_mut()
+            .expect("re-encoded deregister is an object")
+            .remove("protocol_version");
+        assert_external_members_match_reference(
+            "### 4.3 `Deregister` fields",
+            "Deregister fields",
+            &reencoded_value,
+        );
+    }
+
+    #[test]
+    fn request_decoding_rejects_a_missing_required_member() {
+        for (operation, request) in [
+            (
+                Operation::Mint,
+                Request::Register(register_request(Some("opaque group"))),
+            ),
+            (
+                Operation::Deregister,
+                Request::Deregister(deregister_request(Some(7))),
+            ),
+        ] {
+            let encoded = encode_request(&request).expect("request encodes");
+            let value: serde_json::Value =
+                serde_json::from_slice(&encoded).expect("request is JSON");
+            let members = value.as_object().expect("request is an object").clone();
+            for member in members.keys() {
+                if member == "instance" {
+                    continue;
                 }
+                let mut reduced = members.clone();
+                reduced.remove(member);
+                let payload = serde_json::to_vec(&serde_json::Value::Object(reduced))
+                    .expect("payload serializes");
+                assert!(
+                    decode_request(operation, &payload).is_err(),
+                    "{member} is a required member"
+                );
+            }
+        }
+
+        let register = register_request(Some("opaque group"));
+        let encoded = encode_request(&Request::Register(register)).expect("register encodes");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("register is JSON");
+        let spec = value
+            .get("spec")
+            .and_then(serde_json::Value::as_object)
+            .expect("register carries a spec object")
+            .clone();
+        for member in spec.keys() {
+            if member == "cert_group" {
+                continue;
+            }
+            let mut reduced_spec = spec.clone();
+            reduced_spec.remove(member);
+            let mut reduced = value.clone();
+            reduced
+                .as_object_mut()
+                .expect("register is an object")
+                .insert("spec".to_string(), serde_json::Value::Object(reduced_spec));
+            let payload = serde_json::to_vec(&reduced).expect("payload serializes");
+            assert!(
+                decode_request(Operation::Mint, &payload).is_err(),
+                "spec.{member} is a required member"
+            );
+        }
+    }
+
+    #[test]
+    fn requests_ignore_protocol_only_authority_members() {
+        for (operation, expected) in [
+            (
+                Operation::Mint,
+                Request::Register(register_request(Some("opaque group"))),
+            ),
+            (
+                Operation::Deregister,
+                Request::Deregister(deregister_request(Some(7))),
+            ),
+        ] {
+            let canonical = encode_request(&expected).expect("request encodes");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&canonical).expect("request is JSON");
+            let members = value.as_object_mut().expect("request is an object");
+            for member in PROTOCOL_ONLY_AUTHORITY_MEMBERS {
+                members.insert(
+                    member.to_string(),
+                    serde_json::json!("unix-peer:uid=1000/asserted"),
+                );
             }
 
-            let payload = serde_json::to_vec(&value).expect("register payload serializes");
-            assert!(matches!(
-                decode_request(Operation::Deregister, &payload),
-                Err(CodecError::RegisterOnlyRequestMember(rejected)) if rejected == member
-            ));
+            let payload = serde_json::to_vec(&value).expect("payload serializes");
+            let decoded =
+                decode_request(operation, &payload).expect("authority members are unknown members");
+            assert_eq!(decoded, expected);
+
+            let reencoded = encode_request(&decoded).expect("request re-encodes");
+            assert_eq!(reencoded, canonical);
+            let reencoded = String::from_utf8(reencoded).expect("request is UTF-8 JSON");
+            for member in PROTOCOL_ONLY_AUTHORITY_MEMBERS {
+                assert!(
+                    !reencoded.contains(member),
+                    "{member} must not survive into a decoded request"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn requests_preserve_opaque_idempotency_keys() {
+        const KEYS: [&str; 2] = [" Mixed Case/\u{1f600}\t", "0000-1111"];
+
+        let decoded = KEYS.map(|key| {
+            let mut register = register_request(Some("opaque group"));
+            register.idempotency_key = key.to_string();
+            let mut deregister = deregister_request(Some(7));
+            deregister.idempotency_key = key.to_string();
+
+            let register = decode_request(
+                Operation::Mint,
+                &encode_request(&Request::Register(register)).expect("register encodes"),
+            )
+            .expect("register decodes");
+            let deregister = decode_request(
+                Operation::Deregister,
+                &encode_request(&Request::Deregister(deregister)).expect("deregister encodes"),
+            )
+            .expect("deregister decodes");
+            let (Request::Register(mut register), Request::Deregister(mut deregister)) =
+                (register, deregister)
+            else {
+                panic!("each operation selects its own request shape")
+            };
+
+            assert_eq!(register.idempotency_key, key);
+            assert_eq!(deregister.idempotency_key, key);
+            register.idempotency_key = String::new();
+            deregister.idempotency_key = String::new();
+            (register, deregister)
+        });
+        assert_eq!(decoded.first(), decoded.last());
+    }
+
+    #[test]
+    fn absent_cert_group_is_omitted_and_decodes_as_none() {
+        let absent = Request::Register(register_request(None));
+        let encoded = encode_request(&absent).expect("register encodes");
+        let text = String::from_utf8(encoded.clone()).expect("register is UTF-8 JSON");
+        assert!(!text.contains("cert_group"));
+        assert!(!text.contains("null"));
+        assert_eq!(
+            decode_request(Operation::Mint, &encoded).expect("register decodes"),
+            absent
+        );
+
+        let present = Request::Register(register_request(Some("opaque group")));
+        let encoded = encode_request(&present).expect("register encodes");
+        assert_eq!(
+            decode_request(Operation::Mint, &encoded).expect("register decodes"),
+            present
+        );
+
+        let mut null_group =
+            serde_json::to_value(register_request(None)).expect("register serializes");
+        null_group
+            .get_mut("spec")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("register carries a spec object")
+            .insert("cert_group".to_string(), serde_json::Value::Null);
+        assert!(
+            decode_request(
+                Operation::Mint,
+                &serde_json::to_vec(&null_group).expect("payload serializes")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1162,169 +1363,497 @@ mod tests {
         );
     }
 
-    #[test]
+    // Every current verb refusal, labelled with the row the reference's own
+    // mapping table records it under.  One list feeds both the mapping and the
+    // envelope test, so a variant added to `map_refusal` without a row here is
+    // a failing assertion rather than an untested arm.
     #[allow(clippy::too_many_lines)]
+    fn every_current_verb_error() -> Vec<(&'static str, VerbError)> {
+        vec![
+            (
+                "ReservedServiceName",
+                VerbError::ReservedServiceName {
+                    service_name: "bootroot-api".to_string(),
+                },
+            ),
+            (
+                "Registrar(ConfigUnreadable)",
+                VerbError::Registrar(RegistrarError::ConfigUnreadable {
+                    path: PathBuf::from("config"),
+                    source: std::io::Error::other("unreadable"),
+                }),
+            ),
+            (
+                "Registrar(FingerprintLineMalformed)",
+                VerbError::Registrar(RegistrarError::FingerprintLineMalformed {
+                    path: PathBuf::from("config"),
+                }),
+            ),
+            (
+                "Registrar(FingerprintMismatch)",
+                VerbError::Registrar(RegistrarError::FingerprintMismatch {
+                    path: PathBuf::from("config"),
+                    declared: "declared".to_string(),
+                    computed: "computed".to_string(),
+                }),
+            ),
+            (
+                "Registrar(ConfigMalformed)",
+                VerbError::Registrar(RegistrarError::ConfigMalformed {
+                    path: PathBuf::from("config"),
+                    message: "malformed".to_string(),
+                }),
+            ),
+            (
+                "Registrar(UnsupportedSchemaVersion)",
+                VerbError::Registrar(RegistrarError::UnsupportedSchemaVersion {
+                    path: PathBuf::from("config"),
+                    found: 2,
+                    supported: 1,
+                }),
+            ),
+            (
+                "Registrar(UnknownMultiplicity)",
+                VerbError::Registrar(RegistrarError::UnknownMultiplicity {
+                    component: "api".to_string(),
+                    value: "unknown".to_string(),
+                }),
+            ),
+            (
+                "Registrar(UnknownReloadKind)",
+                VerbError::Registrar(RegistrarError::UnknownReloadKind {
+                    component: "api".to_string(),
+                    value: "unknown".to_string(),
+                }),
+            ),
+            (
+                "Registrar(InvalidReloadTarget)",
+                VerbError::Registrar(RegistrarError::InvalidReloadTarget {
+                    component: "api".to_string(),
+                    kind: ReloadKind::Systemd,
+                }),
+            ),
+            (
+                "Registrar(InvalidDomain)",
+                VerbError::Registrar(RegistrarError::InvalidDomain {
+                    domain: "invalid".to_string(),
+                    kind: ValidationError::InvalidDomainName,
+                }),
+            ),
+            (
+                "Registrar(InvalidComponentKey)",
+                VerbError::Registrar(RegistrarError::InvalidComponentKey {
+                    component: "invalid".to_string(),
+                    kind: ValidationError::InvalidDnsLabel,
+                }),
+            ),
+            (
+                "Registrar(InvalidServiceName)",
+                VerbError::Registrar(RegistrarError::InvalidServiceName {
+                    value: "invalid".to_string(),
+                    kind: ValidationError::InvalidDnsLabel,
+                }),
+            ),
+            (
+                "Registrar(InvalidHost)",
+                VerbError::Registrar(RegistrarError::InvalidHost {
+                    value: "invalid".to_string(),
+                    kind: ValidationError::InvalidDnsLabel,
+                }),
+            ),
+            (
+                "Registrar(ComponentNotConfigured)",
+                VerbError::Registrar(RegistrarError::ComponentNotConfigured {
+                    component: "api".to_string(),
+                }),
+            ),
+            (
+                "Registrar(ServiceInstanceMismatch)",
+                VerbError::Registrar(RegistrarError::ServiceInstanceMismatch {
+                    component: "api".to_string(),
+                    multiplicity: Multiplicity::ManyPerHost,
+                    instance_supplied: false,
+                }),
+            ),
+            (
+                "Registrar(DerivedKeyInvalid)",
+                VerbError::Registrar(RegistrarError::DerivedKeyInvalid {
+                    key: "invalid".to_string(),
+                    kind: ValidationError::InvalidRegistrationId,
+                }),
+            ),
+            (
+                "Registrar(SpecIdentityDisagreement)",
+                VerbError::Registrar(RegistrarError::SpecIdentityDisagreement {
+                    field: SpecIdentityField::Both,
+                    expected: "api".to_string(),
+                    spec_component: Some("other".to_string()),
+                    spec_service_name: Some("other".to_string()),
+                }),
+            ),
+            (
+                "Registrar(ServiceSpecOutsideSafeSet)",
+                VerbError::Registrar(RegistrarError::ServiceSpecOutsideSafeSet {
+                    component: "api".to_string(),
+                }),
+            ),
+            (
+                "RegistrationIdCollision",
+                VerbError::RegistrationIdCollision {
+                    registration_id: "registration-1".to_string(),
+                    stored_host: "stored".to_string(),
+                    requested_host: "requested".to_string(),
+                },
+            ),
+            (
+                "StoredSpecConflict",
+                VerbError::StoredSpecConflict {
+                    registration_id: "registration-1".to_string(),
+                },
+            ),
+            (
+                "HostMismatch",
+                VerbError::HostMismatch {
+                    registration_id: "registration-1".to_string(),
+                    stored_host: "stored".to_string(),
+                    requested_host: "requested".to_string(),
+                },
+            ),
+            (
+                "InvalidWrapTtl(Zero)",
+                VerbError::InvalidWrapTtl(WrapTtlRefusal::Zero),
+            ),
+            (
+                "InvalidWrapTtl(Negative)",
+                VerbError::InvalidWrapTtl(WrapTtlRefusal::Negative),
+            ),
+            (
+                "InvalidWrapTtl(NotWholeSeconds)",
+                VerbError::InvalidWrapTtl(WrapTtlRefusal::NotWholeSeconds),
+            ),
+            (
+                "InvalidWrapTtl(ExceedsOpenBaoRange)",
+                VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange),
+            ),
+            (
+                "Unavailable",
+                VerbError::unavailable("fixture", anyhow::anyhow!("unavailable")),
+            ),
+        ]
+    }
+
+    // The reference's mapping table, minus the rows describing refusals no
+    // internal variant produces yet.
+    fn reference_refusal_mapping() -> BTreeMap<String, (RefusalClass, Option<EnrollError>)> {
+        reference_refusal_mapping_rows()
+            .into_iter()
+            .filter(|(label, _)| !label.starts_with("Future "))
+            .collect()
+    }
+
+    fn reference_refusal_mapping_rows() -> Vec<(String, (RefusalClass, Option<EnrollError>))> {
+        reference_table_rows("The refusal mapping is exhaustive over the current bootroot verb")
+            .into_iter()
+            .map(|row| {
+                let label = row
+                    .first()
+                    .expect("mapping row names an internal variant")
+                    .trim_matches('`')
+                    .to_string();
+                let class = reference_class(
+                    row.get(2)
+                        .expect("mapping row carries a class")
+                        .trim_matches('`'),
+                );
+                let identifier = reference_identifier(
+                    row.get(1)
+                        .expect("mapping row carries a wire identifier")
+                        .trim_matches('`'),
+                );
+                (label, (class, identifier))
+            })
+            .collect()
+    }
+
+    fn reference_class(class: &str) -> RefusalClass {
+        serde_json::from_value(serde_json::Value::String(class.to_string()))
+            .expect("reference class is a wire class")
+    }
+
+    // Reads a mapping-table cell such as `RegistrarUnavailable { reason: X }`
+    // back into the identifier it names, so no external spelling is retyped
+    // into a test.  A row that records a member without a fixed value — the
+    // rate-limit refusal's `retry_after` — supplies a placeholder, because the
+    // row assigns the identifier and leaves the value to the refusal.
+    fn reference_identifier(identifier: &str) -> Option<EnrollError> {
+        if identifier == "none" {
+            return None;
+        }
+        let (identifier, payload) = match identifier.split_once(" { ") {
+            None => (identifier, None),
+            Some((identifier, payload)) => (identifier, Some(payload.trim_end_matches('}').trim())),
+        };
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "id".to_string(),
+            serde_json::Value::String(identifier.to_string()),
+        );
+        if let Some(payload) = payload {
+            match payload.split_once(": ") {
+                Some((member, value)) => object.insert(
+                    member.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                ),
+                None => object.insert(payload.to_string(), serde_json::json!(0)),
+            };
+        }
+        Some(
+            serde_json::from_value(serde_json::Value::Object(object))
+                .expect("reference identifier is a wire identifier"),
+        )
+    }
+
+    #[test]
     fn every_verb_refusal_maps_to_its_contract_class_and_identifier() {
-        let unavailable = Some(EnrollError::RegistrarUnavailable {
-            reason: RegistrarUnavailableReason::NotProvisioned,
-        });
-        for error in [
-            RegistrarError::ConfigUnreadable {
-                path: PathBuf::from("config"),
-                source: std::io::Error::other("unreadable"),
-            },
-            RegistrarError::FingerprintLineMalformed {
-                path: PathBuf::from("config"),
-            },
-            RegistrarError::FingerprintMismatch {
-                path: PathBuf::from("config"),
-                declared: "declared".to_string(),
-                computed: "computed".to_string(),
-            },
-            RegistrarError::ConfigMalformed {
-                path: PathBuf::from("config"),
-                message: "malformed".to_string(),
-            },
-            RegistrarError::UnsupportedSchemaVersion {
-                path: PathBuf::from("config"),
-                found: 2,
-                supported: 1,
-            },
-            RegistrarError::UnknownMultiplicity {
-                component: "api".to_string(),
-                value: "unknown".to_string(),
-            },
-            RegistrarError::UnknownReloadKind {
-                component: "api".to_string(),
-                value: "unknown".to_string(),
-            },
-            RegistrarError::InvalidReloadTarget {
-                component: "api".to_string(),
-                kind: ReloadKind::Systemd,
-            },
-            RegistrarError::InvalidDomain {
-                domain: "invalid".to_string(),
-                kind: ValidationError::InvalidDomainName,
-            },
-            RegistrarError::InvalidComponentKey {
-                component: "invalid".to_string(),
-                kind: ValidationError::InvalidDnsLabel,
-            },
-        ] {
+        let expected = reference_refusal_mapping();
+        let mut covered = BTreeSet::new();
+        for (label, error) in every_current_verb_error() {
+            let row = expected
+                .get(label)
+                .unwrap_or_else(|| panic!("the reference records a mapping row for {label}"));
             assert_eq!(
-                map_refusal(&VerbError::Registrar(error)),
-                (RefusalClass::Permanent, unavailable.clone())
+                &map_refusal(&error),
+                row,
+                "{label} maps to its recorded row"
             );
+            covered.insert(label.to_string());
         }
-
-        for error in [
-            RegistrarError::InvalidServiceName {
-                value: "invalid".to_string(),
-                kind: ValidationError::InvalidDnsLabel,
-            },
-            RegistrarError::InvalidHost {
-                value: "invalid".to_string(),
-                kind: ValidationError::InvalidDnsLabel,
-            },
-        ] {
-            assert_eq!(
-                map_refusal(&VerbError::Registrar(error)),
-                (
-                    RefusalClass::Permanent,
-                    Some(EnrollError::ServiceLabelInvalid)
-                )
-            );
-        }
-
-        for error in [
-            RegistrarError::ComponentNotConfigured {
-                component: "api".to_string(),
-            },
-            RegistrarError::ServiceInstanceMismatch {
-                component: "api".to_string(),
-                multiplicity: Multiplicity::ManyPerHost,
-                instance_supplied: false,
-            },
-        ] {
-            assert_eq!(
-                map_refusal(&VerbError::Registrar(error)),
-                (
-                    RefusalClass::Permanent,
-                    Some(EnrollError::ServiceInstanceMismatch)
-                )
-            );
-        }
-
         assert_eq!(
-            map_refusal(&VerbError::Registrar(RegistrarError::DerivedKeyInvalid {
-                key: "invalid".to_string(),
-                kind: ValidationError::InvalidRegistrationId,
-            })),
-            (RefusalClass::Retryable, None)
+            covered,
+            expected.keys().cloned().collect::<BTreeSet<_>>(),
+            "every recorded mapping row is exercised"
         );
-        for error in [
-            RegistrarError::SpecIdentityDisagreement {
-                field: SpecIdentityField::Both,
-                expected: "api".to_string(),
-                spec_component: Some("other".to_string()),
-                spec_service_name: Some("other".to_string()),
-            },
-            RegistrarError::ServiceSpecOutsideSafeSet {
-                component: "api".to_string(),
-            },
-        ] {
-            assert_eq!(
-                map_refusal(&VerbError::Registrar(error)),
-                (
-                    RefusalClass::Permanent,
-                    Some(EnrollError::ServiceSpecConflict)
-                )
-            );
-        }
+    }
 
-        for error in [
-            VerbError::ReservedServiceName {
-                service_name: "bootroot-api".to_string(),
-            },
-            VerbError::InvalidWrapTtl(WrapTtlRefusal::Zero),
-            VerbError::InvalidWrapTtl(WrapTtlRefusal::Negative),
-            VerbError::InvalidWrapTtl(WrapTtlRefusal::NotWholeSeconds),
-            VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange),
-            VerbError::unavailable("fixture", anyhow::anyhow!("unavailable")),
-        ] {
-            assert_eq!(map_refusal(&error), (RefusalClass::Retryable, None));
+    #[test]
+    fn the_reference_records_the_three_future_mapping_assignments() {
+        let future = reference_refusal_mapping_rows()
+            .into_iter()
+            .filter(|(label, _)| label.starts_with("Future "))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        assert_eq!(future.len(), 3);
+        for (class, identifier) in &future {
+            let identifier = identifier
+                .as_ref()
+                .expect("a future assignment names an identifier");
+            assert!(validate_refusal_class(*class, Some(identifier)).is_ok());
         }
-        assert_eq!(
-            map_refusal(&VerbError::RegistrationIdCollision {
-                registration_id: "registration".to_string(),
-                stored_host: "stored".to_string(),
-                requested_host: "requested".to_string(),
+        assert!(future.contains(&(
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::PostMintUnrecordable,
             }),
-            (
-                RefusalClass::Permanent,
-                Some(EnrollError::ServiceNameCollision)
+        )));
+        assert!(future.contains(&(
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::AuditUnwritable,
+            }),
+        )));
+        assert!(
+            future
+                .iter()
+                .any(|(class, identifier)| *class == RefusalClass::Retryable
+                    && matches!(identifier, Some(EnrollError::RegistrarBusy { .. })))
+        );
+    }
+
+    #[test]
+    fn every_verb_refusal_round_trips_through_the_refusal_envelope() {
+        let health = RegistrarHealth::default();
+        for (label, error) in every_current_verb_error() {
+            let (class, expected_error) = map_refusal(&error);
+            let refusal = VerbRefusal::new(
+                fixture_context(Some("registration-1"), ProducingArm::Binding),
+                error,
+            );
+            let encoded = encode_refusal_response(&refusal, &health)
+                .unwrap_or_else(|_| panic!("the {label} refusal encodes"));
+
+            let value: serde_json::Value =
+                serde_json::from_slice(&encoded).expect("refusal is JSON");
+            let members = value.as_object().expect("refusal is an object");
+            assert_eq!(
+                members.get("class").cloned(),
+                Some(serde_json::to_value(class).expect("class serializes")),
+                "{label} encodes its recorded class"
+            );
+            assert_eq!(
+                members.get("error").cloned(),
+                expected_error
+                    .as_ref()
+                    .map(|error| serde_json::to_value(error).expect("identifier serializes")),
+                "{label} encodes its recorded identifier form"
+            );
+
+            let decoded = decode_refusal_response(&encoded)
+                .unwrap_or_else(|_| panic!("the {label} refusal decodes"));
+            assert_eq!(decoded.class, class);
+            assert_eq!(decoded.error, expected_error);
+            assert_eq!(decoded.registration_id.as_deref(), Some("registration-1"));
+            assert_eq!(decoded.request_id, "request-0001");
+        }
+    }
+
+    #[test]
+    fn every_identifier_and_reason_round_trips_through_the_refusal_envelope() {
+        let health = RegistrarHealth::default();
+        let classes = reference_identifier_classes();
+        let reasons = [
+            RegistrarUnavailableReason::CredentialInvalid,
+            RegistrarUnavailableReason::NotProvisioned,
+            RegistrarUnavailableReason::AuditUnwritable,
+            RegistrarUnavailableReason::EndpointUnreachable,
+            RegistrarUnavailableReason::PostMintUnrecordable,
+            RegistrarUnavailableReason::RegistrarUnreachable,
+        ];
+        let errors = [
+            EnrollError::ServiceSpecConflict,
+            EnrollError::ServiceNameCollision,
+            EnrollError::ServiceInstanceMismatch,
+            EnrollError::ServiceHostMismatch,
+            EnrollError::RegistrarBusy { retry_after: 30 },
+            EnrollError::ServiceLabelInvalid,
+        ]
+        .into_iter()
+        .chain(
+            reasons
+                .into_iter()
+                .map(|reason| EnrollError::RegistrarUnavailable { reason }),
+        );
+
+        let mut covered_identifiers = BTreeSet::new();
+        let mut covered_reasons = BTreeSet::new();
+        for error in errors {
+            let encoded_error = serde_json::to_value(&error).expect("identifier serializes");
+            let identifier = encoded_error
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .expect("an identifier uses the id tag")
+                .to_string();
+            let class = *classes
+                .get(&identifier)
+                .expect("the reference records the identifier");
+
+            let encoded = encode_refusal(
+                "request-0001",
+                Some("registration-1"),
+                class,
+                Some(error.clone()),
+                &health,
             )
+            .expect("the refusal envelope encodes");
+            let decoded = decode_refusal_response(&encoded).expect("the refusal envelope decodes");
+            assert_eq!(decoded.class, class);
+            assert_eq!(decoded.error, Some(error));
+
+            if let Some(reason) = encoded_error
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                covered_reasons.insert(reason.to_string());
+            }
+            covered_identifiers.insert(identifier);
+        }
+
+        assert_eq!(
+            covered_identifiers.len(),
+            reference_count("typed enroll errors")
         );
         assert_eq!(
-            map_refusal(&VerbError::StoredSpecConflict {
-                registration_id: "registration".to_string(),
-            }),
-            (
-                RefusalClass::Permanent,
-                Some(EnrollError::ServiceSpecConflict)
-            )
+            covered_identifiers,
+            classes.keys().cloned().collect::<BTreeSet<_>>()
         );
         assert_eq!(
-            map_refusal(&VerbError::HostMismatch {
-                registration_id: "registration".to_string(),
-                stored_host: "stored".to_string(),
-                requested_host: "requested".to_string(),
-            }),
-            (
-                RefusalClass::Permanent,
-                Some(EnrollError::ServiceHostMismatch)
-            )
+            covered_reasons.len(),
+            reference_count("RegistrarUnavailable reasons")
         );
+    }
+
+    #[test]
+    fn collapsed_refusals_encode_one_identical_class_and_error() {
+        for (expected_error, errors) in [
+            (
+                EnrollError::ServiceSpecConflict,
+                vec![
+                    VerbError::Registrar(RegistrarError::SpecIdentityDisagreement {
+                        field: SpecIdentityField::Both,
+                        expected: "api".to_string(),
+                        spec_component: Some("other".to_string()),
+                        spec_service_name: Some("other".to_string()),
+                    }),
+                    VerbError::Registrar(RegistrarError::ServiceSpecOutsideSafeSet {
+                        component: "api".to_string(),
+                    }),
+                    VerbError::StoredSpecConflict {
+                        registration_id: "registration-1".to_string(),
+                    },
+                ],
+            ),
+            (
+                EnrollError::ServiceInstanceMismatch,
+                vec![
+                    VerbError::Registrar(RegistrarError::ComponentNotConfigured {
+                        component: "api".to_string(),
+                    }),
+                    VerbError::Registrar(RegistrarError::ServiceInstanceMismatch {
+                        component: "api".to_string(),
+                        multiplicity: Multiplicity::ManyPerHost,
+                        instance_supplied: false,
+                    }),
+                ],
+            ),
+        ] {
+            let expected_value =
+                serde_json::to_value(&expected_error).expect("identifier serializes");
+            assert_eq!(
+                object_member_names(&expected_value),
+                vec!["id".to_string()],
+                "a collapsed identifier carries no discriminator beyond its id"
+            );
+            let expected = (
+                serde_json::to_string(&RefusalClass::Permanent).expect("class serializes"),
+                serde_json::to_string(&expected_value).expect("identifier serializes"),
+            );
+
+            let sources = errors.len();
+            let encoded = errors
+                .into_iter()
+                .map(encoded_class_and_error)
+                .collect::<Vec<_>>();
+            assert_eq!(encoded.len(), sources);
+            for form in &encoded {
+                assert_eq!(*form, expected);
+            }
+        }
+    }
+
+    fn encoded_class_and_error(error: VerbError) -> (String, String) {
+        let refusal = VerbRefusal::new(
+            fixture_context(Some("registration-1"), ProducingArm::Binding),
+            error,
+        );
+        let encoded = encode_refusal_response(&refusal, &RegistrarHealth::default())
+            .expect("collapsed refusal encodes");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("refusal is JSON");
+        let members = value.as_object().expect("refusal is an object");
+        (
+            serde_json::to_string(members.get("class").expect("refusal carries a class"))
+                .expect("class serializes"),
+            serde_json::to_string(members.get("error").expect("refusal carries an error"))
+                .expect("identifier serializes"),
+        )
     }
 
     #[test]
@@ -1362,9 +1891,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn external_error_names_and_counts_conform_to_the_reference() {
-        let expected_identifier_classes = reference_table_rows("### 6.1 The identifier set")
+    fn reference_identifier_classes() -> BTreeMap<String, RefusalClass> {
+        reference_table_rows("### 6.1 The identifier set")
             .into_iter()
             .map(|row| {
                 let identifier = row
@@ -1372,13 +1900,15 @@ mod tests {
                     .expect("identifier row has a name")
                     .trim_matches('`')
                     .to_string();
-                let class = serde_json::from_value(serde_json::Value::String(
-                    row.get(2).expect("identifier row has a class").to_string(),
-                ))
-                .expect("reference identifier class is a wire class");
+                let class = reference_class(row.get(2).expect("identifier row has a class"));
                 (identifier, class)
             })
-            .collect::<BTreeMap<_, RefusalClass>>();
+            .collect()
+    }
+
+    #[test]
+    fn external_error_names_and_counts_conform_to_the_reference() {
+        let expected_identifier_classes = reference_identifier_classes();
         assert_eq!(
             expected_identifier_classes.len(),
             reference_count("typed enroll errors")
@@ -1711,6 +2241,153 @@ mod tests {
 
             let decoded = decode_refusal_response(&encoded).expect("refusal response decodes");
             assert_eq!(decoded.registration_id.as_deref(), expected_registration_id);
+        }
+    }
+
+    #[test]
+    fn mint_response_carries_the_granted_deadline() {
+        // Two granted instants, each with the UTC string the response must
+        // carry: a deadline derived from the requested lifetime instead would
+        // not move with them.
+        const GRANTED: [(i64, &str); 2] = [
+            (1_700_000_000, "2023-11-14T22:13:20Z"),
+            (1_700_003_600, "2023-11-14T23:13:20Z"),
+        ];
+
+        let health = RegistrarHealth::default();
+        let anchor = trust_payload();
+        for (timestamp, expected) in GRANTED {
+            let granted = OffsetDateTime::from_unix_timestamp(timestamp)
+                .expect("the fixture instant is representable");
+            let elsewhere = granted.to_offset(
+                time::UtcOffset::from_hms(9, 0, 0).expect("the fixture offset is valid"),
+            );
+            for expires_at in [granted, elsewhere] {
+                let outcome = MintOutcome::new(
+                    fixture_context(Some("registration-1"), ProducingArm::Issuance),
+                    MintKind::FirstMint,
+                    "api.node.example.test".to_string(),
+                    "role-id".to_string(),
+                    WrappedSecretIdToken::new("wrapped-secret".to_string()),
+                    expires_at,
+                );
+                let encoded =
+                    encode_mint_response(outcome, &anchor, &health).expect("mint outcome encodes");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&encoded).expect("mint response is JSON");
+                assert_eq!(
+                    value
+                        .get("material")
+                        .and_then(|material| material.get("expires_at"))
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected),
+                    "the response carries the granted deadline as a UTC instant"
+                );
+                assert_eq!(
+                    decode_mint_response(&encoded)
+                        .expect("mint response decodes")
+                        .material
+                        .expires_at,
+                    granted
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_response_shape_carries_one_reproducible_empty_health_snapshot() {
+        let health = RegistrarHealth::default();
+        let anchor = trust_payload();
+        let mint = || {
+            MintOutcome::new(
+                fixture_context(Some("registration-1"), ProducingArm::Issuance),
+                MintKind::FirstMint,
+                "api.node.example.test".to_string(),
+                "role-id".to_string(),
+                WrappedSecretIdToken::new("wrapped-secret".to_string()),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+        };
+        let deregister = || {
+            DeregisterOutcome::new(
+                fixture_context(Some("registration-1"), ProducingArm::Teardown),
+                DeregisterKind::IdentityRemoved,
+                TeardownReport::default(),
+            )
+        };
+        let permanent = || {
+            VerbRefusal::new(
+                fixture_context(Some("registration-1"), ProducingArm::Binding),
+                VerbError::HostMismatch {
+                    registration_id: "registration-1".to_string(),
+                    stored_host: "stored".to_string(),
+                    requested_host: "node".to_string(),
+                },
+            )
+        };
+        let retryable = || {
+            VerbRefusal::new(
+                fixture_context(None, ProducingArm::PreDerivation),
+                VerbError::unavailable("fixture", anyhow::anyhow!("unavailable")),
+            )
+        };
+        let busy = || {
+            encode_refusal(
+                "request-0001",
+                Some("registration-1"),
+                RefusalClass::Retryable,
+                Some(EnrollError::RegistrarBusy { retry_after: 30 }),
+                &health,
+            )
+        };
+
+        let shapes = [
+            (
+                "mint success",
+                encode_mint_response(mint(), &anchor, &health).expect("mint encodes"),
+                encode_mint_response(mint(), &anchor, &health).expect("mint re-encodes"),
+            ),
+            (
+                "deregister success",
+                encode_deregister_response(&deregister(), &health).expect("deregister encodes"),
+                encode_deregister_response(&deregister(), &health).expect("deregister re-encodes"),
+            ),
+            (
+                "permanent refusal",
+                encode_refusal_response(&permanent(), &health).expect("permanent refusal encodes"),
+                encode_refusal_response(&permanent(), &health)
+                    .expect("permanent refusal re-encodes"),
+            ),
+            (
+                "retryable refusal",
+                encode_refusal_response(&retryable(), &health).expect("retryable refusal encodes"),
+                encode_refusal_response(&retryable(), &health)
+                    .expect("retryable refusal re-encodes"),
+            ),
+            (
+                "retryable refusal with an identifier",
+                busy().expect("busy refusal encodes"),
+                busy().expect("busy refusal re-encodes"),
+            ),
+        ];
+
+        for (shape, first, second) in shapes {
+            assert_eq!(first, second, "{shape} does not encode reproducibly");
+
+            let text = String::from_utf8(first).expect("response is UTF-8 JSON");
+            assert!(
+                text.contains(r#""registrar_health":{}"#),
+                "{shape} does not carry the empty health snapshot"
+            );
+            let value: serde_json::Value = serde_json::from_str(&text).expect("response is JSON");
+            let snapshot = value
+                .get("registrar_health")
+                .expect("response carries registrar_health");
+            assert_eq!(
+                serde_json::from_value::<RegistrarHealth>(snapshot.clone())
+                    .expect("the snapshot decodes"),
+                RegistrarHealth::default()
+            );
         }
     }
 

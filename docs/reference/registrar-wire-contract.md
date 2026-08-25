@@ -441,7 +441,12 @@ integer.
 
 The encoder emits those orders byte-stably, while decoders are
 order-insensitive. Serialization emits no members outside the listed shapes;
-deserialization tolerates an unknown member at the implemented version. A
+deserialization tolerates an unknown member at the implemented version. The
+frame's operation alone selects which request shape is decoded, so a member
+named only by the other operation's shape is an unknown member like any other
+and is ignored rather than rejected; a deregistration frame therefore decodes
+to the same `Deregister` whether or not it also carries `delivery_mode`,
+`spec`, or `wrap_ttl`, and re-encodes with the §4.3 members only. A
 request payload that cannot be decoded into its selected typed shape returns a
 typed codec error only: it does not construct a refusal or emit response bytes,
 because no verb invocation or request id exists yet. Request shapes carry no
@@ -461,8 +466,13 @@ base64-decodes, parses a `serde_json::Value`, passes it to
 Any failure in that path is a decode error, never a wire refusal.
 
 `registrar_health` is the endpoint-local, snapshot-supplied container for
-future `certificates`, `limiter`, and `audit_capacity` members. It is `{}` in
-v1 and appears on mint success, deregister success, and refusal responses.
+future `certificates`, `limiter`, and `audit_capacity` members. Each of those
+three is already owned: `certificates` is populated by
+[#769](https://github.com/aicers/bootroot/issues/769), `limiter` by
+[#787](https://github.com/aicers/bootroot/issues/787), and `audit_capacity` by
+[#774](https://github.com/aicers/bootroot/issues/774). That records ownership
+only; no member schema is defined and no member is populated here. It is `{}`
+in v1 and appears on mint success, deregister success, and refusal responses.
 It is distinct from the registrar ecosystem's `audit_health` tail in §9. A
 response encoder receives an explicit `RegistrarHealth` snapshot and has no
 other source for it; the protocol module does not read audit, limiter, or
