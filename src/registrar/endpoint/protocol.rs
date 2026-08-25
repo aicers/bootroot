@@ -20,6 +20,9 @@ use time::OffsetDateTime;
 
 use super::frame::Operation;
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
+use crate::registrar::audit::AuditPhase;
+#[cfg(test)]
+use crate::registrar::audit::AuditStoreError;
 use crate::registrar::error::RegistrarError;
 #[cfg(test)]
 use crate::registrar::identity::{derive_registration_id, validate_request_labels};
@@ -491,19 +494,22 @@ fn validate_refusal_class(
 // Each internal variant has its own arm so additions cannot silently inherit
 // the unclassified wire form, even where two current arms return the same form.
 //
-// Three wire forms are already assigned to refusals no internal variant
-// produces yet, and the change that introduces each one adds its own arm here
-// rather than reaching this mapping through a wildcard:
+// One wire form is still assigned to a refusal no internal variant produces
+// yet, and the change that introduces it adds its own arm here rather than
+// reaching this mapping through a wildcard: the registrar's own rate-limit
+// refusal maps to retryable `RegistrarBusy { retry_after }`, in whole
+// seconds. No internal variant is added for it here: an arm without a
+// variant to match would be unreachable, and a variant without a producer
+// would be dead.
 //
-// - a post-mint outcome-audit write failure maps to permanent
-//   `RegistrarUnavailable { reason: PostMintUnrecordable }`;
-// - an intent-audit write failure maps to permanent
-//   `RegistrarUnavailable { reason: AuditUnwritable }`;
-// - the registrar's own rate-limit refusal maps to retryable
-//   `RegistrarBusy { retry_after }`, in whole seconds.
-//
-// No internal variant is added for them here: an arm without a variant to
-// match would be unreachable, and a variant without a producer would be dead.
+// Both `AuditUnwritable` phases map onto the one transcribed
+// `AuditUnwritable` reason. The reference's §6.5 row transcribes the
+// source's intent-phase condition; a non-mutating outcome-phase failure
+// presents the same caller-visible facts — nothing minted, no teardown
+// owed, the audit store unwritable — where `PostMintUnrecordable` would
+// falsely owe a teardown and the unclassified form would drop the
+// audit-store signal. The locally owned half of the reference records this
+// producer set.
 #[allow(clippy::match_same_arms)]
 #[allow(clippy::too_many_lines)]
 fn map_refusal(error: &VerbError) -> (RefusalClass, Option<EnrollError>) {
@@ -616,6 +622,30 @@ fn map_refusal(error: &VerbError) -> (RefusalClass, Option<EnrollError>) {
         VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange) => {
             (RefusalClass::Retryable, None)
         }
+        VerbError::AuditUnwritable {
+            phase: AuditPhase::Intent,
+            ..
+        } => (
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::AuditUnwritable,
+            }),
+        ),
+        VerbError::AuditUnwritable {
+            phase: AuditPhase::Outcome,
+            ..
+        } => (
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::AuditUnwritable,
+            }),
+        ),
+        VerbError::PostMintUnrecordable { .. } => (
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::PostMintUnrecordable,
+            }),
+        ),
         VerbError::Unavailable { .. } => (RefusalClass::Retryable, None),
     }
 }
@@ -1536,10 +1566,37 @@ mod tests {
                 VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange),
             ),
             (
+                "AuditUnwritable { phase: Intent }",
+                VerbError::AuditUnwritable {
+                    phase: AuditPhase::Intent,
+                    source: fixture_audit_store_error(),
+                },
+            ),
+            (
+                "AuditUnwritable { phase: Outcome }",
+                VerbError::AuditUnwritable {
+                    phase: AuditPhase::Outcome,
+                    source: fixture_audit_store_error(),
+                },
+            ),
+            (
+                "PostMintUnrecordable",
+                VerbError::PostMintUnrecordable {
+                    source: fixture_audit_store_error(),
+                },
+            ),
+            (
                 "Unavailable",
                 VerbError::unavailable("fixture", anyhow::anyhow!("unavailable")),
             ),
         ]
+    }
+
+    fn fixture_audit_store_error() -> AuditStoreError {
+        AuditStoreError::Append {
+            path: PathBuf::from("audit"),
+            source: std::io::Error::other("append failed"),
+        }
     }
 
     // The reference's mapping table, minus the rows describing refusals no
@@ -1636,31 +1693,19 @@ mod tests {
     }
 
     #[test]
-    fn the_reference_records_the_three_future_mapping_assignments() {
+    fn the_reference_records_the_future_rate_limit_assignment() {
         let future = reference_refusal_mapping_rows()
             .into_iter()
             .filter(|(label, _)| label.starts_with("Future "))
             .map(|(_, row)| row)
             .collect::<Vec<_>>();
-        assert_eq!(future.len(), 3);
+        assert_eq!(future.len(), 1);
         for (class, identifier) in &future {
             let identifier = identifier
                 .as_ref()
                 .expect("a future assignment names an identifier");
             assert!(validate_refusal_class(*class, Some(identifier)).is_ok());
         }
-        assert!(future.contains(&(
-            RefusalClass::Permanent,
-            Some(EnrollError::RegistrarUnavailable {
-                reason: RegistrarUnavailableReason::PostMintUnrecordable,
-            }),
-        )));
-        assert!(future.contains(&(
-            RefusalClass::Permanent,
-            Some(EnrollError::RegistrarUnavailable {
-                reason: RegistrarUnavailableReason::AuditUnwritable,
-            }),
-        )));
         assert!(
             future
                 .iter()
