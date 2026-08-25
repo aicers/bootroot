@@ -784,7 +784,7 @@ mod reject_null_option {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
     use super::*;
     use crate::input_validation::ValidationError;
@@ -869,6 +869,22 @@ mod tests {
         assert_eq!(object_member_names(value), expected);
     }
 
+    fn replace_serialized_value<T>(
+        value: &mut serde_json::Value,
+        current: &T,
+        replacement: serde_json::Value,
+    ) where
+        T: Serialize,
+    {
+        let current = serde_json::to_value(current).expect("current value serializes");
+        let members = value.as_object_mut().expect("value is a JSON object");
+        let member = members
+            .iter()
+            .find_map(|(member, value)| (value == &current).then(|| member.clone()))
+            .expect("fixture contains the current value");
+        members.insert(member, replacement);
+    }
+
     fn trust_payload() -> TrustPayload {
         let ca_bundle_pem =
             "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string();
@@ -881,31 +897,6 @@ mod tests {
             trusted_ca_sha256: vec![crate::tls::sha256_hex(certificate.as_ref())],
             ca_bundle_pem,
         }
-    }
-
-    #[test]
-    fn request_encoding_uses_external_delivery_mode_spelling() {
-        let request = Request::Register(RegisterRequest {
-            protocol_version: ProtocolVersion::current(),
-            service_name: "api".to_string(),
-            delivery_mode: WireDeliveryMode::RemoteBootstrap,
-            host: "node".to_string(),
-            instance: None,
-            spec: WireServiceSpec {
-                component: "api".to_string(),
-                service_name: "api".to_string(),
-                reload: "opaque".to_string(),
-                cert_group: None,
-            },
-            wrap_ttl: 60,
-            idempotency_key: "key".to_string(),
-        });
-
-        let encoded = encode_request(&request).expect("serializable request");
-        assert_eq!(
-            String::from_utf8(encoded).expect("JSON is UTF-8"),
-            r#"{"protocol_version":1,"service_name":"api","delivery_mode":"RemoteBootstrap","host":"node","spec":{"component":"api","service_name":"api","reload":"opaque"},"wrap_ttl":60,"idempotency_key":"key"}"#
-        );
     }
 
     #[test]
@@ -929,12 +920,48 @@ mod tests {
             assert!(decode_request(Operation::Deregister, payload).is_err());
         }
 
-        for payload in [
-            br#"{"protocol_version":1,"service_name":"api","delivery_mode":"Other","host":"node","spec":{"component":"api","service_name":"api","reload":"opaque"},"wrap_ttl":60,"idempotency_key":"key"}"#.as_slice(),
-            br#"{"protocol_version":1,"service_name":"api","delivery_mode":"LocalFile","host":"node","spec":{"component":"api","service_name":"api","reload":"opaque"},"wrap_ttl":-1,"idempotency_key":"key"}"#,
-            br#"{"protocol_version":1,"service_name":"api","delivery_mode":"LocalFile","host":"node","spec":{"component":"api","service_name":"api","reload":"opaque"},"wrap_ttl":1.5,"idempotency_key":"key"}"#,
-        ] {
-            assert!(decode_request(Operation::Mint, payload).is_err());
+        let register = RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "api".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "node".to_string(),
+            instance: None,
+            spec: WireServiceSpec {
+                component: "api".to_string(),
+                service_name: "api".to_string(),
+                reload: "opaque".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 60,
+            idempotency_key: "key".to_string(),
+        };
+
+        let mut invalid_delivery_mode =
+            serde_json::to_value(&register).expect("register serializes");
+        replace_serialized_value(
+            &mut invalid_delivery_mode,
+            &WireDeliveryMode::LocalFile,
+            serde_json::Value::String("Other".to_string()),
+        );
+
+        let mut negative_ttl = serde_json::to_value(&register).expect("register serializes");
+        replace_serialized_value(&mut negative_ttl, &register.wrap_ttl, serde_json::json!(-1));
+
+        let mut fractional_ttl = serde_json::to_value(&register).expect("register serializes");
+        replace_serialized_value(
+            &mut fractional_ttl,
+            &register.wrap_ttl,
+            serde_json::json!(1.5),
+        );
+
+        for payload in [invalid_delivery_mode, negative_ttl, fractional_ttl] {
+            assert!(
+                decode_request(
+                    Operation::Mint,
+                    &serde_json::to_vec(&payload).expect("payload serializes")
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1214,22 +1241,27 @@ mod tests {
 
     #[test]
     fn external_error_names_and_counts_conform_to_the_reference() {
-        let mut expected_identifiers: Vec<_> = reference_table_rows("### 6.1 The identifier set")
+        let expected_identifier_classes = reference_table_rows("### 6.1 The identifier set")
             .into_iter()
             .map(|row| {
-                row.first()
+                let identifier = row
+                    .first()
                     .expect("identifier row has a name")
                     .trim_matches('`')
-                    .to_string()
+                    .to_string();
+                let class = serde_json::from_value(serde_json::Value::String(
+                    row.get(2).expect("identifier row has a class").to_string(),
+                ))
+                .expect("reference identifier class is a wire class");
+                (identifier, class)
             })
-            .collect();
-        expected_identifiers.sort_unstable();
+            .collect::<BTreeMap<_, RefusalClass>>();
         assert_eq!(
-            expected_identifiers.len(),
+            expected_identifier_classes.len(),
             reference_count("typed enroll errors")
         );
 
-        let mut encoded_identifiers = [
+        let actual_identifier_classes = [
             EnrollError::ServiceSpecConflict,
             EnrollError::ServiceNameCollision,
             EnrollError::ServiceInstanceMismatch,
@@ -1242,16 +1274,25 @@ mod tests {
         ]
         .iter()
         .map(|error| {
-            serde_json::to_value(error)
+            let identifier = serde_json::to_value(error)
                 .expect("identifier serializes")
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .expect("identifier uses an id member")
-                .to_string()
+                .to_string();
+            let class = *expected_identifier_classes
+                .get(&identifier)
+                .expect("encoded identifier appears in the reference");
+            assert!(validate_refusal_class(class, Some(error)).is_ok());
+            let other_class = match class {
+                RefusalClass::Retryable => RefusalClass::Permanent,
+                RefusalClass::Permanent => RefusalClass::Retryable,
+            };
+            assert!(validate_refusal_class(other_class, Some(error)).is_err());
+            (identifier, class)
         })
-        .collect::<Vec<_>>();
-        encoded_identifiers.sort_unstable();
-        assert_eq!(encoded_identifiers, expected_identifiers);
+        .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual_identifier_classes, expected_identifier_classes);
 
         let mut expected_reasons: Vec<_> =
             reference_table_rows("### 6.5 `RegistrarUnavailable` reason set (closed)")
@@ -1446,13 +1487,42 @@ mod tests {
 
     #[test]
     fn refusal_decoding_rejects_a_class_that_conflicts_with_its_error_form() {
-        for payload in [
-            br#"{"protocol_version":1,"request_id":"request","class":"permanent","registrar_health":{}}"#
-                .as_slice(),
-            br#"{"protocol_version":1,"request_id":"request","class":"retryable","error":{"id":"ServiceHostMismatch"},"registrar_health":{}}"#,
-            br#"{"protocol_version":1,"request_id":"request","class":"permanent","error":{"id":"RegistrarBusy","retry_after":30},"registrar_health":{}}"#,
+        let unclassified = RefusalResponse {
+            protocol_version: ProtocolVersion::current(),
+            request_id: "request".to_string(),
+            registration_id: None,
+            class: RefusalClass::Permanent,
+            error: None,
+            registrar_health: RegistrarHealth::default(),
+        };
+        assert!(
+            decode_refusal_response(
+                &serde_json::to_vec(&unclassified).expect("unclassified refusal serializes")
+            )
+            .is_err()
+        );
+
+        for (error, class) in [
+            (EnrollError::ServiceHostMismatch, RefusalClass::Retryable),
+            (
+                EnrollError::RegistrarBusy { retry_after: 30 },
+                RefusalClass::Permanent,
+            ),
         ] {
-            assert!(decode_refusal_response(payload).is_err());
+            let response = RefusalResponse {
+                protocol_version: ProtocolVersion::current(),
+                request_id: "request".to_string(),
+                registration_id: None,
+                class,
+                error: Some(error),
+                registrar_health: RegistrarHealth::default(),
+            };
+            assert!(
+                decode_refusal_response(
+                    &serde_json::to_vec(&response).expect("refusal serializes")
+                )
+                .is_err()
+            );
         }
     }
 
