@@ -162,7 +162,10 @@ value is deterministic, so a caller with several outstanding requests
 should jitter its own retries.
 
 Either way the daemon counts what it suppressed, one counter per bucket
-since start. Read them together rather than as a total: a rising
+since start. Those two counts live in the daemon's own memory and have
+no operator-facing surface yet — nothing reports them, and this build
+charges nothing against the buckets to count. Once one arrives, read
+them as two numbers rather than as a total: a rising
 `predecision_refusal` count says someone is flooding malformed input
 while those callers still got their real answers, and a rising
 `admission` count says legitimate traffic is being held back and a
