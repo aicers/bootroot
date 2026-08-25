@@ -3175,6 +3175,19 @@ fn every_startup_refusal_names_the_setting_at_fault_and_generates_nothing() {
             Some(missing.clone()),
         ),
         (
+            "an unreadable key file",
+            build_server_config(
+                Some(&cert_path),
+                Some(&directory),
+                Some(&bundle),
+                &pins,
+                TEST_DOMAIN,
+            )
+            .expect_err("unreadable key"),
+            SERVER_KEY_SETTING,
+            Some(directory.clone()),
+        ),
+        (
             "a key that is not the leaf's",
             build_server_config(
                 Some(&cert_path),
@@ -3303,6 +3316,110 @@ fn a_trust_bundle_that_is_not_pem_is_refused() {
     )
     .expect_err("a non-PEM bundle must be refused");
     assert_diagnostic_names(&error, CA_BUNDLE_SETTING, Some(&garbage));
+}
+
+/// The endpoint's own material is read as finely as the diagnostic
+/// needs: a PEM block that does not decode is an unparseable file, a
+/// file carrying no PEM block at all holds no certificate, and a key
+/// that decodes into something this build cannot sign with is neither
+/// of those.
+///
+/// Each sends an operator somewhere different — a truncated copy, the
+/// wrong file, a key from a stack this build does not carry — so a
+/// single "bad file" would be the least useful of the three.
+#[test]
+fn malformed_server_material_is_diagnosed_by_what_is_wrong_with_it() {
+    // The body of the corrupt key file, so the diagnostic can be
+    // asserted not to quote it.
+    const KEY_BODY_MARKER: &str = "not-base64-key-body";
+
+    let pki = Pki::new();
+    let (cert_path, key_path) = pki.server_material();
+    let bundle = pki.ca_bundle_path();
+    let pins = pki.pins();
+
+    let corrupt_cert = pki.path("corrupt.crt");
+    std::fs::write(
+        &corrupt_cert,
+        "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write a corrupt certificate PEM");
+    let error = build_server_config(
+        Some(&corrupt_cert),
+        Some(&key_path),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a certificate PEM that does not decode must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::Unparsable { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_CERT_SETTING, Some(&corrupt_cert));
+
+    let not_pem = pki.path("not-pem.crt");
+    std::fs::write(&not_pem, b"this file is not PEM at all\n").expect("write a non-PEM file");
+    let error = build_server_config(
+        Some(&not_pem),
+        Some(&key_path),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a certificate setting pointing at a non-PEM file must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::NoCertificate { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_CERT_SETTING, Some(&not_pem));
+
+    // The key diagnostics have to say what is wrong without quoting the
+    // bytes they failed on: this input is key material, and an error
+    // that echoed it would put it in a log.
+    let corrupt_key = pki.path("corrupt.key");
+    std::fs::write(
+        &corrupt_key,
+        format!("-----BEGIN PRIVATE KEY-----\n!!{KEY_BODY_MARKER}!!\n-----END PRIVATE KEY-----\n"),
+    )
+    .expect("write a corrupt key PEM");
+    let error = build_server_config(
+        Some(&cert_path),
+        Some(&corrupt_key),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a key PEM that does not decode must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::Unparsable { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_KEY_SETTING, Some(&corrupt_key));
+    assert!(
+        !format!("{error:#}").contains(KEY_BODY_MARKER),
+        "a key diagnostic must not quote the material it failed on: {error:#}"
+    );
+
+    let unsupported_key = pki.path("unsupported.key");
+    std::fs::write(
+        &unsupported_key,
+        "-----BEGIN PRIVATE KEY-----\nbm90IGEga2V5\n-----END PRIVATE KEY-----\n",
+    )
+    .expect("write a well-formed PEM block holding no usable key");
+    let error = build_server_config(
+        Some(&cert_path),
+        Some(&unsupported_key),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a key this build cannot sign with must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::UnsupportedKey { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_KEY_SETTING, Some(&unsupported_key));
 }
 
 /// The two paths transposed is the likeliest way to get this wrong, and
