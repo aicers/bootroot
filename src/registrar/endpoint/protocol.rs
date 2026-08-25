@@ -1517,9 +1517,9 @@ mod tests {
     fn mint_response_decoding_enforces_version_and_anchor_framing() {
         let trust_payload = trust_payload();
         let anchor = encode_ca_anchor(&trust_payload).expect("anchor encodes");
-        assert!(
-            decode_ca_anchor(&anchor).is_ok(),
-            "encoded anchor must decode: {anchor}"
+        assert_eq!(
+            decode_ca_anchor(&anchor).expect("encoded anchor must decode"),
+            trust_payload
         );
         let response = MintResponse {
             protocol_version: ProtocolVersion::current(),
@@ -1651,8 +1651,20 @@ mod tests {
         );
         assert!(decode_ca_anchor(&uppercase_fingerprint).is_err());
 
+        let mismatched_lowercase_fingerprint = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "trusted_ca_sha256": ["a".repeat(64)],
+                "ca_bundle_pem": &payload.ca_bundle_pem,
+            }))
+            .expect("JSON serializes"),
+        );
+        assert!(decode_ca_anchor(&mismatched_lowercase_fingerprint).is_err());
+
         let missing_members = base64::engine::general_purpose::STANDARD.encode(br"{}");
         assert!(decode_ca_anchor(&missing_members).is_err());
+
+        let non_json_bytes = base64::engine::general_purpose::STANDARD.encode(b"not JSON");
+        assert!(decode_ca_anchor(&non_json_bytes).is_err());
     }
 
     fn fixture_context(registration_id: Option<&str>, arm: ProducingArm) -> VerbContext {
