@@ -4,8 +4,8 @@
 //! refusal path. It does not own the payload: the versioned request and
 //! response schemas, their codec, their field names and the mapping of
 //! verb outcomes onto caller-visible responses belong to the registrar
-//! protocol, which is separate work. This trait is the whole of the
-//! contract between them.
+//! protocol module. This trait is the whole of the contract between the
+//! endpoint and a production handler that consumes that protocol.
 //!
 //! What crosses it is deliberately narrow. The handler receives the
 //! *checked* operation as an enum, the payload as opaque bytes, and the

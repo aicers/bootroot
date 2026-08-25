@@ -27,10 +27,10 @@
 //! - [`refusal`] is the single pre-verb refusal path: a closed taxonomy
 //!   of seven reasons, a daemon-generated connection diagnostic id, zero
 //!   response bytes and a clean close.
-//! - [`handler`] is the seam this issue stops at. The endpoint owns the
-//!   transport; the payload schema, its codec and the mapping of verb
-//!   outcomes onto caller-visible responses belong to the protocol work
-//!   that supplies the production [`handler::RegistrarRequestHandler`].
+//! - [`handler`] is the seam this module stops at. The endpoint owns the
+//!   transport; [`protocol`] owns the payload schema, its codec and the
+//!   mapping of verb outcomes onto caller-visible responses. Supplying the
+//!   production [`handler::RegistrarRequestHandler`] remains separate work.
 //! - [`serve`] is the accept loop, the bounded connection fleet and the
 //!   drain-then-abort shutdown.
 //!
@@ -62,6 +62,7 @@ pub(crate) mod activation;
 pub(crate) mod frame;
 pub(crate) mod handler;
 pub(crate) mod policy;
+pub(crate) mod protocol;
 pub(crate) mod refusal;
 pub(crate) mod serve;
 
@@ -164,11 +165,10 @@ impl std::fmt::Debug for ActivatedEndpoint {
 
 /// The production request handler, of which there is none.
 ///
-/// The versioned request and response payloads, their codec and the
-/// mapping of verb outcomes onto caller-visible responses are the
-/// protocol sibling's, not this listener's. Until that lands, an enabled
-/// endpoint refuses to start rather than accepting requests it cannot
-/// answer.
+/// The versioned request and response payloads, their codec and the mapping
+/// of verb outcomes onto caller-visible responses live in [`protocol`]. A
+/// production handler that invokes the verbs remains pending, so an enabled
+/// endpoint refuses to start rather than accepting requests it cannot answer.
 fn production_handler() -> Option<Arc<dyn RegistrarRequestHandler>> {
     None
 }
@@ -237,8 +237,8 @@ pub(crate) fn activate(enabled: bool) -> anyhow::Result<Option<Arc<ActivatedEndp
     let Some(handler) = production_handler() else {
         anyhow::bail!(
             "registrar_endpoint.enabled is true, but no registrar request handler is registered \
-             in this build. Enabling the endpoint is unsupported until the registrar protocol \
-             work supplies one; set registrar_endpoint.enabled = false"
+             in this build. Enabling the endpoint is unsupported until a production request \
+             handler is added; set registrar_endpoint.enabled = false"
         );
     };
     let contract =
