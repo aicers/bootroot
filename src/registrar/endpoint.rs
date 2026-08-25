@@ -173,7 +173,6 @@ pub(crate) struct ActivatedEndpoint {
     // the concrete resolver from a built `ServerConfig`, so a build
     // that dropped it would leave renewal with nothing to swap
     // through. Reachability is asserted through `cert_resolver`.
-    #[allow(dead_code)]
     resolver: Arc<EndpointCertResolver>,
     domain: String,
 }
@@ -212,9 +211,9 @@ impl ActivatedEndpoint {
     /// not extend `Any`, so code holding the configuration or the
     /// acceptor cannot reach the concrete resolver at all — it survives
     /// here or nowhere.
-    // Same reason as the field: the renewal work that calls this is a
-    // sibling issue, and the accessor exists so that work needs nothing
-    // from this one.
+    // The renewal work that calls this is a sibling issue, so until it
+    // lands nothing outside a test reaches the accessor. It exists now
+    // so that work needs nothing from this one.
     #[allow(dead_code)]
     pub(crate) fn cert_resolver(&self) -> &Arc<EndpointCertResolver> {
         &self.resolver
