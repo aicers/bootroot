@@ -239,7 +239,7 @@ impl fmt::Display for AuditPhase {
 /// Named after `RegistrarVerbs::mint` and `RegistrarVerbs::deregister`.
 /// `register` is not a verb this repository has and is never
 /// serialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditVerb {
     /// `mint`.
@@ -781,7 +781,7 @@ pub(crate) mod bridge {
     /// and the operator-facing detail that goes with it, or `None` for a
     /// refusal that can never reach the trail.
     ///
-    /// The two audit-failure variants are the whole of that `None`.
+    /// Three variants produce that `None`, for two different reasons.
     /// `VerbError::AuditUnwritable` and `VerbError::PostMintUnrecordable`
     /// are produced *by* a failed record write, so the record that would
     /// carry one is the record whose write just failed. Saying so in the
@@ -792,6 +792,13 @@ pub(crate) mod bridge {
     /// and the reason table stays a total, one-to-one mapping of the
     /// refusals a durable line can hold.
     ///
+    /// `VerbError::Throttled` is `None` for the opposite reason: it is
+    /// produced by the limiter *before* the intent write, on an
+    /// invocation whose records are suppressed by construction, so it
+    /// never reaches an outcome write at all. Coalescing limited
+    /// invocations into counted records is separate work with its own
+    /// record variant; this mapping stays free of one.
+    ///
     /// The detail is the refusal's *own* message and never a formatted
     /// error chain. `VerbError::Unavailable` is taken from its explicit
     /// `activity` field rather than its `Display`, so its `anyhow`
@@ -800,7 +807,9 @@ pub(crate) mod bridge {
     /// `Display` were later changed to interpolate it.
     pub(crate) fn refusal_outcome(error: &VerbError) -> Option<AuditOutcome> {
         let (reason, detail) = match error {
-            VerbError::AuditUnwritable { .. } | VerbError::PostMintUnrecordable { .. } => {
+            VerbError::AuditUnwritable { .. }
+            | VerbError::PostMintUnrecordable { .. }
+            | VerbError::Throttled { .. } => {
                 return None;
             }
             VerbError::ReservedServiceName { .. } => {

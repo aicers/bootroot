@@ -35,6 +35,10 @@ use super::binding::{
     BINDING_SCHEMA_VERSION, BindingRecord, BindingReloadKind, BindingSpec, BindingState,
     REGISTRAR_BINDING_KV_SUFFIX,
 };
+use super::limiter::{
+    CountingLimitedInvocationSink, LimitedInvocation, LimitedInvocationSink, LimiterBucket,
+    VerbRateLimiter, VerbRateLimiterSettings,
+};
 use super::outcome::{
     CallerIdentity, DeregisterKind, MintKind, MintOutcome, ProducingArm, RequestId, VerbContext,
     VerbError, VerbRefusal, WrappedSecretIdToken,
@@ -152,6 +156,22 @@ fn verbs_with_store(
     config: RegistrarConfig,
     audit_store: AuditRecordStore,
 ) -> RegistrarVerbs {
+    verbs_with_limiter(
+        client,
+        kv_mount,
+        config,
+        audit_store,
+        VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0,
+    )
+}
+
+fn verbs_with_limiter(
+    client: OpenBaoClient,
+    kv_mount: &str,
+    config: RegistrarConfig,
+    audit_store: AuditRecordStore,
+    limiter: VerbRateLimiter,
+) -> RegistrarVerbs {
     RegistrarVerbs::new(RegistrarVerbsConfig {
         client,
         kv_mount: kv_mount.to_string(),
@@ -165,6 +185,7 @@ fn verbs_with_store(
         secret_id_ttl: SECRET_ID_TTL.to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
         audit_store,
+        limiter,
     })
 }
 
@@ -2215,6 +2236,665 @@ async fn the_caller_identity_reaches_the_record_unchanged() {
 }
 
 // ---------------------------------------------------------------------
+// Fast tier: the two token buckets in front of both verbs
+// ---------------------------------------------------------------------
+
+/// A sink that both counts and keeps every event, built as a trivial
+/// forwarding wrapper around the shipped counting sink.
+///
+/// The wrapper is the shape the sibling record work's coalescing sink
+/// takes, so driving the verbs through one here is the composability
+/// assertion as well as the recording one.
+#[derive(Debug)]
+struct RecordingSink {
+    counts: Arc<CountingLimitedInvocationSink>,
+    events: std::sync::Mutex<Vec<LimitedInvocation>>,
+}
+
+impl RecordingSink {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counts: Arc::new(CountingLimitedInvocationSink::new()),
+            events: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn events(&self) -> Vec<LimitedInvocation> {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count(&self, bucket: LimiterBucket) -> u64 {
+        self.counts.count(bucket)
+    }
+}
+
+impl LimitedInvocationSink for RecordingSink {
+    fn limited(&self, event: &LimitedInvocation) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event.clone());
+        self.counts.limited(event);
+    }
+}
+
+/// A refusal harness whose limiter the test sizes itself, with the sink
+/// that recorded its limited invocations.
+async fn limited_harness(
+    fixture: &RegistrarConfigFixture,
+    settings: VerbRateLimiterSettings,
+) -> (MockServer, TempDir, RegistrarVerbs, Arc<RecordingSink>) {
+    let server = MockServer::start().await;
+    let (dir, config) = load_fixture(fixture);
+    let sink = RecordingSink::new();
+    let verbs = verbs_with_limiter(
+        mock_client(&server),
+        "secret",
+        config,
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        VerbRateLimiter::new(settings, sink.clone()),
+    );
+    (server, dir, verbs, sink)
+}
+
+/// A refusal budget of `refusal_burst` with the admission budget left
+/// wide, and refill intervals long enough that no test accrues a token
+/// by accident.
+fn refusal_budget(refusal_burst: u32) -> VerbRateLimiterSettings {
+    VerbRateLimiterSettings {
+        predecision_refusal_burst: refusal_burst,
+        predecision_refusal_refill_interval_ms: 600_000,
+        ..VerbRateLimiterSettings::default()
+    }
+}
+
+/// The mirror of [`refusal_budget`]: a narrow admission budget with the
+/// refusal budget left wide.
+fn admission_budget(admission_burst: u32) -> VerbRateLimiterSettings {
+    VerbRateLimiterSettings {
+        admission_burst,
+        admission_refill_interval_ms: 600_000,
+        ..VerbRateLimiterSettings::default()
+    }
+}
+
+/// Asserts that a limited refusal and its unlimited twin map to the same
+/// wire answer — the same `RefusalClass` and the same identifier, or the
+/// same absence of one — and that neither is `RegistrarBusy`.
+///
+/// `map_refusal` lives in the endpoint module, which is compiled only on
+/// Linux, so off Linux there is no mapping to read and the pairwise
+/// assertion covers the `VerbError` alone. The `check` and `test-core`
+/// CI jobs both run on Linux, which is where the wire half is gated.
+#[cfg(target_os = "linux")]
+fn assert_same_wire_answer(name: &str, limited: &VerbRefusal, unlimited: &VerbRefusal) {
+    use crate::registrar::endpoint::protocol::{
+        RegistrarHealth, decode_refusal_response, encode_refusal_response,
+    };
+
+    let answer = |refusal: &VerbRefusal| {
+        let encoded = encode_refusal_response(refusal, &RegistrarHealth::default())
+            .expect("a refusal encodes");
+        let decoded = decode_refusal_response(&encoded).expect("a refusal decodes");
+        (
+            format!("{:?}", decoded.class),
+            decoded.error.map(|error| format!("{error:?}")),
+        )
+    };
+
+    let (class, identifier) = answer(limited);
+    assert_eq!(
+        (class, identifier.clone()),
+        answer(unlimited),
+        "{name}: limiting must not change the wire identifier or the class"
+    );
+    assert!(
+        !identifier
+            .as_deref()
+            .is_some_and(|rendered| rendered.contains("RegistrarBusy")),
+        "{name}: RegistrarBusy is never substituted on the pre-decision path"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn assert_same_wire_answer(_name: &str, _limited: &VerbRefusal, _unlimited: &VerbRefusal) {}
+
+/// Every pre-decision refusal the verbs can produce, as a mint request
+/// paired with the fixture it needs.
+///
+/// The set spans both wire classes deliberately: a permanent
+/// identifier-carrying refusal, a reserved name and an out-of-range
+/// `wrap_ttl`, the last two of which are retryable with no identifier
+/// today. What limiting preserves is the answer, not its permanence.
+fn pre_decision_cases() -> Vec<(&'static str, RegistrarConfigFixture, MintRequest)> {
+    let unconfigured = base_fixture();
+    let mut spec_conflict = mint_request("roxyd", "h1", None);
+    spec_conflict.spec = requested(&sample_spec()).with_service_name("roxyd-h1");
+    let mut zero_wrap_ttl = mint_request("roxyd", "h1", None);
+    zero_wrap_ttl.wrap_ttl = Duration::ZERO;
+    let mut negative_wrap_ttl = mint_request("roxyd", "h1", None);
+    negative_wrap_ttl.wrap_ttl = Duration::seconds(-5);
+    vec![
+        (
+            "an invalid service_name label",
+            base_fixture(),
+            mint_request("bad_name", "h1", None),
+        ),
+        (
+            "an invalid host label",
+            base_fixture(),
+            mint_request("roxyd", "-h1", None),
+        ),
+        (
+            "a reserved service_name",
+            base_fixture(),
+            mint_request("bootroot-decoy", "h1", None),
+        ),
+        (
+            "an unconfigured component",
+            unconfigured,
+            mint_request("absent", "h1", None),
+        ),
+        (
+            "an instance on a one-per-host component",
+            base_fixture(),
+            mint_request("roxyd", "h1", Some(1)),
+        ),
+        (
+            "a restated spec that disagrees",
+            base_fixture(),
+            spec_conflict,
+        ),
+        ("a zero wrap_ttl", base_fixture(), zero_wrap_ttl),
+        ("a negative wrap_ttl", base_fixture(), negative_wrap_ttl),
+    ]
+}
+
+/// A flood of invocations the pure checks refuse is limited: past the
+/// burst, neither record phase is written, one event is emitted per
+/// limited invocation, and the caller still receives the refusal its own
+/// input earned.
+#[tokio::test]
+async fn a_pre_decision_flood_is_limited_without_writing_a_record() {
+    const BURST: u32 = 2;
+    const FLOOD: u32 = 5;
+    let (server, _dir, verbs, sink) = limited_harness(&base_fixture(), refusal_budget(BURST)).await;
+
+    let mut refusals = Vec::new();
+    for _ in 0..FLOOD {
+        refusals.push(
+            verbs
+                .mint(&mint_request("bootroot-decoy", "h1", None))
+                .await
+                .expect_err("a reserved service_name must be refused"),
+        );
+    }
+
+    // Every caller got the same answer, limited or not.
+    for refusal in &refusals {
+        assert_envelope(refusal, ProducingArm::PreDerivation);
+        assert!(
+            matches!(refusal.error(), VerbError::ReservedServiceName { .. }),
+            "limiting suppresses the record, never the answer: {:?}",
+            refusal.error()
+        );
+    }
+
+    // Only the first two wrote anything, and each wrote a complete pair.
+    let recorded: Vec<_> = refusals
+        .iter()
+        .filter(|refusal| !lines_for(&verbs, refusal.context().request_id().as_str()).is_empty())
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        BURST as usize,
+        "only the invocations that found a token may write"
+    );
+    for refusal in recorded {
+        let asked = Asked::new("mint", "bootroot-decoy", "h1", None);
+        assert_eq!(
+            assert_refusal_pair(&verbs, refusal, &asked),
+            "reserved_service_name"
+        );
+    }
+    assert_eq!(
+        trail(&verbs).len(),
+        BURST as usize * 2,
+        "a limited invocation appends nothing at all"
+    );
+
+    // One event per limited invocation, carrying the key it was charged
+    // against, and nothing on the other bucket.
+    let events = sink.events();
+    assert_eq!(events.len(), (FLOOD - BURST) as usize);
+    for event in &events {
+        assert_eq!(event.caller().as_str(), CALLER);
+        assert_eq!(event.verb(), crate::registrar::audit::AuditVerb::Mint);
+        assert_eq!(event.bucket(), LimiterBucket::PredecisionRefusal);
+    }
+    assert_eq!(
+        sink.count(LimiterBucket::PredecisionRefusal),
+        u64::from(FLOOD - BURST)
+    );
+    assert_eq!(sink.count(LimiterBucket::Admission), 0);
+
+    assert_untouched(&server).await;
+}
+
+/// Driven pairwise across the whole pre-decision refusal set: the
+/// `VerbError`, the mapped wire identifier — or its absence — and the
+/// `RefusalClass` are equal whether the invocation was limited or not,
+/// and `RegistrarBusy` is never substituted for an answer the daemon has
+/// already determined.
+#[tokio::test]
+async fn limiting_preserves_the_callers_answer_across_every_pre_decision_refusal() {
+    for (name, fixture, request) in pre_decision_cases() {
+        // Unlimited: a wide refusal budget, so the first invocation finds
+        // a token.
+        let (unlimited_server, _unlimited_dir, unlimited, _) =
+            limited_harness(&fixture, refusal_budget(1)).await;
+        let unlimited_refusal = unlimited
+            .mint(&request)
+            .await
+            .expect_err("every case here is a pre-decision refusal");
+
+        // Limited: a burst of exactly one, spent by an invocation of the
+        // same shape, so the second is limited on the same bucket.
+        let (limited_server, _limited_dir, limited, sink) =
+            limited_harness(&fixture, refusal_budget(1)).await;
+        let _spent = limited
+            .mint(&request)
+            .await
+            .expect_err("the first invocation spends the bucket's one token");
+        let limited_refusal = limited
+            .mint(&request)
+            .await
+            .expect_err("the second invocation is limited");
+        assert_eq!(
+            sink.count(LimiterBucket::PredecisionRefusal),
+            1,
+            "{name} must have been limited on the pre-decision bucket"
+        );
+
+        assert_eq!(
+            format!("{:?}", limited_refusal.error()),
+            format!("{:?}", unlimited_refusal.error()),
+            "{name}: limiting must not change the VerbError"
+        );
+        assert!(
+            !matches!(limited_refusal.error(), VerbError::Throttled { .. }),
+            "{name}: a pre-decision refusal is never replaced by a throttle"
+        );
+        assert_same_wire_answer(name, &limited_refusal, &unlimited_refusal);
+
+        // Neither invocation reached OpenBao, and the limited one wrote
+        // nothing.
+        assert_untouched(&unlimited_server).await;
+        assert_untouched(&limited_server).await;
+        assert!(
+            lines_for(&limited, limited_refusal.context().request_id().as_str()).is_empty(),
+            "{name}: a limited invocation appends nothing"
+        );
+    }
+}
+
+/// The isolation the two buckets exist for: a flood on the free path
+/// cannot starve legitimate mints. With the `predecision_refusal` bucket
+/// drained, an admitted mint is still performed — it reaches `OpenBao`
+/// and both its records are written.
+#[tokio::test]
+async fn a_pre_decision_flood_does_not_starve_an_admitted_mint() {
+    let (server, _dir, verbs, sink) = limited_harness(&base_fixture(), refusal_budget(1)).await;
+
+    // Drain the refusal bucket and then flood past it.
+    for _ in 0..4 {
+        verbs
+            .mint(&mint_request("bootroot-decoy", "h1", None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+    }
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 3);
+    assert_untouched(&server).await;
+
+    // A well-formed mint is charged the untouched admission bucket, so
+    // it is attempted: it reaches OpenBao — which this harness answers
+    // with nothing, so the invocation ends unavailable rather than
+    // throttled — and its pair is written.
+    let refusal = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("an unanswered OpenBao makes this mint unavailable");
+    assert!(
+        matches!(refusal.error(), VerbError::Unavailable { .. }),
+        "an admitted mint is performed, not throttled: {:?}",
+        refusal.error()
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("the mock server records requests");
+    assert!(
+        !requests.is_empty(),
+        "the admitted mint must have reached OpenBao"
+    );
+    assert_pair(
+        &verbs,
+        refusal.context().request_id().as_str(),
+        &Asked::new("mint", "roxyd", "h1", None),
+    );
+    assert_eq!(
+        sink.count(LimiterBucket::Admission),
+        0,
+        "the refusal flood must not have spent admission budget"
+    );
+}
+
+/// A refusal raised **after** the pure checks pass spends an `admission`
+/// token, and the bucket charged is never revised by what the invocation
+/// turned out to be. Draining it that way makes the next mint throttled
+/// — with no `OpenBao` call, no record, and one event on the admission
+/// bucket.
+#[tokio::test]
+async fn a_derivation_refusal_spends_an_admission_token_and_the_next_mint_is_throttled() {
+    let long_component = "c".repeat(63);
+    let long_host = "h".repeat(63);
+    let fixture =
+        base_fixture().with_component(&long_component, Multiplicity::ManyPerHost, &sample_spec());
+    let (server, _dir, verbs, sink) = limited_harness(&fixture, admission_budget(1)).await;
+
+    // Stage 1 passes, so this is an admission invocation even though it
+    // refuses before any OpenBao call and reaches no lock.
+    let refusal = verbs
+        .mint(&mint_request(&long_component, &long_host, Some(1000)))
+        .await
+        .expect_err("an over-long derived key must be refused");
+    assert_envelope(&refusal, ProducingArm::Derivation);
+    assert!(matches!(
+        refusal.error(),
+        VerbError::Registrar(RegistrarError::DerivedKeyInvalid { .. })
+    ));
+    assert_pair(
+        &verbs,
+        refusal.context().request_id().as_str(),
+        &Asked::new("mint", &long_component, &long_host, Some(1000)),
+    );
+    let lines_before = trail(&verbs).len();
+
+    // The admission bucket is now empty, so the next mint is not
+    // attempted at all.
+    let throttled = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect_err("a drained admission bucket throttles");
+    assert_envelope(&throttled, ProducingArm::PreDerivation);
+    let VerbError::Throttled { retry_after } = throttled.error() else {
+        panic!("expected a throttle, got {:?}", throttled.error());
+    };
+    assert!(
+        *retry_after >= 1,
+        "the retry payload is an unsigned whole-second duration of at least 1"
+    );
+    assert_eq!(
+        trail(&verbs).len(),
+        lines_before,
+        "a throttled invocation writes neither record"
+    );
+    assert_untouched(&server).await;
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "one event per limited invocation");
+    let event = events.first().expect("one event");
+    assert_eq!(event.bucket(), LimiterBucket::Admission);
+    assert_eq!(event.caller().as_str(), CALLER);
+    assert_eq!(sink.count(LimiterBucket::Admission), 1);
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 0);
+
+    // And the other bucket is untouched: a pre-decision refusal still
+    // gets its own answer and its own pair.
+    let reserved = verbs
+        .mint(&mint_request("bootroot-decoy", "h1", None))
+        .await
+        .expect_err("a reserved service_name must be refused");
+    assert!(matches!(
+        reserved.error(),
+        VerbError::ReservedServiceName { .. }
+    ));
+    assert_pair(
+        &verbs,
+        reserved.context().request_id().as_str(),
+        &Asked::new("mint", "bootroot-decoy", "h1", None),
+    );
+}
+
+/// The throttle is distinguishable in `VerbError` from every permanent
+/// unavailability variant, whose reasons all mean *until an operator
+/// acts*.
+#[tokio::test]
+async fn the_throttle_is_its_own_variant_rather_than_an_unavailability() {
+    let (_server, _dir, verbs, _sink) = limited_harness(&base_fixture(), admission_budget(1)).await;
+
+    // Spend the deregister verb's admission token, then throttle it.
+    let _spent = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await;
+    let throttled = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect_err("a drained admission bucket throttles");
+    assert!(
+        matches!(throttled.error(), VerbError::Throttled { .. }),
+        "expected a throttle, got {:?}",
+        throttled.error()
+    );
+    assert!(
+        !matches!(
+            throttled.error(),
+            VerbError::Unavailable { .. }
+                | VerbError::AuditUnwritable { .. }
+                | VerbError::PostMintUnrecordable { .. }
+        ),
+        "the throttle is its own variant"
+    );
+}
+
+/// Counts every `tracing` event emitted on the thread it is installed
+/// on, and does nothing else.
+#[derive(Debug)]
+struct EventCounter {
+    events: Arc<AtomicU64>,
+}
+
+impl EventCounter {
+    fn new() -> (Self, Arc<AtomicU64>) {
+        let events = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                events: events.clone(),
+            },
+            events,
+        )
+    }
+}
+
+impl tracing::Subscriber for EventCounter {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, _event: &tracing::Event<'_>) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// A limited invocation writes nothing per invocation anywhere, the
+/// daemon log included. One `tracing` line per limited invocation would
+/// be one unbounded write per flooded request — the disk pressure the
+/// buckets exist to remove, handed back on the cheapest path a caller
+/// has. The evidence a flood leaves is the sink's per-bucket count.
+#[tokio::test]
+async fn a_limited_invocation_emits_no_daemon_log_line() {
+    const FLOOD: u32 = 8;
+    let settings = VerbRateLimiterSettings {
+        admission_burst: 1,
+        admission_refill_interval_ms: 600_000,
+        predecision_refusal_burst: 1,
+        predecision_refusal_refill_interval_ms: 600_000,
+    };
+    let (_server, _dir, verbs, sink) = limited_harness(&base_fixture(), settings).await;
+
+    // Spend both tokens before the counter is watching: an admitted
+    // invocation logs whatever it logs, and that is not what this pins.
+    let _refusal = verbs
+        .mint(&mint_request("bootroot-decoy", "h1", None))
+        .await;
+    let _admitted = verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await;
+
+    let (counter, events) = EventCounter::new();
+    let _guard = tracing::subscriber::set_default(counter);
+    for _ in 0..FLOOD {
+        verbs
+            .mint(&mint_request("bootroot-decoy", "h1", None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+        verbs
+            .deregister(&deregister_request("roxyd", "h1", None))
+            .await
+            .expect_err("a drained admission bucket throttles");
+    }
+
+    assert_eq!(
+        events.load(Ordering::Relaxed),
+        0,
+        "a limited invocation must leave the daemon log untouched"
+    );
+    assert_eq!(
+        sink.count(LimiterBucket::PredecisionRefusal) + sink.count(LimiterBucket::Admission),
+        u64::from(FLOOD) * 2,
+        "the sink counted every limited invocation the log did not"
+    );
+}
+
+/// Each invocation charges its bucket exactly once. The pure checks run
+/// once per invocation and what they produced is carried forward, so an
+/// invocation never pays two tokens for one request.
+#[tokio::test]
+async fn each_invocation_charges_its_bucket_exactly_once() {
+    const BURST: u32 = 4;
+    let (server, _dir, verbs, sink) = limited_harness(&base_fixture(), refusal_budget(BURST)).await;
+
+    for _ in 0..BURST {
+        verbs
+            .mint(&mint_request("bootroot-decoy", "h1", None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+    }
+    assert_eq!(
+        sink.count(LimiterBucket::PredecisionRefusal),
+        0,
+        "exactly {BURST} tokens cover exactly {BURST} invocations"
+    );
+
+    verbs
+        .mint(&mint_request("bootroot-decoy", "h1", None))
+        .await
+        .expect_err("a reserved service_name must be refused");
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 1);
+    assert_untouched(&server).await;
+}
+
+/// Both verbs hold their own buckets, so draining one verb's refusal
+/// budget leaves the other's whole.
+#[tokio::test]
+async fn the_two_verbs_hold_separate_buckets() {
+    let (server, _dir, verbs, sink) = limited_harness(&base_fixture(), refusal_budget(1)).await;
+
+    for _ in 0..3 {
+        verbs
+            .mint(&mint_request("bootroot-decoy", "h1", None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+    }
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 2);
+
+    let refusal = verbs
+        .deregister(&deregister_request("bootroot-decoy", "h1", None))
+        .await
+        .expect_err("a reserved service_name must be refused");
+    assert_eq!(
+        sink.count(LimiterBucket::PredecisionRefusal),
+        2,
+        "the deregister verb's own bucket is still full"
+    );
+    assert_pair(
+        &verbs,
+        refusal.context().request_id().as_str(),
+        &Asked::new("deregister", "bootroot-decoy", "h1", None),
+    );
+    assert_untouched(&server).await;
+}
+
+/// The limiter is charged before the intent write, so a limited
+/// invocation cannot be the amplifier for the exhaustion it prevents:
+/// nothing is appended on either bucket.
+#[tokio::test]
+async fn a_limited_invocation_on_either_bucket_appends_nothing() {
+    let settings = VerbRateLimiterSettings {
+        admission_burst: 1,
+        admission_refill_interval_ms: 600_000,
+        predecision_refusal_burst: 1,
+        predecision_refusal_refill_interval_ms: 600_000,
+    };
+    let (server, _dir, verbs, sink) = limited_harness(&base_fixture(), settings).await;
+
+    // Spend both of the deregister verb's buckets: one pre-decision
+    // refusal and one admitted invocation that refuses at derivation.
+    verbs
+        .deregister(&deregister_request("bootroot-decoy", "h1", None))
+        .await
+        .expect_err("a reserved service_name must be refused");
+    verbs
+        .deregister(&deregister_request("roxyd", "H1", None))
+        .await
+        .expect_err("an uppercase host must fail derivation");
+    let lines_before = trail(&verbs).len();
+    assert_eq!(lines_before, 4, "two admitted invocations, two pairs");
+
+    verbs
+        .deregister(&deregister_request("bootroot-decoy", "h1", None))
+        .await
+        .expect_err("a reserved service_name must be refused");
+    verbs
+        .deregister(&deregister_request("roxyd", "h1", None))
+        .await
+        .expect_err("a drained admission bucket throttles");
+    assert_eq!(
+        trail(&verbs).len(),
+        lines_before,
+        "neither limited invocation may append"
+    );
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 1);
+    assert_eq!(sink.count(LimiterBucket::Admission), 1);
+    assert_untouched(&server).await;
+}
+
+// ---------------------------------------------------------------------
 // Ignored tier: everything that depends on a prior OpenBao write
 // ---------------------------------------------------------------------
 
@@ -2252,6 +2932,24 @@ impl LiveBackend {
 
     fn verbs(&self, config: RegistrarConfig) -> RegistrarVerbs {
         verbs_with(self.client(), &self.kv_mount, config)
+    }
+
+    /// As [`LiveBackend::verbs`], with a limiter the test sizes itself
+    /// and the sink that recorded its limited invocations.
+    fn verbs_with_sink(
+        &self,
+        config: RegistrarConfig,
+        settings: VerbRateLimiterSettings,
+    ) -> (RegistrarVerbs, Arc<RecordingSink>) {
+        let sink = RecordingSink::new();
+        let verbs = verbs_with_limiter(
+            self.client(),
+            &self.kv_mount,
+            config,
+            AuditRecordStore::open_temporary().expect("a temporary audit store"),
+            VerbRateLimiter::new(settings, sink.clone()),
+        );
+        (verbs, sink)
     }
 
     /// Issues a token carrying exactly `policies`, so a test can drive a
@@ -3452,7 +4150,10 @@ mod internal_factory {
     use tempfile::TempDir;
     use time::Duration;
 
-    use super::{AuditRecordStore, RegistrarVerbs, base_fixture, load_fixture, mint_request};
+    use super::{
+        AuditRecordStore, RegistrarVerbs, VerbRateLimiter, VerbRateLimiterSettings, base_fixture,
+        load_fixture, mint_request,
+    };
     use crate::openbao::SecretIdOptions;
     use crate::registrar::internal::InternalCredentialError;
     use crate::registrar::verbs::InternalVerbsSource;
@@ -3468,6 +4169,7 @@ mod internal_factory {
         options: &'a SecretIdOptions,
         policy: &'a crate::registrar::verbs::wrap_ttl::WrapTtlPolicy,
         audit_store: &'a AuditRecordStore,
+        limiter: &'a VerbRateLimiter,
     ) -> InternalVerbsSource<'a> {
         InternalVerbsSource {
             secrets_dir,
@@ -3480,6 +4182,7 @@ mod internal_factory {
             secret_id_ttl: "24h",
             wrap_ttl_policy: policy,
             audit_store,
+            limiter,
         }
     }
 
@@ -3492,6 +4195,7 @@ mod internal_factory {
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
         let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+        let limiter = VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0;
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "http://localhost:8200",
@@ -3499,6 +4203,7 @@ mod internal_factory {
             &options,
             &policy,
             &store,
+            &limiter,
         )) else {
             panic!("plaintext must be refused");
         };
@@ -3566,6 +4271,7 @@ mod internal_factory {
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
         let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+        let limiter = VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0;
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "https://localhost:8200",
@@ -3573,6 +4279,7 @@ mod internal_factory {
             &options,
             &policy,
             &store,
+            &limiter,
         )) else {
             panic!("a drifted config must be refused");
         };
@@ -3605,6 +4312,7 @@ mod internal_factory {
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
         let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+        let limiter = VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0;
         let url = dead_https_url();
         let verbs = RegistrarVerbs::internal(&InternalVerbsSource {
             secrets_dir: host.dir.path(),
@@ -3617,6 +4325,7 @@ mod internal_factory {
             secret_id_ttl: "24h",
             wrap_ttl_policy: &policy,
             audit_store: &store,
+            limiter: &limiter,
         })
         .expect("a provisioned host on its own root must build the verbs");
 
@@ -3765,6 +4474,7 @@ mod internal_factory {
         let options = SecretIdOptions::default();
         let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
         let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+        let limiter = VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0;
         let Err(err) = RegistrarVerbs::internal(&source(
             dir.path(),
             "https://localhost:8200",
@@ -3772,6 +4482,7 @@ mod internal_factory {
             &options,
             &policy,
             &store,
+            &limiter,
         )) else {
             panic!("an unprovisioned host must be refused");
         };
@@ -3839,6 +4550,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
     let options = SecretIdOptions::default();
     let policy = WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum");
     let store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+    let limiter = VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0;
     let Err(err) = RegistrarVerbs::internal(&InternalVerbsSource {
         secrets_dir: dir.path(),
         openbao_url: "https://localhost:8200",
@@ -3850,6 +4562,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
         secret_id_ttl: "24h",
         wrap_ttl_policy: &policy,
         audit_store: &store,
+        limiter: &limiter,
     }) else {
         panic!("a superseded root must be refused");
     };
@@ -3860,4 +4573,45 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The isolation the two buckets exist for, against a live `OpenBao`: a
+/// caller that has drained its `predecision_refusal` bucket still gets a
+/// real mint performed and recorded on the same connection.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn a_drained_refusal_bucket_does_not_starve_a_live_mint() {
+    let backend = LiveBackend::from_env();
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    let (verbs, sink) = backend.verbs_with_sink(config, refusal_budget(1));
+
+    for _ in 0..4 {
+        verbs
+            .mint(&mint_request("bootroot-decoy", &host, None))
+            .await
+            .expect_err("a reserved service_name must be refused");
+    }
+    assert_eq!(sink.count(LimiterBucket::PredecisionRefusal), 3);
+
+    let outcome = verbs
+        .mint(&mint_request("roxyd", &host, None))
+        .await
+        .expect("a flood on the free path must not starve a legitimate mint");
+    assert_eq!(outcome.kind(), MintKind::FirstMint);
+    assert_eq!(
+        sink.count(LimiterBucket::Admission),
+        0,
+        "the refusal flood must not have spent admission budget"
+    );
+    let recorded = assert_pair(
+        &verbs,
+        outcome.context().request_id().as_str(),
+        &Asked::new("mint", "roxyd", &host, None),
+    );
+    assert_eq!(
+        recorded["outcome"]["class"],
+        json!("first_mint"),
+        "{recorded}"
+    );
 }

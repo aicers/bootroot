@@ -182,6 +182,34 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
     if settings.audit_min_retain_days == 0 {
         anyhow::bail!("registrar.audit_min_retain_days must be greater than 0");
     }
+    // A zero burst throttles the first legitimate mint, and a zero refill
+    // interval is an unbounded token supply that disables the limiter
+    // silently. Both are rejected here rather than clamped, so an
+    // operator who meant to change the sizing finds out at load time.
+    if settings.rate_limit_admission_burst == 0 {
+        anyhow::bail!(
+            "registrar.rate_limit_admission_burst must be greater than 0; a zero burst \
+             throttles the first legitimate mint"
+        );
+    }
+    if settings.rate_limit_admission_refill_interval_ms == 0 {
+        anyhow::bail!(
+            "registrar.rate_limit_admission_refill_interval_ms must be greater than 0; a zero \
+             interval is an unbounded token supply that disables the limiter silently"
+        );
+    }
+    if settings.rate_limit_predecision_refusal_burst == 0 {
+        anyhow::bail!(
+            "registrar.rate_limit_predecision_refusal_burst must be greater than 0; a zero burst \
+             limits the first legitimate refusal"
+        );
+    }
+    if settings.rate_limit_predecision_refusal_refill_interval_ms == 0 {
+        anyhow::bail!(
+            "registrar.rate_limit_predecision_refusal_refill_interval_ms must be greater than 0; \
+             a zero interval is an unbounded token supply that disables the limiter silently"
+        );
+    }
     Ok(())
 }
 

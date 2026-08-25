@@ -5,6 +5,7 @@ use anyhow::Result;
 use config::builder::DefaultState;
 use config::{Config, ConfigBuilder, ConfigError, Environment, File, FileFormat, FileStoredFormat};
 use serde::Deserialize;
+use serde::de::{Deserializer, Unexpected, Visitor};
 
 use crate::secret::HmacSecret;
 
@@ -64,13 +65,15 @@ pub struct Settings {
     /// bootroot-host wants.
     #[serde(default)]
     pub registrar_endpoint: RegistrarEndpointSettings,
-    /// The daemon-owned registrar audit record store. An absent
-    /// `[registrar]` table leaves every key at its documented default.
+    /// The daemon-owned registrar audit record store and the verb rate
+    /// limiter. An absent `[registrar]` table leaves every key at its
+    /// documented default.
     #[serde(default)]
     pub registrar: RegistrarSettings,
 }
 
-/// The daemon's own settings for the registrar audit record store.
+/// The daemon's own settings for the registrar audit record store and
+/// the rate limiter that bounds what reaches it.
 ///
 /// These are deliberately **not** in the bootler-rendered
 /// `/etc/clumit-security/provisioning.toml`
@@ -82,7 +85,8 @@ pub struct Settings {
 ///
 /// Nothing here is reachable from a registrar request. Once a writer is
 /// wired in, it will open the store from these values and pass the verbs
-/// an already-opened handle.
+/// an already-opened handle, and build their limiter from the four
+/// `rate_limit_*` keys the same way.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(from = "RawRegistrarSettings")]
 pub struct RegistrarSettings {
@@ -112,6 +116,107 @@ pub struct RegistrarSettings {
     pub audit_store_low_water_bytes: u64,
     /// Operator-selected enforcement for the audit store reserve.
     pub audit_store_enforcement: AuditStoreEnforcement,
+    /// Tokens an idle registrar `admission` bucket holds — the largest
+    /// legitimate bring-up wave one client identity may drive at once.
+    ///
+    /// Size it as `wave_hosts × modules_per_host`. The default assumes
+    /// the reference deployment's 64 hosts × 8 modules = 512 mints in
+    /// one wave. A wave larger than the burst still completes rather
+    /// than being refused; it takes `(mints − burst) ×
+    /// rate_limit_admission_refill_interval_ms / 1000` extra seconds.
+    pub rate_limit_admission_burst: u32,
+    /// Milliseconds per token accrued into a registrar `admission`
+    /// bucket, which is the sustained mint rate.
+    ///
+    /// An interval rather than a rate so the whole configuration
+    /// surface stays free of floating-point values: a rate would have to
+    /// be fractional to express "one token per second or slower".
+    pub rate_limit_admission_refill_interval_ms: u32,
+    /// Tokens an idle registrar `predecision_refusal` bucket holds.
+    ///
+    /// Much smaller than the admission burst: legitimate refusals on
+    /// this path are operator typos arriving one at a time.
+    pub rate_limit_predecision_refusal_burst: u32,
+    /// Milliseconds per token accrued into a registrar
+    /// `predecision_refusal` bucket.
+    pub rate_limit_predecision_refusal_refill_interval_ms: u32,
+}
+
+/// A `[registrar]` rate-limit value: an unsigned integer, and nothing a
+/// configuration file can be coerced into one from.
+///
+/// The configuration layer's own `u32` conversion is permissive: it turns
+/// `0.5` into `1` and `"512"` into `512` and reports nothing. For a
+/// limiter's sizing that is a silently wrong bound rather than a typo the
+/// operator gets told about — a burst of `1` throttles the first
+/// legitimate mint of every bring-up, and nothing in the running daemon
+/// says why. Reading the value's *own* type first and refusing everything
+/// that is not a non-negative integer is what turns each of those into a
+/// load error naming the offending key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateLimitValue(u32);
+
+impl<'de> Deserialize<'de> for RateLimitValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(RateLimitValueVisitor)
+            .map(Self)
+    }
+}
+
+struct RateLimitValueVisitor;
+
+impl Visitor<'_> for RateLimitValueVisitor {
+    type Value = u32;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an unsigned integer")
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<u32, E> {
+        u32::try_from(value).map_err(|_| E::custom(format!("{value} exceeds {}", u32::MAX)))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<u32, E> {
+        u32::try_from(value).map_err(|_| {
+            if value < 0 {
+                E::invalid_value(Unexpected::Signed(value), &self)
+            } else {
+                E::custom(format!("{value} exceeds {}", u32::MAX))
+            }
+        })
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<u32, E> {
+        Err(E::invalid_type(Unexpected::Float(value), &self))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<u32, E> {
+        Err(E::invalid_type(Unexpected::Str(value), &self))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<u32, E> {
+        Err(E::invalid_type(Unexpected::Bool(value), &self))
+    }
+}
+
+fn default_rate_limit_admission_burst() -> RateLimitValue {
+    RateLimitValue(defaults::default_rate_limit_admission_burst())
+}
+
+fn default_rate_limit_admission_refill_interval_ms() -> RateLimitValue {
+    RateLimitValue(defaults::default_rate_limit_admission_refill_interval_ms())
+}
+
+fn default_rate_limit_predecision_refusal_burst() -> RateLimitValue {
+    RateLimitValue(defaults::default_rate_limit_predecision_refusal_burst())
+}
+
+fn default_rate_limit_predecision_refusal_refill_interval_ms() -> RateLimitValue {
+    RateLimitValue(defaults::default_rate_limit_predecision_refusal_refill_interval_ms())
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +241,14 @@ struct RawRegistrarSettings {
     audit_store_low_water_bytes: u64,
     #[serde(default)]
     audit_store_enforcement: AuditStoreEnforcement,
+    #[serde(default = "default_rate_limit_admission_burst")]
+    rate_limit_admission_burst: RateLimitValue,
+    #[serde(default = "default_rate_limit_admission_refill_interval_ms")]
+    rate_limit_admission_refill_interval_ms: RateLimitValue,
+    #[serde(default = "default_rate_limit_predecision_refusal_burst")]
+    rate_limit_predecision_refusal_burst: RateLimitValue,
+    #[serde(default = "default_rate_limit_predecision_refusal_refill_interval_ms")]
+    rate_limit_predecision_refusal_refill_interval_ms: RateLimitValue,
 }
 
 impl From<RawRegistrarSettings> for RegistrarSettings {
@@ -149,6 +262,10 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             audit_store_reserve_bytes,
             audit_store_low_water_bytes,
             audit_store_enforcement,
+            rate_limit_admission_burst,
+            rate_limit_admission_refill_interval_ms,
+            rate_limit_predecision_refusal_burst,
+            rate_limit_predecision_refusal_refill_interval_ms,
         } = raw;
         let audit_record_dir =
             audit_record_dir.unwrap_or_else(|| defaults::audit_record_dir_for(&audit_store_dir));
@@ -161,6 +278,11 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             audit_store_reserve_bytes,
             audit_store_low_water_bytes,
             audit_store_enforcement,
+            rate_limit_admission_burst: rate_limit_admission_burst.0,
+            rate_limit_admission_refill_interval_ms: rate_limit_admission_refill_interval_ms.0,
+            rate_limit_predecision_refusal_burst: rate_limit_predecision_refusal_burst.0,
+            rate_limit_predecision_refusal_refill_interval_ms:
+                rate_limit_predecision_refusal_refill_interval_ms.0,
         }
     }
 }
@@ -189,6 +311,13 @@ impl Default for RegistrarSettings {
             audit_store_reserve_bytes: defaults::default_audit_store_reserve_bytes(),
             audit_store_low_water_bytes: defaults::default_audit_store_low_water_bytes(),
             audit_store_enforcement: AuditStoreEnforcement::default(),
+            rate_limit_admission_burst: defaults::default_rate_limit_admission_burst(),
+            rate_limit_admission_refill_interval_ms:
+                defaults::default_rate_limit_admission_refill_interval_ms(),
+            rate_limit_predecision_refusal_burst:
+                defaults::default_rate_limit_predecision_refusal_burst(),
+            rate_limit_predecision_refusal_refill_interval_ms:
+                defaults::default_rate_limit_predecision_refusal_refill_interval_ms(),
         }
     }
 }
@@ -1624,8 +1753,250 @@ mod tests {
         assert_eq!(settings.registrar.audit_max_file_bytes, 8_388_608);
         assert_eq!(settings.registrar.audit_max_retained_files, 16);
         assert_eq!(settings.registrar.audit_min_retain_days, 90);
+        assert_eq!(settings.registrar.rate_limit_admission_burst, 512);
+        assert_eq!(
+            settings.registrar.rate_limit_admission_refill_interval_ms,
+            500
+        );
+        assert_eq!(settings.registrar.rate_limit_predecision_refusal_burst, 32);
+        assert_eq!(
+            settings
+                .registrar
+                .rate_limit_predecision_refusal_refill_interval_ms,
+            1000
+        );
         assert_eq!(settings.registrar, RegistrarSettings::default());
         settings.validate().unwrap();
+    }
+
+    /// A `[registrar]` table that sets only the pre-existing keys leaves
+    /// every one of their values unchanged and takes the limiter
+    /// defaults. This is what keeps adding the four `rate_limit_*` keys
+    /// invisible to a deployment that never asked for them.
+    #[test]
+    fn a_registrar_table_without_the_rate_limit_keys_keeps_every_other_value() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+[registrar]
+audit_store_dir = "/srv/bootroot/audit-store"
+audit_record_dir = "/srv/bootroot/audit-store/records"
+audit_max_file_bytes = 131072
+audit_max_retained_files = 4
+audit_min_retain_days = 30
+audit_store_reserve_bytes = 4294967296
+audit_store_low_water_bytes = 1073741824
+audit_store_enforcement = "directory"
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        let registrar = &settings.registrar;
+        assert_eq!(
+            registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/audit-store/records")
+        );
+        assert_eq!(
+            registrar.audit_store_dir,
+            PathBuf::from("/srv/bootroot/audit-store")
+        );
+        assert_eq!(registrar.audit_max_file_bytes, 131_072);
+        assert_eq!(registrar.audit_max_retained_files, 4);
+        assert_eq!(registrar.audit_min_retain_days, 30);
+        assert_eq!(registrar.audit_store_reserve_bytes, 4_294_967_296);
+        assert_eq!(registrar.audit_store_low_water_bytes, 1_073_741_824);
+        assert_eq!(
+            registrar.audit_store_enforcement,
+            AuditStoreEnforcement::Directory
+        );
+        let defaults = RegistrarSettings::default();
+        assert_eq!(
+            registrar.rate_limit_admission_burst,
+            defaults.rate_limit_admission_burst
+        );
+        assert_eq!(
+            registrar.rate_limit_admission_refill_interval_ms,
+            defaults.rate_limit_admission_refill_interval_ms
+        );
+        assert_eq!(
+            registrar.rate_limit_predecision_refusal_burst,
+            defaults.rate_limit_predecision_refusal_burst
+        );
+        assert_eq!(
+            registrar.rate_limit_predecision_refusal_refill_interval_ms,
+            defaults.rate_limit_predecision_refusal_refill_interval_ms
+        );
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn the_registrar_table_reads_explicit_rate_limit_values() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r"
+[registrar]
+rate_limit_admission_burst = 1024
+rate_limit_admission_refill_interval_ms = 250
+rate_limit_predecision_refusal_burst = 8
+rate_limit_predecision_refusal_refill_interval_ms = 2000
+"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(settings.registrar.rate_limit_admission_burst, 1024);
+        assert_eq!(
+            settings.registrar.rate_limit_admission_refill_interval_ms,
+            250
+        );
+        assert_eq!(settings.registrar.rate_limit_predecision_refusal_burst, 8);
+        assert_eq!(
+            settings
+                .registrar
+                .rate_limit_predecision_refusal_refill_interval_ms,
+            2000
+        );
+        settings.validate().unwrap();
+    }
+
+    /// The whole `[registrar]` table, exactly as the configuration
+    /// manual shows it, loads with every key reaching its own field.
+    ///
+    /// The manual prints all twelve keys in **one** TOML block, because
+    /// TOML refuses a table declared twice and a reader pastes what the
+    /// page shows. `deny_unknown_fields` is what makes that block a
+    /// promise rather than a hope: a key renamed here without the page
+    /// following fails this test rather than silently doing nothing in
+    /// an operator's file.
+    #[test]
+    fn the_documented_registrar_table_loads_as_one_block() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+[registrar]
+audit_store_dir = "/var/lib/bootroot/audit-store"
+audit_store_reserve_bytes = 2147483648
+audit_store_low_water_bytes = 536870912
+audit_store_enforcement = "filesystem"
+audit_record_dir = "/var/lib/bootroot/audit-store/records"
+audit_max_file_bytes = 8388608
+audit_max_retained_files = 16
+audit_min_retain_days = 90
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        // The documented block is the shipped defaults written out, so
+        // stating it explicitly must land exactly where leaving the
+        // table out does.
+        assert_eq!(settings.registrar, RegistrarSettings::default());
+        settings.validate().unwrap();
+    }
+
+    /// Zero disables or inverts the limiter, so each of the four keys
+    /// rejects it by name.
+    #[test]
+    fn a_zero_rate_limit_key_fails_validation_naming_the_key() {
+        for key in [
+            "rate_limit_admission_burst",
+            "rate_limit_admission_refill_interval_ms",
+            "rate_limit_predecision_refusal_burst",
+            "rate_limit_predecision_refusal_refill_interval_ms",
+        ] {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                "
+[registrar]
+{key} = 0"
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            let error = settings
+                .validate()
+                .expect_err("a zero {key} must be rejected");
+            assert!(
+                format!("{error:#}").contains(&format!("registrar.{key}")),
+                "the {key} failure must name registrar.{key}: {error:#}"
+            );
+        }
+    }
+
+    /// A value an unsigned integer cannot hold is a load error naming
+    /// the key, not a panic and not a raw serde message with no key in
+    /// it.
+    #[test]
+    fn a_rate_limit_value_of_the_wrong_type_fails_the_load_naming_the_key() {
+        for rendered in ["-1", "0.5", r#""512""#, "true"] {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                "
+[registrar]
+rate_limit_admission_burst = {rendered}"
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let error = Settings::from_file(Some(file.path().to_path_buf())).expect_err(
+                "a rate_limit_admission_burst that is not an unsigned integer must not load",
+            );
+            let rendered_error = format!("{error:#}");
+            assert!(
+                rendered_error.contains("registrar.rate_limit_admission_burst"),
+                "the {rendered} failure must name registrar.rate_limit_admission_burst: \
+                 {rendered_error}"
+            );
+            assert!(
+                rendered_error.contains("expected an unsigned integer"),
+                "the {rendered} failure must say what was expected: {rendered_error}"
+            );
+        }
+    }
+
+    /// A whole number too large for the key's `u32` is the same kind of
+    /// load error, naming the key and the bound it passed.
+    ///
+    /// It is a digit's slip away from a sizing an operator meant, and
+    /// the configuration layer's own conversion would have taken it
+    /// silently, so the bound is asserted rather than assumed.
+    #[test]
+    fn a_rate_limit_value_past_u32_max_fails_the_load_naming_the_key() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "
+[registrar]
+rate_limit_admission_burst = 4294967296"
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let error = Settings::from_file(Some(file.path().to_path_buf()))
+            .expect_err("a burst past u32::MAX must not load");
+        let rendered_error = format!("{error:#}");
+        assert!(
+            rendered_error.contains("registrar.rate_limit_admission_burst"),
+            "the failure must name registrar.rate_limit_admission_burst: {rendered_error}"
+        );
+        assert!(
+            rendered_error.contains("4294967296 exceeds 4294967295"),
+            "the failure must say which bound was passed: {rendered_error}"
+        );
     }
 
     /// An empty table is the same as an absent one: every key defaults

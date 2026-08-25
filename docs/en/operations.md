@@ -115,6 +115,126 @@ fails. Restore the audit configuration and re-run init.
 - **Verification:** confirm the audit device is active with
   `docker compose exec openbao bao audit list`.
 
+#### Registrar verb rate limiting
+
+bootroot does not serve registrar verb requests in this build, so no
+invocation reaches these buckets yet. The limiter is a construction
+dependency of the verbs and arrives with whatever wires them into a
+request handler; the four keys below load and validate now.
+
+The registrar's `mint` and `deregister` verbs each write an audit record
+when an invocation arrives and another when it finishes, refusals
+included. Nothing about that is free: a caller that floods refused
+invocations grows the record store, and a full filesystem is not merely
+a large file. It stops every mint, and — because the OpenBao file audit
+device above is **mandatory**, and OpenBao fails requests it cannot
+audit — it can stop OpenBao serving at all, on the one host that must
+not be restarted.
+
+Two token buckets bound that, per client identity and per verb:
+
+- **`predecision_refusal`** — invocations the registrar's purely local
+  checks refuse: a malformed `service_name` or `host`, a reserved name,
+  an unconfigured component, a wrong instance shape, a restated spec
+  that disagrees, an out-of-range `wrap_ttl`. These reach no OpenBao
+  work at all, so they are the cheapest thing a caller can drive and the
+  path a flood takes.
+- **`admission`** — invocations that passed those checks and may
+  therefore reach OpenBao, whatever they turn out to be.
+
+**What the split guarantees, and what it does not.** A flood on the
+`predecision_refusal` path cannot consume `admission` budget, so the
+free path — no valid input, no OpenBao cost — cannot starve legitimate
+mints. A caller that can produce well-formed, derivable requests can
+still consume `admission` budget with invocations that end in refusal,
+because before the record is written nothing distinguishes them from a
+real mint. That residual is bounded by attacker cost rather than by the
+limiter: every such attempt spends OpenBao work as well as a token.
+
+**What a caller sees.** Being limited suppresses the *records*, never
+the *answer*. An invocation limited on the `predecision_refusal` bucket
+still receives exactly the refusal its own input earned — the same
+error, the same class — and only its two audit records are skipped. An
+invocation limited on the `admission` bucket is not attempted at all,
+takes no lock, makes no OpenBao call, and receives the retryable
+`RegistrarBusy` refusal carrying a whole-second `retry_after`. That
+value is deterministic, so a caller with several outstanding requests
+should jitter its own retries.
+
+Either way the daemon counts what it suppressed, one counter per bucket
+since start. Those two counts live in the daemon's own memory and have
+no operator-facing surface yet — nothing reports them, and this build
+charges nothing against the buckets to count. Once one arrives, read
+them as two numbers rather than as a total: a rising
+`predecision_refusal` count says someone is flooding malformed input
+while those callers still got their real answers, and a rising
+`admission` count says legitimate traffic is being held back and a
+bring-up may be stalling.
+
+Those counters are all a limited invocation leaves behind: nothing is
+written per limited invocation, the daemon's journal included. A log
+line each would be one unbounded write per flooded request, handing the
+flood back the disk pressure the buckets took away from it. Do not
+expect the journal to show a flood in progress; that visibility arrives
+with the counters' operator-facing surface.
+
+**The four keys**, in `agent.toml`'s `[registrar]` table. Every one is
+an unsigned integer; rates are expressed as milliseconds per token
+rather than as a fractional rate, so the configuration surface carries
+no floating-point value. A zero is rejected at load time for all four.
+
+```toml
+[registrar]
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
+```
+
+- `rate_limit_admission_burst` (default `512`) — how many mints one
+  client identity may drive at once before the sustained rate applies.
+- `rate_limit_admission_refill_interval_ms` (default `500`) —
+  milliseconds per accrued admission token, so the default sustains two
+  mints per second.
+- `rate_limit_predecision_refusal_burst` (default `32`) — the same, for
+  the locally refused path. Much smaller, because legitimate refusals
+  here are operator typos arriving one at a time.
+- `rate_limit_predecision_refusal_refill_interval_ms` (default `1000`)
+  — one refusal token per second sustained.
+
+**Sizing the admission burst.** Size it from the largest *legitimate*
+bring-up wave, not from how rare mints are in steady state:
+
+```text
+rate_limit_admission_burst >= wave_hosts × modules_per_host
+```
+
+where `wave_hosts` is the largest number of hosts brought up at once and
+`modules_per_host` the largest number of components on one host. The
+shipped default is the reference deployment's own numbers:
+
+| Deployment          | Hosts | Modules | Mints in one wave | Burst needed |
+| ------------------- | ----- | ------- | ----------------- | ------------ |
+| Reference (default) | 64    | 8       | 512               | 512          |
+| Larger fleet        | 200   | 8       | 1600              | 1600         |
+
+A wave larger than the burst still completes rather than being refused;
+it simply takes
+
+```text
+(mints − burst) × rate_limit_admission_refill_interval_ms / 1000
+```
+
+extra seconds — at the defaults, a 1600-mint wave against the shipped
+burst of 512 takes about 544 extra seconds. Work your own fleet through
+the formula and raise the burst **before** the first bring-up rather
+than after it.
+
+Buckets are held in memory only and start full, so a restarted daemon
+absorbs a full wave immediately and no limiter state survives a restart.
+The buckets are keyed on the caller identity as it arrives, so a caller
+cannot reset its budget by reconnecting.
+
 ## Monitoring operations
 
 - Use `bootroot monitoring up --profile lan|public` to start monitoring.

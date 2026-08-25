@@ -44,12 +44,35 @@
 //!    [`tokio::sync::Mutex`], shared by both verbs so a mint and a
 //!    deregister for one identity can never interleave.
 //!
+//! # The limiter in front of those stages
+//!
+//! Stage 1 runs **before** the intent write, so that the invocation's
+//! rate-limit bucket is knowable before anything durable happens. Every
+//! check in it is pure — no I/O, no lock, nothing outside the process —
+//! so running it early costs nothing and changes no answer it produces,
+//! and what it produced is carried forward rather than recomputed. With
+//! those checks refusing, the invocation is charged its
+//! `predecision_refusal` bucket; with them passing, its `admission`
+//! bucket. Only then does the intent write happen. See [`limiter`] for
+//! the buckets themselves and for what their isolation does and does not
+//! guarantee.
+//!
+//! An invocation whose bucket was empty is **limited**: neither record is
+//! written and one event is published. On the pre-decision path it still
+//! receives the refusal its own input earned — limiting suppresses the
+//! record, never the answer — while at admission the verb is not
+//! attempted at all and the caller receives
+//! [`VerbError::Throttled`]. An intent write that *fails* is a different
+//! thing entirely: it happens after the charge, on an invocation whose
+//! pure checks passed, so it has already spent an `admission` token like
+//! any other admitted invocation.
+//!
 //! # The audit trail around those stages
 //!
-//! Every invocation that reaches a verb body attempts **two** record
-//! writes into the daemon-owned store: an `intent` line at entry, before
-//! stage 1 and therefore before any `OpenBao` call, and an `outcome`
-//! line once the verb has run. The two are paired by `request_id` rather
+//! Every invocation that gets past the limiter attempts **two** record
+//! writes into the daemon-owned store: an `intent` line at entry, after
+//! stage 1 and therefore still before any `OpenBao` call, and an
+//! `outcome` line once the verb has run. The two are paired by `request_id` rather
 //! than by adjacency — intent lines are ordered only by arrival, which
 //! is correct, because nothing holds a lock across a whole invocation.
 //! The outcome line for a result produced under the per-id guard is
@@ -76,10 +99,12 @@
 //! serialize against each other on one derived id instead of each
 //! holding a private lock for it. Stages 1 and 2 read only immutable
 //! per-instance configuration and call pure functions, so nothing there
-//! needs guarding and independent validations run concurrently; a future
-//! entry-stage feature that does introduce shared state — a rate limiter,
-//! say — synchronizes that state itself rather than reinstating a
-//! blanket entry lock over everything before derivation.
+//! needs guarding and independent validations run concurrently. The
+//! limiter is the one entry-stage feature that *does* carry shared
+//! state, and it synchronizes that state itself rather than reinstating
+//! a blanket entry lock over everything before derivation: its lock is
+//! taken and released inside one synchronous charge, and is never held
+//! across an `OpenBao` call or a record write.
 //!
 //! Inside stage 3 the binding is consulted **before** the safe-set:
 //! a different stored host is a collision, a same-host different spec is
@@ -123,6 +148,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod binding;
+pub(crate) mod limiter;
 pub(crate) mod outcome;
 pub(crate) mod wrap_ttl;
 
@@ -139,6 +165,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
 use self::binding::{BindingRecord, BindingSpec, BindingState, REGISTRAR_BINDING_KV_SUFFIX};
+use self::limiter::{ChargeOutcome, LimiterBucket, VerbRateLimiter};
 use self::outcome::{
     CallerIdentity, DeregisterKind, DeregisterOutcome, DeregisterResult, MintKind, MintOutcome,
     MintResult, ProducingArm, RequestId, VerbContext, VerbError, VerbRefusal, WrappedSecretIdToken,
@@ -338,6 +365,15 @@ pub(crate) struct RegistrarVerbsConfig {
     /// invocation whose record cannot be written is refused rather than
     /// served silently — see this module's header.
     pub(crate) audit_store: AuditRecordStore,
+    /// The two-bucket token limiter both verbs are charged against
+    /// before either record is written.
+    ///
+    /// A fixed dependency like the store beside it: the verbs receive it
+    /// and can neither choose its sizing nor decline to have one, and
+    /// nothing in a request reaches it. Whoever provisions the registrar
+    /// surface builds it from the four `registrar.rate_limit_*` keys and
+    /// the sink it wants events published through.
+    pub(crate) limiter: VerbRateLimiter,
 }
 
 /// The fixed, client-free dependencies [`RegistrarVerbs::internal`] is
@@ -387,6 +423,10 @@ pub(crate) struct InternalVerbsSource<'a> {
     /// no more chooses where the trail is written than it chooses which
     /// credential it logs in with.
     pub(crate) audit_store: &'a AuditRecordStore,
+    /// The two-bucket token limiter, borrowed and cloned into the
+    /// service as every clone shares one map and one sink. A fixed
+    /// dependency exactly as the store above is.
+    pub(crate) limiter: &'a VerbRateLimiter,
 }
 
 /// A mint request: an opaque caller plus the identity's parts.
@@ -478,6 +518,7 @@ pub(crate) struct RegistrarVerbs {
     secret_id_ttl: String,
     wrap_ttl_policy: WrapTtlPolicy,
     audit_store: AuditRecordStore,
+    limiter: VerbRateLimiter,
 }
 
 impl RegistrarVerbs {
@@ -497,6 +538,7 @@ impl RegistrarVerbs {
             secret_id_ttl: config.secret_id_ttl,
             wrap_ttl_policy: config.wrap_ttl_policy,
             audit_store: config.audit_store,
+            limiter: config.limiter,
         }
     }
 
@@ -535,6 +577,7 @@ impl RegistrarVerbs {
             secret_id_ttl: source.secret_id_ttl.to_string(),
             wrap_ttl_policy: source.wrap_ttl_policy.clone(),
             audit_store: source.audit_store.clone(),
+            limiter: source.limiter.clone(),
         })
     }
 
@@ -547,6 +590,11 @@ impl RegistrarVerbs {
     /// with.
     pub(crate) fn audit_store(&self) -> &AuditRecordStore {
         &self.audit_store
+    }
+
+    /// Returns the limiter this service was constructed with.
+    pub(crate) fn limiter(&self) -> &VerbRateLimiter {
+        &self.limiter
     }
 
     /// Mints — or idempotently re-mints — one service identity and
@@ -569,41 +617,63 @@ impl RegistrarVerbs {
             )
         };
 
-        // Before stage 1, and therefore before any OpenBao call. A store
-        // that cannot take this line refuses the invocation here, where
-        // refusing is free: nothing has been derived and nothing has
-        // been created, which is what the arm and the absent
-        // registration_id both say.
+        // Stage 1, run first and exactly once. Every check in it is
+        // pure — no I/O, no lock, nothing outside the process — so
+        // running it ahead of the intent write costs nothing and changes
+        // no answer it produces, and it is what makes the invocation's
+        // bucket knowable before anything durable happens. What it
+        // produced is carried forward below rather than recomputed.
+        //
+        // The wrap TTL belongs here with it: it is a purely local
+        // property of the request, checked under the
+        // construction-supplied policy well before any OpenBao call, so
+        // an unusable request never creates material that would then
+        // have to be revoked — and a flood of out-of-range values is as
+        // free to an attacker as a flood of malformed labels.
+        let classified = self
+            .pre_derivation(
+                &request.service_name,
+                &request.host,
+                request.instance,
+                Some(&request.spec),
+            )
+            .and_then(|multiplicity| {
+                let granted = self.wrap_ttl_policy.grant(request.wrap_ttl)?;
+                Ok((multiplicity, granted))
+            });
+
+        // The charge, before the intent write: a limiter that ran after
+        // it could not suppress the record it exists to suppress, and
+        // would make that record the amplifier for the exhaustion it is
+        // preventing.
+        if let Some(retry_after) = self.charge(&audit, bucket_for(classified.is_ok())) {
+            let error = match classified {
+                // Limited on the pre-decision path. The caller's answer
+                // is preserved exactly — same VerbError, same wire
+                // identifier or same absence of one, same RefusalClass —
+                // and only the records are suppressed.
+                Err(err) => err,
+                // Throttled at admission, where the daemon has
+                // determined nothing, so this adds an answer rather than
+                // replacing one. The verb is not attempted at all.
+                Ok(_) => VerbError::Throttled { retry_after },
+            };
+            return Err(refuse(ProducingArm::PreDerivation, None, error));
+        }
+
+        // Admitted, so the invocation continues into the flow that
+        // existed before the limiter. A store that cannot take this line
+        // refuses the invocation here, where refusing is free: nothing
+        // has been derived and nothing has been created, which is what
+        // the arm and the absent registration_id both say.
         if let Err(err) = self.write_intent(&audit).await {
             return Err(refuse(ProducingArm::PreDerivation, None, err));
         }
 
-        // Stage 1. Stateless, so it runs unsynchronized.
-        let multiplicity = match self.pre_derivation(
-            &request.service_name,
-            &request.host,
-            request.instance,
-            Some(&request.spec),
-        ) {
-            Ok(multiplicity) => multiplicity,
+        let (multiplicity, granted) = match classified {
+            Ok(classified) => classified,
             Err(err) => {
                 let refusal = refuse(ProducingArm::PreDerivation, None, err);
-                return Err(self.record_refusal(&audit, refusal).await);
-            }
-        };
-
-        // Still stage 1: the wrap TTL is a purely local property of the
-        // request, checked under the construction-supplied policy well
-        // before any OpenBao call, so an unusable request never creates
-        // material that would then have to be revoked.
-        let granted = match self.wrap_ttl_policy.grant(request.wrap_ttl) {
-            Ok(granted) => granted,
-            Err(err) => {
-                let refusal = refuse(
-                    ProducingArm::PreDerivation,
-                    None,
-                    VerbError::InvalidWrapTtl(err),
-                );
                 return Err(self.record_refusal(&audit, refusal).await);
             }
         };
@@ -666,21 +736,31 @@ impl RegistrarVerbs {
             )
         };
 
-        // Identical to the mint's, and deliberately so: one intent write
-        // per invocation, at entry, needing no arm analysis at all.
+        // Identical to the mint's, and deliberately so, save that a
+        // deregister carries no wrap TTL: stage 1 first and once, then
+        // the charge, then the one intent write per invocation.
+        let classified =
+            self.pre_derivation(&request.service_name, &request.host, request.instance, None);
+
+        if let Some(retry_after) = self.charge(&audit, bucket_for(classified.is_ok())) {
+            let error = match classified {
+                Err(err) => err,
+                Ok(_) => VerbError::Throttled { retry_after },
+            };
+            return Err(refuse(ProducingArm::PreDerivation, None, error));
+        }
+
         if let Err(err) = self.write_intent(&audit).await {
             return Err(refuse(ProducingArm::PreDerivation, None, err));
         }
 
-        let multiplicity =
-            match self.pre_derivation(&request.service_name, &request.host, request.instance, None)
-            {
-                Ok(multiplicity) => multiplicity,
-                Err(err) => {
-                    let refusal = refuse(ProducingArm::PreDerivation, None, err);
-                    return Err(self.record_refusal(&audit, refusal).await);
-                }
-            };
+        let multiplicity = match classified {
+            Ok(multiplicity) => multiplicity,
+            Err(err) => {
+                let refusal = refuse(ProducingArm::PreDerivation, None, err);
+                return Err(self.record_refusal(&audit, refusal).await);
+            }
+        };
 
         let registration_id = match derive_registration_id(
             multiplicity,
@@ -708,6 +788,36 @@ impl RegistrarVerbs {
         let recorded = self.record_deregister(&audit, result).await;
         drop(id_guard);
         recorded
+    }
+
+    /// Charges one invocation against its bucket, before either record
+    /// is written.
+    ///
+    /// Returns `None` when a token was available and the invocation may
+    /// proceed. Returns `Some(retry_after)` when the charged bucket was
+    /// empty, in which case the invocation is **limited**: neither
+    /// record is written, and the limiter has already published its one
+    /// limited-invocation event. Only the admission check point turns
+    /// that value into a caller-facing throttle; on the pre-decision
+    /// path it is discarded and the caller keeps its own refusal.
+    ///
+    /// **A limited invocation writes nothing per invocation anywhere,
+    /// the daemon log included.** The sink event is in-process and
+    /// counted; a `tracing` line per limited invocation would be one
+    /// unbounded write per flooded request, which is the disk pressure
+    /// the buckets exist to remove — reintroduced on the very path they
+    /// were meant to make cheap. What a flood leaves behind is the
+    /// sink's per-bucket count, and coalescing that into a record
+    /// belongs to the sibling record issue.
+    ///
+    /// Synchronous, and the bucket lock is taken and released inside the
+    /// limiter, so nothing here holds it across an `OpenBao` call or a
+    /// record write.
+    fn charge(&self, audit: &AuditContext, bucket: LimiterBucket) -> Option<u64> {
+        match self.limiter.charge(&audit.caller, audit.verb, bucket) {
+            ChargeOutcome::Admitted => None,
+            ChargeOutcome::Limited { retry_after } => Some(retry_after),
+        }
     }
 
     /// Writes the invocation's `intent` line.
@@ -1560,6 +1670,24 @@ impl RegistrarVerbs {
                 ))
             }
         }
+    }
+}
+
+/// Selects the bucket an invocation is charged against from whether the
+/// pure checks of stage 1 refused it.
+///
+/// The whole of the membership rule. `predecision_refusal` is that
+/// enumerated set of checks and nothing else — not "every refusal
+/// reached without I/O": `derive_registration_id` is synchronous and
+/// touches nothing outside the process, and its failures spend an
+/// `admission` token all the same, because they are settled *after* the
+/// charge. The bucket is fixed here and is never revised by what the
+/// invocation turns out to be.
+fn bucket_for(passed_pure_checks: bool) -> LimiterBucket {
+    if passed_pure_checks {
+        LimiterBucket::Admission
+    } else {
+        LimiterBucket::PredecisionRefusal
     }
 }
 
