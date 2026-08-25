@@ -355,7 +355,17 @@ audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+
+# Verb rate limiting; see "Registrar verb rate limiting" below.
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
 ```
+
+That is the whole table, and it is deliberately one block: TOML refuses a
+table declared twice, so a `[registrar]` header repeated further down this
+page would not be something a reader could paste.
 
 bootroot does not create the audit store in this build. It does not write
 registrar verb records in this build.
@@ -540,15 +550,7 @@ it can consume.
 
 ### Registrar verb rate limiting
 
-```toml
-[registrar]
-rate_limit_admission_burst = 512
-rate_limit_admission_refill_interval_ms = 500
-rate_limit_predecision_refusal_burst = 32
-rate_limit_predecision_refusal_refill_interval_ms = 1000
-```
-
-These four keys join the `[registrar]` table above and bound how fast one
+These four keys sit in the `[registrar]` table above and bound how fast one
 client identity may drive the `mint` and `deregister` verbs, so that a
 caller flooding refused invocations cannot grow the record store without
 limit. bootroot serves no registrar verb request in this build, so

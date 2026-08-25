@@ -341,7 +341,17 @@ audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+
+# 동사 속도 제한. 아래 "레지스트라 동사 속도 제한"을 참고하세요.
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
 ```
+
+이것이 테이블 전체이며, 일부러 한 블록으로 두었습니다. TOML은 같은
+테이블을 두 번 선언하는 것을 거부하므로, 이 페이지 아래쪽에서 `[registrar]`
+헤더를 다시 쓴다면 독자가 그대로 붙여 넣을 수 있는 것이 아니게 됩니다.
 
 이 빌드에서 bootroot는 감사 저장소를 만들지 않습니다. 이 빌드에서 레지스트라
 동사 레코드를 쓰지 않습니다.
@@ -511,15 +521,7 @@ flush하며, 디렉터리를 flush할 수 없는 저장소는 열리지 않습�
 
 ### 레지스트라 동사 속도 제한
 
-```toml
-[registrar]
-rate_limit_admission_burst = 512
-rate_limit_admission_refill_interval_ms = 500
-rate_limit_predecision_refusal_burst = 32
-rate_limit_predecision_refusal_refill_interval_ms = 1000
-```
-
-이 네 개의 키는 위의 `[registrar]` 테이블에 함께 들어가며, 한 클라이언트
+이 네 개의 키는 위의 `[registrar]` 테이블에 들어 있으며, 한 클라이언트
 신원이 `mint`/`deregister` 동사를 얼마나 빠르게 호출할 수 있는지를
 제한합니다. 거부되는 호출을 대량으로 밀어 넣는 호출자가 레코드 저장소를
 한없이 키우지 못하게 하기 위한 것입니다. 이 빌드의 bootroot는 레지스트라

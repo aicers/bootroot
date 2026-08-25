@@ -238,10 +238,26 @@ async fn a_partial_interval_is_not_discarded() {
 /// The bucket reads a monotonic clock, so no wall-clock step can mint a
 /// token. Driving the wall clock while the runtime's monotonic clock is
 /// paused is exactly that step.
+///
+/// The refill interval is deliberately far **shorter** than the
+/// wall-clock interval the spin below burns: a bucket reading any
+/// advancing clock would refill to its full burst several times over
+/// here, so the assertion fails for a limiter that reads one and passes
+/// only for a limiter that reads the frozen monotonic clock. A refill
+/// interval longer than the spin would be refused either way and would
+/// assert nothing.
 #[tokio::test]
 async fn a_wall_clock_jump_adds_no_tokens() {
+    const REFILL_INTERVAL_MS: u32 = 5;
+    const WALL_CLOCK_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+
     pause();
-    let (limiter, _) = VerbRateLimiter::with_counting_sink(tiny());
+    let settings = VerbRateLimiterSettings {
+        admission_burst: 3,
+        admission_refill_interval_ms: REFILL_INTERVAL_MS,
+        ..tiny()
+    };
+    let (limiter, _) = VerbRateLimiter::with_counting_sink(settings);
     let identity = caller(CALLER);
     drain(
         &limiter,
@@ -251,12 +267,12 @@ async fn a_wall_clock_jump_adds_no_tokens() {
         3,
     );
     let before = std::time::SystemTime::now();
-    // A real elapsed wall-clock interval, with the monotonic clock the
-    // limiter reads held still.
+    // A real elapsed wall-clock interval — twenty refill intervals' worth
+    // — with the monotonic clock the limiter reads held still.
     while std::time::SystemTime::now()
         .duration_since(before)
         .unwrap_or_default()
-        < std::time::Duration::from_millis(20)
+        < WALL_CLOCK_STEP
     {
         std::hint::spin_loop();
     }
@@ -266,6 +282,17 @@ async fn a_wall_clock_jump_adds_no_tokens() {
             ChargeOutcome::Limited { .. }
         ),
         "only the monotonic clock may accrue tokens"
+    );
+
+    // And the monotonic clock still does: the same elapsed time, advanced
+    // through the runtime's clock rather than the wall clock, refills the
+    // bucket. Without this the assertion above would also pass for a
+    // bucket that never accrues at all.
+    advance(Duration::from_millis(u64::from(REFILL_INTERVAL_MS))).await;
+    assert_eq!(
+        limiter.charge(&identity, AuditVerb::Mint, LimiterBucket::Admission),
+        ChargeOutcome::Admitted,
+        "one monotonic refill interval accrues one token"
     );
 }
 

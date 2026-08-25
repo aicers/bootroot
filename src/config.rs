@@ -1751,6 +1751,47 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
         settings.validate().unwrap();
     }
 
+    /// The whole `[registrar]` table, exactly as the configuration
+    /// manual shows it, loads with every key reaching its own field.
+    ///
+    /// The manual prints all twelve keys in **one** TOML block, because
+    /// TOML refuses a table declared twice and a reader pastes what the
+    /// page shows. `deny_unknown_fields` is what makes that block a
+    /// promise rather than a hope: a key renamed here without the page
+    /// following fails this test rather than silently doing nothing in
+    /// an operator's file.
+    #[test]
+    fn the_documented_registrar_table_loads_as_one_block() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+[registrar]
+audit_store_dir = "/var/lib/bootroot/audit-store"
+audit_store_reserve_bytes = 2147483648
+audit_store_low_water_bytes = 536870912
+audit_store_enforcement = "filesystem"
+audit_record_dir = "/var/lib/bootroot/audit-store/records"
+audit_max_file_bytes = 8388608
+audit_max_retained_files = 16
+audit_min_retain_days = 90
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        // The documented block is the shipped defaults written out, so
+        // stating it explicitly must land exactly where leaving the
+        // table out does.
+        assert_eq!(settings.registrar, RegistrarSettings::default());
+        settings.validate().unwrap();
+    }
+
     /// Zero disables or inverts the limiter, so each of the four keys
     /// rejects it by name.
     #[test]
