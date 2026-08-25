@@ -1827,8 +1827,8 @@ rate_limit_predecision_refusal_refill_interval_ms = 1000
     /// the key, not a panic and not a raw serde message with no key in
     /// it.
     #[test]
-    fn a_negative_or_fractional_rate_limit_value_fails_the_load_naming_the_key() {
-        for rendered in ["-1", "0.5", r#""512""#] {
+    fn a_rate_limit_value_of_the_wrong_type_fails_the_load_naming_the_key() {
+        for rendered in ["-1", "0.5", r#""512""#, "true"] {
             let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
             write_minimal_profile_config(&mut file);
             writeln!(
