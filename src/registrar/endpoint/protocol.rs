@@ -885,6 +885,29 @@ mod tests {
         members.insert(member, replacement);
     }
 
+    fn remove_serialized_value<T>(value: &mut serde_json::Value, current: &T)
+    where
+        T: Serialize,
+    {
+        let current = serde_json::to_value(current).expect("current value serializes");
+        let members = value.as_object_mut().expect("value is a JSON object");
+        let member = members
+            .iter()
+            .find_map(|(member, value)| (value == &current).then(|| member.clone()))
+            .expect("fixture contains the current value");
+        members.remove(&member);
+    }
+
+    fn deregister_request(instance: Option<u32>) -> DeregisterRequest {
+        DeregisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "api".to_string(),
+            host: "node".to_string(),
+            instance,
+            idempotency_key: "key".to_string(),
+        }
+    }
+
     fn trust_payload() -> TrustPayload {
         let ca_bundle_pem =
             "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n".to_string();
@@ -901,23 +924,73 @@ mod tests {
 
     #[test]
     fn protocol_version_rejects_missing_and_unknown_versions() {
-        let missing =
-            br#"{"service_name":"api","host":"node","instance":1,"idempotency_key":"key"}"#;
-        assert!(decode_request(Operation::Deregister, missing).is_err());
-        let unknown = br#"{"protocol_version":2,"service_name":"api","host":"node","instance":1,"idempotency_key":"key"}"#;
-        assert!(decode_request(Operation::Deregister, unknown).is_err());
+        let request = deregister_request(Some(7));
+        let mut missing = serde_json::to_value(&request).expect("request serializes");
+        remove_serialized_value(&mut missing, &request.protocol_version);
+        assert!(
+            decode_request(
+                Operation::Deregister,
+                &serde_json::to_vec(&missing).expect("payload serializes")
+            )
+            .is_err()
+        );
+
+        let mut unknown = serde_json::to_value(&request).expect("request serializes");
+        replace_serialized_value(
+            &mut unknown,
+            &request.protocol_version,
+            serde_json::json!(2),
+        );
+        assert!(
+            decode_request(
+                Operation::Deregister,
+                &serde_json::to_vec(&unknown).expect("payload serializes")
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn request_decoding_accepts_unknown_members_but_rejects_invalid_values() {
-        let unknown_member = br#"{"protocol_version":1,"service_name":"api","host":"node","idempotency_key":"key","future":"value"}"#;
-        assert!(decode_request(Operation::Deregister, unknown_member).is_ok());
+        let request = deregister_request(None);
+        let mut unknown_member = serde_json::to_value(&request).expect("request serializes");
+        unknown_member
+            .as_object_mut()
+            .expect("request serializes as an object")
+            .insert("future".to_string(), serde_json::json!("value"));
+        assert!(
+            decode_request(
+                Operation::Deregister,
+                &serde_json::to_vec(&unknown_member).expect("payload serializes")
+            )
+            .is_ok()
+        );
 
-        for payload in [
-            br#"{"protocol_version":1,"service_name":"api","host":"node","idempotency_key":7}"#.as_slice(),
-            br#"{"protocol_version":1,"service_name":"api","host":"node","instance":4294967296,"idempotency_key":"key"}"#,
-        ] {
-            assert!(decode_request(Operation::Deregister, payload).is_err());
+        let mut invalid_idempotency_key =
+            serde_json::to_value(&request).expect("request serializes");
+        replace_serialized_value(
+            &mut invalid_idempotency_key,
+            &request.idempotency_key,
+            serde_json::json!(7),
+        );
+
+        let request_with_instance = deregister_request(Some(7));
+        let mut out_of_range_instance =
+            serde_json::to_value(&request_with_instance).expect("request serializes");
+        replace_serialized_value(
+            &mut out_of_range_instance,
+            &7_u32,
+            serde_json::json!(4_294_967_296_u64),
+        );
+
+        for payload in [invalid_idempotency_key, out_of_range_instance] {
+            assert!(
+                decode_request(
+                    Operation::Deregister,
+                    &serde_json::to_vec(&payload).expect("payload serializes")
+                )
+                .is_err()
+            );
         }
 
         let register = RegisterRequest {
@@ -1458,8 +1531,16 @@ mod tests {
 
     #[test]
     fn nullable_optional_members_are_rejected() {
-        let payload = br#"{"protocol_version":1,"service_name":"api","host":"node","instance":null,"idempotency_key":"key"}"#;
-        assert!(decode_request(Operation::Deregister, payload).is_err());
+        let request = deregister_request(Some(7));
+        let mut payload = serde_json::to_value(&request).expect("request serializes");
+        replace_serialized_value(&mut payload, &7_u32, serde_json::Value::Null);
+        assert!(
+            decode_request(
+                Operation::Deregister,
+                &serde_json::to_vec(&payload).expect("payload serializes")
+            )
+            .is_err()
+        );
     }
 
     #[test]
