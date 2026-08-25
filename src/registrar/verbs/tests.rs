@@ -2362,69 +2362,164 @@ fn assert_same_wire_answer(name: &str, limited: &VerbRefusal, unlimited: &VerbRe
 #[cfg(not(target_os = "linux"))]
 fn assert_same_wire_answer(_name: &str, _limited: &VerbRefusal, _unlimited: &VerbRefusal) {}
 
+/// One pre-decision refusal case: the request, the fixture it needs,
+/// and the [`VerbError`] the request exists to provoke.
+struct PreDecisionCase {
+    name: &'static str,
+    fixture: RegistrarConfigFixture,
+    request: MintRequest,
+    expects: fn(&VerbError) -> bool,
+}
+
+fn pre_decision_case(
+    name: &'static str,
+    fixture: RegistrarConfigFixture,
+    request: MintRequest,
+    expects: fn(&VerbError) -> bool,
+) -> PreDecisionCase {
+    PreDecisionCase {
+        name,
+        fixture,
+        request,
+        expects,
+    }
+}
+
 /// Every pre-decision refusal the verbs can produce, as a mint request
-/// paired with the fixture it needs.
+/// paired with the fixture it needs and the refusal it is here for.
 ///
 /// The set spans both wire classes deliberately: a permanent
 /// identifier-carrying refusal, a reserved name and an out-of-range
 /// `wrap_ttl`, the last two of which are retryable with no identifier
 /// today. What limiting preserves is the answer, not its permanence.
 ///
-/// Every [`WrapTtlRefusal`] variant appears here, because each is a
-/// distinct answer the caller earned and the limiter must hand back
-/// unchanged.
-fn pre_decision_cases() -> Vec<(&'static str, RegistrarConfigFixture, MintRequest)> {
+/// The expected error travels with each case so that a case cannot
+/// quietly stop covering the refusal it names. A request that began
+/// tripping some earlier check would still pair identically under
+/// limiting and would still satisfy every assertion below, leaving the
+/// refusal uncovered with nothing to say so.
+fn pre_decision_cases() -> Vec<PreDecisionCase> {
+    let mut cases = identity_pre_decision_cases();
+    cases.extend(wrap_ttl_pre_decision_cases());
+    cases
+}
+
+/// The refusals a request earns from its identity triple or its
+/// restated spec, before any wrap-TTL rule is consulted.
+fn identity_pre_decision_cases() -> Vec<PreDecisionCase> {
     let unconfigured = base_fixture();
     let mut spec_conflict = mint_request("roxyd", "h1", None);
     spec_conflict.spec = requested(&sample_spec()).with_service_name("roxyd-h1");
-    let mut zero_wrap_ttl = mint_request("roxyd", "h1", None);
-    zero_wrap_ttl.wrap_ttl = Duration::ZERO;
-    let mut negative_wrap_ttl = mint_request("roxyd", "h1", None);
-    negative_wrap_ttl.wrap_ttl = Duration::seconds(-5);
-    let mut fractional_wrap_ttl = mint_request("roxyd", "h1", None);
-    fractional_wrap_ttl.wrap_ttl = Duration::milliseconds(250);
-    let mut unrepresentable_wrap_ttl = mint_request("roxyd", "h1", None);
-    // One second past the largest whole-second value an `OpenBao`
-    // duration string can carry, so it is refused rather than clamped.
-    unrepresentable_wrap_ttl.wrap_ttl = Duration::seconds(9_223_372_037);
     vec![
-        (
+        pre_decision_case(
             "an invalid service_name label",
             base_fixture(),
             mint_request("bad_name", "h1", None),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::Registrar(RegistrarError::InvalidServiceName { .. })
+                )
+            },
         ),
-        (
+        pre_decision_case(
             "an invalid host label",
             base_fixture(),
             mint_request("roxyd", "-h1", None),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::Registrar(RegistrarError::InvalidHost { .. })
+                )
+            },
         ),
-        (
+        pre_decision_case(
             "a reserved service_name",
             base_fixture(),
             mint_request("bootroot-decoy", "h1", None),
+            |error| matches!(error, VerbError::ReservedServiceName { .. }),
         ),
-        (
+        pre_decision_case(
             "an unconfigured component",
             unconfigured,
             mint_request("absent", "h1", None),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::Registrar(RegistrarError::ComponentNotConfigured { .. })
+                )
+            },
         ),
-        (
+        pre_decision_case(
             "an instance on a one-per-host component",
             base_fixture(),
             mint_request("roxyd", "h1", Some(1)),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::Registrar(RegistrarError::ServiceInstanceMismatch { .. })
+                )
+            },
         ),
-        (
+        pre_decision_case(
             "a restated spec that disagrees",
             base_fixture(),
             spec_conflict,
+            |error| {
+                matches!(
+                    error,
+                    VerbError::Registrar(RegistrarError::SpecIdentityDisagreement { .. })
+                )
+            },
         ),
-        ("a zero wrap_ttl", base_fixture(), zero_wrap_ttl),
-        ("a negative wrap_ttl", base_fixture(), negative_wrap_ttl),
-        ("a sub-second wrap_ttl", base_fixture(), fractional_wrap_ttl),
-        (
+    ]
+}
+
+/// One case per [`WrapTtlRefusal`] variant, because each is a distinct
+/// answer the caller earned and the limiter must hand back unchanged.
+fn wrap_ttl_pre_decision_cases() -> Vec<PreDecisionCase> {
+    let wrap_ttl_request = |requested: Duration| {
+        let mut request = mint_request("roxyd", "h1", None);
+        request.wrap_ttl = requested;
+        request
+    };
+    vec![
+        pre_decision_case(
+            "a zero wrap_ttl",
+            base_fixture(),
+            wrap_ttl_request(Duration::ZERO),
+            |error| matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Zero)),
+        ),
+        pre_decision_case(
+            "a negative wrap_ttl",
+            base_fixture(),
+            wrap_ttl_request(Duration::seconds(-5)),
+            |error| matches!(error, VerbError::InvalidWrapTtl(WrapTtlRefusal::Negative)),
+        ),
+        pre_decision_case(
+            "a sub-second wrap_ttl",
+            base_fixture(),
+            wrap_ttl_request(Duration::milliseconds(250)),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::InvalidWrapTtl(WrapTtlRefusal::NotWholeSeconds)
+                )
+            },
+        ),
+        pre_decision_case(
             "a wrap_ttl past the OpenBao range",
             base_fixture(),
-            unrepresentable_wrap_ttl,
+            // One second past the largest whole-second value an
+            // `OpenBao` duration string can carry, so it is refused
+            // rather than clamped.
+            wrap_ttl_request(Duration::seconds(9_223_372_037)),
+            |error| {
+                matches!(
+                    error,
+                    VerbError::InvalidWrapTtl(WrapTtlRefusal::ExceedsOpenBaoRange)
+                )
+            },
         ),
     ]
 }
@@ -2507,7 +2602,13 @@ async fn a_pre_decision_flood_is_limited_without_writing_a_record() {
 /// already determined.
 #[tokio::test]
 async fn limiting_preserves_the_callers_answer_across_every_pre_decision_refusal() {
-    for (name, fixture, request) in pre_decision_cases() {
+    for PreDecisionCase {
+        name,
+        fixture,
+        request,
+        expects,
+    } in pre_decision_cases()
+    {
         // Unlimited: a wide refusal budget, so the first invocation finds
         // a token.
         let (unlimited_server, _unlimited_dir, unlimited, _) =
@@ -2535,6 +2636,14 @@ async fn limiting_preserves_the_callers_answer_across_every_pre_decision_refusal
             "{name} must have been limited on the pre-decision bucket"
         );
 
+        // The case still refuses for the reason it was written for, so
+        // the pairwise assertions below are comparing the answer this
+        // case exists to cover.
+        assert!(
+            expects(unlimited_refusal.error()),
+            "{name}: no longer produces the refusal it covers: {:?}",
+            unlimited_refusal.error()
+        );
         assert_eq!(
             format!("{:?}", limited_refusal.error()),
             format!("{:?}", unlimited_refusal.error()),
