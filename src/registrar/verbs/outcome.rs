@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use time::OffsetDateTime;
 
+use crate::registrar::audit::{AuditPhase, AuditStoreError};
 use crate::registrar::error::RegistrarError;
 use crate::registrar::verbs::wrap_ttl::WrapTtlRefusal;
 use crate::service_material::TeardownReport;
@@ -397,6 +398,65 @@ pub(crate) enum VerbError {
     /// identically forever.
     #[error("requested wrap_ttl is not usable")]
     InvalidWrapTtl(#[from] WrapTtlRefusal),
+
+    /// An audit record could not be written, on an invocation that
+    /// changed no `OpenBao` state.
+    ///
+    /// Two writes produce it: the **intent** write, which precedes every
+    /// `OpenBao` call and so refuses with nothing created at all, and an
+    /// **outcome** write on an invocation whose mutation disposition is
+    /// still clear. Which one is in [`VerbError::AuditUnwritable::phase`]
+    /// and is inferable from nothing else on the refusal:
+    /// [`ProducingArm`] says how far the *verb* got and has no member
+    /// that tells an intent write from an outcome write.
+    ///
+    /// The name is the one `docs/reference/registrar-wire-contract.md`
+    /// §6.5 records for the closed `RegistrarUnavailable` reason set, and
+    /// is adopted rather than coined here. That set describes it as
+    /// "intent phase only", which is narrower than the condition above;
+    /// the divergence is deliberate and is not resolved here, because
+    /// narrowing the condition to fit the name would leave a
+    /// non-mutating outcome-write failure unreported. This variant is
+    /// internal to the verb layer and nothing more — there is no
+    /// verb-to-wire mapping in this repository, and carrying the phase
+    /// is what lets a later endpoint map [`AuditPhase::Intent`] onto the
+    /// transcribed reason and decide on its own terms what an
+    /// [`AuditPhase::Outcome`] failure tells a caller.
+    #[error("the registrar could not write the {phase} audit record")]
+    AuditUnwritable {
+        /// The write that failed. Reused from the record format rather
+        /// than restated, so a third phase breaks this `match` too.
+        phase: AuditPhase,
+        /// The store's own typed failure.
+        #[source]
+        source: AuditStoreError,
+    },
+
+    /// The outcome record could not be written on an invocation that
+    /// did, or may have, changed `OpenBao` state.
+    ///
+    /// A teardown is owed: the identity may exist, or may have been
+    /// removed, and no durable outcome line says which. A successful
+    /// mint that lands here does **not** return its material — the
+    /// wrapped `secret_id` is dropped and expires unused — so a caller
+    /// re-drives the verb once the store recovers and receives fresh
+    /// material then.
+    ///
+    /// It carries no phase, and that is not an oversight: only an
+    /// outcome write can produce it, because the disposition cannot be
+    /// set before the intent write has already succeeded.
+    ///
+    /// Like [`VerbError::AuditUnwritable`], the name comes from the wire
+    /// contract's §6.5 reason set, which describes it as following "a
+    /// successful mint". The condition here is wider — every invocation
+    /// whose disposition is set, refusals and completed removals
+    /// included — and is deliberately not narrowed to fit the name.
+    #[error("the registrar changed OpenBao state but could not record the outcome")]
+    PostMintUnrecordable {
+        /// The store's own typed failure.
+        #[source]
+        source: AuditStoreError,
+    },
 
     /// A fail-closed failure: `OpenBao` was unreachable or answered
     /// unexpectedly, a stored binding could not be read, or a

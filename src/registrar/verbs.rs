@@ -44,6 +44,32 @@
 //!    [`tokio::sync::Mutex`], shared by both verbs so a mint and a
 //!    deregister for one identity can never interleave.
 //!
+//! # The audit trail around those stages
+//!
+//! Every invocation that reaches a verb body attempts **two** record
+//! writes into the daemon-owned store: an `intent` line at entry, before
+//! stage 1 and therefore before any `OpenBao` call, and an `outcome`
+//! line once the verb has run. The two are paired by `request_id` rather
+//! than by adjacency — intent lines are ordered only by arrival, which
+//! is correct, because nothing holds a lock across a whole invocation.
+//! The outcome line for a result produced under the per-id guard is
+//! written **before that guard is released**, so the next invocation for
+//! the same identity cannot change `OpenBao` and land its outcome line
+//! ahead of the line describing the change it superseded.
+//!
+//! Neither write is best-effort. A failed intent write refuses the
+//! invocation with nothing created, which is free at that point. A
+//! failed outcome write may arrive after `OpenBao` has already changed,
+//! so what it returns is decided by a per-invocation **mutation
+//! disposition** — see [`MutationDisposition`] — and by nothing else:
+//! not the verb, not the outcome class, not the [`ProducingArm`], and
+//! not a re-read of `OpenBao`.
+//!
+//! The `OpenBao` file audit device stays mandatory and is not replaced.
+//! It cannot see a request refused before any `OpenBao` write, and it
+//! does not know who asked or for which `(service_name, host,
+//! instance)`; this trail does.
+//!
 //! Stage 3's per-id lock is the **only** in-process serialization
 //! boundary either verb has. Its map is owned by this module rather than
 //! by a service instance, so two [`RegistrarVerbs`] in one process
@@ -104,6 +130,7 @@ pub(crate) mod wrap_ttl;
 mod tests;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError, Weak};
 
 use anyhow::Context as _;
@@ -118,14 +145,16 @@ use self::outcome::{
 };
 use self::wrap_ttl::{GrantedWrapTtl, WrapTtlPolicy};
 use crate::openbao::{KvCreateIfAbsent, OpenBaoClient, SecretIdOptions, WrapInfo};
-use crate::registrar::audit::AuditRecordStore;
+use crate::registrar::audit::{
+    AuditOutcome, AuditPhase, AuditRecord, AuditRecordStore, AuditVerb, RequestedIdentity, bridge,
+};
 use crate::registrar::config::{Multiplicity, RegistrarConfig};
 use crate::registrar::identity::{RequestedSpec, check_instance_shape, derive_registration_id};
 use crate::registrar::internal::{InternalCredential, InternalCredentialError};
 use crate::registrar::{check_spec_identity, is_reserved_service_name, validate_request_labels};
 use crate::service_material::{
-    ProvisionedServiceRole, ServiceRoleTtls, provision_service_role, service_kv_path,
-    service_role_name, teardown_service_material,
+    ProvisionedServiceRole, ResourceOutcome, ServiceRoleTtls, provision_service_role,
+    service_kv_path, service_role_name, teardown_service_material,
 };
 use crate::trust_bootstrap::{
     SERVICE_EAB_KV_SUFFIX, SERVICE_REISSUE_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX,
@@ -174,6 +203,106 @@ static ID_LOCKS: LazyLock<IdLocks> = LazyLock::new(IdLocks::default);
 /// a pathological pair of processes from spinning here forever.
 const MAX_CLAIM_ATTEMPTS: usize = 3;
 
+/// Whether one invocation has made an `OpenBao` call that can have
+/// changed durable state.
+///
+/// Set from the *result* of each such call and **never cleared**, so it
+/// is monotone over the invocation. Reads never set it — a binding read,
+/// a `role_id` read, acquiring an authenticated client — and neither
+/// does a lost compare-and-set, which wrote nothing at all; that is why
+/// exhausting [`MAX_CLAIM_ATTEMPTS`] refuses with it still clear.
+///
+/// Every *error* does set it, and that asymmetry is the whole point. A
+/// call that failed may have failed after its write reached `OpenBao`,
+/// and the two ways of being wrong are not symmetrical: reporting a
+/// change as an ordinary refusal leaves live, unrecorded state that
+/// nobody is told to clean up, while reporting an unchanged invocation
+/// as owed costs at most one idempotent re-drive that finds nothing. A
+/// `ResourceOutcome::Failed` teardown attempt is indeterminate in
+/// exactly the same way and counts the same.
+///
+/// It is shared behind `&` across `.await` points in a `Send` future, so
+/// an [`AtomicBool`] is the shape to use; the value is per-invocation and
+/// is read by the same task that set it, so no ordering stronger than
+/// the module already uses is needed.
+#[derive(Debug, Default)]
+struct MutationDisposition(AtomicBool);
+
+impl MutationDisposition {
+    /// Records that a call which can have changed `OpenBao` state has
+    /// completed, however it completed.
+    fn set(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Records the outcome of a state-changing call and hands its result
+    /// straight back, so the call site reads as it did before.
+    fn note<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+        self.set();
+        result
+    }
+
+    /// Reports whether this invocation is owed a teardown.
+    fn is_set(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Everything one invocation's two record writes need.
+///
+/// Built at verb entry, before stage 1. The caller identity and the
+/// requested parts are carried into the builders **unchanged and
+/// uninterpreted**: whatever [`CallerIdentity`] holds is what the record
+/// is handed, and what a durable line ends up saying is the store's
+/// business — `AuditRecord::into_bounded` caps the field and records a
+/// digest when it had to. Nothing here pre-truncates or works around
+/// that.
+struct AuditContext {
+    request_id: RequestId,
+    verb: AuditVerb,
+    caller: CallerIdentity,
+    requested: RequestedIdentity,
+    disposition: MutationDisposition,
+}
+
+impl AuditContext {
+    /// Opens the context for one invocation, generating its request id.
+    fn new(verb: AuditVerb, caller: &CallerIdentity, requested: RequestedIdentity) -> Self {
+        Self {
+            request_id: RequestId::generate(),
+            verb,
+            caller: caller.clone(),
+            requested,
+            disposition: MutationDisposition::default(),
+        }
+    }
+
+    /// Builds the record shared by both phases: the timestamp, the
+    /// correlation handle, the verb, the caller and the requested parts.
+    fn intent_record(&self) -> AuditRecord {
+        AuditRecord::intent(
+            OffsetDateTime::now_utc(),
+            self.request_id.as_str().to_string(),
+            self.verb,
+            self.caller.as_str().to_string(),
+            self.requested.clone(),
+        )
+    }
+
+    /// Builds the `outcome` line for a produced result.
+    fn outcome_record(&self, registration_id: Option<&str>, outcome: AuditOutcome) -> AuditRecord {
+        AuditRecord::outcome(
+            OffsetDateTime::now_utc(),
+            self.request_id.as_str().to_string(),
+            self.verb,
+            self.caller.as_str().to_string(),
+            self.requested.clone(),
+            registration_id.map(str::to_string),
+            outcome,
+        )
+    }
+}
+
 /// The fixed dependencies a [`RegistrarVerbs`] is constructed with.
 ///
 /// Every one of these is chosen once, by whatever provisions the
@@ -205,10 +334,9 @@ pub(crate) struct RegistrarVerbsConfig {
     /// fails that surface closed rather than leaving the verbs running
     /// with no trail.
     ///
-    /// No verb arm calls its append API yet. The sibling issue that
-    /// writes intent and outcome records owns the call sites, their
-    /// ordering around the `OpenBao` work, and what a failed write
-    /// returns to a caller; this field is the seam it consumes.
+    /// Both verbs write through it, twice per invocation, and an
+    /// invocation whose record cannot be written is refused rather than
+    /// served silently — see this module's header.
     pub(crate) audit_store: AuditRecordStore,
 }
 
@@ -424,85 +552,316 @@ impl RegistrarVerbs {
     /// Mints — or idempotently re-mints — one service identity and
     /// returns fresh wrap-only material for it.
     pub(crate) async fn mint(&self, request: &MintRequest) -> MintResult {
-        let request_id = RequestId::generate();
-        let caller = request.caller.clone();
+        let audit = AuditContext::new(
+            AuditVerb::Mint,
+            &request.caller,
+            requested_identity(&request.service_name, &request.host, request.instance),
+        );
         let refuse = |arm: ProducingArm, registration_id: Option<String>, error: VerbError| {
             VerbRefusal::new(
-                VerbContext::new(request_id.clone(), caller.clone(), registration_id, arm),
+                VerbContext::new(
+                    audit.request_id.clone(),
+                    audit.caller.clone(),
+                    registration_id,
+                    arm,
+                ),
                 error,
             )
         };
 
+        // Before stage 1, and therefore before any OpenBao call. A store
+        // that cannot take this line refuses the invocation here, where
+        // refusing is free: nothing has been derived and nothing has
+        // been created, which is what the arm and the absent
+        // registration_id both say.
+        if let Err(err) = self.write_intent(&audit).await {
+            return Err(refuse(ProducingArm::PreDerivation, None, err));
+        }
+
         // Stage 1. Stateless, so it runs unsynchronized.
-        let multiplicity = self
-            .pre_derivation(
-                &request.service_name,
-                &request.host,
-                request.instance,
-                Some(&request.spec),
-            )
-            .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
+        let multiplicity = match self.pre_derivation(
+            &request.service_name,
+            &request.host,
+            request.instance,
+            Some(&request.spec),
+        ) {
+            Ok(multiplicity) => multiplicity,
+            Err(err) => {
+                let refusal = refuse(ProducingArm::PreDerivation, None, err);
+                return Err(self.record_refusal(&audit, refusal).await);
+            }
+        };
 
         // Still stage 1: the wrap TTL is a purely local property of the
         // request, checked under the construction-supplied policy well
         // before any OpenBao call, so an unusable request never creates
         // material that would then have to be revoked.
-        let granted = self
-            .wrap_ttl_policy
-            .grant(request.wrap_ttl)
-            .map_err(|err| {
-                refuse(
+        let granted = match self.wrap_ttl_policy.grant(request.wrap_ttl) {
+            Ok(granted) => granted,
+            Err(err) => {
+                let refusal = refuse(
                     ProducingArm::PreDerivation,
                     None,
                     VerbError::InvalidWrapTtl(err),
-                )
-            })?;
+                );
+                return Err(self.record_refusal(&audit, refusal).await);
+            }
+        };
 
         // Stage 2. Derivation is fallible even after the labels
         // validated, and a failure here takes no per-id lock.
-        let registration_id = derive_registration_id(
+        let registration_id = match derive_registration_id(
             multiplicity,
             &request.service_name,
             &request.host,
             request.instance,
-        )
-        .map_err(|err| refuse(ProducingArm::Derivation, None, VerbError::Registrar(err)))?;
+        ) {
+            Ok(registration_id) => registration_id,
+            Err(err) => {
+                let refusal = refuse(ProducingArm::Derivation, None, VerbError::Registrar(err));
+                return Err(self.record_refusal(&audit, refusal).await);
+            }
+        };
         let san = self
             .config
             .san_for(request.instance, &request.service_name, &request.host);
 
-        // Stage 3.
-        let _id_guard = self.id_locks().acquire(&registration_id).await;
-        self.mint_locked(request, &request_id, &registration_id, &san, &granted)
-            .await
+        // Stage 3. The outcome record is written while the per-id guard
+        // is still held: releasing it first would let the next
+        // invocation for this identity claim the binding, change
+        // `OpenBao` and land its outcome line ahead of the line
+        // describing the change it just superseded.
+        let id_guard = self.id_locks().acquire(&registration_id).await;
+        let result = self
+            .mint_locked(
+                request,
+                &audit.request_id,
+                &registration_id,
+                &san,
+                &granted,
+                &audit.disposition,
+            )
+            .await;
+        let recorded = self.record_mint(&audit, result).await;
+        drop(id_guard);
+        recorded
     }
 
     /// Tears one service identity down and removes its durable binding.
     pub(crate) async fn deregister(&self, request: &DeregisterRequest) -> DeregisterResult {
-        let request_id = RequestId::generate();
-        let caller = request.caller.clone();
+        let audit = AuditContext::new(
+            AuditVerb::Deregister,
+            &request.caller,
+            requested_identity(&request.service_name, &request.host, request.instance),
+        );
         let refuse = |arm: ProducingArm, registration_id: Option<String>, error: VerbError| {
             VerbRefusal::new(
-                VerbContext::new(request_id.clone(), caller.clone(), registration_id, arm),
+                VerbContext::new(
+                    audit.request_id.clone(),
+                    audit.caller.clone(),
+                    registration_id,
+                    arm,
+                ),
                 error,
             )
         };
 
-        let multiplicity = self
-            .pre_derivation(&request.service_name, &request.host, request.instance, None)
-            .map_err(|err| refuse(ProducingArm::PreDerivation, None, err))?;
+        // Identical to the mint's, and deliberately so: one intent write
+        // per invocation, at entry, needing no arm analysis at all.
+        if let Err(err) = self.write_intent(&audit).await {
+            return Err(refuse(ProducingArm::PreDerivation, None, err));
+        }
 
-        let registration_id = derive_registration_id(
+        let multiplicity =
+            match self.pre_derivation(&request.service_name, &request.host, request.instance, None)
+            {
+                Ok(multiplicity) => multiplicity,
+                Err(err) => {
+                    let refusal = refuse(ProducingArm::PreDerivation, None, err);
+                    return Err(self.record_refusal(&audit, refusal).await);
+                }
+            };
+
+        let registration_id = match derive_registration_id(
             multiplicity,
             &request.service_name,
             &request.host,
             request.instance,
-        )
-        .map_err(|err| refuse(ProducingArm::Derivation, None, VerbError::Registrar(err)))?;
+        ) {
+            Ok(registration_id) => registration_id,
+            Err(err) => {
+                let refusal = refuse(ProducingArm::Derivation, None, VerbError::Registrar(err));
+                return Err(self.record_refusal(&audit, refusal).await);
+            }
+        };
 
-        let _id_guard = self.id_locks().acquire(&registration_id).await;
-        self.deregister_locked(request, &request_id, &registration_id)
+        // As in the mint: the outcome line is written under the guard.
+        let id_guard = self.id_locks().acquire(&registration_id).await;
+        let result = self
+            .deregister_locked(
+                request,
+                &audit.request_id,
+                &registration_id,
+                &audit.disposition,
+            )
+            .await;
+        let recorded = self.record_deregister(&audit, result).await;
+        drop(id_guard);
+        recorded
+    }
+
+    /// Writes the invocation's `intent` line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerbError::AuditUnwritable`] carrying
+    /// [`AuditPhase::Intent`] for every way the store can fail. There is
+    /// no fallback: the write is not buffered, deferred, retried into a
+    /// second file or substituted with a log line. The `tracing` event
+    /// below carries the store's own error, which may be finer than the
+    /// variant a caller eventually sees, and stands in for nothing.
+    async fn write_intent(&self, audit: &AuditContext) -> Result<(), VerbError> {
+        match self.audit_store.append(audit.intent_record()).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    request_id = audit.request_id.as_str(),
+                    verb = ?audit.verb,
+                    phase = AuditPhase::Intent.as_str(),
+                    "the registrar audit record could not be written; refusing the invocation \
+                     with nothing created"
+                );
+                Err(VerbError::AuditUnwritable {
+                    phase: AuditPhase::Intent,
+                    source: err,
+                })
+            }
+        }
+    }
+
+    /// Writes the invocation's `outcome` line.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VerbError::PostMintUnrecordable`] when the mutation
+    /// disposition is set and [`VerbError::AuditUnwritable`] carrying
+    /// [`AuditPhase::Outcome`] when it is clear. Which store error it
+    /// was does not enter into that — every one of them is a write
+    /// failure for this phase, `Sync` and `DirectorySync` included.
+    async fn write_outcome(
+        &self,
+        audit: &AuditContext,
+        registration_id: Option<&str>,
+        outcome: AuditOutcome,
+    ) -> Result<(), VerbError> {
+        let record = audit.outcome_record(registration_id, outcome);
+        match self.audit_store.append(record).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let owed = audit.disposition.is_set();
+                tracing::error!(
+                    error = %err,
+                    request_id = audit.request_id.as_str(),
+                    verb = ?audit.verb,
+                    phase = AuditPhase::Outcome.as_str(),
+                    teardown_owed = owed,
+                    "the registrar audit record could not be written"
+                );
+                Err(if owed {
+                    VerbError::PostMintUnrecordable { source: err }
+                } else {
+                    VerbError::AuditUnwritable {
+                        phase: AuditPhase::Outcome,
+                        source: err,
+                    }
+                })
+            }
+        }
+    }
+
+    /// Records a mint's result and returns what the caller gets.
+    ///
+    /// A successful mint whose outcome write failed does **not** return
+    /// its material: the freshly issued wrapped `secret_id` is dropped
+    /// and expires unused. The caller is told the identity exists and a
+    /// teardown is owed, and re-driving the mint once the store recovers
+    /// issues fresh material.
+    async fn record_mint(&self, audit: &AuditContext, result: MintResult) -> MintResult {
+        match result {
+            Ok(outcome) => {
+                let written = self
+                    .write_outcome(
+                        audit,
+                        outcome.context().registration_id(),
+                        bridge::mint_outcome(outcome.kind()),
+                    )
+                    .await;
+                match written {
+                    Ok(()) => Ok(outcome),
+                    Err(err) => Err(VerbRefusal::new(outcome.context().clone(), err)),
+                }
+            }
+            Err(refusal) => Err(self.record_refusal(audit, refusal).await),
+        }
+    }
+
+    /// Records a deregister's result and returns what the caller gets.
+    ///
+    /// A sweep that ran is still reported: the teardown report rides
+    /// out on the refusal a failed outcome write produces, so the caller
+    /// sees what was deleted.
+    async fn record_deregister(
+        &self,
+        audit: &AuditContext,
+        result: DeregisterResult,
+    ) -> DeregisterResult {
+        match result {
+            Ok(outcome) => {
+                let written = self
+                    .write_outcome(
+                        audit,
+                        outcome.context().registration_id(),
+                        bridge::deregister_outcome(outcome.kind()),
+                    )
+                    .await;
+                match written {
+                    Ok(()) => Ok(outcome),
+                    Err(err) => Err(VerbRefusal::new(outcome.context().clone(), err)
+                        .with_teardown(outcome.teardown().clone())),
+                }
+            }
+            Err(refusal) => Err(self.record_refusal(audit, refusal).await),
+        }
+    }
+
+    /// Records a refusal and returns the refusal the caller gets: the
+    /// one the verb produced, or the audit failure that replaced it.
+    ///
+    /// A replacement keeps the produced refusal's own envelope — the arm
+    /// says how far the verb got, which is still true — and its teardown
+    /// report, which is the only account of what the sweep managed.
+    async fn record_refusal(&self, audit: &AuditContext, refusal: VerbRefusal) -> VerbRefusal {
+        let Some(outcome) = bridge::refusal_outcome(refusal.error()) else {
+            // Neither audit-failure variant is recordable, by
+            // construction: the record that would carry one is the
+            // record whose write just failed. Nothing is written and the
+            // refusal is returned unchanged.
+            return refusal;
+        };
+        match self
+            .write_outcome(audit, refusal.context().registration_id(), outcome)
             .await
+        {
+            Ok(()) => refusal,
+            Err(err) => {
+                let replaced = VerbRefusal::new(refusal.context().clone(), err);
+                match refusal.teardown() {
+                    Some(teardown) => replaced.with_teardown(teardown.clone()),
+                    None => replaced,
+                }
+            }
+        }
     }
 
     /// Stage 1, shared by both verbs: stateless, synchronous, and
@@ -552,6 +911,7 @@ impl RegistrarVerbs {
         registration_id: &str,
         san: &str,
         granted: &GrantedWrapTtl,
+        disposition: &MutationDisposition,
     ) -> MintResult {
         let refuse = |arm: ProducingArm, error: VerbError| {
             VerbRefusal::new(
@@ -573,7 +933,14 @@ impl RegistrarVerbs {
 
             let Some(record) = existing else {
                 match self
-                    .claim_and_mint(request, request_id, registration_id, san, granted)
+                    .claim_and_mint(
+                        request,
+                        request_id,
+                        registration_id,
+                        san,
+                        granted,
+                        disposition,
+                    )
                     .await?
                 {
                     Some(outcome) => return Ok(outcome),
@@ -585,7 +952,15 @@ impl RegistrarVerbs {
             };
 
             return self
-                .mint_against_binding(request, request_id, registration_id, san, granted, &record)
+                .mint_against_binding(
+                    request,
+                    request_id,
+                    registration_id,
+                    san,
+                    granted,
+                    &record,
+                    disposition,
+                )
                 .await;
         }
 
@@ -613,6 +988,7 @@ impl RegistrarVerbs {
         registration_id: &str,
         san: &str,
         granted: &GrantedWrapTtl,
+        disposition: &MutationDisposition,
     ) -> Result<Option<MintOutcome>, VerbRefusal> {
         let refuse = |arm: ProducingArm, error: VerbError| {
             VerbRefusal::new(
@@ -634,7 +1010,7 @@ impl RegistrarVerbs {
 
         let claim = BindingRecord::creating(&request.host, &request.spec);
         let claimed = self
-            .claim_binding(registration_id, &claim)
+            .claim_binding(registration_id, &claim, disposition)
             .await
             .map_err(|err| refuse(ProducingArm::Binding, err))?;
         if claimed == KvCreateIfAbsent::AlreadyExists {
@@ -648,6 +1024,7 @@ impl RegistrarVerbs {
             granted,
             &claim,
             MintKind::FirstMint,
+            disposition,
         )
         .await
         .map(Some)
@@ -655,6 +1032,11 @@ impl RegistrarVerbs {
 
     /// The existing-binding arm, in its required order: host, then the
     /// stored spec, then the rendered safe-set.
+    // One more than the lint allows, and the extra one is the
+    // per-invocation mutation disposition every locked helper now
+    // threads. Grouping the rest into a struct would restructure the
+    // decision procedure this change is required to leave alone.
+    #[allow(clippy::too_many_arguments)]
     async fn mint_against_binding(
         &self,
         request: &MintRequest,
@@ -663,6 +1045,7 @@ impl RegistrarVerbs {
         san: &str,
         granted: &GrantedWrapTtl,
         record: &BindingRecord,
+        disposition: &MutationDisposition,
     ) -> MintResult {
         let refuse = |arm: ProducingArm, error: VerbError| {
             VerbRefusal::new(
@@ -758,6 +1141,7 @@ impl RegistrarVerbs {
                     &role_name,
                     role_id,
                     MintKind::IdempotentReMint,
+                    disposition,
                 )
                 .await
             }
@@ -773,6 +1157,7 @@ impl RegistrarVerbs {
                     granted,
                     record,
                     MintKind::FirstMint,
+                    disposition,
                 )
                 .await
             }
@@ -797,6 +1182,7 @@ impl RegistrarVerbs {
         granted: &GrantedWrapTtl,
         claim: &BindingRecord,
         kind: MintKind,
+        disposition: &MutationDisposition,
     ) -> MintResult {
         let refuse = |arm: ProducingArm, error: VerbError| {
             VerbRefusal::new(
@@ -814,16 +1200,22 @@ impl RegistrarVerbs {
             .client()
             .await
             .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
-        let provisioned = provision_service_role(
-            &client,
-            &self.kv_mount,
-            registration_id,
-            ServiceRoleTtls {
-                token_ttl: &self.token_ttl,
-                secret_id_ttl: &self.secret_id_ttl,
-            },
-        )
-        .await;
+        // Convergence writes a policy and a role either way: a failure
+        // here may be one that failed after the write reached
+        // `OpenBao`, which is exactly what the disposition is monotone
+        // for.
+        let provisioned = disposition.note(
+            provision_service_role(
+                &client,
+                &self.kv_mount,
+                registration_id,
+                ServiceRoleTtls {
+                    token_ttl: &self.token_ttl,
+                    secret_id_ttl: &self.secret_id_ttl,
+                },
+            )
+            .await,
+        );
         let ProvisionedServiceRole {
             role_name, role_id, ..
         } = match provisioned {
@@ -839,7 +1231,7 @@ impl RegistrarVerbs {
         };
 
         let active = claim.activated(&request.spec);
-        self.write_binding(registration_id, &active)
+        self.write_binding(registration_id, &active, disposition)
             .await
             .map_err(|err| refuse(ProducingArm::Binding, err))?;
 
@@ -852,6 +1244,7 @@ impl RegistrarVerbs {
             &role_name,
             role_id,
             kind,
+            disposition,
         )
         .await
     }
@@ -873,6 +1266,7 @@ impl RegistrarVerbs {
         role_name: &str,
         role_id: String,
         kind: MintKind,
+        disposition: &MutationDisposition,
     ) -> MintResult {
         let refuse = |error: VerbError| {
             VerbRefusal::new(
@@ -887,14 +1281,19 @@ impl RegistrarVerbs {
         };
 
         let client = self.client().await.map_err(refuse)?;
-        let wrap_info = match client
-            .create_secret_id_wrap_only(
-                role_name,
-                &self.secret_id_options,
-                granted.as_openbao_str(),
-            )
-            .await
-        {
+        // An issuance creates a `secret_id` on the role, so it counts as
+        // a state change whether it returned one or failed on the way
+        // back.
+        let issued = disposition.note(
+            client
+                .create_secret_id_wrap_only(
+                    role_name,
+                    &self.secret_id_options,
+                    granted.as_openbao_str(),
+                )
+                .await,
+        );
+        let wrap_info = match issued {
             Ok(wrap_info) => wrap_info,
             Err(err) => {
                 self.client.note_failure(&err).await;
@@ -932,6 +1331,7 @@ impl RegistrarVerbs {
         request: &DeregisterRequest,
         request_id: &RequestId,
         registration_id: &str,
+        disposition: &MutationDisposition,
     ) -> DeregisterResult {
         let context = |arm: ProducingArm| {
             VerbContext::new(
@@ -977,6 +1377,20 @@ impl RegistrarVerbs {
             &REGISTRAR_TEARDOWN_KV_SUFFIXES,
         )
         .await;
+        // A sweep that removed something changed `OpenBao`, and one that
+        // failed may have. An all-`AlreadyAbsent` report deleted nothing
+        // and leaves the disposition clear — which is what makes an
+        // already-absent deregister with nothing to sweep distinguishable
+        // from one that swept a planted orphan, though both produce
+        // `DeregisterKind::AlreadyAbsent`.
+        if teardown.attempts().iter().any(|attempt| {
+            matches!(
+                attempt.outcome,
+                ResourceOutcome::Removed | ResourceOutcome::Failed(_)
+            )
+        }) {
+            disposition.set();
+        }
 
         if !teardown.aggregate_success() {
             return Err(VerbRefusal::new(
@@ -1001,7 +1415,7 @@ impl RegistrarVerbs {
             ));
         }
 
-        self.delete_binding(registration_id)
+        self.delete_binding(registration_id, disposition)
             .await
             .map_err(|err| VerbRefusal::new(context(ProducingArm::Binding), err))?;
 
@@ -1075,6 +1489,7 @@ impl RegistrarVerbs {
         &self,
         registration_id: &str,
         record: &BindingRecord,
+        disposition: &MutationDisposition,
     ) -> Result<KvCreateIfAbsent, VerbError> {
         let path = Self::binding_path(registration_id);
         let body = record
@@ -1085,8 +1500,17 @@ impl RegistrarVerbs {
             .create_kv_if_absent(&self.kv_mount, &path, body)
             .await
         {
-            Ok(outcome) => Ok(outcome),
+            // A won claim wrote the binding. A lost one is the single
+            // outcome of the six call sites that leaves the disposition
+            // clear: the compare-and-set was refused and nothing at all
+            // reached `OpenBao`.
+            Ok(created @ KvCreateIfAbsent::Created(_)) => {
+                disposition.set();
+                Ok(created)
+            }
+            Ok(KvCreateIfAbsent::AlreadyExists) => Ok(KvCreateIfAbsent::AlreadyExists),
             Err(err) => {
+                disposition.set();
                 self.client.note_failure(&err).await;
                 Err(VerbError::unavailable(
                     "claiming the durable binding",
@@ -1100,13 +1524,14 @@ impl RegistrarVerbs {
         &self,
         registration_id: &str,
         record: &BindingRecord,
+        disposition: &MutationDisposition,
     ) -> Result<(), VerbError> {
         let path = Self::binding_path(registration_id);
         let body = record
             .encode()
             .map_err(|err| VerbError::unavailable("encoding the durable binding", err.into()))?;
         let client = self.client().await?;
-        match client.write_kv(&self.kv_mount, &path, body).await {
+        match disposition.note(client.write_kv(&self.kv_mount, &path, body).await) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.client.note_failure(&err).await;
@@ -1118,10 +1543,14 @@ impl RegistrarVerbs {
         }
     }
 
-    async fn delete_binding(&self, registration_id: &str) -> Result<(), VerbError> {
+    async fn delete_binding(
+        &self,
+        registration_id: &str,
+        disposition: &MutationDisposition,
+    ) -> Result<(), VerbError> {
         let path = Self::binding_path(registration_id);
         let client = self.client().await?;
-        match client.delete_kv(&self.kv_mount, &path).await {
+        match disposition.note(client.delete_kv(&self.kv_mount, &path).await) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.client.note_failure(&err).await;
@@ -1131,6 +1560,21 @@ impl RegistrarVerbs {
                 ))
             }
         }
+    }
+}
+
+/// Takes the identity parts a request asked about, exactly as they
+/// arrived.
+///
+/// The three fields of [`RequestedIdentity`] are the whole of what the
+/// format records about a request. A mint's `spec`, `delivery_mode` and
+/// `wrap_ttl` are deliberately absent: the format defines no field for
+/// them, and this module consumes the format rather than extending it.
+fn requested_identity(service_name: &str, host: &str, instance: Option<u32>) -> RequestedIdentity {
+    RequestedIdentity {
+        service_name: service_name.to_string(),
+        host: host.to_string(),
+        instance,
     }
 }
 

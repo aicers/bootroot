@@ -407,13 +407,22 @@ fn appending_preserves_the_caller_supplied_timestamp() {
 // Format: the flattened refusal table
 // ---------------------------------------------------------------------
 
-/// Every variant of the three source enums, paired with the record
-/// reason it must flatten to.
+/// Every variant of the three source enums that a durable line can
+/// hold, paired with the record reason it must flatten to.
 ///
 /// The list is the test's definition of "all of them": adding a variant
 /// upstream without adding it here leaves `refusal_outcome`'s `match`
 /// failing to compile, and adding it here without adding a reason fails
 /// the distinctness assertion below.
+///
+/// The two audit-failure variants — `VerbError::AuditUnwritable` and
+/// `VerbError::PostMintUnrecordable` — are deliberately **not** in this
+/// table and have no [`RefusalReason`]. They are produced by a failed
+/// record write, so the record that would carry one is the record whose
+/// write just failed, and `refusal_outcome` returns `None` for exactly
+/// them. That is covered by
+/// [`the_two_audit_failures_are_the_only_unrecordable_refusals`] rather
+/// than here.
 // One entry per source variant; the exhaustiveness is the point.
 #[allow(clippy::too_many_lines)]
 fn every_refusal() -> Vec<(VerbError, RefusalReason, &'static str)> {
@@ -643,7 +652,7 @@ fn every_source_refusal_maps_to_one_distinct_record_reason() {
 
     let mut seen: Vec<String> = Vec::new();
     for (error, expected_reason, expected_name) in table {
-        let outcome = refusal_outcome(&error);
+        let outcome = refusal_outcome(&error).expect("a recordable refusal produces an outcome");
         let AuditOutcome::Refused { reason, .. } = &outcome else {
             panic!("a refusal must produce the refused class, got {outcome:?}");
         };
@@ -658,6 +667,53 @@ fn every_source_refusal_maps_to_one_distinct_record_reason() {
     assert_eq!(sorted.len(), seen.len(), "every reason must be distinct");
 }
 
+/// The two audit-failure refusals can never reach the trail, and that
+/// is enforced by the return type rather than by prose.
+///
+/// The record that would carry one of them is the record whose write
+/// just failed, so a call site that met a `Some` here would answer a
+/// failed write with a second write of the same kind. Both halves are
+/// asserted together: `None` for exactly these two, and `Some` for every
+/// other refusal the verb layer produces.
+#[test]
+fn the_two_audit_failures_are_the_only_unrecordable_refusals() {
+    let unrecordable = [
+        VerbError::AuditUnwritable {
+            phase: AuditPhase::Intent,
+            source: AuditStoreError::RecordTooLarge {
+                bytes: 1,
+                limit: MIN_AUDIT_MAX_FILE_BYTES,
+            },
+        },
+        VerbError::AuditUnwritable {
+            phase: AuditPhase::Outcome,
+            source: AuditStoreError::Sync {
+                path: PathBuf::from("/var/lib/bootroot/registrar-audit/registrar-audit.jsonl"),
+                source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            },
+        },
+        VerbError::PostMintUnrecordable {
+            source: AuditStoreError::Append {
+                path: PathBuf::from("/var/lib/bootroot/registrar-audit/registrar-audit.jsonl"),
+                source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            },
+        },
+    ];
+    for error in &unrecordable {
+        assert!(
+            refusal_outcome(error).is_none(),
+            "{error:?} must produce no record at all"
+        );
+    }
+
+    for (error, _, name) in every_refusal() {
+        assert!(
+            refusal_outcome(&error).is_some(),
+            "{name} is a durable reason and must still be recordable"
+        );
+    }
+}
+
 #[test]
 fn a_refusal_reason_round_trips_through_the_record_types() {
     for (error, _, name) in every_refusal() {
@@ -668,7 +724,7 @@ fn a_refusal_reason_round_trips_through_the_record_types() {
             CALLER.to_string(),
             requested(None),
             None,
-            refusal_outcome(&error),
+            refusal_outcome(&error).expect("a recordable refusal produces an outcome"),
         );
         let rendered = serde_json::to_string(&record).expect("serializes");
         assert!(
@@ -713,7 +769,7 @@ fn an_unavailable_refusal_records_its_activity_and_nothing_else() {
         "reading the durable binding",
         anyhow::anyhow!("connection refused").context("dialling openbao at https://vault.internal"),
     );
-    let AuditOutcome::Refused { reason, detail } = refusal_outcome(&error) else {
+    let Some(AuditOutcome::Refused { reason, detail }) = refusal_outcome(&error) else {
         panic!("an unavailable refusal must produce the refused class");
     };
     assert_eq!(reason, RefusalReason::Unavailable);
@@ -726,7 +782,7 @@ fn an_unavailable_refusal_records_its_activity_and_nothing_else() {
         CALLER.to_string(),
         requested(None),
         None,
-        refusal_outcome(&error),
+        refusal_outcome(&error).expect("an unavailable refusal is recordable"),
     );
     let rendered = serde_json::to_string(&record).expect("serializes");
     for leaked in ["connection refused", "vault.internal", "dialling openbao"] {
