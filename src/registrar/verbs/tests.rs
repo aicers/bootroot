@@ -2369,6 +2369,10 @@ fn assert_same_wire_answer(_name: &str, _limited: &VerbRefusal, _unlimited: &Ver
 /// identifier-carrying refusal, a reserved name and an out-of-range
 /// `wrap_ttl`, the last two of which are retryable with no identifier
 /// today. What limiting preserves is the answer, not its permanence.
+///
+/// Every [`WrapTtlRefusal`] variant appears here, because each is a
+/// distinct answer the caller earned and the limiter must hand back
+/// unchanged.
 fn pre_decision_cases() -> Vec<(&'static str, RegistrarConfigFixture, MintRequest)> {
     let unconfigured = base_fixture();
     let mut spec_conflict = mint_request("roxyd", "h1", None);
@@ -2377,6 +2381,12 @@ fn pre_decision_cases() -> Vec<(&'static str, RegistrarConfigFixture, MintReques
     zero_wrap_ttl.wrap_ttl = Duration::ZERO;
     let mut negative_wrap_ttl = mint_request("roxyd", "h1", None);
     negative_wrap_ttl.wrap_ttl = Duration::seconds(-5);
+    let mut fractional_wrap_ttl = mint_request("roxyd", "h1", None);
+    fractional_wrap_ttl.wrap_ttl = Duration::milliseconds(250);
+    let mut unrepresentable_wrap_ttl = mint_request("roxyd", "h1", None);
+    // One second past the largest whole-second value an `OpenBao`
+    // duration string can carry, so it is refused rather than clamped.
+    unrepresentable_wrap_ttl.wrap_ttl = Duration::seconds(9_223_372_037);
     vec![
         (
             "an invalid service_name label",
@@ -2410,6 +2420,12 @@ fn pre_decision_cases() -> Vec<(&'static str, RegistrarConfigFixture, MintReques
         ),
         ("a zero wrap_ttl", base_fixture(), zero_wrap_ttl),
         ("a negative wrap_ttl", base_fixture(), negative_wrap_ttl),
+        ("a sub-second wrap_ttl", base_fixture(), fractional_wrap_ttl),
+        (
+            "a wrap_ttl past the OpenBao range",
+            base_fixture(),
+            unrepresentable_wrap_ttl,
+        ),
     ]
 }
 
