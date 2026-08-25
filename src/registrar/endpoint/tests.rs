@@ -3305,6 +3305,51 @@ fn a_trust_bundle_that_is_not_pem_is_refused() {
     assert_diagnostic_names(&error, CA_BUNDLE_SETTING, Some(&garbage));
 }
 
+/// The two paths transposed is the likeliest way to get this wrong, and
+/// each half of it is diagnosed as what it is: a certificate setting
+/// pointing at something holding no certificate, and a key setting
+/// pointing at something holding no key.
+///
+/// Both files parse as PEM, so neither case can be reported as an
+/// unparseable file — the diagnostic has to name the setting whose
+/// content is missing, or an operator reads it as a corrupt file and
+/// goes looking in the wrong place.
+#[test]
+fn transposed_certificate_and_key_paths_are_each_diagnosed_as_themselves() {
+    let pki = Pki::new();
+    let (cert_path, key_path) = pki.server_material();
+    let bundle = pki.ca_bundle_path();
+    let pins = pki.pins();
+
+    let error = build_server_config(
+        Some(&key_path),
+        Some(&key_path),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a key file in the certificate setting must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::NoCertificate { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_CERT_SETTING, Some(&key_path));
+
+    let error = build_server_config(
+        Some(&cert_path),
+        Some(&cert_path),
+        Some(&bundle),
+        &pins,
+        TEST_DOMAIN,
+    )
+    .expect_err("a certificate file in the key setting must be refused");
+    assert!(
+        matches!(error, EndpointTlsError::NoPrivateKey { .. }),
+        "{error:#}"
+    );
+    assert_diagnostic_names(&error, SERVER_KEY_SETTING, Some(&cert_path));
+}
+
 fn directory_entries(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("the material directory is readable")
