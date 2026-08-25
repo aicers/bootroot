@@ -11,6 +11,17 @@ pub const EAB_KID_KEY: &str = "kid";
 pub const EAB_HMAC_KEY: &str = "hmac";
 pub const TRUSTED_CA_KEY: &str = "trusted_ca_sha256";
 pub const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
+
+/// KV v2 path of the deployment's CA anchor, holding [`TRUSTED_CA_KEY`]
+/// and [`CA_BUNDLE_PEM_KEY`].
+///
+/// Full path: `{kv_mount}/data/bootroot/ca`. `bootroot init` and every
+/// root rotation write it, `bootroot service add` reads it for a
+/// service's own trust material, and the registrar endpoint reads it for
+/// the `ca_anchor` a mint response carries. One constant, because two
+/// spellings of a KV path is the drift the shared names exist to
+/// prevent.
+pub const CA_TRUST_KV_PATH: &str = "bootroot/ca";
 pub const CA_BUNDLE_PATH_KEY: &str = "ca_bundle_path";
 
 /// KV v2 path suffix carrying the force-reissue request for a service.

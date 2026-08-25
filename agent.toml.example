@@ -40,9 +40,13 @@ http_responder_token_ttl_secs = 300
 # through the checked-in systemd/bootroot-registrar.socket unit.  There
 # is deliberately no socket path here, and no TCP option.
 #
-# Enabling it is UNSUPPORTED for now: this build registers no registrar
-# request handler, so an enabled endpoint refuses to start.  The
-# registrar protocol work supplies the handler.
+# Enabling it is supported.  The daemon builds the registrar verb layer
+# from the [registrar] keys below and registers a production request
+# handler over it.  [registrar] state_file is REQUIRED when this is
+# true, and a missing provisioning config, state file, internal
+# credential or audit store fails startup with a named diagnostic.
+# Deregistration is served end to end; a mint is refused until the wire
+# spelling of a request's spec is settled by the contract that owns it.
 #
 # Every key here is fixed for the process lifetime.  The listening
 # descriptor is inherited, and the server certificate material is read,
@@ -88,11 +92,29 @@ enabled = false
 # kept beside it.  The defaults are a hard ceiling of 8 MiB x 17 =
 # ~136 MiB.  audit_min_retain_days records the retention target; where
 # the two disagree, the file count wins.
+#
+# The verb-layer keys below provision what the endpoint serves.  They are
+# validated on every host, whether or not the endpoint is enabled, and
+# every duration is a humantime string rather than a bare count of
+# seconds.  state_file has no default and is required only when the
+# endpoint is enabled: it names the state.json bootroot init wrote, which
+# is where the recorded OpenBao URL, KV mount and secrets directory come
+# from — there is deliberately no key for any of the three.  There is no
+# key for secret_id metadata either, and none for the active root
+# fingerprint, which is derived from <secrets_dir>/certs/root_ca.crt.
 [registrar]
 audit_record_dir = "/var/lib/bootroot/registrar-audit"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+# state_file = "/opt/bootroot/state.json"
+provisioning_config_path = "/etc/clumit-security/provisioning.toml"
+max_wrap_ttl = "30m"
+role_token_ttl = "1h"
+role_secret_id_ttl = "24h"
+secret_id_num_uses = 0
+# secret_id_ttl = "10m"
+# secret_id_token_bound_cidrs = ["10.0.0.0/8"]
 
 # Trust settings for CA bundle verification/storage
 [trust]

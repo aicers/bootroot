@@ -1180,14 +1180,13 @@ pub enum AuditStoreError {
 ///
 /// Every one of them comes from the daemon's own configuration. None is
 /// reachable from a registrar request.
-// Transitional, exactly like the bridge above. This codebase does not
-// construct a registrar verb service outside tests yet, so the
-// provisioner that opens a store from the daemon's `[registrar]` table
-// does not exist and nothing but this module's own tests reaches the
-// construction path. Publishing it instead would put the daemon's
+// Deliberately `pub(crate)`: publishing it would put the daemon's
 // filesystem trust boundary on the library's public surface, where any
-// consumer could open a store over a directory of its choosing.
-#[allow(dead_code)]
+// consumer could open a store over a directory of its choosing. The one
+// production caller is the daemon's registrar handler build, which opens
+// the store from the `[registrar]` table — and which is Linux-only,
+// because the endpoint it serves is.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct AuditStoreSettings {
     /// The absolute directory the file family lives in.
@@ -1418,7 +1417,7 @@ impl AuditRecordStore {
     /// already-oversized active file cannot be rotated, or the store
     /// directory cannot be flushed — which is what settles a directory
     /// entry an earlier process created and never made durable.
-    #[allow(dead_code)] // Transitional; see `AuditStoreSettings`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // See `AuditStoreSettings`.
     pub(crate) async fn open(settings: AuditStoreSettings) -> Result<Self, AuditStoreError> {
         Self::open_as(settings, PRODUCTION_UID).await
     }

@@ -372,10 +372,54 @@ and `deregister` verbs on a host-local socket. This is Linux only, it is
 `AF_UNIX` only, and it is systemd socket activation only. Every other
 deployment leaves it off, which is the default.
 
-**Enabling it remains unsupported until a production request handler lands.**
-This build includes the versioned registrar payload codec, but registers no
-handler that invokes the verbs, so `registrar_endpoint.enabled = true` makes
-the daemon refuse to start.
+Enabling it is supported. The daemon builds the verb layer from its
+`[registrar]` settings and registers a production request handler over
+it, so `registrar_endpoint.enabled = true` starts and serves.
+
+#### What an enabled endpoint needs, and what a missing piece does
+
+Everything the handler is built from is resolved **before** any task is
+spawned, so a missing or unusable dependency fails the invocation with a
+diagnostic that names it — never a socket that accepts and cannot
+answer, which would turn every caller into a hang:
+
+- **The deployment state file**, from `[registrar] state_file` — which
+  is **required** when the endpoint is enabled. A failure names the key,
+  the path, and which of `openbao_url` or `kv_mount` was absent, empty or
+  plaintext.
+- **The secrets directory**, from the state file's `secrets_dir` or
+  `secrets` beside it. A failure names the resolved path.
+- **The deployment's active root**, from
+  `<secrets_dir>/certs/root_ca.crt`. A failure names the directory it was
+  read below.
+- **The rendered provisioning config**, from
+  `[registrar] provisioning_config_path`. A failure names the key and the
+  path, a digest mismatch included.
+- **The internal credential**, from the fixed layout below the secrets
+  directory. A failure says the bootroot-internal credential is absent,
+  invalid, or issued under a root the deployment has superseded.
+- **The audit record store**, from `[registrar] audit_record_dir`. A
+  failure names the store and its directory.
+
+A host whose endpoint is **disabled** opens none of them. The registrar
+surface exists only where bootroot itself runs, so an absent surface is
+the ordinary state of a service host rather than a fault.
+
+A `SIGHUP` rebuilds all of it from the reloaded settings, because the
+whole daemon invocation is rebuilt; the listening socket is not, so the
+socket inode is unchanged and `[registrar_endpoint] enabled` stays fixed
+for the process lifetime.
+
+!!! warning "`mint` is not servable yet"
+    Deregistration is served end to end. Minting is not: a mint request
+    carries a `spec` whose `reload` and `cert_group` are opaque strings,
+    and the wire spelling of those two is owned outside this repository
+    and has not been settled or transcribed into
+    `docs/reference/registrar-wire-contract.md`. Until it is, every mint
+    is refused before the verb runs — zero response bytes and a clean
+    close, the endpoint's ordinary undecodable-payload answer — and the
+    daemon logs which conversion failed. Nothing is minted, and no
+    spelling is guessed at.
 
 #### The socket, and who owns it
 
@@ -636,42 +680,42 @@ held above the reload rather than reacquired by it.
 
 #### Audit records
 
-bootroot does not create the audit store in this build. It does not write
-registrar verb records in this build.
-
-Once a writer is wired in, the daemon keeps its own append-only audit trail
-for the two verbs, in `audit_record_dir` (`<audit_store_dir>/records`, or
-`/var/lib/bootroot/audit-store/records` by default).
-It is **not** a replacement for OpenBao's file audit device, which stays
+The daemon keeps its own append-only audit trail for the two verbs, in
+`audit_record_dir` (`<audit_store_dir>/records`, or
+`/var/lib/bootroot/audit-store/records` by default). It is **not** a
+replacement for OpenBao's file audit device, which stays
 mandatory and is still verified by `bootroot init`. It records what that
 device cannot: who asked, for which `(service_name, host, instance)`,
 and requests refused before any OpenBao write happened.
 
-Once a writer is wired in, the daemon owns the artifact end to end. The
-registrar cannot read, append to, delete or redirect it, and no request
-field selects the path or the policy. The settings are in
-`agent.toml`'s `[registrar]` table. See
+The daemon owns the artifact end to end. The registrar cannot read,
+append to, delete or redirect it, and no request field selects the path
+or the policy. The settings are in `agent.toml`'s `[registrar]` table.
+See
 [Registrar audit records](configuration.md#registrar-audit-records) for
-the eight keys and the record shape.
+the eight audit keys and the record shape.
 
 What an operator needs on the host:
 
 - `audit_record_dir` and its immediate parent must be root-owned and not
-  group- or world-writable, and neither may be a symbolic link. Once a
-  writer is wired in, it creates missing components itself — ancestors
-  root-owned `0755`, the store directory root-owned `0700` — and never
-  changes an existing entry's owner or mode.
-- Once a writer is wired in, the store is opened before the registrar
-  surface serves anything, so an unsafe or unusable directory fails that
-  surface closed instead of
-  leaving the verbs running with no trail. It does not stop the daemon's
-  unrelated renewal or fast-poll work.
+  group- or world-writable, and neither may be a symbolic link. The
+  daemon creates missing components itself — ancestors root-owned
+  `0755`, the store directory root-owned `0700` — and never changes an
+  existing entry's owner or mode.
+- The store is opened while the handler is built, before the invocation
+  spawns anything, so an unsafe or unusable directory fails that
+  invocation rather than leaving the verbs running with no trail. On an
+  enabled endpoint that stops the daemon, renewal and fast-poll
+  included — the same loud, named failure every other handler
+  dependency produces, and deliberately not a surface that accepts and
+  cannot answer. A host whose endpoint is disabled never opens the
+  store at all, so nothing here can fail its renewals.
 - Provision disk for the hard ceiling, not for the retention target:
   `audit_max_file_bytes` × (`audit_max_retained_files` + 1), which at
   the defaults is 8 MiB × 17 ≈ **136 MiB**.
 
-Once a writer is wired in and records exist, reading the trail is ordinary
-line-oriented work — the format is JSON Lines, one complete record per line:
+Reading the trail is ordinary line-oriented work — the format is JSON
+Lines, one complete record per line:
 
 ```sh
 # The most recent refusals, newest last.
@@ -714,8 +758,7 @@ verified by this command; the checks bound a directory-substitution race
 to principals already trusted to read the store, rather than eliminating
 the race.
 
-A line is either a whole record or not there at all. Once a writer is wired
-in, a write that fails
+A line is either a whole record or not there at all: a write that fails
 partway through one takes its bytes back off the file — and flushes that
 removal, so a power failure cannot bring them back — before it reports
 the failure, so a pass like the ones above never has to step over a torn
@@ -725,7 +768,7 @@ that instead of reporting an ordinary write failure, and the incomplete
 line, if it is there at all, is the last one in the active file.
 
 Do not rotate these files with `logrotate` or any other external tool.
-Once a writer is wired in, the daemon rotates and trims them itself, at
+The daemon rotates and trims them itself, at
 `registrar-audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.jsonl` names whose fixed
 widths are what make them sort oldest first; a second rotator moving the
 active file out from under the daemon costs records.

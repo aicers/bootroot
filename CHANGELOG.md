@@ -8,6 +8,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot-agent` can now serve the registrar endpoint. Setting
+  `[registrar_endpoint] enabled = true` on a bootroot host makes the
+  daemon build the registrar verb layer from its `[registrar]` settings
+  and answer requests on the systemd-activated
+  `/run/bootroot/registrar.sock`. Eight new `[registrar]` keys provision
+  it: `state_file`, which names the deployment `state.json` the recorded
+  `OpenBao` URL, KV mount and secrets directory are read from and which
+  is required when the endpoint is enabled;
+  `provisioning_config_path`; `max_wrap_ttl`, `role_token_ttl` and
+  `role_secret_id_ttl`; and `secret_id_num_uses`, `secret_id_ttl` and
+  `secret_id_token_bound_cidrs`. Everything the endpoint needs is
+  resolved before anything is spawned, so a missing provisioning config,
+  state file, internal credential or audit store fails startup with a
+  diagnostic that names it rather than leaving a socket nothing is
+  accepting on. Deregistration is served end to end; minting is refused
+  until the wire spelling of a request's `spec` is settled by the
+  contract that owns it.
 - `bootroot status --agent-config` now scans the registrar audit store and
   reports unpaired intents, malformed records, and retention shortfalls. It
   distinguishes a store that is not configured from a provisioned empty store

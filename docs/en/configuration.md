@@ -322,10 +322,25 @@ Serves the registrar's `mint` and `deregister` verbs on a host-local
 bootroot-host deployments and nothing else. The table takes exactly
 three keys; an unknown key is a configuration error.
 
-**Enabling it remains unsupported until a production request handler lands.**
-This build includes the versioned registrar payload codec, but registers no
-handler that invokes the verbs. An enabled endpoint therefore refuses to start
-rather than accepting requests it cannot answer.
+Enabling it is supported. The daemon registers a production request
+handler that decodes the versioned registrar payload, invokes the verbs
+and encodes their answers, so an enabled endpoint starts and serves. It
+needs the `[registrar]` keys below in place: `state_file` is **required**
+when `enabled = true`, and the provisioning config, the deployment state
+file, the internal credential and the audit store are all opened at
+startup. Any one of them missing or unusable fails the invocation with a
+named diagnostic rather than leaving the socket adopted with nothing
+accepting on it.
+
+!!! warning "`mint` is not servable yet"
+    Deregistration is served end to end. Minting is not: a mint request
+    carries a `spec` whose `reload` and `cert_group` are opaque strings,
+    and the wire spelling of those two is owned outside this repository
+    and has not been settled or transcribed into
+    `docs/reference/registrar-wire-contract.md`. Until it is, every mint
+    is refused before the verb runs — zero response bytes and a clean
+    close — and the daemon logs which conversion failed. Nothing is
+    minted and nothing is guessed at.
 
 There is no socket path here, and no TCP option, by design. systemd
 creates and owns `/run/bootroot/registrar.sock` through the checked-in
@@ -417,26 +432,29 @@ rate_limit_predecision_refusal_burst = 32
 rate_limit_predecision_refusal_refill_interval_ms = 1000
 ```
 
-That is the whole table, and it is deliberately one block: TOML refuses a
-table declared twice, so a `[registrar]` header repeated further down this
-page would not be something a reader could paste.
+The `[registrar]` table carries two groups of keys: the audit store the
+daemon writes the registrar's own trail to, and the verb-layer settings
+the registrar endpoint is provisioned from. Both are read on every
+`SIGHUP`, because the whole daemon invocation is rebuilt; only
+`[registrar_endpoint] enabled` is fixed for the process lifetime.
 
-bootroot does not create the audit store in this build. It does not write
-registrar verb records in this build.
+The audit store is opened when — and only when — the registrar endpoint
+is enabled. A host that serves no verbs creates nothing.
 
-Once a writer is wired in, bootroot writes its own append-only audit trail
-for the registrar's `mint` and `deregister` verbs. It sits **beside**
+bootroot writes its own append-only audit trail for the registrar's
+`mint` and `deregister` verbs. It sits **beside**
 OpenBao's mandatory file audit device and replaces nothing: the OpenBao
 device records what OpenBao was asked to do, and this one records who
 asked, for which `(service_name, host, instance)`, and what the answer
 was — including a request refused before any OpenBao write ever
 happened. The OpenBao audit check `bootroot init` performs is unchanged.
 
-Once a writer is wired in, the daemon owns the artifact. The registrar
-cannot read, append to, delete, redirect or select it, and no field of a
-request reaches the path, the modes, the rotation policy or the
-retention policy. An absent `[registrar]` table leaves every key at the
-default above; an unknown key is a configuration error.
+The daemon owns the artifact. The registrar cannot read, append to,
+delete, redirect or select it, and no field of a request reaches the
+path, the modes, the rotation policy or the retention policy. An absent
+`[registrar]` table leaves every key at the default above — `state_file`
+excepted, which has no default at all; an unknown key is a configuration
+error.
 
 - `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
   absolute directory that holds `records/` for daemon records and
@@ -460,6 +478,82 @@ default above; an unknown key is a configuration error.
 - `audit_min_retain_days` (default `90`) — the retention **target** in
   days. Must be greater than 0.
 
+#### Verb-layer settings
+
+These eight keys provision the registrar verbs the endpoint serves. They
+are validated **unconditionally**, on every host: a nonsense value is a
+configuration error whether or not the endpoint is enabled. Only
+`state_file` relates the two tables, and only in one direction — it is
+required when `[registrar_endpoint] enabled = true`.
+
+```toml
+[registrar]
+state_file = "/opt/bootroot/state.json"
+provisioning_config_path = "/etc/clumit-security/provisioning.toml"
+max_wrap_ttl = "30m"
+role_token_ttl = "1h"
+role_secret_id_ttl = "24h"
+secret_id_num_uses = 0
+# secret_id_ttl = "10m"
+# secret_id_token_bound_cidrs = ["10.0.0.0/8"]
+```
+
+- `state_file` (**no default**) — the absolute path to the `state.json`
+  `bootroot init` wrote. It is the single source for three values the
+  verbs need: the recorded `openbao_url`, the `kv_mount`, and the
+  optional `secrets_dir`. There is deliberately no key for any of the
+  three: one file that `init` and `rotate` keep current is what keeps a
+  URL or a mount from being spelled twice and disagreeing. A relative
+  path is rejected. An absent `secrets_dir` member resolves to `secrets`,
+  and a relative one — including that default — resolves against the
+  **state file's own directory**, never the daemon's working directory,
+  which a socket-activated unit has none worth resolving against.
+  Absent, the daemon loads cleanly as long as the endpoint is disabled;
+  with the endpoint enabled it is a configuration error naming both keys.
+  The file is read once per invocation and only on the enabled path, so a
+  rewritten `state.json` takes effect on the next `SIGHUP`, and only
+  three members are read — every other member is ignored and none is ever
+  written back.
+- `provisioning_config_path` (default
+  `/etc/clumit-security/provisioning.toml`) — the absolute path to the
+  provisioning tool's rendered registrar config. bootroot only reads it;
+  its shape is a cross-repository contract. A relative path is rejected,
+  and an absent file or a digest mismatch fails the invocation.
+- `max_wrap_ttl` (default `"30m"`) — the ceiling a requested `wrap_ttl`
+  is granted under. A request longer than this is clamped rather than
+  refused. It must be a positive whole number of seconds within
+  `OpenBao`'s duration range; it is checked by handing it to the very
+  policy a request is held to, so the two cannot diverge.
+- `role_token_ttl` (default `"1h"`) — the role-level `token_ttl` of the
+  `AppRole` a mint creates. Positive whole seconds.
+- `role_secret_id_ttl` (default `"24h"`) — the role-level
+  `secret_id_ttl`. Positive whole seconds.
+- `secret_id_num_uses` (default `0`) — how many times one issued
+  `secret_id` may be used. `0` is unlimited within the TTL, which is what
+  an enrolled host needs: its agent re-authenticates by `AppRole` login
+  on every renewal and every fast-poll cycle, so a single-use credential
+  would work once and then leave the service unable to log in.
+- `secret_id_ttl` (**optional**, no default) — a per-issuance TTL. Absent,
+  the role-level `role_secret_id_ttl` governs, which is what `bootroot
+  service add` does without `--secret-id-ttl`. Positive whole seconds
+  when present.
+- `secret_id_token_bound_cidrs` (**optional**, no default) — CIDRs the
+  issued credential's tokens are bound to. Every entry must be non-empty
+  when the key is present.
+
+Every duration here is a humantime string — `"30m"`, `"1h"`, `"24h"` —
+exactly as `openbao.fast_poll_interval` is. A bare integer of seconds is
+not the contract and is rejected, and neither is `OpenBao`'s own
+spelling; the values are converted to `OpenBao`'s `<n>s` form where they
+are handed over.
+
+There is deliberately **no** key for `secret_id` metadata. `OpenBao`
+echoes metadata back on lookup, and bootroot's own record of who asked
+for what is the audit trail above; a second, operator-typed, unvalidated
+one attached to every issued credential is not a knob this endpoint
+grows. There is no key for the deployment's active root fingerprint
+either — it is derived from `<secrets_dir>/certs/root_ca.crt`.
+
 `audit_max_file_bytes` has a 64 KiB floor because one record has a
 bounded worst-case size and a freshly rotated file must be able to hold
 it. Every attacker-influenced string in a record — the caller identity,
@@ -477,8 +571,8 @@ the file count is a hard capacity constraint and the day count is not.
 
 #### Ownership and permissions
 
-Once a writer is wired in, the store is opened before the registrar surface
-serves anything, and it fails closed rather than degrading:
+The store is opened before the registrar surface serves anything, and it
+fails closed rather than degrading:
 
 - Missing path components are created root-owned mode `0755`; the store
   directory itself is created root-owned mode `0700`; the active file is
@@ -497,8 +591,8 @@ own storage, not at a shared or user-writable path.
 
 #### The record format
 
-Once a writer is wired in, it uses one versioned JSON Lines family. The
-active file is `registrar-audit.jsonl` and each line is one complete JSON
+The trail uses one versioned JSON Lines family. The active file is
+`registrar-audit.jsonl` and each line is one complete JSON
 object followed by a newline. Hostile quotes, backslashes, control
 characters and newlines are JSON-escaped, so one record is always exactly
 one line.
@@ -543,8 +637,8 @@ one line.
 
 #### Rotation and retention
 
-Once a writer is wired in, the active file is rotated **before** an append
-that would take it past `audit_max_file_bytes`, and a file already at or
+The active file is rotated **before** an append that would take it past
+`audit_max_file_bytes`, and a file already at or
 above the limit when the store is opened is rotated before the store is
 usable. Every rotated generation is named:
 
@@ -585,8 +679,8 @@ directory cannot be flushed does not open.
 The defaults are a hard ceiling of 8 MiB × 17 files (the active file
 plus 16 rotated generations) ≈ **136 MiB**.
 
-Once a writer is wired in, sizing the reference deployment uses an
-ordinary-record assumption of **400 bytes** per line. Each invocation then
+Sizing the reference deployment uses an ordinary-record assumption of
+**400 bytes** per line. Each invocation then
 writes two lines, one `intent` and one `outcome`:
 
 ```text
@@ -597,10 +691,9 @@ writes two lines, one `intent` and one `outcome`:
 So a fleet doing 2,000 initial enrolments and 200 invocations a day fits
 its whole 90-day target inside about an eighth of the default ceiling.
 That sizes **ordinary installation and reinstallation activity**, not a
-refusal flood: once a writer is wired in, a caller retrying a refused
-request in a loop writes records at whatever rate it retries, and the
-file-count ceiling — not `audit_min_retain_days` — is what bounds the disk
-it can consume.
+refusal flood: a caller retrying a refused request in a loop writes
+records at whatever rate it retries, and the file-count ceiling — not
+`audit_min_retain_days` — is what bounds the disk it can consume.
 
 ### Registrar verb rate limiting
 

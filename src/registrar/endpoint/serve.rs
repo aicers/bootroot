@@ -110,6 +110,14 @@ pub(crate) fn authorize_peer(peer_uid: u32, daemon_uid: u32) -> bool {
 
 /// Runs the endpoint until the shared shutdown watch goes true.
 ///
+/// `handler` is this invocation's, built by the daemon from this
+/// invocation's settings and cloned into each accepted connection. It is
+/// a parameter rather than something [`ActivatedEndpoint`] carries,
+/// which is what makes "no connection is accepted without a handler
+/// behind it" a signature: there is nothing to fill in later, so there
+/// is no slot, no lock and no interior mutability. A reload builds a
+/// fresh one and starts a fresh accept task over the same listener.
+///
 /// # Errors
 ///
 /// Reserved for a failure that ends the endpoint itself; there is none
@@ -118,6 +126,7 @@ pub(crate) fn authorize_peer(peer_uid: u32, daemon_uid: u32) -> bool {
 /// is a failed `accept`: both are logged and the loop goes on.
 pub(crate) async fn run(
     endpoint: Arc<ActivatedEndpoint>,
+    handler: Arc<dyn RegistrarRequestHandler>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     info!(
@@ -150,7 +159,15 @@ pub(crate) async fn run(
                         // and only this one is the one the contract
                         // names.
                         let accepted_at = Instant::now();
-                        admit(&mut connections, &capacity, &endpoint, stream, accepted_at).await;
+                        admit(
+                            &mut connections,
+                            &capacity,
+                            &endpoint,
+                            &handler,
+                            stream,
+                            accepted_at,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         // A per-connection accept failure is the peer's
@@ -195,6 +212,7 @@ async fn admit(
     connections: &mut JoinSet<()>,
     capacity: &Arc<Semaphore>,
     endpoint: &Arc<ActivatedEndpoint>,
+    handler: &Arc<dyn RegistrarRequestHandler>,
     mut stream: UnixStream,
     accepted_at: Instant,
 ) {
@@ -212,8 +230,16 @@ async fn admit(
         return;
     };
     let endpoint = Arc::clone(endpoint);
+    let handler = Arc::clone(handler);
     connections.spawn(async move {
-        handle_connection(&endpoint, stream, &connection, accepted_at).await;
+        handle_connection(
+            &endpoint,
+            handler.as_ref(),
+            stream,
+            &connection,
+            accepted_at,
+        )
+        .await;
         drop(permit);
     });
 }
@@ -270,6 +296,7 @@ pub(crate) async fn drain(mut connections: JoinSet<()>) {
 /// difference.
 async fn handle_connection(
     endpoint: &ActivatedEndpoint,
+    handler: &dyn RegistrarRequestHandler,
     mut stream: UnixStream,
     connection: &ConnectionId,
     accepted_at: Instant,
@@ -322,14 +349,7 @@ async fn handle_connection(
     // request byte" still holds.
     match recognize_caller(&tls, endpoint.domain()) {
         Ok(caller) => {
-            serve_request(
-                &mut tls,
-                connection,
-                &caller,
-                endpoint.handler().as_ref(),
-                handshaken_at,
-            )
-            .await;
+            serve_request(&mut tls, connection, &caller, handler, handshaken_at).await;
         }
         Err(refusal) => {
             refusal::refuse(&mut tls, connection, &Refusal::caller_identity(refusal)).await;

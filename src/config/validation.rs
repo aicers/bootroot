@@ -12,6 +12,7 @@ use super::{
 use crate::fs_util::path_is_within;
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
+use crate::registrar::verbs::wrap_ttl::{WrapTtlPolicy, WrapTtlRefusal};
 
 const MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES: u64 = i64::MAX.unsigned_abs();
 
@@ -109,6 +110,30 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     }
     validate_registrar_endpoint_settings(&settings.registrar_endpoint)?;
     validate_registrar_settings(&settings.registrar)?;
+    validate_registrar_state_file_requirement(&settings.registrar, &settings.registrar_endpoint)?;
+    Ok(())
+}
+
+/// Requires `[registrar] state_file` exactly when the endpoint is
+/// enabled.
+///
+/// The key's own rule — absolute when present — belongs with the other
+/// range checks in [`validate_registrar_settings`], which sees only its
+/// own table. *Required when the endpoint is enabled* relates two
+/// tables, so it is decided here, where both are visible. It stays a
+/// pure check: whether the path exists is decided when the daemon opens
+/// the file, on the enabled path.
+fn validate_registrar_state_file_requirement(
+    registrar: &RegistrarSettings,
+    endpoint: &RegistrarEndpointSettings,
+) -> Result<()> {
+    if endpoint.enabled && registrar.state_file.is_none() {
+        anyhow::bail!(
+            "registrar.state_file is required when registrar_endpoint.enabled is true: the \
+             daemon reads the deployment's OpenBao URL, KV mount and secrets directory out of \
+             the state.json that key names, and has no other source for them"
+        );
+    }
     Ok(())
 }
 
@@ -182,10 +207,49 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
     if settings.audit_min_retain_days == 0 {
         anyhow::bail!("registrar.audit_min_retain_days must be greater than 0");
     }
-    // A zero burst throttles the first legitimate mint, and a zero refill
-    // interval is an unbounded token supply that disables the limiter
-    // silently. Both are rejected here rather than clamped, so an
-    // operator who meant to change the sizing finds out at load time.
+    validate_rate_limit_sizing(settings)?;
+    if !settings.provisioning_config_path.is_absolute() {
+        anyhow::bail!(
+            "registrar.provisioning_config_path ({}) must be an absolute path; the daemon's \
+             working directory is not contracted to be stable under a service supervisor",
+            settings.provisioning_config_path.display()
+        );
+    }
+    validate_max_wrap_ttl(settings.max_wrap_ttl)?;
+    validate_whole_second_duration("registrar.role_token_ttl", settings.role_token_ttl)?;
+    validate_whole_second_duration("registrar.role_secret_id_ttl", settings.role_secret_id_ttl)?;
+    if let Some(ttl) = settings.secret_id_ttl {
+        validate_whole_second_duration("registrar.secret_id_ttl", ttl)?;
+    }
+    if let Some(cidrs) = &settings.secret_id_token_bound_cidrs {
+        for cidr in cidrs {
+            if cidr.trim().is_empty() {
+                anyhow::bail!(
+                    "registrar.secret_id_token_bound_cidrs must not contain an empty entry"
+                );
+            }
+        }
+    }
+    if let Some(state_file) = &settings.state_file
+        && !state_file.is_absolute()
+    {
+        anyhow::bail!(
+            "registrar.state_file ({}) must be an absolute path; the daemon's working directory \
+             is not contracted to be stable under a service supervisor",
+            state_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// Rejects a rate-limit sizing that would disable the limiter or
+/// throttle a legitimate caller.
+///
+/// A zero burst throttles the first legitimate mint, and a zero refill
+/// interval is an unbounded token supply that disables the limiter
+/// silently. Both are rejected rather than clamped, so an operator who
+/// meant to change the sizing finds out at load time.
+fn validate_rate_limit_sizing(settings: &RegistrarSettings) -> Result<()> {
     if settings.rate_limit_admission_burst == 0 {
         anyhow::bail!(
             "registrar.rate_limit_admission_burst must be greater than 0; a zero burst \
@@ -208,6 +272,63 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
         anyhow::bail!(
             "registrar.rate_limit_predecision_refusal_refill_interval_ms must be greater than 0; \
              a zero interval is an unbounded token supply that disables the limiter silently"
+        );
+    }
+    Ok(())
+}
+
+/// Rejects a `max_wrap_ttl` the registrar could not grant under.
+///
+/// The ceiling is validated by handing it to `WrapTtlPolicy::new` rather
+/// than by a second copy of its rules, so it is held to exactly what a
+/// requested `wrap_ttl` is held to and the policy's own refusal names
+/// the fault.
+fn validate_max_wrap_ttl(value: Duration) -> Result<()> {
+    let maximum = time::Duration::try_from(value).map_err(|_| {
+        anyhow::anyhow!(
+            "registrar.max_wrap_ttl ({}) is outside the range a duration can carry",
+            humantime::format_duration(value)
+        )
+    })?;
+    WrapTtlPolicy::new(maximum).map_err(|refusal| {
+        anyhow::anyhow!(
+            "registrar.max_wrap_ttl ({}) is not a wrap TTL the registrar can grant under: {}",
+            humantime::format_duration(value),
+            wrap_ttl_fault(refusal)
+        )
+    })?;
+    Ok(())
+}
+
+/// Restates a [`WrapTtlRefusal`] about the configured ceiling.
+///
+/// The refusal's own `Display` is written about a *requested* value, so
+/// it would read as though a caller were at fault for an operator's key.
+fn wrap_ttl_fault(refusal: WrapTtlRefusal) -> &'static str {
+    match refusal {
+        WrapTtlRefusal::Zero => "it is zero",
+        WrapTtlRefusal::Negative => "it is negative",
+        WrapTtlRefusal::NotWholeSeconds => "it is not a whole number of seconds",
+        WrapTtlRefusal::ExceedsOpenBaoRange => "it exceeds the largest OpenBao duration",
+    }
+}
+
+/// Rejects a duration `OpenBao` has no spelling for.
+///
+/// `OpenBao` counts whole seconds, so a sub-second remainder has no
+/// representation and truncating it would issue a lifetime nobody chose.
+fn validate_whole_second_duration(key: &str, value: Duration) -> Result<()> {
+    if value.subsec_nanos() != 0 {
+        anyhow::bail!(
+            "{key} ({}) must be a whole number of seconds; OpenBao durations carry no \
+             sub-second remainder",
+            humantime::format_duration(value)
+        );
+    }
+    if value.as_secs() == 0 {
+        anyhow::bail!(
+            "{key} ({}) must be greater than zero",
+            humantime::format_duration(value)
         );
     }
     Ok(())
@@ -513,6 +634,189 @@ mod tests {
             fast_poll_interval: Duration::from_secs(5),
             state_path: std::path::PathBuf::from("/var/lib/bootroot/state.json"),
         }
+    }
+
+    /// Every range rule the documented table fixes, each rejection
+    /// naming the key it is about.
+    #[test]
+    fn each_registrar_range_rule_names_the_key_it_rejected() {
+        let cases: Vec<(&str, RegistrarSettings)> = vec![
+            (
+                "registrar.provisioning_config_path",
+                RegistrarSettings {
+                    provisioning_config_path: std::path::PathBuf::from("provisioning.toml"),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.max_wrap_ttl",
+                RegistrarSettings {
+                    max_wrap_ttl: Duration::from_secs(0),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                // The whole-second rule comes from `WrapTtlPolicy`
+                // rather than from a comparison written here, so it is
+                // exercised rather than assumed.
+                "registrar.max_wrap_ttl",
+                RegistrarSettings {
+                    max_wrap_ttl: Duration::from_millis(1_500),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.role_token_ttl",
+                RegistrarSettings {
+                    role_token_ttl: Duration::from_secs(0),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.role_token_ttl",
+                RegistrarSettings {
+                    role_token_ttl: Duration::from_millis(900),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.role_secret_id_ttl",
+                RegistrarSettings {
+                    role_secret_id_ttl: Duration::from_secs(0),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.secret_id_ttl",
+                RegistrarSettings {
+                    secret_id_ttl: Some(Duration::from_millis(1)),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.secret_id_token_bound_cidrs",
+                RegistrarSettings {
+                    secret_id_token_bound_cidrs: Some(vec![
+                        "10.0.0.0/8".to_string(),
+                        "  ".to_string(),
+                    ]),
+                    ..RegistrarSettings::default()
+                },
+            ),
+            (
+                "registrar.state_file",
+                RegistrarSettings {
+                    state_file: Some(std::path::PathBuf::from("state.json")),
+                    ..RegistrarSettings::default()
+                },
+            ),
+        ];
+
+        for (key, settings) in cases {
+            let error = validate_registrar_settings(&settings)
+                .expect_err(&format!("{key} must be rejected"));
+            assert!(
+                format!("{error:#}").contains(key),
+                "the rejection must name {key}: {error:#}"
+            );
+        }
+    }
+
+    /// `max_wrap_ttl` is validated by handing it to `WrapTtlPolicy::new`
+    /// rather than by a second copy of its rules, so a value the policy
+    /// accepts is a value the validator accepts and no other.
+    #[test]
+    fn the_wrap_ttl_ceiling_is_validated_by_the_policy_itself() {
+        for value in [
+            Duration::from_secs(1),
+            Duration::from_mins(30),
+            Duration::from_hours(24),
+        ] {
+            let settings = RegistrarSettings {
+                max_wrap_ttl: value,
+                ..RegistrarSettings::default()
+            };
+            assert!(
+                validate_registrar_settings(&settings).is_ok(),
+                "the policy accepts {value:?}, so the validator must too"
+            );
+        }
+    }
+
+    /// Every check above is a pure comparison, so a host that will never
+    /// serve a verb still rejects a nonsense value rather than carrying
+    /// it until somebody enables the endpoint.
+    #[test]
+    fn a_registrar_range_violation_is_rejected_with_the_endpoint_disabled() {
+        let settings = RegistrarSettings {
+            role_token_ttl: Duration::from_secs(0),
+            ..RegistrarSettings::default()
+        };
+        let disabled = RegistrarEndpointSettings::default();
+
+        assert!(validate_registrar_settings(&settings).is_err());
+        validate_registrar_state_file_requirement(&RegistrarSettings::default(), &disabled)
+            .expect("a disabled endpoint needs no state_file");
+    }
+
+    /// The cross-table rule: `state_file` is required exactly when the
+    /// endpoint is enabled, and the refusal names both the key and the
+    /// enablement that made it required.
+    #[test]
+    fn state_file_is_required_exactly_when_the_endpoint_is_enabled() {
+        let absent = RegistrarSettings::default();
+        let present = RegistrarSettings {
+            state_file: Some(std::path::PathBuf::from("/var/lib/bootroot/state.json")),
+            ..RegistrarSettings::default()
+        };
+
+        validate_registrar_state_file_requirement(
+            &absent,
+            &RegistrarEndpointSettings {
+                enabled: false,
+                ..RegistrarEndpointSettings::default()
+            },
+        )
+        .expect("a disabled endpoint loads cleanly with no state_file");
+        validate_registrar_state_file_requirement(
+            &present,
+            &RegistrarEndpointSettings {
+                enabled: true,
+                ..RegistrarEndpointSettings::default()
+            },
+        )
+        .expect("an enabled endpoint with a state_file is accepted");
+
+        let error = validate_registrar_state_file_requirement(
+            &absent,
+            &RegistrarEndpointSettings {
+                enabled: true,
+                ..RegistrarEndpointSettings::default()
+            },
+        )
+        .expect_err("an enabled endpoint with no state_file is refused");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("registrar.state_file"),
+            "the refusal must name the key: {rendered}"
+        );
+        assert!(
+            rendered.contains("registrar_endpoint.enabled"),
+            "the refusal must name the enablement that made it required: {rendered}"
+        );
+    }
+
+    /// An absolute `state_file` is accepted and carried through
+    /// unchanged.
+    #[test]
+    fn an_absolute_state_file_is_accepted_and_carried_through() {
+        let path = std::path::PathBuf::from("/var/lib/bootroot/state.json");
+        let settings = RegistrarSettings {
+            state_file: Some(path.clone()),
+            ..RegistrarSettings::default()
+        };
+        validate_registrar_settings(&settings).expect("an absolute state_file validates");
+        assert_eq!(settings.state_file.as_deref(), Some(path.as_path()));
     }
 
     #[test]

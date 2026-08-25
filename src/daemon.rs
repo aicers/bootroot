@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+// Used by the Linux-only registrar handler build below, which is the
+// only fallible composition in this module.
+#[cfg(target_os = "linux")]
+use anyhow::Context as _;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
 
@@ -177,6 +181,11 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     } = invocation;
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
+
+    #[cfg(target_os = "linux")]
+    let registrar_service = resolve_registrar_service(&registrar_endpoint, &settings).await?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = &registrar_endpoint;
     let profile_locks = Arc::new(ProfileLocks::new());
     let shutdown_rx = shutdown.receiver();
     let runtime = IssuanceRuntime {
@@ -198,7 +207,10 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
 
     let mut handles = Vec::new();
 
-    spawn_registrar_endpoint(&mut handles, &registrar_endpoint, &shutdown_rx);
+    #[cfg(target_os = "linux")]
+    if let Some((endpoint, request_handler)) = registrar_service {
+        spawn_registrar_endpoint(&mut handles, endpoint, request_handler, &shutdown_rx);
+    }
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
@@ -290,6 +302,318 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
     })
 }
 
+/// The default secrets directory `bootroot init` records nothing for.
+///
+/// The CLI resolves an absent `secrets_dir` member to this same name
+/// through `StateFile::secrets_dir` (`src/state.rs`). That constant is
+/// in the binary crate and this is the library, so the value is restated
+/// here rather than reached for across the boundary. A test in that
+/// crate fails if `StateFile`'s fallback ever stops being this name.
+#[cfg(target_os = "linux")]
+const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
+
+/// The three members the daemon reads out of the deployment's
+/// `state.json`, and nothing else about that file.
+///
+/// `bootroot init` records the `OpenBao` URL, the KV mount and the
+/// secrets directory there, and `StateFile` — the type that owns the
+/// whole inventory — is a module of the **binary** crate, unreachable
+/// from the library where `run_daemon`, the endpoint and the verb layer
+/// live. So this projection crosses that boundary and makes exactly
+/// these three member names a contract between the two binaries; every
+/// other member is deliberately tolerated and ignored, so the CLI's
+/// inventory can grow a field without breaking a daemon that never looks
+/// at it.
+///
+/// It derives [`serde::Deserialize`] and **not** `Serialize` on purpose:
+/// a serializer here is how a later edit comes to write an operator's
+/// state file back out with three fields and lose the rest.
+#[cfg(target_os = "linux")]
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct RegistrarStateProjection {
+    /// The URL `bootroot init` recorded for this deployment's
+    /// `OpenBao`. Must be `https://`.
+    #[serde(default)]
+    openbao_url: String,
+    /// The KV v2 mount every registrar path is written under.
+    #[serde(default)]
+    kv_mount: String,
+    /// The recorded secrets directory, absent on a deployment that never
+    /// passed `--secrets-dir`.
+    #[serde(default)]
+    secrets_dir: Option<PathBuf>,
+}
+
+/// Reads the three members the registrar surface needs out of the
+/// `state.json` that `[registrar] state_file` names.
+///
+/// Every way this can fail names itself: which key, which path and which
+/// member was at fault.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read, is not JSON, carries
+/// an absent or empty `openbao_url` or `kv_mount`, or carries an
+/// `openbao_url` that is not `https://`.
+#[cfg(target_os = "linux")]
+fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProjection> {
+    let bytes = std::fs::read(state_file).with_context(|| {
+        format!(
+            "reading the deployment state file registrar.state_file names at {}",
+            state_file.display()
+        )
+    })?;
+    let state: RegistrarStateProjection = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing the deployment state file registrar.state_file names at {}",
+            state_file.display()
+        )
+    })?;
+    if state.openbao_url.trim().is_empty() {
+        anyhow::bail!(
+            "the deployment state file at {} carries no openbao_url; the registrar endpoint has \
+             no other source for it",
+            state_file.display()
+        );
+    }
+    if state.kv_mount.trim().is_empty() {
+        anyhow::bail!(
+            "the deployment state file at {} carries no kv_mount; the registrar endpoint has no \
+             other source for it",
+            state_file.display()
+        );
+    }
+    if !config::openbao_url_is_https(&state.openbao_url) {
+        anyhow::bail!(
+            "the openbao_url recorded in the deployment state file at {} is not https://; the \
+             registrar's privileged credential authenticates by client certificate and refuses \
+             a plaintext URL",
+            state_file.display()
+        );
+    }
+    Ok(state)
+}
+
+/// Resolves the secrets directory the recorded state names.
+///
+/// A relative value — including the `secrets` default, which is what a
+/// host that never passed `--secrets-dir` has — resolves against the
+/// **state file's own directory**, never against the process working
+/// directory: `state_file` is absolute, `bootroot init` writes
+/// `state.json` and `secrets/` side by side in the directory it is run
+/// from, and a daemon started by a socket unit has no working directory
+/// worth resolving against.
+#[cfg(target_os = "linux")]
+fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) -> PathBuf {
+    let recorded = recorded.unwrap_or_else(|| Path::new(DEFAULT_STATE_SECRETS_DIR));
+    if recorded.is_absolute() {
+        return recorded.to_path_buf();
+    }
+    match state_file.parent() {
+        Some(parent) => parent.join(recorded),
+        None => recorded.to_path_buf(),
+    }
+}
+
+/// Renders a configured duration as the `<n>s` form `OpenBao` parses.
+///
+/// Validation has already held every one of these to a whole number of
+/// seconds, so nothing is truncated here.
+#[cfg(target_os = "linux")]
+fn openbao_duration(value: Duration) -> String {
+    format!("{}s", value.as_secs())
+}
+
+/// Builds the fixed per-issuance `secret_id` options the verb layer is
+/// constructed with.
+///
+/// `metadata` is deliberately not exposed and is fixed to `None`.
+/// `OpenBao` echoes metadata back on lookup, and bootroot's own record
+/// of who asked for what is the audit trail this daemon writes; a
+/// second, operator-typed, unvalidated one attached to every issued
+/// `secret_id` is not a knob this endpoint grows. `ttl` is absent unless
+/// `secret_id_ttl` is set, which leaves the role-level TTL governing.
+#[cfg(target_os = "linux")]
+fn registrar_secret_id_options(
+    registrar: &config::RegistrarSettings,
+) -> crate::openbao::SecretIdOptions {
+    crate::openbao::SecretIdOptions {
+        ttl: registrar.secret_id_ttl.map(openbao_duration),
+        num_uses: Some(registrar.secret_id_num_uses),
+        metadata: None,
+        token_bound_cidrs: registrar.secret_id_token_bound_cidrs.clone(),
+    }
+}
+
+/// Builds the production registrar request handler from one
+/// invocation's settings.
+///
+/// The fallible half of the handler's construction, and the crate's only
+/// call site of `RegistrarVerbs::internal`. Everything it opens — the
+/// rendered provisioning config, the deployment state file, the audit
+/// record store, the internal credential — is opened here and only here,
+/// so a host whose endpoint is disabled never touches any of them.
+///
+/// Called before anything is spawned, so a failure fails the whole
+/// invocation rather than leaving the socket adopted with no accept
+/// task: a systemd-activated socket with nobody accepting turns every
+/// caller into a hang, which is strictly worse than a failed start.
+///
+/// # Errors
+///
+/// Returns an error naming the dependency at fault: an absent
+/// `registrar.state_file`, a state file that cannot be read or parsed or
+/// whose recorded members are unusable, a resolved secrets directory
+/// that does not exist, an unreadable deployment root, a provisioning
+/// config that is absent or fails its digest gate, a `max_wrap_ttl` that
+/// is not a grantable ceiling, an audit store that cannot be opened, and
+/// an absent, invalid or stale internal credential.
+#[cfg(target_os = "linux")]
+pub(crate) async fn build_registrar_handler(
+    settings: &config::Settings,
+) -> anyhow::Result<Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>> {
+    use crate::registrar::audit::{AuditRecordStore, AuditStoreSettings};
+    use crate::registrar::config::RegistrarConfig;
+    use crate::registrar::endpoint::production::ProductionHandler;
+    use crate::registrar::internal::{InternalCredential, active_root_fingerprint};
+    use crate::registrar::verbs::limiter::{
+        CountingLimitedInvocationSink, VerbRateLimiter, VerbRateLimiterSettings,
+    };
+    use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
+    use crate::registrar::verbs::{InternalVerbsSource, RegistrarVerbs};
+
+    let registrar = &settings.registrar;
+    let state_file = registrar.state_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "registrar.state_file is required when registrar_endpoint.enabled is true, and no \
+             value was configured"
+        )
+    })?;
+    let state = read_registrar_state(state_file)?;
+    let secrets_dir = resolve_secrets_dir(state_file, state.secrets_dir.as_deref());
+    if !secrets_dir.is_dir() {
+        anyhow::bail!(
+            "the secrets directory the deployment state file at {} resolves to, {}, is not a \
+             directory",
+            state_file.display(),
+            secrets_dir.display()
+        );
+    }
+    let active_root = active_root_fingerprint(&secrets_dir).with_context(|| {
+        format!(
+            "reading the deployment's active root fingerprint below {}",
+            secrets_dir.display()
+        )
+    })?;
+
+    let provisioning =
+        RegistrarConfig::load(&registrar.provisioning_config_path).with_context(|| {
+            format!(
+                "loading the rendered registrar config registrar.provisioning_config_path names \
+                 at {}",
+                registrar.provisioning_config_path.display()
+            )
+        })?;
+
+    let maximum = time::Duration::try_from(registrar.max_wrap_ttl).map_err(|_| {
+        anyhow::anyhow!("registrar.max_wrap_ttl is outside the range a duration can carry")
+    })?;
+    let wrap_ttl_policy = WrapTtlPolicy::new(maximum)
+        .map_err(|refusal| anyhow::anyhow!("registrar.max_wrap_ttl is unusable: {refusal}"))?;
+
+    // The credential is loaded before the audit store on purpose, in
+    // cost order: an absent, invalid or superseded credential is settled
+    // without creating or touching the audit trail. It is loaded rather
+    // than borrowed from the verbs because `RegistrarVerbs` builds its
+    // privileged client inside itself and exposes neither it nor the
+    // credential, and the anchor read needs one of its own.
+    let credential = InternalCredential::load(&secrets_dir, &state.openbao_url, &active_root)
+        .context("loading the bootroot-internal credential for the CA-anchor read")?;
+
+    let audit_store = AuditRecordStore::open(AuditStoreSettings {
+        dir: registrar.audit_record_dir.clone(),
+        max_file_bytes: registrar.audit_max_file_bytes,
+        max_retained_files: registrar.audit_max_retained_files,
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "opening the registrar audit record store at {}",
+            registrar.audit_record_dir.display()
+        )
+    })?;
+
+    let secret_id_options = registrar_secret_id_options(registrar);
+
+    // The shipped counting sink rather than the no-op one: its two
+    // counters are what an operator surface reads to tell a stalled
+    // bring-up from a flood of malformed input, and they cost two
+    // atomics. The limiter keeps its own handle on the sink, so nothing
+    // here has to retain one for the counters to accumulate.
+    let limiter = VerbRateLimiter::new(
+        VerbRateLimiterSettings::from(registrar),
+        Arc::new(CountingLimitedInvocationSink::new()),
+    );
+
+    let verbs = RegistrarVerbs::internal(&InternalVerbsSource {
+        secrets_dir: &secrets_dir,
+        openbao_url: &state.openbao_url,
+        active_root_fingerprint: &active_root,
+        kv_mount: &state.kv_mount,
+        config: &provisioning,
+        secret_id_options: &secret_id_options,
+        token_ttl: &openbao_duration(registrar.role_token_ttl),
+        secret_id_ttl: &openbao_duration(registrar.role_secret_id_ttl),
+        wrap_ttl_policy: &wrap_ttl_policy,
+        audit_store: &audit_store,
+        limiter: &limiter,
+    })
+    .context("building the registrar verb service from the bootroot-internal credential")?;
+
+    Ok(Arc::new(ProductionHandler::new(
+        verbs,
+        credential,
+        state.kv_mount,
+    )))
+}
+
+/// The adopted endpoint and the handler that will answer on it, or
+/// `None` when the endpoint is disabled.
+#[cfg(target_os = "linux")]
+type RegistrarService = Option<(
+    Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
+)>;
+
+/// Resolves the registrar endpoint's accept-task dependencies for one
+/// invocation.
+///
+/// Called from `run_daemon` **before** it spawns anything, so the `?`
+/// here fails the whole invocation rather than leaving the socket
+/// adopted with no accept task: a systemd-activated socket with nobody
+/// accepting turns every caller into a hang, which is strictly worse
+/// than a failed start. An operator who enabled the endpoint and whose
+/// provisioning config, state file, internal credential or audit store
+/// is not in place therefore gets a loud, named startup failure.
+///
+/// Nothing is built when the endpoint is disabled: no provisioning
+/// config is loaded, no audit store opened, no state file read and no
+/// credential constructed.
+///
+/// # Errors
+///
+/// Returns whatever [`build_registrar_handler`] could not resolve.
+#[cfg(target_os = "linux")]
+async fn resolve_registrar_service(
+    registrar_endpoint: &RegistrarEndpoint,
+    settings: &config::Settings,
+) -> anyhow::Result<RegistrarService> {
+    match registrar_endpoint.activated() {
+        Some(endpoint) => Ok(Some((endpoint, build_registrar_handler(settings).await?))),
+        None => Ok(None),
+    }
+}
+
 /// Spawns the registrar endpoint's accept task, when one is active.
 ///
 /// The handle joins the same `handles` vector every profile task does,
@@ -298,24 +622,25 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
 /// stopped accepting, drained or aborted its connections and joined
 /// every one of them by the time the reload loop joins the invocation.
 ///
+/// The handler is a parameter rather than something the endpoint
+/// carries, so the accept task cannot be spawned without one — a
+/// signature rather than a runtime invariant, which is why "never accept
+/// a connection without a handler behind it" needs no slot, no lock and
+/// no interior mutability.
+///
 /// On a non-Linux target the endpoint is not compiled at all, and an
 /// enabled setting has already been refused by configuration validation.
+#[cfg(target_os = "linux")]
 fn spawn_registrar_endpoint(
     handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    registrar_endpoint: &RegistrarEndpoint,
+    endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    request_handler: Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
-    #[cfg(target_os = "linux")]
-    if let Some(endpoint) = registrar_endpoint.activated() {
-        let shutdown_rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(async move {
-            crate::registrar::endpoint::serve::run(endpoint, shutdown_rx).await
-        }));
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (handles, registrar_endpoint, shutdown_rx);
-    }
+    let shutdown_rx = shutdown_rx.clone();
+    handles.push(tokio::spawn(async move {
+        crate::registrar::endpoint::serve::run(endpoint, request_handler, shutdown_rx).await
+    }));
 }
 
 async fn run_profile_daemon(
@@ -902,6 +1227,9 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod registrar_handler_tests;
 
 #[cfg(test)]
 mod tests {

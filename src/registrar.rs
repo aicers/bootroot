@@ -531,7 +531,7 @@ impl RegistrarEndpoint {
     /// # Errors
     ///
     /// Returns an error when the endpoint is enabled and cannot be
-    /// served: no registered request handler, a missing or misaddressed
+    /// served: a missing or misaddressed
     /// activation contract, a descriptor that is not a listening
     /// `AF_UNIX` stream socket or whose address is not a pathname, or a
     /// socket pathname whose mode, owner or parent directory fails
