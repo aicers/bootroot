@@ -1260,6 +1260,20 @@ pub(crate) struct InitArgs {
     #[arg(long = "confirm-db-provision")]
     pub(crate) confirm_db_provision: bool,
 
+    /// bootroot-agent config path, read for `[registrar]
+    /// audit_store_dir` and `[registrar_endpoint] enabled`.
+    ///
+    /// The operator's own configuration file — not the
+    /// bootroot-internal `agent.toml` `init` generates under the
+    /// internal credential directory. `[registrar] audit_store_dir` is
+    /// the only definition of where the shared audit store lives, so
+    /// this is required on a run whose `state.json` records an enabled
+    /// registrar endpoint, and on one that finds a rendered `OpenBao`
+    /// audit compose override on disk. The daemon's configuration file
+    /// must therefore exist before such a run.
+    #[arg(long)]
+    pub(crate) agent_config: Option<PathBuf>,
+
     /// Internal: invoked from `bootroot reinit`.  Suppresses overwrite
     /// prompts for files that the reinit caller has already decided to
     /// preserve (`ca.json`, `password.txt`, `state.json`) so a
@@ -1319,6 +1333,17 @@ pub(crate) struct ReinitArgs {
     /// or ephemeral automation only.
     #[arg(long)]
     pub(crate) root_token_output: Option<PathBuf>,
+
+    /// bootroot-agent config path, passed through to the underlying
+    /// init flow.
+    ///
+    /// Reinit re-runs `init`, which reads `[registrar]
+    /// audit_store_dir` and `[registrar_endpoint] enabled` from this
+    /// file and requires it on a host whose `state.json` records an
+    /// enabled registrar endpoint, or which carries a rendered `OpenBao`
+    /// audit compose override.
+    #[arg(long)]
+    pub(crate) agent_config: Option<PathBuf>,
 
     /// Enable optional features passed through to the underlying init
     /// flow (e.g. `show-secrets`).

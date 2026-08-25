@@ -141,6 +141,13 @@ published — plus that the same login without the client certificate is refused
 It also asserts the other side of that split: the `OpenBao` Agent sidecars'
 configuration, `AppRole` pair, templates and the directories holding them still
 belong to the owner of `secrets/`, which a root-run `init` must not take over.
+It asserts what those sidecars are generated *for* as well: this arm brings
+`OpenBao` up on TLS, and the two agents are written before that transition and
+started after it, so their `agent.hcl` and their compose override have to name
+the `https://` address and the CA bundle that verifies the listener's leaf.
+Generating them for the plaintext listener is invisible at bring-up — the
+containers start, `init` succeeds, and the agents then speak HTTP to a TLS port
+and renew nothing.
 
 `init` runs as root here, through `sudo -n env`, because an endpoint-enabled
 `init` publishes those five files `root:root` and refuses to publish any of them
@@ -159,10 +166,45 @@ protected five are still `0:0:600` afterwards, and the sidecar tree is still the
 sweep's to repair. `reinit` and the CA and step-ca-password rotations reach the
 same sweep.
 
+It is also where the shared audit store is exercised, since it is the only arm
+that seeds the endpoint predicate. Beside that predicate the seed phase writes
+the operator configuration file the run passes to `bootroot init
+--agent-config`: `[registrar] audit_store_dir` naming the store and
+`[registrar_endpoint] enabled = true` so the two enablement sources agree —
+`init` refuses to proceed when they disagree. Nothing here starts a
+`bootroot-agent`, so an enabled `[registrar_endpoint]` in a file only the
+installer reads starts nothing. After `init` the run asserts, through `sudo -n`
+because the store is root-owned `0700`, that the store exists with `records/`
+and `openbao/` beneath it, that the store and `records/` are `0:0:700` while
+`openbao/` has passed to the container's user, that the rendered override binds
+`<audit_store_dir>/openbao` and re-declares OpenBao's other two mounts, and that
+the running container's `/openbao/audit` is a bind mount of the store on the
+host. The closing unprivileged `infra up` repeats those assertions — the proof
+that the select path works against a store it cannot descend into — and then
+runs `assert_openbao_audit_log`, the shared file-audit assertion every other
+lifecycle harness runs, unchanged: it reads the *container* path through `docker
+exec`, so a correct bind mount is transparent to it.
+
+The store's base is a physical, world-traversable temporary directory rather
+than the run root, because `bootroot init` requires every existing component
+above the store to be a non-symlink directory carrying `o+x`, and every obvious
+location fails that rule: `RUN_ROOT` is a `mktemp -d` and so `0700`, `$TMPDIR`
+is a `0700` per-user directory on macOS, the logical `/tmp` is a symbolic link
+there, and anywhere under the checkout inherits a home directory that is often
+`0750`. The harness resolves `/tmp` physically, creates its base there from an
+explicit `mktemp -d` template so `$TMPDIR` is never consulted, `chmod 0755`es
+it, and asserts every component of that path itself before `init` runs, so a
+drifting temporary-directory layout fails with the harness's own message rather
+than through `init`'s ancestor error. Teardown removes that base through the
+same `sudo -n` the scenario already requires, and reports it as a leftover if it
+survives.
+
 The endpoint-*disabled* case is not a scenario of its own. Every other arm is an
 endpoint-disabled host and drives its whole run over the plaintext `http://` URL
 `init` recorded, so a listener that transitioned when it should not have fails
-them outright.
+them outright. Those arms provision no store either: with no recorded predicate
+no override is rendered, and their OpenBao audit log stays on the
+`openbao-audit` named volume.
 
 ### Two lifecycle runs can share a host
 

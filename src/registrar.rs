@@ -71,6 +71,7 @@
 //! reserved names.
 
 pub mod audit;
+pub mod audit_store;
 pub mod config;
 #[cfg(target_os = "linux")]
 pub(crate) mod endpoint;

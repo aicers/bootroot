@@ -177,17 +177,27 @@ fn openbao_recreate_invocation(
     identity: &ComposeIdentity,
     compose_file: &Path,
     override_path: Option<&Path>,
+    audit_override_path: Option<&Path>,
 ) -> ComposeInvocation {
     // An endpoint-enabled loopback host transitions to TLS with no
     // exposed-port override at all: the listener stays on loopback and
     // only its scheme changes. Passing a `-f` for a file that does not
-    // exist would fail the recreate, so the override is optional here
+    // exist would fail the recreate, so each override is optional here
     // rather than assumed.
+    //
+    // The order is pinned so it is testable and cannot drift: base
+    // compose file, then the exposed-port override when there is one,
+    // then the audit override. The two rewrite different attributes —
+    // `ports:` and `volumes:` — so they compose without interacting.
     let compose_file = compose_file.to_string_lossy();
     let override_file = override_path.map(|path| path.to_string_lossy());
+    let audit_file = audit_override_path.map(|path| path.to_string_lossy());
     let mut files: Vec<&str> = vec![&compose_file];
     if let Some(override_file) = override_file.as_deref() {
         files.push(override_file);
+    }
+    if let Some(audit_file) = audit_file.as_deref() {
+        files.push(audit_file);
     }
     identity.compose(
         &files,
@@ -203,6 +213,12 @@ pub(super) struct OpenBaoTlsTransition<'a> {
     /// bind intent. `None` for an endpoint-enabled loopback host, which
     /// transitions the same listener to TLS without publishing a port.
     override_path: Option<&'a Path>,
+    /// The rendered audit override, when this host provisioned the
+    /// shared audit store. It rebinds `/openbao/audit` onto
+    /// `<audit_store_dir>/openbao`, so the recreated container comes up
+    /// writing its file audit device into the store rather than into
+    /// the `openbao-audit` named volume.
+    audit_override_path: Option<&'a Path>,
     /// The URL that is about to be written to `state.openbao_url`, i.e.
     /// `client_url_from_bind_addr(&bind_addr)` — never the advertise
     /// address, which local commands must not depend on.
@@ -222,12 +238,14 @@ impl<'a> OpenBaoTlsTransition<'a> {
     pub(super) fn new(
         compose_file: &'a Path,
         override_path: Option<&'a Path>,
+        audit_override_path: Option<&'a Path>,
         https_url: &'a str,
         secrets_dir: &'a Path,
     ) -> Self {
         Self {
             compose_file,
             override_path,
+            audit_override_path,
             https_url,
             secrets_dir,
             docker: Path::new(DOCKER_BIN),
@@ -262,8 +280,12 @@ impl<'a> OpenBaoTlsTransition<'a> {
         println!("{}", messages.init_openbao_tls_recreate());
         *recreated = true;
         let identity = ComposeIdentity::resolve(self.compose_file, None, messages)?;
-        let invocation =
-            openbao_recreate_invocation(&identity, self.compose_file, self.override_path);
+        let invocation = openbao_recreate_invocation(
+            &identity,
+            self.compose_file,
+            self.override_path,
+            self.audit_override_path,
+        );
         run_compose_with_exec(
             &invocation,
             "docker compose up -d openbao (tls)",
@@ -381,6 +403,7 @@ mod tests {
         let default = OpenBaoTlsTransition::new(
             &compose,
             Some(&override_path),
+            None,
             UNREACHABLE_HTTPS_URL,
             dir.path(),
         );
@@ -392,6 +415,7 @@ mod tests {
             ..OpenBaoTlsTransition::new(
                 &compose,
                 Some(&override_path),
+                None,
                 UNREACHABLE_HTTPS_URL,
                 dir.path(),
             )
@@ -421,8 +445,8 @@ mod tests {
         let compose = PathBuf::from("docker-compose.yml");
         let override_path = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
         let identity = ComposeIdentity::for_instance("bootroot");
-        let command =
-            openbao_recreate_invocation(&identity, &compose, Some(&override_path)).command(&[]);
+        let command = openbao_recreate_invocation(&identity, &compose, Some(&override_path), None)
+            .command(&[]);
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -447,6 +471,62 @@ mod tests {
             args.last().map(String::as_str),
             Some("openbao"),
             "the recreate must target only the openbao service: {args:?}"
+        );
+    }
+
+    /// The `-f` arguments of a recreate, in the order they are passed.
+    fn recreate_compose_files(
+        override_path: Option<&Path>,
+        audit_override_path: Option<&Path>,
+    ) -> Vec<String> {
+        let compose = PathBuf::from("docker-compose.yml");
+        let identity = ComposeIdentity::for_instance("bootroot");
+        let command =
+            openbao_recreate_invocation(&identity, &compose, override_path, audit_override_path)
+                .command(&[]);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        args.windows(2)
+            .filter(|pair| pair.first().map(String::as_str) == Some("-f"))
+            .filter_map(|pair| pair.get(1).cloned())
+            .collect()
+    }
+
+    #[test]
+    fn the_recreate_pins_the_order_of_both_overrides() {
+        let exposed = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
+        let audit = PathBuf::from("secrets/openbao/docker-compose.openbao-audit.yml");
+
+        // Base compose file, then the exposed-port override when there
+        // is one, then the audit override. Pinned so it is testable and
+        // cannot drift.
+        assert_eq!(
+            recreate_compose_files(Some(&exposed), Some(&audit)),
+            vec![
+                "docker-compose.yml".to_string(),
+                exposed.display().to_string(),
+                audit.display().to_string(),
+            ]
+        );
+        assert_eq!(
+            recreate_compose_files(Some(&exposed), None),
+            vec![
+                "docker-compose.yml".to_string(),
+                exposed.display().to_string()
+            ]
+        );
+        assert_eq!(
+            recreate_compose_files(None, Some(&audit)),
+            vec![
+                "docker-compose.yml".to_string(),
+                audit.display().to_string()
+            ]
+        );
+        assert_eq!(
+            recreate_compose_files(None, None),
+            vec!["docker-compose.yml".to_string()]
         );
     }
 
@@ -615,6 +695,7 @@ mod tests {
             ..OpenBaoTlsTransition::new(
                 &compose,
                 Some(&override_path),
+                None,
                 UNREACHABLE_HTTPS_URL,
                 dir.path(),
             )
@@ -824,6 +905,7 @@ mod tests {
             ..OpenBaoTlsTransition::new(
                 &compose,
                 Some(&override_path),
+                None,
                 UNREACHABLE_HTTPS_URL,
                 dir.path(),
             )

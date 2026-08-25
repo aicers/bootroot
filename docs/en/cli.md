@@ -756,6 +756,22 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   role/database?" prompt and provision. Equivalent to answering `y` at
   the prompt. Does not enable the feature — a silent no-op unless
   `--enable db-provision` is also passed (#735).
+- `--agent-config <path>`: the operator's `bootroot-agent` configuration
+  file — not the bootroot-internal `agent.toml` that `init` generates
+  under the internal credential directory. `init` reads exactly two
+  tables from it: `[registrar]`, for `audit_store_dir`, which is the
+  single definition of where the shared audit store lives, and
+  `[registrar_endpoint]`, whose `enabled` value is cross-checked against
+  `state.json`'s `registrar_endpoint.enabled`. A disagreement is a hard
+  error and nothing is created, rendered or deleted. **Required** on a
+  run whose `state.json` records an enabled registrar endpoint, and on a
+  run that finds a rendered audit compose override on disk, so the
+  daemon's configuration file must exist first. A run that would
+  provision the store must also be running as root: an unprivileged one
+  is refused before anything is created or rendered, because the store
+  would otherwise be created owned by the caller and refused as
+  foreign-owned by the next root run. See
+  [The shared audit store](operations.md#the-shared-audit-store).
 
 The four flags above are mutually independent: each suppresses exactly
 its own prompt, none implies another, and without them the prompts fire
@@ -2534,6 +2550,21 @@ operator-managed runbook for those.
   produced, since the rename publishes a fresh file and leaves the
   old one readable until it does.
 - `--no-eab`: passed through to `init`
+- `--agent-config <path>`: passed through to `init`, which reads
+  `[registrar] audit_store_dir` and `[registrar_endpoint] enabled` from
+  it. It carries the same requirement `init` has — mandatory on a host
+  whose `state.json` records an enabled registrar endpoint, and on one
+  that carries a rendered audit compose override — and reinit checks
+  that requirement, and the enablement cross-check, **before any
+  destructive operation**: raising it only in the second init pass would
+  land it after OpenBao has been wiped, recreating the partial-init trap
+  reinit exists to recover from. Nothing is created, rendered or deleted
+  by that preflight. It also refuses, for the same reason, an
+  endpoint-enabled host that has no rendered audit override yet: reinit
+  brings the stack back up before it re-runs `init`, and that bring-up
+  requires the override the init pass has not written. Run `bootroot
+  init` as root once on such a host before reinitialising it. See
+  [The shared audit store](operations.md#the-shared-audit-store).
 
 ### Behavior
 

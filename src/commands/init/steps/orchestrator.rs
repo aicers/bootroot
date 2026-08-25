@@ -329,6 +329,26 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     // the plaintext loopback listener.
     let registrar_intent = registrar_internal::registrar_endpoint_intent(&state_path)?;
 
+    // Provision the shared audit store, or unwind it, before a single
+    // Docker call. `--agent-config` is mandatory on a run whose
+    // predicate is enabled and on one that finds a rendered audit
+    // override, so both provisioning and unwinding are cross-checked
+    // against the daemon's own configuration; both preflight refusals
+    // run before anything is created or rendered.
+    let audit_override = crate::commands::audit_store::apply_audit_store(
+        &crate::commands::audit_store::AuditStoreInitInputs {
+            compose_dir: crate::commands::compose_file::compose_file_dir(
+                &args.compose.compose_file,
+            )
+            .as_path(),
+            agent_config: args.agent_config.as_deref(),
+            state_path: &state_path,
+            endpoint_recorded: registrar_intent.is_some(),
+            expected_uid: crate::commands::audit_store::production_uid(),
+        },
+        messages,
+    )?;
+
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
 
@@ -356,6 +376,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         &mut rollback,
         bind_intent,
         registrar_intent.as_ref(),
+        audit_override.as_deref(),
     )
     .await;
 
@@ -667,6 +688,10 @@ async fn run_init_inner(
     rollback: &mut InitRollback,
     bind_intent: bool,
     registrar_intent: Option<&RegistrarInternalIntent>,
+    // The rendered audit override, when this host provisioned one.
+    // Carried onto the `OpenBao` recreate below so the container comes
+    // up on the bind mount rather than the named volume.
+    audit_override: Option<&Path>,
 ) -> Result<InitSummary> {
     let bootstrap = bootstrap_openbao(client, args, messages).await?;
     let overwrite_password = args.secrets_dir.secrets_dir.join("password.txt").exists();
@@ -954,11 +979,18 @@ async fn run_init_inner(
         messages,
     )
     .await?;
-    // `bind_intent` is true exactly for a non-loopback OpenBao bind,
-    // which mandates `--openbao-tls-required` and later triggers the
-    // OpenBao TLS transition below.  Thread it in so the infra agents
-    // are generated to speak TLS (https + CA trust) and their
-    // `docker compose up` is deferred to the post-TLS-transition phase.
+    // The same gate the TLS transition below is keyed off, bound once
+    // and read in both places: a non-loopback bind and an
+    // endpoint-enabled loopback install both end with OpenBao serving
+    // TLS on `:8200`, so both must generate the infra agents to speak
+    // TLS (https + CA trust) and defer their `docker compose up` to the
+    // post-transition phase.  Passing only `bind_intent` here started
+    // the two sidecars against the plaintext listener that the
+    // transition then took away: they came up before the recreate, were
+    // left `Running` by the phase-2 apply because nothing in their
+    // config had changed, and spent the rest of the deployment speaking
+    // HTTP to a TLS port.
+    let tls_required = bind_intent || registrar_intent.is_some();
     let openbao_agent_paths = setup_openbao_agents(
         &args.compose.compose_file,
         &secrets_dir,
@@ -966,7 +998,7 @@ async fn run_init_inner(
         &role_outputs,
         &stepca_templates,
         &responder_paths.template_path,
-        bind_intent,
+        tls_required,
         messages,
     )
     .await?;
@@ -1130,7 +1162,6 @@ async fn run_init_inner(
     // cases share every step below and differ only in whether an
     // exposed-port override is applied and in which SANs the server
     // certificate carries.
-    let tls_required = bind_intent || registrar_intent.is_some();
     let effective_openbao_url = if tls_required {
         let state_path = StateFile::default_path();
         let override_path = bind_intent.then(|| {
@@ -1238,6 +1269,7 @@ async fn run_init_inner(
         let transition = OpenBaoTlsTransition::new(
             &args.compose.compose_file,
             override_path.as_deref(),
+            audit_override,
             &https_url,
             &args.secrets_dir.secrets_dir,
         );

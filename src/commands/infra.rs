@@ -101,6 +101,46 @@ fn build_compose_up_invocation(
     identity.compose(&[compose_str], None, &tail)
 }
 
+/// The compose files one `infra up` puts on the command line, before
+/// they are ordered.
+struct UpComposeOverrides<'a> {
+    compose_file: &'a str,
+    /// The `OpenBao` exposed-port override, rewriting `ports:`.
+    openbao: Option<&'a str>,
+    /// The `OpenBao` audit override, rewriting `volumes:`.
+    audit: Option<&'a str>,
+    responder_config: Option<&'a str>,
+    http01: Option<&'a str>,
+    stepca: Option<&'a str>,
+}
+
+/// Orders the `-f` arguments of an `infra up`.
+///
+/// The first three are pinned and shared with the `init` recreate: base
+/// compose file, then the `OpenBao` exposed-port override when there is
+/// one, then the audit override. Those two rewrite different attributes
+/// of the same service — `ports:` and `volumes:` — so they compose
+/// without interacting, and the merged service keeps both the intended
+/// host port publication and the audit bind mount.
+///
+/// The responder's TLS config is mounted before its exposed-port
+/// override so the container starts with TLS active.
+fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
+    let mut files: Vec<&str> = vec![overrides.compose_file];
+    files.extend(
+        [
+            overrides.openbao,
+            overrides.audit,
+            overrides.responder_config,
+            overrides.http01,
+            overrides.stepca,
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    files
+}
+
 /// Determines whether `infra install` runs the preliminary `docker compose
 /// pull --ignore-pull-failures` before `up`.
 ///
@@ -126,6 +166,19 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         .unwrap_or(Path::new("."));
     let state_path = StateFile::default_path();
     let openbao_override = resolve_openbao_exposed_override(&state_path, compose_dir, messages)?;
+    // The audit override, when this host's recorded registrar predicate
+    // is enabled. `infra up` reads no configuration: the rendered
+    // override names its own bind source, so it is the record of what
+    // `bootroot init` resolved. The store directory it names is held to
+    // the store directory contract — the one check an unprivileged
+    // process can make, since it may not descend into a root-owned
+    // `0700` store.
+    let audit_override = crate::commands::audit_store::resolve_audit_override(
+        &state_path,
+        compose_dir,
+        crate::commands::audit_store::production_uid(),
+        messages,
+    )?;
     // Skip responder overrides when the compose file does not declare
     // the responder service — a stored intent from a previous install
     // must not cause a hard failure against a custom compose file.
@@ -206,21 +259,17 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     let stepca_override_str = stepca_override
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
-    let mut up_files: Vec<&str> = vec![&compose_str];
-    if let Some(ref s) = openbao_override_str {
-        up_files.push(s.as_str());
-    }
-    // Mount the TLS-enabled responder config before applying the
-    // exposed-port override so the container starts with TLS active.
-    if let Some(ref s) = responder_config_override_str {
-        up_files.push(s.as_str());
-    }
-    if let Some(ref s) = http01_override_str {
-        up_files.push(s.as_str());
-    }
-    if let Some(ref s) = stepca_override_str {
-        up_files.push(s.as_str());
-    }
+    let audit_override_str = audit_override
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let up_files = up_compose_files(&UpComposeOverrides {
+        compose_file: &compose_str,
+        openbao: openbao_override_str.as_deref(),
+        audit: audit_override_str.as_deref(),
+        responder_config: responder_config_override_str.as_deref(),
+        http01: http01_override_str.as_deref(),
+        stepca: stepca_override_str.as_deref(),
+    });
     let mut up_tail: Vec<&str> = vec!["up", "-d"];
     up_tail.extend(&svc_refs);
     let up = identity.compose(&up_files, None, &up_tail);
@@ -3400,6 +3449,97 @@ mod tests {
         state.save(&state_path).unwrap();
         write_openbao_exposed_override(dir.path(), "192.168.1.10:8200", &messages).unwrap();
         assert!(find_openbao_exposed_override(&state_path, dir.path()).is_some());
+    }
+
+    /// A deployment carrying both an `OpenBao` non-loopback bind intent
+    /// and an enabled registrar predicate reaches Compose with the base
+    /// file and both overrides, in the pinned order.
+    #[test]
+    fn both_openbao_overrides_reach_the_bring_up_in_the_pinned_order() {
+        let messages = crate::i18n::test_messages();
+        // A physical, world-traversable base: the ancestor rule refuses
+        // the platform temporary directory on macOS, where `$TMPDIR` is
+        // `0700` and `/tmp` is a symbolic link.
+        let physical_tmp = Path::new("/tmp").canonicalize().expect("physical /tmp");
+        let dir = tempfile::Builder::new()
+            .prefix("bootroot-infra-up")
+            .tempdir_in(physical_tmp)
+            .unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            registrar_endpoint: Some(crate::state::RegistrarEndpointState {
+                enabled: true,
+                domain: "example.com".to_string(),
+                host: "host".to_string(),
+            }),
+            ..Default::default()
+        };
+        state.save(&state_path).unwrap();
+
+        write_openbao_exposed_override(dir.path(), "192.168.1.10:8200", &messages).unwrap();
+        let store_dir = dir.path().join("audit-store");
+        bootroot::registrar::audit_store::create_layout(
+            &store_dir,
+            bootroot::fs_util::current_process_euid(),
+        )
+        .unwrap();
+        crate::commands::audit_store::write_audit_override(dir.path(), &store_dir, &messages)
+            .unwrap();
+
+        let exposed = find_openbao_exposed_override(&state_path, dir.path())
+            .expect("the port override is selected");
+        let audit = crate::commands::audit_store::resolve_audit_override(
+            &state_path,
+            dir.path(),
+            bootroot::fs_util::current_process_euid(),
+            &messages,
+        )
+        .expect("the audit override resolves")
+        .expect("the audit override is selected");
+
+        let compose = "docker-compose.yml";
+        let exposed_str = exposed.to_string_lossy().into_owned();
+        let audit_str = audit.to_string_lossy().into_owned();
+        assert_eq!(
+            up_compose_files(&UpComposeOverrides {
+                compose_file: compose,
+                openbao: Some(&exposed_str),
+                audit: Some(&audit_str),
+                responder_config: None,
+                http01: None,
+                stepca: None,
+            }),
+            vec![compose, exposed_str.as_str(), audit_str.as_str()]
+        );
+    }
+
+    /// The port override alone, the audit override alone, and neither.
+    #[test]
+    fn the_bring_up_file_order_covers_every_combination() {
+        let compose = "docker-compose.yml";
+        let exposed = "secrets/openbao/docker-compose.openbao-exposed.yml";
+        let audit = "secrets/openbao/docker-compose.openbao-audit.yml";
+        let files = |openbao, audit| {
+            up_compose_files(&UpComposeOverrides {
+                compose_file: compose,
+                openbao,
+                audit,
+                responder_config: None,
+                http01: None,
+                stepca: None,
+            })
+        };
+        assert_eq!(files(Some(exposed), None), vec![compose, exposed]);
+        assert_eq!(files(None, Some(audit)), vec![compose, audit]);
+        assert_eq!(files(None, None), vec![compose]);
     }
 
     #[test]

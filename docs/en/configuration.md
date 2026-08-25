@@ -438,6 +438,12 @@ the registrar endpoint is provisioned from. Both are read on every
 `SIGHUP`, because the whole daemon invocation is rebuilt; only
 `[registrar_endpoint] enabled` is fixed for the process lifetime.
 
+On a host whose `state.json` records `registrar_endpoint.enabled = true`,
+a root-run `bootroot init` creates `audit_store_dir` with `records/` and
+`openbao/` beneath it. It must run as root there, because the store is
+owned by uid 0 at mode `0700`. A host whose registrar endpoint is not
+enabled still has no store.
+
 The audit store is opened when — and only when — the registrar endpoint
 is enabled. A host that serves no verbs creates nothing.
 
@@ -459,6 +465,12 @@ error.
 - `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
   absolute directory that holds `records/` for daemon records and
   `openbao/` for OpenBao's file audit output. A relative path is refused.
+  This key is the **single definition** of where the store is: nothing
+  records a second copy of it. The install side reads it through
+  `bootroot init --agent-config <path>`, which is required on a host
+  whose registrar endpoint is enabled, so this file must exist before
+  that run. See
+  [The shared audit store](operations.md#the-shared-audit-store).
 - `audit_store_reserve_bytes` (`u64`, default `2147483648`, 2 GiB) — the
   configured shared-store budget. It must not exceed `i64::MAX`; this
   build records the value but does not enforce the budget.

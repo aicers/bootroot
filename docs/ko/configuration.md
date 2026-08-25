@@ -421,6 +421,12 @@ rate_limit_predecision_refusal_refill_interval_ms = 1000
 구성되므로 둘 다 `SIGHUP`마다 다시 읽히며, 프로세스 수명 동안 고정되는
 값은 `[registrar_endpoint] enabled` 하나뿐입니다.
 
+`state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
+root로 실행한 `bootroot init`이 `audit_store_dir`과 그 아래의 `records/`,
+`openbao/`를 생성합니다. 저장소는 uid 0 소유에 모드 `0700`이므로 이 실행은
+반드시 root여야 합니다. 레지스트라 엔드포인트가 활성화되지 않은 호스트에는
+여전히 저장소가 없습니다.
+
 감사 저장소는 레지스트라 엔드포인트가 활성화된 경우에만 열립니다. 동사를
 제공하지 않는 호스트는 아무것도 만들지 않습니다.
 
@@ -440,7 +446,12 @@ OpenBao 감사 장치 확인은 그대로입니다.
 
 - `audit_store_dir` (기본값 `/var/lib/bootroot/audit-store`) — 데몬 레코드용
   `records/`와 OpenBao 파일 감사 출력용 `openbao/`를 담는 절대 경로입니다.
-  상대 경로는 거부됩니다.
+  상대 경로는 거부됩니다. 이 키가 저장소 위치에 대한 **유일한 정의**이며,
+  어디에도 두 번째 사본이 기록되지 않습니다. 설치 측은
+  `bootroot init --agent-config <path>`를 통해 이 값을 읽습니다. 이
+  플래그는 레지스트라 엔드포인트가 활성인 호스트에서 필수이므로, 그
+  실행보다 이 파일이 먼저 존재해야 합니다.
+  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 - `audit_store_reserve_bytes` (`u64`, 기본값 `2147483648`, 2 GiB) — 공유
   저장소의 구성된 예산입니다. `i64::MAX`를 넘을 수 없으며, 이 빌드에서는
   예산을 기록할 뿐 강제하지 않습니다.

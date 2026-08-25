@@ -1243,6 +1243,7 @@ pub(super) mod test_support {
             overwrite_ca_json: false,
             overwrite_state: false,
             confirm_db_provision: false,
+            agent_config: None,
             reinit_mode: false,
             root_token_output: None,
         }
