@@ -488,8 +488,8 @@ impl Settings {
     /// Creates settings from one required configuration file without an
     /// environment overlay.
     ///
-    /// Unlike [`Settings::from_file`], this refuses an absent or unreadable
-    /// file instead of silently deserializing the defaults.
+    /// Unlike [`Settings::from_file`], this refuses an absent, unreadable,
+    /// or unsupported-format file instead of silently deserializing defaults.
     ///
     /// # Errors
     /// Returns an error if the file cannot be read, its format is unsupported,
@@ -501,7 +501,8 @@ impl Settings {
             .try_deserialize()
     }
 
-    /// Builds the defaults-plus-file layers both constructors share.
+    /// Builds the defaults-plus-optional-file layers used by [`Settings::new`]
+    /// and [`Settings::from_file`].
     fn file_builder(
         config_path: Option<PathBuf>,
     ) -> Result<ConfigBuilder<DefaultState>, ConfigError> {

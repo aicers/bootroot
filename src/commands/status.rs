@@ -257,17 +257,14 @@ enum AuditSettingsLoad {
 
 async fn load_audit_status(args: &StatusArgs, messages: &Messages) -> Result<AuditStatus> {
     let settings_path = audit_settings_path(args.agent_config.as_ref());
-    let settings = match map_audit_settings_join_result(
+    let settings = map_audit_settings_join_result(
         settings_path,
         tokio::task::spawn_blocking({
             let agent_config = args.agent_config.clone();
             move || load_audit_settings(agent_config)
         })
         .await,
-    ) {
-        Ok(settings) => settings,
-        Err(status) => return Ok(status),
-    };
+    );
 
     let settings = match settings {
         AuditSettingsLoad::Ready(settings) => settings,
@@ -306,8 +303,8 @@ fn audit_settings_path(agent_config: Option<&PathBuf>) -> PathBuf {
 fn map_audit_settings_join_result(
     settings_path: PathBuf,
     result: std::result::Result<AuditSettingsLoad, tokio::task::JoinError>,
-) -> std::result::Result<AuditSettingsLoad, AuditStatus> {
-    result.map_err(|error| AuditStatus::Failed {
+) -> AuditSettingsLoad {
+    result.unwrap_or_else(|error| AuditSettingsLoad::Failed {
         path: settings_path,
         reason: AuditFailureReason::Diagnostic(error.to_string()),
     })
@@ -772,8 +769,7 @@ mod tests {
     async fn unreadable_regular_agent_config_is_a_failed_scan() {
         use std::os::unix::fs::PermissionsExt;
 
-        // SAFETY: geteuid only reads the process identity and has no preconditions.
-        if unsafe { libc::geteuid() } == 0 {
+        if bootroot::fs_util::current_process_euid() == 0 {
             return;
         }
 
@@ -903,12 +899,12 @@ mod tests {
             .to_string();
         let path = PathBuf::from("selected-agent.toml");
 
-        let Err(AuditStatus::Failed {
+        let AuditSettingsLoad::Failed {
             path: failed_path,
             reason,
-        }) = map_audit_settings_join_result(path.clone(), join_result)
+        } = map_audit_settings_join_result(path.clone(), join_result)
         else {
-            panic!("the join failure must return failed audit status");
+            panic!("the join failure must return failed audit settings");
         };
         assert_eq!(failed_path, path);
         let AuditFailureReason::Diagnostic(reason) = reason else {
