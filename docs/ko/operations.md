@@ -107,7 +107,7 @@ OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하�
 - **확인:** `docker compose exec openbao bao audit list`로 감사 장치가
   활성 상태인지 확인합니다.
 
-#### 레지스트라 동사 속도 제한
+#### 레지스트라 동사 속도 제한 {#registrar-verb-rate-limiting}
 
 이 빌드에서 bootroot는 레지스트라 동사 요청을 처리하지 않으므로, 아직
 이 버킷에 도달하는 호출은 없습니다. 속도 제한기는 동사의 구성 의존성이며

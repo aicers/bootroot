@@ -538,6 +538,52 @@ request in a loop writes records at whatever rate it retries, and the
 file-count ceiling — not `audit_min_retain_days` — is what bounds the disk
 it can consume.
 
+### Registrar verb rate limiting
+
+```toml
+[registrar]
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
+```
+
+These four keys join the `[registrar]` table above and bound how fast one
+client identity may drive the `mint` and `deregister` verbs, so that a
+caller flooding refused invocations cannot grow the record store without
+limit. bootroot serves no registrar verb request in this build, so
+nothing is charged against them yet; they load and validate now.
+
+Each verb carries two token buckets per client identity — one for the
+invocations bootroot's purely local checks refuse, one for those that
+pass them and may reach OpenBao — and each bucket starts full, is held in
+memory only, and accrues one token per refill interval up to its burst.
+[Registrar verb rate limiting](operations.md#registrar-verb-rate-limiting)
+describes what that split does and does not guarantee, what a limited
+caller sees, and how to size the burst for a fleet larger than the
+reference deployment.
+
+- `rate_limit_admission_burst` (`u32`, default `512`) — how many
+  invocations that passed the local checks one client identity may drive
+  at once. Size it as `wave_hosts × modules_per_host`; the default is the
+  reference deployment's 64 hosts × 8 modules.
+- `rate_limit_admission_refill_interval_ms` (`u32`, default `500`) —
+  milliseconds per accrued admission token, so the default sustains two
+  invocations per second.
+- `rate_limit_predecision_refusal_burst` (`u32`, default `32`) — the same
+  budget for locally refused invocations. Much smaller, because
+  legitimate refusals here are operator typos arriving one at a time.
+- `rate_limit_predecision_refusal_refill_interval_ms` (`u32`, default
+  `1000`) — one refusal token per second sustained.
+
+Every one is an unsigned integer, and the rates are milliseconds per
+token rather than fractional rates so that the configuration surface
+carries no floating-point value. A zero is rejected at load time for all
+four — a zero burst limits the first legitimate invocation, and a zero
+interval is an unbounded token supply that would disable the limiter
+silently — and so is a negative or fractional value, naming the offending
+key.
+
 ### EAB (Optional)
 
 ```toml

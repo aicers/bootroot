@@ -509,6 +509,51 @@ flush하며, 디렉터리를 flush할 수 없는 저장소는 열리지 않습�
 레코드를 만들며, 그때 디스크 사용량을 제한하는 것은
 `audit_min_retain_days`가 아니라 파일 개수 상한입니다.
 
+### 레지스트라 동사 속도 제한
+
+```toml
+[registrar]
+rate_limit_admission_burst = 512
+rate_limit_admission_refill_interval_ms = 500
+rate_limit_predecision_refusal_burst = 32
+rate_limit_predecision_refusal_refill_interval_ms = 1000
+```
+
+이 네 개의 키는 위의 `[registrar]` 테이블에 함께 들어가며, 한 클라이언트
+신원이 `mint`/`deregister` 동사를 얼마나 빠르게 호출할 수 있는지를
+제한합니다. 거부되는 호출을 대량으로 밀어 넣는 호출자가 레코드 저장소를
+한없이 키우지 못하게 하기 위한 것입니다. 이 빌드의 bootroot는 레지스트라
+동사 요청을 처리하지 않으므로 아직 이 버킷에 부과되는 호출은 없으며, 키는
+지금도 로드되고 검증됩니다.
+
+동사마다 클라이언트 신원별로 토큰 버킷이 둘 있습니다. 하나는 bootroot의
+순수 로컬 검사만으로 거부되는 호출용이고, 다른 하나는 그 검사를 통과해
+OpenBao에 닿을 수 있는 호출용입니다. 각 버킷은 가득 찬 상태로 시작해
+메모리에만 존재하며, 버스트를 상한으로 리필 간격마다 토큰 하나씩
+쌓입니다. 이 분리가 보장하는 것과 보장하지 않는 것, 제한된 호출자에게
+보이는 것, 기준 배포보다 큰 플릿에서 버스트를 산정하는 방법은
+[레지스트라 동사 속도 제한](operations.md#registrar-verb-rate-limiting)에
+있습니다.
+
+- `rate_limit_admission_burst` (`u32`, 기본값 `512`) — 로컬 검사를 통과한
+  호출을 한 클라이언트 신원이 한 번에 얼마나 밀어 넣을 수 있는지입니다.
+  `wave_hosts × modules_per_host`로 잡으며, 기본값은 기준 배포의 호스트
+  64대 × 모듈 8개입니다.
+- `rate_limit_admission_refill_interval_ms` (`u32`, 기본값 `500`) —
+  admission 토큰 하나가 쌓이는 밀리초 간격입니다. 기본값은 초당 두 건을
+  지속합니다.
+- `rate_limit_predecision_refusal_burst` (`u32`, 기본값 `32`) — 로컬에서
+  거부되는 호출의 같은 예산입니다. 이 경로의 정상적인 거부는 운영자의
+  오타가 하나씩 도착하는 것이므로 훨씬 작습니다.
+- `rate_limit_predecision_refusal_refill_interval_ms` (`u32`, 기본값
+  `1000`) — 초당 거부 토큰 하나를 지속합니다.
+
+모두 부호 없는 정수이며, 속도는 분수 비율이 아니라 토큰당 밀리초 간격으로
+표현해 설정 표면에 부동소수점 값이 하나도 없도록 했습니다. 네 키 모두 0은
+로드 시점에 거부됩니다. 버스트가 0이면 첫 정상 호출부터 제한되고, 간격이
+0이면 토큰이 무한히 공급되어 속도 제한기가 조용히 무력화되기 때문입니다.
+음수나 소수 값도 마찬가지로 문제의 키 이름과 함께 거부됩니다.
+
 ### EAB (선택)
 
 ```toml
