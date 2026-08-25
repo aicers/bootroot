@@ -469,19 +469,54 @@ other source for it; the protocol module does not read audit, limiter, or
 certificate state. This keeps the container's placement common to all response
 forms and makes each future member addition additive.
 
-The refusal mapping is exhaustive over the current bootroot verb errors:
-label failures map to `ServiceLabelInvalid`; component and instance failures
-map to `ServiceInstanceMismatch`; all three spec conflicts map to
-`ServiceSpecConflict`; collisions and host mismatches map to their matching
-identifiers; the ten configuration failures map to
-`RegistrarUnavailable { reason: NotProvisioned }`; and unavailable, derived
-key, reserved-name, and wrap-TTL failures carry no `error` with retryable
-class. Future post-mint audit, intent-audit, and rate-limit errors are assigned
-respectively to permanent `RegistrarUnavailable` reasons
-`PostMintUnrecordable` and `AuditUnwritable`, and retryable `RegistrarBusy`
-with a whole-second `retry_after` payload. These future internal variants still
-need explicit mapping arms when they are added; identical words on either side
-of the boundary do not imply a name-based shortcut.
+The refusal mapping is exhaustive over the current bootroot verb errors. Every
+row is an explicit `match` arm; there is no wildcard arm. `none` means the
+unclassified form, with no `error` member and class `retryable`.
+
+| Internal variant | Wire identifier | Class |
+| --- | --- | --- |
+| `ReservedServiceName` | none | `retryable` |
+| `Registrar(ConfigUnreadable)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(FingerprintLineMalformed)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(FingerprintMismatch)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(ConfigMalformed)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(UnsupportedSchemaVersion)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(UnknownMultiplicity)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(UnknownReloadKind)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(InvalidReloadTarget)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(InvalidDomain)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(InvalidComponentKey)` | `RegistrarUnavailable { reason: NotProvisioned }` | `permanent` |
+| `Registrar(InvalidServiceName)` | `ServiceLabelInvalid` | `permanent` |
+| `Registrar(InvalidHost)` | `ServiceLabelInvalid` | `permanent` |
+| `Registrar(ComponentNotConfigured)` | `ServiceInstanceMismatch` | `permanent` |
+| `Registrar(ServiceInstanceMismatch)` | `ServiceInstanceMismatch` | `permanent` |
+| `Registrar(DerivedKeyInvalid)` | none | `retryable` |
+| `Registrar(SpecIdentityDisagreement)` | `ServiceSpecConflict` | `permanent` |
+| `Registrar(ServiceSpecOutsideSafeSet)` | `ServiceSpecConflict` | `permanent` |
+| `RegistrationIdCollision` | `ServiceNameCollision` | `permanent` |
+| `StoredSpecConflict` | `ServiceSpecConflict` | `permanent` |
+| `HostMismatch` | `ServiceHostMismatch` | `permanent` |
+| `InvalidWrapTtl(Zero)` | none | `retryable` |
+| `InvalidWrapTtl(Negative)` | none | `retryable` |
+| `InvalidWrapTtl(NotWholeSeconds)` | none | `retryable` |
+| `InvalidWrapTtl(ExceedsOpenBaoRange)` | none | `retryable` |
+| `Unavailable` | none | `retryable` |
+| Future outcome-audit write failure | `RegistrarUnavailable { reason: PostMintUnrecordable }` | `permanent` |
+| Future intent-audit write failure (`AuditUnwritable` when introduced) | `RegistrarUnavailable { reason: AuditUnwritable }` | `permanent` |
+| Future registrar rate-limit refusal | `RegistrarBusy { retry_after }` | `retryable` |
+
+The two named collapses are deliberate: `ServiceSpecConflict` carries
+`SpecIdentityDisagreement`, `ServiceSpecOutsideSafeSet`, and
+`StoredSpecConflict`; `ServiceInstanceMismatch` carries
+`ComponentNotConfigured` and `ServiceInstanceMismatch`. The internal variants
+remain distinct in audit records. `Registrar(DerivedKeyInvalid)` is reachable:
+a ten-digit instance with 63-octet service and host labels produces a 138-octet
+candidate, beyond the 131-octet registration-id limit. Its response omits both
+`registration_id` and `error`.
+
+The final three rows describe variants that do not exist yet. Their introducing
+changes must add explicit mapping arms; matching coincident internal and
+external names is not permitted. The rate-limit payload is whole seconds.
 
 ## 11. Counts
 

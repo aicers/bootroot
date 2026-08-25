@@ -22,6 +22,8 @@ use super::frame::Operation;
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
 use crate::registrar::error::RegistrarError;
 #[cfg(test)]
+use crate::registrar::identity::{derive_registration_id, validate_request_labels};
+#[cfg(test)]
 use crate::registrar::verbs::outcome::{
     CallerIdentity, ProducingArm, RequestId, VerbContext, WrappedSecretIdToken,
 };
@@ -259,7 +261,15 @@ pub(crate) enum EnrollError {
 /// `certificates`, `limiter`, and `audit_capacity` belong to their respective
 /// owner issues.  It is intentionally empty until those owners add members.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RegistrarHealth {}
+pub(crate) struct RegistrarHealth {
+    // Kept private and skipped so `Default` is the only in-crate way to create
+    // the empty v1 snapshot, while its wire representation remains `{}`.
+    #[serde(skip)]
+    _constructor: RegistrarHealthConstructor,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RegistrarHealthConstructor;
 
 /// A response-wrapping token carried only at the serialization boundary.
 ///
@@ -1110,6 +1120,46 @@ mod tests {
             assert_eq!(decoded.error, None);
             assert_eq!(decoded.registration_id, None);
         }
+    }
+
+    #[test]
+    fn derived_key_invalid_from_valid_parts_is_an_unclassified_refusal() {
+        let service_name = "s".repeat(63);
+        let host = "h".repeat(63);
+        let instance = u32::MAX;
+        validate_request_labels(&service_name, &host).expect("request labels are valid");
+
+        let error = derive_registration_id(
+            Multiplicity::ManyPerHost,
+            &service_name,
+            &host,
+            Some(instance),
+        )
+        .expect_err("the 138-octet derived key is invalid");
+        let candidate = match &error {
+            RegistrarError::DerivedKeyInvalid { key, .. } => key.clone(),
+            _ => panic!("valid parts must fail only when deriving the key"),
+        };
+        assert_eq!(candidate.len(), 138);
+
+        let refusal = VerbRefusal::new(
+            fixture_context(None, ProducingArm::Derivation),
+            VerbError::Registrar(error),
+        );
+        let encoded = encode_refusal_response(&refusal, &RegistrarHealth::default())
+            .expect("derivation refusal encodes");
+        let decoded = decode_refusal_response(&encoded).expect("derivation refusal decodes");
+
+        assert_eq!(decoded.request_id, "request-0001");
+        assert_eq!(decoded.registration_id, None);
+        assert_eq!(decoded.class, RefusalClass::Retryable);
+        assert_eq!(decoded.error, None);
+        assert!(
+            !String::from_utf8(encoded)
+                .expect("response is UTF-8 JSON")
+                .contains(&candidate),
+            "the rejected candidate must not reach the response"
+        );
     }
 
     #[test]
