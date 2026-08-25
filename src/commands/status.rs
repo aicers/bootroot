@@ -674,6 +674,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supplied_agent_config_reports_a_populated_store_scan() {
+        use bootroot::registrar::audit::{
+            ACTIVE_FILE_NAME, AuditRecord, AuditVerb, RequestedIdentity,
+        };
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let audit_dir = dir.path().join("registrar-audit");
+        std::fs::create_dir(&audit_dir).expect("create audit directory");
+        let intent = AuditRecord::intent(
+            OffsetDateTime::now_utc() - TimeDuration::minutes(2),
+            "populated-store".to_string(),
+            AuditVerb::Mint,
+            "caller".to_string(),
+            RequestedIdentity {
+                service_name: "api".to_string(),
+                host: "host".to_string(),
+                instance: None,
+            },
+        );
+        let mut active = intent.to_line().expect("serialize audit record");
+        active.extend_from_slice(b"not JSON\n");
+        std::fs::write(audit_dir.join(ACTIVE_FILE_NAME), active).expect("write active file");
+
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config");
+
+        let status = load_audit_status(&status_args_with_agent_config(config), &test_messages())
+            .await
+            .expect("load audit status");
+        let AuditStatus::Scan(scan) = status else {
+            panic!("a populated configured store must be scanned");
+        };
+        assert_eq!(
+            scan,
+            AuditScan {
+                intent_without_outcome: 1,
+                malformed_records: 1,
+                retention_short: false,
+            }
+        );
+    }
+
+    /// A symlinked `audit_record_dir` is the one store defect that
+    /// reaches the scanner: `validate_registrar_settings` compares paths
+    /// lexically and accepts it, and the scanner then refuses it with
+    /// `PathCondition::Symlink`. A mode-based refusal would not do —
+    /// mode bits do not stop a root process, so it would invert between
+    /// a root and a non-root run.
+    #[tokio::test]
+    async fn a_symlinked_store_directory_is_a_failed_audit_status() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let target = dir.path().join("audit-target");
+        std::fs::create_dir(&target).expect("create audit target directory");
+        let audit_dir = dir.path().join("registrar-audit");
+        std::os::unix::fs::symlink(&target, &audit_dir).expect("create audit directory symlink");
+        let config = dir.path().join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n",
+                dir.path().display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config");
+
+        let messages = test_messages();
+        let status = load_audit_status(&status_args_with_agent_config(config), &messages)
+            .await
+            .expect("a refused audit store does not abort status");
+        let AuditStatus::Failed { path, reason } = &status else {
+            panic!("a symlinked store directory must fail the audit status");
+        };
+        assert_eq!(path, &audit_dir);
+        let AuditFailureReason::Diagnostic(diagnostic) = reason else {
+            panic!("a scanner refusal is diagnostic text");
+        };
+        assert!(
+            diagnostic.contains("symbolic link"),
+            "the scanner refusal names its condition: {diagnostic}"
+        );
+
+        let lines = audit_section_lines(&messages, &status);
+        assert_eq!(lines.len(), 2, "a failed scan renders one warning");
+        let warning = lines.get(1).expect("failed audit section has a warning");
+        assert_eq!(
+            warning,
+            &messages
+                .status_warning_audit_scan_failed(&audit_dir.display().to_string(), diagnostic)
+        );
+        assert_ne!(warning, messages.status_audit_not_configured());
+        for count_line in [
+            messages.status_audit_unpaired_intents(0),
+            messages.status_audit_malformed_records(0),
+            messages.status_audit_retention_shortfall(false),
+        ] {
+            assert!(
+                !lines.contains(&count_line),
+                "a failed scan renders no count line: {count_line}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn supplied_agent_config_maps_a_missing_store_to_absent() {
         let dir = tempfile::tempdir().expect("create test directory");
         let audit_dir = dir.path().join("missing-registrar-audit");
@@ -1002,6 +1114,36 @@ mod tests {
             panic!("a join error is diagnostic text");
         };
         assert_eq!(reason, join_error);
+    }
+
+    #[test]
+    fn audit_section_renders_a_clean_scan_without_warnings() {
+        let clean = AuditStatus::Scan(AuditScan {
+            intent_without_outcome: 0,
+            malformed_records: 0,
+            retention_short: false,
+        });
+
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).expect("load test locale");
+            let lines = audit_section_lines(&messages, &clean);
+            assert_eq!(
+                lines,
+                vec![
+                    messages.status_section_registrar_audit().to_string(),
+                    messages.status_audit_unpaired_intents(0),
+                    messages.status_audit_malformed_records(0),
+                    messages.status_audit_retention_shortfall(false),
+                ],
+                "{locale} clean scan renders the heading and three counts only"
+            );
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("WARNING") || line.contains("경고")),
+                "{locale} clean scan renders no warning"
+            );
+        }
     }
 
     #[test]
