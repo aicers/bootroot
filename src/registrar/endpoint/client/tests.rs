@@ -46,6 +46,7 @@ use crate::registrar::endpoint::test_support::{
     CapturedEvent, Pki, TestCa, capture_logs, dns_san, endpoint_name, issue_leaf, key_der,
     registrar_client_name, valid_ca, write_leaf_material,
 };
+use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 
 /// The canned success and refusal payloads, taken from the golden
 /// fixtures the protocol module already round-trips, so a case that
@@ -656,6 +657,42 @@ async fn a_certificate_that_is_not_pem_fails_before_the_dial() {
 }
 
 #[tokio::test]
+async fn a_malformed_block_behind_a_valid_leaf_fails_before_the_dial() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+    // The file opens with the leaf the client would otherwise dial
+    // with, so nothing here is missing: a load that skipped the block
+    // it could not parse would authenticate with that leaf and report
+    // no fault at all.
+    let mut bytes = std::fs::read(&deployment.certificate_path).expect("read the good leaf");
+    bytes.extend_from_slice(
+        b"-----BEGIN CERTIFICATE-----\nthis is not base64 at all !!!\n-----END CERTIFICATE-----\n",
+    );
+    std::fs::write(&deployment.certificate_path, &bytes).expect("write the mixed chain");
+
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a block the parser refuses is a fault in the file");
+
+    assert!(
+        matches!(
+            err,
+            ExchangeError::Material {
+                source: ClientMaterialError::MalformedCertificate { .. }
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        double.observed().connections,
+        0,
+        "a chain with a refused block reached the socket"
+    );
+}
+
+#[tokio::test]
 async fn a_key_that_is_not_a_private_key_fails_before_the_dial() {
     let deployment = Deployment::new();
     let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
@@ -962,6 +999,65 @@ async fn bytes_that_are_not_a_tls_record_produce_the_generic_handshake_variant()
         ),
         "{source:?}"
     );
+}
+
+#[test]
+fn a_signature_failure_after_the_pin_passed_is_not_a_pin_refusal() {
+    let deployment = Deployment::new();
+    // `rustls` checks the peer's `CertificateVerify` signature after
+    // the verifier has already accepted the chain, and reports a bad
+    // one as `InvalidCertificate(BadSignature)`. The pin made no such
+    // decision, so the wrapper alone must not select the pin-refusal
+    // variant — and this case is not reachable from the double, which
+    // signs correctly with the key its own leaf carries.
+    let err = deployment
+        .client()
+        .classify_handshake(io::Error::other(rustls::Error::from(
+            rustls::CertificateError::BadSignature,
+        )));
+
+    let ExchangeError::Handshake { source } = err else {
+        panic!("expected the generic handshake failure, saw {err:?}");
+    };
+    assert!(
+        matches!(
+            recovered(&source),
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            ))
+        ),
+        "the recovered error is carried verbatim: {source:?}"
+    );
+}
+
+#[test]
+fn a_verifier_rejection_selects_the_pin_refusal_variant() {
+    let deployment = Deployment::new();
+    // The other half of the rule above, asserted through the same
+    // seam: every rejection `endpoint_pin`'s verifier can reach is a
+    // pin refusal here, whichever `CertificateError` it maps onto.
+    for rejection in [
+        EndpointVerifyRejection::SanMismatch,
+        EndpointVerifyRejection::AnchorMismatch,
+        EndpointVerifyRejection::AnchorNotCa,
+        EndpointVerifyRejection::AnchorExpired,
+        EndpointVerifyRejection::AnchorNotYetValid,
+        EndpointVerifyRejection::AnchorMalformed,
+        EndpointVerifyRejection::ChainVerificationFailed,
+    ] {
+        let err = deployment
+            .client()
+            .classify_handshake(io::Error::other(rustls::Error::from(rejection)));
+        let ExchangeError::PinRefused {
+            expected_name,
+            source,
+        } = err
+        else {
+            panic!("expected the pin refusal for {rejection:?}, saw {err:?}");
+        };
+        assert_eq!(expected_name, endpoint_name());
+        assert_eq!(source, rustls::Error::from(rejection));
+    }
 }
 
 #[tokio::test(start_paused = true)]

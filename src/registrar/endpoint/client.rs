@@ -173,6 +173,16 @@ pub(crate) enum ClientMaterialError {
         /// The path that was handed to the client.
         path: PathBuf,
     },
+    /// The certificate file holds a PEM block the parser refused.
+    ///
+    /// Distinct from [`ClientMaterialError::NoCertificate`] because the
+    /// file is not empty of certificates — it is wrong — and distinct
+    /// from silence because a refused block is never skipped over.
+    #[error("registrar client certificate {} holds a malformed PEM block", .path.display())]
+    MalformedCertificate {
+        /// The path that was handed to the client.
+        path: PathBuf,
+    },
     /// The key file holds no PEM private key.
     #[error("registrar client key {} holds no PEM private key", .path.display())]
     NoPrivateKey {
@@ -232,6 +242,18 @@ pub(crate) enum ExchangeError {
         /// Which half of the pair, and how.
         #[source]
         source: ClientMaterialError,
+    },
+    /// The per-dial load never reported back.
+    ///
+    /// It runs on Tokio's blocking pool, so this is the hand-off itself
+    /// failing rather than any file being wrong: the runtime shut down
+    /// with the load still queued, or the load panicked. Neither is a
+    /// statement about the endpoint, and no connection was opened.
+    #[error("the registrar endpoint dial configuration was never loaded: {source}")]
+    LoadAbandoned {
+        /// Why the blocking task produced no result.
+        #[source]
+        source: tokio::task::JoinError,
     },
     /// The encoded request is longer than the envelope admits. Refused
     /// locally, before the dial.
@@ -507,7 +529,7 @@ impl RegistrarEndpointClient {
         let payload = protocol::encode_request(request).map_err(codec)?;
         let request_frame = frame::encode_request_frame(operation, &payload)
             .map_err(|source| ExchangeError::RequestTooLarge { source })?;
-        let config = self.dial_config()?;
+        let config = self.dial_config().await?;
 
         debug!(
             operation = operation.as_str(),
@@ -548,28 +570,45 @@ impl RegistrarEndpointClient {
     /// unreadable or malformed is a typed failure of the dial rather
     /// than a panic or a fallback, and a renewed pair is picked up
     /// without a restart.
-    fn dial_config(&self) -> Result<ClientConfig, ExchangeError> {
-        let (chain, key) =
-            load_client_material(&self.certificate_path, &self.key_path).map_err(|source| {
-                warn!(
-                    certificate = %self.certificate_path.display(),
-                    key = %self.key_path.display(),
-                    "Registrar client material could not be loaded: {source}"
-                );
-                ExchangeError::Material { source }
-            })?;
-        build_client_config(&self.pin_file, &self.expected_endpoint_name, chain, key).map_err(
-            |err| match err {
-                ClientConfigError::Pin(source) => ExchangeError::Pin { source },
-                ClientConfigError::ClientAuth(source) => ExchangeError::Material {
-                    source: ClientMaterialError::Unusable {
-                        certificate_path: self.certificate_path.clone(),
-                        key_path: self.key_path.clone(),
-                        source,
-                    },
-                },
-            },
-        )
+    ///
+    /// Those three reads are the only blocking syscalls on the dial
+    /// path, and they are outside both exchange timeouts — the connect
+    /// budget starts after this returns — so a filesystem that answers
+    /// slowly, or a path that turns out to be a FIFO, would otherwise
+    /// hold a runtime worker for as long as it liked. They run on the
+    /// blocking pool for that reason, together with the key parsing
+    /// `with_client_auth_cert` does, rather than each read being made
+    /// async separately: the pin file is read inside
+    /// [`endpoint_pin::endpoint_server_verifier`], whose signature this
+    /// issue leaves alone.
+    async fn dial_config(&self) -> Result<ClientConfig, ExchangeError> {
+        let pin_file = self.pin_file.clone();
+        let expected_endpoint_name = self.expected_endpoint_name.clone();
+        let certificate_path = self.certificate_path.clone();
+        let key_path = self.key_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            load_dial_config(
+                &pin_file,
+                &expected_endpoint_name,
+                &certificate_path,
+                &key_path,
+            )
+        })
+        .await
+        .map_err(|source| ExchangeError::LoadAbandoned { source })?;
+        if let Err(ExchangeError::Material { source }) = &loaded {
+            // Emitted here rather than inside the closure: a
+            // `tracing` subscriber installed for one thread — which is
+            // what `tracing::subscriber::set_default` gives, and what
+            // this module's tests capture with — does not see an event
+            // a blocking-pool thread records.
+            warn!(
+                certificate = %self.certificate_path.display(),
+                key = %self.key_path.display(),
+                "Registrar client material could not be loaded: {source}"
+            );
+        }
+        loaded
     }
 
     /// Completes the handshake, writes the one request and reads the one
@@ -607,22 +646,61 @@ impl RegistrarEndpointClient {
     /// `tokio_rustls` wraps the `rustls::Error` the verifier produced in
     /// an [`io::Error`]; recovering it is the same downcast
     /// `serve::handshake_failure_label` performs on the server side, so
-    /// one rule decides both directions. Every
-    /// [`endpoint_pin::EndpointVerifyRejection`] maps onto an
-    /// `InvalidCertificate(_)`, and nothing else the handshake can fail
-    /// with does.
+    /// one rule decides both directions.
+    ///
+    /// What the recovered error is then asked is
+    /// [`endpoint_pin::is_endpoint_verify_rejection`] rather than the
+    /// bare `InvalidCertificate(_)` the server side asks. The two
+    /// questions are not the same one: the server's verifier is
+    /// `WebPkiClientVerifier`, whose decision is the whole of the
+    /// caller's chain check, while this client verifies the peer and
+    /// then goes on to check its `CertificateVerify` signature — and
+    /// `rustls` reports a bad one as `InvalidCertificate(BadSignature)`,
+    /// after the pin has already passed. That is a handshake failure the
+    /// pin did not cause, which is exactly what the generic variant is
+    /// for, so the predicate that owns the rejection mapping decides it
+    /// instead of the wrapper.
     fn classify_handshake(&self, err: io::Error) -> ExchangeError {
         match err
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>())
         {
-            Some(source @ rustls::Error::InvalidCertificate(_)) => ExchangeError::PinRefused {
-                expected_name: self.expected_endpoint_name.clone(),
-                source: source.clone(),
-            },
+            Some(source) if endpoint_pin::is_endpoint_verify_rejection(source) => {
+                ExchangeError::PinRefused {
+                    expected_name: self.expected_endpoint_name.clone(),
+                    source: source.clone(),
+                }
+            }
             _ => ExchangeError::Handshake { source: err },
         }
     }
+}
+
+/// The whole per-dial load, in one blocking call.
+///
+/// [`RegistrarEndpointClient::dial_config`] hands this to the blocking
+/// pool. Kept as a free function taking owned paths so that it can be
+/// moved into the closure, and so the three reads it performs — the
+/// certificate, the key and, inside the verifier, the pin file — stay in
+/// one place.
+fn load_dial_config(
+    pin_file: &Path,
+    expected_endpoint_name: &str,
+    certificate_path: &Path,
+    key_path: &Path,
+) -> Result<ClientConfig, ExchangeError> {
+    let (chain, key) = load_client_material(certificate_path, key_path)
+        .map_err(|source| ExchangeError::Material { source })?;
+    build_client_config(pin_file, expected_endpoint_name, chain, key).map_err(|err| match err {
+        ClientConfigError::Pin(source) => ExchangeError::Pin { source },
+        ClientConfigError::ClientAuth(source) => ExchangeError::Material {
+            source: ClientMaterialError::Unusable {
+                certificate_path: certificate_path.to_path_buf(),
+                key_path: key_path.to_path_buf(),
+                source,
+            },
+        },
+    })
 }
 
 /// Builds the pinned, authenticating client configuration.
@@ -698,10 +776,19 @@ fn load_client_material(
         }
     })?;
 
+    // Collected as a `Result` rather than flattened: a block this
+    // parser refuses is a fault in the file, and dropping it would
+    // authenticate with whatever else the file happened to hold — a
+    // valid leaf followed by a corrupt block would dial with the leaf
+    // alone and report nothing. The parser's own complaint is not
+    // carried: a certificate path can be misconfigured onto a key file,
+    // and `rustls_pemfile` quotes the offending line.
     let chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut io::BufReader::new(certificate_bytes.as_slice()))
-            .flatten()
-            .collect();
+            .collect::<Result<_, io::Error>>()
+            .map_err(|_source| ClientMaterialError::MalformedCertificate {
+                path: certificate_path.to_path_buf(),
+            })?;
     if chain.is_empty() {
         return Err(ClientMaterialError::NoCertificate {
             path: certificate_path.to_path_buf(),

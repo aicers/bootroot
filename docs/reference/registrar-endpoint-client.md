@@ -65,7 +65,15 @@ key, and holds no second copy of either rule.
 Both halves are rebuilt **on every dial**, so the pin file and the client pair
 are re-read every time. A pin file that is missing, unreadable or malformed is
 a typed failure of the dial — never a fallback to trusting whatever the peer
-presents.
+presents. So is a certificate file holding a PEM block the parser refuses: a
+refused block is never skipped over, because a file whose valid leaf is
+followed by a corrupt one would otherwise dial with the leaf alone and report
+nothing.
+
+Those three reads sit outside both timeouts below — the connect budget starts
+once the configuration is in hand — so they run on the runtime's blocking pool
+rather than on a worker thread, where a filesystem answering slowly could hold
+one for as long as it liked.
 
 The name handed to the TLS connector is inert: a handshake over `AF_UNIX` has
 no hostname to match against, so the verifier ignores the dialed name and
@@ -76,6 +84,15 @@ a SAN other than the expected name — fails the dial before a request byte is
 written, with its own error variant naming the **expected** name. The client
 does not parse the peer's certificate, so it does not report the name the
 server actually presented.
+
+That variant is selected by asking whether the recovered `rustls::Error` is one
+the endpoint's verifier could itself have produced, and not by the
+`InvalidCertificate` wrapper alone. The wrapper does not separate the two: the
+peer's `CertificateVerify` signature is checked *after* the verifier has
+already accepted the chain, and a bad one is reported as
+`InvalidCertificate(BadSignature)`. That is a handshake failure the pin did not
+cause, so it reaches the generic handshake variant. The predicate lives beside
+the rejection mapping in `endpoint_pin`, so the two move together.
 
 ## 4. The two timeouts and the response bound
 
