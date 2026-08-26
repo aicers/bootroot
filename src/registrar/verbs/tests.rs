@@ -2478,10 +2478,14 @@ fn identity_pre_decision_cases() -> Vec<PreDecisionCase> {
 /// One case per [`WrapTtlRefusal`] variant, because each is a distinct
 /// answer the caller earned and the limiter must hand back unchanged.
 ///
-/// The set is built by matching over the variants rather than by
-/// listing four cases, so "one per variant" is what the compiler
-/// enforces rather than what this comment asserts: a fifth variant
-/// fails to build here until it is given the request that provokes it.
+/// The request each case sends is chosen by matching over the variants
+/// rather than written out beside them, so a fifth variant fails to
+/// build here until someone writes the request that provokes it.
+///
+/// The list below is the one part the compiler cannot hold: nothing in
+/// Rust enumerates an enum's variants without a derive, so a variant
+/// given a match arm and left out of this list would build and cover
+/// nothing. The arm is what sends whoever adds it here.
 fn wrap_ttl_pre_decision_cases() -> Vec<PreDecisionCase> {
     [
         WrapTtlRefusal::Zero,
