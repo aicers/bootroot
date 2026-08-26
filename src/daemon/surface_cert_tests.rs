@@ -160,6 +160,47 @@ impl Deployment {
         std::fs::write(&self.server_key, key).expect("write server key");
     }
 
+    /// Lays out the bootroot-internal credential set and the
+    /// deployment's active root, with the credential's *stored*
+    /// fingerprint naming `stored_root`.
+    ///
+    /// Passing a CA other than this deployment's own is the middle of a
+    /// full trust rotation: the stored fingerprint still names the root
+    /// the `auth/cert` entry was built for while the active root has
+    /// already moved on.
+    fn seed_internal_credential(&self, stored_root: &TestCa) {
+        let secrets_dir = self.secrets_dir();
+        let active = crate::registrar::internal::active_root_cert_path(&secrets_dir);
+        std::fs::create_dir_all(active.parent().expect("certs dir")).expect("certs dir");
+        std::fs::write(&active, self.ca.pem()).expect("write the active root");
+
+        let internal = InternalPaths::new(&secrets_dir);
+        let key = rcgen::KeyPair::generate().expect("generate key");
+        let (chain, _) = issue_leaf_pem(&self.ca, &client_name(), (2020, 1, 1), (2099, 1, 1));
+        std::fs::write(internal.key(), key.serialize_pem()).expect("write key");
+        std::fs::write(internal.chain(), chain).expect("write chain");
+        std::fs::write(internal.acme_account(), key.serialize_pem()).expect("write account key");
+        std::fs::write(internal.ca_bundle(), self.ca.pem()).expect("write internal bundle");
+        std::fs::write(
+            internal.root_fingerprint(),
+            crate::tls::sha256_hex(stored_root.der()),
+        )
+        .expect("write stored root fingerprint");
+    }
+
+    fn secrets_dir(&self) -> PathBuf {
+        let state_file = self
+            .settings
+            .registrar
+            .state_file
+            .as_deref()
+            .expect("state file");
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_file).expect("read state"))
+                .expect("state json");
+        PathBuf::from(state["secrets_dir"].as_str().expect("secrets_dir"))
+    }
+
     fn snapshot(&self) -> Vec<Vec<u8>> {
         [
             &self.client_cert,
@@ -298,6 +339,45 @@ fn unusable_seeds() -> Vec<(&'static str, Box<dyn Fn(&Deployment)>)> {
     ]
 }
 
+/// A credential whose stored root is no longer the deployment's active
+/// one refuses an endpoint-enabled start that needs issuance, with the
+/// credential's own repair diagnostic — neither retried around nor
+/// proceeded past. Between the middle and the tail of a full trust
+/// rotation that window is deliberate: a leaf issued into it would chain
+/// to a root the `auth/cert` entry does not yet trust, so finishing the
+/// rotation is the remedy rather than anything issuance could do.
+#[tokio::test]
+async fn a_superseded_internal_credential_refuses_with_its_own_repair_diagnostic() {
+    let deployment = Deployment::new();
+    deployment.seed_both_pairs();
+    let superseded = generate_ca("Superseded Root");
+    deployment.seed_internal_credential(&superseded);
+    // Expire one leaf so issuance is genuinely needed: with both pairs
+    // usable the credential is never loaded at all.
+    let (leaf, key) = issue_leaf_pem(&deployment.ca, &client_name(), (2020, 1, 1), (2021, 1, 1));
+    std::fs::write(&deployment.client_cert, leaf).expect("write expired leaf");
+    std::fs::write(&deployment.client_key, key).expect("write expired key");
+    let before = deployment.snapshot();
+
+    let err = ensure_registrar_surface_certificates(&deployment.settings, false)
+        .await
+        .expect_err("a superseded credential refuses the start");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("bootroot rotate registrar-internal-credential"),
+        "the credential's own repair diagnostic reaches the operator: {rendered}"
+    );
+    assert!(
+        rendered.contains(&crate::tls::sha256_hex(superseded.der())),
+        "the stored root is named: {rendered}"
+    );
+    assert_eq!(
+        deployment.snapshot(),
+        before,
+        "nothing is issued or written inside a rotation window"
+    );
+}
+
 /// A rendered internal config that fails the loader's invariants refuses
 /// the start naming that path and the reason, with no name composed from
 /// a guessed label.
@@ -305,16 +385,7 @@ fn unusable_seeds() -> Vec<(&'static str, Box<dyn Fn(&Deployment)>)> {
 async fn an_unusable_internal_config_refuses_and_names_the_path() {
     let deployment = Deployment::new();
     deployment.seed_both_pairs();
-    let state_file = deployment
-        .settings
-        .registrar
-        .state_file
-        .as_deref()
-        .expect("state file");
-    let state: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(state_file).expect("read state"))
-            .expect("state json");
-    let secrets_dir = PathBuf::from(state["secrets_dir"].as_str().expect("secrets_dir"));
+    let secrets_dir = deployment.secrets_dir();
     let internal = InternalPaths::new(&secrets_dir);
 
     for body in ["not toml at all {{{", ""] {

@@ -502,24 +502,13 @@ pub async fn ensure_surface_certificates(
             )
         })?;
 
-    let now = OffsetDateTime::now_utc();
-    let bundle = settings.trust.ca_bundle_path.as_deref();
-    let pending: Vec<(PairPaths, String, UnusableMaterial)> = [client_paths, endpoint_paths]
-        .into_iter()
-        .filter_map(|paths| {
-            let name = paths.leaf.identity(&host, &settings.domain);
-            match evaluate_pair(&paths.cert, &paths.key, &name, bundle, now) {
-                Usability::Usable => {
-                    info!(
-                        "Registrar surface leaf {name} at {} is usable; leaving it as it is.",
-                        paths.cert.display()
-                    );
-                    None
-                }
-                Usability::Unusable(reason) => Some((paths, name, reason)),
-            }
-        })
-        .collect();
+    let pending = pending_issuances(
+        [client_paths, endpoint_paths],
+        &host,
+        &settings.domain,
+        settings.trust.ca_bundle_path.as_deref(),
+        OffsetDateTime::now_utc(),
+    );
     if pending.is_empty() {
         return Ok(());
     }
@@ -549,6 +538,42 @@ pub async fn ensure_surface_certificates(
         .await?;
     }
     Ok(())
+}
+
+/// Selects which of the two pairs need issuing, in the order they are
+/// issued.
+///
+/// The two are evaluated **independently**, and returning the selection
+/// rather than acting on it is what lets that be asserted with no CA in
+/// the loop: one pair being usable never puts the other on this list,
+/// and one pair being unusable never keeps the other off it. A usable
+/// pair is absent from the result and is therefore never written to —
+/// re-issuing it would churn a file the co-located registrar is reading
+/// and hand that process a new key on every restart.
+#[must_use]
+fn pending_issuances(
+    pairs: [PairPaths; 2],
+    host: &str,
+    domain: &str,
+    ca_bundle_path: Option<&Path>,
+    now: OffsetDateTime,
+) -> Vec<(PairPaths, String, UnusableMaterial)> {
+    pairs
+        .into_iter()
+        .filter_map(|paths| {
+            let name = paths.leaf.identity(host, domain);
+            match evaluate_pair(&paths.cert, &paths.key, &name, ca_bundle_path, now) {
+                Usability::Usable => {
+                    info!(
+                        "Registrar surface leaf {name} at {} is usable; leaving it as it is.",
+                        paths.cert.display()
+                    );
+                    None
+                }
+                Usability::Unusable(reason) => Some((paths, name, reason)),
+            }
+        })
+        .collect()
 }
 
 /// Reads the EAB and the responder HMAC through the bootroot-internal

@@ -338,11 +338,10 @@ Two consequences worth stating:
   certificate under its own credential, it needs nothing from the registrar to
   do so: a leaf that is **already expired when bootrootd starts is repaired at
   that start**, before the registrar endpoint loads its TLS material — not by
-  re-provisioning the host. (An earlier
-  draft said the sole recovery was re-running bootler; that was the
-  pre-self-issue model and is wrong under this decision. bootler provisions
-  the **initial** certificate and nothing more. RFC-E §9's `CredentialInvalid`
-  remedy names bootrootd for the same reason.)
+  re-provisioning the host. (An earlier draft said the sole recovery was
+  re-running bootler; that was the pre-self-issue model and is wrong under this
+  decision. bootler provisions the **initial** certificate and nothing more.
+  RFC-E §9's `CredentialInvalid` remedy names bootrootd for the same reason.)
   **The renewal needs a reload contract or it fails exactly as this deployment
   has already failed once:** the daemon writes a renewed certificate to disk
   and, absent a handoff, **nothing tells roxyd to reload it**, so roxyd keeps

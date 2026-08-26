@@ -224,8 +224,6 @@ fn unreadable_material_is_classified_unreadable() {
     use std::os::unix::fs::PermissionsExt as _;
 
     if nix_running_as_root() {
-        // Mode bits do not stop uid 0, so this test can only assert what
-        // it is about where it is not root.
         return;
     }
     let ca = generate_ca("Unreadable CA");
@@ -247,11 +245,11 @@ fn unreadable_material_is_classified_unreadable() {
     std::fs::set_permissions(&disk.key, std::fs::Permissions::from_mode(0o600)).expect("restore");
 }
 
+/// Mode bits do not stop uid 0, so the two tests that make a file
+/// unreadable can only assert what they are about where this is false.
 #[cfg(unix)]
 fn nix_running_as_root() -> bool {
-    // SAFETY: `geteuid` reads this process's effective uid and cannot
-    // fail, take a pointer, or mutate anything.
-    unsafe { libc::geteuid() == 0 }
+    crate::fs_util::current_process_euid() == 0
 }
 
 /// Condition 3, and the classification acceptance criterion: a renewal
@@ -474,6 +472,149 @@ fn every_unusable_state_reports_that_issuance_is_needed() {
         assert!(Usability::Unusable(reason).needs_issuance(), "{reason:?}");
     }
     assert!(!Usability::Usable.needs_issuance());
+}
+
+// ---------------------------------------------------------------------
+// The two pairs are independent
+// ---------------------------------------------------------------------
+
+/// Both pairs of one host, sharing a CA and a bundle, so a pair can be
+/// broken without disturbing the other.
+struct BothPairs {
+    _dir: TempDir,
+    ca: TestCa,
+    bundle: PathBuf,
+    client: (PathBuf, PathBuf),
+    endpoint: (PathBuf, PathBuf),
+}
+
+impl BothPairs {
+    fn usable() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = generate_ca("Independence CA");
+        let bundle = dir.path().join("ca-bundle.pem");
+        std::fs::write(&bundle, ca.pem()).expect("write bundle");
+        let client = (
+            dir.path().join("registrar-client.crt"),
+            dir.path().join("registrar-client.key"),
+        );
+        let endpoint = (
+            dir.path().join("registrar-endpoint.crt"),
+            dir.path().join("registrar-endpoint.key"),
+        );
+        let pairs = Self {
+            _dir: dir,
+            ca,
+            bundle,
+            client,
+            endpoint,
+        };
+        pairs.seed(SurfaceLeaf::Client);
+        pairs.seed(SurfaceLeaf::Endpoint);
+        pairs
+    }
+
+    fn paths(&self, leaf: SurfaceLeaf) -> PairPaths {
+        let (cert, key) = match leaf {
+            SurfaceLeaf::Client => &self.client,
+            SurfaceLeaf::Endpoint => &self.endpoint,
+        };
+        PairPaths {
+            leaf,
+            cert: cert.clone(),
+            key: key.clone(),
+        }
+    }
+
+    fn seed(&self, leaf: SurfaceLeaf) {
+        let paths = self.paths(leaf);
+        let (cert, key) = issue_leaf_pem(
+            &self.ca,
+            &leaf.identity(TEST_HOST, TEST_DOMAIN),
+            (2020, 1, 1),
+            (2099, 1, 1),
+        );
+        std::fs::write(&paths.cert, cert).expect("write leaf");
+        std::fs::write(&paths.key, key).expect("write key");
+    }
+
+    /// Replaces one pair with a leaf that expired years ago, leaving the
+    /// other exactly as it was.
+    fn expire(&self, leaf: SurfaceLeaf) {
+        let paths = self.paths(leaf);
+        let (cert, key) = issue_leaf_pem(
+            &self.ca,
+            &leaf.identity(TEST_HOST, TEST_DOMAIN),
+            (2020, 1, 1),
+            (2021, 1, 1),
+        );
+        std::fs::write(&paths.cert, cert).expect("write leaf");
+        std::fs::write(&paths.key, key).expect("write key");
+    }
+
+    fn pending(&self) -> Vec<(PairPaths, String, UnusableMaterial)> {
+        pending_issuances(
+            [
+                self.paths(SurfaceLeaf::Client),
+                self.paths(SurfaceLeaf::Endpoint),
+            ],
+            TEST_HOST,
+            TEST_DOMAIN,
+            Some(&self.bundle),
+            now(),
+        )
+    }
+}
+
+/// With both pairs usable nothing is selected, so the function returns
+/// before any `OpenBao` call or CA request is reached at all.
+#[test]
+fn both_pairs_usable_selects_neither() {
+    assert!(BothPairs::usable().pending().is_empty());
+}
+
+/// One pair unusable puts **only** that pair on the list. The usable one
+/// is never written to, which is what leaves it byte-identical after the
+/// other has been issued — "no CA request" is a property of the
+/// both-usable case, never a reason to skip issuing the other pair.
+#[test]
+fn one_unusable_pair_selects_only_itself() {
+    for leaf in [SurfaceLeaf::Client, SurfaceLeaf::Endpoint] {
+        let pairs = BothPairs::usable();
+        let untouched = match leaf {
+            SurfaceLeaf::Client => SurfaceLeaf::Endpoint,
+            SurfaceLeaf::Endpoint => SurfaceLeaf::Client,
+        };
+        let before = std::fs::read(&pairs.paths(untouched).cert).expect("read the usable leaf");
+        pairs.expire(leaf);
+
+        let pending = pairs.pending();
+        assert_eq!(pending.len(), 1, "{leaf:?}");
+        let (paths, name, reason) = pending.into_iter().next().expect("one pending pair");
+        assert_eq!(paths.leaf, leaf);
+        assert_eq!(name, leaf.identity(TEST_HOST, TEST_DOMAIN));
+        assert_eq!(reason, UnusableMaterial::Expired);
+        assert_eq!(
+            std::fs::read(&pairs.paths(untouched).cert).expect("read the usable leaf"),
+            before,
+            "{untouched:?} is not selected and so is left byte-identical"
+        );
+    }
+}
+
+/// Both unusable selects both, in the order they are issued: the client
+/// pair first, then the endpoint's.
+#[test]
+fn both_pairs_unusable_selects_both_in_issuance_order() {
+    let pairs = BothPairs::usable();
+    pairs.expire(SurfaceLeaf::Client);
+    pairs.expire(SurfaceLeaf::Endpoint);
+    let selected: Vec<SurfaceLeaf> = pairs
+        .pending()
+        .into_iter()
+        .map(|(paths, _, _)| paths.leaf)
+        .collect();
+    assert_eq!(selected, vec![SurfaceLeaf::Client, SurfaceLeaf::Endpoint]);
 }
 
 // ---------------------------------------------------------------------
