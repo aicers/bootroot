@@ -2106,45 +2106,193 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
         settings.validate().unwrap();
     }
 
-    /// The whole `[registrar]` table, exactly as the configuration
-    /// manual shows it, loads with every key reaching its own field.
+    /// The configuration manuals whose documented `[registrar]` table
+    /// the tests below read, relative to the crate root.
+    const CONFIGURATION_MANUALS: [&str; 2] =
+        ["docs/en/configuration.md", "docs/ko/configuration.md"];
+
+    /// The heading anchor of the manual section holding the audit-record
+    /// and rate-limit `[registrar]` block.
     ///
-    /// The manual prints all twelve keys in **one** TOML block, because
-    /// TOML refuses a table declared twice and a reader pastes what the
-    /// page shows. `deny_unknown_fields` is what makes that block a
-    /// promise rather than a hope: a key renamed here without the page
-    /// following fails this test rather than silently doing nothing in
-    /// an operator's file.
-    #[test]
-    fn the_documented_registrar_table_loads_as_one_block() {
+    /// Both manuals carry a second `[registrar]` block further down —
+    /// the verb-provisioning one, which sets `state_file` and the TTLs
+    /// and is deliberately not a statement of defaults. Selecting by
+    /// section rather than by a key inside the block is what keeps the
+    /// two apart without naming a key that a rename could move: the
+    /// English heading slugifies to this anchor, and the Korean heading
+    /// declares it explicitly.
+    const REGISTRAR_AUDIT_SECTION_ANCHOR: &str = "registrar-audit-records";
+
+    fn manual_path(relative: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    /// Returns the anchor a Markdown heading line resolves to: the
+    /// explicit `{#anchor}` where one is written, and the slug `MkDocs`
+    /// derives from the heading text otherwise.
+    fn heading_anchor(line: &str) -> String {
+        let text = line.trim_start_matches('#').trim();
+        if let Some(rest) = text.strip_suffix('}')
+            && let Some((_, anchor)) = rest.rsplit_once("{#")
+        {
+            return anchor.to_string();
+        }
+        let mut anchor = String::new();
+        for character in text.chars() {
+            if character.is_alphanumeric() {
+                anchor.extend(character.to_lowercase());
+            } else if character.is_whitespace() && !anchor.ends_with('-') {
+                anchor.push('-');
+            }
+        }
+        anchor.trim_matches('-').to_string()
+    }
+
+    /// Reads the first fenced TOML block of the section `anchor` names
+    /// out of the manual at `path`, stripping the fence delimiters and
+    /// nothing else.
+    ///
+    /// Comments and blank lines are part of what an operator would
+    /// paste, so they stay in: what this returns is the page's bytes,
+    /// not a transcription of them.
+    fn documented_toml_block(path: &std::path::Path, anchor: &str) -> String {
+        let manual = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+        let mut lines = manual.lines();
+        lines
+            .by_ref()
+            .find(|line| line.starts_with('#') && heading_anchor(line) == anchor)
+            .unwrap_or_else(|| panic!("{} has no section anchored #{anchor}", path.display()));
+
+        let mut block = String::new();
+        let mut inside = false;
+        for line in lines {
+            if inside {
+                if line.trim_end() == "```" {
+                    return block;
+                }
+                block.push_str(line);
+                block.push('\n');
+            } else if line.trim_end() == "```toml" {
+                inside = true;
+            } else {
+                assert!(
+                    !line.starts_with('#'),
+                    "{}: section #{anchor} ends before any TOML block",
+                    path.display()
+                );
+            }
+        }
+        panic!(
+            "{}: the TOML block under #{anchor} is unterminated",
+            path.display()
+        );
+    }
+
+    /// The keys a documented TOML block assigns, in the order the page
+    /// prints them, ignoring the commented-out ones.
+    fn assigned_keys(block: &str) -> Vec<&str> {
+        block
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                (!line.starts_with('#'))
+                    .then(|| line.split_once(" = "))
+                    .flatten()
+                    .map(|(key, _)| key)
+            })
+            .collect()
+    }
+
+    /// Writes `block` into a fresh configuration file beneath a minimal
+    /// profile and loads it.
+    fn load_with_registrar_block(block: &str) -> Result<Settings, ConfigError> {
         let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         write_minimal_profile_config(&mut file);
-        writeln!(
-            file,
-            r#"
-[registrar]
-audit_store_dir = "/var/lib/bootroot/audit-store"
-audit_store_reserve_bytes = 2147483648
-audit_store_low_water_bytes = 536870912
-audit_store_enforcement = "filesystem"
-audit_record_dir = "/var/lib/bootroot/audit-store/records"
-audit_max_file_bytes = 8388608
-audit_max_retained_files = 16
-audit_min_retain_days = 90
-rate_limit_admission_burst = 512
-rate_limit_admission_refill_interval_ms = 500
-rate_limit_predecision_refusal_burst = 32
-rate_limit_predecision_refusal_refill_interval_ms = 1000
-"#
-        )
-        .unwrap();
+        writeln!(file, "\n{block}").unwrap();
         file.flush().unwrap();
-        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
-        // The documented block is the shipped defaults written out, so
-        // stating it explicitly must land exactly where leaving the
-        // table out does.
-        assert_eq!(settings.registrar, RegistrarSettings::default());
-        settings.validate().unwrap();
+        Settings::from_file(Some(file.path().to_path_buf()))
+    }
+
+    /// The whole audit-record and rate-limit `[registrar]` table, read
+    /// out of each configuration manual rather than transcribed here,
+    /// loads with every key reaching its own field.
+    ///
+    /// Each manual prints all twelve keys in **one** TOML block, because
+    /// TOML refuses a table declared twice and a reader pastes what the
+    /// page shows. Parsing the page itself is what makes that block a
+    /// promise rather than a hope: with the block copied into this file,
+    /// a rename could leave either manual stale and nothing would notice.
+    #[test]
+    fn the_documented_registrar_table_loads_as_one_block() {
+        for manual in CONFIGURATION_MANUALS {
+            let block = documented_toml_block(&manual_path(manual), REGISTRAR_AUDIT_SECTION_ANCHOR);
+            assert!(
+                block.starts_with("[registrar]\n"),
+                "{manual}: the documented block must open the [registrar] table"
+            );
+            assert!(
+                !assigned_keys(&block).contains(&"state_file"),
+                "{manual}: this is the provisioning block, not the audit-record one"
+            );
+            let settings = load_with_registrar_block(&block)
+                .unwrap_or_else(|err| panic!("{manual}: the documented block must load: {err}"));
+            // The documented block is the shipped defaults written out,
+            // so stating it explicitly must land exactly where leaving
+            // the table out does.
+            assert_eq!(
+                settings.registrar,
+                RegistrarSettings::default(),
+                "{manual}: the documented values are the defaults"
+            );
+            settings.validate().unwrap();
+        }
+    }
+
+    /// The manual is the input, key by key: renaming one in a temporary
+    /// copy of the page changes what this test parses, and the load then
+    /// fails through the `deny_unknown_fields` handling naming the key
+    /// the page invented.
+    #[test]
+    fn a_key_renamed_in_a_documented_registrar_table_fails_the_load() {
+        const RENAMED_SUFFIX: &str = "_renamed";
+
+        for manual in CONFIGURATION_MANUALS {
+            let source = std::fs::read_to_string(manual_path(manual)).unwrap();
+            let published =
+                documented_toml_block(&manual_path(manual), REGISTRAR_AUDIT_SECTION_ANCHOR);
+            let keys = assigned_keys(&published);
+            assert_eq!(keys.len(), 12, "{manual}: the block prints all twelve keys");
+
+            for key in keys {
+                let edited_block = published.replace(
+                    &format!("\n{key} = "),
+                    &format!("\n{key}{RENAMED_SUFFIX} = "),
+                );
+                assert_ne!(edited_block, published, "{manual}: {key} must have moved");
+                let dir = tempfile::tempdir().unwrap();
+                let edited_manual = dir.path().join("configuration.md");
+                std::fs::write(&edited_manual, source.replace(&published, &edited_block)).unwrap();
+
+                // Reading the edited copy back proves the extraction is
+                // what feeds the load: the block this test parses is the
+                // one on the page in front of it.
+                let extracted =
+                    documented_toml_block(&edited_manual, REGISTRAR_AUDIT_SECTION_ANCHOR);
+                assert_eq!(
+                    extracted, edited_block,
+                    "{manual}: {key} edit must be read back"
+                );
+
+                let error = load_with_registrar_block(&extracted)
+                    .err()
+                    .unwrap_or_else(|| panic!("{manual}: a renamed {key} must not load"));
+                assert!(
+                    format!("{error}").contains(&format!("{key}{RENAMED_SUFFIX}")),
+                    "{manual}: the error must name the key the page invented: {error}"
+                );
+            }
+        }
     }
 
     /// Zero disables or inverts the limiter, so each of the four keys
