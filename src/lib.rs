@@ -17,7 +17,7 @@ pub mod locale;
 pub mod openbao;
 pub mod profile;
 pub mod registrar;
-pub mod registrar_certs;
+pub(crate) mod registrar_certs;
 pub mod secret;
 pub mod service_material;
 pub mod tls;

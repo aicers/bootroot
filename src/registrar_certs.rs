@@ -108,13 +108,26 @@ pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
 /// The KV v2 path the deployment's HTTP-01 responder HMAC is stored at.
 pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
 
+/// How both surface leaves are published at their configured
+/// certificate path.
+///
+/// Both are written **with** their issuer chain, unlike an ordinary
+/// service leaf, so this is one value rather than a per-leaf choice. A
+/// caller pinning this endpoint selects its trust anchors from the
+/// certificates the server presents, so a leaf-only `server_cert_path`
+/// is refused by the endpoint's own TLS loader and by every correctly
+/// pinned caller; the client leaf is written the same way so the two
+/// halves of the same connection have the same shape and the registrar
+/// can present a complete chain.
+const SURFACE_LEAF_PUBLICATION: LeafPublication = LeafPublication::LeafWithChain;
+
 /// Which of the registrar surface's two leaves a pair holds.
 ///
 /// The two are evaluated and issued independently: one being usable is
 /// never a reason to leave the other unusable, and one needing issuance
 /// is never a reason to re-issue the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceLeaf {
+pub(crate) enum SurfaceLeaf {
     /// The leaf the endpoint presents. A server certificate, so it takes
     /// the ordinary CSR shape and requests no extended key usage.
     EndpointServer,
@@ -126,7 +139,7 @@ pub enum SurfaceLeaf {
 impl SurfaceLeaf {
     /// The reserved service label this leaf's name carries.
     #[must_use]
-    pub fn service_label(self) -> &'static str {
+    pub(crate) fn service_label(self) -> &'static str {
         match self {
             Self::EndpointServer => REGISTRAR_ENDPOINT_LABEL,
             Self::RegistrarClient => REGISTRAR_CLIENT_LABEL,
@@ -135,40 +148,25 @@ impl SurfaceLeaf {
 
     /// The CSR shape this leaf is requested with.
     #[must_use]
-    pub fn csr_shape(self) -> CsrShape {
+    pub(crate) fn csr_shape(self) -> CsrShape {
         match self {
             Self::EndpointServer => CsrShape::Service,
             Self::RegistrarClient => CsrShape::RegistrarClient,
         }
     }
 
-    /// How this leaf is published at its configured certificate path.
-    ///
-    /// Both surface leaves are written **with** their issuer chain,
-    /// unlike an ordinary service leaf. A caller pinning this endpoint
-    /// selects its trust anchors from the certificates the server
-    /// presents, so a leaf-only `server_cert_path` is refused by the
-    /// endpoint's own TLS loader and by every correctly pinned caller;
-    /// the client leaf is written the same way so the two halves of the
-    /// same connection have the same shape and the registrar can present
-    /// a complete chain.
-    #[must_use]
-    pub fn leaf_publication(self) -> LeafPublication {
-        LeafPublication::LeafWithChain
-    }
-
     /// The issuance options this leaf is minted under.
     #[must_use]
-    pub fn issuance_options(self) -> IssuanceOptions {
+    pub(crate) fn issuance_options(self) -> IssuanceOptions {
         IssuanceOptions {
             csr_shape: self.csr_shape(),
-            leaf_publication: self.leaf_publication(),
+            leaf_publication: SURFACE_LEAF_PUBLICATION,
         }
     }
 
     /// Composes this leaf's name at the fixed instance label.
     #[must_use]
-    pub fn identity(self, host: &str, domain: &str) -> String {
+    pub(crate) fn identity(self, host: &str, domain: &str) -> String {
         match self {
             Self::EndpointServer => {
                 registrar_endpoint_identity(REGISTRAR_SURFACE_INSTANCE, host, domain)
@@ -181,7 +179,7 @@ impl SurfaceLeaf {
 
     /// How the certificate path is spelled in a diagnostic.
     #[must_use]
-    pub fn cert_setting(self) -> &'static str {
+    pub(crate) fn cert_setting(self) -> &'static str {
         match self {
             Self::EndpointServer => "[registrar_endpoint] server_cert_path",
             Self::RegistrarClient => "[registrar_endpoint] client_cert_path",
@@ -190,7 +188,7 @@ impl SurfaceLeaf {
 
     /// How the key path is spelled in a diagnostic.
     #[must_use]
-    pub fn key_setting(self) -> &'static str {
+    pub(crate) fn key_setting(self) -> &'static str {
         match self {
             Self::EndpointServer => "[registrar_endpoint] server_key_path",
             Self::RegistrarClient => "[registrar_endpoint] client_key_path",
@@ -210,7 +208,7 @@ impl SurfaceLeaf {
 /// Every one of the eight is answered by issuing a replacement. None of
 /// them is a refusal on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
-pub enum UnusableMaterial {
+pub(crate) enum UnusableMaterial {
     /// One or both files are not there.
     #[error("the certificate or key file does not exist")]
     Absent,
@@ -249,19 +247,11 @@ pub enum UnusableMaterial {
 
 /// The verdict [`evaluate_pair`] returns for one configured pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PairUsability {
+pub(crate) enum PairUsability {
     /// Every condition holds. The pair is left exactly as it is.
     Usable,
     /// One condition failed, naming which.
     Unusable(UnusableMaterial),
-}
-
-impl PairUsability {
-    /// Reports whether an issuance has to run for this pair.
-    #[must_use]
-    pub fn needs_issuance(self) -> bool {
-        matches!(self, Self::Unusable(_))
-    }
 }
 
 /// Applies the eight ordered usability conditions to one configured
@@ -277,7 +267,7 @@ impl PairUsability {
 ///
 /// Consults no pin list, builds no verifier and judges no chain other
 /// than through [`cert_chain::leaf_chains_to_bundle`].
-pub async fn evaluate_pair(
+pub(crate) async fn evaluate_pair(
     cert_path: &Path,
     key_path: &Path,
     expected_name: &str,
@@ -385,15 +375,15 @@ fn is_not_found(result: &std::io::Result<Vec<u8>>) -> bool {
 
 /// One configured pair, resolved down to everything an issuance needs.
 #[derive(Debug, Clone)]
-pub struct SurfacePairPaths {
+pub(crate) struct SurfacePairPaths {
     /// Which leaf this pair holds.
-    pub leaf: SurfaceLeaf,
+    pub(crate) leaf: SurfaceLeaf,
     /// The configured certificate path.
-    pub cert_path: PathBuf,
+    pub(crate) cert_path: PathBuf,
     /// The configured key path.
-    pub key_path: PathBuf,
+    pub(crate) key_path: PathBuf,
     /// The reserved name the leaf must carry.
-    pub name: String,
+    pub(crate) name: String,
 }
 
 /// Resolves both configured pairs from an enabled `[registrar_endpoint]`
@@ -404,7 +394,7 @@ pub struct SurfacePairPaths {
 /// Returns an error naming the first unset path. Configuration
 /// validation has already refused an enabled endpoint with any of the
 /// four unset, so reaching one of these is a caller that skipped it.
-pub fn surface_pairs(
+pub(crate) fn surface_pairs(
     endpoint: &RegistrarEndpointSettings,
     host: &str,
     domain: &str,
@@ -488,18 +478,18 @@ pub async fn ensure_registrar_surface_certificates(
 /// Everything an endpoint-enabled host's issuance is resolved from,
 /// before any pair has been looked at.
 #[derive(Debug, Clone)]
-pub struct SurfacePlan {
+pub(crate) struct SurfacePlan {
     /// The secrets directory the deployment state file resolves to.
-    pub secrets_dir: PathBuf,
+    pub(crate) secrets_dir: PathBuf,
     /// The `OpenBao` URL that file records.
-    pub openbao_url: String,
+    pub(crate) openbao_url: String,
     /// The KV v2 mount that file records. Never taken from `agent.toml`,
     /// which carries no such key for this path.
-    pub kv_mount: String,
+    pub(crate) kv_mount: String,
     /// The bootroot host's own label, from the rendered internal config.
-    pub host: String,
+    pub(crate) host: String,
     /// Both configured pairs, in evaluation order.
-    pub pairs: Vec<SurfacePairPaths>,
+    pub(crate) pairs: Vec<SurfacePairPaths>,
 }
 
 /// Resolves the state file, the secrets directory, the host label and
@@ -518,7 +508,7 @@ pub struct SurfacePlan {
 /// internal agent config is absent, unparseable or fails the loader's
 /// invariants, or when one of the four material paths is unset. No name
 /// is ever composed from a guessed label.
-pub fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
+pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
     let state_file = settings.registrar.state_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "registrar.state_file is required when registrar_endpoint.enabled is true, and no \
@@ -565,7 +555,7 @@ pub fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
 ///
 /// The two are judged independently, so one being usable is never a
 /// reason to leave the other unusable.
-pub async fn pending_pairs(
+pub(crate) async fn pending_pairs(
     plan: &SurfacePlan,
     ca_bundle_path: Option<&Path>,
 ) -> Vec<SurfacePairPaths> {
@@ -599,13 +589,13 @@ pub async fn pending_pairs(
 /// `[acme] http_responder_hmac` upsert is a different arrangement under
 /// a different credential, and is neither used nor imitated here.
 #[derive(Debug)]
-pub struct SurfaceAcmeInputs {
+pub(crate) struct SurfaceAcmeInputs {
     /// The account EAB, absent when the deployment recorded the explicit
     /// clear shape.
-    pub eab: Option<EabCredentials>,
+    pub(crate) eab: Option<EabCredentials>,
     /// The HTTP-01 responder HMAC the challenge publication is
     /// authenticated with.
-    pub responder_hmac: HmacSecret,
+    pub(crate) responder_hmac: HmacSecret,
 }
 
 /// Reads the account EAB and the responder HMAC under the
@@ -624,7 +614,7 @@ pub struct SurfaceAcmeInputs {
 /// cannot be read, or when either payload does not parse. Every one of
 /// them is a refusal: there is no fallback to `agent.toml`, to the
 /// internal profile's rendered config, or to issuing without EAB.
-pub async fn read_acme_inputs(
+pub(crate) async fn read_acme_inputs(
     secrets_dir: &Path,
     openbao_url: &str,
     kv_mount: &str,
@@ -703,7 +693,7 @@ pub(crate) async fn read_acme_inputs_with(
 /// # Errors
 ///
 /// Returns an error naming both configured paths and the failure.
-pub async fn issue_surface_pair(
+pub(crate) async fn issue_surface_pair(
     settings: &Settings,
     pair: &SurfacePairPaths,
     host: &str,

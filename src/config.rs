@@ -421,11 +421,10 @@ impl Default for RegistrarSettings {
 /// Two of the four name the *client* material rather than the
 /// endpoint's own: the leaf the co-located registrar authenticates to
 /// this endpoint with, and its key. They live here because they are one
-/// surface with the server pair — the daemon issues all four
-/// ([`crate::registrar_certs`]) and the provisioning tool
-/// places the initial client certificate at them — and because the
-/// directory holding `client_cert_path` is where the endpoint's
-/// anchor pin file
+/// surface with the server pair — the daemon issues all four at start,
+/// and the provisioning tool places the initial client certificate at
+/// them — and because the directory holding `client_cert_path` is where
+/// the endpoint's anchor pin file
 /// ([`crate::registrar::endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE`])
 /// is looked for.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
