@@ -641,14 +641,16 @@ Three cases still do not end in a started daemon:
 - **The write cannot land** (a path that is a directory, a dangling
   symlink, an immutable file, a permission the daemon lacks). That is an
   issuance failure naming the path and the write error.
-- **`trust.ca_bundle_path` cannot be used.** An unreadable bundle fails
-  *before publication*: the daemon refuses to overwrite a bundle it
-  cannot inspect, so no leaf is written and the bundle is untouched. A
-  missing or unparseable bundle is detected the same way and the merge
-  would repair either, but the outbound ACME client anchors its own TLS
-  to that file and refuses first. All three end in a refusal naming the
-  bundle — which an endpoint-enabled host would reach anyway, since the
-  TLS loader requires a readable, parseable, pinned bundle of its own.
+- **`trust.ca_bundle_path` is unreadable.** It fails *before
+  publication*: the daemon refuses to overwrite a bundle it cannot
+  inspect, so no leaf is written, the refusal names the bundle, and the
+  bundle is left byte-identical. A *missing* or *unparseable but
+  readable* bundle is not on this list — it is repaired. Because that
+  same file is what the outbound ACME connection anchors its own TLS
+  with, the daemon first restores it from the bootroot-internal
+  credential's CA bundle, keeping only the anchors
+  `trust.trusted_ca_sha256` pins, logs that it has done so, and then
+  issues. A bundle that parses is never rewritten by that restore.
 - **The replacement is still outside its validity window** at this host's
   clock, in either direction. Issuance succeeded; the TLS loader's own
   pre-existing refusal then stops the start.
@@ -659,9 +661,14 @@ the deployment `state.json` records, through that same credential — and
 **only** when a leaf actually needs issuing, so a host whose material is
 fine starts with `OpenBao` down. There is no fallback to `agent.toml`'s
 own `[acme] http_responder_hmac` or `[eab]`, and neither value is written
-back to disk. A start that needs issuance inside a trust-rotation window
-refuses with the credential's own repair diagnostic; finishing the
-rotation is the remedy.
+back to disk. A failed read refuses the start, naming the failing read
+**and** the material paths it leaves unissued. `bootroot init` writes
+`bootroot/agent/eab` on every deployment — the cleared `kid`/`hmac` pair
+where there was no EAB to register — so a deployment without one issues
+without a binding, while an *absent* record is a failed read and refuses.
+A start that needs issuance inside a trust-rotation window refuses with
+the credential's own repair diagnostic; finishing the rotation is the
+remedy.
 
 **An already-expired leaf is repaired at that start**, before the TLS
 material is loaded — not at the daemon's first renewal tick, which would

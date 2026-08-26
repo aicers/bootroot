@@ -263,6 +263,21 @@ async fn every_unusable_state_drives_the_unit_to_read_openbao() {
             "{label}: the failure is the credentialed read, not a refusal over the material: \
              {rendered}"
         );
+        // A failed read names the material paths as well as the read, so
+        // the operator learns which files are consequently unissued.
+        // Which pair the seed broke varies; that all four are named when
+        // both are unusable is asserted on its own below.
+        assert!(
+            [
+                &deployment.client_cert,
+                &deployment.client_key,
+                &deployment.server_cert,
+                &deployment.server_key,
+            ]
+            .iter()
+            .any(|path| rendered.contains(&path.display().to_string())),
+            "{label}: the diagnostic names the material paths: {rendered}"
+        );
         // The two pairs are independent, and the credentialed read
         // happens before anything is written: the pair that was still
         // usable is untouched, and so is the one that was not.
@@ -344,6 +359,44 @@ fn unusable_seeds() -> Vec<(&'static str, Box<dyn Fn(&Deployment)>)> {
             }),
         ),
     ]
+}
+
+/// A failed `OpenBao` read names **both** the failing read and every
+/// material path it leaves unissued. The two together are what tell this
+/// apart from any other `OpenBao` failure at start: an operator reading
+/// it learns which read to repair and which files are consequently not
+/// there.
+#[tokio::test]
+async fn a_failed_openbao_read_names_the_read_and_every_material_path() {
+    let deployment = Deployment::new();
+    // Neither pair is seeded, so both are pending and all four paths are
+    // in play.
+    deployment.seed_internal_credential(&deployment.ca);
+
+    let err = ensure_registrar_surface_certificates(&deployment.settings, false)
+        .await
+        .expect_err("an OpenBao that cannot be reached refuses the start");
+    let rendered = format!("{err:#}");
+    for path in [
+        &deployment.client_cert,
+        &deployment.client_key,
+        &deployment.server_cert,
+        &deployment.server_key,
+    ] {
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "the diagnostic names {}: {rendered}",
+            path.display()
+        );
+    }
+    assert!(
+        rendered.contains("ACME inputs") || rendered.contains(TEST_KV_MOUNT),
+        "the diagnostic names the failing read: {rendered}"
+    );
+    assert!(
+        !deployment.client_cert.exists() && !deployment.server_cert.exists(),
+        "no certificate is requested and nothing is written"
+    );
 }
 
 /// A credential whose stored root is no longer the deployment's active

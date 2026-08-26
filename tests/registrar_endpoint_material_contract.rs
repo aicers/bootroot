@@ -30,8 +30,9 @@ const SCANNED_FILES: [&str; 6] = [
 ];
 
 /// Claims that were true while both leaves were supplied out of band,
-/// paired with what makes each one false now.
-const SUPERSEDED_CLAIMS: [(&str, &str); 10] = [
+/// or while a repairable bundle and an unwritten EAB record were still
+/// described as refusals, paired with what makes each one false now.
+const SUPERSEDED_CLAIMS: [(&str, &str); 15] = [
     (
         "supplied out of band",
         "the daemon issues both leaves itself",
@@ -50,6 +51,26 @@ const SUPERSEDED_CLAIMS: [(&str, &str); 10] = [
     (
         "스스로 발급하지도",
         "issuing one for itself is now what the daemon does",
+    ),
+    (
+        "answer rather than a failure",
+        "an absent EAB record is a failed read; the cleared payload is the answer",
+    ),
+    (
+        "실패가 아니라 답입니다",
+        "an absent EAB record is a failed read; the cleared payload is the answer",
+    ),
+    (
+        "refuses before the flow starts",
+        "a missing or unparseable bundle is restored from the internal one and issued over",
+    ),
+    (
+        "and refuses first",
+        "a missing or unparseable bundle is restored from the internal one and issued over",
+    ),
+    (
+        "세 경우 모두",
+        "a missing or unparseable bundle is restored from the internal one and issued over",
     ),
 ];
 

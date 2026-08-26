@@ -723,8 +723,12 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   deployment). The interactive EAB prompt re-prompts on validation
   failure rather than silently accepting garbage (#588 §3a).
 - `--no-eab`: skip the EAB prompt and persist no EAB credentials.
-  Conflicts with `--eab-kid`/`--eab-hmac`. Recommended for OSS
-  step-ca and CI flows that never use EAB (#588 §3b).
+  `bootroot/agent/eab` is still written, carrying the cleared
+  `{kid: "", hmac: ""}` payload — the same shape `rotate eab-clear`
+  writes — so "this deployment has no EAB" is a stored answer rather
+  than an absent path. Conflicts with `--eab-kid`/`--eab-hmac`.
+  Recommended for OSS step-ca and CI flows that never use EAB
+  (#588 §3b).
 - `--save-unseal-keys`: skip the "Save unseal keys to file?" prompt and
   persist the freshly generated unseal keys to
   `<secrets_dir>/openbao/unseal-keys.txt` (mode `0600`). Equivalent to

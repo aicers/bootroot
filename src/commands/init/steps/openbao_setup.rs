@@ -238,11 +238,13 @@ pub(super) async fn configure_openbao(
     }
     let approles = AppRoleLabel::approle_map();
 
-    let mut kv_paths = vec![PATH_STEPCA_PASSWORD, PATH_STEPCA_DB, PATH_RESPONDER_HMAC];
-    if secrets.eab.is_some() {
-        kv_paths.push(PATH_AGENT_EAB);
-    }
-    for path in kv_paths {
+    // `PATH_AGENT_EAB` is unconditional because the write below is.
+    for path in [
+        PATH_STEPCA_PASSWORD,
+        PATH_STEPCA_DB,
+        PATH_RESPONDER_HMAC,
+        PATH_AGENT_EAB,
+    ] {
         if !client
             .kv_exists(&args.openbao.kv_mount, path)
             .await
@@ -600,16 +602,21 @@ async fn write_openbao_secrets(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    if let Some(eab) = eab {
-        client
-            .write_kv(
-                kv_mount,
-                PATH_AGENT_EAB,
-                serde_json::json!({ "kid": eab.kid, "hmac": eab.hmac }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
+    // The record is written whether or not an EAB was registered. With
+    // none, the payload is the cleared `{kid: "", hmac: ""}` shape —
+    // exactly what `rotate eab-clear` writes — so "this deployment has
+    // no EAB" is a stored answer rather than an absent path. Readers can
+    // then tell it apart from a wiped mount or the wrong `kv_mount`,
+    // which is what lets the registrar surface's issuance refuse one and
+    // proceed on the other.
+    let eab_payload = match eab {
+        Some(eab) => serde_json::json!({ "kid": eab.kid, "hmac": eab.hmac }),
+        None => serde_json::json!({ "kid": "", "hmac": "" }),
+    };
+    client
+        .write_kv(kv_mount, PATH_AGENT_EAB, eab_payload)
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
     Ok(())
 }
 
@@ -1012,6 +1019,63 @@ mod tests {
     use super::super::stepca_setup::write_stepca_templates;
     use super::super::test_support::{test_cert_pem, test_messages};
     use super::*;
+
+    /// Every deployment ends up with a written `bootroot/agent/eab`
+    /// record. With no EAB registered the payload is the cleared
+    /// `{kid: "", hmac: ""}` shape — the same one `rotate eab-clear`
+    /// writes — so "this deployment has no EAB" is a stored answer
+    /// rather than an absent path, and a reader can tell it apart from a
+    /// wiped mount or the wrong `kv_mount`.
+    #[tokio::test]
+    async fn write_openbao_secrets_writes_a_cleared_eab_record_when_there_is_none() {
+        use std::sync::{Arc, Mutex};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct Recorder(Arc<Mutex<Vec<serde_json::Value>>>);
+        impl Respond for Recorder {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body = serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+                self.0.lock().expect("bodies lock").push(body);
+                ResponseTemplate::new(200)
+            }
+        }
+
+        let server = MockServer::start().await;
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/secret/data/{PATH_AGENT_EAB}")))
+            .respond_with(Recorder(Arc::clone(&bodies)))
+            .mount(&server)
+            .await;
+        for kv in [PATH_STEPCA_PASSWORD, PATH_STEPCA_DB, PATH_RESPONDER_HMAC] {
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/secret/data/{kv}")))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+        }
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        write_openbao_secrets(
+            &client,
+            "secret",
+            "stepca-password",
+            "postgres://dsn",
+            "responder-hmac",
+            None,
+            &test_messages(),
+        )
+        .await
+        .expect("the secrets are written");
+
+        let bodies = bodies.lock().expect("bodies lock");
+        let payload = bodies.first().expect("the EAB record is written");
+        assert_eq!(payload["data"]["kid"], "");
+        assert_eq!(payload["data"]["hmac"], "");
+    }
 
     fn stepca_and_responder_roles() -> Vec<AppRoleOutput> {
         vec![

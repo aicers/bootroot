@@ -675,8 +675,11 @@ async fn both_acme_inputs_are_read_from_openbao_under_the_recorded_mount() {
     assert_eq!(eab.hmac.expose(), "eab-from-openbao");
 }
 
-/// The explicit clear shape is "this deployment has no EAB", not a
-/// malformed record.
+/// The explicit clear shape is "this deployment has no EAB", and it is
+/// the **only** shape that issues without a binding. `bootroot init`
+/// writes it on every no-EAB path and `rotate eab-clear` writes it to
+/// revoke one, so a deployment that registered no EAB has a stored
+/// answer rather than an absent path.
 #[tokio::test]
 async fn a_cleared_eab_record_yields_no_credentials() {
     let server = MockServer::start().await;
@@ -699,13 +702,17 @@ async fn a_cleared_eab_record_yields_no_credentials() {
     assert!(inputs.eab.is_none());
 }
 
-/// An *absent* EAB record is the shape `bootroot init --no-eab`, a
-/// reinit, and a declined prompt all leave behind, so it is the same
-/// answer as the explicit clear rather than a failed read. The
-/// responder HMAC read in the same call still succeeds, which is what
-/// separates this from an `OpenBao` that cannot be reached.
+/// An *absent* EAB record is a failed read and refuses, naming the read.
+/// It is not the cleared payload: a deployment that registered no EAB
+/// carries one, so absence is what a wiped mount, a deleted path or the
+/// wrong `kv_mount` leaves — and none of those should be answered by
+/// minting the two surface leaves under an unbound account.
+///
+/// The responder HMAC read in the same call succeeds, so the refusal is
+/// demonstrably about the EAB path rather than about an `OpenBao` that
+/// cannot be reached at all.
 #[tokio::test]
-async fn an_absent_eab_record_yields_no_credentials_rather_than_refusing() {
+async fn an_absent_eab_record_refuses_and_names_the_read() {
     let server = MockServer::start().await;
     mount_kv(
         &server,
@@ -721,11 +728,12 @@ async fn an_absent_eab_record_yields_no_credentials_rather_than_refusing() {
         .mount(&server)
         .await;
 
-    let inputs = read_acme_inputs_with(&openbao_client(&server), TEST_KV_MOUNT)
+    let err = read_acme_inputs_with(&openbao_client(&server), TEST_KV_MOUNT)
         .await
-        .expect("an unwritten EAB path is an answer, not a failure");
-    assert!(inputs.eab.is_none());
-    assert_eq!(inputs.responder_hmac.expose(), OPENBAO_HMAC);
+        .expect_err("an absent EAB record is a failed read");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains(AGENT_EAB_KV_PATH), "{rendered}");
+    assert!(rendered.contains(TEST_KV_MOUNT), "{rendered}");
 }
 
 /// A failed read is a refusal naming the failing read, never a fallback
@@ -1536,22 +1544,36 @@ async fn an_unreadable_ca_bundle_fails_before_anything_is_published() {
     );
 }
 
-/// A missing bundle is answered by the merge rather than by a refusal:
-/// it is seeded from an empty bundle and the leaf is published.
+/// Lays out the fixed bootroot-internal directory below a fresh
+/// temporary directory with `ca` as its CA bundle, which is what
+/// [`restore_outbound_anchors`] draws replacement anchors from.
+fn internal_layout_with_bundle(dir: &Path, ca: &TestCa) -> InternalPaths {
+    let paths = InternalPaths::new(dir);
+    std::fs::create_dir_all(paths.dir()).expect("internal dir");
+    std::fs::write(paths.ca_bundle(), ca.pem()).expect("write internal bundle");
+    paths
+}
+
+/// A **missing** `[trust] ca_bundle_path` ends in a published leaf, on
+/// the production path — `insecure_mode` is `false` throughout, so the
+/// outbound client is built the way a real start builds it.
 ///
-/// Driven with `insecure_mode` to isolate that from the *outbound* use
-/// of `trust.ca_bundle_path`, which `AcmeClient::new` reads to anchor
-/// its own TLS and which refuses a missing file before this flow
-/// begins. That is a pre-existing property of the ACME path, not the
-/// publication rule under test here, and an endpoint-enabled host with
-/// no bundle cannot start for the loader's own reasons regardless.
+/// Two rules meet here. `write_merged_ca_bundle` treats "not found" as
+/// the first-issuance seed rather than a refusal, and that alone is not
+/// enough: the same file is what `AcmeClient::new` reads to anchor its
+/// own TLS, so before this the flow refused at client construction over
+/// exactly the material it was there to repair.
+/// [`restore_outbound_anchors`] closes that by restoring the anchors
+/// from the bootroot-internal credential's own CA bundle, under the
+/// deployment's own pins.
 #[tokio::test]
-async fn a_missing_ca_bundle_is_seeded_by_the_merge_rather_than_refusing() {
+async fn a_missing_ca_bundle_is_restored_and_the_leaf_is_published() {
     let harness = start_acme_harness().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let cert = dir.path().join("leaf.pem");
-    let bundle = dir.path().join("ca-bundle.pem");
+    let bundle = dir.path().join("anchors/ca-bundle.pem");
     assert!(!bundle.exists());
+    let internal = internal_layout_with_bundle(dir.path(), &harness.ca);
 
     let mut settings = test_settings(&harness.directory_url, &harness.responder_url);
     settings.acme.http_responder_hmac = HmacSecret::new(OPENBAO_HMAC.to_string());
@@ -1564,25 +1586,37 @@ async fn a_missing_ca_bundle_is_seeded_by_the_merge_rather_than_refusing() {
         cert: cert.clone(),
         key: dir.path().join("leaf.key"),
     };
-    issue_pair(&settings, &paths, TEST_HOST, None, true)
+
+    restore_outbound_anchors(&settings, &internal)
         .await
-        .expect("a missing bundle merges against an empty seed");
+        .expect("a missing bundle is restored from the internal one");
+    assert!(
+        std::fs::read_to_string(&bundle)
+            .expect("read restored bundle")
+            .contains("BEGIN CERTIFICATE"),
+        "the anchors are restored before the outbound client is built"
+    );
+
+    issue_pair(&settings, &paths, TEST_HOST, None, false)
+        .await
+        .expect("issuance reaches the CA over the restored anchors");
     assert!(cert.exists(), "the leaf is published");
     let merged = std::fs::read_to_string(&bundle).expect("read bundle");
-    assert!(merged.contains("BEGIN CERTIFICATE"), "the bundle is seeded");
+    assert!(merged.contains("BEGIN CERTIFICATE"), "the bundle is merged");
 }
 
-/// An unparseable but readable bundle is likewise answered by the merge,
-/// which skips every entry it cannot parse and publishes. Same
-/// `insecure_mode` isolation, for the same reason.
+/// An **unparseable but readable** bundle takes the same path: the merge
+/// skips every entry it cannot parse, and the restore replaces a file
+/// that holds no certificate at all so the outbound client can be built.
+/// `insecure_mode` is `false` here too.
 #[tokio::test]
-async fn an_unparseable_but_readable_ca_bundle_is_merged_over_rather_than_refusing() {
+async fn an_unparseable_ca_bundle_is_restored_and_the_leaf_is_published() {
     let harness = start_acme_harness().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let cert = dir.path().join("leaf.pem");
-    let key = dir.path().join("leaf.key");
     let bundle = dir.path().join("ca-bundle.pem");
     std::fs::write(&bundle, "not a pem at all\n").expect("seed junk bundle");
+    let internal = internal_layout_with_bundle(dir.path(), &harness.ca);
 
     let mut settings = test_settings(&harness.directory_url, &harness.responder_url);
     settings.acme.http_responder_hmac = HmacSecret::new(OPENBAO_HMAC.to_string());
@@ -1593,16 +1627,128 @@ async fn an_unparseable_but_readable_ca_bundle_is_merged_over_rather_than_refusi
     let paths = PairPaths {
         leaf: SurfaceLeaf::Client,
         cert: cert.clone(),
-        key,
+        key: dir.path().join("leaf.key"),
     };
-    issue_pair(&settings, &paths, TEST_HOST, None, true)
+
+    restore_outbound_anchors(&settings, &internal)
         .await
-        .expect("an unparseable but readable bundle is merged over");
+        .expect("an unparseable bundle is replaced by the internal one");
+    issue_pair(&settings, &paths, TEST_HOST, None, false)
+        .await
+        .expect("issuance reaches the CA over the restored anchors");
     assert!(cert.exists(), "the leaf is published");
     let merged = std::fs::read_to_string(&bundle).expect("read bundle");
     assert!(
         merged.contains("BEGIN CERTIFICATE"),
-        "the unparseable entries are skipped and the chain is written"
+        "the unparseable entries are gone and the chain is written"
+    );
+    assert!(
+        !merged.contains("not a pem at all"),
+        "the junk does not survive"
+    );
+}
+
+/// A bundle that parses is left exactly as it is, however stale its
+/// anchors are: moving those is the merge's job after the issuance, and
+/// a restore that fired here would overwrite anchors the deployment
+/// still depends on.
+#[tokio::test]
+async fn a_parseable_ca_bundle_is_left_byte_identical_by_the_restore() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let superseded = generate_ca("Superseded Generation");
+    let current = generate_ca("Current Generation");
+    let bundle = dir.path().join("ca-bundle.pem");
+    std::fs::write(&bundle, superseded.pem()).expect("seed bundle");
+    let before = std::fs::read(&bundle).expect("read bundle");
+    let internal = internal_layout_with_bundle(dir.path(), &current);
+
+    let mut settings = test_settings("http://127.0.0.1:1/directory", "http://127.0.0.1:1");
+    settings.trust = TrustSettings {
+        ca_bundle_path: Some(bundle.clone()),
+        trusted_ca_sha256: vec![crate::tls::sha256_hex(current.der())],
+    };
+
+    restore_outbound_anchors(&settings, &internal)
+        .await
+        .expect("a parseable bundle is not this function's business");
+    assert_eq!(
+        std::fs::read(&bundle).expect("read bundle"),
+        before,
+        "a bundle that parses is left byte-identical"
+    );
+}
+
+/// An **unreadable** bundle is left for `write_merged_ca_bundle` to
+/// refuse over. The restore does not pre-delete it, widen its
+/// permissions, or write past it — the refusal and the byte-identical
+/// file are the guarantee, and this is the one bundle state that is not
+/// a repair.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_ca_bundle_is_not_touched_by_the_restore() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if nix_running_as_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca = generate_ca("Deployment CA");
+    let bundle = dir.path().join("ca-bundle.pem");
+    std::fs::write(&bundle, "existing bundle bytes\n").expect("seed bundle");
+    let before = std::fs::read(&bundle).expect("read bundle");
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o000))
+        .expect("make the bundle unreadable");
+    let internal = internal_layout_with_bundle(dir.path(), &ca);
+
+    let mut settings = test_settings("http://127.0.0.1:1/directory", "http://127.0.0.1:1");
+    settings.trust = TrustSettings {
+        ca_bundle_path: Some(bundle.clone()),
+        trusted_ca_sha256: vec![crate::tls::sha256_hex(ca.der())],
+    };
+
+    restore_outbound_anchors(&settings, &internal)
+        .await
+        .expect("an unreadable bundle is left to the merge to refuse");
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o600)).expect("restore");
+    assert_eq!(
+        std::fs::read(&bundle).expect("read bundle"),
+        before,
+        "the unreadable bundle is byte-identical"
+    );
+}
+
+/// The restored anchors are the deployment's own pins and nothing wider:
+/// an internal bundle carrying a certificate the deployment does not pin
+/// does not smuggle it into `[trust] ca_bundle_path`.
+#[tokio::test]
+async fn the_restore_writes_only_what_the_deployment_pins() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pinned = generate_ca("Pinned Generation");
+    let unpinned = generate_ca("Unpinned Generation");
+    let bundle = dir.path().join("ca-bundle.pem");
+    let internal = InternalPaths::new(dir.path());
+    std::fs::create_dir_all(internal.dir()).expect("internal dir");
+    std::fs::write(
+        internal.ca_bundle(),
+        format!("{}{}", pinned.pem(), unpinned.pem()),
+    )
+    .expect("write internal bundle");
+
+    let mut settings = test_settings("http://127.0.0.1:1/directory", "http://127.0.0.1:1");
+    settings.trust = TrustSettings {
+        ca_bundle_path: Some(bundle.clone()),
+        trusted_ca_sha256: vec![crate::tls::sha256_hex(pinned.der())],
+    };
+
+    restore_outbound_anchors(&settings, &internal)
+        .await
+        .expect("the restore runs");
+    let restored = std::fs::read(&bundle).expect("read restored bundle");
+    let certs = crate::tls::parse_pem_to_cert_list(&restored).expect("parse restored bundle");
+    assert_eq!(certs.len(), 1, "only the pinned anchor is restored");
+    assert_eq!(
+        crate::tls::sha256_hex(certs.first().expect("one anchor")),
+        crate::tls::sha256_hex(pinned.der())
     );
 }
 

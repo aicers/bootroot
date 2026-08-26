@@ -699,8 +699,12 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   필요합니다. 대화형 EAB 프롬프트는 검증 실패 시 재입력을 요청하며,
   과거처럼 `y` 같은 한 글자 값을 그대로 받지 않습니다(#588 §3a).
 - `--no-eab`: EAB 프롬프트를 생략하고 EAB 자격증명을 KV에 기록하지
-  않습니다. `--eab-kid`/`--eab-hmac`과 함께 사용할 수 없습니다.
-  OSS step-ca 및 EAB를 사용하지 않는 CI 흐름에 권장됩니다(#588 §3b).
+  않습니다. `bootroot/agent/eab` 자체는 여전히 기록되며, 비워진
+  `{kid: "", hmac: ""}` 페이로드 — `rotate eab-clear`가 쓰는 것과 같은
+  형태 — 를 담습니다. 그래서 "이 배포에는 EAB가 없다"가 경로의 부재가
+  아니라 저장된 답이 됩니다. `--eab-kid`/`--eab-hmac`과 함께 사용할 수
+  없습니다. OSS step-ca 및 EAB를 사용하지 않는 CI 흐름에
+  권장됩니다(#588 §3b).
 - `--save-unseal-keys`: "Save unseal keys to file?" 프롬프트를
   건너뛰고 새로 생성된 unseal 키를
   `<secrets_dir>/openbao/unseal-keys.txt`에 모드 `0600`으로

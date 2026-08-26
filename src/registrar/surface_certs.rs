@@ -448,16 +448,26 @@ pub struct SurfaceIssuanceInputs<'a> {
 /// returns before any `OpenBao` call, so a daemon whose material is fine
 /// starts with `OpenBao` down.
 ///
+/// Where a leaf does need issuing and `[trust] ca_bundle_path` holds no
+/// certificate at all — missing, or present but unparseable — the
+/// anchors are restored from the bootroot-internal credential's own CA
+/// bundle first, under the deployment's own pins, because that same file
+/// is what the outbound ACME and HTTP-01 legs anchor their TLS with. A
+/// bundle that parses is left alone however stale its anchors are, an
+/// unreadable one stays for the merge to refuse over byte-identically,
+/// and an unset path has nothing to restore.
+///
 /// # Errors
 ///
 /// Returns an error, naming the material paths and the failure, when the
 /// rendered internal config cannot be read or fails its loader's
 /// invariants, when the internal credential is absent, invalid or
-/// superseded by a trust rotation, when either `OpenBao` read fails, or
-/// when an issuance fails — including a CA bundle that cannot be read
-/// and a write that cannot land. There is no fallback to a self-signed
-/// or borrowed leaf, and none to a locally configured EAB or responder
-/// HMAC.
+/// superseded by a trust rotation, when either `OpenBao` read fails —
+/// an absent EAB record included, which is a failed read and not the
+/// cleared payload a deployment without one carries — or when an
+/// issuance fails, including a CA bundle that cannot be read and a write
+/// that cannot land. There is no fallback to a self-signed or borrowed
+/// leaf, and none to a locally configured EAB or responder HMAC.
 pub async fn ensure_surface_certificates(
     settings: &Settings,
     inputs: &SurfaceIssuanceInputs<'_>,
@@ -507,7 +517,19 @@ pub async fn ensure_surface_certificates(
         return Ok(());
     }
 
-    let acme_inputs = read_acme_inputs(secrets_dir, inputs.openbao_url, inputs.kv_mount).await?;
+    // The material paths ride on every failure of the credentialed
+    // read: the operator reading the diagnostic learns which read failed
+    // *and* which files are consequently unissued, and the two together
+    // are what distinguishes this from any other OpenBao failure at
+    // start.
+    let acme_inputs = read_acme_inputs(secrets_dir, inputs.openbao_url, inputs.kv_mount)
+        .await
+        .with_context(|| {
+            format!(
+                "reading the ACME inputs for the registrar surface leaves at {}",
+                pending_material_paths(&pending)
+            )
+        })?;
 
     // The substitution is in-memory only, and is the whole point of
     // saying issuance runs "under" the internal credential: the HMAC
@@ -516,6 +538,16 @@ pub async fn ensure_surface_certificates(
     // rendered config carries.
     let mut issuance_settings = settings.clone();
     issuance_settings.acme.http_responder_hmac = acme_inputs.responder_hmac;
+
+    // The anchors the outbound ACME and HTTP-01 legs need, established
+    // before either leg runs and after every refusal that precedes an
+    // issuance — so a start inside a trust-rotation window still writes
+    // nothing at all. A missing or unparseable `[trust] ca_bundle_path`
+    // is one of the eight states that put a pair on `pending`, and it is
+    // also the file `AcmeClient::new` and `register_http01_token` read
+    // to anchor their *own* TLS, so without this the daemon would refuse
+    // over exactly the material it is here to repair.
+    restore_outbound_anchors(settings, &internal_paths).await?;
 
     for (paths, name, reason) in pending {
         warn!(
@@ -568,6 +600,121 @@ fn pending_issuances(
             }
         })
         .collect()
+}
+
+/// Renders the material paths the pending issuances would write, for a
+/// diagnostic that has to name them alongside the failure.
+fn pending_material_paths(pending: &[(PairPaths, String, UnusableMaterial)]) -> String {
+    pending
+        .iter()
+        .map(|(paths, ..)| format!("{} and {}", paths.cert.display(), paths.key.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Restores `[trust] ca_bundle_path` from the bootroot-internal
+/// credential's own CA bundle when the configured file holds no anchors.
+///
+/// Reached only once a leaf needs issuing, so a host whose material is
+/// fine never reads either file. It exists because `ca_bundle_path` is
+/// two things at once: the anchor set the usability evaluation chains
+/// against, and the file [`crate::acme`]'s outbound client and the
+/// HTTP-01 responder registration both read to anchor their *own* TLS.
+/// A missing or unparseable bundle is one of the eight unusable states
+/// and is answered by issuing — but the issuance cannot even open its
+/// connection to the local step-ca while that same file is the only
+/// anchor source it has.
+///
+/// The replacement anchors are not a new trust source. They are the
+/// bundle the bootroot-internal credential was already about to
+/// authenticate to `OpenBao` with, filtered by `trust.trusted_ca_sha256`
+/// exactly as [`crate::acme`]'s own merge filters what it keeps, so
+/// nothing is trusted here that the deployment's pins do not already
+/// name. Where no pin is configured the file is copied as it stands,
+/// which is the same opt-out the merge and the chain condition honour.
+///
+/// Three cases are deliberately left alone:
+///
+/// - a bundle that parses to at least one certificate, which is not
+///   this function's business however stale its anchors are — the merge
+///   that follows the issuance is what moves those;
+/// - an **unreadable** bundle, which stays for `write_merged_ca_bundle`
+///   to refuse over, byte-identical, rather than being pre-deleted or
+///   have its permissions widened;
+/// - `[trust] ca_bundle_path` unset, where there is no bundle to verify
+///   against, to merge into, or to anchor with.
+async fn restore_outbound_anchors(
+    settings: &Settings,
+    internal_paths: &InternalPaths,
+) -> anyhow::Result<()> {
+    let Some(bundle_path) = settings.trust.ca_bundle_path.as_deref() else {
+        return Ok(());
+    };
+    match std::fs::read(bundle_path) {
+        // Holds anchors already: not this function's business.
+        Ok(bytes) if tls::parse_pem_to_cert_list(&bytes).is_ok() => return Ok(()),
+        // Readable but holding no certificate, or absent: restore.
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Unreadable: left exactly as it is for `write_merged_ca_bundle`
+        // to refuse over. Reading the error no further is deliberate —
+        // the refusal that names the bundle is the one an operator
+        // should see, and it arrives a few lines later.
+        Err(_) => return Ok(()),
+    }
+
+    let internal_bundle = internal_paths.ca_bundle();
+    let bytes = std::fs::read(&internal_bundle).with_context(|| {
+        format!(
+            "reading the bootroot-internal CA bundle at {} to restore the anchors at {}",
+            internal_bundle.display(),
+            bundle_path.display()
+        )
+    })?;
+    let certs = tls::parse_pem_to_cert_list(&bytes).with_context(|| {
+        format!(
+            "parsing the bootroot-internal CA bundle at {} to restore the anchors at {}",
+            internal_bundle.display(),
+            bundle_path.display()
+        )
+    })?;
+    let pinned = settings
+        .trust
+        .trusted_ca_sha256
+        .iter()
+        .map(|pin| pin.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let restored = certs
+        .iter()
+        .filter(|cert| pinned.is_empty() || pinned.contains(&tls::sha256_hex(cert)))
+        .map(|cert| crate::acme::flow::encode_cert_pem(cert))
+        .collect::<String>();
+    if restored.is_empty() {
+        // Nothing the deployment pins is in there. Leave the configured
+        // bundle as it is and let the ACME path report the anchor
+        // failure it is about to hit, rather than replacing that with a
+        // refusal of this function's own invention.
+        return Ok(());
+    }
+    warn!(
+        "The anchors at {} hold no usable certificate; restoring them from the bootroot-internal \
+         CA bundle at {} so the registrar surface's issuance can reach the CA.",
+        bundle_path.display(),
+        internal_bundle.display()
+    );
+    crate::fs_util::write_ca_bundle(
+        bundle_path,
+        &restored,
+        crate::cert_group::CertGroupPolicy { gid: None },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "restoring the anchors at {} from the bootroot-internal CA bundle at {}",
+            bundle_path.display(),
+            internal_bundle.display()
+        )
+    })
 }
 
 /// Reads the EAB and the responder HMAC through the bootroot-internal
@@ -624,40 +771,35 @@ async fn read_acme_inputs_with(
         })
         .map(HmacSecret::new)?;
 
-    // An *absent* EAB record is the answer a deployment that registered
-    // no EAB gives, not a read that failed — `bootroot init --no-eab`,
-    // a reinit, and a declined prompt all leave this path unwritten, and
-    // every other issuance on such a host is already driven with `None`
-    // (`rotate::registrar_internal::read_eab`,
-    // `commands::service::secrets`). Refusing here would leave the two
-    // surface leaves the only material in the deployment that an
-    // EAB-less CA cannot mint. A transport failure or an unparseable
-    // payload is a read failure and refuses; neither falls back to
-    // `agent.toml`'s `[eab]` or the internal profile's. The absence is
-    // logged rather than passed over quietly, so a host that registers
-    // its account without a binding says so.
-    let eab = match client
-        .try_read_kv(kv_mount, AGENT_EAB_KV_PATH)
-        .await
-        .with_context(|| format!("reading {kv_mount}/{AGENT_EAB_KV_PATH}"))?
+    // The EAB is read with `read_kv` rather than `try_read_kv`, so an
+    // *absent* record is a failed read and refuses. "This deployment
+    // registered no EAB" has a written shape of its own — the cleared
+    // `{kid: "", hmac: ""}` payload `bootroot init` writes on every
+    // no-EAB path and `bootroot rotate eab-clear` writes to revoke one —
+    // and that shape is the only one that issues without a binding.
+    // Absence is then what a wiped mount, a deleted path or the wrong
+    // `kv_mount` leaves, and none of those should be answered by quietly
+    // minting the two surface leaves under an unbound account. Neither
+    // arm falls back to `agent.toml`'s `[eab]` or to the internal
+    // profile's.
+    let eab = match parse_eab_payload(
+        &client
+            .read_kv(kv_mount, AGENT_EAB_KV_PATH)
+            .await
+            .with_context(|| format!("reading {kv_mount}/{AGENT_EAB_KV_PATH}"))?,
+    )
+    .with_context(|| format!("parsing {kv_mount}/{AGENT_EAB_KV_PATH}"))?
     {
-        None => {
+        EabPayload::Populated { kid, hmac } => Some(EabCredentials {
+            kid,
+            hmac: HmacSecret::new(hmac),
+        }),
+        EabPayload::Clear => {
             info!(
-                "No EAB record at {kv_mount}/{AGENT_EAB_KV_PATH}; registering the ACME account \
-                 for the registrar surface without an external account binding."
+                "The EAB record at {kv_mount}/{AGENT_EAB_KV_PATH} is cleared; registering the \
+                 ACME account for the registrar surface without an external account binding."
             );
             None
-        }
-        Some(value) => {
-            match parse_eab_payload(&value)
-                .with_context(|| format!("parsing {kv_mount}/{AGENT_EAB_KV_PATH}"))?
-            {
-                EabPayload::Populated { kid, hmac } => Some(EabCredentials {
-                    kid,
-                    hmac: HmacSecret::new(hmac),
-                }),
-                EabPayload::Clear => None,
-            }
         }
     };
 

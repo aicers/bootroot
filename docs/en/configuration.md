@@ -449,22 +449,32 @@ apart:
   symlink, an immutable file, or a permission the daemon does not hold.
   That is an issuance failure, and the diagnostic names the path and the
   write error.
-- **`trust.ca_bundle_path` cannot be used.** An *unreadable* bundle is
-  detected as a need to issue and then fails **before publication**: the
-  daemon refuses to overwrite a bundle it cannot inspect, so no leaf is
-  written and the bundle is left exactly as it was. A *missing* or
-  *unparseable* bundle is detected the same way, and the merge itself
-  would repair either — but the outbound ACME client anchors its own TLS
-  to that same file, so it refuses before the flow starts. All three
-  therefore end in a start refused with a diagnostic naming the bundle,
-  which an endpoint-enabled host would reach in any case: the endpoint's
-  own TLS loader requires a readable, parseable, pinned bundle too.
+- **`trust.ca_bundle_path` is unreadable.** It is detected as a need to
+  issue and then fails **before publication**: the daemon refuses to
+  overwrite a bundle it cannot inspect, so no leaf is written, the start
+  is refused with a diagnostic naming the bundle, and the bundle is left
+  byte-identical. A *missing* or *unparseable but readable* bundle is a
+  different case and does end in a started daemon — see below.
 - **The replacement is still outside its validity window** at this host's
   clock. Issuance succeeded; the endpoint's TLS loader then refuses the
   server leaf, which is its own pre-existing refusal rather than anything
   issuance added. Persistent host-to-CA skew reaches this in both
   directions — a clock far enough behind leaves the replacement not yet
   valid, one far enough ahead leaves it already expired.
+
+**A missing or unparseable anchor file is repaired, not refused.** The
+same `trust.ca_bundle_path` is two things at once: the anchor set a leaf
+is checked against, and the file the outbound ACME connection and the
+HTTP-01 responder registration anchor their own TLS with. So when a leaf
+needs issuing and that file is absent, or present but holding no parseable
+certificate, the daemon restores it from the bootroot-internal
+credential's own CA bundle before the issuance runs, keeping only the
+anchors `trust.trusted_ca_sha256` already pins, and logs that it has done
+so. The issuance then proceeds and merges the chain the CA returns into
+the restored file, exactly as any other issuance does. A bundle that
+parses is never touched by this — however stale its anchors are, moving
+those is the merge's job — and neither is an unreadable one, which stays
+for the refusal above.
 
 **The ACME inputs come from `OpenBao`, not from this file.** The EAB the
 account registers with and the HMAC the HTTP-01 responder registration is
@@ -476,19 +486,23 @@ no fallback: neither this file's `[acme] http_responder_hmac` nor its
 disk. The reads happen **only** when a leaf actually needs issuing, so a
 host whose material is fine starts with `OpenBao` unreachable. A failed
 read — an unreachable `OpenBao`, a refused `auth/cert` login, a missing
-`bootroot/responder/hmac` record, or a payload that does not parse —
-refuses the start with a diagnostic naming the failing read.
+KV record, or a payload that does not parse — refuses the start with a
+diagnostic naming the failing read **and** the material paths it leaves
+unissued.
 
-An **absent** `bootroot/agent/eab` record is the one case that is an
-answer rather than a failure: it is what `bootroot init --no-eab`, a
-reinit, and a declined EAB prompt all leave behind, and the account is
-registered without an external account binding, exactly as every other
-issuance on such a deployment already is. The daemon logs that it is
-doing so. A record that is present but does not parse — including one
-carrying only a `kid` or only an `hmac` — still refuses, and the
-explicit cleared shape (`kid` and `hmac` both empty, as `bootroot rotate
-eab-clear` writes) is read as "this deployment has no EAB" rather than
-as damage.
+A deployment that registered no EAB is not a missing record. `bootroot
+init` writes `bootroot/agent/eab` on every deployment, carrying the
+cleared shape — `kid` and `hmac` both empty, the same payload `bootroot
+rotate eab-clear` writes — where `--no-eab`, a reinit or a declined
+prompt left nothing to register. That cleared shape is read as "this
+deployment has no EAB": the account is registered without an external
+account binding, exactly as every other issuance on such a deployment
+already is, and the daemon logs that it is doing so. An **absent**
+record is therefore not that answer but a failed read — what a wiped
+mount, a deleted path or the wrong `kv_mount` leaves — and it refuses,
+rather than quietly minting the two surface leaves under an unbound
+account. A record that is present but does not parse, including one
+carrying only a `kid` or only an `hmac`, refuses too.
 
 One refusal on that path is deliberate rather than a bug. Between the
 middle and the tail of a full trust rotation the internal credential's

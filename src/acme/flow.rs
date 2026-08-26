@@ -167,7 +167,8 @@ fn published_certificate_pem(leaf_pem: &str, chain: &[Vec<u8>], shape: Published
     }
 }
 
-fn encode_cert_pem(der: &[u8]) -> String {
+/// Encodes one DER certificate as a PEM block.
+pub(crate) fn encode_cert_pem(der: &[u8]) -> String {
     const LINE_WRAP: usize = 64;
     let b64 = STANDARD.encode(der);
     let mut out = String::from("-----BEGIN CERTIFICATE-----\n");

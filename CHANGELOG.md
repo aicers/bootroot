@@ -46,7 +46,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   The EAB and the HTTP-01 responder HMAC used for these issuances are
   read from `OpenBao` under that credential, and only when a leaf
   actually needs issuing, so a host whose material is fine starts with
-  `OpenBao` down.
+  `OpenBao` down. Where a leaf needs issuing and `[trust]
+  ca_bundle_path` is missing or holds no parseable certificate, the
+  anchors are restored from the bootroot-internal credential's own CA
+  bundle first — keeping only what `[trust] trusted_ca_sha256` pins —
+  because that same file is what the outbound ACME connection anchors
+  its TLS with. A bundle that cannot be read is still refused, and left
+  byte-identical.
 - `bootroot status --agent-config` now scans the registrar audit store and
   reports unpaired intents, malformed records, and retention shortfalls. It
   distinguishes a store that is not configured from a provisioned empty store
@@ -61,6 +67,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `bootroot init` now writes `bootroot/agent/eab` on every deployment.
+  Where no EAB was registered — `--no-eab`, a reinit, or a declined
+  prompt — the record carries the cleared `{kid: "", hmac: ""}` payload
+  that `bootroot rotate eab-clear` writes, instead of the path being
+  left unwritten. "This deployment has no EAB" is therefore a stored
+  answer rather than an absent path, and a reader can tell it apart
+  from a wiped mount, a deleted path or the wrong KV mount. Existing
+  readers are unaffected: they already treated the cleared payload as
+  "no EAB", and `bootroot status` now reports the path as present.
 - `bootroot-agent` writes an issued certificate and key only after the
   chain it came with has been verified against `[trust]
   trusted_ca_sha256` and merged into `[trust] ca_bundle_path`. The leaf
