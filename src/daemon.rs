@@ -4,9 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-// Used by the Linux-only registrar handler build below, which is the
-// only fallible composition in this module.
-#[cfg(target_os = "linux")]
 use anyhow::Context as _;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
@@ -302,6 +299,61 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
     })
 }
 
+/// Issues the registrar surface's two certificates, where the endpoint
+/// is enabled and what is on disk cannot be used.
+///
+/// This is the composition boundary rather than the issuance itself:
+/// the rule for what is usable, the names, the ACME inputs and the write
+/// live in [`crate::registrar::surface_certs`], which is handed the
+/// three inventory values and never opens the deployment state file
+/// itself. That boundary is the registrar layer's, and this function is
+/// where it is honoured.
+///
+/// Called from `bootroot-agent` **before** `RegistrarEndpoint::activate`
+/// loads that material, so the endpoint never comes up presenting or
+/// holding an expired leaf. The state file is resolved here rather than
+/// borrowed from `build_registrar_handler`: that handler is built
+/// inside `run_daemon`, which is reached *after* activation, and moving
+/// it earlier would make the audit store and the verb limiter
+/// prerequisites of issuing the certificate the endpoint presents.
+///
+/// A host whose endpoint is disabled reads nothing and issues nothing —
+/// not the state file, not the internal config, and nothing from the CA
+/// or `OpenBao`.
+///
+/// # Errors
+///
+/// Returns an error when `[registrar] state_file` is unset, unreadable,
+/// unparseable or carries unusable members, and whatever
+/// [`crate::registrar::surface_certs::ensure_surface_certificates`]
+/// could not do.
+pub async fn ensure_registrar_surface_certificates(
+    settings: &config::Settings,
+    insecure_mode: bool,
+) -> anyhow::Result<()> {
+    if !settings.registrar_endpoint.enabled {
+        return Ok(());
+    }
+    let state_file = settings.registrar.state_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "registrar.state_file is required when registrar_endpoint.enabled is true, and no \
+             value was configured"
+        )
+    })?;
+    let state = read_registrar_state(state_file)?;
+    let secrets_dir = resolve_secrets_dir(state_file, state.secrets_dir.as_deref());
+    crate::registrar::surface_certs::ensure_surface_certificates(
+        settings,
+        &crate::registrar::surface_certs::SurfaceIssuanceInputs {
+            secrets_dir: &secrets_dir,
+            openbao_url: &state.openbao_url,
+            kv_mount: &state.kv_mount,
+        },
+        insecure_mode,
+    )
+    .await
+}
+
 /// The default secrets directory `bootroot init` records nothing for.
 ///
 /// The CLI resolves an absent `secrets_dir` member to this same name
@@ -309,7 +361,6 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
 /// in the binary crate and this is the library, so the value is restated
 /// here rather than reached for across the boundary. A test in that
 /// crate fails if `StateFile`'s fallback ever stops being this name.
-#[cfg(target_os = "linux")]
 const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 
 /// The three members the daemon reads out of the deployment's
@@ -328,20 +379,19 @@ const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 /// It derives [`serde::Deserialize`] and **not** `Serialize` on purpose:
 /// a serializer here is how a later edit comes to write an operator's
 /// state file back out with three fields and lose the rest.
-#[cfg(target_os = "linux")]
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RegistrarStateProjection {
     /// The URL `bootroot init` recorded for this deployment's
     /// `OpenBao`. Must be `https://`.
     #[serde(default)]
-    openbao_url: String,
+    pub(crate) openbao_url: String,
     /// The KV v2 mount every registrar path is written under.
     #[serde(default)]
-    kv_mount: String,
+    pub(crate) kv_mount: String,
     /// The recorded secrets directory, absent on a deployment that never
     /// passed `--secrets-dir`.
     #[serde(default)]
-    secrets_dir: Option<PathBuf>,
+    pub(crate) secrets_dir: Option<PathBuf>,
 }
 
 /// Reads the three members the registrar surface needs out of the
@@ -355,8 +405,7 @@ pub(crate) struct RegistrarStateProjection {
 /// Returns an error when the file cannot be read, is not JSON, carries
 /// an absent or empty `openbao_url` or `kv_mount`, or carries an
 /// `openbao_url` that is not `https://`.
-#[cfg(target_os = "linux")]
-fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProjection> {
+pub(crate) fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProjection> {
     let bytes = std::fs::read(state_file).with_context(|| {
         format!(
             "reading the deployment state file registrar.state_file names at {}",
@@ -403,8 +452,7 @@ fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProje
 /// `state.json` and `secrets/` side by side in the directory it is run
 /// from, and a daemon started by a socket unit has no working directory
 /// worth resolving against.
-#[cfg(target_os = "linux")]
-fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) -> PathBuf {
     let recorded = recorded.unwrap_or_else(|| Path::new(DEFAULT_STATE_SECRETS_DIR));
     if recorded.is_absolute() {
         return recorded.to_path_buf();
@@ -1230,6 +1278,9 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod registrar_handler_tests;
+
+#[cfg(test)]
+mod surface_cert_tests;
 
 #[cfg(test)]
 mod tests {

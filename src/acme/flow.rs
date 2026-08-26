@@ -21,6 +21,26 @@ fn contact_from_email(email: &str) -> String {
     }
 }
 
+/// Which CSR shape one issuance requests.
+///
+/// `issue_certificate` is the crate's one outbound ACME path, and the
+/// shape it asks for is no longer fixed: the registrar's client leaf
+/// must request `clientAuth`, and nothing else may. The variant is a
+/// parameter rather than a fork of the flow so both shapes keep sharing
+/// every step around the CSR — the account registration, the HTTP-01
+/// authorizations, the chain verification and the publication order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsrShape {
+    /// The ordinary service leaf: one DNS SAN, the CN mirroring it, and
+    /// no extended key usage requested at all. What every caller before
+    /// the registrar surface asked for, and still the default.
+    #[default]
+    Service,
+    /// The registrar's client identity, which additionally requests
+    /// [`rcgen::ExtendedKeyUsagePurpose::ClientAuth`].
+    RegistrarClient,
+}
+
 fn build_csr_params(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
@@ -193,8 +213,10 @@ fn merge_ca_bundle(
 }
 
 /// Writes the merged CA bundle to `bundle_path`. Production code and
-/// the test helper share this path so the chain-only write cannot be
-/// silently reintroduced in only one of them (#622 AC #2).
+/// the test helper share this path — and share the order it runs in,
+/// ahead of the leaf's own publication — so neither the chain-only write
+/// nor a leaf published over an unmergeable bundle can be silently
+/// reintroduced in only one of them (#622 AC #2).
 ///
 /// `NotFound` on the existing bundle is the legitimate first-issuance
 /// case and merges against an empty seed. Every other read error is
@@ -372,7 +394,8 @@ async fn wait_for_order_completion(
     Ok(finalized_order)
 }
 
-/// Issues a certificate via ACME protocol.
+/// Issues a certificate via ACME protocol, requesting the ordinary
+/// service CSR shape.
 ///
 /// # Errors
 /// Returns error if ACME protocol fails.
@@ -382,6 +405,38 @@ pub async fn issue_certificate(
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
     insecure_mode: bool,
+) -> Result<()> {
+    issue_certificate_with_shape(
+        settings,
+        profile,
+        eab_creds,
+        insecure_mode,
+        CsrShape::Service,
+    )
+    .await
+}
+
+/// Issues a certificate via ACME protocol, requesting `csr_shape`.
+///
+/// The publication order is deliberate and is shared by every caller:
+/// the returned chain is verified against `trust.trusted_ca_sha256` and
+/// merged into `[trust].ca_bundle_path` **first**, and the leaf and its
+/// key reach disk only once both have succeeded. A chain that fails pin
+/// verification, or a CA bundle that cannot be read, therefore leaves
+/// nothing published — no caller has any use for a leaf whose anchors
+/// could not be established, and publishing first left exactly that on
+/// disk.
+///
+/// # Errors
+/// Returns error if ACME protocol fails, if the returned chain carries a
+/// fingerprint that is not pinned, or if the CA bundle or the leaf and
+/// key cannot be written.
+pub async fn issue_certificate_with_shape(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    insecure_mode: bool,
+    csr_shape: CsrShape,
 ) -> Result<()> {
     let mut client = AcmeClient::new(
         settings.server.clone(),
@@ -407,7 +462,14 @@ pub async fn issue_certificate(
     validate_http01_authorizations(settings, &mut client, &order).await?;
 
     info!("Generating CSR for domain: {}", primary_domain);
-    let params = build_csr_params(settings, profile)?;
+    let params = match csr_shape {
+        CsrShape::Service => build_csr_params(settings, profile)?,
+        CsrShape::RegistrarClient => build_registrar_client_csr_params(
+            &profile.instance_id,
+            &profile.hostname,
+            &settings.domain,
+        )?,
+    };
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
 
@@ -434,17 +496,12 @@ pub async fn issue_certificate(
         let policy = crate::cert_group::CertGroupPolicy {
             gid: profile.cert_group_gid,
         };
-        fs_util::write_cert_and_key(
-            &profile.paths.cert,
-            &profile.paths.key,
-            &leaf_pem,
-            &key_pem,
-            policy,
-        )
-        .await?;
-        info!("Certificate saved to: {:?}", profile.paths.cert);
-        info!("Private key saved to: {:?}", profile.paths.key);
 
+        // Anchors before leaf. With no bundle configured there is
+        // nothing to verify or merge and publication proceeds as it
+        // always has; an empty chain still only warns. What changed is
+        // that a pin failure or an unmergeable bundle now stops the
+        // write instead of arriving after it.
         if let Some(bundle_path) = &settings.trust.ca_bundle_path {
             if chain.is_empty() {
                 warn!("Certificate chain not present; CA bundle not updated.");
@@ -460,6 +517,22 @@ pub async fn issue_certificate(
                 info!("CA bundle saved to: {:?}", bundle_path);
             }
         }
+
+        // Each file is staged and renamed, so each is individually
+        // atomic — the pair is not. A reader landing between the two
+        // renames observes the new leaf with the old key, or the old
+        // leaf with the new key. Closing that window is the reader's
+        // side of the contract, not this write's.
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &leaf_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
+        info!("Certificate saved to: {:?}", profile.paths.cert);
+        info!("Private key saved to: {:?}", profile.paths.key);
     } else {
         info!(
             "Order finalized, but certificate not yet ready (or failed). Status: {:?}",
@@ -571,14 +644,8 @@ mod tests {
         let policy = crate::cert_group::CertGroupPolicy {
             gid: profile.cert_group_gid,
         };
-        fs_util::write_cert_and_key(
-            &profile.paths.cert,
-            &profile.paths.key,
-            &leaf_pem,
-            &key_pem,
-            policy,
-        )
-        .await?;
+        // Same order as the production path, deliberately: the bundle
+        // first, the leaf and key only once it landed.
         if let Some(bundle_path) = &settings.trust.ca_bundle_path
             && !chain.is_empty()
         {
@@ -591,6 +658,14 @@ mod tests {
             )
             .await?;
         }
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &leaf_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
         Ok(())
     }
 
@@ -984,6 +1059,118 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Untrusted CA fingerprint"));
         assert!(!bundle_path.exists());
+    }
+
+    /// The publication order is anchors-then-leaf, and the test helper
+    /// mirrors it: a chain that fails pin verification leaves **nothing**
+    /// on disk, where the old order had already published the leaf and
+    /// the key by the time the merge was reached.
+    ///
+    /// This changes observable behaviour for every caller of
+    /// `issue_certificate`, deliberately: no caller has a use for a
+    /// published leaf whose anchors could not be established.
+    #[tokio::test]
+    async fn an_untrusted_chain_publishes_neither_the_leaf_nor_the_key() {
+        let temp = tempdir().expect("temp dir");
+        let cert_dir = temp.path().join("certs");
+        let bundle_path = temp.path().join("ca-bundle.pem");
+        tokio::fs::create_dir_all(&cert_dir)
+            .await
+            .expect("create cert dir");
+
+        let mut settings = test_settings();
+        settings.trust.ca_bundle_path = Some(bundle_path.clone());
+        settings.trust.trusted_ca_sha256 = vec!["00".repeat(32)];
+
+        let mut profile = test_profile();
+        profile.paths.cert = cert_dir.join("leaf.pem");
+        profile.paths.key = cert_dir.join("leaf.key");
+
+        let leaf_pem = test_cert_pem("leaf.example");
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let combined = format!("{leaf_pem}{intermediate_pem}");
+
+        write_outputs_for_test(&settings, &profile, &combined)
+            .await
+            .expect_err("an untrusted chain refuses");
+        assert!(!bundle_path.exists(), "no bundle is written");
+        assert!(
+            !profile.paths.cert.exists(),
+            "the leaf is not published ahead of its anchors"
+        );
+        assert!(!profile.paths.key.exists(), "the key is not published");
+    }
+
+    /// An unreadable CA bundle refuses **before publication** too, which
+    /// is the case that could not fail that way under the old order: by
+    /// the time the merge refused, the leaf and key were already on
+    /// disk.
+    #[tokio::test]
+    async fn an_unreadable_bundle_refuses_before_the_leaf_is_published() {
+        let temp = tempdir().expect("temp dir");
+        let cert_dir = temp.path().join("certs");
+        // A directory at the bundle path reproduces a non-`NotFound`
+        // read error portably, without depending on chmod semantics that
+        // root in CI bypasses.
+        let bundle_path = temp.path().join("ca-bundle.pem");
+        tokio::fs::create_dir_all(&bundle_path)
+            .await
+            .expect("create directory at bundle path");
+        tokio::fs::create_dir_all(&cert_dir)
+            .await
+            .expect("create cert dir");
+
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let intermediate_der = parse_pem_der(&intermediate_pem);
+        let mut settings = test_settings();
+        settings.trust.ca_bundle_path = Some(bundle_path.clone());
+        settings.trust.trusted_ca_sha256 = vec![sha256_hex(&intermediate_der)];
+
+        let mut profile = test_profile();
+        profile.paths.cert = cert_dir.join("leaf.pem");
+        profile.paths.key = cert_dir.join("leaf.key");
+
+        let leaf_pem = test_cert_pem("leaf.example");
+        let combined = format!("{leaf_pem}{intermediate_pem}");
+        let err = write_outputs_for_test(&settings, &profile, &combined)
+            .await
+            .expect_err("an unreadable bundle refuses");
+        assert!(
+            format!("{err:#}").contains("refusing to overwrite unreadable CA bundle"),
+            "{err:#}"
+        );
+        assert!(!profile.paths.cert.exists(), "no leaf is published");
+        assert!(!profile.paths.key.exists(), "no key is published");
+    }
+
+    /// With no bundle configured there is nothing to verify or merge, so
+    /// publication proceeds exactly as it always has.
+    #[tokio::test]
+    async fn with_no_bundle_configured_publication_still_proceeds() {
+        let temp = tempdir().expect("temp dir");
+        let cert_dir = temp.path().join("certs");
+        tokio::fs::create_dir_all(&cert_dir)
+            .await
+            .expect("create cert dir");
+
+        let mut settings = test_settings();
+        settings.trust.ca_bundle_path = None;
+        let mut profile = test_profile();
+        profile.paths.cert = cert_dir.join("leaf.pem");
+        profile.paths.key = cert_dir.join("leaf.key");
+
+        write_outputs_for_test(&settings, &profile, &test_cert_pem("leaf.example"))
+            .await
+            .expect("publication proceeds with no bundle configured");
+        assert!(profile.paths.cert.exists());
+        assert!(profile.paths.key.exists());
+    }
+
+    /// The default CSR shape is the service one, so no existing caller
+    /// changed shape when the selector arrived.
+    #[test]
+    fn the_default_csr_shape_is_the_service_shape() {
+        assert_eq!(CsrShape::default(), CsrShape::Service);
     }
 
     /// `write_merged_ca_bundle` must fail closed when the existing

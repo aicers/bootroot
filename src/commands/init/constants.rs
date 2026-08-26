@@ -194,11 +194,17 @@ pub(crate) mod openbao_constants {
     /// policy as the runtime DSN — only operator/root tokens
     /// (and any future rotate-only `AppRole`) may read this path.
     pub(crate) const PATH_STEPCA_DB_ADMIN: &str = "bootroot/stepca/db_admin";
-    pub(crate) const PATH_RESPONDER_HMAC: &str = "bootroot/responder/hmac";
-    pub(crate) const PATH_AGENT_EAB: &str = "bootroot/agent/eab";
+    /// The library's one spelling of the agent EAB's KV path,
+    /// re-exported under the name the binary's other `PATH_*` constants
+    /// use.
+    pub(crate) use bootroot::trust_bootstrap::AGENT_EAB_KV_PATH as PATH_AGENT_EAB;
     /// The library's one spelling of the CA anchor's KV path, re-exported
     /// under the name the binary's other `PATH_*` constants use.
     pub(crate) use bootroot::trust_bootstrap::CA_TRUST_KV_PATH as PATH_CA_TRUST;
+    /// The library's one spelling of the responder HMAC's KV path,
+    /// re-exported under the name the binary's other `PATH_*` constants
+    /// use.
+    pub(crate) use bootroot::trust_bootstrap::RESPONDER_HMAC_KV_PATH as PATH_RESPONDER_HMAC;
 }
 
 #[cfg(test)]

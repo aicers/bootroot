@@ -336,8 +336,9 @@ Two consequences worth stating:
 - **Lapse recovery is bootrootd's, NOT bootler's — and the renewal must be
   handed off to the registrar.** Because the daemon issues and renews the
   certificate under its own credential, it needs nothing from the registrar to
-  do so: a lapsed registrar is repaired by **bootrootd running and reaching
-  its next renewal tick**, not by re-provisioning the host. (An earlier
+  do so: a leaf that is **already expired when bootrootd starts is repaired at
+  that start**, before the registrar endpoint loads its TLS material — not by
+  re-provisioning the host. (An earlier
   draft said the sole recovery was re-running bootler; that was the
   pre-self-issue model and is wrong under this decision. bootler provisions
   the **initial** certificate and nothing more. RFC-E §9's `CredentialInvalid`
@@ -352,9 +353,29 @@ Two consequences worth stating:
   re-reads the certificate from disk on every dial**; the latter is preferred
   because it needs no cross-process signal.
   Ordering trap worth stating: if bootrootd is down **through** the renewal
-  deadline, the registrar first reports `EndpointUnreachable` and only after
-  the operator starts it does it report `CredentialInvalid` — one cause, two
-  remediations, the second historically wrong. Both must point at bootrootd.
+  deadline, the registrar used to report `EndpointUnreachable` first and only
+  after the operator started it report `CredentialInvalid` — one cause, two
+  remediations, the second historically wrong. That server-side second symptom
+  has collapsed: starting bootrootd re-issues the endpoint's server leaf before
+  the endpoint accepts a connection, so **where bootrootd comes up** the
+  registrar's next dial succeeds rather than producing a second, different
+  failure report. The caller's own client leaf is a separate matter and is
+  still observable before any repair can run: the registrar reads its
+  configured client material directly and refuses before dialing, so a
+  bootrootd that was down through *that* leaf's expiry still yields a
+  credential-lapse report until an operator starts it. What start-time repair
+  changes there is the sequence the operator sees — one credential-lapse report
+  instead of *unreachable* followed by *credential invalid* — not whether the
+  lapse is observable at all. Replacing the collapsed symptom is a new
+  sub-case: **if bootrootd cannot bring the endpoint up at start it does not
+  come up at all**, so the registrar goes on reporting the endpoint
+  unreachable, and the remedy is the failure bootrootd's startup diagnostic
+  names rather than anything about credentials. More than one path reaches that
+  outcome — issuance itself failing is the likely cause, but a successful
+  issuance whose replacement the endpoint's own TLS loader then rejects lands in
+  the same place, and the registrar's report is identical; a host clock far
+  enough out of step with the CA's, in either direction, is how the second
+  arises. Both symptoms must still point at bootrootd.
   The daemon surfaces the certificate's remaining lifetime so a failing
   renewal is reported rather than discovered when the next install fails.
 

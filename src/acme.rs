@@ -4,4 +4,6 @@ pub mod http01_protocol;
 pub mod responder_client;
 pub(crate) mod types;
 
-pub use flow::{build_registrar_client_csr_params, issue_certificate};
+pub use flow::{
+    CsrShape, build_registrar_client_csr_params, issue_certificate, issue_certificate_with_shape,
+};

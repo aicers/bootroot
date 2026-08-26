@@ -80,6 +80,7 @@ pub mod error;
 pub mod fixture;
 pub mod identity;
 pub mod internal;
+pub mod surface_certs;
 pub(crate) mod verbs;
 
 #[cfg(test)]
@@ -94,6 +95,7 @@ pub use identity::{
     DerivedIdentity, RequestedSpec, check_instance_shape, check_spec_identity, compose_san,
     derive_registration_id, validate_request_labels,
 };
+pub use surface_certs::{SurfaceIssuanceInputs, ensure_surface_certificates};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::FromDer;
@@ -115,6 +117,17 @@ pub const REGISTRAR_CLIENT_LABEL: &str = "bootroot-registrar";
 /// The reserved second label of the host-local endpoint's server
 /// identity.
 pub const REGISTRAR_ENDPOINT_LABEL: &str = "bootroot-registrar-endpoint";
+
+/// The one instance label both registrar-surface identities are ever
+/// composed at.
+///
+/// There is exactly one registrar and exactly one host-local endpoint
+/// per bootroot host, so a varying label would name a multiplicity that
+/// does not exist — the same argument `REGISTRAR_INTERNAL_INSTANCE`
+/// already makes for the internal identity. Spelled as a constant so
+/// the SAN the daemon composes when it issues either leaf and the SAN a
+/// reader of that leaf expects cannot drift apart.
+pub const REGISTRAR_SURFACE_INSTANCE: &str = "001";
 
 /// The reserved second label of the bootroot-internal privileged
 /// identity.

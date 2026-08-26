@@ -24,6 +24,26 @@ pub const CA_BUNDLE_PEM_KEY: &str = "ca_bundle_pem";
 pub const CA_TRUST_KV_PATH: &str = "bootroot/ca";
 pub const CA_BUNDLE_PATH_KEY: &str = "ca_bundle_path";
 
+/// KV v2 path of the shared agent EAB, holding [`EAB_KID_KEY`] and
+/// [`EAB_HMAC_KEY`].
+///
+/// Full path: `{kv_mount}/data/bootroot/agent/eab`. `bootroot init`
+/// writes it, `bootroot status` reports it, and the daemon reads it
+/// under the bootroot-internal credential when it self-issues the
+/// registrar surface's certificates. Spelled here, in the library,
+/// because both crates name it and two spellings of a KV path is the
+/// drift the shared names exist to prevent.
+pub const AGENT_EAB_KV_PATH: &str = "bootroot/agent/eab";
+
+/// KV v2 path of the HTTP-01 responder's shared HMAC, holding
+/// [`HMAC_KEY`].
+///
+/// Full path: `{kv_mount}/data/bootroot/responder/hmac`. Written by
+/// `bootroot init` and by `bootroot rotate responder-hmac`, and read by
+/// the daemon under the bootroot-internal credential when it self-issues
+/// the registrar surface's certificates.
+pub const RESPONDER_HMAC_KV_PATH: &str = "bootroot/responder/hmac";
+
 /// KV v2 path suffix carrying the force-reissue request for a service.
 ///
 /// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/reissue`.

@@ -28,7 +28,7 @@ mod daemon;
 mod fast_poll;
 
 pub use agent_args::Args;
-pub use daemon::{DaemonInvocation, DaemonShutdown};
+pub use daemon::{DaemonInvocation, DaemonShutdown, ensure_registrar_surface_certificates};
 pub use registrar::RegistrarEndpoint;
 
 /// Runs the agent daemon loop for all profiles.

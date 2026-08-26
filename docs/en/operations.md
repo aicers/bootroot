@@ -543,7 +543,8 @@ is invoked under, and it is not the last check. Every accepted connection
 is then wrapped in mutual TLS.
 
 - **The endpoint presents** the chain at `[registrar_endpoint]
-  server_cert_path`, with the key at `server_key_path`. A caller pins the
+  server_cert_path`, with the key at `server_key_path`, which the daemon
+  issues for itself at start. A caller pins the
   deployment's trust anchor and requires the presented leaf's single DNS
   SAN to be exactly
   `<instance>.bootroot-registrar-endpoint.<host>.<network.domain>`.
@@ -586,17 +587,97 @@ the rest of that connection's lines, and a `reason` field:
 | `not-registrar-client` | Verified, but not the registrar client identity. |
 | `unauthorized-peer` | The peer's uid is not the daemon's effective uid. |
 
+#### The daemon issues both leaves at start
+
+Both names live in the reserved `bootroot-` namespace, so `bootroot
+service add` refuses either — which leaves bootroot's own daemon as the
+only thing that can produce them. At startup, **before** the endpoint's
+TLS material is loaded, `bootroot-agent` mints whichever of the two
+leaves it cannot use and writes each with its key to its own configured
+pair of paths:
+
+- `server_cert_path` / `server_key_path` — the leaf the endpoint
+  presents.
+- `client_cert_path` / `client_key_path` — the registrar's own client
+  leaf. **These two are a published contract.** The co-located registrar
+  process reads them, the provisioning tool places the *initial*
+  certificate there at install time, and the endpoint's anchor pin file
+  `registrar-endpoint-anchors.sha256` is looked for in the same directory
+  as the certificate — so moving the certificate moves the pin file.
+
+All four are required when `enabled = true`, and an unset one is refused
+at configuration-validation time, before anything is read or requested.
+
+Issuance runs under bootroot's own **bootroot-internal privileged
+credential** — the root-owned identity that authenticates to `OpenBao` at
+`auth/cert` — over the same outbound ACME path to the local step-ca every
+other issuance takes. No `AppRole` and no expiring secret is anywhere on
+that path. A host whose endpoint is **disabled** issues nothing and
+requests nothing.
+
+**Material already at a configured path is left alone when it is
+usable**: both files present, both readable, both parsing, the key
+matching the leaf, exactly one DNS SAN and it the reserved name for that
+pair, `not_before` passed, `not_after` not passed, and the leaf still
+chaining to `trust.ca_bundle_path` where one is configured. A usable pair
+is never re-issued at start.
+
+**Everything else is repaired by issuing**, one state per condition:
+absent, unreadable, malformed, key-mismatched, SAN-mismatched, not yet
+valid, expired, and chain-drifted. Each is what an ordinary mishap
+leaves — a renewal that lost power mid-write, one that died between the
+two renames, a daemon that was down through `not_after`, a destructive
+trust-anchor rotation — and refusing would strand the host in a state
+whose repair needs the daemon running.
+
+Three cases still do not end in a started daemon:
+
+- **The write cannot land** (a path that is a directory, a dangling
+  symlink, an immutable file, a permission the daemon lacks). That is an
+  issuance failure naming the path and the write error.
+- **`trust.ca_bundle_path` cannot be used.** An unreadable bundle fails
+  *before publication*: the daemon refuses to overwrite a bundle it
+  cannot inspect, so no leaf is written and the bundle is untouched. A
+  missing or unparseable bundle is detected the same way and the merge
+  would repair either, but the outbound ACME client anchors its own TLS
+  to that file and refuses first. All three end in a refusal naming the
+  bundle — which an endpoint-enabled host would reach anyway, since the
+  TLS loader requires a readable, parseable, pinned bundle of its own.
+- **The replacement is still outside its validity window** at this host's
+  clock, in either direction. Issuance succeeded; the TLS loader's own
+  pre-existing refusal then stops the start.
+
+The EAB and the HTTP-01 responder HMAC these issuances use are read from
+`bootroot/agent/eab` and `bootroot/responder/hmac`, under the KV mount
+the deployment `state.json` records, through that same credential — and
+**only** when a leaf actually needs issuing, so a host whose material is
+fine starts with `OpenBao` down. There is no fallback to `agent.toml`'s
+own `[acme] http_responder_hmac` or `[eab]`, and neither value is written
+back to disk. A start that needs issuance inside a trust-rotation window
+refuses with the credential's own repair diagnostic; finishing the
+rotation is the remedy.
+
+**An already-expired leaf is repaired at that start**, before the TLS
+material is loaded — not at the daemon's first renewal tick, which would
+leave an enabled endpoint unable to serve for a whole lead time on
+precisely the restart performed to recover. Who repairs a lapse is
+unchanged: `bootroot-agent`, never re-provisioning the host.
+
 #### Startup refusals for the TLS material
 
 With the endpoint enabled, the daemon refuses to start — naming the
 setting at fault, and the configured path where there is one — when
-`server_cert_path` or `server_key_path` is absent; when the material at
-either is missing, unreadable, unparseable, key-mismatched or
-SAN-mismatched; when the certificate file holds the leaf without its
-issuer chain, or a chain that does not build to a certificate pinned in
-`trust.trusted_ca_sha256`, or one whose anchor is expired, not yet valid
-or not CA-capable; and when `trust.ca_bundle_path` is absent, unreadable,
-unparseable, or holds nothing that is pinned.
+`server_cert_path`, `server_key_path`, `client_cert_path` or
+`client_key_path` is absent; when issuance itself failed; when the
+certificate file holds the leaf without its issuer chain, or a chain that
+does not build to a certificate pinned in `trust.trusted_ca_sha256`, or
+one whose anchor is expired, not yet valid or not CA-capable; and when
+`trust.ca_bundle_path` is absent, unreadable, unparseable, or holds
+nothing that is pinned.
+
+Material *at* a configured path that is missing, unreadable, unparseable,
+key-mismatched or SAN-mismatched is no longer on that list: each of those
+is repaired by issuing, as described above.
 
 The chain requirement catches a failure that would otherwise have no
 local symptom at all: a caller selects its trust anchors from the
@@ -604,16 +685,16 @@ certificates the server presents, so a bare leaf is refused by every
 correctly configured caller while the daemon looks healthy. The daemon
 runs the caller's own rule against its own material instead.
 
-**The server material is supplied out of band** until certificate
-issuance for this leaf lands. bootroot does not create it, does not
-generate a self-signed substitute, and does not fall back to the host's
-ordinary service leaf.
+Where the daemon cannot bring the endpoint up it does not come up at all,
+so a caller goes on seeing the endpoint as unreachable and the remedy is
+whatever the startup diagnostic names — which covers both a failed
+issuance and a successful one the TLS loader then rejected. Do not assume
+a CA outage; read the diagnostic.
 
-Neither certificate path is reloadable. A `SIGHUP` that changes
-`enabled`, `server_cert_path` or `server_key_path` is rejected with a
-diagnostic naming the key that changed, and the running daemon is left as
-it is. Only the *contents* at those paths can change under a running
-daemon.
+No certificate path is reloadable. A `SIGHUP` that changes `enabled` or
+any of the four paths is rejected with a diagnostic naming the key that
+changed, and the running daemon is left as it is. Only the *contents* at
+those paths can change under a running daemon.
 
 #### Installing the units
 

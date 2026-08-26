@@ -109,9 +109,65 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
         validate_openbao_settings(openbao)?;
     }
     validate_registrar_endpoint_settings(&settings.registrar_endpoint)?;
+    validate_registrar_endpoint_material_paths(&settings.registrar_endpoint)?;
     validate_registrar_settings(&settings.registrar)?;
     validate_registrar_state_file_requirement(&settings.registrar, &settings.registrar_endpoint)?;
     Ok(())
+}
+
+/// The four `[registrar_endpoint]` material paths, in the order a
+/// diagnostic names them.
+///
+/// The server pair first because the endpoint's own TLS loader reads it,
+/// then the client pair the co-located registrar reads. Spelled once so
+/// the refusal below and the settings struct cannot drift on how many
+/// there are.
+const REGISTRAR_ENDPOINT_MATERIAL_KEYS: [&str; 4] = [
+    "server_cert_path",
+    "server_key_path",
+    "client_cert_path",
+    "client_key_path",
+];
+
+/// Requires every `[registrar_endpoint]` certificate and key path when
+/// the endpoint is enabled.
+///
+/// There is no default for any of the four, and an unset one is not a
+/// state issuance can repair: the eight unusable states classify
+/// material *at a configured path*, and issuance has nowhere to write
+/// when there is no path at all. Deciding it here — at
+/// configuration-validation time — puts the refusal before any `OpenBao`
+/// read, any CA request and any endpoint activation.
+///
+/// Placed **after** [`validate_registrar_endpoint_settings`] on purpose:
+/// off Linux that check already refuses any `enabled = true` outright,
+/// so this diagnostic is reachable on Linux only and the ordering is a
+/// decision rather than an accident.
+fn validate_registrar_endpoint_material_paths(settings: &RegistrarEndpointSettings) -> Result<()> {
+    if !settings.enabled {
+        return Ok(());
+    }
+    let configured = [
+        settings.server_cert_path.is_some(),
+        settings.server_key_path.is_some(),
+        settings.client_cert_path.is_some(),
+        settings.client_key_path.is_some(),
+    ];
+    let missing: Vec<&str> = REGISTRAR_ENDPOINT_MATERIAL_KEYS
+        .iter()
+        .zip(configured)
+        .filter_map(|(key, present)| (!present).then_some(*key))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "registrar_endpoint.{} {} required when registrar_endpoint.enabled is true: the daemon \
+         issues the endpoint's server leaf and the registrar's client leaf into these paths \
+         before the endpoint loads its TLS material, and there is no default for any of them",
+        missing.join(", registrar_endpoint."),
+        if missing.len() == 1 { "is" } else { "are" }
+    );
 }
 
 /// Requires `[registrar] state_file` exactly when the endpoint is
@@ -603,6 +659,92 @@ fn validate_retry_settings(backoff_secs: &[u64], label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every one of the four material paths set, which is what an
+    /// endpoint-enabled host must configure.
+    fn endpoint_with_all_paths() -> RegistrarEndpointSettings {
+        RegistrarEndpointSettings {
+            enabled: true,
+            server_cert_path: Some("/etc/bootroot/registrar-endpoint.crt".into()),
+            server_key_path: Some("/etc/bootroot/registrar-endpoint.key".into()),
+            client_cert_path: Some("/etc/bootroot/registrar-client.crt".into()),
+            client_key_path: Some("/etc/bootroot/registrar-client.key".into()),
+        }
+    }
+
+    /// A disabled endpoint needs no material at all, so no path is
+    /// required and none is invented.
+    #[test]
+    fn a_disabled_endpoint_requires_no_material_path() {
+        validate_registrar_endpoint_material_paths(&RegistrarEndpointSettings::default())
+            .expect("a disabled endpoint requires nothing");
+    }
+
+    #[test]
+    fn an_enabled_endpoint_with_every_path_set_is_accepted() {
+        validate_registrar_endpoint_material_paths(&endpoint_with_all_paths())
+            .expect("all four paths set");
+    }
+
+    /// Each of the four in turn, because an unset path is not a state
+    /// issuance can repair: it has nowhere to write. Gated on Linux
+    /// because off Linux `validate_registrar_endpoint_settings` refuses
+    /// any `enabled = true` first, so this diagnostic is unreachable
+    /// there and a test that ignored that would pass in CI and fail on a
+    /// developer's machine.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_with_any_material_path_unset_is_refused_naming_the_key() {
+        type Clear = fn(&mut RegistrarEndpointSettings);
+
+        let unset: [(&str, Clear); 4] = [
+            ("server_cert_path", |settings| {
+                settings.server_cert_path = None;
+            }),
+            ("server_key_path", |settings| {
+                settings.server_key_path = None;
+            }),
+            ("client_cert_path", |settings| {
+                settings.client_cert_path = None;
+            }),
+            ("client_key_path", |settings| {
+                settings.client_key_path = None;
+            }),
+        ];
+        for (key, clear) in unset {
+            let mut settings = endpoint_with_all_paths();
+            clear(&mut settings);
+            let err = validate_registrar_endpoint_material_paths(&settings)
+                .expect_err("an unset path must refuse");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains(&format!("registrar_endpoint.{key}")),
+                "{rendered}"
+            );
+            assert!(rendered.contains("is required"), "{rendered}");
+        }
+    }
+
+    /// Several unset at once are all named, so an operator repairs the
+    /// configuration in one pass rather than one restart per key.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn every_unset_material_path_is_named_at_once() {
+        let settings = RegistrarEndpointSettings {
+            enabled: true,
+            ..RegistrarEndpointSettings::default()
+        };
+        let err = validate_registrar_endpoint_material_paths(&settings)
+            .expect_err("four unset paths must refuse");
+        let rendered = err.to_string();
+        for key in REGISTRAR_ENDPOINT_MATERIAL_KEYS {
+            assert!(
+                rendered.contains(&format!("registrar_endpoint.{key}")),
+                "{key} missing from: {rendered}"
+            );
+        }
+        assert!(rendered.contains("are required"), "{rendered}");
+    }
 
     #[test]
     fn cert_duration_accepts_value_greater_than_default_renew_before() {

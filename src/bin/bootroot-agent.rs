@@ -61,6 +61,15 @@ async fn main() -> anyhow::Result<()> {
     // enablement is therefore fixed for the process lifetime, and every
     // later reload is held to the value captured here.
     let (initial_settings, initial_eab) = load_settings(&args).await?;
+    // Before activation, and deliberately so: the endpoint's TLS loader
+    // reads material this ensures exists first, so an endpoint never
+    // comes up presenting or holding an expired leaf. A leaf already
+    // expired at start is repaired here rather than at the daemon's
+    // first renewal tick — deferring would leave an enabled endpoint
+    // unable to serve for a whole lead time, on precisely the restart an
+    // operator performed to recover. On a host whose endpoint is
+    // disabled this does nothing at all.
+    bootroot::ensure_registrar_surface_certificates(&initial_settings, args.insecure).await?;
     let registrar_endpoint_settings = initial_settings.registrar_endpoint.clone();
     let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
