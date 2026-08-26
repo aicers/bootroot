@@ -181,3 +181,68 @@ fn the_shipped_example_carries_all_four_material_paths_commented_out() {
         );
     }
 }
+
+/// The written shape is stated everywhere, and so is the one case that
+/// does not produce it.
+///
+/// What the daemon publishes is whatever chain the CA returned, and the
+/// preserved empty-chain path publishes a bare leaf after a warning
+/// alone. A passage claiming the chain unconditionally sends an operator
+/// looking for a file bootroot did not write and cannot repair by
+/// issuing again, so both halves are held here: the unqualified claim
+/// must be gone, and the case it hid must be present in every file that
+/// describes the shape.
+///
+/// The comparison is whitespace-normalised because these passages are
+/// hard-wrapped prose and a TOML comment: the same sentence breaks at
+/// different columns in each, and a line-anchored match would pass on a
+/// stale claim that merely rewrapped.
+#[test]
+fn the_written_shape_is_qualified_by_the_empty_chain_case() {
+    /// Claims that assert the issuer chain without qualification.
+    const UNQUALIFIED: [&str; 4] = [
+        "it writes holds the leaf followed by its issuer chain",
+        "daemon writes carries the leaf followed by its issuer chain",
+        "it writes carries the leaf followed by its issuer chain",
+        "리프 다음에 발급자 체인",
+    ];
+    /// Each file that states the shape, and the phrase in its own
+    /// language that states the empty-chain case beside it.
+    const STATED: [(&str, &str); 5] = [
+        ("agent.toml.example", "with no issuer at all"),
+        ("docs/en/configuration.md", "with no issuer at all"),
+        ("docs/en/operations.md", "with no issuer at all"),
+        ("docs/ko/configuration.md", "발급자를 하나도 붙이지 않고"),
+        ("docs/ko/operations.md", "발급자를 하나도 붙이지 않고"),
+    ];
+
+    fn normalise(contents: &str) -> String {
+        contents
+            .replace(['*', '#'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    let root = repo_root();
+    for name in SCANNED_FILES {
+        let contents = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|err| panic!("{name} must be readable: {err}"));
+        let flat = normalise(&contents);
+        for claim in UNQUALIFIED {
+            assert!(
+                !flat.contains(claim),
+                "{name} still claims {claim:?} without qualification, but a CA that returns no \
+                 issuer publishes a bare leaf after a warning alone"
+            );
+        }
+    }
+    for (name, stated) in STATED {
+        let contents = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|err| panic!("{name} must be readable: {err}"));
+        assert!(
+            normalise(&contents).contains(stated),
+            "{name} states what the daemon writes, so it must state the empty-chain case too"
+        );
+    }
+}

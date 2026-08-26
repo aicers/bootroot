@@ -609,10 +609,17 @@ All four are required when `enabled = true`, and an unset one is refused
 at configuration-validation time, before anything is read or requested.
 
 Each certificate file the daemon writes carries **the leaf followed by
-its issuer chain**, which is what the chain requirement below demands,
-and the issuers are merged into `trust.ca_bundle_path` as well. The leaf
-stays the first PEM block, so a reader that wants it alone still finds
-it there.
+the issuer chain the CA returned**, which is what the chain requirement
+below demands, and those issuers are merged into `trust.ca_bundle_path`
+as well. The leaf stays the first PEM block, so a reader that wants it
+alone still finds it there.
+
+A CA that returns the leaf **with no issuer at all** is the one case that
+produces neither: the issuance warns, `trust.ca_bundle_path` is left as
+it was, and the leaf is published on its own — on which the chain
+requirement below then refuses the start. Read the startup diagnostic
+rather than assuming the file was placed by hand: reissuing repairs the
+eight unusable states, and this is not one of them.
 
 Issuance runs under bootroot's own **bootroot-internal privileged
 credential** — the root-owned identity that authenticates to `OpenBao` at
