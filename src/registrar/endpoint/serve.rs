@@ -61,7 +61,7 @@ use super::refusal::{
 };
 use super::{
     ActivatedEndpoint, BODY_READ_TIMEOUT, CONNECTION_DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT,
-    HEADER_IDLE_TIMEOUT, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
+    HandshakeCompleted, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
     MAX_RESPONSE_PAYLOAD_BYTES, RESPONSE_WRITE_TIMEOUT,
 };
 use crate::registrar::verbs::outcome::CallerIdentity;
@@ -343,7 +343,7 @@ async fn handle_connection(
     // The header budget restarts here rather than continuing from
     // acceptance: the handshake had a budget of its own, and a slow one
     // must not leave a caller with no time left to send a header.
-    let handshaken_at = Instant::now();
+    let handshaken_at = HandshakeCompleted::now();
     // Logged because this instant is the origin of the header deadline:
     // without it the log shows a connection accepted and then refused
     // for a missing header, with nothing to say which of the two
@@ -469,13 +469,15 @@ fn recognize_caller(
 /// bytes. It is the instant the TLS handshake completed, not the
 /// instant the connection was accepted: the handshake has a budget of
 /// its own, and a slow one must not leave a caller with no time left to
-/// send a header.
+/// send a header. That distinction is the parameter's type rather than
+/// its name — see [`HandshakeCompleted`] — because acceptance is an
+/// `Instant` in scope at the only call site there is.
 pub(crate) async fn serve_request<S>(
     stream: &mut S,
     connection: &ConnectionId,
     caller: &CallerIdentity,
     handler: &dyn RegistrarRequestHandler,
-    handshaken_at: Instant,
+    handshaken_at: HandshakeCompleted,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -517,12 +519,12 @@ pub(crate) async fn serve_request<S>(
 async fn read_header<S>(
     stream: &mut S,
     connection: &ConnectionId,
-    handshaken_at: Instant,
+    handshaken_at: HandshakeCompleted,
 ) -> Option<(Operation, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let header_deadline = handshaken_at + HEADER_IDLE_TIMEOUT;
+    let header_deadline = handshaken_at.header_deadline();
 
     let mut prefix = [0u8; REQUEST_PREFIX_BYTES];
     if let Err(stop) = read_exactly(stream, &mut prefix, header_deadline, connection).await {

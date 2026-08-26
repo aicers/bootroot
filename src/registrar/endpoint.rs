@@ -103,6 +103,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::net::UnixListener;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
@@ -158,6 +159,37 @@ pub(crate) const SD_LISTEN_FDS_START: RawFd = 3;
 
 /// The mode the activated socket must carry, exactly.
 pub(crate) const REQUIRED_SOCKET_MODE: u32 = 0o700;
+
+/// The instant a TLS handshake completed, which is the origin
+/// [`HEADER_IDLE_TIMEOUT`] is measured from.
+///
+/// A newtype rather than a bare `Instant` because the serving path
+/// carries two instants of that one type whose deadlines are not
+/// interchangeable, and the older of the two — acceptance, which starts
+/// [`HANDSHAKE_TIMEOUT`] — is still in scope at the call that arms the
+/// header budget. Nothing turns an `Instant` into one of these, so
+/// arming that budget from acceptance is a compile error rather than
+/// something a test has to be built to notice.
+#[derive(Clone, Copy)]
+pub(crate) struct HandshakeCompleted(Instant);
+
+impl HandshakeCompleted {
+    /// Stamps the origin at the moment of the call.
+    ///
+    /// Call it where the handshake has just completed and nowhere else:
+    /// what makes the value mean what it says is the call site, and
+    /// that is the one thing the type cannot check.
+    #[must_use]
+    pub(crate) fn now() -> Self {
+        Self(Instant::now())
+    }
+
+    /// Returns the instant the header deadline expires.
+    #[must_use]
+    pub(crate) fn header_deadline(self) -> Instant {
+        self.0 + HEADER_IDLE_TIMEOUT
+    }
+}
 
 /// The listening socket the daemon serves the registrar verbs on,
 /// together with everything a connection is decided against.

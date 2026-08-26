@@ -63,9 +63,9 @@ use super::tls::{
 };
 use super::{
     ActivatedEndpoint, CONNECTION_DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT, HEADER_IDLE_TIMEOUT,
-    MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES, MAX_RESPONSE_PAYLOAD_BYTES,
-    REQUIRED_SOCKET_MODE, UNPRIVILEGED_DAEMON_WARNING, current_effective_uid,
-    warns_about_unprivileged_daemon,
+    HandshakeCompleted, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
+    MAX_RESPONSE_PAYLOAD_BYTES, REQUIRED_SOCKET_MODE, UNPRIVILEGED_DAEMON_WARNING,
+    current_effective_uid, warns_about_unprivileged_daemon,
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::AuditRecordStore;
@@ -1116,7 +1116,7 @@ async fn drive_with(
         &ConnectionId::next(),
         &caller_identity(&registrar_client_name()),
         handler,
-        Instant::now(),
+        HandshakeCompleted::now(),
     )
     .await;
     let mut observed = Vec::new();
@@ -1607,7 +1607,7 @@ async fn the_response_deadline_closes_the_connection_without_a_refusal() {
         &ConnectionId::next(),
         &caller_identity(&registrar_client_name()),
         &handler,
-        started,
+        HandshakeCompleted::now(),
     )
     .await;
 
@@ -2466,16 +2466,6 @@ async fn a_connection_that_never_handshakes_is_dropped_at_the_handshake_timeout(
     running.stop().await;
 }
 
-/// The message the endpoint logs once it has accepted a connection.
-///
-/// It marks the point the handshake deadline is measured from: the
-/// accept loop stamps that origin, and the connection task logs this a
-/// few statements later. A test that means to place anything *between*
-/// acceptance and the handshake has to wait for it, because a `connect`
-/// completes in the listener's backlog — before the endpoint has
-/// accepted anything, and so before it has stamped anything.
-const CONNECTION_ACCEPTED_MESSAGE: &str = "Registrar endpoint accepted a connection.";
-
 /// The message the endpoint logs once a TLS handshake has completed.
 ///
 /// It is the only signal a test has that the *server* is past the
@@ -2487,9 +2477,9 @@ const HANDSHAKE_COMPLETED_MESSAGE: &str = "Registrar endpoint completed a TLS ha
 /// How many scheduler turns [`await_log_message`] will spin for.
 ///
 /// Only a bound on a hang: the connection task needs a handful of turns
-/// to reach either of the events above, and the clock is running
-/// wherever this is used, so an endpoint that never gets there fails
-/// with the message below rather than blocking the suite forever.
+/// to reach the event above, and the clock is running wherever this is
+/// used, so an endpoint that never gets there fails with the message
+/// below rather than blocking the suite forever.
 const LOG_BARRIER_TURNS: usize = 100_000;
 
 /// Yields until the endpoint has logged `message`.
@@ -2527,91 +2517,49 @@ async fn settle() {
     }
 }
 
-/// How far the clock is moved between acceptance and the handshake in
-/// [`a_completed_handshake_gets_the_whole_header_budget_from_that_completion`].
-///
-/// Over a loopback socket a handshake completes a fraction of a
-/// millisecond after the connection was accepted, and no advance can
-/// land inside a gap that narrow: an endpoint arming the header
-/// deadline at acceptance and one arming it at handshake completion
-/// would answer every advance identically. Moving the clock forward
-/// before the `ClientHello` is sent widens that gap to something a test
-/// can aim between. It costs the handshake nothing but budget it does
-/// not need, which is why it stays short of [`HANDSHAKE_TIMEOUT`].
-const PRE_HANDSHAKE_ADVANCE: StdDuration = StdDuration::from_secs(4);
-
-/// How far the clock is moved once that handshake has completed, before
-/// asserting the connection is still open.
-///
-/// Aimed between the two candidate origins: added to
-/// [`PRE_HANDSHAKE_ADVANCE`] it is past `accepted_at +
-/// HEADER_IDLE_TIMEOUT`, so a header deadline armed at acceptance has
-/// expired by then, and on its own it is short of
-/// [`HEADER_IDLE_TIMEOUT`], so one armed at handshake completion has
-/// not.
-const POST_HANDSHAKE_ADVANCE: StdDuration = StdDuration::from_secs(3);
-
-/// The margin added to the last advance of that test, for the timer
+/// The margin the header-budget advances below carry, for the timer
 /// wheel's millisecond granularity.
 ///
 /// A deadline is rounded up to the next millisecond, so advancing by
 /// exactly the budget can land short of it and leave the connection
-/// open. One millisecond covers the whole of that rounding, and keeps
-/// the upper bound the advance places on the budget as tight as the
-/// wheel allows.
+/// open. One millisecond covers the whole of that rounding: it is held
+/// back from the advance that must not reach the deadline, and added to
+/// the one that must.
 const TIMER_ROUNDING: StdDuration = StdDuration::from_millis(1);
-
-/// The two advances above discriminate between the origins only while
-/// these hold, and each relates a test constant to an endpoint one. They
-/// are checked here so that changing either timeout is a compile error
-/// rather than a test that quietly stops proving what it says it does.
-const _: () = {
-    assert!(
-        PRE_HANDSHAKE_ADVANCE.as_nanos() < HANDSHAKE_TIMEOUT.as_nanos(),
-        "the head start must leave the handshake budget unspent"
-    );
-    assert!(
-        POST_HANDSHAKE_ADVANCE.as_nanos() < HEADER_IDLE_TIMEOUT.as_nanos(),
-        "a header budget measured from handshake completion must survive the probe"
-    );
-    assert!(
-        PRE_HANDSHAKE_ADVANCE.as_nanos() + POST_HANDSHAKE_ADVANCE.as_nanos()
-            > HEADER_IDLE_TIMEOUT.as_nanos(),
-        "a header budget measured from acceptance must not survive the probe"
-    );
-};
 
 /// A connection that *does* complete a handshake gets a whole
 /// [`HEADER_IDLE_TIMEOUT`] measured from that completion, and is then
 /// refused as a missing header rather than as a handshake that never
 /// finished.
 ///
-/// The origin is what is at stake, so the test manufactures the one
-/// thing a loopback connection does not have: a wide, exactly known gap
-/// between acceptance and handshake completion. The clock is advanced
-/// by [`PRE_HANDSHAKE_ADVANCE`] after the endpoint has accepted the
-/// connection and before the client sends its `ClientHello`, which
-/// leaves the two candidate origins seconds apart instead of
-/// microseconds. [`POST_HANDSHAKE_ADVANCE`] then lands between the two
-/// deadlines they imply: an endpoint passing `accepted_at` to
-/// `serve_request` refuses the connection during that advance and fails
-/// the assertion after it, and only one measuring from handshake
-/// completion is still open. The remaining advance carries the clock
-/// past the completion-measured deadline as well, and the refusal it
-/// produces names `no-header` rather than a handshake timeout.
+/// Everything up to and including the handshake runs under a live
+/// clock, against the production deadlines: the endpoint has real
+/// progress to make there, and pausing across it would let auto-advance
+/// fire mid-flight, jump to the handshake deadline and refuse a
+/// connection that was getting on with it. Only once the server has
+/// logged the handshake — the client's future resolves earlier than
+/// that — is the clock paused, and from there the header budget is
+/// spent by moving it rather than by waiting.
 ///
-/// That last advance also bounds the budget from above: it stops one
-/// millisecond past `HEADER_IDLE_TIMEOUT` from the pause, so a deadline
-/// an order of magnitude too far away would not be reached by it.
+/// The two advances bound that budget from both sides. What the test
+/// cannot read is the endpoint's own stamp, so the first advance bounds
+/// it instead: the stamp is taken after a handshake that had not begun
+/// at `dialed_at`, so no more of the budget has gone at the pause than
+/// has elapsed since then. Deducting that bound and the wheel's
+/// rounding leaves an advance that cannot reach the deadline, however
+/// long the handshake took, and the connection is still open after it.
+/// The second carries the clock a millisecond past a whole
+/// [`HEADER_IDLE_TIMEOUT`] from the pause, which is at or past the
+/// deadline for the same reason — so a budget an order of magnitude too
+/// generous would fail here rather than pass.
 ///
-/// The clock runs whenever the endpoint has to make progress — through
-/// the accept, and through the handshake itself — and is paused only to
-/// be moved. Pausing across the handshake would let auto-advance fire
-/// while it was still in flight, jumping to the handshake deadline and
-/// refusing a connection that was making progress; the test would then
-/// assert the wrong reason for a reason that has nothing to do with the
-/// endpoint. No wall-clock time is spent on any of the three advances,
-/// so the nine seconds of deadline they cover cost the suite nothing.
+/// The origin itself is not what this test pins down: over a loopback
+/// socket acceptance and handshake completion are microseconds apart,
+/// and no advance can be aimed between deadlines that close together
+/// without moving the clock before the handshake, which this test is
+/// required not to do. That is [`HandshakeCompleted`]'s job in the
+/// serving path, where measuring the header budget from acceptance is a
+/// compile error.
 #[tokio::test]
 async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion() {
     let (logs, _guard) = capture_logs();
@@ -2623,47 +2571,32 @@ async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion
         }),
     );
 
-    // The connection, but not yet the handshake, so that the clock can
-    // be moved between the two.
-    let stream = UnixStream::connect(&harness.socket_path)
-        .await
-        .expect("connect");
-    await_log_message(&logs, CONNECTION_ACCEPTED_MESSAGE).await;
-
-    // Most of the handshake budget, spent before the `ClientHello`.
-    // This is what puts acceptance and handshake completion far enough
-    // apart for an advance to fall between the deadlines they imply.
-    tokio::time::pause();
-    tokio::time::advance(PRE_HANDSHAKE_ADVANCE).await;
-    tokio::time::resume();
-
     // A real handshake through the production endpoint, under a running
-    // clock and under the real handshake deadline — still armed, and
-    // with `PRE_HANDSHAKE_ADVANCE` less of itself left than it began
-    // with.
-    let mut stream = TlsConnector::from(Arc::new(harness.pki.registrar_client_config()))
-        .connect(
-            ServerName::try_from(DIAL_NAME).expect("a valid dial name"),
-            stream,
-        )
+    // clock and under the real handshake deadline.
+    let dialed_at = Instant::now();
+    let mut stream = tls_connect(&harness.socket_path, harness.pki.registrar_client_config())
         .await
         .expect("the registrar client completes a handshake");
     await_log_message(&logs, HANDSHAKE_COMPLETED_MESSAGE).await;
 
-    // From here the connection is inside the header deadline and no
-    // other deadline is armed, so the budget is spent by moving the
-    // clock rather than by waiting.
+    // The handshake is behind the endpoint and the header deadline is
+    // the only one armed, so the budget can be spent without waiting.
     tokio::time::pause();
 
-    // Past `accepted_at + HEADER_IDLE_TIMEOUT` and short of
-    // `handshaken_at + HEADER_IDLE_TIMEOUT`.
-    tokio::time::advance(POST_HANDSHAKE_ADVANCE).await;
+    // How much of that budget has already gone is the endpoint's stamp
+    // against this pause, and the test can read neither. It can bound
+    // the difference: the stamp comes after a handshake that had not
+    // begun at `dialed_at`.
+    let spent_at_most = dialed_at.elapsed();
+    let inside = HEADER_IDLE_TIMEOUT
+        .checked_sub(spent_at_most + TIMER_ROUNDING)
+        .expect("a loopback handshake completes far inside the header budget");
+    tokio::time::advance(inside).await;
     settle().await;
     assert!(
         logs.refusals().is_empty(),
-        "a completed handshake gets a header budget of its own: \
-         {PRE_HANDSHAKE_ADVANCE:?} of one measured from acceptance had \
-         already gone before the handshake even began"
+        "a completed handshake keeps its connection through {inside:?} of \
+         a {HEADER_IDLE_TIMEOUT:?} header budget"
     );
 
     // The rest of that budget, and the wheel's rounding. Asserted before
@@ -2672,11 +2605,11 @@ async fn a_completed_handshake_gets_the_whole_header_budget_from_that_completion
     // under a paused clock, so auto-advance carries it to whatever the
     // next timer is, however far away that is, and reports it as
     // no-header just the same.
-    let remaining = HEADER_IDLE_TIMEOUT
-        .checked_sub(POST_HANDSHAKE_ADVANCE)
-        .expect("the assertion above holds the probe inside the header budget")
-        + TIMER_ROUNDING;
-    tokio::time::advance(remaining).await;
+    let whole_budget = HEADER_IDLE_TIMEOUT + TIMER_ROUNDING;
+    let rest = whole_budget
+        .checked_sub(inside)
+        .expect("the advance above is a whole budget less what preceded it");
+    tokio::time::advance(rest).await;
     settle().await;
     assert_eq!(
         logs.refusals().len(),
