@@ -2521,10 +2521,28 @@ async fn settle() {
     }
 }
 
-/// A connection that *does* complete a handshake gets the full
-/// [`HEADER_IDLE_TIMEOUT`] measured from that completion, and is then
+/// A connection that *does* complete a handshake gets a whole
+/// [`HEADER_IDLE_TIMEOUT`] in which to send a header, and is then
 /// refused as a missing header rather than as a handshake that never
 /// finished.
+///
+/// What the advance below pins down is that budget's *length* and the
+/// reason it ends in: five seconds pass with the connection still open,
+/// and the refusal names `no-header`. It does not pin the origin down
+/// to the microsecond, and is not the coverage that the origin is
+/// handshake completion rather than acceptance. Over a loopback socket
+/// those two instants are a fraction of a millisecond apart, and every
+/// instant this test can name falls outside that gap, so no advance
+/// from one of them separates a deadline armed at acceptance from one
+/// armed at completion. Nor can the budget be bounded from above any
+/// more tightly than it is here: the timer wheel rounds a deadline up
+/// to the next millisecond, so advancing to exactly the pause plus the
+/// budget lands short of the rounded deadline and the connection
+/// outlives the assertion. What holds the origin is the signature
+/// `serve_request` is given -- it takes `handshaken_at`, and its only
+/// production caller stamps that after `handshake` has returned -- and
+/// [`the_header_deadline_expires_with_no_header_when_no_byte_arrives`],
+/// which drives the same deadline from an origin it chooses outright.
 ///
 /// The clock runs for the handshake and is paused only once the server
 /// has completed it. Pausing earlier would let auto-advance fire while
