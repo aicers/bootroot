@@ -61,7 +61,7 @@ use super::refusal::{
 };
 use super::{
     ActivatedEndpoint, BODY_READ_TIMEOUT, CONNECTION_DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT,
-    HEADER_IDLE_TIMEOUT, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
+    HandshakeCompleted, MAX_CONCURRENT_CONNECTIONS, MAX_FRAME_PAYLOAD_BYTES,
     MAX_RESPONSE_PAYLOAD_BYTES, RESPONSE_WRITE_TIMEOUT,
 };
 use crate::registrar::verbs::outcome::CallerIdentity;
@@ -151,13 +151,15 @@ pub(crate) async fn run(
             accepted = endpoint.listener().accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
-                        // The header deadline is cumulative *from
-                        // acceptance*, so the clock starts here rather
-                        // than wherever the connection task is
+                        // The TLS handshake deadline is cumulative
+                        // *from acceptance*, so the clock starts here
+                        // rather than wherever the connection task is
                         // eventually scheduled: under executor
                         // contention those are not the same instant,
                         // and only this one is the one the contract
-                        // names.
+                        // names. The header deadline is a separate
+                        // budget that starts once the handshake has
+                        // completed.
                         let accepted_at = Instant::now();
                         admit(
                             &mut connections,
@@ -341,7 +343,15 @@ async fn handle_connection(
     // The header budget restarts here rather than continuing from
     // acceptance: the handshake had a budget of its own, and a slow one
     // must not leave a caller with no time left to send a header.
-    let handshaken_at = Instant::now();
+    let handshaken_at = HandshakeCompleted::now();
+    // Logged because this instant is the origin of the header deadline:
+    // without it the log shows a connection accepted and then refused
+    // for a missing header, with nothing to say which of the two
+    // budgets the caller actually spent.
+    debug!(
+        connection = connection.as_str(),
+        "Registrar endpoint completed a TLS handshake."
+    );
 
     // The identity is decided here, after the handshake, rather than
     // inside a `ClientCertVerifier` — see [`CallerIdentityRefusal`].
@@ -454,21 +464,24 @@ fn recognize_caller(
 /// an in-memory duplex — including every deadline, with `tokio::time`
 /// paused — without a socket, a peer or a uid.
 ///
-/// `accepted_at` starts the header deadline, which is cumulative
+/// `handshaken_at` starts the header deadline, which is cumulative
 /// through both the five-byte prefix and the declared operation-name
-/// bytes. On the real serving path it is the instant the TLS handshake
-/// completed, not the instant the connection was accepted: the handshake
-/// has a budget of its own.
+/// bytes. It is the instant the TLS handshake completed, not the
+/// instant the connection was accepted: the handshake has a budget of
+/// its own, and a slow one must not leave a caller with no time left to
+/// send a header. That distinction is the parameter's type rather than
+/// its name — see [`HandshakeCompleted`] — because acceptance is an
+/// `Instant` in scope at the only call site there is.
 pub(crate) async fn serve_request<S>(
     stream: &mut S,
     connection: &ConnectionId,
     caller: &CallerIdentity,
     handler: &dyn RegistrarRequestHandler,
-    accepted_at: Instant,
+    handshaken_at: HandshakeCompleted,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some((operation, payload_length)) = read_header(stream, connection, accepted_at).await
+    let Some((operation, payload_length)) = read_header(stream, connection, handshaken_at).await
     else {
         return;
     };
@@ -506,12 +519,12 @@ pub(crate) async fn serve_request<S>(
 async fn read_header<S>(
     stream: &mut S,
     connection: &ConnectionId,
-    accepted_at: Instant,
+    handshaken_at: HandshakeCompleted,
 ) -> Option<(Operation, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let header_deadline = accepted_at + HEADER_IDLE_TIMEOUT;
+    let header_deadline = handshaken_at.header_deadline();
 
     let mut prefix = [0u8; REQUEST_PREFIX_BYTES];
     if let Err(stop) = read_exactly(stream, &mut prefix, header_deadline, connection).await {
