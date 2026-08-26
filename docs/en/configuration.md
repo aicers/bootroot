@@ -604,6 +604,9 @@ audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+openbao_audit_max_file_bytes = 67108864
+openbao_audit_max_retained_files = 7
+openbao_audit_min_retain_days = 90
 
 # Verb rate limiting; see "Registrar verb rate limiting" below.
 rate_limit_admission_burst = 512
@@ -669,6 +672,50 @@ error.
   than 0.
 - `audit_min_retain_days` (default `90`) — the retention **target** in
   days. Must be greater than 0.
+
+The next three bound OpenBao's **own** file audit device, which the
+daemon rotates in place on an endpoint-enabled host. They are separate
+keys rather than a reuse of the three above because the two writers have
+unrelated volumes: one bounded line per registrar invocation, against one
+entry per OpenBao request across the whole deployment. See
+[Rotating the audit device](operations.md#rotating-the-audit-device).
+
+- `openbao_audit_max_file_bytes` (`u64`, default `67108864`, 64 MiB) —
+  the size the device's active log is rotated at. Must be at least
+  `1048576` (1 MiB). That floor is **not** derived from a maximum record
+  size the way `audit_max_file_bytes`'s 64 KiB is: bootroot does not
+  control the size of an OpenBao audit entry, so there is no maximum
+  entry to multiply against. It exists so a rotation stays a rare event
+  rather than something the 60-second check performs on every tick.
+- `openbao_audit_max_retained_files` (`u32`, default `7`) — how many
+  rotated generations are retained beside the active log, not counting
+  the active log itself. Must be greater than 0.
+- `openbao_audit_min_retain_days` (`u32`, default `90`) — the retention
+  **target** in days. Must be greater than 0. The size ceiling always
+  wins, so on a busy deployment this target routinely goes unmet; that is
+  intended and raises no alarm.
+
+**The defaults are derived from the reserve.** The hard ceiling on the
+retained set is `openbao_audit_max_file_bytes ×
+openbao_audit_max_retained_files` = 448 MiB. Under the nominal model the
+device sits at about 512 MiB between passes and peaks at about 576 MiB
+inside one; the verb-record store's own family is `audit_max_file_bytes ×
+(audit_max_retained_files + 1)` = 136 MiB, with no staging copy and so no
+doubling term. Together that is 712 MiB inside the 2 GiB
+`audit_store_reserve_bytes`, about 1.3 GiB of headroom, and the write
+terms would have to reach 824 MiB — roughly 6.9 MiB/s of sustained audit
+output across a 60-second interval — before these two writers reached the
+512 MiB low-water alarm in steady state. Re-derive that arithmetic if you
+change the interval, either bound or the mechanism. It is **not** proof
+that an alarm means a third writer: a stalled rotation puts these two
+past it alone.
+
+A configuration whose `openbao_audit_max_file_bytes × (
+openbao_audit_max_retained_files + 1)` does not fit in a 64-bit integer
+is rejected at load, naming both keys, so the rotation's own budget
+arithmetic can never overflow at runtime. A family over 16 EiB is a typo
+rather than a deployment, and saturating it instead would leave a budget
+of `u64::MAX`, which is no bound at all.
 
 #### Verb-layer settings
 

@@ -6,6 +6,10 @@ use config::{ConfigBuilder, ConfigError, builder::DefaultState};
 use crate::registrar::audit::{
     DEFAULT_AUDIT_MAX_FILE_BYTES, DEFAULT_AUDIT_MAX_RETAINED_FILES, DEFAULT_AUDIT_MIN_RETAIN_DAYS,
 };
+use crate::registrar::openbao_audit::{
+    DEFAULT_OPENBAO_AUDIT_MAX_FILE_BYTES, DEFAULT_OPENBAO_AUDIT_MAX_RETAINED_FILES,
+    DEFAULT_OPENBAO_AUDIT_MIN_RETAIN_DAYS,
+};
 use crate::registrar::verbs::limiter::{
     DEFAULT_RATE_LIMIT_ADMISSION_BURST, DEFAULT_RATE_LIMIT_ADMISSION_REFILL_INTERVAL_MS,
     DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_BURST,
@@ -179,6 +183,18 @@ pub(crate) fn default_audit_max_retained_files() -> u32 {
 
 pub(crate) fn default_audit_min_retain_days() -> u32 {
     DEFAULT_AUDIT_MIN_RETAIN_DAYS
+}
+
+pub(crate) fn default_openbao_audit_max_file_bytes() -> u64 {
+    DEFAULT_OPENBAO_AUDIT_MAX_FILE_BYTES
+}
+
+pub(crate) fn default_openbao_audit_max_retained_files() -> u32 {
+    DEFAULT_OPENBAO_AUDIT_MAX_RETAINED_FILES
+}
+
+pub(crate) fn default_openbao_audit_min_retain_days() -> u32 {
+    DEFAULT_OPENBAO_AUDIT_MIN_RETAIN_DAYS
 }
 
 pub(crate) fn default_provisioning_config_path() -> PathBuf {

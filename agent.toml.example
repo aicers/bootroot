@@ -110,6 +110,18 @@ enabled = false
 # ~136 MiB.  audit_min_retain_days records the retention target; where
 # the two disagree, the file count wins.
 #
+# The three openbao_audit_* keys bound OpenBao's own file audit device,
+# which the daemon rotates in place when the registrar endpoint is
+# enabled.  They are separate keys rather than a reuse of the three
+# above because the two writers have unrelated volumes: one bounded line
+# per registrar invocation, against one entry per OpenBao request across
+# the deployment.  The hard ceiling is on the retained generations —
+# openbao_audit_max_file_bytes x openbao_audit_max_retained_files, 448
+# MiB by default — and the device itself has no absolute footprint
+# ceiling, because bootroot is not the process writing it.  The floor on
+# openbao_audit_max_file_bytes is 1 MiB, which keeps a rotation rare
+# rather than something the 60-second check does every tick.
+#
 # The verb-layer keys below provision what the endpoint serves.  They are
 # validated on every host, whether or not the endpoint is enabled, and
 # every duration is a humantime string rather than a bare count of
@@ -124,6 +136,9 @@ audit_record_dir = "/var/lib/bootroot/registrar-audit"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+openbao_audit_max_file_bytes = 67108864
+openbao_audit_max_retained_files = 7
+openbao_audit_min_retain_days = 90
 # state_file = "/opt/bootroot/state.json"
 provisioning_config_path = "/etc/clumit-security/provisioning.toml"
 max_wrap_ttl = "30m"

@@ -211,6 +211,7 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     if let Some((endpoint, request_handler)) = registrar_service {
         spawn_registrar_endpoint(&mut handles, endpoint, request_handler, &shutdown_rx);
     }
+    spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
@@ -637,6 +638,49 @@ fn spawn_registrar_endpoint(
     handles.push(tokio::spawn(async move {
         crate::registrar::endpoint::serve::run(endpoint, request_handler, shutdown_rx).await
     }));
+}
+
+/// Spawns the task that rotates `OpenBao`'s file audit device, when
+/// this host is one whose device the daemon owns.
+///
+/// The predicate is exactly `[registrar_endpoint] enabled = true` and
+/// nothing else — not the socket, not the unit pair, not whether the
+/// store directory exists. Where it does not hold, `/openbao/audit` is
+/// still backed by the `openbao-audit` named volume, nothing on the
+/// host is there to rotate, and no task is spawned at all.
+///
+/// The device's directory is derived through
+/// [`crate::registrar::audit_store::openbao_dir`] rather than by
+/// joining a subdirectory name on by hand: a second spelling is a
+/// second directory waiting to happen.
+///
+/// The handle joins the same `handles` vector every other daemon task
+/// uses, so [`collect_task_results`] observes it. It is deliberately not
+/// hung off the per-profile check loop: that interval is per-profile,
+/// jittered and operator-configurable up to hours, while the device is a
+/// single global object.
+fn spawn_openbao_audit_rotation(
+    handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    settings: &config::Settings,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    if !settings.registrar_endpoint.enabled {
+        return;
+    }
+    let registrar = &settings.registrar;
+    let rotation = crate::registrar::openbao_audit::OpenBaoAuditRotation::new(
+        crate::registrar::audit_store::openbao_dir(&registrar.audit_store_dir),
+        registrar.openbao_audit_max_file_bytes,
+        registrar.openbao_audit_max_retained_files,
+    );
+    let shutdown_rx = shutdown_rx.clone();
+    handles.push(tokio::spawn(
+        crate::registrar::openbao_audit::run_rotation_loop(
+            rotation,
+            crate::registrar::openbao_audit::ROTATION_INTERVAL,
+            shutdown_rx,
+        ),
+    ));
 }
 
 async fn run_profile_daemon(
@@ -2259,6 +2303,36 @@ http_responder_hmac = "dev-hmac"
         assert_eq!(settings.email, fallback_settings.email);
         assert_eq!(profile.service_name, fallback_profile.service_name);
         assert_eq!(profile.instance_id, fallback_profile.instance_id);
+    }
+
+    /// The rotation task's predicate is exactly `[registrar_endpoint]
+    /// enabled`: on a host where it is not true nothing is spawned at
+    /// all, and the three `[registrar]` rotation keys are inert.
+    #[test]
+    fn the_openbao_audit_rotation_task_is_spawned_only_behind_the_endpoint_gate() {
+        let (_, shutdown_rx) = watch::channel(false);
+
+        let mut settings = build_settings(vec![1]);
+        assert!(
+            !settings.registrar_endpoint.enabled,
+            "an absent [registrar_endpoint] table parses as disabled"
+        );
+        let mut handles = Vec::new();
+        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
+        assert!(handles.is_empty(), "a disabled endpoint spawns no task");
+
+        settings.registrar_endpoint.enabled = true;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let guard = runtime.enter();
+        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
+        assert_eq!(handles.len(), 1, "an enabled endpoint spawns exactly one");
+        drop(guard);
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     /// When the reload itself fails — corrupt TOML, mid-truncate

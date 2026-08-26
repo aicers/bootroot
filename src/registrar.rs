@@ -19,6 +19,11 @@
 //!   registrar's own audit trail is written to, and the versioned JSON
 //!   Lines format it writes. It is public because a reader of the
 //!   format needs the record types; the store's construction is not.
+//! - [`openbao_audit`] rotates `OpenBao`'s own file audit device in
+//!   place, so the generations bootroot owns beside it carry a hard
+//!   configured ceiling. It is public for the three bounds and the
+//!   budget arithmetic the configuration layer validates against; the
+//!   rotation itself is the daemon's.
 //!
 //! The crate-private `verbs` sibling is the layer above: the
 //! transport-free mint and deregister control plane that calls those
@@ -80,6 +85,7 @@ pub mod error;
 pub mod fixture;
 pub mod identity;
 pub mod internal;
+pub mod openbao_audit;
 pub(crate) mod verbs;
 
 #[cfg(test)]

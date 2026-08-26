@@ -12,6 +12,7 @@ use super::{
 use crate::fs_util::path_is_within;
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
+use crate::registrar::openbao_audit::{MIN_OPENBAO_AUDIT_MAX_FILE_BYTES, checked_family_bytes};
 use crate::registrar::verbs::wrap_ttl::{WrapTtlPolicy, WrapTtlRefusal};
 
 const MAX_SIGNED_AUDIT_STORE_RESERVE_BYTES: u64 = i64::MAX.unsigned_abs();
@@ -267,6 +268,7 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
     if settings.audit_min_retain_days == 0 {
         anyhow::bail!("registrar.audit_min_retain_days must be greater than 0");
     }
+    validate_openbao_audit_rotation(settings)?;
     validate_rate_limit_sizing(settings)?;
     if !settings.provisioning_config_path.is_absolute() {
         anyhow::bail!(
@@ -297,6 +299,57 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
             "registrar.state_file ({}) must be an absolute path; the daemon's working directory \
              is not contracted to be stable under a service supervisor",
             state_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// Rejects bounds the `OpenBao` audit device's rotation could not hold
+/// the retained set to.
+///
+/// The floor is not derived from a maximum record size the way the
+/// verb-record store's is: bootroot does not control the size of an
+/// `OpenBao` audit entry, so there is no such constant to multiply
+/// against. It exists so a rotation stays a rare event rather than
+/// something the periodic check performs on every tick.
+///
+/// The last check is what lets the rotation's own budget arithmetic be
+/// total. `S × (N + 1)` is the widest product the runtime ever needs, so
+/// refusing a configuration that overflows it means `S × N` cannot
+/// overflow either and no runtime path has an arithmetic error to
+/// report. Saturating here instead is not an option: a budget saturated
+/// to `u64::MAX` is no bound at all, and the value it would come from is
+/// a typo rather than a deployment — a real one would be over 16 EiB.
+fn validate_openbao_audit_rotation(settings: &RegistrarSettings) -> Result<()> {
+    if settings.openbao_audit_max_file_bytes < MIN_OPENBAO_AUDIT_MAX_FILE_BYTES {
+        anyhow::bail!(
+            "registrar.openbao_audit_max_file_bytes ({}) must be at least \
+             {MIN_OPENBAO_AUDIT_MAX_FILE_BYTES}, the floor that keeps rotating OpenBao's audit \
+             device a rare event rather than something the periodic check does every tick",
+            settings.openbao_audit_max_file_bytes
+        );
+    }
+    if settings.openbao_audit_max_retained_files == 0 {
+        anyhow::bail!(
+            "registrar.openbao_audit_max_retained_files must be greater than 0; retaining no \
+             rotated generation would discard every rotated OpenBao audit record immediately"
+        );
+    }
+    if settings.openbao_audit_min_retain_days == 0 {
+        anyhow::bail!("registrar.openbao_audit_min_retain_days must be greater than 0");
+    }
+    if checked_family_bytes(
+        settings.openbao_audit_max_file_bytes,
+        settings.openbao_audit_max_retained_files,
+    )
+    .is_none()
+    {
+        anyhow::bail!(
+            "registrar.openbao_audit_max_file_bytes ({}) times one more than \
+             registrar.openbao_audit_max_retained_files ({}) does not fit in a 64-bit budget; \
+             a retained family over 16 EiB is a typo rather than a deployment",
+            settings.openbao_audit_max_file_bytes,
+            settings.openbao_audit_max_retained_files
         );
     }
     Ok(())

@@ -106,6 +106,21 @@ pub struct RegistrarSettings {
     /// The retention target in days reported by `bootroot status`.
     /// Where the two disagree, `audit_max_retained_files` wins.
     pub audit_min_retain_days: u32,
+    /// Size at which `OpenBao`'s **own** file audit device is rotated in
+    /// place, in bytes. Deliberately not
+    /// [`RegistrarSettings::audit_max_file_bytes`]: the two writers have
+    /// unrelated volumes — one bounded line per registrar invocation
+    /// against one entry per `OpenBao` request across the deployment —
+    /// so one pair of bounds cannot serve both.
+    pub openbao_audit_max_file_bytes: u64,
+    /// How many rotated `OpenBao` audit generations are retained beside
+    /// the device's active log. With
+    /// [`RegistrarSettings::openbao_audit_max_file_bytes`] this is the
+    /// hard byte ceiling on the set bootroot owns.
+    pub openbao_audit_max_retained_files: u32,
+    /// The retention target in days for those generations. The ceiling
+    /// always wins, so nothing reads this at runtime.
+    pub openbao_audit_min_retain_days: u32,
     /// Absolute directory containing the daemon's records and `OpenBao`'s
     /// file audit output.
     pub audit_store_dir: PathBuf,
@@ -264,6 +279,12 @@ struct RawRegistrarSettings {
     audit_max_retained_files: u32,
     #[serde(default = "defaults::default_audit_min_retain_days")]
     audit_min_retain_days: u32,
+    #[serde(default = "defaults::default_openbao_audit_max_file_bytes")]
+    openbao_audit_max_file_bytes: u64,
+    #[serde(default = "defaults::default_openbao_audit_max_retained_files")]
+    openbao_audit_max_retained_files: u32,
+    #[serde(default = "defaults::default_openbao_audit_min_retain_days")]
+    openbao_audit_min_retain_days: u32,
     #[serde(default = "defaults::default_audit_store_dir")]
     audit_store_dir: PathBuf,
     #[serde(default = "defaults::default_audit_store_reserve_bytes")]
@@ -308,6 +329,9 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             audit_max_file_bytes,
             audit_max_retained_files,
             audit_min_retain_days,
+            openbao_audit_max_file_bytes,
+            openbao_audit_max_retained_files,
+            openbao_audit_min_retain_days,
             audit_store_dir,
             audit_store_reserve_bytes,
             audit_store_low_water_bytes,
@@ -332,6 +356,9 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             audit_max_file_bytes,
             audit_max_retained_files,
             audit_min_retain_days,
+            openbao_audit_max_file_bytes,
+            openbao_audit_max_retained_files,
+            openbao_audit_min_retain_days,
             audit_store_dir,
             audit_store_reserve_bytes,
             audit_store_low_water_bytes,
@@ -373,6 +400,9 @@ impl Default for RegistrarSettings {
             audit_max_file_bytes: defaults::default_audit_max_file_bytes(),
             audit_max_retained_files: defaults::default_audit_max_retained_files(),
             audit_min_retain_days: defaults::default_audit_min_retain_days(),
+            openbao_audit_max_file_bytes: defaults::default_openbao_audit_max_file_bytes(),
+            openbao_audit_max_retained_files: defaults::default_openbao_audit_max_retained_files(),
+            openbao_audit_min_retain_days: defaults::default_openbao_audit_min_retain_days(),
             audit_store_dir,
             audit_store_reserve_bytes: defaults::default_audit_store_reserve_bytes(),
             audit_store_low_water_bytes: defaults::default_audit_store_low_water_bytes(),
@@ -2051,6 +2081,9 @@ mod tests {
         assert_eq!(settings.registrar.audit_max_file_bytes, 8_388_608);
         assert_eq!(settings.registrar.audit_max_retained_files, 16);
         assert_eq!(settings.registrar.audit_min_retain_days, 90);
+        assert_eq!(settings.registrar.openbao_audit_max_file_bytes, 67_108_864);
+        assert_eq!(settings.registrar.openbao_audit_max_retained_files, 7);
+        assert_eq!(settings.registrar.openbao_audit_min_retain_days, 90);
         assert_eq!(settings.registrar.rate_limit_admission_burst, 512);
         assert_eq!(
             settings.registrar.rate_limit_admission_refill_interval_ms,
@@ -2128,6 +2161,78 @@ audit_store_enforcement = "directory"
             defaults.rate_limit_predecision_refusal_refill_interval_ms
         );
         settings.validate().unwrap();
+    }
+
+    /// The device-rotation keys load beside the record store's own,
+    /// which they neither reuse nor disturb.
+    #[test]
+    fn the_registrar_table_reads_the_openbao_audit_rotation_keys() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            r#"
+[registrar]
+audit_store_dir = "/srv/bootroot/audit-store"
+audit_max_file_bytes = 131072
+audit_max_retained_files = 4
+audit_min_retain_days = 30
+openbao_audit_max_file_bytes = 2097152
+openbao_audit_max_retained_files = 3
+openbao_audit_min_retain_days = 45
+"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        let registrar = &settings.registrar;
+        assert_eq!(registrar.openbao_audit_max_file_bytes, 2_097_152);
+        assert_eq!(registrar.openbao_audit_max_retained_files, 3);
+        assert_eq!(registrar.openbao_audit_min_retain_days, 45);
+        // The record store's neighbouring keys are untouched by them:
+        // the two writers have unrelated volumes and unrelated bounds.
+        assert_eq!(registrar.audit_max_file_bytes, 131_072);
+        assert_eq!(registrar.audit_max_retained_files, 4);
+        assert_eq!(registrar.audit_min_retain_days, 30);
+        assert_eq!(
+            registrar.audit_store_dir,
+            PathBuf::from("/srv/bootroot/audit-store")
+        );
+        settings.validate().unwrap();
+    }
+
+    /// A retained family whose byte budget does not fit in `u64` is
+    /// refused at load, naming both keys, so the rotation's own
+    /// arithmetic can be total.
+    #[test]
+    fn validation_rejects_an_openbao_audit_budget_that_cannot_be_computed() {
+        for (max_file_bytes, max_retained_files) in
+            [(u64::MAX, 1_u32), (u64::MAX, u32::MAX), (u64::MAX / 4, 7)]
+        {
+            let settings = RegistrarSettings {
+                openbao_audit_max_file_bytes: max_file_bytes,
+                openbao_audit_max_retained_files: max_retained_files,
+                ..RegistrarSettings::default()
+            };
+            let err = validate_registrar_settings(&settings).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("registrar.openbao_audit_max_file_bytes"),
+                "{message}"
+            );
+            assert!(
+                message.contains("registrar.openbao_audit_max_retained_files"),
+                "{message}"
+            );
+        }
+
+        // And the largest budget that does fit is accepted.
+        let settings = RegistrarSettings {
+            openbao_audit_max_file_bytes: u64::MAX / 8,
+            openbao_audit_max_retained_files: 7,
+            ..RegistrarSettings::default()
+        };
+        validate_registrar_settings(&settings).unwrap();
     }
 
     #[test]
@@ -2318,7 +2423,11 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
             let published =
                 documented_toml_block(&manual_path(manual), REGISTRAR_AUDIT_SECTION_ANCHOR);
             let keys = assigned_keys(&published);
-            assert_eq!(keys.len(), 12, "{manual}: the block prints all twelve keys");
+            assert_eq!(
+                keys.len(),
+                15,
+                "{manual}: the block prints all fifteen keys"
+            );
 
             for key in keys {
                 let edited_block = published.replace(
@@ -2633,6 +2742,24 @@ audit_store_enforcement = "directory"
                     settings.registrar.audit_min_retain_days = 0;
                 }),
                 "registrar.audit_min_retain_days",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.openbao_audit_max_file_bytes = 1_048_575;
+                }),
+                "registrar.openbao_audit_max_file_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.openbao_audit_max_retained_files = 0;
+                }),
+                "registrar.openbao_audit_max_retained_files",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
+                    settings.registrar.openbao_audit_min_retain_days = 0;
+                }),
+                "registrar.openbao_audit_min_retain_days",
             ),
         ] {
             let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();

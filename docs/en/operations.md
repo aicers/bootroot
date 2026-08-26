@@ -119,12 +119,207 @@ fails. Restore the audit configuration and re-run init.
   store was provisioned remain on the `openbao-audit` volume and are
   read as before; nothing migrates them. See
   [The shared audit store](#the-shared-audit-store) below.
-- **Rotation:** OpenBao does not rotate the audit log itself. Use an
-  external log rotation tool (e.g. `logrotate` on a bind-mount, or a
-  sidecar that tails the volume) and send `SIGHUP` to the OpenBao
-  process after rotation so it reopens the file handle.
+- **Rotation:** the deployment rotates the device itself, on a host
+  whose registrar endpoint is enabled. Do **not** point `logrotate`, a
+  tailing sidecar or a signal at the device's directory: a second
+  rotator would race this one over the same active log and collide in
+  the same `audit-*.log` namespace. See
+  [Rotating the audit device](#rotating-the-audit-device) below.
 - **Verification:** confirm the audit device is active with
   `docker compose exec openbao bao audit list`.
+
+#### Rotating the audit device
+
+OpenBao's file audit device never rotates itself, and OpenBao **fails a
+request it cannot audit** — so a device that only grows ends as an
+OpenBao that stops serving. On a host whose `[registrar_endpoint]
+enabled` is `true`, the `bootroot-agent` daemon rotates it: every 60
+seconds it checks the active log, rotates it when it has reached
+`openbao_audit_max_file_bytes`, and holds the generations it has created
+inside their budget. The interval is fixed and is not a configuration
+key.
+
+**What is bounded, and what is not.** Exactly one quantity here is a
+hard ceiling: the **retained set's byte budget**, which is
+`openbao_audit_max_file_bytes × openbao_audit_max_retained_files` —
+448 MiB on the shipped defaults. Nothing overrides it: not the retention
+target, not how large the active log had grown, not how long a pass
+took. Every check that completes re-establishes it, so an excess left
+behind by a failed pass is transient, escalated and retried rather than
+accepted.
+
+Every other figure is an **operating envelope under a stated model**,
+not a bound. Under the nominal model — the previous pass succeeded well
+inside one interval, and OpenBao appends `W` bytes per interval — the
+device sits at about `openbao_audit_max_file_bytes ×
+(openbao_audit_max_retained_files + 1) + W` between passes (512 MiB + `W`
+shipped) and peaks inside a pass at about `openbao_audit_max_file_bytes ×
+(openbao_audit_max_retained_files + 2)` plus twice one interval's writes
+(576 MiB shipped). The peak carries that doubling because the staging
+copy must live in the device's own directory: a hard link cannot cross a
+filesystem, and the publish links the copy into place rather than
+copying it a second time. These are the expected steady state and peak,
+never a worst case.
+
+**The device has no absolute footprint ceiling.** bootroot is not the
+process appending to it, and the only way to stop OpenBao writing is to
+stop it serving. `W` is an assumption about OpenBao rather than a limit,
+and a run of failed passes leaves the active log growing for another
+interval each time, with no finite bound on the run's length. What the
+deployment guarantees is the retained set's ceiling, an emptied active
+log after every successful pass, and a loud signal when either stops
+happening.
+
+**The signal.** A pass that leaves an obligation unmet — a required
+rotation that did not complete, or a retained set still outside a bound
+when the pass returns — logs at `warn` and increments a counter. A pass
+that owed nothing, including one on a quiet host whose log never reaches
+the bound, resets it. At **five consecutive** unmet passes, and at each
+further multiple of five, the daemon logs at `error` naming the run
+length, which obligation is unmet, the active log's current size and the
+retained set's current total. That error is the first thing to check
+when a capacity alarm fires over the shared store: a stalled rotation
+puts these two writers past it on their own.
+
+A failed rotation is an operational event, not a fail-closed control. It
+never fails an OpenBao request, stops the daemon or takes the registrar
+endpoint down.
+
+**What that counter forgives, and what it does not.** Exactly one state
+is silent: nothing at `<audit_store_dir>/openbao/` at all — the endpoint
+enabled on a host where `bootroot init` has not since provisioned the
+store. Such a pass evaluates nothing, says so once at `debug`, and owes
+nothing. Anything else at that path is a fault and counts: a directory
+that cannot be listed, one replaced by a regular file, or one replaced
+by a symbolic link leaves the retained set's ceiling unassertable, and
+reporting it as met would report it holding on no evidence. A pass acts
+only through a real directory — it stops at the path itself rather than
+copying, publishing, truncating or deleting through it, since a link
+there is the first component of every path the pass would build and
+would put all of that inside a directory bootroot never provisioned. A
+link that resolves to nothing is refused on the same terms rather than
+read as the absent directory above. An `audit.log` that is not the
+regular file OpenBao writes counts too — a symbolic link there is
+refused rather than followed, whatever it points at and however small
+its target is, because the device directory is writable by the
+container's audit user while a pass runs as root. Neither a broken
+device directory nor a planted link can therefore look like a quiet
+host: both `warn` per pass and escalate at five.
+
+That check is on a name, and the device directory is writable by the
+container's audit user, so what it measured and what the copy and the
+truncate later open need not be the same file. Each of those opens
+re-establishes it on the descriptor itself, and opens in a way that
+cannot wait: a named pipe put at `audit.log` after the size check would
+otherwise have a pass block on it until a writer arrived, which is the
+one failure this counter cannot report — a pass that never returns is a
+rotation task that never ticks again. Refused, it is an ordinary failed
+pass, and the next tick retries it.
+
+**The mechanism, and its loss window.** The active log is **copied and
+truncated**, never renamed, unlinked or replaced, so the path and the
+descriptor OpenBao holds stay continuously present and writable and
+OpenBao is neither restarted, resealed nor signalled. A pass copies the
+active log's stable prefix into a staging file in the same directory,
+trims that copy to its last complete record, gives it mode `0600` and
+the directory's owner, flushes it, links it into place under its
+generation name, flushes the directory, and only then truncates the
+active log to zero and flushes that.
+
+The publish is a link and a check rather than a rename for the same
+reason each open re-checks its descriptor: no name in that directory
+stays settled. Between the copy's flush and the publish, the container's
+audit user can unlink the staging name and leave a file of their own
+there; a rename would publish that file, and the truncate after it would
+destroy the records the pass believed it had copied. So the pass links
+the name into place, confirms it reached the copy it staged — by the
+file's identity, not by reading the name again — and only then unlinks
+the staging name. Linking also refuses a name already present instead of
+replacing it, so a collision can never overwrite a generation already
+retained; both refusals are ordinary failed passes that leave the active
+log whole.
+
+Both of those facts are established once more immediately before the
+truncate, since that is the commit point: past it, getting either wrong
+costs records rather than a pass. The generation's name is re-checked
+against the staged copy's identity, because the directory flush between
+the publish and the truncate is a disk round trip and the name can stop
+leading to the copy inside it. And the truncate's own descriptor is
+checked against the one the copy was read through, because a *second
+regular file* put at `audit.log` in that window answers every question
+its type can be asked exactly as the first one does: emptying it would
+rotate a file the pass never read, while OpenBao went on appending to
+the original through the descriptor it still holds — the log unbounded,
+the pass reporting success, and the counter never moving. Refusing
+either is an ordinary failed pass that leaves the active log whole and
+the generation, still provisional, unlinked. Neither check closes its
+window outright — a check and the operation it guards cannot be one
+operation — but both put every interval the pass itself introduces
+behind them, leaving the instructions between the check and the call
+rather than the time a copy or a flush takes.
+
+The price is a small loss window at each rotation: the partial trailing
+record, plus whatever OpenBao appended while the copy ran, is destroyed
+by the truncate. A record is therefore either complete in the generation
+or entirely inside that window — never split and never torn.
+
+**The crash residual.** A crash between the truncate and its flush can
+leave the active log back at its pre-truncate length while the
+generation survives, so the next pass rotates an overlapping prefix and
+two generations share records. That is duplication, never loss, and it
+is reported here rather than designed away: a scheme that avoided it by
+unlinking after the truncate would trade duplication for loss. A crash
+inside the publish itself can leave `.audit-rotate.staging` beside the
+new generation as a second name for the same file. It occupies no extra
+space, no bound or trim counts it, and the next pass removes it.
+
+**The retained set.** Rotated generations live beside the active log, in
+`<audit_store_dir>/openbao/` on the host, named
+`audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.log` — UTC, second precision,
+followed by an always-present zero-padded six-digit sequence, so the
+names sort lexicographically in creation order. Each carries mode `0600`
+and the device directory's owner, exactly as the active log does, and is
+written once and never rewritten, compressed or renumbered. A trim drops
+generations oldest-first until at most `openbao_audit_max_retained_files`
+remain **and** their total is inside the byte budget. Those deletions
+are durable only once the directory holding them is flushed: a flush
+that fails leaves the pass unmet — `warn` per pass, escalating at five
+like any other — and is retried on every later pass, including one with
+nothing to delete, until it succeeds. That obligation does not survive
+the daemon, and the deletions it covers do, so a daemon that has just
+started owes a directory flush before it reports the bound met at all:
+one `fsync` on its first pass, whether or not it has anything to
+delete. A set that a crash could restore over budget is never reported
+as inside its bound.
+
+**Reading the retained history.** Concatenate the retained set in name
+order followed by the active log:
+
+```sh
+cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
+```
+
+*Completeness* — every retained record appears in the output at least
+once — holds unconditionally. *Exactness* — every record appears exactly
+once, so the output **is** the retained history in write order — holds
+only where no crash has landed in the window above. After such a crash
+the following generation repeats records the one before it already held,
+so `A B` then `A B C` reads out as `A B A B C`: the output is then
+neither exact nor in write order, and nothing beyond completeness is
+claimed for it.
+
+Do **not** `sort -u` or `uniq` that output. Two byte-identical lines can
+be two genuine events — the same principal repeating the same request
+within one second — and no per-event identity for an OpenBao audit
+record is defined here. Dropping one would destroy evidence, which is a
+worse failure than reading a duplicate.
+
+**Deployments without the registrar endpoint.** Where
+`[registrar_endpoint] enabled` is not `true`, none of this applies. No
+rotation task runs, the three configuration keys have no effect, and
+`/openbao/audit` is still backed by the `openbao-audit` named volume —
+so there is nothing bind-mounted for a host tool to reach either, and no
+external rotation is recommended in its place.
 
 #### Registrar verb rate limiting
 
