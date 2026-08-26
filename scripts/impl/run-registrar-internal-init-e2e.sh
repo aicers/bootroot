@@ -136,6 +136,40 @@ AGENT_CONFIG_FILE=""
 # moves.
 OPENBAO_AUDIT_CONTAINER_DIR="/openbao/audit"
 OPENBAO_AUDIT_CONTAINER_LOG="${OPENBAO_AUDIT_CONTAINER_DIR}/audit.log"
+# `init`'s machine-readable summary, and the root token read out of it.
+# Parsed rather than scraped from the human summary so the read does not
+# depend on which locale the run happened to print in.
+#
+# Deliberately under `RUN_ROOT` rather than `ARTIFACT_DIR`, and set in
+# `create_run_root` once that directory exists.  A root-run `init`
+# writes this file as root at mode `0600`, and it carries the root
+# token, the unseal keys, the step-ca password and every AppRole
+# `secret_id` this run minted.  In the artifact directory it would be a
+# credential bundle published by the CI upload — beside an `init.log`
+# this harness redacts the root token out of for exactly that reason —
+# and a root-owned file the invoking user can neither read nor remove
+# afterwards.  `RUN_ROOT` already holds the run's secrets tree at
+# `0700`, and its removal already copes with root-owned content.
+INIT_SUMMARY_JSON=""
+# The root token, staged out of that summary into two root-owned `0600`
+# files: the token on its own for the rotation test, and a `curl`
+# configuration file carrying it as an `X-Vault-Token` header.
+#
+# Files rather than a shell variable because every use of the token is
+# elevated, and a value handed to an elevated command becomes an
+# argument of it.  `ps` shows every process's arguments to every user on
+# the host, so `curl -H "X-Vault-Token: ..."` publishes the token for as
+# long as the request runs, and `sudo env NAME=<token> ...` publishes it
+# for as long as the test does.  A path published that way discloses
+# nothing: the files are readable by root alone, and both live under
+# `RUN_ROOT`, whose removal already copes with root-owned content.
+OPENBAO_ROOT_TOKEN_FILE=""
+OPENBAO_CURL_CONFIG=""
+# The library test binary the in-place rotation runs through.  Built as
+# the invoking user and executed under `sudo -n`, so no `cargo`
+# invocation ever runs as root and nothing under `target/` changes
+# owner.
+ROTATION_TEST_BIN=""
 
 log_phase() {
   CURRENT_PHASE="$1"
@@ -250,6 +284,9 @@ create_run_root() {
   WORK_DIR="$RUN_ROOT/bootroot"
   SECRETS_DIR="$WORK_DIR/secrets"
   INTERNAL_DIR="$SECRETS_DIR/registrar-internal"
+  INIT_SUMMARY_JSON="$RUN_ROOT/init-summary.json"
+  OPENBAO_ROOT_TOKEN_FILE="$RUN_ROOT/openbao-root-token"
+  OPENBAO_CURL_CONFIG="$RUN_ROOT/openbao-curl.conf"
   mkdir -p "$WORK_DIR/openbao"
   # `docker-compose.deploy.yml` carries no build context, so a directory
   # holding a copy of it plus the two configs it resolves relative to
@@ -484,6 +521,7 @@ run_init() {
     --db-name "stepca" \
     --responder-url "http://127.0.0.1:${PORT_HTTP01}" \
     --agent-config "$AGENT_CONFIG_FILE" \
+    --summary-json "$INIT_SUMMARY_JSON" \
     </dev/null >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
@@ -492,6 +530,38 @@ run_init() {
     fail "bootroot init failed; see $INIT_RAW_LOG"
   fi
   sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$ARTIFACT_DIR/init.log"
+  # Root-owned, because the run that wrote it was.
+  #
+  # The token moves from the summary to its own file on a pipe and never
+  # through an argument list: `jq` runs as the invoking user on `cat`'s
+  # output, and the elevated shell that writes the file reads the value
+  # from standard input.  `printf %s "$(cat)"` drops the newline `jq -r`
+  # ends its output with, so the file is the token and nothing else, and
+  # `umask 077` gives it mode `0600` as it is created rather than after.
+  sudo -n cat "$INIT_SUMMARY_JSON" |
+    jq -r '.root_token // empty' |
+    sudo -n sh -c 'umask 077; printf %s "$(cat)" >"$1"' _ \
+      "$OPENBAO_ROOT_TOKEN_FILE" 2>>"$RUN_LOG" ||
+    fail "could not read the root token out of $INIT_SUMMARY_JSON"
+  # Removed the moment it has been read, so the credential bundle lives
+  # on disk for one command rather than for the rest of the run.  A run
+  # that failed before here leaves it for `remove_run_root`.
+  sudo -n rm -f "$INIT_SUMMARY_JSON" 2>>"$RUN_LOG" ||
+    fail "could not remove $INIT_SUMMARY_JSON after reading it"
+  sudo -n test -s "$OPENBAO_ROOT_TOKEN_FILE" ||
+    fail "init recorded no root token in $INIT_SUMMARY_JSON"
+  # The header every authenticated call below sends, as a `curl -K`
+  # configuration file rather than as a `-H` argument.  Written by the
+  # same elevated shell that reads the token, so the value crosses no
+  # argument list here either.
+  #
+  # Nothing escapes the token into curl's quoted-string syntax because
+  # nothing needs to: an OpenBao token is base64url text with a service
+  # prefix, and carries neither a quote nor a backslash.
+  sudo -n sh -c \
+    'umask 077; printf "header = \"X-Vault-Token: %s\"\n" "$(cat "$1")" >"$2"' _ \
+    "$OPENBAO_ROOT_TOKEN_FILE" "$OPENBAO_CURL_CONFIG" 2>>"$RUN_LOG" ||
+    fail "could not stage the root token's curl configuration"
 }
 
 # ---------------------------------------------------------------------------
@@ -858,6 +928,182 @@ assert_the_shared_audit_log_assertion_still_passes() {
   pass "the shared OpenBao file-audit assertion passes over the store-backed device"
 }
 
+# ---------------------------------------------------------------------------
+# In-place rotation of the file audit device
+# ---------------------------------------------------------------------------
+#
+# This is the one arm where bootroot's rotation meets the real writer.
+# It lives here rather than in `run-local-lifecycle.sh` because the
+# rotation is conditional on `[registrar_endpoint] enabled = true`: only
+# an endpoint-enabled host has `<audit_store_dir>/openbao` bind-mounted
+# under the container's `/openbao/audit`, and this is the only scenario
+# that provisions one.  Everywhere else the device is still on the
+# `openbao-audit` named volume, nothing on the host is there to rotate,
+# and the rotation changes nothing.
+#
+# The rotation itself runs through the library's own code — an ignored
+# unit test, driven the way `run-registrar-verbs-e2e.sh` drives its own
+# — rather than through a shell reimplementation of copy-and-truncate,
+# because a shell copy would prove the mechanism works and say nothing
+# about the code that ships.
+
+# One `OpenBao` API call with the root token, over the transitioned TLS
+# listener, verified against the credential's own private bundle.
+#
+# Elevated because the bundle sits in a `0700` root-owned directory once
+# a root-run `init` has created it, not because the bundle is protected
+# material.  The token itself arrives through `-K`, whose file only root
+# can read, so the argument list carries a path and never a credential.
+openbao_api() {
+  local method="$1" path="$2" data="${3:-}"
+  local bundle="$INTERNAL_DIR/ca-bundle.pem"
+  local -a args=(-sS -m 15 --cacert "$bundle" -X "$method")
+  [ -z "$data" ] || args+=(-d "$data")
+  sudo -n "$CURL_BIN" -K "$OPENBAO_CURL_CONFIG" "${args[@]}" \
+    "https://localhost:${PORT_OPENBAO}/v1/${path}" 2>>"$RUN_LOG"
+}
+
+# The same call without a token, for the AppRole login, which mints one.
+#
+# Its body is read from standard input rather than taken as an argument,
+# because the only call that needs this helper posts a `secret_id`, and
+# that is as much a credential as the root token above.  `-d @-` is
+# curl's spelling of "the body is on stdin"; the caller writes it with
+# the `printf` builtin, which forks no process at all.
+openbao_api_unauthed() {
+  local method="$1" path="$2"
+  local bundle="$INTERNAL_DIR/ca-bundle.pem"
+  sudo -n "$CURL_BIN" -sS -m 15 --cacert "$bundle" -X "$method" -d @- \
+    "https://localhost:${PORT_OPENBAO}/v1/${path}" 2>>"$RUN_LOG"
+}
+
+openbao_seal_state() {
+  openbao_api GET "sys/seal-status" | jq -r '"\(.sealed) \(.initialized)"'
+}
+
+# The container's identity, as three values that all change on a
+# restart: a rotation must move none of them.
+openbao_container_state() {
+  docker inspect "${INSTANCE}-openbao" \
+    --format '{{.State.StartedAt}} {{.RestartCount}} {{.State.Pid}}' 2>>"$RUN_LOG"
+}
+
+# Builds the library test binary as the invoking user.
+#
+# `cargo` never runs under `sudo` here: a root-run build would leave
+# root-owned artifacts under `target/` and break every later build in
+# this checkout.  Only the finished binary crosses the boundary.
+build_rotation_test_binary() {
+  local manifest="$ARTIFACT_DIR/cargo-test-build.json"
+  (cd "$ROOT_DIR" && cargo test --lib --no-run --message-format=json) \
+    >"$manifest" 2>>"$RUN_LOG" ||
+    fail "could not build the library test binary; see $RUN_LOG"
+  ROTATION_TEST_BIN="$(jq -r 'select(.reason == "compiler-artifact")
+      | select(any(.target.kind[]?; . == "lib"))
+      | .executable // empty' "$manifest" | tail -n 1)"
+  [ -n "$ROTATION_TEST_BIN" ] && [ -x "$ROTATION_TEST_BIN" ] ||
+    fail "could not resolve the library test binary out of $manifest"
+  pass "the library test binary is built as the invoking user"
+}
+
+# The device is emptied without restarting, resealing or unsealing
+# OpenBao, and its registration in `sys/audit` is untouched.
+assert_the_device_rotates_in_place() {
+  local before after log="$ARTIFACT_DIR/audit-rotation-test.log"
+  before="$(openbao_container_state)"
+  [ -n "$before" ] || fail "could not read the OpenBao container's state"
+  assert_equal "OpenBao is unsealed and initialised before the rotation" \
+    "false true" "$(openbao_seal_state)"
+
+  # `--exact` and the test's own name, so a rename here fails loudly
+  # rather than silently selecting nothing and reporting success.
+  set +e
+  # Every value below is a path, including the token's: `sudo env` puts
+  # its assignments in an argument list that `ps` shows to every user on
+  # the host, so the test is told where to read the credential rather
+  # than handed the credential.
+  #
+  # shellcheck disable=SC2024 # the redirect is the invoking user's own:
+  # the log belongs beside this run's other artifacts, not to root.
+  sudo -n env \
+    BOOTROOT_OPENBAO_AUDIT_E2E_DIR="${AUDIT_STORE_DIR}/openbao" \
+    BOOTROOT_OPENBAO_AUDIT_E2E_URL="https://localhost:${PORT_OPENBAO}" \
+    BOOTROOT_OPENBAO_AUDIT_E2E_TOKEN_FILE="$OPENBAO_ROOT_TOKEN_FILE" \
+    BOOTROOT_OPENBAO_AUDIT_E2E_CA_BUNDLE="$INTERNAL_DIR/ca-bundle.pem" \
+    "$ROTATION_TEST_BIN" \
+    registrar::openbao_audit::tests::a_live_openbao_audit_device_rotates_in_place \
+    --exact --ignored --nocapture >"$log" 2>&1
+  local status=$?
+  set -e
+  [ "$status" -eq 0 ] ||
+    fail "the in-place rotation of the live audit device failed; see $log"
+  grep -q "1 passed" "$log" ||
+    fail "the in-place rotation test selected no test; see $log"
+  pass "bootroot rotated the live audit device in place, and sys/audit is unchanged"
+
+  after="$(openbao_container_state)"
+  assert_equal "OpenBao was neither restarted nor replaced by the rotation" \
+    "$before" "$after"
+  assert_equal "OpenBao is still unsealed and initialised after the rotation" \
+    "false true" "$(openbao_seal_state)"
+}
+
+# A fresh AppRole login and a fresh KV read, driven after the rotation.
+#
+# The shared assertion below reads the *active* log, which a rotation
+# empties, so it passes exactly when the entries it looks for were
+# written since.  The role is this run's own rather than a sidecar's, so
+# the login is traffic this arm caused.
+drive_fresh_audit_traffic() {
+  local role="audit-rotation-${RUN_TOKEN}" role_id secret_id status
+  openbao_api POST "auth/approle/role/${role}" \
+    '{"token_policies":"default","token_ttl":"60s"}' >/dev/null ||
+    fail "could not create the post-rotation AppRole"
+  role_id="$(openbao_api GET "auth/approle/role/${role}/role-id" |
+    jq -r '.data.role_id // empty')"
+  secret_id="$(openbao_api POST "auth/approle/role/${role}/secret-id" '{}' |
+    jq -r '.data.secret_id // empty')"
+  [ -n "$role_id" ] && [ -n "$secret_id" ] ||
+    fail "could not mint an AppRole credential for the post-rotation traffic"
+
+  status="$(printf '{"role_id":"%s","secret_id":"%s"}' "$role_id" "$secret_id" |
+    openbao_api_unauthed POST "auth/approle/login" |
+    jq -r 'if .auth.client_token then "ok" else "no-token" end')"
+  assert_equal "an AppRole login succeeds immediately after the rotation" "ok" "$status"
+
+  # A read of a path that need not exist: the device records the
+  # request either way, which is what the assertion below looks for, and
+  # inventing a KV secret here would be this arm writing state it does
+  # not own.
+  openbao_api GET "secret/data/bootroot-audit-rotation" >/dev/null ||
+    fail "the KV read driven after the rotation raised"
+  pass "a fresh AppRole login and KV read were driven after the rotation"
+}
+
+# The mechanism rests on the device's descriptor being opened in append
+# mode: a truncate then resets the write offset instead of leaving
+# OpenBao writing at its old one into a sparse hole.  Established
+# against the pinned image rather than assumed.
+#
+# It also rests on the daemon and the container seeing one filesystem,
+# which a Linux bind mount is.  A macOS developer machine is not: Docker
+# Desktop reaches a host bind mount through a VM that does not propagate
+# a host-side truncate to the guest's cached length, so this check fails
+# there for a reason that does not exist on the deployment target.  That
+# is moot for this harness, which already needs passwordless sudo and so
+# does not run on such a host at all.
+assert_the_rotated_active_log_begins_at_offset_zero() {
+  local host_log="${AUDIT_STORE_DIR}/openbao/audit.log" first
+  sudo -n test -s "$host_log" ||
+    fail "the rotated active log took no writes at all"
+  first="$(sudo -n head -c 1 "$host_log" | od -An -tu1 | tr -d '[:space:]')"
+  [ "$first" != "0" ] ||
+    fail "the rotated active log begins with a NUL byte: the device is not appending"
+  sudo -n head -n 1 "$host_log" | jq -e . >/dev/null 2>>"$RUN_LOG" ||
+    fail "the rotated active log's first line is not a well-formed JSON record"
+  pass "the rotated active log begins at offset 0 with a well-formed record"
+}
+
 # The alias is why the ACME challenge above could resolve at all.
 # Asserted directly so a future change that drops it fails with the
 # reason rather than as an unexplained issuance timeout.
@@ -1082,6 +1328,18 @@ main() {
   # with the most of it behind us — the bring-up above recreated the
   # stack and both sidecars re-authenticated against the store-backed
   # device.
+  assert_the_shared_audit_log_assertion_still_passes
+
+  # And last of all, the device this run has been filling is rotated in
+  # place.  Deliberately after the assertion above, so that one still
+  # runs against a log no rotation has touched and this one runs against
+  # a log a rotation has emptied.
+  log_phase "assert-audit-rotation"
+  build_rotation_test_binary
+  assert_the_device_rotates_in_place
+  drive_fresh_audit_traffic
+  assert_the_rotated_active_log_begins_at_offset_zero
+  # The same shared assertion, unmodified, over the rotated deployment.
   assert_the_shared_audit_log_assertion_still_passes
 
   log_phase "done"

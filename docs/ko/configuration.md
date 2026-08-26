@@ -576,6 +576,9 @@ audit_record_dir = "/var/lib/bootroot/audit-store/records"
 audit_max_file_bytes = 8388608
 audit_max_retained_files = 16
 audit_min_retain_days = 90
+openbao_audit_max_file_bytes = 67108864
+openbao_audit_max_retained_files = 7
+openbao_audit_min_retain_days = 90
 
 # 동사 속도 제한. 아래 "레지스트라 동사 속도 제한"을 참고하세요.
 rate_limit_admission_burst = 512
@@ -638,6 +641,48 @@ OpenBao 감사 장치 확인은 그대로입니다.
   회전 세대 수입니다. 0보다 커야 합니다.
 - `audit_min_retain_days` (기본값 `90`) — 보존 **목표** 일수입니다.
   0보다 커야 합니다.
+
+다음 세 개는 OpenBao **자신의** 파일 감사 장치를 제한하며, 엔드포인트가
+활성화된 호스트에서 데몬이 이를 제자리에서 로테이션합니다. 위의 세 키를
+재사용하지 않고 별도 키로 둔 이유는 두 writer의 분량이 서로 무관하기
+때문입니다. 한쪽은 레지스트라 호출당 한정된 한 줄이고, 다른 쪽은 배포
+전체의 OpenBao 요청당 한 항목입니다.
+[감사 장치 로테이션](operations.md#rotating-the-audit-device)을
+참고하세요.
+
+- `openbao_audit_max_file_bytes` (`u64`, 기본값 `67108864`, 64 MiB) —
+  장치의 활성 로그를 로테이션하는 크기입니다. 최소 `1048576`(1 MiB)이어야
+  합니다. 이 하한은 `audit_max_file_bytes`의 64 KiB와 달리 최대 레코드
+  크기에서 **유도된 값이 아닙니다.** bootroot는 OpenBao 감사 항목의 크기를
+  통제하지 않으므로 곱할 최대 항목 크기가 없습니다. 이 하한은 로테이션이
+  60초 검사마다 일어나는 일이 아니라 드문 사건으로 남게 하기 위해
+  존재합니다.
+- `openbao_audit_max_retained_files` (`u32`, 기본값 `7`) — 활성 로그 옆에
+  보관하는 로테이션 세대 수이며, 활성 로그 자체는 포함하지 않습니다.
+  0보다 커야 합니다.
+- `openbao_audit_min_retain_days` (`u32`, 기본값 `90`) — 보존 **목표**
+  일수입니다. 0보다 커야 합니다. 크기 상한이 항상 우선하므로 바쁜
+  배포에서는 이 목표가 흔히 충족되지 않습니다. 이는 의도된 동작이며 경보를
+  발생시키지 않습니다.
+
+**기본값은 예약 용량에서 유도되었습니다.** 보존 집합의 하드 상한은
+`openbao_audit_max_file_bytes × openbao_audit_max_retained_files` =
+448 MiB입니다. 정상 모델에서 장치는 패스 사이에 약 512 MiB, 패스 내부
+최고점에 약 576 MiB입니다. 동사 레코드 저장소의 파일군은
+`audit_max_file_bytes × (audit_max_retained_files + 1)` = 136 MiB이며,
+스테이징 사본이 없으므로 두 배 항도 없습니다. 합하면 2 GiB
+`audit_store_reserve_bytes` 안의 712 MiB로, 약 1.3 GiB의 여유가 남습니다.
+정상 상태에서 이 두 writer가 512 MiB 저수위 경보에 닿으려면 쓰기 항이
+824 MiB — 60초 주기 동안 초당 약 6.9 MiB의 지속 감사 출력 — 에
+이르러야 합니다. 주기나 두 한계, 메커니즘을 바꾼다면 이 계산을 다시
+유도하세요. 이는 경보가 곧 제3의 writer를 뜻한다는 증거가 **아닙니다.**
+로테이션이 멈추면 이 두 writer만으로도 경보 지점을 넘어섭니다.
+
+`openbao_audit_max_file_bytes × (openbao_audit_max_retained_files + 1)`이
+64비트 정수에 들어가지 않는 설정은 두 키를 모두 명시하며 로드 시점에
+거부됩니다. 그래야 로테이션의 예산 산술이 런타임에서 결코 오버플로하지
+않습니다. 16 EiB를 넘는 파일군은 배포가 아니라 오타이며, 대신 포화시키면
+예산이 `u64::MAX`가 되어 아무런 한계도 아니게 됩니다.
 
 #### 동사 계층 설정
 
