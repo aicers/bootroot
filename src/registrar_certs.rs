@@ -451,9 +451,14 @@ fn unset_path(setting: &str) -> anyhow::Error {
 /// internal credential is absent, invalid or superseded by a trust
 /// rotation, when either `OpenBao` read fails, or when an issuance
 /// fails — including a CA bundle that cannot be read and a leaf that
-/// cannot be written. There is no fallback on any of these: no
-/// self-signed leaf, no borrowed one, and no second source for either
-/// ACME input.
+/// cannot be written. Every one of them names the material paths it was
+/// refused for as well as the failure itself. An issuance names its own
+/// pair; the credential load and the two `OpenBao` reads, which are
+/// shared by both pairs, name every pair that was pending; and the
+/// resolution step, which runs before the host label those names are
+/// composed from is known, names the four configured paths.
+/// There is no fallback on any of these: no self-signed leaf, no
+/// borrowed one, and no second source for either ACME input.
 pub async fn ensure_registrar_surface_certificates(
     settings: &Settings,
     insecure_mode: bool,
@@ -461,18 +466,92 @@ pub async fn ensure_registrar_surface_certificates(
     if !settings.registrar_endpoint.enabled {
         return Ok(());
     }
-    let plan = resolve_surface_plan(settings)?;
+    // Named against the configured paths rather than the pairs: this
+    // step is what resolves the host label the pairs' names are composed
+    // from, so nothing here can name a leaf, and the four paths are the
+    // only material identifiers that exist yet.
+    let plan = resolve_surface_plan(settings).with_context(|| {
+        format!(
+            "resolving the registrar surface issuance for the material at {}",
+            describe_configured_paths(&settings.registrar_endpoint)
+        )
+    })?;
     let pending = pending_pairs(&plan, settings.trust.ca_bundle_path.as_deref()).await;
     if pending.is_empty() {
         return Ok(());
     }
     // Only now: with both pairs usable this is never reached, so a
     // daemon whose material is fine starts with OpenBao down.
-    let inputs = read_acme_inputs(&plan.secrets_dir, &plan.openbao_url, &plan.kv_mount).await?;
+    let inputs = read_acme_inputs(&plan.secrets_dir, &plan.openbao_url, &plan.kv_mount)
+        .await
+        .with_context(|| {
+            format!(
+                "reading the ACME inputs for the registrar surface material still to be issued: {}",
+                describe_pairs(&pending)
+            )
+        })?;
     for pair in pending {
         issue_surface_pair(settings, &pair, &plan.host, &inputs, insecure_mode).await?;
     }
     Ok(())
+}
+
+/// Renders the four configured material paths for a diagnostic, before
+/// any of them has been resolved into a pair.
+///
+/// An unset path is rendered as such rather than skipped: configuration
+/// validation has already refused an enabled endpoint with any of the
+/// four unset, so a diagnostic that reaches this with one missing is
+/// reporting a caller that skipped that validation, and hiding the hole
+/// is exactly the wrong answer there.
+fn describe_configured_paths(endpoint: &RegistrarEndpointSettings) -> String {
+    [
+        (
+            SurfaceLeaf::EndpointServer.cert_setting(),
+            endpoint.server_cert_path.as_deref(),
+        ),
+        (
+            SurfaceLeaf::EndpointServer.key_setting(),
+            endpoint.server_key_path.as_deref(),
+        ),
+        (
+            SurfaceLeaf::RegistrarClient.cert_setting(),
+            endpoint.client_cert_path.as_deref(),
+        ),
+        (
+            SurfaceLeaf::RegistrarClient.key_setting(),
+            endpoint.client_key_path.as_deref(),
+        ),
+    ]
+    .iter()
+    .map(|(setting, path)| match path {
+        Some(path) => format!("{setting} = {}", path.display()),
+        None => format!("{setting} (unset)"),
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// Renders the pairs' reserved names and configured paths for a
+/// diagnostic.
+///
+/// A failure that is not about one pair in particular — the two
+/// `OpenBao` reads are shared by both — still has to name the material
+/// it was reached for, so the refusal carries the certificate and key
+/// paths of every pair that was pending and of none that was not.
+fn describe_pairs(pairs: &[SurfacePairPaths]) -> String {
+    pairs
+        .iter()
+        .map(|pair| {
+            format!(
+                "{} at {} and {}",
+                pair.name,
+                pair.cert_path.display(),
+                pair.key_path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Everything an endpoint-enabled host's issuance is resolved from,

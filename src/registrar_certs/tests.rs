@@ -282,6 +282,33 @@ impl Host {
         SurfaceLeaf::RegistrarClient.identity(TEST_HOST, TEST_DOMAIN)
     }
 
+    /// Completes the internal credential's six-file set, so
+    /// `InternalCredential::load` succeeds and a failure is the
+    /// `OpenBao` exchange rather than the material below it.
+    ///
+    /// The four files are written directly rather than through
+    /// `publish_material`: the publication's staging, chown and rename
+    /// path is that module's to test, and all this needs is a leaf and
+    /// key the client-authenticated transport can be built from.
+    fn provision_internal_credential(&self) {
+        let internal = InternalPaths::new(&self.secrets_dir());
+        let (leaf, key) = self.ca.issue(&leaf_params(
+            "internal.bootroot-01.corp.example.internal",
+            -1,
+            30,
+        ));
+        std::fs::write(internal.key(), key).expect("write the internal key");
+        std::fs::write(internal.chain(), format!("{leaf}{}", self.ca.root_pem))
+            .expect("write the internal chain");
+        std::fs::write(internal.acme_account(), "{\"account_key_pkcs8\":\"QUJD\"}")
+            .expect("write the internal ACME account key");
+        std::fs::write(
+            internal.root_fingerprint(),
+            format!("{}\n", self.ca.root_fingerprint()),
+        )
+        .expect("write the internal root fingerprint");
+    }
+
     /// Writes usable material at both configured pairs.
     fn provision_both_pairs(&self) {
         let (cert, key) = self.server_pair();
@@ -2241,6 +2268,95 @@ async fn a_failed_openbao_read_refuses_and_names_the_read() {
     let rendered = format!("{error:#}");
     assert!(rendered.contains(PATH_AGENT_EAB), "{rendered}");
     assert!(rendered.contains(TEST_KV_MOUNT), "{rendered}");
+}
+
+/// The **public issuance unit**'s own refusal on a failed `OpenBao`
+/// exchange names the failing read *and* the material paths of the pairs
+/// it was reached for — the requirement the isolated
+/// `read_acme_inputs_with` cases above cannot see, because they are
+/// called with no pair in hand at all.
+///
+/// The server pair is left usable, so the pending set is exactly the
+/// client pair: the diagnostic must carry that pair's two paths and
+/// neither of the untouched pair's.
+#[tokio::test]
+async fn a_failed_openbao_read_out_of_the_issuance_unit_names_the_pending_material_paths() {
+    let host = Host::with_openbao_url("https://127.0.0.1:1");
+    host.provision_internal_credential();
+    let (server_cert, server_key) = host.server_pair();
+    write_usable_pair(&host.ca, &Host::server_name(), &server_cert, &server_key);
+
+    let mut settings = host.settings.clone();
+    // Nothing is listening here either, so a CA request would fail on
+    // its own — but the OpenBao read is reached first.
+    settings.server = "http://127.0.0.1:1/directory".to_string();
+
+    let error = ensure_registrar_surface_certificates(&settings, false)
+        .await
+        .expect_err("an unreachable OpenBao must refuse the start");
+    let rendered = format!("{error:#}");
+
+    assert!(
+        rendered.contains("OpenBao"),
+        "the failing read must still be named: {rendered}"
+    );
+    let (client_cert, client_key) = host.client_pair();
+    for path in [&client_cert, &client_key] {
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "the pending pair's {} must be named: {rendered}",
+            path.display()
+        );
+    }
+    assert!(
+        rendered.contains(&Host::client_name()),
+        "the pending pair's reserved name must be named: {rendered}"
+    );
+    for path in [&server_cert, &server_key] {
+        assert!(
+            !rendered.contains(&path.display().to_string()),
+            "the usable pair's {} must not be reported as pending: {rendered}",
+            path.display()
+        );
+    }
+
+    // And no material was published for the pending pair.
+    assert!(!client_cert.exists());
+    assert!(!client_key.exists());
+}
+
+/// A resolution failure refuses before any pair exists, so it names the
+/// four **configured** paths instead — the material identifiers that are
+/// available at that point — alongside the failure itself.
+#[tokio::test]
+async fn a_resolution_failure_names_the_configured_material_paths() {
+    let host = Host::new();
+    let state_file = host
+        .settings
+        .registrar
+        .state_file
+        .clone()
+        .expect("a state file");
+    std::fs::remove_file(&state_file).expect("remove the state file");
+
+    let error = ensure_registrar_surface_certificates(&host.settings, false)
+        .await
+        .expect_err("an unreadable state file must refuse the start");
+    let rendered = format!("{error:#}");
+
+    let (server_cert, server_key) = host.server_pair();
+    let (client_cert, client_key) = host.client_pair();
+    for path in [&server_cert, &server_key, &client_cert, &client_key] {
+        assert!(
+            rendered.contains(&path.display().to_string()),
+            "the configured {} must be named: {rendered}",
+            path.display()
+        );
+    }
+    assert!(
+        rendered.contains(&state_file.display().to_string()),
+        "the failure itself must still be named: {rendered}"
+    );
 }
 
 /// A credential whose stored root fingerprint is not the deployment's

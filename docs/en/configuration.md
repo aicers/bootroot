@@ -504,7 +504,13 @@ endpoint-enabled start, and they are ordered:
    a refused certificate login, an unreadable state file or internal
    config, a credential superseded by a trust rotation, or a write that
    could not land. The diagnostic names the material paths and the
-   failure. Nothing falls back to a self-signed or borrowed leaf.
+   failure. Which paths depends on how far the start got: a failure
+   inside one issuance names that pair, the OpenBao reads and the
+   credential load are shared by both pairs and so name every pair that
+   still needed issuing, and a state file or internal config that cannot
+   be read is refused before the host label either name is composed from
+   is known, so it names the four configured paths instead. Nothing
+   falls back to a self-signed or borrowed leaf.
 
 Three cases inside the second are worth calling out, because they look
 like repairs and are not:
