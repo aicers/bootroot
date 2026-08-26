@@ -586,16 +586,17 @@ impl RegistrarEndpointClient {
         let expected_endpoint_name = self.expected_endpoint_name.clone();
         let certificate_path = self.certificate_path.clone();
         let key_path = self.key_path.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            load_dial_config(
-                &pin_file,
-                &expected_endpoint_name,
-                &certificate_path,
-                &key_path,
-            )
-        })
-        .await
-        .map_err(|source| ExchangeError::LoadAbandoned { source })?;
+        let loaded = finish_dial_load(
+            tokio::task::spawn_blocking(move || {
+                load_dial_config(
+                    &pin_file,
+                    &expected_endpoint_name,
+                    &certificate_path,
+                    &key_path,
+                )
+            })
+            .await,
+        );
         if let Err(ExchangeError::Material { source }) = &loaded {
             // Emitted here rather than inside the closure: a
             // `tracing` subscriber installed for one thread — which is
@@ -673,6 +674,28 @@ impl RegistrarEndpointClient {
             }
             _ => ExchangeError::Handshake { source: err },
         }
+    }
+}
+
+/// Turns the blocking load's join result into this dial's outcome.
+///
+/// The one place [`ExchangeError::LoadAbandoned`] is built. Everything
+/// the load itself decided is already an `ExchangeError` and passes
+/// through untouched; the only failure this adds is the hand-off's own —
+/// the runtime shutting down with the load still queued, or the load
+/// panicking.
+///
+/// Kept as a function rather than an inline `map_err` so that a test can
+/// hand it a real [`tokio::task::JoinError`], taken from a blocking task
+/// that really panicked, and assert the variant it selects. No dial can
+/// be made to produce one: a test that killed its own runtime to force
+/// the hand-off to fail would have nothing left to await the verb with.
+fn finish_dial_load(
+    joined: Result<Result<ClientConfig, ExchangeError>, tokio::task::JoinError>,
+) -> Result<ClientConfig, ExchangeError> {
+    match joined {
+        Ok(loaded) => loaded,
+        Err(source) => Err(ExchangeError::LoadAbandoned { source }),
     }
 }
 

@@ -1516,6 +1516,64 @@ async fn a_second_dial_re_reads_the_client_material() {
 }
 
 // ---------------------------------------------------------------------
+// The blocking load's hand-off
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_panicking_dial_load_gives_the_load_abandoned_variant() {
+    // The hand-off is exercised at its seam rather than through a verb.
+    // A dial cannot be made to abandon its load on demand: the two ways
+    // it happens are the runtime shutting down with the load still
+    // queued and the load panicking, and a test that shut its own
+    // runtime down would have nothing left to await the verb with. What
+    // it can do is produce the real `JoinError` — from a blocking task
+    // on this runtime's own pool, panicking for real — and hand it to
+    // the function that owns the variant.
+    let joined = tokio::task::spawn_blocking(|| -> Result<ClientConfig, ExchangeError> {
+        panic!("the per-dial load panicked");
+    })
+    .await;
+
+    let err = finish_dial_load(joined).expect_err("an abandoned load is not a configuration");
+
+    let ExchangeError::LoadAbandoned { source } = &err else {
+        panic!("expected the abandoned-load variant, got {err:?}");
+    };
+    assert!(source.is_panic(), "{source:?}");
+    assert!(
+        err.to_string()
+            .starts_with("the registrar endpoint dial configuration was never loaded"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_load_that_reported_back_keeps_its_own_variant() {
+    // The other half of the seam: a load that ran to completion owns
+    // its outcome, and a failure it decided is not re-labelled as the
+    // hand-off failing.
+    let path = PathBuf::from("/nonexistent/registrar-client.pem");
+    let joined = tokio::task::spawn_blocking(move || {
+        Err(ExchangeError::Material {
+            source: ClientMaterialError::MissingCertificate { path },
+        })
+    })
+    .await;
+
+    let err = finish_dial_load(joined).expect_err("the load reported a failure");
+
+    assert!(
+        matches!(
+            err,
+            ExchangeError::Material {
+                source: ClientMaterialError::MissingCertificate { .. }
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // The one variant with no portable test
 // ---------------------------------------------------------------------
 

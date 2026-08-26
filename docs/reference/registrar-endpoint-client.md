@@ -73,7 +73,11 @@ nothing.
 Those three reads sit outside both timeouts below — the connect budget starts
 once the configuration is in hand — so they run on the runtime's blocking pool
 rather than on a worker thread, where a filesystem answering slowly could hold
-one for as long as it liked.
+one for as long as it liked. The hand-off has a failure of its own, distinct
+from anything the load decided: the runtime shutting down with the load still
+queued, or the load panicking. It has its own variant, no connection is opened
+when it fires, and a load that did report back keeps whichever failure it
+decided.
 
 The name handed to the TLS connector is inert: a handshake over `AF_UNIX` has
 no hostname to match against, so the verifier ignores the dialed name and
