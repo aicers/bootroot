@@ -432,7 +432,8 @@ impl RegistrarEndpointClient {
         }
     }
 
-    /// The endpoint name every dial pins the presented leaf against.
+    /// Returns the endpoint name every dial pins the presented leaf
+    /// against.
     pub(crate) fn expected_endpoint_name(&self) -> &str {
         &self.expected_endpoint_name
     }

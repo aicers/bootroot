@@ -1195,6 +1195,36 @@ async fn a_refusal_is_a_successful_exchange() {
 }
 
 #[tokio::test]
+async fn a_deregister_refusal_is_a_successful_exchange() {
+    // The discrimination is written once per verb, so the deregister
+    // arm gets its own refusal case rather than resting on the mint
+    // one having exercised the shared rule.
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(REFUSAL_PERMANENT)));
+
+    let reply = deployment
+        .client()
+        .deregister(deregister_request())
+        .await
+        .expect("a refusal is not an exchange failure");
+
+    let refusal = match reply {
+        DeregisterReply::Refused(refusal) => refusal,
+        DeregisterReply::Success(response) => panic!("expected the refusal arm, saw {response:?}"),
+    };
+    assert_eq!(refusal.class, protocol::RefusalClass::Permanent);
+    assert_eq!(
+        refusal.error,
+        Some(protocol::EnrollError::ServiceHostMismatch)
+    );
+    assert_eq!(
+        double.observed().connections,
+        1,
+        "the client retried a refusal"
+    );
+}
+
+#[tokio::test]
 async fn a_success_payload_is_not_misdecoded_as_a_refusal() {
     let deployment = Deployment::new();
     let _double = deployment.double(answered(response_frame(DEREGISTER_SUCCESS)));
