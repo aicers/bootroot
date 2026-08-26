@@ -608,6 +608,12 @@ pair of paths:
 All four are required when `enabled = true`, and an unset one is refused
 at configuration-validation time, before anything is read or requested.
 
+Each certificate file the daemon writes carries **the leaf followed by
+its issuer chain**, which is what the chain requirement below demands,
+and the issuers are merged into `trust.ca_bundle_path` as well. The leaf
+stays the first PEM block, so a reader that wants it alone still finds
+it there.
+
 Issuance runs under bootroot's own **bootroot-internal privileged
 credential** — the root-owned identity that authenticates to `OpenBao` at
 `auth/cert` — over the same outbound ACME path to the local step-ca every

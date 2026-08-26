@@ -407,6 +407,15 @@ every other issuance takes. No `AppRole`, and no expiring secret, is on
 that path. The daemon still never generates a self-signed certificate
 and never falls back to the host's ordinary service leaf.
 
+Each certificate file it writes holds **the leaf followed by its issuer
+chain**, and the issuers are merged into `trust.ca_bundle_path` as well.
+Both sides of this handshake select their trust anchor from the chain
+the material *presents* rather than from a bundle on the reader's own
+disk, so a leaf-only file would load cleanly and then be refused — which
+is the same requirement stated for `server_cert_path` above, now met by
+the daemon rather than by whoever placed the file. A reader that wants
+the leaf alone still finds it as the first PEM block.
+
 A host whose endpoint is **disabled** issues nothing, creates no material
 path, and requests nothing from the CA or from `OpenBao`.
 

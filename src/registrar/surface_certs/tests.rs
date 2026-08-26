@@ -758,6 +758,10 @@ async fn an_unreachable_openbao_refuses() {
 // Issuance against a mock ACME server
 // ---------------------------------------------------------------------
 
+/// A validity window a test stamps onto whatever the mock CA issues,
+/// standing in for a host clock persistently out of step with the CA's.
+type StampedValidity = ((i32, u8, u8), (i32, u8, u8));
+
 /// The mock CA's answer to one finalize: it parses the CSR out of the
 /// JWS payload, signs it, and remembers the PEM for the certificate
 /// endpoint to serve.
@@ -765,13 +769,21 @@ struct FinalizeResponder {
     ca: Arc<TestCa>,
     issued: Arc<Mutex<Vec<String>>>,
     order_url: String,
+    /// When set, the window the issued leaf carries — the CA's clock, in
+    /// other words, rather than this host's.
+    validity: Option<StampedValidity>,
 }
 
 impl Respond for FinalizeResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let csr_der = csr_from_jws(&request.body);
-        let params =
+        let mut params =
             rcgen::CertificateSigningRequestParams::from_der(&csr_der.into()).expect("parse CSR");
+        if let Some((not_before, not_after)) = self.validity {
+            params.params.not_before =
+                rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+            params.params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        }
         let leaf = params.signed_by(self.ca.as_ref()).expect("sign CSR");
         let pem = format!("{}{}", leaf.pem(), self.ca.pem());
         self.issued.lock().expect("issued lock").push(pem);
@@ -880,8 +892,15 @@ impl Respond for AccountRecorder {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn start_acme_harness() -> AcmeHarness {
+    start_acme_harness_with_validity(None).await
+}
+
+/// The same harness, with the CA stamping `validity` onto every leaf it
+/// issues. `None` leaves the CSR's own window alone, which is what an
+/// unskewed deployment produces.
+#[allow(clippy::too_many_lines)]
+async fn start_acme_harness_with_validity(validity: Option<StampedValidity>) -> AcmeHarness {
     let ca = Arc::new(generate_ca("Mock Step CA"));
     let acme = MockServer::start().await;
     let responder = MockServer::start().await;
@@ -983,6 +1002,7 @@ async fn start_acme_harness() -> AcmeHarness {
             ca: Arc::clone(&ca),
             issued: Arc::clone(&issued),
             order_url: format!("{base}/order/1"),
+            validity,
         })
         .mount(&acme)
         .await;
@@ -1105,6 +1125,158 @@ async fn the_issued_server_leaf_carries_the_reserved_endpoint_name() {
         certs.first().expect("leaf"),
         signing_key.as_ref()
     ));
+}
+
+/// Runs the check the endpoint's own TLS loader runs over the material
+/// it finds at `server_cert_path`.
+///
+/// `build_server_config`'s `self_check` is exactly this: the merged
+/// [`RegistrarEndpointVerifier`] built from the deployment's pins and
+/// the leaf's expected name, called on the loaded chain at the host's
+/// clock. Driven directly rather than through the loader because the
+/// endpoint module is Linux-only and this rule is not.
+fn loader_self_check(
+    cert_file_pem: &str,
+    ca: &TestCa,
+) -> Result<(), crate::registrar::endpoint_pin::EndpointVerifyRejection> {
+    use rustls::pki_types::UnixTime;
+
+    use crate::registrar::endpoint_pin::RegistrarEndpointVerifier;
+
+    let certs = parse_certificates(cert_file_pem.as_bytes()).expect("the published file parses");
+    let (leaf, intermediates) = certs.split_first().expect("a leaf");
+    let pins = std::iter::once(crate::tls::sha256_hex(ca.der())).collect();
+    let verifier = RegistrarEndpointVerifier::new(pins, &endpoint_name()).expect("verifier");
+    verifier.verify(leaf, intermediates, UnixTime::now())
+}
+
+/// The server pair issuance publishes is material the endpoint's own
+/// loader accepts — the leaf followed by its issuer chain, reaching a
+/// pinned anchor.
+///
+/// This is the end the whole ordering exists for: issuance runs before
+/// the endpoint loads its TLS material, so material issuance wrote and
+/// the loader then refuses leaves the daemon unable to start on a
+/// certificate it minted for itself a moment earlier. The loader picks
+/// its anchor out of the chain the *file* presents rather than out of
+/// the CA bundle, so a leaf-only publication is refused however the
+/// bundle is pinned.
+#[tokio::test]
+async fn the_published_server_pair_satisfies_the_endpoints_own_loader() {
+    let harness = start_acme_harness().await;
+    let outcome = issue_into_tempdir(&harness, SurfaceLeaf::Endpoint, OPENBAO_HMAC, None).await;
+
+    let certs = parse_certificates(outcome.leaf_pem.as_bytes()).expect("certificates");
+    assert!(
+        certs.len() > 1,
+        "the published file carries the leaf followed by its issuer chain"
+    );
+    assert_eq!(
+        single_dns_san(certs.first().expect("leaf").as_ref()).expect("one DNS SAN"),
+        endpoint_name(),
+        "the leaf is the first block, so every leaf-only reader still finds it"
+    );
+    loader_self_check(&outcome.leaf_pem, &harness.ca).expect("the loader accepts what was issued");
+}
+
+/// The client pair is published the same way and for the same reason:
+/// the endpoint verifies a caller against the *pinned subset* of the
+/// bundle, so a leaf whose issuer is not itself the pinned anchor has to
+/// present that issuer.
+#[tokio::test]
+async fn the_published_client_pair_carries_its_issuer_chain() {
+    let harness = start_acme_harness().await;
+    let outcome = issue_into_tempdir(&harness, SurfaceLeaf::Client, OPENBAO_HMAC, None).await;
+
+    let certs = parse_certificates(outcome.leaf_pem.as_bytes()).expect("certificates");
+    assert!(certs.len() > 1, "the issuer chain is published with it");
+    assert_eq!(
+        single_dns_san(certs.first().expect("leaf").as_ref()).expect("one DNS SAN"),
+        client_name()
+    );
+    let bundle = std::fs::read(&outcome.bundle).expect("read the merged bundle");
+    assert!(
+        cert_chain::leaf_chains_to_bundle(outcome.leaf_pem.as_bytes(), &bundle)
+            .expect("the chain check parses"),
+        "the published leaf chains to the anchors the same issuance merged"
+    );
+}
+
+/// An ordinary service issuance is unchanged: it still publishes the
+/// leaf alone, with its issuers reaching disk through the merged bundle.
+/// The chain publication is the registrar surface's, not a new default
+/// every existing caller silently acquired.
+#[test]
+fn the_default_publication_shape_is_the_leaf_alone() {
+    assert_eq!(
+        crate::acme::PublishedChain::default(),
+        crate::acme::PublishedChain::LeafOnly
+    );
+}
+
+/// Case 3 of the guarantee, in both directions: a **successful**
+/// issuance whose replacement is still outside its validity window at
+/// this host's clock. A host clock far enough behind the CA leaves the
+/// replacement not yet valid; one far enough ahead — by more than a
+/// leaf's whole lifetime — leaves it already expired, which needs much
+/// more skew but is what a dead RTC or a snapshot-restored VM produces.
+///
+/// The two outcomes are told apart deliberately. Issuance reports
+/// success and publishes, so this is not an issuance failure and an
+/// implementer is not sent looking for a bug in the write path; the
+/// refusal that follows is the endpoint loader's own, pre-existing one.
+/// Nothing here corrects a clock, retries, or adds a second verifier.
+#[tokio::test]
+async fn a_replacement_still_outside_its_window_is_the_loaders_refusal_not_an_issuance_failure() {
+    for (label, window) in [
+        (
+            "a host clock far behind the CA",
+            ((2090, 1, 1), (2099, 1, 1)),
+        ),
+        (
+            "a host clock far ahead of the CA",
+            ((2020, 1, 1), (2021, 1, 1)),
+        ),
+    ] {
+        let harness = start_acme_harness_with_validity(Some(window)).await;
+        let outcome = issue_into_tempdir(&harness, SurfaceLeaf::Endpoint, OPENBAO_HMAC, None).await;
+        assert!(
+            outcome.cert.exists() && outcome.key.exists(),
+            "{label}: issuance succeeded and published"
+        );
+        assert!(
+            loader_self_check(&outcome.leaf_pem, &harness.ca).is_err(),
+            "{label}: the endpoint's loader refuses the replacement, so the daemon does not start"
+        );
+    }
+}
+
+/// The same condition on the **client** pair alone does not block the
+/// start. The endpoint's loader reads the *server* pair and nothing
+/// else, so a client leaf outside its window is not among its inputs —
+/// it is the co-located registrar's problem to report, and the daemon
+/// comes up either way.
+#[tokio::test]
+async fn a_client_leaf_outside_its_window_does_not_block_the_endpoint() {
+    let harness = start_acme_harness().await;
+    let server = issue_into_tempdir(&harness, SurfaceLeaf::Endpoint, OPENBAO_HMAC, None).await;
+
+    let skewed = start_acme_harness_with_validity(Some(((2090, 1, 1), (2099, 1, 1)))).await;
+    let client = issue_into_tempdir(&skewed, SurfaceLeaf::Client, OPENBAO_HMAC, None).await;
+    assert_eq!(
+        evaluate_pair(
+            &client.cert,
+            &client.key,
+            &client_name(),
+            None,
+            OffsetDateTime::now_utc(),
+        ),
+        Usability::Unusable(UnusableMaterial::NotYetValid),
+        "the client leaf really is out of window"
+    );
+
+    loader_self_check(&server.leaf_pem, &harness.ca)
+        .expect("the endpoint's own material is unaffected");
 }
 
 /// The endpoint's operation set is exactly two, and this work adds

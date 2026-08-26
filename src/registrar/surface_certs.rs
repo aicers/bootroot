@@ -72,7 +72,7 @@ use tracing::{info, warn};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::{ASN1Time, FromDer};
 
-use crate::acme::{CsrShape, issue_certificate_with_shape};
+use crate::acme::{CsrShape, PublishedChain, issue_certificate_with_shape};
 use crate::config::{
     DaemonProfileSettings, HookSettings, Paths, RegistrarEndpointSettings, Settings,
 };
@@ -679,6 +679,17 @@ async fn read_acme_inputs_with(
 /// satisfiable after a rotation. The endpoint pin file is a different
 /// file and is never touched here: the pin is over trust *anchors*, not
 /// over either leaf, and the provisioning tool writes it once.
+///
+/// Both leaves are published as **leaf followed by issuer chain**, which
+/// is the one place the surface departs from what an ordinary service
+/// leaf is written as. Neither side of this handshake authenticates the
+/// other against a bundle on its own disk: the endpoint's TLS loader
+/// picks its anchor out of the chain the material *presents*
+/// (`pinned_anchors`), and the registrar pins the endpoint the same way.
+/// A leaf-only file therefore loads cleanly and is then refused by the
+/// loader a few lines later, however the bundle is pinned — so the
+/// daemon would issue the endpoint's own certificate and then decline to
+/// come up on it.
 async fn issue_pair(
     settings: &Settings,
     paths: &PairPaths,
@@ -694,6 +705,7 @@ async fn issue_pair(
         eab,
         insecure_mode,
         paths.leaf.csr_shape(),
+        PublishedChain::LeafAndChain,
     )
     .await
     .with_context(|| {

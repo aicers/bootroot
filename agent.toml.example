@@ -77,7 +77,9 @@ http_responder_token_ttl_secs = 300
 # finds at these paths that it cannot use — missing, unreadable,
 # unparseable, key-mismatched, misnamed, outside its validity window, or
 # no longer chaining to trust.ca_bundle_path.  Usable material is left
-# exactly as it is.
+# exactly as it is.  Each file it writes carries the leaf followed by
+# its issuer chain, which is what the loader above requires; the leaf
+# stays the first PEM block.
 #
 # client_cert_path and client_key_path are the registrar's own client
 # leaf.  The co-located registrar process reads them, the provisioning

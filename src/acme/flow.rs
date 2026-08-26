@@ -41,6 +41,31 @@ pub enum CsrShape {
     RegistrarClient,
 }
 
+/// What the published certificate file carries.
+///
+/// Orthogonal to [`CsrShape`]: one decides what is asked of the CA, this
+/// decides what reaches `paths.cert` once the CA has answered. The
+/// issuer chain is written to `[trust].ca_bundle_path` either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublishedChain {
+    /// The leaf alone. Its issuers reach disk only through the merged CA
+    /// bundle, which is where every reader of an ordinary service leaf
+    /// looks for them. What every caller before the registrar surface
+    /// published, and still the default.
+    #[default]
+    LeafOnly,
+    /// The leaf followed by the issuer chain the CA returned.
+    ///
+    /// Required by material a peer authenticates against a *pinned*
+    /// anchor set, because such a verifier selects its anchor from the
+    /// **presented** chain rather than from a bundle on the reader's
+    /// disk: the registrar endpoint's own TLS loader does exactly that,
+    /// and refuses a leaf-only file however the bundle is pinned. A
+    /// reader that wants the leaf alone still finds it as the first PEM
+    /// block.
+    LeafAndChain,
+}
+
 fn build_csr_params(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
@@ -121,6 +146,25 @@ fn split_leaf_and_chain(cert_pem: &str) -> Result<(String, Vec<Vec<u8>>)> {
     let leaf_pem = encode_cert_pem(&leaf.contents);
     let chain = certs.into_iter().map(|pem| pem.contents).collect();
     Ok((leaf_pem, chain))
+}
+
+/// Assembles what reaches `paths.cert`.
+///
+/// `chain` is empty whenever `[trust].ca_bundle_path` is unconfigured —
+/// there the split never ran and `leaf_pem` is already whatever the CA
+/// returned — so both variants publish the same bytes in that shape and
+/// the selector only ever matters where a bundle is configured.
+fn published_certificate_pem(leaf_pem: &str, chain: &[Vec<u8>], shape: PublishedChain) -> String {
+    match shape {
+        PublishedChain::LeafOnly => leaf_pem.to_string(),
+        PublishedChain::LeafAndChain => {
+            let mut published = leaf_pem.to_string();
+            for issuer in chain {
+                published.push_str(&encode_cert_pem(issuer));
+            }
+            published
+        }
+    }
 }
 
 fn encode_cert_pem(der: &[u8]) -> String {
@@ -395,7 +439,7 @@ async fn wait_for_order_completion(
 }
 
 /// Issues a certificate via ACME protocol, requesting the ordinary
-/// service CSR shape.
+/// service CSR shape and publishing the leaf alone.
 ///
 /// # Errors
 /// Returns error if ACME protocol fails.
@@ -412,11 +456,13 @@ pub async fn issue_certificate(
         eab_creds,
         insecure_mode,
         CsrShape::Service,
+        PublishedChain::LeafOnly,
     )
     .await
 }
 
-/// Issues a certificate via ACME protocol, requesting `csr_shape`.
+/// Issues a certificate via ACME protocol, requesting `csr_shape` and
+/// publishing what `published_chain` selects.
 ///
 /// The publication order is deliberate and is shared by every caller:
 /// the returned chain is verified against `trust.trusted_ca_sha256` and
@@ -437,6 +483,7 @@ pub async fn issue_certificate_with_shape(
     eab_creds: Option<crate::eab::EabCredentials>,
     insecure_mode: bool,
     csr_shape: CsrShape,
+    published_chain: PublishedChain,
 ) -> Result<()> {
     let mut client = AcmeClient::new(
         settings.server.clone(),
@@ -523,10 +570,11 @@ pub async fn issue_certificate_with_shape(
         // renames observes the new leaf with the old key, or the old
         // leaf with the new key. Closing that window is the reader's
         // side of the contract, not this write's.
+        let cert_file_pem = published_certificate_pem(&leaf_pem, &chain, published_chain);
         fs_util::write_cert_and_key(
             &profile.paths.cert,
             &profile.paths.key,
-            &leaf_pem,
+            &cert_file_pem,
             &key_pem,
             policy,
         )

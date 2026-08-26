@@ -236,9 +236,16 @@ async fn both_pairs_usable_starts_with_openbao_down_and_touches_nothing() {
     );
 }
 
-/// Each of the eight states, driven through the whole unit: an
-/// `OpenBao` that cannot be reached proves the daemon decided to issue,
-/// and the failure names the read rather than the material's state.
+/// Every unusable state, driven through the whole unit: an `OpenBao`
+/// that cannot be reached proves the daemon decided to issue, and the
+/// failure names the read rather than the material's state.
+///
+/// Seven of the eight are seeded on the client pair and the eighth,
+/// *expired*, is seeded on the server pair as well, so the same decision
+/// is shown on both. *Unreadable* is the one state absent from this
+/// list: it needs a file uid 0 cannot read, which does not exist, and it
+/// is asserted against [`super::super::registrar::surface_certs`]'s own
+/// evaluation where the root case can be skipped.
 #[tokio::test]
 async fn every_unusable_state_drives_the_unit_to_read_openbao() {
     for (label, seed) in unusable_seeds() {
