@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use bootroot::config::CliOverrides;
 use bootroot::{
-    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint, config, eab, profile, run_daemon,
-    run_oneshot,
+    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint, config, eab,
+    ensure_registrar_surface_certificates, profile, run_daemon, run_oneshot,
 };
 use clap::Parser;
 #[cfg(unix)]
@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
     // later reload is held to the value captured here.
     let (initial_settings, initial_eab) = load_settings(&args).await?;
     let registrar_endpoint_settings = initial_settings.registrar_endpoint.clone();
+    // Above activation on purpose: the endpoint's TLS loader reads the
+    // server pair the moment `activate` runs, so the material it finds
+    // has to be material this call has already ensured. On a host where
+    // the endpoint is disabled this does nothing at all — no path
+    // created, nothing asked of the CA or of OpenBao.
+    ensure_registrar_surface_certificates(&initial_settings, args.insecure).await?;
     let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
 

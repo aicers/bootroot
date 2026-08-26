@@ -74,22 +74,6 @@ pub(crate) const CA_BUNDLE_SETTING: &str = "trust.ca_bundle_path";
 /// How the anchor pin list is spelled in a diagnostic.
 pub(crate) const TRUSTED_CA_SETTING: &str = "trust.trusted_ca_sha256";
 
-/// The payload the cert/key match check signs and verifies.
-///
-/// Its content is irrelevant — what matters is that the same bytes go
-/// through the loaded key and come back out verifiable against the
-/// leaf's public key, which is what proves the two are a pair.
-const KEY_MATCH_TEST_MESSAGE: &[u8] = b"bootroot-registrar-endpoint-cert-key-match";
-
-/// The signature schemes the cert/key match check will try, in
-/// preference order.
-const KEY_MATCH_SCHEMES: [rustls::SignatureScheme; 4] = [
-    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-    rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-    rustls::SignatureScheme::RSA_PSS_SHA256,
-    rustls::SignatureScheme::ED25519,
-];
-
 /// Why the endpoint's TLS configuration could not be built.
 ///
 /// Every variant is a startup refusal, and every one of them names the
@@ -535,7 +519,7 @@ pub(crate) fn load_certified_key(
             setting: SERVER_CERT_SETTING,
             path: cert_path.to_path_buf(),
         })?;
-    if !cert_key_matches(leaf, signing_key.as_ref()) {
+    if !tls::cert_key_matches(leaf, signing_key.as_ref()) {
         return Err(EndpointTlsError::KeyMismatch {
             setting: SERVER_KEY_SETTING,
             path: key_path.to_path_buf(),
@@ -544,30 +528,6 @@ pub(crate) fn load_certified_key(
     }
 
     Ok(CertifiedKey::new(certs, signing_key))
-}
-
-/// Reports whether `signing_key` is the private key of `leaf`.
-fn cert_key_matches(leaf: &CertificateDer<'_>, signing_key: &dyn rustls::sign::SigningKey) -> bool {
-    let Some(signer) = signing_key.choose_scheme(&KEY_MATCH_SCHEMES) else {
-        return false;
-    };
-    let algorithm: &dyn ring::signature::VerificationAlgorithm = match signer.scheme() {
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
-        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
-        rustls::SignatureScheme::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
-        rustls::SignatureScheme::ED25519 => &ring::signature::ED25519,
-        _ => return false,
-    };
-    let Ok(signature) = signer.sign(KEY_MATCH_TEST_MESSAGE) else {
-        return false;
-    };
-    let Ok((_, certificate)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
-        return false;
-    };
-    let public_key: &[u8] = certificate.public_key().subject_public_key.as_ref();
-    ring::signature::UnparsedPublicKey::new(algorithm, public_key)
-        .verify(KEY_MATCH_TEST_MESSAGE, &signature)
-        .is_ok()
 }
 
 /// Reads a configured file, separating "not there" from "there and

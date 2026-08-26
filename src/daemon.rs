@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-// Used by the Linux-only registrar handler build below, which is the
-// only fallible composition in this module.
-#[cfg(target_os = "linux")]
+// Used by the deployment state file's reader and by the Linux-only
+// registrar handler build below, the two fallible compositions in this
+// module.
 use anyhow::Context as _;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
@@ -309,7 +309,6 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
 /// in the binary crate and this is the library, so the value is restated
 /// here rather than reached for across the boundary. A test in that
 /// crate fails if `StateFile`'s fallback ever stops being this name.
-#[cfg(target_os = "linux")]
 const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 
 /// The three members the daemon reads out of the deployment's
@@ -328,20 +327,19 @@ const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 /// It derives [`serde::Deserialize`] and **not** `Serialize` on purpose:
 /// a serializer here is how a later edit comes to write an operator's
 /// state file back out with three fields and lose the rest.
-#[cfg(target_os = "linux")]
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RegistrarStateProjection {
     /// The URL `bootroot init` recorded for this deployment's
     /// `OpenBao`. Must be `https://`.
     #[serde(default)]
-    openbao_url: String,
+    pub(crate) openbao_url: String,
     /// The KV v2 mount every registrar path is written under.
     #[serde(default)]
-    kv_mount: String,
+    pub(crate) kv_mount: String,
     /// The recorded secrets directory, absent on a deployment that never
     /// passed `--secrets-dir`.
     #[serde(default)]
-    secrets_dir: Option<PathBuf>,
+    pub(crate) secrets_dir: Option<PathBuf>,
 }
 
 /// Reads the three members the registrar surface needs out of the
@@ -355,8 +353,7 @@ pub(crate) struct RegistrarStateProjection {
 /// Returns an error when the file cannot be read, is not JSON, carries
 /// an absent or empty `openbao_url` or `kv_mount`, or carries an
 /// `openbao_url` that is not `https://`.
-#[cfg(target_os = "linux")]
-fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProjection> {
+pub(crate) fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProjection> {
     let bytes = std::fs::read(state_file).with_context(|| {
         format!(
             "reading the deployment state file registrar.state_file names at {}",
@@ -403,8 +400,7 @@ fn read_registrar_state(state_file: &Path) -> anyhow::Result<RegistrarStateProje
 /// `state.json` and `secrets/` side by side in the directory it is run
 /// from, and a daemon started by a socket unit has no working directory
 /// worth resolving against.
-#[cfg(target_os = "linux")]
-fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) -> PathBuf {
+pub(crate) fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) -> PathBuf {
     let recorded = recorded.unwrap_or_else(|| Path::new(DEFAULT_STATE_SECRETS_DIR));
     if recorded.is_absolute() {
         return recorded.to_path_buf();

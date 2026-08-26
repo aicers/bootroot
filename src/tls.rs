@@ -468,6 +468,56 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// The payload the certificate/key match check signs and verifies.
+///
+/// Its content is irrelevant — what matters is that the same bytes go
+/// through the loaded key and come back out verifiable against the
+/// leaf's public key, which is what proves the two are a pair.
+const KEY_MATCH_TEST_MESSAGE: &[u8] = b"bootroot-cert-key-match";
+
+/// The signature schemes the certificate/key match check will try, in
+/// preference order.
+const KEY_MATCH_SCHEMES: [rustls::SignatureScheme; 4] = [
+    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+    rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+    rustls::SignatureScheme::RSA_PSS_SHA256,
+    rustls::SignatureScheme::ED25519,
+];
+
+/// Reports whether `signing_key` is the private key of `leaf`.
+///
+/// A signature rather than a comparison of encoded key material: the
+/// loaded key signs a fixed message and the leaf's public key verifies
+/// it, so a key that merely parses alongside an unrelated certificate is
+/// refused. The endpoint's TLS loader and the registrar surface's
+/// start-time usability evaluation both ask this question, and they ask
+/// it here so a leaf one accepts cannot be one the other rejects.
+pub(crate) fn cert_key_matches(
+    leaf: &CertificateDer<'_>,
+    signing_key: &dyn rustls::sign::SigningKey,
+) -> bool {
+    let Some(signer) = signing_key.choose_scheme(&KEY_MATCH_SCHEMES) else {
+        return false;
+    };
+    let algorithm: &dyn ring::signature::VerificationAlgorithm = match signer.scheme() {
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
+        rustls::SignatureScheme::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
+        rustls::SignatureScheme::ED25519 => &ring::signature::ED25519,
+        _ => return false,
+    };
+    let Ok(signature) = signer.sign(KEY_MATCH_TEST_MESSAGE) else {
+        return false;
+    };
+    let Ok((_, certificate)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else {
+        return false;
+    };
+    let public_key: &[u8] = certificate.public_key().subject_public_key.as_ref();
+    ring::signature::UnparsedPublicKey::new(algorithm, public_key)
+        .verify(KEY_MATCH_TEST_MESSAGE, &signature)
+        .is_ok()
+}
+
 fn invalid_certificate(error: rustls::CertificateError) -> rustls::Error {
     rustls::Error::InvalidCertificate(error)
 }

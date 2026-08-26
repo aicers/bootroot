@@ -2831,8 +2831,7 @@ fn endpoint_settings(enabled: bool) -> crate::config::Settings {
         openbao: None,
         registrar_endpoint: crate::config::RegistrarEndpointSettings {
             enabled,
-            server_cert_path: None,
-            server_key_path: None,
+            ..crate::config::RegistrarEndpointSettings::default()
         },
         registrar: crate::config::RegistrarSettings::default(),
     }

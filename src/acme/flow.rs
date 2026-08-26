@@ -21,6 +21,65 @@ fn contact_from_email(email: &str) -> String {
     }
 }
 
+/// Which CSR shape an issuance asks the CA for.
+///
+/// The one outbound ACME path serves every caller, and all but one of
+/// them want the shape it has always built. So the default is today's
+/// behaviour and the variant is the opt-in, rather than each caller
+/// restating what it wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CsrShape {
+    /// The ordinary service leaf: the profile's composed name as the
+    /// single DNS SAN, mirrored into the common name, requesting no
+    /// extended key usage at all.
+    #[default]
+    Service,
+    /// The registrar's client leaf: the same composed name, plus
+    /// [`rcgen::ExtendedKeyUsagePurpose::ClientAuth`].
+    ///
+    /// Selected only by the registrar client issuance. The registrar
+    /// *endpoint* leaf is a server certificate and takes
+    /// [`CsrShape::Service`], which is why this is a shape rather than a
+    /// "registrar" flag.
+    RegistrarClient,
+}
+
+/// What an issuance publishes at `profile.paths.cert`.
+///
+/// The ordinary service leaf goes to disk alone, with the issuer chain
+/// reaching consumers through `[trust].ca_bundle_path`. The registrar
+/// surface's leaves cannot: a caller pinning this endpoint selects its
+/// trust anchors **from the certificates the server presents**, so a
+/// leaf-only file loads cleanly, matches its key, carries the right name
+/// and is then refused by the endpoint's own loader and by every
+/// correctly pinned caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeafPublication {
+    /// The leaf alone, exactly as every service issuance has always
+    /// written it.
+    #[default]
+    LeafOnly,
+    /// The leaf followed by the issuer chain the CA returned with it.
+    ///
+    /// With `[trust].ca_bundle_path` unconfigured there is no split to
+    /// make and this is what the leaf-only arm writes anyway, so the two
+    /// coincide there.
+    LeafWithChain,
+}
+
+/// How one issuance differs from the ordinary service issuance.
+///
+/// Both members default to today's behaviour, so
+/// [`issue_certificate`] is this struct's default and every existing
+/// caller is unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IssuanceOptions {
+    /// Which CSR shape to ask the CA for.
+    pub csr_shape: CsrShape,
+    /// What to write at `profile.paths.cert`.
+    pub leaf_publication: LeafPublication,
+}
+
 fn build_csr_params(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
@@ -372,7 +431,8 @@ async fn wait_for_order_completion(
     Ok(finalized_order)
 }
 
-/// Issues a certificate via ACME protocol.
+/// Issues a certificate via ACME protocol, in the ordinary service
+/// shape.
 ///
 /// # Errors
 /// Returns error if ACME protocol fails.
@@ -382,6 +442,41 @@ pub async fn issue_certificate(
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
     insecure_mode: bool,
+) -> Result<()> {
+    issue_certificate_with(
+        settings,
+        profile,
+        eab_creds,
+        insecure_mode,
+        IssuanceOptions::default(),
+    )
+    .await
+}
+
+/// Issues a certificate via ACME protocol under `options`.
+///
+/// The one outbound ACME path. [`issue_certificate`] is this function at
+/// [`IssuanceOptions::default`]; only the registrar surface's issuances
+/// pass anything else.
+///
+/// The leaf and its key are published **last**: the returned chain is
+/// verified against `trust.trusted_ca_sha256` and merged into
+/// `trust.ca_bundle_path` first, and nothing is written at either
+/// configured path if either step fails. A published leaf whose chain
+/// failed pin verification, or whose bundle could not be merged, is of
+/// no use to any caller, and the previous order left exactly that on
+/// disk.
+///
+/// # Errors
+/// Returns error if ACME protocol fails, if the returned chain carries a
+/// fingerprint that is not pinned, if the existing CA bundle cannot be
+/// read, or if the leaf and key cannot be written.
+pub async fn issue_certificate_with(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    insecure_mode: bool,
+    options: IssuanceOptions,
 ) -> Result<()> {
     let mut client = AcmeClient::new(
         settings.server.clone(),
@@ -407,7 +502,14 @@ pub async fn issue_certificate(
     validate_http01_authorizations(settings, &mut client, &order).await?;
 
     info!("Generating CSR for domain: {}", primary_domain);
-    let params = build_csr_params(settings, profile)?;
+    let params = match options.csr_shape {
+        CsrShape::Service => build_csr_params(settings, profile)?,
+        CsrShape::RegistrarClient => build_registrar_client_csr_params(
+            &profile.instance_id,
+            &profile.hostname,
+            &settings.domain,
+        )?,
+    };
     let cert_key = rcgen::KeyPair::generate()?;
     let csr_der = params.serialize_request(&cert_key)?;
 
@@ -434,17 +536,13 @@ pub async fn issue_certificate(
         let policy = crate::cert_group::CertGroupPolicy {
             gid: profile.cert_group_gid,
         };
-        fs_util::write_cert_and_key(
-            &profile.paths.cert,
-            &profile.paths.key,
-            &leaf_pem,
-            &key_pem,
-            policy,
-        )
-        .await?;
-        info!("Certificate saved to: {:?}", profile.paths.cert);
-        info!("Private key saved to: {:?}", profile.paths.key);
 
+        // The chain first, the leaf after. An unpinned fingerprint or a
+        // CA bundle that cannot be read fails here, before anything is
+        // published, so no consumer is left holding a leaf whose issuer
+        // this host does not trust. With `ca_bundle_path` unconfigured
+        // there is nothing to verify or merge, and with an empty chain
+        // the bundle is left alone with a warning; neither is a refusal.
         if let Some(bundle_path) = &settings.trust.ca_bundle_path {
             if chain.is_empty() {
                 warn!("Certificate chain not present; CA bundle not updated.");
@@ -460,6 +558,34 @@ pub async fn issue_certificate(
                 info!("CA bundle saved to: {:?}", bundle_path);
             }
         }
+
+        let cert_file_pem = match options.leaf_publication {
+            LeafPublication::LeafOnly => leaf_pem,
+            LeafPublication::LeafWithChain => {
+                let mut published = leaf_pem;
+                for der in &chain {
+                    published.push_str(&encode_cert_pem(der));
+                }
+                published
+            }
+        };
+
+        // Each file is staged and `rename(2)`d, so neither destination
+        // ever holds a truncated PEM. The *pair* is not atomic: the two
+        // renames are separate, so a reader landing between them sees
+        // the new leaf with the old key, or the old leaf with the new
+        // key. Closing that window is the reader's side of the contract
+        // — a bounded retry on a mismatched pair — and is not done here.
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &cert_file_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
+        info!("Certificate saved to: {:?}", profile.paths.cert);
+        info!("Private key saved to: {:?}", profile.paths.key);
     } else {
         info!(
             "Order finalized, but certificate not yet ready (or failed). Status: {:?}",
@@ -571,14 +697,9 @@ mod tests {
         let policy = crate::cert_group::CertGroupPolicy {
             gid: profile.cert_group_gid,
         };
-        fs_util::write_cert_and_key(
-            &profile.paths.cert,
-            &profile.paths.key,
-            &leaf_pem,
-            &key_pem,
-            policy,
-        )
-        .await?;
+        // Mirrors the production sequence, publication order included:
+        // the chain is verified and the bundle merged first, and the
+        // leaf and key are written only once both have succeeded.
         if let Some(bundle_path) = &settings.trust.ca_bundle_path
             && !chain.is_empty()
         {
@@ -591,6 +712,14 @@ mod tests {
             )
             .await?;
         }
+        fs_util::write_cert_and_key(
+            &profile.paths.cert,
+            &profile.paths.key,
+            &leaf_pem,
+            &key_pem,
+            policy,
+        )
+        .await?;
         Ok(())
     }
 
@@ -984,6 +1113,48 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("Untrusted CA fingerprint"));
         assert!(!bundle_path.exists());
+        // The publication order is what makes this assertable: the
+        // chain is verified before anything is written, so a chain that
+        // fails pin verification leaves no leaf and no key behind.
+        assert!(
+            !profile.paths.cert.exists(),
+            "no leaf may be published when the chain fails verification"
+        );
+        assert!(
+            !profile.paths.key.exists(),
+            "no key may be published when the chain fails verification"
+        );
+    }
+
+    /// The default publication is the leaf alone, and every service
+    /// caller keeps it: the issuer chain reaches consumers through
+    /// `[trust].ca_bundle_path`.
+    #[test]
+    fn test_issuance_options_default_to_todays_behaviour() {
+        let options = IssuanceOptions::default();
+        assert_eq!(options.csr_shape, CsrShape::Service);
+        assert_eq!(options.leaf_publication, LeafPublication::LeafOnly);
+    }
+
+    /// `LeafWithChain` appends the issuer chain the CA returned, which
+    /// is what a caller pinning trust anchors from the presented
+    /// certificates needs and what the leaf-only form cannot give it.
+    #[test]
+    fn test_leaf_with_chain_appends_the_returned_issuers() {
+        let leaf_pem = test_cert_pem("leaf.example");
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let root_pem = test_cert_pem("root.example");
+        let combined = format!("{leaf_pem}{intermediate_pem}{root_pem}");
+
+        let (published_leaf, chain) = split_leaf_and_chain(&combined).unwrap();
+        assert_eq!(published_leaf.matches("BEGIN CERTIFICATE").count(), 1);
+
+        let mut with_chain = published_leaf.clone();
+        for der in &chain {
+            with_chain.push_str(&encode_cert_pem(der));
+        }
+        assert_eq!(with_chain.matches("BEGIN CERTIFICATE").count(), 3);
+        assert_eq!(parse_pem_der(&leaf_pem), parse_pem_der(&with_chain));
     }
 
     /// `write_merged_ca_bundle` must fail closed when the existing

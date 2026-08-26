@@ -49,11 +49,11 @@ http_responder_token_ttl_secs = 300
 # spelling of a request's spec is settled by the contract that owns it.
 #
 # Every key here is fixed for the process lifetime.  The listening
-# descriptor is inherited, and the server certificate material is read,
-# once before the reload loop, so a SIGHUP that changes any of the three
-# is rejected and the running daemon is left as it is; changing one takes
-# a service restart.  On a non-Linux target an enabled endpoint fails
-# config validation.
+# descriptor is inherited, and the certificate material at all four
+# paths is read, once before the reload loop, so a SIGHUP that changes
+# any of the five is rejected and the running daemon is left as it is;
+# changing one takes a service restart.  On a non-Linux target an
+# enabled endpoint fails config validation.
 #
 # The endpoint terminates mTLS.  It presents the material below and
 # accepts exactly one client identity,
@@ -66,12 +66,29 @@ http_responder_token_ttl_secs = 300
 # server_cert_path must hold the endpoint's leaf FOLLOWED BY its issuer
 # chain, up to a certificate pinned in trust.trusted_ca_sha256.  A
 # leaf-only file loads cleanly and is then rejected by every correctly
-# pinned caller, so the daemon refuses to start on one instead.  Until
-# issuance for this leaf lands, both files are supplied out of band.
+# pinned caller, so the daemon refuses to start on one instead.
+#
+# client_cert_path and client_key_path hold the leaf the co-located
+# registrar authenticates back with, 001.bootroot-registrar.<host>.
+# <network.domain>, and its key.  That process reads them, and the
+# provisioning tool places the INITIAL certificate at them; the endpoint
+# anchor pin file registrar-endpoint-anchors.sha256 is looked for in the
+# same directory as client_cert_path.
+#
+# All four paths are REQUIRED when enabled = true, and there is no
+# default for any of them: an unset one fails config validation before
+# anything is read or requested.  The daemon issues both leaves itself
+# at start, under the bootroot-internal credential, whenever the
+# material at a configured path is missing, unreadable, unparseable,
+# key-mismatched, SAN-mismatched, outside its validity window in either
+# direction, or no longer chained to trust.ca_bundle_path.  Material
+# that is usable is left byte-identical.
 [registrar_endpoint]
 enabled = false
 # server_cert_path = "/etc/bootroot/certs/registrar-endpoint.crt"
 # server_key_path = "/etc/bootroot/certs/registrar-endpoint.key"
+# client_cert_path = "/etc/bootroot/certs/registrar-client.crt"
+# client_key_path = "/etc/bootroot/certs/registrar-client.key"
 
 # Registrar audit records (daemon-owned).
 #

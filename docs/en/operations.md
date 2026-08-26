@@ -589,14 +589,21 @@ the rest of that connection's lines, and a `reason` field:
 #### Startup refusals for the TLS material
 
 With the endpoint enabled, the daemon refuses to start — naming the
-setting at fault, and the configured path where there is one — when
-`server_cert_path` or `server_key_path` is absent; when the material at
-either is missing, unreadable, unparseable, key-mismatched or
-SAN-mismatched; when the certificate file holds the leaf without its
-issuer chain, or a chain that does not build to a certificate pinned in
-`trust.trusted_ca_sha256`, or one whose anchor is expired, not yet valid
-or not CA-capable; and when `trust.ca_bundle_path` is absent, unreadable,
-unparseable, or holds nothing that is pinned.
+setting at fault, and the configured path where there is one — when any
+of `server_cert_path`, `server_key_path`, `client_cert_path` or
+`client_key_path` is unset; when the certificate file holds the leaf
+without its issuer chain, or a chain that does not build to a certificate
+pinned in `trust.trusted_ca_sha256`, or one whose anchor is expired, not
+yet valid or not CA-capable; and when `trust.ca_bundle_path` is absent,
+unreadable, unparseable, or holds nothing that is pinned.
+
+Material *at* a configured path that is missing, unreadable,
+unparseable, key-mismatched, SAN-mismatched, outside its validity window
+or no longer chained to the bundle is **not** a refusal. The daemon
+issues a replacement for it at start, before this loader runs — see
+[The daemon issues both leaves at start](configuration.md#the-daemon-issues-both-leaves-at-start)
+in the configuration guide for the rule and for the three cases where an
+attempted issuance still does not end in a started daemon.
 
 The chain requirement catches a failure that would otherwise have no
 local symptom at all: a caller selects its trust anchors from the
@@ -604,16 +611,17 @@ certificates the server presents, so a bare leaf is refused by every
 correctly configured caller while the daemon looks healthy. The daemon
 runs the caller's own rule against its own material instead.
 
-**The server material is supplied out of band** until certificate
-issuance for this leaf lands. bootroot does not create it, does not
-generate a self-signed substitute, and does not fall back to the host's
-ordinary service leaf.
+**The daemon issues both leaves itself**, under the bootroot-internal
+credential, over the outbound ACME path to the local step-ca. The
+provisioning tool places the *initial* client certificate at
+`client_cert_path`; the server pair is minted on first start, with
+nothing yet listening. bootroot never generates a self-signed
+substitute and never falls back to the host's ordinary service leaf.
 
-Neither certificate path is reloadable. A `SIGHUP` that changes
-`enabled`, `server_cert_path` or `server_key_path` is rejected with a
-diagnostic naming the key that changed, and the running daemon is left as
-it is. Only the *contents* at those paths can change under a running
-daemon.
+None of the four certificate paths is reloadable. A `SIGHUP` that changes
+`enabled` or any of them is rejected with a diagnostic naming the key
+that changed, and the running daemon is left as it is. Only the
+*contents* at those paths can change under a running daemon.
 
 #### Installing the units
 

@@ -25,6 +25,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   accepting on. Deregistration is served end to end; minting is refused
   until the wire spelling of a request's `spec` is settled by the
   contract that owns it.
+- An endpoint-enabled `bootroot-agent` now issues the registrar
+  surface's own two certificates at start, so neither has to be supplied
+  out of band. Four `[registrar_endpoint]` keys name the material —
+  `server_cert_path` and `server_key_path` for the leaf the endpoint
+  presents, and `client_cert_path` and `client_key_path` for the leaf the
+  co-located registrar authenticates back with — and all four are
+  required whenever the endpoint is enabled, with no defaults. The daemon
+  mints whichever pair is missing, unreadable, unparseable,
+  key-mismatched, SAN-mismatched, outside its validity window or no
+  longer chained to `[trust] ca_bundle_path`, over the same outbound ACME
+  path to step-ca every other certificate goes through, under the
+  root-owned bootroot-internal credential rather than any `AppRole`. The
+  external account binding and the HTTP-01 responder HMAC it issues with
+  are read from `OpenBao` at issuance time and never written to disk, and
+  they are read only when a leaf actually needs issuing — a host whose
+  material is in date starts having asked nothing of `OpenBao` or of the
+  CA, and its certificates and keys survive the restart byte-identically.
+  An already-expired leaf is repaired at start, before the endpoint's TLS
+  material loads, rather than at the first renewal tick.
 - `bootroot status --agent-config` now scans the registrar audit store and
   reports unpaired intents, malformed records, and retention shortfalls. It
   distinguishes a store that is not configured from a provisioned empty store
@@ -39,6 +58,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `bootroot-agent` now publishes an issued certificate and its key only
+  after the returned chain has been verified against `[trust]
+  trusted_ca_sha256` and merged into `[trust] ca_bundle_path`. The leaf
+  used to be written first, so an issuance whose chain carried an
+  unpinned fingerprint, or whose CA bundle could not be read, left a
+  certificate and key on disk that no consumer could use. Every profile's
+  renewal inherits the new order: on either failure nothing is written,
+  the previous material is left exactly as it was, and the error names
+  what went wrong.
 - A `SIGHUP` reload of `bootroot-agent` now stops the running daemon
   gracefully instead of aborting it. A reload used to cancel the daemon
   task outright, dropping whatever each renewal, hook or fast-poll step
