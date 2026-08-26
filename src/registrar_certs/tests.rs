@@ -35,6 +35,12 @@ const TEST_EMAIL: &str = "ops@example.internal";
 const LOCAL_HMAC: &str = "local-agent-toml-hmac";
 const LOCAL_EAB_KID: &str = "local-eab-kid";
 
+/// The responder HMAC the *rendered internal config* carries. A third
+/// distinct value, because that file is the nearest wrong answer: it
+/// sits on disk beside the credential this path already loads and
+/// carries both ACME keys as `bootroot init` wrote them.
+const INTERNAL_CONFIG_HMAC: &str = "internal-config-hmac";
+
 /// The values seeded into `OpenBao`, which are the ones an issuance must
 /// actually use.
 const OPENBAO_HMAC: &str = "openbao-responder-hmac";
@@ -200,7 +206,7 @@ impl Host {
                 domain: TEST_DOMAIN,
                 hostname: TEST_HOST,
                 responder_url: "http://127.0.0.1:8080",
-                responder_hmac: &"internal-config-hmac".into(),
+                responder_hmac: &INTERNAL_CONFIG_HMAC.into(),
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[ca.root_fingerprint()],
@@ -1362,6 +1368,13 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
         LOCAL_EAB_KID
     );
 
+    // The rendered internal config is the nearest wrong answer, and it
+    // is on disk: it carries both ACME keys as `bootroot init` wrote
+    // them. Hashed before the issuance so the substitution can be shown
+    // to be in memory only.
+    let internal_config = InternalPaths::new(&host.secrets_dir()).agent_config();
+    let internal_config_before = digest_of(&internal_config);
+
     let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
     let client = pairs
         .iter()
@@ -1370,6 +1383,16 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
     issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
         .await
         .expect("issued");
+
+    // Neither value was written back. The fast-poll loop upserts
+    // `[acme] http_responder_hmac` on disk under the AppRole; this path
+    // neither uses nor imitates that, so every rendered config it could
+    // have reached for is byte-identical afterwards.
+    assert_eq!(
+        internal_config_before,
+        digest_of(&internal_config),
+        "the rendered internal config must not be rewritten by an issuance"
+    );
 
     // The responder registration verifies under the OpenBao HMAC and
     // not under the local one.
@@ -1390,17 +1413,22 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
         ),
         "the registration must be signed with the OpenBao HMAC"
     );
-    let local_signer = crate::acme::http01_protocol::Http01HmacSigner::new(LOCAL_HMAC);
-    assert!(
-        !local_signer.verify_request(
-            &request.signature,
-            request.timestamp,
-            &request.token,
-            &request.key_authorization,
-            request.ttl_secs,
-        ),
-        "the local agent.toml HMAC must not be what signed it"
-    );
+    for (label, hmac) in [
+        ("the local agent.toml", LOCAL_HMAC),
+        ("the rendered internal config", INTERNAL_CONFIG_HMAC),
+    ] {
+        let signer = crate::acme::http01_protocol::Http01HmacSigner::new(hmac);
+        assert!(
+            !signer.verify_request(
+                &request.signature,
+                request.timestamp,
+                &request.token,
+                &request.key_authorization,
+                request.ttl_secs,
+            ),
+            "{label} HMAC must not be what signed it"
+        );
+    }
     drop(requests);
 
     // The account registered with the OpenBao EAB.
