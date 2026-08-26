@@ -106,7 +106,7 @@ const CLIENT_KEY_SETTING: &str = "[registrar_endpoint] client_key_path";
 /// is never a reason to leave the other as it was found, and one needing
 /// issuance is never a reason to reissue the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfaceLeaf {
+pub(crate) enum SurfaceLeaf {
     /// The registrar's client identity,
     /// `<instance>.bootroot-registrar.<host>.<domain>`, which requests
     /// `clientAuth`.
@@ -174,7 +174,7 @@ impl SurfaceLeaf {
 /// at all, issuance has nowhere to write, and configuration validation
 /// refuses it before anything here runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum UnusableMaterial {
+pub(crate) enum UnusableMaterial {
     /// Condition 1: one or both files are not there. A first start, or a
     /// host whose material was cleared.
     #[error("the certificate or the key file is absent")]
@@ -223,21 +223,13 @@ pub enum UnusableMaterial {
 
 /// What the eight ordered conditions decided about one pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Usability {
+pub(crate) enum Usability {
     /// Every condition holds. The pair is left exactly as it is: it is
     /// not re-issued, which would churn a file the co-located registrar
     /// is reading and hand that process a new key on every restart.
     Usable,
     /// Some condition does not hold, and issuance is attempted.
     Unusable(UnusableMaterial),
-}
-
-impl Usability {
-    /// Reports whether the pair needs issuing.
-    #[must_use]
-    pub fn needs_issuance(self) -> bool {
-        matches!(self, Self::Unusable(_))
-    }
 }
 
 /// One identity's configured pair of paths.
@@ -450,7 +442,9 @@ pub struct SurfaceIssuanceInputs<'a> {
 /// endpoint itself is gated on; there is no second enablement key.
 ///
 /// The two pairs are evaluated independently against the eight ordered
-/// conditions in [`UnusableMaterial`]. When both are usable the function
+/// usability conditions this module defines — present, readable,
+/// parseable, key-matched, correctly named, in window at both ends, and
+/// chaining to the configured anchors. When both are usable the function
 /// returns before any `OpenBao` call, so a daemon whose material is fine
 /// starts with `OpenBao` down.
 ///

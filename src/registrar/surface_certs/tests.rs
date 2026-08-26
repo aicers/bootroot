@@ -456,10 +456,14 @@ fn with_no_bundle_configured_the_chain_condition_does_not_run() {
 }
 
 /// The enumeration is the eight conditions negated one at a time, and
-/// every one of them answers by issuing rather than by refusing.
+/// each one names its own cause: an operator reading the diagnostic the
+/// issuance log carries must be able to tell which condition fired.
+/// Two variants sharing a message would send someone looking for a
+/// permission problem that is really a typo in a path, which is the
+/// whole reason absent and unreadable are separate to begin with.
 #[test]
-fn every_unusable_state_reports_that_issuance_is_needed() {
-    for reason in [
+fn every_unusable_state_carries_its_own_diagnostic() {
+    let reasons = [
         UnusableMaterial::Absent,
         UnusableMaterial::Unreadable,
         UnusableMaterial::Malformed,
@@ -468,10 +472,14 @@ fn every_unusable_state_reports_that_issuance_is_needed() {
         UnusableMaterial::NotYetValid,
         UnusableMaterial::Expired,
         UnusableMaterial::ChainDrifted,
-    ] {
-        assert!(Usability::Unusable(reason).needs_issuance(), "{reason:?}");
+    ];
+    let mut seen = std::collections::BTreeSet::new();
+    for reason in reasons {
+        let rendered = reason.to_string();
+        assert!(!rendered.is_empty(), "{reason:?} renders nothing");
+        assert!(seen.insert(rendered.clone()), "{reason:?}: {rendered}");
     }
-    assert!(!Usability::Usable.needs_issuance());
+    assert_eq!(seen.len(), reasons.len(), "the eight conditions are eight");
 }
 
 // ---------------------------------------------------------------------
