@@ -23,6 +23,8 @@
 //! refused and learns nothing it did not already know about the daemon's
 //! internals.
 
+use super::MAX_FRAME_PAYLOAD_BYTES;
+
 /// Bytes of the fixed request prefix: the four-byte payload length and
 /// the one-byte operation-name length.
 pub(crate) const REQUEST_PREFIX_BYTES: usize = 5;
@@ -175,4 +177,54 @@ pub(crate) fn declared_payload_length(prefix: [u8; REQUEST_PREFIX_BYTES]) -> u32
 /// Reads the one-byte operation-name length out of a request prefix.
 pub(crate) fn declared_name_length(prefix: [u8; REQUEST_PREFIX_BYTES]) -> u8 {
     prefix[4]
+}
+
+/// Why a request envelope could not be composed.
+///
+/// The caller's half of the envelope has exactly one way to fail that
+/// the layout above does not already rule out: a payload the four-byte
+/// length field could carry and this endpoint's bound will not accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("request payload is {length} bytes, over the {limit}-byte maximum")]
+pub(crate) struct OverLongRequestPayload {
+    /// Length of the payload that was offered.
+    pub(crate) length: usize,
+    /// The bound it broke, which is [`MAX_FRAME_PAYLOAD_BYTES`].
+    pub(crate) limit: usize,
+}
+
+/// Composes the request envelope around an already-encoded payload.
+///
+/// The caller's half of the layout this module owns, so a client writes
+/// the prefix through this function rather than restating the field
+/// order and the length arithmetic beside its socket.
+///
+/// # Errors
+///
+/// Returns [`OverLongRequestPayload`] when `payload` exceeds
+/// [`MAX_FRAME_PAYLOAD_BYTES`]. The endpoint would refuse such a frame
+/// with a bare close, so refusing it here costs a caller nothing and
+/// tells it why.
+pub(crate) fn encode_request_frame(
+    operation: Operation,
+    payload: &[u8],
+) -> Result<Vec<u8>, OverLongRequestPayload> {
+    if payload.len() > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(OverLongRequestPayload {
+            length: payload.len(),
+            limit: MAX_FRAME_PAYLOAD_BYTES,
+        });
+    }
+    let payload_length = u32::try_from(payload.len())
+        .expect("the length was just checked against MAX_FRAME_PAYLOAD_BYTES, which fits a u32");
+    let name = operation.as_str().as_bytes();
+    let name_length = u8::try_from(name.len())
+        .expect("every Operation name is at most MAX_OPERATION_NAME_BYTES long, which fits a u8");
+
+    let mut frame = Vec::with_capacity(REQUEST_PREFIX_BYTES + name.len() + payload.len());
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.push(name_length);
+    frame.extend_from_slice(name);
+    frame.extend_from_slice(payload);
+    Ok(frame)
 }

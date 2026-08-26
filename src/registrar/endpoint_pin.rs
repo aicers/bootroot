@@ -169,6 +169,38 @@ impl From<EndpointVerifyRejection> for rustls::Error {
     }
 }
 
+/// Reports whether `error` is one [`RegistrarEndpointVerifier`] could
+/// itself have produced.
+///
+/// `tokio_rustls` hands a caller one `io::Error` for every way a
+/// handshake can fail, and the `rustls::Error` recovered from it is all
+/// there is to tell a *trust decision this verifier made* from a later
+/// failure that merely shares the `InvalidCertificate` wrapper. The
+/// wrapper alone does not separate them: `rustls` reports a bad
+/// `CertificateVerify` signature — checked after
+/// [`ServerCertVerifier::verify_server_cert`] has already accepted the
+/// chain — as `InvalidCertificate(BadSignature)`, which no rule here
+/// decided.
+///
+/// So the question is asked of the exact set
+/// `From<EndpointVerifyRejection>` above emits, and it is asked here,
+/// beside that impl, because the two have to move together.
+#[must_use]
+pub fn is_endpoint_verify_rejection(error: &rustls::Error) -> bool {
+    let rustls::Error::InvalidCertificate(certificate) = error else {
+        return false;
+    };
+    matches!(
+        certificate,
+        rustls::CertificateError::BadEncoding
+            | rustls::CertificateError::NotValidForName
+            | rustls::CertificateError::UnknownIssuer
+            | rustls::CertificateError::ApplicationVerificationFailure
+            | rustls::CertificateError::Expired
+            | rustls::CertificateError::NotValidYet
+    )
+}
+
 /// Derives the conventional pin-file path from a registrar client
 /// certificate path: that path's parent directory joined with
 /// [`REGISTRAR_ENDPOINT_ANCHORS_FILE`].
@@ -1100,5 +1132,66 @@ mod tests {
         std::fs::write(&path, format!("{}\n", tls::sha256_hex(anchor.as_ref())))
             .expect("write pin file");
         assert!(build_endpoint_client_config(&path, &endpoint_name()).is_ok());
+    }
+
+    #[test]
+    fn every_verifier_rejection_is_recognized_as_one() {
+        let rejections = [
+            EndpointVerifyRejection::San(SanShapeError::Malformed),
+            EndpointVerifyRejection::San(SanShapeError::Missing),
+            EndpointVerifyRejection::San(SanShapeError::Multiple),
+            EndpointVerifyRejection::San(SanShapeError::NotDns),
+            EndpointVerifyRejection::SanMismatch,
+            EndpointVerifyRejection::AnchorMismatch,
+            EndpointVerifyRejection::AnchorMalformed,
+            EndpointVerifyRejection::AnchorNotCa,
+            EndpointVerifyRejection::AnchorExpired,
+            EndpointVerifyRejection::AnchorNotYetValid,
+            EndpointVerifyRejection::ChainVerificationFailed,
+        ];
+        for rejection in rejections {
+            // Exhaustive on purpose. A variant added to either enum
+            // fails to compile here, which is the reminder that the
+            // list above and `is_endpoint_verify_rejection` both have
+            // to grow with it — a rejection missing from the predicate
+            // would reach a caller as a generic handshake failure.
+            match rejection {
+                EndpointVerifyRejection::San(shape) => match shape {
+                    SanShapeError::Malformed
+                    | SanShapeError::Missing
+                    | SanShapeError::Multiple
+                    | SanShapeError::NotDns => {}
+                },
+                EndpointVerifyRejection::SanMismatch
+                | EndpointVerifyRejection::AnchorMismatch
+                | EndpointVerifyRejection::AnchorMalformed
+                | EndpointVerifyRejection::AnchorNotCa
+                | EndpointVerifyRejection::AnchorExpired
+                | EndpointVerifyRejection::AnchorNotYetValid
+                | EndpointVerifyRejection::ChainVerificationFailed => {}
+            }
+            assert!(
+                is_endpoint_verify_rejection(&rustls::Error::from(rejection)),
+                "{rejection:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handshake_signature_failure_is_not_a_verifier_rejection() {
+        // `rustls` checks the peer's `CertificateVerify` signature
+        // after `verify_server_cert` has already accepted the chain,
+        // and reports a bad one under the same `InvalidCertificate`
+        // wrapper every rejection above uses. No rule in this module
+        // produced it.
+        assert!(!is_endpoint_verify_rejection(&rustls::Error::from(
+            rustls::CertificateError::BadSignature
+        )));
+        assert!(!is_endpoint_verify_rejection(
+            &rustls::Error::NoCertificatesPresented
+        ));
+        assert!(!is_endpoint_verify_rejection(&rustls::Error::from(
+            rustls::CertificateError::Revoked
+        )));
     }
 }

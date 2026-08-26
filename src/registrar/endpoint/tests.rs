@@ -17,22 +17,25 @@
 //!   `tempfile::tempdir()`, and hands its descriptor through the very
 //!   activation seam production uses. Code under test never binds,
 //!   unlinks or chmods anything.
+//!
+//! The certificate material the last two tiers rest on, and the
+//! `tracing` capture the stream tier reads its diagnostics back out of,
+//! live in [`super::test_support`] rather than here. They are shared
+//! with the client's tests, so that neither module grows a second
+//! `rcgen` CA builder or a second capturing subscriber and keeps passing
+//! against material — or against a capture — the other no longer
+//! produces.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::os::fd::RawFd;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, KeyPair, KeyUsagePurpose,
-    SanType, date_time_ymd,
-};
 use rustls::ClientConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::pki_types::ServerName;
 use tempfile::TempDir;
 use time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
@@ -41,8 +44,6 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
-use tracing::field::{Field, Visit};
-use tracing_subscriber::layer::{Context, SubscriberExt as _};
 use wiremock::MockServer;
 
 use super::activation::{
@@ -57,6 +58,11 @@ use super::handler::{HANDLER_REJECTED_PAYLOAD, HandlerRefusal, RegistrarRequestH
 use super::policy::{self, SocketMetadata, SocketPolicyViolation};
 use super::refusal::{ConnectionId, UNREAD_OPERATION, refuse};
 use super::serve::{self, authorize_peer, caller_identity, serve_request};
+use super::test_support::{
+    CapturedEvent, CapturedLogs, DIAL_NAME, NEAR_MISS_DOMAIN, Pki, TEST_DOMAIN, TEST_HOST,
+    TEST_INSTANCE, capture_logs, client_config_pinning, client_material_from, dns_san,
+    endpoint_name, generate_ca, registrar_client_name, valid_ca,
+};
 use super::tls::{
     CA_BUNDLE_SETTING, EndpointCertResolver, EndpointTlsError, SERVER_CERT_SETTING,
     SERVER_KEY_SETTING, TRUSTED_CA_SETTING, build_server_config,
@@ -72,9 +78,7 @@ use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::endpoint::production::ProductionHandler;
 use crate::registrar::endpoint::protocol;
-use crate::registrar::endpoint_pin::{
-    EndpointVerifyRejection, REGISTRAR_ENDPOINT_ANCHORS_FILE, endpoint_server_verifier,
-};
+use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
 use crate::registrar::internal::InternalCredential;
@@ -86,9 +90,7 @@ use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 use crate::registrar::verbs::{
     DeregisterRequest, MintRequest, RegistrarVerbs, RegistrarVerbsConfig,
 };
-use crate::registrar::{
-    RegistrarIdentityError, ReloadSpec, registrar_client_identity, registrar_endpoint_identity,
-};
+use crate::registrar::{RegistrarIdentityError, ReloadSpec, registrar_client_identity};
 
 /// A pid no test process can have, for the mismatch arm.
 const OTHER_PID: u32 = 424_242;
@@ -653,104 +655,6 @@ fn name_bytes_are_escaped_and_capped_for_logging() {
     let long = [b'a'; 40];
     let escaped = escape_name_bytes(&long);
     assert_eq!(escaped, format!("{}...", "a".repeat(32)));
-}
-
-// ---------------------------------------------------------------------
-// Captured logging, so a refusal's diagnostic fields are assertable
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct CapturedEvent {
-    message: String,
-    fields: BTreeMap<String, String>,
-}
-
-impl CapturedEvent {
-    fn field(&self, name: &str) -> &str {
-        self.fields
-            .get(name)
-            .map_or("", std::string::String::as_str)
-    }
-}
-
-#[derive(Clone, Default)]
-struct CapturedLogs(Arc<StdMutex<Vec<CapturedEvent>>>);
-
-impl CapturedLogs {
-    fn events(&self) -> Vec<CapturedEvent> {
-        self.0
-            .lock()
-            .expect("the capture mutex is only held to push and read")
-            .clone()
-    }
-
-    /// Every refusal event captured so far.
-    fn refusals(&self) -> Vec<CapturedEvent> {
-        self.events()
-            .into_iter()
-            .filter(|event| {
-                event
-                    .message
-                    .starts_with("Registrar endpoint refused a connection")
-            })
-            .collect()
-    }
-
-    /// The one refusal event, which every refusal path emits exactly
-    /// once.
-    fn refusal(&self) -> CapturedEvent {
-        let mut matching = self.refusals();
-        assert_eq!(
-            matching.len(),
-            1,
-            "expected exactly one refusal event, saw {matching:?}"
-        );
-        matching.remove(0)
-    }
-}
-
-struct FieldCollector(BTreeMap<String, String>);
-
-impl Visit for FieldCollector {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_string(), value.to_string());
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().to_string(), format!("{value:?}"));
-    }
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
-    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-        let mut collector = FieldCollector(BTreeMap::new());
-        event.record(&mut collector);
-        let message = collector
-            .0
-            .remove("message")
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string();
-        self.0
-            .lock()
-            .expect("the capture mutex is only held to push and read")
-            .push(CapturedEvent {
-                message,
-                fields: collector.0,
-            });
-    }
-}
-
-/// Installs a capturing subscriber for the current thread.
-///
-/// Every test that uses it runs on a current-thread runtime, so the
-/// whole future stays on the thread the guard was taken on.
-fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
-    let logs = CapturedLogs::default();
-    let subscriber = tracing_subscriber::registry().with(logs.clone());
-    let guard = tracing::subscriber::set_default(subscriber);
-    (logs, guard)
 }
 
 // ---------------------------------------------------------------------
@@ -1657,262 +1561,6 @@ async fn drain_aborts_connections_that_outlast_the_window() {
         started.elapsed() >= CONNECTION_DRAIN_TIMEOUT,
         "the drain window must be honoured before the abort"
     );
-}
-
-// ---------------------------------------------------------------------
-// Certificate material: a whole deployment's PKI under a tempdir
-// ---------------------------------------------------------------------
-
-/// The deployment domain every test identity is composed under.
-const TEST_DOMAIN: &str = "example.internal";
-/// The host label the registrar and the endpoint both run on.
-const TEST_HOST: &str = "h1";
-/// The instance label every test identity carries.
-const TEST_INSTANCE: &str = "001";
-/// A domain that is a bare string suffix of [`TEST_DOMAIN`] without
-/// being a label-boundary suffix of it.
-const NEAR_MISS_DOMAIN: &str = "evil-example.internal";
-/// Basename stem of the conforming server material.
-const SERVER_STEM: &str = "endpoint";
-/// The name a client dials with. The endpoint verifier deliberately
-/// ignores it — over `AF_UNIX` there is no meaningful name — so it is a
-/// placeholder and never the pinned identity.
-const DIAL_NAME: &str = "localhost";
-
-type TestCa = CertifiedIssuer<'static, KeyPair>;
-
-/// The endpoint server identity every test endpoint presents.
-fn endpoint_name() -> String {
-    registrar_endpoint_identity(TEST_INSTANCE, TEST_HOST, TEST_DOMAIN)
-}
-
-/// The one client identity the endpoint accepts.
-fn registrar_client_name() -> String {
-    registrar_client_identity(TEST_INSTANCE, TEST_HOST, TEST_DOMAIN)
-}
-
-fn dns_san(name: &str) -> SanType {
-    SanType::DnsName(name.to_string().try_into().expect("a valid DNS SAN"))
-}
-
-/// Self-signs a CA whose validity window is `(not_before, not_after)`.
-fn generate_ca(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> TestCa {
-    let key = KeyPair::generate().expect("generate key");
-    let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
-    params
-        .distinguished_name
-        .push(DnType::CommonName, "Bootroot Endpoint Test CA");
-    params.is_ca = rcgen::IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-    ];
-    params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
-    params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
-    CertifiedIssuer::self_signed(params, key).expect("self-signed CA")
-}
-
-fn valid_ca() -> TestCa {
-    generate_ca((2020, 1, 1), (2099, 1, 1))
-}
-
-/// Issues a leaf carrying exactly `sans`, signed by `ca`.
-///
-/// The validity window is wide open because these handshakes run against
-/// the real clock.
-fn issue_leaf(ca: &TestCa, sans: Vec<SanType>) -> (rcgen::Certificate, KeyPair) {
-    let key = KeyPair::generate().expect("generate key");
-    let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
-    params.is_ca = rcgen::IsCa::NoCa;
-    params.not_before = date_time_ymd(2020, 1, 1);
-    params.not_after = date_time_ymd(2099, 1, 1);
-    params.subject_alt_names = sans;
-    let certificate = params.signed_by(&key, ca).expect("issued leaf");
-    (certificate, key)
-}
-
-fn key_der(key: &KeyPair) -> PrivateKeyDer<'static> {
-    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()))
-}
-
-/// A deployment's certificate material, written under
-/// `tempfile::tempdir()`: one CA, the bundle file, the pin file, and
-/// whatever leaves a test asks for.
-///
-/// Nothing here binds a path: every file is under the temporary
-/// directory this value owns, and dropping it removes them.
-struct Pki {
-    dir: TempDir,
-    ca: TestCa,
-    /// Every certificate written to the bundle file, as PEM, pinned or
-    /// not.
-    bundle: Vec<String>,
-    /// The subset of the bundle named in `trust.trusted_ca_sha256`.
-    pins: Vec<String>,
-}
-
-/// Issues a client leaf carrying `sans`, signed by `issuer`, and returns
-/// the chain and key a `ClientConfig` authenticates with.
-fn client_material_from(
-    issuer: &TestCa,
-    sans: Vec<SanType>,
-) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-    let (certificate, key) = issue_leaf(issuer, sans);
-    (
-        vec![
-            CertificateDer::from(certificate.der().to_vec()),
-            CertificateDer::from(issuer.der().to_vec()),
-        ],
-        key_der(&key),
-    )
-}
-
-/// A caller pinning whatever `pin_file` names, authenticating with
-/// `auth` or with nothing when it is `None`.
-fn client_config_pinning(
-    pin_file: &Path,
-    auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-) -> ClientConfig {
-    let verifier =
-        endpoint_server_verifier(pin_file, &endpoint_name()).expect("an endpoint verifier");
-    let builder = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier);
-    match auth {
-        Some((chain, key)) => builder
-            .with_client_auth_cert(chain, key)
-            .expect("client authentication material"),
-        None => builder.with_no_client_auth(),
-    }
-}
-
-impl Pki {
-    /// The conforming deployment: one CA, in the bundle and pinned.
-    fn new() -> Self {
-        Self::over(valid_ca())
-    }
-
-    fn over(ca: TestCa) -> Self {
-        let pin = crate::tls::sha256_hex(ca.der().as_ref());
-        let pem = ca.pem();
-        Self {
-            dir: tempfile::tempdir().expect("tempdir"),
-            ca,
-            bundle: vec![pem],
-            pins: vec![pin],
-        }
-    }
-
-    /// Adds a CA to the bundle file without pinning it, so a leaf it
-    /// issued is in the operator's bundle and still not admitted.
-    fn add_unpinned(&mut self, ca: &TestCa) {
-        self.bundle.push(ca.pem());
-    }
-
-    fn pins(&self) -> Vec<String> {
-        self.pins.clone()
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.path().join(name)
-    }
-
-    /// Writes the bundle file and returns its path.
-    fn ca_bundle_path(&self) -> PathBuf {
-        let path = self.path("ca-bundle.pem");
-        let mut pem = String::new();
-        for certificate in &self.bundle {
-            pem.push_str(certificate);
-        }
-        std::fs::write(&path, pem).expect("write the CA bundle");
-        path
-    }
-
-    /// Writes the caller-side pin file and returns its path.
-    fn pin_file_path(&self) -> PathBuf {
-        self.pin_file_over(&self.pins())
-    }
-
-    fn pin_file_over(&self, pins: &[String]) -> PathBuf {
-        let path = self.path(REGISTRAR_ENDPOINT_ANCHORS_FILE);
-        let mut contents = String::new();
-        for pin in pins {
-            contents.push_str(pin);
-            contents.push('\n');
-        }
-        std::fs::write(&path, contents).expect("write the pin file");
-        path
-    }
-
-    /// Writes server material: the leaf carrying `sans`, optionally
-    /// followed by its issuer, plus the leaf's key.
-    fn server_material_from(
-        &self,
-        issuer: &TestCa,
-        stem: &str,
-        sans: Vec<SanType>,
-        with_chain: bool,
-    ) -> (PathBuf, PathBuf) {
-        let (certificate, key) = issue_leaf(issuer, sans);
-        let mut pem = certificate.pem();
-        if with_chain {
-            pem.push_str(&issuer.pem());
-        }
-        let cert_path = self.path(&format!("{stem}.crt"));
-        let key_path = self.path(&format!("{stem}.key"));
-        std::fs::write(&cert_path, pem).expect("write the server chain");
-        std::fs::write(&key_path, key.serialize_pem()).expect("write the server key");
-        (cert_path, key_path)
-    }
-
-    /// The conforming server material: the endpoint identity, leaf plus
-    /// issuer chain, issued by the pinned CA.
-    fn server_material(&self) -> (PathBuf, PathBuf) {
-        self.server_material_from(&self.ca, SERVER_STEM, vec![dns_san(&endpoint_name())], true)
-    }
-
-    /// The registrar's own client material, from the pinned CA.
-    fn registrar_client_material(&self) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        client_material_from(&self.ca, vec![dns_san(&registrar_client_name())])
-    }
-
-    /// Runs the production configuration builder over this deployment's
-    /// material.
-    fn build(
-        &self,
-        cert_path: &Path,
-        key_path: &Path,
-    ) -> Result<(Arc<rustls::ServerConfig>, Arc<EndpointCertResolver>), EndpointTlsError> {
-        build_server_config(
-            Some(cert_path),
-            Some(key_path),
-            Some(&self.ca_bundle_path()),
-            &self.pins(),
-            TEST_DOMAIN,
-        )
-    }
-
-    /// The configuration and resolver the conforming material produces.
-    fn conforming(&self) -> (Arc<rustls::ServerConfig>, Arc<EndpointCertResolver>) {
-        let (cert_path, key_path) = self.server_material();
-        self.build(&cert_path, &key_path)
-            .expect("conforming material must build a configuration")
-    }
-
-    /// A caller that pins this deployment's anchor and authenticates
-    /// with `auth`, or with nothing when it is `None`.
-    fn client_config(
-        &self,
-        auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
-    ) -> ClientConfig {
-        client_config_pinning(&self.pin_file_path(), auth)
-    }
-
-    /// The caller the endpoint is meant to serve.
-    fn registrar_client_config(&self) -> ClientConfig {
-        self.client_config(Some(self.registrar_client_material()))
-    }
 }
 
 /// Opens one TLS connection to the endpoint, or reports why the

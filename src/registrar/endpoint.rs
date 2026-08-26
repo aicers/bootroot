@@ -38,6 +38,13 @@
 //!   resolver a renewal swaps new material through.
 //! - [`serve`] is the accept loop, the bounded connection fleet and the
 //!   drain-then-abort shutdown.
+//! - [`client`] is the other end of all of it: this repository's
+//!   reference caller, which dials the socket, completes the pinned
+//!   handshake and drives one request over one connection. It has no
+//!   production consumer here — the deployed caller lives in another
+//!   repository — and exists so that the caller behaviour this endpoint
+//!   expects is written down as running code rather than reinvented
+//!   inline by whichever test needs it next.
 //!
 //! # What authenticates a caller
 //!
@@ -84,6 +91,7 @@
 //! while the socket inode stays exactly as it was.
 
 pub(crate) mod activation;
+pub(crate) mod client;
 pub(crate) mod frame;
 pub(crate) mod handler;
 pub(crate) mod policy;
@@ -93,6 +101,8 @@ pub(crate) mod refusal;
 pub(crate) mod serve;
 pub(crate) mod tls;
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
