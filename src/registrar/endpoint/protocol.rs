@@ -10,11 +10,13 @@
 // caller's half — `encode_request`, the three response decoders and the
 // `ca_anchor` decode behind the mint one — has no production consumer
 // in this crate, because the enrolling agent that speaks this protocol
-// is separate work. Keeping both halves in one module is what lets a
-// test round-trip a payload through the exact bytes the endpoint
-// writes, so the caller's half is allowed to be unreached rather than
-// deleted and written again against the same reference when that agent
-// lands.
+// is separate work. `super::client` is this repository's reference
+// implementation of that caller and drives every one of them, but it is
+// itself unreached for the same reason, so the allow stays. Keeping both
+// halves in one module is what lets a test round-trip a payload through
+// the exact bytes the endpoint writes, so the caller's half is allowed
+// to be unreached rather than deleted and written again against the same
+// reference when that agent lands.
 #![allow(dead_code)]
 
 use std::fmt;
