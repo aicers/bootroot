@@ -625,17 +625,29 @@ async fn read_acme_inputs_with(
         .map(HmacSecret::new)?;
 
     // An *absent* EAB record is the answer a deployment that registered
-    // no EAB gives — `bootroot init` writes this path only when one was
-    // registered, and the internal leaf's own issuance is driven with
-    // `None` on such a host. A transport failure or an unparseable
+    // no EAB gives, not a read that failed — `bootroot init --no-eab`,
+    // a reinit, and a declined prompt all leave this path unwritten, and
+    // every other issuance on such a host is already driven with `None`
+    // (`rotate::registrar_internal::read_eab`,
+    // `commands::service::secrets`). Refusing here would leave the two
+    // surface leaves the only material in the deployment that an
+    // EAB-less CA cannot mint. A transport failure or an unparseable
     // payload is a read failure and refuses; neither falls back to
-    // `agent.toml`'s `[eab]` or the internal profile's.
+    // `agent.toml`'s `[eab]` or the internal profile's. The absence is
+    // logged rather than passed over quietly, so a host that registers
+    // its account without a binding says so.
     let eab = match client
         .try_read_kv(kv_mount, AGENT_EAB_KV_PATH)
         .await
         .with_context(|| format!("reading {kv_mount}/{AGENT_EAB_KV_PATH}"))?
     {
-        None => None,
+        None => {
+            info!(
+                "No EAB record at {kv_mount}/{AGENT_EAB_KV_PATH}; registering the ACME account \
+                 for the registrar surface without an external account binding."
+            );
+            None
+        }
         Some(value) => {
             match parse_eab_payload(&value)
                 .with_context(|| format!("parsing {kv_mount}/{AGENT_EAB_KV_PATH}"))?

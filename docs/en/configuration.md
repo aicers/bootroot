@@ -476,8 +476,19 @@ no fallback: neither this file's `[acme] http_responder_hmac` nor its
 disk. The reads happen **only** when a leaf actually needs issuing, so a
 host whose material is fine starts with `OpenBao` unreachable. A failed
 read — an unreachable `OpenBao`, a refused `auth/cert` login, a missing
-KV path or an unparseable payload — refuses the start with a diagnostic
-naming the failing read.
+`bootroot/responder/hmac` record, or a payload that does not parse —
+refuses the start with a diagnostic naming the failing read.
+
+An **absent** `bootroot/agent/eab` record is the one case that is an
+answer rather than a failure: it is what `bootroot init --no-eab`, a
+reinit, and a declined EAB prompt all leave behind, and the account is
+registered without an external account binding, exactly as every other
+issuance on such a deployment already is. The daemon logs that it is
+doing so. A record that is present but does not parse — including one
+carrying only a `kid` or only an `hmac` — still refuses, and the
+explicit cleared shape (`kid` and `hmac` both empty, as `bootroot rotate
+eab-clear` writes) is read as "this deployment has no EAB" rather than
+as damage.
 
 One refusal on that path is deliberate rather than a bug. Between the
 middle and the tail of a full trust rotation the internal credential's

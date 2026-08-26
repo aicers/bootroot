@@ -699,6 +699,35 @@ async fn a_cleared_eab_record_yields_no_credentials() {
     assert!(inputs.eab.is_none());
 }
 
+/// An *absent* EAB record is the shape `bootroot init --no-eab`, a
+/// reinit, and a declined prompt all leave behind, so it is the same
+/// answer as the explicit clear rather than a failed read. The
+/// responder HMAC read in the same call still succeeds, which is what
+/// separates this from an `OpenBao` that cannot be reached.
+#[tokio::test]
+async fn an_absent_eab_record_yields_no_credentials_rather_than_refusing() {
+    let server = MockServer::start().await;
+    mount_kv(
+        &server,
+        RESPONDER_HMAC_KV_PATH,
+        serde_json::json!({ "hmac": OPENBAO_HMAC }),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!(
+            "/v1/{TEST_KV_MOUNT}/data/{AGENT_EAB_KV_PATH}"
+        )))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({ "errors": [] })))
+        .mount(&server)
+        .await;
+
+    let inputs = read_acme_inputs_with(&openbao_client(&server), TEST_KV_MOUNT)
+        .await
+        .expect("an unwritten EAB path is an answer, not a failure");
+    assert!(inputs.eab.is_none());
+    assert_eq!(inputs.responder_hmac.expose(), OPENBAO_HMAC);
+}
+
 /// A failed read is a refusal naming the failing read, never a fallback
 /// to a locally configured value.
 #[tokio::test]
