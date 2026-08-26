@@ -17,6 +17,7 @@ pub mod locale;
 pub mod openbao;
 pub mod profile;
 pub mod registrar;
+pub(crate) mod registrar_certs;
 pub mod secret;
 pub mod service_material;
 pub mod tls;
@@ -30,6 +31,7 @@ mod fast_poll;
 pub use agent_args::Args;
 pub use daemon::{DaemonInvocation, DaemonShutdown};
 pub use registrar::RegistrarEndpoint;
+pub use registrar_certs::ensure_registrar_surface_certificates;
 
 /// Runs the agent daemon loop for all profiles.
 ///

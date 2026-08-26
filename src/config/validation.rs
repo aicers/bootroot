@@ -109,9 +109,69 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
         validate_openbao_settings(openbao)?;
     }
     validate_registrar_endpoint_settings(&settings.registrar_endpoint)?;
+    validate_registrar_endpoint_material_paths(&settings.registrar_endpoint)?;
     validate_registrar_settings(&settings.registrar)?;
     validate_registrar_state_file_requirement(&settings.registrar, &settings.registrar_endpoint)?;
     Ok(())
+}
+
+/// The four `[registrar_endpoint]` keys that must carry a path once the
+/// endpoint is enabled, in the order a diagnostic lists them.
+const REGISTRAR_ENDPOINT_MATERIAL_KEYS: [&str; 4] = [
+    "server_cert_path",
+    "server_key_path",
+    "client_cert_path",
+    "client_key_path",
+];
+
+/// Requires all four `[registrar_endpoint]` material paths when the
+/// endpoint is enabled.
+///
+/// There are no defaults, and an unset path is not a repairable state:
+/// start-time issuance repairs *material at a configured path*, and it
+/// has nowhere to write when there is no path at all. So this is decided
+/// here — before any state file is read, any `OpenBao` request is made,
+/// any certificate is requested and any activation is attempted — rather
+/// than being discovered by whatever would have used the path.
+///
+/// Ordered deliberately **after** [`validate_registrar_endpoint_settings`]:
+/// off Linux an enabled endpoint is refused outright as an unsupported
+/// platform, and that diagnostic must not be displaced by one about a
+/// missing key on a target that could never serve the endpoint anyway.
+fn validate_registrar_endpoint_material_paths(settings: &RegistrarEndpointSettings) -> Result<()> {
+    if !settings.enabled {
+        return Ok(());
+    }
+    let configured = [
+        settings.server_cert_path.as_deref(),
+        settings.server_key_path.as_deref(),
+        settings.client_cert_path.as_deref(),
+        settings.client_key_path.as_deref(),
+    ];
+    let missing: Vec<&str> = REGISTRAR_ENDPOINT_MATERIAL_KEYS
+        .iter()
+        .zip(configured)
+        .filter_map(|(key, value)| value.is_none().then_some(*key))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "registrar_endpoint.enabled is true, but [registrar_endpoint] {} unset; there is no \
+         default for either certificate pair and the daemon has nowhere to write the material \
+         it issues. Configure server_cert_path, server_key_path, client_cert_path and \
+         client_key_path",
+        render_missing_keys(&missing)
+    );
+}
+
+/// Renders the missing-key list as the subject of the diagnostic above,
+/// so one missing key does not read as a plural.
+fn render_missing_keys(missing: &[&str]) -> String {
+    match missing {
+        [only] => format!("{only} is"),
+        _ => format!("{} are", missing.join(", ")),
+    }
 }
 
 /// Requires `[registrar] state_file` exactly when the endpoint is

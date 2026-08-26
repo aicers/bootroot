@@ -192,9 +192,13 @@ the **basename** and a **derivation rule**, and no absolute directory:
   computes exactly this and touches no filesystem and no configuration.
 
 So the file's absolute directory **follows the configured registrar client
-certificate path** and is not fixed here; it is settled by whatever provisions
-that certificate. bootroot's own pinning helper takes the pin-file path as an
-explicit argument, with no built-in default and no configuration lookup.
+certificate path** and is not fixed here. On a bootroot host that path is
+`[registrar_endpoint] client_cert_path` in `agent.toml`, which is required
+whenever the endpoint is enabled — so the setting that names the client
+certificate is the same setting that fixes where these pins are read from.
+bootroot's own pinning helper still takes the pin-file path as an explicit
+argument, with no built-in default and no configuration lookup, and issuance
+never writes this file: the pin is over trust **anchors**, not over a leaf.
 
 ### 4.3 Format
 

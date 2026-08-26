@@ -116,6 +116,17 @@ pub const REGISTRAR_CLIENT_LABEL: &str = "bootroot-registrar";
 /// identity.
 pub const REGISTRAR_ENDPOINT_LABEL: &str = "bootroot-registrar-endpoint";
 
+/// The one instance label both registrar *surface* identities are ever
+/// composed at.
+///
+/// There is exactly one registrar and exactly one endpoint per bootroot
+/// host, so a varying label would name a multiplicity that does not
+/// exist — the same argument `REGISTRAR_INTERNAL_INSTANCE` makes for
+/// the third name. It is a constant rather than a literal at each call
+/// site so the SAN the daemon composes and the SAN a test asserts
+/// cannot drift apart.
+pub const REGISTRAR_SURFACE_INSTANCE: &str = "001";
+
 /// The reserved second label of the bootroot-internal privileged
 /// identity.
 ///

@@ -411,12 +411,22 @@ impl Default for RegistrarSettings {
 /// running one is rejected outright and the running daemon is left
 /// undisturbed; changing it takes a service restart.
 ///
-/// The two certificate paths are fixed for the same reason and by the
+/// The four certificate paths are fixed for the same reason and by the
 /// same argument: the material at them is loaded once, above the reload
 /// loop, so a path a `SIGHUP` changed would be read by nothing. What
 /// remains re-readable is the *content* at those paths, through the
 /// endpoint's certificate resolver, which is what certificate renewal
 /// drives.
+///
+/// Two of the four name the *client* material rather than the
+/// endpoint's own: the leaf the co-located registrar authenticates to
+/// this endpoint with, and its key. They live here because they are one
+/// surface with the server pair — the daemon issues all four at start,
+/// and the provisioning tool places the initial client certificate at
+/// them — and because the directory holding `client_cert_path` is where
+/// the endpoint's anchor pin file
+/// ([`crate::registrar::endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE`])
+/// is looked for.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrarEndpointSettings {
@@ -434,22 +444,39 @@ pub struct RegistrarEndpointSettings {
     /// `server_cert_path`. Required when the endpoint is enabled.
     #[serde(default)]
     pub server_key_path: Option<PathBuf>,
+    /// PEM file holding the registrar's client leaf,
+    /// `<instance>.bootroot-registrar.<host>.<domain>`, **followed by
+    /// its issuer chain**. Required when the endpoint is enabled.
+    ///
+    /// A published contract rather than an internal detail: the
+    /// co-located registrar process reads this file, the provisioning
+    /// tool places the *initial* certificate at it, and the daemon
+    /// re-issues it whenever the material there is unusable. Its parent
+    /// directory is also where the endpoint anchor pin file
+    /// `registrar-endpoint-anchors.sha256` is looked for.
+    #[serde(default)]
+    pub client_cert_path: Option<PathBuf>,
+    /// PEM file holding the private key of the leaf at
+    /// `client_cert_path`. Required when the endpoint is enabled.
+    #[serde(default)]
+    pub client_key_path: Option<PathBuf>,
 }
 
 /// Checks that a reloaded configuration keeps the whole
 /// `[registrar_endpoint]` table at the values the running process
 /// started with.
 ///
-/// None of the three keys is reloadable, and each for the same reason:
+/// None of the five keys is reloadable, and each for the same reason:
 /// what it configures is consumed once, above the reload loop. The
 /// activation contract is — enabling it on a `SIGHUP` would have no
 /// descriptor to serve, and disabling it would leave the socket unit
-/// holding a pathname nothing accepts on — and so is the server
-/// certificate material, which is read at startup and would be read by
-/// nothing if its path changed later. All three are rejected here
-/// rather than half-applied.
+/// holding a pathname nothing accepts on — and so is the certificate
+/// material, whose four paths are read at startup, before activation
+/// and before the endpoint's own TLS load, and would be read by nothing
+/// if one of them changed later. All five are rejected here rather than
+/// half-applied.
 ///
-/// The *contents* at the two paths stay re-readable through the
+/// The *contents* at the four paths stay re-readable through the
 /// endpoint's certificate resolver; only the paths themselves are
 /// fixed.
 ///
@@ -482,6 +509,20 @@ pub fn check_registrar_endpoint_reload(
             &render_optional_path(reloaded.server_key_path.as_deref()),
         ));
     }
+    if running.client_cert_path != reloaded.client_cert_path {
+        return Err(registrar_endpoint_reload_rejected(
+            "client_cert_path",
+            &render_optional_path(running.client_cert_path.as_deref()),
+            &render_optional_path(reloaded.client_cert_path.as_deref()),
+        ));
+    }
+    if running.client_key_path != reloaded.client_key_path {
+        return Err(registrar_endpoint_reload_rejected(
+            "client_key_path",
+            &render_optional_path(running.client_key_path.as_deref()),
+            &render_optional_path(reloaded.client_key_path.as_deref()),
+        ));
+    }
     Ok(())
 }
 
@@ -500,9 +541,10 @@ fn registrar_endpoint_reload_rejected(key: &str, running: &str, reloaded: &str) 
     anyhow::anyhow!(
         "registrar_endpoint.{key} changed from {running} to {reloaded}; \
          the whole [registrar_endpoint] table is fixed for the process lifetime \
-         because the listening socket is inherited and the server certificate \
-         material is loaded once at startup, so this reload is rejected and the \
-         running daemon is left as it is. Restart the service to apply the change"
+         because the listening socket is inherited and the certificate \
+         material at all four paths is loaded once at startup, so this reload is \
+         rejected and the running daemon is left as it is. Restart the service to \
+         apply the change"
     )
 }
 
@@ -1910,17 +1952,21 @@ mod tests {
         }
     }
 
-    /// The table's three keys all deserialize, and the two paths land
-    /// on `Settings` as the `PathBuf`s the loader will read.
+    /// The table's five keys all deserialize, and the four paths land
+    /// on `Settings` as the `PathBuf`s the loader will read. The client
+    /// pair is in the same shape and the same spelling as the server
+    /// pair, because the four are one surface.
     #[test]
-    fn the_registrar_endpoint_table_reads_the_two_certificate_paths() {
+    fn the_registrar_endpoint_table_reads_the_four_certificate_paths() {
         let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
         write_minimal_profile_config(&mut file);
         writeln!(
             file,
             "\n[registrar_endpoint]\nenabled = true\n\
              server_cert_path = \"/etc/bootroot/registrar-endpoint.crt\"\n\
-             server_key_path = \"/etc/bootroot/registrar-endpoint.key\""
+             server_key_path = \"/etc/bootroot/registrar-endpoint.key\"\n\
+             client_cert_path = \"/etc/bootroot/registrar-client.crt\"\n\
+             client_key_path = \"/etc/bootroot/registrar-client.key\""
         )
         .unwrap();
         file.flush().unwrap();
@@ -1934,11 +1980,19 @@ mod tests {
             settings.registrar_endpoint.server_key_path.as_deref(),
             Some(Path::new("/etc/bootroot/registrar-endpoint.key"))
         );
+        assert_eq!(
+            settings.registrar_endpoint.client_cert_path.as_deref(),
+            Some(Path::new("/etc/bootroot/registrar-client.crt"))
+        );
+        assert_eq!(
+            settings.registrar_endpoint.client_key_path.as_deref(),
+            Some(Path::new("/etc/bootroot/registrar-client.key"))
+        );
     }
 
-    /// Both paths are optional, so a table naming only `enabled` still
-    /// parses — the material refusal comes from the endpoint's own
-    /// startup, not from the deserializer.
+    /// All four paths are optional to the *deserializer*, so a table
+    /// naming only `enabled` still parses — the refusal for an unset
+    /// path is validation's, a step later, and only on Linux.
     #[test]
     fn the_registrar_endpoint_certificate_paths_are_optional() {
         let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
@@ -1948,9 +2002,11 @@ mod tests {
         let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
         assert!(settings.registrar_endpoint.server_cert_path.is_none());
         assert!(settings.registrar_endpoint.server_key_path.is_none());
+        assert!(settings.registrar_endpoint.client_cert_path.is_none());
+        assert!(settings.registrar_endpoint.client_key_path.is_none());
     }
 
-    /// The table takes exactly three keys, so a misspelled one is a
+    /// The table takes exactly five keys, so a misspelled one is a
     /// config error rather than a setting that silently does nothing.
     #[test]
     fn the_registrar_endpoint_table_rejects_an_unknown_key() {
@@ -2681,6 +2737,24 @@ audit_store_enforcement = "directory"
             enabled,
             server_cert_path: cert.map(PathBuf::from),
             server_key_path: key.map(PathBuf::from),
+            ..RegistrarEndpointSettings::default()
+        }
+    }
+
+    /// Every one of the four material paths, so a reload test can move
+    /// exactly one of them and leave the other three where they were.
+    fn full_endpoint_settings(
+        server_cert: Option<&str>,
+        server_key: Option<&str>,
+        client_cert: Option<&str>,
+        client_key: Option<&str>,
+    ) -> RegistrarEndpointSettings {
+        RegistrarEndpointSettings {
+            enabled: true,
+            server_cert_path: server_cert.map(PathBuf::from),
+            server_key_path: server_key.map(PathBuf::from),
+            client_cert_path: client_cert.map(PathBuf::from),
+            client_key_path: client_key.map(PathBuf::from),
         }
     }
 
@@ -2708,30 +2782,91 @@ audit_store_enforcement = "directory"
         );
     }
 
-    /// The two certificate paths are fixed for the same reason, so a
-    /// reload that changes either is rejected and the diagnostic names
-    /// the key that changed — not merely "the table".
+    /// All four certificate paths are fixed for the same reason, so a
+    /// reload that changes any of them is rejected and the diagnostic
+    /// names the key that changed — not merely "the table".
     #[test]
-    fn a_reload_that_changes_either_certificate_path_is_rejected_and_names_the_key() {
-        let running = endpoint_settings(true, Some("/etc/a.crt"), Some("/etc/a.key"));
+    fn a_reload_that_changes_any_certificate_path_is_rejected_and_names_the_key() {
+        let running = full_endpoint_settings(
+            Some("/etc/a.crt"),
+            Some("/etc/a.key"),
+            Some("/etc/c.crt"),
+            Some("/etc/c.key"),
+        );
         assert!(check_registrar_endpoint_reload(&running, &running.clone()).is_ok());
 
         for (reloaded, expected) in [
             (
-                endpoint_settings(true, Some("/etc/b.crt"), Some("/etc/a.key")),
+                full_endpoint_settings(
+                    Some("/etc/b.crt"),
+                    Some("/etc/a.key"),
+                    Some("/etc/c.crt"),
+                    Some("/etc/c.key"),
+                ),
                 "registrar_endpoint.server_cert_path",
             ),
             (
-                endpoint_settings(true, Some("/etc/a.crt"), Some("/etc/b.key")),
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    Some("/etc/b.key"),
+                    Some("/etc/c.crt"),
+                    Some("/etc/c.key"),
+                ),
                 "registrar_endpoint.server_key_path",
             ),
             (
-                endpoint_settings(true, None, Some("/etc/a.key")),
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    Some("/etc/a.key"),
+                    Some("/etc/d.crt"),
+                    Some("/etc/c.key"),
+                ),
+                "registrar_endpoint.client_cert_path",
+            ),
+            (
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    Some("/etc/a.key"),
+                    Some("/etc/c.crt"),
+                    Some("/etc/d.key"),
+                ),
+                "registrar_endpoint.client_key_path",
+            ),
+            (
+                full_endpoint_settings(
+                    None,
+                    Some("/etc/a.key"),
+                    Some("/etc/c.crt"),
+                    Some("/etc/c.key"),
+                ),
                 "registrar_endpoint.server_cert_path",
             ),
             (
-                endpoint_settings(true, Some("/etc/a.crt"), None),
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    None,
+                    Some("/etc/c.crt"),
+                    Some("/etc/c.key"),
+                ),
                 "registrar_endpoint.server_key_path",
+            ),
+            (
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    Some("/etc/a.key"),
+                    None,
+                    Some("/etc/c.key"),
+                ),
+                "registrar_endpoint.client_cert_path",
+            ),
+            (
+                full_endpoint_settings(
+                    Some("/etc/a.crt"),
+                    Some("/etc/a.key"),
+                    Some("/etc/c.crt"),
+                    None,
+                ),
+                "registrar_endpoint.client_key_path",
             ),
         ] {
             let err = check_registrar_endpoint_reload(&running, &reloaded).unwrap_err();
@@ -2775,6 +2910,84 @@ audit_store_enforcement = "directory"
             !err.to_string().contains("LISTEN_PID"),
             "the refusal must be about the platform, not the contract: {err}"
         );
+    }
+
+    /// With the endpoint enabled, every one of the four material paths
+    /// is required and an unset one is refused at configuration
+    /// validation — before any state file is read, any `OpenBao` request
+    /// is made, any certificate is requested and any activation is
+    /// attempted.
+    ///
+    /// Gated on Linux because `validate_registrar_endpoint_settings`
+    /// runs first and refuses an enabled endpoint outright everywhere
+    /// else, with a diagnostic about the platform rather than about a
+    /// key. A test that ignored that would pass in CI and fail on a
+    /// developer's machine.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_with_an_unset_material_path_is_refused_by_validation() {
+        const PATHS: [(&str, &str); 4] = [
+            ("server_cert_path", "/etc/bootroot/registrar-endpoint.crt"),
+            ("server_key_path", "/etc/bootroot/registrar-endpoint.key"),
+            ("client_cert_path", "/etc/bootroot/registrar-client.crt"),
+            ("client_key_path", "/etc/bootroot/registrar-client.key"),
+        ];
+        for omitted in 0..PATHS.len() {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(file, "\n[registrar_endpoint]\nenabled = true").unwrap();
+            for (index, (key, value)) in PATHS.iter().enumerate() {
+                if index != omitted {
+                    writeln!(file, "{key} = \"{value}\"").unwrap();
+                }
+            }
+            writeln!(
+                file,
+                "\n[registrar]\nstate_file = \"/var/lib/bootroot/state.json\""
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            let err = settings.validate().unwrap_err();
+            let rendered = err.to_string();
+            let missing = PATHS.get(omitted).expect("index is inside the array").0;
+            assert!(
+                rendered.contains(missing),
+                "the diagnostic must name {missing}: {rendered}"
+            );
+            for (present, _) in PATHS
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| (index != omitted).then_some((entry.0, entry.1)))
+            {
+                assert!(
+                    !rendered.contains(&format!("{present} is unset")),
+                    "a configured key must not be reported as unset: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// All four configured, and the enabled endpoint's configuration
+    /// validates. The refusal above is about the keys and nothing else.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_with_all_four_material_paths_validates() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "\n[registrar_endpoint]\nenabled = true\n\
+             server_cert_path = \"/etc/bootroot/registrar-endpoint.crt\"\n\
+             server_key_path = \"/etc/bootroot/registrar-endpoint.key\"\n\
+             client_cert_path = \"/etc/bootroot/registrar-client.crt\"\n\
+             client_key_path = \"/etc/bootroot/registrar-client.key\"\n\
+             \n[registrar]\nstate_file = \"/var/lib/bootroot/state.json\""
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+        settings.validate().unwrap();
     }
 
     /// A disabled endpoint validates everywhere, including where it
