@@ -542,99 +542,8 @@ async fn material_satisfying_every_condition_is_usable() {
 /// state each negation is classified as.
 #[tokio::test]
 async fn each_of_the_eight_conditions_names_its_own_unusable_state() {
-    // The table is the point of this test: one row per condition, each
-    // carrying the setup that negates it. A named type alias for the
-    // row would move the shape away from the rows it describes, and the
-    // eight cases below are what has to stay readable.
-    #[allow(clippy::type_complexity)]
-    let cases: Vec<(
-        &str,
-        Box<dyn Fn(&Path, &TestCa, &str, &Path, &Path)>,
-        UnusableMaterial,
-    )> = vec![
-        (
-            "absent",
-            Box::new(|_dir, _ca, _name, _cert, _key| {}),
-            UnusableMaterial::Absent,
-        ),
-        (
-            "unreadable",
-            // A directory at the certificate path reproduces a
-            // non-NotFound read error portably, without depending on
-            // chmod semantics that root in CI can bypass.
-            Box::new(|_dir, ca, name, cert, key| {
-                std::fs::create_dir_all(cert).expect("directory at the certificate path");
-                let (_, key_pem) = ca.issue(&leaf_params(name, -1, 30));
-                std::fs::write(key, key_pem).expect("write the key");
-            }),
-            UnusableMaterial::Unreadable,
-        ),
-        (
-            "malformed",
-            // What a renewal that lost power mid-write leaves.
-            Box::new(|_dir, ca, name, cert, key| {
-                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, -1, 30));
-                let truncated = leaf_pem.get(..leaf_pem.len() / 2).unwrap_or_default();
-                write_pair(cert, key, truncated, &key_pem);
-            }),
-            UnusableMaterial::Malformed,
-        ),
-        (
-            "key-mismatched",
-            // What a renewal that died between the two renames leaves.
-            Box::new(|_dir, ca, name, cert, key| {
-                let (leaf_pem, _) = ca.issue(&leaf_params(name, -1, 30));
-                let (_, other_key) = ca.issue(&leaf_params(name, -1, 30));
-                write_pair(cert, key, &leaf_pem, &other_key);
-            }),
-            UnusableMaterial::KeyMismatched,
-        ),
-        (
-            "SAN-mismatched",
-            Box::new(|_dir, ca, _name, cert, key| {
-                let (leaf_pem, key_pem) = ca.issue(&leaf_params(
-                    "001.some-other.bootroot-01.corp.example.internal",
-                    -1,
-                    30,
-                ));
-                write_pair(cert, key, &leaf_pem, &key_pem);
-            }),
-            UnusableMaterial::SanMismatched,
-        ),
-        (
-            "not-yet-valid",
-            // A host clock behind the CA's.
-            Box::new(|_dir, ca, name, cert, key| {
-                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, 5, 30));
-                write_pair(cert, key, &leaf_pem, &key_pem);
-            }),
-            UnusableMaterial::NotYetValid,
-        ),
-        (
-            "expired",
-            // A daemon down through the leaf's not_after.
-            Box::new(|_dir, ca, name, cert, key| {
-                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, -30, -1));
-                write_pair(cert, key, &leaf_pem, &key_pem);
-            }),
-            UnusableMaterial::Expired,
-        ),
-        (
-            "chain-drifted",
-            // A destructive trust-anchor rotation: an in-date, correctly
-            // named leaf signed by a CA generation the bundle no longer
-            // holds.
-            Box::new(|_dir, _ca, name, cert, key| {
-                let previous = TestCa::new("Previous Generation CA");
-                let (leaf_pem, key_pem) = previous.issue(&leaf_params(name, -1, 30));
-                write_pair(cert, key, &leaf_pem, &key_pem);
-            }),
-            UnusableMaterial::ChainDrifted,
-        ),
-    ];
-
     let mut seen: HashSet<UnusableMaterial> = HashSet::new();
-    for (label, prepare, expected) in cases {
+    for (label, prepare, expected) in eight_unusable_cases() {
         let dir = TempDir::new().expect("tempdir");
         let ca = TestCa::new("Usability CA");
         let name = SurfaceLeaf::RegistrarClient.identity(TEST_HOST, TEST_DOMAIN);
@@ -644,7 +553,7 @@ async fn each_of_the_eight_conditions_names_its_own_unusable_state() {
         let bundle = dir.path().join("bundle.pem");
         std::fs::write(&bundle, &ca.root_pem).expect("write bundle");
 
-        prepare(dir.path(), &ca, &name, &cert, &key);
+        prepare(&ca, &name, &cert, &key);
 
         assert_eq!(
             evaluate_pair(&cert, &key, &name, Some(&bundle)).await,
@@ -658,6 +567,103 @@ async fn each_of_the_eight_conditions_names_its_own_unusable_state() {
         8,
         "the enumeration is the eight negations and nothing else"
     );
+}
+
+/// One row per condition of the usability rule: the setup that negates
+/// it, and the state that negation must be classified as.
+///
+/// Shared by the classification test above and by the test below that
+/// every one of the eight actually drives an issuance, so the two cannot
+/// come to disagree about what the eight are. A named type alias for the
+/// row would move the shape away from the rows it describes, and the
+/// eight cases are what has to stay readable.
+#[allow(clippy::type_complexity)]
+fn eight_unusable_cases() -> Vec<(
+    &'static str,
+    Box<dyn Fn(&TestCa, &str, &Path, &Path)>,
+    UnusableMaterial,
+)> {
+    vec![
+        (
+            "absent",
+            Box::new(|_ca, _name, _cert, _key| {}),
+            UnusableMaterial::Absent,
+        ),
+        (
+            "unreadable",
+            // A directory at the certificate path reproduces a
+            // non-NotFound read error portably, without depending on
+            // chmod semantics that root in CI can bypass.
+            Box::new(|ca, name, cert, key| {
+                std::fs::create_dir_all(cert).expect("directory at the certificate path");
+                let (_, key_pem) = ca.issue(&leaf_params(name, -1, 30));
+                std::fs::write(key, key_pem).expect("write the key");
+            }),
+            UnusableMaterial::Unreadable,
+        ),
+        (
+            "malformed",
+            // What a renewal that lost power mid-write leaves.
+            Box::new(|ca, name, cert, key| {
+                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, -1, 30));
+                let truncated = leaf_pem.get(..leaf_pem.len() / 2).unwrap_or_default();
+                write_pair(cert, key, truncated, &key_pem);
+            }),
+            UnusableMaterial::Malformed,
+        ),
+        (
+            "key-mismatched",
+            // What a renewal that died between the two renames leaves.
+            Box::new(|ca, name, cert, key| {
+                let (leaf_pem, _) = ca.issue(&leaf_params(name, -1, 30));
+                let (_, other_key) = ca.issue(&leaf_params(name, -1, 30));
+                write_pair(cert, key, &leaf_pem, &other_key);
+            }),
+            UnusableMaterial::KeyMismatched,
+        ),
+        (
+            "SAN-mismatched",
+            Box::new(|ca, _name, cert, key| {
+                let (leaf_pem, key_pem) = ca.issue(&leaf_params(
+                    "001.some-other.bootroot-01.corp.example.internal",
+                    -1,
+                    30,
+                ));
+                write_pair(cert, key, &leaf_pem, &key_pem);
+            }),
+            UnusableMaterial::SanMismatched,
+        ),
+        (
+            "not-yet-valid",
+            // A host clock behind the CA's.
+            Box::new(|ca, name, cert, key| {
+                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, 5, 30));
+                write_pair(cert, key, &leaf_pem, &key_pem);
+            }),
+            UnusableMaterial::NotYetValid,
+        ),
+        (
+            "expired",
+            // A daemon down through the leaf's not_after.
+            Box::new(|ca, name, cert, key| {
+                let (leaf_pem, key_pem) = ca.issue(&leaf_params(name, -30, -1));
+                write_pair(cert, key, &leaf_pem, &key_pem);
+            }),
+            UnusableMaterial::Expired,
+        ),
+        (
+            "chain-drifted",
+            // A destructive trust-anchor rotation: an in-date, correctly
+            // named leaf signed by a CA generation the bundle no longer
+            // holds.
+            Box::new(|_ca, name, cert, key| {
+                let previous = TestCa::new("Previous Generation CA");
+                let (leaf_pem, key_pem) = previous.issue(&leaf_params(name, -1, 30));
+                write_pair(cert, key, &leaf_pem, &key_pem);
+            }),
+            UnusableMaterial::ChainDrifted,
+        ),
+    ]
 }
 
 /// Absence outranks unreadability: an unreadable certificate beside an
@@ -769,22 +775,32 @@ async fn a_missing_or_unreadable_bundle_is_detected_as_chain_drift() {
 }
 
 /// Every one of the eight makes the daemon *attempt* an issuance rather
-/// than refuse, which is what `needs_issuance` reports.
-#[test]
-fn every_unusable_state_needs_an_issuance() {
-    for state in [
-        UnusableMaterial::Absent,
-        UnusableMaterial::Unreadable,
-        UnusableMaterial::Malformed,
-        UnusableMaterial::KeyMismatched,
-        UnusableMaterial::SanMismatched,
-        UnusableMaterial::NotYetValid,
-        UnusableMaterial::Expired,
-        UnusableMaterial::ChainDrifted,
-    ] {
-        assert!(PairUsability::Unusable(state).needs_issuance(), "{state}");
+/// than refuse: put the client pair into each state in turn and
+/// `pending_pairs` comes back holding it, over a configured pair on a
+/// provisioned host rather than over a classification in isolation.
+///
+/// None of the eight is a refusal on its own, and the usable server pair
+/// beside it is never dragged along — which is the same run asserting
+/// that one pair needing issuance is not a reason to re-issue the other.
+#[tokio::test]
+async fn every_unusable_state_drives_an_issuance() {
+    for (label, prepare, expected) in eight_unusable_cases() {
+        let host = Host::new();
+        host.provision_both_pairs();
+        let (cert, key) = host.client_pair();
+        std::fs::remove_file(&cert).expect("clear the provisioned certificate");
+        std::fs::remove_file(&key).expect("clear the provisioned key");
+        prepare(&host.ca, &Host::client_name(), &cert, &key);
+
+        let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+        let pending = pending_pairs(&plan, host.settings.trust.ca_bundle_path.as_deref()).await;
+        let leaves: Vec<SurfaceLeaf> = pending.iter().map(|pair| pair.leaf).collect();
+        assert_eq!(
+            leaves,
+            vec![SurfaceLeaf::RegistrarClient],
+            "{label} ({expected}) must drive an issuance of the client pair and of nothing else"
+        );
     }
-    assert!(!PairUsability::Usable.needs_issuance());
 }
 
 // ---------------------------------------------------------------------
@@ -2349,6 +2365,51 @@ async fn both_surface_leaves_are_published_with_their_issuer_chain() {
         // certificate file and one key file, with no generation
         // directory and no combined PEM.
         assert!(cert_path.is_file());
+    }
+}
+
+/// What issuance publishes is what the usability evaluation accepts, so
+/// a second start re-issues nothing and both pairs survive it
+/// byte-identically.
+///
+/// The two halves are written and read by this one module and can drift
+/// apart without any other test noticing: every "leave alone" test above
+/// provisions its material by hand, so a publication shape the
+/// evaluation then rejects would still pass all of them while re-minting
+/// both leaves on every restart — churning a file the co-located
+/// registrar is reading and handing that process a new key each time.
+#[tokio::test]
+async fn material_this_issuance_published_is_usable_on_the_next_start() {
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+
+    assert_eq!(
+        run_issuance(&host).await.len(),
+        2,
+        "a bare host needs both pairs issued"
+    );
+    let published: Vec<(PathBuf, String)> = [host.server_pair(), host.client_pair()]
+        .into_iter()
+        .flat_map(|(cert, key)| [cert, key])
+        .map(|path| {
+            let digest = digest_of(&path);
+            (path, digest)
+        })
+        .collect();
+
+    let second = run_issuance(&host).await;
+    assert!(
+        second.is_empty(),
+        "the material issuance just published must be usable: {second:?}"
+    );
+    for (path, digest) in published {
+        assert_eq!(
+            digest,
+            digest_of(&path),
+            "{} must survive the restart byte-identically",
+            path.display()
+        );
     }
 }
 
