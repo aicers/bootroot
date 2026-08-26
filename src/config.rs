@@ -424,6 +424,11 @@ impl Default for RegistrarSettings {
 /// `registrar-endpoint-anchors.sha256` — so the client pair is
 /// configuration this daemon writes *and* a published contract the
 /// co-located registrar reads.
+///
+/// Being one surface is also why they must name four *distinct* files,
+/// which configuration validation enforces: the two pairs are issued one
+/// after the other, and a shared path would keep only the last write
+/// while every file left on disk stayed individually well-formed.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrarEndpointSettings {

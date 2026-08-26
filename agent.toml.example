@@ -89,6 +89,12 @@ http_responder_token_ttl_secs = 300
 # tool places the initial certificate at them, and the endpoint's anchor
 # pin file registrar-endpoint-anchors.sha256 is looked for in the same
 # directory as client_cert_path.
+#
+# All four are required when enabled = true and must name four distinct
+# files.  The two pairs are issued one after the other, so a path shared
+# between them would keep only the last write and leave one identity
+# reading material that is not its own; the daemon refuses such a
+# configuration before it reads or requests anything.
 [registrar_endpoint]
 enabled = false
 # server_cert_path = "/etc/bootroot/certs/registrar-endpoint.crt"

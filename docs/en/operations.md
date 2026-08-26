@@ -605,8 +605,13 @@ pair of paths:
   `registrar-endpoint-anchors.sha256` is looked for in the same directory
   as the certificate — so moving the certificate moves the pin file.
 
-All four are required when `enabled = true`, and an unset one is refused
-at configuration-validation time, before anything is read or requested.
+All four are required when `enabled = true`, and they must name four
+distinct files. An unset one, and two that name the same file, are both
+refused at configuration-validation time, before anything is read or
+requested. The two pairs are issued one after the other, so a shared path
+would keep only the last write: the endpoint would come up presenting a
+leaf that loads cleanly while the registrar read that same file as its
+own client credential.
 
 Each certificate file the daemon writes carries **the leaf followed by
 the issuer chain the CA returned**, which is what the chain requirement
@@ -688,7 +693,8 @@ unchanged: `bootroot-agent`, never re-provisioning the host.
 With the endpoint enabled, the daemon refuses to start — naming the
 setting at fault, and the configured path where there is one — when
 `server_cert_path`, `server_key_path`, `client_cert_path` or
-`client_key_path` is absent; when issuance itself failed; when the
+`client_key_path` is absent; when two of those four name the same file;
+when issuance itself failed; when the
 certificate file holds the leaf without its issuer chain, or a chain that
 does not build to a certificate pinned in `trust.trusted_ca_sha256`, or
 one whose anchor is expired, not yet valid or not CA-capable; and when

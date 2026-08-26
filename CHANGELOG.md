@@ -36,8 +36,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `[registrar_endpoint]` keys, `client_cert_path` and `client_key_path`,
   name where the client pair lives; the co-located registrar reads them
   and the endpoint's anchor pin file sits beside the certificate. All
-  four material paths are required when the endpoint is enabled, and an
-  unset one is refused at configuration-validation time. Material
+  four material paths are required when the endpoint is enabled and
+  must name four distinct files; an unset one, and two that name the
+  same file, are both refused at configuration-validation time. Material
   already at a configured path is left alone when it is present,
   readable, parseable, key-matched, correctly named, inside its
   validity window and still chaining to `[trust] ca_bundle_path`;

@@ -383,6 +383,19 @@ CA material to verify callers with.
   silently widen who may connect, and a bundle in which nothing is pinned
   is a startup refusal rather than an endpoint that trusts everything.
 
+The four material paths must name **four distinct files**, and a
+configuration in which two of them name the same file is refused at
+configuration-validation time, with a diagnostic naming the settings that
+collide and the file they share. The server pair and the client pair are
+classified and issued independently, one after the other, so a shared
+path would keep only whichever write landed last — and nothing further
+down would object, because each file it looks at is individually
+well-formed: the endpoint would start presenting a leaf that loads and
+matches its key, and the registrar would authenticate with an identity
+that is not its own. Comparison is textual after `.`/`..` are normalized
+away; nothing is opened, since on the start that issues them these files
+need not exist yet.
+
 The chain requirement is not a formality. A caller verifies this endpoint
 by pinning trust anchors and selecting them **from the certificates the
 server actually presents**, so a file holding the leaf alone loads
@@ -578,9 +591,10 @@ outside. Read the diagnostic rather than assuming a CA outage.
 With the endpoint enabled, each of the following is a **startup
 refusal**, naming the setting at fault and — where the setting has a
 value — the configured path: an absent `server_cert_path`,
-`server_key_path`, `client_cert_path` or `client_key_path`; material the
-self-check above rejects; an absent, unreadable, unparseable or unpinned
-`trust.ca_bundle_path`; and a failed issuance.
+`server_key_path`, `client_cert_path` or `client_key_path`; two of those
+four naming the same file; material the self-check above rejects; an
+absent, unreadable, unparseable or unpinned `trust.ca_bundle_path`; and a
+failed issuance.
 
 Material *at* a configured path that is missing, unreadable, unparseable,
 key-mismatched or SAN-mismatched is **not** on that list. Each of those

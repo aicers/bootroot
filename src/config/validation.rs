@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -9,7 +10,7 @@ use super::{
     DaemonProfileSettings, HookCommand, OpenBaoSettings, RegistrarEndpointSettings,
     RegistrarSettings, Settings, TrustSettings,
 };
-use crate::fs_util::path_is_within;
+use crate::fs_util::{absolute_lexical, path_is_within};
 use crate::input_validation::{ValidationError, validate_dns_label, validate_registration_id};
 use crate::registrar::audit::MIN_AUDIT_MAX_FILE_BYTES;
 use crate::registrar::verbs::wrap_ttl::{WrapTtlPolicy, WrapTtlRefusal};
@@ -130,7 +131,8 @@ const REGISTRAR_ENDPOINT_MATERIAL_KEYS: [&str; 4] = [
 ];
 
 /// Requires every `[registrar_endpoint]` certificate and key path when
-/// the endpoint is enabled.
+/// the endpoint is enabled, and requires the four to be four distinct
+/// files.
 ///
 /// There is no default for any of the four, and an unset one is not a
 /// state issuance can repair: the eight unusable states classify
@@ -138,6 +140,24 @@ const REGISTRAR_ENDPOINT_MATERIAL_KEYS: [&str; 4] = [
 /// when there is no path at all. Deciding it here — at
 /// configuration-validation time — puts the refusal before any `OpenBao`
 /// read, any CA request and any endpoint activation.
+///
+/// Distinctness is decided here for the same reason and answers a
+/// failure the usability evaluation cannot see. The two pairs are
+/// classified independently and then issued in sequence, so a path
+/// shared between them leaves only whichever write landed last: the
+/// endpoint can come up presenting a leaf that loads and matches its
+/// key, while the co-located registrar reads that same file as its
+/// client credential and authenticates as the wrong identity — or with a
+/// key that is not the leaf's at all. Nothing downstream refuses over
+/// it, because every file it looks at is individually well-formed.
+///
+/// Comparison is [`absolute_lexical`]: relative spellings are resolved
+/// against the process working directory and `.`/`..` are normalized
+/// away, but nothing is opened and no symlink is followed, because these
+/// files legitimately do not exist yet on the start that issues them.
+/// Two distinct names that a symlink later resolves to one file are
+/// therefore not caught here; the endpoint's own startup self-check is
+/// what stands behind that.
 ///
 /// Placed **after** [`validate_registrar_endpoint_settings`] on purpose:
 /// off Linux that check already refuses any `enabled = true` outright,
@@ -148,26 +168,78 @@ fn validate_registrar_endpoint_material_paths(settings: &RegistrarEndpointSettin
         return Ok(());
     }
     let configured = [
-        settings.server_cert_path.is_some(),
-        settings.server_key_path.is_some(),
-        settings.client_cert_path.is_some(),
-        settings.client_key_path.is_some(),
+        settings.server_cert_path.as_deref(),
+        settings.server_key_path.as_deref(),
+        settings.client_cert_path.as_deref(),
+        settings.client_key_path.as_deref(),
     ];
-    let missing: Vec<&str> = REGISTRAR_ENDPOINT_MATERIAL_KEYS
-        .iter()
-        .zip(configured)
-        .filter_map(|(key, present)| (!present).then_some(*key))
-        .collect();
-    if missing.is_empty() {
+    let mut present: Vec<(&str, &Path)> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    for (key, path) in REGISTRAR_ENDPOINT_MATERIAL_KEYS.iter().zip(configured) {
+        match path {
+            Some(path) => present.push((*key, path)),
+            None => missing.push(*key),
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "registrar_endpoint.{} {} required when registrar_endpoint.enabled is true: the \
+             daemon issues the endpoint's server leaf and the registrar's client leaf into these \
+             paths before the endpoint loads its TLS material, and there is no default for any \
+             of them",
+            missing.join(", registrar_endpoint."),
+            if missing.len() == 1 { "is" } else { "are" }
+        );
+    }
+    let collisions = colliding_material_paths(&present)?;
+    if collisions.is_empty() {
         return Ok(());
     }
     anyhow::bail!(
-        "registrar_endpoint.{} {} required when registrar_endpoint.enabled is true: the daemon \
-         issues the endpoint's server leaf and the registrar's client leaf into these paths \
-         before the endpoint loads its TLS material, and there is no default for any of them",
-        missing.join(", registrar_endpoint."),
-        if missing.len() == 1 { "is" } else { "are" }
+        "{} must name distinct files when registrar_endpoint.enabled is true: the daemon issues \
+         the endpoint's server leaf and the registrar's client leaf independently and one after \
+         the other, so a shared path keeps only the last write and leaves the other identity \
+         reading material that is not its own",
+        collisions.join("; ")
     );
+}
+
+/// Groups the configured material paths by the file they name and
+/// renders one description per group holding more than one setting.
+///
+/// Returns an empty vector when the four are four distinct files.
+///
+/// # Errors
+///
+/// Returns an error when a path cannot be made absolute, which needs the
+/// process working directory.
+fn colliding_material_paths(present: &[(&str, &Path)]) -> Result<Vec<String>> {
+    let mut groups: Vec<(PathBuf, Vec<&str>)> = Vec::new();
+    for (key, path) in present {
+        let normalized = absolute_lexical(path).with_context(|| {
+            format!(
+                "resolving registrar_endpoint.{key} ({}) to compare it with the other registrar \
+                 endpoint material paths",
+                path.display()
+            )
+        })?;
+        if let Some((_, keys)) = groups.iter_mut().find(|(seen, _)| *seen == normalized) {
+            keys.push(key);
+        } else {
+            groups.push((normalized, vec![key]));
+        }
+    }
+    Ok(groups
+        .iter()
+        .filter(|(_, keys)| keys.len() > 1)
+        .map(|(path, keys)| {
+            format!(
+                "registrar_endpoint.{} ({})",
+                keys.join(" and registrar_endpoint."),
+                path.display()
+            )
+        })
+        .collect())
 }
 
 /// Requires `[registrar] state_file` exactly when the endpoint is
@@ -744,6 +816,123 @@ mod tests {
             );
         }
         assert!(rendered.contains("are required"), "{rendered}");
+    }
+
+    /// A path shared between the server pair and the client pair is
+    /// refused, because the two issuances run one after the other and
+    /// the second silently replaces the first — leaving an endpoint that
+    /// starts cleanly and a registrar reading the endpoint's identity as
+    /// its own. Gated on Linux for the same reason as the unset-path
+    /// tests above.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_sharing_a_path_between_the_two_pairs_is_refused() {
+        let shared = "/etc/bootroot/shared.pem";
+        let mut settings = endpoint_with_all_paths();
+        settings.server_cert_path = Some(shared.into());
+        settings.client_cert_path = Some(shared.into());
+        let err = validate_registrar_endpoint_material_paths(&settings)
+            .expect_err("a path shared between the two pairs must refuse");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("registrar_endpoint.server_cert_path"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("registrar_endpoint.client_cert_path"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(shared), "{rendered}");
+        assert!(rendered.contains("must name distinct files"), "{rendered}");
+        // The two that do not collide stay out of the diagnostic, so the
+        // operator reads which pair of keys to repair rather than the
+        // whole table.
+        assert!(
+            !rendered.contains("registrar_endpoint.server_key_path"),
+            "{rendered}"
+        );
+    }
+
+    /// A certificate and its own key pointed at one file is the same
+    /// defect within a pair, and is refused by the same rule rather than
+    /// by a second one.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_pointing_a_certificate_and_its_key_at_one_file_is_refused() {
+        let shared = "/etc/bootroot/registrar-client.pem";
+        let mut settings = endpoint_with_all_paths();
+        settings.client_cert_path = Some(shared.into());
+        settings.client_key_path = Some(shared.into());
+        let err = validate_registrar_endpoint_material_paths(&settings)
+            .expect_err("a certificate and its key at one path must refuse");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("registrar_endpoint.client_cert_path"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("registrar_endpoint.client_key_path"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(shared), "{rendered}");
+    }
+
+    /// Every colliding group is named in one diagnostic, so an operator
+    /// repairs the configuration in one pass — the same property the
+    /// unset-path refusal has.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn every_colliding_group_of_material_paths_is_named_at_once() {
+        let settings = RegistrarEndpointSettings {
+            enabled: true,
+            server_cert_path: Some("/etc/bootroot/one.pem".into()),
+            server_key_path: Some("/etc/bootroot/two.pem".into()),
+            client_cert_path: Some("/etc/bootroot/one.pem".into()),
+            client_key_path: Some("/etc/bootroot/two.pem".into()),
+        };
+        let err = validate_registrar_endpoint_material_paths(&settings)
+            .expect_err("two colliding groups must refuse");
+        let rendered = err.to_string();
+        for key in REGISTRAR_ENDPOINT_MATERIAL_KEYS {
+            assert!(
+                rendered.contains(&format!("registrar_endpoint.{key}")),
+                "{key} missing from: {rendered}"
+            );
+        }
+        assert!(rendered.contains("/etc/bootroot/one.pem"), "{rendered}");
+        assert!(rendered.contains("/etc/bootroot/two.pem"), "{rendered}");
+    }
+
+    /// Equivalent spellings of one absolute path collide, so the
+    /// refusal cannot be sidestepped by writing the same file two ways.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn material_paths_that_differ_only_in_spelling_still_collide() {
+        let mut settings = endpoint_with_all_paths();
+        settings.server_cert_path = Some("/etc/bootroot/certs/leaf.pem".into());
+        settings.client_cert_path = Some("/etc/bootroot/certs/../certs/./leaf.pem".into());
+        let err = validate_registrar_endpoint_material_paths(&settings)
+            .expect_err("two spellings of one path must refuse");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("/etc/bootroot/certs/leaf.pem"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("must name distinct files"), "{rendered}");
+    }
+
+    /// The distinctness rule applies only to an enabled endpoint: a
+    /// disabled one issues nothing and reads nothing, so there is
+    /// nothing for a shared path to destroy.
+    #[test]
+    fn a_disabled_endpoint_with_colliding_paths_is_accepted() {
+        let mut settings = endpoint_with_all_paths();
+        settings.enabled = false;
+        settings
+            .server_cert_path
+            .clone_from(&settings.client_cert_path);
+        validate_registrar_endpoint_material_paths(&settings)
+            .expect("a disabled endpoint requires nothing");
     }
 
     #[test]

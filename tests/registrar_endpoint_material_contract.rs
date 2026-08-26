@@ -182,6 +182,48 @@ fn the_shipped_example_carries_all_four_material_paths_commented_out() {
     }
 }
 
+/// Every file that publishes the four paths also states that they must
+/// name four distinct files.
+///
+/// A shared path is refused at configuration-validation time and is
+/// invisible everywhere else: each file the daemon leaves on disk is
+/// individually well-formed, so nothing downstream reports it. An
+/// operator who copies a path twice therefore learns why only from these
+/// passages, and a file that lists the four without the rule reads as
+/// though repeating one were allowed.
+#[test]
+fn the_four_paths_are_published_with_the_rule_that_they_are_distinct() {
+    /// Each file that states the contract, and the phrase in its own
+    /// language that states the distinctness rule.
+    const STATED: [(&str, &str); 6] = [
+        ("agent.toml.example", "four distinct files"),
+        ("src/config.rs", "four distinct files"),
+        ("docs/en/configuration.md", "four distinct files"),
+        ("docs/en/operations.md", "four distinct files"),
+        ("docs/ko/configuration.md", "서로 다른 네 개의 파일"),
+        ("docs/ko/operations.md", "서로 다른 네 개의 파일"),
+    ];
+
+    let root = repo_root();
+    for (name, stated) in STATED {
+        let contents = std::fs::read_to_string(root.join(name))
+            .unwrap_or_else(|err| panic!("{name} must be readable: {err}"));
+        // Whitespace-normalised, and the comment and emphasis markers
+        // these files wrap the sentence in dropped with it, so a rewrap
+        // cannot hide the rule the way it cannot hide a stale claim.
+        let flat = contents
+            .replace(['*', '#'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(stated),
+            "{name} publishes the four material paths, so it must state that they name distinct \
+             files"
+        );
+    }
+}
+
 /// The written shape is stated everywhere, and so is the one case that
 /// does not produce it.
 ///
