@@ -2000,6 +2000,25 @@ impl DeviceLayout {
                 )));
             }
         };
+        // The name is held to the exact generation shape before it is
+        // joined, not merely on the way in. A pass writes only names
+        // `rotated_file_name` produced, but the marker sits in a
+        // directory the container's audit user can write — the same
+        // adversary every open in this module is `O_NOFOLLOW`ed
+        // against — and `Path::join` reads `..` as a step out of the
+        // directory and an absolute name as a replacement for the whole
+        // path. Unchecked, a marker that user planted would have root
+        // rename a file anywhere on the host to the active path.
+        if parse_rotated_name(&intent.generation).is_none() {
+            return MarkerBranch::Done(Box::new(self.unrecognised(
+                state,
+                &format!(
+                    "the rotation-intent marker names {:?}, which is not a generation name this \
+                     daemon could have written",
+                    intent.generation
+                ),
+            )));
+        }
         let generation = self.dir.join(&intent.generation);
         let recognised = match std::fs::symlink_metadata(&generation) {
             Ok(meta) => meta.is_file() && file_identity(&meta) == intent.identity(),

@@ -374,8 +374,9 @@ closes — stop and investigate rather than waiting.
 
 **Where the daemon refuses to act.** A pass that starts with the active
 path absent decides from the marker and nothing else. If there is no
-marker, or it names a file that is gone or whose identity no longer
-matches, the daemon does not recognise the state as its own: it logs one
+marker, or it names anything but one of this device's own generations,
+or it names a file that is gone or whose identity no longer matches, the
+daemon does not recognise the state as its own: it logs one
 `error`, rotates nothing, trims nothing and moves **no** generation into
 place. A newer generation is never renamed into position because it is
 the newest or the most recently modified — an operator or a filesystem

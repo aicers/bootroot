@@ -3879,6 +3879,60 @@ async fn a_restart_with_the_active_path_absent_decides_from_the_marker_alone() {
     }
 }
 
+/// A marker naming anything but a generation of this device's own is
+/// refused before the name is ever joined to the device directory.
+///
+/// The marker sits in a directory the container's audit user can write.
+/// `Path::join` reads `..` as a step out of that directory and an
+/// absolute name as a replacement for the whole path, so a marker that
+/// user planted would otherwise have root rename a file anywhere on the
+/// host to the active path — and the identity it has to match is one it
+/// can read for any file bind-mounted into its own container.
+#[tokio::test(start_paused = true)]
+async fn a_marker_naming_a_file_outside_the_device_directory_moves_nothing() {
+    let root = tempfile::tempdir().expect("a temporary directory");
+    let dir = root.path().join("openbao");
+    std::fs::create_dir(&dir).expect("the device directory");
+    let victim = root.path().join("victim.conf");
+    std::fs::write(&victim, b"the file the marker points at\n").expect("the victim writes");
+    let victim_bytes = std::fs::read(&victim).expect("the victim reads");
+
+    for name in [
+        "../victim.conf".to_string(),
+        victim.display().to_string(),
+        "audit-20260301T115900Z-00000.log".to_string(),
+        "audit.log".to_string(),
+    ] {
+        write_intent(&dir.join(MARKER_FILE_NAME), identity_of(&victim), &name);
+        let mut rotation = rotation_at(dir.clone(), S, N);
+
+        let logs = logs_from(async {
+            let outcome = rotation.run_pass(at(0)).await;
+            assert!(outcome.rotation.is_unmet(), "{name}");
+            assert!(outcome.retained_unmet, "{name}: nothing was established");
+        })
+        .await;
+        assert_eq!(
+            count_lines_at(&logs, "ERROR"),
+            1,
+            "{name}: one error:\n{logs}"
+        );
+        assert!(
+            logs.contains("not a generation name this daemon could have written"),
+            "{name}:\n{logs}"
+        );
+        assert!(
+            !dir.join(ACTIVE_FILE_NAME).exists(),
+            "{name}: nothing was moved into place"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("the victim still reads"),
+            victim_bytes,
+            "{name}: the file the marker named was left where it was"
+        );
+    }
+}
+
 /// The pending-restore state machine has no on-disk representation, and
 /// a running daemon never reconstructs it from the marker.
 #[tokio::test(start_paused = true)]
