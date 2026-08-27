@@ -1610,9 +1610,9 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
 /// flag, so the outbound transport does not read the bundle and the
 /// merge's own refusal is what is under test. The transport's separate,
 /// pre-existing use of the same file is covered by
-/// [`a_bundle_the_outbound_transport_cannot_read_fails_before_publication`].
+/// [`an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic`].
 #[tokio::test]
-async fn an_unreadable_ca_bundle_fails_before_anything_is_published() {
+async fn an_unreadable_ca_bundle_fails_at_merge_before_anything_is_published() {
     let mut host = Host::new();
     let acme = start_acme(Arc::clone(&host.ca)).await;
     aim_at(&mut host.settings, &acme);
@@ -1640,6 +1640,51 @@ async fn an_unreadable_ca_bundle_fails_before_anything_is_published() {
     assert!(
         rendered.contains(&bundle.display().to_string()),
         "{rendered}"
+    );
+
+    let (cert_path, key_path) = host.client_pair();
+    assert!(!cert_path.exists(), "no leaf may be published");
+    assert!(!key_path.exists(), "no key may be published");
+    assert!(bundle.is_dir(), "the bundle must be left exactly as it was");
+}
+
+/// An unreadable output bundle is not bootstrap-eligible, so normal-mode
+/// issuance refuses while constructing its ordinary TLS client before it can
+/// send ACME traffic or publish either material file.
+#[tokio::test]
+async fn an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic() {
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+
+    // A directory at the bundle path is a non-NotFound read error on every
+    // platform, without depending on chmod semantics that root in CI can
+    // bypass.
+    let bundle = host.dir.path().join("unreadable-bundle.pem");
+    std::fs::create_dir_all(&bundle).expect("directory at the bundle path");
+    host.settings.trust.ca_bundle_path = Some(bundle.clone());
+
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        .await
+        .expect_err("an unreadable bundle must stop normal-mode issuance");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("Failed to read CA bundle at"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&bundle.display().to_string()),
+        "{rendered}"
+    );
+    assert_eq!(
+        acme.observed.directory_requests.load(Ordering::Relaxed),
+        0,
+        "an unreadable bundle must prevent ACME traffic"
     );
 
     let (cert_path, key_path) = host.client_pair();
