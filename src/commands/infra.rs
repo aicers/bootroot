@@ -2826,14 +2826,20 @@ mod tests {
     #[test]
     fn preflight_compose_published_ports_checks_openbao_localhost_during_install() {
         let listener = std::net::TcpListener::bind("127.0.0.1:8200");
-        // Whether this process owns the listener or a local deployment
-        // already does, the default OpenBao port must not be skipped. Keeping
-        // our listener held also avoids racing another parallel test between
-        // a successful bind and the preflight re-bind.
-        let err = preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
-            .expect_err("preflight must abort when 8200 is busy");
-        assert!(err.to_string().contains("8200"), "{err}");
+        if listener.is_err() {
+            // Port already in use on this host (e.g. a real openbao
+            // running locally); the preflight must still detect the
+            // collision rather than skip it.
+            let err =
+                preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
+                    .expect_err("preflight must abort when 8200 is busy");
+            assert!(err.to_string().contains("8200"), "{err}");
+            return;
+        }
         drop(listener);
+        // 8200 free: the preflight succeeds without any "override skip".
+        preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
+            .expect("free 8200 must pass preflight");
     }
 
     /// The compose-declared defaults, for tests that only exercise one

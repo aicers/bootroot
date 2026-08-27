@@ -630,6 +630,19 @@ struct RegistrarMaintenance {
     counts: Arc<crate::registrar::verbs::limiter::CountingLimitedInvocationSink>,
 }
 
+/// Copies the limiter's process-lifetime counters into the shared snapshot.
+#[cfg(target_os = "linux")]
+pub(crate) fn refresh_registrar_health(
+    health: &Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    counts: &crate::registrar::verbs::limiter::CountingLimitedInvocationSink,
+) {
+    let mut snapshot = health.lock().unwrap_or_else(PoisonError::into_inner);
+    snapshot.limiter.limited_predecision_refusal =
+        counts.count(crate::registrar::verbs::limiter::LimiterBucket::PredecisionRefusal);
+    snapshot.limiter.limited_admission =
+        counts.count(crate::registrar::verbs::limiter::LimiterBucket::Admission);
+}
+
 /// The adopted endpoint and the handler that will answer on it, or
 /// `None` when the endpoint is disabled.
 #[cfg(target_os = "linux")]
@@ -748,16 +761,7 @@ fn spawn_openbao_audit_rotation(
                 shutdown_rx,
                 move || {
                     maintenance.coalescing.maintain();
-                    let mut snapshot = maintenance
-                        .health
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    snapshot.limiter.limited_predecision_refusal = maintenance
-                        .counts
-                        .count(crate::registrar::verbs::limiter::LimiterBucket::PredecisionRefusal);
-                    snapshot.limiter.limited_admission = maintenance
-                        .counts
-                        .count(crate::registrar::verbs::limiter::LimiterBucket::Admission);
+                    refresh_registrar_health(&maintenance.health, &maintenance.counts);
                 },
             ),
         ));
