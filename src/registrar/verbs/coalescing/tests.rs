@@ -89,7 +89,7 @@ fn assert_window_span(record: &AuditRecord) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn windows_coalesce_by_key_and_forward_every_event_to_the_counter() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -146,7 +146,7 @@ async fn windows_coalesce_by_key_and_forward_every_event_to_the_counter() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn an_arrival_at_an_expired_deadline_closes_its_predecessor_before_counting_it() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -186,7 +186,7 @@ async fn an_arrival_at_an_expired_deadline_closes_its_predecessor_before_countin
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn maintenance_closes_a_silent_window_at_its_deadline() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -218,7 +218,7 @@ async fn maintenance_closes_a_silent_window_at_its_deadline() {
     assert_window_span(&records[0]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn a_failed_limited_record_write_keeps_the_limiter_decision_nonfatal() {
     let sink = Arc::new(sink());
     sink.store.faults().append.store(true, Ordering::SeqCst);
@@ -238,7 +238,7 @@ async fn a_failed_limited_record_write_keeps_the_limiter_decision_nonfatal() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn capacity_flushes_the_oldest_window_without_losing_the_new_event() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -285,7 +285,7 @@ async fn capacity_flushes_the_oldest_window_without_losing_the_new_event() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn an_overdue_capacity_victim_closes_at_its_deadline() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -325,7 +325,7 @@ async fn an_overdue_capacity_victim_closes_at_its_deadline() {
     assert_window_span(record);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn shutdown_flush_closes_an_overdue_window_at_its_deadline() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
@@ -357,7 +357,7 @@ async fn shutdown_flush_closes_an_overdue_window_at_its_deadline() {
     assert_window_span(record);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn one_key_keeps_one_open_window_across_three_rollovers() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));

@@ -141,18 +141,10 @@ impl CoalescingLimitedInvocationSink {
         // Limiter events are already suppressed traffic: a failure to record
         // their aggregate must never retrospectively change that caller's
         // response. This intentionally logs and continues.
-        let result = tokio::runtime::Handle::try_current().map(|handle| {
-            tokio::task::block_in_place(|| handle.block_on(self.store.append(record)))
-        });
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!("could not append coalesced limited registrar audit record: {error}");
-            }
+        match self.store.append_synchronously(record) {
+            Ok(()) => {}
             Err(error) => {
-                warn!(
-                    "could not append coalesced limited registrar audit record outside Tokio: {error}"
-                );
+                warn!("could not append coalesced limited registrar audit record: {error}");
             }
         }
     }

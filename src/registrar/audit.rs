@@ -68,8 +68,8 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
@@ -1322,9 +1322,9 @@ struct StoreInner {
     max_file_bytes: u64,
     max_retained_files: u32,
     expected_uid: u32,
-    /// Serializes append-and-sync, and owns the blocking task running
-    /// one. Held for exactly that operation and never across a verb
-    /// lock or an `OpenBao` call.
+    /// Tracks an asynchronous append and owns its blocking task. Held
+    /// for exactly that operation and never across a verb lock or an
+    /// `OpenBao` call.
     ///
     /// The handle lives *inside* the lock rather than on the awaiting
     /// future's stack because [`AuditRecordStore::append`] can be
@@ -1336,6 +1336,14 @@ struct StoreInner {
     /// starting a second write into the same file. Nothing can hold
     /// this lock while a blocking append is still live.
     append_lock: TokioMutex<Option<JoinHandle<Result<(), AuditStoreError>>>>,
+    /// Serializes the filesystem critical section across asynchronous
+    /// appends and the synchronous bridge used by limiter coalescing.
+    ///
+    /// The bridge cannot enter Tokio's runtime: it is called by a
+    /// synchronous limiter sink and must work on either runtime flavor.
+    /// This mutex is taken only by blocking filesystem work, never by an
+    /// async task directly.
+    filesystem_lock: Mutex<()>,
     /// Set when this store creates a name in its directory — the active
     /// file, or a rotated generation — and cleared only by a directory
     /// flush that succeeded. A failed flush therefore stays owed: the
@@ -1649,6 +1657,7 @@ impl AuditRecordStore {
             max_retained_files: settings.max_retained_files,
             expected_uid,
             append_lock: TokioMutex::new(None),
+            filesystem_lock: Mutex::new(()),
             pending_dir_sync: AtomicBool::new(false),
             #[cfg(test)]
             tempdir: None,
@@ -1770,6 +1779,59 @@ impl AuditRecordStore {
     ///   write that fails after a partial write is undone, and the
     ///   undo flushed, before [`AuditStoreError::Append`] is returned.
     pub async fn append(&self, record: AuditRecord) -> Result<(), AuditStoreError> {
+        let line = Self::serialize_record(record)?;
+        // Held for the append-and-sync operation only. The blocking
+        // work below is the entire critical section, so this guard
+        // never spans a verb lock or an `OpenBao` call.
+        let mut in_flight = self.inner.append_lock.lock().await;
+        // An append whose caller went away left its blocking task
+        // running and its handle here. Wait for it before starting
+        // another: that task is still writing into the same file, and
+        // nothing can abort it.
+        Self::settle_abandoned(&mut in_flight).await;
+        let inner = Arc::clone(&self.inner);
+        let handle = in_flight.insert(tokio::task::spawn_blocking(move || {
+            let _filesystem = inner
+                .filesystem_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            inner.append_blocking(&line)
+        }));
+        // Awaited *through* the slot rather than taken out of it:
+        // dropping this future here has to leave the handle where the
+        // next append looks for it.
+        let joined = handle.await;
+        *in_flight = None;
+        match joined {
+            Ok(result) => result,
+            Err(err) => Err(AuditStoreError::TaskJoin {
+                message: err.to_string(),
+            }),
+        }
+    }
+
+    /// Appends one record without entering a Tokio runtime.
+    ///
+    /// This is the bridge for synchronous callers whose bounded work
+    /// requires an inline audit attempt. It shares the filesystem lock
+    /// with [`Self::append`], so it cannot write beside an async append.
+    /// Callers must keep failures explicit; this does not add a
+    /// best-effort or skip mode to the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::append`].
+    pub(crate) fn append_synchronously(&self, record: AuditRecord) -> Result<(), AuditStoreError> {
+        let line = Self::serialize_record(record)?;
+        let _filesystem = self
+            .inner
+            .filesystem_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.inner.append_blocking(&line)
+    }
+
+    fn serialize_record(record: AuditRecord) -> Result<Vec<u8>, AuditStoreError> {
         if record.record_version != AUDIT_RECORD_VERSION {
             return Err(AuditStoreError::UnsupportedRecordVersion {
                 version: record.record_version,
@@ -1850,31 +1912,7 @@ impl AuditRecordStore {
                 nanosecond: record.ts.nanosecond(),
             });
         }
-        let line = record.into_bounded().to_line()?;
-        // Held for the append-and-sync operation only. The blocking
-        // work below is the entire critical section, so this guard
-        // never spans a verb lock or an `OpenBao` call.
-        let mut in_flight = self.inner.append_lock.lock().await;
-        // An append whose caller went away left its blocking task
-        // running and its handle here. Wait for it before starting
-        // another: that task is still writing into the same file, and
-        // nothing can abort it.
-        Self::settle_abandoned(&mut in_flight).await;
-        let inner = Arc::clone(&self.inner);
-        let handle = in_flight.insert(tokio::task::spawn_blocking(move || {
-            inner.append_blocking(&line)
-        }));
-        // Awaited *through* the slot rather than taken out of it:
-        // dropping this future here has to leave the handle where the
-        // next append looks for it.
-        let joined = handle.await;
-        *in_flight = None;
-        match joined {
-            Ok(result) => result,
-            Err(err) => Err(AuditStoreError::TaskJoin {
-                message: err.to_string(),
-            }),
-        }
+        record.into_bounded().to_line()
     }
 
     /// Waits for the blocking half of an append whose caller was
