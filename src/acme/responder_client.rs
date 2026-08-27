@@ -155,6 +155,49 @@ pub async fn register_http01_token(
     Ok(())
 }
 
+/// Registers a token over the registrar bundle-repair bootstrap transport.
+///
+/// HTTPS requests use only preconfigured certificate fingerprints and the
+/// chain the responder presents.  This deliberately does not inspect the
+/// configured CA bundle, which is the state the surrounding issuance repairs.
+pub(crate) async fn register_http01_token_with_bootstrap(
+    settings: &Settings,
+    token: &str,
+    key_authorization: &str,
+    pins: &[String],
+) -> Result<()> {
+    let base_url = settings.acme.http_responder_url.trim_end_matches('/');
+    let client = if base_url.starts_with("https://") {
+        Client::builder()
+            .timeout(Duration::from_secs(
+                settings.acme.http_responder_timeout_secs,
+            ))
+            .use_preconfigured_tls(crate::tls::build_bootstrap_client_config(pins)?)
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to build bootstrap responder client: {error}")
+            })?
+    } else {
+        Client::builder()
+            .timeout(Duration::from_secs(
+                settings.acme.http_responder_timeout_secs,
+            ))
+            .build()
+            .map_err(|error| anyhow::anyhow!("Failed to build responder client: {error}"))?
+    };
+    let registration = ResponderRegistration {
+        base_url,
+        hmac_secret: settings.acme.http_responder_hmac.expose(),
+        timeout_secs: settings.acme.http_responder_timeout_secs,
+        token,
+        key_authorization,
+        ttl_secs: settings.acme.http_responder_token_ttl_secs,
+        trust: None,
+    };
+    send_registration(&registration, &client).await?;
+    Ok(())
+}
+
 /// Reads the CA bundle PEM from disk when `TrustSettings::ca_bundle_path` is set.
 fn read_ca_pem_from_trust(trust: &crate::config::TrustSettings) -> Result<Option<String>> {
     let Some(path) = trust.ca_bundle_path.as_ref() else {
@@ -814,6 +857,47 @@ mod tests {
         assert!(
             err.to_string().contains("Failed to register HTTP-01 token"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_responder_tls_uses_pins_without_reading_the_bundle() {
+        let (_ca_pem, ca_fingerprint, server_cert_der, server_key_der, ca_der) =
+            generate_tls_responder_ca();
+        let port = start_tls_responder(server_cert_der, server_key_der, ca_der).await;
+        let mut settings = test_settings(&format!("https://localhost:{port}"), "hmac-secret");
+        settings.trust.ca_bundle_path = Some("/not/read/by/bootstrap.pem".into());
+        settings.trust.trusted_ca_sha256 = vec![ca_fingerprint];
+
+        register_http01_token_with_bootstrap(
+            &settings,
+            "tok",
+            "tok.key",
+            &settings.trust.trusted_ca_sha256,
+        )
+        .await
+        .expect("bootstrap responder TLS should use the presented pinned chain");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_responder_tls_rejects_a_mismatched_pin() {
+        let (_ca_pem, _ca_fingerprint, server_cert_der, server_key_der, ca_der) =
+            generate_tls_responder_ca();
+        let port = start_tls_responder(server_cert_der, server_key_der, ca_der).await;
+        let mut settings = test_settings(&format!("https://localhost:{port}"), "hmac-secret");
+        settings.trust.ca_bundle_path = Some("/not/read/by/bootstrap.pem".into());
+        settings.trust.trusted_ca_sha256 = vec!["00".repeat(32)];
+
+        assert!(
+            register_http01_token_with_bootstrap(
+                &settings,
+                "tok",
+                "tok.key",
+                &settings.trust.trusted_ca_sha256,
+            )
+            .await
+            .is_err(),
+            "an unpinned responder chain must fail closed"
         );
     }
 
