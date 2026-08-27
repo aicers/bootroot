@@ -1747,6 +1747,22 @@ container_audit_bind() {
     2>>"$RUN_LOG" || true
 }
 
+# A unit-name list from `systemctl show`, folded to a form the rendered
+# name can be compared against.
+#
+# The reserve's mount unit is named for its path, so every `-` in that
+# path is `\x2d` in the unit name -- and a name carrying a backslash is
+# one `systemctl show` considers to need quoting.  It prints it as a
+# double-quoted word with each backslash doubled, so the raw name this
+# run rendered is a substring of neither `After=` nor `Wants=` as they
+# come back.  Both sides drop their quotes and backslashes here rather
+# than this script reimplementing systemd's quoting rules to rebuild the
+# printed spelling; what is left still names the unit unambiguously.
+fold_unit_list() {
+  local folded="${1//\\/}"
+  printf '%s' "${folded//\"/}"
+}
+
 # Everything the reserve is for on the deployment's side: a live OpenBao
 # writing its mandatory file audit device into a mounted one.
 #
@@ -1836,16 +1852,18 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   # is the residual both manuals state and which this asserts rather
   # than quietly strengthens.
   if sudo -n systemctl cat docker.service >/dev/null 2>&1; then
-    case "$(sudo -n systemctl show docker.service -p After --value)" in
-      *"$unit"*) pass "the loaded docker.service orders itself after the mount unit" ;;
+    local folded_unit
+    folded_unit="$(fold_unit_list "$unit")"
+    case "$(fold_unit_list "$(sudo -n systemctl show docker.service -p After --value)")" in
+      *"$folded_unit"*) pass "the loaded docker.service orders itself after the mount unit" ;;
       *) fail "docker.service does not order itself after $unit" ;;
     esac
-    case "$(sudo -n systemctl show docker.service -p Wants --value)" in
-      *"$unit"*) pass "the loaded docker.service wants the mount unit" ;;
+    case "$(fold_unit_list "$(sudo -n systemctl show docker.service -p Wants --value)")" in
+      *"$folded_unit"*) pass "the loaded docker.service wants the mount unit" ;;
       *) fail "docker.service does not want $unit" ;;
     esac
-    case "$(sudo -n systemctl show docker.service -p Requires --value)" in
-      *"$unit"*) fail "docker.service carries a hard relation to $unit" ;;
+    case "$(fold_unit_list "$(sudo -n systemctl show docker.service -p Requires --value)")" in
+      *"$folded_unit"*) fail "docker.service carries a hard relation to $unit" ;;
       *) pass "the loaded docker.service carries no hard relation to the mount unit" ;;
     esac
   else
