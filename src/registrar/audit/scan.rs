@@ -468,6 +468,11 @@ fn classify_line(line: &[u8], data: &mut FileData, scan_state: Option<&mut ScanS
             (record.phase, record.outcome.is_some()),
             (AuditPhase::Intent | AuditPhase::Limited, true) | (AuditPhase::Outcome, false)
         )
+        || (matches!(record.phase, AuditPhase::Intent | AuditPhase::Outcome)
+            && (record.limited_bucket.is_some()
+                || record.count.is_some()
+                || record.window_start.is_some()
+                || record.window_end.is_some()))
         || (record.phase == AuditPhase::Limited
             && (!record.request_id.is_empty()
                 || !record.requested.service_name.is_empty()
@@ -790,6 +795,79 @@ mod tests {
             .expect("scan limited record");
         assert_eq!(scan.malformed_records, 0);
         assert_eq!(scan.intent_without_outcome, 1);
+    }
+
+    #[test]
+    fn rejects_limited_only_fields_on_intents_and_outcomes_without_pairing_side_effects() {
+        let dir = audit_store();
+        let now = OffsetDateTime::now_utc();
+        let request_id = "paired".to_string();
+        append_record(
+            dir.path(),
+            &AuditRecord::intent(
+                now - Duration::minutes(2),
+                request_id.clone(),
+                AuditVerb::Mint,
+                "caller".to_string(),
+                identity(),
+            ),
+        );
+        append_record(
+            dir.path(),
+            &AuditRecord::outcome(
+                now - Duration::minutes(1),
+                request_id,
+                AuditVerb::Mint,
+                "caller".to_string(),
+                identity(),
+                None,
+                AuditOutcome::FirstMint,
+            ),
+        );
+
+        macro_rules! append_records_with_limited_field {
+            ($field:ident, $value:expr, $request_id:literal) => {{
+                let mut intent = AuditRecord::intent(
+                    now - Duration::minutes(2),
+                    $request_id.to_string(),
+                    AuditVerb::Mint,
+                    "caller".to_string(),
+                    identity(),
+                );
+                intent.$field = Some($value);
+                append_record(dir.path(), &intent);
+
+                let mut outcome = AuditRecord::outcome(
+                    now - Duration::minutes(1),
+                    "paired".to_string(),
+                    AuditVerb::Mint,
+                    "caller".to_string(),
+                    identity(),
+                    None,
+                    AuditOutcome::FirstMint,
+                );
+                outcome.$field = Some($value);
+                append_record(dir.path(), &outcome);
+            }};
+        }
+
+        append_records_with_limited_field!(
+            limited_bucket,
+            super::super::LimitedBucket::Admission,
+            "limited-bucket-intent"
+        );
+        append_records_with_limited_field!(count, 1, "count-intent");
+        append_records_with_limited_field!(
+            window_start,
+            now - Duration::seconds(60),
+            "window-start-intent"
+        );
+        append_records_with_limited_field!(window_end, now, "window-end-intent");
+
+        let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect("scan mixed-phase limited fields");
+        assert_eq!(scan.malformed_records, 8);
+        assert_eq!(scan.intent_without_outcome, 0);
     }
 
     #[test]
