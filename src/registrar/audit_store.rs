@@ -51,6 +51,16 @@ pub const RECORDS_SUBDIR: &str = "records";
 /// into.
 pub const OPENBAO_SUBDIR: &str = "openbao";
 
+/// The container path `openbao/openbao.hcl`'s audit stanza writes its
+/// file audit device to, and the destination the rendered Compose
+/// override binds [`OPENBAO_SUBDIR`] at.
+///
+/// One spelling, because two places need it for different reasons: the
+/// install side renders the bind mount, and the daemon's rotation
+/// identifies its own container by looking for exactly that
+/// destination in a running container's mount table.
+pub const OPENBAO_CONTAINER_AUDIT_DIR: &str = "/openbao/audit";
+
 /// Mode of the store directory and of [`RECORDS_SUBDIR`].
 pub const STORE_DIR_MODE: u32 = 0o700;
 

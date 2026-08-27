@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::registrar::audit_store::{
-    AuditStoreLayoutError, PRODUCTION_UID, STORE_DIR_MODE, check_ancestors, check_store_directory,
-    create_layout,
+    AuditStoreLayoutError, OPENBAO_CONTAINER_AUDIT_DIR, PRODUCTION_UID, STORE_DIR_MODE,
+    check_ancestors, check_store_directory, create_layout,
 };
 use serde::Deserialize;
 
@@ -35,7 +35,7 @@ use crate::state::StateFile;
 
 /// The container path `openbao/openbao.hcl` writes its file audit
 /// device to. Unchanged by this override — only what backs it moves.
-const OPENBAO_AUDIT_CONTAINER_PATH: &str = "/openbao/audit";
+const OPENBAO_AUDIT_CONTAINER_PATH: &str = OPENBAO_CONTAINER_AUDIT_DIR;
 
 /// The `openbao` service's other two mounts, re-declared verbatim
 /// because `!override` replaces the whole list and dropping one would

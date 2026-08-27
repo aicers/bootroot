@@ -1364,6 +1364,53 @@ write_manifest() {
 EOF
 }
 
+# Establishes the reopen against the running image, proves the check
+# that establishes it can go red, and then holds the device to the
+# unmodified audit-log assertion.
+#
+# The order is the point. `bootroot-agent` rotates this device by
+# renaming the active log aside and signalling the container, and that
+# is lossless only where the image honours `SIGHUP`; where it does not,
+# every rotation silently degrades to a copy-and-truncate that destroys
+# the records written while the copy runs. Re-establishing it on every
+# lifecycle pass is what turns an `OPENBAO_IMAGE` bump that breaks the
+# reopen into a red build rather than a quiet loss of audit records.
+#
+# The audit-log assertion then runs *after* a signal-form rotation has
+# occurred, against the active log OpenBao created — with a fresh
+# AppRole login and KV read driven into it first, since the entries it
+# looks for went into the renamed generation.
+assert_openbao_audit_device() {
+  local container="${RUN_INSTANCE}-openbao"
+
+  log_phase "assert-openbao-audit-reopen"
+  assert_openbao_audit_reopen "$container" "$OPENBAO_URL" \
+    "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID"
+  assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target \
+    "$container" "$OPENBAO_URL"
+
+  log_phase "assert-openbao-audit-log"
+  drive_openbao_audit_traffic
+  assert_openbao_audit_log "$container"
+}
+
+# Drives one AppRole login and one KV read, so the active log OpenBao
+# created after the reopen carries both of the entries
+# `assert_openbao_audit_log` looks for.
+drive_openbao_audit_traffic() {
+  local url="${OPENBAO_URL%/}" token
+
+  token="$(
+    curl -sS -X POST -H 'Content-Type: application/json' \
+      -d "{\"role_id\":\"${RUNTIME_ROTATE_ROLE_ID}\",\"secret_id\":\"${RUNTIME_ROTATE_SECRET_ID}\"}" \
+      "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
+  )"
+  [ -n "$token" ] || fail "the post-rotation AppRole login returned no token"
+  curl -sS -o /dev/null -H "X-Vault-Token: ${token}" \
+    "${url}/v1/secret/data/bootroot" ||
+    fail "the post-rotation KV read could not be driven"
+}
+
 main() {
   mkdir -p "$ARTIFACT_DIR" "$WORKSPACE_DIR" "$CERT_META_DIR" "$REMOTE_DIR" "$REMOTE_CERTS_DIR"
   : >"$PHASE_LOG"
@@ -1419,8 +1466,7 @@ main() {
   run_rotations_with_verification
   stop_local_bootroot_agent_daemons
 
-  log_phase "assert-openbao-audit-log"
-  assert_openbao_audit_log "${RUN_INSTANCE}-openbao"
+  assert_openbao_audit_device
 
   write_manifest
 }

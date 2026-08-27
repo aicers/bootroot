@@ -1,4 +1,4 @@
-//! Tests for the `OpenBao` audit device's in-place rotation.
+//! Tests for the `OpenBao` audit device's rotation.
 //!
 //! Everything here runs against a real directory under
 //! `tempfile::tempdir()`, because every guarantee this module makes is a
@@ -8,6 +8,11 @@
 //! clock-rollback case is driven rather than waited for, and so is the
 //! sequence namespace.
 //!
+//! Docker is behind a seam ([`StubDocker`]), so both forms are reachable
+//! without a daemon: a stub that matches no container drives the
+//! fallback, and one that creates a fresh active log when it is
+//! signalled drives the signal form. Neither ever runs `docker`.
+//!
 //! The bounds used below are far under
 //! [`MIN_OPENBAO_AUDIT_MAX_FILE_BYTES`] on purpose. That floor is a
 //! configuration rule, enforced where a configuration is loaded; the
@@ -15,7 +20,7 @@
 //! to megabyte files would buy nothing but minutes.
 
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt as _;
+use std::future::Future;
 use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use time::format_description::well_known::Rfc3339;
+use tracing::instrument::WithSubscriber as _;
 
 use super::*;
 
@@ -33,31 +39,53 @@ use super::*;
 /// A hook a test installs to observe or measure a pass mid-flight.
 type PassHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
-/// Switches a test flips to make one step of a pass fail, and the two
-/// hooks that let it look at state a pass holds for one instant.
+/// The active log's contents, its identity and the retained set's
+/// names, as one moment of a pass found them.
+type Restored = Option<(Vec<u8>, (u64, u64), Vec<String>)>;
+
+/// Switches a test flips to make one step of a pass fail, and the hooks
+/// that let it look at, or interfere with, state a pass holds for one
+/// instant.
 ///
-/// A failed `fsync`, a failed truncate and a failed unlink cannot be
-/// provoked from outside the process, and "the step returned an error"
-/// is exactly the case whose handling this module is mostly about.
+/// A failed `fsync`, a failed rename, a failed truncate and a failed
+/// unlink cannot be provoked from outside the process, and "the step
+/// returned an error" is exactly the case this module is mostly about.
 /// Every check that reads one is `#[cfg(test)]`, so a shipped build
 /// contains neither the field nor the branch.
 pub(crate) struct FaultInjection {
     /// Fail the flush of the staging copy.
-    pub(crate) staging_sync: AtomicBool,
+    staging_sync: AtomicBool,
     /// Fail the flush of the directory the generation was published
     /// into.
-    pub(crate) directory_sync: AtomicBool,
+    directory_sync: AtomicBool,
     /// Fail the truncate that empties the active log.
-    pub(crate) truncate: AtomicBool,
+    truncate: AtomicBool,
     /// Fail the flush that makes that truncate durable.
-    pub(crate) active_sync: AtomicBool,
+    active_sync: AtomicBool,
     /// Index into the oldest-first trim at which every further removal
     /// fails. `usize::MAX` disarms it.
     trim_fails_from: AtomicUsize,
     /// Fail the flush that makes a trim's deletions durable.
     trim_sync: AtomicBool,
+    /// Fail the rotation-intent marker's write.
+    marker_write: AtomicBool,
+    /// Fail the marker's unlink.
+    marker_unlink: AtomicBool,
+    /// Fail the flush that makes that unlink durable.
+    marker_flush: AtomicBool,
+    /// Fail the rename that moves the active log aside.
+    rename: AtomicBool,
+    /// Fail the flush that has to land before the signal.
+    rename_sync: AtomicBool,
+    /// Fail the rename-back. `0` is off, `1` an ordinary error and `2`
+    /// the `EEXIST` a name that appeared under it produces — which is
+    /// not a failure by itself, so the branch it opens has to be
+    /// drivable on its own.
+    restore_rename: AtomicUsize,
+    /// Fail the flush that makes the rename-back durable.
+    restore_sync: AtomicBool,
     /// Runs with the active log's path, after the size decision has
-    /// been taken on it and before the copy opens it.
+    /// been taken on it and before the fallback's copy opens it.
     before_stage: Mutex<Option<PassHook>>,
     /// Runs with the staging copy's path, after it is staged and before
     /// it is published.
@@ -65,6 +93,13 @@ pub(crate) struct FaultInjection {
     /// Runs with the published generation's path, after the directory
     /// flush and before the truncate.
     before_truncate: Mutex<Option<PassHook>>,
+    /// Runs with the active log's path, immediately before the
+    /// recovery's first look — the window a reopen landing after the
+    /// deadline arrives in.
+    before_recovery: Mutex<Option<PassHook>>,
+    /// Runs with the active log's path, after that look and before the
+    /// rename-back — the window an `EEXIST` is produced in.
+    before_restore_rename: Mutex<Option<PassHook>>,
 }
 
 impl Default for FaultInjection {
@@ -76,11 +111,25 @@ impl Default for FaultInjection {
             active_sync: AtomicBool::new(false),
             trim_fails_from: AtomicUsize::new(usize::MAX),
             trim_sync: AtomicBool::new(false),
+            marker_write: AtomicBool::new(false),
+            marker_unlink: AtomicBool::new(false),
+            marker_flush: AtomicBool::new(false),
+            rename: AtomicBool::new(false),
+            rename_sync: AtomicBool::new(false),
+            restore_rename: AtomicUsize::new(0),
+            restore_sync: AtomicBool::new(false),
             before_stage: Mutex::new(None),
             after_stage: Mutex::new(None),
             before_truncate: Mutex::new(None),
+            before_recovery: Mutex::new(None),
+            before_restore_rename: Mutex::new(None),
         }
     }
+}
+
+/// Reads one hook out from behind its lock.
+fn hook_of(slot: &Mutex<Option<PassHook>>) -> Option<PassHook> {
+    slot.lock().expect("the hook lock is live").clone()
 }
 
 impl FaultInjection {
@@ -108,73 +157,347 @@ impl FaultInjection {
         self.trim_sync.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn marker_write_fails(&self) -> bool {
+        self.marker_write.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn marker_unlink_fails(&self) -> bool {
+        self.marker_unlink.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn marker_flush_fails(&self) -> bool {
+        self.marker_flush.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn rename_fails(&self) -> bool {
+        self.rename.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn rename_sync_fails(&self) -> bool {
+        self.rename_sync.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn restore_rename_fails(&self) -> Option<std::io::ErrorKind> {
+        match self.restore_rename.load(Ordering::SeqCst) {
+            1 => Some(std::io::ErrorKind::Other),
+            2 => Some(std::io::ErrorKind::AlreadyExists),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn restore_sync_fails(&self) -> bool {
+        self.restore_sync.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn before_stage(&self) -> Option<PassHook> {
-        self.before_stage
-            .lock()
-            .expect("the hook lock is live")
-            .clone()
+        hook_of(&self.before_stage)
     }
 
     pub(crate) fn after_stage(&self) -> Option<PassHook> {
-        self.after_stage
-            .lock()
-            .expect("the hook lock is live")
-            .clone()
+        hook_of(&self.after_stage)
     }
 
     pub(crate) fn before_truncate(&self) -> Option<PassHook> {
-        self.before_truncate
-            .lock()
-            .expect("the hook lock is live")
-            .clone()
+        hook_of(&self.before_truncate)
+    }
+
+    pub(crate) fn before_recovery(&self) -> Option<PassHook> {
+        hook_of(&self.before_recovery)
+    }
+
+    pub(crate) fn before_restore_rename(&self) -> Option<PassHook> {
+        hook_of(&self.before_restore_rename)
     }
 }
 
 impl OpenBaoAuditRotation {
+    fn faults(&self) -> &FaultInjection {
+        &self.layout.faults
+    }
+
     fn fail_trim_from(&self, index: usize) {
-        self.faults.trim_fails_from.store(index, Ordering::SeqCst);
+        self.faults().trim_fails_from.store(index, Ordering::SeqCst);
     }
 
     fn allow_trim(&self) {
-        self.faults
+        self.faults()
             .trim_fails_from
             .store(usize::MAX, Ordering::SeqCst);
     }
 
     fn fail_trim_sync(&self) {
-        self.faults.trim_sync.store(true, Ordering::SeqCst);
+        self.faults().trim_sync.store(true, Ordering::SeqCst);
     }
 
     fn allow_trim_sync(&self) {
-        self.faults.trim_sync.store(false, Ordering::SeqCst);
+        self.faults().trim_sync.store(false, Ordering::SeqCst);
+    }
+
+    fn fail_staging_sync(&self) {
+        self.faults().staging_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_directory_sync(&self) {
+        self.faults().directory_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_truncate(&self) {
+        self.faults().truncate.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_truncate(&self) {
+        self.faults().truncate.store(false, Ordering::SeqCst);
+    }
+
+    fn fail_active_sync(&self) {
+        self.faults().active_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_active_sync(&self) {
+        self.faults().active_sync.store(false, Ordering::SeqCst);
+    }
+
+    fn fail_marker_write(&self) {
+        self.faults().marker_write.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_marker_unlink(&self) {
+        self.faults().marker_unlink.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_marker_unlink(&self) {
+        self.faults().marker_unlink.store(false, Ordering::SeqCst);
+    }
+
+    fn fail_marker_flush(&self) {
+        self.faults().marker_flush.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_marker_flush(&self) {
+        self.faults().marker_flush.store(false, Ordering::SeqCst);
+    }
+
+    fn fail_rename(&self) {
+        self.faults().rename.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_rename_sync(&self) {
+        self.faults().rename_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_restore_rename(&self) {
+        self.faults().restore_rename.store(1, Ordering::SeqCst);
+    }
+
+    /// Refuses the rename-back exactly as a name that appeared under it
+    /// would, so the post-`EEXIST` re-stat decides on its own.
+    fn refuse_restore_rename(&self) {
+        self.faults().restore_rename.store(2, Ordering::SeqCst);
+    }
+
+    fn allow_restore_rename(&self) {
+        self.faults().restore_rename.store(0, Ordering::SeqCst);
+    }
+
+    fn fail_restore_sync(&self) {
+        self.faults().restore_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn allow_restore_sync(&self) {
+        self.faults().restore_sync.store(false, Ordering::SeqCst);
+    }
+
+    fn install(slot: &Mutex<Option<PassHook>>, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        *slot.lock().expect("the hook lock is live") = Some(Arc::new(hook));
     }
 
     fn before_stage(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
-        *self
-            .faults
-            .before_stage
-            .lock()
-            .expect("the hook lock is live") = Some(Arc::new(hook));
+        Self::install(&self.faults().before_stage, hook);
     }
 
     fn on_stage(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
-        *self
-            .faults
-            .after_stage
-            .lock()
-            .expect("the hook lock is live") = Some(Arc::new(hook));
+        Self::install(&self.faults().after_stage, hook);
     }
 
     fn on_publish(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
-        *self
-            .faults
-            .before_truncate
-            .lock()
-            .expect("the hook lock is live") = Some(Arc::new(hook));
+        Self::install(&self.faults().before_truncate, hook);
+    }
+
+    fn on_recovery(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        Self::install(&self.faults().before_recovery, hook);
+    }
+
+    fn on_restore_rename(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        Self::install(&self.faults().before_restore_rename, hook);
+    }
+
+    fn marker_path(&self) -> &Path {
+        &self.layout.marker_path
+    }
+
+    fn restore_is_pending(&self) -> bool {
+        self.state.pending_restore.is_some()
     }
 
     fn passes(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.passes)
+    }
+}
+
+// ---------------------------------------------------------------------
+// The Docker seam
+// ---------------------------------------------------------------------
+
+/// What a stubbed container "does" when it is signalled.
+type SignalHook = Arc<dyn Fn() + Send + Sync>;
+
+/// One addressing failure: a label and the stub that produces it.
+type AddressingCase = (&'static str, Box<dyn Fn(&Path) -> Arc<StubDocker>>);
+
+/// A [`DockerControl`] a test drives.
+///
+/// Every addressing and signalling failure the rotation has to answer
+/// for is reachable here — Docker unreachable, no match, several
+/// matches, a signal that fails — and so is the one success: a stub
+/// that creates a fresh active log when it is signalled is what an
+/// image honouring `SIGHUP` looks like from the daemon's side.
+pub(crate) struct StubDocker {
+    /// Container id paired with the JSON `docker inspect` would print
+    /// for its `.Mounts`.
+    containers: Vec<(String, String)>,
+    ps_fails: AtomicBool,
+    inspect_fails: AtomicBool,
+    signal_fails: AtomicBool,
+    signalled: Mutex<Vec<String>>,
+    on_signal: Mutex<Option<SignalHook>>,
+}
+
+/// The mount table a container bound at `dir` would report.
+fn bind_mounts_json(dir: &Path) -> String {
+    format!(
+        "[{{\"Type\":\"bind\",\"Source\":\"{}\",\"Destination\":\"{}\"}}]",
+        dir.display(),
+        OPENBAO_CONTAINER_AUDIT_DIR
+    )
+}
+
+impl StubDocker {
+    /// A Docker with no containers at all: the addressing failure that
+    /// drives every fallback test.
+    fn without_containers() -> Arc<Self> {
+        Arc::new(Self {
+            containers: Vec::new(),
+            ps_fails: AtomicBool::new(false),
+            inspect_fails: AtomicBool::new(false),
+            signal_fails: AtomicBool::new(false),
+            signalled: Mutex::new(Vec::new()),
+            on_signal: Mutex::new(None),
+        })
+    }
+
+    /// A Docker whose named containers report the given mount tables.
+    fn with_containers(containers: Vec<(String, String)>) -> Arc<Self> {
+        Arc::new(Self {
+            containers,
+            ps_fails: AtomicBool::new(false),
+            inspect_fails: AtomicBool::new(false),
+            signal_fails: AtomicBool::new(false),
+            signalled: Mutex::new(Vec::new()),
+            on_signal: Mutex::new(None),
+        })
+    }
+
+    /// The one container this install's device directory is bound into.
+    fn bound_to(dir: &Path) -> Arc<Self> {
+        Self::with_containers(vec![("bao".to_string(), bind_mounts_json(dir))])
+    }
+
+    fn fail_ps(&self) {
+        self.ps_fails.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_inspect(&self) {
+        self.inspect_fails.store(true, Ordering::SeqCst);
+    }
+
+    fn fail_signal(&self) {
+        self.signal_fails.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the stub behave like an image that honours the signal: the
+    /// container creates a fresh active log at `active`, on a new inode,
+    /// mode `0600`.
+    fn reopens(&self, active: PathBuf) {
+        self.on_signal(move || create_active_log(&active));
+    }
+
+    /// Makes the stub behave like an image that does not.
+    fn stops_reopening(&self) {
+        *self.on_signal.lock().expect("the hook lock is live") = None;
+    }
+
+    /// Installs what the container does when it is signalled, which is
+    /// the window in which the configured path is absent.
+    fn on_signal(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_signal.lock().expect("the hook lock is live") = Some(Arc::new(hook));
+    }
+
+    fn signalled(&self) -> Vec<String> {
+        self.signalled
+            .lock()
+            .expect("the record lock is live")
+            .clone()
+    }
+}
+
+/// Creates an empty active log the way `OpenBao` would: a fresh inode
+/// at the configured name, mode `0600`, never replacing one already
+/// there.
+fn create_active_log(path: &Path) {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .expect("the reopened active log is created");
+}
+
+impl DockerControl for StubDocker {
+    fn running_containers(&self) -> anyhow::Result<Vec<String>> {
+        if self.ps_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("injected `docker ps` failure");
+        }
+        Ok(self.containers.iter().map(|(id, _)| id.clone()).collect())
+    }
+
+    fn container_mounts(&self, container: &str) -> anyhow::Result<String> {
+        if self.inspect_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("injected `docker inspect` failure");
+        }
+        self.containers
+            .iter()
+            .find(|(id, _)| id == container)
+            .map(|(_, mounts)| mounts.clone())
+            .ok_or_else(|| anyhow::anyhow!("no such container: {container}"))
+    }
+
+    fn signal_hup(&self, container: &str) -> anyhow::Result<()> {
+        self.signalled
+            .lock()
+            .expect("the record lock is live")
+            .push(container.to_string());
+        if let Some(hook) = self
+            .on_signal
+            .lock()
+            .expect("the hook lock is live")
+            .clone()
+        {
+            hook();
+        }
+        if self.signal_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("injected `docker kill` failure");
+        }
+        Ok(())
     }
 }
 
@@ -198,11 +521,44 @@ fn at(offset_secs: i64) -> OffsetDateTime {
     base() + time::Duration::seconds(offset_secs)
 }
 
+/// A rotation over `dir` whose Docker matches no container, so every
+/// pass falls back to copy-and-truncate.
+///
+/// The default deliberately: the mechanics the fallback owns — the
+/// staging copy, the publish, the trim, the bound — are what most of
+/// these tests are about, and they are reached identically either way.
+fn rotation_at(dir: PathBuf, max_file_bytes: u64, max_retained_files: u32) -> OpenBaoAuditRotation {
+    OpenBaoAuditRotation::with_control(
+        dir,
+        max_file_bytes,
+        max_retained_files,
+        StubDocker::without_containers(),
+    )
+}
+
 fn fixture(max_file_bytes: u64, max_retained_files: u32) -> (TempDir, OpenBaoAuditRotation) {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let rotation =
-        OpenBaoAuditRotation::new(dir.path().to_path_buf(), max_file_bytes, max_retained_files);
+    let rotation = rotation_at(dir.path().to_path_buf(), max_file_bytes, max_retained_files);
     (dir, rotation)
+}
+
+/// A rotation whose Docker matches this install's container and whose
+/// container recreates the active log when it is signalled: the signal
+/// form, end to end, with no Docker daemon anywhere.
+fn signal_fixture(
+    max_file_bytes: u64,
+    max_retained_files: u32,
+) -> (TempDir, OpenBaoAuditRotation, Arc<StubDocker>) {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let docker = StubDocker::bound_to(dir.path());
+    docker.reopens(dir.path().join(ACTIVE_FILE_NAME));
+    let rotation = OpenBaoAuditRotation::with_control(
+        dir.path().to_path_buf(),
+        max_file_bytes,
+        max_retained_files,
+        Arc::clone(&docker) as Arc<dyn DockerControl>,
+    );
+    (dir, rotation, docker)
 }
 
 /// One synthetic audit record, fixed width so a test can count bytes.
@@ -268,6 +624,33 @@ fn len_of(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |meta| meta.len())
 }
 
+fn identity_of(path: &Path) -> (u64, u64) {
+    let meta = std::fs::symlink_metadata(path).expect("the path stats");
+    file_identity(&meta)
+}
+
+/// Every byte held by a file of the audit-log family — the active log
+/// and the retained generations — and nothing else.
+///
+/// Deliberately not [`device_bytes`]: the marker and the file it is
+/// staged through are neither, and a "nothing was copied" assertion
+/// they could satisfy would assert nothing.
+fn log_family_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("the device directory lists")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name == ACTIVE_FILE_NAME || parse_rotated_name(name).is_some())
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// Every byte in the device's directory: the retained set, the active
 /// log and anything staged. What "the device's footprint" means.
 fn device_bytes(dir: &Path) -> u64 {
@@ -282,16 +665,20 @@ fn device_bytes(dir: &Path) -> u64 {
 
 /// Runs `body` with a subscriber of its own and answers what it logged.
 ///
-/// `with_default` binds the subscriber to this thread, which is where a
-/// directly driven pass does its work, so nothing leaks between tests
-/// running in parallel.
-fn logs_from(body: impl FnOnce()) -> String {
+/// The subscriber is bound to the future rather than to a thread, and
+/// the pass propagates it into the blocking phases it runs its
+/// filesystem work on, so nothing leaks between tests running in
+/// parallel and nothing a pass logs is lost.
+async fn logs_from<F: Future<Output = ()>>(body: F) -> String {
     #[derive(Clone)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
 
     impl std::io::Write for Captured {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            self.0
+                .lock()
+                .expect("the capture lock is live")
+                .extend_from_slice(buf);
             Ok(buf.len())
         }
 
@@ -307,8 +694,8 @@ fn logs_from(body: impl FnOnce()) -> String {
         .with_max_level(tracing::Level::TRACE)
         .with_writer(move || writer.clone())
         .finish();
-    tracing::subscriber::with_default(subscriber, body);
-    let captured = buffer.lock().unwrap().clone();
+    body.with_subscriber(subscriber).await;
+    let captured = buffer.lock().expect("the capture lock is live").clone();
     String::from_utf8(captured).expect("the captured log is UTF-8")
 }
 
@@ -328,25 +715,15 @@ fn assert_complete_json_lines(path: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Footprint
-// ---------------------------------------------------------------------
-
-/// The one hard ceiling: after every bound evaluation that completes,
-/// the retained generations alone total at or under `S × N`.
-///
-/// Driven with an active log far larger than `S` on every round, so the
-/// count bound alone could never hold it, and with no assumption about
-/// write rate or prior success.
-#[test]
-fn hard_ceiling_holds_after_every_completed_evaluation() {
+#[tokio::test]
+async fn hard_ceiling_holds_after_every_completed_evaluation() {
     let (dir, mut rotation) = fixture(S, N);
     let budget = retained_budget_bytes(S, N);
     for round in 0..24_i64 {
         // Three times the bound, so a generation is oversized and the
         // byte trim rather than the count is what enforces the ceiling.
         append_records(&dir.path().join(ACTIVE_FILE_NAME), S * 3);
-        let outcome = rotation.run_pass(at(round * 60));
+        let outcome = rotation.run_pass(at(round * 60)).await;
         assert!(outcome.evaluated);
         assert!(
             !outcome.retained_unmet,
@@ -373,8 +750,8 @@ fn hard_ceiling_holds_after_every_completed_evaluation() {
 /// instant where the retained set, the active log at its captured
 /// length and the newly published generation coexist. A model the
 /// deployment leaves is a figure this test says nothing about.
-#[test]
-fn conditional_envelope_under_the_stated_model() {
+#[tokio::test]
+async fn conditional_envelope_under_the_stated_model() {
     const W: u64 = 512;
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
@@ -390,7 +767,7 @@ fn conditional_envelope_under_the_stated_model() {
     let mut captured_len = 0_u64;
     for round in 0..8_i64 {
         captured_len = append_records(&active, S + W);
-        let outcome = rotation.run_pass(at(round * 60));
+        let outcome = rotation.run_pass(at(round * 60)).await;
         assert!(outcome.rotated(), "the model's preceding pass succeeded");
 
         // Between passes, under the model.
@@ -417,8 +794,8 @@ fn conditional_envelope_under_the_stated_model() {
 /// A long run of failed passes grows the device's total past the
 /// envelope — specified behaviour, not a defect — while the retained
 /// set stays inside `S × N` throughout.
-#[test]
-fn a_long_run_of_failed_passes_leaves_the_total_unbounded() {
+#[tokio::test]
+async fn a_long_run_of_failed_passes_leaves_the_total_unbounded() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let budget = retained_budget_bytes(S, N);
@@ -427,13 +804,13 @@ fn a_long_run_of_failed_passes_leaves_the_total_unbounded() {
     // populated retained set rather than an empty one.
     for round in 0..4_i64 {
         append_records(&active, S + 256);
-        assert!(rotation.run_pass(at(round * 60)).rotated());
+        assert!(rotation.run_pass(at(round * 60)).await.rotated());
     }
 
-    rotation.faults.truncate.store(true, Ordering::SeqCst);
+    rotation.fail_truncate();
     for round in 4..40_i64 {
         append_records(&active, S);
-        let outcome = rotation.run_pass(at(round * 60));
+        let outcome = rotation.run_pass(at(round * 60)).await;
         assert!(
             outcome.rotation.is_unmet(),
             "round {round} should have failed"
@@ -455,8 +832,8 @@ fn a_long_run_of_failed_passes_leaves_the_total_unbounded() {
 /// A rotation that publishes and empties, followed by a forced trim
 /// failure, counts as unmet rather than completed — and the very next
 /// pass repairs the set although no rotation is required by then.
-#[test]
-fn a_rotation_that_could_not_trim_counts_as_unmet() {
+#[tokio::test]
+async fn a_rotation_that_could_not_trim_counts_as_unmet() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let budget = retained_budget_bytes(S, N);
@@ -467,7 +844,7 @@ fn a_rotation_that_could_not_trim_counts_as_unmet() {
     rotation.fail_trim_from(0);
     append_records(&active, S);
 
-    let failed = rotation.run_pass(at(0));
+    let failed = rotation.run_pass(at(0)).await;
     assert!(failed.rotated(), "the rotation itself completed");
     assert_eq!(len_of(&active), 0, "the active log was emptied");
     assert!(failed.retained_unmet, "the ceiling was left unenforced");
@@ -479,7 +856,7 @@ fn a_rotation_that_could_not_trim_counts_as_unmet() {
         len_of(&active) < S,
         "the next pass has no rotation to perform"
     );
-    let repaired = rotation.run_pass(at(60));
+    let repaired = rotation.run_pass(at(60)).await;
     assert!(!repaired.rotated(), "no rotation was required");
     assert!(!repaired.retained_unmet);
     assert_eq!(repaired.consecutive_failures, 0);
@@ -488,16 +865,20 @@ fn a_rotation_that_could_not_trim_counts_as_unmet() {
 
 /// A set left over budget by a lowered `N` is trimmed on the next pass,
 /// without waiting for a rotation.
-#[test]
-fn a_lowered_bound_is_repaired_without_a_rotation() {
+#[tokio::test]
+async fn a_lowered_bound_is_repaired_without_a_rotation() {
     let dir = tempfile::tempdir().expect("a temporary directory");
+    // Under the size trigger, so no rotation is required — but present,
+    // because a device directory with generations and no active log at
+    // all is a state the daemon refuses to act in.
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     for sequence in 0..6 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S / 2);
     }
     assert_eq!(generation_names(dir.path()).len(), 6);
 
-    let mut lowered = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, 2);
-    let outcome = lowered.run_pass(at(0));
+    let mut lowered = rotation_at(dir.path().to_path_buf(), S, 2);
+    let outcome = lowered.run_pass(at(0)).await;
     assert!(!outcome.rotated(), "no active log, so no rotation");
     assert!(!outcome.retained_unmet);
     assert_eq!(outcome.consecutive_failures, 0);
@@ -507,13 +888,13 @@ fn a_lowered_bound_is_repaired_without_a_rotation() {
 
 /// The plain case: an active log driven past `S` becomes a generation
 /// and the active log is emptied. No device-level total is asserted.
-#[test]
-fn an_active_log_past_the_bound_is_rotated() {
+#[tokio::test]
+async fn an_active_log_past_the_bound_is_rotated() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let captured = append_records(&active, S);
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(outcome.rotated());
     assert_eq!(outcome.consecutive_failures, 0);
     assert_eq!(len_of(&active), 0);
@@ -531,8 +912,8 @@ fn an_active_log_past_the_bound_is_rotated() {
 
 /// The trailing partial record is destroyed whole rather than carried
 /// into the generation, so no record is split across the two files.
-#[test]
-fn a_trailing_partial_record_is_destroyed_rather_than_carried_in() {
+#[tokio::test]
+async fn a_trailing_partial_record_is_destroyed_rather_than_carried_in() {
     use std::io::Write as _;
 
     let (dir, mut rotation) = fixture(S, N);
@@ -547,7 +928,7 @@ fn a_trailing_partial_record_is_destroyed_rather_than_carried_in() {
         .expect("the fragment is written");
     file.flush().expect("the fragment flushes");
 
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
     let names = generation_names(dir.path());
     let published = dir.path().join(names.first().expect("one generation"));
     assert_eq!(
@@ -569,8 +950,8 @@ fn a_trailing_partial_record_is_destroyed_rather_than_carried_in() {
 /// published and the log empty — which is only reachable if the
 /// truncate ran after the directory flush and the flush ran after the
 /// truncate.
-#[test]
-fn the_publish_is_ordered_and_each_pre_commit_failure_unlinks_the_copy() {
+#[tokio::test]
+async fn the_publish_is_ordered_and_each_pre_commit_failure_unlinks_the_copy() {
     for fault in ["staging_sync", "directory_sync", "truncate"] {
         let (dir, mut rotation) = fixture(S, N);
         let active = dir.path().join(ACTIVE_FILE_NAME);
@@ -578,12 +959,12 @@ fn the_publish_is_ordered_and_each_pre_commit_failure_unlinks_the_copy() {
         let before = std::fs::read(&active).expect("the active log reads");
 
         match fault {
-            "staging_sync" => rotation.faults.staging_sync.store(true, Ordering::SeqCst),
-            "directory_sync" => rotation.faults.directory_sync.store(true, Ordering::SeqCst),
-            _ => rotation.faults.truncate.store(true, Ordering::SeqCst),
+            "staging_sync" => rotation.fail_staging_sync(),
+            "directory_sync" => rotation.fail_directory_sync(),
+            _ => rotation.fail_truncate(),
         }
 
-        let outcome = rotation.run_pass(at(0));
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(
             outcome.rotation.is_unmet(),
             "{fault}: the pass should have failed"
@@ -607,8 +988,8 @@ fn the_publish_is_ordered_and_each_pre_commit_failure_unlinks_the_copy() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     append_records(&active, S);
-    rotation.faults.active_sync.store(true, Ordering::SeqCst);
-    let outcome = rotation.run_pass(at(0));
+    rotation.fail_active_sync();
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(outcome.rotation.is_unmet());
     assert_eq!(
         generation_names(dir.path()).len(),
@@ -632,8 +1013,8 @@ fn the_publish_is_ordered_and_each_pre_commit_failure_unlinks_the_copy() {
 /// destroying the records the pass believed it had just copied. The
 /// publish therefore checks that the name it created reached the inode
 /// it staged.
-#[test]
-fn a_staging_path_replaced_before_the_publish_is_refused() {
+#[tokio::test]
+async fn a_staging_path_replaced_before_the_publish_is_refused() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     append_records(&active, S);
@@ -647,7 +1028,7 @@ fn a_staging_path_replaced_before_the_publish_is_refused() {
         std::fs::write(path, b"").expect("the impostor is created");
     });
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a replaced staging path is a failed pass"
@@ -675,8 +1056,8 @@ fn a_staging_path_replaced_before_the_publish_is_refused() {
 /// retained set held; `link` refuses. The refusal is a failed pass, and
 /// its recovery must leave the colliding file alone — it is not this
 /// pass's to unlink.
-#[test]
-fn a_publish_never_overwrites_an_existing_generation() {
+#[tokio::test]
+async fn a_publish_never_overwrites_an_existing_generation() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     append_records(&active, S);
@@ -692,7 +1073,7 @@ fn a_publish_never_overwrites_an_existing_generation() {
         std::fs::write(&occupied, b"an earlier generation\n").expect("the collision is created");
     });
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a name collision is a failed pass, not a silent replacement"
@@ -723,8 +1104,8 @@ fn a_publish_never_overwrites_an_existing_generation() {
 /// records held nowhere else: the staging name is already gone by then,
 /// so the copy is reachable only through the descriptor the pass is
 /// about to drop.
-#[test]
-fn a_generation_replaced_after_the_publish_is_refused_before_the_truncate() {
+#[tokio::test]
+async fn a_generation_replaced_after_the_publish_is_refused_before_the_truncate() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     append_records(&active, S);
@@ -737,7 +1118,7 @@ fn a_generation_replaced_after_the_publish_is_refused_before_the_truncate() {
         std::fs::write(target, b"").expect("the impostor is created");
     });
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a replaced generation is a failed pass"
@@ -775,8 +1156,8 @@ fn a_generation_replaced_after_the_publish_is_refused_before_the_truncate() {
 /// original open for the whole pass, which is what `OpenBao` does: its
 /// writes keep landing on the inode the name stopped leading to, so a
 /// truncate of the replacement would bound nothing at all.
-#[test]
-fn an_active_log_swapped_for_another_regular_file_is_refused_at_the_truncate() {
+#[tokio::test]
+async fn an_active_log_swapped_for_another_regular_file_is_refused_at_the_truncate() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let captured = append_records(&active, S);
@@ -791,7 +1172,7 @@ fn an_active_log_swapped_for_another_regular_file_is_refused_at_the_truncate() {
         std::fs::write(&planted, b"a replacement\n").expect("the replacement is created");
     });
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a swapped active log is a failed pass, never a completed rotation"
@@ -817,8 +1198,8 @@ fn an_active_log_swapped_for_another_regular_file_is_refused_at_the_truncate() {
 
 /// A failure past the commit point never rolls the rotation back, and
 /// the trim in that same pass still runs.
-#[test]
-fn a_failure_past_the_commit_point_keeps_the_generation_and_still_trims() {
+#[tokio::test]
+async fn a_failure_past_the_commit_point_keeps_the_generation_and_still_trims() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let budget = retained_budget_bytes(S, N);
@@ -828,17 +1209,18 @@ fn a_failure_past_the_commit_point_keeps_the_generation_and_still_trims() {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S);
     }
     let captured = append_records(&active, S);
-    rotation.faults.active_sync.store(true, Ordering::SeqCst);
+    rotation.fail_active_sync();
 
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(outcome.rotation.is_unmet(), "the flush failure is owed");
         assert_eq!(outcome.consecutive_failures, 1);
         assert!(
             !outcome.retained_unmet,
             "the trim in the same pass reached the bound"
         );
-    });
+    })
+    .await;
     assert!(
         logs.contains(&active.display().to_string()),
         "the failure names the path it left the generation at"
@@ -856,25 +1238,26 @@ fn a_failure_past_the_commit_point_keeps_the_generation_and_still_trims() {
     assert!(retained_bytes(dir.path()) <= budget);
 
     // And the next pass proceeds normally.
-    rotation.faults.active_sync.store(false, Ordering::SeqCst);
+    rotation.allow_active_sync();
     append_records(&active, S);
-    let next = rotation.run_pass(at(60));
+    let next = rotation.run_pass(at(60)).await;
     assert!(next.rotated());
     assert_eq!(next.consecutive_failures, 0);
 }
 
 /// A trim is never rolled back: deletions already made stay made, and
 /// the next pass resumes from wherever the failed one reached.
-#[test]
-fn a_partial_trim_is_not_rolled_back() {
+#[tokio::test]
+async fn a_partial_trim_is_not_rolled_back() {
     let dir = tempfile::tempdir().expect("a temporary directory");
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     for sequence in 0..6 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S / 4);
     }
-    let mut rotation = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, 2);
+    let mut rotation = rotation_at(dir.path().to_path_buf(), S, 2);
     rotation.fail_trim_from(2);
 
-    let partial = rotation.run_pass(at(0));
+    let partial = rotation.run_pass(at(0)).await;
     assert!(partial.retained_unmet, "a bound is still unmet");
     assert_eq!(partial.consecutive_failures, 1);
     let after = generation_names(dir.path());
@@ -886,7 +1269,7 @@ fn a_partial_trim_is_not_rolled_back() {
     );
 
     rotation.allow_trim();
-    let resumed = rotation.run_pass(at(60));
+    let resumed = rotation.run_pass(at(60)).await;
     assert!(!resumed.retained_unmet);
     assert_eq!(resumed.consecutive_failures, 0);
     assert_eq!(generation_names(dir.path()).len(), 2);
@@ -895,8 +1278,8 @@ fn a_partial_trim_is_not_rolled_back() {
 /// A captured prefix with no newline at all yields no generation and
 /// leaves the active log untouched — while the retained-set bound is
 /// still evaluated, so an over-budget set seeded beforehand is trimmed.
-#[test]
-fn a_prefix_with_no_record_boundary_skips_the_rotation_but_still_trims() {
+#[tokio::test]
+async fn a_prefix_with_no_record_boundary_skips_the_rotation_but_still_trims() {
     use std::io::Write as _;
 
     let (dir, mut rotation) = fixture(S, N);
@@ -915,15 +1298,16 @@ fn a_prefix_with_no_record_boundary_skips_the_rotation_but_still_trims() {
     file.flush().expect("the blob flushes");
     let before = std::fs::read(&active).expect("the active log reads");
 
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(
             outcome.rotation.is_unmet(),
             "the rotation was owed and skipped"
         );
         assert!(!outcome.rotated());
         assert!(!outcome.retained_unmet, "the set was still trimmed");
-    });
+    })
+    .await;
     assert!(logs.contains("no complete record"), "the skip is logged");
     assert_eq!(
         std::fs::read(&active).expect("the active log reads"),
@@ -936,20 +1320,21 @@ fn a_prefix_with_no_record_boundary_skips_the_rotation_but_still_trims() {
 
 /// Trimming is by bytes as well as by count: a set already within `N`
 /// still drops oldest-first until the total is at or under `S × N`.
-#[test]
-fn the_trim_enforces_bytes_and_not_only_the_count() {
+#[tokio::test]
+async fn the_trim_enforces_bytes_and_not_only_the_count() {
     let dir = tempfile::tempdir().expect("a temporary directory");
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     // Each half again as large as `S`, which is what a periodic check
     // legitimately produces: two fit the four-generation budget and
     // three do not, although all three fit it by count.
     for sequence in 0..3 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S + S / 2);
     }
-    let mut rotation = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, 4);
+    let mut rotation = rotation_at(dir.path().to_path_buf(), S, 4);
     assert_eq!(generation_names(dir.path()).len(), 3, "within N by count");
     assert!(retained_bytes(dir.path()) > retained_budget_bytes(S, 4));
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(!outcome.retained_unmet);
     assert!(retained_bytes(dir.path()) <= retained_budget_bytes(S, 4));
     assert!(
@@ -966,19 +1351,21 @@ fn the_trim_enforces_bytes_and_not_only_the_count() {
 /// A single generation larger than the whole retained budget is dropped
 /// whole and logged with its size and the budget — including when the
 /// same pass has just published it.
-#[test]
-fn a_generation_larger_than_the_whole_budget_is_dropped_whole() {
+#[tokio::test]
+async fn a_generation_larger_than_the_whole_budget_is_dropped_whole() {
     let budget = retained_budget_bytes(S, 2);
 
     // Seeded: the oversized generation is already there.
     let dir = tempfile::tempdir().expect("a temporary directory");
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     let seeded = seed_generation(dir.path(), "20260301T115900Z", 0, budget * 3);
     let seeded_len = len_of(&seeded);
-    let mut rotation = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, 2);
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let mut rotation = rotation_at(dir.path().to_path_buf(), S, 2);
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(!outcome.retained_unmet);
-    });
+    })
+    .await;
     assert!(generation_names(dir.path()).is_empty());
     assert!(logs.contains(&seeded_len.to_string()), "the size is logged");
     assert!(logs.contains(&budget.to_string()), "the budget is logged");
@@ -987,14 +1374,15 @@ fn a_generation_larger_than_the_whole_budget_is_dropped_whole() {
     let (fresh, mut rotation) = fixture(S, 2);
     let active = fresh.path().join(ACTIVE_FILE_NAME);
     append_records(&active, budget * 3);
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(outcome.rotated(), "the rotation itself completed");
         assert!(
             !outcome.retained_unmet,
             "and the ceiling was re-established"
         );
-    });
+    })
+    .await;
     assert!(
         generation_names(fresh.path()).is_empty(),
         "the generation this pass published was dropped whole"
@@ -1006,15 +1394,15 @@ fn a_generation_larger_than_the_whole_budget_is_dropped_whole() {
 /// Names carry an always-present zero-padded six-digit sequence, are
 /// one past the greatest already present rather than the lowest unused
 /// one, and sort lexicographically in creation order.
-#[test]
-fn generations_are_named_and_ordered_by_an_always_present_sequence() {
+#[tokio::test]
+async fn generations_are_named_and_ordered_by_an_always_present_sequence() {
     let (dir, mut rotation) = fixture(S, 16);
     let active = dir.path().join(ACTIVE_FILE_NAME);
 
     append_records(&active, S);
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
     append_records(&active, S);
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
     assert_eq!(
         generation_names(dir.path()),
         vec![
@@ -1029,7 +1417,7 @@ fn generations_are_named_and_ordered_by_an_always_present_sequence() {
     std::fs::remove_file(dir.path().join(rotated_file_name("20260301T120000Z", 0)))
         .expect("the oldest generation is removed");
     append_records(&active, S);
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
     assert_eq!(
         generation_names(dir.path()),
         vec![
@@ -1040,7 +1428,7 @@ fn generations_are_named_and_ordered_by_an_always_present_sequence() {
 
     // And across a second boundary the sort is still creation order.
     append_records(&active, S);
-    assert!(rotation.run_pass(at(1)).rotated());
+    assert!(rotation.run_pass(at(1)).await.rotated());
     let names = generation_names(dir.path());
     let mut sorted = names.clone();
     sorted.sort_unstable();
@@ -1059,20 +1447,20 @@ fn generations_are_named_and_ordered_by_an_always_present_sequence() {
 /// A clock stepped backwards cannot reorder the set: the stamp is
 /// floored at the newest existing generation's, so the published name
 /// is strictly greater than every name already present.
-#[test]
-fn a_clock_stepped_backwards_cannot_reorder_the_set() {
+#[tokio::test]
+async fn a_clock_stepped_backwards_cannot_reorder_the_set() {
     let (dir, mut rotation) = fixture(S, 8);
     let active = dir.path().join(ACTIVE_FILE_NAME);
 
     append_records(&active, S);
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
     let first = generation_names(dir.path());
     let earliest = first.first().cloned().expect("a first generation");
 
     // An hour backwards, which is what an NTP step or a manual
     // correction produces.
     append_records(&active, S);
-    assert!(rotation.run_pass(at(-3600)).rotated());
+    assert!(rotation.run_pass(at(-3600)).await.rotated());
     let names = generation_names(dir.path());
     let newest = names.last().cloned().expect("a newest generation");
     assert!(
@@ -1085,10 +1473,10 @@ fn a_clock_stepped_backwards_cannot_reorder_the_set() {
     // written, although the clock says the newest is the older of the
     // two.
     append_records(&active, S);
-    assert!(rotation.run_pass(at(-3600)).rotated());
+    assert!(rotation.run_pass(at(-3600)).await.rotated());
     let published = generation_names(dir.path());
-    let mut tightened = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, 2);
-    assert!(!tightened.run_pass(at(-3600)).retained_unmet);
+    let mut tightened = rotation_at(dir.path().to_path_buf(), S, 2);
+    assert!(!tightened.run_pass(at(-3600)).await.retained_unmet);
     let after = generation_names(dir.path());
     assert!(after.len() < published.len(), "the trim dropped something");
     assert!(
@@ -1105,15 +1493,16 @@ fn a_clock_stepped_backwards_cannot_reorder_the_set() {
     // skipped rather than published out of order.
     let exhausted = tempfile::tempdir().expect("a temporary directory");
     seed_generation(exhausted.path(), "20260301T120500Z", MAX_SEQUENCE, 32);
-    let mut rotation = OpenBaoAuditRotation::new(exhausted.path().to_path_buf(), S, 4);
+    let mut rotation = rotation_at(exhausted.path().to_path_buf(), S, 4);
     let active = exhausted.path().join(ACTIVE_FILE_NAME);
     append_records(&active, S);
     let before = std::fs::read(&active).expect("the active log reads");
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(-3600));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(-3600)).await;
         assert!(outcome.rotation.is_unmet());
         assert!(!outcome.rotated());
-    });
+    })
+    .await;
     assert!(logs.contains("collision sequence"), "the skip is logged");
     assert_eq!(generation_names(exhausted.path()).len(), 1);
     assert_eq!(
@@ -1128,14 +1517,14 @@ fn a_clock_stepped_backwards_cannot_reorder_the_set() {
 /// The rotation is not even given `openbao_audit_min_retain_days` — it
 /// is a declared target the trim never consults — and this pins that,
 /// so nobody later adds an age guard that would break the ceiling.
-#[test]
-fn the_ceiling_wins_over_the_retention_age() {
+#[tokio::test]
+async fn the_ceiling_wins_over_the_retention_age() {
     let (dir, mut rotation) = fixture(S, 2);
     let active = dir.path().join(ACTIVE_FILE_NAME);
     let mut published = Vec::new();
     for round in 0..3_i64 {
         append_records(&active, S);
-        assert!(rotation.run_pass(at(round)).rotated());
+        assert!(rotation.run_pass(at(round)).await.rotated());
         published = generation_names(dir.path());
     }
     let names = generation_names(dir.path());
@@ -1154,8 +1543,8 @@ fn the_ceiling_wins_over_the_retention_age() {
 /// Staging copies and generations carry mode `0600` and the device
 /// directory's uid and gid, both applied before the publish; the active
 /// log's own owner and mode survive a rotation unchanged.
-#[test]
-fn staging_copies_and_generations_carry_the_directory_owner_at_mode_0600() {
+#[tokio::test]
+async fn staging_copies_and_generations_carry_the_directory_owner_at_mode_0600() {
     use std::os::unix::fs::MetadataExt as _;
 
     let (dir, mut rotation) = fixture(S, N);
@@ -1172,7 +1561,7 @@ fn staging_copies_and_generations_carry_the_directory_owner_at_mode_0600() {
             Some((meta.permissions().mode() & 0o7777, meta.uid(), meta.gid()));
     });
 
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
 
     let observed = staged
         .lock()
@@ -1224,8 +1613,8 @@ fn staging_copies_and_generations_carry_the_directory_owner_at_mode_0600() {
 /// cases, and the other two — a target below `S`, and a link pointing
 /// at nothing — would otherwise read as a healthy quiet host and as an
 /// unprovisioned one.
-#[test]
-fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
+#[tokio::test]
+async fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
     let elsewhere = tempfile::tempdir().expect("a temporary directory");
 
     // A target at or over `S`, which is the case that would reach the
@@ -1237,7 +1626,7 @@ fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
     std::os::unix::fs::symlink(&target, dir.path().join(ACTIVE_FILE_NAME))
         .expect("the link is planted");
 
-    let outcome = rotation.run_pass(at(0));
+    let outcome = rotation.run_pass(at(0)).await;
     assert!(
         outcome.rotation.is_unmet(),
         "following the link is a pass this must not complete"
@@ -1264,8 +1653,8 @@ fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
     std::os::unix::fs::symlink(&small, dir.path().join(ACTIVE_FILE_NAME))
         .expect("the link is planted");
 
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(
             outcome.rotation.is_unmet(),
             "a link under the size trigger is still tampering"
@@ -1278,7 +1667,8 @@ fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
             outcome.active_bytes, 0,
             "the linked file's size is not the device's footprint"
         );
-    });
+    })
+    .await;
     assert!(logs.contains("not a regular file"), "{logs}");
     assert_eq!(len_of(&small), small_len, "the target is left alone");
 
@@ -1291,14 +1681,15 @@ fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
     )
     .expect("the link is planted");
 
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(
             outcome.rotation.is_unmet(),
             "a broken link is tampering, not an unprovisioned host"
         );
         assert_eq!(outcome.consecutive_failures, 1);
-    });
+    })
+    .await;
     assert!(logs.contains("not a regular file"), "{logs}");
     assert!(
         !logs.contains("no active log"),
@@ -1324,8 +1715,8 @@ fn an_active_log_replaced_by_a_symlink_is_refused_rather_than_followed() {
 ///
 /// Each pass therefore runs on a thread of its own here and the test
 /// fails if it does not come back, rather than hanging the suite.
-#[test]
-fn an_active_log_replaced_after_the_size_check_is_refused_at_each_open() {
+#[tokio::test]
+async fn an_active_log_replaced_after_the_size_check_is_refused_at_each_open() {
     // Between the size decision and the copy's open. The pass has
     // already decided to rotate, so this is the read side, which is the
     // one that would wait rather than fail.
@@ -1338,7 +1729,7 @@ fn an_active_log_replaced_after_the_size_check_is_refused_at_each_open() {
         plant_fifo(path);
     });
 
-    let outcome = returns_within("the copy's open", move || rotation.run_pass(at(0)));
+    let outcome = returns_within("the copy's open", rotation.run_pass(at(0))).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a replaced active log is a failed pass"
@@ -1364,7 +1755,7 @@ fn an_active_log_replaced_after_the_size_check_is_refused_at_each_open() {
     let planted = active.clone();
     rotation.on_publish(move |_| plant_fifo(&planted));
 
-    let outcome = returns_within("the truncate's open", move || rotation.run_pass(at(0)));
+    let outcome = returns_within("the truncate's open", rotation.run_pass(at(0))).await;
     assert!(
         outcome.rotation.is_unmet(),
         "a replaced active log is a failed pass here too"
@@ -1415,38 +1806,30 @@ fn plant_fifo(path: &Path) {
 /// only a deadline can distinguish it from slow.
 const HANG_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Runs `body` on a thread of its own and returns what it produced, or
-/// fails the test naming `label` when it did not return in time.
-fn returns_within<R: Send + 'static>(label: &str, body: impl FnOnce() -> R + Send + 'static) -> R {
-    let (done, waiter) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let value = body();
-        done.send(()).ok();
-        value
-    });
-    match waiter.recv_timeout(HANG_DEADLINE) {
-        Ok(()) => handle.join().expect("the pass does not panic"),
-        // The sender was dropped without sending, so the body panicked.
-        // Joining republishes that panic rather than reporting it as a
-        // hang.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            handle.join().expect("the pass does not panic");
-            unreachable!("a body that dropped the sender without sending panicked")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-            "{label} never returned: it is parked on the planted FIFO, and the rotation task it \
-             runs inside would tick, retry and escalate never again"
-        ),
-    }
+/// Awaits `body` and returns what it produced, or fails the test naming
+/// `label` when it did not return in time.
+///
+/// A pass parks on a blocking thread rather than on the reactor, so the
+/// deadline still fires while the parked one never comes back — which
+/// is exactly the distinction being drawn.
+async fn returns_within<R>(label: &str, body: impl Future<Output = R>) -> R {
+    tokio::time::timeout(HANG_DEADLINE, body)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{label} never returned: it is parked on the planted FIFO, and the rotation task \
+                 it runs inside would tick, retry and escalate never again"
+            )
+        })
 }
 
 /// Generations sit in the device's own directory beside the active log,
 /// and a pass creates no directory at all.
-#[test]
-fn a_pass_creates_no_directory_and_publishes_beside_the_active_log() {
+#[tokio::test]
+async fn a_pass_creates_no_directory_and_publishes_beside_the_active_log() {
     let (dir, mut rotation) = fixture(S, N);
     append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
-    assert!(rotation.run_pass(at(0)).rotated());
+    assert!(rotation.run_pass(at(0)).await.rotated());
 
     let directories: Vec<_> = std::fs::read_dir(dir.path())
         .expect("the device directory lists")
@@ -1466,22 +1849,23 @@ fn a_pass_creates_no_directory_and_publishes_beside_the_active_log() {
 /// A run of consecutive failures warns per increment and escalates at
 /// the threshold and each further multiple, never every tick, and is
 /// reset by the first completed pass.
-#[test]
-fn consecutive_failures_warn_per_pass_and_escalate_at_each_multiple() {
+#[tokio::test]
+async fn consecutive_failures_warn_per_pass_and_escalate_at_each_multiple() {
     let (dir, mut rotation) = fixture(S, N);
     let active = dir.path().join(ACTIVE_FILE_NAME);
-    rotation.faults.truncate.store(true, Ordering::SeqCst);
+    rotation.fail_truncate();
 
     // Appended once rather than per round: the run of failures is what
     // this test is about, and a log that grew past the whole retained
     // budget would bring the pathological-generation warning with it.
     append_records(&active, S);
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..12_i64 {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(outcome.rotation.is_unmet());
         }
-    });
+    })
+    .await;
     assert_eq!(
         count_lines_at(&logs, "ERROR"),
         2,
@@ -1501,46 +1885,49 @@ fn consecutive_failures_warn_per_pass_and_escalate_at_each_multiple() {
         "the retained set's total is in the escalation"
     );
 
-    rotation.faults.truncate.store(false, Ordering::SeqCst);
-    let recovered = logs_from(|| {
-        let outcome = rotation.run_pass(at(12 * 60));
+    rotation.allow_truncate();
+    let recovered = logs_from(async {
+        let outcome = rotation.run_pass(at(12 * 60)).await;
         assert!(outcome.rotated());
         assert_eq!(outcome.consecutive_failures, 0);
-    });
-    assert_eq!(count_lines_at(&recovered, "ERROR"), 0);
-    assert_eq!(count_lines_at(&recovered, "WARN"), 0);
+    })
+    .await;
+    assert_eq!(count_lines_at(&recovered, "ERROR"), 0, "{recovered}");
+    assert_eq!(count_lines_at(&recovered, "WARN"), 0, "{recovered}");
 }
 
 /// A pass with no unmet obligation of either kind neither increments
 /// nor escalates, on a quiet host and on one where the gate is on but
 /// nothing was ever provisioned — and the same hosts seeded over budget
 /// are repaired and reset, or escalate when the trim is forced to fail.
-#[test]
-fn a_pass_with_nothing_owed_never_increments_or_escalates() {
+#[tokio::test]
+async fn a_pass_with_nothing_owed_never_increments_or_escalates() {
     let ticks = i64::from(FAILURE_ESCALATION_THRESHOLD) * 4;
 
     // A quiet host: an active log that never reaches S.
     let (quiet, mut rotation) = fixture(S, N);
     append_records(&quiet.path().join(ACTIVE_FILE_NAME), S / 4);
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..ticks {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(outcome.evaluated);
             assert_eq!(outcome.consecutive_failures, 0);
         }
-    });
+    })
+    .await;
     assert_eq!(count_lines_at(&logs, "WARN"), 0, "{logs}");
     assert_eq!(count_lines_at(&logs, "ERROR"), 0, "{logs}");
 
     // A host where the gate is on and nothing backs it.
     let (bare, mut rotation) = fixture(S, N);
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..ticks {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(outcome.evaluated, "the directory is there");
             assert_eq!(outcome.consecutive_failures, 0);
         }
-    });
+    })
+    .await;
     assert_eq!(count_lines_at(&logs, "WARN"), 0, "{logs}");
     assert_eq!(count_lines_at(&logs, "ERROR"), 0, "{logs}");
     drop(bare);
@@ -1550,13 +1937,14 @@ fn a_pass_with_nothing_owed_never_increments_or_escalates() {
     for sequence in 0..8 {
         seed_generation(quiet.path(), "20260301T115900Z", sequence, S);
     }
-    let mut rotation = OpenBaoAuditRotation::new(quiet.path().to_path_buf(), S, N);
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let mut rotation = rotation_at(quiet.path().to_path_buf(), S, N);
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(!outcome.rotated());
         assert!(!outcome.retained_unmet);
         assert_eq!(outcome.consecutive_failures, 0);
-    });
+    })
+    .await;
     assert_eq!(count_lines_at(&logs, "WARN"), 0, "{logs}");
 
     // And with the trim forced to fail it increments and escalates,
@@ -1564,15 +1952,16 @@ fn a_pass_with_nothing_owed_never_increments_or_escalates() {
     for sequence in 8..16 {
         seed_generation(quiet.path(), "20260301T115900Z", sequence, S);
     }
-    let mut rotation = OpenBaoAuditRotation::new(quiet.path().to_path_buf(), S, N);
+    let mut rotation = rotation_at(quiet.path().to_path_buf(), S, N);
     rotation.fail_trim_from(0);
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..i64::from(FAILURE_ESCALATION_THRESHOLD) {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(!outcome.rotated(), "no rotation was ever required");
             assert!(outcome.retained_unmet);
         }
-    });
+    })
+    .await;
     assert_eq!(count_lines_at(&logs, "ERROR"), 1, "{logs}");
     assert!(logs.contains("retained-set bound"));
 }
@@ -1580,17 +1969,18 @@ fn a_pass_with_nothing_owed_never_increments_or_escalates() {
 /// A missing active log is a no-op, said once rather than once a tick,
 /// and an absent device directory leaves the pass with nothing
 /// evaluated at all.
-#[test]
-fn a_missing_active_log_is_a_no_op_and_an_absent_directory_evaluates_nothing() {
+#[tokio::test]
+async fn a_missing_active_log_is_a_no_op_and_an_absent_directory_evaluates_nothing() {
     let (dir, mut rotation) = fixture(S, N);
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..20_i64 {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(outcome.evaluated);
             assert!(!outcome.rotation.is_unmet());
             assert_eq!(outcome.active_bytes, 0);
         }
-    });
+    })
+    .await;
     assert_eq!(
         logs.matches("no active log").count(),
         1,
@@ -1598,26 +1988,46 @@ fn a_missing_active_log_is_a_no_op_and_an_absent_directory_evaluates_nothing() {
     );
     assert_eq!(count_lines_at(&logs, "WARN"), 0);
 
-    // Even so, an over-budget set on such a host is trimmed rather than
-    // stranded.
+    // Seed an over-budget set beside it and the pass still refuses to
+    // act, because with the active path absent any of those files may
+    // be the inode OpenBao is writing to. Nothing is trimmed and one
+    // `error` names the state.
     for sequence in 0..8 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S);
     }
-    let outcome = rotation.run_pass(at(0));
+    let seeded = generation_names(dir.path());
+    let refused = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(outcome.rotation.is_unmet());
+        assert!(outcome.retained_unmet, "nothing was established");
+    })
+    .await;
+    assert_eq!(count_lines_at(&refused, "ERROR"), 1, "{refused}");
+    assert!(refused.contains("no rotation-intent marker"), "{refused}");
+    assert_eq!(
+        generation_names(dir.path()),
+        seeded,
+        "a pass that cannot establish which file is live trims nothing"
+    );
+
+    // Give it an active log again and the ordinary trim resumes.
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
+    let outcome = rotation.run_pass(at(60)).await;
     assert!(!outcome.retained_unmet);
     assert!(retained_bytes(dir.path()) <= retained_budget_bytes(S, N));
 
     // An absent directory evaluates nothing.
     let absent = tempfile::tempdir().expect("a temporary directory");
     let missing = absent.path().join("openbao");
-    let mut rotation = OpenBaoAuditRotation::new(missing, S, N);
-    let logs = logs_from(|| {
+    let mut rotation = rotation_at(missing, S, N);
+    let logs = logs_from(async {
         for round in 0..20_i64 {
-            let outcome = rotation.run_pass(at(round * 60));
+            let outcome = rotation.run_pass(at(round * 60)).await;
             assert!(!outcome.evaluated);
             assert_eq!(outcome.consecutive_failures, 0);
         }
-    });
+    })
+    .await;
     assert_eq!(logs.matches("directory is absent").count(), 1, "{logs}");
     assert_eq!(count_lines_at(&logs, "WARN"), 0);
     assert_eq!(count_lines_at(&logs, "ERROR"), 0);
@@ -1637,17 +2047,17 @@ fn a_missing_active_log_is_a_no_op_and_an_absent_directory_evaluates_nothing() {
 /// step at a time inside it: nothing is copied, published, truncated or
 /// deleted through a path that is not the directory this rotation was
 /// given.
-#[test]
-fn a_device_directory_that_is_not_a_directory_is_a_failed_pass() {
+#[tokio::test]
+async fn a_device_directory_that_is_not_a_directory_is_a_failed_pass() {
     let parent = tempfile::tempdir().expect("a temporary directory");
 
     // A regular file where the device directory should be.
     let as_file = parent.path().join("openbao");
     append_records(&as_file, 1);
-    let mut rotation = OpenBaoAuditRotation::new(as_file, S, N);
-    let logs = logs_from(|| {
+    let mut rotation = rotation_at(as_file, S, N);
+    let logs = logs_from(async {
         for round in 0..FAILURE_ESCALATION_THRESHOLD {
-            let outcome = rotation.run_pass(at(i64::from(round) * 60));
+            let outcome = rotation.run_pass(at(i64::from(round) * 60)).await;
             assert!(outcome.evaluated, "a fault is not nothing to evaluate");
             assert!(
                 outcome.retained_unmet,
@@ -1655,7 +2065,8 @@ fn a_device_directory_that_is_not_a_directory_is_a_failed_pass() {
             );
             assert_eq!(outcome.consecutive_failures, round + 1);
         }
-    });
+    })
+    .await;
     assert!(
         !logs.contains("directory is absent"),
         "a directory that is present is not absent:\n{logs}"
@@ -1669,13 +2080,14 @@ fn a_device_directory_that_is_not_a_directory_is_a_failed_pass() {
     // And a device directory under a path that is not a directory,
     // which errors with something other than `NotFound` at every step.
     let beneath = parent.path().join("openbao").join("audit");
-    let mut rotation = OpenBaoAuditRotation::new(beneath, S, N);
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let mut rotation = rotation_at(beneath, S, N);
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(outcome.evaluated);
         assert!(outcome.retained_unmet);
         assert_eq!(outcome.consecutive_failures, 1);
-    });
+    })
+    .await;
     assert!(!logs.contains("directory is absent"), "{logs}");
     assert!(count_lines_at(&logs, "WARN") > 0, "{logs}");
 }
@@ -1690,8 +2102,8 @@ fn a_device_directory_that_is_not_a_directory_is_a_failed_pass() {
 /// inside whatever directory the link named — and a dangling link would
 /// read as `NotFound`, which is the one state that is silent, resets
 /// the counter and disables the escalation with it.
-#[test]
-fn a_symlinked_device_directory_is_refused_rather_than_followed() {
+#[tokio::test]
+async fn a_symlinked_device_directory_is_refused_rather_than_followed() {
     let parent = tempfile::tempdir().expect("a temporary directory");
 
     // A link resolving to a real directory, populated so that a
@@ -1707,10 +2119,10 @@ fn a_symlinked_device_directory_is_refused_rather_than_followed() {
 
     let linked = parent.path().join("openbao");
     std::os::unix::fs::symlink(elsewhere.path(), &linked).expect("the link is planted");
-    let mut rotation = OpenBaoAuditRotation::new(linked, S, N);
+    let mut rotation = rotation_at(linked, S, N);
 
-    let logs = logs_from(|| {
-        let outcome = rotation.run_pass(at(0));
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
         assert!(
             outcome.evaluated,
             "a planted link is not nothing to evaluate"
@@ -1722,7 +2134,8 @@ fn a_symlinked_device_directory_is_refused_rather_than_followed() {
             outcome.active_bytes, 0,
             "nothing behind the link is the device's footprint"
         );
-    });
+    })
+    .await;
     assert!(logs.contains("not a directory"), "{logs}");
     assert_eq!(
         len_of(&active),
@@ -1741,11 +2154,11 @@ fn a_symlinked_device_directory_is_refused_rather_than_followed() {
     let dangling = parent.path().join("dangling");
     std::os::unix::fs::symlink(parent.path().join("never-created"), &dangling)
         .expect("the link is planted");
-    let mut rotation = OpenBaoAuditRotation::new(dangling, S, N);
+    let mut rotation = rotation_at(dangling, S, N);
 
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..FAILURE_ESCALATION_THRESHOLD {
-            let outcome = rotation.run_pass(at(i64::from(round) * 60));
+            let outcome = rotation.run_pass(at(i64::from(round) * 60)).await;
             assert!(
                 outcome.evaluated,
                 "a broken link is tampering, not an unprovisioned host"
@@ -1753,7 +2166,8 @@ fn a_symlinked_device_directory_is_refused_rather_than_followed() {
             assert!(outcome.retained_unmet);
             assert_eq!(outcome.consecutive_failures, round + 1);
         }
-    });
+    })
+    .await;
     assert!(
         !logs.contains("directory is absent"),
         "a link that resolves to nothing is still a link:\n{logs}"
@@ -1775,18 +2189,19 @@ fn a_symlinked_device_directory_is_refused_rather_than_followed() {
 /// retry has to happen on a pass that deleted nothing too, since a host
 /// quiet enough never to trim again would otherwise carry the debt for
 /// as long as it stays quiet.
-#[test]
-fn a_trim_whose_flush_failed_stays_unmet_until_a_later_flush_succeeds() {
+#[tokio::test]
+async fn a_trim_whose_flush_failed_stays_unmet_until_a_later_flush_succeeds() {
     let (dir, mut rotation) = fixture(S, N);
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     for sequence in 0..8 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S);
     }
     rotation.fail_trim_sync();
 
     let mut trimmed = Vec::new();
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..FAILURE_ESCALATION_THRESHOLD {
-            let outcome = rotation.run_pass(at(i64::from(round) * 60));
+            let outcome = rotation.run_pass(at(i64::from(round) * 60)).await;
             assert!(
                 outcome.trim_flush_pending,
                 "round {round}: the deletions are still only in the page cache"
@@ -1800,7 +2215,8 @@ fn a_trim_whose_flush_failed_stays_unmet_until_a_later_flush_succeeds() {
                 trimmed = generation_names(dir.path());
             }
         }
-    });
+    })
+    .await;
     assert!(logs.contains("not durable"), "{logs}");
     assert_eq!(
         count_lines_at(&logs, "ERROR"),
@@ -1816,7 +2232,9 @@ fn a_trim_whose_flush_failed_stays_unmet_until_a_later_flush_succeeds() {
     assert!(retained_bytes(dir.path()) <= retained_budget_bytes(S, N));
 
     rotation.allow_trim_sync();
-    let repaired = rotation.run_pass(at(i64::from(FAILURE_ESCALATION_THRESHOLD) * 60));
+    let repaired = rotation
+        .run_pass(at(i64::from(FAILURE_ESCALATION_THRESHOLD) * 60))
+        .await;
     assert!(
         !repaired.trim_flush_pending,
         "a flush that succeeded clears the debt"
@@ -1834,14 +2252,15 @@ fn a_trim_whose_flush_failed_stays_unmet_until_a_later_flush_succeeds() {
 /// counter and never flush — leaving on disk precisely the over-budget
 /// set a crash restores, with nothing left anywhere that remembers it.
 /// So a fresh instance starts owing a flush rather than assuming one.
-#[test]
-fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
+#[tokio::test]
+async fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
     let (dir, mut rotation) = fixture(S, N);
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S / 4);
     for sequence in 0..8 {
         seed_generation(dir.path(), "20260301T115900Z", sequence, S);
     }
     rotation.fail_trim_sync();
-    let first = rotation.run_pass(at(0));
+    let first = rotation.run_pass(at(0)).await;
     assert!(first.trim_flush_pending);
     assert!(first.retained_unmet);
     let trimmed = generation_names(dir.path());
@@ -1852,11 +2271,11 @@ fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
     // What the new task can see is a set already inside both bounds,
     // which nothing it did put there and no listing can tell apart
     // from one whose deletions reached the disk.
-    let mut restarted = OpenBaoAuditRotation::new(dir.path().to_path_buf(), S, N);
+    let mut restarted = rotation_at(dir.path().to_path_buf(), S, N);
     restarted.fail_trim_sync();
-    let logs = logs_from(|| {
+    let logs = logs_from(async {
         for round in 0..FAILURE_ESCALATION_THRESHOLD {
-            let outcome = restarted.run_pass(at(i64::from(round + 1) * 60));
+            let outcome = restarted.run_pass(at(i64::from(round + 1) * 60)).await;
             assert!(
                 outcome.trim_flush_pending,
                 "round {round}: a new task owes the flush it cannot prove happened"
@@ -1871,7 +2290,8 @@ fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
                 "round {round}: the counter is not reset by a bound held only in the page cache"
             );
         }
-    });
+    })
+    .await;
     assert!(logs.contains("not durable"), "{logs}");
     assert_eq!(
         count_lines_at(&logs, "ERROR"),
@@ -1885,7 +2305,9 @@ fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
     );
 
     restarted.allow_trim_sync();
-    let repaired = restarted.run_pass(at(i64::from(FAILURE_ESCALATION_THRESHOLD + 1) * 60));
+    let repaired = restarted
+        .run_pass(at(i64::from(FAILURE_ESCALATION_THRESHOLD + 1) * 60))
+        .await;
     assert!(
         !repaired.trim_flush_pending,
         "a flush that succeeded discharges the inherited debt"
@@ -1896,8 +2318,8 @@ fn the_trim_flush_debt_is_owed_again_by_a_new_rotation_instance() {
 
 /// The runtime budget helper is total, and the expression validation
 /// refuses an overflow of is the one that can overflow.
-#[test]
-fn the_budget_arithmetic_is_total_at_runtime_and_checked_at_validation() {
+#[tokio::test]
+async fn the_budget_arithmetic_is_total_at_runtime_and_checked_at_validation() {
     // The largest configuration validation admits: `S × (N + 1)` still
     // fits, so `S × N` does a fortiori.
     let n = 7_u32;
@@ -1926,7 +2348,7 @@ async fn the_task_retries_a_failed_pass_on_the_next_tick() {
     append_records(&active, S * 8);
     let before = std::fs::read(&active).expect("the active log reads");
 
-    rotation.faults.truncate.store(true, Ordering::SeqCst);
+    rotation.fail_truncate();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     rotation.on_publish(move |_| {
         let _ = tx.send(());
@@ -2030,13 +2452,14 @@ async fn audit_registration(url: &str, ca_pem: Option<&str>, token: &str) -> Str
         .to_string()
 }
 
-/// Rotates a live deployment's file audit device in place.
+/// Rotates a live deployment's file audit device by rename-and-reopen.
 ///
 /// Ignored, and driven by `scripts/impl/run-registrar-internal-init-e2e.sh`
 /// against the pinned `OpenBao` image with the device bind-mounted out
 /// of the shared audit store. It is the only place the mechanism meets
-/// the real writer: nothing here restarts, reseals or signals the
-/// container, and the harness asserts around this test that `StartedAt`,
+/// the real writer and the real Docker: the container is addressed
+/// through its bind mount and signalled by id, nothing is restarted or
+/// resealed, and the harness asserts around this test that `StartedAt`,
 /// `RestartCount` and `Pid` did not move and that the seal status did
 /// not change.
 ///
@@ -2045,7 +2468,7 @@ async fn audit_registration(url: &str, ca_pem: Option<&str>, token: &str) -> Str
 /// traffic before anything rotated.
 #[tokio::test]
 #[ignore = "requires a provisioned OpenBao audit device on the host"]
-async fn a_live_openbao_audit_device_rotates_in_place() {
+async fn a_live_openbao_audit_device_rotates_by_reopen_on_signal() {
     use std::os::unix::fs::MetadataExt as _;
 
     let dir = PathBuf::from(required_env(E2E_DIR));
@@ -2070,32 +2493,58 @@ async fn a_live_openbao_audit_device_rotates_in_place() {
     let active = dir.join(ACTIVE_FILE_NAME);
     let before = std::fs::metadata(&active).expect("the live active log stats");
     assert!(before.len() > 0, "the device has written something");
+    let before_bytes = std::fs::read(&active).expect("the live active log reads");
 
+    // The real `DockerControl`: this is where the addressing rule and
+    // the signal are exercised against a running container.
     let bound = (before.len() / 2).max(1);
     let mut rotation = OpenBaoAuditRotation::new(dir.clone(), bound, 7);
-    let outcome = rotation.run_pass(OffsetDateTime::now_utc());
+    let outcome = rotation.run_pass(OffsetDateTime::now_utc()).await;
     assert!(outcome.rotated(), "the live device was rotated");
+    assert_eq!(
+        outcome.form,
+        RotationForm::Signal,
+        "the pinned image honours SIGHUP, so no fallback may be taken"
+    );
     assert!(!outcome.retained_unmet, "and its retained set is bounded");
 
     let names = generation_names(&dir);
     let published = dir.join(names.last().expect("a published generation"));
-    assert_complete_json_lines(&published);
     let generation = std::fs::metadata(&published).expect("the generation stats");
     assert_eq!(
-        generation.permissions().mode() & 0o7777,
-        GENERATION_FILE_MODE
+        generation.ino(),
+        before.ino(),
+        "the generation is the file OpenBao was writing, renamed rather than copied"
+    );
+    let generation_bytes = std::fs::read(&published).expect("the generation reads");
+    assert!(
+        generation_bytes.starts_with(&before_bytes),
+        "not one byte of the active log was lost by the rotation"
+    );
+
+    let after = std::fs::metadata(&active).expect("the new active log stats");
+    assert_ne!(
+        after.ino(),
+        before.ino(),
+        "OpenBao created a new active log rather than reusing the renamed one"
     );
     let owner = std::fs::metadata(&dir).expect("the device directory stats");
     assert_eq!(
-        (generation.uid(), generation.gid()),
-        (owner.uid(), owner.gid())
+        (after.uid(), after.gid()),
+        (owner.uid(), owner.gid()),
+        "the new active log is the container's to write, not root's"
     );
+    assert_ne!(after.uid(), 0, "no root-owned audit.log is created");
+    assert_eq!(after.permissions().mode() & 0o7777, 0o600);
 
-    let after = std::fs::metadata(&active).expect("the active log stats");
-    assert_eq!(after.len(), 0, "the active log was emptied");
-    assert_eq!(after.ino(), before.ino(), "and never replaced");
-    assert_eq!(after.permissions().mode(), before.permissions().mode());
-    assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+    assert!(
+        !dir.join(STAGING_FILE_NAME).exists(),
+        "the signal form stages no copy"
+    );
+    assert!(
+        !dir.join(MARKER_FILE_NAME).exists(),
+        "a confirmed reopen removes the rotation-intent marker"
+    );
 
     client
         .verify_audit_file()
@@ -2105,5 +2554,1731 @@ async fn a_live_openbao_audit_device_rotates_in_place() {
         audit_registration(&url, ca_pem.as_deref(), &token).await,
         registration_before,
         "the device is not disabled, re-registered or re-pathed by a rotation"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The signal form
+// ---------------------------------------------------------------------
+
+/// A pass whose reopen is confirmed loses nothing: the active file
+/// *becomes* the generation, and the new active log is a different
+/// inode that starts empty.
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_reopen_rotates_without_copying_or_truncating() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_bytes = std::fs::read(&active).expect("the active log reads");
+    let before_id = identity_of(&active);
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated());
+    assert_eq!(outcome.form, RotationForm::Signal);
+    assert_eq!(outcome.consecutive_failures, 0);
+    assert_eq!(
+        docker.signalled(),
+        vec!["bao".to_string()],
+        "the container is signalled by the id the mount matched, exactly once"
+    );
+
+    let names = generation_names(dir.path());
+    let published = dir.path().join(names.first().expect("one generation"));
+    assert_eq!(
+        identity_of(&published),
+        before_id,
+        "the generation is the file OpenBao was writing, renamed rather than copied"
+    );
+    assert_eq!(
+        std::fs::read(&published).expect("the generation reads"),
+        before_bytes,
+        "not one byte was lost or truncated away"
+    );
+    assert_eq!(len_of(&published), captured);
+
+    assert!(
+        active.exists(),
+        "the pass does not return until the path is back"
+    );
+    assert_ne!(identity_of(&active), before_id, "on a new inode");
+    assert_eq!(len_of(&active), 0, "which OpenBao created empty");
+    assert!(
+        !dir.path().join(STAGING_FILE_NAME).exists(),
+        "the signal form stages nothing"
+    );
+    assert!(
+        !rotation.marker_path().exists(),
+        "a confirmed reopen removes the rotation-intent marker"
+    );
+}
+
+/// The signal form stages no copy, asserted against copied *bytes*
+/// rather than against a file count the marker could satisfy.
+///
+/// Measured inside the window, from the seam: at the instant the
+/// container is signalled the device directory holds exactly the bytes
+/// it held before the pass, under one fewer name.
+#[tokio::test(start_paused = true)]
+async fn the_signal_form_never_holds_a_second_copy_of_the_active_log() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    for sequence in 0..2 {
+        seed_generation(dir.path(), "20260301T115900Z", sequence, S / 2);
+    }
+    append_records(&active, S);
+    let before = log_family_bytes(dir.path());
+
+    let observed = Arc::new(AtomicUsize::new(usize::MAX));
+    let recorder = Arc::clone(&observed);
+    let watched = dir.path().to_path_buf();
+    let reopened = active.clone();
+    docker.on_signal(move || {
+        let total = usize::try_from(log_family_bytes(&watched)).expect("the total fits");
+        recorder.store(total, Ordering::SeqCst);
+        create_active_log(&reopened);
+    });
+
+    assert!(rotation.run_pass(at(0)).await.rotated());
+    let inside = u64::try_from(observed.load(Ordering::SeqCst)).expect("the total fits");
+    assert_eq!(
+        inside, before,
+        "the same bytes under one fewer name: nothing was duplicated"
+    );
+
+    // And when the pass ends nothing duplicates what the active log
+    // still holds, because the active log holds nothing at all.
+    assert_eq!(len_of(&active), 0);
+    assert_eq!(log_family_bytes(dir.path()), before);
+}
+
+/// `OpenBao`'s open descriptor keeps accepting writes across the window
+/// in which the configured path is absent, and every one of those
+/// writes is in the generation.
+///
+/// The invariant is the descriptor's, not the path's: this test
+/// deliberately asserts the path is *absent* mid-window rather than
+/// present at every instant, which rename-first cannot deliver.
+#[tokio::test(start_paused = true)]
+async fn the_descriptor_stays_writable_while_the_path_is_absent() {
+    use std::io::Write as _;
+
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+
+    // The descriptor OpenBao holds: opened before the rename, never
+    // reopened, and appending throughout.
+    let writer = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .append(true)
+            .open(&active)
+            .expect("OpenBao's own descriptor opens"),
+    ));
+    let held = Arc::clone(&writer);
+    let path = active.clone();
+    docker.on_signal(move || {
+        assert!(
+            !path.exists(),
+            "the configured path is absent in this window, and that is the mechanism"
+        );
+        held.lock()
+            .expect("the writer lock is live")
+            .write_all(b"{\"written\":\"while the path was absent\"}\n")
+            .expect("the descriptor is still writable");
+        create_active_log(&path);
+    });
+
+    assert!(rotation.run_pass(at(0)).await.rotated());
+    let names = generation_names(dir.path());
+    let published = dir.path().join(names.first().expect("one generation"));
+    let body = std::fs::read_to_string(&published).expect("the generation reads");
+    assert!(
+        body.contains("while the path was absent"),
+        "the write made through the descriptor is in the generation"
+    );
+    assert!(
+        active.exists(),
+        "and the path is back before the pass returns"
+    );
+}
+
+/// A retained set mixing generations from both forms sorts in creation
+/// order and trims oldest-first.
+#[tokio::test(start_paused = true)]
+async fn both_forms_share_one_naming_family_and_one_trim() {
+    let (dir, mut rotation, docker) = signal_fixture(S, 16);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+
+    let mut expected = Vec::new();
+    for round in 0..4_i64 {
+        // Alternate the forms: an image that reopens, then one that
+        // does not, then back.
+        if round % 2 == 0 {
+            docker.reopens(active.clone());
+        } else {
+            docker.stops_reopening();
+        }
+        append_records(&active, S);
+        let outcome = rotation.run_pass(at(round)).await;
+        assert!(outcome.rotated(), "round {round}");
+        assert_eq!(
+            outcome.form,
+            if round % 2 == 0 {
+                RotationForm::Signal
+            } else {
+                RotationForm::Fallback
+            },
+            "round {round} used the form its image supports"
+        );
+        expected.push(rotated_file_name(&rotation_stamp(at(round)), 0));
+    }
+
+    let names = generation_names(dir.path());
+    assert_eq!(names, expected, "one family, in creation order");
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted);
+
+    // Tightened, the trim drops oldest-first across both forms.
+    let mut tightened = OpenBaoAuditRotation::with_control(
+        dir.path().to_path_buf(),
+        S,
+        2,
+        StubDocker::without_containers(),
+    );
+    assert!(!tightened.run_pass(at(10)).await.retained_unmet);
+    let after = generation_names(dir.path());
+    assert!(
+        !after.is_empty() && after.len() < expected.len(),
+        "the tightened bound dropped something and kept something"
+    );
+    assert_eq!(
+        Some(after.as_slice()),
+        expected.get(expected.len() - after.len()..),
+        "what survived is the newest, whichever form wrote it"
+    );
+    assert!(retained_bytes(dir.path()) <= retained_budget_bytes(S, 2));
+}
+
+/// The pass waits for the reopen instead of checking once, the wait is
+/// bounded, and it runs entirely on `tokio::time`.
+///
+/// Under a paused clock a five-second deadline costs the test nothing,
+/// which is the proof that no wall-clock sleep is involved: the elapsed
+/// virtual time is asserted, and the test itself returns at once.
+#[tokio::test(start_paused = true)]
+async fn the_wait_is_bounded_and_runs_on_tokio_time() {
+    // A reopen that lands is confirmed, and the pass does not fall back.
+    let (dir, mut rotation, _docker) = signal_fixture(S, N);
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    let started = tokio::time::Instant::now();
+    let outcome = rotation.run_pass(at(0)).await;
+    assert_eq!(outcome.form, RotationForm::Signal);
+    assert!(
+        started.elapsed() < REOPEN_DEADLINE,
+        "a reopen that lands is confirmed well inside the deadline"
+    );
+
+    // A reopen that never lands expires the deadline, and only then is
+    // the fallback taken.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    let started = tokio::time::Instant::now();
+    let outcome = rotation.run_pass(at(0)).await;
+    let waited = started.elapsed();
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    assert!(
+        waited >= REOPEN_DEADLINE,
+        "the deadline is what triggers the fallback, not a single check: waited {waited:?}"
+    );
+    assert!(
+        waited < REOPEN_DEADLINE + Duration::from_secs(1),
+        "and it is bounded: waited {waited:?}"
+    );
+    assert_eq!(len_of(&dir.path().join(ACTIVE_FILE_NAME)), 0);
+}
+
+/// The rotation drives no `OpenBao` request: the only calls it makes are
+/// the three Docker ones, and the confirmation is the inode rule.
+#[tokio::test(start_paused = true)]
+async fn the_runtime_evidence_is_the_inode_rule_and_nothing_is_asked_of_openbao() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+
+    // The reopen creates a file at the path whose inode differs, and
+    // that alone is the confirmation — no token, no client and no URL
+    // exists anywhere in this rotation to ask OpenBao with.
+    assert!(rotation.run_pass(at(0)).await.rotated());
+    assert_eq!(docker.signalled().len(), 1);
+
+    // Presence alone is not the test. A "reopen" that puts the
+    // generation's own inode back at the path is refused, not confirmed.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let dirpath = dir.path().to_path_buf();
+    let path = active.clone();
+    docker.on_signal(move || {
+        let generation = generation_names(&dirpath)
+            .pop()
+            .expect("the generation is in place before the signal");
+        std::fs::hard_link(dirpath.join(generation), &path).expect("the same inode is put back");
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated(), "presence is not the predicate");
+        assert_eq!(outcome.form, RotationForm::None);
+    })
+    .await;
+    assert!(
+        logs.contains("carries the rotated generation's own identity"),
+        "{logs}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Recovery and the fallback
+// ---------------------------------------------------------------------
+
+/// A partial failure recovers to the pre-rotation state *before* the
+/// tick continues, and the same tick then finishes through
+/// copy-and-truncate.
+///
+/// The two are one tick, not alternatives: what the seam observes at
+/// the fallback's first step is the exact pre-pass filesystem — the
+/// active log back at its path with its original contents, the signal
+/// generation gone, and the retained set at its pre-pass contents with
+/// nothing dropped on the strength of the abandoned attempt.
+#[tokio::test(start_paused = true)]
+async fn a_failed_reopen_restores_the_pre_rotation_state_and_then_falls_back() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    for sequence in 0..2 {
+        seed_generation(dir.path(), "20260301T115900Z", sequence, S / 2);
+    }
+    let seeded = generation_names(dir.path());
+    append_records(&active, S);
+    let before_bytes = std::fs::read(&active).expect("the active log reads");
+    let before_id = identity_of(&active);
+
+    let restored: Arc<Mutex<Restored>> = Arc::new(Mutex::new(None));
+    let recorder = Arc::clone(&restored);
+    let watched = dir.path().to_path_buf();
+    rotation.before_stage(move |path| {
+        *recorder.lock().expect("the record lock is live") = Some((
+            std::fs::read(path).expect("the restored active log reads"),
+            identity_of(path),
+            generation_names(&watched),
+        ));
+    });
+
+    let outcome = rotation.run_pass(at(0)).await;
+    let (seen_bytes, seen_id, seen_names) = restored
+        .lock()
+        .expect("the record lock is live")
+        .take()
+        .expect("the fallback ran after the recovery");
+    assert_eq!(seen_bytes, before_bytes, "restored byte for byte");
+    assert_eq!(
+        seen_id, before_id,
+        "and on the very inode it was renamed from"
+    );
+    assert_eq!(
+        seen_names, seeded,
+        "the signal generation is gone and nothing was dropped for it"
+    );
+
+    assert!(outcome.rotated(), "the same tick completed the rotation");
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    assert_eq!(outcome.consecutive_failures, 0);
+    assert_eq!(len_of(&active), 0, "through copy-and-truncate");
+    assert_eq!(identity_of(&active), before_id, "of the same inode");
+    let names = generation_names(dir.path());
+    assert_eq!(
+        names.len(),
+        seeded.len() + 1,
+        "the fallback's generation joined the set"
+    );
+    assert!(
+        !outcome.retained_unmet,
+        "and the ordinary bound evaluation applied"
+    );
+}
+
+/// The fallback is announced once per process and never again.
+#[tokio::test(start_paused = true)]
+async fn the_fallback_is_announced_once() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+
+    let logs = logs_from(async {
+        for round in 0..4_i64 {
+            append_records(&active, S);
+            let outcome = rotation.run_pass(at(round * 60)).await;
+            assert_eq!(outcome.form, RotationForm::Fallback, "round {round}");
+        }
+    })
+    .await;
+    assert_eq!(
+        logs.matches("this process rotates it by copy-and-truncate instead")
+            .count(),
+        1,
+        "one announcement per process, never one a minute:\n{logs}"
+    );
+    assert!(logs.contains("INFO"), "and it is an info event:\n{logs}");
+    assert!(
+        logs.contains("no running container binds this device directory")
+            || logs.contains("did not reopen inside the deadline"),
+        "naming the reason:\n{logs}"
+    );
+}
+
+/// The fallback opens the active path exactly once and truncates
+/// through that descriptor, and re-verifies before it does.
+///
+/// With the path re-pointed at another inode, or the held file
+/// shortened below the prefix that was copied, nothing is truncated:
+/// the copy is unlinked, one `warn` names the failed check, and the
+/// pass fails.
+#[tokio::test(start_paused = true)]
+async fn the_fallback_reverifies_before_truncating_and_truncates_what_it_copied() {
+    // Re-pointed to a different inode between the copy and the truncate.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let held = OpenOptions::new()
+        .append(true)
+        .open(&active)
+        .expect("OpenBao's own descriptor opens");
+    let planted = active.clone();
+    rotation.on_publish(move |_| {
+        std::fs::remove_file(&planted).expect("the active log is unlinked");
+        std::fs::write(&planted, b"a replacement\n").expect("the replacement is created");
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.rotation.is_unmet());
+    })
+    .await;
+    assert!(
+        logs.contains("no longer names the file this pass copied"),
+        "{logs}"
+    );
+    assert!(
+        generation_names(dir.path()).is_empty(),
+        "the copy is unlinked rather than published over a truncate that never ran"
+    );
+    assert_eq!(
+        held.metadata().expect("the held descriptor stats").len(),
+        captured,
+        "the file OpenBao is still writing to keeps every byte"
+    );
+    assert_eq!(
+        std::fs::read(&active).expect("the replacement reads"),
+        b"a replacement\n",
+        "and the replacement is never emptied"
+    );
+
+    // Shortened below the copied prefix, on the very inode that was
+    // copied — the delayed reopen that truncates rather than replaces.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let shortened = active.clone();
+    rotation.on_publish(move |_| {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&shortened)
+            .expect("the active log opens");
+        file.set_len(16).expect("the active log is shortened");
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.rotation.is_unmet());
+    })
+    .await;
+    assert!(logs.contains("shorter than the"), "{logs}");
+    assert!(generation_names(dir.path()).is_empty());
+    assert_eq!(
+        len_of(&active),
+        16,
+        "the shortened file is left exactly as it was found"
+    );
+}
+
+/// A delayed reopen landing after the deadline but before the
+/// rename-back is a slow success, not a fallback.
+#[tokio::test(start_paused = true)]
+async fn a_reopen_landing_before_the_recovery_looks_is_a_success() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let before_id = identity_of(&active);
+    rotation.on_recovery(create_active_log);
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated(), "a delayed reopen is a slow success");
+    assert_eq!(outcome.form, RotationForm::Signal);
+    let names = generation_names(dir.path());
+    assert_eq!(names.len(), 1, "nothing was copied and nothing truncated");
+    assert_eq!(
+        identity_of(&dir.path().join(names.first().expect("one generation"))),
+        before_id
+    );
+    assert_ne!(identity_of(&active), before_id);
+    assert!(!dir.path().join(STAGING_FILE_NAME).exists());
+    assert!(!rotation.marker_path().exists());
+}
+
+/// A reopen landing *after* the rename-back resolves a path that
+/// exists, so it reopens the very inode `OpenBao` was already appending
+/// to. The fallback then works through that same inode from end to end.
+#[tokio::test(start_paused = true)]
+async fn a_reopen_landing_after_the_rename_back_leaves_the_fallback_intact() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_id = identity_of(&active);
+
+    // The reopen resolves the restored name: same file, so nothing about
+    // the filesystem changes. Modelled by a hook that opens the path the
+    // recovery has just restored.
+    let reopened = active.clone();
+    rotation.before_stage(move |path| {
+        let resolved = OpenOptions::new()
+            .append(true)
+            .open(&reopened)
+            .expect("a reopen of a path that exists finds the same file");
+        assert_eq!(
+            file_identity(&resolved.metadata().expect("the reopened file stats")),
+            identity_of(path),
+            "descriptor and path are the same file"
+        );
+    });
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated());
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    let names = generation_names(dir.path());
+    let published = dir.path().join(names.first().expect("one generation"));
+    assert_eq!(len_of(&published), captured, "the generation is intact");
+    assert_eq!(
+        identity_of(&active),
+        before_id,
+        "against the inode it copied"
+    );
+    assert_eq!(len_of(&active), 0);
+}
+
+/// The rename-back never clobbers a new active log, and `EEXIST` is
+/// decided by the common predicate rather than by itself.
+#[tokio::test(start_paused = true)]
+async fn the_rename_back_refuses_an_active_log_and_decides_by_the_inode() {
+    // A new active log appearing between the recovery's look and the
+    // rename-back: `EEXIST`, re-statted, a differing inode, a success.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let before_id = identity_of(&active);
+    rotation.on_restore_rename(move |path| {
+        create_active_log(path);
+        std::fs::write(path, b"{\"created\":\"by the delayed reopen\"}\n")
+            .expect("the new active log is written");
+    });
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(
+        outcome.rotated(),
+        "the delayed reopen is the reopened predicate"
+    );
+    assert_eq!(outcome.form, RotationForm::Signal);
+    assert_eq!(
+        std::fs::read(&active).expect("the new active log reads"),
+        b"{\"created\":\"by the delayed reopen\"}\n",
+        "the file OpenBao created is left untouched"
+    );
+    let names = generation_names(dir.path());
+    assert_eq!(
+        names.len(),
+        1,
+        "the generation is kept: it holds the earlier records"
+    );
+    assert_eq!(
+        identity_of(&dir.path().join(names.first().expect("one generation"))),
+        before_id
+    );
+    assert!(!rotation.marker_path().exists());
+
+    // A re-stat that matches the generation's own identity takes the
+    // anomaly path instead.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let watched = dir.path().to_path_buf();
+    rotation.on_restore_rename(move |path| {
+        let generation = generation_names(&watched)
+            .pop()
+            .expect("the generation is in place");
+        std::fs::hard_link(watched.join(generation), path).expect("the same inode is linked back");
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.rotation.is_unmet());
+        assert_eq!(outcome.form, RotationForm::None);
+    })
+    .await;
+    assert!(
+        logs.contains("carries the rotated generation's own identity"),
+        "{logs}"
+    );
+    assert_eq!(
+        len_of(&active),
+        len_of(
+            &dir.path().join(
+                generation_names(dir.path())
+                    .pop()
+                    .expect("the generation stands")
+            )
+        ),
+        "nothing was truncated"
+    );
+    assert!(
+        !dir.path().join(STAGING_FILE_NAME).exists(),
+        "and nothing was copied"
+    );
+}
+
+/// A post-`EEXIST` re-stat that finds the path absent again is a failed
+/// restore, and stays in the pending state — neither a silent success
+/// nor a fallback.
+#[tokio::test(start_paused = true)]
+async fn a_post_eexist_restat_finding_the_path_absent_stays_pending() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    // Refused exactly as a name that appeared under the rename-back
+    // would refuse it, with nothing at the path by the time the re-stat
+    // runs: the name was there for the rename and gone a moment later.
+    rotation.refuse_restore_rename();
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.restore_pending, "the restore is outstanding");
+        assert_eq!(outcome.form, RotationForm::None);
+    })
+    .await;
+    assert!(
+        logs.contains("live audit log under a rotated name"),
+        "{logs}"
+    );
+    assert!(rotation.restore_is_pending());
+    assert!(!active.exists(), "and nothing was invented at the path");
+    assert!(
+        rotation.marker_path().exists(),
+        "a pending restore keeps its marker"
+    );
+    assert!(
+        !dir.path().join(STAGING_FILE_NAME).exists(),
+        "no fallback ran"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The pending restore
+// ---------------------------------------------------------------------
+
+/// Drives a signal-form pass whose rename-back fails, and returns the
+/// device directory, the rotation holding the pending restore, and the
+/// name the live audit inode is stranded under.
+async fn strand_the_live_inode(
+    max_file_bytes: u64,
+    max_retained_files: u32,
+) -> (TempDir, OpenBaoAuditRotation, String) {
+    let (dir, mut rotation, docker) = signal_fixture(max_file_bytes, max_retained_files);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, max_file_bytes);
+    rotation.fail_restore_rename();
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(
+        outcome.restore_pending,
+        "the restore did not fail as arranged"
+    );
+    rotation.allow_restore_rename();
+    let stranded = generation_names(dir.path())
+        .pop()
+        .expect("the live inode is under a generation name");
+    (dir, rotation, stranded)
+}
+
+/// A failed rename-back never costs the live audit log: it is neither
+/// trimmed — with bounds set so an ordinary trim would drop it — nor
+/// truncated, one `error` names it and the absent active path, and each
+/// pending tick does exactly the restore retry and the bound
+/// evaluation.
+#[tokio::test(start_paused = true)]
+async fn a_failed_rename_back_holds_the_live_inode_and_each_tick_only_retries() {
+    // `N` of one, so the retained set is meant to hold a single
+    // generation: an ordinary trim would drop everything else, the
+    // stranded file included.
+    let (dir, mut rotation, docker) = signal_fixture(S, 1);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    for sequence in 0..3 {
+        seed_generation(dir.path(), "20260301T115900Z", sequence, S / 2);
+    }
+    append_records(&active, S);
+    let live_bytes = std::fs::read(&active).expect("the active log reads");
+    rotation.fail_restore_rename();
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(outcome.restore_pending);
+        assert!(
+            outcome.rotation.is_unmet(),
+            "a failed restore is a failed pass"
+        );
+    })
+    .await;
+    let stranded = generation_names(dir.path())
+        .pop()
+        .expect("the live inode is under a generation name");
+    assert!(
+        logs.contains(&stranded),
+        "the error names the file to move back:\n{logs}"
+    );
+    assert!(
+        logs.contains(&active.display().to_string()),
+        "and the absent active path:\n{logs}"
+    );
+    assert!(
+        logs.contains("do not delete, compress or move it anywhere but back"),
+        "{logs}"
+    );
+
+    // Each later tick retries the restore and evaluates the bound with
+    // the stranded file excluded — and does nothing else.
+    for round in 1..4_i64 {
+        let outcome = rotation.run_pass(at(round * 60)).await;
+        assert!(outcome.restore_pending, "round {round}");
+        assert!(
+            outcome.rotation.is_unmet(),
+            "round {round} counts toward the escalation"
+        );
+        assert!(!active.exists(), "round {round}: no rotation, no fallback");
+        assert!(
+            !dir.path().join(STAGING_FILE_NAME).exists(),
+            "round {round}: nothing was copied"
+        );
+        assert!(
+            generation_names(dir.path()).contains(&stranded),
+            "round {round}: the live audit log was not trimmed"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(&stranded)).expect("the live file reads"),
+            live_bytes,
+            "round {round}: and it was not truncated"
+        );
+    }
+    assert!(
+        generation_names(dir.path()).len() < 4,
+        "the remaining generations are still trimmed against bounds computed without it"
+    );
+}
+
+/// A pending restore clears when the rename-back succeeds, and the next
+/// tick rotates as usual.
+#[tokio::test(start_paused = true)]
+async fn a_pending_restore_clears_when_the_rename_back_succeeds() {
+    let (dir, mut rotation, stranded) = strand_the_live_inode(S, N).await;
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let live_bytes = std::fs::read(dir.path().join(&stranded)).expect("the live file reads");
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(60)).await;
+        assert!(!outcome.restore_pending, "the restore cleared");
+        assert!(!outcome.rotation.is_unmet(), "and the tick owes nothing");
+        assert!(
+            !outcome.retained_unmet,
+            "the bound is evaluated with nothing excluded"
+        );
+    })
+    .await;
+    assert!(logs.contains("ordinary rotation resumes"), "{logs}");
+    assert_eq!(
+        std::fs::read(&active).expect("the restored active log reads"),
+        live_bytes,
+        "the live inode is back at the configured path"
+    );
+    assert!(generation_names(dir.path()).is_empty());
+    assert!(
+        !rotation.marker_path().exists(),
+        "a cleared restore removes its marker"
+    );
+
+    // And the next tick rotates as usual.
+    append_records(&active, S);
+    assert!(rotation.run_pass(at(120)).await.rotated());
+}
+
+/// A pending restore also clears when a new active log appears while it
+/// is outstanding: the `EEXIST` re-stat shows an inode that is not the
+/// pending file's, which is the reopened predicate applied later.
+#[tokio::test(start_paused = true)]
+async fn a_pending_restore_clears_when_a_new_active_log_appears() {
+    let (dir, mut rotation, stranded) = strand_the_live_inode(S, N).await;
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    // The delayed reopen, or an operator, produced one.
+    create_active_log(&active);
+    let fresh_id = identity_of(&active);
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(60)).await;
+        assert!(!outcome.restore_pending);
+        assert!(!outcome.rotation.is_unmet());
+        assert!(!outcome.retained_unmet);
+    })
+    .await;
+    assert!(logs.contains("genuine rotated generation now"), "{logs}");
+    assert_eq!(identity_of(&active), fresh_id, "the new file is left alone");
+    assert!(
+        generation_names(dir.path()).contains(&stranded),
+        "and the formerly pending file rejoins the retained set"
+    );
+    assert!(!rotation.marker_path().exists());
+
+    // With nothing excluded any more, a tightened bound may drop it.
+    let mut tightened = OpenBaoAuditRotation::with_control(
+        dir.path().to_path_buf(),
+        S,
+        0,
+        StubDocker::without_containers(),
+    );
+    assert!(!tightened.run_pass(at(120)).await.retained_unmet);
+    assert!(generation_names(dir.path()).is_empty());
+}
+
+/// A retry whose re-stat matches the pending file's own identity is the
+/// same-inode anomaly, and the restore stays outstanding.
+#[tokio::test(start_paused = true)]
+async fn a_retry_restat_matching_the_pending_file_takes_the_anomaly_path() {
+    let (dir, mut rotation, stranded) = strand_the_live_inode(S, N).await;
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    std::fs::hard_link(dir.path().join(&stranded), &active).expect("the same inode is linked");
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(60)).await;
+        assert!(
+            outcome.restore_pending,
+            "the restore is not resolved by that"
+        );
+        assert!(outcome.rotation.is_unmet());
+        assert!(outcome.retained_unmet, "and no bound was established");
+    })
+    .await;
+    assert!(logs.contains("held-back file's own identity"), "{logs}");
+    assert!(
+        generation_names(dir.path()).contains(&stranded),
+        "nothing was trimmed"
+    );
+    assert!(
+        !dir.path().join(STAGING_FILE_NAME).exists(),
+        "nothing was copied"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The same-inode anomaly
+// ---------------------------------------------------------------------
+
+/// An active path carrying the generation's own identity fails the pass
+/// instead of falling back: nothing truncated, nothing trimmed, no
+/// rename-back attempted.
+#[tokio::test(start_paused = true)]
+async fn the_same_inode_anomaly_truncates_nothing_and_trims_nothing() {
+    let (dir, mut rotation, docker) = signal_fixture(S, 1);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    // Over budget, so an ordinary trim would certainly act.
+    for sequence in 0..4 {
+        seed_generation(dir.path(), "20260301T115900Z", sequence, S);
+    }
+    let seeded = generation_names(dir.path());
+    let captured = append_records(&active, S);
+
+    // The generation's own inode put back at the active path, in the
+    // window the recovery's first look reads.
+    let watched = dir.path().to_path_buf();
+    rotation.on_recovery(move |path| {
+        let generation = generation_names(&watched)
+            .pop()
+            .expect("the generation is in place");
+        std::fs::hard_link(watched.join(generation), path).expect("the same inode is linked back");
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.rotation.is_unmet(), "counted toward the escalation");
+        assert_eq!(outcome.form, RotationForm::None);
+        assert!(outcome.retained_unmet, "no bound was evaluated at all");
+    })
+    .await;
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "one error:\n{logs}");
+    assert!(
+        logs.contains("carries the rotated generation's own identity"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains(&active.display().to_string()),
+        "naming both paths:\n{logs}"
+    );
+
+    let names = generation_names(dir.path());
+    assert_eq!(names.len(), seeded.len() + 1, "nothing was trimmed");
+    assert_eq!(len_of(&active), captured, "and nothing was truncated");
+    assert!(
+        !dir.path().join(STAGING_FILE_NAME).exists(),
+        "no fallback ran"
+    );
+}
+
+/// A rename-back whose directory flush failed fails the pass and runs
+/// no fallback that tick, although the live filesystem is back at its
+/// pre-rotation state.
+#[tokio::test(start_paused = true)]
+async fn a_failed_rename_back_flush_fails_the_pass_and_runs_no_fallback() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_id = identity_of(&active);
+    rotation.fail_restore_sync();
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.rotated());
+        assert!(outcome.rotation.is_unmet());
+        assert_eq!(outcome.form, RotationForm::None);
+        assert!(!outcome.restore_pending, "the rename itself landed");
+    })
+    .await;
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "{logs}");
+    assert!(logs.contains("not durable"), "{logs}");
+    assert!(
+        logs.contains(&active.display().to_string()),
+        "naming both paths:\n{logs}"
+    );
+    assert_eq!(
+        identity_of(&active),
+        before_id,
+        "the log is back at its path"
+    );
+    assert_eq!(len_of(&active), captured, "with every record");
+    assert!(
+        generation_names(dir.path()).is_empty(),
+        "and no fallback generation was produced on that tick"
+    );
+    assert!(
+        rotation.marker_path().exists(),
+        "the marker is kept after a rename-back whose flush failed"
+    );
+
+    // The next pass's start-of-pass cleanup removes it and rotates.
+    rotation.allow_restore_sync();
+    let outcome = rotation.run_pass(at(60)).await;
+    assert!(outcome.rotated());
+    assert!(!rotation.marker_path().exists());
+}
+
+/// The flush after the rename lands before the signal, and a flush that
+/// fails signals nothing and runs the recovery.
+#[tokio::test(start_paused = true)]
+async fn a_failed_rename_flush_signals_nothing_and_recovers() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_id = identity_of(&active);
+    rotation.fail_rename_sync();
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(
+            outcome.rotated(),
+            "the same tick still completed the rotation"
+        );
+        assert_eq!(outcome.form, RotationForm::Fallback);
+    })
+    .await;
+    assert!(
+        logs.contains("refusing to signal against an unflushed rename"),
+        "{logs}"
+    );
+    assert!(
+        docker.signalled().is_empty(),
+        "the container is never signalled against an unflushed rename"
+    );
+    assert_eq!(
+        identity_of(&active),
+        before_id,
+        "the recovery restored the path"
+    );
+    assert_eq!(len_of(&active), 0, "and the fallback then emptied it");
+    let names = generation_names(dir.path());
+    assert_eq!(
+        len_of(&dir.path().join(names.first().expect("one generation"))),
+        captured
+    );
+}
+
+// ---------------------------------------------------------------------
+// The rotation-intent marker
+// ---------------------------------------------------------------------
+
+/// Reads the marker back, for the tests that assert on what a pass
+/// wrote.
+fn read_intent(path: &Path) -> RotationIntent {
+    let body = std::fs::read(path).expect("the marker reads");
+    serde_json::from_slice(&body).expect("the marker parses")
+}
+
+/// Writes a marker directly, for the restart states no pass produces on
+/// its own.
+fn write_intent(path: &Path, identity: (u64, u64), generation: &str) {
+    let intent = RotationIntent {
+        active_dev: identity.0,
+        active_ino: identity.1,
+        generation: generation.to_string(),
+    };
+    std::fs::write(
+        path,
+        serde_json::to_vec(&intent).expect("the marker serialises"),
+    )
+    .expect("the marker is written");
+}
+
+/// The marker is on disk before the rename is issued, holds the active
+/// log's pre-rename identity and the generation name, and sits outside
+/// the glob every listing and trim uses.
+#[tokio::test(start_paused = true)]
+async fn the_marker_is_written_before_the_rename_and_holds_the_pre_rename_identity() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let before_id = identity_of(&active);
+
+    // The signal runs after the rename and its flush, so the marker
+    // this reads is the one the rename was issued under.
+    let observed = Arc::new(Mutex::new(None));
+    let recorder = Arc::clone(&observed);
+    let marker = rotation.marker_path().to_path_buf();
+    let reopened = active.clone();
+    docker.on_signal(move || {
+        *recorder.lock().expect("the record lock is live") = Some(read_intent(&marker));
+        create_active_log(&reopened);
+    });
+
+    assert!(rotation.run_pass(at(0)).await.rotated());
+    let intent = observed
+        .lock()
+        .expect("the record lock is live")
+        .take()
+        .expect("the marker was on disk before the signal");
+    assert_eq!(
+        intent.identity(),
+        before_id,
+        "the marker records the identity the rename carries into the generation"
+    );
+    let published = generation_names(dir.path()).pop().expect("one generation");
+    assert_eq!(intent.generation, published);
+    assert!(
+        parse_rotated_name(MARKER_FILE_NAME).is_none(),
+        "the marker's name is outside the glob the trim uses"
+    );
+}
+
+/// A marker write forced to fail renames nothing and falls back on the
+/// same tick.
+#[tokio::test(start_paused = true)]
+async fn a_marker_write_that_fails_renames_nothing() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_id = identity_of(&active);
+    rotation.fail_marker_write();
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated(), "the tick still rotated");
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    assert!(
+        docker.signalled().is_empty(),
+        "nothing was renamed, so nothing was signalled"
+    );
+    assert_eq!(
+        identity_of(&active),
+        before_id,
+        "the active log never moved"
+    );
+    assert_eq!(len_of(&active), 0, "the fallback emptied it in place");
+    let names = generation_names(dir.path());
+    assert_eq!(
+        len_of(&dir.path().join(names.first().expect("one generation"))),
+        captured
+    );
+    assert!(!rotation.marker_path().exists());
+}
+
+/// A rename that fails removes the marker it wrote and falls back on the
+/// same tick.
+#[tokio::test(start_paused = true)]
+async fn a_rename_that_fails_removes_its_own_marker() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    rotation.fail_rename();
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated());
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    assert!(docker.signalled().is_empty());
+    assert!(
+        !rotation.marker_path().exists(),
+        "a rename that never happened leaves no marker behind"
+    );
+}
+
+/// A failed marker removal fails the pass, blocks every rotation until
+/// it clears, and is retried first on the next tick — while trimming
+/// continues.
+#[tokio::test(start_paused = true)]
+async fn a_failed_marker_removal_fails_the_pass_and_blocks_rotation() {
+    for fault in ["unlink", "flush"] {
+        let (dir, mut rotation, docker) = signal_fixture(S, N);
+        let active = dir.path().join(ACTIVE_FILE_NAME);
+        for sequence in 0..8 {
+            seed_generation(dir.path(), "20260301T115900Z", sequence, S);
+        }
+        append_records(&active, S);
+        if fault == "unlink" {
+            rotation.fail_marker_unlink();
+        } else {
+            rotation.fail_marker_flush();
+        }
+
+        let logs = logs_from(async {
+            let outcome = rotation.run_pass(at(0)).await;
+            assert!(
+                outcome.rotation.is_unmet(),
+                "{fault}: a removal that failed is not a successful pass"
+            );
+            assert!(outcome.marker_cleanup_pending, "{fault}");
+            assert!(!outcome.retained_unmet, "{fault}: trimming still runs");
+        })
+        .await;
+        assert_eq!(
+            count_lines_at(&logs, "ERROR"),
+            1,
+            "{fault}: one error:\n{logs}"
+        );
+        assert!(
+            logs.contains(MARKER_FILE_NAME),
+            "{fault}: naming the marker:\n{logs}"
+        );
+        assert!(
+            retained_bytes(dir.path()) <= retained_budget_bytes(S, N),
+            "{fault}: the trim reached the bound"
+        );
+
+        // The next tick retries the removal first and rotates nothing
+        // while it is outstanding.
+        let signals_before = docker.signalled().len();
+        append_records(&active, S);
+        let blocked = rotation.run_pass(at(60)).await;
+        assert!(blocked.marker_cleanup_pending, "{fault}");
+        assert!(blocked.rotation.is_unmet(), "{fault}");
+        assert_eq!(
+            docker.signalled().len(),
+            signals_before,
+            "{fault}: no rotation is attempted while a cleanup is outstanding"
+        );
+
+        // And once it clears, the tick carries on as usual.
+        if fault == "unlink" {
+            rotation.allow_marker_unlink();
+        } else {
+            rotation.allow_marker_flush();
+        }
+        let cleared = rotation.run_pass(at(120)).await;
+        assert!(!cleared.marker_cleanup_pending, "{fault}");
+        assert!(!rotation.marker_path().exists(), "{fault}");
+        assert!(cleared.rotated(), "{fault}: the same tick rotated");
+    }
+}
+
+/// A marker found at the start of a pass whose active path is present is
+/// removed before that pass does anything else, whatever identity it
+/// records — which is what makes the cleanup self-healing across a
+/// restart.
+#[tokio::test(start_paused = true)]
+async fn a_stale_marker_is_removed_at_the_start_of_the_next_pass() {
+    // After a completed fallback, whose marker removal was forced to
+    // fail, and then a restart.
+    for form in ["fallback", "rename-back"] {
+        let (dir, mut rotation, docker) = signal_fixture(S, N);
+        let active = dir.path().join(ACTIVE_FILE_NAME);
+        append_records(&active, S);
+        if form == "fallback" {
+            docker.stops_reopening();
+        } else {
+            docker.stops_reopening();
+            rotation.fail_truncate();
+        }
+        rotation.fail_marker_unlink();
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(outcome.marker_cleanup_pending, "{form}");
+        let marker = rotation.marker_path().to_path_buf();
+        assert!(marker.exists(), "{form}: the marker outlived its pass");
+        let recorded = read_intent(&marker);
+        assert_eq!(
+            recorded.identity(),
+            identity_of(&active),
+            "{form}: after both outcomes the active path is on exactly the inode the marker \
+             recorded, so an identity test would read this marker as live"
+        );
+
+        // The daemon goes away with the in-memory cleanup debt.
+        drop(rotation);
+        let mut restarted = OpenBaoAuditRotation::with_control(
+            dir.path().to_path_buf(),
+            S,
+            N,
+            StubDocker::without_containers(),
+        );
+        let after = restarted.run_pass(at(60)).await;
+        assert!(!marker.exists(), "{form}: the stale marker is gone");
+        assert!(!after.marker_cleanup_pending, "{form}");
+    }
+}
+
+/// A pass starting with the active path absent decides from the marker
+/// alone, and never from generation order or mtime.
+#[tokio::test(start_paused = true)]
+async fn a_restart_with_the_active_path_absent_decides_from_the_marker_alone() {
+    // (a) A marker naming a file that still carries the recorded
+    //     identity: renamed back, and the pending-restore path taken.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let live = seed_generation(dir.path(), "20260301T115900Z", 0, S);
+    let live_bytes = std::fs::read(&live).expect("the live file reads");
+    // A newer, unrelated generation, which name order alone would pick.
+    seed_generation(dir.path(), "20260301T120500Z", 0, S / 2);
+    let marker = dir.path().join(MARKER_FILE_NAME);
+    write_intent(
+        &marker,
+        identity_of(&live),
+        "audit-20260301T115900Z-000000.log",
+    );
+    let mut rotation = rotation_at(dir.path().to_path_buf(), S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(!outcome.restore_pending, "the rename-back succeeded");
+    })
+    .await;
+    assert!(logs.contains("rotation-intent marker authorises"), "{logs}");
+    assert_eq!(
+        std::fs::read(&active).expect("the restored active log reads"),
+        live_bytes,
+        "the file the marker named is what came back, not the newest"
+    );
+    assert!(
+        generation_names(dir.path()).contains(&rotated_file_name("20260301T120500Z", 0)),
+        "the newer unrelated generation was never moved into place"
+    );
+    assert!(!marker.exists(), "and the restore removed the marker");
+
+    // (b) The active path exists after all: the marker is removed and an
+    //     ordinary pass carries on.
+    let (dir, mut rotation) = fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let marker = dir.path().join(MARKER_FILE_NAME);
+    write_intent(&marker, (1, 2), "audit-20260301T115900Z-000000.log");
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated(), "an ordinary pass carried on");
+    assert!(!marker.exists());
+
+    // (c) No marker at all, beside a generation: nothing is rotated,
+    //     nothing trimmed, nothing moved into place.
+    // (d) A marker naming a file that is gone.
+    // (e) A marker naming a file whose identity no longer matches.
+    for state in ["absent", "vanished", "mismatched"] {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let other = seed_generation(dir.path(), "20260301T115900Z", 0, S);
+        let newest = seed_generation(dir.path(), "20260301T120500Z", 0, S);
+        let marker = dir.path().join(MARKER_FILE_NAME);
+        match state {
+            "absent" => {}
+            "vanished" => write_intent(&marker, (1, 2), "audit-20260301T110000Z-000000.log"),
+            _ => write_intent(
+                &marker,
+                (identity_of(&other).0, identity_of(&other).1 ^ 0xffff),
+                "audit-20260301T115900Z-000000.log",
+            ),
+        }
+        let seeded = generation_names(dir.path());
+        let mut rotation = rotation_at(dir.path().to_path_buf(), S, 1);
+
+        let logs = logs_from(async {
+            let outcome = rotation.run_pass(at(0)).await;
+            assert!(outcome.rotation.is_unmet(), "{state}");
+            assert!(outcome.retained_unmet, "{state}: nothing was established");
+        })
+        .await;
+        assert_eq!(
+            count_lines_at(&logs, "ERROR"),
+            1,
+            "{state}: one error:\n{logs}"
+        );
+        assert!(
+            logs.contains("cannot establish which file the device is writing to"),
+            "{state}:\n{logs}"
+        );
+        assert_eq!(
+            generation_names(dir.path()),
+            seeded,
+            "{state}: nothing was trimmed, although the bound says one generation"
+        );
+        assert!(
+            !dir.path().join(ACTIVE_FILE_NAME).exists(),
+            "{state}: no generation was moved into place"
+        );
+        assert!(
+            newest.exists(),
+            "{state}: and the newest was left where it was"
+        );
+    }
+}
+
+/// The pending-restore state machine has no on-disk representation, and
+/// a running daemon never reconstructs it from the marker.
+#[tokio::test(start_paused = true)]
+async fn the_pending_restore_state_lives_only_in_memory() {
+    let (dir, rotation, stranded) = strand_the_live_inode(S, N).await;
+    assert!(rotation.restore_is_pending());
+
+    // Nothing on disk names the state: only the marker, which is the
+    // intent rather than the state machine, and it records the identity
+    // and the generation name — not that a restore is outstanding.
+    let intent = read_intent(rotation.marker_path());
+    assert_eq!(intent.generation, stranded);
+    let body = std::fs::read_to_string(rotation.marker_path()).expect("the marker reads");
+    assert!(
+        !body.contains("pending") && !body.contains("restore"),
+        "the marker is an intent, not a state machine: {body}"
+    );
+
+    // A second rotation over the same directory, standing in for a
+    // daemon that never had the state, does not adopt it: it starts
+    // with the active path absent and consults the marker, which is the
+    // only path by which the marker is ever read.
+    let mut restarted = rotation_at(dir.path().to_path_buf(), S, N);
+    assert!(
+        !restarted.restore_is_pending(),
+        "a new task starts with nothing pending"
+    );
+    let outcome = restarted.run_pass(at(120)).await;
+    assert!(
+        !outcome.restore_pending,
+        "and the marker branch resolved it rather than reconstructing a pending state"
+    );
+    assert!(dir.path().join(ACTIVE_FILE_NAME).exists());
+}
+
+// ---------------------------------------------------------------------
+// Addressing the container
+// ---------------------------------------------------------------------
+
+/// The daemon addresses only this install's container, from the device's
+/// bind mount, and signals it by id.
+#[tokio::test(start_paused = true)]
+async fn the_container_is_selected_by_this_installs_bind_mount_and_signalled_by_id() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let other = tempfile::tempdir().expect("another install's audit store");
+    // Three running containers: one binding another install's store at
+    // the same destination, one binding this store somewhere else, and
+    // the one that is actually this install's.
+    let docker = StubDocker::with_containers(vec![
+        ("other-install".to_string(), bind_mounts_json(other.path())),
+        (
+            "wrong-destination".to_string(),
+            format!(
+                "[{{\"Type\":\"bind\",\"Source\":\"{}\",\"Destination\":\"/somewhere/else\"}}]",
+                dir.path().display()
+            ),
+        ),
+        ("ours".to_string(), bind_mounts_json(dir.path())),
+    ]);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    docker.reopens(active.clone());
+    let mut rotation = OpenBaoAuditRotation::with_control(
+        dir.path().to_path_buf(),
+        S,
+        N,
+        Arc::clone(&docker) as Arc<dyn DockerControl>,
+    );
+    append_records(&active, S);
+
+    assert!(rotation.run_pass(at(0)).await.rotated());
+    assert_eq!(
+        docker.signalled(),
+        vec!["ours".to_string()],
+        "only this install's container is signalled, and by its id"
+    );
+}
+
+/// Every addressing and signalling failure falls back rather than
+/// stopping the rotation task, and none of them renames anything.
+#[tokio::test(start_paused = true)]
+async fn every_addressing_failure_falls_back_with_nothing_moved() {
+    let cases: Vec<AddressingCase> = vec![
+        (
+            "no match",
+            Box::new(|_: &Path| StubDocker::without_containers()),
+        ),
+        (
+            "several matches",
+            Box::new(|dir: &Path| {
+                StubDocker::with_containers(vec![
+                    ("one".to_string(), bind_mounts_json(dir)),
+                    ("two".to_string(), bind_mounts_json(dir)),
+                ])
+            }),
+        ),
+        (
+            "docker unreachable",
+            Box::new(|dir: &Path| {
+                let docker = StubDocker::bound_to(dir);
+                docker.fail_ps();
+                docker
+            }),
+        ),
+        (
+            "inspect fails",
+            Box::new(|dir: &Path| {
+                let docker = StubDocker::bound_to(dir);
+                docker.fail_inspect();
+                docker
+            }),
+        ),
+    ];
+
+    for (label, build) in cases {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let docker = build(dir.path());
+        let mut rotation = OpenBaoAuditRotation::with_control(
+            dir.path().to_path_buf(),
+            S,
+            N,
+            Arc::clone(&docker) as Arc<dyn DockerControl>,
+        );
+        let active = dir.path().join(ACTIVE_FILE_NAME);
+        let captured = append_records(&active, S);
+        let before_id = identity_of(&active);
+
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(outcome.rotated(), "{label}: the rotation still happened");
+        assert_eq!(outcome.form, RotationForm::Fallback, "{label}");
+        assert_eq!(
+            outcome.consecutive_failures, 0,
+            "{label}: not a failed pass"
+        );
+        assert!(
+            docker.signalled().is_empty(),
+            "{label}: nothing was signalled"
+        );
+        assert_eq!(
+            identity_of(&active),
+            before_id,
+            "{label}: the active log was never renamed"
+        );
+        assert_eq!(len_of(&active), 0, "{label}");
+        assert!(
+            !rotation.marker_path().exists(),
+            "{label}: no marker outlives a pass that never renamed"
+        );
+        let names = generation_names(dir.path());
+        assert_eq!(
+            len_of(&dir.path().join(names.first().expect("one generation"))),
+            captured,
+            "{label}"
+        );
+    }
+}
+
+/// A `docker kill` that exits non-zero is never read as proof that the
+/// signal was not delivered: the filesystem decides, both ways.
+#[tokio::test(start_paused = true)]
+async fn a_failed_docker_kill_is_decided_from_the_filesystem() {
+    // The signal failed and the path reopened anyway: a success.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.fail_signal();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let before_id = identity_of(&active);
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated(), "the exit status decides nothing");
+    assert_eq!(outcome.form, RotationForm::Signal);
+    assert_ne!(identity_of(&active), before_id);
+
+    // The signal failed and the path stayed absent: the ordinary
+    // recovery, then the ordinary fallback.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.fail_signal();
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let before_id = identity_of(&active);
+
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotated());
+    assert_eq!(outcome.form, RotationForm::Fallback);
+    assert_eq!(
+        identity_of(&active),
+        before_id,
+        "restored before the fallback"
+    );
+    assert_eq!(len_of(&active), 0);
+    let names = generation_names(dir.path());
+    assert_eq!(
+        len_of(&dir.path().join(names.first().expect("one generation"))),
+        captured
+    );
+}
+
+/// The mount predicate itself: destination, type and a canonicalized
+/// source all have to agree.
+#[test]
+fn only_a_bind_of_this_device_directory_at_the_container_audit_path_matches() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let other = tempfile::tempdir().expect("another directory");
+    let want = std::fs::canonicalize(dir.path()).expect("the device directory canonicalizes");
+
+    assert!(mounts_bind_device(&bind_mounts_json(dir.path()), &want));
+    assert!(!mounts_bind_device(&bind_mounts_json(other.path()), &want));
+    assert!(!mounts_bind_device("[]", &want));
+    assert!(!mounts_bind_device("not json", &want));
+    assert!(!mounts_bind_device(
+        &format!(
+            "[{{\"Type\":\"volume\",\"Source\":\"{}\",\"Destination\":\"{}\"}}]",
+            dir.path().display(),
+            OPENBAO_CONTAINER_AUDIT_DIR
+        ),
+        &want
+    ));
+    assert!(!mounts_bind_device(
+        &format!(
+            "[{{\"Type\":\"bind\",\"Source\":\"{}\",\"Destination\":\"/openbao/file\"}}]",
+            dir.path().display()
+        ),
+        &want
+    ));
+
+    // A symlinked store still matches, because both sides are resolved.
+    let linked = other.path().join("link-to-store");
+    std::os::unix::fs::symlink(dir.path(), &linked).expect("the link is planted");
+    assert!(mounts_bind_device(&bind_mounts_json(&linked), &want));
+}
+
+// ---------------------------------------------------------------------
+// The marker-authorised restore's loss condition
+// ---------------------------------------------------------------------
+
+/// The marker-authorised restore is reported as a loss condition rather
+/// than as a tidy recovery, and the records written to an unlinked
+/// active inode are gone once its descriptor closes.
+///
+/// The sequence: a terminal marker removal forced to fail, the new
+/// `audit.log` unlinked while `OpenBao` holds it open, a restart, the
+/// marker-authorised restore, and then a reopen closing that
+/// descriptor.
+#[tokio::test(start_paused = true)]
+async fn the_marker_authorised_restore_reports_a_loss_condition() {
+    use std::io::Write as _;
+
+    let (dir, mut rotation, _docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+
+    // A confirmed reopen whose terminal marker removal fails.
+    rotation.fail_marker_unlink();
+    let outcome = rotation.run_pass(at(0)).await;
+    assert_eq!(outcome.form, RotationForm::Signal);
+    assert!(
+        outcome.marker_cleanup_pending,
+        "the marker outlived its rotation"
+    );
+    let generation = generation_names(dir.path())
+        .pop()
+        .expect("the rotation published one");
+    let marker = rotation.marker_path().to_path_buf();
+    assert!(marker.exists());
+
+    // OpenBao holds the new active log open, and something unlinks it
+    // before the next tick can clear the marker.
+    let mut writer = OpenOptions::new()
+        .append(true)
+        .open(&active)
+        .expect("OpenBao's descriptor on the new active log");
+    std::fs::remove_file(&active).expect("the new active log is unlinked");
+    writer
+        .write_all(b"{\"written\":\"after the unlink\"}\n")
+        .expect("OpenBao keeps appending to the unlinked inode");
+    writer.flush().expect("the write lands");
+
+    // The daemon restarts, losing the in-memory cleanup debt.
+    drop(rotation);
+    let mut restarted = rotation_at(dir.path().to_path_buf(), S, N);
+    let logs = logs_from(async {
+        let outcome = restarted.run_pass(at(60)).await;
+        assert!(!outcome.restore_pending, "the restore itself succeeded");
+    })
+    .await;
+
+    assert_eq!(
+        count_lines_at(&logs, "ERROR"),
+        1,
+        "reported at error:\n{logs}"
+    );
+    assert!(
+        logs.contains(&generation),
+        "naming the restored generation:\n{logs}"
+    );
+    assert!(
+        logs.contains(&active.display().to_string()),
+        "and the active path:\n{logs}"
+    );
+    assert!(
+        logs.contains("Check whether new entries are appearing in the restored"),
+        "telling the operator what to check:\n{logs}"
+    );
+    assert!(
+        logs.contains("lost the moment its descriptor closes"),
+        "and naming the condition:\n{logs}"
+    );
+
+    // The restore has put a plausible `audit.log` at the configured
+    // path, which is exactly how it masks the breakage.
+    assert!(active.exists());
+    assert!(
+        !std::fs::read_to_string(&active)
+            .expect("the restored log reads")
+            .contains("after the unlink"),
+        "the restored generation does not hold what went to the unlinked inode"
+    );
+
+    // And when the descriptor closes, those records are gone: no file
+    // anywhere in the device directory holds them.
+    drop(writer);
+    let anywhere = std::fs::read_dir(dir.path())
+        .expect("the device directory lists")
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .any(|body| body.contains("after the unlink"));
+    assert!(
+        !anywhere,
+        "the records written to the unlinked inode are unreachable and then freed"
+    );
+}
+
+/// The marker's lifetime is the pass's, outcome by outcome.
+///
+/// Removed whenever the pass ends with no rotation in flight, and kept
+/// by exactly the two states that still have one.
+#[tokio::test(start_paused = true)]
+async fn the_marker_lives_exactly_as_long_as_its_rotation() {
+    // A confirmed reopen.
+    let (dir, mut rotation, _docker) = signal_fixture(S, N);
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    assert_eq!(rotation.run_pass(at(0)).await.form, RotationForm::Signal);
+    assert!(!rotation.marker_path().exists(), "confirmed reopen");
+
+    // A flushed rename-back followed by a completed fallback: one
+    // removal covers the pass, and the pass ends with neither.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    assert_eq!(rotation.run_pass(at(0)).await.form, RotationForm::Fallback);
+    assert!(
+        !rotation.marker_path().exists(),
+        "flushed rename-back and completed fallback"
+    );
+
+    // An abandoned fallback: the pre-truncate re-verification refuses,
+    // nothing is truncated, and the marker still goes.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let shortened = active.clone();
+    rotation.on_publish(move |_| {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&shortened)
+            .expect("the active log opens");
+        file.set_len(16).expect("the active log is shortened");
+    });
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotation.is_unmet(), "the fallback was abandoned");
+    assert_eq!(len_of(&active), 16, "nothing was truncated by this pass");
+    assert!(!rotation.marker_path().exists(), "abandoned fallback");
+    assert_ne!(captured, 16);
+
+    // A rename that never happened.
+    let (dir, mut rotation, _docker) = signal_fixture(S, N);
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    rotation.fail_rename();
+    assert_eq!(rotation.run_pass(at(0)).await.form, RotationForm::Fallback);
+    assert!(
+        !rotation.marker_path().exists(),
+        "rename that never happened"
+    );
+
+    // A pending restore keeps it.
+    let (_dir, rotation, _stranded) = strand_the_live_inode(S, N).await;
+    assert!(rotation.restore_is_pending());
+    assert!(rotation.marker_path().exists(), "pending restore");
+
+    // And so does a rename-back whose flush failed.
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    docker.stops_reopening();
+    append_records(&dir.path().join(ACTIVE_FILE_NAME), S);
+    rotation.fail_restore_sync();
+    let outcome = rotation.run_pass(at(0)).await;
+    assert!(outcome.rotation.is_unmet());
+    assert!(!outcome.restore_pending);
+    assert!(
+        rotation.marker_path().exists(),
+        "rename-back whose flush failed"
     );
 }

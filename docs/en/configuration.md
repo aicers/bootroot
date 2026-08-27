@@ -674,7 +674,7 @@ error.
   days. Must be greater than 0.
 
 The next three bound OpenBao's **own** file audit device, which the
-daemon rotates in place on an endpoint-enabled host. They are separate
+daemon rotates on an endpoint-enabled host. They are separate
 keys rather than a reuse of the three above because the two writers have
 unrelated volumes: one bounded line per registrar invocation, against one
 entry per OpenBao request across the whole deployment. See

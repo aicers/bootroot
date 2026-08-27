@@ -149,17 +149,34 @@ behind by a failed pass is transient, escalated and retried rather than
 accepted.
 
 Every other figure is an **operating envelope under a stated model**,
-not a bound. Under the nominal model — the previous pass succeeded well
-inside one interval, and OpenBao appends `W` bytes per interval — the
-device sits at about `openbao_audit_max_file_bytes ×
-(openbao_audit_max_retained_files + 1) + W` between passes (512 MiB + `W`
-shipped) and peaks inside a pass at about `openbao_audit_max_file_bytes ×
-(openbao_audit_max_retained_files + 2)` plus twice one interval's writes
-(576 MiB shipped). The peak carries that doubling because the staging
-copy must live in the device's own directory: a hard link cannot cross a
-filesystem, and the publish links the copy into place rather than
-copying it a second time. These are the expected steady state and peak,
-never a worst case.
+not a bound. Write `S` for `openbao_audit_max_file_bytes`, `N` for
+`openbao_audit_max_retained_files`, `L` for the active log's length when
+a pass captures it, and `W` for one interval's writes. Under the nominal
+model — the previous pass succeeded well inside one interval, OpenBao
+appends `W` bytes per interval, and so `L ≈ S + W` — the device sits at
+about `S × (N + 1) + W` between passes (512 MiB + `W` shipped).
+
+Its transient peak *inside* a pass depends on which of the two
+mechanisms below the pass took:
+
+- **Rename-and-reopen**, the normal one, copies nothing. Its transient
+  total is `S × N + L + D_signal` — about `S × (N + 1) + W + D_signal`,
+  or 512 MiB plus those terms — where `D_signal` is what OpenBao appends
+  to the new active log before the pass ends. The new active log does
+  not *stay* empty: OpenBao appends to it from creation while the pass
+  still has its confirmation and its trim to run.
+- **Copy-and-truncate**, the fallback, stages a full copy of the active
+  log beside it, so mid-pass the device holds the retained set, the
+  active log and the copy at once: `S × N + 2L + D`, about
+  `S × (N + 2) + 2W + D` or 576 MiB plus those terms, where `D` is what
+  OpenBao appends while the copy runs. The doubling is there because the
+  staging copy must live in the device's own directory: a hard link
+  cannot cross a filesystem, and the publish links the copy into place
+  rather than copying it a second time.
+
+What the normal mechanism removes is the duplicated `L`, not every write
+term. Both are expected values under the model above, never worst cases
+and never ceilings.
 
 **The device has no absolute footprint ceiling.** bootroot is not the
 process appending to it, and the only way to stop OpenBao writing is to
@@ -206,6 +223,13 @@ container's audit user while a pass runs as root. Neither a broken
 device directory nor a planted link can therefore look like a quiet
 host: both `warn` per pass and escalate at five.
 
+An `audit.log` that is **absent** is forgiven only where the device
+directory holds neither a rotation-intent marker nor any retained
+generation — a device whose container has simply not created it yet.
+With either present, an absent active log is a state the daemon refuses
+to act in rather than a quiet one — see **Where the daemon refuses to
+act** in the recovery rules below.
+
 That check is on a name, and the device directory is writable by the
 container's audit user, so what it measured and what the copy and the
 truncate later open need not be the same file. Each of those opens
@@ -216,15 +240,180 @@ one failure this counter cannot report — a pass that never returns is a
 rotation task that never ticks again. Refused, it is an ordinary failed
 pass, and the next tick retries it.
 
-**The mechanism, and its loss window.** The active log is **copied and
-truncated**, never renamed, unlinked or replaced, so the path and the
-descriptor OpenBao holds stay continuously present and writable and
-OpenBao is neither restarted, resealed nor signalled. A pass copies the
-active log's stable prefix into a staging file in the same directory,
-trims that copy to its last complete record, gives it mode `0600` and
-the directory's owner, flushes it, links it into place under its
-generation name, flushes the directory, and only then truncates the
-active log to zero and flushes that.
+**The mechanism: rename-and-reopen.** A pass renames the active log to
+its generation name, flushes the directory, sends `SIGHUP` to the
+container's main process, and waits — up to five seconds, looking every
+100 ms — for OpenBao to create a fresh `audit.log` at the configured
+path. Nothing is copied and nothing is truncated, so **not one byte is
+lost**: OpenBao's open descriptor still refers to the renamed inode and
+keeps every record it wrote, and the new file starts empty. The rotation
+loses no records, with one exception — the critical recovery condition
+below — and with the fallback's own loss window where the fallback is
+taken.
+
+OpenBao is **not** restarted, resealed or unsealed by any of this.
+`docker kill --signal=HUP` signals a running container; `docker
+restart`, `docker stop`/`start` and `docker compose up` are restarts and
+none of them is used.
+
+The daemon finds the container to signal from the device's **bind
+mount**, which is what it actually holds: it enumerates running
+containers, reads each one's mounts, and selects the one carrying a
+`bind` whose destination is `/openbao/audit` and whose source is this
+install's own `<audit_store_dir>/openbao`, canonicalized on both sides.
+Two installs on one host have different `audit_store_dir` values, so
+that source discriminates between them. It signals by container id,
+never by name. No configuration key and no environment variable is
+involved, and none selects the mechanism: the choice between the two
+forms is made once per pass from what the filesystem shows.
+
+**What "reopened" means, and what it does not.** The evidence is
+file-level: the configured path exists **and** its `(st_dev, st_ino)`
+differs from the rotated generation's. Presence alone is not the test —
+the generation *is* the inode the path used to name. The daemon drives
+no OpenBao request to establish it. A `docker kill` that exits non-zero
+is not read as proof that the signal never arrived either; the
+filesystem decides, and a signal acted on late is caught by the recovery
+below and treated as a slow success.
+
+**The path is briefly absent, and that is the mechanism rather than a
+fault.** Rename-first necessarily leaves the configured path missing
+from the rename until OpenBao recreates it or the recovery puts it back.
+What holds throughout is the **descriptor**: OpenBao's open handle
+refers to the inode rather than to the name, so it keeps accepting
+writes across that window, and a pass that succeeds does not return
+until the path is present again. The daemon never pre-creates
+`audit.log` itself — a root-owned file in a directory the container
+cannot chown is a device that cannot write.
+
+**How it is established, and re-established.** That OpenBao reopens the
+device on `SIGHUP` is a claim about the *image*, so it is not taken on
+trust. It was established against **`openbao/openbao:2.5.5`**, the
+pinned tag (overridable through `OPENBAO_IMAGE`), and the Docker E2E
+lifecycle re-establishes it on **every CI pass**: the check renames the
+active log aside, signals the container, waits up to 30 seconds for the
+path to reappear, asserts the new file is a *different inode*, drives
+one authenticated read whose audited path carries a fresh random nonce,
+and then asserts that nonce is in the new active log and **not** in the
+renamed generation, whose size is unchanged. It also asserts the
+container's `StartedAt`, `RestartCount` and `Pid` are identical before
+and after and that `sys/seal-status` reports `sealed=false` and
+`initialized=true` both times. An `OPENBAO_IMAGE` bump that breaks the
+reopen therefore fails the build rather than silently degrading every
+rotation to the lossy form.
+
+**The rotation-intent marker.** Immediately *before* the rename, a pass
+writes `rotation-intent.json` into the device's directory, holding the
+active log's `(st_dev, st_ino)` and the generation name it is about to
+rename to. A rename preserves the inode, so that identity names the same
+file before and after — which is how a daemon that restarted mid-rotation
+recognises its own interrupted rotation rather than guessing from
+generation order or mtime. The file holds one path and two integers and
+no secret, sits outside the `audit-*.log` namespace so no listing, bound
+or trim ever sees it, and is written with the staged, flushed, renamed,
+directory-flushed discipline every other file bootroot reads back uses.
+It is removed as soon as the rotation is over, and a removal that fails
+is an `error`, fails the pass, and blocks every further rotation until
+it is retried successfully.
+
+**The recovery.** The dangerous state is a rename that succeeded and a
+reopen that did not: OpenBao still audits into the renamed inode, but
+nothing exists at the active path, so an operator — and the CI
+assertion — sees an absent audit log on a healthy deployment. So before
+a pass reports any failure it looks at the active path and acts:
+
+- **Present on a different inode** — the pass in fact succeeded, whatever
+  the wait reported. It is left alone and the pass is a success.
+- **Absent** — the generation is renamed *back*, restoring the exact
+  pre-rotation state. No write is lost: OpenBao's descriptor refers to
+  the inode, so it accepted writes throughout, including while the path
+  was absent. The rename-back refuses to replace an `audit.log` OpenBao
+  has meanwhile created — atomically, so it cannot lose that race — and
+  when it is refused, the path is re-examined and decided by the same
+  inode rule.
+- **Present carrying the generation's own identity** — an assumption has
+  broken. The pass renames nothing back, truncates nothing, **trims
+  nothing** and logs one `error` naming both paths. Falling back here
+  would truncate the very inode the generation names.
+
+If the rename-back itself fails, OpenBao is still appending through its
+open descriptor to a file now called `audit-<…>.log` while `audit.log`
+does not exist. **That file is not a rotated generation: it is the live
+audit log under the wrong name.** The daemon logs one `error` naming it
+and the absent path, and from then on each tick does exactly two things
+— retry the rename-back, and evaluate the retained-set bound with that
+file excluded from both the trim's candidates and the byte total. It
+rotates nothing, signals nothing and truncates nothing while that is
+outstanding. Do **not** delete, compress or move that file anywhere but
+back: unlinking it unlinks the device's only writable target.
+
+**The critical recovery condition.** One state reaches a restore that
+can lose records, and it is stated here rather than hidden. It needs a
+double fault: a pass's marker removal fails **and** something unlinks
+the new `audit.log` before the next tick clears the marker. A daemon
+restarting into that state finds the active path absent, reads the
+marker, finds the generation it names still carrying the recorded
+identity, and renames it back — while OpenBao goes on appending to the
+unlinked newer inode. That generation's own records survive. **The
+records written to the unlinked inode do not**: no path reaches them,
+and when its descriptor is closed — by a later rotation, or by the
+container restarting — the inode is freed and everything written since
+the unlink is gone. The restore also *masks* the breakage, putting a
+plausible `audit.log` at the configured path where an operator would
+otherwise have seen an absent one.
+
+The branch is still the right default: in the ordinary case it is this
+daemon's own interrupted rotation, where restoring reunites the path and
+the descriptor and loses nothing. But it is reported at **`error`, not
+`warn`**, naming the restored generation and the active path, and it
+tells the operator what to check: **whether new entries are appearing in
+the restored `audit.log`**. If they are, this was an interrupted rotation
+and the restore was correct. If they are not, OpenBao is writing where
+nothing can read, and those records will be lost when its descriptor
+closes — stop and investigate rather than waiting.
+
+**Where the daemon refuses to act.** A pass that starts with the active
+path absent decides from the marker and nothing else. If there is no
+marker, or it names a file that is gone or whose identity no longer
+matches, the daemon does not recognise the state as its own: it logs one
+`error`, rotates nothing, trims nothing and moves **no** generation into
+place. A newer generation is never renamed into position because it is
+the newest or the most recently modified — an operator or a filesystem
+fault can unlink the active pathname while OpenBao keeps writing to the
+now-unlinked inode, and renaming an unrelated file into place would
+restore a name while the live stream stayed unreachable. The one
+exception is a directory holding neither a marker nor any generation at
+all, which is a host whose device has simply not been created yet: that
+stays the silent no-op it always was.
+
+**The fallback: copy-and-truncate.** Where the reopen cannot be
+confirmed, the pass completes the rotation on the *same tick* by copying
+and truncating instead. This is the mechanism that needs no cooperation
+from OpenBao at all, and it is why an image bump cannot stop rotation
+happening — at the cost of a loss window and the larger in-pass
+footprint above. It runs after the recovery has restored the active
+path, so it always acts on the file that is there.
+
+A fallback pass copies the active log's stable prefix into a staging
+file in the same directory, trims that copy to its last complete record,
+gives it mode `0600` and the directory's owner, flushes it, links it
+into place under its generation name, flushes the directory, and only
+then truncates the active log to zero and flushes that. It opens the
+active path **exactly once** and works through that one descriptor —
+`fstat` for the length, the read for the copy, and the truncate — so
+copying one inode and truncating another is impossible by construction;
+and immediately before the truncate it re-verifies that the path still
+resolves to that same file and that the file still holds at least the
+bytes copied. If either check fails it abandons the tick **without
+truncating**, unlinks the copy and logs a `warn`.
+
+**What an operator sees when the fallback is taken.** Exactly one `info`
+event, on the first fallback a daemon process takes, naming the reason.
+It is not repeated: a rotation every 60 seconds must not turn a degraded
+mechanism into a log flood. That single line is the signal that this
+deployment is rotating the lossy way — a **degraded** state, not the
+normal one. The CI check above is what stops it becoming permanent and
+unnoticed.
 
 The publish is a link and a check rather than a rename for the same
 reason each open re-checks its descriptor: no name in that directory
@@ -258,12 +447,15 @@ operation — but both put every interval the pass itself introduces
 behind them, leaving the instructions between the check and the call
 rather than the time a copy or a flush takes.
 
-The price is a small loss window at each rotation: the partial trailing
-record, plus whatever OpenBao appended while the copy ran, is destroyed
-by the truncate. A record is therefore either complete in the generation
-or entirely inside that window — never split and never torn.
+The price of the fallback is a small loss window at each rotation: the
+partial trailing record, plus whatever OpenBao appended while the copy
+ran, is destroyed by the truncate. A record is therefore either complete
+in the generation or entirely inside that window — never split and never
+torn. The normal rename-and-reopen mechanism has no such window at all,
+which is the reason it is attempted first.
 
-**The crash residual.** A crash between the truncate and its flush can
+**The crash residual.** A crash between the fallback's truncate and its
+flush can
 leave the active log back at its pre-truncate length while the
 generation survives, so the next pass rotates an overlapping prefix and
 two generations share records. That is duplication, never loss, and it
