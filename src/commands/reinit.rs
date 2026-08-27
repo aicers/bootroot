@@ -132,16 +132,11 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         validate_summary_json_output_path(out, messages)?;
     }
 
-    // 4.5. Same preflight for the audit store.  The init pass below
-    //      requires `--agent-config` on a host whose `state.json`
-    //      records an enabled registrar endpoint, or which carries a
-    //      rendered audit compose override, and refuses when that
-    //      file's `[registrar_endpoint] enabled` disagrees with the
-    //      recorded predicate.  `write_minimal_state` preserves that
-    //      predicate, so the answer here is the answer the init pass
-    //      gets — and raising it there would land after the OpenBao
-    //      wipe, recreating the partial-init trap.  Every check is a
-    //      read: nothing is created, rendered or deleted by it.
+    // 4.5. Preflight the audit-store endpoint/configuration gates and
+    //      filesystem reserve phase-one refusals. Every check is a
+    //      read: nothing is created, rendered or deleted by it. The
+    //      normal init pass below handles rendering, verification,
+    //      outcome reporting and phase-two instructions after the wipe.
     preflight_audit_store(
         &AuditStoreInitInputs {
             compose_dir: &compose_dir,
@@ -203,10 +198,13 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     // 9. Remove OpenBao runtime/bootstrap artifacts (narrow).
     remove_openbao_runtime_state(&effective_secrets_dir, messages)?;
 
-    // 10. Rewrite state.json with intent-only fields BEFORE infra up so
-    //     the infra-up path layers the correct compose overrides for
-    //     any recorded non-loopback bind.
-    write_minimal_state(
+    // 10. Rewrite state.json with intent-only fields before infra up.
+    //     Keep the registrar predicate out of this transient state:
+    //     infra up consumes it by requiring an existing audit override,
+    //     while a fresh filesystem-mode host has not reached ordinary
+    //     init yet to render one. Non-loopback OpenBao bind intent stays
+    //     present so infra up restores its required port override.
+    write_minimal_state_for_infra(
         &state_path,
         &snapshot,
         &openbao,
@@ -223,12 +221,36 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         services: vec![OPENBAO_COMPOSE_SERVICE.to_string()],
         image_archive_dir: None,
         restart_policy: "always".to_string(),
-        openbao_url: openbao.openbao_url.clone(),
+        // A registrar endpoint leaves OpenBao's preserved HCL serving
+        // TLS on loopback. The transient state below omits its predicate
+        // so infra up does not require an audit override that ordinary
+        // init has yet to render, but that must not also make infra up
+        // probe the TLS listener over HTTP.
+        openbao_url: reinit_runtime_openbao_url(
+            &openbao.openbao_url,
+            snapshot.registrar_endpoint.as_ref(),
+        ),
         openbao_unseal_from_file: None,
     };
-    run_infra_up(&infra_args, messages).await?;
+    let infra_result = run_infra_up(&infra_args, messages).await;
 
-    // 12. Re-run init in reinit mode.  Reinit-mode behavior is enforced
+    // 12. Restore the preserved endpoint predicate before handling the
+    //     bring-up result. A failed infra up must not strand recovery
+    //     with its registrar intent erased. On success, ordinary init
+    //     consumes the restored predicate and therefore uses the same
+    //     audit-store path, outcome, and phase-two instructions as
+    //     direct init.
+    write_minimal_state(
+        &state_path,
+        &snapshot,
+        &openbao,
+        &effective_secrets_dir,
+        messages,
+    )
+    .await?;
+    infra_result?;
+
+    // 13. Re-run init in reinit mode.  Reinit-mode behavior is enforced
     //     inside the init flow: overwrite prompts for preserved files
     //     are skipped, and an existing `password.txt` short-circuits
     //     the auto-gen path so the step-ca password is not rotated.
@@ -497,6 +519,51 @@ pub(crate) async fn write_minimal_state(
     effective_secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    write_minimal_state_with_registrar_endpoint(
+        state_path,
+        snapshot,
+        openbao,
+        effective_secrets_dir,
+        snapshot.registrar_endpoint.clone(),
+        messages,
+    )
+    .await
+}
+
+/// Writes the transient minimal state `infra up` needs during reinit.
+///
+/// A fresh filesystem-mode audit store does not have a rendered compose
+/// override until the ordinary init pass that follows `infra up`. Omitting
+/// the predicate for this one invocation prevents its override reader from
+/// treating that normal init concern as a pre-init failure. The caller
+/// restores the predicate with [`write_minimal_state`] before invoking init.
+async fn write_minimal_state_for_infra(
+    state_path: &Path,
+    snapshot: &DeploymentIntent,
+    openbao: &OpenBaoArgs,
+    effective_secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    write_minimal_state_with_registrar_endpoint(
+        state_path,
+        snapshot,
+        openbao,
+        effective_secrets_dir,
+        None,
+        messages,
+    )
+    .await
+}
+
+/// Serializes a reinit state carrying the selected registrar predicate.
+async fn write_minimal_state_with_registrar_endpoint(
+    state_path: &Path,
+    snapshot: &DeploymentIntent,
+    openbao: &OpenBaoArgs,
+    effective_secrets_dir: &Path,
+    registrar_endpoint: Option<crate::state::RegistrarEndpointState>,
+    messages: &Messages,
+) -> Result<()> {
     let state = StateFile {
         openbao_url: openbao.openbao_url.clone(),
         kv_mount: openbao.kv_mount.clone(),
@@ -511,7 +578,7 @@ pub(crate) async fn write_minimal_state(
         stepca_bind_addr: snapshot.stepca_bind_addr.clone(),
         stepca_advertise_addr: snapshot.stepca_advertise_addr.clone(),
         infra_certs: snapshot.infra_certs.clone(),
-        registrar_endpoint: snapshot.registrar_endpoint.clone(),
+        registrar_endpoint,
         ..Default::default()
     };
     state
@@ -1075,6 +1142,8 @@ fn init_args_for_reinit(
                 openbao_host_port_env,
             ),
         };
+        openbao.openbao_url =
+            reinit_runtime_openbao_url(&openbao.openbao_url, snapshot.registrar_endpoint.as_ref());
     }
     let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
     let stepca_provisioner = preserved_stepca_provisioner_from_ca_json(effective_secrets_dir)
@@ -1129,6 +1198,24 @@ fn init_args_for_reinit(
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })
+}
+
+/// Returns the URL for recovery work against a preserved `OpenBao` listener.
+///
+/// A recorded registrar endpoint enables TLS even when `OpenBao` stays on
+/// loopback. Reinit starts that already-configured listener before its
+/// follow-up init pass can restore the endpoint predicate to `state.json`,
+/// so both operations must retain the HTTPS scheme independently of that
+/// transient state.
+fn reinit_runtime_openbao_url(
+    openbao_url: &str,
+    registrar_endpoint: Option<&crate::state::RegistrarEndpointState>,
+) -> String {
+    if registrar_endpoint.is_some_and(|endpoint| endpoint.enabled) {
+        openbao_url.replacen("http://", "https://", 1)
+    } else {
+        openbao_url.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2524,6 +2611,26 @@ mod tests {
         );
     }
 
+    /// A loopback registrar endpoint still leaves the preserved `OpenBao`
+    /// listener on TLS, although it has no non-loopback bind override.
+    #[test]
+    fn reinit_runtime_url_uses_https_for_a_registrar_endpoint() {
+        let endpoint = crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "example.internal".to_string(),
+            host: "bootroot-01".to_string(),
+        };
+
+        assert_eq!(
+            reinit_runtime_openbao_url("http://localhost:18200", Some(&endpoint)),
+            "https://localhost:18200"
+        );
+        assert_eq!(
+            reinit_runtime_openbao_url("http://localhost:18200", None),
+            "http://localhost:18200"
+        );
+    }
+
     /// Closes #731: with no snapshotted `openbao_bind_addr`, the second
     /// init pass targets the configured `OpenBao` host port instead of the
     /// CLI default's literal 8200.
@@ -3301,6 +3408,61 @@ mod tests {
 
         let rewritten = StateFile::load(&state_path).unwrap();
         assert_eq!(rewritten.registrar_endpoint, original.registrar_endpoint);
+    }
+
+    /// Reinit starts `OpenBao` before the ordinary init pass can render a
+    /// fresh audit override. Its transient state must therefore omit the
+    /// endpoint predicate for `infra up`, then restore it for init.
+    #[tokio::test]
+    async fn transient_infra_state_omits_then_restores_registrar_endpoint() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut original = state_with_intent();
+        original.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "example.internal".to_string(),
+            host: "bootroot-01".to_string(),
+        });
+        original.save(&state_path).unwrap();
+        let snapshot = snapshot_deployment_intent(&state_path).expect("snapshot");
+        let openbao = OpenBaoArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+        };
+        let messages = test_messages();
+
+        write_minimal_state_for_infra(
+            &state_path,
+            &snapshot,
+            &openbao,
+            Path::new("secrets"),
+            &messages,
+        )
+        .await
+        .expect("write transient state");
+        assert!(
+            StateFile::load(&state_path)
+                .expect("transient state")
+                .registrar_endpoint
+                .is_none(),
+            "infra up must not require an override that init has not rendered"
+        );
+
+        write_minimal_state(
+            &state_path,
+            &snapshot,
+            &openbao,
+            Path::new("secrets"),
+            &messages,
+        )
+        .await
+        .expect("restore state");
+        assert_eq!(
+            StateFile::load(&state_path)
+                .expect("restored state")
+                .registrar_endpoint,
+            original.registrar_endpoint
+        );
     }
 
     /// A host that never recorded the predicate still records none: the

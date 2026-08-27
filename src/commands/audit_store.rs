@@ -32,7 +32,7 @@ use bootroot::config::AuditStoreEnforcement;
 use bootroot::fs_util;
 use bootroot::registrar::audit_store::{
     AuditStoreLayoutError, OPENBAO_CONTAINER_AUDIT_DIR, PRODUCTION_UID, STORE_DIR_MODE,
-    check_ancestors, check_store_directory, create_layout, create_mount_point,
+    check_store_directory, create_layout, create_mount_point,
 };
 use serde::Deserialize;
 
@@ -475,24 +475,20 @@ pub(crate) enum AuditStorePlan {
     Provision(Box<AgentConfigView>),
 }
 
-/// Decides what this run does about the audit store, creating,
-/// rendering and deleting nothing.
+/// Decides how endpoint and explicit-enforcement configuration gates
+/// the audit store, creating, rendering and deleting nothing.
 ///
-/// Every refusal `bootroot init` makes before it touches the filesystem
-/// lives here — the required flag, the four load failures, the
-/// enablement cross-check, the caller's own uid and the stale override
-/// — so a caller with a destructive step of its own can raise them
-/// ahead of that step rather than after it. [`apply_audit_store`] is
-/// this plus the acting.
+/// These gates do not inspect a prospective store layout. Reinit uses
+/// them before its wipe, then separately evaluates the filesystem
+/// reserve's phase-one facts. [`plan_audit_store`] adds the provisioning
+/// checks that ordinary init needs before it acts.
 ///
 /// # Errors
 ///
 /// Returns an error when `--agent-config` is required and absent, when
-/// the file cannot be loaded, when the two recorded enablement values
-/// disagree, when a run that would provision is not running as
-/// `expected_uid`, or when a rendered override names a different store
-/// than the configuration now resolves.
-fn plan_audit_store(
+/// the file cannot be loaded, or when the two recorded enablement values
+/// disagree.
+fn select_audit_store_plan(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
 ) -> Result<AuditStorePlan> {
@@ -528,6 +524,26 @@ fn plan_audit_store(
         });
     }
 
+    Ok(AuditStorePlan::Provision(Box::new(view)))
+}
+
+/// Decides what ordinary init does about the audit store, creating,
+/// rendering and deleting nothing.
+///
+/// This is [`select_audit_store_plan`] plus the validation that matters
+/// only to a provisioning init pass. Reinit deliberately does not run
+/// these checks before its wipe: a fresh host needs init to create and
+/// render its first store, while reserve phase one remains the sole
+/// filesystem preflight boundary.
+fn plan_audit_store(
+    inputs: &AuditStoreInitInputs<'_>,
+    messages: &Messages,
+) -> Result<AuditStorePlan> {
+    let plan = select_audit_store_plan(inputs, messages)?;
+    let AuditStorePlan::Provision(view) = plan else {
+        return Ok(plan);
+    };
+
     // Refuse an unprivileged provisioning run *before* `create_layout`
     // has a chance to create anything. The layout is created owned by
     // whichever process creates it, so a non-root run would build
@@ -547,7 +563,8 @@ fn plan_audit_store(
         ));
     }
 
-    if rendered_present {
+    let override_path = audit_override_path(inputs.compose_dir);
+    if override_path.exists() {
         let rendered_store = read_audit_override_store_dir(&override_path, messages)?;
         // `Path`'s own equality compares components, so the rendered
         // spelling and the configured one agree wherever they name
@@ -562,53 +579,28 @@ fn plan_audit_store(
         }
     }
 
-    Ok(AuditStorePlan::Provision(Box::new(view)))
+    Ok(AuditStorePlan::Provision(view))
 }
 
-/// Raises every refusal an `init` would raise about the audit store,
+/// Raises the audit-store refusals that must precede a reinit wipe,
 /// without creating, rendering or deleting anything.
 ///
 /// `bootroot reinit` re-runs `init`, but only after it has removed the
-/// `OpenBao` container and its volumes. A refusal raised for the first
-/// time by that second pass would land after the wipe — the partial-init
-/// trap reinit exists to recover from — so reinit raises them here
-/// instead, beside its other pre-wipe preflights. Every check below is
-/// a read, so running it twice costs nothing and decides nothing.
+/// `OpenBao` container and its volumes. The endpoint/configuration gates
+/// and filesystem reserve phase-one refusals therefore run here, before
+/// that wipe. Phase-two work and normal init concerns remain on the init
+/// path. Every check below is a read, so running it twice costs nothing
+/// and decides nothing.
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`apply_audit_store`], except those that
-/// only a write can produce, plus the missing-override refusal the
-/// bring-up between the wipe and the init pass would raise.
+/// Returns the endpoint/configuration gate errors and filesystem reserve
+/// phase-one refusals that apply before reinit wipes `OpenBao`.
 pub(crate) fn preflight_audit_store(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
 ) -> Result<()> {
-    if let AuditStorePlan::Provision(view) = plan_audit_store(inputs, messages)? {
-        // The ancestor chain is the one remaining refusal `create_layout`
-        // makes before it creates anything, and it is a pure read too.
-        //
-        // The configured spelling is the right input here even in
-        // `filesystem` mode, where everything *derived* comes from the
-        // simplified path instead. An ancestor chain is spelling-
-        // invariant: `Path::ancestors` walks `parent()`, which is
-        // defined over components, and components normalise away
-        // repeated separators, a trailing separator and every `.` —
-        // exactly what simplification removes. A configured
-        // `…/audit-store/.` therefore yields `…/bootroot`, `…/lib`,
-        // `/var`, `/` — the same chain the simplified path yields, and
-        // one that never contains the store directory itself. Checking
-        // it before `evaluate` keeps a missing or untraversable
-        // ancestor ahead of the reserve verdicts, which is the order
-        // `create_layout` establishes on the init path.
-        check_ancestors(&view.audit_store_dir).map_err(|err| {
-            anyhow::anyhow!(layout_error_message(
-                &err,
-                StoreCheckCaller::Init,
-                inputs.expected_uid,
-                messages
-            ))
-        })?;
+    if let AuditStorePlan::Provision(view) = select_audit_store_plan(inputs, messages)? {
         // Phase-1 refusals only, and every one of them a pure read: a
         // sub-minimum reserve, a store path the artifacts cannot carry,
         // an image of the wrong type or the wrong size, a filesystem
@@ -633,17 +625,6 @@ pub(crate) fn preflight_audit_store(
                     &view.audit_store_dir.display().to_string()
                 ));
             }
-        }
-        // Reinit brings the stack back up *before* it re-runs `init`,
-        // and that bring-up gates on the recorded predicate alone: with
-        // it enabled it requires the rendered override, which the init
-        // pass has not written yet on a host that has never provisioned
-        // one. Saying so here costs a read; leaving it to the bring-up
-        // costs the wipe. Rendering it instead is not the answer — the
-        // store it names has to be created by the root-run init pass,
-        // and this preflight writes nothing.
-        if !audit_override_path(inputs.compose_dir).exists() {
-            anyhow::bail!(messages.error_audit_store_override_missing());
         }
     }
     Ok(())
@@ -1522,12 +1503,12 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// `bootroot reinit` removes the `OpenBao` container and its volumes
-    /// before it re-runs `init`, so every refusal the init pass would
-    /// make has to be reachable ahead of that wipe. This asserts the
-    /// preflight raises each of them and, for the runs it accepts,
-    /// leaves the filesystem exactly as it found it.
+    /// before it re-runs `init`, so the endpoint/configuration gates and
+    /// filesystem reserve phase-one refusals must be reachable ahead of
+    /// that wipe. This asserts they are, and that accepted runs leave the
+    /// filesystem exactly as they found it.
     #[test]
-    fn the_preflight_raises_every_init_refusal_without_touching_anything() {
+    fn the_preflight_raises_endpoint_configuration_gates_without_touching_anything() {
         // The required flag, on the two runs that require it.
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
@@ -1580,43 +1561,45 @@ mod tests {
         assert_eq!(fs::read(&rendered).expect("read"), before);
     }
 
-    /// The bring-up reinit runs between the wipe and the init pass gates
-    /// on the recorded predicate alone, so it demands the rendered
-    /// override the init pass has not written yet. On a host whose
-    /// predicate was recorded by hand and never provisioned, that
-    /// refusal has to land here rather than after `OpenBao` has been
-    /// removed.
+    /// A fresh filesystem-mode host has no rendered override for the
+    /// pre-wipe preflight to read. Once it clears phase one, it must
+    /// proceed to the ordinary init path, which renders the override,
+    /// reports the not-activated outcome, and gives the operator the
+    /// phase-two commands exactly as a direct init would.
     #[test]
-    fn the_preflight_refuses_a_provisioning_run_with_no_override_yet() {
+    fn the_preflight_leaves_fresh_filesystem_provisioning_to_init() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
         let state = fixture.state(Some(true));
-        let agreeing = fixture.agent_config(true);
+        let agreeing = fixture.filesystem_agent_config(true);
+        let inputs = Fixture::inputs(Some(&agreeing), &state, true, &compose_dir);
 
-        let err = preflight_audit_store(
-            &Fixture::inputs(Some(&agreeing), &state, true, &compose_dir),
-            &test_messages(),
-        )
-        .expect_err("refused before the wipe");
-        assert!(err.to_string().contains("bootroot init"), "{err}");
+        preflight_audit_store(&inputs, &test_messages()).expect("phase one clears");
         assert!(!fixture.store_dir().exists());
         assert!(!audit_override_path(&compose_dir).exists());
+        assert!(!fixture.artifact_dir().exists());
 
-        // The same refusal the bring-up would have raised afterwards,
-        // which is what makes raising it here the whole point.
-        let bring_up = resolve_audit_override(
-            &state,
-            &compose_dir,
-            current_process_euid(),
-            &test_messages(),
-        )
-        .expect_err("the bring-up refuses the same host");
-        assert_eq!(bring_up.to_string(), err.to_string());
+        let outcome = apply_audit_store(&inputs, &test_messages())
+            .expect_err("ordinary init reports the phase-two outcome");
+        let text = outcome.to_string();
+        assert!(text.contains("provisioned, not activated"), "{text}");
+        let rerun = test_messages().audit_reserve_step_rerun(RESERVE_RERUN_COMMAND);
+        for step in [
+            test_messages().audit_reserve_step_image(),
+            test_messages().audit_reserve_step_install(),
+            test_messages().audit_reserve_step_subdirectories(),
+            rerun.as_str(),
+        ] {
+            assert!(text.contains(step), "missing {step:?} from {text}");
+        }
+        assert!(audit_override_path(&compose_dir).exists());
+        assert!(fixture.artifact_dir().is_dir());
     }
 
     #[test]
-    fn the_preflight_raises_the_stale_override_and_the_ancestor_refusals() {
-        // A stale override, with the rendered file left byte-identical.
+    fn the_preflight_defers_stale_override_and_ancestor_checks_to_init() {
+        // A stale override is an ordinary init concern. The preflight
+        // leaves it byte-identical and does not stop the wipe.
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
         let state = fixture.state(Some(true));
@@ -1632,11 +1615,11 @@ mod tests {
             &Fixture::inputs(Some(&agreeing), &state, true, &compose_dir),
             &test_messages(),
         )
-        .expect_err("refused as stale");
+        .expect("the stale override is deferred to init");
         assert_eq!(fs::read(&rendered).expect("read"), before);
 
-        // An ancestor without `o+x`, on a fixture with no rendered
-        // override to get past first.
+        // An ancestor without `o+x` is likewise a layout check for the
+        // ordinary init pass, not a filesystem reserve phase-one fact.
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
         let state = fixture.state(Some(true));
@@ -1644,16 +1627,13 @@ mod tests {
         fs::create_dir(&tight).expect("ancestor");
         fs::set_permissions(&tight, fs::Permissions::from_mode(0o700)).expect("chmod");
         let store = tight.join("audit-store");
-        let agent_config = fixture.agent_config_for(&store, true);
-        let err = preflight_audit_store(
+        let agent_config =
+            fixture.filesystem_agent_config_at(&store, true, RESERVE_FLOOR_FOR_TESTS);
+        preflight_audit_store(
             &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
             &test_messages(),
         )
-        .expect_err("refused");
-        assert!(
-            err.to_string().contains(&tight.display().to_string()),
-            "{err}"
-        );
+        .expect("the ancestor check is deferred to init");
         assert!(!store.exists());
     }
 
@@ -1737,22 +1717,20 @@ mod tests {
         );
     }
 
-    /// The same refusal reaches `reinit` through the shared preflight,
-    /// so an unprivileged reinit is refused while `OpenBao` is still
-    /// intact rather than after the wipe.
+    /// Reinit's preflight is deliberately phase-one-only. An ordinary
+    /// init still rejects an unprivileged provisioning process, but
+    /// reinit leaves that post-wipe/init concern to its init pass.
     #[test]
-    fn the_preflight_raises_the_unprivileged_refusal_before_the_wipe() {
+    fn the_preflight_defers_the_unprivileged_refusal_to_init() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
         let store_dir = fixture.store_dir();
         let agent_config = fixture.agent_config(true);
         let state = fixture.state(Some(true));
-        // Rendered, so the missing-override refusal cannot be what
-        // fires here.
         write_audit_override(&compose_dir, &store_dir, &test_messages()).expect("render");
 
         let foreign_uid = current_process_euid().wrapping_add(1);
-        let err = preflight_audit_store(
+        preflight_audit_store(
             &AuditStoreInitInputs {
                 compose_dir: &compose_dir,
                 agent_config: Some(&agent_config),
@@ -1762,8 +1740,7 @@ mod tests {
             },
             &test_messages(),
         )
-        .expect_err("refused");
-        assert!(err.to_string().contains(&foreign_uid.to_string()), "{err}");
+        .expect("the uid check is deferred to init");
         assert!(!store_dir.exists(), "the preflight created a store");
     }
 
@@ -2588,17 +2565,11 @@ mod tests {
         );
     }
 
-    /// A store path that is not simplified reinits, and the ancestor
-    /// chain is why.
+    /// A store path that is not simplified survives the phase-one-only
+    /// reinit preflight.
     ///
-    /// `reinit`'s pre-wipe preflight checks the ancestors of the
-    /// *configured* spelling while everything else in `filesystem`
-    /// mode is derived from the simplified one. That is safe because
-    /// an ancestor chain is spelling-invariant: `Path::ancestors`
-    /// walks `parent()`, which normalises away the trailing `.`, so
-    /// the store directory is never itself walked as one of its own
-    /// ancestors and its required `0700` — which has no `o+x` — is
-    /// never held against the traversability rule.
+    /// `filesystem` mode derives its reserve facts from the simplified
+    /// path. The ordinary init pass alone owns directory layout checks.
     #[test]
     fn the_reinit_preflight_clears_a_store_path_that_is_not_simplified() {
         let messages = test_messages();
@@ -2626,9 +2597,8 @@ mod tests {
         // would refuse.
         assert_eq!(mode & 0o001, 0, "the store directory has no o+x");
 
-        // The pre-wipe preflight now clears: no ancestor refusal, and
-        // no phase-1 refusal either, so a valid deployment spelled
-        // this way can reinit.
+        // The pre-wipe preflight only evaluates reserve phase one, so
+        // this valid deployment spelling can reinit.
         preflight_audit_store(&inputs, &messages).expect("the pre-wipe preflight clears");
 
         // It still creates nothing beneath the store and installs
