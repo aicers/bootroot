@@ -67,10 +67,15 @@ assert_openbao_audit_log() {
 # budget that expires with no file there is a **refuted** reopen,
 # reported as such — never inconclusive, and never lengthened to make a
 # slow image pass.
-OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS="${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS:-30}"
+#
+# Fixed, and deliberately not read from the environment: an overridable
+# budget is exactly the "longer wait bolted on" the paragraph above
+# refuses, and a run that quietly extended it would report an
+# established reopen the pinned budget refutes.
+OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS=30
 
-# How often it looks, inside that budget.
-OPENBAO_AUDIT_REOPEN_POLL_SECONDS="${OPENBAO_AUDIT_REOPEN_POLL_SECONDS:-0.5}"
+# How often it looks, inside that budget. Fixed for the same reason.
+OPENBAO_AUDIT_REOPEN_POLL_SECONDS=0.5
 
 # Reports what `docker inspect` says about a container's process, which
 # is how "no restart" is measured rather than observed.
@@ -85,6 +90,27 @@ openbao_audit_seal_state() {
     jq -r '"sealed=\(.sealed) initialized=\(.initialized)"'
 }
 
+# Prints an unused generation name under the current second's stamp.
+#
+# The daemon's own rotation publishes into this directory under exactly
+# this naming, so the name derived from the current second can already
+# be taken. The sequence is walked until one is free rather than
+# assuming `-000000` is.
+openbao_audit_free_generation() {
+  local container="$1" dir="$2" stamp sequence candidate
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  sequence=0
+  while [ "$sequence" -lt 1000 ]; do
+    candidate="$(printf '%s/audit-%s-%06d.log' "$dir" "$stamp" "$sequence")"
+    if ! docker exec "$container" test -e "$candidate" 2>/dev/null; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+    sequence=$((sequence + 1))
+  done
+  return 1
+}
+
 # Runs the reopen protocol and answers 0 when it holds.
 #
 # Usage:
@@ -97,12 +123,11 @@ openbao_audit_seal_state() {
 openbao_audit_reopen_probe() {
   local container="$1" url="${2%/}" role_id="$3" secret_id="$4"
   local path="${5:-$OPENBAO_AUDIT_LOG_PATH_DEFAULT}"
-  local dir generation old_id new_id
+  local dir generation old_id new_id moved_id
   local state_before state_after seal_before seal_after
-  local gen_size gen_size_after nonce token status waited
+  local gen_size gen_size_after nonce token status waited attempt moved
 
   dir="$(dirname "$path")"
-  generation="${dir}/audit-$(date -u +%Y%m%dT%H%M%SZ)-000000.log"
 
   # "No container restart" is measured, not observed: the three fields
   # and the seal state are captured before and compared after.
@@ -121,14 +146,52 @@ openbao_audit_reopen_probe() {
     echo "probe: no active audit log at ${container}:${path}" >&2
     return 1
   fi
-  # `mv -n`, never a plain `mv`: the generation name is derived from the
-  # current second and a fixed sequence, so it can collide with one
-  # `bootroot-agent` itself published in that second, and a plain `mv`
-  # would silently destroy that generation's records. Refused, the
-  # active path is still there on its old inode and step 4 refutes the
-  # probe — a loud failure rather than a lost audit generation.
-  if ! docker exec "$container" mv -n "$path" "$generation"; then
-    echo "probe: could not rename ${path} aside to ${generation}" >&2
+  # `mv -n`, never a plain `mv`: the name is derived from the current
+  # second, so it can collide with a generation `bootroot-agent` itself
+  # published in that second, and a plain `mv` would silently destroy
+  # that generation's records.
+  #
+  # But `mv -n` exits 0 when it refuses, on GNU and BSD alike, so the
+  # rename is verified rather than trusted: the generation has to come
+  # out carrying the identity the active log went in with. Without that
+  # check a collision leaves the active log where it was, the probe
+  # signals an unrotated device and step 4 refutes it — a red build
+  # reporting an image fault that never happened.
+  #
+  # A name taken between the free-sequence check and the rename is
+  # retried under the next free one rather than refuted: a daemon
+  # rotation landing in the same second is not evidence about the image.
+  attempt=0
+  moved=""
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    if ! generation="$(openbao_audit_free_generation "$container" "$dir")"; then
+      echo "probe: every generation sequence under this second's stamp is taken" >&2
+      return 1
+    fi
+    # The exit status is not what decides. `mv -n` reports a refused
+    # destination differently across implementations — GNU and BSD both
+    # succeed doing it — and only the filesystem says whether the inode
+    # moved.
+    docker exec "$container" mv -n "$path" "$generation" >/dev/null 2>&1 || true
+    moved_id="$(docker exec "$container" stat -c '%d:%i' "$generation" 2>/dev/null || true)"
+    if [ "$moved_id" = "$old_id" ]; then
+      moved="yes"
+      break
+    fi
+    # It did not move. With the active log still on its old inode the
+    # destination was simply taken, so the next free sequence is tried;
+    # anything else is not a collision and is not retried.
+    if [ "$(docker exec "$container" stat -c '%d:%i' "$path" 2>/dev/null || true)" != "$old_id" ]; then
+      break
+    fi
+  done
+  if [ -z "$moved" ]; then
+    # Nothing is restored here: this probe moved nothing, so it has
+    # nothing of its own to move back, and the generation name leads to
+    # a file it did not put there.
+    echo "probe: ${path} was never renamed aside; ${generation} carries '${moved_id}' rather \
+than ${old_id}" >&2
     return 1
   fi
 
