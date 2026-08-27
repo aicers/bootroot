@@ -262,18 +262,22 @@ pub(crate) enum EnrollError {
 /// Three members are reserved and each already has an owner: `certificates`
 /// is populated by #769, `limiter` by #787, and `audit_capacity` by #774.
 /// Recording the owners fixes neither a member schema nor a value; the
-/// container is intentionally empty, and serializes as `{}`, until each owner
-/// adds its own member.
+/// container carries only the limiter member currently owned by #787.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistrarHealth {
-    // Kept private and skipped so `Default` is the only in-crate way to create
-    // the empty v1 snapshot, while its wire representation remains `{}`.
-    #[serde(skip)]
-    _constructor: RegistrarHealthConstructor,
+    /// Limited invocations counted since this daemon started.
+    #[serde(default)]
+    pub(crate) limiter: LimiterHealth,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct RegistrarHealthConstructor;
+/// Process-lifetime counters for the two limiter checkpoints.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LimiterHealth {
+    /// Limits on requests whose permanent refusal was already known.
+    pub(crate) limited_predecision_refusal: u64,
+    /// Limits that produced the retryable admission throttle.
+    pub(crate) limited_admission: u64,
+}
 
 /// A response-wrapping token carried only at the serialization boundary.
 ///
@@ -644,6 +648,15 @@ fn map_refusal(error: &VerbError) -> (RefusalClass, Option<EnrollError>) {
         ),
         VerbError::AuditUnwritable {
             phase: AuditPhase::Outcome,
+            ..
+        } => (
+            RefusalClass::Permanent,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::AuditUnwritable,
+            }),
+        ),
+        VerbError::AuditUnwritable {
+            phase: AuditPhase::Limited,
             ..
         } => (
             RefusalClass::Permanent,
@@ -2232,7 +2245,7 @@ mod tests {
         let encoded = serde_json::to_string(&response).expect("response serializes");
         assert_eq!(
             encoded,
-            r#"{"protocol_version":1,"request_id":"request","class":"retryable","registrar_health":{}}"#
+            r#"{"protocol_version":1,"request_id":"request","class":"retryable","registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}}"#
         );
 
         let with_unknown_member = r#"{"protocol_version":1,"request_id":"request","class":"retryable","registrar_health":{},"future":true}"#;
@@ -2240,6 +2253,21 @@ mod tests {
             .expect("unknown response member is tolerated");
         assert_eq!(decoded.class, RefusalClass::Retryable);
         assert_eq!(decoded.error, None);
+        assert_eq!(decoded.registrar_health, RegistrarHealth::default());
+    }
+
+    #[test]
+    fn limiter_health_preserves_the_two_independent_counters() {
+        let health = RegistrarHealth {
+            limiter: LimiterHealth {
+                limited_predecision_refusal: 3,
+                limited_admission: 5,
+            },
+        };
+        let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &health)
+            .expect("refusal encodes");
+        let decoded = decode_refusal_response(&encoded).expect("refusal decodes");
+        assert_eq!(decoded.registrar_health, health);
     }
 
     #[test]
@@ -2472,8 +2500,10 @@ mod tests {
 
             let text = String::from_utf8(first).expect("response is UTF-8 JSON");
             assert!(
-                text.contains(r#""registrar_health":{}"#),
-                "{shape} does not carry the empty health snapshot"
+                text.contains(
+                    r#""registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}"#
+                ),
+                "{shape} does not carry the limiter health snapshot"
             );
             let value: serde_json::Value = serde_json::from_str(&text).expect("response is JSON");
             let snapshot = value

@@ -612,6 +612,7 @@ rate_limit_admission_burst = 512
 rate_limit_admission_refill_interval_ms = 500
 rate_limit_predecision_refusal_burst = 32
 rate_limit_predecision_refusal_refill_interval_ms = 1000
+rate_limit_coalesce_window_seconds = 60
 ```
 
 The `[registrar]` table carries two groups of keys: the audit store the
@@ -957,11 +958,10 @@ records at whatever rate it retries, and the file-count ceiling — not
 
 ### Registrar verb rate limiting
 
-These four keys sit in the `[registrar]` table above and bound how fast one
+These five keys sit in the `[registrar]` table above and bound how fast one
 client identity may drive the `mint` and `deregister` verbs, so that a
 caller flooding refused invocations cannot grow the record store without
-limit. bootroot serves no registrar verb request in this build, so
-nothing is charged against them yet; they load and validate now.
+limit. They apply when the registrar endpoint is enabled.
 
 Each verb carries two token buckets per client identity — one for the
 invocations bootroot's purely local checks refuse, one for those that
@@ -984,14 +984,17 @@ reference deployment.
   legitimate refusals here are operator typos arriving one at a time.
 - `rate_limit_predecision_refusal_refill_interval_ms` (`u32`, default
   `1000`) — one refusal token per second sustained.
+- `rate_limit_coalesce_window_seconds` (`u64`, default `60`) — the
+  arrival-anchored window used to group suppressed invocations into one audit
+  record. It must be a positive integer.
 
 Every one is an unsigned integer, and the rates are milliseconds per
 token rather than fractional rates so that the configuration surface
 carries no floating-point value. A zero is rejected at load time for all
-four — a zero burst limits the first legitimate invocation, and a zero
+five — a zero burst limits the first legitimate invocation, a zero
 interval is an unbounded token supply that would disable the limiter
-silently — and so is a negative or fractional value, naming the offending
-key.
+silently, and a zero coalescing window cannot group limited invocations —
+and so is a negative or fractional value, naming the offending key.
 
 ### EAB (Optional)
 

@@ -40,6 +40,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use anyhow::Context as _;
 use tracing::{debug, warn};
@@ -75,21 +76,39 @@ pub(crate) struct ProductionHandler {
     /// The KV v2 mount the anchor is read under. The same value the
     /// verbs were built with, resolved once by the daemon.
     kv_mount: String,
+    health: Arc<StdMutex<RegistrarHealth>>,
 }
 
 impl ProductionHandler {
     /// Creates the handler over dependencies somebody else built.
     ///
     /// Performs no I/O and reads no configuration.
+    #[cfg(test)]
     pub(crate) fn new(
         verbs: RegistrarVerbs,
         credential: InternalCredential,
         kv_mount: String,
     ) -> Self {
+        Self::with_health(
+            verbs,
+            credential,
+            kv_mount,
+            Arc::new(StdMutex::new(RegistrarHealth::default())),
+        )
+    }
+
+    /// Creates the handler with the daemon-owned registrar health snapshot.
+    pub(crate) fn with_health(
+        verbs: RegistrarVerbs,
+        credential: InternalCredential,
+        kv_mount: String,
+        health: Arc<StdMutex<RegistrarHealth>>,
+    ) -> Self {
         Self {
             verbs,
             credential,
             kv_mount,
+            health,
         }
     }
 
@@ -119,7 +138,11 @@ impl ProductionHandler {
             HandlerRefusal
         })?;
 
-        let health = RegistrarHealth::default();
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let encoded = match self.verbs.mint(&request).await {
             Ok(outcome) => protocol::encode_mint_response(outcome, &anchor, &health),
             Err(refusal) => protocol::encode_refusal_response(&refusal, &health),
@@ -155,7 +178,11 @@ impl ProductionHandler {
             instance: request.instance,
         };
 
-        let health = RegistrarHealth::default();
+        let health = self
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         let encoded = match self.verbs.deregister(&request).await {
             Ok(outcome) => protocol::encode_deregister_response(&outcome, &health),
             Err(refusal) => protocol::encode_refusal_response(&refusal, &health),

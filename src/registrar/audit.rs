@@ -68,8 +68,8 @@ use std::os::unix::fs::{
 };
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
@@ -215,6 +215,8 @@ pub enum AuditPhase {
     Intent,
     /// What the invocation produced.
     Outcome,
+    /// A counted group of invocations the rate limiter suppressed.
+    Limited,
 }
 
 impl AuditPhase {
@@ -224,6 +226,7 @@ impl AuditPhase {
         match self {
             Self::Intent => "intent",
             Self::Outcome => "outcome",
+            Self::Limited => "limited",
         }
     }
 }
@@ -248,8 +251,29 @@ pub enum AuditVerb {
     Deregister,
 }
 
+/// The limiter bucket that suppressed a counted audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitedBucket {
+    /// The request was refused before registration-id derivation.
+    PredecisionRefusal,
+    /// The request was held at the admission checkpoint.
+    Admission,
+}
+
+impl LimitedBucket {
+    /// Returns the bucket spelling used in audit records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PredecisionRefusal => "predecision_refusal",
+            Self::Admission => "admission",
+        }
+    }
+}
+
 /// The identity parts a request asked about.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedIdentity {
     /// The component's plain keyword, exactly as the caller sent it.
@@ -464,6 +488,7 @@ pub struct AuditRecord {
     #[serde(with = "millisecond_rfc3339")]
     pub ts: OffsetDateTime,
     /// The invocation's correlation handle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_id: String,
     /// Which verb was invoked.
     pub verb: AuditVerb,
@@ -471,6 +496,7 @@ pub struct AuditRecord {
     /// byte cap.
     pub caller_identity: String,
     /// The identity parts the request asked about.
+    #[serde(default, skip_serializing_if = "requested_identity_is_absent")]
     pub requested: RequestedIdentity,
     /// The derived key, omitted entirely until derivation has produced
     /// one. Never `null` and never an empty string: an empty value is
@@ -482,6 +508,26 @@ pub struct AuditRecord {
     /// refused by [`AuditRecordStore::append`] rather than written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<AuditOutcome>,
+    /// The limiter bucket for a `limited` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_bucket: Option<LimitedBucket>,
+    /// Number of suppressed invocations represented by a `limited` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// First arrival included by a `limited` record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_millisecond_rfc3339"
+    )]
+    pub window_start: Option<OffsetDateTime>,
+    /// Exclusive end of the limited record's coalescing window.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_millisecond_rfc3339"
+    )]
+    pub window_end: Option<OffsetDateTime>,
     /// What was shortened, if anything. Omitted entirely when nothing
     /// was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +558,10 @@ impl AuditRecord {
             requested,
             registration_id: None,
             outcome: None,
+            limited_bucket: None,
+            count: None,
+            window_start: None,
+            window_end: None,
             truncated: None,
         }
     }
@@ -544,6 +594,39 @@ impl AuditRecord {
             requested,
             registration_id: registration_id.filter(|id| !id.is_empty()),
             outcome: Some(outcome),
+            limited_bucket: None,
+            count: None,
+            window_start: None,
+            window_end: None,
+            truncated: None,
+        }
+    }
+
+    /// Builds one counted coalescing record for limiter-suppressed traffic.
+    #[must_use]
+    pub fn limited(
+        ts: OffsetDateTime,
+        verb: AuditVerb,
+        caller_identity: String,
+        bucket: LimitedBucket,
+        count: u64,
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+    ) -> Self {
+        Self {
+            record_version: AUDIT_RECORD_VERSION,
+            phase: AuditPhase::Limited,
+            ts: canonical_timestamp(ts),
+            request_id: String::new(),
+            verb,
+            caller_identity,
+            requested: RequestedIdentity::default(),
+            registration_id: None,
+            outcome: None,
+            limited_bucket: Some(bucket),
+            count: Some(count),
+            window_start: Some(canonical_timestamp(window_start)),
+            window_end: Some(canonical_timestamp(window_end)),
             truncated: None,
         }
     }
@@ -594,6 +677,10 @@ impl AuditRecord {
         line.push(b'\n');
         Ok(line)
     }
+}
+
+fn requested_identity_is_absent(value: &RequestedIdentity) -> bool {
+    value.service_name.is_empty() && value.host.is_empty() && value.instance.is_none()
 }
 
 /// Reports whether a `registration_id` has nothing to say, which is
@@ -741,6 +828,38 @@ mod millisecond_rfc3339 {
             )));
         }
         Ok(parsed)
+    }
+}
+
+mod optional_millisecond_rfc3339 {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+    use time::OffsetDateTime;
+
+    // Serde's `with` callback supplies a reference to the field.
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S>(
+        value: &Option<OffsetDateTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => super::millisecond_rfc3339::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+            super::millisecond_rfc3339::deserialize(
+                serde::de::value::StringDeserializer::<D::Error>::new(value),
+            )
+            .map(Some)
+        })
     }
 }
 
@@ -1203,9 +1322,9 @@ struct StoreInner {
     max_file_bytes: u64,
     max_retained_files: u32,
     expected_uid: u32,
-    /// Serializes append-and-sync, and owns the blocking task running
-    /// one. Held for exactly that operation and never across a verb
-    /// lock or an `OpenBao` call.
+    /// Tracks an asynchronous append and owns its blocking task. Held
+    /// for exactly that operation and never across a verb lock or an
+    /// `OpenBao` call.
     ///
     /// The handle lives *inside* the lock rather than on the awaiting
     /// future's stack because [`AuditRecordStore::append`] can be
@@ -1217,6 +1336,14 @@ struct StoreInner {
     /// starting a second write into the same file. Nothing can hold
     /// this lock while a blocking append is still live.
     append_lock: TokioMutex<Option<JoinHandle<Result<(), AuditStoreError>>>>,
+    /// Serializes the filesystem critical section across asynchronous
+    /// appends and the synchronous bridge used by limiter coalescing.
+    ///
+    /// The bridge cannot enter Tokio's runtime: it is called by a
+    /// synchronous limiter sink and must work on either runtime flavor.
+    /// This mutex is taken only by blocking filesystem work, never by an
+    /// async task directly.
+    filesystem_lock: Mutex<()>,
     /// Set when this store creates a name in its directory — the active
     /// file, or a rotated generation — and cleared only by a directory
     /// flush that succeeded. A failed flush therefore stays owed: the
@@ -1530,6 +1657,7 @@ impl AuditRecordStore {
             max_retained_files: settings.max_retained_files,
             expected_uid,
             append_lock: TokioMutex::new(None),
+            filesystem_lock: Mutex::new(()),
             pending_dir_sync: AtomicBool::new(false),
             #[cfg(test)]
             tempdir: None,
@@ -1651,6 +1779,59 @@ impl AuditRecordStore {
     ///   write that fails after a partial write is undone, and the
     ///   undo flushed, before [`AuditStoreError::Append`] is returned.
     pub async fn append(&self, record: AuditRecord) -> Result<(), AuditStoreError> {
+        let line = Self::serialize_record(record)?;
+        // Held for the append-and-sync operation only. The blocking
+        // work below is the entire critical section, so this guard
+        // never spans a verb lock or an `OpenBao` call.
+        let mut in_flight = self.inner.append_lock.lock().await;
+        // An append whose caller went away left its blocking task
+        // running and its handle here. Wait for it before starting
+        // another: that task is still writing into the same file, and
+        // nothing can abort it.
+        Self::settle_abandoned(&mut in_flight).await;
+        let inner = Arc::clone(&self.inner);
+        let handle = in_flight.insert(tokio::task::spawn_blocking(move || {
+            let _filesystem = inner
+                .filesystem_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            inner.append_blocking(&line)
+        }));
+        // Awaited *through* the slot rather than taken out of it:
+        // dropping this future here has to leave the handle where the
+        // next append looks for it.
+        let joined = handle.await;
+        *in_flight = None;
+        match joined {
+            Ok(result) => result,
+            Err(err) => Err(AuditStoreError::TaskJoin {
+                message: err.to_string(),
+            }),
+        }
+    }
+
+    /// Appends one record without entering a Tokio runtime.
+    ///
+    /// This is the bridge for synchronous callers whose bounded work
+    /// requires an inline audit attempt. It shares the filesystem lock
+    /// with [`Self::append`], so it cannot write beside an async append.
+    /// Callers must keep failures explicit; this does not add a
+    /// best-effort or skip mode to the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::append`].
+    pub(crate) fn append_synchronously(&self, record: AuditRecord) -> Result<(), AuditStoreError> {
+        let line = Self::serialize_record(record)?;
+        let _filesystem = self
+            .inner
+            .filesystem_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.inner.append_blocking(&line)
+    }
+
+    fn serialize_record(record: AuditRecord) -> Result<Vec<u8>, AuditStoreError> {
         if record.record_version != AUDIT_RECORD_VERSION {
             return Err(AuditStoreError::UnsupportedRecordVersion {
                 version: record.record_version,
@@ -1673,7 +1854,51 @@ impl AuditRecordStore {
                     requirement: "must carry an outcome",
                 });
             }
-            (AuditPhase::Intent, false) | (AuditPhase::Outcome, true) => {}
+            (AuditPhase::Intent, false) | (AuditPhase::Outcome, true) => {
+                if record.limited_bucket.is_some()
+                    || record.count.is_some()
+                    || record.window_start.is_some()
+                    || record.window_end.is_some()
+                {
+                    return Err(AuditStoreError::InconsistentPhase {
+                        phase: record.phase,
+                        requirement: "must not carry limited-record fields",
+                    });
+                }
+            }
+            (AuditPhase::Limited, false) => {
+                if let (Some(start), Some(end), Some(_bucket), Some(count)) = (
+                    record.window_start,
+                    record.window_end,
+                    record.limited_bucket,
+                    record.count,
+                ) && record.request_id.is_empty()
+                    && requested_identity_is_absent(&record.requested)
+                    && record.registration_id.is_none()
+                    && count > 0
+                {
+                    if end >= start {
+                        // The configured coalescing duration is owned by the
+                        // sink; the store only rejects inverted bounds.
+                    } else {
+                        return Err(AuditStoreError::InconsistentPhase {
+                            phase: AuditPhase::Limited,
+                            requirement: "must end no earlier than it starts",
+                        });
+                    }
+                } else {
+                    return Err(AuditStoreError::InconsistentPhase {
+                        phase: AuditPhase::Limited,
+                        requirement: "must contain only complete limited-record fields",
+                    });
+                }
+            }
+            (AuditPhase::Limited, true) => {
+                return Err(AuditStoreError::InconsistentPhase {
+                    phase: AuditPhase::Limited,
+                    requirement: "must not carry an outcome",
+                });
+            }
         }
         if !record.ts.offset().is_utc() {
             return Err(AuditStoreError::NonUtcTimestamp {
@@ -1687,31 +1912,7 @@ impl AuditRecordStore {
                 nanosecond: record.ts.nanosecond(),
             });
         }
-        let line = record.into_bounded().to_line()?;
-        // Held for the append-and-sync operation only. The blocking
-        // work below is the entire critical section, so this guard
-        // never spans a verb lock or an `OpenBao` call.
-        let mut in_flight = self.inner.append_lock.lock().await;
-        // An append whose caller went away left its blocking task
-        // running and its handle here. Wait for it before starting
-        // another: that task is still writing into the same file, and
-        // nothing can abort it.
-        Self::settle_abandoned(&mut in_flight).await;
-        let inner = Arc::clone(&self.inner);
-        let handle = in_flight.insert(tokio::task::spawn_blocking(move || {
-            inner.append_blocking(&line)
-        }));
-        // Awaited *through* the slot rather than taken out of it:
-        // dropping this future here has to leave the handle where the
-        // next append looks for it.
-        let joined = handle.await;
-        *in_flight = None;
-        match joined {
-            Ok(result) => result,
-            Err(err) => Err(AuditStoreError::TaskJoin {
-                message: err.to_string(),
-            }),
-        }
+        record.into_bounded().to_line()
     }
 
     /// Waits for the blocking half of an append whose caller was

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::PoisonError;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -168,6 +170,9 @@ pub struct DaemonInvocation {
 ///
 /// # Errors
 /// Returns an error if issuance or shutdown handling fails.
+// The daemon composes lifecycle-owned services in one place; extracting the
+// registrar maintenance wiring would make shutdown ownership less visible.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
     let DaemonInvocation {
         settings,
@@ -208,10 +213,25 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     let mut handles = Vec::new();
 
     #[cfg(target_os = "linux")]
-    if let Some((endpoint, request_handler)) = registrar_service {
-        spawn_registrar_endpoint(&mut handles, endpoint, request_handler, &shutdown_rx);
-    }
-    spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
+    let registrar_maintenance = if let Some((endpoint, built)) = registrar_service {
+        spawn_registrar_endpoint(
+            &mut handles,
+            endpoint,
+            built.handler,
+            Arc::clone(&built.coalescing),
+            &shutdown_rx,
+        );
+        Some(RegistrarMaintenance {
+            coalescing: built.coalescing,
+            health: built.health,
+            counts: built.counts,
+        })
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let registrar_maintenance = None;
+    spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx, registrar_maintenance);
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
@@ -466,13 +486,17 @@ fn registrar_secret_id_options(
 /// is not a grantable ceiling, an audit store that cannot be opened, and
 /// an absent, invalid or stale internal credential.
 #[cfg(target_os = "linux")]
+// This is the one fallible composition of registrar dependencies.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn build_registrar_handler(
     settings: &config::Settings,
-) -> anyhow::Result<Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>> {
+) -> anyhow::Result<BuiltRegistrarHandler> {
     use crate::registrar::audit::{AuditRecordStore, AuditStoreSettings};
     use crate::registrar::config::RegistrarConfig;
     use crate::registrar::endpoint::production::ProductionHandler;
+    use crate::registrar::endpoint::protocol::{LimiterHealth, RegistrarHealth};
     use crate::registrar::internal::{InternalCredential, active_root_fingerprint};
+    use crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink;
     use crate::registrar::verbs::limiter::{
         CountingLimitedInvocationSink, VerbRateLimiter, VerbRateLimiterSettings,
     };
@@ -547,10 +571,14 @@ pub(crate) async fn build_registrar_handler(
     // bring-up from a flood of malformed input, and they cost two
     // atomics. The limiter keeps its own handle on the sink, so nothing
     // here has to retain one for the counters to accumulate.
-    let limiter = VerbRateLimiter::new(
-        VerbRateLimiterSettings::from(registrar),
-        Arc::new(CountingLimitedInvocationSink::new()),
-    );
+    let counts = Arc::new(CountingLimitedInvocationSink::new());
+    let coalescing = Arc::new(CoalescingLimitedInvocationSink::new(
+        Arc::clone(&counts),
+        audit_store.clone(),
+        registrar.rate_limit_coalesce_window_seconds,
+    ));
+    let limiter =
+        VerbRateLimiter::new(VerbRateLimiterSettings::from(registrar), coalescing.clone());
 
     let verbs = RegistrarVerbs::internal(&InternalVerbsSource {
         secrets_dir: &secrets_dir,
@@ -567,11 +595,52 @@ pub(crate) async fn build_registrar_handler(
     })
     .context("building the registrar verb service from the bootroot-internal credential")?;
 
-    Ok(Arc::new(ProductionHandler::new(
-        verbs,
-        credential,
-        state.kv_mount,
-    )))
+    let health = Arc::new(StdMutex::new(RegistrarHealth {
+        limiter: LimiterHealth {
+            limited_predecision_refusal: 0,
+            limited_admission: 0,
+        },
+    }));
+    Ok(BuiltRegistrarHandler {
+        handler: Arc::new(ProductionHandler::with_health(
+            verbs,
+            credential,
+            state.kv_mount,
+            health.clone(),
+        )),
+        coalescing,
+        health,
+        counts,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct BuiltRegistrarHandler {
+    handler: Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
+    coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
+    health: Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    counts: Arc<crate::registrar::verbs::limiter::CountingLimitedInvocationSink>,
+}
+
+/// State refreshed together on the daemon's existing maintenance cadence.
+#[cfg(target_os = "linux")]
+struct RegistrarMaintenance {
+    coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
+    health: Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    counts: Arc<crate::registrar::verbs::limiter::CountingLimitedInvocationSink>,
+}
+
+/// Copies the limiter's process-lifetime counters into the shared snapshot.
+#[cfg(target_os = "linux")]
+pub(crate) fn refresh_registrar_health(
+    health: &Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    counts: &crate::registrar::verbs::limiter::CountingLimitedInvocationSink,
+) {
+    let mut snapshot = health.lock().unwrap_or_else(PoisonError::into_inner);
+    snapshot.limiter.limited_predecision_refusal =
+        counts.count(crate::registrar::verbs::limiter::LimiterBucket::PredecisionRefusal);
+    snapshot.limiter.limited_admission =
+        counts.count(crate::registrar::verbs::limiter::LimiterBucket::Admission);
 }
 
 /// The adopted endpoint and the handler that will answer on it, or
@@ -579,7 +648,7 @@ pub(crate) async fn build_registrar_handler(
 #[cfg(target_os = "linux")]
 type RegistrarService = Option<(
     Arc<crate::registrar::endpoint::ActivatedEndpoint>,
-    Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
+    BuiltRegistrarHandler,
 )>;
 
 /// Resolves the registrar endpoint's accept-task dependencies for one
@@ -632,11 +701,18 @@ fn spawn_registrar_endpoint(
     handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
     endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
     request_handler: Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
+    coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     let shutdown_rx = shutdown_rx.clone();
     handles.push(tokio::spawn(async move {
-        crate::registrar::endpoint::serve::run(endpoint, request_handler, shutdown_rx).await
+        let result =
+            crate::registrar::endpoint::serve::run(endpoint, request_handler, shutdown_rx).await;
+        // `run` drains every accepted connection before it returns. Flushing
+        // here therefore includes limited invocations from requests that were
+        // already in flight when shutdown began.
+        coalescing.flush();
+        result
     }));
 }
 
@@ -663,6 +739,8 @@ fn spawn_openbao_audit_rotation(
     handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
     settings: &config::Settings,
     shutdown_rx: &watch::Receiver<bool>,
+    #[cfg(target_os = "linux")] registrar_maintenance: Option<RegistrarMaintenance>,
+    #[cfg(not(target_os = "linux"))] _registrar_maintenance: Option<()>,
 ) {
     if !settings.registrar_endpoint.enabled {
         return;
@@ -674,6 +752,21 @@ fn spawn_openbao_audit_rotation(
         registrar.openbao_audit_max_retained_files,
     );
     let shutdown_rx = shutdown_rx.clone();
+    #[cfg(target_os = "linux")]
+    if let Some(maintenance) = registrar_maintenance {
+        handles.push(tokio::spawn(
+            crate::registrar::openbao_audit::run_rotation_loop_with_maintenance(
+                rotation,
+                crate::registrar::openbao_audit::ROTATION_INTERVAL,
+                shutdown_rx,
+                move || {
+                    maintenance.coalescing.maintain();
+                    refresh_registrar_health(&maintenance.health, &maintenance.counts);
+                },
+            ),
+        ));
+        return;
+    }
     handles.push(tokio::spawn(
         crate::registrar::openbao_audit::run_rotation_loop(
             rotation,
@@ -2318,7 +2411,7 @@ http_responder_hmac = "dev-hmac"
             "an absent [registrar_endpoint] table parses as disabled"
         );
         let mut handles = Vec::new();
-        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
+        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx, None);
         assert!(handles.is_empty(), "a disabled endpoint spawns no task");
 
         settings.registrar_endpoint.enabled = true;
@@ -2327,7 +2420,7 @@ http_responder_hmac = "dev-hmac"
             .build()
             .unwrap();
         let guard = runtime.enter();
-        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx);
+        spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx, None);
         assert_eq!(handles.len(), 1, "an enabled endpoint spawns exactly one");
         drop(guard);
         for handle in handles {

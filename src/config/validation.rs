@@ -387,6 +387,23 @@ fn validate_rate_limit_sizing(settings: &RegistrarSettings) -> Result<()> {
              a zero interval is an unbounded token supply that disables the limiter silently"
         );
     }
+    if settings.rate_limit_coalesce_window_seconds == 0 {
+        anyhow::bail!(
+            "registrar.rate_limit_coalesce_window_seconds must be greater than 0; a zero \
+             window cannot coalesce limited invocations"
+        );
+    }
+    let coalesce_duration =
+        std::time::Duration::from_secs(settings.rate_limit_coalesce_window_seconds);
+    if tokio::time::Instant::now()
+        .checked_add(coalesce_duration)
+        .is_none()
+    {
+        anyhow::bail!(
+            "registrar.rate_limit_coalesce_window_seconds is too large to represent a \
+             coalescing deadline"
+        );
+    }
     Ok(())
 }
 

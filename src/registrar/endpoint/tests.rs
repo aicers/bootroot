@@ -31,7 +31,7 @@ use std::os::fd::RawFd;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration as StdDuration;
 
 use rustls::ClientConfig;
@@ -83,7 +83,8 @@ use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
 use crate::registrar::internal::InternalCredential;
 use crate::registrar::verbs::limiter::{
-    NoopLimitedInvocationSink, VerbRateLimiter, VerbRateLimiterSettings,
+    CountingLimitedInvocationSink, LimiterBucket, NoopLimitedInvocationSink, VerbRateLimiter,
+    VerbRateLimiterSettings,
 };
 use crate::registrar::verbs::outcome::CallerIdentity;
 use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
@@ -856,6 +857,23 @@ const HARNESS_KV_MOUNT: &str = "secret";
 fn production_handler(
     server: &MockServer,
 ) -> (TempDir, AuditRecordStore, Arc<dyn RegistrarRequestHandler>) {
+    production_handler_with_limiter(
+        server,
+        VerbRateLimiter::new(
+            VerbRateLimiterSettings::default(),
+            Arc::new(NoopLimitedInvocationSink),
+        ),
+        Arc::new(StdMutex::new(protocol::RegistrarHealth::default())),
+    )
+}
+
+/// Builds the production handler with the supplied limiter and shared health
+/// snapshot, so a test can observe daemon-maintained endpoint health.
+fn production_handler_with_limiter(
+    server: &MockServer,
+    limiter: VerbRateLimiter,
+    health: Arc<StdMutex<protocol::RegistrarHealth>>,
+) -> (TempDir, AuditRecordStore, Arc<dyn RegistrarRequestHandler>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = RegistrarConfigFixture::new()
         .write_to(dir.path())
@@ -876,13 +894,7 @@ fn production_handler(
         secret_id_ttl: "86400s".to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
         audit_store: audit_store.clone(),
-        // The shipped sizing, publishing nothing: these tests drive a
-        // handful of requests, so the default burst never binds and
-        // what is under test is the socket path rather than the bound.
-        limiter: VerbRateLimiter::new(
-            VerbRateLimiterSettings::default(),
-            Arc::new(NoopLimitedInvocationSink),
-        ),
+        limiter,
     });
 
     let secrets_dir = dir.path().join("secrets");
@@ -893,10 +905,11 @@ fn production_handler(
     (
         dir,
         audit_store,
-        Arc::new(ProductionHandler::new(
+        Arc::new(ProductionHandler::with_health(
             verbs,
             credential,
             HARNESS_KV_MOUNT.to_string(),
+            health,
         )),
     )
 }
@@ -961,6 +974,19 @@ fn deregister_payload(service_name: &str, host: &str, idempotency_key: &str) -> 
         "idempotency_key": idempotency_key,
     }))
     .expect("the payload encodes")
+}
+
+/// Reads the health snapshot from any serialized registrar response shape.
+fn response_health(response: &[u8]) -> protocol::RegistrarHealth {
+    let value: serde_json::Value =
+        serde_json::from_slice(response).expect("the production response is JSON");
+    serde_json::from_value(
+        value
+            .get("registrar_health")
+            .expect("every response carries registrar health")
+            .clone(),
+    )
+    .expect("registrar health has the documented shape")
 }
 
 // ---------------------------------------------------------------------
@@ -2463,6 +2489,96 @@ async fn a_verb_refusal_is_framed_as_a_wire_refusal_with_its_identifier_and_clas
             .expect("the mock records requests")
             .is_empty(),
         "a pre-derivation refusal must reach OpenBao not at all"
+    );
+}
+
+/// The daemon refreshes a single health snapshot between requests rather than
+/// assembling limiter values while serializing each response.
+#[tokio::test]
+async fn limited_events_reach_responses_only_after_daemon_maintenance() {
+    let server = MockServer::start().await;
+    let counts = Arc::new(CountingLimitedInvocationSink::new());
+    let health = Arc::new(StdMutex::new(protocol::RegistrarHealth::default()));
+    let limiter = VerbRateLimiter::new(
+        VerbRateLimiterSettings {
+            admission_burst: 1,
+            admission_refill_interval_ms: 600_000,
+            predecision_refusal_burst: 1,
+            predecision_refusal_refill_interval_ms: 600_000,
+        },
+        counts.clone(),
+    );
+    let (_dir, _audit, handler) = production_handler_with_limiter(&server, limiter, health.clone());
+    let caller = CallerIdentity::new("daemon-maintenance-test");
+    let predecision = deregister_payload(UNCONFIGURED_COMPONENT, "h1", "predecision");
+    let admission = deregister_payload("roxyd", "h1", "admission");
+
+    handler
+        .handle(Operation::Deregister, &predecision, caller.clone())
+        .await
+        .expect("the first pre-decision refusal encodes");
+    let limited_predecision = handler
+        .handle(Operation::Deregister, &predecision, caller.clone())
+        .await
+        .expect("the limited pre-decision refusal encodes");
+    assert_eq!(
+        response_health(&limited_predecision),
+        protocol::RegistrarHealth::default(),
+        "responses retain the daemon snapshot before maintenance"
+    );
+    assert_eq!(counts.count(LimiterBucket::PredecisionRefusal), 1);
+    assert_eq!(counts.count(LimiterBucket::Admission), 0);
+
+    crate::daemon::refresh_registrar_health(&health, &counts);
+    let after_predecision_refresh = handler
+        .handle(Operation::Deregister, &admission, caller.clone())
+        .await
+        .expect("the admitted request encodes");
+    assert_eq!(
+        response_health(&after_predecision_refresh).limiter,
+        protocol::LimiterHealth {
+            limited_predecision_refusal: 1,
+            limited_admission: 0,
+        },
+        "refreshing pre-decision limits leaves admission at zero"
+    );
+
+    let limited_admission = handler
+        .handle(Operation::Deregister, &admission, caller.clone())
+        .await
+        .expect("the limited admission refusal encodes");
+    let limited_admission = protocol::decode_refusal_response(&limited_admission)
+        .expect("the limited admission refusal decodes");
+    assert!(
+        matches!(
+            limited_admission.error,
+            Some(protocol::EnrollError::RegistrarBusy { .. })
+        ),
+        "an admission limit returns the retryable throttle"
+    );
+    assert_eq!(
+        limited_admission.registrar_health.limiter,
+        protocol::LimiterHealth {
+            limited_predecision_refusal: 1,
+            limited_admission: 0,
+        },
+        "the admission event waits for the next maintenance refresh"
+    );
+    assert_eq!(counts.count(LimiterBucket::PredecisionRefusal), 1);
+    assert_eq!(counts.count(LimiterBucket::Admission), 1);
+
+    crate::daemon::refresh_registrar_health(&health, &counts);
+    let after_admission_refresh = handler
+        .handle(Operation::Deregister, &predecision, caller)
+        .await
+        .expect("the next limited pre-decision refusal encodes");
+    assert_eq!(
+        response_health(&after_admission_refresh).limiter,
+        protocol::LimiterHealth {
+            limited_predecision_refusal: 1,
+            limited_admission: 1,
+        },
+        "refreshing admission limits leaves the pre-decision count intact"
     );
 }
 

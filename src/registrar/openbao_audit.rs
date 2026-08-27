@@ -3827,10 +3827,27 @@ fn mounts_bind_device(mounts: &str, want: &Path) -> bool {
 /// must never fail an `OpenBao` request, stop the daemon or take the
 /// registrar endpoint down.
 pub(crate) async fn run_rotation_loop(
+    rotation: OpenBaoAuditRotation,
+    interval: Duration,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    run_rotation_loop_with_maintenance(rotation, interval, shutdown, || {}).await
+}
+
+/// Runs one device's rotation and daemon-owned registrar maintenance until
+/// shutdown.
+///
+/// The maintenance callback shares the rotation loop's existing cadence, so
+/// registrar coalescing adds no second scheduler or per-window task.
+pub(crate) async fn run_rotation_loop_with_maintenance<F>(
     mut rotation: OpenBaoAuditRotation,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    mut maintenance: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(),
+{
     loop {
         if *shutdown.borrow() {
             break;
@@ -3844,6 +3861,7 @@ pub(crate) async fn run_rotation_loop(
                 // one.
                 let outcome = rotation.run_pass(OffsetDateTime::now_utc()).await;
                 report_pass(&outcome);
+                maintenance();
             }
         }
     }

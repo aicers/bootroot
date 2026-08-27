@@ -466,8 +466,27 @@ fn classify_line(line: &[u8], data: &mut FileData, scan_state: Option<&mut ScanS
     let malformed = record.record_version != AUDIT_RECORD_VERSION
         || matches!(
             (record.phase, record.outcome.is_some()),
-            (AuditPhase::Intent, true) | (AuditPhase::Outcome, false)
-        );
+            (AuditPhase::Intent | AuditPhase::Limited, true) | (AuditPhase::Outcome, false)
+        )
+        || (record.phase == AuditPhase::Limited
+            && (!record.request_id.is_empty()
+                || !record.requested.service_name.is_empty()
+                || !record.requested.host.is_empty()
+                || record.requested.instance.is_some()
+                || record.registration_id.is_some()
+                || record.limited_bucket.is_none()
+                || record.count.is_none_or(|count| count == 0)
+                || record.window_start.is_none()
+                || record.window_end.is_none()
+                || record
+                    .window_start
+                    .zip(record.window_end)
+                    .is_some_and(|(start, end)| end < start)
+                || record.truncated.as_ref().is_some_and(|truncated| {
+                    truncated.requested_service_name.is_some()
+                        || truncated.requested_host.is_some()
+                        || truncated.outcome_detail.is_some()
+                })));
     if malformed {
         if scan_state.is_some() {
             data.malformed += 1;
@@ -496,6 +515,7 @@ fn observe_record(record: AuditRecord, state: &mut ScanState) {
                 state.duplicate_lines += 1;
             }
         }
+        AuditPhase::Limited => {}
     }
 }
 
@@ -746,6 +766,30 @@ mod tests {
         assert_eq!(scan.intent_without_outcome, 1);
         assert_eq!(scan.malformed_records, 1);
         assert!(!scan.retention_short);
+    }
+
+    #[test]
+    fn accepts_limited_records_without_pairing_them() {
+        let dir = audit_store();
+        let now = OffsetDateTime::now_utc();
+        append_record(
+            dir.path(),
+            &AuditRecord::limited(
+                now,
+                AuditVerb::Mint,
+                "limited-caller".to_string(),
+                super::super::LimitedBucket::Admission,
+                3,
+                now - Duration::seconds(60),
+                now,
+            ),
+        );
+        append_record(dir.path(), &old_intent(now, "still-unpaired"));
+
+        let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect("scan limited record");
+        assert_eq!(scan.malformed_records, 0);
+        assert_eq!(scan.intent_without_outcome, 1);
     }
 
     #[test]
