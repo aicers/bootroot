@@ -28,7 +28,7 @@ fn contact_from_email(email: &str) -> String {
 /// behaviour and the variant is the opt-in, rather than each caller
 /// restating what it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CsrShape {
+pub(crate) enum CsrShape {
     /// The ordinary service leaf: the profile's composed name as the
     /// single DNS SAN, mirrored into the common name, requesting no
     /// extended key usage at all.
@@ -54,7 +54,7 @@ pub enum CsrShape {
 /// and is then refused by the endpoint's own loader and by every
 /// correctly pinned caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LeafPublication {
+pub(crate) enum LeafPublication {
     /// The leaf alone, exactly as every service issuance has always
     /// written it.
     #[default]
@@ -73,11 +73,11 @@ pub enum LeafPublication {
 /// [`issue_certificate`] is this struct's default and every existing
 /// caller is unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct IssuanceOptions {
+pub(crate) struct IssuanceOptions {
     /// Which CSR shape to ask the CA for.
-    pub csr_shape: CsrShape,
+    pub(crate) csr_shape: CsrShape,
     /// What to write at `profile.paths.cert`.
-    pub leaf_publication: LeafPublication,
+    pub(crate) leaf_publication: LeafPublication,
 }
 
 fn build_csr_params(
