@@ -131,6 +131,26 @@ PORT_HTTP01=0
 AUDIT_STORE_BASE=""
 AUDIT_STORE_DIR=""
 AGENT_CONFIG_FILE=""
+# What the `filesystem`-mode activation below put on the host, so that
+# cleanup can take it back off whether the run reached the end or a
+# `fail` in the middle of it.  A mount left behind outlives this run,
+# and the `rm -rf` that removes the store base would descend into it.
+RESERVE_STORE_DIR=""
+RESERVE_IMAGE=""
+RESERVE_UNIT_NAME=""
+# Where the reserve runs below point `bootroot init` so that one which
+# gets *past* the audit store stops immediately afterwards.
+#
+# The audit store is provisioned before any Docker call, and a run that
+# reaches `enforced` carries straight on into `bootstrap_openbao` --
+# which would initialise this scenario's OpenBao, without saving its
+# unseal keys, well before `run_init` gets to.  The next step after the
+# outcome that does reach the network is the OpenBao health check, so a
+# URL nothing answers on ends the run there: `--agent-config` has
+# already been read and the outcome already printed, and nothing of the
+# deployment has been touched.  A non-default `--openbao-url` is left
+# alone by the port resolution, which is what makes this reliable.
+RESERVE_DEAD_OPENBAO_URL="http://127.0.0.1:1"
 # The container path `openbao/openbao.hcl` writes its file audit device
 # to.  Unchanged by the override this run renders — only what backs it
 # moves.
@@ -170,6 +190,13 @@ OPENBAO_CURL_CONFIG=""
 # invocation ever runs as root and nothing under `target/` changes
 # owner.
 ROTATION_TEST_BIN=""
+# How long the two entries the shared file-audit assertion looks for are
+# given to reach a device whose bind source has just moved.  The
+# bring-up returns once the containers are up, not once the two infra
+# sidecars have logged in and rendered, so the assertion needs a window
+# rather than a single probe.
+AUDIT_ENTRIES_ATTEMPTS="${AUDIT_ENTRIES_ATTEMPTS:-60}"
+AUDIT_ENTRIES_DELAY_SECS="${AUDIT_ENTRIES_DELAY_SECS:-2}"
 
 log_phase() {
   CURRENT_PHASE="$1"
@@ -199,11 +226,35 @@ assert_equal() {
   pass "$what"
 }
 
+# The same, for a lower bound rather than an equality.
+#
+# A `yes`/`no` rendered by the caller would compare correctly and then
+# throw away the two numbers that say *how* it failed, which is the one
+# thing the log is read for afterwards.  Both figures are reported here
+# instead.
+assert_at_least() {
+  local what="$1" floor="$2" actual="$3"
+  [ "$actual" -ge "$floor" ] ||
+    fail "${what}: expected at least '${floor}', got '${actual}'"
+  pass "$what"
+}
+
 # uid, gid and mode of a file below the root-owned internal directory,
 # in one probe.  GNU and BSD `stat` spell the format differently and
 # both are tried, as the mode probe this replaces did.
 file_owner_mode() {
   sudo -n stat -c '%u:%g:%a' "$1" 2>/dev/null || sudo -n stat -f '%u:%g:%OLp' "$1"
+}
+
+# The image's identity as a file and as a filesystem, in one probe.
+#
+# Read while the reserve is mounted, so every term has to be one the
+# mounted filesystem does not move on its own; see the caller for which
+# ones do.
+image_identity() {
+  printf '%s %s\n' \
+    "$(sudo -n stat -c '%i %s' "$1")" \
+    "$(sudo -n blkid -o value -s UUID "$1")"
 }
 
 ensure_prerequisites() {
@@ -452,17 +503,459 @@ seed_registrar_endpoint_predicate() {
 # Nothing in this scenario starts a `bootroot-agent` daemon, so an
 # enabled `[registrar_endpoint]` in a file only the installer reads
 # starts nothing and refuses nothing.
+#
+# `audit_store_enforcement = "directory"` is deliberate and is what the
+# rest of this scenario is about: the store's layout, its ownership
+# contract, the rendered Compose override and the device that lands on
+# it.  The shipped `filesystem` default puts a loopback-backed reserve
+# under `audit_store_dir`, which needs a loop device, `mkfs.ext4` and a
+# live systemd on the host — none of which a container-based CI runner
+# has.  `filesystem` mode's own phase-1 and phase-3 behaviour is
+# asserted separately below, where it needs none of those.
 seed_agent_configuration() {
   AGENT_CONFIG_FILE="$WORK_DIR/operator-agent.toml"
   cat >"$AGENT_CONFIG_FILE" <<EOF
 [registrar]
 audit_store_dir = "${AUDIT_STORE_DIR}"
+audit_store_enforcement = "directory"
 
 [registrar_endpoint]
 enabled = true
 EOF
   [ -s "$AGENT_CONFIG_FILE" ] || fail "could not write $AGENT_CONFIG_FILE"
   pass "the operator configuration names the audit store and agrees with the predicate"
+}
+
+# The `bootroot-agent` configuration a `filesystem`-mode section runs
+# under.
+#
+# The reserve every caller passes is the smallest one that clears the
+# mode's minimum, so the free-space preflight asks this runner for
+# 16 MiB rather than for the shipped 2 GiB default, and the two record
+# keys are what that minimum is derived from -- named here rather than
+# defaulted so the figure the refusal would quote is this file's and not
+# a shipped default's.
+#
+# `[registrar_endpoint] enabled` agrees with the predicate seeded into
+# `state.json`; `init` refuses to proceed when the two disagree.
+write_reserve_agent_config() {
+  local path="$1" store="$2" reserve="$3"
+  cat >"$path" <<EOF
+[registrar]
+audit_store_dir = "${store}"
+audit_store_enforcement = "filesystem"
+audit_store_reserve_bytes = ${reserve}
+audit_store_low_water_bytes = 1024
+audit_max_file_bytes = 65536
+audit_max_retained_files = 1
+
+[registrar_endpoint]
+enabled = true
+EOF
+  [ -s "$path" ] || fail "could not write $path"
+}
+
+# `filesystem` mode stops the run at **provisioned, not activated** and
+# performs no phase-2 step whatever.
+#
+# Run before `run_init`, against a store path of its own, so it sees the
+# host as a fresh one: no rendered override to cross-check, and a store
+# directory nothing has created.  It reaches the audit store step of
+# `bootroot init` — which runs before any Docker call — and fails there,
+# so nothing of the deployment is touched either.
+#
+# Every assertion here is about what bootroot may do to the host, which
+# is why it needs no loop device: bootroot issues no `mkfs`, installs no
+# unit, runs no `systemctl` and mounts nothing.  It renders those as
+# commands and stops.
+#
+# This is also the boot-path containment case, with the mount unit not
+# enabled: no bootroot code path creates `<audit_store_dir>/openbao` or
+# `records/`, none runs a mount-establishing command, and no run reports
+# **enforced**.  What Docker and the OpenBao container would do against
+# an unmounted store is **deliberately not asserted** here.  The rendered
+# Compose override is left byte-identical by this change, so a container
+# brought back by `restart: always` still has Docker manufacture the bind
+# source under the empty mount point; closing that is the bind guard's,
+# and it belongs to the installer fail-closed issue rather than here.
+assert_filesystem_mode_stops_before_it_touches_the_host() {
+  local store config log artifacts unit
+  store="$AUDIT_STORE_BASE/reserve-store"
+  config="$WORK_DIR/operator-agent-filesystem.toml"
+  log="$ARTIFACT_DIR/init-filesystem-mode.log"
+  artifacts="$WORK_DIR/audit-store"
+
+  write_reserve_agent_config "$config" "$store" 16777216
+
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --agent-config "$config" \
+    </dev/null >"$log" 2>&1; then
+    fail "filesystem mode reported success on an unactivated host; see $log"
+  fi
+  grep -q "provisioned, not activated" "$log" ||
+    fail "the run did not report provisioned, not activated; see $log"
+  grep -q "ownership is not verified" "$log" ||
+    fail "the outcome does not state that openbao/ ownership was not verified"
+  pass "filesystem mode reports provisioned, not activated and stops"
+
+  # The one filesystem object bootroot creates is the mount point.
+  sudo -n test -d "$store" || fail "the mount point $store was not created"
+  if sudo -n test -e "$store/records"; then
+    fail "filesystem mode created records/ beneath an unmounted store"
+  fi
+  if sudo -n test -e "$store/openbao"; then
+    fail "filesystem mode created openbao/ beneath an unmounted store"
+  fi
+  if sudo -n test -e "${store}.img"; then
+    fail "bootroot created the loopback image itself"
+  fi
+  pass "only the mount point was created: no subdirectories and no image"
+
+  # The three artifacts are written, and they are inert.
+  unit="$(find "$artifacts" -maxdepth 1 -name '*.mount' -print -quit)"
+  [ -n "$unit" ] || fail "no .mount unit was rendered under $artifacts"
+  [ -f "$artifacts/docker.service.d/10-bootroot-audit-store.conf" ] ||
+    fail "the docker.service drop-in was not rendered"
+  [ -f "$artifacts/bootroot-registrar.service.d/10-bootroot-audit-store.conf" ] ||
+    fail "the bootroot-registrar.service drop-in was not rendered"
+  grep -qF "Where=${store}" "$unit" || fail "the unit does not mount $store"
+  grep -qF "What=${store}.img" "$unit" || fail "the unit does not name the derived image"
+  grep -q "^Options=loop$" "$unit" || fail "the unit is not loop-backed"
+  grep -q "^Type=ext4$" "$unit" || fail "the unit is not ext4"
+  for dropin in docker.service.d bootroot-registrar.service.d; do
+    grep -q "^Wants=" "$artifacts/$dropin/10-bootroot-audit-store.conf" ||
+      fail "$dropin lost its Wants="
+    grep -q "^After=" "$artifacts/$dropin/10-bootroot-audit-store.conf" ||
+      fail "$dropin lost its After="
+    if grep -Eq "^(Requires|BindsTo|RequiresMountsFor)=" \
+      "$artifacts/$dropin/10-bootroot-audit-store.conf"; then
+      fail "$dropin carries a hard relation"
+    fi
+  done
+  pass "the three artifacts are rendered, loop-backed and ordered only"
+
+  # The unit name is systemd's own, not this implementation's idea of
+  # it, where a `systemd-escape` exists to say so.
+  if command -v systemd-escape >/dev/null 2>&1; then
+    assert_equal "the rendered unit name matches systemd-escape --path" \
+      "$(systemd-escape --path "$store").mount" "$(basename "$unit")"
+  else
+    log "systemd-escape is not on this host; the unit name comparison is skipped"
+  fi
+
+  # The rendered image commands carry both flags, for the two different
+  # failures each of them prevents.
+  grep -q -- "mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0" "$log" ||
+    fail "the rendered mkfs.ext4 is missing -m 0 or one of its -E options"
+  grep -q -- "install -m 0600 /dev/null" "$log" ||
+    fail "an absent image did not render its install"
+  grep -q -- "fallocate -l 16777216" "$log" ||
+    fail "an absent image did not render a full-length preallocation"
+  pass "the rendered image commands are the absent-image row, in full"
+
+  # `bootroot infra up` is never named as the way to render or verify
+  # the reserve.
+  if grep -q "infra up" "$log"; then
+    fail "the outcome tells the operator to run infra up"
+  fi
+  pass "no rendered step names bootroot infra up"
+
+  # Nothing of `/etc/systemd/system` was written by that run.
+  for installed in \
+    "/etc/systemd/system/$(basename "$unit")" \
+    "/etc/systemd/system/docker.service.d/10-bootroot-audit-store.conf" \
+    "/etc/systemd/system/bootroot-registrar.service.d/10-bootroot-audit-store.conf"; do
+    if sudo -n test -e "$installed"; then
+      fail "bootroot installed $installed itself"
+    fi
+  done
+  pass "bootroot installed no unit and no drop-in"
+
+  # Leave the compose directory as `run_init` expects to find it: the
+  # artifacts above belong to a store this scenario does not go on to
+  # use.  Both were created by the root-run `init`, so both need `sudo`
+  # to remove -- a plain `rm -rf` fails on them and, under `set -e`,
+  # aborts the run.
+  sudo -n rm -rf "$artifacts" "$store"
+  remove_rendered_audit_override
+}
+
+# Removes the Compose override the run above rendered.
+#
+# `apply_audit_store` renders it *before* it verifies, so a run that
+# stops at `provisioned, not activated` still leaves one on disk -- and
+# it names that run's throwaway store.  `plan_audit_store` cross-checks
+# a rendered override against the store the next `--agent-config`
+# resolves and refuses the two when they differ, so leaving it behind
+# would refuse every later run in this scenario, `run_init` included,
+# with the stale-override error rather than with its own verdict.
+remove_rendered_audit_override() {
+  sudo_to_log rm -f "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" || true
+}
+
+# One elevated command, with its output appended to this run's log.
+#
+# The redirect is the invoking user's, not `sudo`'s, which is the
+# intent: `$RUN_LOG` is that user's own file and stays readable by them
+# afterwards.
+# shellcheck disable=SC2024
+sudo_to_log() {
+  sudo -n "$@" >>"$RUN_LOG" 2>&1
+}
+
+# Whether this host can carry an activated reserve at all.
+#
+# The activation below is the operator's own phase-2 sequence run
+# verbatim, so it needs everything that sequence names: a live systemd
+# to enable the generated `.mount` unit under, the two tools the
+# rendered image commands invoke, and a kernel with loop devices.  A
+# host missing any of them skips the section with a line saying so --
+# the macOS preflight runs this same scenario, and there `systemctl`
+# does not exist at all.
+reserve_activation_is_possible() {
+  [ -d /run/systemd/system ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  command -v mkfs.ext4 >/dev/null 2>&1 || return 1
+  command -v fallocate >/dev/null 2>&1 || return 1
+  command -v losetup >/dev/null 2>&1 || return 1
+  command -v blkid >/dev/null 2>&1 || return 1
+  sudo -n test -e /dev/loop-control || return 1
+}
+
+# The rendered phase-2 commands, pasted into a shell exactly as printed.
+#
+# Reading them back out of the outcome rather than restating them here
+# is the point: an operator's only source for these is that text, so a
+# command it renders wrong -- a store path whose spaces or backslashes
+# lost their quoting, a unit name `sh` ate the `\x2d` out of -- fails
+# here rather than in a deployment.  Two lines are the caller's and are
+# not run: step 1 names a unit no CI host has installed, and step 5 is
+# the re-run this function performs itself, with the flags this scenario
+# needs.
+run_rendered_phase_two() {
+  local log="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      "systemctl stop "*) continue ;;
+      "bootroot init"*) continue ;;
+    esac
+    log "running rendered step: $line"
+    sudo_to_log sh -c "$line" ||
+      fail "a rendered phase-2 command failed: $line"
+  done < <(sed -n 's/^       \(.*\)$/\1/p' "$log")
+}
+
+# Everything the reserve is for, end to end: the rendered commands
+# activate it, the re-run reports **enforced**, a second re-run changes
+# nothing, and a write past the reserve stops at the reserve instead of
+# at the host's root filesystem.
+assert_the_rendered_steps_activate_the_reserve() {
+  local config log store image unit reserve=16777216
+  if ! reserve_activation_is_possible; then
+    log "this host has no systemd, loop device or mkfs.ext4; the activation section is skipped"
+    return 0
+  fi
+  store="$AUDIT_STORE_BASE/reserve-active"
+  image="${store}.img"
+  config="$WORK_DIR/operator-agent-activate.toml"
+  log="$ARTIFACT_DIR/init-reserve-activate.log"
+
+  write_reserve_agent_config "$config" "$store" "$reserve"
+
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$log" 2>&1; then
+    fail "the first run reported success on an unactivated host; see $log"
+  fi
+  grep -q "provisioned, not activated" "$log" ||
+    fail "the first run did not report provisioned, not activated; see $log"
+
+  # `|| unit=""` rather than letting the assignment fail the run: an
+  # absent staging directory is this scenario's own message to give,
+  # not `set -e`'s silence.
+  unit="$(basename "$(find "$WORK_DIR/audit-store" -maxdepth 1 -name '*.mount' -print -quit)")" ||
+    unit=""
+  [ -n "$unit" ] || fail "no .mount unit was rendered under $WORK_DIR/audit-store"
+  # Recorded before the first host-changing command, so cleanup can
+  # undo whatever the sequence got through.
+  RESERVE_STORE_DIR="$store"
+  RESERVE_IMAGE="$image"
+  RESERVE_UNIT_NAME="$unit"
+
+  run_rendered_phase_two "$log"
+  pass "every rendered phase-2 command ran verbatim"
+
+  # The unit systemd loaded names the paths that were configured, byte
+  # for byte, which is the assertion a unit-name or `Where=` escaping
+  # bug fails.
+  assert_equal "the rendered unit name matches systemd-escape --path" \
+    "$(systemd-escape --path "$store").mount" "$unit"
+  assert_equal "the loaded unit mounts the configured store" \
+    "Where=${store}" "$(sudo -n systemctl show -p Where "$unit")"
+  assert_equal "the mount unit is active" \
+    "ActiveState=active" "$(sudo -n systemctl show -p ActiveState "$unit")"
+  # `What=` reads back as the loop device once the mount is up rather
+  # than as the file the unit names, so the image is confirmed the way
+  # the verification itself confirms it: through the device's backing
+  # file.
+  local source
+  source="$(sudo -n systemctl show -p What --value "$unit")"
+  assert_equal "the mount is on a loop device backed by the derived image" \
+    "$image" "$(sudo -n losetup -O BACK-FILE --noheadings "$source" | sed 's/^ *//;s/ *$//')"
+
+  # The two `-E` options are what keep the image's blocks where the
+  # preallocation put them.  `nodiscard` stops `mke2fs` from discarding
+  # them as it writes the filesystem, which on a loop device is a hole
+  # punch through to the backing file.  `lazy_itable_init=0` stops the
+  # kernel's `ext4lazyinit` thread from zeroing the inode tables a few
+  # seconds *after* the mount comes up, which the loop driver serves the
+  # same way -- so this assertion is deliberately made after the mount
+  # is active and the subdirectories are on it, which is the window that
+  # background thread runs in.  Either one missing leaves an image that
+  # passes every size check while the root filesystem is still what
+  # fills.
+  #
+  # `>=` rather than `=`, and it is the same comparison the verification
+  # itself makes: `st_blocks` counts the *hosting* filesystem's blocks,
+  # so a file whose extents no longer fit in its inode carries an extent
+  # tree block on top of its own length.  On the CI runner this image
+  # measures one 4 KiB block above the reserve.  What "fully allocated"
+  # asserts is that nothing of the image's own length is a hole, which
+  # is `allocated >= size`; an equality here would be a test that fails
+  # on the host's extent layout rather than on anything bootroot did.
+  local allocated
+  allocated="$(( $(sudo -n stat -c %b "$image") * 512 ))"
+  # Logged unconditionally: this is the one figure in the section that
+  # the host, rather than bootroot, has the last word on, so a run that
+  # fails here has to say by how much and a run that passes has to leave
+  # the number behind for the next one to be compared against.
+  log "image allocation after mkfs: $(sudo -n stat -c 'size=%s blocks=%b unit=%B' "$image")"
+  assert_at_least "the image is fully allocated once the mount is up" \
+    "$reserve" "$allocated"
+  assert_equal "the image is the size of the reserve" \
+    "$reserve" "$(sudo -n stat -c %s "$image")"
+  assert_equal "the image is root-owned at 0600" "0:0:600" "$(file_owner_mode "$image")"
+
+  # The subdirectories are on the mounted filesystem rather than on the
+  # directory underneath it.
+  assert_equal "records/ sits on the mounted reserve" \
+    "$(store_device "$store")" "$(store_device "$store/records")"
+  assert_equal "records/ is root-owned at 0700" "0:0:700" \
+    "$(file_owner_mode "$store/records")"
+  assert_equal "openbao/ is at 0700" "700" \
+    "$(sudo -n stat -c %a "$store/openbao")"
+  # The store directory itself, which is the *mounted filesystem's* root
+  # once the mount is up.  `mkfs.ext4` gives that root `0755`, and the
+  # store directory contract -- the one `bootroot infra up` applies to
+  # the path the rendered override names -- is exactly `0700`, so the
+  # rendered step 4 restates it.  Asserting the result here is what
+  # keeps that command from being rendered and never confirmed: without
+  # it, a run reaches **enforced** and the next `bootroot infra up`
+  # refuses the store it just activated.
+  assert_equal "the mounted store directory is root-owned at 0700" "0:0:700" \
+    "$(file_owner_mode "$store")"
+
+  # Inode, size and the ext4 UUID -- one term per word of the claim:
+  # a recreated image is a new inode, a resized one a new size, a
+  # reformatted one a new filesystem UUID.
+  #
+  # Deliberately *not* `st_blocks` or mtime, which the first draft of
+  # this assertion used and which are both unstable here for reasons
+  # that have nothing to do with bootroot.  The image is a mounted
+  # filesystem's backing file for the whole window: ext4 commits its
+  # journal and rewrites its superblock through the loop device every
+  # few seconds, which moves mtime, and the host's own allocation
+  # bookkeeping moves `st_blocks`.  Neither is part of "recreated,
+  # resized or reformatted", and the allocation is asserted on its own
+  # above.
+  local before after
+  before="$(image_identity "$image")"
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"${log}.2" 2>&1; then
+    : # This run reaches **enforced** and would otherwise carry on into
+      # the initialisation proper; the dead URL above stops it at the
+      # OpenBao health check instead.  The audit store outcome is what
+      # this asserts, and it is printed before that.
+  fi
+  grep -q "enforced (filesystem)" "${log}.2" ||
+    fail "the re-run did not report enforced; see ${log}.2"
+  grep -q "ownership is not verified" "${log}.2" ||
+    fail "the enforced outcome does not carry the openbao/ ownership caveat"
+  pass "the re-run reports enforced"
+
+  # Re-provisioning is idempotent and never reformats: no image command
+  # is rendered at all, and the image is the one that was already there.
+  if grep -Eq "mkfs\.ext4|install -m 0600|fallocate -l" "${log}.2"; then
+    fail "the re-run rendered an image command over an activated reserve; see ${log}.2"
+  fi
+  after="$(image_identity "$image")"
+  assert_equal "the image was not recreated, resized or reformatted" "$before" "$after"
+
+  # The allocation again, and this one is the assertion that catches a
+  # missing `lazy_itable_init=0`.  The check above runs seconds after
+  # the mount, which is before the kernel's background inode-table pass
+  # has had a chance to hand those blocks back; the re-run in between
+  # is a whole `bootroot init` and covers that window without this
+  # scenario having to sleep through it.
+  log "image allocation after the re-run: $(sudo -n stat -c 'size=%s blocks=%b unit=%B' "$image")"
+  assert_at_least "the image is still fully allocated after the re-run" \
+    "$reserve" "$(( $(sudo -n stat -c %b "$image") * 512 ))"
+
+  # The ceiling, which is the whole point: a write past the reserve
+  # fails on the reserve, and the host's root filesystem is not what
+  # absorbs it.
+  local root_before root_after
+  root_before="$(df -P -k / | awk 'NR==2 {print $4}')"
+  if sudo_to_log dd if=/dev/zero of="$store/records/fill" bs=1M count=64; then
+    fail "a write of four times the reserve succeeded; the ceiling is not enforced"
+  fi
+  assert_equal "the overflowing file stopped inside the reserve" "yes" \
+    "$([ "$(sudo -n stat -c %s "$store/records/fill")" -lt "$reserve" ] && echo yes || echo no)"
+  root_after="$(df -P -k / | awk 'NR==2 {print $4}')"
+  # A tolerance rather than an equality: this is a live host and other
+  # things write to it while the assertion runs.  What it catches is the
+  # reserve's worth of bytes landing on the root filesystem, which is
+  # four orders of magnitude above the noise.
+  assert_equal "the root filesystem did not absorb the overflow" "yes" \
+    "$([ "$(( root_before - root_after ))" -lt 8192 ] && echo yes || echo no)"
+  sudo -n rm -f "$store/records/fill"
+
+  remove_reserve_activation
+  # Leave the compose directory as `run_init` expects to find it: the
+  # staged artifacts and the rendered override both name this section's
+  # own store, and the override would refuse every later run.
+  sudo -n rm -rf "$WORK_DIR/audit-store"
+  remove_rendered_audit_override
+}
+
+# Takes the activation back off the host, in the order the manual's
+# removal sequence gives: disable the mount, remove the unit and both
+# drop-ins, reload, and only then delete the image.
+remove_reserve_activation() {
+  [ -n "$RESERVE_UNIT_NAME" ] || return 0
+  sudo_to_log systemctl disable --now "$RESERVE_UNIT_NAME" || true
+  # Belt and braces: a mount established by something other than the
+  # unit, or one the disable could not stop, would otherwise be what the
+  # store base's `rm -rf` descends into.
+  sudo_to_log umount "$RESERVE_STORE_DIR" || true
+  sudo_to_log rm -f \
+    "/etc/systemd/system/$RESERVE_UNIT_NAME" \
+    "/etc/systemd/system/docker.service.d/10-bootroot-audit-store.conf" \
+    "/etc/systemd/system/bootroot-registrar.service.d/10-bootroot-audit-store.conf" || true
+  sudo_to_log systemctl daemon-reload || true
+  sudo_to_log rm -rf "$RESERVE_IMAGE" "$RESERVE_STORE_DIR" || true
+  RESERVE_UNIT_NAME=""
+  RESERVE_STORE_DIR=""
+  RESERVE_IMAGE=""
 }
 
 # The store's directories are created owned by whoever creates them, so
@@ -864,6 +1357,25 @@ assert_audit_store_is_provisioned() {
   pass "openbao/ belongs to the container's user while the store and records/ stay root's"
 }
 
+# `directory` is a success, and it derives nothing: no image path, no
+# unit name, no artifact, and no leftover named.
+assert_the_directory_mode_outcome_is_a_success() {
+  grep -q "unenforced (directory)" "$INIT_RAW_LOG" ||
+    fail "the run did not report unenforced (directory); see $INIT_RAW_LOG"
+  grep -q "project quota" "$INIT_RAW_LOG" ||
+    fail "the directory outcome does not name the project-quota route"
+  if grep -q "provisioned, not activated" "$INIT_RAW_LOG"; then
+    fail "a directory-mode run reported a filesystem-mode outcome"
+  fi
+  if [ -e "$WORK_DIR/audit-store" ]; then
+    fail "a directory-mode run rendered the reserve's artifacts"
+  fi
+  if sudo -n test -e "${AUDIT_STORE_DIR}.img"; then
+    fail "a directory-mode run created a loopback image"
+  fi
+  pass "directory mode reports unenforced (directory) and derives nothing"
+}
+
 # The rendered override is what moved the device, and it is the record
 # `bootroot infra up` reads the bind source back out of.
 assert_the_audit_override_binds_the_store() {
@@ -883,12 +1395,8 @@ assert_the_audit_override_binds_the_store() {
 # The criterion this whole scenario exists for on this side: the running
 # container's audit directory is backed by the store on the host.
 assert_the_container_audit_dir_is_backed_by_the_store() {
-  local mount
-  mount="$(docker inspect "${INSTANCE}-openbao" \
-    --format "{{range .Mounts}}{{if eq .Destination \"${OPENBAO_AUDIT_CONTAINER_DIR}\"}}{{.Type}} {{.Source}}{{end}}{{end}}" \
-    2>>"$RUN_LOG" || true)"
   assert_equal "the container's ${OPENBAO_AUDIT_CONTAINER_DIR} is a bind mount of the store" \
-    "bind ${AUDIT_STORE_DIR}/openbao" "$mount"
+    "bind ${AUDIT_STORE_DIR}/openbao" "$(container_audit_bind)"
 
   # `verify_audit_file` passed at init — the run would have aborted with
   # the audit-setup failure otherwise — and the device is writing into
@@ -1164,6 +1672,302 @@ assert_the_rotated_active_log_begins_at_offset_zero() {
   pass "the rotated active log begins at offset 0 with a well-formed record"
 }
 
+# Whether both entries the shared file-audit assertion looks for are in
+# the device's current file.
+#
+# The same two predicates `assert_openbao_audit_log` applies, run as a
+# probe rather than as an assertion: the caller polls on this and then
+# lets the shared helper be the thing that decides, so a device that
+# never fills still fails with that helper's message and its container
+# path.
+openbao_audit_entries_present() {
+  local path="$1"
+  docker exec "${INSTANCE}-openbao" sh -c \
+    "grep -F '\"type\":\"response\"' '$path' | grep -F '\"path\":\"auth/approle/login\"' >/dev/null" \
+    >/dev/null 2>&1 || return 1
+  docker exec "${INSTANCE}-openbao" sh -c \
+    "grep -F '\"type\":\"response\"' '$path' | grep -F '\"operation\":\"read\"' | grep -E '\"path\":\"secret/data/' >/dev/null" \
+    >/dev/null 2>&1
+}
+
+# Gives a device whose bind source has just moved the window its file
+# needs to fill again.
+#
+# A bring-up returns once the containers are up; the entries below are
+# written when the two infra sidecars re-authenticate and re-render
+# against it, which is seconds later on an idle runner and longer on a
+# loaded one.  Bounded, and it never decides the assertion: on timeout
+# it returns and the shared helper reports what is actually missing.
+wait_for_openbao_audit_entries() {
+  local attempt=0
+  while [ "$attempt" -lt "$AUDIT_ENTRIES_ATTEMPTS" ]; do
+    if openbao_audit_entries_present "$OPENBAO_AUDIT_CONTAINER_LOG"; then
+      log "the moved audit device carries both sidecars' entries"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep "$AUDIT_ENTRIES_DELAY_SECS"
+  done
+  log "the moved audit device did not fill within ${AUDIT_ENTRIES_ATTEMPTS} attempts"
+  return 0
+}
+
+# Waits for a file on the reserve to grow past a size the caller
+# recorded earlier.
+#
+# The audit device appends, so a restarted container inherits every
+# entry the previous one wrote and the shared assertion would pass on
+# those alone.  What has to be shown after a restart is that the *new*
+# container is writing into the mounted reserve, which is growth and
+# nothing else.  Bounded, and it reports rather than decides: the caller
+# asserts on the two sizes so a failure names them.
+wait_for_file_growth() {
+  local path="$1" floor="$2" attempt=0
+  while [ "$attempt" -lt "$AUDIT_ENTRIES_ATTEMPTS" ]; do
+    if [ "$(sudo -n stat -c %s "$path" 2>/dev/null || echo 0)" -gt "$floor" ]; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep "$AUDIT_ENTRIES_DELAY_SECS"
+  done
+  return 0
+}
+
+# The store's device number, which is the mounted filesystem's once the
+# reserve is up and the directory underneath it otherwise.
+store_device() {
+  sudo -n stat -c %d "$1"
+}
+
+# The audit device the running OpenBao container is bound to, as
+# `docker inspect` reports it.
+container_audit_bind() {
+  docker inspect "${INSTANCE}-openbao" \
+    --format "{{range .Mounts}}{{if eq .Destination \"${OPENBAO_AUDIT_CONTAINER_DIR}\"}}{{.Type}} {{.Source}}{{end}}{{end}}" \
+    2>>"$RUN_LOG" || true
+}
+
+# Everything the reserve is for on the deployment's side: a live OpenBao
+# writing its mandatory file audit device into a mounted one.
+#
+# The activation section above proves the reserve itself -- that the
+# rendered commands bring it up, that the re-run reports **enforced**,
+# that a second run reformats nothing and that a write past it stops at
+# the reserve.  Every assertion there runs against a store with no
+# deployment on it and a deliberately dead OpenBao URL, so what none of
+# them says is whether a container can be brought up on one at all.
+# That is a different set of failures: the bind source is a directory
+# inside a mounted filesystem whose root the *operator* chmods by hand,
+# its `openbao/` is root-owned `0700` until the compose entrypoint
+# chowns it, an unprivileged `bootroot infra up` has to accept the store
+# it finds there, and the mount has to still be under the container
+# after the stack is restarted over it.
+#
+# Run last, and deliberately.  It moves this deployment's audit device
+# off the `directory`-mode store every assertion above is about, and it
+# ends by filling the reserve out from under a running container.
+# Nothing after it would still hold, and nothing is scheduled after it.
+#
+# Skipped whole on a host that cannot carry an activated reserve, on the
+# same probe the activation section uses: the assertions here are about
+# a deployment on a real loop device, and there is no weaker form of
+# them worth running.
+assert_the_deployment_runs_on_a_mounted_reserve() {
+  local config log store image unit reserve=16777216
+  if ! reserve_activation_is_possible; then
+    log "this host has no systemd, loop device or mkfs.ext4; the mounted-reserve deployment section is skipped"
+    return 0
+  fi
+  store="$AUDIT_STORE_BASE/reserve-deployed"
+  image="${store}.img"
+  config="$WORK_DIR/operator-agent-deployed.toml"
+  log="$ARTIFACT_DIR/init-reserve-deployed.log"
+  write_reserve_agent_config "$config" "$store" "$reserve"
+
+  # The override on disk names the `directory`-mode store this
+  # deployment was initialised against, and `plan_audit_store` refuses a
+  # run whose `--agent-config` resolves another one -- which is the
+  # check that keeps a moved store from being provisioned quietly.
+  # Removing it here is the harness stating that this is not a
+  # relocation: the device moves to an *empty* reserve, and the old
+  # store keeps every byte it had, which is what the reads at the end
+  # confirm.  Carrying records across belongs to the relocation issue.
+  remove_rendered_audit_override
+
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$log" 2>&1; then
+    fail "the first run reported success on an unactivated host; see $log"
+  fi
+  grep -q "provisioned, not activated" "$log" ||
+    fail "the first run did not report provisioned, not activated; see $log"
+
+  unit="$(basename "$(find "$WORK_DIR/audit-store" -maxdepth 1 -name '*.mount' -print -quit)")" ||
+    unit=""
+  [ -n "$unit" ] || fail "no .mount unit was rendered under $WORK_DIR/audit-store"
+  # Recorded before the first host-changing command, so cleanup can undo
+  # whatever the sequence got through.
+  RESERVE_STORE_DIR="$store"
+  RESERVE_IMAGE="$image"
+  RESERVE_UNIT_NAME="$unit"
+
+  run_rendered_phase_two "$log"
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"${log}.2" 2>&1; then
+    : # The dead URL stops this run at the OpenBao health check, which
+      # is the first step after the audit store that reaches the
+      # network.  The outcome is printed before it.
+  fi
+  grep -q "enforced (filesystem)" "${log}.2" ||
+    fail "the run over the activated reserve did not report enforced; see ${log}.2"
+  pass "the reserve the deployment will use reports enforced"
+
+  # The ordering the automatic boot path rests on, read back off the
+  # unit systemd actually loaded rather than off the file phase 2
+  # installed.  `Wants=` plus `After=` and nothing stronger is the whole
+  # relation: a failed mount job does not stop `docker.service`, which
+  # is the residual both manuals state and which this asserts rather
+  # than quietly strengthens.
+  if sudo -n systemctl cat docker.service >/dev/null 2>&1; then
+    case "$(sudo -n systemctl show docker.service -p After --value)" in
+      *"$unit"*) pass "the loaded docker.service orders itself after the mount unit" ;;
+      *) fail "docker.service does not order itself after $unit" ;;
+    esac
+    case "$(sudo -n systemctl show docker.service -p Wants --value)" in
+      *"$unit"*) pass "the loaded docker.service wants the mount unit" ;;
+      *) fail "docker.service does not want $unit" ;;
+    esac
+    case "$(sudo -n systemctl show docker.service -p Requires --value)" in
+      *"$unit"*) fail "docker.service carries a hard relation to $unit" ;;
+      *) pass "the loaded docker.service carries no hard relation to the mount unit" ;;
+    esac
+  else
+    log "docker.service is not a systemd unit on this host; the loaded-ordering assertion is skipped"
+  fi
+
+  # The bring-up that moves the device.  Unprivileged, like every other
+  # `infra up` in this scenario: it reads the bind source back out of
+  # the override this run rendered and checks the store directory that
+  # names -- which, with the reserve up, is the *mounted filesystem's
+  # root*.  `mkfs.ext4` leaves that root at `0755` and the store
+  # contract is `0700`, so this is also where the rendered `chmod 0700`
+  # on `audit_store_dir` earns its place: without it the bring-up
+  # refuses the store the run it followed had just reported enforced.
+  log "bringing the stack up on the mounted reserve"
+  run_bootroot infra up \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --openbao-url "https://localhost:${PORT_OPENBAO}" \
+    >>"$RUN_LOG" 2>&1 || fail "infra up failed over the mounted reserve; see $RUN_LOG"
+  pass "an unprivileged bring-up accepted the mounted reserve as the store"
+
+  assert_equal "the container's ${OPENBAO_AUDIT_CONTAINER_DIR} is a bind mount of the mounted reserve" \
+    "bind ${store}/openbao" "$(container_audit_bind)"
+
+  local store_dev
+  store_dev="$(store_device "$store")"
+  assert_equal "records/ sits on the mounted reserve" \
+    "$store_dev" "$(store_device "$store/records")"
+  assert_equal "openbao/ sits on the mounted reserve" \
+    "$store_dev" "$(store_device "$store/openbao")"
+
+  wait_for_openbao_audit_entries
+  sudo -n test -s "$store/openbao/audit.log" ||
+    fail "the OpenBao audit log did not land on the mounted reserve"
+  assert_equal "the audit log itself sits on the mounted reserve" \
+    "$store_dev" "$(store_device "$store/openbao/audit.log")"
+  assert_openbao_audit_log "${INSTANCE}-openbao" "$OPENBAO_AUDIT_CONTAINER_LOG"
+  pass "the shared OpenBao file-audit assertion passes over a device on the mounted reserve"
+
+  # The restart.  `stop` and then the product's own bring-up rather than
+  # `docker restart`: what has to survive is the stack being taken down
+  # and put back over a mount nothing in Compose knows about, and the
+  # bring-up is the surface an operator would use.  OpenBao seals when
+  # it stops and `infra up` unseals it again, so the sidecars
+  # re-authenticate afterwards and the device fills a second time.
+  local started_before started_after log_before
+  started_before="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.StartedAt}}' 2>>"$RUN_LOG" || true)"
+  [ -n "$started_before" ] || fail "could not read the OpenBao container's start time"
+  log_before="$(sudo -n stat -c %s "$store/openbao/audit.log")"
+  instance_compose stop >>"$RUN_LOG" 2>&1 || fail "could not stop the stack over the mounted reserve"
+  log "bringing the stack back up over the mounted reserve"
+  run_bootroot infra up \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --openbao-url "https://localhost:${PORT_OPENBAO}" \
+    >>"$RUN_LOG" 2>&1 || fail "infra up failed after the stack restart; see $RUN_LOG"
+  started_after="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.StartedAt}}' 2>>"$RUN_LOG" || true)"
+  if [ "$started_before" = "$started_after" ]; then
+    fail "the OpenBao container was not restarted; start time stayed at ${started_before}"
+  fi
+  pass "the stack was stopped and brought back up over the mounted reserve"
+
+  assert_equal "the mount unit is still active after the restart" \
+    "ActiveState=active" "$(sudo -n systemctl show -p ActiveState "$unit")"
+  assert_equal "the restarted container's ${OPENBAO_AUDIT_CONTAINER_DIR} is still the mounted reserve" \
+    "bind ${store}/openbao" "$(container_audit_bind)"
+  assert_equal "the store is still the mounted filesystem after the restart" \
+    "$store_dev" "$(store_device "$store")"
+  wait_for_file_growth "$store/openbao/audit.log" "$log_before"
+  assert_equal "the restarted container is writing into the mounted reserve" "yes" \
+    "$([ "$(sudo -n stat -c %s "$store/openbao/audit.log")" -gt "$log_before" ] && echo yes || echo no)"
+  assert_openbao_audit_log "${INSTANCE}-openbao" "$OPENBAO_AUDIT_CONTAINER_LOG"
+  pass "the shared file-audit assertion passes again after the stack restart"
+
+  # The regression an owner-comparing implementation fails, end to end:
+  # the compose entrypoint has chowned `/openbao/audit` to the container's
+  # own user by now, so `openbao/` on the host is no longer root's --
+  # and a run over it must still report **enforced**, because its owner
+  # is deliberately not compared.
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"${log}.3" 2>&1; then
+    :
+  fi
+  grep -q "enforced (filesystem)" "${log}.3" ||
+    fail "a run over a container-owned openbao/ did not report enforced; see ${log}.3"
+  grep -q "ownership is not verified" "${log}.3" ||
+    fail "the enforced outcome does not carry the openbao/ ownership caveat"
+  pass "the reserve is still enforced once the container owns openbao/"
+
+  # The ceiling, against the deployment rather than against an empty
+  # reserve: the filesystem the running container's audit device sits on
+  # is the reserve, so a write past it fails there and the host's root
+  # filesystem is not what absorbs it.  Last of all, because it fills
+  # the device OpenBao is required to be able to write.
+  local root_before root_after
+  root_before="$(df -P -k / | awk 'NR==2 {print $4}')"
+  if sudo_to_log dd if=/dev/zero of="$store/records/fill" bs=1M count=64; then
+    fail "a write of four times the reserve succeeded under the deployment"
+  fi
+  assert_equal "the overflowing file stopped inside the deployed reserve" "yes" \
+    "$([ "$(sudo -n stat -c %s "$store/records/fill")" -lt "$reserve" ] && echo yes || echo no)"
+  root_after="$(df -P -k / | awk 'NR==2 {print $4}')"
+  assert_equal "the root filesystem did not absorb the overflow" "yes" \
+    "$([ "$(( root_before - root_after ))" -lt 8192 ] && echo yes || echo no)"
+  sudo -n rm -f "$store/records/fill"
+
+  # The `directory`-mode store this deployment was initialised against
+  # is untouched by all of the above: the device moved, and nothing
+  # carried or removed what was already there.
+  sudo -n test -s "$AUDIT_STORE_DIR/openbao/audit.log" ||
+    fail "the directory-mode store lost the audit log it already held"
+  pass "the store the device moved off still holds every byte it had"
+
+  # The activation stays on the host until cleanup: the container is
+  # bound into the mounted store and the unmount would be refused while
+  # it runs.  `cleanup` tears the instance down first and then calls
+  # `remove_reserve_activation`, which the globals above are set for.
+}
+
 # The alias is why the ACME challenge above could resolve at all.
 # Asserted directly so a future change that drops it fails with the
 # reason rather than as an unexplained issuance timeout.
@@ -1296,6 +2100,10 @@ cleanup() {
   }
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] &&
     { docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true; }
+  # Before the store base is removed: an activated reserve is a mount
+  # inside it, and `rm -rf` would descend into the mounted filesystem
+  # rather than into the directory it is covering.
+  remove_reserve_activation
   remove_run_root
   remove_audit_store_base
   report_project_leftovers "$INSTANCE" "registrar-internal-init cleanup" || cleanup_status=1
@@ -1343,6 +2151,10 @@ main() {
   log_phase "refuse-unprivileged"
   assert_an_unprivileged_init_is_refused
 
+  log_phase "assert-filesystem-mode"
+  assert_filesystem_mode_stops_before_it_touches_the_host
+  assert_the_rendered_steps_activate_the_reserve
+
   log_phase "init"
   run_init
 
@@ -1356,6 +2168,7 @@ main() {
 
   log_phase "assert-audit-store"
   assert_audit_store_is_provisioned
+  assert_the_directory_mode_outcome_is_a_success
   assert_the_audit_override_binds_the_store
   assert_the_container_audit_dir_is_backed_by_the_store
 
@@ -1390,10 +2203,10 @@ main() {
   # device.
   assert_the_shared_audit_log_assertion_still_passes
 
-  # And last of all, the device this run has been filling is rotated in
-  # place.  Deliberately after the assertion above, so that one still
-  # runs against a log no rotation has touched and this one runs against
-  # a log a rotation has emptied.
+  # The device this run has been filling is then rotated in place.
+  # Deliberately after the assertion above, so that one still runs
+  # against a log no rotation has touched and this one runs against a
+  # log a rotation has emptied.
   log_phase "assert-audit-rotation"
   build_rotation_test_binary
   drive_a_marker_record_before_the_rotation
@@ -1403,6 +2216,13 @@ main() {
   assert_the_rotated_active_log_begins_at_offset_zero
   # The same shared assertion, unmodified, over the rotated deployment.
   assert_the_shared_audit_log_assertion_still_passes
+
+  # Last, and after everything the `directory`-mode deployment asserts:
+  # this phase moves the audit device onto a mounted reserve and ends by
+  # filling that reserve out from under the container, so no assertion
+  # above would still hold once it has run.
+  log_phase "assert-filesystem-deployment"
+  assert_the_deployment_runs_on_a_mounted_reserve
 
   log_phase "done"
   log "endpoint-enabled init checks passed"

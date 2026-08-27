@@ -16,22 +16,31 @@
 //! store, and what this module delivers for that half is the empty
 //! `records/` directory the store's trust checks accept.
 //!
-//! Nothing here enforces `audit_store_reserve_bytes`; the budget stays
-//! a number in this build.
+//! `audit_store_reserve_bytes` is enforced here in the shipped
+//! `filesystem` mode, by [`reserve`]: a fully allocated loopback image
+//! sized to the reserve, an `ext4` filesystem on it, and a generated
+//! mount unit that puts it at `audit_store_dir` and restores it on
+//! boot. The ceiling is then the image size, a quota by construction
+//! the kernel enforces against both writers. An explicit
+//! `audit_store_enforcement = "directory"` opts out of all of it and
+//! leaves the budget a recorded number.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::config::AuditStoreEnforcement;
 use bootroot::fs_util;
 use bootroot::registrar::audit_store::{
     AuditStoreLayoutError, OPENBAO_CONTAINER_AUDIT_DIR, PRODUCTION_UID, STORE_DIR_MODE,
-    check_ancestors, check_store_directory, create_layout,
+    check_ancestors, check_store_directory, create_layout, create_mount_point,
 };
 use serde::Deserialize;
 
 use crate::commands::init::OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME;
 use crate::i18n::Messages;
 use crate::state::StateFile;
+
+pub(crate) mod reserve;
 
 /// The container path `openbao/openbao.hcl` writes its file audit
 /// device to. Unchanged by this override — only what backs it moves.
@@ -45,6 +54,16 @@ const OPENBAO_CONFIG_MOUNT: &str = "./openbao:/openbao/config:ro";
 
 /// Mode a freshly rendered override is created at.
 const OVERRIDE_FILE_MODE: u32 = 0o644;
+
+/// The command a rendered "run this again" step names on this surface.
+///
+/// A parameter rather than a literal inside the catalogue string, so
+/// the installer fail-closed issue renders the same step for
+/// `bootroot infra up` without a second copy of the sentence. Nothing
+/// here supplies any other value: an already-initialised host cannot
+/// re-run `bootroot init`, so activating enforcement on a live
+/// deployment needs a surface this build does not have.
+const RESERVE_RERUN_COMMAND: &str = "bootroot init";
 
 /// The `[registrar]` and `[registrar_endpoint]` halves of the
 /// operator's configuration file, and nothing else.
@@ -73,7 +92,7 @@ struct AgentConfigPartial {
     registrar_endpoint: bootroot::config::RegistrarEndpointSettings,
 }
 
-/// The two readings `--agent-config` carries.
+/// The readings `--agent-config` carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentConfigView {
     /// `[registrar] audit_store_dir`, already validated.
@@ -81,6 +100,17 @@ pub(crate) struct AgentConfigView {
     /// `[registrar_endpoint] enabled`, read as a plain field with no
     /// semantic rule applied.
     pub(crate) endpoint_enabled: bool,
+    /// `[registrar] audit_store_enforcement` — the **only** input that
+    /// selects a mode. Never inferred, never fallen back from, never
+    /// written back.
+    pub(crate) enforcement: AuditStoreEnforcement,
+    /// `[registrar] audit_store_reserve_bytes`.
+    pub(crate) reserve_bytes: u64,
+    /// `[registrar] audit_max_file_bytes`, half of the reserve
+    /// minimum's record worst case.
+    pub(crate) max_file_bytes: u64,
+    /// `[registrar] audit_max_retained_files`, the other half.
+    pub(crate) max_retained_files: u32,
 }
 
 /// Reads the two tables `init` needs out of the operator's
@@ -127,6 +157,10 @@ pub(crate) fn load_agent_config(path: &Path, messages: &Messages) -> Result<Agen
     Ok(AgentConfigView {
         audit_store_dir: partial.registrar.audit_store_dir,
         endpoint_enabled: partial.registrar_endpoint.enabled,
+        enforcement: partial.registrar.audit_store_enforcement,
+        reserve_bytes: partial.registrar.audit_store_reserve_bytes,
+        max_file_bytes: partial.registrar.audit_max_file_bytes,
+        max_retained_files: partial.registrar.audit_max_retained_files,
     })
 }
 
@@ -436,8 +470,9 @@ pub(crate) enum AuditStorePlan {
     /// in them are left exactly as they are: switching a host off
     /// changes what is mounted, never what is stored.
     Unwind(PathBuf),
-    /// Provision the store at this directory and render the override.
-    Provision(PathBuf),
+    /// Provision the store the configuration names and render the
+    /// override.
+    Provision(Box<AgentConfigView>),
 }
 
 /// Decides what this run does about the audit store, creating,
@@ -514,6 +549,11 @@ fn plan_audit_store(
 
     if rendered_present {
         let rendered_store = read_audit_override_store_dir(&override_path, messages)?;
+        // `Path`'s own equality compares components, so the rendered
+        // spelling and the configured one agree wherever they name
+        // one directory — which is what keeps `filesystem` mode's
+        // recording of the simplified form from reading back as a
+        // store that moved.
         if rendered_store != view.audit_store_dir {
             anyhow::bail!(messages.error_audit_store_override_stale(
                 &rendered_store.display().to_string(),
@@ -522,7 +562,7 @@ fn plan_audit_store(
         }
     }
 
-    Ok(AuditStorePlan::Provision(view.audit_store_dir))
+    Ok(AuditStorePlan::Provision(Box::new(view)))
 }
 
 /// Raises every refusal an `init` would raise about the audit store,
@@ -544,10 +584,24 @@ pub(crate) fn preflight_audit_store(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
 ) -> Result<()> {
-    if let AuditStorePlan::Provision(store_dir) = plan_audit_store(inputs, messages)? {
+    if let AuditStorePlan::Provision(view) = plan_audit_store(inputs, messages)? {
         // The ancestor chain is the one remaining refusal `create_layout`
         // makes before it creates anything, and it is a pure read too.
-        check_ancestors(&store_dir).map_err(|err| {
+        //
+        // The configured spelling is the right input here even in
+        // `filesystem` mode, where everything *derived* comes from the
+        // simplified path instead. An ancestor chain is spelling-
+        // invariant: `Path::ancestors` walks `parent()`, which is
+        // defined over components, and components normalise away
+        // repeated separators, a trailing separator and every `.` —
+        // exactly what simplification removes. A configured
+        // `…/audit-store/.` therefore yields `…/bootroot`, `…/lib`,
+        // `/var`, `/` — the same chain the simplified path yields, and
+        // one that never contains the store directory itself. Checking
+        // it before `evaluate` keeps a missing or untraversable
+        // ancestor ahead of the reserve verdicts, which is the order
+        // `create_layout` establishes on the init path.
+        check_ancestors(&view.audit_store_dir).map_err(|err| {
             anyhow::anyhow!(layout_error_message(
                 &err,
                 StoreCheckCaller::Init,
@@ -555,6 +609,31 @@ pub(crate) fn preflight_audit_store(
                 messages
             ))
         })?;
+        // Phase-1 refusals only, and every one of them a pure read: a
+        // sub-minimum reserve, a store path the artifacts cannot carry,
+        // an image of the wrong type or the wrong size, a filesystem
+        // with no room for the outstanding allocation, and an
+        // underlying store larger than the reserve. Nothing is
+        // created, nothing is rendered, nothing is installed, no mount
+        // is verified and no outcome line is printed — a refusal
+        // raised for the first time by the post-wipe `init` pass would
+        // land after the OpenBao wipe.
+        if view.enforcement == AuditStoreEnforcement::Filesystem {
+            let reserve_inputs = reserve_inputs(inputs, &view);
+            let facts = reserve::evaluate(&reserve_inputs, &reserve::HostProbe, messages)?;
+            // The one deliberate consequence, raised here rather than
+            // by the post-wipe pass: a host whose store already holds
+            // records cannot reinit until enforcement is activated or
+            // `directory` mode is configured. The post-wipe pass would
+            // reach the same verdict, after the records the verdict
+            // exists to protect had already survived a wipe that had
+            // no reason to spare them.
+            if facts.underlying_not_empty() {
+                anyhow::bail!(messages.audit_reserve_finding_store_not_empty(
+                    &view.audit_store_dir.display().to_string()
+                ));
+            }
+        }
         // Reinit brings the stack back up *before* it re-runs `init`,
         // and that bring-up gates on the recorded predicate alone: with
         // it enabled it requires the rendered override, which the init
@@ -600,18 +679,102 @@ pub(crate) fn apply_audit_store(
             })?;
             Ok(None)
         }
-        AuditStorePlan::Provision(store_dir) => {
-            create_layout(&store_dir, inputs.expected_uid).map_err(|err| {
-                anyhow::anyhow!(layout_error_message(
-                    &err,
-                    StoreCheckCaller::Init,
-                    inputs.expected_uid,
-                    messages
-                ))
-            })?;
-            let rendered = write_audit_override(inputs.compose_dir, &store_dir, messages)?;
-            Ok(Some(rendered))
-        }
+        AuditStorePlan::Provision(view) => match view.enforcement {
+            AuditStoreEnforcement::Directory => {
+                // The explicit opt-out, and its own complete path. The
+                // store is created exactly as before this surface
+                // existed, all three directories in one pass; no image
+                // path or unit name is derived, no path this surface
+                // introduces is `stat`ed, and no leftover is looked
+                // for or named.
+                create_layout(&view.audit_store_dir, inputs.expected_uid).map_err(|err| {
+                    anyhow::anyhow!(layout_error_message(
+                        &err,
+                        StoreCheckCaller::Init,
+                        inputs.expected_uid,
+                        messages
+                    ))
+                })?;
+                let rendered =
+                    write_audit_override(inputs.compose_dir, &view.audit_store_dir, messages)?;
+                println!(
+                    "{}",
+                    reserve::render_directory_outcome(
+                        &view.audit_store_dir,
+                        view.reserve_bytes,
+                        messages
+                    )
+                );
+                Ok(Some(rendered))
+            }
+            AuditStoreEnforcement::Filesystem => {
+                let reserve_inputs = reserve_inputs(inputs, &view);
+                let probe = reserve::HostProbe;
+                // Phase 1. Every refusal below is a read, and it runs
+                // before the one filesystem object this path creates.
+                let facts = reserve::evaluate(&reserve_inputs, &probe, messages)?;
+                // Everything below is the *simplified* store path
+                // phase 1 established, never the configured spelling.
+                // The mount point has to be the directory `Where=`
+                // names, and the override's bind source has to be the
+                // directory the mount covers; deriving the artifacts
+                // from one path and creating the other is how a
+                // configured `…/audit-store/.` provisions a store no
+                // unit ever mounts.
+                let store_dir = facts.store_dir.as_path();
+                // The mount point, and nothing beneath it. Its
+                // subdirectories come into being on the mounted
+                // filesystem, which is step 4 of the rendered list and
+                // the operator's to run.
+                create_mount_point(store_dir, inputs.expected_uid, !facts.mount_present())
+                    .map_err(|err| {
+                        anyhow::anyhow!(layout_error_message(
+                            &err,
+                            StoreCheckCaller::Init,
+                            inputs.expected_uid,
+                            messages
+                        ))
+                    })?;
+                let rendered = write_audit_override(inputs.compose_dir, store_dir, messages)?;
+                let artifacts = reserve::render_artifacts(&reserve_inputs, &facts);
+                reserve::write_artifacts(&artifacts, messages)?;
+                // Phase 3.
+                let report =
+                    reserve::verify(&reserve_inputs, &facts, &artifacts, &probe, messages)?;
+                let outcome = reserve::render_filesystem_outcome(
+                    &reserve_inputs,
+                    &facts,
+                    &artifacts,
+                    &report,
+                    messages,
+                );
+                if matches!(report, reserve::ReserveReport::NotActivated { .. }) {
+                    // The run fails under this outcome. It does not
+                    // report success, rewrite `audit_store_enforcement`
+                    // or continue as `directory`.
+                    anyhow::bail!(outcome);
+                }
+                println!("{outcome}");
+                Ok(Some(rendered))
+            }
+        },
+    }
+}
+
+/// Assembles what the reserve derives everything from out of the two
+/// halves the install side holds it in.
+fn reserve_inputs<'a>(
+    inputs: &'a AuditStoreInitInputs<'a>,
+    view: &'a AgentConfigView,
+) -> reserve::ReserveInputs<'a> {
+    reserve::ReserveInputs {
+        store_dir: &view.audit_store_dir,
+        compose_dir: inputs.compose_dir,
+        reserve_bytes: view.reserve_bytes,
+        max_file_bytes: view.max_file_bytes,
+        max_retained_files: view.max_retained_files,
+        expected_uid: inputs.expected_uid,
+        rerun_command: RESERVE_RERUN_COMMAND,
     }
 }
 
@@ -684,6 +847,10 @@ mod tests {
 
     const AGENT_CONFIG_NAME: &str = "agent.toml";
 
+    /// 16 MiB — the `filesystem`-mode floor, and the smallest reserve
+    /// a test can ask a host to have room for.
+    const RESERVE_FLOOR_FOR_TESTS: u64 = 16 * 1024 * 1024;
+
     /// A temporary directory every ancestor of which is world
     /// traversable; see the twin helper in the library layout module
     /// for why the platform default will not do.
@@ -739,15 +906,30 @@ mod tests {
             self.base.path().join("audit-store")
         }
 
+        /// The layout and override assertions below are about the
+        /// path `directory` mode keeps verbatim — all three
+        /// directories created in one pass, the override rendered,
+        /// the run continuing. `filesystem` mode's own path has its
+        /// own tests in [`super::reserve::tests`], so these say which
+        /// mode they mean rather than riding on the default.
         fn agent_config(&self, enabled: bool) -> PathBuf {
             self.agent_config_for(&self.store_dir(), enabled)
         }
 
         fn agent_config_for(&self, store_dir: &Path, enabled: bool) -> PathBuf {
+            self.agent_config_in_mode(store_dir, enabled, "directory")
+        }
+
+        fn agent_config_in_mode(
+            &self,
+            store_dir: &Path,
+            enabled: bool,
+            enforcement: &str,
+        ) -> PathBuf {
             write_agent_config(
                 self.base.path(),
                 &format!(
-                    "[registrar]\naudit_store_dir = \"{}\"\n\n[registrar_endpoint]\nenabled = {enabled}\n",
+                    "[registrar]\naudit_store_dir = \"{}\"\naudit_store_enforcement = \"{enforcement}\"\n\n[registrar_endpoint]\nenabled = {enabled}\n",
                     store_dir.display()
                 ),
             )
@@ -755,6 +937,43 @@ mod tests {
 
         fn state(&self, endpoint: Option<bool>) -> PathBuf {
             write_state(self.base.path(), endpoint)
+        }
+
+        /// A `filesystem`-mode configuration whose reserve is the
+        /// smallest one that clears the minimum, so the free-space
+        /// preflight asks the host for 16 MiB rather than for the
+        /// shipped 2 GiB default.
+        fn filesystem_agent_config(&self, enabled: bool) -> PathBuf {
+            self.filesystem_agent_config_with(enabled, RESERVE_FLOOR_FOR_TESTS)
+        }
+
+        fn filesystem_agent_config_with(&self, enabled: bool, reserve: u64) -> PathBuf {
+            self.filesystem_agent_config_at(&self.store_dir(), enabled, reserve)
+        }
+
+        /// The same, over a store path the caller spells itself, so a
+        /// test can configure one that is not simplified.
+        fn filesystem_agent_config_at(
+            &self,
+            store_dir: &Path,
+            enabled: bool,
+            reserve: u64,
+        ) -> PathBuf {
+            write_agent_config(
+                self.base.path(),
+                &format!(
+                    "[registrar]\naudit_store_dir = \"{}\"\naudit_store_enforcement = \"filesystem\"\naudit_store_reserve_bytes = {reserve}\naudit_store_low_water_bytes = 1024\naudit_max_file_bytes = 65536\naudit_max_retained_files = 1\n\n[registrar_endpoint]\nenabled = {enabled}\n",
+                    store_dir.display()
+                ),
+            )
+        }
+
+        fn image_path(&self) -> PathBuf {
+            self.base.path().join("audit-store.img")
+        }
+
+        fn artifact_dir(&self) -> PathBuf {
+            self.compose_dir().join("audit-store")
         }
 
         fn inputs<'a>(
@@ -1799,6 +2018,48 @@ mod tests {
         assert!(rendered.contains("bootroot init"), "{rendered}");
     }
 
+    /// The mounted store root's own contract is enforced on the
+    /// bring-up, which is the surface the issue assigns it to.
+    ///
+    /// Phase 3 verifies the image, the three artifacts, the mount
+    /// identity and the two subdirectories — the four checks
+    /// `enforced` is defined as. The root directory of the mounted
+    /// filesystem is not among them: `mkfs.ext4` gives it `0755`, and
+    /// bringing it to `0700` is phase-2 step 4's rendered `chmod`,
+    /// there so that "the store directory contract — the one
+    /// `bootroot infra up` applies to the path the rendered override
+    /// names" holds. This asserts that the check is really there, so
+    /// an operator who skipped that `chmod` is refused before any
+    /// container binds into the store.
+    #[test]
+    fn a_bring_up_refuses_a_filesystem_mode_store_root_left_at_the_mkfs_mode() {
+        let messages = test_messages();
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        apply_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &messages,
+        )
+        .expect_err("provisioned, not activated");
+
+        let store = fixture.store_dir();
+        // What an `lstat` of the mount point sees once the operator
+        // has mounted the reserve and not yet run step 4's `chmod`.
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let err = resolve_audit_override(&state, &compose_dir, current_process_euid(), &messages)
+            .expect_err("refused");
+        let rendered = err.to_string();
+        let store = store.display().to_string();
+        assert!(rendered.contains(&store), "{rendered}");
+        assert!(
+            rendered.contains(&format!("chmod 0700 {store}")),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn a_disabled_predicate_selects_nothing_and_leaves_a_rendered_file_inert() {
         let (fixture, _state, compose_dir) = provisioned_fixture();
@@ -2060,5 +2321,346 @@ mod tests {
             err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
+    }
+
+    /// With the endpoint off, nothing this surface adds runs in
+    /// either mode — no image path derived, no artifact rendered, no
+    /// outcome line, no exit-status change.
+    #[test]
+    fn the_endpoint_gate_comes_first_in_both_modes() {
+        for enforcement in ["filesystem", "directory"] {
+            let fixture = Fixture::new();
+            let state = fixture.state(Some(false));
+            let compose_dir = fixture.compose_dir();
+            let agent_config =
+                fixture.agent_config_in_mode(&fixture.store_dir(), false, enforcement);
+            let inputs = Fixture::inputs(Some(&agent_config), &state, false, &compose_dir);
+            assert_eq!(
+                plan_audit_store(&inputs, &test_messages()).expect("planned"),
+                AuditStorePlan::Idle,
+                "{enforcement}"
+            );
+            assert_eq!(
+                apply_audit_store(&inputs, &test_messages())
+                    .expect("nothing to do")
+                    .as_deref(),
+                None,
+                "{enforcement}"
+            );
+            assert!(!fixture.store_dir().exists(), "{enforcement}");
+            assert!(!fixture.image_path().exists(), "{enforcement}");
+            assert!(!fixture.artifact_dir().exists(), "{enforcement}");
+        }
+    }
+
+    /// The install path creates the mount point and neither
+    /// subdirectory: creating them first and mounting over them
+    /// produces an empty store and a container that cannot write its
+    /// mandatory audit device.
+    #[test]
+    fn a_filesystem_mode_run_creates_only_the_mount_point_and_stops() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        let error = apply_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &test_messages(),
+        )
+        .expect_err("provisioned, not activated");
+        let text = error.to_string();
+        assert!(text.contains("provisioned, not activated"), "{text}");
+        assert!(text.contains("ownership is not verified"), "{text}");
+
+        let store = fixture.store_dir();
+        assert!(store.is_dir());
+        assert!(!store.join(RECORDS_SUBDIR).exists());
+        assert!(!store.join(OPENBAO_SUBDIR).exists());
+        // Not one phase-2 step is performed: no image, nothing under
+        // `/etc/systemd/system`, no mount.
+        assert!(!fixture.image_path().exists());
+
+        // The three artifacts are written, and they are inert.
+        assert!(fixture.artifact_dir().is_dir());
+        assert!(
+            fixture
+                .artifact_dir()
+                .join("docker.service.d")
+                .join("10-bootroot-audit-store.conf")
+                .is_file()
+        );
+        assert!(
+            fixture
+                .artifact_dir()
+                .join("bootroot-registrar.service.d")
+                .join("10-bootroot-audit-store.conf")
+                .is_file()
+        );
+        let mount_units: Vec<PathBuf> = fs::read_dir(fixture.artifact_dir())
+            .expect("artifact dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "mount"))
+            .collect();
+        assert_eq!(mount_units.len(), 1, "{mount_units:?}");
+        let unit = fs::read_to_string(mount_units.first().expect("the unit")).expect("unit");
+        assert!(
+            unit.contains(&format!("Where={}", store.display())),
+            "{unit}"
+        );
+        assert!(
+            unit.contains(&format!("What={}", fixture.image_path().display())),
+            "{unit}"
+        );
+
+        // The rendered Compose override is untouched by any of it.
+        let content = fs::read_to_string(audit_override_path(&compose_dir)).expect("override");
+        assert!(!content.contains("create_host_path"), "{content}");
+        assert!(!content.contains("bind:"), "{content}");
+    }
+
+    /// Phase 1 simplifies the store path, and the install path has to
+    /// provision *that* path rather than the configured spelling: the
+    /// mount point is the directory `Where=` names, and the Compose
+    /// override's bind source is the directory the mount covers.
+    #[test]
+    fn a_store_path_that_is_not_simplified_is_provisioned_where_the_unit_names() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let store = fixture.store_dir();
+        // The configured spelling: a trailing `.` component, which
+        // `validate_registrar_settings` accepts and which no ancestor
+        // walk over the raw path ever creates.
+        let configured = store.join(".");
+        let agent_config =
+            fixture.filesystem_agent_config_at(&configured, true, RESERVE_FLOOR_FOR_TESTS);
+        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_dir);
+
+        let error =
+            apply_audit_store(&inputs, &test_messages()).expect_err("provisioned, not activated");
+        assert!(
+            error.to_string().contains("provisioned, not activated"),
+            "{error}"
+        );
+
+        // The mount point exists, at the simplified path and at the
+        // store directory contract's mode.
+        let meta = fs::symlink_metadata(&store).expect("the mount point");
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        assert!(!store.join(RECORDS_SUBDIR).exists());
+        assert!(!store.join(OPENBAO_SUBDIR).exists());
+
+        // The unit and the override name one and the same directory.
+        let mount_unit = fs::read_dir(fixture.artifact_dir())
+            .expect("artifact dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().is_some_and(|ext| ext == "mount"))
+            .expect("the unit");
+        let unit = fs::read_to_string(mount_unit).expect("unit");
+        assert!(
+            unit.contains(&format!("Where={}\n", store.display())),
+            "{unit}"
+        );
+        assert_eq!(
+            read_audit_override_store_dir(&audit_override_path(&compose_dir), &test_messages())
+                .expect("the rendered override"),
+            store
+        );
+
+        // And the re-run gets no further than the first one did: the
+        // override it just wrote is not read back as naming another
+        // store.
+        let error =
+            apply_audit_store(&inputs, &test_messages()).expect_err("provisioned, not activated");
+        assert!(
+            error.to_string().contains("provisioned, not activated"),
+            "{error}"
+        );
+    }
+
+    /// `directory` mode derives nothing and probes nothing, and its
+    /// outcome is a success.
+    #[test]
+    fn a_directory_mode_run_creates_all_three_and_names_no_leftover() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        // A leftover image from a previous `filesystem`-mode run: a
+        // `directory` run neither reads it nor names it.
+        fs::write(fixture.image_path(), b"leftover").expect("leftover image");
+        let agent_config = fixture.agent_config(true);
+        let selected = apply_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &test_messages(),
+        )
+        .expect("unenforced (directory) is a success");
+        assert!(selected.is_some());
+
+        let store = fixture.store_dir();
+        assert!(store.join(RECORDS_SUBDIR).is_dir());
+        assert!(store.join(OPENBAO_SUBDIR).is_dir());
+        assert!(!fixture.artifact_dir().exists());
+        assert_eq!(
+            fs::read(fixture.image_path()).expect("leftover image"),
+            b"leftover"
+        );
+    }
+
+    /// Every phase-1 refusal reaches `reinit` before the wipe, as a
+    /// pure read.
+    #[test]
+    fn the_reinit_preflight_raises_the_reserve_refusals_before_the_wipe() {
+        let messages = test_messages();
+
+        // A sub-minimum reserve.
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config_with(true, 1024 * 1024);
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &messages,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("does not clear the"), "{error}");
+        assert!(!fixture.store_dir().exists());
+        assert!(!fixture.artifact_dir().exists());
+
+        // A store path the artifacts cannot carry.
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        // A trailing space: systemd strips it off the value, leaving
+        // `Where=` naming a path the unit name no longer matches.
+        let hostile = fixture.base.path().join("audit-store ");
+        let agent_config = fixture.agent_config_in_mode(&hostile, true, "filesystem");
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &messages,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("systemd artifacts"), "{error}");
+        assert!(!hostile.exists());
+
+        // An image of the wrong size.
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        fs::write(fixture.image_path(), b"wrong size").expect("image");
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &messages,
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("never resized"), "{error}");
+        assert_eq!(
+            fs::read(fixture.image_path()).expect("image"),
+            b"wrong size"
+        );
+
+        // A store that already holds records.
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        fs::create_dir_all(fixture.store_dir().join(RECORDS_SUBDIR)).expect("records");
+        fs::write(
+            fixture.store_dir().join(RECORDS_SUBDIR).join("audit.log"),
+            b"a record",
+        )
+        .expect("a record");
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &messages,
+        )
+        .expect_err("refused");
+        assert!(
+            error.to_string().contains("two supported ways forward"),
+            "{error}"
+        );
+        assert!(!fixture.artifact_dir().exists());
+        assert_eq!(
+            fs::read(fixture.store_dir().join(RECORDS_SUBDIR).join("audit.log"))
+                .expect("the record"),
+            b"a record"
+        );
+    }
+
+    /// A store path that is not simplified reinits, and the ancestor
+    /// chain is why.
+    ///
+    /// `reinit`'s pre-wipe preflight checks the ancestors of the
+    /// *configured* spelling while everything else in `filesystem`
+    /// mode is derived from the simplified one. That is safe because
+    /// an ancestor chain is spelling-invariant: `Path::ancestors`
+    /// walks `parent()`, which normalises away the trailing `.`, so
+    /// the store directory is never itself walked as one of its own
+    /// ancestors and its required `0700` — which has no `o+x` — is
+    /// never held against the traversability rule.
+    #[test]
+    fn the_reinit_preflight_clears_a_store_path_that_is_not_simplified() {
+        let messages = test_messages();
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let configured = fixture.store_dir().join(".");
+        let agent_config =
+            fixture.filesystem_agent_config_at(&configured, true, RESERVE_FLOOR_FOR_TESTS);
+        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_dir);
+
+        // Provision: the mount point lands at the simplified path and
+        // at the store directory contract's mode, and the override is
+        // rendered. Phase 2 is the operator's, so the run stops at
+        // `provisioned, not activated`.
+        apply_audit_store(&inputs, &messages).expect_err("provisioned, not activated");
+        let store = fixture.store_dir();
+        let mode = fs::symlink_metadata(&store)
+            .expect("the mount point")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        // The mode an ancestor walk over the store directory itself
+        // would refuse.
+        assert_eq!(mode & 0o001, 0, "the store directory has no o+x");
+
+        // The pre-wipe preflight now clears: no ancestor refusal, and
+        // no phase-1 refusal either, so a valid deployment spelled
+        // this way can reinit.
+        preflight_audit_store(&inputs, &messages).expect("the pre-wipe preflight clears");
+
+        // It still creates nothing beneath the store and installs
+        // nothing: it is a pure read.
+        assert!(!store.join(RECORDS_SUBDIR).exists());
+        assert!(!store.join(OPENBAO_SUBDIR).exists());
+        assert!(!fixture.image_path().exists());
+    }
+
+    /// The re-run step names the command the run continues under, and
+    /// nothing on this surface tells an operator to reach for
+    /// `bootroot infra up`.
+    #[test]
+    fn the_rerun_step_is_parameterised_and_never_names_infra_up() {
+        for locale in ["en", "ko"] {
+            let messages = Messages::new(locale).expect("a locale");
+            let rendered = messages.audit_reserve_step_rerun(RESERVE_RERUN_COMMAND);
+            assert!(
+                rendered.contains(RESERVE_RERUN_COMMAND),
+                "{locale}: {rendered}"
+            );
+            assert!(!rendered.contains("infra up"), "{locale}: {rendered}");
+            for text in [
+                messages.audit_reserve_outcome_not_activated("/store"),
+                messages.audit_reserve_outcome_directory("/store", 1),
+                messages.audit_reserve_outcome_enforced("/img", 1, "u.mount", "/store"),
+                messages.audit_reserve_finding_store_not_empty("/store"),
+                messages.audit_reserve_steps_header().to_string(),
+                messages.audit_reserve_openbao_owner_caveat().to_string(),
+            ] {
+                assert!(!text.contains("infra up"), "{locale}: {text}");
+            }
+        }
     }
 }

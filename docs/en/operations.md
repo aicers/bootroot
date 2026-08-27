@@ -747,9 +747,48 @@ that directory is: nothing records a second copy of it — not `state.json`,
 not a flag, not an environment variable — because two values that can
 drift are two directories waiting to happen.
 
-Nothing enforces `audit_store_reserve_bytes` in this build. A configured
-reserve is a recorded number and not a guarantee the filesystem is
-holding space for you.
+`[registrar] audit_store_enforcement` decides what stands behind
+`audit_store_reserve_bytes`, and it is the **only** input that selects a
+mode: bootroot never infers one, never falls back from one to the other,
+and never writes the key back. Everything the reserve adds is also gated
+on `[registrar_endpoint] enabled`; on a host that has not enabled the
+endpoint none of it runs, whatever the `audit_store_*` keys say.
+
+- `filesystem` (the default) puts a **kernel-enforced ceiling** behind
+  the reserve. `bootroot init` provisions a fully allocated loopback
+  image of exactly `audit_store_reserve_bytes`, carrying an ext4
+  filesystem, mounted at `audit_store_dir` through a generated systemd
+  mount unit that is restored on boot. Writes past the reserve then fail
+  with `ENOSPC` on the reserve instead of filling the host's root
+  filesystem. What it does **not** protect: a full reserve still stops
+  OpenBao serving, because its file audit device is mandatory and it
+  fails requests it cannot audit.
+- `directory` is the explicit opt-out, for a host that cannot mount one.
+  The store is a plain directory, the reserve is a budget with nothing
+  behind it, and an XFS or ext4 project quota applied to
+  `audit_store_dir` by hand is the documented route to a real ceiling.
+  Nothing bootroot does in this mode derives an image path or a unit
+  name, `stat`s any path the reserve introduces, or names a leftover a
+  previous `filesystem`-mode run may have left behind.
+
+**The four outcomes.** A run reports exactly one of them.
+
+| Outcome | Mode | Exit |
+| --- | --- | --- |
+| `enforced` | `filesystem` | success, the run continues |
+| `provisioned, not activated` | `filesystem` | **failure**, the run stops |
+| `failed` | `filesystem` | failure, the run stops |
+| `unenforced (directory)` | `directory` | **success**, the run continues |
+
+`enforced` requires four things together: the image's whole contract, all
+three generated artifacts installed and byte-identical to what the run
+rendered, `audit_store_dir` mounted from that image, and both
+subdirectories at their contracts on the mounted filesystem. Any one
+unsatisfied is `provisioned, not activated` — never a partial success and
+never a silent fall back to `directory`. `failed` is a preflight, a
+render or a verification read that could not be completed at all.
+`unenforced (directory)` is a **success**: the run exits 0 and leaves the
+reserve unprotected by anything but the operator's own quota.
 
 **How the install side reads it.** `bootroot init --agent-config <path>`
 names the operator's `bootroot-agent` configuration file — not the
@@ -764,11 +803,17 @@ deleted. The daemon's configuration file must therefore exist before such
 a run.
 
 **What `bootroot init` does.** On an endpoint-enabled host it creates
-`audit_store_dir` with `records/` and `openbao/` beneath it, renders a
-Compose override binding `<audit_store_dir>/openbao` at
-`/openbao/audit`, and recreates OpenBao onto it. It **must run as root**:
-`audit_store_dir` and `records/` are owned by uid 0 at mode `0700`, which
-is what keeps an unprivileged process from reading the trail. A run
+`audit_store_dir`, renders a Compose override binding
+`<audit_store_dir>/openbao` at `/openbao/audit`, and recreates OpenBao
+onto it. Whether `records/` and `openbao/` are created in the same pass
+depends on `audit_store_enforcement`: under `directory` all three are,
+exactly as they always were, while under the default `filesystem` the
+two subdirectories are created on the mounted reserve by the operator
+instead — see
+[Activating the reserve on a fresh host](#activating-the-reserve-on-a-fresh-host).
+It **must run as root**: `audit_store_dir` and `records/` are owned by
+uid 0 at mode `0700`, which is what keeps an unprivileged process from
+reading the trail. A run
 that would provision the store and is not running as uid 0 is refused
 before anything is created or rendered, and named as such: the
 directories would otherwise be created owned by the caller, and the
@@ -790,14 +835,286 @@ the path, what it found, and the `chown 0:0` / `chmod 0700` that fixes
 it. `bootroot infra up` checks `audit_store_dir` alone, creates nothing
 and repairs nothing.
 
-**Moving a provisioned store** is a manual procedure, because re-pointing
-the mount would leave the old audit history behind:
+#### Activating the reserve on a fresh host
+
+The work splits into three phases. Phase 1 and phase 3 are bootroot's;
+**phase 2 is entirely the operator's**, and bootroot renders those steps
+as exact commands and runs none of them. It issues no `mkfs`, no mount,
+no `systemctl`, no write under `/etc/systemd/system`, and no `chown` or
+`chmod` on the image or a subdirectory. The one filesystem object it
+creates is `audit_store_dir` itself, because a mount needs somewhere to
+go.
+
+The sequence on a fresh, endpoint-enabled `filesystem`-mode host is:
+
+1. Run `bootroot init --agent-config <path>` as root. It reports
+   **provisioned, not activated**, writes the three artifacts under
+   `<compose dir>/audit-store/`, prints the remaining commands, and
+   **stops**. That staging directory sits beside the Compose deployment
+   and never inside `audit_store_dir`, which the mount would hide; a
+   configuration that would put it there is refused before anything is
+   created or rendered.
+2. Run those commands, in the order printed.
+3. Run `bootroot init --agent-config <path>` again. It verifies the
+   result, reports **enforced**, and continues the initialisation it
+   stopped short of.
+
+**The image path and the unit name are derived, not configured.** The
+image is `audit_store_dir` with `.img` appended —
+`/var/lib/bootroot/audit-store.img` on the default store — a sibling of
+the store and never inside the filesystem it backs, owned by uid 0 at
+mode `0600`. The mount unit's name is forced by systemd, which requires a
+`.mount` unit to be named for its mount point: the default store gives
+`var-lib-bootroot-audit\x2dstore.mount`, byte-identical to what
+`systemd-escape --path /var/lib/bootroot/audit-store` prints. Neither
+gets a configuration key of its own; a second definition of the store's
+location is two directories waiting to happen.
+
+**Both are derived from the store path's simplified spelling** —
+repeated and trailing `/` removed and every `.` component dropped, which
+is what `systemd-escape --path` produces and what the kernel's own mount
+table names — and `filesystem` mode provisions that spelling throughout.
+The mount point `bootroot init` creates and the bind source it records in
+the rendered Compose override are the directory the mount unit's `Where=`
+names, so a configured `/var/lib/bootroot/audit-store/` and a configured
+`/var/lib/bootroot/audit-store` are one store rather than two.
+
+The image is created **fully allocated**, never sparse, and the
+filesystem is made with `mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0`.
+Every one of those matters. `-m 0` because ext4 otherwise reserves 5% for
+uid 0 and the two writers sit on opposite sides of it, so the OpenBao
+container would hit `ENOSPC` at 95% of the reserve while the daemon's
+records could still be written. `-E nodiscard` because `mke2fs` discards
+a device's blocks during creation when the device says it can, and a loop
+device over a regular file says exactly that — the discard becomes a hole
+punch, and hands back a sparse image that passes every size check while
+the root filesystem is still what fills.
+
+`-E lazy_itable_init=0` closes that same hole one step later, and it is
+the one that opens *after* the operator's sequence has finished. Left at
+its default, `mke2fs` leaves the inode tables uninitialised and the
+kernel's `ext4lazyinit` thread zeroes them in the background a few
+seconds after the mount comes up — through the same write-zeroes path
+the loop driver serves by punching the backing file rather than by
+writing to it. The reserve would then give its inode tables back to the
+filesystem underneath it once activation looked complete: a little over
+a mebibyte at the 16 MiB floor, tens of mebibytes on the shipped 2 GiB
+default, and none of it still held by the kernel against either writer.
+Writing the tables at `mkfs` time costs one pass over them once and
+makes the allocation final.
+
+**Re-provisioning is idempotent and never reformats.** A second run
+compares the image against the whole contract — a regular file at the
+derived path, of exactly `audit_store_reserve_bytes`, with its blocks
+allocated over that full length, owned by uid 0 at mode `0600` — and
+renders commands only for what deviates. Only an **absent** image ever
+draws an `install`, a full-length preallocation or an `mkfs.ext4`. A
+sparse image draws an in-place allocation that neither recreates nor
+reformats it; a wrong owner or mode draws only its `chown` or `chmod`; a
+correct image draws nothing at all.
+
+**The store's subdirectories are created on the mounted filesystem, by
+the operator.** In `filesystem` mode `bootroot init` creates neither
+`records/` nor `openbao/`, mount present or absent: creating them first
+and mounting over them produces an empty store and an OpenBao container
+that cannot write its mandatory audit device. The rendered commands
+create them once the mount is active, `chmod 0700` both, and `chown 0:0`
+`records/` only. They also restate `chmod 0700` on `audit_store_dir`
+itself: `mkfs.ext4` gives the new filesystem's root directory `0755`, and
+that root **is** the store directory once the mount is up, while the
+store directory contract is exactly `0700`. That contract is checked by
+`bootroot infra up`, on the path the rendered override names, rather than
+by the reserve's own verification: **enforced** gates on the image, the
+three artifacts, the mount identity and the two subdirectories, so a root
+left at the `mkfs` mode is caught by the next bring-up, which refuses it
+naming the same `chmod`. In `directory` mode all three
+directories are created in one pass, exactly as they always were. The
+layout contract itself is unchanged either way: the same two
+subdirectories, the same owners and modes, and `audit_record_dir` derived
+the same way.
+
+#### The two ordering targets
+
+A writer that starts before the mount resolves its path to the
+*underlying* directory and writes onto the root filesystem, with the
+reservation mounted over it later and empty — healthy-looking, protecting
+nothing. Two generated drop-ins order both writers after the mount unit:
+
+- `/etc/systemd/system/docker.service.d/10-bootroot-audit-store.conf`,
+  because the OpenBao container is not started by a bootroot unit. The
+  Compose services carry `restart: always`, so on boot the Docker daemon
+  is what brings it back.
+- `/etc/systemd/system/bootroot-registrar.service.d/10-bootroot-audit-store.conf`,
+  because the daemon that writes the verb records has no unit of its own
+  — the endpoint is a config-gated feature inside `bootroot-agent`,
+  supervised by `bootroot-registrar.service`. The shipped unit under
+  `systemd/` is **not** edited.
+
+Both carry the same `[Unit]` body, `Wants=` and `After=` the mount unit
+and **nothing stronger**. Neither carries `Requires=`, `BindsTo=` or
+`RequiresMountsFor=`, and this is deliberate. On `docker.service` a hard
+requirement would fail the whole Compose stack when the mount failed,
+taking step-ca and postgres down over a fault local to one directory. On
+`bootroot-registrar.service` it would replace a bootroot error naming the
+store, the expected unit and the remedy with systemd's bare refusal, and
+`BindsTo=` would tear down a *running* daemon the moment the mount went
+away.
+
+**`Wants=` plus `After=` orders the boot; it does not guarantee the
+mount.** That gap is a residual, stated below rather than papered over.
+
+#### What the reserve does not cover
+
+Six things, each of which an operator has to know about rather than
+assume away:
+
+1. **A full reserve still stops OpenBao serving.** The ceiling keeps the
+   root filesystem alive; it does not keep the deployment issuing.
+2. **A failed mount job at boot leaves the OpenBao device on the root
+   filesystem.** Ordering is `Wants=`/`After=` and nothing stronger, so a
+   failed mount does not stop `docker.service`; `restart: always` brings
+   the container back and Docker creates a missing bind source by
+   default, so `<audit_store_dir>/openbao` is manufactured under the
+   empty mount point. A later change declares that bind
+   `create_host_path: false`, which closes this **only** where the
+   underlying store carries no `openbao/` of its own — and every host
+   upgraded from the earlier layout does carry one, so there the bind
+   succeeds and the device lands on the root filesystem again until the
+   underlying store is renamed aside.
+3. **A started daemon still creates `records/` beneath an unmounted
+   store.** Opening the record store is what creates its directories, and
+   that path knows nothing of a mode or a mount. A run-time gate refusing
+   to open the store while the mount is missing is a later change.
+4. **A mount lost while the container runs is not detected.** A running
+   container keeps the mount it started with.
+5. **The empty-mount-point invariant is established before activation and
+   never re-checked.** Once the filesystem is mounted, the directory
+   beneath it cannot be named by any read available here, so `enforced`
+   never claims it is empty.
+6. **`openbao/`'s ownership is not verified.** Its owner is the OpenBao
+   container entrypoint's to set on the first container start, and
+   nothing supplies that uid to a phase that runs before any Docker call.
+   Check it by hand with
+   `sudo stat -c '%U %a' <audit_store_dir>/openbao` once the stack is up.
+   Every `filesystem`-mode outcome line, **enforced** included, says so.
+
+Proving that a reserve which clears the minimum is actually **big
+enough** is not part of `enforced` either. That is capacity work, and the
+sizing section below is what an operator has instead.
+
+#### A store that already holds records
+
+While the mount is absent, `bootroot init` reads `audit_store_dir` on the
+underlying filesystem and requires it to be **empty** — the whole
+directory, not either subdirectory. Mounting over content hides every
+byte of it from every reader, this verification included, and what is
+hidden may be the only copy of records written before the reserve
+existed.
+
+A store that is not empty is reported as **provisioned, not activated**.
+Nothing is deleted, moved or mounted over; the three artifacts are still
+written, because the operator will need them; and **no phase-2 command
+whatever** is rendered, because a partial list is an invitation to keep
+going and the step it ends at mounts a filesystem over those records.
+There are two supported ways forward: relocate those records, a separate
+procedure this build does not provide, or configure
+`audit_store_enforcement = "directory"` and run without a kernel-enforced
+ceiling.
+
+The same refusal reaches `bootroot reinit` **before it wipes anything**.
+Reinit's pre-wipe preflight raises this surface's phase-1 refusals — a
+sub-minimum reserve, a store path the artifacts cannot carry, a store
+that would contain the staged artifacts, an image of the wrong type or
+the wrong size, a filesystem with no room for the outstanding
+allocation, an underlying store larger than the reserve, and a store
+that already holds records — as pure reads: nothing is created,
+rendered or installed, no mount is verified and no outcome line is
+printed. So an endpoint-enabled `filesystem`-mode host whose store
+already holds records **cannot reinit** until enforcement is activated or
+`directory` mode is configured. A host that clears every one of them goes
+on to the post-wipe `init` pass, which is an ordinary `bootroot init` run
+carrying all three phases.
+
+#### Changing the reserve
+
+A changed `audit_store_reserve_bytes` is answered by **replacing** the
+image, and never by a resize, a truncation or a reformat in either
+direction. bootroot refuses an image whose size is not exactly the
+configured reserve, names both sizes, and renders no image command at
+all; it never renders a command that would resize one either.
+Reformatting destroys the records the reserve exists to keep, and a
+silent grow leaves the mount unit, the image and the configuration
+describing three different ceilings. The replacement runs in a
+maintenance window with both writers stopped.
+
+#### Removing the reserve
+
+bootroot unmounts nothing, disables no unit and deletes nothing on any
+path — the image may hold the only copy of records written under the
+mount, so removal is never automated and never rendered. The sequence is:
+
+```sh
+systemctl disable --now '<escaped audit_store_dir>.mount'
+rm /etc/systemd/system/'<escaped audit_store_dir>.mount'
+rm /etc/systemd/system/docker.service.d/10-bootroot-audit-store.conf
+rm /etc/systemd/system/bootroot-registrar.service.d/10-bootroot-audit-store.conf
+systemctl daemon-reload
+rm <audit_store_dir>.img
+```
+
+Delete the image last, and only once whatever it holds has been dealt
+with.
+
+#### Sizing the reserve
+
+Two writers share the store and only one of them is self-bounding.
+
+- **The daemon's verb records** are bounded by their own rotation, at
+  `audit_max_file_bytes` × (`audit_max_retained_files` + 1). On the
+  shipped defaults — 8 MiB and 16 — that is 17 × 8 MiB, about **136
+  MiB**.
+- **OpenBao's file audit device has no bound at all.** Nothing here
+  rotates, prunes or caps it, so its growth is the operator's to plan
+  for.
+
+In `filesystem` mode the reserve additionally has a **minimum**, which is
+the larger of two figures: a fixed **16 MiB** floor, which keeps the
+rendered `mkfs.ext4` clear of the sizes at which `mke2fs` refuses
+outright or quietly omits the journal, and the record figure above,
+compared **strictly** — usable space inside an image never exceeds the
+image itself, so a reserve at or below the record figure is one the
+daemon's rotation alone can fill. A reserve below the minimum is refused
+before anything is created or rendered, naming the value, the minimum and
+two remedies: raise `audit_store_reserve_bytes`, or configure
+`directory` mode. Where the retention settings are large enough that
+**no** acceptable reserve could clear the minimum, the refusal says so
+instead and names the two record keys, because raising the reserve is not
+a remedy that can be followed there.
+
+**Clearing the minimum is not a claim that the reserve is big enough.**
+An ext4 filesystem offers less than the image it sits in, and the OpenBao
+device is unbounded, so sizing the reserve so both writers fit stays the
+operator's arithmetic. The 2 GiB default is a starting point, not a
+measurement of your deployment.
+
+**Moving a provisioned store** is a manual procedure under
+`audit_store_enforcement = "directory"`, because re-pointing the bind
+would leave the old audit history behind:
 
 1. Stop the stack.
 2. Relocate the directory to the new path.
 3. Update `[registrar] audit_store_dir` and delete the rendered override
    at `secrets/openbao/docker-compose.openbao-audit.yml`.
 4. Re-run `bootroot init` as root with `--agent-config`.
+
+**Those steps do not carry over to `filesystem` mode**, and this build
+provides no replacement for them. The image, the mount unit and both
+drop-ins all name the old store path, and a store carrying records at the
+new path is refused rather than mounted over — the same refusal
+["A store that already holds records"](#a-store-that-already-holds-records)
+describes. Until a supported procedure exists, the two ways forward there
+are the ones that refusal names: leave the store where it is, or
+configure `directory` mode and move it by the steps above.
 
 **Switching a registrar endpoint host off** takes two edits, and until
 both agree `bootroot init` refuses:
@@ -1269,10 +1586,12 @@ held above the reload rather than reacquired by it.
 #### Audit records
 
 On a host whose `state.json` records `registrar_endpoint.enabled = true`,
-a root-run `bootroot init` creates `audit_store_dir` with `records/` and
-`openbao/` beneath it. It must run as root there, because the store is
-owned by uid 0 at mode `0700`. A host whose registrar endpoint is not
-enabled still has no store.
+a root-run `bootroot init` creates `audit_store_dir`, and `records/` and
+`openbao/` beneath it under `audit_store_enforcement = "directory"`.
+Under the default `filesystem` those two are created on the mounted
+reserve by the operator instead. It must run as root either way, because
+the store is owned by uid 0 at mode `0700`. A host whose registrar
+endpoint is not enabled still has no store.
 
 The daemon keeps its own append-only audit trail for the two verbs, in
 `audit_record_dir` (`<audit_store_dir>/records`, or

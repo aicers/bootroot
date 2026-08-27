@@ -201,4 +201,389 @@ impl Messages {
             ),
         }
     }
+
+    pub(crate) fn error_audit_reserve_store_path_unrenderable(
+        &self,
+        path: &str,
+        fault: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_store_path_unrenderable,
+            &[("path", path), ("fault", fault)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_path_fault_line_break(&self) -> &'static str {
+        self.strings().audit_reserve_path_fault_line_break
+    }
+
+    pub(crate) fn audit_reserve_path_fault_edge_whitespace(&self) -> &'static str {
+        self.strings().audit_reserve_path_fault_edge_whitespace
+    }
+
+    pub(crate) fn audit_reserve_path_fault_final_backslash(&self) -> &'static str {
+        self.strings().audit_reserve_path_fault_final_backslash
+    }
+
+    pub(crate) fn error_audit_reserve_image_parentless(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_audit_reserve_image_parentless,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_staging_inside_store(
+        &self,
+        staging: &str,
+        store: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_staging_inside_store,
+            &[("staging", staging), ("store", store)],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_below_minimum(
+        &self,
+        path: &str,
+        configured: u64,
+        minimum: u64,
+        floor: u64,
+        records: u64,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_below_minimum,
+            &[
+                ("path", path),
+                ("configured", &configured.to_string()),
+                ("minimum", &minimum.to_string()),
+                ("floor", &floor.to_string()),
+                ("records", &records.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_minimum_unreachable(
+        &self,
+        path: &str,
+        max_file_bytes: u64,
+        max_retained_files: u32,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_minimum_unreachable,
+            &[
+                ("path", path),
+                ("max_file_bytes", &max_file_bytes.to_string()),
+                ("max_retained_files", &max_retained_files.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_image_not_regular(&self, path: &str, found: &str) -> String {
+        format_template(
+            self.strings().error_audit_reserve_image_not_regular,
+            &[("path", path), ("found", found)],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_image_size_mismatch(
+        &self,
+        path: &str,
+        found: u64,
+        expected: u64,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_image_size_mismatch,
+            &[
+                ("path", path),
+                ("found", &found.to_string()),
+                ("expected", &expected.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_free_space(
+        &self,
+        path: &str,
+        outstanding: u64,
+        available: u64,
+        reserve: u64,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_free_space,
+            &[
+                ("path", path),
+                ("outstanding", &outstanding.to_string()),
+                ("available", &available.to_string()),
+                ("reserve", &reserve.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_underlying_too_large(
+        &self,
+        path: &str,
+        used: u64,
+        reserve: u64,
+    ) -> String {
+        format_template(
+            self.strings().error_audit_reserve_underlying_too_large,
+            &[
+                ("path", path),
+                ("used", &used.to_string()),
+                ("reserve", &reserve.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_arithmetic(&self, figure: &str) -> String {
+        format_template(
+            self.strings().error_audit_reserve_arithmetic,
+            &[("figure", figure)],
+        )
+    }
+
+    pub(crate) fn error_audit_reserve_unreadable(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().error_audit_reserve_unreadable,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_figure_allocated(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_figure_allocated,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_figure_underlying(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_figure_underlying,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_figure_available(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_figure_available,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_kind_regular(&self) -> &'static str {
+        self.strings().audit_reserve_kind_regular
+    }
+
+    pub(crate) fn audit_reserve_kind_directory(&self) -> &'static str {
+        self.strings().audit_reserve_kind_directory
+    }
+
+    pub(crate) fn audit_reserve_kind_symlink(&self) -> &'static str {
+        self.strings().audit_reserve_kind_symlink
+    }
+
+    pub(crate) fn audit_reserve_kind_other(&self) -> &'static str {
+        self.strings().audit_reserve_kind_other
+    }
+
+    pub(crate) fn audit_reserve_mount_description(&self, fs_type: &str, source: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_mount_description,
+            &[("fs_type", fs_type), ("source", source)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_outcome_directory(&self, store: &str, reserve: u64) -> String {
+        format_template(
+            self.strings().audit_reserve_outcome_directory,
+            &[("store", store), ("reserve", &reserve.to_string())],
+        )
+    }
+
+    pub(crate) fn audit_reserve_outcome_enforced(
+        &self,
+        image: &str,
+        size: u64,
+        unit: &str,
+        store: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_outcome_enforced,
+            &[
+                ("image", image),
+                ("size", &size.to_string()),
+                ("unit", unit),
+                ("store", store),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_outcome_not_activated(&self, store: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_outcome_not_activated,
+            &[("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_openbao_owner_caveat(&self) -> &'static str {
+        self.strings().audit_reserve_openbao_owner_caveat
+    }
+
+    pub(crate) fn audit_reserve_outstanding_header(&self) -> &'static str {
+        self.strings().audit_reserve_outstanding_header
+    }
+
+    pub(crate) fn audit_reserve_artifacts_header(&self) -> &'static str {
+        self.strings().audit_reserve_artifacts_header
+    }
+
+    pub(crate) fn audit_reserve_steps_header(&self) -> &'static str {
+        self.strings().audit_reserve_steps_header
+    }
+
+    pub(crate) fn audit_reserve_no_steps(&self) -> &'static str {
+        self.strings().audit_reserve_no_steps
+    }
+
+    pub(crate) fn audit_reserve_no_steps_unremediable(&self, command: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_no_steps_unremediable,
+            &[("command", command)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_note_stacked(&self, store: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_note_stacked,
+            &[("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_store_not_empty(&self, store: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_store_not_empty,
+            &[("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_image_absent(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_image_absent,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_image_sparse(
+        &self,
+        path: &str,
+        missing: u64,
+        size: u64,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_image_sparse,
+            &[
+                ("path", path),
+                ("missing", &missing.to_string()),
+                ("size", &size.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_image_owner(
+        &self,
+        path: &str,
+        found: u32,
+        expected: u32,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_image_owner,
+            &[
+                ("path", path),
+                ("found", &found.to_string()),
+                ("expected", &expected.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_image_mode(
+        &self,
+        path: &str,
+        found: u32,
+        expected: u32,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_image_mode,
+            &[
+                ("path", path),
+                ("found", &format!("{found:04o}")),
+                ("expected", &format!("{expected:04o}")),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_artifact_absent(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_artifact_absent,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_artifact_differs(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_artifact_differs,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_mount_absent(&self, store: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_mount_absent,
+            &[("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_mount_foreign(&self, store: &str, found: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_mount_foreign,
+            &[("store", store), ("found", found)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_subdir_absent(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_subdir_absent,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_subdir_invalid(&self, path: &str, found: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_subdir_invalid,
+            &[("path", path), ("found", found)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_step_stop_writers(&self) -> &'static str {
+        self.strings().audit_reserve_step_stop_writers
+    }
+
+    pub(crate) fn audit_reserve_step_image(&self) -> &'static str {
+        self.strings().audit_reserve_step_image
+    }
+
+    pub(crate) fn audit_reserve_step_install(&self) -> &'static str {
+        self.strings().audit_reserve_step_install
+    }
+
+    pub(crate) fn audit_reserve_step_subdirectories(&self) -> &'static str {
+        self.strings().audit_reserve_step_subdirectories
+    }
+
+    pub(crate) fn audit_reserve_step_rerun(&self, command: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_step_rerun,
+            &[("command", command)],
+        )
+    }
 }
