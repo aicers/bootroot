@@ -480,6 +480,15 @@ Where the crate handles key material or secrets:
   It may be skipped only when your changes do not affect the Docker
   lifecycle, E2E scripts, or any code paths exercised by the E2E tests
   (rotation, service add/verify, daemon, config, etc.).
+- **When the matrix cannot run in your environment**: the matrix needs
+  passwordless `sudo` — its step 13 runs `bootroot init` as root through
+  `sudo -n`, and `--skip-hosts` does not stand in for it. On a machine
+  that cannot supply it, run the matrix as far as it goes and let CI's
+  `Docker E2E` jobs gate the arm that did not run. Say which was which
+  in the pull request body: the arm that ran and passed locally, the arm
+  that did not run, and why. This is not licence to weaken, skip,
+  `continue-on-error`, or delete a check to make a local run pass — and
+  a change exempt under the bullet above still needs no matrix at all.
 - The extended E2E suite is scheduled CI coverage in
   `e2e-extended.yml`, not a per-pull-request requirement. Run
   `scripts/preflight/ci/e2e-extended.sh` only for investigation or when
