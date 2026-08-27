@@ -165,7 +165,7 @@ INIT_SUMMARY_JSON=""
 # `RUN_ROOT`, whose removal already copes with root-owned content.
 OPENBAO_ROOT_TOKEN_FILE=""
 OPENBAO_CURL_CONFIG=""
-# The library test binary the in-place rotation runs through.  Built as
+# The library test binary the device's rotation runs through.  Built as
 # the invoking user and executed under `sudo -n`, so no `cargo`
 # invocation ever runs as root and nothing under `target/` changes
 # owner.
