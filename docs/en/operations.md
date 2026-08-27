@@ -368,7 +368,24 @@ inode and the reopen predicate alone would call it a success. The
 descriptor the pass has held since the rename keeps the displaced
 records allocated while it decides, and the `error` names it
 (`pinned_fd`) so an operator can reach them through the daemon's
-`/proc/<pid>/fd` before the pass returns and closes it.
+`/proc/<pid>/fd`.
+
+**A displaced generation ends this device's rotation.** That descriptor
+is not closed when the pass returns. `SIGHUP` has already closed
+OpenBao's own and the name those records were under leads elsewhere, so
+it is the last thing pointing at them, and an operator reads the `error`
+some time after it is written: a descriptor released with the pass would
+be a recovery route that never existed. So the daemon holds it until it
+is restarted, and every later pass refuses outright — it renames
+nothing, truncates nothing and **trims nothing**, since a trim deletes
+inside the very directory whose contents the first pass could not
+account for. Each of those passes says so, at `warn` and at `error`
+every fifth, carrying the same `pinned_fd`, so an operator arriving at
+any one of them still has the route. Two things follow: the displaced
+inode stays allocated for as long as the daemon runs, which is the point
+— records nobody has copied out yet are worth more than the space they
+hold — and the device's audit log is not rotated again until an operator
+reconciles the directory by hand and restarts the daemon.
 
 **The recovery.** The dangerous state is a rename that succeeded and a
 reopen that did not: OpenBao still audits into the renamed inode, but

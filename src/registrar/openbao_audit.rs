@@ -694,14 +694,15 @@ fn generation_carries(generation: &Path, recorded: (u64, u64)) -> Result<(), Str
 ///   a name, so what was checked and what is held are the same file by
 ///   construction. A name checked and then used is a name the
 ///   container's audit user can re-point in between.
-/// - Holding it keeps the inode allocated for as long as the pass runs.
-///   That matters across the signal: `SIGHUP` closes `OpenBao`'s own
-///   descriptor on the file it was appending to, so if the directory
-///   entry has meanwhile been removed, this descriptor is the only
-///   thing standing between those records and the kernel freeing them.
-///   The pass refuses and escalates rather than reporting a rotation,
-///   and while it does the records are still reachable through
-///   `/proc/<pid>/fd`.
+/// - Holding it keeps the inode allocated. That matters across the
+///   signal: `SIGHUP` closes `OpenBao`'s own descriptor on the file it
+///   was appending to, so if the directory entry has meanwhile been
+///   removed, this descriptor is the only thing standing between those
+///   records and the kernel freeing them. The pass refuses and
+///   escalates rather than reporting a rotation, and the descriptor
+///   outlives the pass in a [`DisplacedIncident`] so that
+///   `/proc/<pid>/fd` is a route an operator can still take when they
+///   read the line.
 ///
 /// # Errors
 ///
@@ -988,6 +989,48 @@ struct PendingRestore {
     identity: (u64, u64),
 }
 
+/// The descriptor a pass was holding when it found the generation it had
+/// just renamed replaced, kept for the life of the rotation task.
+///
+/// The pass that detects this refuses to act, and where it had already
+/// signalled, the descriptor [`pin_generation`] took is the only thing
+/// keeping the rotated records allocated: `SIGHUP` has closed
+/// `OpenBao`'s own, and the directory entry that named them is gone.
+/// Dropping it when the pass returned would free them a moment later,
+/// so the recovery route the refusal's `error` points an operator at —
+/// the daemon's `/proc/<pid>/fd` — would be gone before anyone could
+/// read the line. So it is not dropped: it is kept here, and this
+/// outlives every later pass.
+///
+/// Two consequences are deliberate. The inode stays allocated until the
+/// daemon is restarted, because records an operator has not yet copied
+/// out are worth more than the space they hold. And the task rotates
+/// this device no further: what it can no longer do is account for the
+/// device directory's contents, and that is what every remaining step —
+/// rename, truncate, trim — acts on.
+///
+/// Held only in the task's memory, like [`PendingRestore`], and given
+/// **no** on-disk representation: a descriptor cannot be written down,
+/// and a daemon that restarts has already closed it.
+#[derive(Debug, Clone)]
+struct DisplacedIncident {
+    /// The generation name the pass renamed the active log to, whose
+    /// entry no longer leads to the recorded inode.
+    generation: PathBuf,
+    /// The identity the marker recorded, which [`Self::pinned`] still
+    /// refers to.
+    identity: (u64, u64),
+    /// The open descriptor on the displaced inode.
+    ///
+    /// Never read through: it is held so the records stay reachable,
+    /// and an operator reads them through `/proc/<pid>/fd/<n>`. `Arc`
+    /// because the state this lives in is cloned into and out of every
+    /// blocking phase, and those clones have to be the one descriptor
+    /// rather than a `dup` per pass — the number the refusal prints
+    /// must keep naming the same entry.
+    pinned: Arc<File>,
+}
+
 // ---------------------------------------------------------------------
 // The rotation
 // ---------------------------------------------------------------------
@@ -1054,6 +1097,11 @@ struct PassState {
     /// failed and is still owed. No rotation is attempted while one is
     /// outstanding.
     marker_cleanup_pending: bool,
+    /// The descriptor a pass was left holding on a displaced
+    /// generation, if one ever was. Set once and never cleared: it
+    /// halts this device's rotation for the life of the daemon. See
+    /// [`DisplacedIncident`].
+    displaced: Option<DisplacedIncident>,
 }
 
 /// The periodic rotation of one `OpenBao` file audit device, and the
@@ -1080,9 +1128,10 @@ enum PassPhase {
 
 /// What the first blocking phase hands the wait and the second phase.
 ///
-/// Not `Clone`: it owns the descriptor pinning the generation, and two
-/// copies of that would be two independent lifetimes for the one thing
-/// keeping the rotated records allocated.
+/// Not `Clone`: one pass has one of these. The descriptor inside it is
+/// refcounted rather than owned outright, so a refusal can keep it open
+/// past the pass without ever `dup`ing it into a second entry — the
+/// number a refusal prints has to stay the one an operator can open.
 #[derive(Debug)]
 struct SignalContext {
     /// The generation the active log was renamed to.
@@ -1093,9 +1142,11 @@ struct SignalContext {
     /// rename carried into the generation. The predicate's other half.
     identity: (u64, u64),
     /// An open descriptor on the generation, taken when its identity
-    /// was verified and held until the pass is over. See
+    /// was verified and held for the rest of the pass — and past it,
+    /// through the [`DisplacedIncident`] a refusal hands to the state,
+    /// which is the one thing that outlives the pass holding it. See
     /// [`pin_generation`] for what it buys.
-    pinned: File,
+    pinned: Arc<File>,
     /// What `docker kill` said, if it failed. Recorded rather than
     /// acted on: a non-zero exit is not proof the signal never arrived.
     signal_error: Option<String>,
@@ -1173,6 +1224,7 @@ impl OpenBaoAuditRotation {
                 reported_fallback: false,
                 pending_restore: None,
                 marker_cleanup_pending: false,
+                displaced: None,
             },
             #[cfg(test)]
             passes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1388,14 +1440,24 @@ impl DeviceLayout {
 
     /// Everything a pass does before it waits for the reopen.
     ///
-    /// The order is fixed and each step earns its place: an outstanding
-    /// marker cleanup first, because a marker outliving its rotation can
+    /// The order is fixed and each step earns its place: a displaced
+    /// generation first, because it is the one state that ends this
+    /// device's rotation rather than owing something; then an
+    /// outstanding marker cleanup, because a marker outliving its rotation can
     /// authorise the wrong restore; then a pending restore, because
     /// there is no safe active path to rotate or truncate while one is
     /// outstanding; then the stale-marker cleanup or the
     /// marker-authorised branch, depending on whether the active path is
     /// there; and only then the rotation itself.
     fn begin(&self, state: &mut PassState, now: OffsetDateTime) -> PassPhase {
+        // Before the directory is even looked at, because this is the
+        // one condition looking cannot answer: a pass has already found
+        // this device's contents unaccountable, and every step below
+        // acts on them.
+        if let Some(incident) = state.displaced.clone() {
+            return PassPhase::Done(Box::new(self.halted(state, &incident)));
+        }
+
         match self.inspect_dir(state) {
             // Nothing on this host backs the device, so there is
             // neither a rotation to owe nor a set to evaluate. Said
@@ -1492,6 +1554,71 @@ impl DeviceLayout {
         }
 
         self.rotate_if_required(state, now)
+    }
+
+    /// The answer every pass gives once a generation has been found
+    /// displaced: this device rotates no further.
+    ///
+    /// Halting is the point and not a side effect. The pass that
+    /// detected it could not say which file the device was writing to
+    /// or what the generation names now lead to, and nothing since has
+    /// reconciled the directory — so a later pass renaming, truncating
+    /// or trimming inside it would be acting on exactly the state the
+    /// first one refused to act on, and a trim deletes. So no
+    /// obligation is evaluated and none is reported met; the counter
+    /// keeps climbing, and the escalation it drives is what keeps the
+    /// device in front of an operator.
+    ///
+    /// The line names the descriptor every pass from here on holds, so
+    /// an operator arriving at any of them — not only at the one that
+    /// detected it — can still reach the displaced records through
+    /// `/proc/<pid>/fd`. It escalates to `error` on the same cadence as
+    /// every other unmet obligation, so a device stuck here is neither
+    /// silent nor an `error` a minute for as long as the daemon runs.
+    fn halted(&self, state: &mut PassState, incident: &DisplacedIncident) -> PassOutcome {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let failures = state.consecutive_failures;
+        let message = "this OpenBao audit device rotates no further: a pass found the generation \
+                       it had renamed the active log to replaced, and the records it moved aside \
+                       are reachable only through the descriptor this daemon holds open. An \
+                       operator must copy them out of this daemon's /proc/<pid>/fd/<pinned_fd>, \
+                       reconcile the device directory by hand and restart the daemon";
+        // The same facts at two levels rather than one level with a
+        // condition on it: `tracing` fixes an event's level at compile
+        // time, so this is what saying it once a pass and escalating on
+        // the count costs.
+        if failures.is_multiple_of(FAILURE_ESCALATION_THRESHOLD) {
+            error!(
+                directory = %self.dir.display(),
+                generation = %incident.generation.display(),
+                recorded = %format!("{}:{}", incident.identity.0, incident.identity.1),
+                pinned_fd = incident.pinned.as_raw_fd(),
+                consecutive_failures = failures,
+                "{message}"
+            );
+        } else {
+            warn!(
+                directory = %self.dir.display(),
+                generation = %incident.generation.display(),
+                recorded = %format!("{}:{}", incident.identity.0, incident.identity.1),
+                pinned_fd = incident.pinned.as_raw_fd(),
+                consecutive_failures = failures,
+                "{message}"
+            );
+        }
+        PassOutcome {
+            evaluated: true,
+            rotation: RotationOutcome::Failed,
+            form: RotationForm::None,
+            retained_unmet: true,
+            consecutive_failures: failures,
+            trim_flush_pending: state.trim_flush_pending,
+            restore_pending: state.pending_restore.is_some(),
+            marker_cleanup_pending: state.marker_cleanup_pending,
+            active_bytes: 0,
+            retained_bytes: 0,
+            retained_files: 0,
+        }
     }
 
     /// Everything a pass does once the wait has answered.
@@ -1772,7 +1899,7 @@ impl DeviceLayout {
             generation,
             generation_name,
             identity,
-            pinned,
+            pinned: Arc::new(pinned),
             signal_error: None,
         };
 
@@ -2069,8 +2196,11 @@ impl DeviceLayout {
     ///
     /// The descriptor [`pin_generation`] took is still open while this
     /// runs, so the displaced records are allocated and reachable
-    /// through `/proc/<pid>/fd` for as long as the pass lives, which is
-    /// what the `error` tells the operator to use.
+    /// through `/proc/<pid>/fd` — and it does not close when the pass
+    /// returns. It is kept in a [`DisplacedIncident`] for the life of
+    /// the daemon, which is what makes the `error`'s recovery route
+    /// usable by an operator who reads the line a minute later, and
+    /// what stops every later pass acting on this directory.
     fn displaced(
         &self,
         state: &mut PassState,
@@ -2092,10 +2222,16 @@ impl DeviceLayout {
              identity recorded before the rename, so something removed or replaced it after the \
              rename. Whatever is now at the active path, the records rotated aside are not in \
              the file this pass named: no rotation is reported, nothing is renamed back, \
-             truncated or trimmed. An operator must reconcile the device directory by hand, and \
-             should recover the displaced inode through a descriptor that still refers to it — \
-             OpenBao's own, or this daemon's pinned_fd, which closes when this pass returns"
+             truncated or trimmed. This daemon holds pinned_fd open on the displaced inode \
+             until it is restarted, and rotates this device no further: an operator must copy \
+             those records out of /proc/<this daemon's pid>/fd/<pinned_fd> and reconcile the \
+             device directory by hand"
         );
+        state.displaced = Some(DisplacedIncident {
+            generation: context.generation.clone(),
+            identity: context.identity,
+            pinned: Arc::clone(&context.pinned),
+        });
         self.conclude(state, RotationOutcome::Failed, RotationForm::None, false)
     }
 

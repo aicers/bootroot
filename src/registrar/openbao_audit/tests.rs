@@ -384,6 +384,12 @@ impl OpenBaoAuditRotation {
         self.state.pending_restore.is_some()
     }
 
+    /// The descriptor a pass was left holding on a displaced
+    /// generation, if one was.
+    fn displaced_incident(&self) -> Option<&DisplacedIncident> {
+        self.state.displaced.as_ref()
+    }
+
     fn passes(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.passes)
     }
@@ -4785,4 +4791,112 @@ async fn a_generation_replaced_while_the_container_is_signalled_is_never_reporte
     );
     assert_ne!(captured, 0);
     assert!(rotation.marker_path().exists(), "the marker is kept");
+}
+
+/// The descriptor on a displaced generation outlives the pass that took
+/// it, and every pass after it refuses to touch the device.
+///
+/// The refusal's whole recovery route is the daemon's `/proc/<pid>/fd`,
+/// and an operator reads the line some time after it is written. A
+/// descriptor closed when the pass returned would be a route that never
+/// existed: `SIGHUP` has already closed `OpenBao`'s own, and the name the
+/// records were under leads somewhere else, so the last thing pointing
+/// at them would go with it. So the incident is held in the task's
+/// state, the records stay readable through it, and the device is
+/// rotated no further — the directory's contents are exactly what the
+/// first pass could not account for.
+#[tokio::test(start_paused = true)]
+async fn a_displaced_generation_stays_reachable_after_the_pass_returns() {
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let recorded = identity_of(&active);
+    let first_record = record(0);
+
+    let root = dir.path().to_path_buf();
+    let reopened = active.clone();
+    docker.on_signal(move || {
+        let generation = root.join(
+            generation_names(&root)
+                .first()
+                .expect("the rename happened before the signal"),
+        );
+        let stand_in = root.join("replacement.log");
+        create_active_log(&stand_in);
+        std::fs::rename(&stand_in, &generation).expect("the replacement takes the name");
+        create_active_log(&reopened);
+    });
+
+    let displaced = rotation.run_pass(at(0)).await;
+    assert!(displaced.rotation.is_unmet(), "the pass failed");
+
+    let incident = rotation
+        .displaced_incident()
+        .expect("the pass kept the descriptor it was holding");
+    assert_eq!(
+        incident.identity, recorded,
+        "and it is the inode the marker recorded"
+    );
+    let meta = incident.pinned.metadata().expect("the descriptor stats");
+    assert_eq!(
+        (meta.dev(), meta.ino()),
+        recorded,
+        "still, after the pass returned: the entry was replaced, the descriptor was not"
+    );
+    let mut head = vec![0_u8; first_record.len()];
+    incident
+        .pinned
+        .read_at(&mut head, 0)
+        .expect("the displaced records are readable through it");
+    assert_eq!(
+        head,
+        first_record.as_bytes(),
+        "which is the route the refusal tells an operator to take"
+    );
+    assert_ne!(
+        identity_of(
+            &dir.path().join(
+                generation_names(dir.path())
+                    .first()
+                    .expect("the generation name is still there")
+            )
+        ),
+        recorded,
+        "while the name itself leads to the impostor"
+    );
+
+    // And the next tick acts on nothing: no rename, no signal, no trim.
+    append_records(&active, S);
+    let before = generation_names(dir.path());
+    let mut result = None;
+    let logs = logs_from(async {
+        result = Some(rotation.run_pass(at(60)).await);
+    })
+    .await;
+    let halted = result.expect("the pass returned an outcome");
+    assert!(halted.rotation.is_unmet(), "the pass failed again:\n{logs}");
+    assert_eq!(halted.form, RotationForm::None, "by no form");
+    assert_eq!(halted.consecutive_failures, 2);
+    assert!(halted.retained_unmet, "and established no bound");
+    assert_eq!(
+        generation_names(dir.path()),
+        before,
+        "nothing was renamed, published or trimmed:\n{logs}"
+    );
+    assert_eq!(
+        docker.signalled().len(),
+        1,
+        "and the container was not signalled again:\n{logs}"
+    );
+    assert!(logs.contains("rotates no further"), "{logs}");
+    assert!(
+        logs.contains("pinned_fd"),
+        "naming the descriptor on every pass, not only the first:\n{logs}"
+    );
+    assert!(
+        rotation.displaced_incident().is_some(),
+        "and the incident is kept for the life of the task"
+    );
 }
