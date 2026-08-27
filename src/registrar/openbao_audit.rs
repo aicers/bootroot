@@ -164,6 +164,17 @@ const STAGING_FILE_NAME: &str = ".audit-rotate.staging";
 /// provisions, so it needs no directory of its own.
 const MARKER_FILE_NAME: &str = "rotation-intent.json";
 
+/// The most of a rotation-intent marker this daemon will ever read.
+///
+/// What it writes is one generation name and two integers — under 300
+/// bytes with a name of the maximum length `rotated_file_name`
+/// produces. The cap is generous beside that, and finite, which is the
+/// point: the marker sits in a directory the container's audit user can
+/// write, so an unbounded read is an allocation whose size that user
+/// chooses. Anything larger is not a marker this daemon wrote, and the
+/// branch that reads it refuses to act.
+const MARKER_MAX_BYTES: u64 = 4 * 1024;
+
 /// Digits in a rotated generation's collision sequence.
 ///
 /// Fixed width and always present, so the names sort lexicographically
@@ -561,12 +572,13 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 // Files, names and identities
 // ---------------------------------------------------------------------
 
-/// Opens the device's active log through `options`, and hands back the
-/// descriptor only once that descriptor is the regular file `OpenBao`
-/// writes.
+/// Opens a path in the device directory through `options`, and hands
+/// back the descriptor only once that descriptor is a regular file.
 ///
-/// A pass establishes what is at `audit.log` with `symlink_metadata`
-/// before it decides to rotate, but the device directory is writable by
+/// Every open this module makes goes through here — the active log the
+/// fallback copies and truncates, and the rotation-intent marker a pass
+/// reads. A pass establishes what is at a path with `symlink_metadata`
+/// before it decides anything, but the device directory is writable by
 /// the container's audit user, so what that call measured and what an
 /// `open` a moment later reaches need not be the same file. The window
 /// is small and it is not closeable — there is no atomic "open the file
@@ -584,7 +596,9 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 ///   writer arrives; that open is inside a blocking phase, and a thread
 ///   parked in it never returns, so the rotation task stops ticking
 ///   altogether: no retry, no failure counter, no escalation, and no
-///   response to shutdown. Non-blocking, the same open either fails
+///   response to shutdown. That is the whole reason the marker is read
+///   through here too rather than with a plain `std::fs::read`.
+///   Non-blocking, the same open either fails
 ///   outright (`ENXIO`, for the write side with no reader) or returns a
 ///   descriptor the check below rejects. On a regular file the flag
 ///   means nothing at all, so it costs the healthy path nothing.
@@ -597,7 +611,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 /// Returns the `open` or `fstat` error, or [`io::ErrorKind::InvalidInput`]
 /// where the descriptor is not a regular file. Every one of those is a
 /// failed pass, which the next tick retries.
-fn open_active(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+fn open_regular(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     let file = options
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
@@ -606,7 +620,7 @@ fn open_active(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} is not a regular file (found {:?}); refusing to rotate through it",
+                "{} is not a regular file (found {:?}); refusing to work through it",
                 path.display(),
                 meta.file_type()
             ),
@@ -624,6 +638,26 @@ fn open_active(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
 /// name it read them through.
 fn file_identity(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
+}
+
+/// Answers whether a freshly renamed generation carries the identity the
+/// rotation-intent marker recorded.
+///
+/// # Errors
+///
+/// Returns what the generation carries instead, for the message the
+/// refusal logs: a differing `dev:ino`, the file type where the name no
+/// longer leads to a regular file, or the `lstat` error.
+fn generation_carries(generation: &Path, recorded: (u64, u64)) -> Result<(), String> {
+    match std::fs::symlink_metadata(generation) {
+        Ok(meta) if !meta.is_file() => Err(format!("{:?}", meta.file_type())),
+        Ok(meta) if file_identity(&meta) == recorded => Ok(()),
+        Ok(meta) => {
+            let (dev, ino) = file_identity(&meta);
+            Err(format!("{dev}:{ino}"))
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 /// Formats `now` as the `YYYYMMDDTHHMMSSZ` UTC stamp a generation's name
@@ -1626,6 +1660,30 @@ impl DeviceLayout {
             )));
         }
 
+        // The rename moved *a* file. Which one is the question every
+        // later branch answers from `identity`, and it is answerable
+        // only if the rename carried the inode the marker records into
+        // the generation. The device directory is writable by the
+        // container's audit user, so `audit.log` can be replaced
+        // between the `active_identity` above and the rename below it,
+        // and the rename then carries the *replacement* aside while
+        // OpenBao goes on appending to the real inode, now unlinked.
+        // Everything after this point would read that as a clean
+        // rotation: the signal closes the descriptor on the unlinked
+        // inode, the reopen puts a fresh file at the path, and the
+        // confirmation — comparing it against the pre-rename identity
+        // — finds a differing inode and reports a lossless rotation
+        // over records that are gone. So the assumption is checked
+        // rather than assumed, before anything irreversible acts on it.
+        if let Err(observed) = generation_carries(&generation, identity) {
+            return PassPhase::Done(Box::new(self.shifted(
+                state,
+                &generation,
+                identity,
+                &observed,
+            )));
+        }
+
         let context = SignalContext {
             generation,
             generation_name,
@@ -1810,6 +1868,58 @@ impl DeviceLayout {
              identity; nothing in this mechanism produces that state, so this pass renames \
              nothing back, truncates nothing, trims nothing and leaves the next pass to \
              re-evaluate"
+        );
+        self.conclude(state, RotationOutcome::Failed, RotationForm::None, false)
+    }
+
+    /// The state a replacement at the active path produces: the pass
+    /// renamed a file aside and the generation is not the inode it
+    /// recorded.
+    ///
+    /// A rename preserves the inode, so nothing in this mechanism
+    /// produces this either. What it means is that the daemon cannot
+    /// establish which file the device is writing to — the very state
+    /// [`Self::unrecognised`] refuses to act in — so this pass refuses
+    /// too, and for the same reason each refusal is specifically owed:
+    ///
+    /// - It does not **signal**. The signal is what would close
+    ///   `OpenBao`'s descriptor on the inode that was displaced, and
+    ///   until it is closed every record on it is still reachable by
+    ///   an operator through `/proc/<pid>/fd`.
+    /// - It does not **rename back**. Renaming the generation into
+    ///   place would restore the replacement under the active name, and
+    ///   the next tick would rotate it exactly as this one did, hiding
+    ///   the breakage behind a plausible `audit.log`.
+    /// - It does not **fall back**. There is no active path to copy or
+    ///   truncate, and the one file there is is not the device's.
+    /// - It does not **trim**, and it keeps the marker: both are acting.
+    ///   The marker now names a file that no longer carries the
+    ///   recorded identity, which is precisely what the next pass's
+    ///   marker branch declines to move into place.
+    ///
+    /// So the active path is left absent — what an operator and
+    /// `assert_openbao_audit_log` should see on a device this broken —
+    /// with one `error` naming both files, and the pass counts toward
+    /// the consecutive-failure escalation.
+    fn shifted(
+        &self,
+        state: &mut PassState,
+        generation: &Path,
+        recorded: (u64, u64),
+        observed: &str,
+    ) -> PassOutcome {
+        error!(
+            path = %self.active_path.display(),
+            generation = %generation.display(),
+            recorded = %format!("{}:{}", recorded.0, recorded.1),
+            observed = observed,
+            "the OpenBao audit log was renamed aside and the generation does not carry the \
+             identity recorded a moment earlier, so something replaced the active log while \
+             this pass was preparing to rotate it. OpenBao is still appending to the \
+             displaced inode, which no longer has a name: this pass signals nothing, renames \
+             nothing back, truncates nothing and trims nothing. An operator must reconcile \
+             the device directory by hand, and should recover the displaced inode through \
+             the container's open descriptors before anything closes them"
         );
         self.conclude(state, RotationOutcome::Failed, RotationForm::None, false)
     }
@@ -2184,19 +2294,19 @@ impl DeviceLayout {
         // Reading through a planted link would copy an arbitrary
         // root-readable file into a generation this pass then chowns to
         // the container's audit user, and reading through a planted
-        // FIFO would never return at all. `open_active` refuses both.
-        let active = match open_active(OpenOptions::new().read(true).write(true), &self.active_path)
-        {
-            Ok(active) => active,
-            Err(err) => {
-                warn!(
-                    path = %self.active_path.display(),
-                    error = %err,
-                    "could not open the OpenBao audit device's active log to rotate it"
-                );
-                return RotationOutcome::Failed;
-            }
-        };
+        // FIFO would never return at all. `open_regular` refuses both.
+        let active =
+            match open_regular(OpenOptions::new().read(true).write(true), &self.active_path) {
+                Ok(active) => active,
+                Err(err) => {
+                    warn!(
+                        path = %self.active_path.display(),
+                        error = %err,
+                        "could not open the OpenBao audit device's active log to rotate it"
+                    );
+                    return RotationOutcome::Failed;
+                }
+            };
         let (identity, len) = match active.metadata() {
             Ok(meta) => (file_identity(&meta), meta.len()),
             Err(err) => {
@@ -2666,7 +2776,7 @@ impl DeviceLayout {
     /// [`io::ErrorKind::InvalidInput`] where the path does not lead to
     /// the regular file `OpenBao` writes.
     fn active_identity(&self) -> io::Result<(u64, u64)> {
-        let file = open_active(OpenOptions::new().read(true), &self.active_path)?;
+        let file = open_regular(OpenOptions::new().read(true), &self.active_path)?;
         Ok(file_identity(&file.metadata()?))
     }
 
@@ -2758,19 +2868,46 @@ impl DeviceLayout {
 
     /// Reads the marker, or `None` where there is none.
     ///
+    /// Through [`open_regular`] and under [`MARKER_MAX_BYTES`], for the
+    /// reasons every other open in this module goes that way: the path
+    /// is one the container's audit user can re-point, and this read
+    /// runs on the blocking half of a pass. `std::fs::read` would
+    /// follow a symbolic link planted there, park a blocking thread for
+    /// ever on a FIFO — taking the rotation task's ticking, its failure
+    /// counter and its escalation with it — and size its allocation
+    /// from whatever the file claims to be.
+    ///
     /// # Errors
     ///
-    /// Returns the read error, or an [`io::ErrorKind::InvalidData`]
-    /// where the marker does not parse. Both take the unrecognised
+    /// Returns the `open` or read error, or an
+    /// [`io::ErrorKind::InvalidData`] where the marker is over the cap
+    /// or does not parse. Every one of those takes the unrecognised
     /// branch, which refuses to act.
     fn read_marker(&self) -> io::Result<Option<RotationIntent>> {
-        match std::fs::read(&self.marker_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
+        let file = match open_regular(OpenOptions::new().read(true), &self.marker_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let mut bytes = Vec::new();
+        // One byte past the cap, so a file exactly at it still reads and
+        // the first byte over is observable rather than silently cut to
+        // a prefix that might still parse.
+        let read = u64::try_from(file.take(MARKER_MAX_BYTES + 1).read_to_end(&mut bytes)?)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if read > MARKER_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is larger than the {MARKER_MAX_BYTES}-byte cap on a \
+                     rotation-intent marker",
+                    self.marker_path.display()
+                ),
+            ));
         }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
     }
 
     /// Removes the marker and makes the removal durable, answering
@@ -2842,6 +2979,10 @@ impl DeviceLayout {
     /// Renames the active log to its generation name, refusing to
     /// replace anything already there.
     fn rename_aside(&self, target: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.faults.before_rename_aside() {
+            hook(&self.active_path);
+        }
         #[cfg(test)]
         if self.faults.rename_fails() {
             return Err(io::Error::other("injected rename failure"));

@@ -84,6 +84,11 @@ pub(crate) struct FaultInjection {
     restore_rename: AtomicUsize,
     /// Fail the flush that makes the rename-back durable.
     restore_sync: AtomicBool,
+    /// Runs with the active log's path, after the rotation-intent
+    /// marker is on disk and before the rename moves the log aside —
+    /// the window in which a replacement at that path costs the pass
+    /// the identity it just recorded.
+    before_rename_aside: Mutex<Option<PassHook>>,
     /// Runs with the active log's path, after the size decision has
     /// been taken on it and before the fallback's copy opens it.
     before_stage: Mutex<Option<PassHook>>,
@@ -118,6 +123,7 @@ impl Default for FaultInjection {
             rename_sync: AtomicBool::new(false),
             restore_rename: AtomicUsize::new(0),
             restore_sync: AtomicBool::new(false),
+            before_rename_aside: Mutex::new(None),
             before_stage: Mutex::new(None),
             after_stage: Mutex::new(None),
             before_truncate: Mutex::new(None),
@@ -187,6 +193,10 @@ impl FaultInjection {
 
     pub(crate) fn restore_sync_fails(&self) -> bool {
         self.restore_sync.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn before_rename_aside(&self) -> Option<PassHook> {
+        hook_of(&self.before_rename_aside)
     }
 
     pub(crate) fn before_stage(&self) -> Option<PassHook> {
@@ -309,6 +319,10 @@ impl OpenBaoAuditRotation {
 
     fn install(slot: &Mutex<Option<PassHook>>, hook: impl Fn(&Path) + Send + Sync + 'static) {
         *slot.lock().expect("the hook lock is live") = Some(Arc::new(hook));
+    }
+
+    fn on_rename_aside(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        Self::install(&self.faults().before_rename_aside, hook);
     }
 
     fn before_stage(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
@@ -4335,4 +4349,177 @@ async fn the_marker_lives_exactly_as_long_as_its_rotation() {
         rotation.marker_path().exists(),
         "rename-back whose flush failed"
     );
+}
+
+/// The rotation-intent marker is read the way every other file in this
+/// directory is opened, and neither a link, a FIFO, nor a size the
+/// container chose gets past it.
+///
+/// The marker sits in a directory the container's audit user can write,
+/// and the branch that reads it runs on a pass's blocking half — so a
+/// plain `std::fs::read` there is the same three hazards the active
+/// log's opens are held to, on the one path that decides whether a file
+/// is renamed into place. It follows a symbolic link, so that user
+/// chooses which bytes authorise the restore. It parks for ever on a
+/// FIFO, taking the rotation task's ticking, its failure counter and
+/// its escalation with it. And it sizes its allocation from a file
+/// whose size that user chose. Each case is tampering, so each takes
+/// the branch that refuses to act.
+#[tokio::test]
+async fn a_marker_that_is_not_this_daemon_s_own_file_refuses_to_act() {
+    let cap = usize::try_from(MARKER_MAX_BYTES).expect("the cap fits a usize");
+    for case in ["fifo", "symlink", "oversize"] {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let live = seed_generation(dir.path(), "20260301T115900Z", 0, S);
+        let live_bytes = std::fs::read(&live).expect("the seeded generation reads");
+        let name = rotated_file_name("20260301T115900Z", 0);
+        let marker = dir.path().join(MARKER_FILE_NAME);
+        match case {
+            "fifo" => plant_fifo(&marker),
+            // A marker that would authorise the restore, reached
+            // through a link rather than as itself.
+            "symlink" => {
+                let elsewhere = dir.path().join("elsewhere.json");
+                write_intent(&elsewhere, identity_of(&live), &name);
+                std::os::unix::fs::symlink(&elsewhere, &marker).expect("the link is planted");
+            }
+            // The same marker, valid JSON to the last byte, padded past
+            // the cap with the whitespace a parser ignores: uncapped,
+            // this parses and moves the generation into place.
+            _ => {
+                let intent = RotationIntent {
+                    active_dev: identity_of(&live).0,
+                    active_ino: identity_of(&live).1,
+                    generation: name.clone(),
+                };
+                let mut body = serde_json::to_vec(&intent).expect("the marker serialises");
+                body.resize(body.len() + cap, b' ');
+                std::fs::write(&marker, body).expect("the oversize marker is written");
+            }
+        }
+        let mut rotation = rotation_at(dir.path().to_path_buf(), S, N);
+        let active = dir.path().join(ACTIVE_FILE_NAME);
+
+        let logs = logs_from(async {
+            let outcome = returns_within("the marker's read", rotation.run_pass(at(0))).await;
+            assert!(outcome.rotation.is_unmet(), "{case}");
+            assert_eq!(
+                outcome.consecutive_failures, 1,
+                "{case}: and it escalates like any other failure"
+            );
+        })
+        .await;
+        assert_eq!(
+            count_lines_at(&logs, "ERROR"),
+            1,
+            "{case}: one error:\n{logs}"
+        );
+        assert!(
+            logs.contains("cannot establish which file the device is writing to"),
+            "{case}:\n{logs}"
+        );
+        if case == "oversize" {
+            assert!(
+                logs.contains("cap on a rotation-intent marker"),
+                "the size is what refused it, not the parse:\n{logs}"
+            );
+        }
+        assert!(
+            !active.exists(),
+            "{case}: no generation was moved into place"
+        );
+        assert_eq!(
+            std::fs::read(&live).expect("the seeded generation still reads"),
+            live_bytes,
+            "{case}: and the file the marker named was left where it was"
+        );
+    }
+}
+
+/// An active log replaced between the marker and the rename signals
+/// nothing and reports no success.
+///
+/// The identity the marker records is what every later branch decides
+/// by, and it is recorded from a file the rename is only *expected* to
+/// carry aside. The device directory is writable by the container's
+/// audit user, so in that window `audit.log` can be unlinked — `OpenBao`
+/// keeps writing through its descriptor to the now-nameless inode — and
+/// a fresh file put at the name. Left unchecked, the rename carries the
+/// impostor into the generation, the `SIGHUP` closes the descriptor on
+/// the real inode and frees every record on it, and the confirmation
+/// compares the reopened log against the stale identity, finds it
+/// differs and calls the whole thing a lossless rotation.
+#[tokio::test(start_paused = true)]
+async fn a_replacement_between_the_marker_and_the_rename_is_never_signalled() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let recorded = identity_of(&active);
+
+    let replaced = active.clone();
+    let once = Arc::new(AtomicBool::new(false));
+    rotation.on_rename_aside(move |path| {
+        assert_eq!(path, replaced, "the hook is handed the active log");
+        if once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::fs::remove_file(&replaced).expect("the live log is unlinked");
+        create_active_log(&replaced);
+    });
+
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(0)).await;
+        assert!(outcome.rotation.is_unmet(), "the pass failed");
+        assert_eq!(outcome.form, RotationForm::None, "and rotated by no form");
+        assert_eq!(outcome.consecutive_failures, 1);
+        assert!(!outcome.restore_pending, "no restore was attempted");
+    })
+    .await;
+
+    assert!(
+        docker.signalled().is_empty(),
+        "the signal is what would close OpenBao's descriptor on the displaced inode:\n{logs}"
+    );
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "one error:\n{logs}");
+    assert!(
+        logs.contains("does not carry the identity recorded a moment earlier"),
+        "{logs}"
+    );
+    assert!(
+        !active.exists(),
+        "the active path is left absent rather than restored under a name that would hide this"
+    );
+    let generations = generation_names(dir.path());
+    let generation = dir
+        .path()
+        .join(generations.first().expect("the rename did happen"));
+    assert_eq!(
+        len_of(&generation),
+        0,
+        "what was renamed aside is the impostor, not the log that held the records"
+    );
+    assert_ne!(captured, 0);
+    assert_ne!(
+        identity_of(&generation),
+        recorded,
+        "which is exactly what the check caught"
+    );
+    assert!(
+        rotation.marker_path().exists(),
+        "the marker is kept: removing it would be acting"
+    );
+
+    // And the next tick refuses too, from the marker alone: it names a
+    // file that no longer carries the identity it recorded.
+    let logs = logs_from(async {
+        let outcome = rotation.run_pass(at(60)).await;
+        assert!(outcome.rotation.is_unmet(), "the next tick refuses too");
+    })
+    .await;
+    assert!(
+        logs.contains("no longer carries the identity it recorded"),
+        "{logs}"
+    );
+    assert!(docker.signalled().is_empty());
+    assert!(!active.exists());
 }

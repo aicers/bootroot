@@ -314,7 +314,30 @@ or trim ever sees it, and is written with the staged, flushed, renamed,
 directory-flushed discipline every other file bootroot reads back uses.
 It is removed as soon as the rotation is over, and a removal that fails
 is an `error`, fails the pass, and blocks every further rotation until
-it is retried successfully.
+it is retried successfully. It is also *read* the way every other file
+in that directory is opened — without following a symbolic link, without
+waiting on anything that is not a regular file, and under a fixed size
+cap — because the directory is writable by the container's audit user
+and the branch that reads the marker is the one that decides whether a
+file is renamed into place.
+
+**The rename is checked rather than assumed.** Immediately after the
+rename and *before* the signal, the pass re-stats the generation and
+confirms it carries the identity the marker recorded. A rename preserves
+the inode, so it should — but the directory is writable, so `audit.log`
+can be replaced between the moment that identity is taken and the moment
+the rename is issued. The rename would then carry the *replacement*
+aside while OpenBao went on appending to the real, now-nameless inode;
+the signal would close that descriptor and free every record on it; and
+the confirmation, comparing the reopened log against a stale identity,
+would find it differs and report a lossless rotation over records that
+were gone. So a generation that does not carry the recorded identity
+stops the pass where it stands. It signals nothing, renames nothing
+back, truncates nothing, trims nothing and keeps the marker, and it logs
+one `error` naming both files. The active path is deliberately left
+absent — the state an operator and the CI assertion should see on a
+device this broken — and the displaced inode is still reachable through
+the container's open descriptors until something closes them.
 
 **The recovery.** The dangerous state is a rename that succeeded and a
 reopen that did not: OpenBao still audits into the renamed inode, but
@@ -374,9 +397,11 @@ closes — stop and investigate rather than waiting.
 
 **Where the daemon refuses to act.** A pass that starts with the active
 path absent decides from the marker and nothing else. If there is no
-marker, or it names anything but one of this device's own generations,
-or it names a file that is gone or whose identity no longer matches, the
-daemon does not recognise the state as its own: it logs one
+marker, or the marker is not a regular file of the daemon's own — a
+symbolic link, a FIFO, or one larger than the cap — or it names anything
+but one of this device's own generations, or it names a file that is
+gone or whose identity no longer matches, the daemon does not recognise
+the state as its own: it logs one
 `error`, rotates nothing, trims nothing and moves **no** generation into
 place. A newer generation is never renamed into position because it is
 the newest or the most recently modified — an operator or a filesystem
