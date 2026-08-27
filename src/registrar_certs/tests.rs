@@ -1648,6 +1648,28 @@ async fn an_unreadable_ca_bundle_fails_before_anything_is_published() {
     assert!(bundle.is_dir(), "the bundle must be left exactly as it was");
 }
 
+/// `--insecure` retains its existing transport behavior: it bypasses TLS
+/// verification without probing a bundle that only normal-mode bootstrap can
+/// repair.
+#[test]
+fn insecure_mode_does_not_select_bootstrap_pins() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let trust = crate::config::TrustSettings {
+        ca_bundle_path: Some(dir.path().join("missing-bundle.pem")),
+        trusted_ca_sha256: vec!["00".repeat(32)],
+    };
+
+    assert!(
+        bootstrap_pins_for_mode(&trust, false).is_some(),
+        "normal mode selects bootstrap pins"
+    );
+    let bootstrap_pins = bootstrap_pins_for_mode(&trust, true);
+    assert!(
+        bootstrap_pins.is_none(),
+        "insecure mode must not select or inspect bootstrap trust"
+    );
+}
+
 /// A missing bundle and an unparseable-but-readable one stay on the
 /// repair path: the merge seeds against nothing, the pair is published,
 /// and the bundle comes back holding the pinned anchor.

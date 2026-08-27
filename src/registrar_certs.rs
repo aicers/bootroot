@@ -784,7 +784,10 @@ pub(crate) async fn issue_surface_pair(
         .profiles
         .first()
         .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
-    let bootstrap_pins = bootstrap_pins(&issuance.trust);
+    // `--insecure` is an explicit transport override.  It must retain its
+    // established behavior and not inspect the output bundle before the
+    // existing post-issuance merge gate does.
+    let bootstrap_pins = bootstrap_pins_for_mode(&issuance.trust, insecure_mode);
     crate::acme::issue_certificate_with_bootstrap(
         &issuance,
         profile,
@@ -825,6 +828,17 @@ fn bootstrap_pins(trust: &crate::config::TrustSettings) -> Option<&[String]> {
         }
         Err(_) | Ok(_) => None,
     }
+}
+
+/// Selects bootstrap trust only for normal-mode issuance.
+///
+/// `--insecure` deliberately does not inspect the configured output bundle
+/// before the existing merge gate, preserving its established behavior.
+fn bootstrap_pins_for_mode(
+    trust: &crate::config::TrustSettings,
+    insecure_mode: bool,
+) -> Option<&[String]> {
+    (!insecure_mode).then(|| bootstrap_pins(trust)).flatten()
 }
 
 /// Builds the settings one surface issuance runs under.
