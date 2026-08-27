@@ -121,7 +121,13 @@ openbao_audit_reopen_probe() {
     echo "probe: no active audit log at ${container}:${path}" >&2
     return 1
   fi
-  if ! docker exec "$container" mv "$path" "$generation"; then
+  # `mv -n`, never a plain `mv`: the generation name is derived from the
+  # current second and a fixed sequence, so it can collide with one
+  # `bootroot-agent` itself published in that second, and a plain `mv`
+  # would silently destroy that generation's records. Refused, the
+  # active path is still there on its old inode and step 4 refutes the
+  # probe — a loud failure rather than a lost audit generation.
+  if ! docker exec "$container" mv -n "$path" "$generation"; then
     echo "probe: could not rename ${path} aside to ${generation}" >&2
     return 1
   fi
@@ -261,17 +267,33 @@ silently degrade to the lossy copy-and-truncate fallback on this image"
 # refusal has to come from the reopen evidence, not from a container the
 # probe could not talk to.
 #
+# The stand-in carries the reference container's own Compose project
+# label. It is removed on the line after the probe returns, but a run
+# killed in between would otherwise strand it for as long as the machine
+# runs: the E2E teardown and the dead-run sweep both collect by
+# `com.docker.compose.project`, and the startup leftover check matches
+# only the fixed service-name suffixes, so an unlabelled container of
+# this name is reachable by none of the three.
+#
 # Usage:
 #   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target <reference-container> <url>
 assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target() {
   local reference="$1" url="$2"
-  local image standin status output
+  local image project standin status output
+  local -a labels=()
 
   image="$(docker inspect -f '{{.Config.Image}}' "$reference")" ||
     fail "could not read the image of ${reference}"
+  project="$(docker inspect \
+    -f '{{index .Config.Labels "com.docker.compose.project"}}' "$reference")" ||
+    fail "could not read the Compose project of ${reference}"
+  [ -z "$project" ] || labels=(--label "com.docker.compose.project=${project}")
   standin="${reference}-reopen-probe-standin"
   docker rm -f "$standin" >/dev/null 2>&1 || true
-  docker run -d --name "$standin" --entrypoint sh "$image" -c \
+  # `${labels[@]+…}`, not a bare `${labels[@]}`: under `set -u` an empty
+  # array is an unbound variable before bash 4.4, and this file is
+  # sourced by harnesses that set it.
+  docker run -d --name "$standin" ${labels[@]+"${labels[@]}"} --entrypoint sh "$image" -c \
     'trap "" HUP; mkdir -p /openbao/audit; : > /openbao/audit/audit.log; while true; do sleep 1; done' \
     >/dev/null || fail "could not start the non-reopening stand-in"
 
