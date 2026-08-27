@@ -1838,90 +1838,131 @@ async fn tls_bootstrap_rejects_empty_or_mismatched_pins_before_acme_traffic() {
 }
 
 /// An HTTPS HTTP-01 responder uses the same bootstrap pins as the ACME
-/// client, so a trusted responder request completes without reading the
-/// missing output bundle.
+/// client, so a trusted responder request completes without reading an
+/// output bundle eligible for repair.
 #[tokio::test]
 async fn tls_bootstrap_uses_pins_for_an_https_responder() {
-    let mut host = Host::new();
-    let acme = start_tls_acme(Arc::clone(&host.ca)).await;
-    let responder_proxy = TlsAcmeProxy::start(&host.ca, &acme.responder.uri()).await;
-    aim_at(&mut host.settings, &acme);
-    host.settings.acme.http_responder_url = responder_proxy.url.clone();
-    let bundle = host.dir.path().join("bootstrap-bundle.pem");
-    host.settings.trust.ca_bundle_path = Some(bundle.clone());
+    for (label, seed) in [
+        ("missing bundle", None),
+        (
+            "readable unparseable bundle",
+            Some("not a certificate at all\n"),
+        ),
+    ] {
+        let mut host = Host::new();
+        let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+        let responder_proxy = TlsAcmeProxy::start(&host.ca, &acme.responder.uri()).await;
+        aim_at(&mut host.settings, &acme);
+        host.settings.acme.http_responder_url = responder_proxy.url.clone();
+        let bundle = host.dir.path().join("bootstrap-bundle.pem");
+        if let Some(contents) = seed {
+            std::fs::write(&bundle, contents).expect("seed the output bundle");
+            assert!(
+                crate::tls::parse_pem_to_cert_list(contents.as_bytes()).is_err(),
+                "{label} must contain no parseable certificate"
+            );
+        }
+        host.settings.trust.ca_bundle_path = Some(bundle.clone());
 
-    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
-    let client = pairs
-        .iter()
-        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
-        .expect("the client pair");
-    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
-        .await
-        .expect("a pinned HTTPS responder must complete bootstrap issuance");
+        let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+        let client = pairs
+            .iter()
+            .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+            .expect("the client pair");
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{label}: a pinned HTTPS responder must complete bootstrap issuance: {error:#}"
+                )
+            });
 
-    assert!(
-        !acme
-            .observed
-            .responder_requests
-            .lock()
-            .expect("responder log is not poisoned")
-            .is_empty(),
-        "the HTTPS responder must receive the bootstrap registration"
-    );
-    assert!(
-        bundle.exists(),
-        "successful issuance must repair the bundle"
-    );
+        assert!(
+            !acme
+                .observed
+                .responder_requests
+                .lock()
+                .expect("responder log is not poisoned")
+                .is_empty(),
+            "{label}: the HTTPS responder must receive the bootstrap registration"
+        );
+        let repaired = std::fs::read_to_string(&bundle)
+            .unwrap_or_else(|error| panic!("{label}: read the repaired bundle: {error}"));
+        crate::tls::parse_pem_to_cert_list(repaired.as_bytes())
+            .unwrap_or_else(|error| panic!("{label}: issuance must repair the bundle: {error:#}"));
+    }
 }
 
 /// An HTTPS responder whose chain has no configured pin fails closed after
 /// the ACME connection succeeds and before certificate publication.
 #[tokio::test]
 async fn tls_bootstrap_rejects_an_unpinned_https_responder() {
-    let mut host = Host::new();
-    let acme = start_tls_acme(Arc::clone(&host.ca)).await;
-    let responder_ca = TestCa::new("Unpinned Responder CA");
-    let responder_proxy = TlsAcmeProxy::start(&responder_ca, &acme.responder.uri()).await;
-    aim_at(&mut host.settings, &acme);
-    host.settings.acme.http_responder_url = responder_proxy.url.clone();
-    let bundle = host.dir.path().join("bootstrap-bundle.pem");
-    host.settings.trust.ca_bundle_path = Some(bundle.clone());
+    for (label, seed) in [
+        ("missing bundle", None),
+        (
+            "readable unparseable bundle",
+            Some("not a certificate at all\n"),
+        ),
+    ] {
+        let mut host = Host::new();
+        let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+        let responder_ca = TestCa::new("Unpinned Responder CA");
+        let responder_proxy = TlsAcmeProxy::start(&responder_ca, &acme.responder.uri()).await;
+        aim_at(&mut host.settings, &acme);
+        host.settings.acme.http_responder_url = responder_proxy.url.clone();
+        let bundle = host.dir.path().join("bootstrap-bundle.pem");
+        if let Some(contents) = seed {
+            std::fs::write(&bundle, contents).expect("seed the output bundle");
+            assert!(
+                crate::tls::parse_pem_to_cert_list(contents.as_bytes()).is_err(),
+                "{label} must contain no parseable certificate"
+            );
+        }
+        host.settings.trust.ca_bundle_path = Some(bundle.clone());
 
-    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
-    let client = pairs
-        .iter()
-        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
-        .expect("the client pair");
-    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
-        .await
-        .expect_err("an unpinned HTTPS responder must fail bootstrap issuance");
+        let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+        let client = pairs
+            .iter()
+            .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+            .expect("the client pair");
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+            .await
+            .expect_err("an unpinned HTTPS responder must fail bootstrap issuance");
 
-    assert_eq!(
-        acme.observed.directory_requests.load(Ordering::Relaxed),
-        1,
-        "the ACME connection must succeed before the responder is contacted"
-    );
-    assert!(
-        acme.observed
-            .responder_requests
-            .lock()
-            .expect("responder log is not poisoned")
-            .is_empty(),
-        "the unpinned responder must receive no HTTP registration"
-    );
-    let (cert_path, key_path) = host.client_pair();
-    assert!(
-        !cert_path.exists(),
-        "an unpinned responder must not publish a leaf"
-    );
-    assert!(
-        !key_path.exists(),
-        "an unpinned responder must not publish a key"
-    );
-    assert!(
-        !bundle.exists(),
-        "an unpinned responder must not repair the bundle"
-    );
+        assert_eq!(
+            acme.observed.directory_requests.load(Ordering::Relaxed),
+            1,
+            "{label}: the ACME connection must succeed before the responder is contacted"
+        );
+        assert!(
+            acme.observed
+                .responder_requests
+                .lock()
+                .expect("responder log is not poisoned")
+                .is_empty(),
+            "{label}: the unpinned responder must receive no HTTP registration"
+        );
+        let (cert_path, key_path) = host.client_pair();
+        assert!(
+            !cert_path.exists(),
+            "{label}: an unpinned responder must not publish a leaf"
+        );
+        assert!(
+            !key_path.exists(),
+            "{label}: an unpinned responder must not publish a key"
+        );
+        match seed {
+            Some(contents) => assert_eq!(
+                std::fs::read_to_string(&bundle).expect("read the unchanged bundle"),
+                contents,
+                "{label}: an unpinned responder must not repair the bundle"
+            ),
+            None => assert!(
+                !bundle.exists(),
+                "{label}: an unpinned responder must not repair the bundle"
+            ),
+        }
+    }
 }
 
 /// A missing output bundle uses the registrar-only pin bootstrap transport,
