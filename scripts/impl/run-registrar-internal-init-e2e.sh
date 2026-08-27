@@ -1430,7 +1430,10 @@ assert_the_container_audit_dir_is_backed_by_the_store() {
 # `init` starts them *after* the TLS recreate that moves the device
 # (`apply_openbao_agent_compose_override`, phase 2 of the agent
 # bring-up), so their traffic lands in the store rather than in the
-# volume the device wrote to beforehand.
+# volume the device wrote to beforehand.  That holds for the first call
+# alone: once a rotation or a move of the store has made another file
+# the active one, the sidecars' entries are in the file left behind and
+# the arm drives its own through `drive_fresh_audit_traffic` first.
 assert_the_shared_audit_log_assertion_still_passes() {
   assert_openbao_audit_log "${INSTANCE}-openbao" "$OPENBAO_AUDIT_CONTAINER_LOG"
   pass "the shared OpenBao file-audit assertion passes over the store-backed device"
@@ -1617,36 +1620,47 @@ it was written to"
 post-rotation entry is in the new active log, and neither is duplicated"
 }
 
-# A fresh AppRole login and a fresh KV read, driven after the rotation.
+# A fresh AppRole login and a fresh KV read, driven against whatever
+# file the device is writing to now.
 #
-# The shared assertion below reads the *active* log, which a rotation
-# replaces, so it passes exactly when the entries it looks for were
-# written since.  The role is this run's own rather than a sidecar's, so
-# the login is traffic this arm caused.
+# The shared assertion reads the device's *active* log, so it passes
+# exactly when the entries it looks for were written since that file
+# became the active one -- which both a rotation and a move of the store
+# invalidate.  Waiting for the two infra sidecars to supply them again
+# is not an option in either case: an OpenBao Agent that already holds a
+# token renews it rather than logging in afresh, and the token survives
+# the container being replaced because it lives in OpenBao's storage, so
+# no `auth/approle/login` need ever follow.  The role is therefore this
+# run's own, and the login is traffic the calling arm caused.
+#
+# `slug` names the arm in the role and in the KV path it reads, so two
+# arms driving traffic in one run do not share either; `occasion` is the
+# phrase the two reported assertions end with.
 drive_fresh_audit_traffic() {
-  local role="audit-rotation-${RUN_TOKEN}" role_id secret_id status
+  local slug="$1" occasion="$2"
+  local role="audit-${slug}-${RUN_TOKEN}" role_id secret_id status
   openbao_api POST "auth/approle/role/${role}" \
     '{"token_policies":"default","token_ttl":"60s"}' >/dev/null ||
-    fail "could not create the post-rotation AppRole"
+    fail "could not create the AppRole for the traffic driven ${occasion}"
   role_id="$(openbao_api GET "auth/approle/role/${role}/role-id" |
     jq -r '.data.role_id // empty')"
   secret_id="$(openbao_api POST "auth/approle/role/${role}/secret-id" '{}' |
     jq -r '.data.secret_id // empty')"
   [ -n "$role_id" ] && [ -n "$secret_id" ] ||
-    fail "could not mint an AppRole credential for the post-rotation traffic"
+    fail "could not mint an AppRole credential for the traffic driven ${occasion}"
 
   status="$(printf '{"role_id":"%s","secret_id":"%s"}' "$role_id" "$secret_id" |
     openbao_api_unauthed POST "auth/approle/login" |
     jq -r 'if .auth.client_token then "ok" else "no-token" end')"
-  assert_equal "an AppRole login succeeds immediately after the rotation" "ok" "$status"
+  assert_equal "an AppRole login succeeds ${occasion}" "ok" "$status"
 
   # A read of a path that need not exist: the device records the
   # request either way, which is what the assertion below looks for, and
   # inventing a KV secret here would be this arm writing state it does
   # not own.
-  openbao_api GET "secret/data/bootroot-audit-rotation" >/dev/null ||
-    fail "the KV read driven after the rotation raised"
-  pass "a fresh AppRole login and KV read were driven after the rotation"
+  openbao_api GET "secret/data/bootroot-audit-${slug}" >/dev/null ||
+    fail "the KV read driven ${occasion} raised"
+  pass "a fresh AppRole login and KV read were driven ${occasion}"
 }
 
 # The active log OpenBao created after the reopen is a fresh file it
@@ -1670,46 +1684,6 @@ assert_the_rotated_active_log_begins_at_offset_zero() {
   sudo -n head -n 1 "$host_log" | jq -e . >/dev/null 2>>"$RUN_LOG" ||
     fail "the rotated active log's first line is not a well-formed JSON record"
   pass "the rotated active log begins at offset 0 with a well-formed record"
-}
-
-# Whether both entries the shared file-audit assertion looks for are in
-# the device's current file.
-#
-# The same two predicates `assert_openbao_audit_log` applies, run as a
-# probe rather than as an assertion: the caller polls on this and then
-# lets the shared helper be the thing that decides, so a device that
-# never fills still fails with that helper's message and its container
-# path.
-openbao_audit_entries_present() {
-  local path="$1"
-  docker exec "${INSTANCE}-openbao" sh -c \
-    "grep -F '\"type\":\"response\"' '$path' | grep -F '\"path\":\"auth/approle/login\"' >/dev/null" \
-    >/dev/null 2>&1 || return 1
-  docker exec "${INSTANCE}-openbao" sh -c \
-    "grep -F '\"type\":\"response\"' '$path' | grep -F '\"operation\":\"read\"' | grep -E '\"path\":\"secret/data/' >/dev/null" \
-    >/dev/null 2>&1
-}
-
-# Gives a device whose bind source has just moved the window its file
-# needs to fill again.
-#
-# A bring-up returns once the containers are up; the entries below are
-# written when the two infra sidecars re-authenticate and re-render
-# against it, which is seconds later on an idle runner and longer on a
-# loaded one.  Bounded, and it never decides the assertion: on timeout
-# it returns and the shared helper reports what is actually missing.
-wait_for_openbao_audit_entries() {
-  local attempt=0
-  while [ "$attempt" -lt "$AUDIT_ENTRIES_ATTEMPTS" ]; do
-    if openbao_audit_entries_present "$OPENBAO_AUDIT_CONTAINER_LOG"; then
-      log "the moved audit device carries both sidecars' entries"
-      return 0
-    fi
-    attempt=$((attempt + 1))
-    sleep "$AUDIT_ENTRIES_DELAY_SECS"
-  done
-  log "the moved audit device did not fill within ${AUDIT_ENTRIES_ATTEMPTS} attempts"
-  return 0
 }
 
 # Waits for a file on the reserve to grow past a size the caller
@@ -1895,7 +1869,10 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   assert_equal "openbao/ sits on the mounted reserve" \
     "$store_dev" "$(store_device "$store/openbao")"
 
-  wait_for_openbao_audit_entries
+  # The device is writing to a file that did not exist a moment ago, so
+  # the two entries the shared assertion looks for have to be driven
+  # rather than waited for -- see `drive_fresh_audit_traffic`.
+  drive_fresh_audit_traffic reserve-move "over the moved audit device"
   sudo -n test -s "$store/openbao/audit.log" ||
     fail "the OpenBao audit log did not land on the mounted reserve"
   assert_equal "the audit log itself sits on the mounted reserve" \
@@ -1907,8 +1884,8 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   # `docker restart`: what has to survive is the stack being taken down
   # and put back over a mount nothing in Compose knows about, and the
   # bring-up is the surface an operator would use.  OpenBao seals when
-  # it stops and `infra up` unseals it again, so the sidecars
-  # re-authenticate afterwards and the device fills a second time.
+  # it stops and `infra up` unseals it again, and the traffic driven
+  # below then fills the device a second time.
   local started_before started_after log_before
   started_before="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.StartedAt}}' 2>>"$RUN_LOG" || true)"
   [ -n "$started_before" ] || fail "could not read the OpenBao container's start time"
@@ -1931,6 +1908,7 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
     "bind ${store}/openbao" "$(container_audit_bind)"
   assert_equal "the store is still the mounted filesystem after the restart" \
     "$store_dev" "$(store_device "$store")"
+  drive_fresh_audit_traffic reserve-restart "over the restarted container"
   wait_for_file_growth "$store/openbao/audit.log" "$log_before"
   assert_equal "the restarted container is writing into the mounted reserve" "yes" \
     "$([ "$(sudo -n stat -c %s "$store/openbao/audit.log")" -gt "$log_before" ] && echo yes || echo no)"
@@ -2230,7 +2208,7 @@ main() {
   drive_a_marker_record_before_the_rotation
   assert_the_device_rotates_by_reopen_on_signal
   assert_the_rotation_lost_no_record
-  drive_fresh_audit_traffic
+  drive_fresh_audit_traffic rotation "immediately after the rotation"
   assert_the_rotated_active_log_begins_at_offset_zero
   # The same shared assertion, unmodified, over the rotated deployment.
   assert_the_shared_audit_log_assertion_still_passes
