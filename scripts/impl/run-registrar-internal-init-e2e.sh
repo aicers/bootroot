@@ -907,8 +907,18 @@ assert_the_rendered_steps_activate_the_reserve() {
 
   # Re-provisioning must not touch the activated image.  In particular,
   # mtime, length and allocated blocks are the lifecycle contract's
-  # observable non-destructive facts.  Keep the inode and filesystem UUID
-  # comparison as well: they make a recreation or reformat failure clear.
+  # observable non-destructive facts.  Remount read-only before taking the
+  # snapshots: an ext4 journal or superblock update while it is mounted
+  # read-write would otherwise change the backing image independently of
+  # `bootroot init`.  This run only reads the mounted reserve to report
+  # **enforced**, so read-only also makes an unexpected write fail instead
+  # of being mistaken for filesystem background activity.  Keep the inode
+  # and filesystem UUID comparison as well: they make a recreation or
+  # reformat failure clear.
+  sudo -n sync ||
+    fail "could not flush the activated reserve before re-provisioning"
+  sudo -n mount -o remount,ro "$store" ||
+    fail "could not remount the activated reserve read-only for re-provisioning"
   local before after metadata_before metadata_after
   before="$(image_identity "$image")"
   metadata_before="$(image_reprovisioning_metadata "$image")"
@@ -939,6 +949,8 @@ assert_the_rendered_steps_activate_the_reserve() {
   assert_equal "the image was not recreated, resized or reformatted" "$before" "$after"
   assert_equal "the image mtime, length and allocated blocks did not change on re-provisioning" \
     "$metadata_before" "$metadata_after"
+  sudo -n mount -o remount,rw "$store" ||
+    fail "could not restore the activated reserve read-write after re-provisioning"
 
   # The allocation again, and this one is the assertion that catches a
   # missing `lazy_itable_init=0`.  The check above runs seconds after
