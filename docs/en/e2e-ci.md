@@ -193,8 +193,10 @@ neither subdirectory, no image, and nothing under `/etc/systemd/system` — the
 three artifacts are written beside the Compose override and installed by
 nobody. The second part activates it, and runs only where the host can carry
 one: a live systemd to enable the generated `.mount` unit under, `mkfs.ext4`,
-`fallocate`, `losetup` and a loop device. There the rendered phase-2 commands
-are read back out of the outcome and pasted into a shell exactly as printed —
+`dd`, `losetup` and a loop device. `fallocate` is optional: the rendered
+allocation command falls back to `dd` when it is unavailable. The
+rendered phase-2 commands are read back out of the outcome and pasted
+into a shell exactly as printed —
 which is what proves an operator can — and the re-run must then report
 `enforced`. It asserts that the unit name is byte-identical to `systemd-escape
 --path`, that the loaded unit's `Where=` is the configured store, that the

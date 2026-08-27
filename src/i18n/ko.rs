@@ -653,7 +653,7 @@ pub(super) static STRINGS: Strings = Strings {
     audit_reserve_finding_subdir_absent: "마운트된 파일 시스템에 {path}이(가) 존재하지 않습니다.",
     audit_reserve_finding_subdir_invalid: "마운트된 파일 시스템의 {path}이(가) {found}입니다.",
     audit_reserve_step_stop_writers: "두 기록자를 모두 멈춥니다. Compose 스택을 멈춰 어떤 컨테이너도 저장소 아래의 바인드를 잡지 않게 하고, `bootroot-registrar.service`를 멈춰 마운트를 세우는 동안 동사 레코드가 기록되지 않게 합니다.",
-    audit_reserve_step_image: "루프백 이미지를 만들거나 고칩니다.",
+    audit_reserve_step_image: "루프백 이미지를 만들거나 고칩니다. 이미 마운트된 예약량이 희소하고 `fallocate`를 사용할 수 없거나 실패하면, 렌더링된 대체 경로는 제자리 수리 전에 마운트를 해제하고 다음 활성화 단계가 다시 마운트합니다.",
     audit_reserve_step_install: "렌더링된 산출물을 설치하고 마운트를 활성화합니다.",
     audit_reserve_step_subdirectories: "이제 마운트된 파일 시스템 위에 저장소의 하위 디렉터리를 만듭니다. `openbao/`에는 `chown`을 렌더링하지 않습니다. 그 소유자는 첫 컨테이너 기동에서 OpenBao entrypoint가 정합니다.",
     audit_reserve_step_rerun: "`{command}`를 다시 실행하세요. 결과를 검증해 enforced를 보고하고, 이 실행이 멈춘 지점부터 이어갑니다.",
