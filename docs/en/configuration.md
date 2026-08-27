@@ -621,10 +621,13 @@ the registrar endpoint is provisioned from. Both are read on every
 `[registrar_endpoint] enabled` is fixed for the process lifetime.
 
 On a host whose `state.json` records `registrar_endpoint.enabled = true`,
-a root-run `bootroot init` creates `audit_store_dir` with `records/` and
-`openbao/` beneath it. It must run as root there, because the store is
-owned by uid 0 at mode `0700`. A host whose registrar endpoint is not
-enabled still has no store.
+a root-run `bootroot init` creates `audit_store_dir`, and `records/` and
+`openbao/` beneath it under `audit_store_enforcement = "directory"`.
+Under the default `filesystem` those two are created on the mounted
+reserve by the operator instead, because creating them first and mounting
+over them would leave them hidden and empty. It must run as root either
+way, because the store is owned by uid 0 at mode `0700`. A host whose
+registrar endpoint is not enabled still has no store.
 
 The audit store is opened when — and only when — the registrar endpoint
 is enabled. A host that serves no verbs creates nothing.
@@ -654,13 +657,32 @@ error.
   that run. See
   [The shared audit store](operations.md#the-shared-audit-store).
 - `audit_store_reserve_bytes` (`u64`, default `2147483648`, 2 GiB) — the
-  configured shared-store budget. It must not exceed `i64::MAX`; this
-  build records the value but does not enforce the budget.
+  shared-store budget. It must not exceed `i64::MAX`. Under the default
+  `filesystem` enforcement it is the exact size of the loopback image
+  `bootroot init` provisions, so it is a ceiling the kernel holds both
+  writers to; under `directory` it is a recorded number with nothing
+  behind it. In `filesystem` mode it also has a **minimum** — the larger
+  of 16 MiB and `audit_max_file_bytes` × (`audit_max_retained_files` +
+  1), compared strictly — and a reserve below it is refused before
+  anything is created or rendered. `validate_registrar_settings` gains no
+  lower bound from that: the minimum is a `filesystem`-mode,
+  endpoint-enabled refusal, and it would mean nothing for the
+  deployments it does not apply to. See
+  [Sizing the reserve](operations.md#sizing-the-reserve).
 - `audit_store_low_water_bytes` (`u64`, default `536870912`, 512 MiB) —
   the future capacity-alarm threshold. It must be less than the reserve.
-- `audit_store_enforcement` (default `filesystem`) — selects a future
-  filesystem-backed ceiling or an unenforced `directory` budget. Neither
-  mode is implemented in this build.
+- `audit_store_enforcement` (default `filesystem`) — selects the
+  enforcement behind `audit_store_reserve_bytes`, and is the **only**
+  input that does: bootroot never infers a mode, never falls back from
+  one to the other, and never writes this key back. `filesystem`
+  provisions and verifies a fully allocated loopback image mounted at
+  `audit_store_dir` through a generated systemd mount unit, so the
+  reserve is enforced by the kernel. `directory` is the explicit
+  opt-out: a plain directory, an unenforced budget, and an XFS or ext4
+  project quota as the operator-side route to a real ceiling. Both are
+  gated on `[registrar_endpoint] enabled` — on a host that has not
+  enabled the endpoint neither mode does anything at all. See
+  [The shared audit store](operations.md#the-shared-audit-store).
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
   the resolved directory must stay inside `audit_store_dir`.

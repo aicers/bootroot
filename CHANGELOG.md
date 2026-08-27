@@ -75,6 +75,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   distinguishes a store that is not configured from a provisioned empty store
   and from a scan that failed, so an unreadable audit trail cannot appear
   healthy.
+- The registrar's shared audit store now has a ceiling the kernel
+  enforces. `[registrar] audit_store_enforcement` selects it: under the
+  default `filesystem`, an endpoint-enabled `bootroot init` derives a
+  loopback image of exactly `audit_store_reserve_bytes` beside the store,
+  a systemd `.mount` unit that puts it at `audit_store_dir` and is
+  restored on boot, and two ordering drop-ins that keep both writers from
+  starting ahead of it — so an audit artifact fills the reserve with
+  `ENOSPC` instead of filling the host's root filesystem. bootroot
+  renders every host-changing step as an exact command and runs none of
+  them: the first run reports `provisioned, not activated` and stops, the
+  operator runs the printed commands, and the next run verifies the whole
+  chain and reports `enforced`. It reformats, resizes, moves and deletes
+  nothing to get there — an image of the wrong size and a store that
+  already holds records are each refused, and the second refusal reaches
+  `bootroot reinit` before it wipes. Setting the key to `directory` is
+  the explicit opt-out and keeps the earlier behaviour, leaving the
+  reserve a budget with a project quota as the route to a real ceiling.
 - `bootroot-agent` takes a new optional `[acme].account_key_path`. When
   it is set, the ACME **account** signing key is loaded from that path,
   or created there once with `0600` permissions, so the profile keeps one

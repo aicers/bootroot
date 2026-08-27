@@ -124,8 +124,13 @@ pub struct RegistrarSettings {
     /// Absolute directory containing the daemon's records and `OpenBao`'s
     /// file audit output.
     pub audit_store_dir: PathBuf,
-    /// Bytes the operator sets aside for the shared audit store. Nothing
-    /// enforces this budget in this build.
+    /// Bytes the operator sets aside for the shared audit store.
+    ///
+    /// Under the default `filesystem` enforcement this is the size of
+    /// the loopback image `bootroot init` provisions and mounts at
+    /// `audit_store_dir`, so it is a ceiling the kernel enforces
+    /// against both writers. Under `directory` it stays a recorded
+    /// budget with nothing behind it.
     pub audit_store_reserve_bytes: u64,
     /// Remaining bytes at which a future capacity alarm fires.
     pub audit_store_low_water_bytes: u64,
@@ -384,11 +389,20 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditStoreEnforcement {
-    /// A filesystem-provided ceiling, supplied by separate work and not
-    /// yet in place in this build.
+    /// A filesystem-provided ceiling: a fully allocated loopback image
+    /// of exactly `audit_store_reserve_bytes`, carrying an ext4
+    /// filesystem, mounted at `audit_store_dir` through a generated
+    /// systemd mount unit that is restored on boot.
+    ///
+    /// `bootroot init` derives, preflights, renders and verifies that
+    /// chain on an endpoint-enabled host; the steps that change the
+    /// host are the operator's, rendered as exact commands and run by
+    /// nobody else.
     #[default]
     Filesystem,
-    /// A plain directory with an unenforced configured reserve.
+    /// A plain directory with an unenforced configured reserve, for a
+    /// host that cannot mount one. Reachable only by explicit
+    /// configuration — never inferred, and never fallen back to.
     Directory,
 }
 

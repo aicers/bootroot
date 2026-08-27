@@ -593,10 +593,13 @@ rate_limit_predecision_refusal_refill_interval_ms = 1000
 값은 `[registrar_endpoint] enabled` 하나뿐입니다.
 
 `state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
-root로 실행한 `bootroot init`이 `audit_store_dir`과 그 아래의 `records/`,
-`openbao/`를 생성합니다. 저장소는 uid 0 소유에 모드 `0700`이므로 이 실행은
-반드시 root여야 합니다. 레지스트라 엔드포인트가 활성화되지 않은 호스트에는
-여전히 저장소가 없습니다.
+root로 실행한 `bootroot init`이 `audit_store_dir`을 생성하며,
+`audit_store_enforcement = "directory"`에서는 그 아래의 `records/`,
+`openbao/`도 함께 생성합니다. 기본값인 `filesystem`에서는 그 두 디렉터리를
+먼저 만들고 그 위에 마운트하면 비어 있는 채로 가려지므로, 마운트된 예약량
+위에 운영자가 직접 생성합니다. 저장소는 uid 0 소유에 모드 `0700`이므로 어느
+쪽이든 이 실행은 반드시 root여야 합니다. 레지스트라 엔드포인트가 활성화되지
+않은 호스트에는 여전히 저장소가 없습니다.
 
 감사 저장소는 레지스트라 엔드포인트가 활성화된 경우에만 열립니다. 동사를
 제공하지 않는 호스트는 아무것도 만들지 않습니다.
@@ -624,13 +627,31 @@ OpenBao 감사 장치 확인은 그대로입니다.
   실행보다 이 파일이 먼저 존재해야 합니다.
   [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 - `audit_store_reserve_bytes` (`u64`, 기본값 `2147483648`, 2 GiB) — 공유
-  저장소의 구성된 예산입니다. `i64::MAX`를 넘을 수 없으며, 이 빌드에서는
-  예산을 기록할 뿐 강제하지 않습니다.
+  저장소의 예산입니다. `i64::MAX`를 넘을 수 없습니다. 기본값인
+  `filesystem` 강제에서는 `bootroot init`이 준비하는 루프백 이미지의 정확한
+  크기이므로, 커널이 두 기록자에게 적용하는 상한입니다. `directory`에서는
+  뒤에 아무것도 없는 기록된 숫자입니다. `filesystem` 모드에서는
+  **최솟값**도 있습니다. 16 MiB와 `audit_max_file_bytes` ×
+  (`audit_max_retained_files` + 1) 중 큰 쪽이며 엄격하게 비교되고, 그보다
+  작은 예약량은 아무것도 생성·렌더링되기 전에 거부됩니다.
+  `validate_registrar_settings`에는 그로 인한 하한이 추가되지 않습니다.
+  최솟값은 엔드포인트가 활성인 `filesystem` 모드의 거부이며, 해당하지 않는
+  배포에는 아무 의미도 없기 때문입니다.
+  [예약량 크기 잡기](operations.md#sizing-the-reserve)를 참고하세요.
 - `audit_store_low_water_bytes` (`u64`, 기본값 `536870912`, 512 MiB) —
   향후 용량 경보 임계값입니다. reserve보다 작아야 합니다.
-- `audit_store_enforcement` (기본값 `filesystem`) — 향후 파일시스템 기반
-  상한 또는 강제되지 않는 `directory` 예산을 선택합니다. 이 빌드에서는 두
-  모드 모두 구현되지 않았습니다.
+- `audit_store_enforcement` (기본값 `filesystem`) —
+  `audit_store_reserve_bytes` 뒤에 설 강제 방식을 선택하며, 그렇게 하는
+  입력은 이 키 하나뿐입니다. bootroot는 모드를 추론하지 않고, 한쪽에서
+  다른 쪽으로 물러나지 않으며, 이 키를 다시 쓰지도 않습니다.
+  `filesystem`은 생성된 systemd 마운트 유닛을 통해 `audit_store_dir`에
+  마운트되는, 완전히 할당된 루프백 이미지를 준비하고 검증하므로 예약량이
+  커널에 의해 강제됩니다. `directory`는 명시적 opt-out입니다. 평범한
+  디렉터리, 강제되지 않는 예산, 그리고 실제 상한을 얻는 운영자 측 경로로서
+  XFS 또는 ext4 프로젝트 쿼터입니다. 두 모드 모두
+  `[registrar_endpoint] enabled`에 걸려 있으며, 엔드포인트를 활성화하지
+  않은 호스트에서는 어느 모드도 아무 일도 하지 않습니다.
+  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 - `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
   놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
   `audit_store_dir` 안에 있어야 합니다.

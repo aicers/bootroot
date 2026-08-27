@@ -185,6 +185,87 @@ runs `assert_openbao_audit_log`, the shared file-audit assertion every other
 lifecycle harness runs, unchanged: it reads the *container* path through `docker
 exec`, so a correct bind mount is transparent to it.
 
+It is also the only arm that exercises the store's **reserve**, and it does so
+in three parts. The first needs nothing of the host: against a store path of its
+own, an endpoint-enabled `filesystem`-mode `bootroot init` must report
+`provisioned, not activated` and stop, having created the mount point and
+neither subdirectory, no image, and nothing under `/etc/systemd/system` — the
+three artifacts are written beside the Compose override and installed by
+nobody. The second part activates it, and runs only where the host can carry
+one: a live systemd to enable the generated `.mount` unit under, `mkfs.ext4`,
+`fallocate`, `losetup` and a loop device. There the rendered phase-2 commands
+are read back out of the outcome and pasted into a shell exactly as printed —
+which is what proves an operator can — and the re-run must then report
+`enforced`. It asserts that the unit name is byte-identical to `systemd-escape
+--path`, that the loaded unit's `Where=` is the configured store, that the
+mount is a loop device whose backing file is the derived image, that the image
+is fully allocated once the mount is up and again after the re-run — the first
+is what an implementation missing `-E nodiscard` fails, the second what one
+missing `-E lazy_itable_init=0` fails, since the kernel's background
+inode-table pass hands those blocks back only seconds after the mount — that
+the store directory and both subdirectories
+carry their contract's owner and mode on the mounted filesystem — the store
+directory above all, since `mkfs.ext4` gives the filesystem's root `0755` and
+the rendered step 4 is what restates it at `0700` — that a second run renders no
+image command and leaves the image at the inode, size and filesystem UUID it
+already had, and that a write of
+four times the reserve fails on the reserve while the host's root filesystem
+does not absorb it. Teardown disables the unit, unmounts, removes the unit,
+both drop-ins and the image, and runs from the cleanup trap as well as from
+the end of the section, so a failure in the middle of it leaves no mount
+behind for the store base's removal to descend into. A host without systemd —
+the macOS preflight, a container runner — logs the skip and goes on.
+
+The third part puts a *deployment* on an activated reserve, and runs under the
+same host probe as the second. It is last in the run, because it moves this
+deployment's audit device off the `directory`-mode store every assertion above
+is about and ends by filling the reserve out from under a running container. It
+removes the rendered override naming the old store first — `bootroot init`
+refuses a run whose `--agent-config` resolves a different one — activates a
+reserve of its own exactly as the second part does, and then brings the stack up
+on it with an unprivileged `bootroot infra up`. That bring-up is itself an
+assertion: it reads the bind source out of the override and checks the store
+directory it names, which with the mount up is the *mounted filesystem's root*,
+so a run that had not restated `chmod 0700` on `audit_store_dir` in step 4 is
+refused here by the very command that follows it. It then asserts that the
+container's `/openbao/audit` is a bind mount of the mounted store, that both
+subdirectories and the audit log itself sit on the mounted filesystem, and that
+`assert_openbao_audit_log` — the same shared assertion, unchanged — passes over
+that device. The ordering the automatic boot path rests on is read back off the
+unit systemd actually loaded rather than off the file that was installed:
+`docker.service` wants the mount unit and is ordered after it, and carries no
+hard relation to it, which is the residual both manuals state rather than a
+stronger guarantee. The stack is then stopped and brought back up over the
+mount: the mount unit is still active, the restarted container is still bound to
+the reserve, and the audit log *grows*. Growth rather than content, because the
+device appends — entries the previous container wrote would satisfy the shared
+assertion on their own, and only growth shows the new one writing. A `bootroot
+init` over the reserve afterwards must still report `enforced` even though the
+Compose entrypoint has by then chowned `openbao/` to the container's own user,
+which is the regression an owner-comparing implementation fails. Last, the
+ceiling again and this time against the deployment: a write of four times the
+reserve fails on the reserve, and the host's root filesystem does not absorb it.
+The activation stays on the host until the cleanup trap, because the container
+is bound into the mounted store and the unmount would be refused while it runs.
+
+Every reserve part runs its `bootroot init` against a URL nothing answers on,
+and the first two delete the Compose override afterwards; none of that is
+incidental. The
+audit store is provisioned before any Docker call, so a run that reaches
+`enforced` carries straight on into the initialisation proper and would
+initialise this scenario's OpenBao ahead of the real `init` — the dead URL
+stops it at the OpenBao health check instead, after the outcome has been
+printed and before anything of the deployment is touched. And the override is
+rendered before the outcome is verified, so even a run that stops at
+`provisioned, not activated` leaves one naming its own throwaway store;
+`bootroot init` cross-checks a rendered override against the store the next
+`--agent-config` resolves and refuses the two when they differ, so one left
+behind would refuse every later run in the scenario with that error rather
+than with its own verdict. The third part is that same rule from the other
+side: it removes the override the deployment was initialised with before it
+provisions a store of its own, and leaves the one it renders in place, because
+that file is what the bring-up on the next line reads the bind source out of.
+
 The store's base is a physical, world-traversable temporary directory rather
 than the run root, because `bootroot init` requires every existing component
 above the store to be a non-symlink directory carrying `o+x`, and every obvious

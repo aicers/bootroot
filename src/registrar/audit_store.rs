@@ -13,6 +13,15 @@
 //! the ownership rule are stated once. Nothing here writes a record,
 //! opens a store, or enforces the configured reserve.
 //!
+//! Which of the two creation shapes the install side drives is decided
+//! by `[registrar] audit_store_enforcement`. [`create_layout`] makes
+//! all three directories in one pass, which is what a `directory`
+//! deployment gets. [`create_mount_point`] makes only the store
+//! directory, which is what a `filesystem` deployment gets: there the
+//! two subdirectories have to come into being on the filesystem
+//! mounted over that directory, so creating them here would put them
+//! underneath it. Neither function knows about the reserve itself.
+//!
 //! # The store directory contract
 //!
 //! The store directory and its record subdirectory are each a
@@ -363,6 +372,43 @@ pub fn create_layout(
     Ok(layout)
 }
 
+/// Creates the store's **mount point** and nothing beneath it, owned
+/// by the running process and at the contract's mode.
+///
+/// [`create_layout`] minus its two subdirectories, for the
+/// `filesystem` enforcement mode. There the store's subdirectories
+/// have to come into being on the mounted filesystem: creating them
+/// first and mounting over them produces an empty store and an
+/// `OpenBao` container that cannot write its mandatory audit device,
+/// with the originals hidden underneath. So the install path creates
+/// only `store_dir` itself — a mount needs somewhere to go — and the
+/// two subdirectories are the operator's to create once the mount is
+/// active.
+///
+/// `check_mount_point` decides whether the store directory contract is
+/// asserted. It is skipped while a filesystem is mounted here: what
+/// `lstat` then sees is that filesystem's root directory, whose mode
+/// `mkfs` chose and which no step of this surface may change.
+///
+/// # Errors
+///
+/// Returns an error when an ancestor fails [`check_ancestors`], when a
+/// directory cannot be created, or when `check_mount_point` is set and
+/// the store directory departs from the contract.
+pub fn create_mount_point(
+    store_dir: &Path,
+    expected_uid: u32,
+    check_mount_point: bool,
+) -> Result<AuditStoreLayout, AuditStoreLayoutError> {
+    check_ancestors(store_dir)?;
+    create_missing_ancestors(store_dir)?;
+    create_dir_with_mode(store_dir, STORE_DIR_MODE)?;
+    if check_mount_point {
+        check_store_directory(store_dir, expected_uid)?;
+    }
+    Ok(layout_of(store_dir))
+}
+
 /// Requires `path` to be a directory and not a symbolic link, and
 /// asserts nothing at all about its owner or its mode.
 fn check_plain_directory(path: &Path) -> Result<(), AuditStoreLayoutError> {
@@ -518,6 +564,44 @@ mod tests {
         assert_eq!(mode_of(&layout.store_dir), STORE_DIR_MODE);
         assert_eq!(mode_of(&layout.records_dir), STORE_DIR_MODE);
         assert!(layout.openbao_dir.is_dir());
+    }
+
+    #[test]
+    fn a_mount_point_is_created_without_either_subdirectory() {
+        let base = traversable_tempdir();
+        let store = base.path().join("var").join("lib").join("audit-store");
+        let layout = create_mount_point(&store, current_uid(), true).expect("mount point");
+
+        assert_eq!(layout.store_dir, store);
+        assert_eq!(mode_of(&store), STORE_DIR_MODE);
+        assert_eq!(mode_of(&base.path().join("var")), ANCESTOR_DIR_MODE);
+        // Creating these here would put them underneath the filesystem
+        // about to be mounted over the store, which is an empty store
+        // and a container that cannot write its audit device.
+        assert!(!layout.records_dir.exists());
+        assert!(!layout.openbao_dir.exists());
+
+        // Idempotent: a second call over the same directory neither
+        // creates nor repairs anything.
+        create_mount_point(&store, current_uid(), true).expect("mount point again");
+        assert!(!layout.records_dir.exists());
+        assert!(!layout.openbao_dir.exists());
+    }
+
+    #[test]
+    fn a_mount_point_check_can_be_skipped_for_a_directory_a_filesystem_is_mounted_over() {
+        let base = traversable_tempdir();
+        let store = base.path().join("audit-store");
+        create_mount_point(&store, current_uid(), true).expect("mount point");
+        // `mkfs.ext4` gives a filesystem's root directory `0755`, and
+        // that root is what an `lstat` of the store sees once the mount
+        // is up — a mode no step of the install path may change, and
+        // one the contract would otherwise refuse.
+        std::fs::set_permissions(&store, Permissions::from_mode(0o755)).expect("mode");
+
+        assert!(create_mount_point(&store, current_uid(), true).is_err());
+        create_mount_point(&store, current_uid(), false).expect("the check is skipped");
+        assert_eq!(mode_of(&store), 0o755, "and nothing repaired it");
     }
 
     #[test]
