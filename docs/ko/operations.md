@@ -578,10 +578,9 @@ cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
 
 #### 레지스트라 동사 속도 제한 {#registrar-verb-rate-limiting}
 
-이 빌드에서 bootroot는 레지스트라 동사 요청을 처리하지 않으므로, 아직
-이 버킷에 도달하는 호출은 없습니다. 속도 제한기는 동사의 구성 의존성이며
-동사를 요청 핸들러에 연결하는 변경과 함께 도착합니다. 아래 네 개의 키는
-지금도 로드되고 검증됩니다.
+레지스트라 엔드포인트가 활성화된 경우 `mint`와 `deregister` 요청이 이
+버킷에 도달합니다. 속도 제한기는 동사의 구성 의존성이며, 아래 다섯 키가
+두 버킷과 억제된 호출의 내구성 있는 증거를 설정합니다.
 
 레지스트라의 `mint`/`deregister` 동사는 호출이 도착할 때 한 줄, 끝날 때
 한 줄씩 감사 레코드를 남기며 거부된 호출도 예외가 아닙니다. 이는 공짜가
@@ -622,24 +621,21 @@ cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
 넣어 재시도해야 합니다.
 
 어느 쪽이든 데몬은 억제한 호출을 버킷별로 하나씩, 기동 이후 누적으로
-셉니다. 다만 이 두 값은 아직 데몬의 메모리 안에만 있고 운영자가 읽을
-수 있는 표면이 없습니다. 이를 보고하는 곳도 없고, 이 빌드에서는 버킷에
-가산되는 호출 자체가 없습니다. 읽을 수 있게 되면 합계가 아니라 두 값을
-따로 읽으세요. `predecision_refusal`이 오르는 것은 누군가 잘못된 입력을
+셉니다. 모든 응답의 `registrar_health.limiter`가 이 두 값을 합계가 아니라
+따로 제공합니다. `predecision_refusal`이 오르는 것은 누군가 잘못된 입력을
 대량으로 밀어 넣고 있다는 뜻이며 그 호출자들은 여전히 진짜 답을 받고
 있습니다. `admission`이 오르는 것은 정상 트래픽이 막히고 있다는 뜻이며
 진행 중인 브링업이 지연되고 있을 수 있습니다.
 
-제한된 호출이 남기는 것은 이 카운터뿐입니다. 데몬 저널을 포함해 제한된
-호출마다 기록되는 것은 아무것도 없습니다. 호출마다 로그 한 줄을 남기면
-밀려드는 요청 하나하나가 무제한 쓰기 하나가 되어, 버킷이 없앤 디스크
-압박을 그대로 되돌려 주기 때문입니다. 그러므로 진행 중인 폭주를 저널에서
-찾으려 하지 마세요. 그 가시성은 카운터를 운영자가 읽을 수 있게 될 때 함께
-옵니다.
+제한된 호출마다 기록되는 것은 여전히 없습니다. 호출마다 로그 한 줄을
+남기면 밀려드는 요청 하나하나가 무제한 쓰기 하나가 되어, 버킷이 없앤
+디스크 압박을 그대로 되돌려 주기 때문입니다. 대신 도착 기준 창마다
+`limited` 감사 레코드 하나가 만들어지므로, 진행 중인 폭주는
+`registrar_health.limiter`에서 보고 감사 기록에서 확인하세요.
 
-**설정 키 네 개**는 `agent.toml`의 `[registrar]` 테이블에 있습니다. 모두
+**설정 키 다섯 개**는 `agent.toml`의 `[registrar]` 테이블에 있습니다. 모두
 부호 없는 정수이며, 속도는 분수 비율이 아니라 토큰당 밀리초 간격으로
-표현합니다. 덕분에 설정 표면에 부동소수점 값이 하나도 없습니다. 네 키
+표현합니다. 덕분에 설정 표면에 부동소수점 값이 하나도 없습니다. 다섯 키
 모두 0은 로드 시점에 거부됩니다.
 
 ```toml
@@ -648,6 +644,7 @@ rate_limit_admission_burst = 512
 rate_limit_admission_refill_interval_ms = 500
 rate_limit_predecision_refusal_burst = 32
 rate_limit_predecision_refusal_refill_interval_ms = 1000
+rate_limit_coalesce_window_seconds = 60
 ```
 
 - `rate_limit_admission_burst` (기본값 `512`) — 한 클라이언트 신원이
@@ -660,6 +657,15 @@ rate_limit_predecision_refusal_refill_interval_ms = 1000
   도착하는 것이므로 훨씬 작습니다.
 - `rate_limit_predecision_refusal_refill_interval_ms` (기본값 `1000`) —
   초당 거부 토큰 하나를 지속합니다.
+- `rate_limit_coalesce_window_seconds` (기본값 `60`) — 억제된 호출을
+  하나의 감사 레코드로 묶는 도착 기준 창입니다.
+
+억제된 호출은 호출자 신원, 동사, 버킷(`predecision_refusal` 또는
+`admission`), 횟수와 창 경계를 담은 `limited` 감사 레코드로 기록됩니다.
+메모리에는 최대 256개 창(약 150 KB)만 유지됩니다. 기본 60초 창에서는
+64개 신원이 네 키를 계속 구동할 때만 분당 최대 256개(시간당 15,360개)를
+기록할 수 있으며, 현재 단일 신원 설계는 시간당 240개입니다. 응답의
+`registrar_health.limiter`는 두 버킷의 프로세스 수명 카운터를 제공합니다.
 
 **admission 버스트 산정.** 정상 상태에서 mint가 드물다는 감이 아니라,
 가장 큰 *정상* 브링업 파도를 기준으로 잡으세요.

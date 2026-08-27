@@ -27,10 +27,10 @@ use super::bridge::{deregister_outcome, mint_outcome, refusal_outcome};
 use super::{
     ACTIVE_FILE_NAME, AUDIT_RECORD_VERSION, AppendGate, AuditOutcome, AuditPhase, AuditRecord,
     AuditRecordStore, AuditStoreError, AuditStoreSettings, AuditVerb, FaultInjection,
-    MAX_RECORD_FIELD_BYTES, MAX_SERIALIZED_RECORD_BYTES, MIN_AUDIT_MAX_FILE_BYTES, PathCondition,
-    RefusalReason, RequestedIdentity, TruncationDigest, Truncations, canonical_timestamp,
-    current_uid, directory_condition, file_condition, format_millisecond_rfc3339,
-    parse_rotated_name, rotated_file_name, rotation_stamp,
+    LimitedBucket, MAX_RECORD_FIELD_BYTES, MAX_SERIALIZED_RECORD_BYTES, MIN_AUDIT_MAX_FILE_BYTES,
+    PathCondition, RefusalReason, RequestedIdentity, TruncationDigest, Truncations,
+    canonical_timestamp, current_uid, directory_condition, file_condition,
+    format_millisecond_rfc3339, parse_rotated_name, rotated_file_name, rotation_stamp,
 };
 use crate::input_validation::ValidationError;
 use crate::registrar::config::{Multiplicity, ReloadKind};
@@ -98,6 +98,22 @@ fn golden_fixtures() -> Vec<(&'static str, AuditRecord, String)> {
         ),
         format!(
             r#"{{"record_version":1,"phase":"intent","ts":"{TS}","request_id":"req-2","verb":"deregister","caller_identity":"{CALLER}","requested":{{"service_name":"review","host":"h1"}}}}"#
+        ),
+    ));
+
+    fixtures.push((
+        "limited invocation window",
+        AuditRecord::limited(
+            ts(),
+            AuditVerb::Mint,
+            CALLER.to_string(),
+            LimitedBucket::Admission,
+            7,
+            ts() - Duration::seconds(60),
+            ts(),
+        ),
+        format!(
+            r#"{{"record_version":1,"phase":"limited","ts":"{TS}","verb":"mint","caller_identity":"{CALLER}","limited_bucket":"admission","count":7,"window_start":"2026-08-23T12:33:56.789Z","window_end":"{TS}"}}"#
         ),
     ));
 
@@ -258,6 +274,36 @@ fn golden_fixtures_pin_exact_bytes_and_round_trip() {
             "{name}: a record is exactly one line"
         );
     }
+}
+
+#[test]
+fn a_limited_record_bounds_only_its_caller_identity() {
+    let caller = "x".repeat(MAX_RECORD_FIELD_BYTES + 1);
+    let record = AuditRecord::limited(
+        ts(),
+        AuditVerb::Deregister,
+        caller,
+        LimitedBucket::PredecisionRefusal,
+        1,
+        ts() - Duration::seconds(1),
+        ts(),
+    )
+    .into_bounded();
+
+    assert!(record.caller_identity.len() <= MAX_RECORD_FIELD_BYTES);
+    assert!(
+        record
+            .truncated
+            .as_ref()
+            .and_then(|truncated| truncated.caller_identity.as_ref())
+            .is_some(),
+        "a capped limited caller carries its truncation proof"
+    );
+    assert!(record.request_id.is_empty());
+    assert!(record.requested.service_name.is_empty());
+    assert!(record.requested.host.is_empty());
+    assert!(record.registration_id.is_none());
+    assert!(record.outcome.is_none());
 }
 
 /// An offset of nine hours, so a shifted value's wall-clock reading

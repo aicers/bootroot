@@ -465,19 +465,20 @@ base64-decodes, parses a `serde_json::Value`, passes it to
 `parse_trust_payload`, and then applies the stricter canonical framing checks.
 Any failure in that path is a decode error, never a wire refusal.
 
-`registrar_health` is the endpoint-local, snapshot-supplied container for
-future `certificates`, `limiter`, and `audit_capacity` members. Each of those
-three is already owned: `certificates` is populated by
-[#769](https://github.com/aicers/bootroot/issues/769), `limiter` by
-[#787](https://github.com/aicers/bootroot/issues/787), and `audit_capacity` by
-[#774](https://github.com/aicers/bootroot/issues/774). That records ownership
-only; no member schema is defined and no member is populated here. It is `{}`
-in v1 and appears on mint success, deregister success, and refusal responses.
-It is distinct from the registrar ecosystem's `audit_health` tail in §9. A
-response encoder receives an explicit `RegistrarHealth` snapshot and has no
-other source for it; the protocol module does not read audit, limiter, or
-certificate state. This keeps the container's placement common to all response
-forms and makes each future member addition additive.
+`registrar_health` is the endpoint-local, snapshot-supplied container. Its
+additive `limiter` member is present on mint-success, deregister-success, and
+refusal responses, in the response position shown above:
+
+```json
+{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}
+```
+
+Both members are JSON `u64` counters since this daemon process started.
+`limited_predecision_refusal` counts suppression after a permanent local
+refusal was known; `limited_admission` counts suppression that produces the
+retryable admission throttle. A response encoder receives one daemon-held
+`RegistrarHealth` snapshot and has no other source for it; the protocol module
+does not read audit, limiter, or certificate state.
 
 The refusal mapping is exhaustive over the current bootroot verb errors. Every
 row is an explicit `match` arm; there is no wildcard arm. `none` means the

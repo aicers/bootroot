@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- The registrar endpoint now coalesces rate-limited invocations into bounded
+  audit records and reports separate process-lifetime counters for permanent
+  refusal and admission limits in every response's `registrar_health.limiter`
+  member.
 - `bootroot-agent` can now serve the registrar endpoint. Setting
   `[registrar_endpoint] enabled = true` on a bootroot host makes the
   daemon build the registrar verb layer from its `[registrar]` settings

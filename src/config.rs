@@ -160,6 +160,8 @@ pub struct RegistrarSettings {
     /// Milliseconds per token accrued into a registrar
     /// `predecision_refusal` bucket.
     pub rate_limit_predecision_refusal_refill_interval_ms: u32,
+    /// Seconds in each arrival-anchored limited-invocation audit window.
+    pub rate_limit_coalesce_window_seconds: u64,
     /// Absolute path to the provisioning tool's rendered registrar
     /// config. Only read; nothing in this repository writes it.
     pub provisioning_config_path: PathBuf,
@@ -270,6 +272,56 @@ fn default_rate_limit_predecision_refusal_refill_interval_ms() -> RateLimitValue
     RateLimitValue(defaults::default_rate_limit_predecision_refusal_refill_interval_ms())
 }
 
+/// A positive coalescing window may be longer than the limiter's
+/// `u32`-sized bursts and refill intervals.
+#[derive(Debug)]
+struct CoalescingWindowValue(u64);
+
+impl<'de> Deserialize<'de> for CoalescingWindowValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = u64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an unsigned integer")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(value)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                u64::try_from(value).map_err(|_| E::invalid_value(Unexpected::Signed(value), &self))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                Err(E::invalid_type(Unexpected::Float(value), &self))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Err(E::invalid_type(Unexpected::Str(value), &self))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Err(E::invalid_type(Unexpected::Bool(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(Self)
+    }
+}
+
+fn default_rate_limit_coalesce_window_seconds() -> CoalescingWindowValue {
+    CoalescingWindowValue(u64::from(
+        defaults::default_rate_limit_coalesce_window_seconds(),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 // The raw representation mirrors the TOML contract so key names do not
@@ -306,6 +358,8 @@ struct RawRegistrarSettings {
     rate_limit_predecision_refusal_burst: RateLimitValue,
     #[serde(default = "default_rate_limit_predecision_refusal_refill_interval_ms")]
     rate_limit_predecision_refusal_refill_interval_ms: RateLimitValue,
+    #[serde(default = "default_rate_limit_coalesce_window_seconds")]
+    rate_limit_coalesce_window_seconds: CoalescingWindowValue,
     #[serde(default = "defaults::default_provisioning_config_path")]
     provisioning_config_path: PathBuf,
     #[serde(default = "defaults::default_max_wrap_ttl", with = "duration_serde")]
@@ -345,6 +399,7 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             rate_limit_admission_refill_interval_ms,
             rate_limit_predecision_refusal_burst,
             rate_limit_predecision_refusal_refill_interval_ms,
+            rate_limit_coalesce_window_seconds,
             provisioning_config_path,
             max_wrap_ttl,
             role_token_ttl,
@@ -373,6 +428,7 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             rate_limit_predecision_refusal_burst: rate_limit_predecision_refusal_burst.0,
             rate_limit_predecision_refusal_refill_interval_ms:
                 rate_limit_predecision_refusal_refill_interval_ms.0,
+            rate_limit_coalesce_window_seconds: rate_limit_coalesce_window_seconds.0,
             provisioning_config_path,
             max_wrap_ttl,
             role_token_ttl,
@@ -428,6 +484,9 @@ impl Default for RegistrarSettings {
                 defaults::default_rate_limit_predecision_refusal_burst(),
             rate_limit_predecision_refusal_refill_interval_ms:
                 defaults::default_rate_limit_predecision_refusal_refill_interval_ms(),
+            rate_limit_coalesce_window_seconds: u64::from(
+                defaults::default_rate_limit_coalesce_window_seconds(),
+            ),
             provisioning_config_path: defaults::default_provisioning_config_path(),
             max_wrap_ttl: defaults::default_max_wrap_ttl(),
             role_token_ttl: defaults::default_role_token_ttl(),
@@ -2110,6 +2169,7 @@ mod tests {
                 .rate_limit_predecision_refusal_refill_interval_ms,
             1000
         );
+        assert_eq!(settings.registrar.rate_limit_coalesce_window_seconds, 60);
         assert_eq!(settings.registrar, RegistrarSettings::default());
         settings.validate().unwrap();
     }
@@ -2173,6 +2233,10 @@ audit_store_enforcement = "directory"
         assert_eq!(
             registrar.rate_limit_predecision_refusal_refill_interval_ms,
             defaults.rate_limit_predecision_refusal_refill_interval_ms
+        );
+        assert_eq!(
+            registrar.rate_limit_coalesce_window_seconds,
+            defaults.rate_limit_coalesce_window_seconds
         );
         settings.validate().unwrap();
     }
@@ -2428,7 +2492,7 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
     /// out of each configuration manual rather than transcribed here,
     /// loads with every key reaching its own field.
     ///
-    /// Each manual prints all twelve keys in **one** TOML block, because
+    /// Each manual prints all sixteen keys in **one** TOML block, because
     /// TOML refuses a table declared twice and a reader pastes what the
     /// page shows. Parsing the page itself is what makes that block a
     /// promise rather than a hope: with the block copied into this file,
@@ -2474,8 +2538,8 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
             let keys = assigned_keys(&published);
             assert_eq!(
                 keys.len(),
-                15,
-                "{manual}: the block prints all fifteen keys"
+                16,
+                "{manual}: the block prints all sixteen keys"
             );
 
             for key in keys {
@@ -2518,6 +2582,7 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
             "rate_limit_admission_refill_interval_ms",
             "rate_limit_predecision_refusal_burst",
             "rate_limit_predecision_refusal_refill_interval_ms",
+            "rate_limit_coalesce_window_seconds",
         ] {
             let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
             write_minimal_profile_config(&mut file);
@@ -2552,17 +2617,17 @@ rate_limit_predecision_refusal_refill_interval_ms = 2000
                 file,
                 "
 [registrar]
-rate_limit_admission_burst = {rendered}"
+rate_limit_coalesce_window_seconds = {rendered}"
             )
             .unwrap();
             file.flush().unwrap();
             let error = Settings::from_file(Some(file.path().to_path_buf())).expect_err(
-                "a rate_limit_admission_burst that is not an unsigned integer must not load",
+                "a coalescing-window value that is not an unsigned integer must not load",
             );
             let rendered_error = format!("{error:#}");
             assert!(
-                rendered_error.contains("registrar.rate_limit_admission_burst"),
-                "the {rendered} failure must name registrar.rate_limit_admission_burst: \
+                rendered_error.contains("registrar.rate_limit_coalesce_window_seconds"),
+                "the {rendered} failure must name registrar.rate_limit_coalesce_window_seconds: \
                  {rendered_error}"
             );
             assert!(
@@ -2601,6 +2666,28 @@ rate_limit_admission_burst = 4294967296"
             rendered_error.contains("4294967296 exceeds 4294967295"),
             "the failure must say which bound was passed: {rendered_error}"
         );
+    }
+
+    #[test]
+    fn a_coalescing_window_uses_its_documented_u64_range() {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        writeln!(
+            file,
+            "
+[registrar]
+rate_limit_coalesce_window_seconds = 4294967296"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let settings = Settings::from_file(Some(file.path().to_path_buf()))
+            .expect("a u64 coalescing window loads");
+        assert_eq!(
+            settings.registrar.rate_limit_coalesce_window_seconds,
+            4_294_967_296
+        );
+        settings.validate().expect("a nonzero window validates");
     }
 
     /// An empty table is the same as an absent one: every key defaults

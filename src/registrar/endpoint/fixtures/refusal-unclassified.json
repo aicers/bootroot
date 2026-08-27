@@ -1,1 +1,1 @@
-{"protocol_version":1,"request_id":"request-0001","class":"retryable","registrar_health":{}}
+{"protocol_version":1,"request_id":"request-0001","class":"retryable","registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}}

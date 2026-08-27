@@ -1,1 +1,1 @@
-{"protocol_version":1,"request_id":"request-0001","registration_id":"registration-1","class":"retryable","error":{"id":"RegistrarBusy","retry_after":30},"registrar_health":{}}
+{"protocol_version":1,"request_id":"request-0001","registration_id":"registration-1","class":"retryable","error":{"id":"RegistrarBusy","retry_after":30},"registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}}

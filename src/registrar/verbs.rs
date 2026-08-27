@@ -154,6 +154,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod binding;
+pub(crate) mod coalescing;
 pub(crate) mod limiter;
 pub(crate) mod outcome;
 pub(crate) mod wrap_ttl;

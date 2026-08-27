@@ -173,6 +173,10 @@ pub(crate) fn default_rate_limit_predecision_refusal_refill_interval_ms() -> u32
     DEFAULT_RATE_LIMIT_PREDECISION_REFUSAL_REFILL_INTERVAL_MS
 }
 
+pub(crate) fn default_rate_limit_coalesce_window_seconds() -> u32 {
+    60
+}
+
 pub(crate) fn default_audit_max_file_bytes() -> u64 {
     DEFAULT_AUDIT_MAX_FILE_BYTES
 }

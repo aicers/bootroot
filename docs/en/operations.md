@@ -620,10 +620,10 @@ external rotation is recommended in its place.
 
 #### Registrar verb rate limiting
 
-bootroot does not serve registrar verb requests in this build, so no
-invocation reaches these buckets yet. The limiter is a construction
-dependency of the verbs and arrives with whatever wires them into a
-request handler; the four keys below load and validate now.
+When the registrar endpoint is enabled, its `mint` and `deregister` requests
+reach these buckets. The limiter is a construction dependency of the verbs;
+the five keys below configure its two bucket types and the durable evidence
+for suppressed invocations.
 
 The registrar's `mint` and `deregister` verbs each write an audit record
 when an invocation arrives and another when it finishes, refusals
@@ -665,26 +665,24 @@ value is deterministic, so a caller with several outstanding requests
 should jitter its own retries.
 
 Either way the daemon counts what it suppressed, one counter per bucket
-since start. Those two counts live in the daemon's own memory and have
-no operator-facing surface yet — nothing reports them, and this build
-charges nothing against the buckets to count. Once one arrives, read
-them as two numbers rather than as a total: a rising
+since start. Every response publishes those two values as
+`registrar_health.limiter`, rather than as a total: a rising
 `predecision_refusal` count says someone is flooding malformed input
 while those callers still got their real answers, and a rising
 `admission` count says legitimate traffic is being held back and a
 bring-up may be stalling.
 
-Those counters are all a limited invocation leaves behind: nothing is
-written per limited invocation, the daemon's journal included. A log
-line each would be one unbounded write per flooded request, handing the
-flood back the disk pressure the buckets took away from it. Do not
-expect the journal to show a flood in progress; that visibility arrives
-with the counters' operator-facing surface.
+Nothing is written for each limited invocation, the daemon's journal
+included. A log line each would be one unbounded write per flooded
+request, handing the flood back the disk pressure the buckets took away
+from it. Instead, an arrival-anchored window produces one `limited`
+audit record, so use `registrar_health.limiter` to observe a flood in
+progress and the audit trail to inspect it.
 
-**The four keys**, in `agent.toml`'s `[registrar]` table. Every one is
+**The five keys**, in `agent.toml`'s `[registrar]` table. Every one is
 an unsigned integer; rates are expressed as milliseconds per token
 rather than as a fractional rate, so the configuration surface carries
-no floating-point value. A zero is rejected at load time for all four.
+no floating-point value. A zero is rejected at load time for all five.
 
 ```toml
 [registrar]
@@ -692,6 +690,7 @@ rate_limit_admission_burst = 512
 rate_limit_admission_refill_interval_ms = 500
 rate_limit_predecision_refusal_burst = 32
 rate_limit_predecision_refusal_refill_interval_ms = 1000
+rate_limit_coalesce_window_seconds = 60
 ```
 
 - `rate_limit_admission_burst` (default `512`) — how many mints one
@@ -704,6 +703,16 @@ rate_limit_predecision_refusal_refill_interval_ms = 1000
   here are operator typos arriving one at a time.
 - `rate_limit_predecision_refusal_refill_interval_ms` (default `1000`)
   — one refusal token per second sustained.
+- `rate_limit_coalesce_window_seconds` (default `60`) — arrival-anchored
+  seconds per counted limited-invocation record.
+
+Suppressed invocations are written as `limited` audit records containing the
+caller identity, verb, bucket (`predecision_refusal` or `admission`), count,
+and window bounds. At most 256 windows (roughly 150 KB) are held in memory.
+At the default 60-second window this permits at most 256 records per minute
+(15,360 per hour) only if 64 identities continuously drive all four keys; the
+present single-identity design remains 240 records per hour. Responses publish
+the two process-lifetime counters as `registrar_health.limiter`.
 
 **Sizing the admission burst.** Size it from the largest *legitimate*
 bring-up wave, not from how rare mints are in steady state:

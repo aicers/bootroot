@@ -2405,12 +2405,17 @@ async fn the_task_retries_a_failed_pass_on_the_next_tick() {
         let _ = tx.send(());
     });
     let passes = rotation.passes();
+    let maintenance_ticks = Arc::new(AtomicUsize::new(0));
+    let observed_ticks = Arc::clone(&maintenance_ticks);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let handle = tokio::spawn(run_rotation_loop(
+    let handle = tokio::spawn(run_rotation_loop_with_maintenance(
         rotation,
         Duration::from_millis(2),
         shutdown_rx,
+        move || {
+            observed_ticks.fetch_add(1, Ordering::SeqCst);
+        },
     ));
 
     // Awaited rather than slept on: each message is one pass reaching
@@ -2426,6 +2431,10 @@ async fn the_task_retries_a_failed_pass_on_the_next_tick() {
         .expect("a failed pass never fails the task");
 
     assert!(passes.load(Ordering::SeqCst) >= 3, "the pass was retried");
+    assert!(
+        maintenance_ticks.load(Ordering::SeqCst) >= 3,
+        "maintenance runs on every completed rotation tick"
+    );
     assert_eq!(
         std::fs::read(&active).expect("the active log reads"),
         before,

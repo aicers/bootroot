@@ -215,6 +215,8 @@ pub enum AuditPhase {
     Intent,
     /// What the invocation produced.
     Outcome,
+    /// A counted group of invocations the rate limiter suppressed.
+    Limited,
 }
 
 impl AuditPhase {
@@ -224,6 +226,7 @@ impl AuditPhase {
         match self {
             Self::Intent => "intent",
             Self::Outcome => "outcome",
+            Self::Limited => "limited",
         }
     }
 }
@@ -248,8 +251,29 @@ pub enum AuditVerb {
     Deregister,
 }
 
+/// The limiter bucket that suppressed a counted audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitedBucket {
+    /// The request was refused before registration-id derivation.
+    PredecisionRefusal,
+    /// The request was held at the admission checkpoint.
+    Admission,
+}
+
+impl LimitedBucket {
+    /// Returns the bucket spelling used in audit records.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PredecisionRefusal => "predecision_refusal",
+            Self::Admission => "admission",
+        }
+    }
+}
+
 /// The identity parts a request asked about.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedIdentity {
     /// The component's plain keyword, exactly as the caller sent it.
@@ -464,6 +488,7 @@ pub struct AuditRecord {
     #[serde(with = "millisecond_rfc3339")]
     pub ts: OffsetDateTime,
     /// The invocation's correlation handle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub request_id: String,
     /// Which verb was invoked.
     pub verb: AuditVerb,
@@ -471,6 +496,7 @@ pub struct AuditRecord {
     /// byte cap.
     pub caller_identity: String,
     /// The identity parts the request asked about.
+    #[serde(default, skip_serializing_if = "requested_identity_is_absent")]
     pub requested: RequestedIdentity,
     /// The derived key, omitted entirely until derivation has produced
     /// one. Never `null` and never an empty string: an empty value is
@@ -482,6 +508,26 @@ pub struct AuditRecord {
     /// refused by [`AuditRecordStore::append`] rather than written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<AuditOutcome>,
+    /// The limiter bucket for a `limited` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limited_bucket: Option<LimitedBucket>,
+    /// Number of suppressed invocations represented by a `limited` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// First arrival included by a `limited` record.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_millisecond_rfc3339"
+    )]
+    pub window_start: Option<OffsetDateTime>,
+    /// Exclusive end of the limited record's coalescing window.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_millisecond_rfc3339"
+    )]
+    pub window_end: Option<OffsetDateTime>,
     /// What was shortened, if anything. Omitted entirely when nothing
     /// was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +558,10 @@ impl AuditRecord {
             requested,
             registration_id: None,
             outcome: None,
+            limited_bucket: None,
+            count: None,
+            window_start: None,
+            window_end: None,
             truncated: None,
         }
     }
@@ -544,6 +594,39 @@ impl AuditRecord {
             requested,
             registration_id: registration_id.filter(|id| !id.is_empty()),
             outcome: Some(outcome),
+            limited_bucket: None,
+            count: None,
+            window_start: None,
+            window_end: None,
+            truncated: None,
+        }
+    }
+
+    /// Builds one counted coalescing record for limiter-suppressed traffic.
+    #[must_use]
+    pub fn limited(
+        ts: OffsetDateTime,
+        verb: AuditVerb,
+        caller_identity: String,
+        bucket: LimitedBucket,
+        count: u64,
+        window_start: OffsetDateTime,
+        window_end: OffsetDateTime,
+    ) -> Self {
+        Self {
+            record_version: AUDIT_RECORD_VERSION,
+            phase: AuditPhase::Limited,
+            ts: canonical_timestamp(ts),
+            request_id: String::new(),
+            verb,
+            caller_identity,
+            requested: RequestedIdentity::default(),
+            registration_id: None,
+            outcome: None,
+            limited_bucket: Some(bucket),
+            count: Some(count),
+            window_start: Some(canonical_timestamp(window_start)),
+            window_end: Some(canonical_timestamp(window_end)),
             truncated: None,
         }
     }
@@ -594,6 +677,10 @@ impl AuditRecord {
         line.push(b'\n');
         Ok(line)
     }
+}
+
+fn requested_identity_is_absent(value: &RequestedIdentity) -> bool {
+    value.service_name.is_empty() && value.host.is_empty() && value.instance.is_none()
 }
 
 /// Reports whether a `registration_id` has nothing to say, which is
@@ -741,6 +828,38 @@ mod millisecond_rfc3339 {
             )));
         }
         Ok(parsed)
+    }
+}
+
+mod optional_millisecond_rfc3339 {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+    use time::OffsetDateTime;
+
+    // Serde's `with` callback supplies a reference to the field.
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S>(
+        value: &Option<OffsetDateTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => super::millisecond_rfc3339::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+            super::millisecond_rfc3339::deserialize(
+                serde::de::value::StringDeserializer::<D::Error>::new(value),
+            )
+            .map(Some)
+        })
     }
 }
 
@@ -1673,7 +1792,51 @@ impl AuditRecordStore {
                     requirement: "must carry an outcome",
                 });
             }
-            (AuditPhase::Intent, false) | (AuditPhase::Outcome, true) => {}
+            (AuditPhase::Intent, false) | (AuditPhase::Outcome, true) => {
+                if record.limited_bucket.is_some()
+                    || record.count.is_some()
+                    || record.window_start.is_some()
+                    || record.window_end.is_some()
+                {
+                    return Err(AuditStoreError::InconsistentPhase {
+                        phase: record.phase,
+                        requirement: "must not carry limited-record fields",
+                    });
+                }
+            }
+            (AuditPhase::Limited, false) => {
+                if let (Some(start), Some(end), Some(_bucket), Some(count)) = (
+                    record.window_start,
+                    record.window_end,
+                    record.limited_bucket,
+                    record.count,
+                ) && record.request_id.is_empty()
+                    && requested_identity_is_absent(&record.requested)
+                    && record.registration_id.is_none()
+                    && count > 0
+                {
+                    if end >= start {
+                        // The configured coalescing duration is owned by the
+                        // sink; the store only rejects inverted bounds.
+                    } else {
+                        return Err(AuditStoreError::InconsistentPhase {
+                            phase: AuditPhase::Limited,
+                            requirement: "must end no earlier than it starts",
+                        });
+                    }
+                } else {
+                    return Err(AuditStoreError::InconsistentPhase {
+                        phase: AuditPhase::Limited,
+                        requirement: "must contain only complete limited-record fields",
+                    });
+                }
+            }
+            (AuditPhase::Limited, true) => {
+                return Err(AuditStoreError::InconsistentPhase {
+                    phase: AuditPhase::Limited,
+                    requirement: "must not carry an outcome",
+                });
+            }
         }
         if !record.ts.offset().is_utc() {
             return Err(AuditStoreError::NonUtcTimestamp {
