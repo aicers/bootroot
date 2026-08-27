@@ -165,7 +165,7 @@ INIT_SUMMARY_JSON=""
 # `RUN_ROOT`, whose removal already copes with root-owned content.
 OPENBAO_ROOT_TOKEN_FILE=""
 OPENBAO_CURL_CONFIG=""
-# The library test binary the in-place rotation runs through.  Built as
+# The library test binary the device's rotation runs through.  Built as
 # the invoking user and executed under `sudo -n`, so no `cargo`
 # invocation ever runs as root and nothing under `target/` changes
 # owner.
@@ -929,23 +929,26 @@ assert_the_shared_audit_log_assertion_still_passes() {
 }
 
 # ---------------------------------------------------------------------------
-# In-place rotation of the file audit device
+# Rotation of the file audit device by reopen-on-signal
 # ---------------------------------------------------------------------------
 #
-# This is the one arm where bootroot's rotation meets the real writer.
-# It lives here rather than in `run-local-lifecycle.sh` because the
-# rotation is conditional on `[registrar_endpoint] enabled = true`: only
-# an endpoint-enabled host has `<audit_store_dir>/openbao` bind-mounted
-# under the container's `/openbao/audit`, and this is the only scenario
-# that provisions one.  Everywhere else the device is still on the
-# `openbao-audit` named volume, nothing on the host is there to rotate,
-# and the rotation changes nothing.
+# This is the one arm where bootroot's rotation meets the real writer
+# and the real Docker.  It lives here rather than in
+# `run-local-lifecycle.sh` because the rotation is conditional on
+# `[registrar_endpoint] enabled = true`: only an endpoint-enabled host
+# has `<audit_store_dir>/openbao` bind-mounted under the container's
+# `/openbao/audit`, and this is the only scenario that provisions one.
+# Everywhere else the device is still on the `openbao-audit` named
+# volume, nothing on the host is there to rotate, and the rotation
+# changes nothing.
 #
 # The rotation itself runs through the library's own code — an ignored
 # unit test, driven the way `run-registrar-verbs-e2e.sh` drives its own
-# — rather than through a shell reimplementation of copy-and-truncate,
-# because a shell copy would prove the mechanism works and say nothing
-# about the code that ships.
+# — rather than through a shell reimplementation of the mechanism,
+# because a shell rename-and-signal would prove the mechanism works and
+# say nothing about the code that ships.  The test asserts the *signal*
+# form was taken, so an image that stopped honouring `SIGHUP` fails this
+# arm rather than quietly degrading it to the lossy fallback.
 
 # One `OpenBao` API call with the root token, over the transitioned TLS
 # listener, verified against the credential's own private bundle.
@@ -1006,9 +1009,10 @@ build_rotation_test_binary() {
   pass "the library test binary is built as the invoking user"
 }
 
-# The device is emptied without restarting, resealing or unsealing
-# OpenBao, and its registration in `sys/audit` is untouched.
-assert_the_device_rotates_in_place() {
+# The active log becomes a generation and OpenBao creates a new one,
+# without restarting, resealing or unsealing it, and its registration in
+# `sys/audit` is untouched.
+assert_the_device_rotates_by_reopen_on_signal() {
   local before after log="$ARTIFACT_DIR/audit-rotation-test.log"
   before="$(openbao_container_state)"
   [ -n "$before" ] || fail "could not read the OpenBao container's state"
@@ -1031,15 +1035,16 @@ assert_the_device_rotates_in_place() {
     BOOTROOT_OPENBAO_AUDIT_E2E_TOKEN_FILE="$OPENBAO_ROOT_TOKEN_FILE" \
     BOOTROOT_OPENBAO_AUDIT_E2E_CA_BUNDLE="$INTERNAL_DIR/ca-bundle.pem" \
     "$ROTATION_TEST_BIN" \
-    registrar::openbao_audit::tests::a_live_openbao_audit_device_rotates_in_place \
+    registrar::openbao_audit::tests::a_live_openbao_audit_device_rotates_by_reopen_on_signal \
     --exact --ignored --nocapture >"$log" 2>&1
   local status=$?
   set -e
   [ "$status" -eq 0 ] ||
-    fail "the in-place rotation of the live audit device failed; see $log"
+    fail "the reopen-on-signal rotation of the live audit device failed; see $log"
   grep -q "1 passed" "$log" ||
-    fail "the in-place rotation test selected no test; see $log"
-  pass "bootroot rotated the live audit device in place, and sys/audit is unchanged"
+    fail "the reopen-on-signal rotation test selected no test; see $log"
+  pass "bootroot rotated the live audit device by reopen-on-signal, losing no record, and \
+sys/audit is unchanged"
 
   after="$(openbao_container_state)"
   assert_equal "OpenBao was neither restarted nor replaced by the rotation" \
@@ -1048,10 +1053,66 @@ assert_the_device_rotates_in_place() {
     "false true" "$(openbao_seal_state)"
 }
 
+# The audited path of the record driven before the rotation.
+LOSSLESS_MARKER_BEFORE=""
+
+# Drives one request whose audited path is unique to this run, so that
+# "the rotation lost nothing" can be asserted against a *record* rather
+# than against a byte count that a coincidence could satisfy.
+drive_a_marker_record_before_the_rotation() {
+  LOSSLESS_MARKER_BEFORE="lossless-$(od -An -N8 -tx1 </dev/urandom | tr -d ' \n')"
+  openbao_api GET "secret/data/${LOSSLESS_MARKER_BEFORE}" >/dev/null ||
+    fail "could not drive the pre-rotation marker record"
+  sudo -n grep -qF "$LOSSLESS_MARKER_BEFORE" "${AUDIT_STORE_DIR}/openbao/audit.log" ||
+    fail "the pre-rotation marker record never reached the active log"
+  pass "a marker record was driven into the active log before the rotation"
+}
+
+# The rotation loses no record: the entry driven before it is in the
+# generation and nowhere else, the entry driven after it is in the new
+# active log and nowhere else, and neither is duplicated.
+#
+# The rename-and-reopen mechanism copies nothing, so the generation *is*
+# the file the pre-rotation entry was written to.  A copy-and-truncate
+# fallback would have destroyed whatever landed while the copy ran, which
+# is the property this arm exists to pin.
+#
+# `sudo -n bash -c` rather than a bare `sudo -n grep`: the glob has to be
+# expanded by the elevated shell, since the store directory is root-owned
+# and `0700` and the invoking user cannot list it.
+assert_the_rotation_lost_no_record() {
+  local dir="${AUDIT_STORE_DIR}/openbao" after hits
+  after="lossless-$(od -An -N8 -tx1 </dev/urandom | tr -d ' \n')"
+  openbao_api GET "secret/data/${after}" >/dev/null ||
+    fail "could not drive the post-rotation marker record"
+
+  hits="$(sudo -n bash -c \
+    "grep -lF '${LOSSLESS_MARKER_BEFORE}' '${dir}'/audit-*.log '${dir}/audit.log' 2>/dev/null | wc -l" |
+    tr -d ' ')"
+  assert_equal "the record driven before the rotation survives in exactly one file" \
+    "1" "$hits"
+  if sudo -n grep -qF "$LOSSLESS_MARKER_BEFORE" "${dir}/audit.log"; then
+    fail "the pre-rotation record is in the new active log, so the generation is not the file \
+it was written to"
+  fi
+  sudo -n bash -c "grep -qF '${LOSSLESS_MARKER_BEFORE}' '${dir}'/audit-*.log" ||
+    fail "the record driven before the rotation is in no generation: the rotation lost it"
+
+  hits="$(sudo -n bash -c \
+    "grep -lF '${after}' '${dir}'/audit-*.log '${dir}/audit.log' 2>/dev/null | wc -l" |
+    tr -d ' ')"
+  assert_equal "the record driven after the rotation appears in exactly one file" "1" "$hits"
+  sudo -n grep -qF "$after" "${dir}/audit.log" ||
+    fail "the record driven after the rotation did not reach the new active log"
+
+  pass "the rotation lost no record: the pre-rotation entry is in the generation, the \
+post-rotation entry is in the new active log, and neither is duplicated"
+}
+
 # A fresh AppRole login and a fresh KV read, driven after the rotation.
 #
 # The shared assertion below reads the *active* log, which a rotation
-# empties, so it passes exactly when the entries it looks for were
+# replaces, so it passes exactly when the entries it looks for were
 # written since.  The role is this run's own rather than a sidecar's, so
 # the login is traffic this arm caused.
 drive_fresh_audit_traffic() {
@@ -1080,18 +1141,17 @@ drive_fresh_audit_traffic() {
   pass "a fresh AppRole login and KV read were driven after the rotation"
 }
 
-# The mechanism rests on the device's descriptor being opened in append
-# mode: a truncate then resets the write offset instead of leaving
-# OpenBao writing at its old one into a sparse hole.  Established
-# against the pinned image rather than assumed.
+# The active log OpenBao created after the reopen is a fresh file it
+# appends to from offset zero, not one it went on writing at its old
+# offset into a sparse hole.  Established against the pinned image
+# rather than assumed, because "the signal was honoured" and "the new
+# file is written correctly" are two claims and only the first is what
+# the reopen evidence establishes.
 #
 # It also rests on the daemon and the container seeing one filesystem,
-# which a Linux bind mount is.  A macOS developer machine is not: Docker
-# Desktop reaches a host bind mount through a VM that does not propagate
-# a host-side truncate to the guest's cached length, so this check fails
-# there for a reason that does not exist on the deployment target.  That
-# is moot for this harness, which already needs passwordless sudo and so
-# does not run on such a host at all.
+# which a Linux bind mount is.  That is moot for this harness, which
+# already needs passwordless sudo and so does not run on a macOS
+# developer machine at all.
 assert_the_rotated_active_log_begins_at_offset_zero() {
   local host_log="${AUDIT_STORE_DIR}/openbao/audit.log" first
   sudo -n test -s "$host_log" ||
@@ -1336,7 +1396,9 @@ main() {
   # a log a rotation has emptied.
   log_phase "assert-audit-rotation"
   build_rotation_test_binary
-  assert_the_device_rotates_in_place
+  drive_a_marker_record_before_the_rotation
+  assert_the_device_rotates_by_reopen_on_signal
+  assert_the_rotation_lost_no_record
   drive_fresh_audit_traffic
   assert_the_rotated_active_log_begins_at_offset_zero
   # The same shared assertion, unmodified, over the rotated deployment.

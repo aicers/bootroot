@@ -111,11 +111,11 @@ enabled = false
 # the two disagree, the file count wins.
 #
 # The three openbao_audit_* keys bound OpenBao's own file audit device,
-# which the daemon rotates in place when the registrar endpoint is
-# enabled.  They are separate keys rather than a reuse of the three
-# above because the two writers have unrelated volumes: one bounded line
-# per registrar invocation, against one entry per OpenBao request across
-# the deployment.  The hard ceiling is on the retained generations —
+# which the daemon rotates when the registrar endpoint is enabled.  They
+# are separate keys rather than a reuse of the three above because the
+# two writers have unrelated volumes: one bounded line per registrar
+# invocation, against one entry per OpenBao request across the
+# deployment.  The hard ceiling is on the retained generations —
 # openbao_audit_max_file_bytes x openbao_audit_max_retained_files, 448
 # MiB by default — and the device itself has no absolute footprint
 # ceiling, because bootroot is not the process writing it.  The floor on

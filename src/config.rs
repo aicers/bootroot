@@ -2201,6 +2201,41 @@ openbao_audit_min_retain_days = 45
         settings.validate().unwrap();
     }
 
+    /// Nothing selects which rotation mechanism the daemon uses.
+    ///
+    /// The choice is made at runtime from what the filesystem shows
+    /// after the signal, once per pass, and a key that could pin it
+    /// would let a deployment sit silently on the lossy form. So the
+    /// `[registrar]` table refuses one, like any other unknown key.
+    #[test]
+    fn no_registrar_key_selects_the_openbao_audit_rotation_mechanism() {
+        for key in [
+            "openbao_audit_rotation_mechanism = \"truncate\"",
+            "openbao_audit_signal_rotation = false",
+            "openbao_audit_container = \"bootroot-openbao\"",
+        ] {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                r#"
+[registrar]
+audit_store_dir = "/srv/bootroot/audit-store"
+{key}
+"#
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let error = Settings::from_file(Some(file.path().to_path_buf()))
+                .expect_err("a mechanism selector is not a configuration key");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("unknown field"),
+                "{key} must be refused as an unknown field, got: {rendered}"
+            );
+        }
+    }
+
     /// A retained family whose byte budget does not fit in `u64` is
     /// refused at load, naming both keys, so the rotation's own
     /// arithmetic can be total.

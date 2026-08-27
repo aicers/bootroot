@@ -44,25 +44,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   CA, and its certificates and keys survive the restart byte-identically.
   An already-expired leaf is repaired at start, before the endpoint's TLS
   material loads, rather than at the first renewal tick.
-- `bootroot-agent` now rotates `OpenBao`'s file audit device in place on
-  a host whose registrar endpoint is enabled, so the deployment no
-  longer needs an external rotator against it. Every 60 seconds the
-  daemon copies the active log's stable prefix aside as
-  `audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.log` beside it, then truncates the
-  active log to zero — `OpenBao` is never restarted, resealed or
-  signalled, and the log is never unlinked, renamed or replaced. Three
-  new `[registrar]` keys bound it: `openbao_audit_max_file_bytes`
-  (default 64 MiB, floor 1 MiB), `openbao_audit_max_retained_files`
-  (default 7) and `openbao_audit_min_retain_days` (default 90). The
-  product of the first two is a hard ceiling on the retained
-  generations that every completed check re-establishes; the device
-  itself has no absolute footprint ceiling, because bootroot is not the
-  process writing it, so a run of five consecutive checks that leave an
-  obligation unmet is logged at `error` with the active log's size and
-  the retained set's total. A rotation failure never fails an `OpenBao`
-  request, stops the daemon or takes the endpoint down. Hosts without
-  the registrar endpoint are unchanged: no rotation runs, the three keys
-  have no effect, and the device stays on the `openbao-audit` volume.
+- `bootroot-agent` now rotates `OpenBao`'s file audit device on a host
+  whose registrar endpoint is enabled, so the deployment no longer needs
+  an external rotator against it. Every 60 seconds the daemon renames the
+  active log aside as `audit-<YYYYMMDDTHHMMSSZ>-<NNNNNN>.log` beside it
+  and sends `SIGHUP` to the `OpenBao` container, which creates a fresh
+  `audit.log` — nothing is copied and nothing is truncated, so a rotation
+  loses no record, and `OpenBao` is never restarted, resealed or
+  unsealed. The container is found from the device's own bind mount and
+  signalled by id, so a host running two installs signals the right one.
+  Where the reopen cannot be confirmed the daemon restores the active log
+  and completes the same rotation by copying its stable prefix aside and
+  truncating it, announcing that once at `info`; that fallback loses the
+  records written while the copy runs, so it is a degraded state rather
+  than the normal one. Three new `[registrar]` keys bound the result:
+  `openbao_audit_max_file_bytes` (default 64 MiB, floor 1 MiB),
+  `openbao_audit_max_retained_files` (default 7) and
+  `openbao_audit_min_retain_days` (default 90). The product of the first
+  two is a hard ceiling on the retained generations that every completed
+  check re-establishes; the device itself has no absolute footprint
+  ceiling, because bootroot is not the process writing it, so a run of
+  five consecutive checks that leave an obligation unmet is logged at
+  `error` with the active log's size and the retained set's total. A
+  rotation failure never fails an `OpenBao` request, stops the daemon or
+  takes the endpoint down. Hosts without the registrar endpoint are
+  unchanged: no rotation runs, the three keys have no effect, and the
+  device stays on the `openbao-audit` volume.
 - `bootroot status --agent-config` now scans the registrar audit store and
   reports unpaired intents, malformed records, and retention shortfalls. It
   distinguishes a store that is not configured from a provisioned empty store
