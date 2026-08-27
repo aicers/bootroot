@@ -4457,24 +4457,47 @@ async fn a_replacement_between_the_marker_and_the_rename_is_never_signalled() {
     let recorded = identity_of(&active);
 
     let replaced = active.clone();
+    let stand_in = dir.path().join("replacement.log");
     let once = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&observed);
     rotation.on_rename_aside(move |path| {
         assert_eq!(path, replaced, "the hook is handed the active log");
         if once.swap(true, Ordering::SeqCst) {
             return;
         }
-        std::fs::remove_file(&replaced).expect("the live log is unlinked");
-        create_active_log(&replaced);
+        // Staged under a second name and renamed *over* the live log,
+        // rather than unlinking it and recreating the name. While the
+        // live inode is still linked its number cannot be handed out
+        // again, so the replacement is a different file by
+        // construction. Unlinking first would let a filesystem that
+        // recycles inode numbers — most of them, ext4 among them —
+        // hand back the very identity the marker recorded, and a pass
+        // that carried on would be right to.
+        create_active_log(&stand_in);
+        *slot.lock().expect("the record lock is live") = Some(identity_of(&stand_in));
+        std::fs::rename(&stand_in, &replaced).expect("the replacement takes the name");
     });
 
+    let mut result = None;
     let logs = logs_from(async {
-        let outcome = rotation.run_pass(at(0)).await;
-        assert!(outcome.rotation.is_unmet(), "the pass failed");
-        assert_eq!(outcome.form, RotationForm::None, "and rotated by no form");
-        assert_eq!(outcome.consecutive_failures, 1);
-        assert!(!outcome.restore_pending, "no restore was attempted");
+        result = Some(rotation.run_pass(at(0)).await);
     })
     .await;
+    let outcome = result.expect("the pass returned an outcome");
+    assert_ne!(
+        observed
+            .lock()
+            .expect("the record lock is live")
+            .take()
+            .expect("the replacement was made"),
+        recorded,
+        "the replacement is a different file, which is the whole of this case"
+    );
+    assert!(outcome.rotation.is_unmet(), "the pass failed:\n{logs}");
+    assert_eq!(outcome.form, RotationForm::None, "and rotated by no form");
+    assert_eq!(outcome.consecutive_failures, 1);
+    assert!(!outcome.restore_pending, "no restore was attempted");
 
     assert!(
         docker.signalled().is_empty(),
