@@ -257,6 +257,51 @@ image_identity() {
     "$(sudo -n blkid -o value -s UUID "$1")"
 }
 
+# The backing image properties a re-provisioning run must leave alone.
+# GNU stat's %y spelling includes the nanoseconds, so two writes in the
+# same second cannot collapse to the same snapshot.
+image_reprovisioning_metadata() {
+  sudo -n stat -c 'mtime=%y size=%s blocks=%b' "$1"
+}
+
+# Writes past the reserve and accepts only the kernel's ENOSPC result.
+#
+# `dd` reports the errno as a localized string, so its nonzero status cannot
+# distinguish a full reserve from an I/O or permission failure.  Python
+# exposes the numeric errno directly; it exits successfully only for ENOSPC.
+# It writes one byte more than the configured reserve in bounded chunks so
+# the result cannot be a successful short write.
+assert_reserve_ceiling_enospc() {
+  local file="$1" reserve="$2" description="$3"
+  if ! sudo_to_log "$PYTHON_BIN" -c '
+import errno
+import sys
+
+path = sys.argv[1]
+remaining = int(sys.argv[2]) + 1
+chunk = b"\0" * (1024 * 1024)
+
+try:
+    with open(path, "wb", buffering=0) as output:
+        while remaining:
+            written = output.write(chunk[:min(remaining, len(chunk))])
+            if written == 0:
+                raise OSError(errno.EIO, "write returned zero bytes")
+            remaining -= written
+except OSError as error:
+    if error.errno == errno.ENOSPC:
+        sys.exit(0)
+    print(f"unexpected write failure errno={error.errno}", file=sys.stderr)
+    sys.exit(1)
+
+print("write beyond the reserve unexpectedly succeeded", file=sys.stderr)
+sys.exit(1)
+' "$file" "$reserve"; then
+    fail "${description} did not fail with ENOSPC; see ${RUN_LOG}"
+  fi
+  pass "${description} failed with ENOSPC"
+}
+
 ensure_prerequisites() {
   command -v docker >/dev/null 2>&1 || fail "docker is required"
   docker compose version >/dev/null 2>&1 || fail "docker compose is required"
@@ -945,21 +990,23 @@ assert_the_rendered_steps_activate_the_reserve() {
   assert_equal "the mounted store directory is root-owned at 0700" "0:0:700" \
     "$(file_owner_mode "$store")"
 
-  # Inode, size and the ext4 UUID -- one term per word of the claim:
-  # a recreated image is a new inode, a resized one a new size, a
-  # reformatted one a new filesystem UUID.
-  #
-  # Deliberately *not* `st_blocks` or mtime, which the first draft of
-  # this assertion used and which are both unstable here for reasons
-  # that have nothing to do with bootroot.  The image is a mounted
-  # filesystem's backing file for the whole window: ext4 commits its
-  # journal and rewrites its superblock through the loop device every
-  # few seconds, which moves mtime, and the host's own allocation
-  # bookkeeping moves `st_blocks`.  Neither is part of "recreated,
-  # resized or reformatted", and the allocation is asserted on its own
-  # above.
-  local before after
+  # Re-provisioning must not touch the activated image.  In particular,
+  # mtime, length and allocated blocks are the lifecycle contract's
+  # observable non-destructive facts.  Remount read-only before taking the
+  # snapshots: an ext4 journal or superblock update while it is mounted
+  # read-write would otherwise change the backing image independently of
+  # `bootroot init`.  This run only reads the mounted reserve to report
+  # **enforced**, so read-only also makes an unexpected write fail instead
+  # of being mistaken for filesystem background activity.  Keep the inode
+  # and filesystem UUID comparison as well: they make a recreation or
+  # reformat failure clear.
+  sudo -n sync ||
+    fail "could not flush the activated reserve before re-provisioning"
+  sudo -n mount -o remount,ro "$store" ||
+    fail "could not remount the activated reserve read-only for re-provisioning"
+  local before after metadata_before metadata_after
   before="$(image_identity "$image")"
+  metadata_before="$(image_reprovisioning_metadata "$image")"
   if run_bootroot_as_root init \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
     --secrets-dir "$SECRETS_DIR" \
@@ -983,7 +1030,12 @@ assert_the_rendered_steps_activate_the_reserve() {
     fail "the re-run rendered an image command over an activated reserve; see ${log}.2"
   fi
   after="$(image_identity "$image")"
+  metadata_after="$(image_reprovisioning_metadata "$image")"
   assert_equal "the image was not recreated, resized or reformatted" "$before" "$after"
+  assert_equal "the image mtime, length and allocated blocks did not change on re-provisioning" \
+    "$metadata_before" "$metadata_after"
+  sudo -n mount -o remount,rw "$store" ||
+    fail "could not restore the activated reserve read-write after re-provisioning"
 
   # The allocation again, and this one is the assertion that catches a
   # missing `lazy_itable_init=0`.  The check above runs seconds after
@@ -1000,9 +1052,8 @@ assert_the_rendered_steps_activate_the_reserve() {
   # absorbs it.
   local root_before root_after
   root_before="$(df -P -k / | awk 'NR==2 {print $4}')"
-  if sudo_to_log dd if=/dev/zero of="$store/records/fill" bs=1M count=64; then
-    fail "a write of four times the reserve succeeded; the ceiling is not enforced"
-  fi
+  assert_reserve_ceiling_enospc "$store/records/fill" "$reserve" \
+    "a write beyond the reserve"
   assert_equal "the overflowing file stopped inside the reserve" "yes" \
     "$([ "$(sudo -n stat -c %s "$store/records/fill")" -lt "$reserve" ] && echo yes || echo no)"
   root_after="$(df -P -k / | awk 'NR==2 {print $4}')"
@@ -2026,9 +2077,8 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   # the device OpenBao is required to be able to write.
   local root_before root_after
   root_before="$(df -P -k / | awk 'NR==2 {print $4}')"
-  if sudo_to_log dd if=/dev/zero of="$store/records/fill" bs=1M count=64; then
-    fail "a write of four times the reserve succeeded under the deployment"
-  fi
+  assert_reserve_ceiling_enospc "$store/records/fill" "$reserve" \
+    "a write beyond the deployed reserve"
   assert_equal "the overflowing file stopped inside the deployed reserve" "yes" \
     "$([ "$(sudo -n stat -c %s "$store/records/fill")" -lt "$reserve" ] && echo yes || echo no)"
   root_after="$(df -P -k / | awk 'NR==2 {print $4}')"
