@@ -86,6 +86,35 @@ pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<C
         .context("Failed to build trusted HTTP client")
 }
 
+/// Builds a TLS configuration that establishes trust solely from certificates
+/// the peer presents whose fingerprints already occur in `pins`.
+///
+/// This is intentionally restricted to start-time registrar repair.  The
+/// configured CA bundle is derived output in that path, so neither it nor the
+/// system roots can establish the connection that recreates it.
+///
+/// # Errors
+///
+/// Returns an error when `pins` is empty.
+pub(crate) fn build_bootstrap_client_config(pins: &[String]) -> Result<ClientConfig> {
+    install_crypto_provider();
+    let allowed = pins
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    if allowed.is_empty() {
+        anyhow::bail!("trusted_ca_sha256 must not be empty for bootstrap TLS");
+    }
+
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(BootstrapPinnedCertVerifier::new(allowed)));
+    Ok(config)
+}
+
 /// Builds a [`reqwest::Client`] whose trust root is the given PEM-encoded
 /// CA bundle (in-memory, no file I/O), with optional SHA-256 certificate
 /// pinning.
@@ -441,6 +470,112 @@ impl ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
+/// Verifies a peer chain against pins that predate the connection.
+///
+/// Unlike [`PinnedCertVerifier`], this verifier cannot have roots up front:
+/// the only recoverable CA material is the peer's TLS chain.  It filters that
+/// chain to configured pins, then lets webpki build a normal path to one of
+/// those anchors.  The direct end-entity-pin fallback deliberately remains
+/// the same as the ordinary pin verifier's branch.
+#[derive(Debug)]
+struct BootstrapPinnedCertVerifier {
+    allowed: HashSet<String>,
+    supported_algs: WebPkiSupportedAlgorithms,
+}
+
+impl BootstrapPinnedCertVerifier {
+    fn new(allowed: HashSet<String>) -> Self {
+        Self {
+            allowed,
+            supported_algs: rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+
+    fn check_direct_pin(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        now: UnixTime,
+    ) -> Result<(), rustls::Error> {
+        PinnedCertVerifier::new(None, self.allowed.clone()).check_direct_pin(end_entity, now)
+    }
+
+    fn verify_to_presented_pin(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Option<bool> {
+        let mut roots = rustls::RootCertStore::empty();
+        for certificate in std::iter::once(end_entity).chain(intermediates.iter()) {
+            if self.allowed.contains(&sha256_hex(certificate.as_ref())) {
+                // A directly pinned server leaf is not a trust anchor. Leave
+                // it to the unchanged direct-pin branch when it cannot enter
+                // the root store; it must not make an actual pinned anchor
+                // elsewhere in the chain disappear.
+                let _ = roots.add(CertificateDer::from(certificate.as_ref().to_vec()));
+            }
+        }
+        if roots.is_empty() {
+            return None;
+        }
+        let Ok(verifier) = WebPkiServerVerifier::builder(Arc::new(roots)).build() else {
+            return Some(false);
+        };
+        Some(
+            verifier
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .is_ok(),
+        )
+    }
+}
+
+impl ServerCertVerifier for BootstrapPinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let chained = self
+            .verify_to_presented_pin(end_entity, intermediates, server_name, ocsp_response, now)
+            .unwrap_or(false);
+        if !chained {
+            // Keep the ordinary verifier's direct end-entity-pin fallback:
+            // a failed path to a presented pinned anchor must not reject a
+            // separately valid direct pin on the server certificate.
+            self.check_direct_pin(end_entity, now)?;
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
+    }
+}
+
 /// Computes the `trusted_ca_sha256` fingerprints (lowercase hex SHA-256 of
 /// each certificate's DER) for every certificate in a PEM bundle.
 ///
@@ -727,6 +862,95 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bootstrap_verifier_builds_a_path_to_a_presented_pinned_anchor() {
+        install_crypto_provider();
+        let root_key = KeyPair::generate().expect("root key");
+        let mut root_params = CertificateParams::default();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root = root_params
+            .self_signed(&root_key)
+            .expect("root certificate");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("leaf parameters");
+        let issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf certificate");
+        let leaf = CertificateDer::from(leaf.der().to_vec());
+        let root = CertificateDer::from(root.der().to_vec());
+        let verifier = BootstrapPinnedCertVerifier::new(HashSet::from([sha256_hex(root.as_ref())]));
+
+        let result = verifier.verify_server_cert(
+            &leaf,
+            &[root],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            direct_pin_test_time(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bootstrap_verifier_rejects_a_pinned_certificate_off_the_chain() {
+        install_crypto_provider();
+        let pinned_root_key = KeyPair::generate().expect("pinned root key");
+        let mut pinned_root_params = CertificateParams::default();
+        pinned_root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let pinned_root = pinned_root_params
+            .self_signed(&pinned_root_key)
+            .expect("pinned root certificate");
+
+        let issuing_root_key = KeyPair::generate().expect("issuing root key");
+        let mut issuing_root_params = CertificateParams::default();
+        issuing_root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::from_params(&issuing_root_params, &issuing_root_key);
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("leaf parameters");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf certificate");
+        let leaf = CertificateDer::from(leaf.der().to_vec());
+        let pinned_root = CertificateDer::from(pinned_root.der().to_vec());
+        let verifier =
+            BootstrapPinnedCertVerifier::new(HashSet::from([sha256_hex(pinned_root.as_ref())]));
+
+        let result = verifier.verify_server_cert(
+            &leaf,
+            &[pinned_root],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            direct_pin_test_time(),
+        );
+
+        assert!(
+            result.is_err(),
+            "a pinned certificate not on the leaf's validation path must not establish trust"
+        );
+    }
+
+    #[test]
+    fn bootstrap_verifier_keeps_the_direct_pin_fallback() {
+        install_crypto_provider();
+        let certificate = generate_ca_certificate();
+        let verifier =
+            BootstrapPinnedCertVerifier::new(HashSet::from([sha256_hex(certificate.as_ref())]));
+
+        let result = verifier.verify_server_cert(
+            &certificate,
+            &[],
+            &ServerName::try_from("localhost").expect("valid server name"),
+            &[],
+            direct_pin_test_time(),
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]

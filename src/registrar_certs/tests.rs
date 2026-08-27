@@ -5,7 +5,9 @@
 //! test mutates the process environment.
 
 use std::collections::HashSet;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
@@ -13,6 +15,10 @@ use rcgen::{
     SanType,
 };
 use tempfile::TempDir;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use wiremock::matchers::{method, path as path_matcher};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -844,6 +850,8 @@ async fn every_unusable_state_drives_an_issuance() {
 /// actually reached a wire rather than on what was passed in.
 #[derive(Default)]
 struct Observed {
+    /// Every directory request accepted by the mock CA.
+    directory_requests: AtomicUsize,
     /// The decoded `newAccount` payloads, one per registration.
     account_payloads: Mutex<Vec<serde_json::Value>>,
     /// The `(timestamp, signature, token, key_authorization)` of every
@@ -865,10 +873,79 @@ struct ResponderRequest {
 /// bound on port 0.
 struct AcmeFixture {
     _acme: MockServer,
-    _responder: MockServer,
+    responder: MockServer,
+    tls_proxy: Option<TlsAcmeProxy>,
     directory_url: String,
     responder_url: String,
     observed: Arc<Observed>,
+}
+
+/// A local TLS listener which forwards raw HTTP to the mock ACME server.
+///
+/// The ACME fixture itself stays HTTP-only because `wiremock` does not offer a
+/// TLS listener.  This proxy lets the full issuance flow exercise the same
+/// TLS client connections a real registrar repair uses.
+struct TlsAcmeProxy {
+    handle: JoinHandle<()>,
+    url: String,
+}
+
+impl TlsAcmeProxy {
+    async fn start(ca: &TestCa, upstream: &str) -> Self {
+        crate::tls::install_crypto_provider();
+        let (leaf_pem, key_pem) = ca.issue(&leaf_params("localhost", -1, 30));
+        let leaf = crate::tls::parse_pem_to_cert_list(leaf_pem.as_bytes())
+            .expect("TLS proxy leaf parses")
+            .into_iter()
+            .next()
+            .expect("TLS proxy leaf exists");
+        let root = crate::tls::parse_pem_to_cert_list(ca.root_pem.as_bytes())
+            .expect("TLS proxy root parses")
+            .into_iter()
+            .next()
+            .expect("TLS proxy root exists");
+        let mut reader = BufReader::new(key_pem.as_bytes());
+        let key = rustls_pemfile::private_key(&mut reader)
+            .expect("TLS proxy key parses")
+            .expect("TLS proxy key exists");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![leaf, root], key)
+            .expect("TLS proxy configuration");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TLS proxy binds a local port");
+        let port = listener.local_addr().expect("TLS proxy address").port();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let upstream = upstream
+            .strip_prefix("http://")
+            .expect("wiremock uses HTTP URLs")
+            .to_string();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let Ok(mut upstream) = TcpStream::connect(&upstream).await else {
+                    return;
+                };
+                let _ = copy_bidirectional(&mut stream, &mut upstream).await;
+            }
+        });
+        Self {
+            handle,
+            url: format!("https://localhost:{port}"),
+        }
+    }
+}
+
+impl Drop for TlsAcmeProxy {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 /// Answers the authorization: pending on the first fetch, so the
@@ -1000,6 +1077,25 @@ struct AccountResponder {
     account_url: String,
 }
 
+/// Counts a directory request and returns the configured ACME endpoints.
+struct DirectoryResponder {
+    base: String,
+    observed: Arc<Observed>,
+}
+
+impl Respond for DirectoryResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.observed
+            .directory_requests
+            .fetch_add(1, Ordering::Relaxed);
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "newNonce": format!("{}/new-nonce", self.base),
+            "newAccount": format!("{}/new-account", self.base),
+            "newOrder": format!("{}/new-order", self.base),
+        }))
+    }
+}
+
 impl Respond for AccountResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         if let Some(payload) = jws_payload(&request.body) {
@@ -1024,13 +1120,38 @@ async fn start_acme(ca: Arc<TestCa>) -> AcmeFixture {
     let observed = Arc::new(Observed::default());
     let base = acme.uri();
 
+    start_acme_with_urls(ca, acme, responder, observed, base).await
+}
+
+/// Starts the ACME fixture behind a local TLS listener whose certificate chains
+/// to `ca`.
+async fn start_tls_acme(ca: Arc<TestCa>) -> AcmeFixture {
+    let acme = MockServer::start().await;
+    let responder = MockServer::start().await;
+    let observed = Arc::new(Observed::default());
+    let tls_proxy = TlsAcmeProxy::start(&ca, &acme.uri()).await;
+    let base = tls_proxy.url.clone();
+
+    let mut fixture = start_acme_with_urls(ca, acme, responder, observed, base).await;
+    fixture.tls_proxy = Some(tls_proxy);
+    fixture
+}
+
+/// Mounts the mock ACME routes using `base` for every ACME URL sent to the
+/// client.  The backing mock server may be reached directly or through TLS.
+async fn start_acme_with_urls(
+    ca: Arc<TestCa>,
+    acme: MockServer,
+    responder: MockServer,
+    observed: Arc<Observed>,
+    base: String,
+) -> AcmeFixture {
     Mock::given(method("GET"))
         .and(path_matcher("/directory"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "newNonce": format!("{base}/new-nonce"),
-            "newAccount": format!("{base}/new-account"),
-            "newOrder": format!("{base}/new-order"),
-        })))
+        .respond_with(DirectoryResponder {
+            base: base.clone(),
+            observed: Arc::clone(&observed),
+        })
         .mount(&acme)
         .await;
 
@@ -1114,7 +1235,8 @@ async fn start_acme(ca: Arc<TestCa>) -> AcmeFixture {
         directory_url: format!("{base}/directory"),
         responder_url: responder.uri(),
         _acme: acme,
-        _responder: responder,
+        responder,
+        tls_proxy: None,
         observed,
     }
 }
@@ -1546,7 +1668,7 @@ async fn a_missing_or_unparseable_bundle_still_publishes() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), true)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
             .await
             .unwrap_or_else(|err| panic!("seed {seed:?} must still publish: {err:#}"));
 
@@ -1560,18 +1682,185 @@ async fn a_missing_or_unparseable_bundle_still_publishes() {
     }
 }
 
-/// The outbound ACME transport is anchored to `[trust].ca_bundle_path`
-/// too, and that is checked before the flow begins.
-///
-/// So on a host whose ACME directory is reached over TLS — every real
-/// deployment — a bundle that is missing, unreadable or unparseable
-/// fails the issuance there rather than at the merge. It is still a
-/// failure **before publication**, naming the bundle, and it is
-/// pre-existing behaviour of the shared outbound path rather than
-/// anything issuance decides. Asserted so the boundary is recorded
-/// rather than discovered.
+/// A missing or parse-empty output bundle is repaired over authenticated TLS,
+/// without the bootroot-internal credential CA bundle being available.
 #[tokio::test]
-async fn a_bundle_the_outbound_transport_cannot_read_fails_before_publication() {
+async fn tls_bootstrap_repairs_missing_or_unparseable_bundles() {
+    for seed in [None, Some("not a certificate at all\n")] {
+        let mut host = Host::new();
+        let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+        aim_at(&mut host.settings, &acme);
+        let bundle = host.dir.path().join("bootstrap-bundle.pem");
+        if let Some(contents) = seed {
+            std::fs::write(&bundle, contents).expect("seed the output bundle");
+        }
+        host.settings.trust.ca_bundle_path = Some(bundle.clone());
+
+        let internal_bundle = InternalPaths::new(&host.secrets_dir()).ca_bundle();
+        std::fs::remove_file(&internal_bundle).expect("remove the internal credential CA bundle");
+
+        let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+        let client = pairs
+            .iter()
+            .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+            .expect("the client pair");
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("TLS bootstrap seed {seed:?} must complete issuance: {error:#}")
+            });
+
+        assert!(
+            !acme
+                .observed
+                .csrs
+                .lock()
+                .expect("CSR log is not poisoned")
+                .is_empty(),
+            "seed {seed:?} must reach the TLS-proxied ACME server"
+        );
+        let (cert_path, key_path) = host.client_pair();
+        assert!(cert_path.exists(), "seed {seed:?} must publish the leaf");
+        assert!(key_path.exists(), "seed {seed:?} must publish the key");
+        let merged = std::fs::read_to_string(&bundle).expect("read the repaired bundle");
+        crate::tls::parse_pem_to_cert_list(merged.as_bytes())
+            .expect("seed {seed:?} must leave a parseable bundle");
+    }
+}
+
+/// An empty or mismatched bootstrap pin set fails before the TLS proxy can
+/// forward an ACME HTTP request, and cannot publish either material file.
+#[tokio::test]
+async fn tls_bootstrap_rejects_empty_or_mismatched_pins_before_acme_traffic() {
+    for pins in [Vec::new(), vec!["00".repeat(32)]] {
+        let mut host = Host::new();
+        let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+        aim_at(&mut host.settings, &acme);
+        let bundle = host.dir.path().join("bootstrap-bundle.pem");
+        host.settings.trust.ca_bundle_path = Some(bundle.clone());
+        host.settings.trust.trusted_ca_sha256 = pins;
+
+        let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+        let client = pairs
+            .iter()
+            .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+            .expect("the client pair");
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+            .await
+            .expect_err("untrusted bootstrap transport must fail the issuance");
+
+        assert_eq!(
+            acme.observed.directory_requests.load(Ordering::Relaxed),
+            0,
+            "a rejected pin set must prevent ACME HTTP traffic"
+        );
+        let (cert_path, key_path) = host.client_pair();
+        assert!(
+            !cert_path.exists(),
+            "a rejected pin set must not publish a leaf"
+        );
+        assert!(
+            !key_path.exists(),
+            "a rejected pin set must not publish a key"
+        );
+        assert!(
+            !bundle.exists(),
+            "a rejected pin set must not create a bundle"
+        );
+    }
+}
+
+/// An HTTPS HTTP-01 responder uses the same bootstrap pins as the ACME
+/// client, so a trusted responder request completes without reading the
+/// missing output bundle.
+#[tokio::test]
+async fn tls_bootstrap_uses_pins_for_an_https_responder() {
+    let mut host = Host::new();
+    let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+    let responder_proxy = TlsAcmeProxy::start(&host.ca, &acme.responder.uri()).await;
+    aim_at(&mut host.settings, &acme);
+    host.settings.acme.http_responder_url = responder_proxy.url.clone();
+    let bundle = host.dir.path().join("bootstrap-bundle.pem");
+    host.settings.trust.ca_bundle_path = Some(bundle.clone());
+
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        .await
+        .expect("a pinned HTTPS responder must complete bootstrap issuance");
+
+    assert!(
+        !acme
+            .observed
+            .responder_requests
+            .lock()
+            .expect("responder log is not poisoned")
+            .is_empty(),
+        "the HTTPS responder must receive the bootstrap registration"
+    );
+    assert!(
+        bundle.exists(),
+        "successful issuance must repair the bundle"
+    );
+}
+
+/// An HTTPS responder whose chain has no configured pin fails closed after
+/// the ACME connection succeeds and before certificate publication.
+#[tokio::test]
+async fn tls_bootstrap_rejects_an_unpinned_https_responder() {
+    let mut host = Host::new();
+    let acme = start_tls_acme(Arc::clone(&host.ca)).await;
+    let responder_ca = TestCa::new("Unpinned Responder CA");
+    let responder_proxy = TlsAcmeProxy::start(&responder_ca, &acme.responder.uri()).await;
+    aim_at(&mut host.settings, &acme);
+    host.settings.acme.http_responder_url = responder_proxy.url.clone();
+    let bundle = host.dir.path().join("bootstrap-bundle.pem");
+    host.settings.trust.ca_bundle_path = Some(bundle.clone());
+
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        .await
+        .expect_err("an unpinned HTTPS responder must fail bootstrap issuance");
+
+    assert_eq!(
+        acme.observed.directory_requests.load(Ordering::Relaxed),
+        1,
+        "the ACME connection must succeed before the responder is contacted"
+    );
+    assert!(
+        acme.observed
+            .responder_requests
+            .lock()
+            .expect("responder log is not poisoned")
+            .is_empty(),
+        "the unpinned responder must receive no HTTP registration"
+    );
+    let (cert_path, key_path) = host.client_pair();
+    assert!(
+        !cert_path.exists(),
+        "an unpinned responder must not publish a leaf"
+    );
+    assert!(
+        !key_path.exists(),
+        "an unpinned responder must not publish a key"
+    );
+    assert!(
+        !bundle.exists(),
+        "an unpinned responder must not repair the bundle"
+    );
+}
+
+/// A missing output bundle uses the registrar-only pin bootstrap transport,
+/// then is recreated through the ordinary verified merge path.
+#[tokio::test]
+async fn a_missing_bundle_uses_pinned_bootstrap_and_is_repaired() {
     let mut host = Host::new();
     let acme = start_acme(Arc::clone(&host.ca)).await;
     aim_at(&mut host.settings, &acme);
@@ -1583,18 +1872,18 @@ async fn a_bundle_the_outbound_transport_cannot_read_fails_before_publication() 
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
         .await
-        .expect_err("the transport cannot be anchored to a bundle that is not there");
-    let rendered = format!("{error:#}");
-    assert!(
-        rendered.contains(&bundle.display().to_string()),
-        "{rendered}"
-    );
+        .expect("the pinned bootstrap transport repairs a missing bundle");
 
     let (cert_path, key_path) = host.client_pair();
-    assert!(!cert_path.exists());
-    assert!(!key_path.exists());
+    assert!(
+        cert_path.exists(),
+        "the leaf is published only after the bundle merge succeeds"
+    );
+    assert!(key_path.exists());
+    let merged = std::fs::read_to_string(&bundle).expect("the bundle was recreated");
+    crate::tls::parse_pem_to_cert_list(merged.as_bytes()).expect("a parseable merged bundle");
 }
 
 /// A filesystem condition preventing the replacement from being written

@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 use crate::acme::types::{Authorization, Order};
 use crate::config::{AcmeSettings, TrustSettings};
 use crate::eab::EabCredentials;
-use crate::tls::build_http_client;
+use crate::tls::{build_bootstrap_client_config, build_http_client};
 
 const ALG_ES256: &str = "ES256";
 const ALG_HS256: &str = "HS256";
@@ -113,11 +113,26 @@ impl AcmeClient {
     ///
     /// # Errors
     /// Returns error if account key generation fails or HTTP client build fails.
+    #[cfg(test)]
     pub(crate) fn new(
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
         insecure_mode: bool,
+    ) -> Result<Self> {
+        Self::new_with_bootstrap(directory_url, settings, trust, insecure_mode, None)
+    }
+
+    /// Creates an ACME client for the registrar bundle-repair path.
+    ///
+    /// `bootstrap_pins` is used only while the configured output bundle is
+    /// absent or has no parseable certificates.  It never reads that bundle.
+    pub(crate) fn new_with_bootstrap(
+        directory_url: String,
+        settings: &AcmeSettings,
+        trust: &TrustSettings,
+        insecure_mode: bool,
+        bootstrap_pins: Option<&[String]>,
     ) -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = match settings.account_key_path.as_deref() {
@@ -129,7 +144,13 @@ impl AcmeClient {
         };
         let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
             .map_err(|_| anyhow::anyhow!("Failed to parse the ACME account key"))?;
-        let client = build_http_client(trust, insecure_mode)?;
+        let client = match bootstrap_pins {
+            Some(pins) if !insecure_mode => Client::builder()
+                .use_preconfigured_tls(build_bootstrap_client_config(pins)?)
+                .build()
+                .context("Failed to build bootstrap HTTP client")?,
+            _ => build_http_client(trust, insecure_mode)?,
+        };
 
         Ok(Self {
             client,
@@ -1053,6 +1074,7 @@ mod tests {
         use std::net::SocketAddr;
         use std::path::PathBuf;
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         use anyhow::{Context, Result};
         use rcgen::generate_simple_self_signed;
@@ -1067,6 +1089,7 @@ mod tests {
             addr: SocketAddr,
             cert_der: Vec<u8>,
             cert_pem: String,
+            requests: Arc<AtomicUsize>,
             handle: JoinHandle<()>,
         }
 
@@ -1098,6 +1121,8 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").await.context("bind tcp")?;
             let addr = listener.local_addr().context("local addr")?;
             let acceptor = TlsAcceptor::from(Arc::new(config));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed_requests = Arc::clone(&requests);
 
             let handle = tokio::spawn(async move {
                 loop {
@@ -1105,10 +1130,12 @@ mod tests {
                         return;
                     };
                     let acceptor = acceptor.clone();
+                    let observed_requests = Arc::clone(&observed_requests);
                     tokio::spawn(async move {
                         let Ok(mut stream) = acceptor.accept(stream).await else {
                             return;
                         };
+                        observed_requests.fetch_add(1, Ordering::Relaxed);
                         let mut buffer = [0u8; 4096];
                         let read = match stream.read(&mut buffer).await {
                             Ok(0) | Err(_) => return,
@@ -1148,6 +1175,7 @@ mod tests {
                 addr,
                 cert_der,
                 cert_pem,
+                requests,
                 handle,
             })
         }
@@ -1209,6 +1237,11 @@ mod tests {
                 false,
             )?;
             assert!(client.fetch_directory().await.is_err());
+            assert_eq!(
+                server.requests.load(Ordering::Relaxed),
+                0,
+                "a pin mismatch must fail during TLS before any ACME request"
+            );
             server.handle.abort();
             Ok(())
         }
@@ -1232,6 +1265,64 @@ mod tests {
             client.fetch_directory().await?;
             server.handle.abort();
             Ok(())
+        }
+
+        #[tokio::test]
+        async fn bootstrap_accepts_a_presented_pinned_anchor() -> Result<()> {
+            let server = start_tls_server().await?;
+            let trust = TrustSettings {
+                ca_bundle_path: Some("/not/read/by/bootstrap.pem".into()),
+                trusted_ca_sha256: vec![sha256_hex(&server.cert_der)],
+            };
+
+            let mut client = AcmeClient::new_with_bootstrap(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+                false,
+                Some(&trust.trusted_ca_sha256),
+            )?;
+            client.fetch_directory().await?;
+            server.handle.abort();
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn bootstrap_rejects_an_unpinned_presented_chain() -> Result<()> {
+            let server = start_tls_server().await?;
+            let trust = TrustSettings::default();
+            let pins = vec!["00".repeat(32)];
+
+            let mut client = AcmeClient::new_with_bootstrap(
+                format!("{}/directory", server.url()),
+                &trust_test_settings(),
+                &trust,
+                false,
+                Some(&pins),
+            )?;
+            assert!(client.fetch_directory().await.is_err());
+            server.handle.abort();
+            Ok(())
+        }
+
+        #[test]
+        fn bootstrap_rejects_an_empty_pin_set() {
+            let trust = TrustSettings::default();
+            let result = AcmeClient::new_with_bootstrap(
+                "https://localhost/directory".to_string(),
+                &trust_test_settings(),
+                &trust,
+                false,
+                Some(&[]),
+            );
+            let Err(error) = result else {
+                panic!("empty pins must not create a bootstrap client");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("trusted_ca_sha256 must not be empty")
+            );
         }
 
         #[tokio::test]

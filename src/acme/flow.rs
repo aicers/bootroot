@@ -304,9 +304,10 @@ async fn validate_http01_authorizations(
     settings: &crate::config::Settings,
     client: &mut AcmeClient,
     order: &crate::acme::types::Order,
+    bootstrap_pins: Option<&[String]>,
 ) -> Result<()> {
     for authz_url in &order.authorizations {
-        validate_authorization_http01(settings, client, authz_url).await?;
+        validate_authorization_http01(settings, client, authz_url, bootstrap_pins).await?;
     }
     Ok(())
 }
@@ -315,6 +316,7 @@ async fn validate_authorization_http01(
     settings: &crate::config::Settings,
     client: &mut AcmeClient,
     authz_url: &str,
+    bootstrap_pins: Option<&[String]>,
 ) -> Result<()> {
     tracing::debug!("Fetching authorization: {}", authz_url);
     let authz = client.fetch_authorization(authz_url).await?;
@@ -336,7 +338,20 @@ async fn validate_authorization_http01(
 
     let key_auth = client.compute_key_authorization(&challenge_token)?;
 
-    responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
+    match bootstrap_pins {
+        Some(pins) => {
+            responder_client::register_http01_token_with_bootstrap(
+                settings,
+                &challenge_token,
+                &key_auth,
+                pins,
+            )
+            .await?;
+        }
+        None => {
+            responder_client::register_http01_token(settings, &challenge_token, &key_auth).await?;
+        }
+    }
 
     tracing::debug!("Triggering challenge validation...");
     client.trigger_challenge(&challenge_url).await?;
@@ -478,11 +493,29 @@ pub async fn issue_certificate_with(
     insecure_mode: bool,
     options: IssuanceOptions,
 ) -> Result<()> {
-    let mut client = AcmeClient::new(
+    issue_certificate_with_bootstrap(settings, profile, eab_creds, insecure_mode, options, None)
+        .await
+}
+
+/// Issues a registrar-surface certificate with optional pin-only bootstrap
+/// TLS while the configured output bundle is being repaired.
+pub(crate) async fn issue_certificate_with_bootstrap(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    insecure_mode: bool,
+    options: IssuanceOptions,
+    bootstrap_pins: Option<&[String]>,
+) -> Result<()> {
+    // `--insecure` remains its existing explicit override.  Bootstrap mode
+    // never changes that mode's ACME or responder transport behavior.
+    let bootstrap_pins = (!insecure_mode).then_some(bootstrap_pins).flatten();
+    let mut client = AcmeClient::new_with_bootstrap(
         settings.server.clone(),
         &settings.acme,
         &settings.trust,
         insecure_mode,
+        bootstrap_pins,
     )?;
 
     client.fetch_directory().await?;
@@ -499,7 +532,7 @@ pub async fn issue_certificate_with(
         .await?;
     info!("Order created: {:?}", order);
 
-    validate_http01_authorizations(settings, &mut client, &order).await?;
+    validate_http01_authorizations(settings, &mut client, &order, bootstrap_pins).await?;
 
     info!("Generating CSR for domain: {}", primary_domain);
     let params = match options.csr_shape {

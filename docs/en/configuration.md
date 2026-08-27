@@ -523,15 +523,14 @@ like repairs and are not:
   as a need to issue, and then fails *before publication*: the merge
   refuses to overwrite a bundle it cannot inspect, no leaf is written and
   the bundle is left byte-identical.
-- **A `trust.ca_bundle_path` that is missing or unparseable** is detected
-  the same way, and also fails before publication — but for a different
-  reason, one that predates this issuance and applies to every
-  certificate the agent renews. That bundle is what anchors TLS to the
-  ACME directory, so the agent cannot authenticate step-ca without it and
-  refuses to talk to it at all. The diagnostic names the bundle. Once
-  `trust.ca_bundle_path` holds the deployment's anchors again — which is
-  what `bootroot init` and the fast-poll trust refresh put there — the
-  next start issues normally and the merge repopulates the file.
+- **A `trust.ca_bundle_path` that is missing or readable but unparseable**
+  is repairable during registrar-surface startup issuance. Bootroot uses
+  only the preconfigured `trust.trusted_ca_sha256` pins to authenticate
+  the presented step-ca chain for that issuance (and an HTTPS HTTP-01
+  responder), then verifies and merges the returned pinned chain before
+  publishing either leaf or key. It does not use system roots or learn
+  trust from the peer. An empty or mismatched pin set fails closed; an
+  unreadable bundle remains the separate failure above.
 
 !!! warning "These are this issue's two, not the daemon's only two"
     An endpoint-enabled start is still refused by everything listed

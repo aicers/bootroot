@@ -26,7 +26,7 @@
 //!
 //! "Under that credential" has observable content rather than being a
 //! statement about which process holds which file: the two ACME inputs
-//! [`crate::acme::issue_certificate_with`] needs — the account
+//! [`crate::acme::issue_certificate`] needs — the account
 //! EAB and the HTTP-01 responder HMAC — are read from `OpenBao` through
 //! it, at the mount the deployment state file records, and are used in
 //! memory only. There is no fallback to `agent.toml`, to the internal
@@ -784,12 +784,14 @@ pub(crate) async fn issue_surface_pair(
         .profiles
         .first()
         .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
-    crate::acme::issue_certificate_with(
+    let bootstrap_pins = bootstrap_pins(&issuance.trust);
+    crate::acme::issue_certificate_with_bootstrap(
         &issuance,
         profile,
         inputs.eab.clone(),
         insecure_mode,
         pair.leaf.issuance_options(),
+        bootstrap_pins,
     )
     .await
     .with_context(|| {
@@ -800,6 +802,29 @@ pub(crate) async fn issue_surface_pair(
             pair.key_path.display()
         )
     })
+}
+
+/// Selects pin-only TLS only for a missing or parse-empty output bundle.
+///
+/// A different read error remains on the ordinary path, whose existing
+/// bundle loader reports the error and refuses before ACME traffic.  That
+/// distinction prevents an unreadable bundle from being silently repaired or
+/// overwritten.
+fn bootstrap_pins(trust: &crate::config::TrustSettings) -> Option<&[String]> {
+    let path = trust.ca_bundle_path.as_ref()?;
+    match std::fs::read(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(&trust.trusted_ca_sha256)
+        }
+        Ok(contents)
+            if tls::parse_pem_to_cert_list(&contents)
+                .and_then(|certs| tls::certs_to_root_store(&certs))
+                .is_err() =>
+        {
+            Some(&trust.trusted_ca_sha256)
+        }
+        Err(_) | Ok(_) => None,
+    }
 }
 
 /// Builds the settings one surface issuance runs under.
