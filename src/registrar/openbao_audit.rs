@@ -121,6 +121,7 @@ use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read as _, Seek as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -131,7 +132,9 @@ use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::fs_util::{self, Destination, StagedMode, sync_parent_dir};
+use crate::fs_util::{
+    StagedDurability, StagedMode, StagedOwner, publish_staged_blocking, sync_parent_dir,
+};
 use crate::registrar::audit_store::OPENBAO_CONTAINER_AUDIT_DIR;
 
 #[cfg(test)]
@@ -174,6 +177,15 @@ const MARKER_FILE_NAME: &str = "rotation-intent.json";
 /// chooses. Anything larger is not a marker this daemon wrote, and the
 /// branch that reads it refuses to act.
 const MARKER_MAX_BYTES: u64 = 4 * 1024;
+
+/// The mode bits a rotation-intent marker may not carry.
+///
+/// The marker authenticates by its owner, and an owner says nothing
+/// about a file anybody may write: group- or world-writable, a
+/// root-owned marker is one the container's audit user can rewrite in
+/// place. [`GENERATION_FILE_MODE`] is what this daemon creates it at,
+/// so a marker over this mask is not one of its own either.
+const MARKER_FORBIDDEN_MODE: u32 = 0o022;
 
 /// Digits in a rotated generation's collision sequence.
 ///
@@ -629,6 +641,18 @@ fn open_regular(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Returns the effective uid this process runs as.
+///
+/// The owner a file this process publishes carries, and so the owner a
+/// file it published is recognised by. Root in the daemon, the invoking
+/// user under `cargo test`.
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no argument, touches no memory this
+    // process owns, cannot fail and is async-signal-safe. There is no
+    // safe wrapper for it in `std`.
+    unsafe { libc::geteuid() }
+}
+
 /// Returns the `(device, inode)` pair that names a *file*, as opposed
 /// to a path that currently happens to lead to one.
 ///
@@ -658,6 +682,42 @@ fn generation_carries(generation: &Path, recorded: (u64, u64)) -> Result<(), Str
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+/// Opens the freshly renamed generation, checks through the descriptor
+/// that it carries the identity the marker recorded, and hands the
+/// descriptor back to be held for the rest of the pass.
+///
+/// Two things the path-level [`generation_carries`] cannot do:
+///
+/// - The check is `fstat` on an open descriptor rather than `lstat` on
+///   a name, so what was checked and what is held are the same file by
+///   construction. A name checked and then used is a name the
+///   container's audit user can re-point in between.
+/// - Holding it keeps the inode allocated for as long as the pass runs.
+///   That matters across the signal: `SIGHUP` closes `OpenBao`'s own
+///   descriptor on the file it was appending to, so if the directory
+///   entry has meanwhile been removed, this descriptor is the only
+///   thing standing between those records and the kernel freeing them.
+///   The pass refuses and escalates rather than reporting a rotation,
+///   and while it does the records are still reachable through
+///   `/proc/<pid>/fd`.
+///
+/// # Errors
+///
+/// Returns what the generation carries instead, for the message the
+/// refusal logs: a differing `dev:ino`, or the `open`/`fstat` error —
+/// which is what a name that leads to nothing, or to something that is
+/// not a regular file, arrives as.
+fn pin_generation(generation: &Path, recorded: (u64, u64)) -> Result<File, String> {
+    let file =
+        open_regular(OpenOptions::new().read(true), generation).map_err(|err| err.to_string())?;
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    let identity = file_identity(&meta);
+    if identity != recorded {
+        return Err(format!("{}:{}", identity.0, identity.1));
+    }
+    Ok(file)
 }
 
 /// Formats `now` as the `YYYYMMDDTHHMMSSZ` UTC stamp a generation's name
@@ -1019,7 +1079,11 @@ enum PassPhase {
 }
 
 /// What the first blocking phase hands the wait and the second phase.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: it owns the descriptor pinning the generation, and two
+/// copies of that would be two independent lifetimes for the one thing
+/// keeping the rotated records allocated.
+#[derive(Debug)]
 struct SignalContext {
     /// The generation the active log was renamed to.
     generation: PathBuf,
@@ -1028,6 +1092,10 @@ struct SignalContext {
     /// The identity the active log carried before the rename, which the
     /// rename carried into the generation. The predicate's other half.
     identity: (u64, u64),
+    /// An open descriptor on the generation, taken when its identity
+    /// was verified and held until the pass is over. See
+    /// [`pin_generation`] for what it buys.
+    pinned: File,
     /// What `docker kill` said, if it failed. Recorded rather than
     /// acted on: a non-zero exit is not proof the signal never arrived.
     signal_error: Option<String>,
@@ -1436,6 +1504,15 @@ impl DeviceLayout {
     ) -> PassOutcome {
         match wait {
             ReopenWait::Reopened => {
+                // The predicate is about the *active* path, and on its
+                // own it would call this a lossless rotation on the
+                // strength of a fresh inode being there. It says
+                // nothing about the generation, which is where every
+                // record written before the rename now lives, so that
+                // is established before anything is reported.
+                if let Err(observed) = generation_carries(&context.generation, context.identity) {
+                    return self.displaced(state, context, &observed);
+                }
                 debug!(
                     generation = %context.generation.display(),
                     "rotated the OpenBao audit device by reopen-on-signal; no record was copied \
@@ -1675,19 +1752,27 @@ impl DeviceLayout {
         // — finds a differing inode and reports a lossless rotation
         // over records that are gone. So the assumption is checked
         // rather than assumed, before anything irreversible acts on it.
-        if let Err(observed) = generation_carries(&generation, identity) {
-            return PassPhase::Done(Box::new(self.shifted(
-                state,
-                &generation,
-                identity,
-                &observed,
-            )));
-        }
+        // Pinned rather than merely stat'd: the check is made through
+        // the descriptor it hands back, and holding that descriptor
+        // keeps the rotated records allocated across the signal even if
+        // the entry naming them is removed.
+        let pinned = match pin_generation(&generation, identity) {
+            Ok(pinned) => pinned,
+            Err(observed) => {
+                return PassPhase::Done(Box::new(self.shifted(
+                    state,
+                    &generation,
+                    identity,
+                    &observed,
+                )));
+            }
+        };
 
         let context = SignalContext {
             generation,
             generation_name,
             identity,
+            pinned,
             signal_error: None,
         };
 
@@ -1708,6 +1793,32 @@ impl DeviceLayout {
                 &context,
                 now,
                 "the rename could not be made durable, so the container was never signalled",
+            )));
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = self.faults.before_signal() {
+            hook(&context.generation);
+        }
+
+        // Checked once more, immediately before the signal. The window
+        // the check above opened is not empty — the flush between them
+        // is a disk round trip — and this is the last instant at which
+        // refusing still costs nothing: past it `SIGHUP` closes
+        // `OpenBao`'s descriptor on the inode this generation names,
+        // and a generation that has meanwhile been unlinked or replaced
+        // takes every record on it with that close. What remains
+        // uncloseable is the interval between this check and the signal
+        // itself, which no ordering can remove; the confirmation
+        // re-checks after the wait so a replacement landing there is
+        // reported as the failure it is rather than as a lossless
+        // rotation.
+        if let Err(observed) = generation_carries(&context.generation, context.identity) {
+            return PassPhase::Done(Box::new(self.shifted(
+                state,
+                &context.generation,
+                context.identity,
+                &observed,
             )));
         }
 
@@ -1755,6 +1866,9 @@ impl DeviceLayout {
         now: OffsetDateTime,
         reason: &str,
     ) -> PassOutcome {
+        if let Err(observed) = generation_carries(&context.generation, context.identity) {
+            return self.displaced(state, context, &observed);
+        }
         match self.recover(context) {
             Recovery::Reopened => {
                 debug!(
@@ -1920,6 +2034,67 @@ impl DeviceLayout {
              nothing back, truncates nothing and trims nothing. An operator must reconcile \
              the device directory by hand, and should recover the displaced inode through \
              the container's open descriptors before anything closes them"
+        );
+        self.conclude(state, RotationOutcome::Failed, RotationForm::None, false)
+    }
+
+    /// The state a replacement of the *generation* produces: the rename
+    /// landed on the recorded inode and something moved that inode's
+    /// name off it afterwards.
+    ///
+    /// The window is real and cannot be closed by ordering alone. The
+    /// generation's identity is verified through an open descriptor
+    /// immediately after the rename and again immediately before the
+    /// signal, but the device directory is writable by the container's
+    /// audit user throughout, and between that last check and
+    /// `docker kill` returning there is an interval no check can cover.
+    /// A replacement landing in it would otherwise be read as a clean
+    /// rotation: the reopen puts a fresh inode at the active path, the
+    /// predicate compares it against the *pre-rename* identity, finds
+    /// it differs and reports a lossless rotation over records nothing
+    /// can reach. So the generation is checked once more before any
+    /// success is reported and before any recovery renames it back —
+    /// and where it no longer holds, this pass refuses exactly as
+    /// [`Self::shifted`] does:
+    ///
+    /// - It reports **no rotation**. Whatever the reopen did, the
+    ///   records this pass moved aside are not where it put them.
+    /// - It does not **rename back**, for [`Self::shifted`]'s reason:
+    ///   the file under that name is not the one this pass renamed, and
+    ///   moving it to the active path would hide that behind a
+    ///   plausible `audit.log`.
+    /// - It does not **fall back** and does not **trim**, and it keeps
+    ///   the marker: all three are acting on a directory whose contents
+    ///   the daemon can no longer account for.
+    ///
+    /// The descriptor [`pin_generation`] took is still open while this
+    /// runs, so the displaced records are allocated and reachable
+    /// through `/proc/<pid>/fd` for as long as the pass lives, which is
+    /// what the `error` tells the operator to use.
+    fn displaced(
+        &self,
+        state: &mut PassState,
+        context: &SignalContext,
+        observed: &str,
+    ) -> PassOutcome {
+        error!(
+            path = %self.active_path.display(),
+            generation = %context.generation.display(),
+            recorded = %format!("{}:{}", context.identity.0, context.identity.1),
+            observed = observed,
+            signal_error = context.signal_error.as_deref().unwrap_or("none"),
+            // The descriptor `pin_generation` took, still open on the
+            // recorded inode: `/proc/<this daemon's pid>/fd/<fd>` is
+            // where the displaced records are, for as long as this pass
+            // holds it.
+            pinned_fd = context.pinned.as_raw_fd(),
+            "the generation this pass renamed the OpenBao audit log to no longer carries the \
+             identity recorded before the rename, so something removed or replaced it after the \
+             rename. Whatever is now at the active path, the records rotated aside are not in \
+             the file this pass named: no rotation is reported, nothing is renamed back, \
+             truncated or trimmed. An operator must reconcile the device directory by hand, and \
+             should recover the displaced inode through a descriptor that still refers to it — \
+             OpenBao's own, or this daemon's pinned_fd, which closes when this pass returns"
         );
         self.conclude(state, RotationOutcome::Failed, RotationForm::None, false)
     }
@@ -2859,10 +3034,19 @@ impl DeviceLayout {
             generation: generation.to_string(),
         };
         let body = serde_json::to_vec(&intent)?;
-        fs_util::atomic_write_blocking(
-            Destination::bootroot_owned(&self.marker_path),
+        // `StagedOwner::WritingProcess`, not `atomic_write_blocking`'s
+        // `StagedOwner::Destination`: this marker's owner is what
+        // `read_marker` authenticates it by, and preserving the
+        // destination's ownership would hand a forgery's uid to the
+        // genuine article. Published at the name, never through a
+        // symlink found there, for the reason every open in this module
+        // is `O_NOFOLLOW`ed.
+        publish_staged_blocking(
+            &self.marker_path,
             &body,
             StagedMode::Policy(GENERATION_FILE_MODE),
+            StagedOwner::WritingProcess,
+            StagedDurability::FlushDirectory,
         )
     }
 
@@ -2877,18 +3061,22 @@ impl DeviceLayout {
     /// counter and its escalation with it — and size its allocation
     /// from whatever the file claims to be.
     ///
+    /// Then through [`Self::authenticate_marker`], because none of that
+    /// says who *wrote* the file.
+    ///
     /// # Errors
     ///
     /// Returns the `open` or read error, or an
-    /// [`io::ErrorKind::InvalidData`] where the marker is over the cap
-    /// or does not parse. Every one of those takes the unrecognised
-    /// branch, which refuses to act.
+    /// [`io::ErrorKind::InvalidData`] where the marker is not the
+    /// daemon's own, is over the cap, or does not parse. Every one of
+    /// those takes the unrecognised branch, which refuses to act.
     fn read_marker(&self) -> io::Result<Option<RotationIntent>> {
         let file = match open_regular(OpenOptions::new().read(true), &self.marker_path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        self.authenticate_marker(&file)?;
         let mut bytes = Vec::new();
         // One byte past the cap, so a file exactly at it still reads and
         // the first byte over is observable rather than silently cut to
@@ -2908,6 +3096,80 @@ impl DeviceLayout {
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Answers whether the opened marker is one this daemon wrote,
+    /// rather than one the container's audit user planted.
+    ///
+    /// `O_NOFOLLOW` decides which inode a name resolves to. It says
+    /// nothing about where that inode came from, and provenance is the
+    /// whole question here: the marker is the only thing that
+    /// authorises [`Self::marker_branch`] to rename a generation back
+    /// over the active path, and `/openbao/audit` is owned and writable
+    /// by the container's audit user (`docker-compose.yml`), which can
+    /// therefore write a perfectly well-formed `rotation-intent.json`
+    /// naming any generation still on disk. Left unauthenticated, that
+    /// user could wait until `audit.log` is gone — which it can arrange
+    /// itself, by unlinking it while `OpenBao` keeps appending to the
+    /// inode — and have root move an unrelated historical generation
+    /// into place: the absent-path signal an operator and
+    /// `assert_openbao_audit_log` would have seen disappears behind a
+    /// plausible active log, while the live stream stays unreachable
+    /// and its records are lost the moment its descriptor closes.
+    ///
+    /// Two properties, both read off the *descriptor* rather than the
+    /// path, so neither can be raced after the check:
+    ///
+    /// - The owner is the process that writes it. That is uid 0 in
+    ///   production, where the daemon runs as root and the audit user
+    ///   has no way to create a root-owned file or to `chown` one to
+    ///   root; it is the test process's own uid under `cargo test`,
+    ///   which is why this reads the effective uid rather than
+    ///   hard-coding zero. [`StagedOwner::WritingProcess`] is what
+    ///   keeps that true across a rewrite.
+    /// - Nobody else may write it. A marker root-owned but group- or
+    ///   world-writable is one the audit user can rewrite in place,
+    ///   which would make the owner check say nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidData`] where either fails, or
+    /// the `fstat` error. All of them take the unrecognised branch,
+    /// which refuses to act.
+    fn authenticate_marker(&self, file: &File) -> io::Result<()> {
+        let meta = file.metadata()?;
+        let expected = effective_uid();
+        // A test process cannot chown a file to another uid, so the
+        // expectation is what moves: every marker on disk then looks
+        // like somebody else's, which is the state a marker written by
+        // the container's audit user puts the daemon in.
+        #[cfg(test)]
+        let expected = if self.faults.marker_owner_is_foreign() {
+            expected.wrapping_add(1)
+        } else {
+            expected
+        };
+        if meta.uid() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is owned by uid {} rather than this daemon's own uid {expected}, so it is                      not a rotation-intent marker this daemon wrote",
+                    self.marker_path.display(),
+                    meta.uid()
+                ),
+            ));
+        }
+        if meta.mode() & MARKER_FORBIDDEN_MODE != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} is writable by somebody other than its owner (mode {:04o}), so what it                      records is not this daemon's alone",
+                    self.marker_path.display(),
+                    meta.mode() & 0o7777
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Removes the marker and makes the removal durable, answering

@@ -979,6 +979,22 @@ pub enum StagedOwner {
     /// to the writer (a `service add` run by root replacing a file the
     /// long-running agent reads) is an outage.
     Destination,
+    /// Leave the new inode owned by the writing process, whatever the
+    /// destination carried.
+    ///
+    /// For a file published into a directory an untrusted user can
+    /// write, whose *provenance* is what a later reader authenticates
+    /// it by. The `OpenBao` audit device's rotation-intent marker is
+    /// one: `/openbao/audit` is owned and writable by the container's
+    /// audit user, so that user can plant a `rotation-intent.json` of
+    /// its own — and the daemon, which decides from that marker whether
+    /// to rename a generation back over the live audit log, tells the
+    /// two apart by the marker's owner.
+    /// [`StagedOwner::Destination`] would defeat exactly that: it
+    /// carries the planted file's uid onto the daemon's own marker, so
+    /// the daemon's next write hands the forgery's ownership to the
+    /// genuine article and the check can no longer distinguish them.
+    WritingProcess,
     /// Leave the uid to the writing process and set the group to the
     /// `--cert-group` policy's gid, where it names one.
     ///
@@ -1328,7 +1344,7 @@ pub fn publish_staged_blocking(
                 format!("Failed to chown {} to gid {gid}", tmp.path().display())
             })?;
         }
-        StagedOwner::PolicyGroup(None) => {}
+        StagedOwner::WritingProcess | StagedOwner::PolicyGroup(None) => {}
         StagedOwner::ContainingDir => {
             // The directory is guaranteed to exist: the temporary was
             // just staged inside it. Its owner is the uid every reader

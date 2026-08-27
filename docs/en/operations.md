@@ -321,9 +321,25 @@ cap — because the directory is writable by the container's audit user
 and the branch that reads the marker is the one that decides whether a
 file is renamed into place.
 
+Refusing to follow a link decides which file a name leads to; it says
+nothing about who wrote that file. So the marker is also
+**authenticated** before anything acts on it: the daemon reads the
+owner and the mode off the open descriptor and requires the marker to
+be its own — owned by the uid the daemon runs as, and writable by
+nobody else — and it writes the marker under its own ownership rather
+than preserving whatever was at that path before. Without that check,
+the container's audit user could unlink `audit.log` while OpenBao kept
+appending to the now-nameless inode, drop a well-formed
+`rotation-intent.json` naming any generation still on disk, and have
+the daemon move an unrelated historical file into place: the absent
+`audit.log` an operator and the CI assertion would have seen
+disappears behind a plausible active log while the live stream stays
+unreachable.
+
 **The rename is checked rather than assumed.** Immediately after the
-rename and *before* the signal, the pass re-stats the generation and
-confirms it carries the identity the marker recorded. A rename preserves
+rename the pass opens the generation and confirms *through that
+descriptor* that it carries the identity the marker recorded, and it
+holds the descriptor open for the rest of the pass. A rename preserves
 the inode, so it should — but the directory is writable, so `audit.log`
 can be replaced between the moment that identity is taken and the moment
 the rename is issued. The rename would then carry the *replacement*
@@ -338,6 +354,21 @@ one `error` naming both files. The active path is deliberately left
 absent — the state an operator and the CI assertion should see on a
 device this broken — and the displaced inode is still reachable through
 the container's open descriptors until something closes them.
+
+The same check is made twice more, because the directory stays writable
+for as long as the pass runs: once immediately before the signal — the
+last instant at which refusing still costs nothing, since `SIGHUP` is
+what closes OpenBao's descriptor on the rotated inode — and once after
+the reopen, before any success is reported or any recovery renames the
+generation back. The interval between that last check and `docker kill`
+returning is the one no ordering can close, so it is not assumed away:
+a generation replaced there is reported as a failed pass rather than as
+a lossless rotation, even though the active path is back on a fresh
+inode and the reopen predicate alone would call it a success. The
+descriptor the pass has held since the rename keeps the displaced
+records allocated while it decides, and the `error` names it
+(`pinned_fd`) so an operator can reach them through the daemon's
+`/proc/<pid>/fd` before the pass returns and closes it.
 
 **The recovery.** The dangerous state is a rename that succeeded and a
 reopen that did not: OpenBao still audits into the renamed inode, but
@@ -398,7 +429,8 @@ closes — stop and investigate rather than waiting.
 **Where the daemon refuses to act.** A pass that starts with the active
 path absent decides from the marker and nothing else. If there is no
 marker, or the marker is not a regular file of the daemon's own — a
-symbolic link, a FIFO, or one larger than the cap — or it names anything
+symbolic link, a FIFO, one larger than the cap, one owned by another
+user, or one anybody but its owner may write — or it names anything
 but one of this device's own generations, or it names a file that is
 gone or whose identity no longer matches, the daemon does not recognise
 the state as its own: it logs one

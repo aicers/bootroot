@@ -105,6 +105,15 @@ pub(crate) struct FaultInjection {
     /// Runs with the active log's path, after that look and before the
     /// rename-back — the window an `EEXIST` is produced in.
     before_restore_rename: Mutex<Option<PassHook>>,
+    /// Runs with the *generation's* path, after the rename's directory
+    /// flush and before the pre-signal re-check — the window in which a
+    /// replacement of the generation must still stop the signal.
+    before_signal: Mutex<Option<PassHook>>,
+    /// Expect a marker owned by somebody other than this process, which
+    /// is how a marker the container's audit user wrote looks to the
+    /// daemon. A test process cannot chown a file to another uid, so
+    /// the expectation moves rather than the file.
+    marker_owner_foreign: AtomicBool,
 }
 
 impl Default for FaultInjection {
@@ -129,6 +138,8 @@ impl Default for FaultInjection {
             before_truncate: Mutex::new(None),
             before_recovery: Mutex::new(None),
             before_restore_rename: Mutex::new(None),
+            before_signal: Mutex::new(None),
+            marker_owner_foreign: AtomicBool::new(false),
         }
     }
 }
@@ -217,6 +228,14 @@ impl FaultInjection {
 
     pub(crate) fn before_restore_rename(&self) -> Option<PassHook> {
         hook_of(&self.before_restore_rename)
+    }
+
+    pub(crate) fn before_signal(&self) -> Option<PassHook> {
+        hook_of(&self.before_signal)
+    }
+
+    pub(crate) fn marker_owner_is_foreign(&self) -> bool {
+        self.marker_owner_foreign.load(Ordering::SeqCst)
     }
 }
 
@@ -343,6 +362,18 @@ impl OpenBaoAuditRotation {
 
     fn on_restore_rename(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
         Self::install(&self.faults().before_restore_rename, hook);
+    }
+
+    fn before_signal(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        Self::install(&self.faults().before_signal, hook);
+    }
+
+    /// Makes every marker on disk look like one the container's audit
+    /// user wrote.
+    fn foreign_marker_owner(&self) {
+        self.faults()
+            .marker_owner_foreign
+            .store(true, Ordering::SeqCst);
     }
 
     fn marker_path(&self) -> &Path {
@@ -4545,4 +4576,213 @@ async fn a_replacement_between_the_marker_and_the_rename_is_never_signalled() {
     );
     assert!(docker.signalled().is_empty());
     assert!(!active.exists());
+}
+
+/// A marker the daemon did not write authorises no restore, however
+/// well formed it is.
+///
+/// `/openbao/audit` is owned and writable by the container's audit user
+/// (`docker-compose.yml`), and `O_NOFOLLOW` decides which inode a name
+/// resolves to rather than who wrote it. That user can therefore unlink
+/// `audit.log` — `OpenBao` keeps appending to the now-nameless inode —
+/// and drop a perfectly well-formed `rotation-intent.json` naming any
+/// generation still on disk. Restoring from it would move an unrelated
+/// historical file into place, so the absent-path signal an operator
+/// and `assert_openbao_audit_log` would have seen disappears behind a
+/// plausible active log while the live stream stays unreachable.
+///
+/// A test process cannot chown a file to another uid, so the daemon's
+/// expectation moves instead of the file: with it, every marker on disk
+/// is somebody else's. The same directory and the same marker are then
+/// handed to a rotation without it, which restores — so what refused
+/// the first pass was the ownership and nothing else about the file.
+#[tokio::test(start_paused = true)]
+async fn a_marker_the_daemon_did_not_write_is_never_restored_from() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let live = seed_generation(dir.path(), "20260301T115900Z", 0, S);
+    let live_bytes = std::fs::read(&live).expect("the seeded generation reads");
+    let name = rotated_file_name("20260301T115900Z", 0);
+    let marker = dir.path().join(MARKER_FILE_NAME);
+    write_intent(&marker, identity_of(&live), &name);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+
+    let mut planted = rotation_at(dir.path().to_path_buf(), S, N);
+    planted.foreign_marker_owner();
+    let logs = logs_from(async {
+        let outcome = planted.run_pass(at(0)).await;
+        assert!(outcome.rotation.is_unmet(), "the pass failed");
+        assert!(!outcome.restore_pending, "and started no restore");
+        assert_eq!(outcome.consecutive_failures, 1);
+    })
+    .await;
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "one error:\n{logs}");
+    assert!(
+        logs.contains("rather than this daemon's own uid"),
+        "the owner is what refused it:\n{logs}"
+    );
+    assert!(
+        logs.contains("cannot establish which file the device is writing to"),
+        "on the branch that refuses to act:\n{logs}"
+    );
+    assert!(!active.exists(), "no generation was moved into place");
+    assert_eq!(
+        std::fs::read(&live).expect("the seeded generation still reads"),
+        live_bytes,
+        "and the file the marker named was left where it was"
+    );
+    assert!(marker.exists(), "the marker is kept: removing it is acting");
+
+    // The control: the same directory, the same marker, a daemon that
+    // recognises the owner. This one restores.
+    drop(planted);
+    let mut own = rotation_at(dir.path().to_path_buf(), S, N);
+    let logs = logs_from(async {
+        let outcome = own.run_pass(at(60)).await;
+        assert!(!outcome.restore_pending, "the restore itself succeeded");
+    })
+    .await;
+    assert!(
+        logs.contains("authorises renaming"),
+        "the marker branch was reached this time:\n{logs}"
+    );
+    assert!(
+        active.exists(),
+        "and the generation the marker named is back at the active path"
+    );
+    assert_eq!(
+        std::fs::read(&active).expect("the restored active log reads"),
+        live_bytes
+    );
+}
+
+/// A generation replaced after the rename is never signalled over.
+///
+/// The identity check made through the pinned descriptor happens
+/// immediately after the rename; the directory flush that has to land
+/// before the signal is a disk round trip after it, and the device
+/// directory is writable by the container's audit user throughout. A
+/// replacement landing in that window has to stop the signal, because
+/// the signal is what closes `OpenBao`'s descriptor on the inode this
+/// pass moved aside — and once it is closed, and no name reaches that
+/// inode, every record on it is gone.
+#[tokio::test(start_paused = true)]
+async fn a_generation_replaced_before_the_signal_stops_the_signal() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    append_records(&active, S);
+    let recorded = identity_of(&active);
+
+    let stand_in = dir.path().join("replacement.log");
+    let once = Arc::new(AtomicBool::new(false));
+    rotation.before_signal(move |generation| {
+        if once.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Renamed *over* the generation rather than unlinked first, so
+        // the live inode stays linked and its number cannot be handed
+        // back to the replacement — the reason the sibling race test
+        // gives.
+        create_active_log(&stand_in);
+        std::fs::rename(&stand_in, generation).expect("the replacement takes the name");
+    });
+
+    let mut result = None;
+    let logs = logs_from(async {
+        result = Some(rotation.run_pass(at(0)).await);
+    })
+    .await;
+    let outcome = result.expect("the pass returned an outcome");
+    assert!(outcome.rotation.is_unmet(), "the pass failed:\n{logs}");
+    assert_eq!(outcome.form, RotationForm::None, "and rotated by no form");
+    assert_eq!(outcome.consecutive_failures, 1);
+    assert!(!outcome.restore_pending, "no restore was attempted");
+    assert!(
+        docker.signalled().is_empty(),
+        "the signal would have closed OpenBao's descriptor on the displaced inode:\n{logs}"
+    );
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "one error:\n{logs}");
+    assert!(
+        logs.contains("does not carry the identity recorded a moment earlier"),
+        "{logs}"
+    );
+    assert!(!active.exists(), "and nothing was moved back over it");
+    let generation = dir.path().join(
+        generation_names(dir.path())
+            .first()
+            .expect("the rename did happen"),
+    );
+    assert_ne!(
+        identity_of(&generation),
+        recorded,
+        "the name now leads to the impostor, which is what the check caught"
+    );
+    assert!(rotation.marker_path().exists(), "the marker is kept");
+}
+
+/// A generation replaced while the container is being signalled is
+/// never reported as a rotation.
+///
+/// The interval between the last check and `docker kill` returning is
+/// the one no ordering can close, so it is not assumed away: the stub
+/// container replaces the generation and then honours the signal, which
+/// is a genuine reopen. The active-path predicate alone would call that
+/// a lossless rotation — a fresh inode is at the configured path, and
+/// it is not the pre-rename identity — while every record the pass
+/// moved aside sits on an inode no name reaches. The confirmation
+/// re-checks the generation before reporting anything, so what comes
+/// back is a failed pass and one `error`.
+#[tokio::test(start_paused = true)]
+async fn a_generation_replaced_while_the_container_is_signalled_is_never_reported_as_rotated() {
+    let (dir, mut rotation, docker) = signal_fixture(S, N);
+    let active = dir.path().join(ACTIVE_FILE_NAME);
+    let captured = append_records(&active, S);
+    let recorded = identity_of(&active);
+
+    let root = dir.path().to_path_buf();
+    let reopened = active.clone();
+    docker.on_signal(move || {
+        let generation = root.join(
+            generation_names(&root)
+                .first()
+                .expect("the rename happened before the signal"),
+        );
+        let stand_in = root.join("replacement.log");
+        create_active_log(&stand_in);
+        std::fs::rename(&stand_in, &generation).expect("the replacement takes the name");
+        // And the image honours the signal, so the active path comes
+        // back on a fresh inode: everything the predicate looks at
+        // says this pass succeeded.
+        create_active_log(&reopened);
+    });
+
+    let mut result = None;
+    let logs = logs_from(async {
+        result = Some(rotation.run_pass(at(0)).await);
+    })
+    .await;
+    let outcome = result.expect("the pass returned an outcome");
+    assert_eq!(
+        docker.signalled().len(),
+        1,
+        "the container was signalled, which is the whole of this case"
+    );
+    assert!(
+        active.exists() && identity_of(&active) != recorded,
+        "and the reopen landed, so the active-path predicate alone would report a rotation"
+    );
+    assert!(outcome.rotation.is_unmet(), "the pass failed:\n{logs}");
+    assert_eq!(outcome.form, RotationForm::None, "and rotated by no form");
+    assert_eq!(outcome.consecutive_failures, 1);
+    assert!(!outcome.restore_pending, "no restore was attempted");
+    assert_eq!(count_lines_at(&logs, "ERROR"), 1, "one error:\n{logs}");
+    assert!(
+        logs.contains("no longer carries the identity recorded before the rename"),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("pinned_fd"),
+        "naming the descriptor the displaced records are still reachable through:\n{logs}"
+    );
+    assert_ne!(captured, 0);
+    assert!(rotation.marker_path().exists(), "the marker is kept");
 }
