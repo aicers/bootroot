@@ -62,6 +62,23 @@ fn expire(
     verb: AuditVerb,
     bucket: LimiterBucket,
 ) {
+    expire_at(
+        sink,
+        caller,
+        verb,
+        bucket,
+        OffsetDateTime::now_utc()
+            - WallDuration::seconds(i64::try_from(WINDOW_SECONDS).expect("fits i64")),
+    );
+}
+
+fn expire_at(
+    sink: &CoalescingLimitedInvocationSink,
+    caller: &str,
+    verb: AuditVerb,
+    bucket: LimiterBucket,
+    wall_start: OffsetDateTime,
+) {
     let key = WindowKey {
         caller: CallerIdentity::new(caller),
         verb,
@@ -75,8 +92,7 @@ fn expire(
     // Tokio's monotonic test clock is not advanced here. Make the wall-clock
     // projection agree with the forced deadline, as it would after a real
     // configured window had elapsed.
-    window.wall_start = OffsetDateTime::now_utc()
-        - WallDuration::seconds(i64::try_from(WINDOW_SECONDS).expect("fits i64"));
+    window.wall_start = wall_start;
 }
 
 fn assert_window_span(record: &AuditRecord) {
@@ -362,6 +378,8 @@ async fn one_key_keeps_one_open_window_across_three_rollovers() {
     let sink = Arc::new(sink());
     let limiter = limiter(Arc::clone(&sink));
     let caller = CallerIdentity::new("rollover-caller");
+    let window_seconds = i64::try_from(WINDOW_SECONDS).expect("fits i64");
+    let first_window_start = OffsetDateTime::now_utc() - WallDuration::seconds(window_seconds * 3);
 
     emit_limited(
         &limiter,
@@ -370,14 +388,15 @@ async fn one_key_keeps_one_open_window_across_three_rollovers() {
         LimiterBucket::Admission,
     );
     assert_eq!(sink.windows.lock().expect("map lock").len(), 1);
-    expire(
+    expire_at(
         &sink,
         caller.as_str(),
         AuditVerb::Mint,
         LimiterBucket::Admission,
+        first_window_start,
     );
 
-    for _ in 0..2 {
+    for rollover in 1_i64..=2 {
         assert!(matches!(
             limiter.charge(&caller, AuditVerb::Mint, LimiterBucket::Admission),
             ChargeOutcome::Limited { .. }
@@ -387,11 +406,12 @@ async fn one_key_keeps_one_open_window_across_three_rollovers() {
             1,
             "a successor replaces its predecessor instead of creating a second open window"
         );
-        expire(
+        expire_at(
             &sink,
             caller.as_str(),
             AuditVerb::Mint,
             LimiterBucket::Admission,
+            first_window_start + WallDuration::seconds(window_seconds * rollover),
         );
     }
 
@@ -401,6 +421,25 @@ async fn one_key_keeps_one_open_window_across_three_rollovers() {
     assert!(records.iter().all(|record| record.count == Some(1)));
     for record in &records {
         assert_window_span(record);
+    }
+    for records in records.windows(2) {
+        let predecessor = records
+            .first()
+            .expect("adjacent records have a predecessor");
+        let successor = records.get(1).expect("adjacent records have a successor");
+        let predecessor_start = predecessor
+            .window_start
+            .expect("limited record has a start");
+        let predecessor_end = predecessor.window_end.expect("limited record has an end");
+        let successor_start = successor.window_start.expect("limited record has a start");
+        assert!(
+            predecessor_start <= successor_start,
+            "records are emitted in window order"
+        );
+        assert!(
+            predecessor_end <= successor_start,
+            "adjacent limited windows do not overlap"
+        );
     }
 }
 
