@@ -652,6 +652,14 @@ OpenBao 감사 장치 확인은 그대로입니다.
   `[registrar_endpoint] enabled`에 걸려 있으며, 엔드포인트를 활성화하지
   않은 호스트에서는 어느 모드도 아무 일도 하지 않습니다.
   [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
+
+  엔드포인트가 활성화된 `filesystem`에서는 데몬이 시작할 때
+  `audit_store_dir`이 마운트되었는지 확인합니다. 마운트되지 않았다면 갱신
+  작업은 계속하지만 레지스트라 동사에는 영구 `registrar_unavailable` /
+  `audit_unwritable` 거부를 응답합니다. 시작 journal은 저장소와 예상 마운트
+  유닛을 밝히며, 각 거부의 새 `request_id`는 감사 레코드가 아니라 데몬 로그
+  한 줄을 가리킵니다. 시작 뒤에 마운트했다면 다음 데몬 시작부터 사용합니다.
+  이 확인은 `directory`와 비활성 엔드포인트에서는 없습니다.
 - `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
   놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
   `audit_store_dir` 안에 있어야 합니다.

@@ -449,7 +449,8 @@ to the same `Deregister` whether or not it also carries `delivery_mode`,
 `spec`, or `wrap_ttl`, and re-encodes with the §4.3 members only. A
 request payload that cannot be decoded into its selected typed shape returns a
 typed codec error only: it does not construct a refusal or emit response bytes,
-because no verb invocation or request id exists yet. Request shapes carry no
+because the handler cannot generate a response correlation handle for malformed
+input. Request shapes carry no
 caller identity, request id, registration id, composed name, domain, token
 policy, or policy body; the authenticated caller identity stays on the
 transport seam.

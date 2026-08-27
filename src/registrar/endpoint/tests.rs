@@ -78,6 +78,7 @@ use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::endpoint::production::ProductionHandler;
 use crate::registrar::endpoint::protocol;
+use crate::registrar::endpoint::unavailable::UnavailableHandler;
 use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
@@ -2386,6 +2387,96 @@ async fn a_payload_the_handler_rejects_closes_with_no_bytes() {
 // The production handler over the socket
 // ---------------------------------------------------------------------
 
+/// The unavailable handler still sits behind the real accept loop: callers
+/// complete their authenticated connection and receive the typed refusal,
+/// rather than connecting successfully to an adopted socket that no task ever
+/// accepts from. Its request ids resolve to one informational daemon line and
+/// not to an audit record, because opening the audit store is what this path
+/// must avoid.
+#[tokio::test]
+async fn an_unavailable_audit_store_answers_each_verb_with_a_correlatable_refusal() {
+    let (logs, _guard) = capture_logs();
+    let harness = Harness::bind().expect("harness");
+    let audit_store_dir = PathBuf::from("/srv/bootroot/audit-store");
+    let expected_mount_unit = "srv-bootroot-audit\\x2dstore.mount";
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(UnavailableHandler::new(
+            audit_store_dir.clone(),
+            expected_mount_unit.to_string(),
+            crate::DaemonMessages::default(),
+        )),
+    );
+
+    let mut request_ids = Vec::new();
+    for (operation, name, payload) in [
+        (
+            "mint",
+            b"mint".as_slice(),
+            register_payload("roxyd", "h1", "caller-mint-key"),
+        ),
+        (
+            "deregister",
+            b"deregister" as &[u8],
+            deregister_payload("roxyd", "h1", "caller-deregister-key"),
+        ),
+    ] {
+        let observed = harness.round_trip(&frame_of(name, &payload)).await;
+        let body = decode_response(&observed);
+        let response = protocol::decode_refusal_response(&body)
+            .expect("the unavailable response uses the ordinary refusal shape");
+        assert_eq!(response.class, protocol::RefusalClass::Permanent);
+        assert_eq!(
+            response.error,
+            Some(protocol::EnrollError::RegistrarUnavailable {
+                reason: protocol::RegistrarUnavailableReason::AuditUnwritable,
+            })
+        );
+        assert!(response.registration_id.is_none());
+        assert_eq!(
+            response.registrar_health,
+            protocol::RegistrarHealth::default()
+        );
+        assert!(!response.request_id.is_empty());
+        assert_ne!(response.request_id, "caller-mint-key");
+        assert_ne!(response.request_id, "caller-deregister-key");
+        request_ids.push((operation, response.request_id));
+    }
+    let [(_, first_request_id), (_, second_request_id)] = request_ids.as_slice() else {
+        panic!("the fixture carries one refusal for each registrar operation");
+    };
+    assert_ne!(first_request_id, second_request_id);
+
+    running.stop().await;
+
+    let refusal_logs: Vec<_> = logs
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.message
+                == "Registrar endpoint refused a request because the audit store is not mounted"
+        })
+        .collect();
+    assert_eq!(refusal_logs.len(), request_ids.len());
+    for (operation, request_id) in request_ids {
+        let event = refusal_logs
+            .iter()
+            .find(|event| event.field("request_id") == request_id)
+            .expect("each response id has one daemon log line");
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(event.field("operation"), operation);
+        assert_eq!(
+            event.field("caller"),
+            format!("registrar-client:{}", registrar_client_name())
+        );
+        assert_eq!(
+            event.field("audit_store_dir"),
+            audit_store_dir.display().to_string()
+        );
+        assert_eq!(event.field("expected_mount_unit"), expected_mount_unit);
+    }
+}
+
 /// A deregistration driven over the real socket, through the real
 /// framing, the real production handler and the real codec, over real
 /// verbs pointed at a `wiremock` with nothing mounted — which is how a
@@ -2541,7 +2632,7 @@ async fn the_idempotency_key_reaches_nothing_downstream() {
     assert_eq!(first.outcome, second.outcome);
     assert_ne!(
         first.request_id, second.request_id,
-        "the request id is per invocation and is not the idempotency key"
+        "the request id is per response and is not the idempotency key"
     );
 
     // The intent line is what the verb was handed. Blanking the one

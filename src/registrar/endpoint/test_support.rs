@@ -10,6 +10,7 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -18,11 +19,16 @@ use rcgen::{
     SanType, date_time_ymd,
 };
 use rustls::ClientConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::UnixStream;
+use tokio::sync::Notify;
+use tokio_rustls::TlsConnector;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, SubscriberExt as _};
 
+use super::activation::ActivationContract;
 use super::client;
 use super::tls::{EndpointCertResolver, EndpointTlsError, build_server_config};
 use crate::registrar::endpoint_pin::{
@@ -37,6 +43,7 @@ use crate::registrar::{registrar_client_identity, registrar_endpoint_identity};
 #[derive(Debug, Clone)]
 pub(super) struct CapturedEvent {
     pub(super) message: String,
+    pub(super) level: tracing::Level,
     pub(super) fields: BTreeMap<String, String>,
 }
 
@@ -49,14 +56,32 @@ impl CapturedEvent {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct CapturedLogs(Arc<StdMutex<Vec<CapturedEvent>>>);
+pub(crate) struct CapturedLogs {
+    events: Arc<StdMutex<Vec<CapturedEvent>>>,
+    changed: Arc<Notify>,
+}
 
 impl CapturedLogs {
     pub(super) fn events(&self) -> Vec<CapturedEvent> {
-        self.0
+        self.events
             .lock()
             .expect("the capture mutex is only held to push and read")
             .clone()
+    }
+
+    /// Waits until a captured event contains `needle`.
+    pub(crate) async fn wait_for_message_containing(&self, needle: &str) {
+        loop {
+            let changed = self.changed.notified();
+            if self
+                .events()
+                .iter()
+                .any(|event| event.message.contains(needle))
+            {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Every refusal event captured so far.
@@ -107,13 +132,15 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-        self.0
+        self.events
             .lock()
             .expect("the capture mutex is only held to push and read")
             .push(CapturedEvent {
                 message,
+                level: *event.metadata().level(),
                 fields: collector.0,
             });
+        self.changed.notify_one();
     }
 }
 
@@ -130,7 +157,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
 /// this one. Rebuilding recomputes it over the live subscribers, this
 /// one now among them, so a capture cannot come back empty because some
 /// other test happened to reach the same log line first.
-pub(super) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -412,5 +439,74 @@ impl Pki {
     /// The caller the endpoint is meant to serve.
     pub(super) fn registrar_client_config(&self) -> ClientConfig {
         self.client_config(Some(self.registrar_client_material()))
+    }
+}
+
+/// A socket-activated endpoint harness used by daemon integration tests.
+///
+/// The harness owns the temporary socket and certificate material while the
+/// daemon owns the accept task. It follows the production adoption path, so a
+/// test proves that a daemon invocation accepts a real mutual-TLS request.
+pub(crate) struct DaemonEndpointHarness {
+    _dir: TempDir,
+    pki: Pki,
+    socket_path: PathBuf,
+    endpoint: Arc<super::ActivatedEndpoint>,
+}
+
+impl DaemonEndpointHarness {
+    /// Creates an endpoint that a daemon invocation can serve.
+    pub(crate) fn bind() -> anyhow::Result<Self> {
+        let pki = Pki::new();
+        let (server_config, resolver) = pki.conforming();
+        let dir = tempfile::tempdir()?;
+        let socket_path = dir.path().join("registrar.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(super::REQUIRED_SOCKET_MODE),
+        )?;
+        let endpoint = super::adopt(
+            ActivationContract::from_test_descriptor(super::into_raw_fd(listener)),
+            super::current_effective_uid(),
+            server_config,
+            resolver,
+            TEST_DOMAIN.to_string(),
+        )?;
+
+        Ok(Self {
+            _dir: dir,
+            pki,
+            socket_path,
+            endpoint,
+        })
+    }
+
+    /// Returns the opaque endpoint handle a daemon invocation owns.
+    pub(crate) fn registrar_endpoint(&self) -> crate::registrar::RegistrarEndpoint {
+        crate::registrar::RegistrarEndpoint::from_test_activated(Arc::clone(&self.endpoint))
+    }
+
+    /// Sends one framed registrar request and reads the complete response.
+    pub(crate) async fn round_trip(&self, request: &[u8]) -> Vec<u8> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .expect("connect to the daemon-owned endpoint");
+        let mut tls = TlsConnector::from(Arc::new(self.pki.registrar_client_config()))
+            .connect(
+                ServerName::try_from(DIAL_NAME).expect("the test dial name is a valid DNS name"),
+                stream,
+            )
+            .await
+            .expect("the daemon-owned endpoint completes the TLS handshake");
+        tls.write_all(request)
+            .await
+            .expect("write the registrar request");
+        tls.flush().await.expect("flush the registrar request");
+        let mut response = Vec::new();
+        tls.read_to_end(&mut response)
+            .await
+            .expect("the daemon-owned endpoint closes the response cleanly");
+        response
     }
 }

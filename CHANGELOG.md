@@ -92,6 +92,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot reinit` before it wipes. Setting the key to `directory` is
   the explicit opt-out and keeps the earlier behaviour, leaving the
   reserve a budget with a project quota as the route to a real ceiling.
+- When an enabled registrar endpoint uses `filesystem` enforcement but its
+  audit store is not mounted, `bootroot-agent` now keeps certificate renewal
+  running and answers each registrar request with the permanent
+  `registrar_unavailable` / `audit_unwritable` refusal. The daemon names the
+  expected mount unit at startup, and each response's fresh `request_id`
+  identifies its informational journal line rather than an audit record.
 - `bootroot-agent` takes a new optional `[acme].account_key_path`. When
   it is set, the ACME **account** signing key is loaded from that path,
   or created there once with `0600` permissions, so the profile keeps one

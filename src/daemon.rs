@@ -157,6 +157,8 @@ pub struct DaemonInvocation {
     pub insecure_mode: bool,
     /// CLI overrides that must survive a config reload.
     pub cli_overrides: config::CliOverrides,
+    /// Localized messages for the invocation's operator diagnostics.
+    pub messages: crate::DaemonMessages,
     /// The stop signal, held by the caller across reloads.
     pub shutdown: DaemonShutdown,
     /// The activated registrar endpoint, held by the caller across
@@ -168,6 +170,7 @@ pub struct DaemonInvocation {
 ///
 /// # Errors
 /// Returns an error if issuance or shutdown handling fails.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
     let DaemonInvocation {
         settings,
@@ -176,6 +179,7 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
         config_path,
         insecure_mode,
         cli_overrides,
+        messages,
         shutdown,
         registrar_endpoint,
     } = invocation;
@@ -183,9 +187,10 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
     #[cfg(target_os = "linux")]
-    let registrar_service = resolve_registrar_service(&registrar_endpoint, &settings).await?;
+    let registrar_service =
+        resolve_registrar_service(&registrar_endpoint, &settings, messages).await?;
     #[cfg(not(target_os = "linux"))]
-    let _ = &registrar_endpoint;
+    let _ = (&registrar_endpoint, messages);
     let profile_locks = Arc::new(ProfileLocks::new());
     let shutdown_rx = shutdown.receiver();
     let runtime = IssuanceRuntime {
@@ -604,10 +609,81 @@ type RegistrarService = Option<(
 async fn resolve_registrar_service(
     registrar_endpoint: &RegistrarEndpoint,
     settings: &config::Settings,
+    messages: crate::DaemonMessages,
 ) -> anyhow::Result<RegistrarService> {
     match registrar_endpoint.activated() {
-        Some(endpoint) => Ok(Some((endpoint, build_registrar_handler(settings).await?))),
+        Some(endpoint) => {
+            let handler =
+                build_or_refuse_registrar_handler(settings, audit_store_is_mount_point, messages)
+                    .await?;
+            Ok(Some((endpoint, handler)))
+        }
         None => Ok(None),
+    }
+}
+
+/// Returns whether `store_dir` is a mount point, without inspecting its source.
+///
+/// Linux gives a mounted directory a different `st_dev` from its parent. A
+/// metadata failure is treated as absent so the endpoint fails closed without
+/// creating the path it is checking.
+#[cfg(target_os = "linux")]
+fn audit_store_is_mount_point(store_dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    audit_store_is_mount_point_with(store_dir, |path| {
+        std::fs::metadata(path).map(|metadata| metadata.dev())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn audit_store_is_mount_point_with(
+    store_dir: &Path,
+    metadata_device: impl Fn(&Path) -> std::io::Result<u64>,
+) -> bool {
+    let Some(parent) = store_dir.parent() else {
+        return false;
+    };
+    match (metadata_device(store_dir), metadata_device(parent)) {
+        (Ok(store_device), Ok(parent_device)) => store_device != parent_device,
+        _ => false,
+    }
+}
+
+/// Builds the production handler, or the audited-store refusal handler.
+///
+/// The mount check is deliberately evaluated only for `filesystem` mode. In
+/// the refusal case this returns before resolving a production dependency, so
+/// it cannot create the absent store through
+/// [`crate::registrar::audit::AuditRecordStore::open`].
+#[cfg(target_os = "linux")]
+async fn build_or_refuse_registrar_handler(
+    settings: &config::Settings,
+    is_mount_point: impl FnOnce(&Path) -> bool,
+    messages: crate::DaemonMessages,
+) -> anyhow::Result<Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>> {
+    let registrar = &settings.registrar;
+    if registrar.audit_store_enforcement == config::AuditStoreEnforcement::Filesystem
+        && !is_mount_point(&registrar.audit_store_dir)
+    {
+        let mount_unit = crate::registrar::audit_store::mount_unit_name(&registrar.audit_store_dir);
+        warn!(
+            audit_store_dir = %registrar.audit_store_dir.display(),
+            expected_mount_unit = mount_unit.as_str(),
+            "{}", messages.audit_store_not_mounted_at_start()
+        );
+        // Unlike every other endpoint dependency failure, a missing
+        // audit-store mount degrades only the endpoint: the handler still
+        // accepts the activated socket and the daemon keeps its
+        // certificate-renewal duties running.
+        let handler = crate::registrar::endpoint::unavailable::UnavailableHandler::new(
+            registrar.audit_store_dir.clone(),
+            mount_unit,
+            messages,
+        );
+        Ok(Arc::new(handler))
+    } else {
+        build_registrar_handler(settings).await
     }
 }
 
@@ -1288,6 +1364,22 @@ mod tests {
     const TEST_JITTER_SECS: u64 = 10;
     const TEST_BASE_SECS: u64 = 60;
     const TEST_SEED_NS: i128 = 123_456_789;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_audit_store_mount_gate_compares_only_devices() {
+        let store = Path::new("/srv/bootroot/audit-store");
+        assert!(audit_store_is_mount_point_with(store, |path| {
+            if path == store { Ok(2) } else { Ok(1) }
+        }));
+        assert!(!audit_store_is_mount_point_with(store, |_| Ok(1)));
+        assert!(!audit_store_is_mount_point_with(store, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fixture has no store",
+            ))
+        }));
+    }
 
     fn build_profile(cert_path: PathBuf) -> config::DaemonProfileSettings {
         config::DaemonProfileSettings {

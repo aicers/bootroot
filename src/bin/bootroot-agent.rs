@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bootroot::config::CliOverrides;
 use bootroot::{
-    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint, config, eab,
+    Args, DaemonInvocation, DaemonMessages, DaemonShutdown, RegistrarEndpoint, config, eab,
     ensure_registrar_surface_certificates, profile, run_daemon, run_oneshot,
 };
 use clap::Parser;
@@ -68,6 +68,11 @@ async fn main() -> anyhow::Result<()> {
     // the endpoint is disabled this does nothing at all — no path
     // created, nothing asked of the CA or of OpenBao.
     ensure_registrar_surface_certificates(&initial_settings, args.insecure).await?;
+    let daemon_messages = if initial_settings.registrar_endpoint.enabled {
+        DaemonMessages::from_environment()
+    } else {
+        DaemonMessages::default()
+    };
     let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
 
@@ -86,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
             config_path: args.config.clone(),
             insecure_mode: args.insecure,
             cli_overrides: cli_overrides.clone(),
+            messages: daemon_messages,
             shutdown: shutdown.clone(),
             registrar_endpoint: registrar_endpoint.clone(),
         }));

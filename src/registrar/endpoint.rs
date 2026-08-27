@@ -100,9 +100,10 @@ pub(crate) mod protocol;
 pub(crate) mod refusal;
 pub(crate) mod serve;
 pub(crate) mod tls;
+pub(crate) mod unavailable;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 

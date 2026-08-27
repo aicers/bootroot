@@ -456,6 +456,25 @@ pub(crate) fn encode_refusal_response(
     )
 }
 
+/// Encodes the permanent response used when the registrar cannot serve.
+///
+/// This deliberately accepts the already-decided unavailable vocabulary
+/// rather than a verb-layer refusal: the caller may reject a request before a
+/// verb, and therefore before an audit context, exists.
+pub(super) fn encode_registrar_unavailable(
+    request_id: &str,
+    reason: RegistrarUnavailableReason,
+    health: &RegistrarHealth,
+) -> Result<Vec<u8>, CodecError> {
+    encode_refusal(
+        request_id,
+        None,
+        RefusalClass::Permanent,
+        Some(EnrollError::RegistrarUnavailable { reason }),
+        health,
+    )
+}
+
 fn encode_refusal(
     request_id: &str,
     registration_id: Option<&str>,

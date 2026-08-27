@@ -45,6 +45,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::registrar::audit_store::mount_unit_name;
 
 use crate::i18n::Messages;
 
@@ -86,9 +87,6 @@ const ARTIFACT_FILE_MODE: u32 = 0o644;
 /// so a set-user-ID or sticky bit is a departure rather than something
 /// the mask hides.
 const MODE_MASK: u32 = 0o7777;
-
-/// Suffix systemd forces on a mount unit's name.
-const MOUNT_UNIT_SUFFIX: &str = ".mount";
 
 /// Where the three artifacts are installed.
 const SYSTEMD_UNIT_DIR: &str = "/etc/systemd/system";
@@ -730,6 +728,7 @@ fn derive_image_path(store_dir: &Path, messages: &Messages) -> Result<PathBuf> {
 ///
 /// The mount unit's name is not chosen: a `.mount` unit's name must be
 /// the escaped form of its mount point, or systemd refuses to load it.
+#[cfg(test)]
 fn systemd_escape_path(store_dir: &Path) -> String {
     let bytes = store_dir.as_os_str().as_bytes();
     let components: Vec<&[u8]> = bytes
@@ -759,17 +758,13 @@ fn systemd_escape_path(store_dir: &Path) -> String {
 
 /// One byte of a unit name, escaped by systemd's own rule: everything
 /// outside `[0-9A-Za-z:_.]` becomes `\xNN` in lower-case hex.
+#[cfg(test)]
 fn escape_unit_name_byte(byte: u8) -> String {
     if byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'.') {
         String::from_utf8(vec![byte]).unwrap_or_else(|_| format!("\\x{byte:02x}"))
     } else {
         format!("\\x{byte:02x}")
     }
-}
-
-/// Returns the `.mount` unit's name for `store_dir`.
-fn mount_unit_name(store_dir: &Path) -> String {
-    format!("{}{MOUNT_UNIT_SUFFIX}", systemd_escape_path(store_dir))
 }
 
 /// Renders `path` as a whole unit value — `What=` and `Where=`, which

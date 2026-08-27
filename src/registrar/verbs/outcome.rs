@@ -27,10 +27,12 @@ const REQUEST_ID_RANDOM_BYTES: usize = 9;
 /// the system random source is unavailable.
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// A correlation handle for one verb invocation, generated at entry.
+/// A registrar correlation handle for one endpoint response.
 ///
-/// Not a secret and not an idempotency key: it correlates an audit
-/// record with a response, and nothing is cached under it.
+/// A verb mints it at entry, while the refusing handler mints it when no verb
+/// runs. It correlates a response with its audit record where there is one,
+/// and with the daemon log line for an unaudited refusal where there is not.
+/// It is not a secret or an idempotency key, and nothing is cached under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequestId(String);
 

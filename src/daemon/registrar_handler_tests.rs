@@ -6,15 +6,27 @@
 //! fixed path, mutates the process environment or reaches the network.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tempfile::TempDir;
+use tokio::time::timeout;
+use wiremock::MockServer;
 
 use super::{
-    RegistrarStateProjection, build_registrar_handler, openbao_duration, read_registrar_state,
-    registrar_secret_id_options, resolve_secrets_dir,
+    DaemonInvocation, DaemonShutdown, RegistrarStateProjection, build_or_refuse_registrar_handler,
+    build_registrar_handler, openbao_duration, read_registrar_state, registrar_secret_id_options,
+    resolve_secrets_dir, run_daemon,
 };
-use crate::config::Settings;
+use crate::DaemonMessages;
+use crate::config::{AuditStoreEnforcement, OpenBaoSettings, Settings};
+use crate::registrar::endpoint::frame::{Operation, encode_request_frame};
+use crate::registrar::endpoint::protocol::{
+    DeregisterRequest, EnrollError, ProtocolVersion, RefusalClass, RegistrarUnavailableReason,
+    Request, decode_refusal_response, encode_request,
+};
+use crate::registrar::endpoint::test_support::{DaemonEndpointHarness, capture_logs};
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{
     InternalAgentConfigParams, InternalPaths, active_root_cert_path, render_internal_agent_config,
@@ -94,6 +106,21 @@ fn write_internal_credential(secrets_dir: &Path, root_fingerprint: &str) {
         },
     );
     std::fs::write(paths.agent_config(), rendered).expect("write the internal agent config");
+}
+
+/// Writes a certificate whose validity window makes the periodic renewal
+/// task wait for its normal next tick instead of beginning an ACME exchange.
+fn write_unexpired_certificate(path: &Path) {
+    let key = KeyPair::generate().expect("generate certificate key");
+    let mut params =
+        CertificateParams::new(vec!["example.com".to_string()]).expect("certificate params");
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(90);
+    let cert = params.self_signed(&key).expect("self-signed certificate");
+    std::fs::create_dir_all(path.parent().expect("the certificate directory"))
+        .expect("mkdir certificate directory");
+    std::fs::write(path, cert.pem()).expect("write the certificate");
 }
 
 /// The whole arrangement one invocation needs, minus whatever the case
@@ -621,27 +648,103 @@ provisioning_config_path = "{provisioning}"
 #[test]
 fn the_handler_is_built_only_for_an_active_endpoint() {
     let source = include_str!("../daemon.rs");
-    let call_sites: Vec<&str> = source
-        .match_indices("build_registrar_handler(settings)")
-        .map(|(at, _)| &source[at.saturating_sub(160)..at])
+    let resolver = source
+        .split("async fn resolve_registrar_service")
+        .nth(1)
+        .and_then(|rest| rest.split("fn audit_store_is_mount_point").next())
+        .expect("resolve_registrar_service is followed by the mount predicate");
+    let call_sites: Vec<_> = resolver
+        .match_indices("build_or_refuse_registrar_handler(")
         .collect();
     assert_eq!(
         call_sites.len(),
         1,
         "the handler has exactly one call site in the composition layer"
     );
+    let Some((handler_call, _)) = call_sites.first().copied() else {
+        panic!("the assertion above established one handler build call");
+    };
+    let endpoint_guard = resolver
+        .find("match registrar_endpoint.activated()")
+        .expect("the resolver guards the handler with endpoint activation");
     assert!(
-        call_sites[0].contains("registrar_endpoint.activated()"),
-        "the one call site is inside the active-endpoint guard: {}",
-        call_sites[0]
+        endpoint_guard < handler_call,
+        "the one call site follows the active-endpoint guard"
     );
 }
 
-/// The one guard is consulted before `run_daemon` spawns anything, so a
-/// dependency it cannot resolve fails the invocation rather than leaving
-/// a task, or the adopted socket, behind.
+/// An absent filesystem-backed store is rejected before the production handler
+/// reaches `AuditRecordStore::open`, which would otherwise create both paths.
+#[tokio::test]
+async fn an_unmounted_filesystem_store_does_not_open_or_create_the_record_store() {
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings();
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Filesystem;
+    settings.registrar.provisioning_config_path = deployment.dir.path().join("missing.toml");
+    std::fs::remove_dir_all(&deployment.audit_dir).expect("remove the arranged store");
+
+    let _handler =
+        build_or_refuse_registrar_handler(&settings, |_| false, DaemonMessages::default())
+            .await
+            .expect("the refusal handler does not resolve production dependencies");
+
+    assert!(
+        !deployment.audit_dir.exists(),
+        "the refusal path does not create the absent audit store"
+    );
+    assert!(
+        !deployment.audit_dir.join("records").exists(),
+        "the refusal path does not create the record directory"
+    );
+}
+
+/// `directory` mode must not probe a mount point before building the ordinary
+/// handler, because its configured directory is intentionally unmounted.
+#[tokio::test]
+async fn directory_enforcement_does_not_run_the_mount_gate() {
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings();
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    settings.registrar.provisioning_config_path = deployment.dir.path().join("missing.toml");
+
+    let result = build_or_refuse_registrar_handler(
+        &settings,
+        |_| panic!("directory enforcement must not probe the audit-store mount"),
+        DaemonMessages::default(),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("directory enforcement passes to the ordinary handler without probing the mount")
+    };
+    assert!(
+        format!("{error:#}").contains("missing.toml"),
+        "directory enforcement reaches the ordinary handler's dependencies: {error:#}"
+    );
+}
+
+/// A filesystem store that passes the gate still takes the ordinary handler
+/// path. A deliberately missing production dependency makes that selection
+/// observable without a real mount or an external service.
+#[tokio::test]
+async fn a_mounted_filesystem_store_builds_the_production_handler() {
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings();
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Filesystem;
+    settings.registrar.provisioning_config_path = deployment.dir.path().join("missing.toml");
+
+    assert!(
+        build_or_refuse_registrar_handler(&settings, |_| true, DaemonMessages::default())
+            .await
+            .is_err(),
+        "a mounted filesystem store continues to resolve the production handler"
+    );
+}
+
+/// Resolving a refusal handler must still lead to both daemon duties: the
+/// endpoint accepts and answers instead of leaving its inherited socket idle,
+/// and fast-poll keeps running its renewal work.
 #[test]
-fn the_registrar_service_is_resolved_before_anything_is_spawned() {
+fn the_registrar_service_is_resolved_before_endpoint_and_fast_poll_start() {
     let source = include_str!("../daemon.rs");
     let body = source
         .split("pub(crate) async fn run_daemon")
@@ -656,9 +759,165 @@ fn the_registrar_service_is_resolved_before_anything_is_spawned() {
     let watcher = body
         .find("spawn_shutdown_watcher(")
         .expect("run_daemon spawns the shutdown watcher");
+    let endpoint = body
+        .find("spawn_registrar_endpoint(")
+        .expect("run_daemon starts the accepted registrar endpoint");
+    let fast_poll = body
+        .find("fast_poll::run_fast_poll_loop(")
+        .expect("run_daemon starts the fast-poll renewal loop");
     assert!(
         resolved_at < first_spawn && resolved_at < watcher,
         "the registrar service is resolved before the invocation spawns anything"
+    );
+    assert!(
+        resolved_at < endpoint && resolved_at < fast_poll,
+        "the registrar service is resolved before the endpoint and fast-poll tasks start"
+    );
+}
+
+/// An absent filesystem store degrades the socket endpoint, not the daemon.
+///
+/// This drives a real daemon invocation with the ordinary profile and
+/// fast-poll tasks, then proves that the adopted socket answers a refusal and
+/// that both renewal duties reached their running state before shutdown. The
+/// `OpenBao` mock is local and deliberately returns no auth response: the test
+/// is about task survival, not a live backend.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unmounted_store_refuses_verbs_without_stopping_daemon_duties() {
+    let (logs, _guard) = capture_logs();
+    let deployment = Deployment::arrange();
+    let endpoint = DaemonEndpointHarness::bind().expect("daemon endpoint harness");
+    let openbao = MockServer::start().await;
+    let role_id_path = deployment.path().join("role-id");
+    let secret_id_path = deployment.path().join("secret-id");
+    std::fs::write(&role_id_path, "role-id\n").expect("write role id");
+    std::fs::write(&secret_id_path, "secret-id\n").expect("write secret id");
+
+    let mut settings = deployment.settings();
+    settings.registrar_endpoint.enabled = true;
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Filesystem;
+    settings.registrar.provisioning_config_path = deployment.path().join("missing.toml");
+    let profile = settings
+        .profiles
+        .first()
+        .expect("the fixture has one profile");
+    write_unexpired_certificate(&profile.paths.cert);
+    std::fs::remove_dir_all(&deployment.audit_dir).expect("remove the arranged store");
+    settings.openbao = Some(OpenBaoSettings {
+        url: openbao.uri(),
+        allow_plaintext_http: false,
+        kv_mount: "secret".to_string(),
+        role_id_path,
+        secret_id_path,
+        ca_bundle_path: None,
+        fast_poll_interval: Duration::from_secs(60),
+        state_path: deployment.path().join("fast-poll-state.json"),
+    });
+
+    let shutdown = DaemonShutdown::new();
+    let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: None,
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        messages: DaemonMessages::default(),
+        shutdown: shutdown.clone(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    }));
+
+    let payload = encode_request(&Request::Deregister(DeregisterRequest {
+        protocol_version: ProtocolVersion::current(),
+        service_name: "api".to_string(),
+        host: "host".to_string(),
+        instance: Some(1),
+        idempotency_key: "caller-supplied-key".to_string(),
+    }))
+    .expect("valid deregister request");
+    let frame = encode_request_frame(Operation::Deregister, &payload).expect("request frame");
+    let response = endpoint.round_trip(&frame).await;
+    let Some(prefix) = response.get(..4) else {
+        panic!("the daemon answers the request with a response frame");
+    };
+    let length = u32::from_be_bytes(
+        prefix
+            .try_into()
+            .expect("a response prefix always has four bytes"),
+    );
+    let body_length = usize::try_from(length).expect("a u32 response length fits usize");
+    let Some(body) = response.get(4..) else {
+        panic!("the response frame carries a body");
+    };
+    assert_eq!(body.len(), body_length, "the response body is complete");
+    let refusal = decode_refusal_response(body).expect("the daemon returns a refusal response");
+    assert_eq!(refusal.class, RefusalClass::Permanent);
+    assert_eq!(
+        refusal.error,
+        Some(EnrollError::RegistrarUnavailable {
+            reason: RegistrarUnavailableReason::AuditUnwritable,
+        })
+    );
+
+    timeout(
+        Duration::from_secs(2),
+        logs.wait_for_message_containing("Fast-poll enabled:"),
+    )
+    .await
+    .expect("the fast-poll task starts while the endpoint refuses");
+    timeout(
+        Duration::from_secs(2),
+        logs.wait_for_message_containing("daemon enabled. check_interval="),
+    )
+    .await
+    .expect("the per-profile renewal task starts while the endpoint refuses");
+
+    shutdown.stop();
+    timeout(Duration::from_secs(2), daemon)
+        .await
+        .expect("the daemon shuts down")
+        .expect("the daemon task joins")
+        .expect("the unavailable endpoint does not stop the daemon");
+    assert!(
+        !deployment.audit_dir.exists(),
+        "the daemon never opens or creates the unavailable audit store"
+    );
+}
+
+/// An ordinary registrar dependency failure is still fatal to the daemon.
+///
+/// The mount refusal above is deliberately the sole exception: selecting the
+/// production handler with an unusable record directory must retain the
+/// existing startup failure rather than silently becoming another refusal.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unopenable_audit_store_stops_the_daemon() {
+    let deployment = Deployment::arrange();
+    let endpoint = DaemonEndpointHarness::bind().expect("daemon endpoint harness");
+    let mut settings = deployment.settings();
+    settings.registrar_endpoint.enabled = true;
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    let blocked = deployment.path().join("not-a-directory");
+    std::fs::write(&blocked, "a regular file blocks the record directory")
+        .expect("write the blocking file");
+    settings.registrar.audit_record_dir = blocked.join("records");
+
+    let error = run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: None,
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        messages: DaemonMessages::default(),
+        shutdown: DaemonShutdown::new(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    })
+    .await
+    .expect_err("an unopenable production audit store stops the daemon");
+
+    assert!(
+        format!("{error:#}").contains("not-a-directory"),
+        "the startup failure identifies the record-store path: {error:#}"
     );
 }
 

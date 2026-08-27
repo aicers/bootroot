@@ -771,6 +771,26 @@ endpoint none of it runs, whatever the `audit_store_*` keys say.
   name, `stat`s any path the reserve introduces, or names a leftover a
   previous `filesystem`-mode run may have left behind.
 
+**Runtime refusal.** On an endpoint-enabled `filesystem` deployment, the
+daemon checks at startup that `audit_store_dir` is a mount point. If it is not,
+the daemon logs the store path and its expected mount unit once, keeps its
+certificate-renewal and fast-poll work running, and accepts registrar
+connections only to return a permanent `registrar_unavailable` refusal with
+reason `audit_unwritable`. It does not leave callers waiting on the activated
+socket, and retrying cannot repair the condition. The check happens only at
+daemon start: mounting the store later takes effect on the next start. It does
+not run when the endpoint is disabled or when enforcement is `directory`.
+
+Each refused response has a newly generated `request_id`. It has no audit
+record because the unwritable audit trail is why the request was refused;
+instead, the daemon emits one informational log line carrying that id, the
+caller, the operation, the store path and the expected mount unit. Give that id
+to the operator to find the refusal in the journal rather than searching a
+store that contains no record for it.
+
+Set `BOOTROOT_LANG=ko` before starting an endpoint-enabled agent to emit these
+two journal diagnostics in Korean; English is the default.
+
 **The four outcomes.** A run reports exactly one of them.
 
 | Outcome | Mode | Exit |
@@ -981,10 +1001,9 @@ assume away:
    upgraded from the earlier layout does carry one, so there the bind
    succeeds and the device lands on the root filesystem again until the
    underlying store is renamed aside.
-3. **A started daemon still creates `records/` beneath an unmounted
-   store.** Opening the record store is what creates its directories, and
-   that path knows nothing of a mode or a mount. A run-time gate refusing
-   to open the store while the mount is missing is a later change.
+3. **A mount lost while the daemon runs is not detected.** The daemon's
+   mount check is made only at startup, so a loss after that point takes
+   effect on the next daemon start.
 4. **A mount lost while the container runs is not detected.** A running
    container keeps the mount it started with.
 5. **The empty-mount-point invariant is established before activation and

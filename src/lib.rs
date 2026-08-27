@@ -6,6 +6,7 @@ pub mod agent_args;
 pub mod cert_chain;
 pub mod cert_group;
 pub mod config;
+pub mod daemon_messages;
 pub mod db;
 pub mod eab;
 pub mod fs_util;
@@ -30,6 +31,7 @@ mod fast_poll;
 
 pub use agent_args::Args;
 pub use daemon::{DaemonInvocation, DaemonShutdown};
+pub use daemon_messages::DaemonMessages;
 pub use registrar::RegistrarEndpoint;
 pub use registrar_certs::ensure_registrar_surface_certificates;
 

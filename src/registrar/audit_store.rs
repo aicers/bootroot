@@ -48,6 +48,7 @@
 
 use std::fs::{DirBuilder, Permissions};
 use std::io;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +77,49 @@ pub const STORE_DIR_MODE: u32 = 0o700;
 /// Mode a missing component above the store is created at, matching the
 /// record store's own `ANCESTOR_DIR_MODE`.
 pub const ANCESTOR_DIR_MODE: u32 = 0o755;
+
+/// Returns the systemd mount-unit name forced by `store_dir`.
+///
+/// A `.mount` unit must use systemd's escaped spelling of its mount point.
+/// The installer renders that unit while the daemon names it in a refusal, so
+/// the derivation lives beside the shared store layout rather than in either
+/// caller.
+#[must_use]
+pub fn mount_unit_name(store_dir: &Path) -> String {
+    format!("{}.mount", systemd_escape_path(store_dir))
+}
+
+fn systemd_escape_path(store_dir: &Path) -> String {
+    let components: Vec<&[u8]> = store_dir
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect();
+    if components.is_empty() {
+        return "-".to_string();
+    }
+
+    let mut escaped = String::new();
+    for (index, component) in components.iter().enumerate() {
+        if index > 0 {
+            escaped.push('-');
+        }
+        for byte in *component {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b':' | b'_' | b'.') {
+                escaped.push(char::from(*byte));
+            } else {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\x{byte:02x}");
+            }
+        }
+    }
+    if let Some(rest) = escaped.strip_prefix('.') {
+        format!("\\x2e{rest}")
+    } else {
+        escaped
+    }
+}
 
 /// The uid production requires the store directory and its record
 /// subdirectory to be owned by.
@@ -848,6 +892,14 @@ mod tests {
         assert_eq!(
             settings.audit_record_dir,
             records_dir(&settings.audit_store_dir)
+        );
+    }
+
+    #[test]
+    fn the_mount_unit_name_matches_systemd_path_escaping() {
+        assert_eq!(
+            mount_unit_name(Path::new("/var/lib/bootroot/audit-store")),
+            "var-lib-bootroot-audit\\x2dstore.mount"
         );
     }
 

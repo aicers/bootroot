@@ -683,6 +683,15 @@ error.
   gated on `[registrar_endpoint] enabled` — on a host that has not
   enabled the endpoint neither mode does anything at all. See
   [The shared audit store](operations.md#the-shared-audit-store).
+
+  When the endpoint is enabled under `filesystem`, the daemon checks at
+  startup that `audit_store_dir` is mounted. If it is not, it keeps renewal
+  work running but answers registrar verbs with the permanent
+  `registrar_unavailable` / `audit_unwritable` refusal. The startup journal
+  names the store and its expected mount unit; each refusal has a fresh
+  `request_id` that resolves to one daemon log line, not an audit record. A
+  mount added after startup is used after the next daemon start. This check is
+  absent for `directory` and for a disabled endpoint.
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
   the resolved directory must stay inside `audit_store_dir`.

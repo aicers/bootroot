@@ -593,6 +593,16 @@ impl RegistrarEndpoint {
     pub(crate) fn activated(&self) -> Option<std::sync::Arc<endpoint::ActivatedEndpoint>> {
         self.inner.clone()
     }
+
+    /// Wraps a harness-provided endpoint for an in-process daemon test.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn from_test_activated(
+        endpoint: std::sync::Arc<endpoint::ActivatedEndpoint>,
+    ) -> Self {
+        Self {
+            inner: Some(endpoint),
+        }
+    }
 }
 
 impl std::fmt::Debug for RegistrarEndpoint {
