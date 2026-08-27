@@ -1384,6 +1384,11 @@ assert_openbao_audit_device() {
   local container="${RUN_INSTANCE}-openbao"
 
   log_phase "assert-openbao-audit-reopen"
+  # Before the probe itself, the bound every one of its waits runs
+  # under: a bound a command can decline is a probe that hangs, and one
+  # that answers with the command's own status for a wait its budget
+  # already closed.
+  assert_openbao_audit_bound_stops_a_command_that_will_not_stop
   assert_openbao_audit_reopen "$container" "$OPENBAO_URL" \
     "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID"
   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target \
@@ -1399,17 +1404,24 @@ assert_openbao_audit_device() {
 # Drives one AppRole login and one KV read, so the active log OpenBao
 # created after the reopen carries both of the entries
 # `assert_openbao_audit_log` looks for.
+#
+# The `secret_id` and the token it mints reach `curl` over a pipe rather
+# than in `argv`, the same way the reopen probe hands them over: `ps`
+# shows a process's arguments to every user on the host, so a credential
+# spelled on the command line is published for as long as the request
+# runs.
 drive_openbao_audit_traffic() {
   local url="${OPENBAO_URL%/}" token
 
   token="$(
-    curl -sS -X POST -H 'Content-Type: application/json' \
-      -d "{\"role_id\":\"${RUNTIME_ROTATE_ROLE_ID}\",\"secret_id\":\"${RUNTIME_ROTATE_SECRET_ID}\"}" \
-      "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
+    printf '{"role_id":"%s","secret_id":"%s"}' \
+      "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID" |
+      curl -sS -X POST -H 'Content-Type: application/json' \
+        --data @- "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
   )"
   [ -n "$token" ] || fail "the post-rotation AppRole login returned no token"
-  curl -sS -o /dev/null -H "X-Vault-Token: ${token}" \
-    "${url}/v1/secret/data/bootroot" ||
+  openbao_audit_curl_header_config "X-Vault-Token: ${token}" |
+    curl -sS -o /dev/null --config - "${url}/v1/secret/data/bootroot" ||
     fail "the post-rotation KV read could not be driven"
 }
 

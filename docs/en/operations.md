@@ -313,6 +313,25 @@ the same image, one whose main process ignores `SIGHUP` and one that
 honours it but recreates the log only after the budget has passed, and
 fails the build if either is reported as a reopen.
 
+Each of those bounded looks is bounded in a way the command it runs
+cannot decline. The timeout is recorded by the watchdog rather than read
+off the command's exit status, so a command that catches the signal,
+tidies up and exits 0 past the budget is still a timeout and not a
+successful answer; the command is started in a process group of its own
+and the whole group is signalled, so a `docker exec` that spawned
+something does not leave it holding the pipe; and the signal is followed
+by an unconditional kill five seconds later, so a command that ignores
+it stops anyway. That bound is itself proved before the probe runs: the
+lifecycle asserts it reports a timeout for a command that traps the
+signal and exits 0, and that it both reports a timeout for and leaves
+nothing behind of one that ignores the signal outright.
+
+The probe's own credentials never reach a command line. The AppRole
+`secret_id` goes to `curl` as a request body on standard input and the
+token it mints as a header in a configuration on standard input, because
+`ps` shows a process's arguments to every user on the host — and these
+harnesses run on shared CI runners.
+
 **The rotation-intent marker.** Immediately *before* the rename, a pass
 writes `rotation-intent.json` into the device's directory, holding the
 active log's `(st_dev, st_ino)` and the generation name it is about to

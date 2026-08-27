@@ -85,6 +85,17 @@ OPENBAO_AUDIT_REOPEN_POLL_SECONDS=0.5
 # runner lives, with no result either way.
 OPENBAO_AUDIT_PROBE_STEP_SECONDS=30
 
+# How long a command that has been told to stop is given to do so before
+# it is killed outright.
+#
+# A bound that only asks is not a bound. `docker` installs a `TERM`
+# handler of its own and a container runtime under load can sit in it,
+# and a shell wrapper anywhere in the way may ignore the signal
+# entirely; either way the wait the bound exists to end simply
+# continues. So the ask is followed by `KILL`, which nothing can
+# decline.
+OPENBAO_AUDIT_PROBE_KILL_GRACE_SECONDS=5
+
 # Reports the probe's clock, in whole seconds.
 #
 # Whole seconds is the resolution `date` offers everywhere this runs, so
@@ -108,29 +119,75 @@ openbao_audit_now() {
 #
 # `timeout` would say this in one word and is not assumed: a stock macOS
 # has none, and these harnesses run there.
+#
+# The timeout is recorded where the command cannot reach it, and the
+# command is stopped in a way it cannot decline:
+#
+#   * The 124 comes from a marker the watchdog writes, never from the
+#     child's exit status. A command is free to trap `TERM`, tidy up and
+#     exit 0, and reading the status alone would take that for a
+#     successful answer arriving inside the budget — the exact false
+#     establishment this bound exists to prevent, one layer down.
+#   * The child is started under job control so that it leads a process
+#     group of its own, and the whole group is signalled. `docker exec`
+#     is not a leaf: killing the client alone leaves whatever it spawned
+#     behind, still holding the pipe this function's caller is reading.
+#   * `TERM` first, then `KILL` after the grace above, so a command that
+#     ignores the ask still stops and `wait` still returns.
 openbao_audit_bounded() {
   local limit="$1"
   shift
-  local pid watchdog deadline status
+  local pid watchdog deadline status marker monitor
+  marker="$(mktemp "${TMPDIR:-/tmp}/bootroot-openbao-audit-bounded.XXXXXX")" || return 1
   deadline=$(($(openbao_audit_now) + limit))
+  # `set -m` is what puts the child in its own process group, and it is
+  # restored rather than assumed off: this file is sourced, and the
+  # harness sourcing it may be running under job control already.
+  monitor=""
+  case "$-" in
+    *m*) monitor="on" ;;
+  esac
+  set -m
   "$@" &
   pid=$!
+  [ -n "$monitor" ] || set +m
   # The watchdog is redirected away from this function's own stdout, so
   # that it cannot hold a command substitution's pipe open after the
   # command it guards has been reaped, and it waits in one-second steps,
   # so that the `sleep` left behind when it is dismissed early outlives
-  # it by no more than one of them.
+  # it by no more than one of them. It stands down the moment the child
+  # is gone, so a pid the parent has already reaped is never signalled.
   (
+    hard_deadline=0
     while [ "$(openbao_audit_now)" -lt "$deadline" ]; do
+      kill -0 "$pid" 2>/dev/null || exit 0
       sleep 1
     done
-    kill -TERM "$pid" 2>/dev/null || true
+    kill -0 "$pid" 2>/dev/null || exit 0
+    printf 'timeout\n' >"$marker"
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    hard_deadline=$(($(openbao_audit_now) + OPENBAO_AUDIT_PROBE_KILL_GRACE_SECONDS))
+    while [ "$(openbao_audit_now)" -lt "$hard_deadline" ]; do
+      kill -0 "$pid" 2>/dev/null || exit 0
+      sleep 1
+    done
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   ) >/dev/null 2>&1 &
   watchdog=$!
   status=0
-  wait "$pid" || status=$?
+  # The `wait` is what reports a job's death by signal, and that report
+  # is the shell's, not the command's; it is silenced here so that a
+  # bounded command cannot write a line into output a caller is
+  # matching on. The command's own stderr is untouched — it was
+  # inherited when the job was started.
+  { wait "$pid" || status=$?; } 2>/dev/null
   kill -TERM "$watchdog" 2>/dev/null || true
   wait "$watchdog" 2>/dev/null || true
+  if [ -s "$marker" ]; then
+    rm -f "$marker"
+    return 124
+  fi
+  rm -f "$marker"
   if [ "$status" -gt 128 ]; then
     return 124
   fi
@@ -154,6 +211,18 @@ openbao_audit_seal_state() {
   local url="${1%/}"
   curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" "${url}/v1/sys/seal-status" |
     jq -r '"sealed=\(.sealed) initialized=\(.initialized)"'
+}
+
+# Prints a curl config carrying one header, for curl to read on stdin.
+#
+# `--header` has no `@file` form, so a config is the only way to hand
+# curl a header without putting it in `argv`. The value is escaped for
+# curl's config parser, which reads `\\` and `\"` inside a quoted value
+# and would otherwise end the value at the first quote in a token.
+openbao_audit_curl_header_config() {
+  printf 'header = "'
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+  printf '"\n'
 }
 
 # Prints an unused generation name under the current second's stamp.
@@ -318,20 +387,28 @@ device on the signal" >&2
   #    what is asserted, and OpenBao writes the path into it in the
   #    clear.
   nonce="$(od -An -N8 -tx1 </dev/urandom | tr -d ' \n')"
+  # The `secret_id` and the token it mints go to curl over a pipe, never
+  # in `argv`. An argument is world-readable in `/proc` and in `ps` for
+  # as long as the process runs, and these harnesses run on shared CI
+  # runners and on developer machines with other people's agents on
+  # them; the login body goes in through `--data @-` and the bearer
+  # header through a config on stdin, which is the only way curl accepts
+  # a header without spelling it on the command line.
   token="$(
-    curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
-      -X POST -H 'Content-Type: application/json' \
-      -d "{\"role_id\":\"${role_id}\",\"secret_id\":\"${secret_id}\"}" \
-      "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
+    printf '{"role_id":"%s","secret_id":"%s"}' "$role_id" "$secret_id" |
+      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+        -X POST -H 'Content-Type: application/json' \
+        --data @- "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
   )"
   if [ -z "$token" ]; then
     echo "probe: the AppRole login returned no token" >&2
     return 1
   fi
   status="$(
-    curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
-      -o /dev/null -w '%{http_code}' -H "X-Vault-Token: ${token}" \
-      "${url}/v1/secret/data/bootroot-audit-reopen-probe/${nonce}"
+    openbao_audit_curl_header_config "X-Vault-Token: ${token}" |
+      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+        -o /dev/null -w '%{http_code}' --config - \
+        "${url}/v1/secret/data/bootroot-audit-reopen-probe/${nonce}"
   )"
   case "$status" in
     200 | 403 | 404) ;;
@@ -525,4 +602,90 @@ ${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS}s budget; the budget is not being measured
 reason, so it is not the budget that would go red: ${OPENBAO_AUDIT_STANDIN_OUTPUT}"
       ;;
   esac
+}
+
+# How long the bound self-test gives each of its two stand-in commands.
+#
+# One second, because what is under test is that the bound fires and
+# that what it fires stops the command — neither of which depends on how
+# long it waited first. The probe's own 30-second step bound would only
+# add a minute to every lifecycle run to prove the same thing.
+OPENBAO_AUDIT_BOUND_SELFTEST_LIMIT_SECONDS=1
+
+# Asserts the probe's command bound stops a command that will not stop
+# itself.
+#
+# Every wait in the probe runs under that bound, so a bound that can be
+# declined is a probe that can hang — and, worse, one that reports the
+# command's own answer for a wait whose budget had already closed. Green
+# runs say nothing about either: a command that answers in time is
+# bounded correctly whatever the bound does when it fires.
+#
+# Two stand-ins, one per way a bound can be talked out of it. The first
+# traps the signal, takes longer than the budget and exits 0, so a bound
+# that reads the child's exit status reports a success the budget
+# refused. The second ignores the signal outright and leaves a child of
+# its own behind, so an ask with nothing behind it never returns at all.
+assert_openbao_audit_bound_stops_a_command_that_will_not_stop() {
+  local status started elapsed ceiling pidfile leader follower waited
+
+  status=0
+  openbao_audit_bounded "$OPENBAO_AUDIT_BOUND_SELFTEST_LIMIT_SECONDS" \
+    sh -c 'trap "sleep 2; exit 0" TERM; sleep 300 & wait' >/dev/null 2>&1 || status=$?
+  if [ "$status" -ne 124 ]; then
+    fail "the openbao audit probe's command bound answered ${status} rather than 124 for a \
+command that trapped its signal and exited 0 past the budget; a timed-out command's own exit \
+status is being read as the probe's answer, so a late reopen can still be reported as \
+established"
+  fi
+
+  pidfile="$(mktemp "${TMPDIR:-/tmp}/bootroot-openbao-audit-bound-selftest.XXXXXX")" ||
+    fail "could not create the openbao audit bound self-test's pid file"
+  status=0
+  started="$(openbao_audit_now)"
+  # The stand-in's `$$` and `$!` are the *stand-in's*, so the quotes are
+  # single deliberately; the pid file reaches it as `$1` rather than
+  # through an expansion for the same reason.
+  # shellcheck disable=SC2016
+  openbao_audit_bounded "$OPENBAO_AUDIT_BOUND_SELFTEST_LIMIT_SECONDS" \
+    sh -c 'trap "" TERM; sleep 300 & printf "%s %s\n" "$$" "$!" >"$1"; while true; do
+      sleep 1
+    done' sh "$pidfile" >/dev/null 2>&1 || status=$?
+  elapsed=$(($(openbao_audit_now) - started))
+  leader=""
+  follower=""
+  read -r leader follower <"$pidfile" || true
+  rm -f "$pidfile"
+  if [ "$status" -ne 124 ]; then
+    fail "the openbao audit probe's command bound answered ${status} rather than 124 for a \
+command that ignores its signal"
+  fi
+  ceiling=$((OPENBAO_AUDIT_BOUND_SELFTEST_LIMIT_SECONDS +
+    OPENBAO_AUDIT_PROBE_KILL_GRACE_SECONDS + 5))
+  if [ "$elapsed" -gt "$ceiling" ]; then
+    fail "the openbao audit probe's command bound took ${elapsed}s to abandon a command that \
+ignores its signal, past the ${ceiling}s its budget and kill grace allow"
+  fi
+  # Without both pids there is nothing to check for, and a check with
+  # nothing to look for passes. That is a broken self-test, not a bound
+  # that held.
+  if [ -z "$leader" ] || [ -z "$follower" ]; then
+    fail "the openbao audit bound self-test's stand-in recorded no process group \
+('${leader}', '${follower}'), so nothing proves the bound killed one"
+  fi
+  # The command led a process group and left a child in it, so the
+  # evidence is that *both* are gone: signalling the leader alone would
+  # leave the child holding the pipe the probe reads. A moment is
+  # allowed for the reparented child to be reaped after the kill.
+  waited=0
+  while [ "$waited" -lt 5 ]; do
+    kill -0 "$leader" 2>/dev/null || kill -0 "$follower" 2>/dev/null || return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  kill -KILL -"$leader" 2>/dev/null || true
+  kill -KILL "$follower" 2>/dev/null || true
+  fail "the openbao audit probe's command bound reported abandoning a command that ignores its \
+signal while leaving its process group running (${leader}, ${follower}); a stuck docker \
+invocation would still hold the probe's pipe open"
 }
