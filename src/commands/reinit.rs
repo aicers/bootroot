@@ -221,7 +221,15 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         services: vec![OPENBAO_COMPOSE_SERVICE.to_string()],
         image_archive_dir: None,
         restart_policy: "always".to_string(),
-        openbao_url: openbao.openbao_url.clone(),
+        // A registrar endpoint leaves OpenBao's preserved HCL serving
+        // TLS on loopback. The transient state below omits its predicate
+        // so infra up does not require an audit override that ordinary
+        // init has yet to render, but that must not also make infra up
+        // probe the TLS listener over HTTP.
+        openbao_url: reinit_runtime_openbao_url(
+            &openbao.openbao_url,
+            snapshot.registrar_endpoint.as_ref(),
+        ),
         openbao_unseal_from_file: None,
     };
     let infra_result = run_infra_up(&infra_args, messages).await;
@@ -1134,6 +1142,8 @@ fn init_args_for_reinit(
                 openbao_host_port_env,
             ),
         };
+        openbao.openbao_url =
+            reinit_runtime_openbao_url(&openbao.openbao_url, snapshot.registrar_endpoint.as_ref());
     }
     let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
     let stepca_provisioner = preserved_stepca_provisioner_from_ca_json(effective_secrets_dir)
@@ -1188,6 +1198,24 @@ fn init_args_for_reinit(
         reinit_mode: true,
         root_token_output: args.root_token_output.clone(),
     })
+}
+
+/// Returns the URL for recovery work against a preserved `OpenBao` listener.
+///
+/// A recorded registrar endpoint enables TLS even when `OpenBao` stays on
+/// loopback. Reinit starts that already-configured listener before its
+/// follow-up init pass can restore the endpoint predicate to `state.json`,
+/// so both operations must retain the HTTPS scheme independently of that
+/// transient state.
+fn reinit_runtime_openbao_url(
+    openbao_url: &str,
+    registrar_endpoint: Option<&crate::state::RegistrarEndpointState>,
+) -> String {
+    if registrar_endpoint.is_some_and(|endpoint| endpoint.enabled) {
+        openbao_url.replacen("http://", "https://", 1)
+    } else {
+        openbao_url.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2580,6 +2608,26 @@ mod tests {
         assert_eq!(
             init_args.openbao.openbao_url, "https://192.168.1.10:8200",
             "non-loopback bind intent must drive the init client URL"
+        );
+    }
+
+    /// A loopback registrar endpoint still leaves the preserved `OpenBao`
+    /// listener on TLS, although it has no non-loopback bind override.
+    #[test]
+    fn reinit_runtime_url_uses_https_for_a_registrar_endpoint() {
+        let endpoint = crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: "example.internal".to_string(),
+            host: "bootroot-01".to_string(),
+        };
+
+        assert_eq!(
+            reinit_runtime_openbao_url("http://localhost:18200", Some(&endpoint)),
+            "https://localhost:18200"
+        );
+        assert_eq!(
+            reinit_runtime_openbao_url("http://localhost:18200", None),
+            "http://localhost:18200"
         );
     }
 
