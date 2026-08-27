@@ -77,16 +77,82 @@ OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS=30
 # How often it looks, inside that budget. Fixed for the same reason.
 OPENBAO_AUDIT_REOPEN_POLL_SECONDS=0.5
 
+# How long any one command the probe waits on may run.
+#
+# The budget above is a claim about the image; this one is about the
+# harness surviving the machinery underneath it. A `docker exec` that
+# never answers would otherwise park a lifecycle run for as long as the
+# runner lives, with no result either way.
+OPENBAO_AUDIT_PROBE_STEP_SECONDS=30
+
+# Reports the probe's clock, in whole seconds.
+#
+# Whole seconds is the resolution `date` offers everywhere this runs, so
+# each deadline below is enforced to within a second of the budget it
+# names — under it rather than over, since the deadline is tested before
+# the command that could satisfy it is issued.
+openbao_audit_now() {
+  date -u +%s
+}
+
+# Runs a command, abandoning it after `limit` seconds. Reports 124 when
+# it does, the same convention `timeout` uses.
+#
+# Every wait in this probe is measured as elapsed time rather than as
+# counted sleeps, because the two differ by however long Docker takes to
+# answer: a loop that only counts its own sleeps runs for its budget
+# *plus* every command in between, and then reports a reopen that the
+# budget it names had already refuted. Bounding each command is the
+# other half of the same point — an unbounded one both hangs the run and
+# lands its answer after the budget closed.
+#
+# `timeout` would say this in one word and is not assumed: a stock macOS
+# has none, and these harnesses run there.
+openbao_audit_bounded() {
+  local limit="$1"
+  shift
+  local pid watchdog deadline status
+  deadline=$(($(openbao_audit_now) + limit))
+  "$@" &
+  pid=$!
+  # The watchdog is redirected away from this function's own stdout, so
+  # that it cannot hold a command substitution's pipe open after the
+  # command it guards has been reaped, and it waits in one-second steps,
+  # so that the `sleep` left behind when it is dismissed early outlives
+  # it by no more than one of them.
+  (
+    while [ "$(openbao_audit_now)" -lt "$deadline" ]; do
+      sleep 1
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  status=0
+  wait "$pid" || status=$?
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  if [ "$status" -gt 128 ]; then
+    return 124
+  fi
+  return "$status"
+}
+
+# Runs one probe command under the step bound above.
+openbao_audit_step() {
+  openbao_audit_bounded "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" "$@"
+}
+
 # Reports what `docker inspect` says about a container's process, which
 # is how "no restart" is measured rather than observed.
 openbao_audit_container_state() {
-  docker inspect -f '{{.State.StartedAt}} {{.RestartCount}} {{.State.Pid}}' "$1"
+  openbao_audit_step docker inspect \
+    -f '{{.State.StartedAt}} {{.RestartCount}} {{.State.Pid}}' "$1"
 }
 
 # Reports the seal state as `sealed=<bool> initialized=<bool>`.
 openbao_audit_seal_state() {
   local url="${1%/}"
-  curl -sS "${url}/v1/sys/seal-status" |
+  curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" "${url}/v1/sys/seal-status" |
     jq -r '"sealed=\(.sealed) initialized=\(.initialized)"'
 }
 
@@ -102,7 +168,7 @@ openbao_audit_free_generation() {
   sequence=0
   while [ "$sequence" -lt 1000 ]; do
     candidate="$(printf '%s/audit-%s-%06d.log' "$dir" "$stamp" "$sequence")"
-    if ! docker exec "$container" test -e "$candidate" 2>/dev/null; then
+    if ! openbao_audit_step docker exec "$container" test -e "$candidate" 2>/dev/null; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -125,7 +191,8 @@ openbao_audit_reopen_probe() {
   local path="${5:-$OPENBAO_AUDIT_LOG_PATH_DEFAULT}"
   local dir generation old_id new_id moved_id
   local state_before state_after seal_before seal_after
-  local gen_size gen_size_after nonce token status waited attempt moved
+  local gen_size gen_size_after nonce token status attempt moved
+  local deadline now reappeared arrived
 
   dir="$(dirname "$path")"
 
@@ -142,7 +209,7 @@ openbao_audit_reopen_probe() {
   fi
 
   # 1. Capture the active log's identity, and rename it aside.
-  if ! old_id="$(docker exec "$container" stat -c '%d:%i' "$path")"; then
+  if ! old_id="$(openbao_audit_step docker exec "$container" stat -c '%d:%i' "$path")"; then
     echo "probe: no active audit log at ${container}:${path}" >&2
     return 1
   fi
@@ -173,8 +240,10 @@ openbao_audit_reopen_probe() {
     # destination differently across implementations — GNU and BSD both
     # succeed doing it — and only the filesystem says whether the inode
     # moved.
-    docker exec "$container" mv -n "$path" "$generation" >/dev/null 2>&1 || true
-    moved_id="$(docker exec "$container" stat -c '%d:%i' "$generation" 2>/dev/null || true)"
+    openbao_audit_step docker exec "$container" mv -n "$path" "$generation" \
+      >/dev/null 2>&1 || true
+    moved_id="$(openbao_audit_step docker exec "$container" \
+      stat -c '%d:%i' "$generation" 2>/dev/null || true)"
     if [ "$moved_id" = "$old_id" ]; then
       moved="yes"
       break
@@ -182,7 +251,8 @@ openbao_audit_reopen_probe() {
     # It did not move. With the active log still on its old inode the
     # destination was simply taken, so the next free sequence is tried;
     # anything else is not a collision and is not retried.
-    if [ "$(docker exec "$container" stat -c '%d:%i' "$path" 2>/dev/null || true)" != "$old_id" ]; then
+    if [ "$(openbao_audit_step docker exec "$container" \
+      stat -c '%d:%i' "$path" 2>/dev/null || true)" != "$old_id" ]; then
       break
     fi
   done
@@ -197,29 +267,39 @@ than ${old_id}" >&2
 
   # 2. Send the signal. `docker kill --signal=HUP` signals a running
   #    container; it is not a restart, which the state comparison pins.
-  if ! docker kill --signal=HUP "$container" >/dev/null; then
+  if ! openbao_audit_step docker kill --signal=HUP "$container" >/dev/null; then
     echo "probe: could not signal ${container}" >&2
     openbao_audit_restore_generation "$container" "$path" "$generation"
     return 1
   fi
 
-  # 3. Poll for the configured path to reappear, bounded.
-  waited=0
-  while ! docker exec "$container" test -e "$path" 2>/dev/null; do
-    if awk "BEGIN { exit !($waited >= $OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS) }"; then
-      echo "probe: REFUTED — ${path} did not reappear within \
-${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS}s of SIGHUP; this image does not reopen its file audit \
-device on the signal" >&2
-      openbao_audit_restore_generation "$container" "$path" "$generation"
-      return 1
+  # 3. Poll for the configured path to reappear, until a deadline the
+  #    budget fixes in elapsed time. The look itself is bounded by what
+  #    is left of that budget, so no answer arrives after it: a file
+  #    that comes back late is a refuted reopen, not a slow one.
+  deadline=$(($(openbao_audit_now) + OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS))
+  reappeared=""
+  while :; do
+    now="$(openbao_audit_now)"
+    [ "$now" -lt "$deadline" ] || break
+    if openbao_audit_bounded "$((deadline - now))" \
+        docker exec "$container" test -e "$path" >/dev/null 2>&1; then
+      reappeared="yes"
+      break
     fi
     sleep "$OPENBAO_AUDIT_REOPEN_POLL_SECONDS"
-    waited="$(awk "BEGIN { print $waited + $OPENBAO_AUDIT_REOPEN_POLL_SECONDS }")"
   done
+  if [ -z "$reappeared" ]; then
+    echo "probe: REFUTED — ${path} did not reappear within \
+${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS}s of SIGHUP; this image does not reopen its file audit \
+device on the signal" >&2
+    openbao_audit_restore_generation "$container" "$path" "$generation"
+    return 1
+  fi
 
   # 4. A *new inode* at the path, not the same file back under its old
   #    name. Presence alone is not the test.
-  new_id="$(docker exec "$container" stat -c '%d:%i' "$path")" || {
+  new_id="$(openbao_audit_step docker exec "$container" stat -c '%d:%i' "$path")" || {
     echo "probe: could not stat the reopened ${path}" >&2
     return 1
   }
@@ -230,7 +310,8 @@ device on the signal" >&2
 
   # 5. Only now capture the generation's size, so writes OpenBao
   #    buffered *before* the reopen are not read as writes after it.
-  gen_size="$(docker exec "$container" stat -c '%s' "$generation")" || return 1
+  gen_size="$(openbao_audit_step docker exec "$container" \
+    stat -c '%s' "$generation")" || return 1
 
   # 6. Drive one authenticated, non-mutating request whose audited path
   #    is unique to this run. A 403 or 404 is fine: the audit entry is
@@ -238,7 +319,8 @@ device on the signal" >&2
   #    clear.
   nonce="$(od -An -N8 -tx1 </dev/urandom | tr -d ' \n')"
   token="$(
-    curl -sS -X POST -H 'Content-Type: application/json' \
+    curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+      -X POST -H 'Content-Type: application/json' \
       -d "{\"role_id\":\"${role_id}\",\"secret_id\":\"${secret_id}\"}" \
       "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
   )"
@@ -247,7 +329,8 @@ device on the signal" >&2
     return 1
   fi
   status="$(
-    curl -sS -o /dev/null -w '%{http_code}' -H "X-Vault-Token: ${token}" \
+    curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+      -o /dev/null -w '%{http_code}' -H "X-Vault-Token: ${token}" \
       "${url}/v1/secret/data/bootroot-audit-reopen-probe/${nonce}"
   )"
   case "$status" in
@@ -258,24 +341,34 @@ device on the signal" >&2
       ;;
   esac
 
-  # 7. Poll, bounded the same way, until the entry is in the new log.
-  waited=0
-  while ! docker exec "$container" grep -qF "$nonce" "$path" 2>/dev/null; do
-    if awk "BEGIN { exit !($waited >= $OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS) }"; then
-      echo "probe: REFUTED — the driven request's entry never reached ${path}" >&2
-      return 1
+  # 7. Poll, against a deadline of its own, until the entry is in the
+  #    new log.
+  deadline=$(($(openbao_audit_now) + OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS))
+  arrived=""
+  while :; do
+    now="$(openbao_audit_now)"
+    [ "$now" -lt "$deadline" ] || break
+    if openbao_audit_bounded "$((deadline - now))" \
+        docker exec "$container" grep -qF "$nonce" "$path" >/dev/null 2>&1; then
+      arrived="yes"
+      break
     fi
     sleep "$OPENBAO_AUDIT_REOPEN_POLL_SECONDS"
-    waited="$(awk "BEGIN { print $waited + $OPENBAO_AUDIT_REOPEN_POLL_SECONDS }")"
   done
+  if [ -z "$arrived" ]; then
+    echo "probe: REFUTED — the driven request's entry never reached ${path} within \
+${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS}s" >&2
+    return 1
+  fi
 
   # 8. And the renamed generation received nothing further — both
   #    halves pinned to the same request.
-  if docker exec "$container" grep -qF "$nonce" "$generation"; then
+  if openbao_audit_step docker exec "$container" grep -qF "$nonce" "$generation"; then
     echo "probe: REFUTED — the renamed generation also received the driven request" >&2
     return 1
   fi
-  gen_size_after="$(docker exec "$container" stat -c '%s' "$generation")" || return 1
+  gen_size_after="$(openbao_audit_step docker exec "$container" \
+    stat -c '%s' "$generation")" || return 1
   if [ "$gen_size_after" != "$gen_size" ]; then
     echo "probe: REFUTED — the renamed generation grew from ${gen_size} to ${gen_size_after} \
 after the reopen" >&2
@@ -305,10 +398,11 @@ after the reopen" >&2
 # is the one thing this must never do.
 openbao_audit_restore_generation() {
   local container="$1" path="$2" generation="$3"
-  if docker exec "$container" test -e "$path" 2>/dev/null; then
+  if openbao_audit_step docker exec "$container" test -e "$path" 2>/dev/null; then
     return 0
   fi
-  docker exec "$container" mv -n "$generation" "$path" >/dev/null 2>&1 || true
+  openbao_audit_step docker exec "$container" mv -n "$generation" "$path" \
+    >/dev/null 2>&1 || true
 }
 
 # Asserts the reopen holds, failing the harness when it does not.
@@ -316,6 +410,58 @@ assert_openbao_audit_reopen() {
   openbao_audit_reopen_probe "$@" ||
     fail "openbao audit device does not reopen on SIGHUP; bootroot-agent's rotation would \
 silently degrade to the lossy copy-and-truncate fallback on this image"
+}
+
+# How long after the signal the late-reopen stand-in recreates the log.
+#
+# Past the budget, so the probe must refute it, and not far past: what
+# it guards against is a probe that measures its budget in counted
+# sleeps rather than in elapsed time, and such a probe keeps waiting for
+# the budget *plus* every `docker exec` in between — comfortably long
+# enough to see a file that arrives here and call the reopen
+# established.
+OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS=40
+
+# Runs the probe against a stand-in of the reference container's own
+# image, whose main process is the given `sh -c` script.
+#
+# The stand-in carries the reference container's own Compose project
+# label. It is removed on the line after the probe returns, but a run
+# killed in between would otherwise strand it for as long as the machine
+# runs: the E2E teardown and the dead-run sweep both collect by
+# `com.docker.compose.project`, and the startup leftover check matches
+# only the fixed service-name suffixes, so an unlabelled container of
+# this name is reachable by none of the three.
+#
+# The probe's status and combined output are left in
+# `OPENBAO_AUDIT_STANDIN_STATUS` and `OPENBAO_AUDIT_STANDIN_OUTPUT`,
+# since a function can return only one of the two.
+openbao_audit_run_against_standin() {
+  local reference="$1" url="$2" suffix="$3" script="$4"
+  local image project standin
+  local -a labels=()
+
+  image="$(docker inspect -f '{{.Config.Image}}' "$reference")" ||
+    fail "could not read the image of ${reference}"
+  project="$(docker inspect \
+    -f '{{index .Config.Labels "com.docker.compose.project"}}' "$reference")" ||
+    fail "could not read the Compose project of ${reference}"
+  [ -z "$project" ] || labels=(--label "com.docker.compose.project=${project}")
+  standin="${reference}-${suffix}"
+  docker rm -f "$standin" >/dev/null 2>&1 || true
+  # `${labels[@]+…}`, not a bare `${labels[@]}`: under `set -u` an empty
+  # array is an unbound variable before bash 4.4, and this file is
+  # sourced by harnesses that set it.
+  docker run -d --name "$standin" ${labels[@]+"${labels[@]}"} --entrypoint sh "$image" -c \
+    "$script" >/dev/null || fail "could not start the ${suffix} stand-in"
+
+  OPENBAO_AUDIT_STANDIN_STATUS=0
+  # The run stops at the reappearance budget, before it reaches the
+  # credentials, so those are placeholders.
+  OPENBAO_AUDIT_STANDIN_OUTPUT="$(
+    openbao_audit_reopen_probe "$standin" "$url" "role" "secret" 2>&1
+  )" || OPENBAO_AUDIT_STANDIN_STATUS=$?
+  docker rm -f "$standin" >/dev/null 2>&1 || true
 }
 
 # Asserts the probe itself is capable of refusing.
@@ -330,50 +476,53 @@ silently degrade to the lossy copy-and-truncate fallback on this image"
 # refusal has to come from the reopen evidence, not from a container the
 # probe could not talk to.
 #
-# The stand-in carries the reference container's own Compose project
-# label. It is removed on the line after the probe returns, but a run
-# killed in between would otherwise strand it for as long as the machine
-# runs: the E2E teardown and the dead-run sweep both collect by
-# `com.docker.compose.project`, and the startup leftover check matches
-# only the fixed service-name suffixes, so an unlabelled container of
-# this name is reachable by none of the three.
-#
 # Usage:
 #   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target <reference-container> <url>
 assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target() {
-  local reference="$1" url="$2"
-  local image project standin status output
-  local -a labels=()
-
-  image="$(docker inspect -f '{{.Config.Image}}' "$reference")" ||
-    fail "could not read the image of ${reference}"
-  project="$(docker inspect \
-    -f '{{index .Config.Labels "com.docker.compose.project"}}' "$reference")" ||
-    fail "could not read the Compose project of ${reference}"
-  [ -z "$project" ] || labels=(--label "com.docker.compose.project=${project}")
-  standin="${reference}-reopen-probe-standin"
-  docker rm -f "$standin" >/dev/null 2>&1 || true
-  # `${labels[@]+…}`, not a bare `${labels[@]}`: under `set -u` an empty
-  # array is an unbound variable before bash 4.4, and this file is
-  # sourced by harnesses that set it.
-  docker run -d --name "$standin" ${labels[@]+"${labels[@]}"} --entrypoint sh "$image" -c \
-    'trap "" HUP; mkdir -p /openbao/audit; : > /openbao/audit/audit.log; while true; do sleep 1; done' \
-    >/dev/null || fail "could not start the non-reopening stand-in"
-
-  status=0
-  # The run stops at the reappearance budget, before it reaches the
-  # credentials, so those are placeholders.
-  output="$(openbao_audit_reopen_probe "$standin" "$url" "role" "secret" 2>&1)" || status=$?
-  docker rm -f "$standin" >/dev/null 2>&1 || true
-  if [ "$status" -eq 0 ]; then
+  openbao_audit_run_against_standin "$1" "$2" "reopen-probe-standin" \
+    'trap "" HUP; mkdir -p /openbao/audit; : > /openbao/audit/audit.log; while true; do sleep 1; done'
+  if [ "$OPENBAO_AUDIT_STANDIN_STATUS" -eq 0 ]; then
     fail "the openbao audit reopen probe passed a target that does not reopen; the check that \
 guards the rotation mechanism cannot itself be trusted"
   fi
-  case "$output" in
+  case "$OPENBAO_AUDIT_STANDIN_OUTPUT" in
     *"did not reappear within"*) ;;
     *)
       fail "the openbao audit reopen probe refused the non-reopening stand-in for the wrong \
-reason, so it is not the reopen evidence that would go red: ${output}"
+reason, so it is not the reopen evidence that would go red: \
+${OPENBAO_AUDIT_STANDIN_OUTPUT}"
+      ;;
+  esac
+}
+
+# Asserts the probe refuses a reopen that arrives after its budget.
+#
+# The budget is a claim about elapsed time, and the difference between
+# holding to it and drifting past it is invisible in a green run: a
+# stand-in that never reopens is refused either way. So this one *does*
+# reopen — it honours `SIGHUP` and recreates the log, but only once the
+# budget has passed. An image that needs longer than the pinned budget
+# is an image the rotation degrades on, so the answer has to be the same
+# refusal, and a probe that waited long enough to see this file would be
+# reporting an established reopen the budget it names refutes.
+#
+# Usage:
+#   assert_openbao_audit_reopen_probe_refutes_a_late_reopen <reference-container> <url>
+assert_openbao_audit_reopen_probe_refutes_a_late_reopen() {
+  openbao_audit_run_against_standin "$1" "$2" "late-reopen-probe-standin" \
+    "mkdir -p /openbao/audit; : > /openbao/audit/audit.log; \
+trap 'sleep ${OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS}; : > /openbao/audit/audit.log' HUP; \
+while true; do sleep 1; done"
+  if [ "$OPENBAO_AUDIT_STANDIN_STATUS" -eq 0 ]; then
+    fail "the openbao audit reopen probe established a reopen that arrived \
+${OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS}s after the signal, past its \
+${OPENBAO_AUDIT_REOPEN_BUDGET_SECONDS}s budget; the budget is not being measured in elapsed time"
+  fi
+  case "$OPENBAO_AUDIT_STANDIN_OUTPUT" in
+    *"did not reappear within"*) ;;
+    *)
+      fail "the openbao audit reopen probe refused the late-reopening stand-in for the wrong \
+reason, so it is not the budget that would go red: ${OPENBAO_AUDIT_STANDIN_OUTPUT}"
       ;;
   esac
 }

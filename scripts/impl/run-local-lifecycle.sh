@@ -1388,6 +1388,8 @@ assert_openbao_audit_device() {
     "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID"
   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target \
     "$container" "$OPENBAO_URL"
+  assert_openbao_audit_reopen_probe_refutes_a_late_reopen \
+    "$container" "$OPENBAO_URL"
 
   log_phase "assert-openbao-audit-log"
   drive_openbao_audit_traffic

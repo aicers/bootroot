@@ -302,6 +302,17 @@ and after and that `sys/seal-status` reports `sealed=false` and
 reopen therefore fails the build rather than silently degrading every
 rotation to the lossy form.
 
+Those 30 seconds are **elapsed time**, and each look inside them is
+bounded by whatever is left of them. A check that counted only its own
+sleeps would run for the budget plus every `docker exec` in between —
+comfortably long enough to see a file that arrived a minute after the
+signal and call the reopen established, on an image whose rotations
+would all degrade to the lossy form. And it is the check itself that is
+kept honest: the lifecycle also runs the probe against two stand-ins of
+the same image, one whose main process ignores `SIGHUP` and one that
+honours it but recreates the log only after the budget has passed, and
+fails the build if either is reported as a reopen.
+
 **The rotation-intent marker.** Immediately *before* the rename, a pass
 writes `rotation-intent.json` into the device's directory, holding the
 active log's `(st_dev, st_ino)` and the generation name it is about to
