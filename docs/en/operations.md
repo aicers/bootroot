@@ -920,7 +920,14 @@ renders commands only for what deviates. Only an **absent** image ever
 draws an `install`, a full-length preallocation or an `mkfs.ext4`. A
 sparse image draws an in-place allocation that neither recreates nor
 reformats it; a wrong owner or mode draws only its `chown` or `chmod`; a
-correct image draws nothing at all.
+correct image draws nothing at all. The rendered allocation command
+uses `fallocate` when it is available and succeeds. Otherwise, a new image is
+zero-filled with `dd`; an existing sparse image is read and written back
+in place with `dd conv=notrunc`, so holes become allocated zeroes without
+changing its length or records. When that existing image is the mounted
+reserve, the fallback first unmounts it after both writers have stopped; the
+following activation step mounts the rendered unit again. The backing file is
+therefore never rewritten while its filesystem is live.
 
 **The store's subdirectories are created on the mounted filesystem, by
 the operator.** In `filesystem` mode `bootroot init` creates neither

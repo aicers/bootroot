@@ -653,7 +653,7 @@ pub(super) static STRINGS: Strings = Strings {
     audit_reserve_finding_subdir_absent: "{path} does not exist on the mounted filesystem.",
     audit_reserve_finding_subdir_invalid: "{path} on the mounted filesystem is {found}.",
     audit_reserve_step_stop_writers: "Stop both writers: the Compose stack, so no container holds a bind under the store, and `bootroot-registrar.service`, so no verb record is written while the mount is being established.",
-    audit_reserve_step_image: "Create or repair the loopback image.",
+    audit_reserve_step_image: "Create or repair the loopback image. If an already mounted reserve is sparse and `fallocate` is unavailable or fails, the rendered fallback unmounts it before the in-place repair; the following activation step mounts it again.",
     audit_reserve_step_install: "Install the rendered artifacts and activate the mount.",
     audit_reserve_step_subdirectories: "Create the store's subdirectories on the now-mounted filesystem. No `chown` is rendered for `openbao/`: its owner is the OpenBao entrypoint's to set on the first container start.",
     audit_reserve_step_rerun: "Run `{command}` again. It verifies the result, reports enforced and continues where this run stopped.",

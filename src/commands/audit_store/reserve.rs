@@ -145,6 +145,12 @@ const MKFS_EXTENDED_OPTIONS: &str = "nodiscard,lazy_itable_init=0";
 /// The prefix every loop device node carries.
 const LOOP_DEVICE_PREFIX: &str = "/dev/loop";
 
+/// The block size the portable `dd` allocation fallback writes at.
+///
+/// One mebibyte keeps the fallback practical without relying on a
+/// non-portable `dd` suffix such as `1M`.
+const DD_ALLOCATION_BLOCK_BYTES: u64 = 1024 * 1024;
+
 /// What the kernel appends to a loop device's backing file when the
 /// file has been unlinked.
 const DELETED_SUFFIX: &str = " (deleted)";
@@ -1540,16 +1546,23 @@ fn evaluate_openbao_dir(facts: Option<FileFacts>) -> SubdirState {
 /// No state but **absent** ever renders `install`, a truncation, an
 /// allocation to the full length or `mkfs.ext4` — each of those
 /// destroys or reformats an image that may hold the deployment's
-/// records. The sparse remedy allocates the missing bytes in place:
-/// `fallocate -l <reserve>` on a file already of that length allocates
-/// without extending, so the filesystem inside it, and any records on
-/// it, survive.
+/// records. The sparse remedy allocates the missing bytes in place.
+/// `fallocate -l <reserve>` does that when it succeeds; otherwise `dd`
+/// reads and writes the existing image without truncating it. Reads
+/// from a hole yield zeroes, and writing those same bytes allocates the
+/// hole while preserving the filesystem and records already present.
+/// When the proved reserve is mounted, the `dd` route first unmounts it:
+/// the backing file must be offline while it is rewritten.
 fn image_commands(inputs: &ReserveInputs<'_>, facts: &Phase1Facts) -> Vec<String> {
     let image = sh_quote_path(&facts.image_path);
     match facts.image {
         ImageEvaluation::Absent => vec![
             format!("install -m {IMAGE_FILE_MODE:04o} /dev/null {image}"),
-            format!("fallocate -l {} {image}", inputs.reserve_bytes),
+            allocation_command(
+                inputs.reserve_bytes,
+                &image,
+                &zero_fill_allocation_command(inputs.reserve_bytes, &image),
+            ),
             format!("mkfs.ext4 -m 0 -E {MKFS_EXTENDED_OPTIONS} {image}"),
         ],
         ImageEvaluation::Correct => Vec::new(),
@@ -1560,7 +1573,13 @@ fn image_commands(inputs: &ReserveInputs<'_>, facts: &Phase1Facts) -> Vec<String
         } => {
             let mut commands = Vec::new();
             if unallocated_bytes > 0 {
-                commands.push(format!("fallocate -l {} {image}", inputs.reserve_bytes));
+                let fallback = preserve_existing_allocation_command(&image);
+                let fallback = if matches!(facts.mount, MountEvaluation::Reserve { .. }) {
+                    format!("umount {} && {fallback}", sh_quote_path(&facts.store_dir))
+                } else {
+                    fallback
+                };
+                commands.push(allocation_command(inputs.reserve_bytes, &image, &fallback));
             }
             if wrong_owner.is_some() {
                 commands.push(format!("chown 0:0 {image}"));
@@ -1571,6 +1590,52 @@ fn image_commands(inputs: &ReserveInputs<'_>, facts: &Phase1Facts) -> Vec<String
             commands
         }
     }
+}
+
+/// Renders the allocation command with its `fallocate` and portable
+/// zero-fill routes.
+///
+/// `fallocate` remains the usual route, but a failed availability check
+/// or allocation falls through to `dd`. The caller supplies a fallback
+/// appropriate for either a new image or an existing one, because only
+/// a new image may be truncated.
+fn allocation_command(reserve_bytes: u64, image: &str, fallback: &str) -> String {
+    format!(
+        "if command -v fallocate >/dev/null 2>&1 && fallocate -l {reserve_bytes} {image}; then :; else {fallback}; fi"
+    )
+}
+
+/// Renders a zero-fill allocation of a newly created image.
+///
+/// The final byte-sized write carries a non-mebibyte remainder without
+/// rounding the image's length up. Its `notrunc` conversion is needed
+/// because the preceding full-block write may have created the image.
+fn zero_fill_allocation_command(reserve_bytes: u64, image: &str) -> String {
+    let whole_blocks = reserve_bytes / DD_ALLOCATION_BLOCK_BYTES;
+    let remainder = reserve_bytes % DD_ALLOCATION_BLOCK_BYTES;
+    let mut commands = Vec::new();
+    if whole_blocks > 0 {
+        commands.push(format!(
+            "dd if=/dev/zero of={image} bs={DD_ALLOCATION_BLOCK_BYTES} count={whole_blocks}"
+        ));
+    }
+    if remainder > 0 {
+        let offset = whole_blocks * DD_ALLOCATION_BLOCK_BYTES;
+        commands.push(format!(
+            "dd if=/dev/zero of={image} bs=1 count={remainder} seek={offset} conv=notrunc"
+        ));
+    }
+    commands.join(" && ")
+}
+
+/// Renders an in-place allocation of an existing exact-size image.
+///
+/// `conv=notrunc` is the non-destructive part of this route: `dd`
+/// reads every existing byte before writing it back at the same offset.
+/// Existing data is unchanged, while reads from sparse regions supply
+/// zeroes that cause the missing blocks to be allocated.
+fn preserve_existing_allocation_command(image: &str) -> String {
+    format!("dd if={image} of={image} bs={DD_ALLOCATION_BLOCK_BYTES} conv=notrunc")
 }
 
 /// The per-directory remediation for one subdirectory.
@@ -1640,6 +1705,17 @@ fn phase2_steps(
     messages: &Messages,
 ) -> Vec<Phase2Step> {
     let mount_outstanding = !matches!(facts.mount, MountEvaluation::Reserve { .. });
+    let remount_after_sparse_fallback = matches!(
+        facts,
+        Phase1Facts {
+            image: ImageEvaluation::Deviating {
+                unallocated_bytes: 1..,
+                ..
+            },
+            mount: MountEvaluation::Reserve { .. },
+            ..
+        }
+    );
     let image = image_commands(inputs, facts);
 
     let mut artifact_commands: Vec<String> = artifacts
@@ -1657,7 +1733,7 @@ fn phase2_steps(
     if !artifact_commands.is_empty() {
         artifact_commands.push("systemctl daemon-reload".to_string());
     }
-    if mount_outstanding {
+    if mount_outstanding || remount_after_sparse_fallback {
         artifact_commands.push(format!(
             "systemctl enable --now {}",
             sh_quote(&facts.unit_name)
@@ -2030,6 +2106,11 @@ pub(crate) fn render_filesystem_outcome(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs::{self, File};
+    use std::os::unix::fs::{FileExt, MetadataExt, symlink};
+    use std::process::Command;
+
+    use tempfile::tempdir;
 
     use super::*;
     use crate::i18n::test_messages;
@@ -2579,7 +2660,15 @@ mod tests {
         let inputs = fixture.inputs();
         let messages = test_messages();
         let install = format!("install -m 0600 /dev/null '{IMAGE}'");
-        let allocate = format!("fallocate -l {DEFAULT_RESERVE} '{IMAGE}'");
+        let fallocate = format!("fallocate -l {DEFAULT_RESERVE} '{IMAGE}'");
+        let absent_fallback = format!("dd if=/dev/zero of='{IMAGE}' bs=1048576 count=2048");
+        let sparse_fallback = format!("dd if='{IMAGE}' of='{IMAGE}' bs=1048576 conv=notrunc");
+        let absent_allocate = format!(
+            "if command -v fallocate >/dev/null 2>&1 && {fallocate}; then :; else {absent_fallback}; fi"
+        );
+        let sparse_allocate = format!(
+            "if command -v fallocate >/dev/null 2>&1 && {fallocate}; then :; else {sparse_fallback}; fi"
+        );
         // Pinned as literal text rather than through
         // `MKFS_EXTENDED_OPTIONS`: what an operator pastes is the only
         // thing that decides whether the image stays allocated, so a
@@ -2595,7 +2684,7 @@ mod tests {
         assert_eq!(facts.image, ImageEvaluation::Absent);
         assert_eq!(
             image_commands(&inputs, &facts),
-            vec![install.clone(), allocate.clone(), mkfs.clone()]
+            vec![install.clone(), absent_allocate, mkfs.clone()]
         );
 
         // Wrong file type: a hard error with no image command at all.
@@ -2638,7 +2727,10 @@ mod tests {
             image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE / 2, TEST_UID, 0o600),
         );
         let facts = evaluate(&inputs, &sparse, &messages).expect("phase 1");
-        assert_eq!(image_commands(&inputs, &facts), vec![allocate.clone()]);
+        assert_eq!(
+            image_commands(&inputs, &facts),
+            vec![sparse_allocate.clone()]
+        );
 
         // Wrong owner alone, wrong mode alone.
         let foreign = bare_host().file(
@@ -2661,7 +2753,176 @@ mod tests {
             image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE / 2, TEST_UID, 0o644),
         );
         let facts = evaluate(&inputs, &both, &messages).expect("phase 1");
-        assert_eq!(image_commands(&inputs, &facts), vec![allocate, chmod]);
+        assert_eq!(
+            image_commands(&inputs, &facts),
+            vec![sparse_allocate, chmod]
+        );
+    }
+
+    #[test]
+    fn the_allocation_fallbacks_preserve_existing_image_data() {
+        let reserve = MIN_RESERVE_FLOOR_BYTES + 1;
+        let fixture = Fixture {
+            reserve_bytes: reserve,
+            ..Fixture::default()
+        };
+        let inputs = fixture.inputs();
+        let directory = tempdir().expect("temporary directory");
+        let bin_directory = tempdir().expect("temporary PATH directory");
+        let dd = Command::new("/bin/sh")
+            .args(["-c", "command -v dd"])
+            .output()
+            .expect("find dd");
+        assert!(dd.status.success(), "dd is available for the fallback test");
+        let dd = String::from_utf8(dd.stdout).expect("dd path is UTF-8");
+        let dd = PathBuf::from(dd.trim());
+        symlink(&dd, bin_directory.path().join("dd")).expect("make dd available without fallocate");
+
+        let absent = directory.path().join("absent.img");
+        File::create(&absent).expect("create the phase-two absent image");
+        let absent_facts = phase1_facts(&fixture, absent.clone(), ImageEvaluation::Absent);
+        let absent_commands = image_commands(&inputs, &absent_facts);
+        run_allocation_fallback(
+            absent_commands
+                .get(1)
+                .expect("the absent allocation command"),
+            bin_directory.path(),
+        );
+        assert_fully_allocated(&absent, reserve);
+
+        let sparse = directory.path().join("sparse.img");
+        let sparse_file = File::create(&sparse).expect("create sparse image");
+        sparse_file
+            .set_len(reserve)
+            .expect("set sparse image length");
+        write_all_at(&sparse_file, b"first record", 0);
+        write_all_at(&sparse_file, b"middle record", reserve / 2);
+        write_all_at(&sparse_file, b"last record", reserve - 11);
+        let before = fs::read(&sparse).expect("read sparse image before repair");
+        assert!(
+            allocated_bytes(&sparse) < reserve,
+            "fixture image must begin sparse"
+        );
+
+        let sparse_facts = phase1_facts(
+            &fixture,
+            sparse.clone(),
+            ImageEvaluation::Deviating {
+                unallocated_bytes: reserve - allocated_bytes(&sparse),
+                wrong_owner: None,
+                wrong_mode: None,
+            },
+        );
+        let sparse_commands = image_commands(&inputs, &sparse_facts);
+        run_allocation_fallback(
+            sparse_commands
+                .first()
+                .expect("the sparse allocation command"),
+            bin_directory.path(),
+        );
+        assert_fully_allocated(&sparse, reserve);
+        assert_eq!(
+            fs::read(&sparse).expect("read sparse image after repair"),
+            before,
+            "the sparse repair must preserve every existing byte"
+        );
+    }
+
+    #[test]
+    fn a_mounted_sparse_image_is_offline_for_the_dd_fallback() {
+        let fixture = Fixture::default();
+        let messages = test_messages();
+        let (host, mut facts, artifacts) = activated_host(&fixture);
+        facts.image = ImageEvaluation::Deviating {
+            unallocated_bytes: DEFAULT_RESERVE / 2,
+            wrong_owner: None,
+            wrong_mode: None,
+        };
+
+        let report =
+            verify(&fixture.inputs(), &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::NotActivated { steps, .. } = report else {
+            panic!("a sparse mounted image is not enforced");
+        };
+        let image = steps
+            .iter()
+            .find(|step| step.kind == Phase2StepKind::Image)
+            .expect("the image step");
+        assert!(
+            image.commands.iter().any(|command| {
+                command.contains(&format!("umount '{}'", fixture.store.display()))
+                    && command.contains("dd if=")
+            }),
+            "{:?}",
+            image.commands
+        );
+
+        let install = steps
+            .iter()
+            .find(|step| step.kind == Phase2StepKind::InstallUnits)
+            .expect("the remount step");
+        assert!(
+            install.commands.iter().any(|command| {
+                command == &format!("systemctl enable --now '{}'", facts.unit_name)
+            }),
+            "{:?}",
+            install.commands
+        );
+    }
+
+    fn phase1_facts(fixture: &Fixture, image_path: PathBuf, image: ImageEvaluation) -> Phase1Facts {
+        Phase1Facts {
+            store_dir: fixture.store.clone(),
+            image_path,
+            unit_name: UNIT.to_string(),
+            image,
+            mount: MountEvaluation::Absent,
+            underlying: UnderlyingState::Empty,
+        }
+    }
+
+    fn run_allocation_fallback(command: &str, path: &Path) {
+        let status = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", path)
+            .status()
+            .expect("run the rendered allocation fallback");
+        assert!(status.success(), "{command}");
+    }
+
+    fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) {
+        while !bytes.is_empty() {
+            let written = file
+                .write_at(bytes, offset)
+                .expect("write fixture image data");
+            assert_ne!(written, 0, "a non-empty write must make progress");
+            bytes = bytes
+                .get(written..)
+                .expect("a file write cannot exceed its source buffer");
+            offset += u64::try_from(written).expect("usize fits in u64");
+        }
+    }
+
+    fn assert_fully_allocated(path: &Path, expected_length: u64) {
+        let metadata = fs::metadata(path).expect("stat allocated image");
+        assert_eq!(
+            metadata.len(),
+            expected_length,
+            "the image length must be exact"
+        );
+        assert!(
+            allocated_bytes(path) >= expected_length,
+            "the image must have blocks over its full length"
+        );
+    }
+
+    fn allocated_bytes(path: &Path) -> u64 {
+        fs::metadata(path)
+            .expect("stat image allocation")
+            .blocks()
+            .checked_mul(ST_BLOCKS_UNIT_BYTES)
+            .expect("test image allocation fits in u64")
     }
 
     #[test]

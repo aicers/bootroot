@@ -651,8 +651,12 @@ assert_filesystem_mode_stops_before_it_touches_the_host() {
     fail "the rendered mkfs.ext4 is missing -m 0 or one of its -E options"
   grep -q -- "install -m 0600 /dev/null" "$log" ||
     fail "an absent image did not render its install"
+  grep -q -- "if command -v fallocate" "$log" ||
+    fail "an absent image did not render its allocation fallback"
   grep -q -- "fallocate -l 16777216" "$log" ||
-    fail "an absent image did not render a full-length preallocation"
+    fail "an absent image did not retain its fallocate allocation route"
+  grep -q -- "dd if=/dev/zero" "$log" ||
+    fail "an absent image did not render its zero-fill allocation route"
   pass "the rendered image commands are the absent-image row, in full"
 
   # `bootroot infra up` is never named as the way to render or verify
@@ -709,8 +713,9 @@ sudo_to_log() {
 #
 # The activation below is the operator's own phase-2 sequence run
 # verbatim, so it needs everything that sequence names: a live systemd
-# to enable the generated `.mount` unit under, the two tools the
-# rendered image commands invoke, and a kernel with loop devices.  A
+# to enable the generated `.mount` unit under, `mkfs.ext4`, `dd`, and a
+# kernel with loop devices. `fallocate` is optional because the rendered
+# image command falls back to `dd` when it is unavailable. A
 # host missing any of them skips the section with a line saying so --
 # the macOS preflight runs this same scenario, and there `systemctl`
 # does not exist at all.
@@ -718,7 +723,7 @@ reserve_activation_is_possible() {
   [ -d /run/systemd/system ] || return 1
   command -v systemctl >/dev/null 2>&1 || return 1
   command -v mkfs.ext4 >/dev/null 2>&1 || return 1
-  command -v fallocate >/dev/null 2>&1 || return 1
+  command -v dd >/dev/null 2>&1 || return 1
   command -v losetup >/dev/null 2>&1 || return 1
   command -v blkid >/dev/null 2>&1 || return 1
   sudo -n test -e /dev/loop-control || return 1
@@ -894,7 +899,7 @@ assert_the_rendered_steps_activate_the_reserve() {
 
   # Re-provisioning is idempotent and never reformats: no image command
   # is rendered at all, and the image is the one that was already there.
-  if grep -Eq "mkfs\.ext4|install -m 0600|fallocate -l" "${log}.2"; then
+  if grep -Eq "mkfs\.ext4|install -m 0600|command -v fallocate|dd if=" "${log}.2"; then
     fail "the re-run rendered an image command over an activated reserve; see ${log}.2"
   fi
   after="$(image_identity "$image")"
