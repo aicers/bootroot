@@ -695,6 +695,86 @@ remove_rendered_audit_override() {
   sudo_to_log rm -f "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" || true
 }
 
+# A reinit whose configured reserve has not yet been activated must get
+# past the destructive boundary, enter the ordinary init pass, and stop
+# with precisely the same phase-two guidance as direct init. The first
+# filesystem-mode assertion above covers the direct invocation; this one
+# covers the recovery sequence between the wipe and that invocation.
+assert_reinit_defers_a_fresh_filesystem_reserve_to_init() {
+  local store config log direct_log before_container after_container direct_commands reinit_commands
+  store="$AUDIT_STORE_BASE/reinit-reserve-store"
+  config="$WORK_DIR/operator-agent-reinit-filesystem.toml"
+  log="$ARTIFACT_DIR/reinit-filesystem-mode.log"
+  direct_log="$ARTIFACT_DIR/init-reinit-filesystem-mode.log"
+
+  # The existing directory-mode override belongs to the deployment we
+  # have just exercised. Removing it makes this reserve fixture fresh:
+  # reinit's pre-wipe `infra up` has no override to read, and its ordinary
+  # init pass must render the one for `store` after the wipe.
+  remove_rendered_audit_override
+  if [ -e "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ]; then
+    fail "could not remove the audit override before fresh-reserve reinit"
+  fi
+  write_reserve_agent_config "$config" "$store" 16777216
+
+  # Establish the direct-init baseline with the identical configuration,
+  # then return the reserve to its fresh state before asking reinit to
+  # traverse the same init path.
+  if run_bootroot_as_root init \
+    --no-eab \
+    --skip responder-check \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --agent-config "$config" \
+    </dev/null >"$direct_log" 2>&1; then
+    fail "direct init reported success on an unactivated filesystem reserve; see $direct_log"
+  fi
+  grep -q "provisioned, not activated" "$direct_log" ||
+    fail "direct init did not reach the unactivated-reserve outcome; see $direct_log"
+  direct_commands="$(sed -n '/Run these as root, in order, then run the command in the last step:/,/ownership is not verified/p' "$direct_log" | sed -n 's/^       //p')"
+  [ -n "$direct_commands" ] ||
+    fail "direct init rendered no phase-two commands; see $direct_log"
+  sudo -n rm -rf "$WORK_DIR/audit-store" "$store"
+  remove_rendered_audit_override
+  [ ! -e "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ] ||
+    fail "could not reset the direct-init reserve fixture before reinit"
+
+  before_container="$(docker inspect --format '{{.Id}}' "${INSTANCE}-openbao")"
+
+  if run_bootroot_as_root reinit \
+    --yes \
+    --no-eab \
+    --skip responder-check \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --agent-config "$config" \
+    </dev/null >"$log" 2>&1; then
+    fail "reinit reported success on an unactivated filesystem reserve; see $log"
+  fi
+
+  # Reaching a different container proves reinit crossed its wipe and
+  # used the ordinary infra-up handoff; reaching this outcome proves the
+  # following init pass, rather than the preflight, rendered the reserve.
+  after_container="$(docker inspect --format '{{.Id}}' "${INSTANCE}-openbao")"
+  [ "$before_container" != "$after_container" ] ||
+    fail "reinit did not replace OpenBao before the filesystem outcome; see $log"
+  grep -q "provisioned, not activated" "$log" ||
+    fail "reinit did not reach init's unactivated-reserve outcome; see $log"
+  [ -f "$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml" ] ||
+    fail "ordinary init did not render the audit override after reinit"
+  [ -d "$WORK_DIR/audit-store" ] ||
+    fail "ordinary init did not render the reserve artifacts after reinit"
+
+  # The outcome is not merely similar: the complete ordered command
+  # sequence must exactly match direct init with the same inputs.
+  reinit_commands="$(sed -n '/Run these as root, in order, then run the command in the last step:/,/ownership is not verified/p' "$log" | sed -n 's/^       //p')"
+  [ "$reinit_commands" = "$direct_commands" ] ||
+    fail "reinit's phase-two commands differ from direct init; see $direct_log and $log"
+  assert_equal "reinit restores the enabled endpoint predicate before init" \
+    "true" "$(jq -r '.registrar_endpoint.enabled' "$WORK_DIR/state.json")"
+  pass "fresh filesystem reinit reaches ordinary init with direct-init phase-two guidance"
+}
+
 # One elevated command, with its output appended to this run's log.
 #
 # The redirect is the invoking user's, not `sudo`'s, which is the
@@ -2219,6 +2299,12 @@ main() {
   # above would still hold once it has run.
   log_phase "assert-filesystem-deployment"
   assert_the_deployment_runs_on_a_mounted_reserve
+
+  # This intentionally leaves the deployment at the ordinary init
+  # phase-two boundary, so it follows every assertion that needs the
+  # activated reserve above.
+  log_phase "assert-reinit-filesystem-boundary"
+  assert_reinit_defers_a_fresh_filesystem_reserve_to_init
 
   log_phase "done"
   log "endpoint-enabled init checks passed"
