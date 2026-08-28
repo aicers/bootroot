@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
@@ -951,39 +950,89 @@ async fn disabled_endpoint_configurations_do_not_enter_the_mount_refusal_path() 
     }
 }
 
-/// Directory enforcement invokes the ordinary handler builder without probing
-/// the audit-store mount or emitting the filesystem-mode startup diagnostic.
+/// Directory enforcement starts the ordinary handler without probing the
+/// audit-store mount or emitting the filesystem-mode startup diagnostic.
 ///
-/// A successful production builder needs root-owned audit directories, which
-/// unit tests intentionally cannot create. The production-builder failure
-/// test below covers that seam with a real unopenable store; this test holds
-/// the mount-gate choice itself to the endpoint-enabled directory contract.
+/// The endpoint accepts a request and reaches the production handler's
+/// deliberately unsettled wire-spec refusal. That refusal occurs before any
+/// `OpenBao` I/O, so this exercises daemon composition without a network.
 #[tokio::test(flavor = "current_thread")]
-async fn an_enabled_directory_endpoint_does_not_select_the_mount_refusal() {
+async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
     let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
     let deployment = Deployment::arrange();
     let mut settings = deployment.settings_with_endpoint(true);
     settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    configure_valid_profile_certificate(&mut settings, &deployment);
     let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
         .expect("bind a test endpoint through the production adoption seam");
-    let registrar_endpoint = endpoint.registrar_endpoint();
-    let gate = registrar_endpoint
-        .audit_store_mount_gate(&settings.registrar, |_| {
-            panic!("directory mode must not probe the audit store")
-        })
-        .expect("the enabled endpoint carries a mount gate");
-    let builder_called = Arc::new(AtomicBool::new(false));
-    let builder_called_by_future = Arc::clone(&builder_called);
-    let Err(error) = resolve_registrar_handler_for_gate(gate, move || async move {
-        builder_called_by_future.store(true, Ordering::Relaxed);
-        anyhow::bail!("the ordinary production handler builder was reached")
+
+    let shutdown = DaemonShutdown::new();
+    let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: Some(deployment.path().join("agent.toml")),
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        shutdown: shutdown.clone(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    }));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if logs
+                .events()
+                .into_iter()
+                .any(|event| event.message.contains("certificate still valid"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    else {
-        panic!("directory mode must invoke the ordinary production handler builder");
-    };
-    assert!(builder_called.load(Ordering::Relaxed));
-    assert!(format!("{error:#}").contains("ordinary production handler builder was reached"));
+    .expect("the profile daemon remains available with a directory audit store");
+
+    let exchange = endpoint
+        .client()
+        .mint(RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "edge-proxy".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "edge-node-01".to_string(),
+            instance: Some(1),
+            spec: WireServiceSpec {
+                component: "edge-proxy".to_string(),
+                service_name: "edge-proxy".to_string(),
+                reload: "none".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 300,
+            idempotency_key: "caller-key".to_string(),
+        })
+        .await;
+    assert!(
+        exchange.is_err(),
+        "the ordinary handler's unsettled spec refusal closes the connection"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if logs
+                .events()
+                .into_iter()
+                .any(|event| event.message == "Registrar endpoint could not convert the wire spec")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the enabled endpoint must dispatch the request to the ordinary handler");
+    assert!(
+        !daemon.is_finished(),
+        "the directory configuration must keep the daemon running"
+    );
     assert!(
         logs.events().into_iter().all(|event| {
             event.message
@@ -993,6 +1042,12 @@ async fn an_enabled_directory_endpoint_does_not_select_the_mount_refusal() {
         }),
         "directory mode must not emit an audit-mount diagnostic or refusal"
     );
+
+    shutdown.stop();
+    daemon
+        .await
+        .expect("the directory daemon task joins")
+        .expect("the directory daemon shuts down cleanly");
 }
 
 /// A production audit-store failure remains a daemon failure: directory mode
