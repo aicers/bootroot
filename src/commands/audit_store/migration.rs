@@ -708,6 +708,7 @@ mod rendered_sequence {
     use tempfile::{TempDir, tempdir};
 
     use super::*;
+    use crate::commands::audit_store::reserve::HostProbe;
     use crate::i18n::test_messages;
 
     /// Runs a rendered step's commands as one `sh` script, stopping at
@@ -829,6 +830,37 @@ mod rendered_sequence {
         fs::remove_file(&linked).expect("break the link");
         fs::write(&linked, &bytes).expect("an independent copy");
         assert!(!run(&fixture.scratch, &[&verify]));
+    }
+
+    #[test]
+    fn a_name_and_a_target_that_collide_are_refused_before_any_comparison_runs() {
+        let fixture = fixture();
+        // The pair a manifest carrying a path and a link target as two
+        // variable-length fields cannot tell apart: `a b` linked to `c`
+        // and `a` linked to `b c` are one byte sequence. Neither side
+        // ever reaches a comparison. bootroot refuses the entry when it
+        // renders, over the real filesystem the operator's `cp -a`
+        // would read, and the guard refuses it again immediately before
+        // the copy — this one pointing *inside* the store, where the
+        // rendered-sequence guard fixture points outside it.
+        let colliding = fixture.source.join("openbao").join("a b");
+        symlink("c", &colliding).expect("plant the colliding link");
+        let messages = test_messages();
+        let refused = first_forbidden_entry(&fixture.source, &HostProbe, &messages)
+            .expect("walk the holding directory")
+            .expect("the colliding link is refused");
+        assert_eq!(refused, (colliding, FileKind::Symlink));
+
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(
+            !run(&fixture.scratch, &[&guard]),
+            "the guard before the copy must refuse the colliding link"
+        );
+        // And nothing downstream of it runs: the sequence stops at the
+        // first non-zero exit, so the copy and the three comparisons
+        // are never reached.
+        assert!(!run(&fixture.scratch, &[&guard, &copy, &verify]));
+        assert!(!fixture.destination.join("openbao").exists());
     }
 
     #[test]

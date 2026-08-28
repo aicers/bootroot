@@ -4744,33 +4744,52 @@ mod tests {
     #[test]
     fn a_forbidden_entry_refuses_the_copy_on_every_pass() {
         let fixture = Fixture::default();
-        for (kind, needle) in [
-            (FileKind::Symlink, "a symbolic link"),
-            (FileKind::Other, "neither a regular file nor a directory"),
-        ] {
-            let (base, facts, artifacts) = migrating_host(&fixture, 8);
-            let planted = format!("{HOLDING}/records/planted");
-            let host = base
-                .entries(
-                    &format!("{HOLDING}/records"),
-                    &[&format!("{HOLDING}/records/audit.log"), &planted],
-                )
-                .file(
-                    &planted,
-                    FileFacts {
-                        kind,
-                        ino: 93,
-                        ..dir_facts(TEST_UID, 0o777)
-                    },
-                );
-            // Twice over, from the same probe: the entry walk is re-run
-            // rather than answered from a cached verdict.
-            for _ in 0..2 {
-                let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
-                assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
-                let joined = findings.join("\n");
-                assert!(joined.contains(&planted), "{joined}");
-                assert!(joined.contains(needle), "{joined}");
+        let records = format!("{HOLDING}/records");
+        let openbao = format!("{HOLDING}/openbao");
+        // Both subdirectories, because `openbao/` is the one the layout
+        // contract leaves to the container's entrypoint and so the one
+        // an entry the store itself refuses nothing about can appear
+        // in. Where the link points is not a case of its own: the
+        // verdict is decided from the entry's own type, and the
+        // rendered-sequence fixtures carry one pointing outside the
+        // store and one pointing inside it.
+        for subdir in [&records, &openbao] {
+            for (kind, needle) in [
+                (FileKind::Symlink, "a symbolic link"),
+                (FileKind::Other, "neither a regular file nor a directory"),
+            ] {
+                let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                let planted = format!("{subdir}/planted");
+                let host = base
+                    .entries(HOLDING, &[&records, &openbao])
+                    .file(
+                        &openbao,
+                        FileFacts {
+                            ino: 94,
+                            ..dir_facts(TEST_UID, 0o700)
+                        },
+                    )
+                    .entries(&records, &[&format!("{records}/audit.log")])
+                    .entries(&openbao, &[])
+                    .entries(subdir, &[&planted])
+                    .file(
+                        &planted,
+                        FileFacts {
+                            kind,
+                            ino: 93,
+                            ..dir_facts(TEST_UID, 0o777)
+                        },
+                    );
+                // Twice over, from the same probe: the entry walk is
+                // re-run rather than answered from a cached verdict.
+                for _ in 0..2 {
+                    let (findings, steps) =
+                        migration_report_of(&fixture, &facts, &artifacts, &host);
+                    assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+                    let joined = findings.join("\n");
+                    assert!(joined.contains(&planted), "{joined}");
+                    assert!(joined.contains(needle), "{joined}");
+                }
             }
         }
     }
