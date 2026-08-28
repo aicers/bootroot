@@ -693,7 +693,9 @@ error.
   work, while callers receive a permanent `registrar_unavailable` /
   `audit_unwritable` response. The journal names the store and expected
   mount unit; each refusal's fresh `request_id` resolves to that log line,
-  not to an audit record. Mounting the store later requires a daemon
+  not to an audit record. Its `registrar_health` object is empty (`{}`), so
+  it exposes no limiter or other production-handler health state. Mounting
+  the store later requires a daemon
   restart, as does changing this key or `audit_store_dir`; a `SIGHUP`
   that changes either is rejected. `directory` mode and disabled
   endpoints perform no check.

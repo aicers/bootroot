@@ -621,8 +621,8 @@ cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
 넣어 재시도해야 합니다.
 
 어느 쪽이든 데몬은 억제한 호출을 버킷별로 하나씩, 기동 이후 누적으로
-셉니다. 모든 응답의 `registrar_health.limiter`가 이 두 값을 합계가 아니라
-따로 제공합니다. `predecision_refusal`이 오르는 것은 누군가 잘못된 입력을
+셉니다. 프로덕션 핸들러 응답의 `registrar_health.limiter`가 이 두 값을 합계가
+아니라 따로 제공합니다. `predecision_refusal`이 오르는 것은 누군가 잘못된 입력을
 대량으로 밀어 넣고 있다는 뜻이며 그 호출자들은 여전히 진짜 답을 받고
 있습니다. `admission`이 오르는 것은 정상 트래픽이 막히고 있다는 뜻이며
 진행 중인 브링업이 지연되고 있을 수 있습니다.
@@ -664,8 +664,9 @@ rate_limit_coalesce_window_seconds = 60
 `admission`), 횟수와 창 경계를 담은 `limited` 감사 레코드로 기록됩니다.
 메모리에는 최대 256개 창(약 150 KB)만 유지됩니다. 기본 60초 창에서는
 64개 신원이 네 키를 계속 구동할 때만 분당 최대 256개(시간당 15,360개)를
-기록할 수 있으며, 현재 단일 신원 설계는 시간당 240개입니다. 응답의
-`registrar_health.limiter`는 두 버킷의 프로세스 수명 카운터를 제공합니다.
+기록할 수 있으며, 현재 단일 신원 설계는 시간당 240개입니다. 프로덕션
+핸들러 응답의 `registrar_health.limiter`는 두 버킷의 프로세스 수명 카운터를
+제공합니다.
 
 **admission 버스트 산정.** 정상 상태에서 mint가 드물다는 감이 아니라,
 가장 큰 *정상* 브링업 파도를 기준으로 잡으세요.
@@ -958,7 +959,9 @@ postgres까지 내려갑니다. `bootroot-registrar.service`에 걸면 저장소
 실행됩니다. 일반 인증서 갱신과 fast-poll 의무도 계속됩니다. 엔드포인트는
 systemd가 소유한 소켓에서 호출자를 계속 받고 peer 검사를 마친 뒤, 기다리게
 하지 않고 reason이 `audit_unwritable`인 영구 `registrar_unavailable` 거부를
-돌려줍니다. 재시도로 이 상태가 풀리지는 않습니다.
+돌려줍니다. 재시도로 이 상태가 풀리지는 않습니다. 이 경로에서는 limiter,
+인증서, 용량 또는 다른 프로덕션 핸들러 상태를 만들지 않았으므로
+`registrar_health` 객체가 비어 있습니다(`{}`).
 
 각 응답에는 새로 생성한 `request_id`가 있습니다. 동사가 실행되지 않았으므로
 그 id의 감사 레코드는 없고, 대신 데몬은 id, operation, caller identity,

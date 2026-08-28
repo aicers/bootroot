@@ -559,13 +559,20 @@ pub(crate) async fn build_registrar_handler(
     let credential = InternalCredential::load(&secrets_dir, &state.openbao_url, &active_root)
         .context("loading the bootroot-internal credential for the CA-anchor read")?;
 
-    let audit_store = AuditRecordStore::open(AuditStoreSettings {
+    let audit_store_settings = AuditStoreSettings {
         dir: registrar.audit_record_dir.clone(),
         max_file_bytes: registrar.audit_max_file_bytes,
         max_retained_files: registrar.audit_max_retained_files,
-    })
-    .await
-    .with_context(|| {
+    };
+    #[cfg(test)]
+    let audit_store = if registrar.open_audit_store_as_test_user {
+        AuditRecordStore::open_for_tests(audit_store_settings).await
+    } else {
+        AuditRecordStore::open(audit_store_settings).await
+    };
+    #[cfg(not(test))]
+    let audit_store = AuditRecordStore::open(audit_store_settings).await;
+    let audit_store = audit_store.with_context(|| {
         format!(
             "opening the registrar audit record store at {}",
             registrar.audit_record_dir.display()

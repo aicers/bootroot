@@ -20,7 +20,7 @@ use super::{
     openbao_duration, read_registrar_state, registrar_secret_id_options,
     resolve_registrar_handler_for_gate, resolve_secrets_dir, run_daemon,
 };
-use crate::config::{OpenBaoSettings, Settings};
+use crate::config::{AuditStoreEnforcement, OpenBaoSettings, Settings};
 use crate::registrar::endpoint::client::MintReply;
 use crate::registrar::endpoint::protocol::{
     EnrollError, ProtocolVersion, RefusalClass, RegisterRequest, RegistrarUnavailableReason,
@@ -196,6 +196,18 @@ enabled = {enabled}
         .expect("write agent.toml");
         Settings::from_required_file(&config).expect("the test configuration loads")
     }
+}
+
+fn configure_valid_profile_certificate(settings: &mut Settings, deployment: &Deployment) {
+    let certificate = deployment.path().join("current-profile.pem");
+    let key = KeyPair::generate().expect("generate profile certificate key");
+    let certificate_params = CertificateParams::new(Vec::new()).expect("build profile certificate");
+    let certificate_pem = certificate_params
+        .self_signed(&key)
+        .expect("self-sign profile certificate")
+        .pem();
+    std::fs::write(&certificate, certificate_pem).expect("write current profile certificate");
+    settings.profiles[0].paths.cert = certificate;
 }
 
 /// The projection reads exactly three members and tolerates every other
@@ -750,15 +762,7 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
     settings.registrar.audit_store_dir = unmounted_store.clone();
     settings.registrar.audit_record_dir = unmounted_store.join("records");
 
-    let certificate = deployment.path().join("current-profile.pem");
-    let key = KeyPair::generate().expect("generate profile certificate key");
-    let certificate_params = CertificateParams::new(Vec::new()).expect("build profile certificate");
-    let certificate_pem = certificate_params
-        .self_signed(&key)
-        .expect("self-sign profile certificate")
-        .pem();
-    std::fs::write(&certificate, certificate_pem).expect("write current profile certificate");
-    settings.profiles[0].paths.cert = certificate;
+    configure_valid_profile_certificate(&mut settings, &deployment);
 
     let role_id = deployment.path().join("role-id");
     let secret_id = deployment.path().join("secret-id");
@@ -849,6 +853,29 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
         !unmounted_store.exists(),
         "the refusing daemon must not create the unmounted store"
     );
+    let startup_diagnostics: Vec<_> = logs
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.message
+                == "Registrar endpoint will refuse requests because the audit store is not mounted"
+        })
+        .collect();
+    assert_eq!(
+        startup_diagnostics.len(),
+        1,
+        "the process-lifetime mount verdict emits one startup warning"
+    );
+    let startup = &startup_diagnostics[0];
+    assert_eq!(startup.level, "WARN");
+    assert_eq!(
+        startup.field("audit_store"),
+        unmounted_store.display().to_string()
+    );
+    assert_eq!(
+        startup.field("mount_unit"),
+        audit_store_mount_unit_name(&unmounted_store)
+    );
     shutdown.stop();
     daemon
         .await
@@ -856,26 +883,198 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
         .expect("the mount refusal does not make run_daemon fail");
 }
 
-/// A mounted store retains the normal failure semantics: only the missing
-/// mount is converted into an endpoint refusal, never a production-handler
-/// dependency failure.
-#[tokio::test]
-async fn a_mounted_store_propagates_production_handler_failures() {
-    let temp = tempfile::tempdir().expect("temporary store parent");
-    let gate =
-        crate::registrar::AuditStoreMountGate::mounted_for_test(temp.path().join("audit-store"));
+/// Disabling the endpoint leaves the audit-store mount gate entirely out of
+/// daemon composition, whether the configured enforcement is filesystem or a
+/// plain directory. The profile loop still starts and no missing directory is
+/// created while it runs.
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_endpoint_configurations_do_not_enter_the_mount_refusal_path() {
+    for (name, enforcement) in [
+        ("filesystem", AuditStoreEnforcement::Filesystem),
+        ("directory", AuditStoreEnforcement::Directory),
+    ] {
+        let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
+        let deployment = Deployment::arrange();
+        let mut settings = deployment.settings();
+        let unused_store = deployment.path().join(format!("unused-{name}-audit-store"));
+        settings.registrar.audit_store_enforcement = enforcement;
+        settings.registrar.audit_store_dir = unused_store.clone();
+        settings.registrar.audit_record_dir = unused_store.join("records");
+        configure_valid_profile_certificate(&mut settings, &deployment);
 
-    let Err(error) = resolve_registrar_handler_for_gate(&gate, || async {
-        Err(anyhow::anyhow!("record store cannot be opened"))
+        let shutdown = DaemonShutdown::new();
+        let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+            settings: Arc::new(settings),
+            default_eab: None,
+            eab_refresh_path: None,
+            config_path: Some(deployment.path().join("agent.toml")),
+            insecure_mode: false,
+            cli_overrides: crate::config::CliOverrides::default(),
+            shutdown: shutdown.clone(),
+            registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+        }));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if logs
+                    .events()
+                    .into_iter()
+                    .any(|event| event.message.contains("daemon enabled"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the profile daemon remains available while the endpoint is disabled");
+        assert!(
+            !unused_store.exists(),
+            "{name} mode must not probe the audit store"
+        );
+        assert!(
+            logs.events().into_iter().all(|event| {
+                event.message
+                    != "Registrar endpoint will refuse requests because the audit store is not mounted"
+                    && event.message
+                        != "Registrar endpoint refused a request because the audit store is not mounted"
+            }),
+            "{name} mode must not emit an audit-mount diagnostic or refusal"
+        );
+
+        shutdown.stop();
+        daemon
+            .await
+            .expect("the disabled daemon task joins")
+            .expect("the disabled daemon shuts down cleanly");
+    }
+}
+
+/// Directory enforcement starts the ordinary handler without probing the
+/// audit-store mount or emitting the filesystem-mode startup diagnostic.
+///
+/// The endpoint accepts a request and reaches the production handler's
+/// deliberately unsettled wire-spec refusal. That refusal occurs before any
+/// `OpenBao` I/O, so this exercises daemon composition without a network.
+#[tokio::test(flavor = "current_thread")]
+async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
+    let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings_with_endpoint(true);
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    settings.registrar.open_audit_store_as_test_user = true;
+    configure_valid_profile_certificate(&mut settings, &deployment);
+    let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+
+    let shutdown = DaemonShutdown::new();
+    let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: Some(deployment.path().join("agent.toml")),
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        shutdown: shutdown.clone(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    }));
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if logs
+                .events()
+                .into_iter()
+                .any(|event| event.message.contains("daemon enabled"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    else {
-        panic!("a production-handler failure must still stop the daemon");
-    };
+    .expect("the profile daemon remains available with a directory audit store");
 
+    let exchange = endpoint
+        .client()
+        .mint(RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "edge-proxy".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "edge-node-01".to_string(),
+            instance: Some(1),
+            spec: WireServiceSpec {
+                component: "edge-proxy".to_string(),
+                service_name: "edge-proxy".to_string(),
+                reload: "none".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 300,
+            idempotency_key: "caller-key".to_string(),
+        })
+        .await;
     assert!(
-        format!("{error:#}").contains("record store cannot be opened"),
-        "the production failure remains visible: {error:#}"
+        exchange.is_err(),
+        "the ordinary handler's unsettled spec refusal closes the connection"
+    );
+    let events = logs.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.field("reason") == "handler-rejected-payload"),
+        "the enabled endpoint must dispatch the request to the ordinary handler: {events:?}; \
+         exchange: {exchange:?}"
+    );
+    assert!(
+        !daemon.is_finished(),
+        "the directory configuration must keep the daemon running"
+    );
+    assert!(
+        logs.events().into_iter().all(|event| {
+            event.message
+                != "Registrar endpoint will refuse requests because the audit store is not mounted"
+                && event.message
+                    != "Registrar endpoint refused a request because the audit store is not mounted"
+        }),
+        "directory mode must not emit an audit-mount diagnostic or refusal"
+    );
+
+    shutdown.stop();
+    daemon
+        .await
+        .expect("the directory daemon task joins")
+        .expect("the directory daemon shuts down cleanly");
+}
+
+/// A production audit-store failure remains a daemon failure: directory mode
+/// reaches the real builder without consulting the mount predicate, and a
+/// regular file cannot become the record directory it needs.
+#[tokio::test]
+async fn an_unopenable_production_audit_store_stops_the_daemon() {
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings_with_endpoint(true);
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    std::fs::remove_dir_all(&settings.registrar.audit_record_dir)
+        .expect("remove the fixture record directory");
+    std::fs::write(&settings.registrar.audit_record_dir, "not a directory")
+        .expect("place an unopenable record directory fixture");
+
+    let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+    let error = run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: Some(deployment.path().join("agent.toml")),
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        shutdown: DaemonShutdown::new(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    })
+    .await
+    .expect_err("an unopenable production audit store must stop the daemon");
+    assert!(
+        format!("{error:#}").contains("opening the registrar audit record store at"),
+        "the production audit-store failure remains visible: {error:#}"
     );
 }
 
