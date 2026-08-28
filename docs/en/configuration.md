@@ -683,7 +683,14 @@ error.
   project quota as the operator-side route to a real ceiling. Both are
   gated on `[registrar_endpoint] enabled` — on a host that has not
   enabled the endpoint neither mode does anything at all. See
-  [The shared audit store](operations.md#the-shared-audit-store).
+  [The shared audit store](operations.md#the-shared-audit-store). At
+  daemon start, an enabled `filesystem` endpoint refuses registrar verbs
+  if `audit_store_dir` is not mounted. The daemon continues its renewal
+  work, while callers receive a permanent `registrar_unavailable` /
+  `audit_unwritable` response. The journal names the store and expected
+  mount unit; each refusal's fresh `request_id` resolves to that log line,
+  not to an audit record. Mounting the store later requires a daemon
+  restart. `directory` mode and disabled endpoints perform no check.
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
   the resolved directory must stay inside `audit_store_dir`.

@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::PoisonError;
@@ -13,6 +17,8 @@ use anyhow::Context as _;
 use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "linux")]
+use crate::registrar::AuditStoreMountGate;
 use crate::registrar::RegistrarEndpoint;
 use crate::{acme, cert_chain, config, eab, fast_poll, hooks, profile, utils};
 
@@ -214,18 +220,20 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
 
     #[cfg(target_os = "linux")]
     let registrar_maintenance = if let Some((endpoint, built)) = registrar_service {
+        let BuiltRegistrarHandler {
+            handler,
+            maintenance,
+        } = built;
         spawn_registrar_endpoint(
             &mut handles,
             endpoint,
-            built.handler,
-            Arc::clone(&built.coalescing),
+            handler,
+            maintenance
+                .as_ref()
+                .map(|maintenance| Arc::clone(&maintenance.coalescing)),
             &shutdown_rx,
         );
-        Some(RegistrarMaintenance {
-            coalescing: built.coalescing,
-            health: built.health,
-            counts: built.counts,
-        })
+        maintenance
     } else {
         None
     };
@@ -608,18 +616,18 @@ pub(crate) async fn build_registrar_handler(
             state.kv_mount,
             health.clone(),
         )),
-        coalescing,
-        health,
-        counts,
+        maintenance: Some(RegistrarMaintenance {
+            coalescing,
+            health,
+            counts,
+        }),
     })
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) struct BuiltRegistrarHandler {
     handler: Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
-    coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
-    health: Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
-    counts: Arc<crate::registrar::verbs::limiter::CountingLimitedInvocationSink>,
+    maintenance: Option<RegistrarMaintenance>,
 }
 
 /// State refreshed together on the daemon's existing maintenance cadence.
@@ -669,14 +677,129 @@ type RegistrarService = Option<(
 /// # Errors
 ///
 /// Returns whatever [`build_registrar_handler`] could not resolve.
+///
+/// An absent filesystem audit-store mount is the deliberate exception: it
+/// installs a refusing handler so the adopted socket remains answered while
+/// the daemon's renewal duties continue. Every other handler dependency
+/// failure still stops the invocation.
 #[cfg(target_os = "linux")]
 async fn resolve_registrar_service(
     registrar_endpoint: &RegistrarEndpoint,
     settings: &config::Settings,
 ) -> anyhow::Result<RegistrarService> {
     match registrar_endpoint.activated() {
-        Some(endpoint) => Ok(Some((endpoint, build_registrar_handler(settings).await?))),
+        Some(endpoint) => {
+            let gate = registrar_endpoint
+                .audit_store_mount_gate(&settings.registrar, audit_store_is_mount_point)
+                .expect("an active endpoint always carries an audit-store gate");
+            let built =
+                resolve_registrar_handler_for_gate(gate, || build_registrar_handler(settings))
+                    .await?;
+            Ok(Some((endpoint, built)))
+        }
         None => Ok(None),
+    }
+}
+
+/// Selects the handler for one active endpoint after its mount verdict.
+///
+/// An unmounted filesystem store is intentionally resolved without invoking
+/// `build_handler`: opening that handler's audit store would manufacture the
+/// directory the endpoint must refuse over.
+#[cfg(target_os = "linux")]
+async fn resolve_registrar_handler_for_gate<F, Fut>(
+    gate: &AuditStoreMountGate,
+    build_handler: F,
+) -> anyhow::Result<BuiltRegistrarHandler>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = anyhow::Result<BuiltRegistrarHandler>>,
+{
+    if gate.requires_mount() && !gate.mounted() {
+        let audit_store_dir = gate.store_dir().to_path_buf();
+        let mount_unit = audit_store_mount_unit_name(&audit_store_dir);
+        let messages = crate::daemon_messages::DaemonMessages::from_environment();
+        if gate.take_startup_diagnostic() {
+            warn!(
+                audit_store = %audit_store_dir.display(),
+                mount_unit = mount_unit.as_str(),
+                "{}", messages.audit_store_not_mounted_at_start()
+            );
+        }
+        return Ok(BuiltRegistrarHandler {
+            handler: Arc::new(crate::registrar::endpoint::refusing::RefusingHandler::new(
+                audit_store_dir,
+                mount_unit,
+                messages,
+            )),
+            maintenance: None,
+        });
+    }
+    build_handler().await
+}
+
+/// Reports whether `store_dir` is a mount point by comparing device ids.
+///
+/// Failure to read either directory fails the endpoint closed: it is not
+/// evidence that the configured filesystem store is mounted, and this path
+/// must not create it merely to find out.
+#[cfg(target_os = "linux")]
+fn audit_store_is_mount_point(store_dir: &Path) -> bool {
+    let Some(parent) = store_dir.parent() else {
+        return false;
+    };
+    let Ok(store) = std::fs::metadata(store_dir) else {
+        return false;
+    };
+    let Ok(parent) = std::fs::metadata(parent) else {
+        return false;
+    };
+    has_distinct_device_ids(store.dev(), parent.dev())
+}
+
+/// Compares the two metadata values the mount-point predicate needs.
+#[cfg(target_os = "linux")]
+const fn has_distinct_device_ids(store_device: u64, parent_device: u64) -> bool {
+    store_device != parent_device
+}
+
+/// Returns the systemd mount unit name derived from the mount point.
+#[cfg(target_os = "linux")]
+fn audit_store_mount_unit_name(store_dir: &Path) -> String {
+    format!("{}.mount", systemd_escape_path(store_dir))
+}
+
+/// Spells a mount point the way `systemd-escape --path` does.
+#[cfg(target_os = "linux")]
+fn systemd_escape_path(store_dir: &Path) -> String {
+    let components: Vec<&[u8]> = store_dir
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .filter(|component| !component.is_empty() && *component != b".")
+        .collect();
+    if components.is_empty() {
+        return "-".to_string();
+    }
+
+    let mut escaped = String::new();
+    for (index, component) in components.iter().enumerate() {
+        if index > 0 {
+            escaped.push('-');
+        }
+        for byte in *component {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b':' | b'_' | b'.') {
+                escaped.push(char::from(*byte));
+            } else {
+                use std::fmt::Write as _;
+                write!(escaped, "\\x{byte:02x}").expect("writing a String cannot fail");
+            }
+        }
+    }
+    if let Some(rest) = escaped.strip_prefix('.') {
+        format!("\\x2e{rest}")
+    } else {
+        escaped
     }
 }
 
@@ -701,7 +824,7 @@ fn spawn_registrar_endpoint(
     handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
     endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
     request_handler: Arc<dyn crate::registrar::endpoint::handler::RegistrarRequestHandler>,
-    coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
+    coalescing: Option<Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>>,
     shutdown_rx: &watch::Receiver<bool>,
 ) {
     let shutdown_rx = shutdown_rx.clone();
@@ -711,7 +834,9 @@ fn spawn_registrar_endpoint(
         // `run` drains every accepted connection before it returns. Flushing
         // here therefore includes limited invocations from requests that were
         // already in flight when shutdown began.
-        coalescing.flush();
+        if let Some(coalescing) = coalescing {
+            coalescing.flush();
+        }
         result
     }));
 }

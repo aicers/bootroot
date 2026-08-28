@@ -37,6 +37,7 @@ use crate::registrar::{registrar_client_identity, registrar_endpoint_identity};
 #[derive(Debug, Clone)]
 pub(super) struct CapturedEvent {
     pub(super) message: String,
+    pub(super) level: String,
     pub(super) fields: BTreeMap<String, String>,
 }
 
@@ -112,6 +113,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
             .expect("the capture mutex is only held to push and read")
             .push(CapturedEvent {
                 message,
+                level: event.metadata().level().to_string(),
                 fields: collector.0,
             });
     }

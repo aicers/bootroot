@@ -6,6 +6,8 @@ pub mod agent_args;
 pub mod cert_chain;
 pub mod cert_group;
 pub mod config;
+#[cfg(any(target_os = "linux", test))]
+mod daemon_messages;
 pub mod db;
 pub mod eab;
 pub mod fs_util;

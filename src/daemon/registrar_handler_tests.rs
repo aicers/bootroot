@@ -11,8 +11,9 @@ use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tempfile::TempDir;
 
 use super::{
-    RegistrarStateProjection, build_registrar_handler, openbao_duration, read_registrar_state,
-    registrar_secret_id_options, resolve_secrets_dir,
+    RegistrarStateProjection, audit_store_is_mount_point, audit_store_mount_unit_name,
+    build_registrar_handler, has_distinct_device_ids, openbao_duration, read_registrar_state,
+    registrar_secret_id_options, resolve_registrar_handler_for_gate, resolve_secrets_dir,
 };
 use crate::config::Settings;
 use crate::registrar::fixture::RegistrarConfigFixture;
@@ -631,9 +632,112 @@ fn the_handler_is_built_only_for_an_active_endpoint() {
         "the handler has exactly one call site in the composition layer"
     );
     assert!(
-        call_sites[0].contains("registrar_endpoint.activated()"),
-        "the one call site is inside the active-endpoint guard: {}",
-        call_sites[0]
+        source
+            .split("async fn resolve_registrar_service")
+            .nth(1)
+            .is_some_and(|resolver| resolver.contains("registrar_endpoint.activated()")),
+        "the one call site is inside the active-endpoint guard"
+    );
+}
+
+/// The daemon-side gate needs only the device-id comparison; its metadata
+/// source is deliberately injected at this seam so the test needs no mount.
+#[test]
+fn the_audit_store_mount_gate_compares_only_device_ids() {
+    assert!(has_distinct_device_ids(10, 11));
+    assert!(!has_distinct_device_ids(10, 10));
+    assert_eq!(
+        audit_store_mount_unit_name(Path::new("/var/lib/bootroot/audit-store")),
+        "var-lib-bootroot-audit\\x2dstore.mount"
+    );
+    assert_eq!(
+        audit_store_mount_unit_name(Path::new("/store/with space")),
+        "store-with\\x20space.mount"
+    );
+
+    let source = include_str!("../daemon.rs");
+    let resolver = source
+        .split("async fn resolve_registrar_service")
+        .nth(1)
+        .expect("the registrar resolver is present");
+    let gate = resolver
+        .find("audit_store_mount_gate")
+        .expect("the resolver consults the mount gate");
+    let handler = resolver
+        .find("build_registrar_handler(settings)")
+        .expect("the resolver builds the production handler");
+    assert!(
+        gate < handler,
+        "the mount gate precedes every handler dependency"
+    );
+    assert!(!resolver.contains("/proc/self/mounts"));
+    assert!(!resolver.contains("/sys/block"));
+}
+
+/// A missing path or a directory on its parent's filesystem is not evidence
+/// of the filesystem reserve. The probe is read-only, so neither case creates
+/// the configured store before the refusal path takes over.
+#[test]
+fn the_mount_point_probe_fails_closed_without_creating_the_store() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let missing_store = temp.path().join("missing-audit-store");
+    assert!(!audit_store_is_mount_point(&missing_store));
+    assert!(
+        !missing_store.exists(),
+        "probing a missing store must not create it"
+    );
+
+    let plain_store = temp.path().join("plain-audit-store");
+    std::fs::create_dir(&plain_store).expect("create a non-mounted store directory");
+    assert!(!audit_store_is_mount_point(&plain_store));
+}
+
+/// An absent mount selects the refusing handler before any production
+/// dependency can open the record store, load a credential or read state.
+#[tokio::test]
+async fn an_unmounted_store_bypasses_production_handler_construction() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let store = temp.path().join("audit-store");
+    let gate = crate::registrar::AuditStoreMountGate::unmounted_for_test(store.clone());
+
+    let built = resolve_registrar_handler_for_gate(&gate, || async {
+        Err(anyhow::anyhow!(
+            "the production handler must not be constructed"
+        ))
+    })
+    .await
+    .expect("the unmounted store receives a refusing handler instead of an error");
+
+    assert!(
+        built.maintenance.is_none(),
+        "the refusing handler owns no limiter or audit-store maintenance"
+    );
+    assert!(
+        !store.exists(),
+        "selecting the refusal does not create the unmounted store"
+    );
+}
+
+/// A mounted store retains the normal failure semantics: only the missing
+/// mount is converted into an endpoint refusal, never a production-handler
+/// dependency failure.
+#[tokio::test]
+async fn a_mounted_store_propagates_production_handler_failures() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let gate =
+        crate::registrar::AuditStoreMountGate::mounted_for_test(temp.path().join("audit-store"));
+
+    let Err(error) = resolve_registrar_handler_for_gate(&gate, || async {
+        Err(anyhow::anyhow!("record store cannot be opened"))
+    })
+    .await
+    else {
+        panic!("a production-handler failure must still stop the daemon");
+    };
+
+    assert!(
+        format!("{error:#}").contains("record store cannot be opened"),
+        "the production failure remains visible: {error:#}"
     );
 }
 
