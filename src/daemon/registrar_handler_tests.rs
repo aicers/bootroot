@@ -18,7 +18,7 @@ use super::{
     DaemonInvocation, DaemonShutdown, RegistrarStateProjection, audit_store_is_mount_point,
     audit_store_mount_unit_name, build_registrar_handler, has_distinct_device_ids,
     openbao_duration, read_registrar_state, registrar_secret_id_options,
-    resolve_registrar_handler_for_gate, resolve_secrets_dir, run_daemon,
+    resolve_registrar_handler_for_gate, resolve_registrar_service, resolve_secrets_dir, run_daemon,
 };
 use crate::config::{AuditStoreEnforcement, OpenBaoSettings, Settings};
 use crate::registrar::endpoint::client::MintReply;
@@ -948,6 +948,169 @@ async fn disabled_endpoint_configurations_do_not_enter_the_mount_refusal_path() 
             .expect("the disabled daemon task joins")
             .expect("the disabled daemon shuts down cleanly");
     }
+}
+
+/// A disabled endpoint reaches no audit-store reload check at all.
+///
+/// The guard sits under the enablement captured once, above the reload loop,
+/// so a host that never enabled the endpoint compares nothing about its audit
+/// store and is told nothing about one. Asserted over the reload loop's own
+/// source, because a disabled daemon reaching that check would be observable
+/// only as a diagnostic it must never print.
+#[test]
+fn a_disabled_endpoint_reaches_no_audit_store_reload_check() {
+    let source = include_str!("../bin/bootroot-agent.rs");
+    let call = source
+        .find("config::check_registrar_audit_store_reload(")
+        .expect("the reload loop holds the audit-store check");
+    let guard = source[..call]
+        .rfind("if ")
+        .expect("the check sits under a guard");
+    assert!(
+        source[guard..call].contains("registrar_endpoint_settings.enabled"),
+        "only an endpoint enabled at process start reaches the audit-store check"
+    );
+}
+
+/// A `directory` endpoint reloading another `directory` configuration keeps
+/// the reload behavior it had before the mount gate existed.
+///
+/// Both invocations go through the composition the `SIGHUP` loop drives, on
+/// the one `RegistrarEndpoint` that survives it. The second one moves
+/// `audit_store_dir`: the reload is not refused, the moved store is what the
+/// rebuilt handler opens, the store the process started with is left alone,
+/// no mount metadata is read, and no mount-gate diagnostic is logged.
+#[tokio::test]
+async fn a_directory_reload_follows_the_moved_store_without_a_mount_gate() {
+    let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
+    let deployment = Deployment::arrange();
+    let activated = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+    let endpoint = activated.registrar_endpoint();
+
+    let mut running = deployment.settings_with_endpoint(true);
+    running.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    running.registrar.open_audit_store_as_test_user = true;
+    let started_with = running.registrar.audit_store_dir.clone();
+    resolve_registrar_service(&endpoint, &running)
+        .await
+        .expect("the directory endpoint composes an ordinary handler")
+        .expect("an enabled endpoint resolves a service");
+
+    // The reload: the operator moves the store, and only the store.
+    let moved = deployment.path().join("moved-audit-store");
+    let mut reloaded = running.clone();
+    reloaded.registrar.audit_store_dir = moved.clone();
+    reloaded.registrar.audit_record_dir = moved.join("records");
+    crate::config::check_registrar_audit_store_reload(&running.registrar, &reloaded.registrar)
+        .expect("a directory-to-directory store move is not a mount-gate input");
+
+    let (_, built) = resolve_registrar_service(&endpoint, &reloaded)
+        .await
+        .expect("the reloaded directory configuration composes a handler")
+        .expect("an enabled endpoint resolves a service");
+    assert!(
+        built.maintenance.is_some(),
+        "the rebuild reaches the ordinary handler rather than the refusing one"
+    );
+    assert!(
+        moved.join("records").is_dir(),
+        "the rebuilt handler opens the reloaded store, not the one it started with"
+    );
+
+    // The retained verdict is still the directory one, so the probe the
+    // filesystem path would run is never reached.
+    let gate = endpoint
+        .audit_store_mount_gate(&reloaded.registrar, |_| {
+            panic!("directory mode must not read the store's mount metadata")
+        })
+        .expect("an active endpoint carries a gate");
+    assert!(!gate.requires_mount());
+    assert_eq!(
+        gate.store_dir(),
+        started_with,
+        "the retained verdict names the startup store and nothing rebuilt it"
+    );
+    assert!(
+        logs.events().into_iter().all(|event| {
+            event.message
+                != "Registrar endpoint will refuse requests because the audit store is not mounted"
+        }),
+        "a directory reload emits no mount-gate warning"
+    );
+}
+
+/// A filesystem verdict cannot be replaced or reinterpreted by a reload.
+///
+/// The gate is a process-lifetime `OnceLock`, so a reloaded configuration
+/// that reached composition would be served by the verdict this process
+/// already took: the daemon would keep refusing over an unmounted store the
+/// operator believes they just switched away from, or would build a
+/// filesystem-mode handler that never checked a mount at all. Both are the
+/// divergence the reload boundary refuses instead.
+#[tokio::test]
+async fn a_filesystem_verdict_cannot_be_reinterpreted_by_a_reload() {
+    let deployment = Deployment::arrange();
+    let activated = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+    let endpoint = activated.registrar_endpoint();
+
+    let mut running = deployment.settings_with_endpoint(true);
+    let unmounted = deployment.path().join("unmounted-audit-store");
+    running.registrar.audit_store_enforcement = AuditStoreEnforcement::Filesystem;
+    running.registrar.audit_store_dir = unmounted.clone();
+    running.registrar.audit_record_dir = unmounted.join("records");
+    let (_, built) = resolve_registrar_service(&endpoint, &running)
+        .await
+        .expect("an unmounted filesystem store still answers its socket")
+        .expect("an enabled endpoint resolves a service");
+    assert!(
+        built.maintenance.is_none(),
+        "the unmounted store selects the refusing handler"
+    );
+
+    for (name, reloaded) in [
+        (
+            "audit_store_dir",
+            crate::config::RegistrarSettings {
+                audit_store_dir: deployment.path().join("elsewhere-audit-store"),
+                ..running.registrar.clone()
+            },
+        ),
+        (
+            "audit_store_enforcement",
+            crate::config::RegistrarSettings {
+                audit_store_enforcement: AuditStoreEnforcement::Directory,
+                ..running.registrar.clone()
+            },
+        ),
+    ] {
+        crate::config::check_registrar_audit_store_reload(&running.registrar, &reloaded)
+            .expect_err(&format!("a changed {name} needs a service restart"));
+
+        // What the refusal is protecting: the verdict the reloaded settings
+        // would be served by is still the one taken at process start.
+        let gate = endpoint
+            .audit_store_mount_gate(&reloaded, |_| {
+                panic!("a later invocation must not re-probe the store")
+            })
+            .expect("an active endpoint carries a gate");
+        assert!(gate.requires_mount() && !gate.mounted());
+        assert_eq!(
+            gate.store_dir(),
+            unmounted,
+            "the retained verdict describes the startup store, whatever {name} now says"
+        );
+    }
+
+    // An endpoint that started in directory mode has no verdict for a
+    // filesystem reload to be served by, so that direction is refused too.
+    let directory = crate::config::RegistrarSettings {
+        audit_store_enforcement: AuditStoreEnforcement::Directory,
+        ..running.registrar.clone()
+    };
+    crate::config::check_registrar_audit_store_reload(&directory, &running.registrar)
+        .expect_err("a reload into filesystem mode needs a service restart");
 }
 
 /// Directory enforcement starts the ordinary handler without probing the

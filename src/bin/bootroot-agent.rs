@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use bootroot::config::CliOverrides;
 use bootroot::{
-    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint, config, eab,
-    ensure_registrar_surface_certificates, profile, run_daemon, run_oneshot,
+    Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint,
+    audit_store_reload_rejection_message, config, eab, ensure_registrar_surface_certificates,
+    profile, run_daemon, run_oneshot,
 };
 use clap::Parser;
 #[cfg(unix)]
@@ -104,13 +105,20 @@ async fn main() -> anyhow::Result<()> {
                                 error!("Reload rejected: {err}");
                                 continue;
                             }
+                            // Localized, and narrower than the endpoint
+                            // guard above: only a reload that would detach
+                            // the filesystem mount verdict this process took
+                            // at start is refused. A `directory` daemon
+                            // reloading another `directory` configuration
+                            // reaches none of this.
                             if registrar_endpoint_settings.enabled
-                                && let Err(err) = config::check_registrar_audit_store_reload(
-                                    &registrar_audit_settings,
-                                    &settings.registrar,
-                                )
+                                && let Err(rejection) =
+                                    config::check_registrar_audit_store_reload(
+                                        &registrar_audit_settings,
+                                        &settings.registrar,
+                                    )
                             {
-                                error!("Reload rejected: {err}");
+                                error!("{}", audit_store_reload_rejection_message(&rejection));
                                 continue;
                             }
                             info!("Reload signal received. Restarting daemon with new config.");
