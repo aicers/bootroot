@@ -1176,7 +1176,10 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
 
    두 줄 모두 명령이며, 아래의 모든 렌더링 목록은 이 실행이 가리킨
    `--compose-file`과 해결된 Compose 프로젝트를 이미 채워 넣은 채로
-   그 두 줄을 담습니다.
+   그 두 줄을 담습니다. 각 목록을 닫는 재실행 명령도 같은
+   `--compose-file`을 이름으로 담으므로, 아래의 모든 단계는 운영자의
+   현재 디렉터리에 우연히 놓인 `docker-compose.yml`이 아니라 이 단계가
+   기록자를 멈춘 바로 그 배포를 상대로 진행됩니다.
 
 2. 저장소를 옮겨 두고 마운트 지점을 비어 있고 root 소유로 다시 만듭니다.
 
@@ -1185,10 +1188,10 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
    install -d -m 0700 -o root -g root <audit_store_dir>
    ```
 
-3. `bootroot infra up --agent-config <path>`를 실행합니다. 보관
-   디렉터리를 발견해 **migration incomplete**를 보고하고 어떤 컨테이너도
-   시작하지 않습니다. 하부 저장소가 다시 비었으므로 여기서 렌더링되는
-   것은 남은 **활성화**입니다. 이미지가 놓인 상태에 맞는 이미지 명령, 세
+3. `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`를 실행합니다. 보관 디렉터리를 발견해 **migration
+   incomplete**를 보고하고 어떤 컨테이너도 시작하지 않습니다. 하부
+   저장소가 다시 비었으므로 여기서 렌더링되는 것은 남은 **활성화**입니다. 이미지가 놓인 상태에 맞는 이미지 명령, 세
    산출물 설치, `systemctl daemon-reload`, 그리고
    `systemctl enable --now <escaped audit_store_dir>.mount`입니다.
    `records/`나 `openbao/`의 생성은 **포함되지 않습니다.** 그것은 6단계가
@@ -1197,7 +1200,8 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
    1단계가 이미 그것을 충족했습니다.
 4. 그 명령들을 실행합니다. 이제 마운트가 올라왔고 그 위의 저장소는 비어
    있습니다.
-5. `bootroot infra up --agent-config <path>`를 다시 실행합니다. 여전히
+5. `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`를 다시 실행합니다. 매번 같은 한 쌍입니다. 여전히
    **migration incomplete**이고 여전히 어떤 컨테이너도 시작하지 않으며,
    이번에는 용량 판정을 보고하고 복사를 렌더링합니다. 내용이 들어가지
    않으면 대신 두 가지 길을 제시합니다.
@@ -1247,9 +1251,10 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
    mv <audit_store_dir>.pre-mount <audit_store_dir>.migrated
    ```
 
-9. `bootroot infra up --agent-config <path>`를 실행합니다. 남은 보관
-   디렉터리가 없으므로 마운트된 파일 시스템 위의 저장소를 검증해 예약량을
-   **enforced**로 보고하고 Compose 스택을 시작합니다. 그 뒤 OpenBao의
+9. `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`를 실행합니다. 남은 보관 디렉터리가 없으므로 마운트된 파일
+   시스템 위의 저장소를 검증해 예약량을 **enforced**로 보고하고 Compose
+   스택을 시작합니다. 그 뒤 OpenBao의
    봉인을 해제하고 `bootroot-registrar.service`를 시작하세요. 기록자들은
    1단계부터 멈춰 있었으므로 복사와 검증이 진행되는 동안 저장소에 기록된
    것은 없습니다.
@@ -1366,9 +1371,9 @@ bootroot는 중간이 아니라 양 끝에서 호출됩니다. 2~5단계는 운�
 실행입니다.
 
 1. `audit_store_reserve_bytes`를 바꾼 뒤
-   `bootroot infra up --agent-config <path>`를 실행합니다. 크기
-   불일치로 실패하면서 두 크기를 지목하고 이곳을 가리킵니다. 설치기의
-   최소 예약량보다 작은 값은 그 검사가 먼저 거부하므로, 포맷할 수 없는
+   `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`를 실행합니다. 크기 불일치로 실패하면서 두 크기를 지목하고
+   이곳을 가리킵니다. 설치기의 최소 예약량보다 작은 값은 그 검사가 먼저 거부하므로, 포맷할 수 없는
    크기를 상대로 절차가 시작되는 일은 없습니다.
 2. 두 기록자를 모두 멈춥니다. OpenBao 컨테이너는 다시 시작할 때
    **shamir 봉인 해제를 수동으로** 해야 하는 예정된 중지이며,
@@ -1425,8 +1430,9 @@ bootroot는 중간이 아니라 양 끝에서 호출됩니다. 2~5단계는 운�
 
    그다음 OpenBao 컨테이너를 시작해 봉인을 해제하고
    `bootroot-registrar.service`를 시작합니다.
-6. `bootroot infra up --agent-config <path>`를 실행합니다. 갱신된
-   예약량에 대해 이미지를 검증하고 **enforced**를 보고합니다. 그때에야
+6. `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`를 실행합니다. 갱신된 예약량에 대해 이미지를 검증하고
+   **enforced**를 보고합니다. 그때에야
    `<audit_store_dir>.img.old`를 제거할 수 있으며, 그것도 운영자가 직접
    합니다. bootroot는 여기서도 삭제를 렌더링하지 않고 그 파일의 경로와
    크기를 회수 가능으로 보고합니다.

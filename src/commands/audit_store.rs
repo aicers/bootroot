@@ -1002,8 +1002,19 @@ fn verify_filesystem_reserve_for_infra_up(
     expected_uid: u32,
     messages: &Messages,
 ) -> Result<()> {
+    // The re-run names both of the run's own inputs, not just the
+    // configuration. `--compose-file` is what selects the deployment,
+    // and the first migration step stops *that* stack by name: a re-run
+    // without it falls back to `docker-compose.yml` in whatever
+    // directory the operator happens to be standing in, so the
+    // migration would be driven against one deployment while the
+    // writers of another stay stopped. It is rendered unconditionally
+    // rather than only when it differs from the default, because the
+    // default is resolved against the current directory and the
+    // rendered list is meant to be runnable from anywhere.
     let rerun_command = format!(
-        "bootroot infra up --agent-config {}",
+        "bootroot infra up --compose-file {} --agent-config {}",
+        reserve::sh_quote_path(compose_file),
         reserve::sh_quote_path(agent_config)
     );
     let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
@@ -2426,12 +2437,51 @@ mod tests {
         assert!(output.contains("provisioned, not activated"), "{output}");
         assert!(
             output.contains(&format!(
-                "bootroot infra up --agent-config '{}'",
+                "bootroot infra up --compose-file '{}' --agent-config '{}'",
+                compose_file.display(),
                 quoted_config.display().to_string().replace('\'', "'\\''")
             )),
             "{output}"
         );
         assert!(fixture.artifact_dir().is_dir());
+    }
+
+    /// The re-run has to carry the deployment the run was pointed at.
+    /// A migration begun against a stack file that is neither named
+    /// `docker-compose.yml` nor in the operator's current directory
+    /// stops *that* stack in its first step, so a re-run that omitted
+    /// `--compose-file` would resume against a different one.
+    #[test]
+    fn the_infra_up_rerun_carries_a_non_default_compose_file() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let compose_file = compose_dir.join("stack; $(touch ignored) '.yml");
+        let config = fixture.filesystem_agent_config(true);
+        write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
+            .expect("override");
+
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_file,
+            Some(&config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("unactivated reserve refuses bring-up");
+        let output = err.to_string();
+        assert!(
+            output.contains(&format!(
+                "bootroot infra up --compose-file '{}' --agent-config '{}'",
+                compose_file.display().to_string().replace('\'', "'\\''"),
+                config.display(),
+            )),
+            "{output}"
+        );
+        assert!(
+            !output.contains("bootroot infra up --agent-config"),
+            "{output}"
+        );
     }
 
     #[test]

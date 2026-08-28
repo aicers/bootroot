@@ -1243,7 +1243,11 @@ records:
 
    Both lines are commands, and every rendered list below carries them
    with the `--compose-file` this run was pointed at and the Compose
-   project it resolved already filled in.
+   project it resolved already filled in. The re-run each list closes
+   with names that same `--compose-file`, so every pass below is driven
+   against the deployment whose writers this step stopped rather than
+   against whatever `docker-compose.yml` the operator's current
+   directory happens to hold.
 
 2. Rename the store aside and recreate the mount point empty and
    root-owned.
@@ -1253,18 +1257,20 @@ records:
    install -d -m 0700 -o root -g root <audit_store_dir>
    ```
 
-3. Run `bootroot infra up --agent-config <path>`. It finds the holding
-   directory, reports **migration incomplete** and starts no container.
-   The underlying store is empty again, so what it renders here is the
-   outstanding **activation**: the image commands for the state the image
-   is in, the three artifact installs, the `systemctl daemon-reload` and
-   the `systemctl enable --now <escaped audit_store_dir>.mount` — and
+3. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It finds the holding directory, reports **migration
+   incomplete** and starts no container. The underlying store is empty
+   again, so what it renders here is the outstanding **activation**: the
+   image commands for the state the image is in, the three artifact
+   installs, the `systemctl daemon-reload` and the `systemctl enable
+   --now <escaped audit_store_dir>.mount` — and
    **not** the creation of `records/` or `openbao/`, which step 6
    performs instead. bootroot cannot see that the writers are already
    down, so the stop-both-writers step appears in that list too, with
    both its commands; step 1 has satisfied it.
 4. Run those commands. The mount is now up and the store on it is empty.
-5. Run `bootroot infra up --agent-config <path>` again. Still **migration
+5. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>` again — the same pair every time. Still **migration
    incomplete** and still starting no container, it now reports the
    capacity verdict and renders the copy — or, where the contents do not
    fit, the two routes out instead.
@@ -1315,10 +1321,11 @@ records:
    mv <audit_store_dir>.pre-mount <audit_store_dir>.migrated
    ```
 
-9. Run `bootroot infra up --agent-config <path>`. With no holding
-   directory left it verifies the store on the mounted filesystem,
-   reports the reserve as **enforced** and starts the Compose stack; then
-   unseal OpenBao and start `bootroot-registrar.service`. The writers
+9. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. With no holding directory left it verifies the store on the
+   mounted filesystem, reports the reserve as **enforced** and starts the
+   Compose stack; then unseal OpenBao and start
+   `bootroot-registrar.service`. The writers
    have been down since step 1, so nothing wrote into the store while the
    copy and its verification were in flight.
 
@@ -1445,9 +1452,10 @@ steps 2 to 5 are yours, while steps 1 and 6 are `bootroot infra up`
 passes that change nothing on the host.
 
 1. Update `audit_store_reserve_bytes`, then run
-   `bootroot infra up --agent-config <path>`. It fails with the size
-   mismatch, naming both sizes and pointing here. A value below the
-   installer's minimum reserve is refused by that check first, so the
+   `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It fails with the size mismatch, naming both sizes and
+   pointing here. A value below the installer's minimum reserve is
+   refused by that check first, so the
    procedure never starts against a size that cannot be formatted.
 2. Stop both writers — the OpenBao container, a scheduled stop needing a
    **manual shamir unseal** on restart, and
@@ -1505,9 +1513,10 @@ passes that change nothing on the host.
 
    Then start the OpenBao container, unseal it, and start
    `bootroot-registrar.service`.
-6. Run `bootroot infra up --agent-config <path>`. It verifies the image
-   against the updated reserve and reports **enforced**. Only then does
-   `<audit_store_dir>.img.old` become removable, and by you: bootroot
+6. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It verifies the image against the updated reserve and
+   reports **enforced**. Only then does `<audit_store_dir>.img.old`
+   become removable, and by you: bootroot
    renders no delete here either, reporting that file's path and size as
    reclaimable.
 
