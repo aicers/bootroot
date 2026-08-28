@@ -715,6 +715,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn audit_reserve_note_retained_image_reclaimable(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_note_retained_image_reclaimable,
+            &[("path", path), ("size", &size.to_string())],
+        )
+    }
+
     pub(crate) fn audit_reserve_figure_source_plus_margin(&self, path: &str) -> String {
         format_template(
             self.strings().audit_reserve_figure_source_plus_margin,

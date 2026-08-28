@@ -132,7 +132,11 @@ pub(super) fn derive_paths(store_dir: &Path) -> MigrationPaths {
     }
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// Appends `suffix` to `path`'s own bytes.
+///
+/// A sibling is derived by appending rather than by joining, so a path
+/// that is not valid UTF-8 keeps its bytes.
+pub(super) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut bytes = path.as_os_str().as_bytes().to_vec();
     bytes.extend_from_slice(suffix.as_bytes());
     PathBuf::from(OsStr::from_bytes(&bytes).to_os_string())

@@ -71,6 +71,14 @@ const RESERVE_CAP_BYTES: u64 = i64::MAX.unsigned_abs();
 /// Suffix appended to `audit_store_dir` to derive the image path.
 const IMAGE_SUFFIX: &str = ".img";
 
+/// Suffix the replacement procedure renames the outgoing image to.
+///
+/// `<audit_store_dir>.img.old` is what a reserve change rolls back to,
+/// so it is kept until a run reports **enforced** against the new size.
+/// bootroot renders no delete for it and never renames it itself; it
+/// reports it, once it is safe to remove, as reclaimable space.
+const RETAINED_IMAGE_SUFFIX: &str = ".old";
+
 /// Mode the loopback image is created at, and held to afterwards. A
 /// principal that can rewrite the image can rewrite the audit
 /// filesystem underneath both writers.
@@ -2072,6 +2080,7 @@ pub(crate) fn verify(
 
     let mut findings = Vec::new();
     let mut notes = migrated_notes(facts, probe, messages)?;
+    notes.extend(retained_image_notes(facts, probe, messages)?);
     let image_display = display_path(&facts.image_path);
 
     findings.extend(image_findings(
@@ -2220,6 +2229,38 @@ fn migrated_notes(
         Some(bytes) => messages.audit_reserve_note_migrated_reclaimable(&path, bytes),
         None => messages.audit_reserve_note_migrated_reclaimable_unsized(&path),
     }])
+}
+
+/// The note a retained `<audit_store_dir>.img.old` earns under the
+/// normal outcomes.
+///
+/// The replacement procedure keeps the outgoing image until a run
+/// reports **enforced** against the updated reserve, because renaming
+/// it back is the rollback. Once that run has happened the file is a
+/// second full-size image nothing reads, so its path and allocated
+/// size are reported as reclaimable and removing it is the operator's.
+/// bootroot renders no delete for it.
+///
+/// A figure that cannot be represented is not a refusal here — nothing
+/// gates on it — so the note is simply not reported.
+fn retained_image_notes(
+    facts: &Phase1Facts,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<Vec<String>> {
+    let path = migration::with_suffix(&facts.image_path, RETAINED_IMAGE_SUFFIX);
+    let Some(retained) = lstat_named(probe, &path, messages)? else {
+        return Ok(Vec::new());
+    };
+    if retained.kind != FileKind::Regular {
+        return Ok(Vec::new());
+    }
+    let Some(bytes) = retained.blocks.checked_mul(ST_BLOCKS_UNIT_BYTES) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![
+        messages.audit_reserve_note_retained_image_reclaimable(&display_path(&path), bytes),
+    ])
 }
 
 /// The **migration incomplete** outcome.
@@ -4397,6 +4438,10 @@ mod tests {
         assert_eq!(decode_mount_field("a\\40"), b"a\\40".to_vec());
     }
 
+    /// The apparent length the holding directory's one file carries,
+    /// chosen to be nothing like its allocation.
+    const SPARSE_APPARENT_BYTES: u64 = 1 << 30;
+
     const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
     const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
 
@@ -4426,7 +4471,12 @@ mod tests {
             &format!("{HOLDING}/records/audit.log"),
             FileFacts {
                 kind: FileKind::Regular,
-                size: blocks.saturating_mul(ST_BLOCKS_UNIT_BYTES),
+                // Apparent length deliberately unrelated to the
+                // allocation, and far larger: the capacity verdict has
+                // to rest on the blocks the copy will actually have to
+                // allocate, so an implementation summing `st_size`
+                // fails every case below rather than agreeing with one.
+                size: SPARSE_APPARENT_BYTES,
                 blocks,
                 uid: TEST_UID,
                 mode: 0o600,
@@ -5024,6 +5074,45 @@ mod tests {
         let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
         assert!(text.contains("Reclaimable"), "{text}");
         assert!(!text.contains("migration incomplete"), "{text}");
+    }
+
+    /// The replacement procedure keeps `<audit_store_dir>.img.old`
+    /// until a run reports **enforced** against the updated reserve,
+    /// because renaming it back is the rollback. Once that run has
+    /// happened it is a second full-size image nothing reads, and both
+    /// manuals say bootroot reports its path and size as reclaimable
+    /// rather than deleting it.
+    #[test]
+    fn a_retained_replacement_image_is_reported_as_reclaimable() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let retained = format!("{IMAGE}{RETAINED_IMAGE_SUFFIX}");
+        let (base, facts, artifacts) = activated_host(&fixture);
+
+        // Without it, nothing is said.
+        let report = verify(&inputs, &facts, &artifacts, &base, &messages).expect("phase 3");
+        let ReserveReport::Enforced { notes } = &report else {
+            panic!("an activated host is enforced: {report:?}");
+        };
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let host = base.file(
+            &retained,
+            image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE, 0, 0o600),
+        );
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::Enforced { notes } = &report else {
+            panic!("a retained image does not hold the outcome: {report:?}");
+        };
+        let joined = notes.join("\n");
+        assert!(joined.contains(&retained), "{joined}");
+        assert!(joined.contains(&DEFAULT_RESERVE.to_string()), "{joined}");
+        // Reported, never removed: no delete is rendered for it here or
+        // anywhere else.
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("Reclaimable"), "{text}");
+        assert!(!text.contains("rm "), "{text}");
     }
 
     #[test]

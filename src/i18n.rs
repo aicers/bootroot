@@ -683,6 +683,7 @@ pub(crate) struct Strings {
     pub(crate) audit_reserve_finding_migration_capacity_short: &'static str,
     pub(crate) audit_reserve_note_migrated_reclaimable: &'static str,
     pub(crate) audit_reserve_note_migrated_reclaimable_unsized: &'static str,
+    pub(crate) audit_reserve_note_retained_image_reclaimable: &'static str,
     pub(crate) audit_reserve_figure_source_plus_margin: &'static str,
     pub(crate) audit_reserve_migration_prerequisites: &'static str,
     pub(crate) audit_reserve_migration_window: &'static str,
@@ -1050,6 +1051,7 @@ mod tests {
         const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
         const STORE: &str = "/var/lib/bootroot/audit-store";
         const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
+        const RETAINED_IMAGE: &str = "/var/lib/bootroot/audit-store.img.old";
         const AVAILABLE: u64 = 1_000;
         const SOURCE: u64 = 2_000;
         const MARGIN: u64 = 3_000;
@@ -1057,7 +1059,7 @@ mod tests {
         for locale in ["en", "ko"] {
             let m = Messages::new(locale).unwrap();
             let figure = m.audit_reserve_figure_available(STORE);
-            let cases: [(String, Vec<String>); 12] = [
+            let cases: [(String, Vec<String>); 13] = [
                 (
                     m.audit_reserve_outcome_migration_incomplete(STORE),
                     vec![STORE.to_string()],
@@ -1116,6 +1118,10 @@ mod tests {
                 (
                     m.audit_reserve_note_migrated_reclaimable(MIGRATED, SOURCE),
                     vec![MIGRATED.to_string(), SOURCE.to_string()],
+                ),
+                (
+                    m.audit_reserve_note_retained_image_reclaimable(RETAINED_IMAGE, SOURCE),
+                    vec![RETAINED_IMAGE.to_string(), SOURCE.to_string()],
                 ),
             ];
             for (rendered, values) in &cases {
