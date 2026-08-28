@@ -962,6 +962,7 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
     let deployment = Deployment::arrange();
     let mut settings = deployment.settings_with_endpoint(true);
     settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    settings.registrar.open_audit_store_as_test_user = true;
     configure_valid_profile_certificate(&mut settings, &deployment);
     let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
         .expect("bind a test endpoint through the production adoption seam");
@@ -983,7 +984,7 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
             if logs
                 .events()
                 .into_iter()
-                .any(|event| event.message.contains("certificate still valid"))
+                .any(|event| event.message.contains("daemon enabled"))
             {
                 break;
             }
@@ -1015,20 +1016,14 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
         exchange.is_err(),
         "the ordinary handler's unsettled spec refusal closes the connection"
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if logs
-                .events()
-                .into_iter()
-                .any(|event| event.message == "Registrar endpoint could not convert the wire spec")
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the enabled endpoint must dispatch the request to the ordinary handler");
+    let events = logs.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.field("reason") == "handler-rejected-payload"),
+        "the enabled endpoint must dispatch the request to the ordinary handler: {events:?}; \
+         exchange: {exchange:?}"
+    );
     assert!(
         !daemon.is_finished(),
         "the directory configuration must keep the daemon running"

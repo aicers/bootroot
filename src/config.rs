@@ -193,6 +193,11 @@ pub struct RegistrarSettings {
     /// validation enforces because it is the one level that sees both
     /// tables.
     pub state_file: Option<PathBuf>,
+    /// Lets a daemon-composition fixture open its temporary audit store as
+    /// the test process rather than uid 0. No configuration input can set
+    /// this, and production always uses the root-owned store policy.
+    #[cfg(test)]
+    pub(crate) open_audit_store_as_test_user: bool,
 }
 
 /// A `[registrar]` rate-limit value: an unsigned integer, and nothing a
@@ -437,6 +442,8 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             secret_id_ttl,
             secret_id_token_bound_cidrs,
             state_file,
+            #[cfg(test)]
+            open_audit_store_as_test_user: false,
         }
     }
 }
@@ -495,6 +502,8 @@ impl Default for RegistrarSettings {
             secret_id_ttl: None,
             secret_id_token_bound_cidrs: None,
             state_file: None,
+            #[cfg(test)]
+            open_audit_store_as_test_user: false,
         }
     }
 }
