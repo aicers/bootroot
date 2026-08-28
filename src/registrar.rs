@@ -542,7 +542,9 @@ pub struct RegistrarEndpoint {
 ///
 /// The socket endpoint itself survives `SIGHUP` reloads, so the mount verdict
 /// does too: a mount established after startup applies on the next daemon
-/// start rather than changing the handler underneath an adopted socket.
+/// start rather than changing the handler underneath an adopted socket. The
+/// reload boundary rejects changes to the two configuration values that select
+/// this verdict, so a reloaded handler cannot describe another store.
 #[cfg(target_os = "linux")]
 pub(crate) struct AuditStoreMountGate {
     requires_mount: bool,
@@ -656,6 +658,18 @@ impl RegistrarEndpoint {
     #[cfg(target_os = "linux")]
     pub(crate) fn activated(&self) -> Option<std::sync::Arc<endpoint::ActivatedEndpoint>> {
         self.inner.clone()
+    }
+
+    /// Wraps a test endpoint in the same process-lifetime holder production
+    /// activation creates.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn from_activated_for_test(
+        endpoint: std::sync::Arc<endpoint::ActivatedEndpoint>,
+    ) -> Self {
+        Self {
+            inner: Some(endpoint),
+            audit_store_gate: Some(std::sync::Arc::new(std::sync::OnceLock::new())),
+        }
     }
 
     /// Returns the process-lifetime audit-store mount verdict.

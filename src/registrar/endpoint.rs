@@ -103,7 +103,7 @@ pub(crate) mod serve;
 pub(crate) mod tls;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -280,6 +280,70 @@ impl std::fmt::Debug for ActivatedEndpoint {
             .field("daemon_uid", &self.daemon_uid)
             .field("domain", &self.domain)
             .finish_non_exhaustive()
+    }
+}
+
+/// A socket-activated endpoint and authenticated reference client for a
+/// daemon-composition test.
+///
+/// This exists only in test builds. It drives the production adoption and
+/// caller paths without requiring process-environment mutation for systemd
+/// activation.
+#[cfg(test)]
+pub(crate) struct DaemonTestEndpoint {
+    _socket_dir: tempfile::TempDir,
+    pki: test_support::Pki,
+    socket_path: PathBuf,
+    endpoint: Arc<ActivatedEndpoint>,
+}
+
+#[cfg(test)]
+impl DaemonTestEndpoint {
+    /// Binds and adopts a conforming endpoint for one daemon test.
+    pub(crate) fn bind() -> anyhow::Result<Self> {
+        use std::os::fd::IntoRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let pki = test_support::Pki::new();
+        let (server_config, resolver) = pki.conforming();
+        let socket_dir = tempfile::tempdir()?;
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket_path = socket_dir.path().join("registrar.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(REQUIRED_SOCKET_MODE),
+        )?;
+        let endpoint = adopt(
+            ActivationContract::from_test_descriptor(listener.into_raw_fd()),
+            current_effective_uid(),
+            server_config,
+            resolver,
+            test_support::TEST_DOMAIN.to_string(),
+        )?;
+        Ok(Self {
+            _socket_dir: socket_dir,
+            pki,
+            socket_path,
+            endpoint,
+        })
+    }
+
+    /// Returns the registrar handle the daemon composes an accept task from.
+    pub(crate) fn registrar_endpoint(&self) -> crate::registrar::RegistrarEndpoint {
+        crate::registrar::RegistrarEndpoint::from_activated_for_test(Arc::clone(&self.endpoint))
+    }
+
+    /// Returns an authenticated caller pinned to this endpoint.
+    pub(crate) fn client(&self) -> client::RegistrarEndpointClient {
+        let (certificate_path, key_path) = self.pki.registrar_client_files();
+        client::RegistrarEndpointClient::new(
+            &self.socket_path,
+            self.pki.pin_file_path(),
+            certificate_path,
+            key_path,
+            test_support::endpoint_name(),
+        )
     }
 }
 

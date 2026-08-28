@@ -629,6 +629,47 @@ pub fn check_registrar_endpoint_reload(
     Ok(())
 }
 
+/// Checks that a reloaded configuration keeps the audit-store mount gate's
+/// inputs at the values the running process started with.
+///
+/// The registrar endpoint survives `SIGHUP`, and its audit-store mount
+/// verdict is deliberately fixed for that same process lifetime. Changing
+/// either input that selected the verdict would let a reloaded production
+/// handler and its retained verdict describe different stores. Those two
+/// inputs therefore require a service restart; the rest of `[registrar]`
+/// remains reloadable.
+///
+/// # Errors
+///
+/// Returns an error naming the first gate input that changed, and both of its
+/// values.
+pub fn check_registrar_audit_store_reload(
+    running: &RegistrarSettings,
+    reloaded: &RegistrarSettings,
+) -> Result<()> {
+    if running.audit_store_enforcement != reloaded.audit_store_enforcement {
+        return Err(registrar_audit_store_reload_rejected(
+            "audit_store_enforcement",
+            match running.audit_store_enforcement {
+                AuditStoreEnforcement::Filesystem => "filesystem",
+                AuditStoreEnforcement::Directory => "directory",
+            },
+            match reloaded.audit_store_enforcement {
+                AuditStoreEnforcement::Filesystem => "filesystem",
+                AuditStoreEnforcement::Directory => "directory",
+            },
+        ));
+    }
+    if running.audit_store_dir != reloaded.audit_store_dir {
+        return Err(registrar_audit_store_reload_rejected(
+            "audit_store_dir",
+            &running.audit_store_dir.display().to_string(),
+            &reloaded.audit_store_dir.display().to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// What an absent optional path is spelled as in a reload diagnostic.
 /// Never an empty string, which would read as a path of no characters.
 const UNSET_SETTING: &str = "<unset>";
@@ -648,6 +689,19 @@ fn registrar_endpoint_reload_rejected(key: &str, running: &str, reloaded: &str) 
          material at all four paths is loaded once at startup, so this reload is \
          rejected and the running daemon is left as it is. Restart the service to \
          apply the change"
+    )
+}
+
+fn registrar_audit_store_reload_rejected(
+    key: &str,
+    running: &str,
+    reloaded: &str,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "registrar.{key} changed from {running} to {reloaded}; the audit-store mount verdict is \
+         fixed for the process lifetime because the activated endpoint survives reloads, so this \
+         reload is rejected and the running daemon is left as it is. Restart the service to apply \
+         the change"
     )
 }
 
@@ -3042,6 +3096,49 @@ audit_store_enforcement = "directory"
         assert!(
             err.to_string().contains("registrar_endpoint.enabled"),
             "{err}"
+        );
+    }
+
+    /// The mount verdict belongs to the activated endpoint's process
+    /// lifetime, so the two settings that select it cannot change across a
+    /// reload. Other registrar settings retain their reload behavior.
+    #[test]
+    fn a_reload_that_changes_the_audit_store_gate_is_rejected() {
+        let running = RegistrarSettings::default();
+        assert!(check_registrar_audit_store_reload(&running, &running).is_ok());
+
+        let changed_mode = RegistrarSettings {
+            audit_store_enforcement: AuditStoreEnforcement::Directory,
+            ..running.clone()
+        };
+        let error = check_registrar_audit_store_reload(&running, &changed_mode)
+            .expect_err("a changed enforcement mode must not detach the mount verdict");
+        assert!(
+            error
+                .to_string()
+                .contains("registrar.audit_store_enforcement"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Restart the service"), "{error}");
+
+        let changed_path = RegistrarSettings {
+            audit_store_dir: PathBuf::from("/srv/bootroot/audit-store"),
+            ..running.clone()
+        };
+        let error = check_registrar_audit_store_reload(&running, &changed_path)
+            .expect_err("a changed store path must not detach the mount verdict");
+        assert!(
+            error.to_string().contains("registrar.audit_store_dir"),
+            "{error}"
+        );
+
+        let changed_limit = RegistrarSettings {
+            audit_max_file_bytes: running.audit_max_file_bytes + 1,
+            ..running.clone()
+        };
+        assert!(
+            check_registrar_audit_store_reload(&running, &changed_limit).is_ok(),
+            "unrelated registrar settings remain reloadable"
         );
     }
 

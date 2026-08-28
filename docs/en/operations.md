@@ -994,8 +994,11 @@ and no audit record exists for that id; instead the daemon writes one
 per-refusal log line with the id, operation, caller identity, store path
 and expected unit. This lets an operator trace a caller report without
 searching the unavailable store. The check is made only at daemon start,
-so mounting the store later takes effect on the next restart. It does not
-run when the endpoint is disabled or when enforcement is `directory`.
+so mounting the store later takes effect on the next restart. For the same
+reason, an enabled endpoint rejects a `SIGHUP` that changes either
+`audit_store_dir` or `audit_store_enforcement`; restart the service to
+apply that change. It does not run when the endpoint is disabled or when
+enforcement is `directory`.
 
 #### What the reserve does not cover
 

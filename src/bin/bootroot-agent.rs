@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // later reload is held to the value captured here.
     let (initial_settings, initial_eab) = load_settings(&args).await?;
     let registrar_endpoint_settings = initial_settings.registrar_endpoint.clone();
+    let registrar_audit_settings = initial_settings.registrar.clone();
     // Above activation on purpose: the endpoint's TLS loader reads the
     // server pair the moment `activate` runs, so the material it finds
     // has to be material this call has already ensured. On a host where
@@ -100,6 +101,15 @@ async fn main() -> anyhow::Result<()> {
                                 &registrar_endpoint_settings,
                                 &settings.registrar_endpoint,
                             ) {
+                                error!("Reload rejected: {err}");
+                                continue;
+                            }
+                            if registrar_endpoint_settings.enabled
+                                && let Err(err) = config::check_registrar_audit_store_reload(
+                                    &registrar_audit_settings,
+                                    &settings.registrar,
+                                )
+                            {
                                 error!("Reload rejected: {err}");
                                 continue;
                             }

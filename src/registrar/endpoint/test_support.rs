@@ -35,14 +35,14 @@ use crate::registrar::{registrar_client_identity, registrar_endpoint_identity};
 // ---------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub(super) struct CapturedEvent {
-    pub(super) message: String,
-    pub(super) level: String,
-    pub(super) fields: BTreeMap<String, String>,
+pub(crate) struct CapturedEvent {
+    pub(crate) message: String,
+    pub(crate) level: String,
+    pub(crate) fields: BTreeMap<String, String>,
 }
 
 impl CapturedEvent {
-    pub(super) fn field(&self, name: &str) -> &str {
+    pub(crate) fn field(&self, name: &str) -> &str {
         self.fields
             .get(name)
             .map_or("", std::string::String::as_str)
@@ -50,10 +50,10 @@ impl CapturedEvent {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct CapturedLogs(Arc<StdMutex<Vec<CapturedEvent>>>);
+pub(crate) struct CapturedLogs(Arc<StdMutex<Vec<CapturedEvent>>>);
 
 impl CapturedLogs {
-    pub(super) fn events(&self) -> Vec<CapturedEvent> {
+    pub(crate) fn events(&self) -> Vec<CapturedEvent> {
         self.0
             .lock()
             .expect("the capture mutex is only held to push and read")
@@ -61,7 +61,7 @@ impl CapturedLogs {
     }
 
     /// Every refusal event captured so far.
-    pub(super) fn refusals(&self) -> Vec<CapturedEvent> {
+    pub(crate) fn refusals(&self) -> Vec<CapturedEvent> {
         self.events()
             .into_iter()
             .filter(|event| {
@@ -74,7 +74,7 @@ impl CapturedLogs {
 
     /// The one refusal event, which every refusal path emits exactly
     /// once.
-    pub(super) fn refusal(&self) -> CapturedEvent {
+    pub(crate) fn refusal(&self) -> CapturedEvent {
         let mut matching = self.refusals();
         assert_eq!(
             matching.len(),
@@ -132,7 +132,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
 /// this one. Rebuilding recomputes it over the live subscribers, this
 /// one now among them, so a capture cannot come back empty because some
 /// other test happened to reach the same log line first.
-pub(super) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+pub(crate) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -377,6 +377,17 @@ impl Pki {
         &self,
     ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         client_material_from(&self.ca, vec![dns_san(&registrar_client_name())])
+    }
+
+    /// Writes the registrar client's certificate and key for a whole
+    /// endpoint exchange driven through the reference client.
+    pub(super) fn registrar_client_files(&self) -> (PathBuf, PathBuf) {
+        self.server_material_from(
+            &self.ca,
+            "registrar-client",
+            vec![dns_san(&registrar_client_name())],
+            true,
+        )
     }
 
     /// Runs the production configuration builder over this deployment's
