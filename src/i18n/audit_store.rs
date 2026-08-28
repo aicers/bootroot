@@ -641,6 +641,18 @@ impl Messages {
             .to_string()
     }
 
+    pub(crate) fn audit_reserve_finding_migration_mount_foreign(
+        &self,
+        store: &str,
+        found: &str,
+        holding: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_mount_foreign,
+            &[("store", store), ("found", found), ("holding", holding)],
+        )
+    }
+
     pub(crate) fn audit_reserve_finding_migration_mount_point(&self, path: &str) -> String {
         format_template(
             self.strings().audit_reserve_finding_migration_mount_point,

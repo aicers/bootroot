@@ -669,8 +669,15 @@ pub(crate) fn preflight_audit_store(
         // land after the OpenBao wipe.
         if view.enforcement == AuditStoreEnforcement::Filesystem {
             let compose_dir = compose_file_dir(inputs.compose_file);
+            let compose_file = rendered_path(inputs.compose_file, messages)?;
             let identity = ComposeIdentity::resolve(inputs.compose_file, None, messages)?;
-            let reserve_inputs = reserve_inputs(inputs, &view, &compose_dir, identity.project());
+            let reserve_inputs = reserve_inputs(
+                inputs,
+                &view,
+                &compose_dir,
+                &compose_file,
+                identity.project(),
+            );
             let facts = reserve::evaluate(&reserve_inputs, &reserve::HostProbe, messages)?;
             // The one deliberate consequence, raised here rather than
             // by the post-wipe pass: a host whose store already holds
@@ -773,9 +780,15 @@ pub(crate) fn apply_audit_store(
             }
             AuditStoreEnforcement::Filesystem => {
                 let compose_dir = compose_file_dir(inputs.compose_file);
+                let compose_file = rendered_path(inputs.compose_file, messages)?;
                 let identity = ComposeIdentity::resolve(inputs.compose_file, None, messages)?;
-                let reserve_inputs =
-                    reserve_inputs(inputs, &view, &compose_dir, identity.project());
+                let reserve_inputs = reserve_inputs(
+                    inputs,
+                    &view,
+                    &compose_dir,
+                    &compose_file,
+                    identity.project(),
+                );
                 let probe = reserve::HostProbe;
                 // Phase 1. Every refusal below is a read, and it runs
                 // before the one filesystem object this path creates.
@@ -851,24 +864,57 @@ pub(crate) fn apply_audit_store(
     }
 }
 
+/// The spelling a rendered command must name a path by: absolute, and
+/// lexically normalized.
+///
+/// Every rendered list is meant to be runnable as it stands, from
+/// wherever the operator is standing, and the migration's own
+/// verification step ends with a `cd` into the store. A relative
+/// `--compose-file`, including the default `docker-compose.yml`, would
+/// resolve against the current directory at the moment each line runs:
+/// the Compose stop would take down one deployment and the re-run after
+/// the copy would look for another under `<audit_store_dir>`, leaving
+/// the writers of the first stopped and the migration unfinishable. The
+/// same holds for `--agent-config`, which is what the re-run reads the
+/// store, the reserve size and the enforcement mode from.
+///
+/// Lexical rather than canonicalizing: the operator's own spelling of
+/// the file is kept, symlinks and all, which is what `docker compose`
+/// was given.
+///
+/// # Errors
+///
+/// Returns the reserve's unreadable-path error when the current
+/// directory cannot be read, which is the only way absolutizing a
+/// relative path fails.
+fn rendered_path(path: &Path, messages: &Messages) -> Result<PathBuf> {
+    bootroot::fs_util::absolute_lexical(path).map_err(|err| {
+        anyhow::anyhow!(
+            messages.error_audit_reserve_unreadable(&path.display().to_string(), &err.to_string())
+        )
+    })
+}
+
 /// Assembles what the reserve derives everything from out of the two
 /// halves the install side holds it in.
 ///
-/// `compose_dir` and `compose_project` are passed in rather than read
-/// off `inputs` because both are derived from the one compose file it
-/// carries — the directory by [`compose_file_dir`] and the project by
+/// `compose_dir`, `compose_file` and `compose_project` are passed in
+/// rather than read off `inputs` because all three are derived from the
+/// one compose file it carries — the directory by [`compose_file_dir`],
+/// the rendered spelling by [`rendered_path`] and the project by
 /// [`ComposeIdentity`] — and the caller owns them for as long as the
 /// borrowed inputs live.
 fn reserve_inputs<'a>(
     inputs: &'a AuditStoreInitInputs<'a>,
     view: &'a AgentConfigView,
     compose_dir: &'a Path,
+    compose_file: &'a Path,
     compose_project: &'a str,
 ) -> reserve::ReserveInputs<'a> {
     reserve::ReserveInputs {
         store_dir: &view.audit_store_dir,
         compose_dir,
-        compose_file: inputs.compose_file,
+        compose_file,
         compose_project,
         reserve_bytes: view.reserve_bytes,
         max_file_bytes: view.max_file_bytes,
@@ -1011,17 +1057,21 @@ fn verify_filesystem_reserve_for_infra_up(
     // writers of another stay stopped. It is rendered unconditionally
     // rather than only when it differs from the default, because the
     // default is resolved against the current directory and the
-    // rendered list is meant to be runnable from anywhere.
+    // rendered list is meant to be runnable from anywhere — which is
+    // also why both paths are absolutized rather than re-emitted as
+    // they were supplied. See [`rendered_path`].
+    let rendered_compose_file = rendered_path(compose_file, messages)?;
+    let rendered_agent_config = rendered_path(agent_config, messages)?;
     let rerun_command = format!(
         "bootroot infra up --compose-file {} --agent-config {}",
-        reserve::sh_quote_path(compose_file),
-        reserve::sh_quote_path(agent_config)
+        reserve::sh_quote_path(&rendered_compose_file),
+        reserve::sh_quote_path(&rendered_agent_config)
     );
     let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let inputs = reserve::ReserveInputs {
         store_dir: &view.audit_store_dir,
         compose_dir,
-        compose_file,
+        compose_file: &rendered_compose_file,
         compose_project: identity.project(),
         reserve_bytes: view.reserve_bytes,
         max_file_bytes: view.max_file_bytes,
@@ -2451,6 +2501,42 @@ mod tests {
     /// `docker-compose.yml` nor in the operator's current directory
     /// stops *that* stack in its first step, so a re-run that omitted
     /// `--compose-file` would resume against a different one.
+    /// The rendered list is run in order, and its verification step
+    /// ends with a `cd` into the store — so a relative `--compose-file`
+    /// or `--agent-config` re-emitted as it was supplied would resolve
+    /// against `<audit_store_dir>` by the time the re-run is reached.
+    /// A child process is the only way to exercise a relative input
+    /// end to end, this process's working directory being no more a
+    /// test's to change than its environment, so the resolution itself
+    /// is pinned here.
+    #[test]
+    fn a_relative_path_is_rendered_against_the_directory_the_run_was_started_in() {
+        let messages = test_messages();
+        let cwd = std::env::current_dir().expect("a working directory");
+        for relative in ["docker-compose.yml", "deploy/stack.yml", "./agent.toml"] {
+            let rendered = rendered_path(Path::new(relative), &messages).expect("resolved");
+            assert!(rendered.is_absolute(), "{}", rendered.display());
+            assert_eq!(
+                rendered,
+                cwd.join(relative.trim_start_matches("./")),
+                "{relative}"
+            );
+            // Not the store the verification leaves the operator in.
+            assert!(
+                !rendered.starts_with("/var/lib/bootroot/audit-store"),
+                "{}",
+                rendered.display()
+            );
+        }
+        // An absolute path is already what a rendered command needs and
+        // is carried through unchanged.
+        let absolute = Path::new("/srv/bootroot/stack.yml");
+        assert_eq!(
+            rendered_path(absolute, &messages).expect("resolved"),
+            absolute
+        );
+    }
+
     #[test]
     fn the_infra_up_rerun_carries_a_non_default_compose_file() {
         let fixture = Fixture::new();

@@ -1181,7 +1181,7 @@ exists, bootroot renders no rename and fails naming the path: `mv dir
 dir.pre-mount` onto an existing directory does not replace it, it moves
 the source *inside* it, and the next copy would then read the wrong tree.
 
-**Three states put the outcome up and take every command away.** In each
+**Four states put the outcome up and take every command away.** In each
 of them the run still reports **migration incomplete** and still fails;
 what it renders is the re-run alone, or the re-run and the rollback.
 
@@ -1203,6 +1203,16 @@ what it renders is the re-run alone, or the re-run and the rollback.
   zero over exactly the entry that must be refused. bootroot refuses it
   against an `lstat` of the path itself, before anything is measured,
   walked or rendered. The rollback is still offered.
+- **Something other than the reserve mounted at `<audit_store_dir>`** — a
+  tmpfs, a bind mount, or a loop device backed by another file.
+  Reporting it as "the reserve is not mounted" and rendering the
+  activation would stack the reserve on top of it; the copy would write
+  the store's records into it; and the rollback's `umount` would take
+  down a filesystem this migration never put there. It is named
+  instead, with what is mounted, and none of the three is rendered.
+  Stop both writers, unmount it or move it aside by hand, and run the
+  command again. bootroot unmounts nothing, here or anywhere else in
+  this procedure.
 - **A phase-1 refusal raised while the migration is open** — most often
   `audit_store_reserve_bytes` changed mid-window, which the image
   contract refuses outright. **migration incomplete** is reported ahead
@@ -1247,7 +1257,11 @@ records:
    with names that same `--compose-file`, so every pass below is driven
    against the deployment whose writers this step stopped rather than
    against whatever `docker-compose.yml` the operator's current
-   directory happens to hold.
+   directory happens to hold. Both it and `--agent-config` are rendered
+   as **absolute** paths, whatever spelling the run was given: step 7's
+   verification ends inside `<audit_store_dir>`, so a relative
+   `docker-compose.yml` carried through to step 9 would be looked for
+   under the store rather than where the deployment is.
 
 2. Rename the store aside and recreate the mount point empty and
    root-owned.
@@ -1408,17 +1422,34 @@ bootroot performs neither.
   discarded with the unmount, which is safe precisely because the
   original was never touched.
 
+  <!-- The guards are what make the rollback idempotent; wrapping one
+       of these lines would make it a different command. -->
+  <!-- markdownlint-disable MD013 -->
+
   ```sh
-  umount <audit_store_dir>
-  rmdir <audit_store_dir>
-  mv <audit_store_dir>.pre-mount <audit_store_dir>
+  if [ -e <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
   ```
+
+  <!-- markdownlint-enable MD013 -->
 
   The `umount` is rendered only where the store is a mount point — from
   step 4 onward. Between step 2 and step 4 the migration is already
   open with nothing mounted, and there the rendered rollback is the
   `rmdir` and the rename alone: an `umount` ahead of them would exit
   non-zero and stop a sequence run verbatim before either.
+
+  **Every line is guarded on the holding path**, which is what makes the
+  rollback idempotent. The holding path is the state that says the
+  migration is still open, so once the rollback has run — or once the
+  closing rename has — the same three lines skip and exit 0, rather than
+  stopping at a `rmdir` of the store they have just put the records
+  back into. The `rmdir` carries a second guard for the mount point's
+  own existence: between step 2 and step 4 nothing has necessarily
+  recreated `<audit_store_dir>`, and a `rmdir` of a directory that is
+  not there would stop the sequence before the rename that carries the
+  rollback.
 
 **After the closing rename**, `<audit_store_dir>.migrated` holds a
 redundant second copy outside the reserve. It clears **migration

@@ -1164,11 +1164,12 @@ assert_the_rendered_steps_activate_the_reserve() {
 # other of which names a unit no CI host has installed; the re-run,
 # which the callers perform themselves with the flags this scenario
 # needs; and the rollback's commands, which are the way *out* of the
-# migration and would undo the sequence -- the `umount` among them only
-# where the reserve is mounted, so it is filtered whether or not the
-# pass that printed the list rendered it.  The closing rename is not one
-# of them -- it renames onto `.migrated` rather than back onto the
-# store.
+# migration and would undo the sequence.  Those three are each guarded
+# on the holding path, which is what makes the rollback idempotent and
+# what gives the filter one prefix to drop them all by -- the `umount`
+# among them included, which is rendered only where the reserve is
+# mounted.  The closing rename is not one of them -- it renames onto
+# `.migrated` rather than back onto the store, and carries no guard.
 #
 # `|| true` on every filter, and it is `pipefail` that makes it
 # necessary: `grep -v` exits non-zero when it emits nothing, which would
@@ -1179,9 +1180,7 @@ rendered_migration_commands() {
     { grep -v '^docker compose .* stop$' || true; } |
     { grep -vxF "systemctl stop bootroot-registrar.service" || true; } |
     { grep -v '^bootroot ' || true; } |
-    { grep -vxF "umount '$store'" || true; } |
-    { grep -vxF "rmdir '$store'" || true; } |
-    { grep -vxF "mv '${store}.pre-mount' '$store'" || true; }
+    { grep -vF "if [ -e '${store}.pre-mount' ]" || true; }
 }
 
 # Runs those commands as **one** shell, stopping at the first non-zero

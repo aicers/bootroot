@@ -664,6 +664,18 @@ pub(super) fn closing_rename_step(
 /// modified. The `rmdir` is non-recursive by choice: it removes the
 /// mount point only if the unmount left it empty.
 ///
+/// **Every command is guarded on the holding path still being there**,
+/// which is what makes the step idempotent: running it a second time
+/// over a store already restored is three skipped commands and an exit
+/// 0, where an unguarded list stops at a `rmdir` of a directory that
+/// now holds the records it just put back. The predicate is the same
+/// one bootroot renders the rollback from at all, so the guard says
+/// exactly what the step says — a migration that is still open. The
+/// `rmdir` carries a second guard for the mount point's own existence:
+/// between the aside rename and the mount coming up nothing has
+/// recreated it on a bring-up path, and `rmdir` over an absent
+/// directory would stop the sequence before the restoring rename.
+///
 /// The unmount is rendered only where the store is a mount point. A
 /// migration is open from the aside rename onward, which is two
 /// `bootroot infra up` passes before the mount comes up, and there
@@ -676,7 +688,10 @@ pub(super) fn closing_rename_step(
 ///
 /// The predicate is the mount table naming the store at all rather than
 /// the reserve being what is mounted: a foreign mount there is still
-/// something the `rmdir` cannot get past.
+/// something the `rmdir` cannot get past. What is *not* rendered from
+/// here is the rollback for a foreign mount — that verdict withholds
+/// the step outright, an `umount` of a filesystem this migration never
+/// put there being nothing the operator should be handed.
 pub(super) fn rollback_step(
     store_dir: &Path,
     holding: &Path,
@@ -684,12 +699,19 @@ pub(super) fn rollback_step(
     messages: &Messages,
 ) -> Phase2Step {
     let store = sh_quote_path(store_dir);
+    let holding = sh_quote_path(holding);
+    // `-e` rather than `-d`: the rollback is also rendered where the
+    // holding path is not a directory, and that state is exactly the
+    // one whose entry has to be moved back rather than skipped.
+    let open = format!("[ -e {holding} ]");
     let mut commands = Vec::with_capacity(3);
     if mount_present {
-        commands.push(format!("umount {store}"));
+        commands.push(format!("if {open}; then umount {store}; fi"));
     }
-    commands.push(format!("rmdir {store}"));
-    commands.push(format!("mv {} {store}", sh_quote_path(holding)));
+    commands.push(format!(
+        "if {open} && [ -d {store} ]; then rmdir {store}; fi"
+    ));
+    commands.push(format!("if {open}; then mv {holding} {store}; fi"));
     Phase2Step {
         kind: Phase2StepKind::Rollback,
         title: messages.audit_reserve_step_rollback().to_string(),
@@ -1121,6 +1143,59 @@ mod rendered_sequence {
         );
         assert!(!run(&occupied.scratch, &[&step]));
         assert!(occupied.source.exists(), "the holding directory was moved");
+    }
+
+    /// The rollback is one of the two operations the issue requires to
+    /// be idempotent, and the operator is the only thing that performs
+    /// it — so a second paste of the same list has to be a no-op rather
+    /// than a `rmdir` of the records the first one put back.
+    #[test]
+    fn a_second_run_of_the_rendered_rollback_changes_nothing() {
+        let fixture = fixture();
+        let step = rollback_step(
+            &fixture.destination,
+            &fixture.source,
+            false,
+            &test_messages(),
+        );
+        assert!(run(&fixture.scratch, &[&step]));
+        let restored = fixture.destination.join("records").join("verbs.log");
+        assert_eq!(
+            fs::read(&restored).expect("the records are back"),
+            b"one\ntwo\n"
+        );
+
+        // Run verbatim a second time: every command is skipped, the
+        // list exits 0, and the restored store is untouched.
+        assert!(run(&fixture.scratch, &[&step]));
+        assert!(fixture.destination.is_dir());
+        assert!(!fixture.source.exists());
+        assert_eq!(
+            fs::read(&restored).expect("the records survived"),
+            b"one\ntwo\n"
+        );
+
+        // And the same list run where the mount point was never
+        // recreated — the state a bring-up pass leaves between the
+        // aside rename and the mount — still restores the store,
+        // rather than stopping at a `rmdir` of a directory that is not
+        // there.
+        let absent = fixture_with_no_mount_point();
+        let step = rollback_step(&absent.destination, &absent.source, false, &test_messages());
+        assert!(run(&absent.scratch, &[&step]));
+        assert_eq!(
+            fs::read(absent.destination.join("records").join("verbs.log"))
+                .expect("the records are back"),
+            b"one\ntwo\n"
+        );
+    }
+
+    /// The fixture with the mount point removed: the aside rename has
+    /// run and nothing has recreated `<audit_store_dir>` yet.
+    fn fixture_with_no_mount_point() -> Fixture {
+        let fixture = fixture();
+        fs::remove_dir(&fixture.destination).expect("remove the empty mount point");
+        fixture
     }
 }
 

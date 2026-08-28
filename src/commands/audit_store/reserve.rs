@@ -437,7 +437,11 @@ pub(crate) struct ReserveInputs<'a> {
     /// artifacts are staged.
     pub(crate) compose_dir: &'a Path,
     /// The compose file this run was pointed at, named by the `-f` of
-    /// the Compose stop the stop-both-writers step renders.
+    /// the Compose stop the stop-both-writers step renders. **Absolute**,
+    /// resolved by the caller against the current directory: the
+    /// rendered verification ends with a `cd` into the store, so a
+    /// relative `-f` in a list run in order would select a deployment
+    /// under the store rather than the one this run stopped.
     pub(crate) compose_file: &'a Path,
     /// The Compose project this run resolved, carried as the `-p` of
     /// that same stop so it reaches the deployment bootroot itself
@@ -534,9 +538,19 @@ impl Phase1Facts {
         self.migration.holding
     }
 
+    /// Whether something other than the reserve is mounted at the
+    /// store.
+    ///
+    /// Distinct from [`Phase1Facts::mount_present`], which any entry
+    /// satisfies: this is the one that says the filesystem at the mount
+    /// point belongs to somebody else.
+    fn mount_foreign(&self) -> bool {
+        matches!(self.mount, MountEvaluation::Foreign { .. })
+    }
+
     /// Whether the run may render anything that would change the store.
     ///
-    /// Two states withhold everything. A **deferred** phase-1 refusal
+    /// Three states withhold everything. A **deferred** phase-1 refusal
     /// describes a reserve that cannot be made, so no image command, no
     /// unit and no copy over it is right. A store that still holds
     /// content while the holding directory already exists is the
@@ -544,9 +558,28 @@ impl Phase1Facts {
     /// the copy would move an unrelated tree onto it, and the rollback
     /// would move the holding directory *inside* the store rather than
     /// replacing it, which is what a rename onto an existing directory
-    /// does.
+    /// does. A **foreign mount** at the store is a third: every command
+    /// the activation would render acts on that filesystem rather than
+    /// on the reserve — `systemctl enable --now` stacks the reserve on
+    /// top of it, the copy writes audit records into it, and the
+    /// rollback's `umount` takes it down.
     fn migration_renders_nothing(&self) -> bool {
-        !self.deferred.is_empty() || self.underlying == UnderlyingState::NotEmpty
+        !self.deferred.is_empty()
+            || self.underlying == UnderlyingState::NotEmpty
+            || self.mount_foreign()
+    }
+
+    /// Whether the rollback may be rendered at all.
+    ///
+    /// It survives a deferred refusal — the store under an open
+    /// migration is the empty mount point the aside rename left, and
+    /// the way back out of it does not depend on the reserve being
+    /// makeable. It does not survive the other two: onto a store that
+    /// still holds content the restoring rename nests one store inside
+    /// another, and over a foreign mount the `umount` takes down a
+    /// filesystem this migration never put there.
+    fn migration_renders_rollback(&self) -> bool {
+        self.underlying != UnderlyingState::NotEmpty && !self.mount_foreign()
     }
 }
 
@@ -2391,7 +2424,9 @@ fn retained_image_notes(
 /// outstanding **activation** — taken from the phase-2 renderer with
 /// the subdirectory step withheld, because the copy is what satisfies
 /// it — and where it is, the capacity verdict and either the copy or
-/// the two routes out. The rollback is offered in every case.
+/// the two routes out. The rollback is offered in every case except
+/// the two that would have it act on something this migration did not
+/// put there: a store that still holds content, and a foreign mount.
 fn migration_report(
     inputs: &ReserveInputs<'_>,
     facts: &Phase1Facts,
@@ -2408,6 +2443,13 @@ fn migration_report(
     if facts.underlying == UnderlyingState::NotEmpty {
         findings.push(messages.audit_reserve_finding_migration_store_not_empty(&store, &holding));
     }
+    if let MountEvaluation::Foreign { description, .. } = &facts.mount {
+        findings.push(messages.audit_reserve_finding_migration_mount_foreign(
+            &store,
+            description,
+            &holding,
+        ));
+    }
     for refusal in &facts.deferred {
         findings.push(messages.audit_reserve_finding_migration_deferred(refusal));
     }
@@ -2415,17 +2457,15 @@ fn migration_report(
         findings.push(messages.audit_reserve_finding_migration_path_exists(&migrated));
     }
     if facts.migration_renders_nothing() {
-        // Neither state leaves an activation or a copy that would be
-        // right to render: the deferred refusal describes a reserve
-        // that cannot be made, and the collision describes a store
-        // whose records a mount would hide and a copy would not be
-        // reading. The rollback survives the first — the store under
-        // an open migration is the empty mount point the aside rename
-        // left — and not the second, where `mv` onto a directory that
-        // exists moves the source inside it rather than replacing it,
-        // which is a store nested in a store.
+        // None of the three leaves an activation or a copy that would
+        // be right to render: the deferred refusal describes a reserve
+        // that cannot be made, the collision describes a store whose
+        // records a mount would hide and a copy would not be reading,
+        // and the foreign mount describes a filesystem that is not
+        // this migration's to mount over, copy into or unmount. The
+        // rollback survives the first alone.
         let mut steps = vec![rerun_step(inputs, messages)];
-        if facts.underlying != UnderlyingState::NotEmpty {
+        if facts.migration_renders_rollback() {
             steps.push(migration::rollback_step(
                 &facts.store_dir,
                 &facts.migration.paths.holding,
@@ -4605,6 +4645,23 @@ mod tests {
     const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
     const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
 
+    /// The three rollback commands as they are rendered, each guarded
+    /// on the holding path still being there so a second run is a
+    /// no-op. Spelled once here rather than in every test that pins
+    /// them.
+    fn rollback_commands(mounted: bool) -> Vec<String> {
+        let open = format!("[ -e '{HOLDING}' ]");
+        let mut commands = Vec::new();
+        if mounted {
+            commands.push(format!("if {open}; then umount '{STORE}'; fi"));
+        }
+        commands.push(format!(
+            "if {open} && [ -d '{STORE}' ]; then rmdir '{STORE}'; fi"
+        ));
+        commands.push(format!("if {open}; then mv '{HOLDING}' '{STORE}'; fi"));
+        commands
+    }
+
     /// Adds a holding directory holding one file under `records/`, on
     /// the device the store's *parent* filesystem uses.
     fn with_holding(host: FakeProbe, blocks: u64) -> FakeProbe {
@@ -4842,11 +4899,7 @@ mod tests {
         );
         assert_eq!(
             step_of(&steps, Phase2StepKind::Rollback).commands,
-            vec![
-                format!("umount '{STORE}'"),
-                format!("rmdir '{STORE}'"),
-                format!("mv '{HOLDING}' '{STORE}'"),
-            ]
+            rollback_commands(true)
         );
     }
 
@@ -5007,10 +5060,7 @@ mod tests {
         let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
         assert_eq!(
             step_of(&steps, Phase2StepKind::Rollback).commands,
-            vec![
-                format!("rmdir '{STORE}'"),
-                format!("mv '{HOLDING}' '{STORE}'"),
-            ]
+            rollback_commands(false)
         );
 
         // The withheld-render state reached with the mount still
@@ -5025,10 +5075,7 @@ mod tests {
         let (_, steps) = migration_report_of(&halved, &halved_facts, &halved_artifacts, &host);
         assert_eq!(
             step_of(&steps, Phase2StepKind::Rollback).commands,
-            vec![
-                format!("rmdir '{STORE}'"),
-                format!("mv '{HOLDING}' '{STORE}'"),
-            ]
+            rollback_commands(false)
         );
 
         // The mount up: the partial copy on the reserve is discarded
@@ -5038,12 +5085,58 @@ mod tests {
             migration_report_of(&fixture, &mounted_facts, &mounted_artifacts, &mounted);
         assert_eq!(
             step_of(&steps, Phase2StepKind::Rollback).commands,
-            vec![
-                format!("umount '{STORE}'"),
-                format!("rmdir '{STORE}'"),
-                format!("mv '{HOLDING}' '{STORE}'"),
-            ]
+            rollback_commands(true)
         );
+    }
+
+    /// A foreign mount at the store is not the reserve, and nothing
+    /// this outcome would otherwise render belongs to it: the
+    /// activation would stack the reserve on top of it, the copy would
+    /// write the store's records into it, and the rollback's `umount`
+    /// would take it down.
+    #[test]
+    fn a_foreign_mount_under_an_open_migration_takes_every_command_away() {
+        let fixture = Fixture::default();
+        let (host, mut facts, artifacts) = migrating_host(&fixture, 8);
+        let description = "a tmpfs mounted from tmpfs";
+        facts.mount = MountEvaluation::Foreign {
+            description: description.to_string(),
+            stacked: false,
+        };
+        assert!(facts.deferred.is_empty());
+        assert_ne!(facts.underlying, UnderlyingState::NotEmpty);
+
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        // It is named rather than reported as "the reserve is not
+        // mounted", which is what an implementation reading only
+        // `MountEvaluation::Reserve` says of it.
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains(description) && finding.contains(HOLDING)),
+            "{findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.contains("The reserve is not mounted yet")),
+            "{findings:?}"
+        );
+        // The re-run alone: no activation, no copy, and no rollback
+        // whose first command unmounts somebody else's filesystem.
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.kind)
+                .collect::<Vec<Phase2StepKind>>(),
+            vec![Phase2StepKind::ReRun],
+            "{steps:?}"
+        );
+        for command in steps.iter().flat_map(|step| step.commands.iter()) {
+            for forbidden in ["umount", "rmdir", "cp -a", "systemctl enable", "mv "] {
+                assert!(!command.contains(forbidden), "{command}");
+            }
+        }
     }
 
     #[test]

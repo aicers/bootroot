@@ -676,6 +676,7 @@ pub(crate) struct Strings {
     pub(crate) audit_reserve_finding_migration_store_not_empty: &'static str,
     pub(crate) audit_reserve_finding_migration_path_exists: &'static str,
     pub(crate) audit_reserve_finding_migration_mount_absent: &'static str,
+    pub(crate) audit_reserve_finding_migration_mount_foreign: &'static str,
     pub(crate) audit_reserve_finding_migration_mount_point: &'static str,
     pub(crate) audit_reserve_finding_migration_holding_kind: &'static str,
     pub(crate) audit_reserve_finding_migration_deferred: &'static str,
@@ -1066,7 +1067,7 @@ mod tests {
         for locale in ["en", "ko"] {
             let m = Messages::new(locale).unwrap();
             let figure = m.audit_reserve_figure_available(STORE);
-            let cases: [(String, Vec<String>); 15] = [
+            let cases: [(String, Vec<String>); 16] = [
                 (
                     m.audit_reserve_outcome_migration_incomplete(STORE),
                     vec![STORE.to_string()],
@@ -1088,6 +1089,10 @@ mod tests {
                     vec![MIGRATED.to_string()],
                 ),
                 (m.audit_reserve_finding_migration_mount_absent(), Vec::new()),
+                (
+                    m.audit_reserve_finding_migration_mount_foreign(STORE, "a tmpfs", HOLDING),
+                    vec![STORE.to_string(), HOLDING.to_string()],
+                ),
                 (
                     m.audit_reserve_finding_migration_mount_point(HOLDING),
                     vec![HOLDING.to_string()],
