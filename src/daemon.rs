@@ -214,6 +214,27 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
 
     #[cfg(target_os = "linux")]
     let registrar_maintenance = if let Some((endpoint, built)) = registrar_service {
+        // Start-time issuance completed before activation. Initialize the
+        // renewal observation from that verified on-disk material here,
+        // before the accept task below can serve its first connection.
+        let renewal_plan = crate::registrar_certs::resolve_surface_plan(&settings)?;
+        let renewal_states =
+            crate::registrar_certs::initialize_renewal_states(&renewal_plan.pairs).await?;
+        endpoint.set_renewal_states(Arc::clone(&renewal_states));
+        let renewal_endpoint = Arc::clone(&endpoint);
+        let renewal_settings = Arc::clone(&settings);
+        let renewal_shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            crate::registrar_certs::run_surface_renewal_loop(
+                renewal_settings,
+                renewal_endpoint,
+                renewal_plan,
+                renewal_states,
+                insecure_mode,
+                renewal_shutdown,
+            )
+            .await
+        }));
         spawn_registrar_endpoint(
             &mut handles,
             endpoint,

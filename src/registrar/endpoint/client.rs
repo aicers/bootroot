@@ -96,6 +96,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// deadline.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The bounded reader-side half of the certificate/key publication
+/// contract. Writers rename the certificate and then the key; a dial in
+/// that interval retries this many complete reads before reporting a
+/// persistent mismatch.
+const PAIR_LOAD_ATTEMPTS: usize = 5;
+
+/// Delays after the first four mismatches in a torn pair read.
+const PAIR_LOAD_DELAYS: [Duration; PAIR_LOAD_ATTEMPTS - 1] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+    Duration::from_millis(8),
+];
+
 /// The name handed to [`TlsConnector::connect`].
 ///
 /// Inert. [`endpoint_pin::RegistrarEndpointVerifier`] deliberately
@@ -188,6 +202,19 @@ pub(crate) enum ClientMaterialError {
     NoPrivateKey {
         /// The path that was handed to the client.
         path: PathBuf,
+    },
+    /// The certificate and key were both readable but belong to
+    /// different generations after every bounded retry.
+    #[error(
+        "registrar client certificate {} and key {} do not form a matching pair",
+        .certificate_path.display(),
+        .key_path.display()
+    )]
+    KeyMismatch {
+        /// The certificate path that was read.
+        certificate_path: PathBuf,
+        /// The key path that was read.
+        key_path: PathBuf,
     },
     /// The pair parsed but `rustls` will not authenticate with it.
     #[error(
@@ -761,16 +788,61 @@ pub(crate) fn build_client_config(
 /// Loads the registrar client leaf and its key from disk.
 ///
 /// The single seam every dial's material comes through. It does the
-/// plain load and nothing more: it does not verify that the key matches
-/// the leaf, does not retry a pair that is momentarily torn by a
-/// renewal, and does not inspect `notAfter`. Later work that owns those
-/// reasons adds them here rather than restructuring the dial path.
+/// checks the key against the leaf and retries the short certificate/key
+/// rename interval. It does not inspect `notAfter`.
 ///
 /// # Errors
 ///
 /// Returns [`ClientMaterialError`] naming the offending path. It names
 /// no byte of either file.
 fn load_client_material(
+    certificate_path: &Path,
+    key_path: &Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ClientMaterialError> {
+    load_client_material_with(
+        || load_client_material_once(certificate_path, key_path),
+        std::thread::sleep,
+    )
+}
+
+/// Applies the bounded torn-pair retry policy around one complete material
+/// read. Keeping the delay operation injectable makes the fixed reader-side
+/// contract deterministic without changing the production filesystem path.
+fn load_client_material_with<Load, Sleep>(
+    mut load_once: Load,
+    mut sleep: Sleep,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ClientMaterialError>
+where
+    Load: FnMut() -> Result<
+        (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>),
+        ClientMaterialError,
+    >,
+    Sleep: FnMut(Duration),
+{
+    for (attempt, delay) in PAIR_LOAD_DELAYS
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
+        match load_once() {
+            Ok(pair) => return Ok(pair),
+            Err(error @ ClientMaterialError::KeyMismatch { .. }) if delay.is_some() => {
+                sleep(delay.expect("retry delay exists before the final attempt"));
+                tracing::debug!(
+                    attempt,
+                    "Registrar client pair changed during a per-dial load; retrying."
+                );
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the fixed pair-load attempt sequence always has a final attempt")
+}
+
+fn load_client_material_once(
     certificate_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ClientMaterialError> {
@@ -827,6 +899,23 @@ fn load_client_material(
         .ok_or_else(|| ClientMaterialError::NoPrivateKey {
             path: key_path.to_path_buf(),
         })?;
+
+    let leaf = chain
+        .first()
+        .ok_or_else(|| ClientMaterialError::NoCertificate {
+            path: certificate_path.to_path_buf(),
+        })?;
+    // An unsupported-but-well-formed key remains this loader's existing
+    // `Unusable` error when `rustls` builds the client configuration.
+    // Only a key this build can use is eligible for the torn-pair retry.
+    if let Ok(signing_key) = rustls::crypto::ring::sign::any_supported_type(&key)
+        && !crate::tls::cert_key_matches(leaf, signing_key.as_ref())
+    {
+        return Err(ClientMaterialError::KeyMismatch {
+            certificate_path: certificate_path.to_path_buf(),
+            key_path: key_path.to_path_buf(),
+        });
+    }
 
     Ok((chain, key))
 }

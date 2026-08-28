@@ -1069,6 +1069,16 @@ impl FixedOwner {
         Self { uid: 0, gid: 0 }
     }
 
+    /// An already-observed owner that an atomic restore must re-establish.
+    ///
+    /// This remains crate-visible: configuration and external callers cannot
+    /// select an arbitrary owner for newly created files.
+    #[must_use]
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn observed(uid: u32, gid: u32) -> Self {
+        Self { uid, gid }
+    }
+
     /// The test process's own effective uid and gid.
     ///
     /// The one way a protected publish is driven under an owner other

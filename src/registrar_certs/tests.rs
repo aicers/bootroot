@@ -324,6 +324,35 @@ impl Host {
     }
 }
 
+/// Builds the activated-endpoint holder renewal exchanges after a successful
+/// publication, over the host's current live material.
+#[cfg(target_os = "linux")]
+fn renewal_test_endpoint(host: &Host) -> Arc<crate::registrar::endpoint::ActivatedEndpoint> {
+    let (server_cert, server_key) = host.server_pair();
+    let bundle = host
+        .settings
+        .trust
+        .ca_bundle_path
+        .as_deref()
+        .expect("the renewal host configures a CA bundle");
+    let (config, _) = crate::registrar::endpoint::tls::build_server_config(
+        Some(&server_cert),
+        Some(&server_key),
+        Some(bundle),
+        &host.settings.trust.trusted_ca_sha256,
+        &host.settings.domain,
+    )
+    .expect("the host's provisioned material builds an endpoint configuration");
+    let socket_path = host.dir.path().join("renewal-test.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind test listener");
+    crate::registrar::endpoint::ActivatedEndpoint::for_renewal_test(
+        listener,
+        socket_path,
+        config,
+        host.settings.domain.clone(),
+    )
+}
+
 fn base_settings() -> Settings {
     Settings {
         email: TEST_EMAIL.to_string(),
@@ -412,6 +441,36 @@ fn the_issuance_profile_composes_the_reserved_name_for_its_pair() {
         assert_eq!(profile.paths.cert, pair.cert_path);
         assert_eq!(profile.paths.key, pair.key_path);
     }
+}
+
+/// Renewal passes an issuance profile built around private staging paths, so
+/// the ACME writer cannot alter a live pair before validation succeeds.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_renewal_issuance_profile_targets_only_the_staged_pair() {
+    let host = Host::new();
+    let live = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN)
+        .expect("both live pairs resolve")
+        .into_iter()
+        .next()
+        .expect("the endpoint server pair exists");
+    let staged = SurfacePairPaths {
+        leaf: live.leaf,
+        cert_path: host.dir.path().join("renewal/certificate.pem"),
+        key_path: host.dir.path().join("renewal/key.pem"),
+        name: live.name.clone(),
+    };
+
+    let issuance = issuance_settings(&host.settings, &staged, TEST_HOST, &"unused".into());
+    let profile = issuance
+        .profiles
+        .first()
+        .expect("the staged profile exists");
+
+    assert_eq!(profile.paths.cert, staged.cert_path);
+    assert_eq!(profile.paths.key, staged.key_path);
+    assert_ne!(profile.paths.cert, live.cert_path);
+    assert_ne!(profile.paths.key, live.key_path);
 }
 
 /// The client leaf selects the `clientAuth` shape and the server leaf
@@ -3095,4 +3154,466 @@ fn no_superseded_passage_survives_in_the_configuration_surface() {
             "{file} no longer carries the corrected claim {passage:?}"
         );
     }
+}
+
+/// Renewal initialization observes the already-validated start-time pairs
+/// without turning that observation into an issuance attempt.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn renewal_initialization_records_both_leaves_without_an_attempt() {
+    let host = Host::new();
+    host.provision_both_pairs();
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+
+    let states = initialize_renewal_states(&plan.pairs)
+        .await
+        .expect("the usable pairs initialize their observations");
+    let states = states
+        .lock()
+        .expect("the renewal observation lock is not poisoned");
+
+    assert_eq!(states.len(), 2);
+    for leaf in [SurfaceLeaf::EndpointServer, SurfaceLeaf::RegistrarClient] {
+        let state = states
+            .get(&leaf)
+            .expect("every enabled leaf has a state entry");
+        assert_eq!(state.attempt, RenewalAttempt::NeverAttempted);
+        assert!(state.attempted_at.is_none());
+        assert!(state.not_after > time::OffsetDateTime::now_utc());
+    }
+}
+
+/// A driven pass over usable leaves is a true no-op: it neither reaches the
+/// issuance boundary nor changes the start-time observations.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn renewal_pass_leaves_usable_pairs_unattempted() {
+    let host = Host::new();
+    host.provision_both_pairs();
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+    let states = initialize_renewal_states(&plan.pairs)
+        .await
+        .expect("the usable pairs initialize their observations");
+    let before = states
+        .lock()
+        .expect("the renewal observation lock is not poisoned")
+        .clone();
+    let issuances = AtomicUsize::new(0);
+
+    run_surface_renewal_pass(&host.settings, &plan, &states, |_| {
+        issuances.fetch_add(1, Ordering::SeqCst);
+        async { Ok(time::OffsetDateTime::UNIX_EPOCH) }
+    })
+    .await;
+
+    assert_eq!(issuances.load(Ordering::SeqCst), 0);
+    let states = states
+        .lock()
+        .expect("the renewal observation lock is not poisoned");
+    for leaf in [SurfaceLeaf::EndpointServer, SurfaceLeaf::RegistrarClient] {
+        let before = before.get(&leaf).expect("the initial observation exists");
+        let after = states.get(&leaf).expect("the current observation exists");
+        assert_eq!(after.not_after, before.not_after);
+        assert_eq!(after.attempt, RenewalAttempt::NeverAttempted);
+        assert!(after.attempted_at.is_none());
+    }
+}
+
+/// A driven ordinary issuance failure records only the affected leaf and
+/// retains its observed expiry for the next retry.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn renewal_pass_records_an_injected_issuance_failure() {
+    let host = Host::new();
+    host.provision_both_pairs();
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+    let states = initialize_renewal_states(&plan.pairs)
+        .await
+        .expect("the usable pairs initialize their observations");
+    let original_server_not_after = states
+        .lock()
+        .expect("the renewal observation lock is not poisoned")
+        .get(&SurfaceLeaf::EndpointServer)
+        .expect("the server observation exists")
+        .not_after;
+    let (server_cert, _) = host.server_pair();
+    std::fs::remove_file(server_cert).expect("remove the server certificate to make it due");
+    let issuances = AtomicUsize::new(0);
+
+    run_surface_renewal_pass(&host.settings, &plan, &states, |_| {
+        issuances.fetch_add(1, Ordering::SeqCst);
+        async { anyhow::bail!("injected registrar issuance failure") }
+    })
+    .await;
+
+    assert_eq!(issuances.load(Ordering::SeqCst), 1);
+    let states = states
+        .lock()
+        .expect("the renewal observation lock is not poisoned");
+    let server = states
+        .get(&SurfaceLeaf::EndpointServer)
+        .expect("the server observation exists");
+    assert_eq!(server.not_after, original_server_not_after);
+    assert!(matches!(
+        &server.attempt,
+        RenewalAttempt::Failed(reason) if reason.contains("injected registrar issuance failure")
+    ));
+    assert!(server.attempted_at.is_some());
+    let client = states
+        .get(&SurfaceLeaf::RegistrarClient)
+        .expect("the client observation exists");
+    assert_eq!(client.attempt, RenewalAttempt::NeverAttempted);
+    assert!(client.attempted_at.is_none());
+}
+
+/// Renewal takes its retry policy from the rendered internal credential
+/// configuration, whose top-level `[retry]` applies when its sole profile
+/// has no override. The outer daemon's retry setting is intentionally
+/// distinct in this fixture.
+#[test]
+#[cfg(target_os = "linux")]
+fn renewal_uses_the_internal_configurations_effective_retry_policy() {
+    let host = Host::new();
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+
+    assert_eq!(host.settings.retry.backoff_secs, vec![1]);
+    assert!(plan.renewal_profile.retry.is_none());
+    assert_eq!(plan.renewal_retry_backoff, vec![5, 15, 60]);
+}
+
+/// A due client renewal exercises the production issuance and publication
+/// paths: all candidate material remains off-live until validation and the
+/// staged TLS configuration have completed, then the live pair and active
+/// acceptor change together.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn client_renewal_publishes_only_after_staging_and_swaps_the_acceptor() {
+    let log = Arc::new(OpenBaoLog::default());
+    let openbao = start_openbao(TEST_KV_MOUNT, &log).await;
+    let mut host = Host::with_openbao_url(&openbao.uri());
+    host.provision_both_pairs();
+    host.provision_internal_credential();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+    let client = plan
+        .pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair exists");
+    let endpoint = renewal_test_endpoint(&host);
+    let previous_acceptor = endpoint.tls_acceptor();
+    let (client_cert, client_key) = host.client_pair();
+    let previous_cert = digest_of(&client_cert);
+    let previous_key = digest_of(&client_key);
+
+    renew_surface_pair(&host.settings, &plan, client, &endpoint, false)
+        .await
+        .expect("the staged client renewal publishes");
+
+    assert_ne!(
+        digest_of(&client_cert),
+        previous_cert,
+        "a new leaf is published"
+    );
+    assert_ne!(
+        digest_of(&client_key),
+        previous_key,
+        "a fresh key is published"
+    );
+    assert!(
+        !Arc::ptr_eq(&previous_acceptor, &endpoint.tls_acceptor()),
+        "the active acceptor changes only after publication succeeds"
+    );
+    let paths = log.paths.lock().expect("the OpenBao log is not poisoned");
+    assert!(
+        paths.iter().any(|path| path == "/v1/auth/cert/login"),
+        "renewal reads its ACME inputs with the internal certificate credential: {paths:?}"
+    );
+}
+
+/// A server candidate under an anchor absent from the endpoint pin file is
+/// refused before publication, retaining both disk material and the active
+/// endpoint configuration.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn unpinned_server_renewal_preserves_live_material_and_active_acceptor() {
+    let log = Arc::new(OpenBaoLog::default());
+    let openbao = start_openbao(TEST_KV_MOUNT, &log).await;
+    let mut host = Host::with_openbao_url(&openbao.uri());
+    host.provision_both_pairs();
+    host.provision_internal_credential();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+    let server = plan
+        .pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::EndpointServer)
+        .expect("the server pair exists");
+    let (client_cert, _) = host.client_pair();
+    let pin_path =
+        crate::registrar::endpoint_pin::anchor_pin_path_for_client_certificate(&client_cert);
+    let foreign = TestCa::new("Unpinned Renewal Root");
+    std::fs::write(&pin_path, format!("{}\n", foreign.root_fingerprint()))
+        .expect("write an unpinned anchor");
+    let endpoint = renewal_test_endpoint(&host);
+    let previous_acceptor = endpoint.tls_acceptor();
+    let paths = [
+        host.settings
+            .trust
+            .ca_bundle_path
+            .clone()
+            .expect("the bundle path is configured"),
+        host.server_pair().0,
+        host.server_pair().1,
+    ];
+    let before: Vec<String> = paths.iter().map(|path| digest_of(path)).collect();
+
+    let error = renew_surface_pair(&host.settings, &plan, server, &endpoint, false)
+        .await
+        .expect_err("an unpinned server candidate must be refused");
+
+    assert!(format!("{error:#}").contains("pin"), "{error:#}");
+    assert_eq!(
+        paths.iter().map(|path| digest_of(path)).collect::<Vec<_>>(),
+        before,
+        "a pin refusal must not touch the live bundle or server pair"
+    );
+    assert!(
+        Arc::ptr_eq(&previous_acceptor, &endpoint.tls_acceptor()),
+        "a pin refusal must leave the active acceptor installed"
+    );
+}
+
+/// Each failure point in the real bundle/certificate/key publication seam
+/// restores every live path and leaves the active acceptor alone. A rollback
+/// failure after a partial publication is reported alongside that failure and
+/// still cannot exchange the active configuration.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn publication_failures_roll_back_or_report_the_rollback_failure() {
+    let host = Host::new();
+    host.provision_both_pairs();
+    let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
+    let client = plan
+        .pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair exists");
+    let endpoint = renewal_test_endpoint(&host);
+    let previous_acceptor = endpoint.tls_acceptor();
+    let bundle = host
+        .settings
+        .trust
+        .ca_bundle_path
+        .as_deref()
+        .expect("the renewal host configures a bundle");
+    let live_paths = [
+        bundle.to_path_buf(),
+        client.cert_path.clone(),
+        client.key_path.clone(),
+    ];
+    let originals: Vec<Vec<u8>> = live_paths
+        .iter()
+        .map(|path| std::fs::read(path).expect("read original live material"))
+        .collect();
+    let staging = tempfile::tempdir().expect("create candidate staging directory");
+    let candidate = SurfacePairPaths {
+        leaf: client.leaf,
+        cert_path: staging.path().join("candidate.crt"),
+        key_path: staging.path().join("candidate.key"),
+        name: client.name.clone(),
+    };
+    let (candidate_cert, candidate_key) = host.ca.issue(&leaf_params(&candidate.name, -1, 30));
+    write_pair(
+        &candidate.cert_path,
+        &candidate.key_path,
+        &candidate_cert,
+        &candidate_key,
+    );
+    let candidate_bundle = staging.path().join("candidate-ca-bundle.pem");
+    std::fs::write(&candidate_bundle, &originals[0]).expect("write staged candidate bundle");
+
+    for failed_stage in [
+        CandidatePublicationStage::Bundle,
+        CandidatePublicationStage::Certificate,
+        CandidatePublicationStage::Key,
+    ] {
+        let snapshot = RenewalSnapshot::capture(bundle, client)
+            .await
+            .expect("capture publication restore artifacts");
+        let (next_config, _) = crate::registrar::endpoint::tls::build_server_config(
+            Some(&host.server_pair().0),
+            Some(&host.server_pair().1),
+            Some(bundle),
+            &host.settings.trust.trusted_ca_sha256,
+            &host.settings.domain,
+        )
+        .expect("build a complete next configuration before publication");
+        let error = publish_surface_renewal_transaction(
+            &endpoint,
+            next_config,
+            || {
+                publish_candidate_after_stage(
+                    bundle,
+                    client,
+                    &candidate,
+                    &candidate_bundle,
+                    |stage| {
+                        if stage == failed_stage {
+                            anyhow::bail!("injected {stage:?} publication failure");
+                        }
+                        Ok(())
+                    },
+                )
+            },
+            || snapshot.restore(),
+        )
+        .await
+        .expect_err("the injected publication failure must be reported");
+        assert!(format!("{error:#}").contains("restored prior material"));
+        assert_eq!(
+            live_paths
+                .iter()
+                .map(|path| std::fs::read(path).expect("read restored live material"))
+                .collect::<Vec<_>>(),
+            originals,
+            "a {failed_stage:?} failure restores bundle, certificate and key"
+        );
+        assert!(Arc::ptr_eq(&previous_acceptor, &endpoint.tls_acceptor()));
+    }
+
+    let _snapshot = RenewalSnapshot::capture(bundle, client)
+        .await
+        .expect("capture publication restore artifacts");
+    let (next_config, _) = crate::registrar::endpoint::tls::build_server_config(
+        Some(&host.server_pair().0),
+        Some(&host.server_pair().1),
+        Some(bundle),
+        &host.settings.trust.trusted_ca_sha256,
+        &host.settings.domain,
+    )
+    .expect("build a complete next configuration before publication");
+    let error = publish_surface_renewal_transaction(
+        &endpoint,
+        next_config,
+        || {
+            publish_candidate_after_stage(bundle, client, &candidate, &candidate_bundle, |stage| {
+                if stage == CandidatePublicationStage::Certificate {
+                    anyhow::bail!("injected certificate publication failure");
+                }
+                Ok(())
+            })
+        },
+        || async { anyhow::bail!("injected rollback failure") },
+    )
+    .await
+    .expect_err("the injected rollback failure must be reported");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("injected certificate publication failure"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("injected rollback failure"), "{rendered}");
+    assert_ne!(
+        std::fs::read(&client.cert_path).expect("read the partially published certificate"),
+        originals[1],
+        "a failed rollback after the certificate rename must not claim the old material returned"
+    );
+    assert!(Arc::ptr_eq(&previous_acceptor, &endpoint.tls_acceptor()));
+}
+
+/// A failed publication restores bytes, mode and the pre-existing owner from
+/// each saved path before another tick is allowed to retry.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn renewal_snapshot_restores_bytes_mode_and_owner() {
+    let directory = tempfile::tempdir().expect("create renewal snapshot directory");
+    let path = directory.path().join("client.key");
+    std::fs::write(&path, b"original private key").expect("write original key");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("set original restrictive key mode");
+    let Some(original_gid) = crate::cert_group::one_supplementary_test_gid() else {
+        // The host cannot exercise a real ownership transition without a
+        // supplementary group the process is allowed to establish.
+        return;
+    };
+    std::os::unix::fs::chown(&path, None, Some(original_gid))
+        .expect("seed an owner distinct from the publishing process");
+    let snapshot = SnapshotFile::capture(&path)
+        .await
+        .expect("capture the live key before publication");
+
+    std::fs::write(&path, b"partially published key").expect("overwrite live key");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("simulate an incorrect published mode");
+    std::os::unix::fs::chown(&path, None, Some(crate::cert_group::current_process_egid()))
+        .expect("simulate a publication that changed ownership");
+    snapshot.restore().await.expect("restore the saved key");
+
+    let metadata = std::fs::metadata(&path).expect("read restored key metadata");
+    assert_eq!(
+        std::fs::read(&path).expect("read restored key"),
+        b"original private key"
+    );
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777,
+        0o600
+    );
+    assert_eq!(std::os::unix::fs::MetadataExt::uid(&metadata), snapshot.uid);
+    assert_eq!(std::os::unix::fs::MetadataExt::gid(&metadata), snapshot.gid);
+}
+
+/// A staged client leaf must be valid for the exact mTLS verifier the next
+/// endpoint configuration would install; a matching key and reserved SAN do
+/// not make an expired certificate safe to publish.
+#[test]
+#[cfg(target_os = "linux")]
+fn renewal_refuses_an_expired_registrar_client_candidate_before_publication() {
+    let host = Host::new();
+    let candidate = SurfacePairPaths {
+        leaf: SurfaceLeaf::RegistrarClient,
+        cert_path: host.dir.path().join("staging/client.crt"),
+        key_path: host.dir.path().join("staging/client.key"),
+        name: Host::client_name(),
+    };
+    let params = crate::acme::build_registrar_client_csr_params(
+        REGISTRAR_SURFACE_INSTANCE,
+        TEST_HOST,
+        TEST_DOMAIN,
+    )
+    .expect("the registrar client CSR builds");
+    let key = KeyPair::generate().expect("create a staged client key");
+    let csr = params
+        .serialize_request(&key)
+        .expect("serialize the staged client CSR");
+    host.ca.sign_inside(-2, -1);
+    let certificate = host.ca.sign_csr(csr.der());
+    write_pair(
+        &candidate.cert_path,
+        &candidate.key_path,
+        &certificate,
+        &key.serialize_pem(),
+    );
+
+    let bundle = host
+        .settings
+        .trust
+        .ca_bundle_path
+        .as_deref()
+        .expect("the endpoint host configures a CA bundle");
+    let error = validate_candidate(
+        &candidate,
+        bundle,
+        &candidate,
+        &host.settings.trust.trusted_ca_sha256,
+    )
+    .expect_err("an expired staged registrar client certificate must not publish");
+    assert!(
+        error
+            .to_string()
+            .contains("not a valid registrar client certificate"),
+        "unexpected validation error: {error:#}"
+    );
 }

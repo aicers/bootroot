@@ -31,13 +31,11 @@
 //!   the outbound path applies. It is never built with
 //!   `allow_unauthenticated()`: a caller presenting no certificate
 //!   fails the handshake rather than arriving unauthenticated.
-//! - **The swap seam.** [`EndpointCertResolver`] holds the presented
-//!   [`CertifiedKey`] behind an `RwLock` and swaps it under the next
-//!   handshake with no restart. [`rustls::ServerConfig`] keeps only an
-//!   `Arc<dyn ResolvesServerCert>` and the trait does not extend `Any`,
-//!   so the typed handle is returned alongside the configuration and
-//!   retained by [`super::ActivatedEndpoint`]; there is no way back to
-//!   it from a built configuration.
+//! - **The swap seam.** A complete [`ServerConfig`] is built before
+//!   publication and exchanged by [`super::ActivatedEndpoint`] only
+//!   after every live file write succeeds. This replaces both the
+//!   presented key and the incoming client verifier for the next
+//!   handshake without disturbing an established connection.
 //!
 //! # Where a refusal is decided
 //!
@@ -67,6 +65,10 @@ pub(crate) const SERVER_CERT_SETTING: &str = "[registrar_endpoint] server_cert_p
 /// How the `[registrar_endpoint]` private-key key is spelled in a
 /// diagnostic.
 pub(crate) const SERVER_KEY_SETTING: &str = "[registrar_endpoint] server_key_path";
+
+/// How the `[registrar_endpoint]` client-certificate key is spelled in a
+/// diagnostic.
+pub(crate) const CLIENT_CERT_SETTING: &str = "[registrar_endpoint] client_cert_path";
 
 /// How the trust bundle setting is spelled in a diagnostic.
 pub(crate) const CA_BUNDLE_SETTING: &str = "trust.ca_bundle_path";
@@ -233,10 +235,19 @@ pub(crate) enum EndpointTlsError {
         /// What the verifier builder reported.
         detail: String,
     },
+    /// The registrar client leaf would not authenticate to the endpoint.
+    #[error("{setting} at {} is not a valid registrar client certificate: {detail}", .path.display())]
+    ClientCertificate {
+        /// The setting at fault.
+        setting: &'static str,
+        /// The staged client certificate path.
+        path: PathBuf,
+        /// What the verifier reported.
+        detail: String,
+    },
 }
 
-/// The endpoint's server-certificate resolver, and the one point a
-/// renewal reaches to replace the presented material.
+/// The endpoint's server-certificate resolver.
 ///
 /// The `RwLock` is taken and released inside the synchronous `resolve`
 /// and `swap`, so no guard is ever held across an `.await`. A poisoned
@@ -258,10 +269,8 @@ impl EndpointCertResolver {
     /// Replaces the certificate and key presented from the next
     /// handshake onwards, with no restart and without disturbing a
     /// connection already established.
-    // Certificate renewal for the endpoint leaf is a sibling issue, so
-    // until it lands the only caller of the seam is the test that
-    // proves it is reachable from the `ActivatedEndpoint` the daemon
-    // holds.
+    // Kept for endpoint unit tests. Production renewal replaces the
+    // complete acceptor so that its client verifier changes too.
     #[allow(dead_code)]
     pub(crate) fn swap(&self, certified_key: CertifiedKey) {
         let mut guard = self
@@ -359,6 +368,61 @@ pub(crate) fn build_server_config(
         .with_client_cert_verifier(client_verifier)
         .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
     Ok((Arc::new(config), resolver))
+}
+
+/// Verifies staged registrar client material against the incoming mTLS rule.
+///
+/// This is the same pinned subset of the staged CA bundle that
+/// [`build_server_config`] installs for incoming handshakes. Running it before
+/// publication refuses an expired certificate or one without `clientAuth`,
+/// rather than leaving the next registrar dial to discover it.
+///
+/// # Errors
+///
+/// Returns an error if no configured pin is present in the bundle, the pinned
+/// subset cannot construct a verifier, or the client leaf is not currently
+/// valid client-authentication material under that verifier.
+pub(crate) fn validate_client_certificate(
+    certified_key: &CertifiedKey,
+    cert_path: &Path,
+    bundle_path: &Path,
+    pins: &[String],
+) -> Result<(), EndpointTlsError> {
+    tls::install_crypto_provider();
+
+    if pins.is_empty() {
+        return Err(EndpointTlsError::MissingSetting {
+            setting: TRUSTED_CA_SETTING,
+        });
+    }
+    let pin_set: HashSet<String> = pins.iter().map(|pin| pin.to_ascii_lowercase()).collect();
+    let anchors = pinned_bundle_anchors(bundle_path, &pin_set)?;
+    let roots =
+        tls::certs_to_root_store(&anchors).map_err(|err| EndpointTlsError::ClientVerifier {
+            setting: CA_BUNDLE_SETTING,
+            path: bundle_path.to_path_buf(),
+            detail: format!("{err:#}"),
+        })?;
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|err| EndpointTlsError::ClientVerifier {
+            setting: CA_BUNDLE_SETTING,
+            path: bundle_path.to_path_buf(),
+            detail: err.to_string(),
+        })?;
+    let leaf = leaf_of(certified_key, cert_path)?;
+    verifier
+        .verify_client_cert(
+            leaf,
+            certified_key.cert.get(1..).unwrap_or_default(),
+            UnixTime::now(),
+        )
+        .map_err(|err| EndpointTlsError::ClientCertificate {
+            setting: CLIENT_CERT_SETTING,
+            path: cert_path.to_path_buf(),
+            detail: err.to_string(),
+        })?;
+    Ok(())
 }
 
 /// Reads the loaded leaf's single DNS SAN and holds it to the endpoint

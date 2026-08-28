@@ -108,7 +108,7 @@ mod tests;
 
 use std::os::unix::io::{FromRawFd as _, RawFd};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -118,7 +118,6 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 use self::activation::{ActivationContract, ActivationValues};
-use self::tls::EndpointCertResolver;
 use crate::config::Settings;
 
 /// Largest declared request payload the endpoint will read.
@@ -217,14 +216,13 @@ pub(crate) struct ActivatedEndpoint {
     listener: UnixListener,
     socket_path: PathBuf,
     daemon_uid: u32,
-    acceptor: TlsAcceptor,
-    // The certificate resolver is retained for exactly one consumer,
-    // and that consumer — renewal for the endpoint leaf — is a sibling
-    // issue. It has to be retained now because there is no way back to
-    // the concrete resolver from a built `ServerConfig`, so a build
-    // that dropped it would leave renewal with nothing to swap
-    // through. Reachability is asserted through `cert_resolver`.
-    resolver: Arc<EndpointCertResolver>,
+    // A complete acceptor is replaced after a renewal publishes every
+    // input it was built from. Replacing only the certificate resolver
+    // would leave the old client verifier installed.
+    acceptor: RwLock<Arc<TlsAcceptor>>,
+    // The renewal task updates this source of truth; the reporting work
+    // reads the same handle without parsing certificate files on requests.
+    renewal_states: RwLock<Option<crate::registrar_certs::SurfaceRenewalStates>>,
     domain: String,
 }
 
@@ -245,30 +243,64 @@ impl ActivatedEndpoint {
     }
 
     /// Returns the acceptor every accepted connection is handed to.
-    pub(crate) fn tls_acceptor(&self) -> &TlsAcceptor {
-        &self.acceptor
+    pub(crate) fn tls_acceptor(&self) -> Arc<TlsAcceptor> {
+        Arc::clone(&self.acceptor.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Returns the resolver that decides which certificate the next
-    /// handshake presents.
+    /// Exchanges the acceptor used by future handshakes.
     ///
-    /// This is the whole of the renewal seam. [`rustls::ServerConfig`]
-    /// keeps only an `Arc<dyn ResolvesServerCert>`, and the trait does
-    /// not extend `Any`, so code holding the configuration or the
-    /// acceptor cannot reach the concrete resolver at all — it survives
-    /// here or nowhere.
-    // The renewal work that calls this is a sibling issue, so until it
-    // lands nothing outside a test reaches the accessor. It exists now
-    // so that work needs nothing from this one.
+    /// Existing handshakes retain the clone they loaded before this
+    /// exchange and therefore continue under their original TLS policy.
+    pub(crate) fn replace_server_config(&self, config: Arc<rustls::ServerConfig>) {
+        let mut acceptor = self
+            .acceptor
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        *acceptor = Arc::new(TlsAcceptor::from(config));
+    }
+
+    /// Installs the daemon-owned registrar certificate renewal observations.
+    pub(crate) fn set_renewal_states(&self, states: crate::registrar_certs::SurfaceRenewalStates) {
+        let mut slot = self
+            .renewal_states
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = Some(states);
+    }
+
+    /// Returns the daemon-owned registrar certificate renewal observations.
+    // The reporting child reads this accessor once its response member lands;
+    // renewal owns the state now so it is not recomputed on a request path.
     #[allow(dead_code)]
-    pub(crate) fn cert_resolver(&self) -> &Arc<EndpointCertResolver> {
-        &self.resolver
+    pub(crate) fn renewal_states(&self) -> Option<crate::registrar_certs::SurfaceRenewalStates> {
+        self.renewal_states
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns the configured `network.domain` the presented client
     /// identity is recognized against.
     pub(crate) fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Creates an endpoint shell for renewal tests.
+    #[cfg(test)]
+    pub(crate) fn for_renewal_test(
+        listener: UnixListener,
+        socket_path: PathBuf,
+        server_config: Arc<rustls::ServerConfig>,
+        domain: String,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            listener,
+            socket_path,
+            daemon_uid: current_effective_uid(),
+            acceptor: RwLock::new(Arc::new(TlsAcceptor::from(server_config))),
+            renewal_states: RwLock::new(None),
+            domain,
+        })
     }
 }
 
@@ -346,7 +378,7 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
     if warns_about_unprivileged_daemon(enabled, effective_uid) {
         warn!("{UNPRIVILEGED_DAEMON_WARNING}");
     }
-    let (server_config, resolver) = tls::build_server_config(
+    let (server_config, _) = tls::build_server_config(
         settings.registrar_endpoint.server_cert_path.as_deref(),
         settings.registrar_endpoint.server_key_path.as_deref(),
         settings.trust.ca_bundle_path.as_deref(),
@@ -361,7 +393,6 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
         contract,
         effective_uid,
         server_config,
-        resolver,
         settings.domain.clone(),
     )
     .map(Some)
@@ -375,7 +406,7 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
 /// against a listener its own harness bound, through the very code
 /// production runs. Nothing below this point binds, unlinks or chmods
 /// anything, and nothing below it reads certificate material: the
-/// already-built configuration and its resolver arrive as values.
+/// already-built configuration arrives as a value.
 ///
 /// # Errors
 ///
@@ -385,7 +416,6 @@ pub(crate) fn adopt(
     contract: ActivationContract,
     effective_uid: u32,
     server_config: Arc<rustls::ServerConfig>,
-    resolver: Arc<EndpointCertResolver>,
     domain: String,
 ) -> anyhow::Result<Arc<ActivatedEndpoint>> {
     let fd = contract.into_descriptor();
@@ -431,8 +461,8 @@ pub(crate) fn adopt(
         listener,
         socket_path,
         daemon_uid: effective_uid,
-        acceptor: TlsAcceptor::from(server_config),
-        resolver,
+        acceptor: RwLock::new(Arc::new(TlsAcceptor::from(server_config))),
+        renewal_states: RwLock::new(None),
         domain,
     }))
 }

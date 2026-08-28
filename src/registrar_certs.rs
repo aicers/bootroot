@@ -42,10 +42,10 @@
 //! that process a new key on every restart. The two pairs are evaluated
 //! independently.
 //!
-//! This is not a scheduler. There is no registration point, no lead-time
-//! constant and no retry policy, and nothing here changes how the
-//! per-service loop or the internal profile's own renewal is scheduled,
-//! credentialed or triggered.
+//! The start-time path is not a scheduler. The daemon-owned renewal adapter
+//! below registers the same two leaves separately, using the rendered
+//! internal profile's cadence, lead time and retry policy; it does not alter
+//! the per-service loop or the internal profile's own renewal process.
 //!
 //! # Why this is not a module of [`crate::registrar`]
 //!
@@ -78,8 +78,20 @@
 //! strictly stronger than this one.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use tokio::sync::watch;
+#[cfg(target_os = "linux")]
+use tracing::error;
 use tracing::{info, warn};
 use x509_parser::prelude::ASN1Time;
 
@@ -97,6 +109,60 @@ use crate::registrar::{
 };
 use crate::secret::HmacSecret;
 use crate::{cert_chain, tls};
+
+/// The outcome recorded for one registrar-surface renewal attempt.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenewalAttempt {
+    /// No renewal has been attempted since daemon start.
+    NeverAttempted,
+    /// The most recent attempt published a replacement.
+    Succeeded,
+    /// The most recent attempt failed before a replacement was active.
+    Failed(String),
+}
+
+/// In-process observation of one registrar-surface leaf.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct SurfaceRenewalState {
+    /// The currently active certificate expiry time.
+    pub(crate) not_after: time::OffsetDateTime,
+    /// The most recent attempt outcome.
+    pub(crate) attempt: RenewalAttempt,
+    /// The time the most recent attempt started, if there was one.
+    pub(crate) attempted_at: Option<time::OffsetDateTime>,
+}
+
+/// The sole in-process source of registrar leaf renewal observations.
+#[cfg(target_os = "linux")]
+pub(crate) type SurfaceRenewalStates = Arc<Mutex<BTreeMap<SurfaceLeaf, SurfaceRenewalState>>>;
+
+/// A staged registrar private key whose debug representation is redacted.
+#[cfg(target_os = "linux")]
+struct SurfacePrivateKeyPem(String);
+
+#[cfg(target_os = "linux")]
+impl SurfacePrivateKeyPem {
+    /// Wraps key material as it enters the renewal publication path.
+    #[must_use]
+    fn new(pem: String) -> Self {
+        Self(pem)
+    }
+
+    /// Borrows the key only for the established certificate/key writer.
+    #[must_use]
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for SurfacePrivateKeyPem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
 
 /// The KV v2 path the deployment's shared agent EAB is stored at.
 ///
@@ -126,7 +192,7 @@ const SURFACE_LEAF_PUBLICATION: LeafPublication = LeafPublication::LeafWithChain
 /// The two are evaluated and issued independently: one being usable is
 /// never a reason to leave the other unusable, and one needing issuance
 /// is never a reason to re-issue the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SurfaceLeaf {
     /// The leaf the endpoint presents. A server certificate, so it takes
     /// the ordinary CSR shape and requests no extended key usage.
@@ -567,6 +633,15 @@ pub(crate) struct SurfacePlan {
     pub(crate) kv_mount: String,
     /// The bootroot host's own label, from the rendered internal config.
     pub(crate) host: String,
+    /// The rendered internal credential profile. Its daemon and retry
+    /// settings are the registrar surface renewal policy.
+    #[cfg(target_os = "linux")]
+    pub(crate) renewal_profile: DaemonProfileSettings,
+    /// The internal credential configuration's effective issuance retry
+    /// policy. The profile may override it; otherwise its own top-level
+    /// `[retry]` applies, never the outer daemon configuration.
+    #[cfg(target_os = "linux")]
+    pub(crate) renewal_retry_backoff: Vec<u64>,
     /// Both configured pairs, in evaluation order.
     pub(crate) pairs: Vec<SurfacePairPaths>,
 }
@@ -608,17 +683,22 @@ pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
             internal_paths.agent_config().display()
         )
     })?;
-    let host = internal
-        .profiles
-        .first()
-        .map(|profile| profile.hostname.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "the rendered internal agent config at {} carries no profile to take the host \
+    let internal_profile = internal.profiles.first().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "the rendered internal agent config at {} carries no profile to take the host \
                  label from",
-                internal_paths.agent_config().display()
-            )
-        })?;
+            internal_paths.agent_config().display()
+        )
+    })?;
+    let host = internal_profile.hostname.clone();
+    #[cfg(target_os = "linux")]
+    let (renewal_profile, renewal_retry_backoff) = (
+        internal_profile.clone(),
+        internal_profile.retry.as_ref().map_or_else(
+            || internal.retry.backoff_secs.clone(),
+            |retry| retry.backoff_secs.clone(),
+        ),
+    );
 
     let pairs = surface_pairs(&settings.registrar_endpoint, &host, &settings.domain)?;
     Ok(SurfacePlan {
@@ -626,8 +706,509 @@ pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
         openbao_url: state.openbao_url,
         kv_mount: state.kv_mount,
         host,
+        #[cfg(target_os = "linux")]
+        renewal_profile,
+        #[cfg(target_os = "linux")]
+        renewal_retry_backoff,
         pairs,
     })
+}
+
+/// Initializes the shared state after start-time issuance and before
+/// the endpoint accept task can begin serving.
+#[cfg(target_os = "linux")]
+pub(crate) async fn initialize_renewal_states(
+    pairs: &[SurfacePairPaths],
+) -> Result<SurfaceRenewalStates> {
+    let mut entries = BTreeMap::new();
+    for pair in pairs {
+        let bytes = tokio::fs::read(&pair.cert_path).await.with_context(|| {
+            format!(
+                "reading registrar certificate at {}",
+                pair.cert_path.display()
+            )
+        })?;
+        let not_after = crate::daemon::parse_cert_not_after(&bytes)?;
+        entries.insert(
+            pair.leaf,
+            SurfaceRenewalState {
+                not_after,
+                attempt: RenewalAttempt::NeverAttempted,
+                attempted_at: None,
+            },
+        );
+    }
+    Ok(Arc::new(Mutex::new(entries)))
+}
+
+/// Runs the registrar leaves on the internal credential profile's
+/// cadence. It is deliberately independent of ordinary service profiles:
+/// this path authenticates using the internal certificate and never reads
+/// `AppRole` material.
+#[cfg(target_os = "linux")]
+pub(crate) async fn run_surface_renewal_loop(
+    settings: Arc<Settings>,
+    endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    plan: SurfacePlan,
+    states: SurfaceRenewalStates,
+    insecure_mode: bool,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let profile = plan.renewal_profile.clone();
+    let mut first_tick = true;
+    loop {
+        if *shutdown.borrow_and_update() {
+            return Ok(());
+        }
+        let delay = if first_tick {
+            first_tick = false;
+            Duration::ZERO
+        } else {
+            crate::utils::jittered_delay(profile.daemon.check_interval, profile.daemon.check_jitter)
+        };
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            () = tokio::time::sleep(delay) => {}
+        }
+        let renewal_settings = Arc::clone(&settings);
+        let renewal_plan = plan.clone();
+        let renewal_endpoint = Arc::clone(&endpoint);
+        run_surface_renewal_pass(&settings, &plan, &states, move |pair| {
+            let settings = Arc::clone(&renewal_settings);
+            let plan = renewal_plan.clone();
+            let endpoint = Arc::clone(&renewal_endpoint);
+            async move { renew_surface_pair(&settings, &plan, &pair, &endpoint, insecure_mode).await }
+        })
+        .await;
+    }
+}
+
+/// Drives one deterministic registrar renewal pass.
+///
+/// The loop above owns cadence and shutdown; this unit owns per-leaf
+/// eligibility and state transitions so tests can exercise a pass without
+/// waiting for its interval. The closure retains the issuance and publication
+/// boundary, leaving a no-op pass unable to reach `OpenBao` or the CA.
+#[cfg(target_os = "linux")]
+async fn run_surface_renewal_pass<Renew, RenewFuture>(
+    settings: &Settings,
+    plan: &SurfacePlan,
+    states: &SurfaceRenewalStates,
+    mut renew: Renew,
+) where
+    Renew: FnMut(SurfacePairPaths) -> RenewFuture,
+    RenewFuture: Future<Output = Result<time::OffsetDateTime>>,
+{
+    for pair in &plan.pairs {
+        let mut eligibility = plan.renewal_profile.clone();
+        eligibility.paths.cert = pair.cert_path.clone();
+        eligibility.paths.key = pair.key_path.clone();
+        let due = match crate::daemon::should_renew(
+            &eligibility,
+            &settings.trust,
+            plan.renewal_profile.daemon.renew_before,
+        )
+        .await
+        {
+            Ok(due) => due,
+            Err(err) => {
+                // This is an eligibility check, not a renewal attempt.
+                // Preserve the last attempt observation until issuance
+                // actually starts on a later tick.
+                warn!(leaf = %pair.name, "Checking registrar renewal eligibility failed: {err:#}");
+                continue;
+            }
+        };
+        if !due {
+            continue;
+        }
+        let attempted_at = time::OffsetDateTime::now_utc();
+        match renew(pair.clone()).await {
+            Ok(not_after) => record_success(states, pair.leaf, not_after, attempted_at),
+            Err(err) => {
+                error!(leaf = %pair.name, "Registrar surface renewal failed: {err:#}");
+                record_failure_at(states, pair.leaf, attempted_at, err.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_success(
+    states: &SurfaceRenewalStates,
+    leaf: SurfaceLeaf,
+    not_after: time::OffsetDateTime,
+    attempted_at: time::OffsetDateTime,
+) {
+    let mut states = states
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = states.get_mut(&leaf) {
+        state.not_after = not_after;
+        state.attempt = RenewalAttempt::Succeeded;
+        state.attempted_at = Some(attempted_at);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn record_failure_at(
+    states: &SurfaceRenewalStates,
+    leaf: SurfaceLeaf,
+    attempted_at: time::OffsetDateTime,
+    reason: String,
+) {
+    let mut states = states
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(state) = states.get_mut(&leaf) {
+        state.attempt = RenewalAttempt::Failed(reason);
+        state.attempted_at = Some(attempted_at);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn renew_surface_pair(
+    settings: &Settings,
+    plan: &SurfacePlan,
+    pair: &SurfacePairPaths,
+    endpoint: &Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    insecure_mode: bool,
+) -> Result<time::OffsetDateTime> {
+    let bundle_path = settings.trust.ca_bundle_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("trust.ca_bundle_path is required for an enabled registrar endpoint")
+    })?;
+    let staging =
+        tempfile::tempdir().context("creating private registrar renewal staging directory")?;
+    let candidate = SurfacePairPaths {
+        leaf: pair.leaf,
+        cert_path: staging.path().join("certificate.pem"),
+        key_path: staging.path().join("key.pem"),
+        name: pair.name.clone(),
+    };
+    let candidate_bundle = staging.path().join("ca-bundle.pem");
+    let live_bundle = tokio::fs::read_to_string(bundle_path)
+        .await
+        .with_context(|| {
+            format!(
+                "reading CA bundle at {} before registrar renewal",
+                bundle_path.display()
+            )
+        })?;
+    crate::fs_util::write_ca_bundle(
+        &candidate_bundle,
+        &live_bundle,
+        crate::cert_group::CertGroupPolicy::none(),
+    )
+    .await
+    .context("seeding staged registrar CA bundle")?;
+
+    let inputs = read_acme_inputs(&plan.secrets_dir, &plan.openbao_url, &plan.kv_mount).await?;
+    // The ACME flow takes its output paths from the single profile in the
+    // settings it receives. Build that profile from the staged pair, rather
+    // than cloning the daemon settings, so issuance cannot reach a live
+    // registrar pair before validation and publication have completed.
+    let mut candidate_settings =
+        issuance_settings(settings, &candidate, &plan.host, &inputs.responder_hmac);
+    candidate_settings.trust.ca_bundle_path = Some(candidate_bundle.clone());
+    crate::daemon::issue_with_retry_inner(
+        || issue_surface_candidate(&candidate_settings, &candidate, &inputs, insecure_mode),
+        tokio::time::sleep,
+        &plan.renewal_retry_backoff,
+    )
+    .await?;
+
+    let client_pair = plan
+        .pairs
+        .iter()
+        .find(|configured| configured.leaf == SurfaceLeaf::RegistrarClient)
+        .ok_or_else(|| anyhow::anyhow!("registrar renewal plan has no client certificate pair"))?;
+    validate_candidate(
+        &candidate,
+        &candidate_bundle,
+        client_pair,
+        &settings.trust.trusted_ca_sha256,
+    )?;
+    let server_pair = if pair.leaf == SurfaceLeaf::EndpointServer {
+        (&candidate.cert_path, &candidate.key_path)
+    } else {
+        let current_server = plan
+            .pairs
+            .iter()
+            .find(|configured| configured.leaf == SurfaceLeaf::EndpointServer)
+            .ok_or_else(|| {
+                anyhow::anyhow!("registrar renewal plan has no server certificate pair")
+            })?;
+        (&current_server.cert_path, &current_server.key_path)
+    };
+    let (next_config, _) = crate::registrar::endpoint::tls::build_server_config(
+        Some(server_pair.0),
+        Some(server_pair.1),
+        Some(&candidate_bundle),
+        &settings.trust.trusted_ca_sha256,
+        &settings.domain,
+    )
+    .context("building staged registrar endpoint TLS configuration")?;
+
+    let snapshot = RenewalSnapshot::capture(bundle_path, pair).await?;
+    publish_surface_renewal_transaction(
+        endpoint,
+        next_config,
+        || publish_candidate(bundle_path, pair, &candidate, &candidate_bundle),
+        || snapshot.restore(),
+    )
+    .await?;
+    let bytes = tokio::fs::read(&pair.cert_path).await?;
+    crate::daemon::parse_cert_not_after(&bytes)
+}
+
+/// Publishes a fully validated registrar renewal and exchanges its already
+/// built TLS configuration only after publication succeeds.
+///
+/// The two operations are parameters so the transaction's failure and
+/// rollback paths remain deterministically testable without weakening the
+/// production publication primitive.
+#[cfg(target_os = "linux")]
+async fn publish_surface_renewal_transaction<Publish, PublishFuture, Restore, RestoreFuture>(
+    endpoint: &crate::registrar::endpoint::ActivatedEndpoint,
+    next_config: Arc<rustls::ServerConfig>,
+    publish: Publish,
+    restore: Restore,
+) -> Result<()>
+where
+    Publish: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<()>>,
+    Restore: FnOnce() -> RestoreFuture,
+    RestoreFuture: Future<Output = Result<()>>,
+{
+    if let Err(publish_error) = publish().await {
+        return match restore().await {
+            Ok(()) => {
+                Err(publish_error.context("publishing registrar renewal; restored prior material"))
+            }
+            Err(rollback_error) => Err(publish_error.context(format!(
+                "publishing registrar renewal; rollback also failed: {rollback_error:#}"
+            ))),
+        };
+    }
+    endpoint.replace_server_config(next_config);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_candidate(
+    candidate: &SurfacePairPaths,
+    bundle: &Path,
+    client_pair: &SurfacePairPaths,
+    trusted_ca_sha256: &[String],
+) -> Result<()> {
+    let certified = crate::registrar::endpoint::tls::load_certified_key(
+        &candidate.cert_path,
+        &candidate.key_path,
+    )
+    .context("loading staged registrar certificate and key")?;
+    if pair_name(&certified, &candidate.cert_path)? != candidate.name {
+        anyhow::bail!("staged registrar certificate does not carry the expected identity");
+    }
+    if candidate.leaf == SurfaceLeaf::EndpointServer {
+        let pins = crate::registrar::endpoint_pin::load_anchor_pins(
+            &crate::registrar::endpoint_pin::anchor_pin_path_for_client_certificate(
+                &client_pair.cert_path,
+            ),
+        )?;
+        let leaf = certified
+            .cert
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("staged endpoint certificate has no leaf"))?;
+        crate::registrar::endpoint_pin::RegistrarEndpointVerifier::new(
+            pins.into_iter().collect(),
+            &candidate.name,
+        )?
+        .verify(
+            leaf,
+            certified.cert.get(1..).unwrap_or_default(),
+            rustls::pki_types::UnixTime::now(),
+        )?;
+    } else {
+        crate::registrar::endpoint::tls::validate_client_certificate(
+            &certified,
+            &candidate.cert_path,
+            bundle,
+            trusted_ca_sha256,
+        )?;
+    }
+    let cert = std::fs::read(&candidate.cert_path)?;
+    if !cert_chain::leaf_chains_to_bundle(&cert, &std::fs::read(bundle)?)? {
+        anyhow::bail!("staged registrar certificate does not chain to the staged CA bundle");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn pair_name(certified: &rustls::sign::CertifiedKey, path: &Path) -> Result<String> {
+    let leaf = certified
+        .cert
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("certificate at {} has no leaf", path.display()))?;
+    single_dns_san(leaf.as_ref())
+        .map_err(|error| anyhow::anyhow!("reading candidate SAN at {}: {error}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+struct RenewalSnapshot {
+    bundle: SnapshotFile,
+    cert: SnapshotFile,
+    key: SnapshotFile,
+}
+
+#[cfg(target_os = "linux")]
+impl RenewalSnapshot {
+    async fn capture(bundle_path: &Path, pair: &SurfacePairPaths) -> Result<Self> {
+        Ok(Self {
+            bundle: SnapshotFile::capture(bundle_path).await?,
+            cert: SnapshotFile::capture(&pair.cert_path).await?,
+            key: SnapshotFile::capture(&pair.key_path).await?,
+        })
+    }
+
+    async fn restore(&self) -> Result<()> {
+        let mut failures = Vec::new();
+        for snapshot in [&self.bundle, &self.cert, &self.key] {
+            if let Err(error) = snapshot.restore().await {
+                failures.push(format!("{}: {error:#}", snapshot.path.display()));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "restoring registrar renewal snapshots failed: {}",
+                failures.join("; ")
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One live path saved before a registrar renewal starts publication.
+#[cfg(target_os = "linux")]
+struct SnapshotFile {
+    bytes: Vec<u8>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl SnapshotFile {
+    async fn capture(path: &Path) -> Result<Self> {
+        let metadata = tokio::fs::metadata(path).await.with_context(|| {
+            format!(
+                "reading metadata for registrar renewal snapshot at {}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            bytes: tokio::fs::read(path).await.with_context(|| {
+                format!("reading registrar renewal snapshot at {}", path.display())
+            })?,
+            mode: metadata.permissions().mode() & 0o7777,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            path: path.to_path_buf(),
+        })
+    }
+
+    async fn restore(&self) -> Result<()> {
+        crate::fs_util::atomic_write_fixed_owner(
+            crate::fs_util::Destination::operator_named(&self.path),
+            &self.bytes,
+            crate::fs_util::StagedMode::Policy(self.mode),
+            crate::fs_util::FixedOwner::observed(self.uid, self.gid),
+        )
+        .await
+        .with_context(|| format!("restoring registrar renewal path {}", self.path.display()))?;
+        let metadata = tokio::fs::metadata(&self.path).await.with_context(|| {
+            format!(
+                "checking restored registrar renewal ownership at {}",
+                self.path.display()
+            )
+        })?;
+        if metadata.uid() != self.uid || metadata.gid() != self.gid {
+            anyhow::bail!(
+                "restored registrar renewal path has owner {}:{}, expected {}:{}",
+                metadata.uid(),
+                metadata.gid(),
+                self.uid,
+                self.gid
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn publish_candidate(
+    bundle_path: &Path,
+    live: &SurfacePairPaths,
+    candidate: &SurfacePairPaths,
+    candidate_bundle: &Path,
+) -> Result<()> {
+    publish_candidate_after_stage(bundle_path, live, candidate, candidate_bundle, |_| Ok(())).await
+}
+
+/// A completed live publication step in the registrar renewal transaction.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidatePublicationStage {
+    Bundle,
+    Certificate,
+    Key,
+}
+
+/// Publishes a staged candidate, notifying `after_stage` after each live
+/// rename.
+///
+/// The callback keeps publication-failure tests at the real writer boundary:
+/// each preceding file has been written with the same production primitive,
+/// and any error still follows the ordinary transaction rollback path.
+#[cfg(target_os = "linux")]
+async fn publish_candidate_after_stage<AfterStage>(
+    bundle_path: &Path,
+    live: &SurfacePairPaths,
+    candidate: &SurfacePairPaths,
+    candidate_bundle: &Path,
+    mut after_stage: AfterStage,
+) -> Result<()>
+where
+    AfterStage: FnMut(CandidatePublicationStage) -> Result<()>,
+{
+    let bundle = tokio::fs::read_to_string(candidate_bundle).await?;
+    let cert = tokio::fs::read_to_string(&candidate.cert_path).await?;
+    let key = SurfacePrivateKeyPem::new(tokio::fs::read_to_string(&candidate.key_path).await?);
+    crate::fs_util::write_ca_bundle(
+        bundle_path,
+        &bundle,
+        crate::cert_group::CertGroupPolicy::none(),
+    )
+    .await?;
+    after_stage(CandidatePublicationStage::Bundle)?;
+
+    // Keep the established certificate-then-key two-rename contract, while
+    // making the intermediate state observable to the transaction tests.
+    let cert_dir = live
+        .cert_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("certificate path has no parent directory"))?;
+    let key_dir = live
+        .key_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("key path has no parent directory"))?;
+    let policy = crate::cert_group::CertGroupPolicy::none();
+    crate::cert_group::ensure_key_parent_dir(key_dir, policy).await?;
+    crate::cert_group::ensure_cert_parent_dir(cert_dir, key_dir, policy).await?;
+    crate::cert_group::write_cert_file(&live.cert_path, &cert, policy).await?;
+    after_stage(CandidatePublicationStage::Certificate)?;
+    crate::cert_group::write_key_file(&live.key_path, key.expose(), policy).await?;
+    after_stage(CandidatePublicationStage::Key)
 }
 
 /// Evaluates both pairs and returns the ones an issuance has to replace.
@@ -780,6 +1361,21 @@ pub(crate) async fn issue_surface_pair(
     insecure_mode: bool,
 ) -> Result<()> {
     let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
+    issue_surface_candidate(&issuance, pair, inputs, insecure_mode).await
+}
+
+/// Issues a registrar surface pair into the paths already embedded in
+/// `issuance`.
+///
+/// Start-time issuance hands this helper the configured output paths. Renewal
+/// builds the same issuance settings around private staging paths, so no
+/// renewal candidate can write a configured pair or the live CA bundle.
+async fn issue_surface_candidate(
+    issuance: &Settings,
+    pair: &SurfacePairPaths,
+    inputs: &SurfaceAcmeInputs,
+    insecure_mode: bool,
+) -> Result<()> {
     let profile = issuance
         .profiles
         .first()
@@ -789,7 +1385,7 @@ pub(crate) async fn issue_surface_pair(
     // existing post-issuance merge gate does.
     let bootstrap_pins = bootstrap_pins_for_mode(&issuance.trust, insecure_mode);
     crate::acme::issue_certificate_with_bootstrap(
-        &issuance,
+        issuance,
         profile,
         inputs.eab.clone(),
         insecure_mode,

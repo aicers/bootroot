@@ -48,6 +48,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   CA, and its certificates and keys survive the restart byte-identically.
   An already-expired leaf is repaired at start, before the endpoint's TLS
   material loads, rather than at the first renewal tick.
+- An enabled registrar endpoint now renews both its server and registrar
+  client certificates on the daemon's regular maintenance cadence. The
+  endpoint applies renewed TLS material to new handshakes without
+  restarting its socket, while the in-repository registrar client reloads
+  its certificate and key for each new dial and safely retries the brief
+  atomic-replacement interval.
 - `bootroot-agent` now rotates `OpenBao`'s file audit device on a host
   whose registrar endpoint is enabled, so the deployment no longer needs
   an external rotator against it. Every 60 seconds the daemon renames the

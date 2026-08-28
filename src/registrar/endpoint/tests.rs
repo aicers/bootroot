@@ -64,8 +64,8 @@ use super::test_support::{
     endpoint_name, generate_ca, registrar_client_name, valid_ca,
 };
 use super::tls::{
-    CA_BUNDLE_SETTING, EndpointCertResolver, EndpointTlsError, SERVER_CERT_SETTING,
-    SERVER_KEY_SETTING, TRUSTED_CA_SETTING, build_server_config,
+    CA_BUNDLE_SETTING, EndpointTlsError, SERVER_CERT_SETTING, SERVER_KEY_SETTING,
+    TRUSTED_CA_SETTING, build_server_config,
 };
 use super::{
     ActivatedEndpoint, CONNECTION_DRAIN_TIMEOUT, HANDSHAKE_TIMEOUT, HEADER_IDLE_TIMEOUT,
@@ -1683,15 +1683,11 @@ impl Harness {
     }
 
     fn bind_over(pki: Pki) -> anyhow::Result<Self> {
-        let (config, resolver) = pki.conforming();
-        Self::bind_with(pki, config, resolver)
+        let (config, _) = pki.conforming();
+        Self::bind_with(pki, config)
     }
 
-    fn bind_with(
-        pki: Pki,
-        config: Arc<rustls::ServerConfig>,
-        resolver: Arc<EndpointCertResolver>,
-    ) -> anyhow::Result<Self> {
+    fn bind_with(pki: Pki, config: Arc<rustls::ServerConfig>) -> anyhow::Result<Self> {
         let dir = conforming_tempdir()?;
         let socket_path = dir.path().join("registrar.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
@@ -1703,7 +1699,6 @@ impl Harness {
             activation_descriptor(listener),
             current_effective_uid(),
             config,
-            resolver,
             TEST_DOMAIN.to_string(),
         )?;
         Ok(Self {
@@ -1743,14 +1738,8 @@ fn adopt_for_test(
     effective_uid: u32,
 ) -> anyhow::Result<Arc<ActivatedEndpoint>> {
     let pki = Pki::new();
-    let (config, resolver) = pki.conforming();
-    super::adopt(
-        contract,
-        effective_uid,
-        config,
-        resolver,
-        TEST_DOMAIN.to_string(),
-    )
+    let (config, _) = pki.conforming();
+    super::adopt(contract, effective_uid, config, TEST_DOMAIN.to_string())
 }
 
 /// Runs one accept loop until the returned sender is told to stop, and
@@ -2835,20 +2824,19 @@ fn the_activated_endpoint_carries_no_handler() {
         !fields.iter().any(|field| field.contains("handler")),
         "the adopted endpoint holds no handler: {fields:?}"
     );
-    assert_eq!(
-        fields,
-        vec![
-            "listener: UnixListener,",
-            "socket_path: PathBuf,",
-            "daemon_uid: u32,",
-            "acceptor: TlsAcceptor,",
-            "// The certificate resolver is retained for exactly one consumer,",
-            "resolver: Arc<EndpointCertResolver>,",
-            "domain: String,",
-        ],
-        "the adopted endpoint holds the socket, its path, the daemon uid and the TLS material — \
-         and no handler"
-    );
+    for expected in [
+        "listener: UnixListener,",
+        "socket_path: PathBuf,",
+        "daemon_uid: u32,",
+        "acceptor: RwLock<Arc<TlsAcceptor>>,",
+        "renewal_states: RwLock<Option<crate::registrar_certs::SurfaceRenewalStates>>",
+        "domain: String,",
+    ] {
+        assert!(
+            fields.iter().any(|field| field.contains(expected)),
+            "the adopted endpoint must retain {expected}; fields: {fields:?}"
+        );
+    }
     assert!(
         !source.contains("fn production_handler"),
         "the missing-handler refusal is gone, not relocated"
@@ -3228,12 +3216,11 @@ async fn a_mismatched_peer_is_refused_even_with_the_registrar_certificate() {
     )
     .expect("chmod");
     let pki = Pki::new();
-    let (config, resolver) = pki.conforming();
+    let (config, _) = pki.conforming();
     let endpoint = super::adopt(
         activation_descriptor(listener),
         current_effective_uid(),
         config,
-        resolver,
         TEST_DOMAIN.to_string(),
     )
     .expect("adoption");
@@ -3349,17 +3336,17 @@ async fn a_pinned_caller_is_served_and_an_unpinned_one_refuses_before_a_request(
     running.stop().await;
 }
 
-/// The renewal seam is reachable from what the daemon holds.
+/// The complete renewal seam is reachable from what the daemon holds.
 ///
-/// The resolver is taken from the [`ActivatedEndpoint`] the harness
-/// produced — not from one the test built — because that is the whole
-/// point: a test that swapped its own resolver would pass while renewal
-/// remained unable to reach one. After the swap the endpoint presents a
+/// The replacement configuration is installed through the
+/// [`ActivatedEndpoint`] the harness produced — not merely built beside
+/// it — because renewal must replace the client verifier as well as the
+/// presented certificate. After the exchange the endpoint presents a
 /// chain under a different anchor, which the caller pinned to the first
 /// anchor now refuses and a caller pinned to the second now accepts,
 /// with no restart in between.
 #[tokio::test]
-async fn swapping_the_resolver_through_the_activated_endpoint_changes_the_presented_chain() {
+async fn replacing_the_acceptor_through_the_activated_endpoint_changes_the_presented_chain() {
     let harness = Harness::bind().expect("harness");
     let running = RunningEndpoint::start(
         &harness.endpoint,
@@ -3374,10 +3361,8 @@ async fn swapping_the_resolver_through_the_activated_endpoint_changes_the_presen
     // A second deployment PKI, and material for the same endpoint name
     // under its anchor.
     let renewed = Pki::new();
-    let (cert_path, key_path) = renewed.server_material();
-    let certified_key = super::tls::load_certified_key(&cert_path, &key_path)
-        .expect("the renewed material must load");
-    harness.endpoint.cert_resolver().swap(certified_key);
+    let (renewed_config, _) = renewed.conforming();
+    harness.endpoint.replace_server_config(renewed_config);
 
     // The caller pinned to the first anchor no longer accepts what is
     // presented, and the caller pinned to the second one does.
@@ -3389,7 +3374,7 @@ async fn swapping_the_resolver_through_the_activated_endpoint_changes_the_presen
 
     let config = client_config_pinning(
         &renewed.pin_file_path(),
-        Some(harness.pki.registrar_client_material()),
+        Some(renewed.registrar_client_material()),
     );
     let served = tls_round_trip(&harness.socket_path, config, &frame_of(b"mint", b"")).await;
     assert!(

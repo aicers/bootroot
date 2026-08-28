@@ -1389,6 +1389,19 @@ is then wrapped in mutual TLS.
 - **The verbs see `registrar-client:<san>`** as the caller of record, and
   never a peer-credential value.
 
+#### Caller certificate reload contract
+
+The registrar client certificate and key are renewed by two atomic
+renames: the certificate is replaced first and the key second. A caller
+must load both files for every new dial and verify that the key belongs to
+the loaded leaf; it must never cache one half across dials or present a
+mismatched pair. The in-repository registrar endpoint client is the
+reference implementation: on a mismatch it reads the pair again up to
+five times, waiting 1 ms, 2 ms, 4 ms, then 8 ms between the first four
+failed reads, and returns a typed mismatch error if the fifth read is
+still torn. Existing connections retain their TLS configuration; a new
+dial picks up the next matching pair without a caller restart or signal.
+
 A connection that opens and never sends a `ClientHello` is dropped after
 five seconds, so an unauthenticated peer cannot hold one of the sixteen
 connection slots open.

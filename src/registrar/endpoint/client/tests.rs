@@ -33,6 +33,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
@@ -715,6 +716,64 @@ async fn a_key_that_is_not_a_private_key_fails_before_the_dial() {
         "{err:?}"
     );
     assert_eq!(double.observed().connections, 0);
+}
+
+#[test]
+fn a_permanent_torn_pair_returns_the_typed_mismatch_error() {
+    let deployment = Deployment::new();
+    let (_other_leaf, other_key) =
+        issue_leaf(&deployment.pki.ca, vec![dns_san(&registrar_client_name())]);
+    std::fs::write(&deployment.key_path, other_key.serialize_pem())
+        .expect("write a different private key beside the client leaf");
+
+    let mut reads = 0;
+    let mut observed_delays = Vec::new();
+    let error = load_client_material_with(
+        || {
+            reads += 1;
+            load_client_material_once(&deployment.certificate_path, &deployment.key_path)
+        },
+        |delay| observed_delays.push(delay),
+    )
+    .expect_err("a permanent torn pair must not be presented");
+    assert!(
+        matches!(error, ClientMaterialError::KeyMismatch { .. }),
+        "expected the typed torn-pair error, got {error:?}"
+    );
+    assert_eq!(reads, PAIR_LOAD_ATTEMPTS);
+    assert_eq!(observed_delays, PAIR_LOAD_DELAYS);
+}
+
+#[test]
+fn a_torn_pair_retries_until_the_second_rename_completes() {
+    let deployment = Deployment::new();
+    let original_key = std::fs::read(&deployment.key_path).expect("read the original key");
+    let (_other_leaf, other_key) =
+        issue_leaf(&deployment.pki.ca, vec![dns_san(&registrar_client_name())]);
+    std::fs::write(&deployment.key_path, other_key.serialize_pem())
+        .expect("write a torn pair after the certificate rename");
+
+    let mut reads = 0;
+    let mut observed_delays = Vec::new();
+    let material = load_client_material_with(
+        || {
+            reads += 1;
+            if reads == 3 {
+                std::fs::write(&deployment.key_path, &original_key)
+                    .expect("complete the key rename before the third read");
+            }
+            load_client_material_once(&deployment.certificate_path, &deployment.key_path)
+        },
+        |delay| observed_delays.push(delay),
+    )
+    .expect("the matching pair after the second rename loads");
+
+    assert!(!material.0.is_empty());
+    assert_eq!(reads, 3);
+    assert_eq!(
+        observed_delays,
+        [Duration::from_millis(1), Duration::from_millis(2)]
+    );
 }
 
 #[tokio::test]
