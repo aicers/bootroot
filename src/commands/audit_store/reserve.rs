@@ -2113,7 +2113,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::i18n::test_messages;
+    use crate::i18n::{Messages, test_messages};
 
     const DEFAULT_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
     const DEFAULT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -3686,6 +3686,121 @@ mod tests {
             }
             for forbidden in ["mkfs", "install ", "systemctl", "fallocate", "mkdir"] {
                 assert!(!text.contains(forbidden), "{forbidden} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_empty_underlying_store_names_the_retained_bind_exposure_in_both_locales() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let host = bare_host()
+            .entries(
+                STORE,
+                &[&format!("{STORE}/records"), &format!("{STORE}/openbao")],
+            )
+            .file(&format!("{STORE}/records"), dir_facts(TEST_UID, 0o700))
+            .file(&format!("{STORE}/openbao"), dir_facts(TEST_UID, 0o700));
+
+        let locales: [(&str, &[&str]); 2] = [
+            (
+                "en",
+                &[
+                    "bring-up is refused before the stack starts, so no container starts",
+                    "`create_host_path: false` governs creation only",
+                    "/var/lib/bootroot/audit-store/openbao already exists",
+                    "audit device writes on the root filesystem",
+                    "until the records are relocated onto the reserve",
+                    "Nothing was deleted, moved or mounted over",
+                    "a separate procedure this build does not provide",
+                    "`audit_store_enforcement = \"directory\"`",
+                ],
+            ),
+            (
+                "ko",
+                &[
+                    "스택을 시작하기 전에 기동이 거부되어 어떤 컨테이너도 시작되지 않습니다",
+                    "`create_host_path: false`는 생성만 통제합니다",
+                    "/var/lib/bootroot/audit-store/openbao가 이미 있고",
+                    "audit device는 루트 파일 시스템에 기록합니다",
+                    "레코드를 예약량으로 옮길 때까지 남습니다",
+                    "아무것도 삭제·이동되지 않았고 그 위로 마운트되지도 않았습니다",
+                    "이 빌드가 제공하지 않는 별도 절차입니다",
+                    "`audit_store_enforcement = \"directory\"`",
+                ],
+            ),
+        ];
+
+        for (locale, required_passages) in locales {
+            let messages = Messages::new(locale).expect("supported test locale");
+            let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+            let artifacts = render_artifacts(&inputs, &facts);
+            let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+            let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+
+            for passage in required_passages {
+                assert!(text.contains(passage), "{locale}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn manual_existing_records_passages_name_the_live_refusal_without_a_procedure() {
+        let manuals: [(&str, &str, &[&str]); 2] = [
+            (
+                "docs/en/operations.md",
+                "#### A store that already holds records",
+                &[
+                    "The same store is refused by `bootroot infra up`",
+                    "before the stack starts, so no container starts.",
+                    "`create_host_path: false` governs creation only",
+                    "until the records are relocated onto the reserve.",
+                    "Nothing is deleted, moved or mounted over",
+                    "a separate procedure this build does not provide",
+                ],
+            ),
+            (
+                "docs/ko/operations.md",
+                "#### 이미 레코드를 담고 있는 저장소",
+                &[
+                    "저장소는 실제 배포에서 `bootroot infra up`으로도 스택을 시작하기 전에 거부되므로",
+                    "거부되므로 어떤 컨테이너도 시작되지 않습니다.",
+                    "`create_host_path: false`는 생성만 통제하므로",
+                    "레코드를 예약량으로 옮길 때까지 이 노출은 남습니다.",
+                    "아무것도 삭제·이동되지 않고 그 위로 마운트되지도 않습니다.",
+                    "이 빌드가 제공하지 않는 별도 절차입니다",
+                ],
+            ),
+        ];
+
+        for (manual, heading, required_passages) in manuals {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(manual);
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            let (_, after_heading) = source
+                .split_once(heading)
+                .unwrap_or_else(|| panic!("{manual}: existing-records heading is absent"));
+            let passage = after_heading
+                .split("\n#### ")
+                .next()
+                .expect("heading always has a following passage");
+            let normalized = passage.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            for required in required_passages {
+                assert!(
+                    normalized.contains(required),
+                    "{manual}: missing {required:?}"
+                );
+            }
+            assert!(
+                !passage.contains("\n```"),
+                "{manual}: the existing-records passage must not add a relocation procedure"
+            );
+            for command in ["`mv ", "`cp ", "`rsync ", "`rm ", "`mount ", "`umount "] {
+                assert!(
+                    !passage.contains(command),
+                    "{manual}: the existing-records passage must not add a relocation command: {command}"
+                );
             }
         }
     }

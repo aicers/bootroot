@@ -1078,14 +1078,18 @@ hidden may be the only copy of records written before the reserve
 existed.
 
 A store that is not empty is reported as **provisioned, not activated**.
-Nothing is deleted, moved or mounted over; the three artifacts are still
-written, because the operator will need them; and **no phase-2 command
-whatever** is rendered, because a partial list is an invitation to keep
-going and the step it ends at mounts a filesystem over those records.
-There are two supported ways forward: relocate those records, a separate
-procedure this build does not provide, or configure
-`audit_store_enforcement = "directory"` and run without a kernel-enforced
-ceiling.
+The same store is refused by `bootroot infra up` on a live deployment
+before the stack starts, so no container starts. Nothing is deleted, moved
+or mounted over; the three artifacts are still written, because the
+operator will need them; and **no phase-2 command whatever** is rendered,
+because a partial list is an invitation to keep going and the step it ends
+at mounts a filesystem over those records. `create_host_path: false`
+governs creation only, so a failed-mount boot still binds an already
+present underlying `openbao/` and writes the audit device on the root
+filesystem until the records are relocated onto the reserve. There are two
+supported ways forward: relocate those records, a separate procedure this
+build does not provide, or configure `audit_store_enforcement =
+"directory"` and run without a kernel-enforced ceiling.
 
 The same refusal reaches `bootroot reinit` **before it wipes anything**.
 Reinit's pre-wipe preflight raises this surface's phase-1 refusals — a

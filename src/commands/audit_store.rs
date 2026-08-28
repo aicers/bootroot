@@ -3050,11 +3050,12 @@ mod tests {
         assert!(!fixture.image_path().exists());
     }
 
-    /// The re-run step names the command the run continues under, and
-    /// nothing on this surface tells an operator to reach for
-    /// `bootroot infra up`.
+    /// The re-run step names the command the run continues under. The
+    /// non-empty-store finding is the one deliberate exception: it
+    /// names the live `infra up` refusal without making it a re-run
+    /// instruction.
     #[test]
-    fn the_rerun_step_is_parameterised_and_never_names_infra_up() {
+    fn the_rerun_step_is_parameterised_while_the_non_empty_finding_names_infra_up() {
         for locale in ["en", "ko"] {
             let messages = Messages::new(locale).expect("a locale");
             let rendered = messages.audit_reserve_step_rerun(RESERVE_RERUN_COMMAND);
@@ -3067,12 +3068,16 @@ mod tests {
                 messages.audit_reserve_outcome_not_activated("/store"),
                 messages.audit_reserve_outcome_directory("/store", 1),
                 messages.audit_reserve_outcome_enforced("/img", 1, "u.mount", "/store"),
-                messages.audit_reserve_finding_store_not_empty("/store"),
                 messages.audit_reserve_steps_header().to_string(),
                 messages.audit_reserve_openbao_owner_caveat().to_string(),
             ] {
                 assert!(!text.contains("infra up"), "{locale}: {text}");
             }
+            let finding = messages.audit_reserve_finding_store_not_empty("/store");
+            assert!(
+                finding.contains("`bootroot infra up`"),
+                "{locale}: {finding}"
+            );
         }
     }
 }
