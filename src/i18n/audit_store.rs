@@ -648,6 +648,24 @@ impl Messages {
         )
     }
 
+    pub(crate) fn audit_reserve_finding_migration_holding_kind(
+        &self,
+        path: &str,
+        found: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_holding_kind,
+            &[("path", path), ("found", found)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_deferred(&self, refusal: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_deferred,
+            &[("refusal", refusal)],
+        )
+    }
+
     pub(crate) fn audit_reserve_finding_migration_forbidden_entry(
         &self,
         path: &str,

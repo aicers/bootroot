@@ -525,6 +525,21 @@ impl Phase1Facts {
     pub(crate) fn migration_open(&self) -> bool {
         self.migration.holding
     }
+
+    /// Whether the run may render anything that would change the store.
+    ///
+    /// Two states withhold everything. A **deferred** phase-1 refusal
+    /// describes a reserve that cannot be made, so no image command, no
+    /// unit and no copy over it is right. A store that still holds
+    /// content while the holding directory already exists is the
+    /// **collision**: mounting the reserve would hide those records,
+    /// the copy would move an unrelated tree onto it, and the rollback
+    /// would move the holding directory *inside* the store rather than
+    /// replacing it, which is what a rename onto an existing directory
+    /// does.
+    fn migration_renders_nothing(&self) -> bool {
+        !self.deferred.is_empty() || self.underlying == UnderlyingState::NotEmpty
+    }
 }
 
 /// What phase 1 found on the filesystem underneath an absent mount.
@@ -564,6 +579,16 @@ pub(crate) struct Phase1Facts {
     /// no other verdict is reached before it, and carried here so
     /// every later decision sees the same reading.
     pub(crate) migration: MigrationPresence,
+    /// Phase-1 refusals a run with an open migration carries instead of
+    /// raising, because **migration incomplete** is reported ahead of
+    /// them and overrides them.
+    ///
+    /// Never non-empty without [`MigrationPresence::holding`], and
+    /// while it is non-empty the migration outcome renders no
+    /// activation and no copy: the reserve those refusals describe
+    /// cannot be made, so every command that assumes it would be wrong,
+    /// and [`Self::image`] carries no meaning of its own.
+    pub(crate) deferred: Vec<String>,
 }
 
 /// One artifact phase 1 renders, staged beside the Compose override
@@ -1447,6 +1472,21 @@ fn preflight_free_space(
 /// that outstanding figure; and the underlying store's emptiness and
 /// size, checkable only while the mount is absent.
 ///
+/// **A holding directory changes what those refusals do, never what
+/// they are.** **migration incomplete** is reported before the image
+/// contract, the artifacts and the mount are considered and overrides
+/// all of them, so none of them may be what a run with an open
+/// migration reports: raising one would leave an operator who changed
+/// `audit_store_reserve_bytes` mid-window with a size-mismatch error,
+/// no mention of the holding directory that holds the only copy of
+/// those records, and no rollback. Every refusal from the reserve
+/// minimum onwards is therefore **deferred** while a migration is open
+/// — carried into [`Phase1Facts::deferred`] and reported as a finding
+/// under that outcome, which still fails the run — and only the
+/// derivations everything else is rendered from stay refusals, none of
+/// them reachable with a migration open, since the aside rename that
+/// opens one is itself rendered from them.
+///
 /// `bootroot reinit` raises exactly these refusals before it wipes:
 /// every one of them is a pure read, so running it twice costs nothing
 /// and decides nothing.
@@ -1460,7 +1500,9 @@ fn preflight_free_space(
 /// file or is the wrong size, a filesystem with less room than the
 /// outstanding allocation, an underlying store larger than the
 /// reserve, a read that failed for want of permission, or a byte
-/// figure that cannot be represented.
+/// figure that cannot be represented. With a holding directory
+/// present, every one of those but the derivations is returned in
+/// [`Phase1Facts::deferred`] instead.
 pub(crate) fn evaluate(
     inputs: &ReserveInputs<'_>,
     probe: &dyn ReserveProbe,
@@ -1473,24 +1515,76 @@ pub(crate) fn evaluate(
     // ordering the next run reports the reserve as enforced over an
     // audit trail stranded in a sibling directory.
     let migration = migration::detect(&store_dir, probe, messages)?;
-    check_reserve_minimum(inputs, messages)?;
+    // The three derivations everything downstream is rendered from,
+    // the migration outcome's own steps included. They stay refusals
+    // whatever the migration state, because there is nothing to render
+    // without them.
     check_store_path_renderable(inputs.store_dir, &store_dir, messages)?;
     check_staging_outside_store(&store_dir, inputs.compose_dir, messages)?;
     let image_path = derive_image_path(&store_dir, messages)?;
     let unit_name = mount_unit_name(&store_dir);
-    let image = evaluate_image(&image_path, inputs, probe, messages)?;
-    preflight_free_space(inputs, &image_path, image, probe, messages)?;
+
+    let mut deferred = Vec::new();
+    let open = migration.holding;
+    if let Err(err) = check_reserve_minimum(inputs, messages) {
+        defer_or_raise(err, open, &mut deferred)?;
+    }
+    // A refused image contract leaves no state to preflight the free
+    // space against: `outstanding_allocation` would answer for an
+    // image that is not the one on disk. So the preflight is skipped
+    // rather than run on a fiction, and the contract's own refusal is
+    // what the outcome names.
+    let image = match evaluate_image(&image_path, inputs, probe, messages) {
+        Ok(image) => Some(image),
+        Err(err) => {
+            defer_or_raise(err, open, &mut deferred)?;
+            None
+        }
+    };
+    if let Some(image) = image
+        && let Err(err) = preflight_free_space(inputs, &image_path, image, probe, messages)
+    {
+        defer_or_raise(err, open, &mut deferred)?;
+    }
     let mount = evaluate_mount(&store_dir, &image_path, probe, messages)?;
-    let underlying = evaluate_underlying(&store_dir, inputs, &mount, probe, messages)?;
+    let underlying = match evaluate_underlying(&store_dir, inputs, &mount, probe, messages) {
+        Ok(state) => state,
+        Err(err) => {
+            defer_or_raise(err, open, &mut deferred)?;
+            // The only refusal it raises over a readable store is that
+            // the store underneath is larger than the reserve, which is
+            // a store that still holds records — the collision the
+            // migration outcome refuses to render anything over.
+            UnderlyingState::NotEmpty
+        }
+    };
     Ok(Phase1Facts {
         store_dir,
         image_path,
         unit_name,
-        image,
+        // Read only where `deferred` is empty: a refused image contract
+        // has no state to report, and every renderer is withheld while
+        // that refusal stands.
+        image: image.unwrap_or(ImageEvaluation::Absent),
         mount,
         underlying,
         migration,
+        deferred,
     })
+}
+
+/// Carries a phase-1 refusal into the migration outcome, or raises it.
+///
+/// The refusal is the same either way; what an open migration changes
+/// is that **migration incomplete** is reported ahead of it and
+/// overrides it, so it is named as a finding under that outcome rather
+/// than being what the run reports. The run fails under either.
+fn defer_or_raise(err: anyhow::Error, open: bool, deferred: &mut Vec<String>) -> Result<()> {
+    if !open {
+        return Err(err);
+    }
+    deferred.push(err.to_string());
+    Ok(())
 }
 
 /// Returns where the three artifacts are staged.
@@ -2287,6 +2381,33 @@ fn migration_report(
     if facts.underlying == UnderlyingState::NotEmpty {
         findings.push(messages.audit_reserve_finding_migration_store_not_empty(&store, &holding));
     }
+    for refusal in &facts.deferred {
+        findings.push(messages.audit_reserve_finding_migration_deferred(refusal));
+    }
+    if facts.migration.migrated {
+        findings.push(messages.audit_reserve_finding_migration_path_exists(&migrated));
+    }
+    if facts.migration_renders_nothing() {
+        // Neither state leaves an activation or a copy that would be
+        // right to render: the deferred refusal describes a reserve
+        // that cannot be made, and the collision describes a store
+        // whose records a mount would hide and a copy would not be
+        // reading. The rollback survives the first — the store under
+        // an open migration is the empty mount point the aside rename
+        // left — and not the second, where `mv` onto a directory that
+        // exists moves the source inside it rather than replacing it,
+        // which is a store nested in a store.
+        let mut steps = vec![rerun_step(inputs, messages)];
+        if facts.underlying != UnderlyingState::NotEmpty {
+            steps.push(migration::rollback_step(
+                &facts.store_dir,
+                &facts.migration.paths.holding,
+                messages,
+            ));
+        }
+        return Ok(ReserveReport::MigrationIncomplete { findings, steps });
+    }
+
     let verdict = migration::assess_copy(
         &facts.store_dir,
         &facts.migration.paths.holding,
@@ -2297,11 +2418,9 @@ fn migration_report(
     findings.extend(migration::verdict_findings(&verdict, messages));
     // The closing rename cannot be rendered onto a path that already
     // exists, so the whole copy is refused rather than started against
-    // one and stopped at the far end.
+    // one and stopped at the far end. Its finding is already in the
+    // list above, where the two withheld states can reach it too.
     let closing_blocked = facts.migration.migrated;
-    if closing_blocked {
-        findings.push(messages.audit_reserve_finding_migration_path_exists(&migrated));
-    }
 
     // The activation comes from the existing phase-2 renderer rather
     // than from a second copy written here, with exactly one step
@@ -2835,6 +2954,7 @@ mod tests {
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
             migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         let unit = String::from_utf8(artifacts.first().expect("the unit").contents.clone())
@@ -2903,6 +3023,7 @@ mod tests {
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
             migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         assert_eq!(artifacts.len(), 3);
@@ -3313,6 +3434,7 @@ mod tests {
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
             migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         }
     }
 
@@ -3853,6 +3975,7 @@ mod tests {
             mount: MountEvaluation::Reserve { stacked: false },
             underlying: UnderlyingState::NotVisible,
             migration: MigrationPresence::none(Path::new(STORE)),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         let mut host = mounted_host("/dev/loop0", "ext4", Some(IMAGE))
@@ -4841,6 +4964,148 @@ mod tests {
                     assert!(joined.contains(needle), "{joined}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_holding_path_beside_a_store_that_still_holds_records_renders_nothing() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        // The collision: `<store>.pre-mount` already there while the
+        // store itself still holds its records. Either the aside
+        // rename never ran and the path was already occupied, or both
+        // writers were left up. The mount is absent, so without this
+        // refusal the activation would be rendered and its
+        // `systemctl enable --now` would mount the reserve over those
+        // records.
+        let host = with_holding(bare_host(), 8)
+            .entries(STORE, &[&format!("{STORE}/records")])
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 40,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        assert!(facts.migration_open());
+        assert_eq!(facts.underlying, UnderlyingState::NotEmpty);
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        // No activation, no copy, no rename in either direction —
+        // mounting would hide the records, the copy would move an
+        // unrelated tree onto the reserve, and `mv <holding> <store>`
+        // onto a directory that exists moves the source inside it.
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![Phase2StepKind::ReRun],
+            "{steps:?}"
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains(HOLDING), "{joined}");
+        assert!(joined.contains(STORE), "{joined}");
+        let report = ReserveReport::MigrationIncomplete { findings, steps };
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("migration incomplete"), "{text}");
+        for forbidden in ["systemctl enable --now", "cp -a", "mv "] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_open_migration_reports_its_outcome_ahead_of_a_phase_one_refusal() {
+        // `audit_store_reserve_bytes` changed while the migration was
+        // open. The image contract refuses that outright, and without
+        // this the operator meets a size-mismatch error naming neither
+        // the holding directory that holds the only copy of those
+        // records nor the way back out of it.
+        let halved = Fixture {
+            reserve_bytes: DEFAULT_RESERVE / 2,
+            ..Fixture::default()
+        };
+        let inputs = halved.inputs();
+        let messages = test_messages();
+        let image = image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE, TEST_UID, IMAGE_FILE_MODE);
+
+        // The same refusal, on the same host, without the holding
+        // directory: still what the run reports.
+        let (base, _, _) = activated_host(&halved);
+        let error = evaluate(&inputs, &base.file(IMAGE, image), &messages).expect_err("refused");
+        assert!(error.to_string().contains(IMAGE), "{error}");
+
+        let (base, _, _) = migrating_host(&halved, 8);
+        let host = base.file(IMAGE, image);
+        let facts = evaluate(&inputs, &host, &messages).expect("the migration outcome overrides");
+        assert!(facts.migration_open());
+        assert_eq!(facts.deferred.len(), 1, "{:?}", facts.deferred);
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (findings, steps) = migration_report_of(&halved, &facts, &artifacts, &host);
+        // The refusal is named, not raised, and what is left is the
+        // rollback: the reserve it describes cannot be made, so no
+        // image command, no unit and no copy over it is right.
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+            "{steps:?}"
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains(HOLDING), "{joined}");
+        assert!(joined.contains(&DEFAULT_RESERVE.to_string()), "{joined}");
+        let report = ReserveReport::MigrationIncomplete { findings, steps };
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("migration incomplete"), "{text}");
+        // Command shapes rather than words: the refusal's own prose
+        // names resizing and reformatting to say they never happen.
+        for forbidden in [
+            "truncate -s",
+            "mkfs.ext4",
+            "systemctl enable --now",
+            "cp -a",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_holding_path_that_is_not_a_directory_refuses_the_copy() {
+        let fixture = Fixture::default();
+        // `cp -a --one-file-system <holding>/. <store>/` resolves the
+        // `/.`, so a link here is followed and whatever it names is
+        // copied into the reserve. The rendered type guard cannot
+        // catch it: `find <link> -xdev -mindepth 1` neither descends
+        // the link nor reports it, and exits zero.
+        for (kind, needle) in [
+            (FileKind::Symlink, "a symbolic link"),
+            (FileKind::Regular, "a regular file"),
+            (FileKind::Other, "neither a regular file nor a directory"),
+        ] {
+            let (base, facts, artifacts) = migrating_host(&fixture, 8);
+            // The tree under it is intact and would otherwise fit, so
+            // only the root's own type can be what refuses this.
+            let host = base.file(
+                HOLDING,
+                FileFacts {
+                    kind,
+                    ino: 90,
+                    ..dir_facts(TEST_UID, 0o777)
+                },
+            );
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            for withheld in [
+                Phase2StepKind::TypeGuard,
+                Phase2StepKind::Copy,
+                Phase2StepKind::Verify,
+                Phase2StepKind::ClosingRename,
+            ] {
+                assert!(
+                    !steps.iter().any(|step| step.kind == withheld),
+                    "{withheld:?} rendered over a holding path that is {needle}: {steps:?}"
+                );
+            }
+            let joined = findings.join("\n");
+            assert!(joined.contains(HOLDING), "{joined}");
+            assert!(joined.contains(needle), "{joined}");
         }
     }
 

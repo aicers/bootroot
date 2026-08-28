@@ -677,6 +677,8 @@ pub(crate) struct Strings {
     pub(crate) audit_reserve_finding_migration_path_exists: &'static str,
     pub(crate) audit_reserve_finding_migration_mount_absent: &'static str,
     pub(crate) audit_reserve_finding_migration_mount_point: &'static str,
+    pub(crate) audit_reserve_finding_migration_holding_kind: &'static str,
+    pub(crate) audit_reserve_finding_migration_deferred: &'static str,
     pub(crate) audit_reserve_finding_migration_forbidden_entry: &'static str,
     pub(crate) audit_reserve_finding_migration_arithmetic: &'static str,
     pub(crate) audit_reserve_finding_migration_capacity_fits: &'static str,
@@ -1047,11 +1049,16 @@ mod tests {
     /// makes the message actionable, and the outcome is decided in Rust
     /// rather than by reading the text, so nothing else would notice.
     #[test]
+    // A table of every migration template against every locale: one
+    // entry per message, and the length is the table's rather than a
+    // function that grew.
+    #[allow(clippy::too_many_lines)]
     fn migration_templates_substitute_in_every_locale() {
         const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
         const STORE: &str = "/var/lib/bootroot/audit-store";
         const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
         const RETAINED_IMAGE: &str = "/var/lib/bootroot/audit-store.img.old";
+        const REFUSAL: &str = "the image is 1 byte and the reserve is 2.";
         const AVAILABLE: u64 = 1_000;
         const SOURCE: u64 = 2_000;
         const MARGIN: u64 = 3_000;
@@ -1059,7 +1066,7 @@ mod tests {
         for locale in ["en", "ko"] {
             let m = Messages::new(locale).unwrap();
             let figure = m.audit_reserve_figure_available(STORE);
-            let cases: [(String, Vec<String>); 13] = [
+            let cases: [(String, Vec<String>); 15] = [
                 (
                     m.audit_reserve_outcome_migration_incomplete(STORE),
                     vec![STORE.to_string()],
@@ -1094,6 +1101,20 @@ mod tests {
                         HOLDING.to_string(),
                         m.audit_reserve_kind_symlink().to_string(),
                     ],
+                ),
+                (
+                    m.audit_reserve_finding_migration_holding_kind(
+                        HOLDING,
+                        m.audit_reserve_kind_symlink(),
+                    ),
+                    vec![
+                        HOLDING.to_string(),
+                        m.audit_reserve_kind_symlink().to_string(),
+                    ],
+                ),
+                (
+                    m.audit_reserve_finding_migration_deferred(REFUSAL),
+                    vec![REFUSAL.to_string()],
                 ),
                 (
                     m.audit_reserve_finding_migration_arithmetic(&figure),

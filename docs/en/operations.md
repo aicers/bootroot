@@ -1181,6 +1181,40 @@ exists, bootroot renders no rename and fails naming the path: `mv dir
 dir.pre-mount` onto an existing directory does not replace it, it moves
 the source *inside* it, and the next copy would then read the wrong tree.
 
+**Three states put the outcome up and take every command away.** In each
+of them the run still reports **migration incomplete** and still fails;
+what it renders is the re-run alone, or the re-run and the rollback.
+
+- **`<audit_store_dir>.pre-mount` beside a store that still holds
+  content.** Either the aside rename never ran and the path was already
+  occupied, or both writers were left up. Nothing bootroot could render
+  is safe: activating the reserve would mount over those records, the
+  copy would move an unrelated tree onto it, and the rollback would move
+  the holding directory *inside* the store rather than replacing it. Not
+  even the rollback is rendered here. Stop both writers, move whichever
+  of the two paths is not the store's records out of the way by hand,
+  and run the command again.
+- **A holding path that is not a directory.** The copy ends in
+  `<audit_store_dir>.pre-mount/.`, and `cp` resolves that suffix however
+  the path before it is spelled — so a symbolic link there is followed
+  and whatever tree it names is copied into the reserve as audit data.
+  The type guard cannot close it either: `find` neither descends a link
+  named on its command line nor reports the link itself, so it exits
+  zero over exactly the entry that must be refused. bootroot refuses it
+  against an `lstat` of the path itself, before anything is measured,
+  walked or rendered. The rollback is still offered.
+- **A phase-1 refusal raised while the migration is open** — most often
+  `audit_store_reserve_bytes` changed mid-window, which the image
+  contract refuses outright. **migration incomplete** is reported ahead
+  of the image contract, the artifacts and the mount and overrides all
+  of them, so the refusal is named as a finding under that outcome
+  rather than being what the run reports. It would otherwise leave you
+  with a size-mismatch error naming neither the holding directory that
+  holds the only copy of those records nor the way back out of it. No
+  activation and no copy is rendered while it stands: the reserve it
+  describes cannot be made. Put the configuration back as it was and run
+  the command again, or take the rollback.
+
 **While a holding directory exists bootroot creates nothing on the
 mounted store, and no rendered step creates anything there either.** The
 subdirectory step — the `mkdir`, `chmod` and `chown` of `records/` and

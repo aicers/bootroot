@@ -198,6 +198,13 @@ pub(super) enum CopyVerdict {
     /// measurement, the copy and the verification would cover
     /// different sets.
     MountPoint { path: String },
+    /// The holding path is not a directory. Refused before anything is
+    /// walked, measured or rendered: `cp -a <holding>/. <store>/`
+    /// resolves the `/.` suffix, so a symbolic link there is the one
+    /// entry the type guard cannot catch — `find <link> -mindepth 1`
+    /// does not descend it and exits zero — and the copy would move
+    /// whatever it points at into the reserve as audit data.
+    HoldingNotDirectory { path: String, kind: &'static str },
     /// The holding directory holds a symbolic link, a device node, a
     /// FIFO or a socket. Refused.
     ForbiddenEntry { path: String, kind: &'static str },
@@ -255,6 +262,16 @@ pub(super) fn assess_copy(
     probe: &dyn ReserveProbe,
     messages: &Messages,
 ) -> Result<CopyVerdict> {
+    // The holding path itself, before anything below walks, measures
+    // or renders from it. `lstat` rather than `stat`, so a symbolic
+    // link is seen as one: the walk here would follow it, and the
+    // rendered copy's `/.` suffix would too.
+    if let Some(kind) = holding_root_kind(holding, probe, messages)? {
+        return Ok(CopyVerdict::HoldingNotDirectory {
+            path: display_path(holding),
+            kind: kind_text(kind, messages),
+        });
+    }
     if let Some(path) = mount_point_at_or_under(holding, probe, messages)? {
         return Ok(CopyVerdict::MountPoint {
             path: display_path(&path),
@@ -361,6 +378,29 @@ fn mount_points(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Returns the holding path's kind when it is not a real directory.
+///
+/// The rendered copy is `cp -a --one-file-system <holding>/. <store>/`,
+/// and the `/.` suffix is resolved by `cp` however the path before it
+/// is spelled — so a symbolic link at the holding path is followed and
+/// whatever tree it names is copied into the reserve as audit data.
+/// The rendered type guard cannot close that: `find <link> -xdev
+/// -mindepth 1` neither descends a link given on its command line nor
+/// reports the link itself, so it exits zero over exactly the entry
+/// that must be refused. The refusal therefore has to be made here,
+/// against `lstat` of the path itself, before the walk below follows
+/// it and before any figure is measured through it.
+fn holding_root_kind(
+    root: &Path,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<Option<FileKind>> {
+    let Some(facts) = lstat_named(probe, root, messages)? else {
+        return Ok(None);
+    };
+    Ok((facts.kind != FileKind::Directory).then_some(facts.kind))
+}
+
 /// Returns the first entry under `root` that is neither a directory nor
 /// a regular file.
 ///
@@ -389,6 +429,13 @@ fn first_forbidden_entry(
     let Some(root_facts) = lstat_named(probe, root, messages)? else {
         return Ok(None);
     };
+    // The root is refused by [`holding_root_kind`] before this is
+    // reached, and it is refused here too rather than assumed: the
+    // listing below follows a symbolic link at `root`, so the walk
+    // must not depend on a caller having checked first.
+    if root_facts.kind != FileKind::Directory {
+        return Ok(Some((root.to_path_buf(), root_facts.kind)));
+    }
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let mut entries = probe
@@ -637,6 +684,9 @@ pub(super) fn verdict_findings(verdict: &CopyVerdict, messages: &Messages) -> Ve
         }
         CopyVerdict::MountPoint { path } => {
             vec![messages.audit_reserve_finding_migration_mount_point(path)]
+        }
+        CopyVerdict::HoldingNotDirectory { path, kind } => {
+            vec![messages.audit_reserve_finding_migration_holding_kind(path, kind)]
         }
         CopyVerdict::ForbiddenEntry { path, kind } => {
             vec![messages.audit_reserve_finding_migration_forbidden_entry(path, kind)]
