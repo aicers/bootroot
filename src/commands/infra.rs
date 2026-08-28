@@ -166,16 +166,13 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         .unwrap_or(Path::new("."));
     let state_path = StateFile::default_path();
     let openbao_override = resolve_openbao_exposed_override(&state_path, compose_dir, messages)?;
-    // The audit override, when this host's recorded registrar predicate
-    // is enabled. `infra up` reads no configuration: the rendered
-    // override names its own bind source, so it is the record of what
-    // `bootroot init` resolved. The store directory it names is held to
-    // the store directory contract — the one check an unprivileged
-    // process can make, since it may not descend into a root-owned
-    // `0700` store.
-    let audit_override = crate::commands::audit_store::resolve_audit_override(
+    // This runs before even a Compose pull. Filesystem mode renders and
+    // verifies the reserve phases here and refuses every result short of
+    // enforced, so Docker cannot start OpenBao against an unmounted store.
+    let audit_override = crate::commands::audit_store::prepare_audit_store_for_infra_up(
         &state_path,
         compose_dir,
+        args.agent_config.as_deref(),
         crate::commands::audit_store::production_uid(),
         messages,
     )?;

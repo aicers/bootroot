@@ -614,15 +614,12 @@ EOF
 # unit, runs no `systemctl` and mounts nothing.  It renders those as
 # commands and stops.
 #
-# This is also the boot-path containment case, with the mount unit not
+# This is also the boot-path containment setup, with the mount unit not
 # enabled: no bootroot code path creates `<audit_store_dir>/openbao` or
 # `records/`, none runs a mount-establishing command, and no run reports
-# **enforced**.  What Docker and the OpenBao container would do against
-# an unmounted store is **deliberately not asserted** here.  The rendered
-# Compose override is left byte-identical by this change, so a container
-# brought back by `restart: always` still has Docker manufacture the bind
-# source under the empty mount point; closing that is the bind guard's,
-# and it belongs to the installer fail-closed issue rather than here.
+# **enforced**. The rendered override's `create_host_path: false` guard
+# is asserted below. This setup does not itself start OpenBao against the
+# absent source, because it exists to hold the provisioning boundary.
 assert_filesystem_mode_stops_before_it_touches_the_host() {
   local store config log artifacts unit
   store="$AUDIT_STORE_BASE/reserve-store"
@@ -722,6 +719,9 @@ assert_filesystem_mode_stops_before_it_touches_the_host() {
   done
   pass "bootroot installed no unit and no drop-in"
 
+  assert_infra_up_refuses_an_unmounted_store "$config" "$store"
+  assert_the_audit_bind_guard_boundaries "$store"
+
   # Leave the compose directory as `run_init` expects to find it: the
   # artifacts above belong to a store this scenario does not go on to
   # use.  Both were created by the root-run `init`, so both need `sudo`
@@ -729,6 +729,83 @@ assert_filesystem_mode_stops_before_it_touches_the_host() {
   # aborts the run.
   sudo -n rm -rf "$artifacts" "$store"
   remove_rendered_audit_override
+}
+
+# `infra up` owns the live-deployment refusal.  Start with no OpenBao
+# container, then drive that public command rather than Compose directly:
+# a successful return or even a newly-created container would mean the
+# audit-store preparation reached Docker too late.
+assert_infra_up_refuses_an_unmounted_store() {
+  local config="$1" store="$2" log status
+  log="$ARTIFACT_DIR/infra-up-unmounted-store.log"
+
+  instance_compose stop openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not stop OpenBao before testing infra up's unmounted-store refusal"
+  instance_compose rm -f openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not remove OpenBao before testing infra up's unmounted-store refusal"
+
+  if run_bootroot_as_root infra up \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --agent-config "$config" \
+    --openbao-url "https://localhost:${PORT_OPENBAO}" \
+    </dev/null >"$log" 2>&1; then
+    fail "infra up succeeded against the unmounted audit store; see $log"
+  fi
+  grep -q "provisioned, not activated" "$log" ||
+    fail "infra up did not report provisioned, not activated; see $log"
+  if docker inspect "${INSTANCE}-openbao" >>"$RUN_LOG" 2>&1; then
+    status="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.Status}}' 2>>"$RUN_LOG")"
+    fail "infra up created an OpenBao container (${status}) before refusing the unmounted store"
+  fi
+  sudo -n test ! -e "$store/openbao" ||
+    fail "infra up created $store/openbao before refusing the unmounted store"
+  pass "infra up refuses the unmounted store before creating an OpenBao container"
+}
+
+# Exercises both sides of Compose's bind-source guard against the
+# unmounted store that the preceding filesystem-mode setup produced.
+#
+# With no `openbao/` below the mount point, Docker must refuse the bind
+# and leave the source absent. An older host does have that directory on
+# the underlying filesystem; Compose then binds it and OpenBao starts.
+# That second result is the retained residual, and relocation onto the
+# reserve is what retires it.
+assert_the_audit_bind_guard_boundaries() {
+  local store="$1" override status
+  override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+
+  instance_compose stop openbao >>"$RUN_LOG" 2>&1 || fail "could not stop OpenBao before testing its guarded bind"
+  instance_compose rm -f openbao >>"$RUN_LOG" 2>&1 || fail "could not remove OpenBao before testing its guarded bind"
+
+  if instance_compose -f "$override" up -d --no-deps openbao >>"$RUN_LOG" 2>&1; then
+    fail "OpenBao started even though its guarded audit bind source was absent"
+  fi
+  status="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.Status}}' 2>>"$RUN_LOG" || true)"
+  [ "$status" != "running" ] ||
+    fail "OpenBao is running despite its absent guarded audit bind source"
+  sudo -n test ! -e "$store/openbao" ||
+    fail "Docker created $store/openbao despite create_host_path: false"
+  pass "an absent audit bind source prevents OpenBao from starting and stays absent"
+
+  sudo -n install -d -m 0700 "$store/openbao" ||
+    fail "could not create the pre-existing audit bind source fixture"
+  instance_compose -f "$override" up -d --no-deps openbao >>"$RUN_LOG" 2>&1 ||
+    fail "OpenBao did not start when the underlying audit bind source existed"
+  wait_for_openbao_listening
+  status="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.Status}}' 2>>"$RUN_LOG" || true)"
+  [ "$status" = "running" ] ||
+    fail "OpenBao did not remain running over the pre-existing audit bind source"
+  pass "a pre-existing audit bind source remains the documented boot-path residual"
+
+  instance_compose -f "$override" stop openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not stop the pre-existing-source OpenBao fixture"
+  instance_compose -f "$override" rm -f openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not remove the pre-existing-source OpenBao fixture"
+  sudo -n rm -rf "$store/openbao" ||
+    fail "could not remove the pre-existing audit bind source fixture"
+  instance_compose up -d openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not restore OpenBao's ordinary audit volume after the bind-guard test"
+  wait_for_openbao_listening
 }
 
 # Removes the Compose override the run above rendered.
@@ -1460,6 +1537,7 @@ run_infra_up_over_the_initialised_deployment() {
   log "running 'infra up' over the initialised deployment"
   run_bootroot infra up \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --agent-config "$AGENT_CONFIG_FILE" \
     --openbao-url "https://localhost:${PORT_OPENBAO}" \
     >>"$RUN_LOG" 2>&1 || fail "infra up failed after init"
   pass "'infra up' completed over the initialised deployment"
@@ -1519,8 +1597,12 @@ assert_the_audit_override_binds_the_store() {
   [ -f "$override" ] || fail "no audit compose override was rendered at $override"
   grep -q "volumes: !override" "$override" ||
     fail "the audit override does not replace the volumes list"
-  grep -qF "${AUDIT_STORE_DIR}/openbao:${OPENBAO_AUDIT_CONTAINER_DIR}" "$override" ||
+  grep -qF "source: '${AUDIT_STORE_DIR}/openbao'" "$override" ||
     fail "the audit override does not bind ${AUDIT_STORE_DIR}/openbao"
+  grep -qF "target: ${OPENBAO_AUDIT_CONTAINER_DIR}" "$override" ||
+    fail "the audit override moved the OpenBao audit path"
+  grep -q "create_host_path: false" "$override" ||
+    fail "the audit override lets Docker create an absent audit bind source"
   grep -qF "openbao-data:/openbao/file" "$override" ||
     fail "the audit override dropped OpenBao's storage mount"
   grep -qF "./openbao:/openbao/config:ro" "$override" ||
@@ -1885,9 +1967,9 @@ fold_unit_list() {
 # That is a different set of failures: the bind source is a directory
 # inside a mounted filesystem whose root the *operator* chmods by hand,
 # its `openbao/` is root-owned `0700` until the compose entrypoint
-# chowns it, an unprivileged `bootroot infra up` has to accept the store
-# it finds there, and the mount has to still be under the container
-# after the stack is restarted over it.
+# chowns it, the root-run `bootroot infra up` has to accept the store it
+# finds there, and the mount has to still be under the container after
+# the stack is restarted over it.
 #
 # Run last, and deliberately.  It moves this deployment's audit device
 # off the `directory`-mode store every assertion above is about, and it
@@ -1980,20 +2062,23 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
     log "docker.service is not a systemd unit on this host; the loaded-ordering assertion is skipped"
   fi
 
-  # The bring-up that moves the device.  Unprivileged, like every other
-  # `infra up` in this scenario: it reads the bind source back out of
-  # the override this run rendered and checks the store directory that
-  # names -- which, with the reserve up, is the *mounted filesystem's
-  # root*.  `mkfs.ext4` leaves that root at `0755` and the store
-  # contract is `0700`, so this is also where the rendered `chmod 0700`
-  # on `audit_store_dir` earns its place: without it the bring-up
-  # refuses the store the run it followed had just reported enforced.
+  # The bring-up that moves the device. Filesystem-mode phase 1 renders
+  # artifacts under the root-owned staging directory from the preceding
+  # root-run init, so this command runs as root too. It reads the bind
+  # source back out of the override this run rendered and checks the
+  # store directory that names -- which, with the reserve up, is the
+  # *mounted filesystem's root*. `mkfs.ext4` leaves that root at `0755`
+  # and the store contract is `0700`, so this is also where the rendered
+  # `chmod 0700` on `audit_store_dir` earns its place: without it the
+  # bring-up refuses the store the run it followed had just reported
+  # enforced.
   log "bringing the stack up on the mounted reserve"
-  run_bootroot infra up \
+  run_bootroot_as_root infra up \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --agent-config "$config" \
     --openbao-url "https://localhost:${PORT_OPENBAO}" \
     >>"$RUN_LOG" 2>&1 || fail "infra up failed over the mounted reserve; see $RUN_LOG"
-  pass "an unprivileged bring-up accepted the mounted reserve as the store"
+  pass "a root-run bring-up accepted the mounted reserve as the store"
 
   assert_equal "the container's ${OPENBAO_AUDIT_CONTAINER_DIR} is a bind mount of the mounted reserve" \
     "bind ${store}/openbao" "$(container_audit_bind)"
@@ -2028,8 +2113,9 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   log_before="$(sudo -n stat -c %s "$store/openbao/audit.log")"
   instance_compose stop >>"$RUN_LOG" 2>&1 || fail "could not stop the stack over the mounted reserve"
   log "bringing the stack back up over the mounted reserve"
-  run_bootroot infra up \
+  run_bootroot_as_root infra up \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --agent-config "$config" \
     --openbao-url "https://localhost:${PORT_OPENBAO}" \
     >>"$RUN_LOG" 2>&1 || fail "infra up failed after the stack restart; see $RUN_LOG"
   started_after="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.StartedAt}}' 2>>"$RUN_LOG" || true)"

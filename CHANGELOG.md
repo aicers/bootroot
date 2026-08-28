@@ -111,6 +111,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- On endpoint-enabled deployments, `bootroot infra up` now requires the
+  daemon's `--agent-config` and refuses to start the Compose stack until a
+  `filesystem` audit-store reserve is enforced. The generated OpenBao audit
+  bind also refuses to create a missing host directory at boot, making a
+  failed mount visible as an OpenBao outage instead of silently writing audit
+  output to the root filesystem. The guard does not cover a pre-existing
+  underlying `openbao/` directory; its contents must be relocated to retire
+  that residual exposure. `audit_store_enforcement = "directory"` remains the
+  explicit opt-out.
 - `bootroot-agent` now publishes an issued certificate and its key only
   after the returned chain has been verified against `[trust]
   trusted_ca_sha256` and merged into `[trust] ca_bundle_path`. The leaf

@@ -656,9 +656,10 @@ error.
   `openbao/` for OpenBao's file audit output. A relative path is refused.
   This key is the **single definition** of where the store is: nothing
   records a second copy of it. The install side reads it through
-  `bootroot init --agent-config <path>`, which is required on a host
-  whose registrar endpoint is enabled, so this file must exist before
-  that run. See
+  `bootroot init --agent-config <path>` and
+  `bootroot infra up --agent-config <path>`, which are required on a host
+  whose registrar endpoint is enabled (or still has an audit override),
+  so this file must exist before either run. See
   [The shared audit store](operations.md#the-shared-audit-store).
 - `audit_store_reserve_bytes` (`u64`, default `2147483648`, 2 GiB) — the
   shared-store budget. It must not exceed `i64::MAX`. Under the default

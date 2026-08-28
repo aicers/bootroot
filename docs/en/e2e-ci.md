@@ -225,16 +225,17 @@ is about and ends by filling the reserve out from under a running container. It
 removes the rendered override naming the old store first — `bootroot init`
 refuses a run whose `--agent-config` resolves a different one — activates a
 reserve of its own exactly as the second part does, and then brings the stack up
-on it with an unprivileged `bootroot infra up`. That bring-up is itself an
-assertion: it reads the bind source out of the override and checks the store
-directory it names, which with the mount up is the *mounted filesystem's root*,
-so a run that had not restated `chmod 0700` on `audit_store_dir` in step 4 is
-refused here by the very command that follows it. It then asserts that the
-container's `/openbao/audit` is a bind mount of the mounted store, that both
-subdirectories and the audit log itself sit on the mounted filesystem, and that
-`assert_openbao_audit_log` — the same shared assertion, unchanged — passes over
-that device. The ordering the automatic boot path rests on is read back off the
-unit systemd actually loaded rather than off the file that was installed:
+on it with a root-run `bootroot infra up` so phase 1 can replace the staged
+artifacts. That bring-up is itself an assertion: it reads the bind source out
+of the override and checks the store directory it names, which with the mount
+up is the *mounted filesystem's root*, so a run that had not restated
+`chmod 0700` on `audit_store_dir` in step 4 is refused here by the very command
+that follows it. It then asserts that the container's `/openbao/audit` is a
+bind mount of the mounted store, that both subdirectories and the audit log
+itself sit on the mounted filesystem, and that `assert_openbao_audit_log` — the
+same shared assertion, unchanged — passes over that device. The ordering the
+automatic boot path rests on is read back off the unit systemd actually loaded
+rather than off the file that was installed:
 `docker.service` wants the mount unit and is ordered after it, and carries no
 hard relation to it, which is the residual both manuals state rather than a
 stronger guarantee. The stack is then stopped and brought back up over the

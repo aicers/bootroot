@@ -818,6 +818,10 @@ pub(crate) struct InfraUpArgs {
     #[command(flatten)]
     pub(crate) compose_file: ComposeFileArgs,
 
+    /// Agent configuration for an endpoint-enabled audit store.
+    #[arg(long)]
+    pub(crate) agent_config: Option<PathBuf>,
+
     /// Comma-separated list of services to start
     // Keep "bootroot-http01" in sync with RESPONDER_SERVICE_NAME.
     #[arg(

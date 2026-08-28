@@ -218,6 +218,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         compose_file: ComposeFileArgs {
             compose_file: compose_file.clone(),
         },
+        agent_config: None,
         services: vec![OPENBAO_COMPOSE_SERVICE.to_string()],
         image_archive_dir: None,
         restart_policy: "always".to_string(),

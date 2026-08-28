@@ -752,16 +752,20 @@ bootroot는 모드를 추론하지 않고, 한쪽에서 다른 쪽으로 물러�
 **성공**입니다. 실행은 0으로 끝나고, 예약량은 운영자 자신의 쿼터 외에는
 아무것도 지켜 주지 않는 상태로 남습니다.
 
-**설치 측에서 값을 읽는 방법.** `bootroot init --agent-config <path>`는
-운영자의 `bootroot-agent` 설정 파일을 지정합니다. `init`이 내부 자격
+**설치 측에서 값을 읽는 방법.** `bootroot init --agent-config <path>`와
+`bootroot infra up --agent-config <path>`는 운영자의 `bootroot-agent` 설정
+파일을 지정합니다. `init`이 내부 자격
 증명 디렉터리에 생성하는 bootroot 내부용 `agent.toml`이 아닙니다.
-`init`은 이 파일에서 정확히 두 테이블만 읽습니다. 저장소 위치를 위한
+두 명령은 이 파일에서 정확히 두 테이블만 읽습니다. 저장소 위치를 위한
 `[registrar]`와, `state.json`과 교차 확인할 활성화 값을 위한
 `[registrar_endpoint]`입니다. 이 플래그는 `state.json`이 레지스트라
 엔드포인트를 활성으로 기록한 실행과, 렌더링된 audit compose 오버라이드가
 디스크에 존재하는 실행에서 **필수**입니다. 그런 실행에서 플래그를
 생략하면 오류이며 아무것도 생성·렌더링·삭제되지 않습니다. 따라서 데몬의
-설정 파일이 그런 실행보다 먼저 존재해야 합니다.
+설정 파일이 엔드포인트를 활성화한 bring-up보다 먼저 존재해야 합니다.
+엔드포인트를 한 번도 활성화하지 않았고 오버라이드도 없는 호스트에서는
+`infra up`에 이 플래그가 필요 없습니다. 설정 파일을 열거나 예약량 경로를
+검사하거나 audit-store 결과를 출력하지도 않습니다.
 
 **`bootroot init`이 하는 일.** 엔드포인트가 활성인 호스트에서
 `audit_store_dir`을 생성하고, `<audit_store_dir>/openbao`를
@@ -791,8 +795,30 @@ init`은 `audit_store_dir` 위의 기존 경로 구성요소가 모두 심볼릭
 **두 명령 모두 저장소를 고치지 않습니다.** `bootroot init`은 기존
 `audit_store_dir`과 `records/`를 위 계약에 비추어 검사하고, 경로와 발견한
 상태, 그리고 이를 고치는 `chown 0:0` / `chmod 0700`을 알리며 실패합니다.
-`bootroot infra up`은 `audit_store_dir`만 검사하며, 아무것도 만들지 않고
-아무것도 고치지 않습니다.
+`bootroot infra up`은 예약량 산출물을 렌더링하고 3단계를 읽지만, 운영자의
+2단계 명령은 하나도 실행하지 않습니다. 마운트·포맷·systemd 유닛 설치·저장소
+하위 디렉터리 생성·소유자나 모드 수정은 하지 않습니다.
+
+#### 기존 배포 bring-up
+
+Docker나 Compose를 호출하기 전에 `bootroot infra up --agent-config <path>`는
+같은 예약량의 1단계와 3단계를 실행합니다. `filesystem` 모드에서는 root로
+실행합니다. 1단계가 root로 실행한 `init`이 이미 소유한
+`<compose dir>/audit-store/` 준비 디렉터리 아래의 세 산출물을 갱신하기
+때문입니다. 이 권한은 렌더링된 산출물을 교체하는 데만 필요하며, 이
+명령은 여전히 2단계의 호스트 변경 작업을 하나도 실행하지 않습니다. 결과가
+**enforced**가 아니면 bring-up을 거부합니다. **provisioned, not activated**
+결과는 산출물과 남은 운영자 명령을 정확히 이름 붙이며, 마지막 명령은
+`bootroot init`이 아니라 같은 `infra up` 호출입니다. 마운트되지 않은
+예약량은 루트 파일 시스템을 쓰는 컨테이너가 아니라 눈에 보이는 OpenBao
+장애가 됩니다.
+
+`directory`는 지원되는 opt-out입니다. `infra up`은
+**unenforced (directory)**를 보고하고 계속하며, 이미지 경로를 파생하거나
+예약량 검증을 실행하지 않습니다. 설정의 endpoint 활성화 값은 여전히
+`state.json`과 일치해야 하며, 설정의 저장소도 기존 오버라이드와 일치해야
+합니다. `audit_store_reserve_bytes`가 바뀌면 이미지를 제자리에서 늘릴 수
+있는 것이 아니라 거부됩니다.
 
 #### 새 호스트에서 예약량 활성화하기 {#activating-the-reserve-on-a-fresh-host}
 
@@ -951,16 +977,16 @@ systemd가 소유한 소켓에서 호출자를 계속 받고 peer 검사를 마�
 
 1. **예약량이 가득 차면 OpenBao는 여전히 서비스를 멈춥니다.** 상한은 루트
    파일 시스템을 살려 둘 뿐, 배포의 발급을 이어가게 하지는 않습니다.
-2. **부팅 시 마운트 작업이 실패하면 OpenBao 장치가 루트 파일 시스템에
-   남습니다.** 순서는 `Wants=`/`After=`뿐이라 마운트 실패가
-   `docker.service`를 멈추지 않고, `restart: always`가 컨테이너를
-   되살리며, Docker는 없는 바인드 소스를 기본적으로 만들어 줍니다. 그래서
-   빈 마운트 지점 아래에 `<audit_store_dir>/openbao`가 만들어집니다.
-   이후 변경에서 그 바인드를 `create_host_path: false`로 선언하지만,
-   그것이 닫는 것은 하부 저장소에 자체 `openbao/`가 **없는** 경우뿐입니다.
-   기존 레이아웃에서 올라온 호스트는 모두 그것을 갖고 있으므로, 그런
-   호스트에서는 바인드가 성공하고 장치는 다시 루트 파일 시스템에
-   떨어집니다. 하부 저장소를 옮겨 두기 전까지는 그렇습니다.
+2. **부팅 시 마운트 작업이 실패하면 바인드 소스가 없을 때 OpenBao도
+   실패합니다.** 생성된 audit bind는 긴 Compose 문법과
+   `create_host_path: false`를 쓰므로 Docker가 빈 마운트 지점 아래에
+   `<audit_store_dir>/openbao`를 만들지 않습니다. 마운트를 고친 뒤 스택을
+   시작할 때까지 OpenBao 컨테이너는 실패 상태로 남습니다. 조용한 audit
+   우회 대신 장애를 드러내는 것이 의도입니다. 이 키는 생성만 막습니다.
+   이전 호스트의 하부 디렉터리에 이미 `openbao/`가 있으면 여전히 그
+   디렉터리가 바인드되어 이 부팅 경로 노출은 남습니다. 기존 내용을
+   예약량으로 옮기는 일이 그것을 없애며, 이 명령은 audit record를
+   옮기거나 삭제하지 않습니다.
 3. **마운트되지 않은 저장소로 시작한 데몬은 레지스트라 동사를 거부합니다.**
    데몬은 레코드 저장소를 열기 전에 이 결정을 내리므로 빈 마운트 지점 아래에
    `audit_store_dir`나 `records/`를 만들지 않습니다. 엔드포인트는 위에서

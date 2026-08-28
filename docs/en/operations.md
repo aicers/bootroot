@@ -800,16 +800,20 @@ render or a verification read that could not be completed at all.
 reserve unprotected by anything but the operator's own quota.
 
 **How the install side reads it.** `bootroot init --agent-config <path>`
-names the operator's `bootroot-agent` configuration file — not the
+and `bootroot infra up --agent-config <path>` name the operator's
+`bootroot-agent` configuration file — not the
 bootroot-internal `agent.toml` that `init` generates under the internal
-credential directory. `init` reads exactly two tables from it,
+credential directory. Both commands read exactly two tables from it,
 `[registrar]` for the store's location and `[registrar_endpoint]` for the
 enablement value it cross-checks against `state.json`. The flag is
-**required** on any run whose `state.json` records an enabled registrar
-endpoint, and on any run that finds a rendered audit compose override on
-disk; omitting it there is an error and nothing is created, rendered or
-deleted. The daemon's configuration file must therefore exist before such
-a run.
+**required** for either command on any run whose `state.json` records an
+enabled registrar endpoint, and on any run that finds a rendered audit
+compose override on disk; omitting it there is an error and nothing is
+created, rendered or deleted. A host that has never enabled the endpoint
+and has no override does not need the flag: `infra up` does not open the
+configuration file, inspect a reserve path, or print an audit-store
+outcome there. The daemon's configuration file must therefore exist before
+an endpoint-enabled bring-up.
 
 **What `bootroot init` does.** On an endpoint-enabled host it creates
 `audit_store_dir`, renders a Compose override binding
@@ -841,8 +845,31 @@ that directory, and nothing is created or rendered on such a run.
 **Neither command repairs the store.** `bootroot init` checks an existing
 `audit_store_dir` and `records/` against that contract and fails naming
 the path, what it found, and the `chown 0:0` / `chmod 0700` that fixes
-it. `bootroot infra up` checks `audit_store_dir` alone, creates nothing
-and repairs nothing.
+it. `bootroot infra up` renders the reserve artifacts and reads phase 3,
+but performs none of the operator's phase-2 commands: it does not mount,
+format, install systemd units, create store subdirectories, or repair an
+owner or mode.
+
+#### Bringing up an existing deployment
+
+Before any Docker or Compose call, `bootroot infra up --agent-config <path>`
+runs the same phase 1 and phase 3 reserve pass. In `filesystem` mode, run it
+as root: phase 1 refreshes the three artifacts under
+`<compose dir>/audit-store/`, a staging directory the root-run `init` already
+owns. This is only the privilege needed to replace those rendered artifacts;
+the command still runs none of phase 2's host-changing steps. It refuses the
+bring-up unless the outcome is **enforced**. A
+**provisioned, not activated** outcome names the artifacts and exact
+remaining operator commands; its final command is the same `infra up`
+invocation, not `bootroot init`. This makes an unmounted reserve a visible
+OpenBao outage instead of a container started against the root filesystem.
+
+`directory` is the supported opt-out. `infra up` reports
+**unenforced (directory)** and continues; it derives no image path and runs
+no reserve verification. The configuration's endpoint enablement must still
+agree with `state.json`, and the configured store must agree with the
+existing override. A changed `audit_store_reserve_bytes` is a refusal, not
+permission to resize an image in place.
 
 #### Activating the reserve on a fresh host
 
@@ -1007,17 +1034,17 @@ assume away:
 
 1. **A full reserve still stops OpenBao serving.** The ceiling keeps the
    root filesystem alive; it does not keep the deployment issuing.
-2. **A failed mount job at boot leaves the OpenBao device on the root
-   filesystem.** Ordering is `Wants=`/`After=` and nothing stronger, so a
-   failed mount does not stop `docker.service`; `restart: always` brings
-   the container back and Docker creates a missing bind source by
-   default, so `<audit_store_dir>/openbao` is manufactured under the
-   empty mount point. A later change declares that bind
-   `create_host_path: false`, which closes this **only** where the
-   underlying store carries no `openbao/` of its own — and every host
-   upgraded from the earlier layout does carry one, so there the bind
-   succeeds and the device lands on the root filesystem again until the
-   underlying store is renamed aside.
+2. **A failed mount job at boot fails OpenBao where its bind source is
+   absent.** The generated audit bind uses Compose's long syntax with
+   `create_host_path: false`, so Docker does not manufacture
+   `<audit_store_dir>/openbao` beneath an empty mount point; the OpenBao
+   container remains failed until the mount is fixed, then the stack can
+   be started. This is deliberately an outage rather than a quiet audit
+   bypass. The key governs creation only: an older host whose underlying
+   directory already has `openbao/` still binds that directory and still
+   has this boot-path exposure. Relocating that existing content onto the
+   reserve is what retires it; this command neither moves nor deletes
+   audit records.
 3. **A daemon started with an unmounted store refuses registrar verbs.**
    The daemon makes this decision before opening the record store, so it
    creates neither `audit_store_dir` nor `records/` beneath the empty

@@ -1,8 +1,11 @@
 use super::{Messages, format_template};
 
 impl Messages {
-    pub(crate) fn error_audit_store_agent_config_required(&self) -> &'static str {
-        self.strings().error_audit_store_agent_config_required
+    pub(crate) fn error_audit_store_agent_config_required(&self, command: &str) -> String {
+        format_template(
+            self.strings().error_audit_store_agent_config_required,
+            &[("command", command)],
+        )
     }
 
     pub(crate) fn error_audit_store_agent_config_unreadable(
