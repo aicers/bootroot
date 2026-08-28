@@ -626,9 +626,10 @@ OpenBao 감사 장치 확인은 그대로입니다.
   `records/`와 OpenBao 파일 감사 출력용 `openbao/`를 담는 절대 경로입니다.
   상대 경로는 거부됩니다. 이 키가 저장소 위치에 대한 **유일한 정의**이며,
   어디에도 두 번째 사본이 기록되지 않습니다. 설치 측은
-  `bootroot init --agent-config <path>`를 통해 이 값을 읽습니다. 이
-  플래그는 레지스트라 엔드포인트가 활성인 호스트에서 필수이므로, 그
-  실행보다 이 파일이 먼저 존재해야 합니다.
+  `bootroot init --agent-config <path>`와
+  `bootroot infra up --agent-config <path>`를 통해 이 값을 읽습니다. 이
+  플래그는 레지스트라 엔드포인트가 활성인 호스트(또는 audit override가
+  남은 호스트)에서 필수이므로, 두 실행보다 이 파일이 먼저 존재해야 합니다.
   [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
 - `audit_store_reserve_bytes` (`u64`, 기본값 `2147483648`, 2 GiB) — 공유
   저장소의 예산입니다. `i64::MAX`를 넘을 수 없습니다. 기본값인

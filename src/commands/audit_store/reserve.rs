@@ -844,7 +844,7 @@ fn sh_quote(value: &str) -> String {
 }
 
 /// Spells `path` as one POSIX `sh` word.
-fn sh_quote_path(path: &Path) -> String {
+pub(super) fn sh_quote_path(path: &Path) -> String {
     sh_quote(&display_path(path))
 }
 

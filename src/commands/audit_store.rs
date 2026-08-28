@@ -7,9 +7,10 @@
 //! Nothing here records a second copy of it — not `state.json`, not a
 //! flag, not an environment variable — because both writers must
 //! resolve into one directory, and two values that can drift are two
-//! directories waiting to happen. That is why `bootroot init` takes
-//! `--agent-config` and why `bootroot infra up` reads the bind source
-//! back out of the rendered override rather than resolving it again.
+//! directories waiting to happen. That is why both `bootroot init` and
+//! an endpoint-enabled `bootroot infra up` take `--agent-config`; the
+//! latter cross-checks it while preserving the bind source read from the
+//! rendered override rather than silently resolving a new one.
 //!
 //! Only the `OpenBao` device actually starts writing here. The daemon's
 //! verb records do not: nothing in this build constructs a record
@@ -25,6 +26,7 @@
 //! `audit_store_enforcement = "directory"` opts out of all of it and
 //! leaves the budget a recorded number.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -233,26 +235,31 @@ pub(crate) fn write_audit_override(
 
 /// The rendered override's bytes for a given bind source.
 ///
-/// Quoting settles what YAML reads back, but not what Compose then
-/// makes of the scalar: it splits a bind mount's value on `:` into
-/// source, target and mode, so a colon anywhere in the store's path
-/// moves the boundary rather than travelling inside it. Both that and a
-/// control character are refused here, before the override is rendered
-/// and before any Docker call, rather than surfacing as a mount error
-/// from a `docker compose` invocation two steps later.
+/// Quoting settles what YAML reads back, but a control character still
+/// has no reliable Compose spelling. A colon is now a distinct `source:`
+/// value in the long bind form, but remains refused because the reader,
+/// systemd escaping and rendered shell commands all have to carry the
+/// path too; widening that input contract is not this change's business.
 fn render_audit_override(bind_source: &Path, messages: &Messages) -> Result<String> {
     let raw = bind_source.to_string_lossy();
     if raw.chars().any(|ch| ch.is_control() || ch == ':') {
         anyhow::bail!(messages.error_audit_store_dir_unrenderable(&raw));
     }
-    let mount = compose_quote(&format!("{raw}:{OPENBAO_AUDIT_CONTAINER_PATH}"));
+    let source = compose_quote(&raw);
+    // Docker only refuses to create a missing source. An older underlying
+    // `openbao/` directory still binds, so relocating that content is what
+    // retires the residual boot-path exposure.
     Ok(format!(
         "\
 services:
   openbao:
     volumes: !override
       - {OPENBAO_DATA_MOUNT}
-      - {mount}
+      - type: bind
+        source: {source}
+        target: {OPENBAO_AUDIT_CONTAINER_PATH}
+        bind:
+          create_host_path: false
       - {OPENBAO_CONFIG_MOUNT}
 "
     ))
@@ -282,9 +289,9 @@ fn compose_unquote(value: &str) -> String {
 
 /// Reads the audit store directory back out of a rendered override.
 ///
-/// The override file is the record of what `init` resolved, which is
-/// what lets `bootroot infra up` bind the same store without reading
-/// the daemon's configuration at all.
+/// The override file is the record of the bind source `init` resolved.
+/// `bootroot infra up` cross-checks the daemon configuration against it,
+/// but keeps that source rather than silently moving the bind.
 ///
 /// # Errors
 ///
@@ -297,16 +304,7 @@ pub(crate) fn read_audit_override_store_dir(
     let display = override_path.display().to_string();
     let content = std::fs::read_to_string(override_path)
         .with_context(|| messages.error_read_file_failed(&display))?;
-    let suffix = format!(":{OPENBAO_AUDIT_CONTAINER_PATH}");
-    let bind_source = collect_openbao_volume_entries(&content)
-        .into_iter()
-        .find_map(|entry| {
-            // Unquote first: the bind source is rendered as a
-            // single-quoted scalar, so the container path is inside the
-            // quotes rather than beside them.
-            let unquoted = compose_unquote(entry.trim());
-            unquoted.strip_suffix(suffix.as_str()).map(PathBuf::from)
-        })
+    let bind_source = read_audit_override_bind_source(&content)
         .ok_or_else(|| anyhow::anyhow!(messages.error_audit_store_override_unreadable(&display)))?;
     // The bind source is `<audit_store_dir>/openbao` by construction,
     // so its parent is the store directory. `infra up` holds *that* to
@@ -320,6 +318,42 @@ pub(crate) fn read_audit_override_store_dir(
         .ok_or_else(|| anyhow::anyhow!(messages.error_audit_store_override_unreadable(&display)))
 }
 
+/// Returns the bind source from either override syntax this repository
+/// has rendered. Existing deployments carry the short form, while new
+/// overrides use a long bind entry so Docker can refuse a missing source.
+fn read_audit_override_bind_source(compose: &str) -> Option<PathBuf> {
+    let entries = collect_openbao_volume_entries(compose);
+    let suffix = format!(":{OPENBAO_AUDIT_CONTAINER_PATH}");
+    for entry in entries {
+        let trimmed = entry.trim();
+        if let Some(source) = trimmed.strip_prefix("type: bind\n") {
+            let mut source_value = None;
+            let mut target = None;
+            for line in source.lines() {
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("source:") {
+                    source_value = Some(compose_unquote(value.trim()));
+                } else if let Some(value) = line.strip_prefix("target:") {
+                    target = Some(compose_unquote(value.trim()));
+                }
+            }
+            if target.as_deref() == Some(OPENBAO_AUDIT_CONTAINER_PATH)
+                && let Some(source) = source_value
+            {
+                return Some(PathBuf::from(source));
+            }
+        } else {
+            // Unquote first: a prior renderer put the container path
+            // inside the same scalar as the source.
+            let unquoted = compose_unquote(trimmed);
+            if let Some(source) = unquoted.strip_suffix(suffix.as_str()) {
+                return Some(PathBuf::from(source));
+            }
+        }
+    }
+    None
+}
+
 /// Collects the `openbao` service's raw `volumes:` entries, with any
 /// surrounding YAML quoting left on.
 fn collect_openbao_volume_entries(compose: &str) -> Vec<String> {
@@ -329,6 +363,7 @@ fn collect_openbao_volume_entries(compose: &str) -> Vec<String> {
     let mut in_volumes = false;
     let mut volumes_indent = 0usize;
 
+    let mut current_mapping: Option<String> = None;
     for line in compose.lines() {
         let indent = line.chars().take_while(|ch| ch.is_whitespace()).count();
         let trimmed = line.trim();
@@ -359,16 +394,32 @@ fn collect_openbao_volume_entries(compose: &str) -> Vec<String> {
         }
 
         if in_volumes && indent <= volumes_indent {
+            if let Some(mapping) = current_mapping.take() {
+                entries.push(mapping);
+            }
             in_volumes = false;
             continue;
         }
 
         if in_volumes && trimmed.starts_with('-') {
+            if let Some(mapping) = current_mapping.take() {
+                entries.push(mapping);
+            }
             let value = trimmed.trim_start_matches('-').trim();
             if !value.is_empty() {
-                entries.push(value.to_string());
+                if value.starts_with("type:") {
+                    current_mapping = Some(format!("{value}\n"));
+                } else {
+                    entries.push(value.to_string());
+                }
             }
+        } else if let Some(mapping) = current_mapping.as_mut() {
+            mapping.push_str(trimmed);
+            mapping.push('\n');
         }
+    }
+    if let Some(mapping) = current_mapping {
+        entries.push(mapping);
     }
 
     entries
@@ -501,7 +552,7 @@ fn select_audit_store_plan(
     // configuration.
     let Some(agent_config) = inputs.agent_config else {
         if inputs.endpoint_recorded || rendered_present {
-            anyhow::bail!(messages.error_audit_store_agent_config_required());
+            anyhow::bail!(messages.error_audit_store_agent_config_required("bootroot init"));
         }
         return Ok(AuditStorePlan::Idle);
     };
@@ -759,6 +810,189 @@ fn reserve_inputs<'a>(
     }
 }
 
+/// Runs the audit-store portion of `bootroot infra up` before any Docker
+/// invocation. It reads and renders the reserve phases, but performs none of
+/// their phase-two host changes.
+///
+/// # Errors
+///
+/// Returns an error when the required configuration is absent or disagrees
+/// with state, the rendered override is stale or unreadable, or filesystem
+/// enforcement is anything short of enforced.
+pub(crate) fn prepare_audit_store_for_infra_up(
+    state_path: &Path,
+    compose_dir: &Path,
+    agent_config: Option<&Path>,
+    expected_uid: u32,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    let override_path = audit_override_path(compose_dir);
+    let override_present = override_path.exists();
+    let endpoint_recorded = if state_path.exists() {
+        StateFile::load(state_path)?
+            .registrar_endpoint
+            .as_ref()
+            .is_some_and(|recorded| recorded.enabled)
+    } else {
+        false
+    };
+
+    // This is intentionally before loading the configuration. A host that
+    // never enabled the endpoint has no override, so `infra up` must keep its
+    // pre-audit-store behavior without opening a configuration file.
+    if !endpoint_recorded && !override_present {
+        return Ok(None);
+    }
+    let agent_config = agent_config.ok_or_else(|| {
+        anyhow::anyhow!(messages.error_audit_store_agent_config_required("bootroot infra up"))
+    })?;
+    let view = load_agent_config(agent_config, messages)?;
+    if view.endpoint_enabled != endpoint_recorded {
+        anyhow::bail!(messages.error_audit_store_enablement_mismatch(
+            &state_path.display().to_string(),
+            endpoint_recorded,
+            &agent_config.display().to_string(),
+            view.endpoint_enabled,
+        ));
+    }
+    if !endpoint_recorded {
+        return Ok(None);
+    }
+    if !override_present {
+        anyhow::bail!(messages.error_audit_store_override_missing());
+    }
+
+    // The old short form remains a supported input. Compare before rewriting
+    // it so the upgrade never silently points an existing deployment at the
+    // store named by a different configuration file.
+    let rendered_store = read_audit_override_store_dir(&override_path, messages)?;
+    if rendered_store != view.audit_store_dir {
+        anyhow::bail!(messages.error_audit_store_override_stale(
+            &rendered_store.display().to_string(),
+            &view.audit_store_dir.display().to_string(),
+        ));
+    }
+    upgrade_audit_override(&override_path, messages)?;
+
+    match view.enforcement {
+        AuditStoreEnforcement::Directory => {
+            check_store_directory(&rendered_store, expected_uid).map_err(|err| {
+                anyhow::anyhow!(layout_error_message(
+                    &err,
+                    StoreCheckCaller::InfraUp,
+                    expected_uid,
+                    messages
+                ))
+            })?;
+            println!(
+                "{}",
+                reserve::render_directory_outcome(&rendered_store, view.reserve_bytes, messages)
+            );
+            Ok(Some(override_path))
+        }
+        AuditStoreEnforcement::Filesystem => {
+            let rerun_command = format!(
+                "bootroot infra up --agent-config {}",
+                reserve::sh_quote_path(agent_config)
+            );
+            let inputs = reserve::ReserveInputs {
+                store_dir: &view.audit_store_dir,
+                compose_dir,
+                reserve_bytes: view.reserve_bytes,
+                max_file_bytes: view.max_file_bytes,
+                max_retained_files: view.max_retained_files,
+                expected_uid,
+                rerun_command: &rerun_command,
+            };
+            let probe = reserve::HostProbe;
+            let facts = reserve::evaluate(&inputs, &probe, messages)?;
+            // Phase 3 deliberately does not assert the mounted filesystem
+            // root's mode. Keep the existing bring-up contract where a mount
+            // is present: the root itself is `audit_store_dir` and must be
+            // the operator-owned `0700` store before Docker can bind into it.
+            if facts.mount_present() {
+                check_store_directory(&facts.store_dir, expected_uid).map_err(|err| {
+                    anyhow::anyhow!(layout_error_message(
+                        &err,
+                        StoreCheckCaller::InfraUp,
+                        expected_uid,
+                        messages
+                    ))
+                })?;
+            }
+            let artifacts = reserve::render_artifacts(&inputs, &facts);
+            reserve::write_artifacts(&artifacts, messages)?;
+            let report = reserve::verify(&inputs, &facts, &artifacts, &probe, messages)?;
+            let outcome =
+                reserve::render_filesystem_outcome(&inputs, &facts, &artifacts, &report, messages);
+            if matches!(report, reserve::ReserveReport::NotActivated { .. }) {
+                anyhow::bail!(outcome);
+            }
+            println!("{outcome}");
+            Ok(Some(override_path))
+        }
+    }
+}
+
+/// Rewrites the former scalar audit bind to the guarded long form.
+///
+/// The source is first recovered from the existing override and is never
+/// derived from configuration: the rewrite changes Compose syntax, not where
+/// an already-running deployment writes its audit device.
+fn upgrade_audit_override(override_path: &Path, messages: &Messages) -> Result<()> {
+    let display = override_path.display().to_string();
+    let content = std::fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&display))?;
+    if read_audit_override_bind_source(&content).is_none() {
+        anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
+    }
+    if collect_openbao_volume_entries(&content)
+        .iter()
+        .any(|entry| {
+            entry.starts_with("type: bind\n")
+                && entry.lines().any(|line| {
+                    line.trim().strip_prefix("target:").map(str::trim)
+                        == Some(OPENBAO_AUDIT_CONTAINER_PATH)
+                })
+        })
+    {
+        return Ok(());
+    }
+
+    let suffix = format!(":{OPENBAO_AUDIT_CONTAINER_PATH}");
+    let mut rewritten = String::with_capacity(content.len() + 100);
+    let mut replaced = false;
+    for line in content.split_inclusive('\n') {
+        let newline = line.strip_suffix('\n').unwrap_or(line);
+        let indentation = newline.len() - newline.trim_start().len();
+        let trimmed = newline.trim();
+        if !replaced && trimmed.starts_with('-') {
+            let value = trimmed.trim_start_matches('-').trim();
+            let unquoted = compose_unquote(value);
+            if let Some(source) = unquoted.strip_suffix(suffix.as_str()) {
+                let indent = " ".repeat(indentation);
+                let source = compose_quote(source);
+                let _ = write!(
+                    rewritten,
+                    "{indent}- type: bind\n{indent}  source: {source}\n{indent}  target: {OPENBAO_AUDIT_CONTAINER_PATH}\n{indent}  bind:\n{indent}    create_host_path: false\n"
+                );
+                replaced = true;
+                continue;
+            }
+        }
+        rewritten.push_str(line);
+    }
+    if !replaced {
+        anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
+    }
+    fs_util::atomic_replace_dir_owner_blocking(
+        fs_util::Destination::operator_named(override_path),
+        rewritten.as_bytes(),
+        fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
+    )
+    .with_context(|| messages.error_write_file_failed(&display))
+}
+
 /// Resolves the audit override for a bring-up, checking only what an
 /// unprivileged process can.
 ///
@@ -774,6 +1008,7 @@ fn reserve_inputs<'a>(
 /// Returns an error naming `bootroot init` when the predicate is
 /// recorded and the override is missing, unreadable, or names a store
 /// directory that departs from the store directory contract.
+#[cfg(test)]
 pub(crate) fn resolve_audit_override(
     state_path: &Path,
     compose_dir: &Path,
@@ -1365,8 +1600,15 @@ mod tests {
             content.contains("./openbao:/openbao/config:ro"),
             "{content}"
         );
+        assert!(content.contains("- type: bind"), "{content}");
         assert!(
-            content.contains(&format!("{}/openbao:/openbao/audit", store.display())),
+            content.contains(&format!("source: '{}/openbao'", store.display())),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "target: /openbao/audit\n        bind:\n          create_host_path: false"
+            ),
             "{content}"
         );
     }
@@ -1899,6 +2141,155 @@ mod tests {
     }
 
     #[test]
+    fn infra_up_requires_its_agent_config_before_selecting_an_override() {
+        let (_fixture, state, compose_dir) = provisioned_fixture();
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            None,
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("missing agent config");
+        assert!(err.to_string().contains("bootroot infra up"), "{err}");
+        assert!(err.to_string().contains("--agent-config"), "{err}");
+    }
+
+    #[test]
+    fn infra_up_requires_its_agent_config_for_a_stale_override() {
+        let (fixture, _state, compose_dir) = provisioned_fixture();
+        let disabled_state = fixture.state(Some(false));
+        let err = prepare_audit_store_for_infra_up(
+            &disabled_state,
+            &compose_dir,
+            None,
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("an override still requires its configuration");
+        assert!(err.to_string().contains("bootroot infra up"), "{err}");
+        assert!(err.to_string().contains("--agent-config"), "{err}");
+    }
+
+    #[test]
+    fn infra_up_rejects_an_agent_config_with_a_different_enablement() {
+        let (fixture, state, compose_dir) = provisioned_fixture();
+        let disabled_config = fixture.agent_config(false);
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&disabled_config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("different endpoint predicates are refused");
+        assert!(err.to_string().contains("enablement disagrees"), "{err}");
+        assert!(
+            err.to_string().contains(&state.display().to_string()),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&disabled_config.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn infra_up_leaves_a_never_enabled_host_without_configuration_reads() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(false));
+        let absent_config = fixture.base.path().join("does-not-exist.toml");
+        assert!(
+            prepare_audit_store_for_infra_up(
+                &state,
+                &fixture.compose_dir(),
+                Some(&absent_config),
+                current_process_euid(),
+                &test_messages(),
+            )
+            .expect("endpoint-disabled host is untouched")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn infra_up_upgrades_a_legacy_override_without_repointing_it() {
+        let (fixture, state, compose_dir) = provisioned_fixture();
+        let config = fixture.agent_config(true);
+        let path = audit_override_path(&compose_dir);
+        let store = fixture.store_dir();
+        let source = format!("{}/{OPENBAO_SUBDIR}", store.display());
+        fs::write(
+            &path,
+            format!(
+                "services:\n  openbao:\n    volumes: !override\n      - {OPENBAO_DATA_MOUNT}\n      - {}\n      - {OPENBAO_CONFIG_MOUNT}\n",
+                compose_quote(&format!("{source}:{OPENBAO_AUDIT_CONTAINER_PATH}"))
+            ),
+        )
+        .expect("legacy override");
+
+        prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect("directory mode succeeds");
+        let upgraded = fs::read_to_string(&path).expect("upgraded override");
+        assert!(
+            upgraded.contains(&format!("source: {}", compose_quote(&source))),
+            "{upgraded}"
+        );
+        assert!(upgraded.contains("create_host_path: false"), "{upgraded}");
+
+        prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect("long form remains valid");
+        assert_eq!(fs::read_to_string(&path).expect("second read"), upgraded);
+    }
+
+    #[test]
+    fn infra_up_renders_and_refuses_an_unactivated_filesystem_reserve() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let config = fixture.filesystem_agent_config(true);
+        let quoted_config = fixture
+            .base
+            .path()
+            .join("agent config; $(touch ignored) '$HOME.toml");
+        fs::rename(&config, &quoted_config).expect("rename config to a shell-sensitive path");
+        write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
+            .expect("override");
+
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&quoted_config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("unactivated reserve refuses bring-up");
+        let output = err.to_string();
+        assert!(output.contains("provisioned, not activated"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "bootroot infra up --agent-config '{}'",
+                quoted_config.display().to_string().replace('\'', "'\\''")
+            )),
+            "{output}"
+        );
+        assert!(fixture.artifact_dir().is_dir());
+    }
+
+    #[test]
     fn a_bring_up_selects_the_override_over_a_conforming_store() {
         let (fixture, state, compose_dir) = provisioned_fixture();
         // An unreadable `openbao/` under an otherwise valid store: the
@@ -2093,6 +2484,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_reader_accepts_the_previous_short_bind_form() {
+        let dir = traversable_tempdir();
+        let store = dir.path().join("legacy-store");
+        let path = audit_override_path(dir.path());
+        fs::create_dir_all(path.parent().expect("parent")).expect("override parent");
+        fs::write(
+            &path,
+            format!(
+                "services:\n  openbao:\n    volumes: !override\n      - {OPENBAO_DATA_MOUNT}\n      - {}\n      - {OPENBAO_CONFIG_MOUNT}\n",
+                compose_quote(&format!(
+                    "{}/{OPENBAO_SUBDIR}:{OPENBAO_AUDIT_CONTAINER_PATH}",
+                    store.display()
+                ))
+            ),
+        )
+        .expect("legacy override");
+
+        assert_eq!(
+            read_audit_override_store_dir(&path, &test_messages()).expect("read legacy form"),
+            store
+        );
+    }
+
+    #[test]
+    fn upgrading_a_legacy_bind_preserves_its_source_and_is_idempotent() {
+        let dir = traversable_tempdir();
+        let store = dir.path().join("legacy store$with'quote");
+        let path = audit_override_path(dir.path());
+        fs::create_dir_all(path.parent().expect("parent")).expect("override parent");
+        let source = format!("{}/{OPENBAO_SUBDIR}", store.display());
+        fs::write(
+            &path,
+            format!(
+                "services:\n  openbao:\n    volumes: !override\n      - {OPENBAO_DATA_MOUNT}\n      - {}\n      - {OPENBAO_CONFIG_MOUNT}\n",
+                compose_quote(&format!("{source}:{OPENBAO_AUDIT_CONTAINER_PATH}"))
+            ),
+        )
+        .expect("legacy override");
+
+        upgrade_audit_override(&path, &test_messages()).expect("upgrade");
+        let upgraded = fs::read_to_string(&path).expect("upgraded override");
+        assert!(
+            upgraded.contains(&format!("source: {}", compose_quote(&source))),
+            "{upgraded}"
+        );
+        assert!(upgraded.contains("create_host_path: false"), "{upgraded}");
+        assert_eq!(
+            read_audit_override_store_dir(&path, &test_messages()).expect("read upgraded form"),
+            store
+        );
+
+        upgrade_audit_override(&path, &test_messages()).expect("second upgrade");
+        assert_eq!(fs::read_to_string(&path).expect("second read"), upgraded);
+    }
+
     /// The one override rendered by root and read unprivileged, so its
     /// mode cannot be left to the umask `bootroot init` happens to run
     /// under.
@@ -2162,19 +2609,15 @@ mod tests {
         );
     }
 
-    /// Both characters a Compose bind mount cannot carry, refused
-    /// before the override is rendered.
+    /// Both characters outside the store path contract are refused before
+    /// the override is rendered.
     ///
-    /// The colon is the one an operator could plausibly reach: Compose
-    /// splits a bind mount's value on it to find the source, the target
-    /// and the mode, so `/srv/a:b` renders a mount naming `/srv/a` with
-    /// the rest read as a target and a mode. Quoting does not help —
-    /// the split happens after YAML has handed Compose the scalar — and
-    /// nothing later would catch it, because the reader strips the same
-    /// container-path suffix and hands back a store directory that
-    /// matches the configuration exactly.
+    /// The long bind form renders a colon in its own `source:` field, but
+    /// the legacy short-form reader, systemd escaping, and rendered shell
+    /// commands still carry the path. Retaining the refusal prevents this
+    /// change from widening their shared input contract.
     #[test]
-    fn a_store_directory_a_compose_mount_cannot_carry_is_refused() {
+    fn a_store_directory_outside_the_supported_path_contract_is_refused() {
         let dir = traversable_tempdir();
         for name in ["bad\nstore", "bad:store"] {
             let store = dir.path().join(name);
@@ -2218,17 +2661,16 @@ mod tests {
                 "{compose} no longer declares {OPENBAO_CONFIG_MOUNT}"
             );
         }
-        assert_eq!(
-            entries,
-            vec![
-                OPENBAO_DATA_MOUNT.to_string(),
-                compose_quote(&format!(
-                    "{}/{OPENBAO_SUBDIR}:{OPENBAO_AUDIT_CONTAINER_PATH}",
-                    store.display()
-                )),
-                OPENBAO_CONFIG_MOUNT.to_string(),
-            ]
+        assert_eq!(entries.first(), Some(&OPENBAO_DATA_MOUNT.to_string()));
+        assert_eq!(entries.last(), Some(&OPENBAO_CONFIG_MOUNT.to_string()));
+        let audit = entries.get(1).expect("audit bind entry");
+        assert!(audit.contains("type: bind"), "{audit}");
+        assert!(
+            audit.contains(&format!("source: '{}/{OPENBAO_SUBDIR}'", store.display())),
+            "{audit}"
         );
+        assert!(audit.contains("target: /openbao/audit"), "{audit}");
+        assert!(audit.contains("create_host_path: false"), "{audit}");
     }
 
     #[test]
@@ -2389,10 +2831,10 @@ mod tests {
             "{unit}"
         );
 
-        // The rendered Compose override is untouched by any of it.
+        // The rendered Compose override has the boot-path bind guard.
         let content = fs::read_to_string(audit_override_path(&compose_dir)).expect("override");
-        assert!(!content.contains("create_host_path"), "{content}");
-        assert!(!content.contains("bind:"), "{content}");
+        assert!(content.contains("create_host_path: false"), "{content}");
+        assert!(content.contains("bind:"), "{content}");
     }
 
     /// Phase 1 simplifies the store path, and the install path has to
