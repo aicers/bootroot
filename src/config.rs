@@ -638,45 +638,112 @@ pub fn check_registrar_endpoint_reload(
     Ok(())
 }
 
-/// Checks that a reloaded configuration keeps the audit-store mount gate's
-/// inputs at the values the running process started with.
+/// Checks that a reloaded configuration cannot detach a filesystem
+/// audit-store mount verdict from the handler that would serve it.
 ///
-/// The registrar endpoint survives `SIGHUP`, and its audit-store mount
-/// verdict is deliberately fixed for that same process lifetime. Changing
-/// either input that selected the verdict would let a reloaded production
-/// handler and its retained verdict describe different stores. Those two
-/// inputs therefore require a service restart; the rest of `[registrar]`
-/// remains reloadable.
+/// The registrar endpoint survives `SIGHUP`, and the filesystem mount verdict
+/// it took at process start is deliberately fixed for that same process
+/// lifetime. Only a reload that would make that verdict and the handler
+/// disagree is refused:
+///
+/// - a changed `audit_store_enforcement` always crosses the filesystem
+///   boundary, either abandoning a verdict already taken or asking for one
+///   this process never took, and
+/// - a changed `audit_store_dir` under filesystem enforcement would have the
+///   retained verdict describe a store the handler no longer writes to.
+///
+/// A `directory` process reloading another `directory` configuration selects
+/// no verdict at all, so it keeps the reload behavior it had before the mount
+/// gate existed: a changed store path is applied like any other reloadable
+/// `[registrar]` value.
 ///
 /// # Errors
 ///
-/// Returns an error naming the first gate input that changed, and both of its
-/// values.
+/// Returns the first setting whose change would detach the verdict, with both
+/// of its values, for the caller to render in the operator's locale.
 pub fn check_registrar_audit_store_reload(
     running: &RegistrarSettings,
     reloaded: &RegistrarSettings,
-) -> Result<()> {
+) -> std::result::Result<(), AuditStoreReloadRejection> {
     if running.audit_store_enforcement != reloaded.audit_store_enforcement {
-        return Err(registrar_audit_store_reload_rejected(
-            "audit_store_enforcement",
-            match running.audit_store_enforcement {
-                AuditStoreEnforcement::Filesystem => "filesystem",
-                AuditStoreEnforcement::Directory => "directory",
-            },
-            match reloaded.audit_store_enforcement {
-                AuditStoreEnforcement::Filesystem => "filesystem",
-                AuditStoreEnforcement::Directory => "directory",
-            },
-        ));
+        return Err(AuditStoreReloadRejection {
+            setting: AuditStoreReloadSetting::Enforcement,
+            running: enforcement_spelling(running.audit_store_enforcement).to_string(),
+            reloaded: enforcement_spelling(reloaded.audit_store_enforcement).to_string(),
+        });
     }
-    if running.audit_store_dir != reloaded.audit_store_dir {
-        return Err(registrar_audit_store_reload_rejected(
-            "audit_store_dir",
-            &running.audit_store_dir.display().to_string(),
-            &reloaded.audit_store_dir.display().to_string(),
-        ));
+    if running.audit_store_enforcement == AuditStoreEnforcement::Filesystem
+        && running.audit_store_dir != reloaded.audit_store_dir
+    {
+        return Err(AuditStoreReloadRejection {
+            setting: AuditStoreReloadSetting::Dir,
+            running: running.audit_store_dir.display().to_string(),
+            reloaded: reloaded.audit_store_dir.display().to_string(),
+        });
     }
     Ok(())
+}
+
+/// The `[registrar]` key whose change a reload was refused over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuditStoreReloadSetting {
+    /// `registrar.audit_store_enforcement`.
+    Enforcement,
+    /// `registrar.audit_store_dir`.
+    Dir,
+}
+
+impl AuditStoreReloadSetting {
+    /// Returns the fully qualified configuration key, as an operator spells it.
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Enforcement => "registrar.audit_store_enforcement",
+            Self::Dir => "registrar.audit_store_dir",
+        }
+    }
+}
+
+/// A refused audit-store reload, and what an operator needs to correct it.
+///
+/// It carries no message of its own and is not an error type, so that no
+/// English-only rendering can escape this layer. The diagnostic the operator
+/// reads is built from these three values by
+/// [`crate::audit_store_reload_rejection_message`], in the daemon's selected
+/// locale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditStoreReloadRejection {
+    setting: AuditStoreReloadSetting,
+    running: String,
+    reloaded: String,
+}
+
+impl AuditStoreReloadRejection {
+    /// Returns the setting whose change was refused.
+    #[must_use]
+    pub const fn setting(&self) -> AuditStoreReloadSetting {
+        self.setting
+    }
+
+    /// Returns the value the running process started with.
+    #[must_use]
+    pub fn running(&self) -> &str {
+        &self.running
+    }
+
+    /// Returns the value the reloaded configuration carries.
+    #[must_use]
+    pub fn reloaded(&self) -> &str {
+        &self.reloaded
+    }
+}
+
+/// Spells an enforcement mode the way `agent.toml` does.
+const fn enforcement_spelling(mode: AuditStoreEnforcement) -> &'static str {
+    match mode {
+        AuditStoreEnforcement::Filesystem => "filesystem",
+        AuditStoreEnforcement::Directory => "directory",
+    }
 }
 
 /// What an absent optional path is spelled as in a reload diagnostic.
@@ -698,19 +765,6 @@ fn registrar_endpoint_reload_rejected(key: &str, running: &str, reloaded: &str) 
          material at all four paths is loaded once at startup, so this reload is \
          rejected and the running daemon is left as it is. Restart the service to \
          apply the change"
-    )
-}
-
-fn registrar_audit_store_reload_rejected(
-    key: &str,
-    running: &str,
-    reloaded: &str,
-) -> anyhow::Error {
-    anyhow::anyhow!(
-        "registrar.{key} changed from {running} to {reloaded}; the audit-store mount verdict is \
-         fixed for the process lifetime because the activated endpoint survives reloads, so this \
-         reload is rejected and the running daemon is left as it is. Restart the service to apply \
-         the change"
     )
 }
 
@@ -3108,37 +3162,60 @@ audit_store_enforcement = "directory"
         );
     }
 
-    /// The mount verdict belongs to the activated endpoint's process
-    /// lifetime, so the two settings that select it cannot change across a
-    /// reload. Other registrar settings retain their reload behavior.
+    /// A filesystem verdict belongs to the activated endpoint's process
+    /// lifetime, so no reload may leave it describing a store the handler
+    /// does not write to. Both settings that select it are held for a
+    /// filesystem process, and an enforcement change is refused from either
+    /// side because it always crosses the filesystem boundary.
     #[test]
-    fn a_reload_that_changes_the_audit_store_gate_is_rejected() {
+    fn a_reload_that_would_detach_the_filesystem_verdict_is_rejected() {
         let running = RegistrarSettings::default();
+        assert_eq!(
+            running.audit_store_enforcement,
+            AuditStoreEnforcement::Filesystem,
+            "the default is the mode this case is about"
+        );
         assert!(check_registrar_audit_store_reload(&running, &running).is_ok());
 
-        let changed_mode = RegistrarSettings {
+        let directory = RegistrarSettings {
             audit_store_enforcement: AuditStoreEnforcement::Directory,
             ..running.clone()
         };
-        let error = check_registrar_audit_store_reload(&running, &changed_mode)
-            .expect_err("a changed enforcement mode must not detach the mount verdict");
-        assert!(
-            error
-                .to_string()
-                .contains("registrar.audit_store_enforcement"),
-            "{error}"
+        let rejection = check_registrar_audit_store_reload(&running, &directory)
+            .expect_err("abandoning the filesystem verdict needs a restart");
+        assert_eq!(
+            rejection.setting(),
+            AuditStoreReloadSetting::Enforcement,
+            "the rejection names the key that changed"
         );
-        assert!(error.to_string().contains("Restart the service"), "{error}");
+        assert_eq!(rejection.running(), "filesystem");
+        assert_eq!(rejection.reloaded(), "directory");
+
+        let rejection = check_registrar_audit_store_reload(&directory, &running)
+            .expect_err("asking for a verdict this process never took needs a restart");
+        assert_eq!(rejection.setting(), AuditStoreReloadSetting::Enforcement);
+        assert_eq!(rejection.running(), "directory");
+        assert_eq!(rejection.reloaded(), "filesystem");
 
         let changed_path = RegistrarSettings {
             audit_store_dir: PathBuf::from("/srv/bootroot/audit-store"),
             ..running.clone()
         };
-        let error = check_registrar_audit_store_reload(&running, &changed_path)
-            .expect_err("a changed store path must not detach the mount verdict");
-        assert!(
-            error.to_string().contains("registrar.audit_store_dir"),
-            "{error}"
+        let rejection = check_registrar_audit_store_reload(&running, &changed_path)
+            .expect_err("a filesystem store path may not move under the retained verdict");
+        assert_eq!(rejection.setting(), AuditStoreReloadSetting::Dir);
+        assert_eq!(
+            rejection.running(),
+            running.audit_store_dir.display().to_string()
+        );
+        assert_eq!(rejection.reloaded(), "/srv/bootroot/audit-store");
+        assert_eq!(
+            AuditStoreReloadSetting::Dir.key(),
+            "registrar.audit_store_dir"
+        );
+        assert_eq!(
+            AuditStoreReloadSetting::Enforcement.key(),
+            "registrar.audit_store_enforcement"
         );
 
         let changed_limit = RegistrarSettings {
@@ -3148,6 +3225,66 @@ audit_store_enforcement = "directory"
         assert!(
             check_registrar_audit_store_reload(&running, &changed_limit).is_ok(),
             "unrelated registrar settings remain reloadable"
+        );
+    }
+
+    /// A `directory` process selects no mount verdict, so it never reaches
+    /// the gate and keeps the reload behavior it had before the gate
+    /// existed: `audit_store_dir` is reloadable like any other key.
+    #[test]
+    fn a_directory_to_directory_reload_keeps_its_store_path_reloadable() {
+        let running = RegistrarSettings {
+            audit_store_enforcement: AuditStoreEnforcement::Directory,
+            ..RegistrarSettings::default()
+        };
+        let moved = RegistrarSettings {
+            audit_store_dir: PathBuf::from("/srv/bootroot/moved-audit-store"),
+            ..running.clone()
+        };
+
+        assert!(check_registrar_audit_store_reload(&running, &running).is_ok());
+        assert!(
+            check_registrar_audit_store_reload(&running, &moved).is_ok(),
+            "a directory store path is not a mount-gate input"
+        );
+    }
+
+    /// The store move as an operator actually performs it: one key edited in
+    /// the configuration file.
+    ///
+    /// `audit_record_dir` must resolve inside the store, so a store that
+    /// moves without it would be refused by validation before the reload
+    /// boundary was ever consulted. A file that leaves the key out — which
+    /// is what "changing only `audit_store_dir`" means — derives the record
+    /// directory from the store on each load, so both the running and the
+    /// reloaded configuration validate and the records follow the move.
+    #[test]
+    fn a_directory_store_moves_on_a_single_key_file_edit() {
+        fn load(audit_store_dir: &str) -> Settings {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                "\n[registrar]\naudit_store_enforcement = \
+                 \"directory\"\naudit_store_dir = \"{audit_store_dir}\""
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            settings.validate().unwrap();
+            settings
+        }
+
+        let running = load("/srv/bootroot/audit-store");
+        let reloaded = load("/srv/bootroot/moved-audit-store");
+        assert_eq!(
+            reloaded.registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/moved-audit-store/records"),
+            "an omitted audit_record_dir follows the store the edit moved"
+        );
+        assert!(
+            check_registrar_audit_store_reload(&running.registrar, &reloaded.registrar).is_ok(),
+            "a directory store move needs no other key to change with it"
         );
     }
 

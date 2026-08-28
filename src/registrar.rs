@@ -543,8 +543,11 @@ pub struct RegistrarEndpoint {
 /// The socket endpoint itself survives `SIGHUP` reloads, so the mount verdict
 /// does too: a mount established after startup applies on the next daemon
 /// start rather than changing the handler underneath an adopted socket. The
-/// reload boundary rejects changes to the two configuration values that select
-/// this verdict, so a reloaded handler cannot describe another store.
+/// reload boundary refuses only what would detach a *filesystem* verdict from
+/// its handler — a changed `audit_store_enforcement`, or a changed
+/// `audit_store_dir` under filesystem enforcement — so a reloaded filesystem
+/// handler cannot describe another store. A `directory` process takes no
+/// verdict to detach and keeps its ordinary reload behavior.
 #[cfg(target_os = "linux")]
 pub(crate) struct AuditStoreMountGate {
     requires_mount: bool,

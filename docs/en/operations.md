@@ -1025,10 +1025,21 @@ per-refusal log line with the id, operation, caller identity, store path
 and expected unit. This lets an operator trace a caller report without
 searching the unavailable store. The check is made only at daemon start,
 so mounting the store later takes effect on the next restart. For the same
-reason, an enabled endpoint rejects a `SIGHUP` that changes either
-`audit_store_dir` or `audit_store_enforcement`; restart the service to
-apply that change. It does not run when the endpoint is disabled or when
-enforcement is `directory`.
+reason, an enabled endpoint rejects a `SIGHUP` that would leave that
+verdict describing a store the handler no longer writes to: a changed
+`audit_store_enforcement`, in either direction, or a changed
+`audit_store_dir` while enforcement stays `filesystem`. The rejection is
+logged in the daemon's language, naming the key and both values, and the
+running daemon keeps serving the configuration it started with; restart
+the service to apply the change. An endpoint running under
+`audit_store_enforcement = "directory"` took no verdict, so a reload that
+moves `audit_store_dir` and stays in `directory` mode is applied like any
+other `[registrar]` change: the next invocation opens the moved store,
+reads no mount metadata and logs nothing about a mount. Move
+`audit_record_dir` in the same edit if the file sets it, since it must
+resolve inside the store; a file that omits it derives it from the store
+and needs no second change. None of this runs when the endpoint is
+disabled.
 
 #### What the reserve does not cover
 

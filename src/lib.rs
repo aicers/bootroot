@@ -6,7 +6,6 @@ pub mod agent_args;
 pub mod cert_chain;
 pub mod cert_group;
 pub mod config;
-#[cfg(any(target_os = "linux", test))]
 mod daemon_messages;
 pub mod db;
 pub mod eab;
@@ -32,6 +31,7 @@ mod fast_poll;
 
 pub use agent_args::Args;
 pub use daemon::{DaemonInvocation, DaemonShutdown};
+pub use daemon_messages::audit_store_reload_rejection_message;
 pub use registrar::RegistrarEndpoint;
 pub use registrar_certs::ensure_registrar_surface_certificates;
 

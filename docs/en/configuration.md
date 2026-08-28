@@ -619,10 +619,16 @@ The `[registrar]` table carries two groups of keys: the audit store the
 daemon writes the registrar's own trail to, and the verb-layer settings
 the registrar endpoint is provisioned from. The table is read on every
 `SIGHUP`, because the whole daemon invocation is rebuilt. When
-`[registrar_endpoint] enabled` is true, `audit_store_dir` and
-`audit_store_enforcement` are fixed with it for the process lifetime:
-they select the mount verdict retained with the activated socket. A reload
-that changes one is rejected; use `systemctl restart` to apply it.
+`[registrar_endpoint] enabled` is true, the reload boundary protects the
+mount verdict the activated socket retains, and nothing else:
+`audit_store_enforcement` cannot change in either direction, and under
+`audit_store_enforcement = "filesystem"` neither can `audit_store_dir`.
+Such a reload is rejected in the daemon's language, naming the key and
+both values; use `systemctl restart` to apply it. Under
+`audit_store_enforcement = "directory"` no verdict is taken, so
+`audit_store_dir` reloads like any other key in the table — subject to
+the containment rule on `audit_record_dir` below, which the example above
+spells out explicitly and a file that omits the key gets for free.
 
 On a host whose `state.json` records `registrar_endpoint.enabled = true`,
 a root-run `bootroot init` creates `audit_store_dir`, and `records/` and
@@ -695,13 +701,21 @@ error.
   mount unit; each refusal's fresh `request_id` resolves to that log line,
   not to an audit record. Its `registrar_health` object is empty (`{}`), so
   it exposes no limiter or other production-handler health state. Mounting
-  the store later requires a daemon
-  restart, as does changing this key or `audit_store_dir`; a `SIGHUP`
-  that changes either is rejected. `directory` mode and disabled
-  endpoints perform no check.
+  the store later requires a daemon restart, as does changing this key in
+  either direction, or changing `audit_store_dir` while this key stays
+  `filesystem`; a `SIGHUP` that does either is rejected. Under
+  `directory` a `SIGHUP` that moves `audit_store_dir` is applied
+  normally. `directory` mode and disabled endpoints perform no check.
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
-  the resolved directory must stay inside `audit_store_dir`.
+  the resolved directory must stay inside `audit_store_dir`. The default
+  is derived from `audit_store_dir` on every load, so a file that leaves
+  this key out carries its records along whenever the store moves. A file
+  that sets it explicitly — as the example above does — has to move both
+  in the same edit: the containment check runs when the reloaded file is
+  read, before the reload boundary is consulted, so a store that moved
+  alone is refused as an invalid configuration rather than as a mount
+  verdict.
 - `audit_max_file_bytes` (default `8388608`, 8 MiB) — the size at which
   the active file is rotated. Must be at least `65536`.
 - `audit_max_retained_files` (default `16`) — how many rotated

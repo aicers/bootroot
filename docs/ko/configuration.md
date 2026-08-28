@@ -591,10 +591,15 @@ rate_limit_coalesce_window_seconds = 60
 자체 감사 기록을 쓰는 감사 저장소이고, 다른 하나는 레지스트라 엔드포인트가
 동사 계층을 구성할 때 쓰는 설정입니다. 데몬 실행 단위 전체가 다시
 구성되므로 테이블은 `SIGHUP`마다 다시 읽힙니다. `[registrar_endpoint] enabled`가
-true이면 `audit_store_dir`과 `audit_store_enforcement`은 활성화된 소켓과 함께
-유지되는 마운트 판정을 선택하므로 그 값과 마찬가지로 프로세스 수명 동안
-고정됩니다. 이들 중 하나를 바꾼 리로드는 거부되며, 적용하려면
-`systemctl restart`를 사용하세요.
+true이면 리로드 경계는 활성화된 소켓이 유지하는 마운트 판정만 지킵니다.
+`audit_store_enforcement`는 어느 방향으로도 바꿀 수 없고,
+`audit_store_enforcement = "filesystem"`에서는 `audit_store_dir`도 바꿀 수
+없습니다. 이런 리로드는 데몬의 언어로 거부되며 메시지에 키와 두 값이 함께
+담깁니다. 적용하려면 `systemctl restart`를 사용하세요.
+`audit_store_enforcement = "directory"`에서는 판정을 내리지 않으므로
+`audit_store_dir`은 테이블의 다른 키와 똑같이 리로드됩니다. 다만 아래
+`audit_record_dir` 포함 규칙은 그대로 적용됩니다. 위 예시처럼 그 키를
+명시한 파일은 규칙을 직접 지켜야 하고, 키를 생략한 파일은 저절로 지켜집니다.
 
 `state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
 root로 실행한 `bootroot init`이 `audit_store_dir`을 생성하며,
@@ -664,12 +669,18 @@ OpenBao 감사 장치 확인은 그대로입니다.
   감사 레코드가 아니라 그 로그 줄을 가리킵니다. `registrar_health` 객체는
   비어 있으므로(`{}`) limiter나 다른 프로덕션 핸들러 상태를 노출하지 않습니다.
   나중에 마운트했다면 데몬을
-  재시작해야 하며, 이 키나 `audit_store_dir`을 바꾸는 경우도 같습니다. 둘 중
-  하나를 바꾼 `SIGHUP`은 거부됩니다. `directory` 모드와 비활성 엔드포인트는
-  검사하지 않습니다.
+  재시작해야 하며, 어느 방향으로든 이 키를 바꾸거나 이 키가 `filesystem`인
+  채로 `audit_store_dir`을 바꾸는 경우도 같습니다. 그런 `SIGHUP`은
+  거부됩니다. `directory`에서 `audit_store_dir`만 옮기는 `SIGHUP`은 평소대로
+  적용됩니다. `directory` 모드와 비활성 엔드포인트는 검사하지 않습니다.
 - `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
   놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
-  `audit_store_dir` 안에 있어야 합니다.
+  `audit_store_dir` 안에 있어야 합니다. 기본값은 로드할 때마다
+  `audit_store_dir`에서 파생되므로, 이 키를 생략한 파일은 저장소를 옮길 때
+  레코드 디렉터리도 함께 따라갑니다. 위 예시처럼 이 키를 명시한 파일은 한
+  번의 편집에서 둘을 함께 옮겨야 합니다. 포함 검사는 리로드된 파일을 읽을
+  때, 즉 리로드 경계를 확인하기 전에 실행되므로 저장소만 옮긴 설정은 마운트
+  판정이 아니라 잘못된 설정으로 거부됩니다.
 - `audit_max_file_bytes` (기본값 `8388608`, 8 MiB) — 활성 파일을
   회전시키는 크기입니다. 최소 `65536`이어야 합니다.
 - `audit_max_retained_files` (기본값 `16`) — 활성 파일 옆에 보관하는
