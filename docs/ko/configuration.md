@@ -597,7 +597,9 @@ true이면 리로드 경계는 활성화된 소켓이 유지하는 마운트 판
 없습니다. 이런 리로드는 데몬의 언어로 거부되며 메시지에 키와 두 값이 함께
 담깁니다. 적용하려면 `systemctl restart`를 사용하세요.
 `audit_store_enforcement = "directory"`에서는 판정을 내리지 않으므로
-`audit_store_dir`은 테이블의 다른 키와 똑같이 리로드됩니다.
+`audit_store_dir`은 테이블의 다른 키와 똑같이 리로드됩니다. 다만 아래
+`audit_record_dir` 포함 규칙은 그대로 적용됩니다. 위 예시처럼 그 키를
+명시한 파일은 규칙을 직접 지켜야 하고, 키를 생략한 파일은 저절로 지켜집니다.
 
 `state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
 root로 실행한 `bootroot init`이 `audit_store_dir`을 생성하며,
@@ -673,7 +675,12 @@ OpenBao 감사 장치 확인은 그대로입니다.
   적용됩니다. `directory` 모드와 비활성 엔드포인트는 검사하지 않습니다.
 - `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
   놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
-  `audit_store_dir` 안에 있어야 합니다.
+  `audit_store_dir` 안에 있어야 합니다. 기본값은 로드할 때마다
+  `audit_store_dir`에서 파생되므로, 이 키를 생략한 파일은 저장소를 옮길 때
+  레코드 디렉터리도 함께 따라갑니다. 위 예시처럼 이 키를 명시한 파일은 한
+  번의 편집에서 둘을 함께 옮겨야 합니다. 포함 검사는 리로드된 파일을 읽을
+  때, 즉 리로드 경계를 확인하기 전에 실행되므로 저장소만 옮긴 설정은 마운트
+  판정이 아니라 잘못된 설정으로 거부됩니다.
 - `audit_max_file_bytes` (기본값 `8388608`, 8 MiB) — 활성 파일을
   회전시키는 크기입니다. 최소 `65536`이어야 합니다.
 - `audit_max_retained_files` (기본값 `16`) — 활성 파일 옆에 보관하는

@@ -997,7 +997,11 @@ async fn a_directory_reload_follows_the_moved_store_without_a_mount_gate() {
         .expect("the directory endpoint composes an ordinary handler")
         .expect("an enabled endpoint resolves a service");
 
-    // The reload: the operator moves the store, and only the store.
+    // The reload: the operator moves the store, and only the store. This
+    // fixture is a struct rather than a file, so the record directory a file
+    // derives from the store when the key is absent is spelled out here;
+    // `config::tests::a_directory_store_moves_on_a_single_key_file_edit`
+    // covers the file edit itself.
     let moved = deployment.path().join("moved-audit-store");
     let mut reloaded = running.clone();
     reloaded.registrar.audit_store_dir = moved.clone();

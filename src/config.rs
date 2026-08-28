@@ -3249,6 +3249,45 @@ audit_store_enforcement = "directory"
         );
     }
 
+    /// The store move as an operator actually performs it: one key edited in
+    /// the configuration file.
+    ///
+    /// `audit_record_dir` must resolve inside the store, so a store that
+    /// moves without it would be refused by validation before the reload
+    /// boundary was ever consulted. A file that leaves the key out — which
+    /// is what "changing only `audit_store_dir`" means — derives the record
+    /// directory from the store on each load, so both the running and the
+    /// reloaded configuration validate and the records follow the move.
+    #[test]
+    fn a_directory_store_moves_on_a_single_key_file_edit() {
+        fn load(audit_store_dir: &str) -> Settings {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                "\n[registrar]\naudit_store_enforcement = \
+                 \"directory\"\naudit_store_dir = \"{audit_store_dir}\""
+            )
+            .unwrap();
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            settings.validate().unwrap();
+            settings
+        }
+
+        let running = load("/srv/bootroot/audit-store");
+        let reloaded = load("/srv/bootroot/moved-audit-store");
+        assert_eq!(
+            reloaded.registrar.audit_record_dir,
+            PathBuf::from("/srv/bootroot/moved-audit-store/records"),
+            "an omitted audit_record_dir follows the store the edit moved"
+        );
+        assert!(
+            check_registrar_audit_store_reload(&running.registrar, &reloaded.registrar).is_ok(),
+            "a directory store move needs no other key to change with it"
+        );
+    }
+
     /// All four certificate paths are fixed for the same reason, so a
     /// reload that changes any of them is rejected and the diagnostic
     /// names the key that changed — not merely "the table".

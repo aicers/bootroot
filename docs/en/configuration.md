@@ -626,7 +626,9 @@ mount verdict the activated socket retains, and nothing else:
 Such a reload is rejected in the daemon's language, naming the key and
 both values; use `systemctl restart` to apply it. Under
 `audit_store_enforcement = "directory"` no verdict is taken, so
-`audit_store_dir` reloads like any other key in the table.
+`audit_store_dir` reloads like any other key in the table — subject to
+the containment rule on `audit_record_dir` below, which the example above
+spells out explicitly and a file that omits the key gets for free.
 
 On a host whose `state.json` records `registrar_endpoint.enabled = true`,
 a root-run `bootroot init` creates `audit_store_dir`, and `records/` and
@@ -706,7 +708,14 @@ error.
   normally. `directory` mode and disabled endpoints perform no check.
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
-  the resolved directory must stay inside `audit_store_dir`.
+  the resolved directory must stay inside `audit_store_dir`. The default
+  is derived from `audit_store_dir` on every load, so a file that leaves
+  this key out carries its records along whenever the store moves. A file
+  that sets it explicitly — as the example above does — has to move both
+  in the same edit: the containment check runs when the reloaded file is
+  read, before the reload boundary is consulted, so a store that moved
+  alone is refused as an invalid configuration rather than as a mount
+  verdict.
 - `audit_max_file_bytes` (default `8388608`, 8 MiB) — the size at which
   the active file is rotated. Must be at least `65536`.
 - `audit_max_retained_files` (default `16`) — how many rotated

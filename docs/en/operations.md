@@ -1035,8 +1035,11 @@ the service to apply the change. An endpoint running under
 `audit_store_enforcement = "directory"` took no verdict, so a reload that
 moves `audit_store_dir` and stays in `directory` mode is applied like any
 other `[registrar]` change: the next invocation opens the moved store,
-reads no mount metadata and logs nothing about a mount. None of this runs
-when the endpoint is disabled.
+reads no mount metadata and logs nothing about a mount. Move
+`audit_record_dir` in the same edit if the file sets it, since it must
+resolve inside the store; a file that omits it derives it from the store
+and needs no second change. None of this runs when the endpoint is
+disabled.
 
 #### What the reserve does not cover
 
