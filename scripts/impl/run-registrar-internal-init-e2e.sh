@@ -1338,6 +1338,15 @@ assert_the_rendered_steps_migrate_an_existing_store() {
     fail "the closing rename deleted the holding directory instead of renaming it"
   pass "the migration closed with a rename and the holding directory survives as .migrated"
 
+  # The verification just passed over a destination that is an ext4
+  # filesystem root, and `mkfs.ext4` puts this directory in every one it
+  # makes.  The metadata comparison exempts exactly that entry; without
+  # the exemption the destination carries one record the holding
+  # directory never had, and no correct relocation could ever verify.
+  sudo -n test -d "$store/lost+found" ||
+    fail "the reserve carries no lost+found, so the exemption was never exercised"
+  pass "the verification passed over a reserve carrying mkfs.ext4's own lost+found"
+
   # The records are on the mounted reserve, with their content and
   # their ownership.
   assert_equal "records/ sits on the mounted reserve" \

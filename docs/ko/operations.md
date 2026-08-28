@@ -1182,7 +1182,8 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
      ! -type d ! -type f -exec false {} +
    find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
    cd <audit_store_dir>.pre-mount
-   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
    sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
    sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
@@ -1190,7 +1191,8 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
    sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
    xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
    cd <audit_store_dir>
-   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
    sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
    sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
@@ -1270,7 +1272,12 @@ incomplete**를 내고 복사를 렌더링하지 않습니다.
 담으므로, 원본의 한 아이노드를 대상에서 두 개의 독립 파일로 늘린 복사는
 종류·모드·소유권·크기·내용이 모두 일치해도 실패합니다. 디렉터리 크기와
 수정 시각은 제외됩니다. 둘 다 파일 시스템이 다르면 정당하게 달라지기
-때문입니다. 불일치는 출력을 읽어서가 아니라 종료 상태로 판정합니다.
+때문입니다. `lost+found`도 트리 자신의 뿌리에 있는 디렉터리인 경우에 한해
+제외됩니다. `mkfs.ext4`는 예약량을 만들 때마다 그것을 만들므로, 복사가
+올려놓지 않은 쪽에 서서 올바른 이전마다 실패를 일으킵니다. 제외되는 것은
+그 항목 하나뿐입니다. 그 아래에 있는 것은 여전히 `lost+found/…` 경로로
+비교되므로, 그곳에 넣어 검증을 몰래 통과시킬 수는 없습니다. 불일치는
+출력을 읽어서가 아니라 종료 상태로 판정합니다.
 
 **재개와 되돌리기.** 둘 다 렌더링되고 둘 다 멱등이며 bootroot는 어느
 것도 수행하지 않습니다.

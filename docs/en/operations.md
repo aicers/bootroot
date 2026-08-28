@@ -1248,7 +1248,8 @@ records:
      ! -type d ! -type f -exec false {} +
    find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
    cd <audit_store_dir>.pre-mount
-   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
    sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
    sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
@@ -1256,7 +1257,8 @@ records:
    sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
    xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
    cd <audit_store_dir>
-   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
    sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
    sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
@@ -1341,8 +1343,13 @@ afterwards. The metadata pass carries the **hard-link count**, so a copy
 that expanded one source inode into two destination files fails even
 though every path matches on type, mode, ownership, size and content.
 Directory sizes and modification times are excluded, both differing
-legitimately between two filesystems. A mismatch is decided by exit
-status, never by reading output.
+legitimately between two filesystems. So is `lost+found`, and only where
+it is a directory at a tree's own root: `mkfs.ext4` creates it in every
+reserve it makes, so it stands on a side the copy did not put it on and
+would fault every correct migration. Only that one entry is exempt —
+anything underneath it is still compared under its `lost+found/…` path,
+so nothing is smuggled past the verification by being put there. A
+mismatch is decided by exit status, never by reading output.
 
 **Resume and rollback.** Both are rendered, both are idempotent, and
 bootroot performs neither.

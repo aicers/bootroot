@@ -85,6 +85,25 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 /// inside either, the manifests would describe themselves.
 const SCRATCH_VARIABLE: &str = "SCRATCH";
 
+/// The `find` expression that keeps `mkfs.ext4`'s own directory out of
+/// the metadata manifests.
+///
+/// Every reserve is a freshly made ext4 filesystem, and `mke2fs`
+/// creates `lost+found` in its root. That root is the *destination* of
+/// the relocation copy and both sides of the replacement one, so the
+/// entry stands on a side the copy did not put it on and the metadata
+/// comparison faults every correct migration — the destination
+/// carrying one record the source does not.
+///
+/// Only the entry itself is exempt, and only where it is a directory at
+/// the tree's own root. Anything *underneath* it still appears in all
+/// three manifests under its `lost+found/…` path and is compared as
+/// usual, so nothing can be smuggled past the verification by being put
+/// there; and a regular file or a symbolic link that merely bears the
+/// name is matched by neither `-path` nor `-type d` together, so it is
+/// compared in full and, being a link, refused by the type guard.
+const LOST_AND_FOUND_EXCLUSION: &str = "! \\( -path './lost+found' -type d \\)";
+
 /// The two derived siblings of the store this procedure uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MigrationPaths {
@@ -498,15 +517,15 @@ fn scratch(name: &str) -> String {
 fn side_commands(tree: &Path, side: &str) -> Vec<String> {
     let mut commands = vec![format!("cd {}", sh_quote_path(tree))];
     // Type, octal mode, numeric uid and gid, hard-link count and the
-    // relative path — over every entry, directories included. The path
-    // is the only variable-length field and it is last, so the record's
-    // own NUL delimits it and no name the container wrote can be read
-    // as ending elsewhere. A second variable-length field after it
-    // would destroy that.
+    // relative path — over every entry, directories included except
+    // the one below. The path is the only variable-length field and it
+    // is last, so the record's own NUL delimits it and no name the
+    // container wrote can be read as ending elsewhere. A second
+    // variable-length field after it would destroy that.
     commands.extend(manifest_commands(
         "meta",
         side,
-        "-printf '%y %m %U %G %n %P\\0'",
+        &format!("{LOST_AND_FOUND_EXCLUSION} -printf '%y %m %U %G %n %P\\0'"),
     ));
     // Sizes are their own pass because a *directory's* size legitimately
     // differs between two filesystems and would fail every correct
@@ -797,6 +816,64 @@ mod rendered_sequence {
         );
     }
 
+    /// `mkfs.ext4` creates `lost+found` in every filesystem it makes, so
+    /// the destination of a real relocation carries one before the copy
+    /// starts. Made here at the mode and ownership `mke2fs` gives it.
+    fn plant_lost_and_found(root: &Path) -> PathBuf {
+        let dir = root.join("lost+found");
+        fs::create_dir(&dir).expect("the filesystem's own directory");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("the mode mke2fs gives it");
+        dir
+    }
+
+    #[test]
+    fn the_reserves_own_lost_and_found_does_not_fail_the_verification() {
+        let fixture = fixture();
+        // Before the copy, as the real sequence has it: the mount is up
+        // and the filesystem's root already holds this one directory
+        // that no source ever put there.
+        plant_lost_and_found(&fixture.destination);
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+    }
+
+    #[test]
+    fn content_under_lost_and_found_is_still_compared() {
+        let fixture = fixture();
+        let stray = plant_lost_and_found(&fixture.source).join("stray.log");
+        fs::write(&stray, b"stray\n").expect("a file under lost+found");
+        plant_lost_and_found(&fixture.destination);
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+        // Only the directory entry is exempt. What it holds carries its
+        // `lost+found/…` path into all three manifests, so a same-sized
+        // difference underneath it is caught exactly as anywhere else.
+        fs::write(
+            fixture.destination.join("lost+found").join("stray.log"),
+            b"other\n",
+        )
+        .expect("rewrite the entry under lost+found");
+        assert!(!run(&fixture.scratch, &[&verify]));
+    }
+
+    #[test]
+    fn a_regular_file_merely_bearing_the_name_is_not_exempt() {
+        let fixture = fixture();
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        fs::write(fixture.source.join("lost+found"), b"not the filesystem's\n")
+            .expect("a regular file bearing the name");
+        assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+        // The exemption is `-path` *and* `-type d` together, so this one
+        // is in the metadata manifest and a changed mode fails it.
+        fs::set_permissions(
+            fixture.destination.join("lost+found"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("change the mode on the destination");
+        assert!(!run(&fixture.scratch, &[&verify]));
+    }
+
     #[test]
     fn a_destination_missing_an_entry_fails_the_verification() {
         let fixture = fixture();
@@ -1005,6 +1082,7 @@ mod manuals {
                 "! -type d ! -type f -exec false {} +",
                 "cp -a --one-file-system <audit_store_dir>.pre-mount/. <audit_store_dir>/",
                 "SCRATCH=\"$(mktemp -d)\"",
+                "! \\( -path './lost+found' -type d \\)",
                 "-printf '%y %m %U %G %n %P\\0'",
                 "-printf '%s %P\\0'",
                 "-type f -print0",
