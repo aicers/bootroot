@@ -38,6 +38,8 @@ use bootroot::registrar::audit_store::{
 };
 use serde::Deserialize;
 
+use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::init::OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME;
 use crate::i18n::Messages;
 use crate::state::StateFile;
@@ -493,9 +495,12 @@ pub(crate) fn layout_error_message(
 /// Everything `bootroot init` needs to decide what to do about the
 /// audit store on this run.
 pub(crate) struct AuditStoreInitInputs<'a> {
-    /// The directory the compose file sits in, under which the
-    /// override is rendered.
-    pub(crate) compose_dir: &'a Path,
+    /// The compose file this run was pointed at. The override is
+    /// rendered in its directory, and the migration's Compose stop
+    /// names it with `-f`; deriving both from one value is what keeps
+    /// the file the stop names and the directory the override lands in
+    /// from ever being two different deployments.
+    pub(crate) compose_file: &'a Path,
     /// The operator's `bootroot-agent` configuration file, when
     /// `--agent-config` was supplied.
     pub(crate) agent_config: Option<&'a Path>,
@@ -544,7 +549,7 @@ fn select_audit_store_plan(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
 ) -> Result<AuditStorePlan> {
-    let override_path = audit_override_path(inputs.compose_dir);
+    let override_path = audit_override_path(&compose_file_dir(inputs.compose_file));
     let rendered_present = override_path.exists();
 
     // A rendered override makes the flag mandatory even on a host whose
@@ -615,7 +620,7 @@ fn plan_audit_store(
         ));
     }
 
-    let override_path = audit_override_path(inputs.compose_dir);
+    let override_path = audit_override_path(&compose_file_dir(inputs.compose_file));
     if override_path.exists() {
         let rendered_store = read_audit_override_store_dir(&override_path, messages)?;
         // `Path`'s own equality compares components, so the rendered
@@ -663,7 +668,9 @@ pub(crate) fn preflight_audit_store(
         // raised for the first time by the post-wipe `init` pass would
         // land after the OpenBao wipe.
         if view.enforcement == AuditStoreEnforcement::Filesystem {
-            let reserve_inputs = reserve_inputs(inputs, &view);
+            let compose_dir = compose_file_dir(inputs.compose_file);
+            let identity = ComposeIdentity::resolve(inputs.compose_file, None, messages)?;
+            let reserve_inputs = reserve_inputs(inputs, &view, &compose_dir, identity.project());
             let facts = reserve::evaluate(&reserve_inputs, &reserve::HostProbe, messages)?;
             // The one deliberate consequence, raised here rather than
             // by the post-wipe pass: a host whose store already holds
@@ -748,8 +755,11 @@ pub(crate) fn apply_audit_store(
                         messages
                     ))
                 })?;
-                let rendered =
-                    write_audit_override(inputs.compose_dir, &view.audit_store_dir, messages)?;
+                let rendered = write_audit_override(
+                    &compose_file_dir(inputs.compose_file),
+                    &view.audit_store_dir,
+                    messages,
+                )?;
                 println!(
                     "{}",
                     reserve::render_directory_outcome(
@@ -762,7 +772,10 @@ pub(crate) fn apply_audit_store(
                 Ok(Some(rendered))
             }
             AuditStoreEnforcement::Filesystem => {
-                let reserve_inputs = reserve_inputs(inputs, &view);
+                let compose_dir = compose_file_dir(inputs.compose_file);
+                let identity = ComposeIdentity::resolve(inputs.compose_file, None, messages)?;
+                let reserve_inputs =
+                    reserve_inputs(inputs, &view, &compose_dir, identity.project());
                 let probe = reserve::HostProbe;
                 // Phase 1. Every refusal below is a read, and it runs
                 // before the one filesystem object this path creates.
@@ -808,7 +821,11 @@ pub(crate) fn apply_audit_store(
                             messages
                         ))
                     })?;
-                let rendered = write_audit_override(inputs.compose_dir, store_dir, messages)?;
+                let rendered = write_audit_override(
+                    &compose_file_dir(inputs.compose_file),
+                    store_dir,
+                    messages,
+                )?;
                 let artifacts = reserve::render_artifacts(&reserve_inputs, &facts);
                 reserve::write_artifacts(&artifacts, messages)?;
                 // Phase 3.
@@ -836,13 +853,23 @@ pub(crate) fn apply_audit_store(
 
 /// Assembles what the reserve derives everything from out of the two
 /// halves the install side holds it in.
+///
+/// `compose_dir` and `compose_project` are passed in rather than read
+/// off `inputs` because both are derived from the one compose file it
+/// carries — the directory by [`compose_file_dir`] and the project by
+/// [`ComposeIdentity`] — and the caller owns them for as long as the
+/// borrowed inputs live.
 fn reserve_inputs<'a>(
     inputs: &'a AuditStoreInitInputs<'a>,
     view: &'a AgentConfigView,
+    compose_dir: &'a Path,
+    compose_project: &'a str,
 ) -> reserve::ReserveInputs<'a> {
     reserve::ReserveInputs {
         store_dir: &view.audit_store_dir,
-        compose_dir: inputs.compose_dir,
+        compose_dir,
+        compose_file: inputs.compose_file,
+        compose_project,
         reserve_bytes: view.reserve_bytes,
         max_file_bytes: view.max_file_bytes,
         max_retained_files: view.max_retained_files,
@@ -862,11 +889,16 @@ fn reserve_inputs<'a>(
 /// enforcement is anything short of enforced.
 pub(crate) fn prepare_audit_store_for_infra_up(
     state_path: &Path,
-    compose_dir: &Path,
+    compose_file: &Path,
     agent_config: Option<&Path>,
     expected_uid: u32,
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
+    // The compose file rather than its directory, so the Compose stop
+    // the migration renders names the file this run was pointed at and
+    // the override lands beside that same file.
+    let compose_dir = compose_file_dir(compose_file);
+    let compose_dir = compose_dir.as_path();
     let override_path = audit_override_path(compose_dir);
     let override_present = override_path.exists();
     let endpoint_recorded = if state_path.exists() {
@@ -943,6 +975,7 @@ pub(crate) fn prepare_audit_store_for_infra_up(
             verify_filesystem_reserve_for_infra_up(
                 &view,
                 compose_dir,
+                compose_file,
                 agent_config,
                 expected_uid,
                 messages,
@@ -964,6 +997,7 @@ pub(crate) fn prepare_audit_store_for_infra_up(
 fn verify_filesystem_reserve_for_infra_up(
     view: &AgentConfigView,
     compose_dir: &Path,
+    compose_file: &Path,
     agent_config: &Path,
     expected_uid: u32,
     messages: &Messages,
@@ -972,9 +1006,12 @@ fn verify_filesystem_reserve_for_infra_up(
         "bootroot infra up --agent-config {}",
         reserve::sh_quote_path(agent_config)
     );
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
     let inputs = reserve::ReserveInputs {
         store_dir: &view.audit_store_dir,
         compose_dir,
+        compose_file,
+        compose_project: identity.project(),
         reserve_bytes: view.reserve_bytes,
         max_file_bytes: view.max_file_bytes,
         max_retained_files: view.max_retained_files,
@@ -1198,6 +1235,13 @@ mod tests {
             self.base.path().join("compose")
         }
 
+        /// The `--compose-file` a run is pointed at. Its directory is
+        /// [`Fixture::compose_dir`], which is what the override is
+        /// rendered into and the artifacts are staged under.
+        fn compose_file(&self) -> PathBuf {
+            self.compose_dir().join("docker-compose.yml")
+        }
+
         fn store_dir(&self) -> PathBuf {
             self.base.path().join("audit-store")
         }
@@ -1276,10 +1320,10 @@ mod tests {
             agent_config: Option<&'a Path>,
             state_path: &'a Path,
             endpoint_recorded: bool,
-            compose_dir: &'a Path,
+            compose_file: &'a Path,
         ) -> AuditStoreInitInputs<'a> {
             AuditStoreInitInputs {
-                compose_dir,
+                compose_file,
                 agent_config,
                 state_path,
                 endpoint_recorded,
@@ -1450,8 +1494,9 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let err = apply_audit_store(
-            &Fixture::inputs(None, &state, true, &compose_dir),
+            &Fixture::inputs(None, &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1464,13 +1509,14 @@ mod tests {
     fn a_rendered_override_without_the_flag_fails_naming_it_and_leaves_the_file() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let rendered = write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
             .expect("render");
         let before = fs::read(&rendered).expect("read");
         let state = fixture.state(Some(false));
 
         let err = apply_audit_store(
-            &Fixture::inputs(None, &state, false, &compose_dir),
+            &Fixture::inputs(None, &state, false, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1483,8 +1529,9 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(None);
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let selected = apply_audit_store(
-            &Fixture::inputs(None, &state, false, &compose_dir),
+            &Fixture::inputs(None, &state, false, &compose_file),
             &test_messages(),
         )
         .expect("no-op run");
@@ -1497,10 +1544,10 @@ mod tests {
     fn a_supplied_file_is_cross_checked_even_where_the_flag_is_optional() {
         let fixture = Fixture::new();
         let state = fixture.state(None);
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         let err = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, false, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, false, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1522,9 +1569,10 @@ mod tests {
             let fixture = Fixture::new();
             let state = fixture.state(Some(recorded));
             let compose_dir = fixture.compose_dir();
+            let compose_file = fixture.compose_file();
             let agent_config = fixture.agent_config(body_enabled);
             let err = apply_audit_store(
-                &Fixture::inputs(Some(&agent_config), &state, recorded, &compose_dir),
+                &Fixture::inputs(Some(&agent_config), &state, recorded, &compose_file),
                 &test_messages(),
             )
             .expect_err("refused");
@@ -1558,7 +1606,7 @@ mod tests {
     fn a_missing_endpoint_table_disagreeing_with_a_recorded_true_is_refused() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = write_agent_config(
             fixture.base.path(),
             &format!(
@@ -1567,7 +1615,7 @@ mod tests {
             ),
         );
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1587,6 +1635,7 @@ mod tests {
                 for rendered_present in [true, false] {
                     let fixture = Fixture::new();
                     let compose_dir = fixture.compose_dir();
+                    let compose_file = fixture.compose_file();
                     let state = fixture.state(Some(recorded));
                     if rendered_present {
                         write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
@@ -1601,7 +1650,7 @@ mod tests {
                             supplied.then_some(agreeing.as_path()),
                             &state,
                             recorded,
-                            &compose_dir,
+                            &compose_file,
                         ),
                         &test_messages(),
                     );
@@ -1626,10 +1675,10 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let before = fs::read(&state).expect("read");
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("provisioned");
@@ -1651,9 +1700,10 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         let selected = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("provisioned");
@@ -1699,9 +1749,10 @@ mod tests {
             let fixture = Fixture::new();
             let state = fixture.state(recorded);
             let compose_dir = fixture.compose_dir();
+            let compose_file = fixture.compose_file();
             let agent_config = fixture.agent_config(false);
             let selected = apply_audit_store(
-                &Fixture::inputs(Some(&agent_config), &state, false, &compose_dir),
+                &Fixture::inputs(Some(&agent_config), &state, false, &compose_file),
                 &test_messages(),
             )
             .expect("no-op");
@@ -1715,14 +1766,14 @@ mod tests {
     fn a_store_directory_at_a_wrong_mode_fails_naming_the_remedy() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         let store = fixture.store_dir();
         fs::create_dir(&store).expect("store");
         fs::set_permissions(&store, fs::Permissions::from_mode(0o750)).expect("chmod");
 
         let err = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1760,10 +1811,11 @@ mod tests {
         let store = tight.join("audit-store");
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config_for(&store, true);
 
         let err = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1779,10 +1831,10 @@ mod tests {
     fn an_existing_openbao_directory_is_left_untouched_and_a_plant_is_refused() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("first run");
@@ -1794,7 +1846,7 @@ mod tests {
         let openbao = fixture.store_dir().join(OPENBAO_SUBDIR);
         fs::set_permissions(&openbao, fs::Permissions::from_mode(0o755)).expect("chmod");
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("re-run over a started deployment");
@@ -1810,7 +1862,7 @@ mod tests {
         fs::remove_dir(&openbao).expect("remove");
         fs::write(&openbao, b"planted").expect("plant");
         let err = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1834,9 +1886,10 @@ mod tests {
         // The required flag, on the two runs that require it.
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let state = fixture.state(Some(true));
         let err = preflight_audit_store(
-            &Fixture::inputs(None, &state, true, &compose_dir),
+            &Fixture::inputs(None, &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -1846,7 +1899,7 @@ mod tests {
         // The enablement cross-check.
         let disagreeing = fixture.agent_config(false);
         preflight_audit_store(
-            &Fixture::inputs(Some(&disagreeing), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&disagreeing), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused on disagreement");
@@ -1858,7 +1911,7 @@ mod tests {
             "[registrar]\naudit_store_dirr = \"/srv/store\"\n",
         );
         preflight_audit_store(
-            &Fixture::inputs(Some(&bad), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&bad), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused on deserialization");
@@ -1872,7 +1925,7 @@ mod tests {
             .expect("render");
         let before = fs::read(&rendered).expect("read");
         preflight_audit_store(
-            &Fixture::inputs(Some(&agreeing), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agreeing), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("accepted");
@@ -1892,9 +1945,10 @@ mod tests {
     fn the_preflight_leaves_fresh_filesystem_provisioning_to_init() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let state = fixture.state(Some(true));
         let agreeing = fixture.filesystem_agent_config(true);
-        let inputs = Fixture::inputs(Some(&agreeing), &state, true, &compose_dir);
+        let inputs = Fixture::inputs(Some(&agreeing), &state, true, &compose_file);
 
         preflight_audit_store(&inputs, &test_messages()).expect("phase one clears");
         assert!(!fixture.store_dir().exists());
@@ -1924,6 +1978,7 @@ mod tests {
         // leaves it byte-identical and does not stop the wipe.
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let state = fixture.state(Some(true));
         let rendered = write_audit_override(
             &compose_dir,
@@ -1934,7 +1989,7 @@ mod tests {
         let before = fs::read(&rendered).expect("read");
         let agreeing = fixture.agent_config(true);
         preflight_audit_store(
-            &Fixture::inputs(Some(&agreeing), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agreeing), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("the stale override is deferred to init");
@@ -1943,7 +1998,6 @@ mod tests {
         // An ancestor without `o+x` is likewise a layout check for the
         // ordinary init pass, not a filesystem reserve phase-one fact.
         let fixture = Fixture::new();
-        let compose_dir = fixture.compose_dir();
         let state = fixture.state(Some(true));
         let tight = fixture.base.path().join("tight");
         fs::create_dir(&tight).expect("ancestor");
@@ -1952,7 +2006,7 @@ mod tests {
         let agent_config =
             fixture.filesystem_agent_config_at(&store, true, RESERVE_FLOOR_FOR_TESTS);
         preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("the ancestor check is deferred to init");
@@ -1965,12 +2019,13 @@ mod tests {
     fn the_preflight_leaves_an_override_it_would_unwind_on_disk() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let rendered = write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
             .expect("render");
         let state = fixture.state(Some(false));
 
         preflight_audit_store(
-            &Fixture::inputs(None, &state, false, &compose_dir),
+            &Fixture::inputs(None, &state, false, &compose_file),
             &test_messages(),
         )
         .expect_err("the rendered override keeps the flag mandatory");
@@ -1978,7 +2033,7 @@ mod tests {
 
         let disabling = fixture.agent_config(false);
         preflight_audit_store(
-            &Fixture::inputs(Some(&disabling), &state, false, &compose_dir),
+            &Fixture::inputs(Some(&disabling), &state, false, &compose_file),
             &test_messages(),
         )
         .expect("an agreeing false is accepted");
@@ -2002,6 +2057,7 @@ mod tests {
     fn an_unprivileged_provisioning_run_creates_nothing() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let store_dir = fixture.store_dir();
         let agent_config = fixture.agent_config(true);
         let state = fixture.state(Some(true));
@@ -2009,7 +2065,7 @@ mod tests {
         let foreign_uid = current_process_euid().wrapping_add(1);
         let err = apply_audit_store(
             &AuditStoreInitInputs {
-                compose_dir: &compose_dir,
+                compose_file: &compose_file,
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: true,
@@ -2046,6 +2102,7 @@ mod tests {
     fn the_preflight_defers_the_unprivileged_refusal_to_init() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let store_dir = fixture.store_dir();
         let agent_config = fixture.agent_config(true);
         let state = fixture.state(Some(true));
@@ -2054,7 +2111,7 @@ mod tests {
         let foreign_uid = current_process_euid().wrapping_add(1);
         preflight_audit_store(
             &AuditStoreInitInputs {
-                compose_dir: &compose_dir,
+                compose_file: &compose_file,
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: true,
@@ -2074,6 +2131,7 @@ mod tests {
     fn an_unwinding_run_is_not_held_to_the_provisioning_uid() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let store_dir = fixture.store_dir();
         let rendered =
             write_audit_override(&compose_dir, &store_dir, &test_messages()).expect("render");
@@ -2082,7 +2140,7 @@ mod tests {
 
         let selected = apply_audit_store(
             &AuditStoreInitInputs {
-                compose_dir: &compose_dir,
+                compose_file: &compose_file,
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: false,
@@ -2103,6 +2161,7 @@ mod tests {
     fn a_stale_override_fails_before_anything_is_created_rendered_or_recreated() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let recorded_store = fixture.base.path().join("old-store");
         let rendered =
             write_audit_override(&compose_dir, &recorded_store, &test_messages()).expect("render");
@@ -2113,7 +2172,7 @@ mod tests {
         let state = fixture.state(Some(true));
 
         let err = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -2143,10 +2202,11 @@ mod tests {
     fn switching_off_stops_the_mount_before_it_deletes_the_rendered_file() {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let enabling = fixture.agent_config(true);
         let provisioned_state = fixture.state(Some(true));
         apply_audit_store(
-            &Fixture::inputs(Some(&enabling), &provisioned_state, true, &compose_dir),
+            &Fixture::inputs(Some(&enabling), &provisioned_state, true, &compose_file),
             &test_messages(),
         )
         .expect("provisioned");
@@ -2171,7 +2231,7 @@ mod tests {
 
         // An `init` still handed the enabling configuration is refused.
         apply_audit_store(
-            &Fixture::inputs(Some(&enabling), &state, false, &compose_dir),
+            &Fixture::inputs(Some(&enabling), &state, false, &compose_file),
             &test_messages(),
         )
         .expect_err("refused on disagreement");
@@ -2179,7 +2239,7 @@ mod tests {
 
         // An `init` given no configuration fails naming the flag.
         apply_audit_store(
-            &Fixture::inputs(None, &state, false, &compose_dir),
+            &Fixture::inputs(None, &state, false, &compose_file),
             &test_messages(),
         )
         .expect_err("the rendered override keeps the flag mandatory");
@@ -2188,7 +2248,7 @@ mod tests {
         // Only an agreeing `false` deletes it.
         let disabling = fixture.agent_config(false);
         let selected = apply_audit_store(
-            &Fixture::inputs(Some(&disabling), &state, false, &compose_dir),
+            &Fixture::inputs(Some(&disabling), &state, false, &compose_file),
             &test_messages(),
         )
         .expect("unwound");
@@ -2207,25 +2267,29 @@ mod tests {
     // `infra up` resolution
     // ---------------------------------------------------------------
 
-    fn provisioned_fixture() -> (Fixture, PathBuf, PathBuf) {
+    /// Returns the fixture, its `state.json`, the compose directory
+    /// the override is rendered into and the compose file a run is
+    /// pointed at.
+    fn provisioned_fixture() -> (Fixture, PathBuf, PathBuf, PathBuf) {
         let fixture = Fixture::new();
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.agent_config(true);
         let state = fixture.state(Some(true));
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("provisioned");
-        (fixture, state, compose_dir)
+        (fixture, state, compose_dir, compose_file)
     }
 
     #[test]
     fn infra_up_requires_its_agent_config_before_selecting_an_override() {
-        let (_fixture, state, compose_dir) = provisioned_fixture();
+        let (_fixture, state, _compose_dir, compose_file) = provisioned_fixture();
         let err = prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             None,
             current_process_euid(),
             &test_messages(),
@@ -2237,11 +2301,11 @@ mod tests {
 
     #[test]
     fn infra_up_requires_its_agent_config_for_a_stale_override() {
-        let (fixture, _state, compose_dir) = provisioned_fixture();
+        let (fixture, _state, _compose_dir, compose_file) = provisioned_fixture();
         let disabled_state = fixture.state(Some(false));
         let err = prepare_audit_store_for_infra_up(
             &disabled_state,
-            &compose_dir,
+            &compose_file,
             None,
             current_process_euid(),
             &test_messages(),
@@ -2253,11 +2317,11 @@ mod tests {
 
     #[test]
     fn infra_up_rejects_an_agent_config_with_a_different_enablement() {
-        let (fixture, state, compose_dir) = provisioned_fixture();
+        let (fixture, state, _compose_dir, compose_file) = provisioned_fixture();
         let disabled_config = fixture.agent_config(false);
         let err = prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&disabled_config),
             current_process_euid(),
             &test_messages(),
@@ -2283,7 +2347,7 @@ mod tests {
         assert!(
             prepare_audit_store_for_infra_up(
                 &state,
-                &fixture.compose_dir(),
+                &fixture.compose_file(),
                 Some(&absent_config),
                 current_process_euid(),
                 &test_messages(),
@@ -2295,7 +2359,7 @@ mod tests {
 
     #[test]
     fn infra_up_upgrades_a_legacy_override_without_repointing_it() {
-        let (fixture, state, compose_dir) = provisioned_fixture();
+        let (fixture, state, compose_dir, compose_file) = provisioned_fixture();
         let config = fixture.agent_config(true);
         let path = audit_override_path(&compose_dir);
         let store = fixture.store_dir();
@@ -2311,7 +2375,7 @@ mod tests {
 
         prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&config),
             current_process_euid(),
             &test_messages(),
@@ -2326,7 +2390,7 @@ mod tests {
 
         prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&config),
             current_process_euid(),
             &test_messages(),
@@ -2340,6 +2404,7 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let config = fixture.filesystem_agent_config(true);
         let quoted_config = fixture
             .base
@@ -2351,7 +2416,7 @@ mod tests {
 
         let err = prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&quoted_config),
             current_process_euid(),
             &test_messages(),
@@ -2371,7 +2436,7 @@ mod tests {
 
     #[test]
     fn a_bring_up_selects_the_override_over_a_conforming_store() {
-        let (fixture, state, compose_dir) = provisioned_fixture();
+        let (fixture, state, compose_dir, _compose_file) = provisioned_fixture();
         // An unreadable `openbao/` under an otherwise valid store: the
         // check never descends, so it still succeeds.
         let openbao = fixture.store_dir().join(OPENBAO_SUBDIR);
@@ -2393,7 +2458,7 @@ mod tests {
 
     #[test]
     fn a_bring_up_without_a_rendered_override_names_bootroot_init() {
-        let (_fixture, state, compose_dir) = provisioned_fixture();
+        let (_fixture, state, compose_dir, _compose_file) = provisioned_fixture();
         fs::remove_file(audit_override_path(&compose_dir)).expect("remove");
         let err = resolve_audit_override(
             &state,
@@ -2424,7 +2489,7 @@ mod tests {
             }),
         ];
         for (label, plant) in store_faults {
-            let (fixture, state, compose_dir) = provisioned_fixture();
+            let (fixture, state, compose_dir, _compose_file) = provisioned_fixture();
             plant(&fixture.store_dir());
             let err = resolve_audit_override(
                 &state,
@@ -2444,7 +2509,7 @@ mod tests {
 
     #[test]
     fn a_bring_up_refuses_a_store_owned_by_another_uid_and_states_the_remedy() {
-        let (fixture, state, compose_dir) = provisioned_fixture();
+        let (fixture, state, compose_dir, _compose_file) = provisioned_fixture();
         let err = resolve_audit_override(
             &state,
             &compose_dir,
@@ -2485,9 +2550,10 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.filesystem_agent_config(true);
         apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &messages,
         )
         .expect_err("provisioned, not activated");
@@ -2510,7 +2576,7 @@ mod tests {
 
     #[test]
     fn a_disabled_predicate_selects_nothing_and_leaves_a_rendered_file_inert() {
-        let (fixture, _state, compose_dir) = provisioned_fixture();
+        let (fixture, _state, compose_dir, _compose_file) = provisioned_fixture();
         for recorded in [None, Some(false)] {
             let state = write_state(fixture.base.path(), recorded);
             assert!(
@@ -2830,10 +2896,10 @@ mod tests {
         for enforcement in ["filesystem", "directory"] {
             let fixture = Fixture::new();
             let state = fixture.state(Some(false));
-            let compose_dir = fixture.compose_dir();
+            let compose_file = fixture.compose_file();
             let agent_config =
                 fixture.agent_config_in_mode(&fixture.store_dir(), false, enforcement);
-            let inputs = Fixture::inputs(Some(&agent_config), &state, false, &compose_dir);
+            let inputs = Fixture::inputs(Some(&agent_config), &state, false, &compose_file);
             assert_eq!(
                 plan_audit_store(&inputs, &test_messages()).expect("planned"),
                 AuditStorePlan::Idle,
@@ -2861,9 +2927,10 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.filesystem_agent_config(true);
         let error = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("provisioned, not activated");
@@ -2926,6 +2993,7 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let store = fixture.store_dir();
         // The configured spelling: a trailing `.` component, which
         // `validate_registrar_settings` accepts and which no ancestor
@@ -2933,7 +3001,7 @@ mod tests {
         let configured = store.join(".");
         let agent_config =
             fixture.filesystem_agent_config_at(&configured, true, RESERVE_FLOOR_FOR_TESTS);
-        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_dir);
+        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_file);
 
         let error =
             apply_audit_store(&inputs, &test_messages()).expect_err("provisioned, not activated");
@@ -2984,13 +3052,13 @@ mod tests {
     fn a_directory_mode_run_creates_all_three_and_names_no_leftover() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         // A leftover image from a previous `filesystem`-mode run: a
         // `directory` run neither reads it nor names it.
         fs::write(fixture.image_path(), b"leftover").expect("leftover image");
         let agent_config = fixture.agent_config(true);
         let selected = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect("unenforced (directory) is a success");
@@ -3016,6 +3084,7 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let config = fixture.filesystem_agent_config(true);
         write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
             .expect("override");
@@ -3028,7 +3097,7 @@ mod tests {
 
         let err = prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&config),
             current_process_euid(),
             &test_messages(),
@@ -3048,7 +3117,7 @@ mod tests {
 
     #[test]
     fn a_directory_mode_bring_up_names_the_holding_directory_and_continues() {
-        let (fixture, state, compose_dir) = provisioned_fixture();
+        let (fixture, state, compose_dir, compose_file) = provisioned_fixture();
         let config = fixture.agent_config(true);
         let holding = holding_dir(&fixture);
         fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
@@ -3058,7 +3127,7 @@ mod tests {
         // left to be mistaken for debris.
         let selected = prepare_audit_store_for_infra_up(
             &state,
-            &compose_dir,
+            &compose_file,
             Some(&config),
             current_process_euid(),
             &test_messages(),
@@ -3075,13 +3144,13 @@ mod tests {
     fn init_reports_the_migration_before_it_creates_the_mount_point() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.filesystem_agent_config(true);
         let holding = holding_dir(&fixture);
         fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
 
         let error = apply_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("an open migration fails the run");
@@ -3127,6 +3196,7 @@ mod tests {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
         let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let config = fixture.filesystem_agent_config(true);
         write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
             .expect("override");
@@ -3145,12 +3215,12 @@ mod tests {
         // Three surfaces, each run twice: a second pass re-reads rather
         // than acting on an earlier verdict.
         for _ in 0..2 {
-            let inputs = Fixture::inputs(Some(&config), &state, true, &compose_dir);
+            let inputs = Fixture::inputs(Some(&config), &state, true, &compose_file);
             preflight_audit_store(&inputs, &test_messages()).expect_err("refused");
             apply_audit_store(&inputs, &test_messages()).expect_err("refused");
             prepare_audit_store_for_infra_up(
                 &state,
-                &compose_dir,
+                &compose_file,
                 Some(&config),
                 current_process_euid(),
                 &test_messages(),
@@ -3170,14 +3240,14 @@ mod tests {
     fn the_reinit_preflight_refuses_an_open_migration_before_the_wipe() {
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.filesystem_agent_config(true);
         let holding = holding_dir(&fixture);
         fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
         fs::write(holding.join(RECORDS_SUBDIR).join("audit.log"), b"a record").expect("a record");
 
         let error = preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &test_messages(),
         )
         .expect_err("refused");
@@ -3198,10 +3268,10 @@ mod tests {
         // A sub-minimum reserve.
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let agent_config = fixture.filesystem_agent_config_with(true, 1024 * 1024);
         let error = preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &messages,
         )
         .expect_err("refused");
@@ -3212,13 +3282,12 @@ mod tests {
         // A store path the artifacts cannot carry.
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
         // A trailing space: systemd strips it off the value, leaving
         // `Where=` naming a path the unit name no longer matches.
         let hostile = fixture.base.path().join("audit-store ");
         let agent_config = fixture.agent_config_in_mode(&hostile, true, "filesystem");
         let error = preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &messages,
         )
         .expect_err("refused");
@@ -3228,11 +3297,10 @@ mod tests {
         // An image of the wrong size.
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
         let agent_config = fixture.filesystem_agent_config(true);
         fs::write(fixture.image_path(), b"wrong size").expect("image");
         let error = preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &messages,
         )
         .expect_err("refused");
@@ -3245,7 +3313,6 @@ mod tests {
         // A store that already holds records.
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
         let agent_config = fixture.filesystem_agent_config(true);
         fs::create_dir_all(fixture.store_dir().join(RECORDS_SUBDIR)).expect("records");
         fs::write(
@@ -3254,7 +3321,7 @@ mod tests {
         )
         .expect("a record");
         let error = preflight_audit_store(
-            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
             &messages,
         )
         .expect_err("refused");
@@ -3280,11 +3347,11 @@ mod tests {
         let messages = test_messages();
         let fixture = Fixture::new();
         let state = fixture.state(Some(true));
-        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
         let configured = fixture.store_dir().join(".");
         let agent_config =
             fixture.filesystem_agent_config_at(&configured, true, RESERVE_FLOOR_FOR_TESTS);
-        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_dir);
+        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_file);
 
         // Provision: the mount point lands at the simplified path and
         // at the store directory contract's mode, and the override is

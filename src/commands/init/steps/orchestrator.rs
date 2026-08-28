@@ -337,10 +337,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     // run before anything is created or rendered.
     let audit_override = crate::commands::audit_store::apply_audit_store(
         &crate::commands::audit_store::AuditStoreInitInputs {
-            compose_dir: crate::commands::compose_file::compose_file_dir(
-                &args.compose.compose_file,
-            )
-            .as_path(),
+            compose_file: &args.compose.compose_file,
             agent_config: args.agent_config.as_deref(),
             state_path: &state_path,
             endpoint_recorded: registrar_intent.is_some(),

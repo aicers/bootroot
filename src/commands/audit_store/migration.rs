@@ -663,16 +663,37 @@ pub(super) fn closing_rename_step(
 /// unmount, which is safe precisely because the source was never
 /// modified. The `rmdir` is non-recursive by choice: it removes the
 /// mount point only if the unmount left it empty.
-pub(super) fn rollback_step(store_dir: &Path, holding: &Path, messages: &Messages) -> Phase2Step {
+///
+/// The unmount is rendered only where the store is a mount point. A
+/// migration is open from the aside rename onward, which is two
+/// `bootroot infra up` passes before the mount comes up, and there
+/// `umount <store>` exits non-zero over a store nothing is mounted on —
+/// stopping a sequence run verbatim before the `rmdir` and the
+/// restoring rename, which are the two commands that carry the
+/// rollback. So the step is the whole way back out from whichever state
+/// it is rendered in, rather than a list whose first line is a failure
+/// the operator has to know to ignore.
+///
+/// The predicate is the mount table naming the store at all rather than
+/// the reserve being what is mounted: a foreign mount there is still
+/// something the `rmdir` cannot get past.
+pub(super) fn rollback_step(
+    store_dir: &Path,
+    holding: &Path,
+    mount_present: bool,
+    messages: &Messages,
+) -> Phase2Step {
     let store = sh_quote_path(store_dir);
+    let mut commands = Vec::with_capacity(3);
+    if mount_present {
+        commands.push(format!("umount {store}"));
+    }
+    commands.push(format!("rmdir {store}"));
+    commands.push(format!("mv {} {store}", sh_quote_path(holding)));
     Phase2Step {
         kind: Phase2StepKind::Rollback,
         title: messages.audit_reserve_step_rollback().to_string(),
-        commands: vec![
-            format!("umount {store}"),
-            format!("rmdir {store}"),
-            format!("mv {} {store}", sh_quote_path(holding)),
-        ],
+        commands,
     }
 }
 
@@ -1062,6 +1083,44 @@ mod rendered_sequence {
             fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
                 .expect("restore the subdirectory so the fixture can be removed");
         }
+    }
+
+    /// The state the aside rename leaves: a holding directory beside an
+    /// empty mount point nothing is mounted on. The rollback rendered
+    /// there has to run to completion as it stands, because an operator
+    /// pasting it is the only thing that performs it.
+    #[test]
+    fn the_mount_absent_rollback_runs_to_completion() {
+        let empty = fixture();
+        let occupied = fixture();
+        let step = rollback_step(&empty.destination, &empty.source, false, &test_messages());
+        assert!(
+            step.commands
+                .iter()
+                .all(|command| !command.contains("umount")),
+            "{:?}",
+            step.commands
+        );
+        assert!(run(&empty.scratch, &[&step]));
+        // The holding directory is back under the store's own name,
+        // with its contents, and nothing is left at the aside path.
+        assert!(!empty.source.exists());
+        assert_eq!(
+            fs::read(empty.destination.join("records").join("verbs.log"))
+                .expect("the records survived the rollback"),
+            b"one\ntwo\n"
+        );
+        // And the same state's rollback still stops where the mount
+        // point is not empty: the `rmdir` is non-recursive.
+        fs::write(occupied.destination.join("stray"), b"x").expect("a stray entry");
+        let step = rollback_step(
+            &occupied.destination,
+            &occupied.source,
+            false,
+            &test_messages(),
+        );
+        assert!(!run(&occupied.scratch, &[&step]));
+        assert!(occupied.source.exists(), "the holding directory was moved");
     }
 }
 

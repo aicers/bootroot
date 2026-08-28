@@ -1241,6 +1241,10 @@ records:
    systemctl stop bootroot-registrar.service
    ```
 
+   Both lines are commands, and every rendered list below carries them
+   with the `--compose-file` this run was pointed at and the Compose
+   project it resolved already filled in.
+
 2. Rename the store aside and recreate the mount point empty and
    root-owned.
 
@@ -1257,8 +1261,8 @@ records:
    the `systemctl enable --now <escaped audit_store_dir>.mount` — and
    **not** the creation of `records/` or `openbao/`, which step 6
    performs instead. bootroot cannot see that the writers are already
-   down, so the stop-both-writers step appears in that list too; step 1
-   has satisfied it.
+   down, so the stop-both-writers step appears in that list too, with
+   both its commands; step 1 has satisfied it.
 4. Run those commands. The mount is now up and the store on it is empty.
 5. Run `bootroot infra up --agent-config <path>` again. Still **migration
    incomplete** and still starting no container, it now reports the
@@ -1395,14 +1399,19 @@ bootroot performs neither.
   its `.pre-mount` name; once the closing rename has run the store is
   authoritative and there is nothing to roll back to. The partial copy is
   discarded with the unmount, which is safe precisely because the
-  original was never touched. The `umount` applies only where the reserve
-  is already mounted.
+  original was never touched.
 
   ```sh
   umount <audit_store_dir>
   rmdir <audit_store_dir>
   mv <audit_store_dir>.pre-mount <audit_store_dir>
   ```
+
+  The `umount` is rendered only where the store is a mount point — from
+  step 4 onward. Between step 2 and step 4 the migration is already
+  open with nothing mounted, and there the rendered rollback is the
+  `rmdir` and the rename alone: an `umount` ahead of them would exit
+  non-zero and stop a sequence run verbatim before either.
 
 **After the closing rename**, `<audit_store_dir>.migrated` holds a
 redundant second copy outside the reserve. It clears **migration

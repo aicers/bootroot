@@ -436,6 +436,14 @@ pub(crate) struct ReserveInputs<'a> {
     /// The directory the compose file sits in, under which the three
     /// artifacts are staged.
     pub(crate) compose_dir: &'a Path,
+    /// The compose file this run was pointed at, named by the `-f` of
+    /// the Compose stop the stop-both-writers step renders.
+    pub(crate) compose_file: &'a Path,
+    /// The Compose project this run resolved, carried as the `-p` of
+    /// that same stop so it reaches the deployment bootroot itself
+    /// would have brought up rather than whichever project Compose
+    /// derives from a directory name.
+    pub(crate) compose_project: &'a str,
     /// `[registrar] audit_store_reserve_bytes`.
     pub(crate) reserve_bytes: u64,
     /// `[registrar] audit_max_file_bytes`.
@@ -1988,7 +1996,7 @@ fn phase2_steps(
 
     let mut steps = Vec::new();
     if !image.is_empty() || mount_outstanding {
-        steps.push(stop_writers_step(messages));
+        steps.push(stop_writers_step(inputs, messages));
     }
     if !image.is_empty() {
         steps.push(Phase2Step {
@@ -2020,15 +2028,34 @@ fn phase2_steps(
 /// The step that stops both writers, shared by the activation sequence
 /// and the migration.
 ///
-/// Only the daemon's half is a command this surface can spell: stopping
-/// the Compose stack takes the operator's own `-f`/`-p` invocation,
-/// which nothing here is given, and a guessed one would stop the wrong
-/// deployment.
-fn stop_writers_step(messages: &Messages) -> Phase2Step {
+/// Both halves are commands, in the order the sequence needs them: the
+/// Compose stack first, so no container holds a bind under the store,
+/// then the daemon, so no verb record is written into it. Neither is
+/// prose. An operator running the rendered list verbatim who was left
+/// to infer the Compose stop would rename, copy and verify a store
+/// `OpenBao` was still writing through its existing bind, and the
+/// records written in that window would be outside the verified copy.
+///
+/// The stop is spelled with the `-f` and `-p` this run resolved rather
+/// than a guessed pair: the compose file is the one bootroot was
+/// pointed at, and the project is the one every invocation of this run
+/// is scoped to, so the command reaches that deployment and no
+/// co-located one. It carries no `BOOTROOT_INSTANCE` pin because
+/// `stop` selects containers by the project label Compose already has
+/// from `-p`, and the compose file's own `.env` supplies the variable
+/// while the file is rendered.
+fn stop_writers_step(inputs: &ReserveInputs<'_>, messages: &Messages) -> Phase2Step {
     Phase2Step {
         kind: Phase2StepKind::StopWriters,
         title: messages.audit_reserve_step_stop_writers().to_string(),
-        commands: vec![format!("systemctl stop {REGISTRAR_UNIT_NAME}")],
+        commands: vec![
+            format!(
+                "docker compose -f {} -p {} stop",
+                sh_quote_path(inputs.compose_file),
+                sh_quote(inputs.compose_project),
+            ),
+            format!("systemctl stop {REGISTRAR_UNIT_NAME}"),
+        ],
     }
 }
 
@@ -2289,7 +2316,7 @@ fn migration_entry_report(
         findings,
         notes: Vec::new(),
         steps: vec![
-            stop_writers_step(messages),
+            stop_writers_step(inputs, messages),
             migration::aside_rename_step(
                 &facts.store_dir,
                 &facts.migration.paths.holding,
@@ -2402,6 +2429,7 @@ fn migration_report(
             steps.push(migration::rollback_step(
                 &facts.store_dir,
                 &facts.migration.paths.holding,
+                facts.mount_present(),
                 messages,
             ));
         }
@@ -2449,7 +2477,7 @@ fn migration_report(
     {
         // Both writers stay down for the whole window, and bootroot
         // cannot see that they already are.
-        steps.insert(0, stop_writers_step(messages));
+        steps.insert(0, stop_writers_step(inputs, messages));
     }
     if verdict.renders_copy() {
         steps.push(migration::type_guard_step(
@@ -2478,6 +2506,7 @@ fn migration_report(
     steps.push(migration::rollback_step(
         &facts.store_dir,
         &facts.migration.paths.holding,
+        facts.mount_present(),
         messages,
     ));
     Ok(ReserveReport::MigrationIncomplete { findings, steps })
@@ -2661,6 +2690,8 @@ mod tests {
     const IMAGE: &str = "/var/lib/bootroot/audit-store.img";
     const UNIT: &str = "var-lib-bootroot-audit\\x2dstore.mount";
     const RERUN: &str = "bootroot init";
+    const COMPOSE_FILE: &str = "/opt/bootroot/docker-compose.yml";
+    const COMPOSE_PROJECT: &str = "bootroot";
 
     /// A host built entirely out of fixture values, so every decision
     /// this module makes is reachable from a test that is not root and
@@ -2822,6 +2853,8 @@ mod tests {
     struct Fixture {
         store: PathBuf,
         compose: PathBuf,
+        compose_file: PathBuf,
+        compose_project: String,
         reserve_bytes: u64,
         max_file_bytes: u64,
         max_retained_files: u32,
@@ -2832,6 +2865,8 @@ mod tests {
             Self {
                 store: PathBuf::from(STORE),
                 compose: PathBuf::from("/opt/bootroot"),
+                compose_file: PathBuf::from(COMPOSE_FILE),
+                compose_project: COMPOSE_PROJECT.to_string(),
                 reserve_bytes: DEFAULT_RESERVE,
                 max_file_bytes: DEFAULT_MAX_FILE_BYTES,
                 max_retained_files: DEFAULT_MAX_RETAINED,
@@ -2844,6 +2879,8 @@ mod tests {
             ReserveInputs {
                 store_dir: &self.store,
                 compose_dir: &self.compose,
+                compose_file: &self.compose_file,
+                compose_project: &self.compose_project,
                 reserve_bytes: self.reserve_bytes,
                 max_file_bytes: self.max_file_bytes,
                 max_retained_files: self.max_retained_files,
@@ -4866,6 +4903,147 @@ mod tests {
             assert!(!command.contains("rm -f"), "{command}");
             assert!(!command.contains("%P "), "{command}");
         }
+    }
+
+    /// Both writers are stopped by *commands*, not by prose. An
+    /// operator who ran every rendered line and was left to infer the
+    /// Compose stop would rename, copy and verify a store `OpenBao` was
+    /// still writing into through its existing bind.
+    #[test]
+    fn the_stop_both_writers_step_renders_the_compose_stop_ahead_of_the_daemon() {
+        let fixture = Fixture::default();
+        let expected = vec![
+            format!("docker compose -f '{COMPOSE_FILE}' -p '{COMPOSE_PROJECT}' stop"),
+            "systemctl stop bootroot-registrar.service".to_string(),
+        ];
+
+        // The activation, the migration's entry pass and every
+        // migration pass render the same two commands in the same
+        // order.
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let plain = bare_host();
+        let plain_facts = evaluate(&inputs, &plain, &messages).expect("phase 1");
+        let plain_artifacts = render_artifacts(&inputs, &plain_facts);
+        let ReserveReport::NotActivated { steps, .. } =
+            verify(&inputs, &plain_facts, &plain_artifacts, &plain, &messages).expect("phase 3")
+        else {
+            panic!("a fresh host is not activated");
+        };
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        // A store that still holds records: the entry into the
+        // migration, rendered before any holding directory exists.
+        let occupied = bare_host()
+            .entries(STORE, &[&format!("{STORE}/records")])
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 77,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let occupied_facts = evaluate(&inputs, &occupied, &messages).expect("phase 1");
+        let occupied_artifacts = render_artifacts(&inputs, &occupied_facts);
+        let ReserveReport::NotActivated { steps, .. } = verify(
+            &inputs,
+            &occupied_facts,
+            &occupied_artifacts,
+            &occupied,
+            &messages,
+        )
+        .expect("phase 3") else {
+            panic!("a store holding records is not activated");
+        };
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        // The `-f` and the `-p` are this run's own, not a guess: a
+        // deployment elsewhere renders its own pair.
+        let elsewhere = Fixture {
+            compose_file: PathBuf::from("/srv/other/stack.yml"),
+            compose_project: "other".to_string(),
+            ..Fixture::default()
+        };
+        let (host, facts, artifacts) = migrating_host(&elsewhere, 8);
+        let (_, steps) = migration_report_of(&elsewhere, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            vec![
+                "docker compose -f '/srv/other/stack.yml' -p 'other' stop".to_string(),
+                "systemctl stop bootroot-registrar.service".to_string(),
+            ]
+        );
+    }
+
+    /// The rollback has to be runnable from the state it is rendered
+    /// in. A migration is open from the aside rename onward, two passes
+    /// before the mount comes up, and `umount` over a store nothing is
+    /// mounted on exits non-zero — stopping a verbatim run before the
+    /// two commands that carry the rollback.
+    #[test]
+    fn the_rollback_carries_the_unmount_only_where_the_reserve_is_mounted() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+
+        // The mount absent: the aside rename has run and the
+        // activation is what is outstanding.
+        let host = with_holding(bare_host(), 8);
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            vec![
+                format!("rmdir '{STORE}'"),
+                format!("mv '{HOLDING}' '{STORE}'"),
+            ]
+        );
+
+        // The withheld-render state reached with the mount still
+        // absent renders the same two commands.
+        let halved = Fixture {
+            reserve_bytes: DEFAULT_RESERVE / 2,
+            ..Fixture::default()
+        };
+        let halved_inputs = halved.inputs();
+        let halved_facts = evaluate(&halved_inputs, &host, &messages).expect("phase 1");
+        let halved_artifacts = render_artifacts(&halved_inputs, &halved_facts);
+        let (_, steps) = migration_report_of(&halved, &halved_facts, &halved_artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            vec![
+                format!("rmdir '{STORE}'"),
+                format!("mv '{HOLDING}' '{STORE}'"),
+            ]
+        );
+
+        // The mount up: the partial copy on the reserve is discarded
+        // with the unmount, so it leads.
+        let (mounted, mounted_facts, mounted_artifacts) = migrating_host(&fixture, 8);
+        let (_, steps) =
+            migration_report_of(&fixture, &mounted_facts, &mounted_artifacts, &mounted);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            vec![
+                format!("umount '{STORE}'"),
+                format!("rmdir '{STORE}'"),
+                format!("mv '{HOLDING}' '{STORE}'"),
+            ]
+        );
     }
 
     #[test]

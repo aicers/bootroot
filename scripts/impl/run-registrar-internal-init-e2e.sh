@@ -937,14 +937,16 @@ reserve_activation_is_possible() {
 # is the point: an operator's only source for these is that text, so a
 # command it renders wrong -- a store path whose spaces or backslashes
 # lost their quoting, a unit name `sh` ate the `\x2d` out of -- fails
-# here rather than in a deployment.  Two lines are the caller's and are
-# not run: step 1 names a unit no CI host has installed, and step 5 is
-# the re-run this function performs itself, with the flags this scenario
-# needs.
+# here rather than in a deployment.  Three lines are the caller's and
+# are not run: step 1's two, which stop the Compose stack this scenario
+# is running against and name a unit no CI host has installed, and step
+# 5, the re-run this function performs itself with the flags this
+# scenario needs.
 run_rendered_phase_two() {
   local log="$1" line
   while IFS= read -r line; do
     case "$line" in
+      "docker compose "*" stop") continue ;;
       "systemctl stop "*) continue ;;
       "bootroot init"*) continue ;;
     esac
@@ -1150,19 +1152,23 @@ assert_the_rendered_steps_activate_the_reserve() {
   remove_rendered_audit_override
 }
 
-# The rendered command lines of an outcome, minus the five this
+# The rendered command lines of an outcome, minus the six this
 # scenario must not run.
 #
 # Read out of the outcome rather than restated here for the same reason
 # the activation section reads its own: an operator's only source for
 # these is that text.  What is dropped is dropped by exact line, never
 # by matching prose, so the filter does not depend on the locale the run
-# printed its titles in: the stop, which names a unit no CI host has
-# installed; the re-run, which the callers perform themselves with the
-# flags this scenario needs; and the rollback's three commands, which
-# are the way *out* of the migration and would undo the sequence.  The
-# closing rename is not one of them -- it renames onto `.migrated`
-# rather than back onto the store.
+# printed its titles in: the stop's two commands, one of which would
+# stop the very Compose stack this scenario is running against and the
+# other of which names a unit no CI host has installed; the re-run,
+# which the callers perform themselves with the flags this scenario
+# needs; and the rollback's commands, which are the way *out* of the
+# migration and would undo the sequence -- the `umount` among them only
+# where the reserve is mounted, so it is filtered whether or not the
+# pass that printed the list rendered it.  The closing rename is not one
+# of them -- it renames onto `.migrated` rather than back onto the
+# store.
 #
 # `|| true` on every filter, and it is `pipefail` that makes it
 # necessary: `grep -v` exits non-zero when it emits nothing, which would
@@ -1170,6 +1176,7 @@ assert_the_rendered_steps_activate_the_reserve() {
 rendered_migration_commands() {
   local log="$1" store="$2"
   sed -n 's/^       \(.*\)$/\1/p' "$log" |
+    { grep -v '^docker compose .* stop$' || true; } |
     { grep -vxF "systemctl stop bootroot-registrar.service" || true; } |
     { grep -v '^bootroot ' || true; } |
     { grep -vxF "umount '$store'" || true; } |
