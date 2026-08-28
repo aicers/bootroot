@@ -1202,8 +1202,17 @@ run_rendered_migration_commands() {
 # are readable on the mounted reserve afterwards with their original
 # ownership, the holding directory is renamed rather than deleted, and
 # no run issued a recursive delete.
+#
+# Sixty-four mebibytes rather than the sixteen the sections above use,
+# and the difference is the copy margin: the capacity check requires the
+# holding directory's allocated size plus a fixed sixteen-mebibyte
+# margin to be at or below what the mounted filesystem leaves an
+# unprivileged writer, and a sixteen-mebibyte image leaves about eleven
+# once ext4's journal and metadata are on it.  At the reserve floor the
+# check can therefore never render a copy however small the store is,
+# which is the refusal case and not the one this section is about.
 assert_the_rendered_steps_migrate_an_existing_store() {
-  local config store image unit reserve=16777216
+  local config store image unit reserve=67108864
   local first second third fourth
   if ! reserve_activation_is_possible; then
     log "this host has no systemd, loop device or mkfs.ext4; the migration section is skipped"
