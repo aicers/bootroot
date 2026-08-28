@@ -99,7 +99,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   chain and reports `enforced`. It reformats, resizes, moves and deletes
   nothing to get there — an image of the wrong size and a store that
   already holds records are each refused, and the second refusal reaches
-  `bootroot reinit` before it wipes. Setting the key to `directory` is
+  `bootroot reinit` before it wipes. A store that already holds records
+  is relocated onto the reserve rather than left at that refusal: the
+  operator renames it aside to `<audit_store_dir>.pre-mount`, and while
+  that holding directory exists every run reports `migration incomplete`
+  ahead of every other outcome and renders what is outstanding — the
+  activation, then a copy gated on the mounted filesystem's own
+  available bytes, then a verification of type, mode, ownership,
+  hard-link count, size and content that has to pass before the closing
+  rename to `<audit_store_dir>.migrated`. bootroot renders and verifies
+  those steps and performs none of them; it deletes nothing anywhere,
+  and the retained copy is reported as reclaimable rather than removed.
+  Setting the key to `directory` is
   the explicit opt-out and keeps the earlier behaviour, leaving the
   reserve a budget with a project quota as the route to a real ceiling.
 - `bootroot-agent` takes a new optional `[acme].account_key_path`. When
@@ -116,9 +127,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `filesystem` audit-store reserve is enforced. The generated OpenBao audit
   bind also refuses to create a missing host directory at boot, making a
   failed mount visible as an OpenBao outage instead of silently writing audit
-  output to the root filesystem. The guard does not cover a pre-existing
-  underlying `openbao/` directory; its contents must be relocated to retire
-  that residual exposure. `audit_store_enforcement = "directory"` remains the
+  output to the root filesystem. The guard governs creation only, so it does
+  not cover a pre-existing underlying `openbao/` directory; completing the
+  documented relocation of that store onto the reserve is what retires the
+  residual exposure. `audit_store_enforcement = "directory"` remains the
   explicit opt-out.
 - `bootroot-agent` now publishes an issued certificate and its key only
   after the returned chain has been verified against `[trust]

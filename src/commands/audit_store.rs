@@ -42,6 +42,7 @@ use crate::commands::init::OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
+pub(crate) mod migration;
 pub(crate) mod reserve;
 
 /// The container path `openbao/openbao.hcl` writes its file audit
@@ -671,9 +672,21 @@ pub(crate) fn preflight_audit_store(
             // reach the same verdict, after the records the verdict
             // exists to protect had already survived a wipe that had
             // no reason to spare them.
+            // The holding-directory refusal comes first here too. A
+            // reinit run while a migration is open would wipe OpenBao
+            // and then meet the same verdict on the post-wipe pass,
+            // with the records the verdict exists to protect having
+            // already survived a wipe that had no reason to spare them.
+            if facts.migration_open() {
+                anyhow::bail!(messages.audit_reserve_finding_migration_holding(
+                    &facts.migration.paths.holding.display().to_string(),
+                    &facts.store_dir.display().to_string(),
+                ));
+            }
             if facts.underlying_not_empty() {
                 anyhow::bail!(messages.audit_reserve_finding_store_not_empty(
-                    &view.audit_store_dir.display().to_string()
+                    &view.audit_store_dir.display().to_string(),
+                    &facts.migration.paths.holding.display().to_string(),
                 ));
             }
         }
@@ -716,9 +729,17 @@ pub(crate) fn apply_audit_store(
                 // The explicit opt-out, and its own complete path. The
                 // store is created exactly as before this surface
                 // existed, all three directories in one pass; no image
-                // path or unit name is derived, no path this surface
-                // introduces is `stat`ed, and no leftover is looked
-                // for or named.
+                // path or unit name is derived and no leftover of a
+                // previous `filesystem`-mode run is looked for. The one
+                // path this mode does read is the holding directory,
+                // because an unfinished migration is detected in both
+                // enforcement modes — here it is named rather than
+                // raised as an outcome.
+                let migration = reserve::detect_migration(
+                    &view.audit_store_dir,
+                    &reserve::HostProbe,
+                    messages,
+                )?;
                 create_layout(&view.audit_store_dir, inputs.expected_uid).map_err(|err| {
                     anyhow::anyhow!(layout_error_message(
                         &err,
@@ -734,6 +755,7 @@ pub(crate) fn apply_audit_store(
                     reserve::render_directory_outcome(
                         &view.audit_store_dir,
                         view.reserve_bytes,
+                        &migration,
                         messages
                     )
                 );
@@ -745,6 +767,25 @@ pub(crate) fn apply_audit_store(
                 // Phase 1. Every refusal below is a read, and it runs
                 // before the one filesystem object this path creates.
                 let facts = reserve::evaluate(&reserve_inputs, &probe, messages)?;
+                // A migration in progress overrides every other
+                // verdict and creates nothing on the mounted store, so
+                // it is reported before the one filesystem object this
+                // path would otherwise create. The three artifacts are
+                // still written: they are inert files the operator
+                // needs, and the outcome's own rendering names them.
+                if facts.migration_open() {
+                    let artifacts = reserve::render_artifacts(&reserve_inputs, &facts);
+                    reserve::write_artifacts(&artifacts, messages)?;
+                    let report =
+                        reserve::verify(&reserve_inputs, &facts, &artifacts, &probe, messages)?;
+                    anyhow::bail!(reserve::render_filesystem_outcome(
+                        &reserve_inputs,
+                        &facts,
+                        &artifacts,
+                        &report,
+                        messages
+                    ));
+                }
                 // Everything below is the *simplified* store path
                 // phase 1 established, never the configured spelling.
                 // The mount point has to be the directory `Where=`
@@ -780,7 +821,7 @@ pub(crate) fn apply_audit_store(
                     &report,
                     messages,
                 );
-                if matches!(report, reserve::ReserveReport::NotActivated { .. }) {
+                if !matches!(report, reserve::ReserveReport::Enforced { .. }) {
                     // The run fails under this outcome. It does not
                     // report success, rewrite `audit_store_enforcement`
                     // or continue as `directory`.
@@ -876,6 +917,9 @@ pub(crate) fn prepare_audit_store_for_infra_up(
 
     match view.enforcement {
         AuditStoreEnforcement::Directory => {
+            // Before every other verdict, in both enforcement modes.
+            let migration =
+                reserve::detect_migration(&rendered_store, &reserve::HostProbe, messages)?;
             check_store_directory(&rendered_store, expected_uid).map_err(|err| {
                 anyhow::anyhow!(layout_error_message(
                     &err,
@@ -886,52 +930,88 @@ pub(crate) fn prepare_audit_store_for_infra_up(
             })?;
             println!(
                 "{}",
-                reserve::render_directory_outcome(&rendered_store, view.reserve_bytes, messages)
+                reserve::render_directory_outcome(
+                    &rendered_store,
+                    view.reserve_bytes,
+                    &migration,
+                    messages
+                )
             );
             Ok(Some(override_path))
         }
         AuditStoreEnforcement::Filesystem => {
-            let rerun_command = format!(
-                "bootroot infra up --agent-config {}",
-                reserve::sh_quote_path(agent_config)
-            );
-            let inputs = reserve::ReserveInputs {
-                store_dir: &view.audit_store_dir,
+            verify_filesystem_reserve_for_infra_up(
+                &view,
                 compose_dir,
-                reserve_bytes: view.reserve_bytes,
-                max_file_bytes: view.max_file_bytes,
-                max_retained_files: view.max_retained_files,
+                agent_config,
                 expected_uid,
-                rerun_command: &rerun_command,
-            };
-            let probe = reserve::HostProbe;
-            let facts = reserve::evaluate(&inputs, &probe, messages)?;
-            // Phase 3 deliberately does not assert the mounted filesystem
-            // root's mode. Keep the existing bring-up contract where a mount
-            // is present: the root itself is `audit_store_dir` and must be
-            // the operator-owned `0700` store before Docker can bind into it.
-            if facts.mount_present() {
-                check_store_directory(&facts.store_dir, expected_uid).map_err(|err| {
-                    anyhow::anyhow!(layout_error_message(
-                        &err,
-                        StoreCheckCaller::InfraUp,
-                        expected_uid,
-                        messages
-                    ))
-                })?;
-            }
-            let artifacts = reserve::render_artifacts(&inputs, &facts);
-            reserve::write_artifacts(&artifacts, messages)?;
-            let report = reserve::verify(&inputs, &facts, &artifacts, &probe, messages)?;
-            let outcome =
-                reserve::render_filesystem_outcome(&inputs, &facts, &artifacts, &report, messages);
-            if matches!(report, reserve::ReserveReport::NotActivated { .. }) {
-                anyhow::bail!(outcome);
-            }
-            println!("{outcome}");
+                messages,
+            )?;
             Ok(Some(override_path))
         }
     }
+}
+
+/// Runs the reserve's phases for a `filesystem`-mode `bootroot infra up`
+/// and refuses every outcome short of **enforced**.
+///
+/// # Errors
+///
+/// Returns the phase-1 refusals, the store-directory contract error, and
+/// the rendered **migration incomplete** or **provisioned, not
+/// activated** outcome, each of which stops the bring-up before any
+/// Docker call.
+fn verify_filesystem_reserve_for_infra_up(
+    view: &AgentConfigView,
+    compose_dir: &Path,
+    agent_config: &Path,
+    expected_uid: u32,
+    messages: &Messages,
+) -> Result<()> {
+    let rerun_command = format!(
+        "bootroot infra up --agent-config {}",
+        reserve::sh_quote_path(agent_config)
+    );
+    let inputs = reserve::ReserveInputs {
+        store_dir: &view.audit_store_dir,
+        compose_dir,
+        reserve_bytes: view.reserve_bytes,
+        max_file_bytes: view.max_file_bytes,
+        max_retained_files: view.max_retained_files,
+        expected_uid,
+        rerun_command: &rerun_command,
+    };
+    let probe = reserve::HostProbe;
+    let facts = reserve::evaluate(&inputs, &probe, messages)?;
+    // The migration verdict comes ahead of the store-directory check as
+    // well: while a migration is open the mount point carries whatever
+    // mode the activation step has reached, and the migration outcome
+    // is what tells the operator how to finish rather than a refusal
+    // naming a mode.
+    if !facts.migration_open() && facts.mount_present() {
+        // Phase 3 deliberately does not assert the mounted filesystem
+        // root's mode. Keep the existing bring-up contract where a mount
+        // is present: the root itself is `audit_store_dir` and must be
+        // the operator-owned `0700` store before Docker can bind into it.
+        check_store_directory(&facts.store_dir, expected_uid).map_err(|err| {
+            anyhow::anyhow!(layout_error_message(
+                &err,
+                StoreCheckCaller::InfraUp,
+                expected_uid,
+                messages
+            ))
+        })?;
+    }
+    let artifacts = reserve::render_artifacts(&inputs, &facts);
+    reserve::write_artifacts(&artifacts, messages)?;
+    let report = reserve::verify(&inputs, &facts, &artifacts, &probe, messages)?;
+    let outcome =
+        reserve::render_filesystem_outcome(&inputs, &facts, &artifacts, &report, messages);
+    if !matches!(report, reserve::ReserveReport::Enforced { .. }) {
+        anyhow::bail!(outcome);
+    }
+    println!("{outcome}");
+    Ok(())
 }
 
 /// Rewrites the former scalar audit bind to the guarded long form.
@@ -2926,6 +3006,189 @@ mod tests {
         );
     }
 
+    /// The derived holding directory beside a fixture's store.
+    fn holding_dir(fixture: &Fixture) -> PathBuf {
+        fixture.base.path().join("audit-store.pre-mount")
+    }
+
+    #[test]
+    fn infra_up_refuses_the_bring_up_while_a_migration_is_open() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let config = fixture.filesystem_agent_config(true);
+        write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
+            .expect("override");
+        // Step 2 of the sequence, already run by the operator: the
+        // store renamed aside and an empty mount point in its place.
+        let holding = holding_dir(&fixture);
+        fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
+        fs::write(holding.join(RECORDS_SUBDIR).join("audit.log"), b"a record").expect("a record");
+        fs::create_dir_all(fixture.store_dir()).expect("mount point");
+
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("an open migration refuses bring-up before any container starts");
+        let output = err.to_string();
+        assert!(output.contains("migration incomplete"), "{output}");
+        assert!(output.contains(&holding.display().to_string()), "{output}");
+        // Nothing was deleted, moved or created on the mounted store.
+        assert_eq!(
+            fs::read(holding.join(RECORDS_SUBDIR).join("audit.log")).expect("the record"),
+            b"a record"
+        );
+        assert!(!fixture.store_dir().join(RECORDS_SUBDIR).exists());
+        assert!(!fixture.store_dir().join(OPENBAO_SUBDIR).exists());
+    }
+
+    #[test]
+    fn a_directory_mode_bring_up_names_the_holding_directory_and_continues() {
+        let (fixture, state, compose_dir) = provisioned_fixture();
+        let config = fixture.agent_config(true);
+        let holding = holding_dir(&fixture);
+        fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
+
+        // `directory` mode raises no outcome of its own for this: the
+        // run succeeds, and the holding directory is named rather than
+        // left to be mistaken for debris.
+        let selected = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_dir,
+            Some(&config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect("directory mode continues");
+        assert_eq!(
+            selected.as_deref(),
+            Some(audit_override_path(&compose_dir).as_path())
+        );
+        assert!(holding.join(RECORDS_SUBDIR).is_dir());
+    }
+
+    #[test]
+    fn init_reports_the_migration_before_it_creates_the_mount_point() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        let holding = holding_dir(&fixture);
+        fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
+
+        let error = apply_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &test_messages(),
+        )
+        .expect_err("an open migration fails the run");
+        assert!(
+            error.to_string().contains("migration incomplete"),
+            "{error}"
+        );
+        // The one filesystem object this path would create is the
+        // mount point, and it is not created while a migration is
+        // open. The artifacts are still written: the outcome's own
+        // activation rendering names them.
+        assert!(!fixture.store_dir().exists());
+        assert!(fixture.artifact_dir().is_dir());
+        assert!(holding.join(RECORDS_SUBDIR).is_dir());
+    }
+
+    /// Every path under `root`, with its length, sorted.
+    fn snapshot(root: &Path) -> Vec<(PathBuf, u64)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let meta = entry.metadata().expect("metadata");
+                out.push((entry.path(), meta.len()));
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// bootroot performs no step of either procedure that changes the
+    /// host: no rename, no copy, no verification, no `rmdir` and no
+    /// unmount, whatever uid the run has. It renders or documents them,
+    /// and reads metadata to decide what to render.
+    #[test]
+    fn no_bootroot_path_performs_host_surgery_on_a_migration() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let config = fixture.filesystem_agent_config(true);
+        write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
+            .expect("override");
+        let holding = holding_dir(&fixture);
+        let migrated = fixture.base.path().join("audit-store.migrated");
+        for tree in [&holding, &migrated] {
+            fs::create_dir_all(tree.join(RECORDS_SUBDIR)).expect("a tree");
+            fs::write(tree.join(RECORDS_SUBDIR).join("audit.log"), b"a record").expect("a record");
+        }
+        fs::create_dir_all(fixture.store_dir()).expect("mount point");
+
+        let before = snapshot(&holding);
+        let before_migrated = snapshot(&migrated);
+        let before_store = snapshot(&fixture.store_dir());
+
+        // Three surfaces, each run twice: a second pass re-reads rather
+        // than acting on an earlier verdict.
+        for _ in 0..2 {
+            let inputs = Fixture::inputs(Some(&config), &state, true, &compose_dir);
+            preflight_audit_store(&inputs, &test_messages()).expect_err("refused");
+            apply_audit_store(&inputs, &test_messages()).expect_err("refused");
+            prepare_audit_store_for_infra_up(
+                &state,
+                &compose_dir,
+                Some(&config),
+                current_process_euid(),
+                &test_messages(),
+            )
+            .expect_err("refused");
+        }
+
+        assert_eq!(snapshot(&holding), before);
+        assert_eq!(snapshot(&migrated), before_migrated);
+        assert_eq!(snapshot(&fixture.store_dir()), before_store);
+        assert!(holding.is_dir());
+        assert!(migrated.is_dir());
+        assert!(!fixture.image_path().exists());
+    }
+
+    #[test]
+    fn the_reinit_preflight_refuses_an_open_migration_before_the_wipe() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let agent_config = fixture.filesystem_agent_config(true);
+        let holding = holding_dir(&fixture);
+        fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
+        fs::write(holding.join(RECORDS_SUBDIR).join("audit.log"), b"a record").expect("a record");
+
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_dir),
+            &test_messages(),
+        )
+        .expect_err("refused");
+        assert!(error.to_string().contains("a migration of"), "{error}");
+        assert!(!fixture.artifact_dir().exists());
+        assert_eq!(
+            fs::read(holding.join(RECORDS_SUBDIR).join("audit.log")).expect("the record"),
+            b"a record"
+        );
+    }
+
     /// Every phase-1 refusal reaches `reinit` before the wipe, as a
     /// pure read.
     #[test]
@@ -3073,7 +3336,8 @@ mod tests {
             ] {
                 assert!(!text.contains("infra up"), "{locale}: {text}");
             }
-            let finding = messages.audit_reserve_finding_store_not_empty("/store");
+            let finding =
+                messages.audit_reserve_finding_store_not_empty("/store", "/store.pre-mount");
             assert!(
                 finding.contains("`bootroot infra up`"),
                 "{locale}: {finding}"

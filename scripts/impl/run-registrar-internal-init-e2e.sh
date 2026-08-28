@@ -1150,6 +1150,238 @@ assert_the_rendered_steps_activate_the_reserve() {
   remove_rendered_audit_override
 }
 
+# The rendered command lines of an outcome, minus the five this
+# scenario must not run.
+#
+# Read out of the outcome rather than restated here for the same reason
+# the activation section reads its own: an operator's only source for
+# these is that text.  What is dropped is dropped by exact line, never
+# by matching prose, so the filter does not depend on the locale the run
+# printed its titles in: the stop, which names a unit no CI host has
+# installed; the re-run, which the callers perform themselves with the
+# flags this scenario needs; and the rollback's three commands, which
+# are the way *out* of the migration and would undo the sequence.  The
+# closing rename is not one of them -- it renames onto `.migrated`
+# rather than back onto the store.
+#
+# `|| true` on every filter, and it is `pipefail` that makes it
+# necessary: `grep -v` exits non-zero when it emits nothing, which would
+# fail the whole pipeline rather than yield an empty list.
+rendered_migration_commands() {
+  local log="$1" store="$2"
+  sed -n 's/^       \(.*\)$/\1/p' "$log" |
+    { grep -vxF "systemctl stop bootroot-registrar.service" || true; } |
+    { grep -v '^bootroot ' || true; } |
+    { grep -vxF "umount '$store'" || true; } |
+    { grep -vxF "rmdir '$store'" || true; } |
+    { grep -vxF "mv '${store}.pre-mount' '$store'" || true; }
+}
+
+# Runs those commands as **one** shell, stopping at the first non-zero
+# exit exactly as the outcome tells the operator to.
+#
+# One shell rather than one per line, because the verification's stages
+# are written to be run that way: `SCRATCH="$(mktemp -d)"` and the two
+# `cd`s are state the following commands depend on.
+run_rendered_migration_commands() {
+  local log="$1" store="$2" script
+  script="$(rendered_migration_commands "$log" "$store")"
+  [ -n "$script" ] || fail "no rendered command was found in $log"
+  log "running rendered migration steps from $(basename "$log")"
+  printf '%s\n' "$script" >>"$RUN_LOG"
+  sudo_to_log sh -e -c "$script" ||
+    fail "a rendered migration command failed; see $RUN_LOG"
+}
+
+# The whole relocation, end to end, on a store that already holds both
+# writers' content.
+#
+# This is the one scenario in which the empty-underlying-directory
+# invariant is reached by moving records rather than by never having
+# had any, so every assertion here is about what survives: the records
+# are readable on the mounted reserve afterwards with their original
+# ownership, the holding directory is renamed rather than deleted, and
+# no run issued a recursive delete.
+assert_the_rendered_steps_migrate_an_existing_store() {
+  local config store image unit reserve=16777216
+  local first second third fourth
+  if ! reserve_activation_is_possible; then
+    log "this host has no systemd, loop device or mkfs.ext4; the migration section is skipped"
+    return 0
+  fi
+  store="$AUDIT_STORE_BASE/reserve-migrate"
+  image="${store}.img"
+  config="$WORK_DIR/operator-agent-migrate.toml"
+  first="$ARTIFACT_DIR/init-migrate-1-refused.log"
+  second="$ARTIFACT_DIR/init-migrate-2-activation.log"
+  third="$ARTIFACT_DIR/init-migrate-3-copy.log"
+  fourth="$ARTIFACT_DIR/init-migrate-4-enforced.log"
+
+  write_reserve_agent_config "$config" "$store" "$reserve"
+
+  # A store that has been written to: both writers' content, at the
+  # ownership and modes the layout contract gives them.
+  sudo_to_log install -d -m 0700 -o root -g root "$store" ||
+    fail "could not seed the store directory"
+  sudo_to_log install -d -m 0700 -o root -g root "$store/records" ||
+    fail "could not seed records/"
+  sudo_to_log install -d -m 0700 -o root -g root "$store/openbao" ||
+    fail "could not seed openbao/"
+  sudo_to_log sh -c "printf 'a verb record\n' > '$store/records/audit.log'" ||
+    fail "could not seed a verb record"
+  sudo_to_log sh -c "printf '{\"type\":\"request\"}\n' > '$store/openbao/audit.log'" ||
+    fail "could not seed an OpenBao audit line"
+
+  # Pass 1: refused, with only the entry into the migration rendered.
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$first" 2>&1; then
+    fail "a store holding records reported success; see $first"
+  fi
+  grep -q "provisioned, not activated" "$first" ||
+    fail "a store holding records was not refused; see $first"
+  grep -qF "mv '$store' '${store}.pre-mount'" "$first" ||
+    fail "the entry into the migration was not rendered; see $first"
+  if grep -Eq "mkfs\.ext4|systemctl enable" "$first"; then
+    fail "the refusal rendered a step that would mount over the records; see $first"
+  fi
+  pass "a store holding records is refused with only the aside rename rendered"
+
+  unit="$(systemd-escape --path "$store").mount"
+  RESERVE_STORE_DIR="$store"
+  RESERVE_IMAGE="$image"
+  RESERVE_UNIT_NAME="$unit"
+
+  run_rendered_migration_commands "$first" "$store"
+  sudo -n test -d "${store}.pre-mount" ||
+    fail "the aside rename did not create ${store}.pre-mount"
+  assert_equal "the recreated mount point is root-owned at 0700" "0:0:700" \
+    "$(file_owner_mode "$store")"
+  pass "the store is aside and the mount point is empty"
+
+  # Pass 2: migration incomplete, rendering the outstanding activation
+  # and no subdirectory creation at all.
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$second" 2>&1; then
+    fail "an open migration reported success; see $second"
+  fi
+  grep -q "migration incomplete" "$second" ||
+    fail "the run did not report migration incomplete; see $second"
+  grep -q -- "mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0" "$second" ||
+    fail "the activation was not rendered under migration incomplete; see $second"
+  grep -q "systemctl enable --now" "$second" ||
+    fail "the activation did not render the mount unit's enable; see $second"
+  if rendered_migration_commands "$second" "$store" | grep -qE "mkdir |chmod "; then
+    fail "the subdirectory step was rendered while a migration was open; see $second"
+  fi
+  pass "the activation is rendered under migration incomplete, without the subdirectory step"
+
+  run_rendered_migration_commands "$second" "$store"
+  assert_equal "the mount unit is active" \
+    "ActiveState=active" "$(sudo -n systemctl show -p ActiveState "$unit")"
+  if sudo -n test -e "$store/records"; then
+    fail "records/ was created on the mounted reserve before the copy"
+  fi
+  pass "the reserve is mounted and the store on it is still empty"
+
+  # Pass 3: migration incomplete, now with the capacity verdict, the
+  # copy, the verification and the closing rename.
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$third" 2>&1; then
+    fail "an open migration reported success; see $third"
+  fi
+  grep -q "migration incomplete" "$third" ||
+    fail "the run did not report migration incomplete; see $third"
+  grep -qF "cp -a --one-file-system '${store}.pre-mount/.' '$store/'" "$third" ||
+    fail "the copy was not rendered; see $third"
+  grep -q -- "xargs -0 -r sha256sum --binary --zero" "$third" ||
+    fail "the content comparison was not rendered NUL-delimited; see $third"
+  grep -qF "mv '${store}.pre-mount' '${store}.migrated'" "$third" ||
+    fail "the closing rename was not rendered; see $third"
+  # The way back out is offered too, while the holding directory still
+  # carries its `.pre-mount` name -- and is filtered out of what this
+  # scenario runs, because running it would undo the sequence.
+  for rollback in \
+    "umount '$store'" \
+    "rmdir '$store'" \
+    "mv '${store}.pre-mount' '$store'"; do
+    grep -qF "$rollback" "$third" ||
+      fail "the rollback did not render '$rollback'; see $third"
+  done
+  pass "the copy, the verification, the closing rename and the rollback are rendered"
+
+  run_rendered_migration_commands "$third" "$store"
+  if sudo -n test -e "${store}.pre-mount"; then
+    fail "the closing rename left ${store}.pre-mount in place"
+  fi
+  sudo -n test -d "${store}.migrated" ||
+    fail "the closing rename deleted the holding directory instead of renaming it"
+  pass "the migration closed with a rename and the holding directory survives as .migrated"
+
+  # The records are on the mounted reserve, with their content and
+  # their ownership.
+  assert_equal "records/ sits on the mounted reserve" \
+    "$(store_device "$store")" "$(store_device "$store/records")"
+  assert_equal "the verb record survived the copy" "a verb record" \
+    "$(sudo -n cat "$store/records/audit.log")"
+  assert_equal "the OpenBao audit line survived the copy" '{"type":"request"}' \
+    "$(sudo -n cat "$store/openbao/audit.log")"
+  assert_equal "records/ kept its ownership and mode" "0:0:700" \
+    "$(file_owner_mode "$store/records")"
+  assert_equal "openbao/ kept its ownership and mode" "0:0:700" \
+    "$(file_owner_mode "$store/openbao")"
+  # `mkfs.ext4` gives the new filesystem's root `0755`, and that root is
+  # the store directory once the mount is up.  No `chmod` is rendered
+  # for it while a migration is open; the copy is what puts it back,
+  # `cp -a <source>/. <destination>/` applying the source directory's
+  # own mode and owner to the destination root.
+  assert_equal "the mounted store directory is back at the contract's mode" "0:0:700" \
+    "$(file_owner_mode "$store")"
+
+  # Pass 4: enforced, with the retained copy reported as reclaimable.
+  if run_bootroot_as_root init \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "$RESERVE_DEAD_OPENBAO_URL" \
+    --agent-config "$config" \
+    </dev/null >"$fourth" 2>&1; then
+    : # Reaches **enforced** and would carry on; the dead URL stops it
+      # at the OpenBao health check, after the outcome is printed.
+  fi
+  grep -q "enforced (filesystem)" "$fourth" ||
+    fail "the closing run did not report enforced; see $fourth"
+  if grep -q "migration incomplete" "$fourth"; then
+    fail "the closing run still reports an open migration; see $fourth"
+  fi
+  grep -qF "${store}.migrated" "$fourth" ||
+    fail "the retained copy is not reported as reclaimable; see $fourth"
+  pass "the reserve is enforced and .migrated is reported as reclaimable"
+
+  # Nothing anywhere in this sequence was a recursive delete.
+  for rendered in "$first" "$second" "$third" "$fourth"; do
+    if sed -n 's/^       \(.*\)$/\1/p' "$rendered" | grep -Eq "rm +-[a-zA-Z]*r"; then
+      fail "a recursive delete was rendered; see $rendered"
+    fi
+  done
+  pass "no rendered command anywhere in the migration is a recursive delete"
+
+  remove_reserve_activation
+  sudo_to_log rm -rf "${store}.migrated" || true
+  sudo -n rm -rf "$WORK_DIR/audit-store"
+  remove_rendered_audit_override
+}
+
 # Takes the activation back off the host, in the order the manual's
 # removal sequence gives: disable the mount, remove the unit and both
 # drop-ins, reload, and only then delete the image.
@@ -2371,6 +2603,7 @@ main() {
   log_phase "assert-filesystem-mode"
   assert_filesystem_mode_stops_before_it_touches_the_host
   assert_the_rendered_steps_activate_the_reserve
+  assert_the_rendered_steps_migrate_an_existing_store
 
   log_phase "init"
   run_init

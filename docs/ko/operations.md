@@ -729,18 +729,28 @@ bootroot는 모드를 추론하지 않고, 한쪽에서 다른 쪽으로 물러�
   저장소는 평범한 디렉터리이고, 예약량은 뒤에 아무것도 없는 예산이며,
   `audit_store_dir`에 XFS 또는 ext4 프로젝트 쿼터를 직접 적용하는 것이
   실제 상한을 얻는 문서화된 경로입니다. 이 모드에서 bootroot는 이미지
-  경로나 유닛 이름을 파생하지 않고, 예약량이 도입하는 어떤 경로도
-  `stat`하지 않으며, 이전 `filesystem` 모드 실행이 남겼을지 모르는
-  잔여물을 지목하지도 않습니다.
+  경로나 유닛 이름을 파생하지 않고, 이전 `filesystem` 모드 실행이
+  남겼을지 모르는 잔여물을 지목하지도 않습니다. 예약량이 도입하는 경로
+  중 읽는 것은 `<audit_store_dir>.pre-mount` 보관 디렉터리 하나뿐이며,
+  이는 **두 모드 모두에서** 확인됩니다. 다만 여기서는 끝나지 않은
+  이전으로 이름만 밝힐 뿐, 별도의 결과로 올리지 않습니다.
 
-**네 가지 결과.** 한 번의 실행은 그중 정확히 하나를 보고합니다.
+**다섯 가지 결과.** 한 번의 실행은 그중 정확히 하나를 보고합니다.
 
 | 결과 | 모드 | 종료 |
 | --- | --- | --- |
+| `migration incomplete` | `filesystem` | **실패**, 실행이 멈춤 |
 | `enforced` | `filesystem` | 성공, 실행이 이어짐 |
 | `provisioned, not activated` | `filesystem` | **실패**, 실행이 멈춤 |
 | `failed` | `filesystem` | 실패, 실행이 멈춤 |
 | `unenforced (directory)` | `directory` | **성공**, 실행이 이어짐 |
+
+`migration incomplete`는 **다른 모든 판정보다 앞섭니다.**
+`<audit_store_dir>.pre-mount` 보관 디렉터리는 저장소의 내용이 예약량으로
+옮겨지는 도중임을 뜻하며, 이미지와 산출물과 마운트가 아무리 완전해도
+실행은 이 결과로 실패하고 예약량이 강제된 것으로 결코 보고하지 않습니다.
+[이미 레코드를 담고 있는 저장소 옮기기](#relocating-a-store-that-already-holds-records)를
+보세요.
 
 `enforced`는 네 가지가 함께 성립할 것을 요구합니다. 이미지의 계약 전체,
 세 산출물이 모두 설치되어 있고 그 실행이 렌더링한 것과 바이트 단위로
@@ -984,8 +994,12 @@ systemd가 소유한 소켓에서 호출자를 계속 받고 peer 검사를 마�
    시작할 때까지 OpenBao 컨테이너는 실패 상태로 남습니다. 조용한 audit
    우회 대신 장애를 드러내는 것이 의도입니다. 이 키는 생성만 막습니다.
    이전 호스트의 하부 디렉터리에 이미 `openbao/`가 있으면 여전히 그
-   디렉터리가 바인드되어 이 부팅 경로 노출은 남습니다. 기존 내용을
-   예약량으로 옮기는 일이 그것을 없애며, 이 명령은 audit record를
+   디렉터리가 바인드되어 이 부팅 경로 노출은 남습니다.
+   [이전 절차](#relocating-a-store-that-already-holds-records)를 끝내는
+   것이 그런 호스트에서 이 가드를 처음으로 실효화합니다. 옮겨 두기
+   이름 바꾸기가 하부 디렉터리를 비우고 복사가 두 하위 디렉터리를
+   마운트된 파일 시스템 위에 올리고 나면, 마운트가 없을 때 바인드
+   소스도 없습니다. bootroot 자신은 어떤 경로에서도 audit record를
    옮기거나 삭제하지 않습니다.
 3. **마운트되지 않은 저장소로 시작한 데몬은 레지스트라 동사를 거부합니다.**
    데몬은 레코드 저장소를 열기 전에 이 결정을 내리므로 빈 마운트 지점 아래에
@@ -1021,28 +1035,267 @@ systemd가 소유한 소켓에서 호출자를 계속 받고 peer 검사를 마�
 저장소는 실제 배포에서 `bootroot infra up`으로도 스택을 시작하기 전에
 거부되므로 어떤 컨테이너도 시작되지 않습니다. 아무것도 삭제·이동되지 않고
 그 위로 마운트되지도 않습니다. 세 산출물은 여전히 기록됩니다. 운영자가
-그것을 필요로 하기 때문입니다. 그리고 **어떤 2단계 명령도** 렌더링하지
-않습니다. 일부만 나열하는 것은 계속하라는 초대이고, 그 목록이 끝나는
-단계가 바로 그 레코드 위로 파일 시스템을 마운트하는 단계이기 때문입니다.
+그것을 필요로 하기 때문입니다. 그리고 렌더링되는 명령은 이전을 **여는**
+것뿐입니다. 두 기록자를 모두 멈추고, 저장소를 옮겨 두고, 그 자리에 빈
+마운트 지점을 두는 것입니다. 그 레코드 위로 파일 시스템을 마운트하는
+단계는 여기서 렌더링되지 않습니다. 그 단계는 옮겨 두기 이름 바꾸기가
+하부 디렉터리를 비운 뒤의 다음 실행에서 나오기 때문입니다.
 `create_host_path: false`는 생성만 통제하므로, 마운트가 실패한 부팅에서는
 하부에 이미 있는 `openbao/`가 여전히 바인드되어 audit device가 루트 파일
 시스템에 기록됩니다. 레코드를 예약량으로 옮길 때까지 이 노출은 남습니다.
-지원되는 길은 둘입니다. 그 레코드를 옮기거나(이 빌드가 제공하지 않는 별도
-절차입니다), `audit_store_enforcement = "directory"`로 설정하고 커널 강제
+지원되는 길은 둘입니다. 아래 문서화된 절차로 그 레코드를 옮기거나,
+`audit_store_enforcement = "directory"`로 설정하고 커널 강제
 상한 없이 운용하는 것입니다.
 
 같은 거부가 `bootroot reinit`에도 **무엇을 지우기 전에** 도달합니다.
 reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기로 제기합니다.
 최솟값 미만의 예약량, 산출물이 담을 수 없는 저장소 경로, 준비된 산출물을
 안에 두게 되는 저장소, 종류나 크기가 틀린 이미지, 남은 할당량을 감당할
-여유가 없는 파일 시스템, 예약량보다 큰 하부 저장소, 그리고 이미 레코드를
-담고 있는 저장소입니다. 아무것도
+여유가 없는 파일 시스템, 예약량보다 큰 하부 저장소, 이미 레코드를
+담고 있는 저장소, 그리고 진행 중인 이전입니다. 아무것도
 생성·렌더링·설치되지 않고, 어떤 마운트도 검증되지 않으며, 결과 문구도
 출력되지 않습니다. 따라서 엔드포인트가 활성이고 `filesystem` 모드이며
 저장소가 이미 레코드를 담고 있는 호스트는, 강제를 활성화하거나
-`directory` 모드를 설정하기 전까지 **reinit할 수 없습니다.** 모든 거부를
+`directory` 모드를 설정하기 전까지 **reinit할 수 없습니다.**
+`<audit_store_dir>.pre-mount`가 아직 있는 호스트도 마찬가지입니다. wipe
+이후의 패스가 같은 판정에 도달할 텐데, 그때는 그 판정이 지키려던 레코드가
+그것을 살려 둘 이유가 없던 wipe를 이미 겪은 뒤이기 때문입니다. 모든 거부를
 통과한 호스트는 wipe 이후의 `init` 패스로 넘어가며, 그 패스는 세 단계를
 모두 수행하는 평범한 `bootroot init` 실행입니다.
+
+#### 이미 레코드를 담고 있는 저장소 옮기기 {#relocating-a-store-that-already-holds-records}
+
+위 거부에서 빠져나오는 길입니다. 기존 레코드를 하나도 잃지 않고,
+성공처럼 읽히는 미완성 상태도 남기지 않으면서 마운트된 예약량 위로
+옮깁니다. **호스트를 바꾸는 모든 단계는 운영자의 몫입니다.** bootroot는
+각 단계를 그대로 실행할 명령으로 렌더링하고 결과를 메타데이터 읽기로
+검증할 뿐, 어느 것도 직접 수행하지 않습니다. 어떤 uid로 실행되든 이름
+바꾸기도, 복사도, 검증도, `rmdir`도, 마운트 해제도 하지 않습니다.
+
+**이 절차가 점검 창에 전제하는 것.** 네 가지 모두 창이 유지되는 동안
+성립해야 하며, 아래의 보장은 여기에 조건부입니다.
+
+- **두 기록자는 내내 멈춰 있습니다.** Compose 스택을 멈춰 어떤
+  컨테이너도 저장소 아래의 바인드를 잡지 않게 하고,
+  `bootroot-registrar.service`를 멈춰 이전이 진행되는 동안 동사 레코드가
+  저장소에 기록되지 않게 합니다. 이후 OpenBao를 다시 시작하려면
+  **shamir 봉인 해제를 수동으로** 해야 하므로, 이는 라이브로 시도할 일이
+  아니라 예정된 점검 창입니다. 어느 쪽이 강제이고 어느 쪽이 절차인지가
+  중요합니다. 옮겨 두기 이름 바꾸기 이후로 `<audit_store_dir>/openbao`는
+  존재하지 않고, audit bind의 `create_host_path: false`가 OpenBao
+  컨테이너를 막습니다. 부팅 경로를 포함해, 반쯤 채워진 저장소에 쓰는
+  대신 컨테이너가 시작에 실패합니다. **마운트가 올라온 뒤에는 데몬에
+  이에 상응하는 것이 없으므로**, 데몬 서비스를 멈추는 것만이 그 레코드를
+  막습니다.
+- **렌더링된 명령은 주어진 순서대로 실행하며**, 처음으로 0이 아닌 값으로
+  끝나는 곳에서 멈춥니다.
+- **렌더링한 실행과 그것이 렌더링한 명령 사이에 특권 마운트 변경이
+  없어야 합니다.** `find -xdev`는 다른 장치의 마운트를 측정과 복사와 세
+  비교에서 똑같이 제외하므로 그것들이 어긋날 수 없습니다. 같은 장치의
+  `mount --bind`는 bootroot의 `/proc/self/mountinfo` 읽기로만 잡히는데,
+  그 읽기는 렌더링할 때 일어나고 복사는 그 뒤입니다. 그 조건 아래에서만
+  셋이 같은 항목 집합을 다룹니다. 무조건적이지 않습니다.
+- **검사와 그 검사가 허가한 명령 사이에 원본 트리 아래의 무엇도 바뀌지
+  않아야 합니다.**
+
+**보관 디렉터리는 그 자체로 하나의 상태입니다.**
+`<audit_store_dir>.pre-mount`는 설정이 아니라 파생된 경로입니다.
+이미지처럼 저장소의 상위 디렉터리에 있는 형제이며, 곧 마운트될 파일
+시스템 바깥에 있으므로 마운트가 올라온 뒤에도 읽을 수 있습니다. 그
+존재는 **두 강제 모드 모두에서, 다른 모든 판정보다 먼저** 확인됩니다.
+`filesystem` 모드에서는 **migration incomplete**를 내고, `directory`
+모드에서는 그 안의 내용이 해당 레코드의 유일한 사본일 수 있는 끝나지
+않은 이전으로 이름이 밝혀집니다. **bootroot는 그것을 지우지도 옮기지도
+고치지도 않습니다.** 그것을 바꿀 수 있는 작업은 두 가지뿐이며 둘 다
+이름 바꾸기이고 둘 다 재귀적이지 않습니다. 가드와 세 비교가 모두 0으로
+끝난 뒤의 `<audit_store_dir>.migrated`로의 마무리 이름 바꾸기, 그리고
+이전이 열려 있는 동안 `<audit_store_dir>`로 되돌리는 이름 바꾸기입니다.
+`<audit_store_dir>.pre-mount`나 `<audit_store_dir>.migrated`가 이미
+존재하면 bootroot는 어떤 이름 바꾸기도 렌더링하지 않고 그 경로를
+지목하며 실패합니다. `mv dir dir.pre-mount`는 대상이 이미 있는
+디렉터리이면 그것을 대체하지 않고 원본을 그 안으로 옮기며, 그러면 다음
+복사가 엉뚱한 트리를 읽습니다.
+
+**보관 디렉터리가 있는 동안 bootroot는 마운트된 저장소에 아무것도 만들지
+않고, 렌더링된 어떤 단계도 그곳에 무엇을 만들지 않습니다.** 하위 디렉터리
+단계, 곧 `records/`와 `openbao/`의 `mkdir`·`chmod`·`chown`은 창이
+유지되는 동안 보류되며, 마운트된 저장소에 그 둘이 없다는 사실도 고칠
+대상으로 보고되지 않습니다. 복사가 하나의 전체 하위 트리 작업으로 원래
+소유권과 모드 그대로 둘을 다시 만듭니다. 마운트 지점 자신의 모드도 복사가
+정리하며, 그래서 그것을 위한 `chmod`도 렌더링되지 않습니다. `mkfs.ext4`는
+새 파일 시스템의 루트를 `0755`로 두는데,
+`cp -a <source>/. <destination>/`가 원본 디렉터리의 모드와 소유자를 대상
+루트에 적용하여 저장소를 저장소 디렉터리 계약이 요구하는 `0700`으로
+되돌립니다.
+
+**렌더링된 명령이 지목하는 전제 조건**: `cmp`를 위한 **diffutils**(축소된
+호스트에는 없을 수 있습니다)와, `sha256sum`이 `--zero`를 갖춘
+**coreutils 8.25 이상**입니다.
+
+저장소가 이미 레코드를 담고 있는 `filesystem` 모드 호스트에서의
+순서입니다.
+
+1. 두 기록자를 모두 멈춥니다.
+
+   ```sh
+   docker compose -f <compose file> -p <project> stop
+   systemctl stop bootroot-registrar.service
+   ```
+
+2. 저장소를 옮겨 두고 마운트 지점을 비어 있고 root 소유로 다시 만듭니다.
+
+   ```sh
+   mv <audit_store_dir> <audit_store_dir>.pre-mount
+   install -d -m 0700 -o root -g root <audit_store_dir>
+   ```
+
+3. `bootroot infra up --agent-config <path>`를 실행합니다. 보관
+   디렉터리를 발견해 **migration incomplete**를 보고하고 어떤 컨테이너도
+   시작하지 않습니다. 하부 저장소가 다시 비었으므로 여기서 렌더링되는
+   것은 남은 **활성화**입니다. 이미지가 놓인 상태에 맞는 이미지 명령, 세
+   산출물 설치, `systemctl daemon-reload`, 그리고
+   `systemctl enable --now <escaped audit_store_dir>.mount`입니다.
+   `records/`나 `openbao/`의 생성은 **포함되지 않습니다.** 그것은 6단계가
+   대신합니다. bootroot는 기록자들이 이미 멈춰 있는지 알 수 없으므로 두
+   기록자를 멈추는 단계도 그 목록에 나타납니다. 1단계가 이미 그것을
+   충족했습니다.
+4. 그 명령들을 실행합니다. 이제 마운트가 올라왔고 그 위의 저장소는 비어
+   있습니다.
+5. `bootroot infra up --agent-config <path>`를 다시 실행합니다. 여전히
+   **migration incomplete**이고 여전히 어떤 컨테이너도 시작하지 않으며,
+   이번에는 용량 판정을 보고하고 복사를 렌더링합니다. 내용이 들어가지
+   않으면 대신 두 가지 길을 제시합니다.
+6. 보관 디렉터리에 유형 가드를 실행하고, 0으로 끝났을 때만 복사합니다.
+
+   ```sh
+   find <audit_store_dir>.pre-mount -xdev -mindepth 1 \
+     ! -type d ! -type f -exec false {} +
+   cp -a --one-file-system <audit_store_dir>.pre-mount/. <audit_store_dir>/
+   ```
+
+7. 검증을 실행합니다. **두 트리 모두**에 유형 가드를 실행한 뒤 세
+   비교를 수행합니다. 넷 모두 0으로 끝나야 합니다.
+
+   ```sh
+   SCRATCH="$(mktemp -d)"
+   find <audit_store_dir>.pre-mount -xdev -mindepth 1 \
+     ! -type d ! -type f -exec false {} +
+   find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
+   cd <audit_store_dir>.pre-mount
+   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
+   sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
+   find . -xdev -mindepth 1 -type f -print0 > "$SCRATCH"/files.source.raw
+   sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
+   xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
+   cd <audit_store_dir>
+   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
+   find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
+   sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
+   find . -xdev -mindepth 1 -type f -print0 > "$SCRATCH"/files.destination.raw
+   sort -z -o "$SCRATCH"/files.destination "$SCRATCH"/files.destination.raw
+   xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.destination > "$SCRATCH"/content.destination
+   cmp "$SCRATCH"/meta.source "$SCRATCH"/meta.destination
+   cmp "$SCRATCH"/size.source "$SCRATCH"/size.destination
+   cmp "$SCRATCH"/content.source "$SCRATCH"/content.destination
+   ```
+
+8. 7단계가 전부 통과한 뒤에만, 삭제가 아닌 이름 바꾸기로 이전을
+   마무리합니다.
+
+   ```sh
+   mv <audit_store_dir>.pre-mount <audit_store_dir>.migrated
+   ```
+
+9. `bootroot infra up --agent-config <path>`를 실행합니다. 남은 보관
+   디렉터리가 없으므로 마운트된 파일 시스템 위의 저장소를 검증해 예약량을
+   **enforced**로 보고하고 Compose 스택을 시작합니다. 그 뒤 OpenBao의
+   봉인을 해제하고 `bootroot-registrar.service`를 시작하세요. 기록자들은
+   1단계부터 멈춰 있었으므로 복사와 검증이 진행되는 동안 저장소에 기록된
+   것은 없습니다.
+
+**용량 검사는 예약량이 아니라 마운트된 파일 시스템을 대상으로 합니다.**
+`audit_store_reserve_bytes`는 이미지의 *명목* 크기입니다. 그 안의 ext4
+파일 시스템은 그보다 적게 담습니다. 저널과 메타데이터는 실제이고 이미
+할당되어 있기 때문입니다. 게다가 기존 OpenBao 감사 로그는 여기서 아무도
+상한을 두지 않고 OpenBao가 회전시키지도 않으므로 어느 값이든 넘을 수
+있습니다. 마운트가 올라오면 bootroot는 마운트된 파일 시스템에서 **비특권
+기록자가 실제로 쓸 수 있는 바이트**를, 보관 디렉터리의 **할당된** 크기에
+블록 반올림과 디렉터리별 메타데이터를 위한 **16 MiB 여유**를 더한 값과
+비교합니다. 세 값을 모두 보고하므로 "복사를 마저 하라"와 "이건 절대 들어가지
+않는다"를 구분할 수 있습니다. 들어가지 않으면 **어떤 복사 명령도 렌더링하지
+않으며**, 두 가지 길은 [교체 절차](#changing-the-reserve)로 예약량을 키우거나
+다시 시도하기 전에 OpenBao 감사 로그를 줄이는 것입니다. 모든 바이트 값은
+검사된 산술이며, 표현할 수 없는 값은 그 값을 지목하는 **migration
+incomplete**를 내고 복사를 렌더링하지 않습니다.
+
+**복사를 렌더링하지 못하게 막는 거부들.** 각각은 경로를 지목하고
+**migration incomplete** 아래에 보고되며, 앞선 판정을 재사용하지 않고 매
+실행마다 다시 판정합니다.
+
+- **보관 디렉터리이거나 그 아래의 마운트 지점.** 판정 기준은 장치 비교가
+  아니라 `/proc/self/mountinfo`에서 읽은 마운트 정체성입니다. 같은
+  장치의 `mount --bind`는 장치 번호가 같아서 `find -xdev`와
+  `cp --one-file-system`이 모두 그 안으로 들어가고, 바인드 원본의 내용이
+  감사 데이터로 계산되고 예약량에 복사되어 호스트에 중복됩니다. 마운트
+  지점은 이스케이프(`\040`, `\011`, `\012`, `\134`)를 되돌린 뒤 경로
+  구성 요소 단위로 비교하므로, `<audit_store_dir>.pre-mount-other` 같은
+  형제는 그 아래에 있는 것으로 읽히지 않습니다.
+- **트리 어디에든 있는 심볼릭 링크, 장치 노드, FIFO, 소켓.** 이는
+  **저장소가 강제하는 것보다 엄격한 이 작업 고유의 이전 규칙**입니다.
+  링크는 상한 바깥에 감사 바이트를 놓을 수 있는 유일한 항목이며,
+  `cp -a`가 이전에 가리키던 곳 그대로 다시 만듭니다. 또한 경로와 링크
+  대상을 둘 다 가변 길이 필드로 적는 목록은 `c`에 연결된 `a b`와 `b c`에
+  연결된 `a`를 구분하지 못합니다. 링크가 어디를 가리키든 거부는
+  유지됩니다. 이 배포에서 그런 항목을 만드는 것은 없습니다.
+
+**검증이 이런 모습인 이유.** bootroot의 거부는 렌더링 시점의 판정이고
+운영자의 `cp -a`는 그 뒤에 옵니다. `-a`에는 `--no-dereference`가 들어
+있으므로, 그 사이에 심어진 항목은 자기 자신으로 복사되어 양쪽에 똑같이
+서게 됩니다. 메타데이터 비교는 그것을 흠잡을 수 없고 나머지 두 비교는
+`-type f`라 건너뜁니다. 비교보다 앞서 두 트리 모두에 유형 가드를 실행하는
+것이 마무리 이름 바꾸기 전에 그것을 잡습니다. 모든 목록은 NUL로 구분되고
+바이트 단위로 비교됩니다. `openbao/` 아래의 모든 파일 이름은 그 컨테이너가
+쓴 것이고, 개행이 든 이름은 줄 단위 목록을 두 레코드로 쪼개기 때문입니다.
+경로는 모든 레코드의 마지막 필드이며 그 뒤에 또 다른 가변 길이 필드는
+없습니다. `sha256sum`의 `--zero`도 같은 이유로 선택 사항이 아닙니다.
+**어떤 단계도 파이프라인이 아닙니다.** 파이프라인은 마지막 명령의 상태를
+보고하므로, `find … | sort -z`는 **순회**가 실패하고 소비자가 짧은 스트림만
+본 경우에도 성공을 보고합니다. 불완전한 트리가 깨끗한 트리로 읽히는 것은 이
+절차가 결코 실패해서는 안 되는 단 하나의 방향입니다. 각 단계는 두 트리
+바깥의 `mktemp -d` 디렉터리 아래 자기 파일을 쓰는 자기 명령입니다. 그
+디렉터리는 나중에 직접 제거하세요. 메타데이터 비교는 **하드 링크 수**를
+담으므로, 원본의 한 아이노드를 대상에서 두 개의 독립 파일로 늘린 복사는
+종류·모드·소유권·크기·내용이 모두 일치해도 실패합니다. 디렉터리 크기와
+수정 시각은 제외됩니다. 둘 다 파일 시스템이 다르면 정당하게 달라지기
+때문입니다. 불일치는 출력을 읽어서가 아니라 종료 상태로 판정합니다.
+
+**재개와 되돌리기.** 둘 다 렌더링되고 둘 다 멱등이며 bootroot는 어느
+것도 수행하지 않습니다.
+
+- **재개**는 부분 복사 위에서 6단계와 7단계를 다시 실행하는 것입니다.
+  원본은 결코 수정되지 않으므로 부분 복사가 원본을 못 쓰게 만들지
+  않습니다.
+- **되돌리기**는 보관 디렉터리가 아직 `.pre-mount` 이름을 지니고 있는
+  동안에만 제공됩니다. 마무리 이름 바꾸기가 끝나면 저장소가 정본이고
+  되돌아갈 곳이 없습니다. 부분 복사는 마운트 해제와 함께 버려지며,
+  원본이 결코 손대어지지 않았기 때문에 안전합니다. `umount`은 예약량이
+  이미 마운트된 경우에만 해당합니다.
+
+  ```sh
+  umount <audit_store_dir>
+  rmdir <audit_store_dir>
+  mv <audit_store_dir>.pre-mount <audit_store_dir>
+  ```
+
+**마무리 이름 바꾸기 이후** `<audit_store_dir>.migrated`는 예약량 바깥에
+중복 사본을 담고 있습니다. 그것은 **migration incomplete**를 해소하며,
+그 뒤로는 모든 정상 결과가 그 경로와 크기를 회수 가능으로 보고합니다.
+제거는 나중의 housekeeping이고 운영자의 몫이며, 그 아래에 마운트된 것이
+없음을 확인한 뒤에만 하세요. bootroot는 여기서도 이 절차의 어디에서도
+삭제를 렌더링하지 않습니다.
 
 #### 예약량을 바꿀 때 {#changing-the-reserve}
 
@@ -1053,6 +1306,101 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
 결코 렌더링하지 않습니다. 재포맷은 예약량이 지키려는 레코드를 파괴하고,
 조용히 늘리면 마운트 유닛과 이미지와 설정이 서로 다른 세 개의 상한을
 말하게 됩니다. 교체는 두 기록자를 모두 멈춘 점검 창에서 수행합니다.
+
+그 교체는 [위의 이전 절차](#relocating-a-store-that-already-holds-records)와
+똑같이 같은 레코드를 파일 시스템 사이로 옮기므로, 같은 계약을 따릅니다.
+이전 집합 거부, 유형 가드, `/.` 원본 접미사를 붙인
+`cp -a --one-file-system`, NUL로 구분된 세 개의 준비된 비교, 그리고 종료
+상태 규칙입니다. 여기서 다시 적지 않고 **거기 적힌 그대로 재사용합니다.**
+이 절차는 **렌더링이 아니라 문서화됩니다.** 크기 불일치는 렌더링을 갖지
+않는 **failed** 결과이므로 이 명령들을 낼 수 있는 판정이 없습니다.
+bootroot는 중간이 아니라 양 끝에서 호출됩니다. 2~5단계는 운영자의
+몫이고, 1단계와 6단계는 호스트를 바꾸지 않는 `bootroot infra up`
+실행입니다.
+
+1. `audit_store_reserve_bytes`를 바꾼 뒤
+   `bootroot infra up --agent-config <path>`를 실행합니다. 크기
+   불일치로 실패하면서 두 크기를 지목하고 이곳을 가리킵니다. 설치기의
+   최소 예약량보다 작은 값은 그 검사가 먼저 거부하므로, 포맷할 수 없는
+   크기를 상대로 절차가 시작되는 일은 없습니다.
+2. 두 기록자를 모두 멈춥니다. OpenBao 컨테이너는 다시 시작할 때
+   **shamir 봉인 해제를 수동으로** 해야 하는 예정된 중지이며,
+   `bootroot-registrar.service`도 함께 멈춥니다. 둘은 5단계가 끝날
+   때까지 멈춘 채로 둡니다.
+3. 새 이미지를 `<audit_store_dir>.img.new`에 만듭니다. 마무리 이름
+   바꾸기가 한 파일 시스템 안에서 원자적이도록 같은 상위 디렉터리에
+   두며, 새 크기로 완전히 할당하고 uid 0, 모드 `0600`으로 두고
+   `mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0`를 실행합니다. 필요한
+   여유 공간은 **새 이미지의 전체 크기**입니다. 옛 이미지의 바이트는
+   6단계까지 회수되지 않습니다.
+
+   ```sh
+   install -m 0600 /dev/null <audit_store_dir>.img.new
+   fallocate -l <new size> <audit_store_dir>.img.new
+   mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0 <audit_store_dir>.img.new
+   ```
+
+4. 새 이미지를 임시 마운트 지점에 마운트한 뒤, **살아 있는 저장소에
+   이전 집합 거부를 실행하고 그다음에 용량으로 복사를 판정합니다. 순서가
+   그렇습니다.** 거부가 성립할 때에만 그 값이 복사가 옮길 것과 같은 항목
+   집합을 설명하기 때문입니다. `/proc/self/mountinfo`를 읽어
+   `<audit_store_dir>`이거나 그 아래인 마운트 지점을 거부하고, 그 위에
+   유형 가드를 실행한 뒤, 두 값을 비교합니다. 원본 값에 활성화 검사와
+   같은 **16 MiB** 여유를 더한 값이 가용 값 이하일 때에만 복사를
+   진행합니다. 들어가지 않으면 아무것도 복사하지 않고 여기서 멈추며, 두
+   가지 길은 더 큰 새 예약량이거나 OpenBao 감사 로그를 먼저 줄이는
+   것입니다. 늘리는 경우도 같은 비교로 판정되며 통과합니다.
+
+   ```sh
+   mkdir -p /mnt/bootroot-audit-new
+   mount -o loop <audit_store_dir>.img.new /mnt/bootroot-audit-new
+   find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
+   du -s -x --block-size=1 <audit_store_dir>
+   df --block-size=1 --output=avail /mnt/bootroot-audit-new
+   ```
+
+   `du`의 `-x`는 **선택 사항이 아닙니다.** 그냥 `du`는 중첩된 마운트로
+   내려가 복사가 옮길 것보다 큰 집합의 값을 냅니다. `--apparent-size`는
+   제외됩니다. 복사가 실제로 필요로 하는 할당 값과 다른, 더 작은 값을
+   보고하기 때문입니다.
+5. **위 이전 절차의 6단계와 7단계에 적힌 그대로** 유형 가드와 복사와 세
+   비교를 실행합니다. 원본은 `<audit_store_dir>`, 대상은 임시 마운트
+   지점이며, 처음으로 0이 아닌 값으로 끝나는 곳에서 멈춥니다. 넷 모두
+   통과한 뒤에만 다음을 실행합니다.
+
+   ```sh
+   umount /mnt/bootroot-audit-new
+   systemctl stop '<escaped audit_store_dir>.mount'
+   mv <audit_store_dir>.img <audit_store_dir>.img.old
+   mv <audit_store_dir>.img.new <audit_store_dir>.img
+   systemctl start '<escaped audit_store_dir>.mount'
+   ```
+
+   그다음 OpenBao 컨테이너를 시작해 봉인을 해제하고
+   `bootroot-registrar.service`를 시작합니다.
+6. `bootroot infra up --agent-config <path>`를 실행합니다. 갱신된
+   예약량에 대해 이미지를 검증하고 **enforced**를 보고합니다. 그때에야
+   `<audit_store_dir>.img.old`를 제거할 수 있으며, 그것도 운영자가 직접
+   합니다. bootroot는 여기서도 삭제를 렌더링하지 않고 그 파일의 경로와
+   크기를 회수 가능으로 보고합니다.
+
+**재개와 되돌리기. 둘 다 멱등이고 bootroot는 어느 것도 수행하지
+않습니다.** 재개는 부분 복사 위에서 복사를 다시 실행한 뒤 가드와 비교를
+실행하는 것입니다. 원본은 살아 있는 저장소이며 결코 수정되지 않습니다.
+되돌리기는 **두 위치**에서 정의됩니다. 5단계의 이름 바꾸기 전이라면 임시
+마운트를 해제하고 `<audit_store_dir>.img.new`를 지웁니다. 살아 있는
+저장소는 손대어진 적이 없습니다. 그 뒤라면 마운트 유닛을 멈추고
+`<audit_store_dir>.img.old`를 되돌려 이름을 바꾼 뒤 유닛을 시작합니다.
+`.img.old`가 6단계의 **enforced** 보고까지 남아 있는 이유가 이것입니다.
+어느 단계에서 실패하든 옛 이미지나 검증된 새 이미지 중 하나는 자리에
+있으며, 둘 다 없는 경우는 없습니다.
+
+**이 절차를 다른 절차와 혼동하지 않게 하는 두 가지 사실.** 어떤 마운트
+유닛 지시자도(`What=`, `Where=`, `Type=`, `Options=`) 크기를 담지
+않으므로, 다시 렌더링된 유닛은 보통 바이트 단위로 동일합니다. 다르다면
+남은 `install`과 `systemctl daemon-reload`가 평범한 산출물 드리프트로
+보고됩니다. 그리고 `audit_store_dir`이 바뀐 경우는 이 절차가 전혀
+아닙니다. 그것은 이미지가 아니라 마운트 지점을 옮기는 일입니다.
 
 #### 예약량을 제거할 때 {#removing-the-reserve}
 
