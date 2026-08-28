@@ -6,15 +6,26 @@
 //! fixed path, mutates the process environment or reaches the network.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use tempfile::TempDir;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
-    RegistrarStateProjection, build_registrar_handler, openbao_duration, read_registrar_state,
-    registrar_secret_id_options, resolve_secrets_dir,
+    DaemonInvocation, DaemonShutdown, RegistrarStateProjection, audit_store_is_mount_point,
+    audit_store_mount_unit_name, build_registrar_handler, has_distinct_device_ids,
+    openbao_duration, read_registrar_state, registrar_secret_id_options,
+    resolve_registrar_handler_for_gate, resolve_secrets_dir, run_daemon,
 };
-use crate::config::Settings;
+use crate::config::{OpenBaoSettings, Settings};
+use crate::registrar::endpoint::client::MintReply;
+use crate::registrar::endpoint::protocol::{
+    EnrollError, ProtocolVersion, RefusalClass, RegisterRequest, RegistrarUnavailableReason,
+    WireDeliveryMode, WireServiceSpec,
+};
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{
     InternalAgentConfigParams, InternalPaths, active_root_cert_path, render_internal_agent_config,
@@ -631,9 +642,240 @@ fn the_handler_is_built_only_for_an_active_endpoint() {
         "the handler has exactly one call site in the composition layer"
     );
     assert!(
-        call_sites[0].contains("registrar_endpoint.activated()"),
-        "the one call site is inside the active-endpoint guard: {}",
-        call_sites[0]
+        source
+            .split("async fn resolve_registrar_service")
+            .nth(1)
+            .is_some_and(|resolver| resolver.contains("registrar_endpoint.activated()")),
+        "the one call site is inside the active-endpoint guard"
+    );
+}
+
+/// The daemon-side gate needs only the device-id comparison; its metadata
+/// source is deliberately injected at this seam so the test needs no mount.
+#[test]
+fn the_audit_store_mount_gate_compares_only_device_ids() {
+    assert!(has_distinct_device_ids(10, 11));
+    assert!(!has_distinct_device_ids(10, 10));
+    assert_eq!(
+        audit_store_mount_unit_name(Path::new("/var/lib/bootroot/audit-store")),
+        "var-lib-bootroot-audit\\x2dstore.mount"
+    );
+    assert_eq!(
+        audit_store_mount_unit_name(Path::new("/store/with space")),
+        "store-with\\x20space.mount"
+    );
+
+    let source = include_str!("../daemon.rs");
+    let resolver = source
+        .split("async fn resolve_registrar_service")
+        .nth(1)
+        .expect("the registrar resolver is present");
+    let gate = resolver
+        .find("audit_store_mount_gate")
+        .expect("the resolver consults the mount gate");
+    let handler = resolver
+        .find("build_registrar_handler(settings)")
+        .expect("the resolver builds the production handler");
+    assert!(
+        gate < handler,
+        "the mount gate precedes every handler dependency"
+    );
+    assert!(!resolver.contains("/proc/self/mounts"));
+    assert!(!resolver.contains("/sys/block"));
+}
+
+/// A missing path or a directory on its parent's filesystem is not evidence
+/// of the filesystem reserve. The probe is read-only, so neither case creates
+/// the configured store before the refusal path takes over.
+#[test]
+fn the_mount_point_probe_fails_closed_without_creating_the_store() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let missing_store = temp.path().join("missing-audit-store");
+    assert!(!audit_store_is_mount_point(&missing_store));
+    assert!(
+        !missing_store.exists(),
+        "probing a missing store must not create it"
+    );
+
+    let plain_store = temp.path().join("plain-audit-store");
+    std::fs::create_dir(&plain_store).expect("create a non-mounted store directory");
+    assert!(!audit_store_is_mount_point(&plain_store));
+}
+
+/// An absent mount selects the refusing handler before any production
+/// dependency can open the record store, load a credential or read state.
+#[tokio::test]
+async fn an_unmounted_store_bypasses_production_handler_construction() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let store = temp.path().join("audit-store");
+    let gate = crate::registrar::AuditStoreMountGate::unmounted_for_test(store.clone());
+
+    let built = resolve_registrar_handler_for_gate(&gate, || async {
+        Err(anyhow::anyhow!(
+            "the production handler must not be constructed"
+        ))
+    })
+    .await
+    .expect("the unmounted store receives a refusing handler instead of an error");
+
+    assert!(
+        built.maintenance.is_none(),
+        "the refusing handler owns no limiter or audit-store maintenance"
+    );
+    assert!(
+        !store.exists(),
+        "selecting the refusal does not create the unmounted store"
+    );
+}
+
+/// An absent filesystem mount substitutes only the endpoint handler: the
+/// accept task still answers callers, while the normal profile and fast-poll
+/// daemon duties continue until the invocation is asked to stop.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn an_unmounted_store_keeps_daemon_duties_running() {
+    let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
+    let openbao = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "auth": { "client_token": "test-token" }
+        })))
+        .mount(&openbao)
+        .await;
+
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings_with_endpoint(true);
+    let unmounted_store = deployment.path().join("unmounted-audit-store");
+    settings.registrar.audit_store_dir = unmounted_store.clone();
+    settings.registrar.audit_record_dir = unmounted_store.join("records");
+
+    let certificate = deployment.path().join("current-profile.pem");
+    let key = KeyPair::generate().expect("generate profile certificate key");
+    let certificate_params = CertificateParams::new(Vec::new()).expect("build profile certificate");
+    let certificate_pem = certificate_params
+        .self_signed(&key)
+        .expect("self-sign profile certificate")
+        .pem();
+    std::fs::write(&certificate, certificate_pem).expect("write current profile certificate");
+    settings.profiles[0].paths.cert = certificate;
+
+    let role_id = deployment.path().join("role-id");
+    let secret_id = deployment.path().join("secret-id");
+    std::fs::write(&role_id, "role-id\n").expect("write AppRole role id");
+    std::fs::write(&secret_id, "secret-id\n").expect("write AppRole secret id");
+    settings.openbao = Some(OpenBaoSettings {
+        url: openbao.uri(),
+        allow_plaintext_http: false,
+        kv_mount: "secret".to_string(),
+        role_id_path: role_id,
+        secret_id_path: secret_id,
+        ca_bundle_path: None,
+        fast_poll_interval: Duration::from_secs(60),
+        state_path: deployment.path().join("fast-poll-state.json"),
+    });
+
+    let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+    let registrar_endpoint = endpoint.registrar_endpoint();
+    let shutdown = DaemonShutdown::new();
+    let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: Some(deployment.path().join("agent.toml")),
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        shutdown: shutdown.clone(),
+        registrar_endpoint,
+    }));
+
+    let response = endpoint
+        .client()
+        .mint(RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "edge-proxy".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "edge-node-01".to_string(),
+            instance: Some(1),
+            spec: WireServiceSpec {
+                component: "edge-proxy".to_string(),
+                service_name: "edge-proxy".to_string(),
+                reload: "none".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 300,
+            idempotency_key: "caller-key".to_string(),
+        })
+        .await
+        .expect("the daemon must answer instead of leaving the activated socket pending");
+    let MintReply::Refused(response) = response else {
+        panic!("the unmounted store must refuse rather than invoke a verb");
+    };
+    assert_eq!(response.class, RefusalClass::Permanent);
+    assert_eq!(
+        response.error,
+        Some(EnrollError::RegistrarUnavailable {
+            reason: RegistrarUnavailableReason::AuditUnwritable,
+        })
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let profile_checked = logs
+                .events()
+                .into_iter()
+                .any(|event| event.message.contains("certificate still valid"));
+            let fast_poll_logged_in = openbao
+                .received_requests()
+                .await
+                .expect("read mock OpenBao requests")
+                .iter()
+                .any(|request| request.url.path() == "/v1/auth/approle/login");
+            if profile_checked && fast_poll_logged_in {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the profile and fast-poll duties must run while the endpoint refuses");
+
+    assert!(
+        !daemon.is_finished(),
+        "the mount refusal must not return from run_daemon"
+    );
+    assert!(
+        !unmounted_store.exists(),
+        "the refusing daemon must not create the unmounted store"
+    );
+    shutdown.stop();
+    daemon
+        .await
+        .expect("the daemon task joins")
+        .expect("the mount refusal does not make run_daemon fail");
+}
+
+/// A mounted store retains the normal failure semantics: only the missing
+/// mount is converted into an endpoint refusal, never a production-handler
+/// dependency failure.
+#[tokio::test]
+async fn a_mounted_store_propagates_production_handler_failures() {
+    let temp = tempfile::tempdir().expect("temporary store parent");
+    let gate =
+        crate::registrar::AuditStoreMountGate::mounted_for_test(temp.path().join("audit-store"));
+
+    let Err(error) = resolve_registrar_handler_for_gate(&gate, || async {
+        Err(anyhow::anyhow!("record store cannot be opened"))
+    })
+    .await
+    else {
+        panic!("a production-handler failure must still stop the daemon");
+    };
+
+    assert!(
+        format!("{error:#}").contains("record store cannot be opened"),
+        "the production failure remains visible: {error:#}"
     );
 }
 

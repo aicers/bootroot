@@ -534,6 +534,68 @@ fn recognize_registrar_name(
 pub struct RegistrarEndpoint {
     #[cfg(target_os = "linux")]
     inner: Option<std::sync::Arc<endpoint::ActivatedEndpoint>>,
+    #[cfg(target_os = "linux")]
+    audit_store_gate: Option<std::sync::Arc<std::sync::OnceLock<AuditStoreMountGate>>>,
+}
+
+/// The audit-store mount verdict fixed for one daemon process lifetime.
+///
+/// The socket endpoint itself survives `SIGHUP` reloads, so the mount verdict
+/// does too: a mount established after startup applies on the next daemon
+/// start rather than changing the handler underneath an adopted socket. The
+/// reload boundary rejects changes to the two configuration values that select
+/// this verdict, so a reloaded handler cannot describe another store.
+#[cfg(target_os = "linux")]
+pub(crate) struct AuditStoreMountGate {
+    requires_mount: bool,
+    store_dir: std::path::PathBuf,
+    mounted: bool,
+    diagnostic_emitted: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl AuditStoreMountGate {
+    /// Reports whether the startup configuration selected filesystem mode.
+    pub(crate) const fn requires_mount(&self) -> bool {
+        self.requires_mount
+    }
+
+    /// Returns the audit-store path the startup verdict covers.
+    pub(crate) fn store_dir(&self) -> &std::path::Path {
+        &self.store_dir
+    }
+
+    /// Reports whether the store was a mount point at daemon start.
+    pub(crate) const fn mounted(&self) -> bool {
+        self.mounted
+    }
+
+    /// Marks the startup diagnostic as emitted and reports whether it was new.
+    pub(crate) fn take_startup_diagnostic(&self) -> bool {
+        !self
+            .diagnostic_emitted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unmounted_for_test(store_dir: std::path::PathBuf) -> Self {
+        Self {
+            requires_mount: true,
+            store_dir,
+            mounted: false,
+            diagnostic_emitted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mounted_for_test(store_dir: std::path::PathBuf) -> Self {
+        Self {
+            requires_mount: true,
+            store_dir,
+            mounted: true,
+            diagnostic_emitted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl RegistrarEndpoint {
@@ -559,8 +621,12 @@ impl RegistrarEndpoint {
     pub fn activate(settings: &crate::config::Settings) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         {
+            let inner = endpoint::activate(settings)?;
             Ok(Self {
-                inner: endpoint::activate(settings)?,
+                audit_store_gate: inner
+                    .as_ref()
+                    .map(|_| std::sync::Arc::new(std::sync::OnceLock::new())),
+                inner,
             })
         }
         #[cfg(not(target_os = "linux"))]
@@ -593,6 +659,46 @@ impl RegistrarEndpoint {
     pub(crate) fn activated(&self) -> Option<std::sync::Arc<endpoint::ActivatedEndpoint>> {
         self.inner.clone()
     }
+
+    /// Wraps a test endpoint in the same process-lifetime holder production
+    /// activation creates.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn from_activated_for_test(
+        endpoint: std::sync::Arc<endpoint::ActivatedEndpoint>,
+    ) -> Self {
+        Self {
+            inner: Some(endpoint),
+            audit_store_gate: Some(std::sync::Arc::new(std::sync::OnceLock::new())),
+        }
+    }
+
+    /// Returns the process-lifetime audit-store mount verdict.
+    ///
+    /// `check_mount` is called only on the first active invocation and only
+    /// when the startup configuration selected filesystem enforcement.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn audit_store_mount_gate<F>(
+        &self,
+        registrar: &crate::config::RegistrarSettings,
+        check_mount: F,
+    ) -> Option<&AuditStoreMountGate>
+    where
+        F: FnOnce(&std::path::Path) -> bool,
+    {
+        let gate = self.audit_store_gate.as_deref()?;
+        Some(gate.get_or_init(|| {
+            let requires_mount = registrar.audit_store_enforcement
+                == crate::config::AuditStoreEnforcement::Filesystem;
+            let store_dir = registrar.audit_store_dir.clone();
+            let mounted = requires_mount && check_mount(&store_dir);
+            AuditStoreMountGate {
+                requires_mount,
+                store_dir,
+                mounted,
+                diagnostic_emitted: std::sync::atomic::AtomicBool::new(false),
+            }
+        }))
+    }
 }
 
 impl std::fmt::Debug for RegistrarEndpoint {
@@ -600,6 +706,63 @@ impl std::fmt::Debug for RegistrarEndpoint {
         f.debug_struct("RegistrarEndpoint")
             .field("active", &self.is_active())
             .finish()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod audit_store_mount_gate_tests {
+    use super::*;
+
+    /// Directory enforcement never probes the path, and a gate retains its
+    /// first verdict for the endpoint's process lifetime.
+    #[test]
+    fn skips_directory_mode_and_keeps_its_first_verdict() {
+        let endpoint = RegistrarEndpoint {
+            inner: None,
+            audit_store_gate: Some(std::sync::Arc::new(std::sync::OnceLock::new())),
+        };
+        let directory = crate::config::RegistrarSettings {
+            audit_store_enforcement: crate::config::AuditStoreEnforcement::Directory,
+            ..crate::config::RegistrarSettings::default()
+        };
+        let directory_gate = endpoint
+            .audit_store_mount_gate(&directory, |_| {
+                panic!("directory mode must not stat the store")
+            })
+            .expect("the test endpoint carries a gate");
+        assert!(!directory_gate.requires_mount());
+        assert!(!directory_gate.mounted());
+
+        let endpoint = RegistrarEndpoint {
+            inner: None,
+            audit_store_gate: Some(std::sync::Arc::new(std::sync::OnceLock::new())),
+        };
+        let mut filesystem = crate::config::RegistrarSettings {
+            audit_store_dir: std::path::PathBuf::from("/audit-store-at-start"),
+            ..crate::config::RegistrarSettings::default()
+        };
+        let first = endpoint
+            .audit_store_mount_gate(&filesystem, |path| {
+                assert_eq!(path, std::path::Path::new("/audit-store-at-start"));
+                false
+            })
+            .expect("the test endpoint carries a gate");
+        assert!(first.requires_mount());
+        assert!(!first.mounted());
+
+        filesystem.audit_store_enforcement = crate::config::AuditStoreEnforcement::Directory;
+        filesystem.audit_store_dir = std::path::PathBuf::from("/different-store");
+        let retained = endpoint
+            .audit_store_mount_gate(&filesystem, |_| {
+                panic!("a later invocation must reuse the verdict")
+            })
+            .expect("the test endpoint carries a gate");
+        assert!(retained.requires_mount());
+        assert_eq!(
+            retained.store_dir(),
+            std::path::Path::new("/audit-store-at-start")
+        );
+        assert!(!retained.mounted());
     }
 }
 

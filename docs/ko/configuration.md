@@ -590,8 +590,11 @@ rate_limit_coalesce_window_seconds = 60
 `[registrar]` 테이블은 두 묶음의 키를 담습니다. 하나는 데몬이 레지스트라의
 자체 감사 기록을 쓰는 감사 저장소이고, 다른 하나는 레지스트라 엔드포인트가
 동사 계층을 구성할 때 쓰는 설정입니다. 데몬 실행 단위 전체가 다시
-구성되므로 둘 다 `SIGHUP`마다 다시 읽히며, 프로세스 수명 동안 고정되는
-값은 `[registrar_endpoint] enabled` 하나뿐입니다.
+구성되므로 테이블은 `SIGHUP`마다 다시 읽힙니다. `[registrar_endpoint] enabled`가
+true이면 `audit_store_dir`과 `audit_store_enforcement`은 활성화된 소켓과 함께
+유지되는 마운트 판정을 선택하므로 그 값과 마찬가지로 프로세스 수명 동안
+고정됩니다. 이들 중 하나를 바꾼 리로드는 거부되며, 적용하려면
+`systemctl restart`를 사용하세요.
 
 `state.json`이 `registrar_endpoint.enabled = true`를 기록한 호스트에서는
 root로 실행한 `bootroot init`이 `audit_store_dir`을 생성하며,
@@ -652,7 +655,15 @@ OpenBao 감사 장치 확인은 그대로입니다.
   XFS 또는 ext4 프로젝트 쿼터입니다. 두 모드 모두
   `[registrar_endpoint] enabled`에 걸려 있으며, 엔드포인트를 활성화하지
   않은 호스트에서는 어느 모드도 아무 일도 하지 않습니다.
-  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요.
+  [공용 감사 저장소](operations.md#공용-감사-저장소)를 참고하세요. 활성화된
+  `filesystem` 엔드포인트는 데몬 시작 시 `audit_store_dir`이 마운트되지
+  않았으면 레지스트라 동사를 거부합니다. 데몬의 갱신 작업은 계속되며,
+  호출자는 영구 `registrar_unavailable` / `audit_unwritable` 응답을 받습니다.
+  journal은 저장소와 기대 마운트 유닛을 지목하고, 각 거부의 새 `request_id`는
+  감사 레코드가 아니라 그 로그 줄을 가리킵니다. 나중에 마운트했다면 데몬을
+  재시작해야 하며, 이 키나 `audit_store_dir`을 바꾸는 경우도 같습니다. 둘 중
+  하나를 바꾼 `SIGHUP`은 거부됩니다. `directory` 모드와 비활성 엔드포인트는
+  검사하지 않습니다.
 - `audit_record_dir` (기본값 `<audit_store_dir>/records`) — 레코드 파일이
   놓이는 절대 경로 디렉터리입니다. 상대 경로는 거부되며, 해석된 경로는
   `audit_store_dir` 안에 있어야 합니다.

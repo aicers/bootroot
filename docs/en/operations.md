@@ -979,6 +979,27 @@ away.
 **`Wants=` plus `After=` orders the boot; it does not guarantee the
 mount.** That gap is a residual, stated below rather than papered over.
 
+At daemon start, an enabled registrar endpoint in `filesystem` mode also
+compares the device id of `audit_store_dir` with its parent. If the store
+is not a mount point, the daemon logs the store path and its expected
+`<escaped audit_store_dir>.mount` unit once, but it keeps running: normal
+certificate renewal and fast-poll duties continue. The endpoint still
+accepts callers and completes its peer checks, then returns a permanent
+`registrar_unavailable` refusal with reason `audit_unwritable`; it does
+not leave callers waiting on the systemd-owned socket. Retrying cannot
+clear that condition.
+
+Each such response has a fresh daemon-generated `request_id`. No verb ran
+and no audit record exists for that id; instead the daemon writes one
+per-refusal log line with the id, operation, caller identity, store path
+and expected unit. This lets an operator trace a caller report without
+searching the unavailable store. The check is made only at daemon start,
+so mounting the store later takes effect on the next restart. For the same
+reason, an enabled endpoint rejects a `SIGHUP` that changes either
+`audit_store_dir` or `audit_store_enforcement`; restart the service to
+apply that change. It does not run when the endpoint is disabled or when
+enforcement is `directory`.
+
 #### What the reserve does not cover
 
 Six things, each of which an operator has to know about rather than
@@ -997,10 +1018,12 @@ assume away:
    upgraded from the earlier layout does carry one, so there the bind
    succeeds and the device lands on the root filesystem again until the
    underlying store is renamed aside.
-3. **A started daemon still creates `records/` beneath an unmounted
-   store.** Opening the record store is what creates its directories, and
-   that path knows nothing of a mode or a mount. A run-time gate refusing
-   to open the store while the mount is missing is a later change.
+3. **A daemon started with an unmounted store refuses registrar verbs.**
+   The daemon makes this decision before opening the record store, so it
+   creates neither `audit_store_dir` nor `records/` beneath the empty
+   mount point. The endpoint remains available only to return the typed
+   permanent refusal described above; this does not detect a mount lost
+   after startup.
 4. **A mount lost while the container runs is not detected.** A running
    container keeps the mount it started with.
 5. **The empty-mount-point invariant is established before activation and

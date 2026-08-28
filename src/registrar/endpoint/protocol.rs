@@ -460,6 +460,25 @@ pub(crate) fn encode_refusal_response(
     )
 }
 
+/// Encodes an endpoint-level registrar-unavailable refusal.
+///
+/// This is deliberately narrower than [`encode_refusal`]: a handler that
+/// did not run a verb must not assemble a verb-layer refusal merely to reuse
+/// its response shape.
+pub(super) fn encode_registrar_unavailable(
+    request_id: &str,
+    reason: RegistrarUnavailableReason,
+    health: &RegistrarHealth,
+) -> Result<Vec<u8>, CodecError> {
+    encode_refusal(
+        request_id,
+        None,
+        RefusalClass::Permanent,
+        Some(EnrollError::RegistrarUnavailable { reason }),
+        health,
+    )
+}
+
 fn encode_refusal(
     request_id: &str,
     registration_id: Option<&str>,

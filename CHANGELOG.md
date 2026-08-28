@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- An enabled registrar endpoint now remains responsive when its
+  filesystem-backed audit store is not mounted. It refuses mint and
+  deregister requests permanently with `registrar_unavailable` /
+  `audit_unwritable`, while certificate renewal continues. Each refusal
+  receives a new `request_id` that identifies its daemon log entry rather
+  than an audit record.
 - The registrar endpoint now coalesces rate-limited invocations into bounded
   audit records and reports separate process-lifetime counters for permanent
   refusal and admission limits in every response's `registrar_health.limiter`

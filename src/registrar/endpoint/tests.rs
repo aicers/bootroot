@@ -78,6 +78,7 @@ use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::endpoint::production::ProductionHandler;
 use crate::registrar::endpoint::protocol;
+use crate::registrar::endpoint::refusing::RefusingHandler;
 use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
@@ -2405,6 +2406,93 @@ async fn a_payload_the_handler_rejects_closes_with_no_bytes() {
         .await;
     assert!(observed.is_empty(), "{observed:?}");
 
+    running.stop().await;
+}
+
+/// An unavailable filesystem audit store still receives each request and
+/// answers it through the ordinary protocol refusal shape.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unmounted_audit_store_returns_typed_refusals_with_log_handles() {
+    let (logs, _guard) = capture_logs();
+    let audit_store = PathBuf::from("/var/lib/bootroot/audit-store");
+    let mount_unit = "var-lib-bootroot-audit\\x2dstore.mount".to_string();
+    let handler = Arc::new(RefusingHandler::new(
+        audit_store.clone(),
+        mount_unit.clone(),
+        crate::daemon_messages::DaemonMessages::default(),
+    ));
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let mut request_ids = Vec::new();
+    for (operation, payload, idempotency_key) in [
+        (
+            b"mint".as_slice(),
+            register_payload("roxyd", "h1", "repeat-key"),
+            "repeat-key",
+        ),
+        (
+            b"mint".as_slice(),
+            register_payload("roxyd", "h1", "repeat-key"),
+            "repeat-key",
+        ),
+        (
+            b"deregister".as_slice(),
+            deregister_payload("roxyd", "h1", "repeat-key"),
+            "repeat-key",
+        ),
+    ] {
+        let observed = harness.round_trip(&frame_of(operation, &payload)).await;
+        let response = protocol::decode_refusal_response(&decode_response(&observed))
+            .expect("the refusal uses the registrar protocol");
+        assert_eq!(response.class, protocol::RefusalClass::Permanent);
+        assert_eq!(
+            response.error,
+            Some(protocol::EnrollError::RegistrarUnavailable {
+                reason: protocol::RegistrarUnavailableReason::AuditUnwritable,
+            })
+        );
+        assert!(response.registration_id.is_none());
+        assert_eq!(
+            response.registrar_health,
+            protocol::RegistrarHealth::default()
+        );
+        assert!(!response.request_id.is_empty());
+        assert_ne!(response.request_id, idempotency_key);
+        request_ids.push(response.request_id);
+    }
+    assert_eq!(request_ids.len(), 3);
+    assert!(
+        request_ids.windows(2).all(|ids| ids[0] != ids[1]),
+        "each refusal receives a fresh request id, even when the request repeats"
+    );
+
+    let events: Vec<_> = logs
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.message
+                == "Registrar endpoint refused a request because the audit store is not mounted"
+        })
+        .collect();
+    assert_eq!(events.len(), 3, "one event is emitted for each refusal");
+    for (event, request_id) in events.iter().zip(&request_ids) {
+        assert_eq!(event.level, "DEBUG", "refusals are not warnings");
+        assert_eq!(event.field("request_id"), request_id);
+        assert_eq!(
+            event.field("audit_store"),
+            audit_store.display().to_string()
+        );
+        assert_eq!(event.field("mount_unit"), mount_unit);
+        assert!(!event.field("caller").is_empty());
+        assert!(!event.field("operation").is_empty());
+    }
+
+    let malformed = harness.round_trip(&frame_of(b"mint", b"not-json")).await;
+    assert!(
+        malformed.is_empty(),
+        "malformed payloads retain the handler-refusal path"
+    );
     running.stop().await;
 }
 

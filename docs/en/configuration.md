@@ -617,9 +617,12 @@ rate_limit_coalesce_window_seconds = 60
 
 The `[registrar]` table carries two groups of keys: the audit store the
 daemon writes the registrar's own trail to, and the verb-layer settings
-the registrar endpoint is provisioned from. Both are read on every
-`SIGHUP`, because the whole daemon invocation is rebuilt; only
-`[registrar_endpoint] enabled` is fixed for the process lifetime.
+the registrar endpoint is provisioned from. The table is read on every
+`SIGHUP`, because the whole daemon invocation is rebuilt. When
+`[registrar_endpoint] enabled` is true, `audit_store_dir` and
+`audit_store_enforcement` are fixed with it for the process lifetime:
+they select the mount verdict retained with the activated socket. A reload
+that changes one is rejected; use `systemctl restart` to apply it.
 
 On a host whose `state.json` records `registrar_endpoint.enabled = true`,
 a root-run `bootroot init` creates `audit_store_dir`, and `records/` and
@@ -683,7 +686,16 @@ error.
   project quota as the operator-side route to a real ceiling. Both are
   gated on `[registrar_endpoint] enabled` — on a host that has not
   enabled the endpoint neither mode does anything at all. See
-  [The shared audit store](operations.md#the-shared-audit-store).
+  [The shared audit store](operations.md#the-shared-audit-store). At
+  daemon start, an enabled `filesystem` endpoint refuses registrar verbs
+  if `audit_store_dir` is not mounted. The daemon continues its renewal
+  work, while callers receive a permanent `registrar_unavailable` /
+  `audit_unwritable` response. The journal names the store and expected
+  mount unit; each refusal's fresh `request_id` resolves to that log line,
+  not to an audit record. Mounting the store later requires a daemon
+  restart, as does changing this key or `audit_store_dir`; a `SIGHUP`
+  that changes either is rejected. `directory` mode and disabled
+  endpoints perform no check.
 - `audit_record_dir` (default `<audit_store_dir>/records`) — the absolute
   directory the record files live in. A relative path is rejected, and
   the resolved directory must stay inside `audit_store_dir`.
