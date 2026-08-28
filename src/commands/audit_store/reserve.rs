@@ -3796,12 +3796,19 @@ mod tests {
                 !passage.contains("\n```"),
                 "{manual}: the existing-records passage must not add a relocation procedure"
             );
-            for command in ["`mv ", "`cp ", "`rsync ", "`rm ", "`mount ", "`umount "] {
+            for command in [
+                "`mv ", "`cp ", "`rsync ", "`rm ", "`mount ", "`umount ", "`find ", "`cmp ",
+                "`diff ",
+            ] {
                 assert!(
                     !passage.contains(command),
                     "{manual}: the existing-records passage must not add a relocation command: {command}"
                 );
             }
+            assert!(
+                !passage.contains(".pre-mount"),
+                "{manual}: the existing-records passage must not name the relocation path .pre-mount"
+            );
         }
     }
 
