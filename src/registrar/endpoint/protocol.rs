@@ -372,6 +372,30 @@ pub(crate) struct RefusalResponse {
     pub(crate) registrar_health: RegistrarHealth,
 }
 
+/// The intentionally empty health object returned before registrar startup.
+///
+/// The audit-store mount refusal has no registrar dependencies behind it, so
+/// it must not claim the limiter snapshot that production handlers own.
+#[derive(Serialize)]
+struct UnavailableRegistrarHealth {}
+
+/// The refusal envelope used before a production registrar exists.
+///
+/// It intentionally mirrors [`RefusalResponse`] while using the one empty
+/// health object permitted on the audit-store mount-refusal path. Keeping it
+/// separate leaves the verb-level encoder restricted to production health.
+#[derive(Serialize)]
+struct AuditStoreUnavailableResponse {
+    protocol_version: ProtocolVersion,
+    request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_id: Option<String>,
+    class: RefusalClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<EnrollError>,
+    registrar_health: UnavailableRegistrarHealth,
+}
+
 /// Decodes and validates a mint response from the registrar endpoint.
 pub(crate) fn decode_mint_response(payload: &[u8]) -> Result<MintResponse, CodecError> {
     let response = serde_json::from_slice::<MintResponse>(payload)?;
@@ -465,18 +489,21 @@ pub(crate) fn encode_refusal_response(
 /// This is deliberately narrower than [`encode_refusal`]: a handler that
 /// did not run a verb must not assemble a verb-layer refusal merely to reuse
 /// its response shape.
-pub(super) fn encode_registrar_unavailable(
-    request_id: &str,
-    reason: RegistrarUnavailableReason,
-    health: &RegistrarHealth,
-) -> Result<Vec<u8>, CodecError> {
-    encode_refusal(
-        request_id,
-        None,
-        RefusalClass::Permanent,
-        Some(EnrollError::RegistrarUnavailable { reason }),
-        health,
-    )
+pub(super) fn encode_audit_store_unavailable(request_id: &str) -> Result<Vec<u8>, CodecError> {
+    let class = RefusalClass::Permanent;
+    let error = Some(EnrollError::RegistrarUnavailable {
+        reason: RegistrarUnavailableReason::AuditUnwritable,
+    });
+    validate_refusal_class(class, error.as_ref())?;
+    let response = AuditStoreUnavailableResponse {
+        protocol_version: ProtocolVersion::current(),
+        request_id: request_id.to_string(),
+        registration_id: None,
+        class,
+        error,
+        registrar_health: UnavailableRegistrarHealth {},
+    };
+    serde_json::to_vec(&response).map_err(Into::into)
 }
 
 fn encode_refusal(

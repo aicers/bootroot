@@ -13,7 +13,7 @@ use tracing::debug;
 
 use super::frame::Operation;
 use super::handler::{HandlerRefusal, RegistrarRequestHandler};
-use super::protocol::{self, RegistrarHealth, RegistrarUnavailableReason};
+use super::protocol;
 use crate::daemon_messages::DaemonMessages;
 use crate::registrar::verbs::outcome::{CallerIdentity, RequestId};
 
@@ -60,12 +60,8 @@ impl RegistrarRequestHandler for RefusingHandler {
                 mount_unit = self.mount_unit.as_str(),
                 "{}", self.messages.audit_store_not_mounted_request_refused()
             );
-            protocol::encode_registrar_unavailable(
-                request_id.as_str(),
-                RegistrarUnavailableReason::AuditUnwritable,
-                &RegistrarHealth::default(),
-            )
-            .map_err(|_| HandlerRefusal)
+            protocol::encode_audit_store_unavailable(request_id.as_str())
+                .map_err(|_| HandlerRefusal)
         })
     }
 }

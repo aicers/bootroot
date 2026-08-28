@@ -2443,7 +2443,39 @@ async fn an_unmounted_audit_store_returns_typed_refusals_with_log_handles() {
         ),
     ] {
         let observed = harness.round_trip(&frame_of(operation, &payload)).await;
-        let response = protocol::decode_refusal_response(&decode_response(&observed))
+        let body = decode_response(&observed);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&body).expect("the refusal response is JSON");
+        let mut members: Vec<_> = raw
+            .as_object()
+            .expect("the refusal response is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        assert_eq!(
+            members,
+            [
+                "class",
+                "error",
+                "protocol_version",
+                "registrar_health",
+                "request_id",
+            ],
+            "the unavailable handler preserves the existing refusal envelope"
+        );
+        assert_eq!(
+            raw.get("registrar_health"),
+            Some(&serde_json::json!({})),
+            "the unavailable handler exposes no production health state"
+        );
+        assert!(
+            raw.get("registrar_health")
+                .and_then(|health| health.get("limiter"))
+                .is_none(),
+            "the unavailable handler exposes no limiter counters"
+        );
+        let response = protocol::decode_refusal_response(&body)
             .expect("the refusal uses the registrar protocol");
         assert_eq!(response.class, protocol::RefusalClass::Permanent);
         assert_eq!(

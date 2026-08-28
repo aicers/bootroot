@@ -586,16 +586,6 @@ impl AuditStoreMountGate {
             diagnostic_emitted: std::sync::atomic::AtomicBool::new(false),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn mounted_for_test(store_dir: std::path::PathBuf) -> Self {
-        Self {
-            requires_mount: true,
-            store_dir,
-            mounted: true,
-            diagnostic_emitted: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
 }
 
 impl RegistrarEndpoint {

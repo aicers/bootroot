@@ -665,7 +665,7 @@ value is deterministic, so a caller with several outstanding requests
 should jitter its own retries.
 
 Either way the daemon counts what it suppressed, one counter per bucket
-since start. Every response publishes those two values as
+since start. Every production-handler response publishes those two values as
 `registrar_health.limiter`, rather than as a total: a rising
 `predecision_refusal` count says someone is flooding malformed input
 while those callers still got their real answers, and a rising
@@ -711,8 +711,9 @@ caller identity, verb, bucket (`predecision_refusal` or `admission`), count,
 and window bounds. At most 256 windows (roughly 150 KB) are held in memory.
 At the default 60-second window this permits at most 256 records per minute
 (15,360 per hour) only if 64 identities continuously drive all four keys; the
-present single-identity design remains 240 records per hour. Responses publish
-the two process-lifetime counters as `registrar_health.limiter`.
+present single-identity design remains 240 records per hour. Production-handler
+responses publish the two process-lifetime counters as
+`registrar_health.limiter`.
 
 **Sizing the admission burst.** Size it from the largest *legitimate*
 bring-up wave, not from how rare mints are in steady state:
@@ -987,7 +988,9 @@ certificate renewal and fast-poll duties continue. The endpoint still
 accepts callers and completes its peer checks, then returns a permanent
 `registrar_unavailable` refusal with reason `audit_unwritable`; it does
 not leave callers waiting on the systemd-owned socket. Retrying cannot
-clear that condition.
+clear that condition. Its `registrar_health` object is empty (`{}`): no
+limiter, certificate, capacity or other production-handler health state was
+created for this path.
 
 Each such response has a fresh daemon-generated `request_id`. No verb ran
 and no audit record exists for that id; instead the daemon writes one
