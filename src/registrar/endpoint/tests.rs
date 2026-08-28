@@ -2409,6 +2409,57 @@ async fn a_payload_the_handler_rejects_closes_with_no_bytes() {
     running.stop().await;
 }
 
+fn assert_audit_store_unavailable_response(body: &[u8], idempotency_key: &str) -> String {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).expect("the refusal response is JSON");
+    let mut members: Vec<_> = raw
+        .as_object()
+        .expect("the refusal response is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        [
+            "class",
+            "error",
+            "protocol_version",
+            "registrar_health",
+            "request_id",
+        ],
+        "the unavailable handler preserves the existing refusal envelope"
+    );
+    assert_eq!(
+        raw.get("registrar_health"),
+        Some(&serde_json::json!({})),
+        "the unavailable handler exposes no production health state"
+    );
+    assert!(
+        raw.get("registrar_health")
+            .and_then(|health| health.get("limiter"))
+            .is_none(),
+        "the unavailable handler exposes no limiter counters"
+    );
+    let response =
+        protocol::decode_refusal_response(body).expect("the refusal uses the registrar protocol");
+    assert_eq!(response.class, protocol::RefusalClass::Permanent);
+    assert_eq!(
+        response.error,
+        Some(protocol::EnrollError::RegistrarUnavailable {
+            reason: protocol::RegistrarUnavailableReason::AuditUnwritable,
+        })
+    );
+    assert!(response.registration_id.is_none());
+    assert_eq!(
+        response.registrar_health,
+        protocol::RegistrarHealth::default()
+    );
+    assert!(!response.request_id.is_empty());
+    assert_ne!(response.request_id, idempotency_key);
+    response.request_id
+}
+
 /// An unavailable filesystem audit store still receives each request and
 /// answers it through the ordinary protocol refusal shape.
 #[tokio::test(flavor = "current_thread")]
@@ -2444,54 +2495,10 @@ async fn an_unmounted_audit_store_returns_typed_refusals_with_log_handles() {
     ] {
         let observed = harness.round_trip(&frame_of(operation, &payload)).await;
         let body = decode_response(&observed);
-        let raw: serde_json::Value =
-            serde_json::from_slice(&body).expect("the refusal response is JSON");
-        let mut members: Vec<_> = raw
-            .as_object()
-            .expect("the refusal response is an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        members.sort_unstable();
-        assert_eq!(
-            members,
-            [
-                "class",
-                "error",
-                "protocol_version",
-                "registrar_health",
-                "request_id",
-            ],
-            "the unavailable handler preserves the existing refusal envelope"
-        );
-        assert_eq!(
-            raw.get("registrar_health"),
-            Some(&serde_json::json!({})),
-            "the unavailable handler exposes no production health state"
-        );
-        assert!(
-            raw.get("registrar_health")
-                .and_then(|health| health.get("limiter"))
-                .is_none(),
-            "the unavailable handler exposes no limiter counters"
-        );
-        let response = protocol::decode_refusal_response(&body)
-            .expect("the refusal uses the registrar protocol");
-        assert_eq!(response.class, protocol::RefusalClass::Permanent);
-        assert_eq!(
-            response.error,
-            Some(protocol::EnrollError::RegistrarUnavailable {
-                reason: protocol::RegistrarUnavailableReason::AuditUnwritable,
-            })
-        );
-        assert!(response.registration_id.is_none());
-        assert_eq!(
-            response.registrar_health,
-            protocol::RegistrarHealth::default()
-        );
-        assert!(!response.request_id.is_empty());
-        assert_ne!(response.request_id, idempotency_key);
-        request_ids.push(response.request_id);
+        request_ids.push(assert_audit_store_unavailable_response(
+            &body,
+            idempotency_key,
+        ));
     }
     assert_eq!(request_ids.len(), 3);
     assert!(
