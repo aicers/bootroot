@@ -2718,10 +2718,13 @@ async fn limited_events_reach_responses_only_after_daemon_maintenance() {
 /// Asserted on a snapshot the handler's own store could not have
 /// produced: the response follows the snapshot, so no scan of its own
 /// ran. Driven over the deregister and refusal shapes, which is every
-/// shape this build's production handler encodes — `Operation::Mint`
-/// is still refused at the transport seam with no response bytes, so
-/// the mint shape's carriage of the member is covered by the
-/// `mint-success.json` golden fixture instead.
+/// shape this build's production handler encodes end to end —
+/// `Operation::Mint` is still refused at the spec conversion with no
+/// response bytes, so the mint arm's own relay is asserted over the
+/// two halves it is made of by
+/// `production::tests::a_mint_response_relays_the_last_snapshot_without_scanning_the_store`,
+/// and that no arm can scan at all by
+/// `production::tests::no_request_path_arm_reads_the_audit_store`.
 #[tokio::test]
 async fn responses_relay_the_last_capacity_snapshot_without_scanning_the_store() {
     use crate::config::AuditStoreEnforcement;

@@ -2,7 +2,7 @@
 //! the CA anchor it frames, and the wire `spec` it cannot yet convert.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 use wiremock::matchers::{method, path as request_path};
@@ -11,15 +11,25 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::{
     ProductionHandler, SpecConversionError, anchor_from_stored, normalize_bundle, requested_spec,
 };
+use crate::config::AuditStoreEnforcement;
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
-use crate::registrar::audit::AuditRecordStore;
+use crate::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
+use crate::registrar::audit::{ACTIVE_FILE_NAME, AuditRecordStore};
+use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::RegistrarConfig;
-use crate::registrar::endpoint::protocol::{WireServiceSpec, decode_ca_anchor, encode_ca_anchor};
+use crate::registrar::endpoint::protocol::{
+    AuditCapacityHealth, LimiterHealth, RegistrarHealth, WireServiceSpec, decode_ca_anchor,
+    decode_mint_response, encode_ca_anchor, encode_mint_response,
+};
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{InternalCredential, active_root_cert_path};
 use crate::registrar::verbs::limiter::{
     NoopLimitedInvocationSink, VerbRateLimiter, VerbRateLimiterSettings,
+};
+use crate::registrar::verbs::outcome::{
+    CallerIdentity, MintKind, MintOutcome, ProducingArm, RequestId, VerbContext,
+    WrappedSecretIdToken,
 };
 use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 use crate::registrar::verbs::{RegistrarVerbs, RegistrarVerbsConfig};
@@ -218,9 +228,16 @@ fn test_limiter() -> VerbRateLimiter {
     )
 }
 
-/// Builds the production handler over real verbs and a real credential,
-/// both pointed at `server`.
-fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler) {
+/// Builds the dependencies the handler is constructed from — real
+/// verbs over `audit_store` and a real credential, both pointed at
+/// `server`.
+///
+/// Split from the constructors so the two harnesses below differ in
+/// nothing but which one they call.
+fn harness_dependencies(
+    server: &MockServer,
+    audit_store: AuditRecordStore,
+) -> (tempfile::TempDir, RegistrarVerbs, InternalCredential) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = RegistrarConfigFixture::new()
         .write_to(dir.path())
@@ -236,7 +253,7 @@ fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler)
         token_ttl: "3600s".to_string(),
         secret_id_ttl: "86400s".to_string(),
         wrap_ttl_policy: WrapTtlPolicy::new(time::Duration::minutes(30)).expect("policy maximum"),
-        audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        audit_store,
         limiter: test_limiter(),
     });
 
@@ -245,9 +262,34 @@ fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler)
     let credential = InternalCredential::for_test(&server.uri(), &secrets_dir, &fingerprint)
         .expect("the harness credential");
 
+    (dir, verbs, credential)
+}
+
+/// Builds the production handler over real verbs and a real credential,
+/// both pointed at `server`.
+fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler) {
+    let (dir, verbs, credential) = harness_dependencies(
+        server,
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+    );
     (
         dir,
         ProductionHandler::new(verbs, credential, HARNESS_KV_MOUNT.to_string()),
+    )
+}
+
+/// Builds the production handler the way the daemon does: over the
+/// shared health snapshot the maintenance tick writes, and over a
+/// caller-held audit store the test can populate.
+fn health_harness(
+    server: &MockServer,
+    audit_store: AuditRecordStore,
+    health: Arc<StdMutex<RegistrarHealth>>,
+) -> (tempfile::TempDir, ProductionHandler) {
+    let (dir, verbs, credential) = harness_dependencies(server, audit_store);
+    (
+        dir,
+        ProductionHandler::with_health(verbs, credential, HARNESS_KV_MOUNT.to_string(), health),
     )
 }
 
@@ -414,4 +456,193 @@ fn an_uppercase_stored_fingerprint_is_the_same_fingerprint() {
     };
     let anchor = anchor_from_stored(&stored).expect("the same pin, spelled in the other case");
     assert_eq!(anchor.trusted_ca_sha256, vec![fingerprint]);
+}
+
+// ---------------------------------------------------------------------
+// The health snapshot a response carries
+// ---------------------------------------------------------------------
+
+/// The retention settings the reader is driven with here. Any pair the
+/// scanner accepts would do: what these tests compare is the reader's
+/// output against the relayed snapshot, not the reader's own rules.
+const SCAN_MAX_RETAINED: u32 = 14;
+const SCAN_MIN_RETAIN_DAYS: u32 = 7;
+
+/// A snapshot no scan of a freshly opened store could produce.
+///
+/// Every measured member is non-default and the record counts are
+/// non-zero, so a response carrying these values took them from the
+/// daemon's holder rather than from the store the handler was built
+/// over.
+fn relay_snapshot() -> RegistrarHealth {
+    let measured_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000);
+    RegistrarHealth {
+        limiter: LimiterHealth::default(),
+        audit_capacity: AuditCapacityHealth {
+            state: AuditCapacityState::LowWater,
+            enforcement: AuditStoreEnforcement::Directory,
+            reserve_bytes: 2_147_483_648,
+            low_water_bytes: 536_870_912,
+            used_bytes: Some(1_700_000_000),
+            headroom_bytes: Some(447_483_648),
+            measured_at: Some(measured_at),
+            intent_without_outcome: Some(4),
+            malformed_records: Some(7),
+            retention_shortfall: Some(true),
+            records_measured_at: Some(measured_at),
+        },
+    }
+}
+
+/// A verb outcome the mint encoder accepts.
+fn mint_outcome() -> MintOutcome {
+    MintOutcome::new(
+        VerbContext::new(
+            RequestId::for_fixture("request-0001"),
+            CallerIdentity::new("registrar-client:001.bootroot-registrar.h1.example.internal"),
+            Some("registration-1".to_string()),
+            ProducingArm::Issuance,
+        ),
+        MintKind::FirstMint,
+        "api.node.example.test".to_string(),
+        "role-id".to_string(),
+        WrappedSecretIdToken::new("wrapped-secret".to_string()),
+        time::OffsetDateTime::UNIX_EPOCH,
+    )
+}
+
+/// A single-certificate anchor the mint encoder frames.
+fn relay_anchor() -> TrustPayload {
+    let (pem, fingerprint) = generate_ca_cert("Deployment CA");
+    TrustPayload {
+        trusted_ca_sha256: vec![fingerprint],
+        ca_bundle_pem: pem,
+    }
+}
+
+/// A mint response relays the daemon's last snapshot and scans no store
+/// of its own.
+///
+/// The reader computes its counts by opening the store's files, so a
+/// call from the request path would put a full-store read on every
+/// successful mint. Driven over the two halves the mint arm is made of:
+/// [`ProductionHandler::health_snapshot`], which is where that arm gets
+/// the value, and `encode_mint_response`, which is what it hands the
+/// value to. The arm calls exactly those and nothing else — pinned by
+/// [`no_request_path_arm_reads_the_audit_store`], which reads this
+/// build's `mint` body — and the whole arm cannot be driven end to end
+/// here because `requested_spec` refuses every wire `spec` until the
+/// grammar is settled, so no payload reaches the encoder through
+/// `handle`.
+///
+/// The proof that no scan ran is not that the numbers look untouched:
+/// the reader is run against the handler's own store in the same test
+/// and returns something different from what the response carried.
+#[tokio::test]
+async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
+    let server = MockServer::start().await;
+    let audit_store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+    let health = Arc::new(StdMutex::new(RegistrarHealth::default()));
+    let (_dir, handler) = health_harness(&server, audit_store.clone(), health.clone());
+
+    // One line the reader counts as malformed, so the store the handler
+    // holds and the snapshot the daemon holds disagree by construction.
+    std::fs::write(
+        audit_store.directory().join(ACTIVE_FILE_NAME),
+        b"{ not an audit record\n",
+    )
+    .expect("seed the store the reader would have scanned");
+
+    let snapshot = relay_snapshot();
+    *health.lock().expect("the snapshot lock is not poisoned") = snapshot.clone();
+
+    let anchor = relay_anchor();
+    let encoded = encode_mint_response(mint_outcome(), &anchor, &handler.health_snapshot())
+        .expect("the mint response encodes");
+    let decoded = decode_mint_response(&encoded).expect("the mint response decodes");
+    assert_eq!(
+        decoded.registrar_health, snapshot,
+        "a mint response relays the daemon-held snapshot verbatim, limiter included"
+    );
+
+    let scanned = scan_audit_store(
+        audit_store.directory(),
+        time::OffsetDateTime::now_utc(),
+        AUDIT_SCAN_WINDOW,
+        SCAN_MAX_RETAINED,
+        SCAN_MIN_RETAIN_DAYS,
+    )
+    .expect("the reader scans the handler's own store");
+    assert_eq!(
+        scanned.malformed_records, 1,
+        "the seeded line is one the reader would have counted"
+    );
+    assert_ne!(
+        Some(scanned.malformed_records),
+        decoded.registrar_health.audit_capacity.malformed_records,
+        "the relayed count is the tick's and not a scan of the store the response was built over"
+    );
+
+    // Only a maintenance tick moves it.
+    health
+        .lock()
+        .expect("the snapshot lock is not poisoned")
+        .audit_capacity
+        .malformed_records = Some(9);
+    let refreshed = encode_mint_response(mint_outcome(), &anchor, &handler.health_snapshot())
+        .expect("the second mint response encodes");
+    assert_eq!(
+        decode_mint_response(&refreshed)
+            .expect("the second mint response decodes")
+            .registrar_health
+            .audit_capacity
+            .malformed_records,
+        Some(9),
+        "the next response follows the holder, which only the tick writes"
+    );
+}
+
+/// No arm of the request path reads the audit store, and every arm takes
+/// its health from the one accessor.
+///
+/// Asserted over this module's source because it is a property of the
+/// arms that exist rather than of any one response: `Operation::Mint` is
+/// refused before the encoder on this build, so a scan added to the mint
+/// arm would be caught by no round trip. The `mint` body is read here
+/// for exactly that reason.
+#[test]
+fn no_request_path_arm_reads_the_audit_store() {
+    // The test module is a sibling file, so this is the production half
+    // whole.
+    let source = include_str!("../production.rs");
+    for reader in [
+        "scan_audit_store",
+        "AuditScan",
+        "AuditRecordStore",
+        "probe_audit_capacity",
+        "audit_store_dir",
+    ] {
+        assert!(
+            !source.contains(reader),
+            "the request path must not read the audit store ({reader})"
+        );
+    }
+
+    for arm in ["    async fn mint(", "    async fn deregister("] {
+        let body = source
+            .split(arm)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{arm} is declared in this file"))
+            .split("\n    }")
+            .next()
+            .unwrap_or_else(|| panic!("{arm} has a body"));
+        assert!(
+            body.contains("let health = self.health_snapshot();"),
+            "{arm} takes its health from the one accessor: {body}"
+        );
+        assert!(
+            !body.contains(".lock()"),
+            "{arm} reaches the holder through the accessor and not around it: {body}"
+        );
+    }
 }
