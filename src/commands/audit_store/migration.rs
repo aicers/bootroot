@@ -231,6 +231,23 @@ impl CopyVerdict {
     pub(super) fn renders_copy(&self) -> bool {
         matches!(self, Self::Fits { .. })
     }
+
+    /// Whether the holding path is so far from a migration's own that
+    /// nothing which acts on the store may be rendered.
+    ///
+    /// [`Self::MountPoint`] and [`Self::ForbiddenEntry`] describe a
+    /// holding *directory* with something wrong inside it: the
+    /// operator clears that and the same migration carries on, so the
+    /// activation the copy still needs is rendered for them. A holding
+    /// path that is not a directory at all leaves no copy that could
+    /// ever be rendered from it, and rendering the activation beside
+    /// the rollback would put a `systemctl enable --now` and an
+    /// `rmdir` of what it mounts in one list — the `umount` that would
+    /// make the second runnable is withheld, correctly, because the
+    /// mount is absent at the moment the list is rendered.
+    pub(super) fn withholds_activation(&self) -> bool {
+        matches!(self, Self::HoldingNotDirectory { .. })
+    }
 }
 
 /// Decides what may be rendered for a migration that is in progress.

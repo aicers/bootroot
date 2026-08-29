@@ -2417,6 +2417,26 @@ fn retained_image_notes(
     ])
 }
 
+/// The step list for a migration state that may change nothing on the
+/// host: the re-run, and the rollback wherever it is safe to offer.
+fn withheld_migration_steps(
+    inputs: &ReserveInputs<'_>,
+    facts: &Phase1Facts,
+    rollback: bool,
+    messages: &Messages,
+) -> Vec<Phase2Step> {
+    let mut steps = vec![rerun_step(inputs, messages)];
+    if rollback {
+        steps.push(migration::rollback_step(
+            &facts.store_dir,
+            &facts.migration.paths.holding,
+            facts.mount_present(),
+            messages,
+        ));
+    }
+    steps
+}
+
 /// The **migration incomplete** outcome.
 ///
 /// It names the holding path, states which step is outstanding, and
@@ -2424,9 +2444,13 @@ fn retained_image_notes(
 /// outstanding **activation** — taken from the phase-2 renderer with
 /// the subdirectory step withheld, because the copy is what satisfies
 /// it — and where it is, the capacity verdict and either the copy or
-/// the two routes out. The rollback is offered in every case except
-/// the two that would have it act on something this migration did not
-/// put there: a store that still holds content, and a foreign mount.
+/// the two routes out. The activation is withheld along with the copy
+/// where the holding path is not a directory, whatever the mount
+/// state: nothing there can ever be copied, so mounting the reserve
+/// for it is a host change this outcome has no use for. The rollback
+/// is offered in every case except the two that would have it act on
+/// something this migration did not put there: a store that still
+/// holds content, and a foreign mount.
 fn migration_report(
     inputs: &ReserveInputs<'_>,
     facts: &Phase1Facts,
@@ -2464,15 +2488,8 @@ fn migration_report(
         // and the foreign mount describes a filesystem that is not
         // this migration's to mount over, copy into or unmount. The
         // rollback survives the first alone.
-        let mut steps = vec![rerun_step(inputs, messages)];
-        if facts.migration_renders_rollback() {
-            steps.push(migration::rollback_step(
-                &facts.store_dir,
-                &facts.migration.paths.holding,
-                facts.mount_present(),
-                messages,
-            ));
-        }
+        let steps =
+            withheld_migration_steps(inputs, facts, facts.migration_renders_rollback(), messages);
         return Ok(ReserveReport::MigrationIncomplete { findings, steps });
     }
 
@@ -2484,6 +2501,19 @@ fn migration_report(
         messages,
     )?;
     findings.extend(migration::verdict_findings(&verdict, messages));
+    if verdict.withholds_activation() {
+        // A holding path that is not a directory is refused before
+        // anything is walked, measured or rendered from it — and the
+        // activation is rendered from the store it would mount over,
+        // not from the holding path, so it would otherwise survive
+        // this refusal. It must not: there is no copy this run could
+        // ever reach, so `systemctl enable --now` would mount the
+        // reserve for a migration that cannot proceed, and the
+        // rollback rendered beside it would then `rmdir` that mount
+        // point without the `umount` an absent mount withholds.
+        let steps = withheld_migration_steps(inputs, facts, true, messages);
+        return Ok(ReserveReport::MigrationIncomplete { findings, steps });
+    }
     // The closing rename cannot be rendered onto a path that already
     // exists, so the whole copy is refused rather than started against
     // one and stopped at the far end. Its finding is already in the
@@ -5346,6 +5376,8 @@ mod tests {
     #[test]
     fn a_holding_path_that_is_not_a_directory_refuses_the_copy() {
         let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
         // `cp -a --one-file-system <holding>/. <store>/` resolves the
         // `/.`, so a link here is followed and whatever it names is
         // copied into the reserve. The rendered type guard cannot
@@ -5356,32 +5388,53 @@ mod tests {
             (FileKind::Regular, "a regular file"),
             (FileKind::Other, "neither a regular file nor a directory"),
         ] {
-            let (base, facts, artifacts) = migrating_host(&fixture, 8);
             // The tree under it is intact and would otherwise fit, so
-            // only the root's own type can be what refuses this.
-            let host = base.file(
-                HOLDING,
-                FileFacts {
-                    kind,
-                    ino: 90,
-                    ..dir_facts(TEST_UID, 0o777)
-                },
-            );
-            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
-            for withheld in [
-                Phase2StepKind::TypeGuard,
-                Phase2StepKind::Copy,
-                Phase2StepKind::Verify,
-                Phase2StepKind::ClosingRename,
-            ] {
-                assert!(
-                    !steps.iter().any(|step| step.kind == withheld),
-                    "{withheld:?} rendered over a holding path that is {needle}: {steps:?}"
+            // only the root's own type can be what refuses this. Both
+            // mount states, because the activation is rendered from
+            // the store rather than from the holding path and would
+            // otherwise survive this refusal while the mount is down.
+            let root = FileFacts {
+                kind,
+                ino: 90,
+                ..dir_facts(TEST_UID, 0o777)
+            };
+            for mounted in [true, false] {
+                let (host, facts, artifacts) = if mounted {
+                    let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                    (base.file(HOLDING, root), facts, artifacts)
+                } else {
+                    let host = with_holding(bare_host(), 8).file(HOLDING, root);
+                    let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                    let artifacts = render_artifacts(&inputs, &facts);
+                    (host, facts, artifacts)
+                };
+                assert_eq!(facts.mount_present(), mounted);
+                let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+                // Nothing that acts on the store: not the copy it can
+                // never reach, and not the activation that would mount
+                // the reserve for it.
+                assert_eq!(
+                    steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                    vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                    "over a holding path that is {needle}, mounted={mounted}: {steps:?}"
                 );
+                let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+                for forbidden in ["mkfs.ext4", "systemctl enable --now", "cp -a", "install -"] {
+                    assert!(
+                        rendered.iter().all(|command| !command.contains(forbidden)),
+                        "{forbidden} over a holding path that is {needle}: {rendered:?}"
+                    );
+                }
+                // The rollback is the way back out, and its `umount`
+                // still tracks the mount state it was rendered under.
+                assert_eq!(
+                    step_of(&steps, Phase2StepKind::Rollback).commands,
+                    rollback_commands(mounted)
+                );
+                let joined = findings.join("\n");
+                assert!(joined.contains(HOLDING), "{joined}");
+                assert!(joined.contains(needle), "{joined}");
             }
-            let joined = findings.join("\n");
-            assert!(joined.contains(HOLDING), "{joined}");
-            assert!(joined.contains(needle), "{joined}");
         }
     }
 

@@ -1202,7 +1202,10 @@ what it renders is the re-run alone, or the re-run and the rollback.
   named on its command line nor reports the link itself, so it exits
   zero over exactly the entry that must be refused. bootroot refuses it
   against an `lstat` of the path itself, before anything is measured,
-  walked or rendered. The rollback is still offered.
+  walked or rendered. The activation goes with the copy, whatever the
+  mount state: nothing at that path can ever be copied, so mounting the
+  reserve for it changes the host for no gain. The rollback is still
+  offered.
 - **Something other than the reserve mounted at `<audit_store_dir>`** — a
   tmpfs, a bind mount, or a loop device backed by another file.
   Reporting it as "the reserve is not mounted" and rendering the
