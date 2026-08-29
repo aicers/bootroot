@@ -1323,12 +1323,22 @@ impl MeasureError {
     }
 }
 
-/// Sums the allocated bytes of everything beneath `root`.
+/// Sums the allocated bytes of `root` and everything beneath it.
 ///
 /// Each `(st_dev, st_ino)` counts once, so a hard-linked pair is not
 /// double-counted, and the walk does not cross a filesystem boundary:
 /// what has to fit inside the reserve is what lives on the underlying
 /// store, not what some other filesystem mounted below it holds.
+///
+/// The root counts as itself. `cp -a <root>/. <destination>/` links
+/// every one of the root's entries into the destination's own root
+/// directory, which has to grow to hold them, so the blocks the source
+/// root spends on those entries are blocks the destination has to
+/// spend too — and a directory that once held a great many files keeps
+/// that allocation. It is also what `du -s` reports, which is the
+/// figure the manual has an operator compute by hand for the same
+/// decision; a walk that stopped at the children would answer a
+/// question the documented procedure does not ask.
 ///
 /// `root` is a parameter rather than the store: the migration's
 /// capacity check calls this against the holding directory, and two
@@ -1354,9 +1364,16 @@ pub(super) fn measure_underlying(
         return Ok(0);
     };
     let figure = messages.audit_reserve_figure_underlying(&display_path(root));
+    let allocated = |facts: &FileFacts| {
+        facts
+            .blocks
+            .checked_mul(ST_BLOCKS_UNIT_BYTES)
+            .ok_or_else(|| MeasureError::Arithmetic(figure.clone()))
+    };
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    seen.insert((root_facts.dev, root_facts.ino));
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
-    let mut total = 0u64;
+    let mut total = allocated(&root_facts)?;
     while let Some(dir) = pending.pop() {
         let entries = probe
             .list_dir(&dir)
@@ -1375,12 +1392,8 @@ pub(super) fn measure_underlying(
             if !seen.insert((facts.dev, facts.ino)) {
                 continue;
             }
-            let allocated = facts
-                .blocks
-                .checked_mul(ST_BLOCKS_UNIT_BYTES)
-                .ok_or_else(|| MeasureError::Arithmetic(figure.clone()))?;
             total = total
-                .checked_add(allocated)
+                .checked_add(allocated(&facts)?)
                 .ok_or_else(|| MeasureError::Arithmetic(figure.clone()))?;
             if facts.kind == FileKind::Directory {
                 pending.push(entry);
@@ -4535,9 +4548,12 @@ mod tests {
                     ..image_facts(8192, 8192, TEST_UID, 0o600)
                 },
             );
+        // The store's own 8 blocks, then one 16-block inode for the
+        // hard-linked pair; the different-device entry contributes
+        // nothing however large it is.
         assert_eq!(
             measure_underlying(Path::new(STORE), &host, &messages).expect("measured"),
-            16 * ST_BLOCKS_UNIT_BYTES
+            (8 + 16) * ST_BLOCKS_UNIT_BYTES
         );
     }
 
@@ -4560,8 +4576,9 @@ mod tests {
         );
         let error = evaluate(&fixture.inputs(), &host, &messages).expect_err("refused");
         let text = error.to_string();
+        // The store's own root, eight blocks of it, plus the entry.
         assert!(
-            text.contains(&(MIN_RESERVE_FLOOR_BYTES * 4).to_string()),
+            text.contains(&(MIN_RESERVE_FLOOR_BYTES * 4 + 8 * ST_BLOCKS_UNIT_BYTES).to_string()),
             "{text}"
         );
         assert!(text.contains(&fixture.reserve_bytes.to_string()), "{text}");
@@ -5180,9 +5197,11 @@ mod tests {
     fn the_capacity_verdict_is_against_the_mounted_filesystem_and_not_the_reserve() {
         let fixture = Fixture::default();
         let margin = super::migration::COPY_MARGIN_BYTES;
-        // `records/` and the file beneath it; the holding directory's
-        // own root is not part of what has to fit on the destination.
-        let source = 2 * 8 * ST_BLOCKS_UNIT_BYTES;
+        // The holding directory's own root, `records/` and the file
+        // beneath it. The root counts: `cp -a <holding>/.` fills the
+        // destination's root directory with the same entries, so its
+        // allocation has to be there too, and `du -s` reports it.
+        let source = 3 * 8 * ST_BLOCKS_UNIT_BYTES;
 
         // (available bytes, whether the copy is rendered)
         let cases: [(u64, bool); 4] = [
@@ -5220,6 +5239,66 @@ mod tests {
                 assert!(joined.contains("audit_store_reserve_bytes"), "{joined}");
             }
         }
+    }
+
+    #[test]
+    fn the_holding_directorys_own_allocation_counts_toward_the_capacity_verdict() {
+        let fixture = Fixture::default();
+        let margin = super::migration::COPY_MARGIN_BYTES;
+        // The tree `with_holding` builds: the root, `records/` and one
+        // file, eight blocks each.
+        let children = 2 * 8 * ST_BLOCKS_UNIT_BYTES;
+        let root = 8 * ST_BLOCKS_UNIT_BYTES;
+
+        // Exactly the children plus the margin is one root directory
+        // short: a walk that began at the root's entries would render
+        // the copy here, against a destination whose own root has to
+        // grow by that much to hold the same entries.
+        for (available, renders_copy) in
+            [(children + margin, false), (children + root + margin, true)]
+        {
+            let (base, facts, artifacts) = migrating_host(&fixture, 8);
+            let mut host = base;
+            host.space.insert(
+                PathBuf::from(STORE),
+                FsSpace {
+                    blocks_available: available,
+                    fragment_size: 1,
+                },
+            );
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert_eq!(
+                steps.iter().any(|step| step.kind == Phase2StepKind::Copy),
+                renders_copy,
+                "available {available}: {steps:?}"
+            );
+            // The figure reported is the one the gate was decided on,
+            // so the operator's own `du -s` agrees with it.
+            assert!(
+                findings.join("\n").contains(&(children + root).to_string()),
+                "{findings:?}"
+            );
+        }
+
+        // The root's own `st_blocks` × 512 is checked like every other
+        // entry's, and overflows before a single child is walked.
+        let (base, facts, artifacts) = migrating_host(&fixture, 8);
+        let host = base.file(
+            HOLDING,
+            FileFacts {
+                ino: 90,
+                blocks: u64::MAX,
+                ..dir_facts(TEST_UID, 0o700)
+            },
+        );
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+        let joined = findings.join("\n");
+        assert!(joined.contains("the size of what"), "{joined}");
+        assert!(
+            joined.contains("cannot be represented as a 64-bit byte count"),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -5608,8 +5687,8 @@ mod tests {
             holding: true,
             migrated: false,
         };
-        // One entry whose allocated size is `u64::MAX - 1`, so the
-        // source figure is representable and source + margin is not.
+        // One entry sized so that it plus the holding root's own 8
+        // blocks is representable and that sum plus the margin is not.
         let host = base
             .file(
                 HOLDING,
@@ -5624,7 +5703,7 @@ mod tests {
                 FileFacts {
                     kind: FileKind::Regular,
                     size: u64::MAX,
-                    blocks: (u64::MAX - 1) / ST_BLOCKS_UNIT_BYTES,
+                    blocks: (u64::MAX - 1) / ST_BLOCKS_UNIT_BYTES - 8,
                     uid: TEST_UID,
                     mode: 0o600,
                     dev: 64,
@@ -5741,8 +5820,10 @@ mod tests {
         };
         let joined = notes.join("\n");
         assert!(joined.contains(MIGRATED), "{joined}");
+        // What `rm -rf` on it gives back: its own root as well as the
+        // directory beneath it.
         assert!(
-            joined.contains(&(16 * ST_BLOCKS_UNIT_BYTES).to_string()),
+            joined.contains(&((8 + 16) * ST_BLOCKS_UNIT_BYTES).to_string()),
             "{joined}"
         );
         let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);

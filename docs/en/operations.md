@@ -1354,7 +1354,12 @@ here bounds and OpenBao does not rotate — can exceed either figure. Once
 the mount is up, bootroot compares the **actual bytes available to an
 unprivileged writer** on the mounted filesystem against the holding
 directory's **allocated** size plus a **16 MiB margin** for block
-rounding and per-directory metadata. It reports all three figures, so
+rounding and per-directory metadata. That size counts the holding
+directory itself as well as everything under it — the destination's own
+root directory has to grow to hold the same entries — so it is exactly
+what `du -s -x --block-size=1` reports, the figure
+[the replacement procedure](#changing-the-reserve) has an operator
+compute by hand for the same decision. It reports all three figures, so
 "finish the copy" is distinguishable from "this will never fit". Where it
 does not fit, **no copy command is rendered at all**, and the two routes
 out are a larger reserve through
