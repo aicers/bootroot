@@ -1638,6 +1638,12 @@ pub async fn write_cert_and_key(
 /// store while a rotation may be rewriting it, so the destination name
 /// must never hold a truncated chain.
 ///
+/// This is one write and takes no lock. Serialising it against the
+/// other in-process writers of the same bundle is the caller's, because
+/// only the caller knows where its read-merge-write span begins; the
+/// lock to take is `crate::ca_bundle_lock`, and taking it here as well
+/// would deadlock every caller that already holds it.
+///
 /// # Errors
 /// Returns an error if the directory cannot be created, the bundle
 /// cannot be written, or the mode/owner cannot be applied.

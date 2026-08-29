@@ -1092,6 +1092,15 @@ impl RegistrarCertRenewal {
 
     /// Validates the candidate, builds the whole replacement, and
     /// publishes it as a recoverable transaction.
+    ///
+    /// Everything the merged CA bundle is involved in — the read the
+    /// staged bytes are computed from, the snapshot, the write and the
+    /// restore a failure performs — happens under
+    /// [`crate::ca_bundle_lock`], because that file is shared with the
+    /// per-profile renewal loop and the fast-poll trust apply. Without
+    /// it a profile merge landing after this snapshot is thrown away by
+    /// this rollback, and one landing after this staged read is
+    /// overwritten by this publication.
     async fn publish_candidate(
         &self,
         pair: &SurfacePairPaths,
@@ -1119,6 +1128,13 @@ impl RegistrarCertRenewal {
                  set to be rebuilt from and no registrar leaf can be published"
                 )
             })?;
+        // Taken before the read the merge is computed from and held
+        // past the last restore a failure can perform, so no other
+        // writer can move the file inside the transaction. The
+        // candidate is validated above it: that reads the pin file and
+        // the plan, never the bundle, and refusing an unpinned
+        // candidate must not wait on another writer's publication.
+        let _bundle = crate::ca_bundle_lock::hold(bundle_path).await;
         let staged_bundle = self.stage_bundle(bundle_path, &material.chain)?;
 
         // The candidate on disk, at the modes the finished files

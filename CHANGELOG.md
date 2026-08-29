@@ -384,6 +384,20 @@ byte for byte.
 
 ### Fixed
 
+- Two of the daemon's own loops writing the CA bundle at the same moment
+  can no longer lose one of them. Up to three profiles issue
+  concurrently by default, and each publication reads
+  `[trust] ca_bundle_path`, merges its issued chain into it and writes
+  the result back; the fast-poll loop replaces the same file wholesale
+  when a trust update arrives. Nothing serialised them, so a merge
+  computed from bytes another writer had already replaced overwrote that
+  writer's anchor, leaving the host serving and validating against a
+  bundle missing a CA it had been told to trust, with nothing recording
+  that it went missing. Every in-process writer now holds one lock per
+  bundle path across its whole read-merge-write span. Hosts are
+  otherwise unaffected: the file's contents, mode and owner are what
+  they were, and a writer waits only for another writer of the same
+  bundle.
 - Prometheus can now scrape step-ca. The bundled monitoring stack has
   always declared a `step-ca` scrape target, but step-ca serves metrics
   only when its `ca.json` carries a top-level `metricsAddress`, nothing

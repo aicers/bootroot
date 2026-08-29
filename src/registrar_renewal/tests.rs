@@ -1555,3 +1555,294 @@ async fn the_next_handshake_uses_the_renewed_material_without_a_restart() {
     );
     drop(held);
 }
+
+// ---------------------------------------------------------------------
+// The shared CA bundle
+// ---------------------------------------------------------------------
+
+/// The production writer with the pair write held open on a gate.
+///
+/// `write_pair` announces that the transaction has passed its snapshots
+/// and its bundle write, waits to be released, and then fails. That is
+/// exactly the window another writer's bundle write must not land in:
+/// the rollback that follows would put back bytes taken before it and
+/// discard it.
+struct GatedPairWrite {
+    inner: FilesystemPaths,
+    reached: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl GatedPairWrite {
+    /// Not `Self`: the seam is a `Box<dyn LivePaths>`.
+    #[allow(clippy::new_ret_no_self)]
+    fn new(
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Box<dyn LivePaths> {
+        Box::new(Self {
+            inner: FilesystemPaths::new(),
+            reached: Mutex::new(Some(reached)),
+            release: Mutex::new(Some(release)),
+        })
+    }
+
+    /// Takes whichever half the gate still holds, without a guard alive
+    /// across the await that follows.
+    fn take<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+        slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+impl LivePaths for GatedPairWrite {
+    fn write_bundle<'a>(&'a self, path: &'a Path, contents: &'a str) -> LiveWrite<'a> {
+        self.inner.write_bundle(path, contents)
+    }
+
+    fn write_pair<'a>(
+        &'a self,
+        _cert_path: &'a Path,
+        _key_path: &'a Path,
+        _cert_pem: &'a str,
+        _key_pem: &'a str,
+    ) -> LiveWrite<'a> {
+        Box::pin(async move {
+            if let Some(reached) = Self::take(&self.reached) {
+                let _ = reached.send(());
+            }
+            if let Some(release) = Self::take(&self.release) {
+                let _ = release.await;
+            }
+            anyhow::bail!("injected certificate and key write failure")
+        })
+    }
+
+    fn restore<'a>(&'a self, snapshot: &'a Snapshot) -> LiveWrite<'a> {
+        self.inner.restore(snapshot)
+    }
+}
+
+/// Every certificate fingerprint the bundle at `path` currently holds.
+fn bundle_fingerprints(path: &Path) -> Vec<String> {
+    let bytes = std::fs::read(path).expect("read the bundle");
+    x509_parser::pem::Pem::iter_from_buffer(&bytes)
+        .filter_map(Result::ok)
+        .filter(|pem| pem.label == "CERTIFICATE")
+        .map(|pem| crate::tls::sha256_hex(&pem.contents))
+        .collect()
+}
+
+/// The harness's settings with `extra` pinned as well, so a second
+/// writer's chain survives the merge and is visible afterwards.
+fn also_trusting(harness: &Harness, extra: &TestCa) -> Arc<Settings> {
+    let mut settings = (*harness.settings).clone();
+    settings.trust.trusted_ca_sha256.push(extra.fingerprint());
+    Arc::new(settings)
+}
+
+/// The publication takes the shared bundle lock before it reads the
+/// bundle, so it writes nothing at all while another in-process writer
+/// holds it — and proceeds once that writer is done.
+#[tokio::test]
+async fn the_registrar_publication_waits_for_the_shared_bundle_lock() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let pair = harness.pair(SurfaceLeaf::EndpointServer);
+    let cert_path = pair.cert_path.clone();
+    let before_cert = digest_of(&cert_path);
+    let before_bundle = digest_of(&harness.bundle_path());
+    let material = harness.ca.material(&pair.name, -1, 60);
+
+    let held = crate::ca_bundle_lock::hold(&harness.bundle_path()).await;
+    let publication = tokio::spawn(async move {
+        let artifacts = Artifacts::create(&pair.key_path).expect("artifacts");
+        let outcome = renewal
+            .publish_candidate(&pair, &material, &artifacts)
+            .await;
+        artifacts.close().expect("artifacts are removed");
+        outcome
+    });
+    // Not a wait on anything real: the task is parked on the mutex and
+    // can never finish while the guard is alive, so this only gives it
+    // the chance to get there.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !publication.is_finished(),
+        "the publication waits for whichever writer holds the shared bundle"
+    );
+    assert_eq!(
+        before_bundle,
+        digest_of(&harness.bundle_path()),
+        "nothing is written to the bundle while another writer holds it"
+    );
+    assert_eq!(
+        before_cert,
+        digest_of(&cert_path),
+        "no live path is written before the transaction owns the bundle"
+    );
+
+    drop(held);
+    publication
+        .await
+        .expect("the publication task")
+        .expect("the candidate publishes once the bundle is free");
+    assert_ne!(
+        before_cert,
+        digest_of(&cert_path),
+        "the publication proceeds as soon as the lock is released"
+    );
+}
+
+/// The per-profile publication takes the same lock, so its merge is
+/// computed against bytes no other writer can replace underneath it.
+#[tokio::test]
+async fn the_profile_bundle_writer_waits_for_the_shared_bundle_lock() {
+    let harness = Harness::build();
+    let other = TestCa::new("Bootroot Second Anchor CA");
+    let settings = also_trusting(&harness, &other);
+    let bundle_path = harness.bundle_path();
+    let before = digest_of(&bundle_path);
+
+    let held = crate::ca_bundle_lock::hold(&bundle_path).await;
+    let merge = tokio::spawn({
+        let bundle_path = bundle_path.clone();
+        let trusted = settings.trust.trusted_ca_sha256.clone();
+        let chain = vec![other.der()];
+        async move {
+            crate::acme::flow::write_merged_ca_bundle(
+                &bundle_path,
+                &chain,
+                &trusted,
+                CertGroupPolicy::none(),
+            )
+            .await
+        }
+    });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        !merge.is_finished(),
+        "the per-profile merge waits for whichever writer holds the bundle"
+    );
+    assert_eq!(
+        before,
+        digest_of(&bundle_path),
+        "the merge reads nothing and writes nothing while the bundle is held"
+    );
+
+    drop(held);
+    merge
+        .await
+        .expect("the merge task")
+        .expect("the merge lands once the bundle is free");
+    assert!(
+        bundle_fingerprints(&bundle_path).contains(&other.fingerprint()),
+        "the merge that waited still adds its anchor"
+    );
+}
+
+/// A per-profile merge that arrives while the registrar transaction is
+/// mid-publication is not lost by that transaction's rollback.
+///
+/// The lock is what makes the assertion hold whichever way the two
+/// tasks are scheduled: the merge can only run entirely before the
+/// transaction takes the bundle — in which case the snapshot the
+/// rollback restores already contains its anchor — or entirely after
+/// the rollback released it. Unserialised, the merge lands between the
+/// snapshot and the rollback, and the rollback puts back a bundle that
+/// never had the anchor in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interleaved_profile_merge_survives_a_registrar_rollback() {
+    let harness = Harness::build();
+    let other = TestCa::new("Bootroot Second Anchor CA");
+    let settings = also_trusting(&harness, &other);
+    let bundle_path = harness.bundle_path();
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let renewal = RegistrarCertRenewal::for_test(
+        Arc::clone(&settings),
+        harness.plan.clone(),
+        Arc::clone(&harness.endpoint),
+        cadence(),
+    )
+    .await
+    .with_live_paths(GatedPairWrite::new(reached_tx, release_rx));
+
+    let pair = harness.pair(SurfaceLeaf::EndpointServer);
+    let cert_path = pair.cert_path.clone();
+    let before_cert = digest_of(&cert_path);
+    let material = harness.ca.material(&pair.name, -1, 60);
+    let publication = tokio::spawn(async move {
+        let artifacts = Artifacts::create(&pair.key_path).expect("artifacts");
+        let outcome = renewal
+            .publish_candidate(&pair, &material, &artifacts)
+            .await;
+        artifacts.close().expect("artifacts are removed");
+        outcome
+    });
+
+    reached_rx
+        .await
+        .expect("the transaction reaches its pair write");
+    let merge = tokio::spawn({
+        let bundle_path = bundle_path.clone();
+        let trusted = settings.trust.trusted_ca_sha256.clone();
+        let chain = vec![other.der()];
+        async move {
+            crate::acme::flow::write_merged_ca_bundle(
+                &bundle_path,
+                &chain,
+                &trusted,
+                CertGroupPolicy::none(),
+            )
+            .await
+        }
+    });
+    // Awaits the condition rather than a clock: the merge either
+    // finishes — which is what it does when nothing serialises the two,
+    // and is the interleaving this test exists to reject — or parks on
+    // a bundle it cannot have until the transaction is done with it.
+    // The cap is only ever reached in the second case, where it costs a
+    // few thousand yields to a runtime with nothing else ready.
+    for _ in 0..10_000 {
+        if merge.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !merge.is_finished(),
+        "the merge must not reach the bundle between the transaction's snapshot and its rollback"
+    );
+    release_tx.send(()).expect("the transaction is released");
+
+    let err = publication
+        .await
+        .expect("the publication task")
+        .expect_err("the injected pair write fails the publication");
+    merge
+        .await
+        .expect("the merge task")
+        .expect("the merge lands either side of the transaction");
+
+    let fingerprints = bundle_fingerprints(&bundle_path);
+    assert!(
+        fingerprints.contains(&other.fingerprint()),
+        "a concurrent merge is never discarded by the rollback: {err:#}"
+    );
+    assert!(
+        fingerprints.contains(&harness.ca.fingerprint()),
+        "the rollback still restores the anchor the transaction snapshotted"
+    );
+    assert_eq!(
+        before_cert,
+        digest_of(&cert_path),
+        "the failed publication leaves the live pair as it was"
+    );
+}

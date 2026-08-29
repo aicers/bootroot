@@ -263,12 +263,20 @@ pub(crate) fn merge_ca_bundle(
 /// intermediate-only state this PR hardens against would silently
 /// reappear whenever mode/ACL/ownership drift makes the file
 /// unreadable but still writeable.
-async fn write_merged_ca_bundle(
+///
+/// The read and the write are one transaction, held under
+/// [`crate::ca_bundle_lock`] for the whole span. The bundle is shared
+/// with the registrar surface's renewal and with the fast-poll trust
+/// apply, and a merge computed from bytes another writer has already
+/// replaced would publish a bundle missing an anchor this host was told
+/// to trust.
+pub(crate) async fn write_merged_ca_bundle(
     bundle_path: &Path,
     chain: &[Vec<u8>],
     trusted: &[String],
     policy: CertGroupPolicy,
 ) -> Result<()> {
+    let _bundle = crate::ca_bundle_lock::hold(bundle_path).await;
     let existing = match tokio::fs::read(bundle_path).await {
         Ok(bytes) => Some(bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
