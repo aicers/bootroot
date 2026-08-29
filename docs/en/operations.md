@@ -1365,7 +1365,17 @@ figure and renders no copy.
 
 **Refusals that stop the copy being rendered.** Each names the path, is
 reported under **migration incomplete**, and is re-decided on every pass
-rather than answered from an earlier verdict.
+rather than answered from an earlier verdict. Both are decided ahead of
+the mount state, so both arise with the reserve not yet mounted — and
+there **the activation goes with the copy**. It is the step that brings
+the mount up, while the rollback rendered beside it carries its `umount`
+only where the store is already a mount point, so a list holding both
+would create the mount and then stop at an `rmdir` of it, short of the
+restoring rename. Clear what the finding names and run the command
+again: with the holding tree clean the next pass renders the activation
+as usual. With the reserve already mounted the activation stands,
+because nothing in that list creates the mount its rollback was rendered
+for.
 
 - **A mount point at or under the holding directory.** The test is mount
   identity read from `/proc/self/mountinfo`, not a device comparison: a

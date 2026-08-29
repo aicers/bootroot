@@ -2445,10 +2445,11 @@ fn withheld_migration_steps(
 /// the subdirectory step withheld, because the copy is what satisfies
 /// it — and where it is, the capacity verdict and either the copy or
 /// the two routes out. The activation is withheld along with the copy
-/// where the holding path is not a directory, whatever the mount
-/// state: nothing there can ever be copied, so mounting the reserve
-/// for it is a host change this outcome has no use for. The rollback
-/// is offered in every case except the two that would have it act on
+/// wherever [`migration::CopyVerdict::withholds_activation`] says the
+/// list would otherwise create a mount its own rollback cannot undo:
+/// always where the holding path is not a directory, and under an
+/// absent mount for the migration-set refusals too. The rollback is
+/// offered in every case except the two that would have it act on
 /// something this migration did not put there: a store that still
 /// holds content, and a foreign mount.
 fn migration_report(
@@ -2501,16 +2502,17 @@ fn migration_report(
         messages,
     )?;
     findings.extend(migration::verdict_findings(&verdict, messages));
-    if verdict.withholds_activation() {
-        // A holding path that is not a directory is refused before
-        // anything is walked, measured or rendered from it — and the
-        // activation is rendered from the store it would mount over,
-        // not from the holding path, so it would otherwise survive
-        // this refusal. It must not: there is no copy this run could
-        // ever reach, so `systemctl enable --now` would mount the
-        // reserve for a migration that cannot proceed, and the
-        // rollback rendered beside it would then `rmdir` that mount
-        // point without the `umount` an absent mount withholds.
+    if verdict.withholds_activation(mount_up) {
+        // The activation is rendered from the store rather than from
+        // the holding path, so a refusal that only withheld the copy
+        // would leave it standing. It must not, wherever the same list
+        // also carries the rollback: `systemctl enable --now` brings
+        // the mount up, and the rollback below it was rendered under
+        // the mount state of *this* pass — with the mount absent it
+        // has no `umount`, so its `rmdir` meets a live mount point,
+        // exits non-zero and stops the sequence before the restoring
+        // rename. One list would then create the mount and make its
+        // own way back out unrunnable.
         let steps = withheld_migration_steps(inputs, facts, true, messages);
         return Ok(ReserveReport::MigrationIncomplete { findings, steps });
     }
@@ -5434,6 +5436,84 @@ mod tests {
                 let joined = findings.join("\n");
                 assert!(joined.contains(HOLDING), "{joined}");
                 assert!(joined.contains(needle), "{joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_migration_set_refusal_under_an_absent_mount_withholds_the_activation() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let records = format!("{HOLDING}/records");
+        let log = format!("{records}/audit.log");
+        let bind = format!("{records}/bound");
+        let planted = format!("{records}/planted");
+        let mountinfo = format!("36 35 0:64 / {bind} rw,relatime shared:1 - ext4 /dev/sda1 rw\n");
+
+        // Both refusals are decided ahead of the mount state, so both
+        // arise with the reserve not yet mounted — and there the
+        // activation is what would bring the mount up while the
+        // rollback beside it is rendered without the `umount` an
+        // absent mount withholds. One list would create the mount and
+        // then stop at an `rmdir` of it, short of the restoring
+        // rename.
+        let cases: [(&str, &dyn Fn(FakeProbe) -> FakeProbe); 2] = [
+            (bind.as_str(), &|host: FakeProbe| host.mountinfo(&mountinfo)),
+            (planted.as_str(), &|host: FakeProbe| {
+                host.entries(&records, &[&log, &planted]).file(
+                    &planted,
+                    FileFacts {
+                        kind: FileKind::Symlink,
+                        ino: 93,
+                        ..dir_facts(TEST_UID, 0o777)
+                    },
+                )
+            }),
+        ];
+
+        for (offending, plant) in cases {
+            for mounted in [true, false] {
+                let (host, facts, artifacts) = if mounted {
+                    let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                    (plant(base), facts, artifacts)
+                } else {
+                    let host = plant(with_holding(bare_host(), 8));
+                    let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                    let artifacts = render_artifacts(&inputs, &facts);
+                    (host, facts, artifacts)
+                };
+                assert_eq!(facts.mount_present(), mounted);
+                let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+                assert!(findings.join("\n").contains(offending), "{findings:?}");
+                assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+
+                let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+                let rollback = &step_of(&steps, Phase2StepKind::Rollback).commands;
+                assert_eq!(rollback, &rollback_commands(mounted));
+                // The invariant either state has to hold: no list
+                // brings the mount up unless the rollback rendered in
+                // it can take that mount back down.
+                assert!(
+                    rendered
+                        .iter()
+                        .all(|command| !command.contains("systemctl enable --now"))
+                        || rollback.iter().any(|command| command.contains("umount")),
+                    "{offending}, mounted={mounted}: {rendered:?}"
+                );
+                if !mounted {
+                    assert_eq!(
+                        steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                        vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                        "{offending}: {steps:?}"
+                    );
+                    for forbidden in ["mkfs.ext4", "systemctl enable --now", "install -", "cp -a"] {
+                        assert!(
+                            rendered.iter().all(|command| !command.contains(forbidden)),
+                            "{forbidden} over {offending}: {rendered:?}"
+                        );
+                    }
+                }
             }
         }
     }

@@ -232,21 +232,41 @@ impl CopyVerdict {
         matches!(self, Self::Fits { .. })
     }
 
-    /// Whether the holding path is so far from a migration's own that
-    /// nothing which acts on the store may be rendered.
+    /// Whether the activation must be withheld along with the copy,
+    /// given the mount state the list is being rendered under.
     ///
-    /// [`Self::MountPoint`] and [`Self::ForbiddenEntry`] describe a
-    /// holding *directory* with something wrong inside it: the
-    /// operator clears that and the same migration carries on, so the
-    /// activation the copy still needs is rendered for them. A holding
-    /// path that is not a directory at all leaves no copy that could
-    /// ever be rendered from it, and rendering the activation beside
-    /// the rollback would put a `systemctl enable --now` and an
-    /// `rmdir` of what it mounts in one list — the `umount` that would
-    /// make the second runnable is withheld, correctly, because the
-    /// mount is absent at the moment the list is rendered.
-    pub(super) fn withholds_activation(&self) -> bool {
-        matches!(self, Self::HoldingNotDirectory { .. })
+    /// The activation is what brings the mount up, and the rollback
+    /// rendered beside it carries its `umount` only where the store is
+    /// already a mount point. So a list holding both, rendered while
+    /// the mount is absent, is one an operator cannot walk back: the
+    /// `systemctl enable --now` mounts the reserve, and the rollback
+    /// underneath it then meets `rmdir` against a live mount point,
+    /// exits non-zero and stops before the restoring rename. The
+    /// activation may therefore be rendered under an absent mount only
+    /// where it is the outcome's own remedy — [`Self::MountAbsent`],
+    /// where the next pass reaches the copy because the mount is the
+    /// only thing missing.
+    ///
+    /// [`Self::MountPoint`] and [`Self::ForbiddenEntry`] are decided
+    /// ahead of the mount state and so arise under either. With the
+    /// mount up they keep the activation: the reserve is already
+    /// there, so nothing in the list creates the mount its rollback
+    /// was rendered for, and the artifacts the copy still needs are
+    /// worth installing while the operator clears the entry. With the
+    /// mount absent they withhold it, and the operator clears the
+    /// entry first; the pass after that is [`Self::MountAbsent`] and
+    /// renders the activation as usual.
+    ///
+    /// [`Self::HoldingNotDirectory`] withholds under both, because no
+    /// copy is reachable from such a path on any pass — mounting the
+    /// reserve for it is a host change with nothing on the other side.
+    /// The capacity verdicts are reached only with the mount up.
+    pub(super) fn withholds_activation(&self, mount_up: bool) -> bool {
+        match self {
+            Self::HoldingNotDirectory { .. } => true,
+            Self::MountAbsent => false,
+            _ => !mount_up,
+        }
     }
 }
 
