@@ -85,24 +85,46 @@ const MOUNTINFO_MOUNT_POINT_FIELD: usize = 4;
 /// inside either, the manifests would describe themselves.
 const SCRATCH_VARIABLE: &str = "SCRATCH";
 
+/// The entry `mke2fs` creates in the root of every filesystem it makes.
+const LOST_AND_FOUND_NAME: &str = "lost+found";
+
 /// The `find` expression that keeps `mkfs.ext4`'s own directory out of
-/// the metadata manifests.
+/// the **destination** metadata manifest.
 ///
 /// Every reserve is a freshly made ext4 filesystem, and `mke2fs`
 /// creates `lost+found` in its root. That root is the *destination* of
-/// the relocation copy and both sides of the replacement one, so the
-/// entry stands on a side the copy did not put it on and the metadata
-/// comparison faults every correct migration — the destination
-/// carrying one record the source does not.
+/// the relocation copy, so the entry stands on a side the copy did not
+/// put it on and the metadata comparison would fault every correct
+/// migration — the destination carrying one record the source does not.
 ///
-/// Only the entry itself is exempt, and only where it is a directory at
-/// the tree's own root. Anything *underneath* it still appears in all
-/// three manifests under its `lost+found/…` path and is compared as
-/// usual, so nothing can be smuggled past the verification by being put
-/// there; and a regular file or a symbolic link that merely bears the
-/// name is matched by neither `-path` nor `-type d` together, so it is
-/// compared in full and, being a link, refused by the type guard.
+/// It is rendered **only on the destination side, and only where the
+/// source root carries no `lost+found` directory of its own**. A
+/// symmetric exemption would be the wider thing it looks like: a
+/// holding directory that does hold one — the whole source tree of the
+/// replacement procedure, whose source is itself a mounted reserve —
+/// would have that directory's type, mode, ownership and link count
+/// compared against nothing at all, and a mismatch on it would pass the
+/// gate. Where the source has one, both sides record it and it is
+/// compared like any other directory.
+///
+/// Only the entry itself is ever exempt, and only where it is a
+/// directory at the tree's own root. Anything *underneath* it still
+/// appears in all three manifests under its `lost+found/…` path and is
+/// compared as usual, so nothing can be smuggled past the verification
+/// by being put there; and a regular file or a symbolic link that
+/// merely bears the name is matched by neither `-path` nor `-type d`
+/// together, so it is compared in full and, being a link, refused by
+/// the type guard.
 const LOST_AND_FOUND_EXCLUSION: &str = "! \\( -path './lost+found' -type d \\)";
+
+/// What the metadata manifest records of every entry: type, octal mode,
+/// numeric uid and gid, hard-link count and the relative path.
+///
+/// The path is the only variable-length field and it is last, so the
+/// record's own NUL delimits it and no name the container wrote can be
+/// read as ending elsewhere. A second variable-length field after it
+/// would destroy that.
+const METADATA_PRINTF: &str = "-printf '%y %m %U %G %n %P\\0'";
 
 /// The two derived siblings of the store this procedure uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,11 +605,57 @@ pub(super) fn copy_step(store_dir: &Path, holding: &Path, messages: &Messages) -
 /// must never fail in.
 fn manifest_commands(name: &str, side: &str, find_arguments: &str) -> Vec<String> {
     let raw = scratch(&format!("{name}.{side}.raw"));
-    let sorted = scratch(&format!("{name}.{side}"));
-    vec![
-        format!("find . -xdev -mindepth 1 {find_arguments} > {raw}"),
-        format!("sort -z -o {sorted} {raw}"),
-    ]
+    vec![find_command(find_arguments, &raw), sort_command(name, side)]
+}
+
+/// One walk of the side already `cd`-ed into, into its own raw file.
+fn find_command(find_arguments: &str, raw: &str) -> String {
+    format!("find . -xdev -mindepth 1 {find_arguments} > {raw}")
+}
+
+/// The sort that turns one raw manifest into the file `cmp` reads.
+fn sort_command(name: &str, side: &str) -> String {
+    format!(
+        "sort -z -o {} {}",
+        scratch(&format!("{name}.{side}")),
+        scratch(&format!("{name}.{side}.raw")),
+    )
+}
+
+/// The metadata manifest for one side.
+///
+/// `source_root` is `Some` on the destination side alone, naming the
+/// tree the copy came *from*. The exemption for `mke2fs`'s own
+/// `lost+found` belongs to that side only — the source cannot carry a
+/// record the copy did not put there — and even there it applies only
+/// where the source root has no such directory. So the destination's
+/// walk is chosen by the shell, at the moment it runs, from the source
+/// it is about to be compared against: with a source `lost+found`
+/// directory the destination records its counterpart and the two are
+/// compared like any other pair; without one, the destination's
+/// `mke2fs`-seeded entry is the one record dropped.
+///
+/// The predicate is `-d` **and** not `-L` rather than `-d` alone
+/// because `test -d` answers for the target of a symbolic link, and
+/// nothing in this procedure follows one. `find -type d` does not
+/// either, so the two spellings agree on every entry — a link named
+/// `lost+found` at the source root is not a directory to either of
+/// them, whatever it points at.
+fn metadata_commands(side: &str, source_root: Option<&Path>) -> Vec<String> {
+    let raw = scratch(&format!("meta.{side}.raw"));
+    let whole = find_command(METADATA_PRINTF, &raw);
+    let find = match source_root {
+        None => whole,
+        Some(root) => {
+            let entry = sh_quote_path(&root.join(LOST_AND_FOUND_NAME));
+            let exempt = find_command(
+                &format!("{LOST_AND_FOUND_EXCLUSION} {METADATA_PRINTF}"),
+                &raw,
+            );
+            format!("if [ -d {entry} ] && [ ! -L {entry} ]; then {whole}; else {exempt}; fi")
+        }
+    };
+    vec![find, sort_command("meta", side)]
 }
 
 /// One path under the scratch directory, as the rendered shell spells
@@ -598,19 +666,9 @@ fn scratch(name: &str) -> String {
 
 /// Every manifest for one side, produced after a `cd` into that side so
 /// the recorded paths are relative and directly comparable.
-fn side_commands(tree: &Path, side: &str) -> Vec<String> {
+fn side_commands(tree: &Path, side: &str, source_root: Option<&Path>) -> Vec<String> {
     let mut commands = vec![format!("cd {}", sh_quote_path(tree))];
-    // Type, octal mode, numeric uid and gid, hard-link count and the
-    // relative path — over every entry, directories included except
-    // the one below. The path is the only variable-length field and it
-    // is last, so the record's own NUL delimits it and no name the
-    // container wrote can be read as ending elsewhere. A second
-    // variable-length field after it would destroy that.
-    commands.extend(manifest_commands(
-        "meta",
-        side,
-        &format!("{LOST_AND_FOUND_EXCLUSION} -printf '%y %m %U %G %n %P\\0'"),
-    ));
+    commands.extend(metadata_commands(side, source_root));
     // Sizes are their own pass because a *directory's* size legitimately
     // differs between two filesystems and would fail every correct
     // migration. Modification times are excluded for the same reason:
@@ -653,8 +711,8 @@ pub(super) fn verification_step(
     let mut commands = vec![format!("{SCRATCH_VARIABLE}=\"$(mktemp -d)\"")];
     commands.push(type_guard_command(holding));
     commands.push(type_guard_command(store_dir));
-    commands.extend(side_commands(holding, "source"));
-    commands.extend(side_commands(store_dir, "destination"));
+    commands.extend(side_commands(holding, "source", None));
+    commands.extend(side_commands(store_dir, "destination", Some(holding)));
     for name in ["meta", "size", "content"] {
         commands.push(format!(
             "cmp {} {}",
@@ -812,6 +870,48 @@ pub(super) fn verdict_findings(verdict: &CopyVerdict, messages: &Messages) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::test_messages;
+
+    /// The `mke2fs` exemption is asymmetric on purpose. The source walk
+    /// carries none of it — a record the copy did not put there cannot
+    /// arise on the side the copy came *from* — and the destination's
+    /// is decided by the shell, when it runs, from what the source root
+    /// actually holds.
+    #[test]
+    fn only_the_destination_metadata_walk_can_drop_the_seeded_directory() {
+        let store = Path::new("/var/lib/bootroot/audit-store");
+        let holding = Path::new("/var/lib/bootroot/audit-store.pre-mount");
+        let commands = verification_step(store, holding, &test_messages()).commands;
+        let walk = |side: &str| {
+            let raw = format!("> \"$SCRATCH\"/meta.{side}.raw");
+            commands
+                .iter()
+                .find(|command| command.contains(&raw))
+                .unwrap_or_else(|| panic!("the {side} metadata walk is rendered"))
+                .clone()
+        };
+        let source = walk("source");
+        let destination = walk("destination");
+
+        // Type, mode, numeric uid and gid and the hard-link count, on
+        // both sides and in that order.
+        for walk in [&source, &destination] {
+            assert!(walk.contains("-printf '%y %m %U %G %n %P\\0'"), "{walk}");
+        }
+        assert!(!source.contains("lost+found"), "{source}");
+        assert_eq!(
+            destination,
+            concat!(
+                "if [ -d '/var/lib/bootroot/audit-store.pre-mount/lost+found' ]",
+                " && [ ! -L '/var/lib/bootroot/audit-store.pre-mount/lost+found' ]",
+                "; then find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\\0'",
+                " > \"$SCRATCH\"/meta.destination.raw",
+                "; else find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\)",
+                " -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.destination.raw",
+                "; fi",
+            )
+        );
+    }
 
     #[test]
     fn the_two_paths_are_siblings_of_the_store_with_no_configuration_key() {
@@ -986,6 +1086,114 @@ mod rendered_sequence {
         assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
     }
 
+    /// A holding directory that carries a root `lost+found` of its own
+    /// — the whole source tree of the replacement procedure, whose
+    /// source is a mounted reserve — has that directory copied like any
+    /// other, so it is compared like any other. Nothing is exempt here:
+    /// the destination's entry is the source's counterpart rather than
+    /// a record only `mke2fs` put there.
+    #[test]
+    fn a_source_root_lost_and_found_is_verified_against_its_copy() {
+        let fixture = fixture();
+        plant_lost_and_found(&fixture.source);
+        plant_lost_and_found(&fixture.destination);
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+    }
+
+    /// Every metadata field the manifest carries for that directory,
+    /// each broken on its own over a copy that had already passed.
+    #[test]
+    fn a_mismatched_source_root_lost_and_found_fails_the_verification() {
+        // Type: the copied directory replaced by a regular file of the
+        // same name, which `%y` reports as `f` against the source's `d`.
+        let type_mismatch = |fixture: &Fixture| {
+            let entry = fixture.destination.join("lost+found");
+            fs::remove_dir(&entry).expect("the copied directory");
+            fs::write(&entry, b"not a directory\n").expect("a regular file in its place");
+        };
+        // Mode: `mke2fs` gives it 0700 and the copy preserves it.
+        let mode_mismatch = |fixture: &Fixture| {
+            fs::set_permissions(
+                fixture.destination.join("lost+found"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("change the mode on the destination");
+        };
+        // Link count: a directory's `%n` is two plus its subdirectory
+        // count, so nothing can move it without also changing what the
+        // manifest lists underneath. The comparison faults both, which
+        // is the point — the field is compared rather than skipped.
+        let link_count_mismatch = |fixture: &Fixture| {
+            fs::create_dir(fixture.destination.join("lost+found").join("recovered"))
+                .expect("a subdirectory the source does not have");
+        };
+        for break_it in [
+            &type_mismatch as &dyn Fn(&Fixture),
+            &mode_mismatch,
+            &link_count_mismatch,
+        ] {
+            let fixture = fixture();
+            plant_lost_and_found(&fixture.source);
+            plant_lost_and_found(&fixture.destination);
+            let (guard, copy, verify) = copy_and_verify(&fixture);
+            assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+            break_it(&fixture);
+            assert!(!run(&fixture.scratch, &[&verify]));
+        }
+    }
+
+    /// `%U` and `%G` are the two fields no unprivileged process can
+    /// move, so this half of the same contract runs only where the
+    /// ownership can actually be changed. The rendered form is asserted
+    /// unconditionally beside it.
+    #[test]
+    fn a_reowned_source_root_lost_and_found_fails_the_verification() {
+        if bootroot::fs_util::current_process_euid() != 0 {
+            return;
+        }
+        for (uid, gid) in [(Some(1), None), (None, Some(1))] {
+            let fixture = fixture();
+            plant_lost_and_found(&fixture.source);
+            plant_lost_and_found(&fixture.destination);
+            let (guard, copy, verify) = copy_and_verify(&fixture);
+            assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+            std::os::unix::fs::chown(fixture.destination.join("lost+found"), uid, gid)
+                .expect("re-own the copied directory");
+            assert!(
+                !run(&fixture.scratch, &[&verify]),
+                "uid {uid:?} gid {gid:?}"
+            );
+        }
+    }
+
+    /// The destination's metadata walk is the one stage rendered
+    /// inside a compound command, and a compound command is exactly
+    /// where a failed walk could be swallowed. An `if` reports the
+    /// status of the branch it ran, so the sequence still stops there —
+    /// the same fail-closed direction every other stage carries.
+    #[test]
+    fn a_failed_destination_walk_inside_the_conditional_still_fails_closed() {
+        // The permission bits do nothing for root, so the fixture would
+        // pass vacuously there.
+        if bootroot::fs_util::current_process_euid() == 0 {
+            return;
+        }
+        let fixture = fixture();
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(run(&fixture.scratch, &[&guard, &copy]));
+        // Listable but not `stat`able: the type guard answers `-type`
+        // from the directory entry's own `d_type` and still exits 0,
+        // and the restriction is on the destination alone, so every
+        // source stage completes and the conditional is reached.
+        let blocked = fixture.destination.join("records");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o444))
+            .expect("restrict the destination subdirectory");
+        assert!(!run(&fixture.scratch, &[&verify]));
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore the subdirectory so the fixture can be removed");
+    }
+
     #[test]
     fn content_under_lost_and_found_is_still_compared() {
         let fixture = fixture();
@@ -994,9 +1202,10 @@ mod rendered_sequence {
         plant_lost_and_found(&fixture.destination);
         let (guard, copy, verify) = copy_and_verify(&fixture);
         assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
-        // Only the directory entry is exempt. What it holds carries its
-        // `lost+found/…` path into all three manifests, so a same-sized
-        // difference underneath it is caught exactly as anywhere else.
+        // What that directory holds carries its `lost+found/…` path
+        // into all three manifests, so a same-sized difference
+        // underneath it is caught exactly as anywhere else — and would
+        // be even where the directory entry itself were exempt.
         fs::write(
             fixture.destination.join("lost+found").join("stray.log"),
             b"other\n",
@@ -1012,8 +1221,10 @@ mod rendered_sequence {
         fs::write(fixture.source.join("lost+found"), b"not the filesystem's\n")
             .expect("a regular file bearing the name");
         assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
-        // The exemption is `-path` *and* `-type d` together, so this one
-        // is in the metadata manifest and a changed mode fails it.
+        // The exemption is `-path` *and* `-type d` together, and it is
+        // only reached where the source root holds no directory of that
+        // name — which this one does not. So this entry is in the
+        // metadata manifest and a changed mode fails it.
         fs::set_permissions(
             fixture.destination.join("lost+found"),
             fs::Permissions::from_mode(0o600),
@@ -1393,6 +1604,32 @@ mod manuals {
                 ".pre-mount-other",
             ] {
                 assert!(passage.contains(required), "{page}: missing {required:?}");
+            }
+        }
+    }
+
+    /// The `mke2fs` exemption is on the destination side alone, and
+    /// decided from the source root when the shell runs it. Both
+    /// manuals have to carry that form rather than the symmetric one
+    /// bootroot no longer renders, whose reading is that a holding
+    /// directory with a `lost+found` of its own has it compared
+    /// against nothing.
+    #[test]
+    fn both_manuals_pin_the_asymmetric_lost_and_found_exemption() {
+        for (page, heading, next, _) in PAGES {
+            let source = read(page);
+            let blocks = command_blocks(section(&source, heading, next));
+            assert_eq!(
+                blocks.matches("-path './lost+found' -type d").count(),
+                1,
+                "{page}: the exemption belongs to one side only"
+            );
+            for required in [
+                "if [ -d <audit_store_dir>.pre-mount/lost+found ] \\",
+                "&& [ ! -L <audit_store_dir>.pre-mount/lost+found ]; then",
+                "find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\\0'",
+            ] {
+                assert!(blocks.contains(required), "{page}: missing {required:?}");
             }
         }
     }

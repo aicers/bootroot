@@ -1325,6 +1325,11 @@ assert_the_rendered_steps_migrate_an_existing_store() {
     fail "the copy was not rendered; see $third"
   grep -q -- "xargs -0 -r sha256sum --binary --zero" "$third" ||
     fail "the content comparison was not rendered NUL-delimited; see $third"
+  # The `mkfs.ext4` exemption is on the destination side alone, and the
+  # rendered shell decides whether to apply it from what the holding
+  # root actually holds.
+  grep -qF "if [ -d '${store}.pre-mount/lost+found' ] && [ ! -L '${store}.pre-mount/lost+found' ]" "$third" ||
+    fail "the destination walk is not decided from the holding root; see $third"
   grep -qF "mv '${store}.pre-mount' '${store}.migrated'" "$third" ||
     fail "the closing rename was not rendered; see $third"
   # The way back out is offered too, while the holding directory still
@@ -1349,11 +1354,17 @@ assert_the_rendered_steps_migrate_an_existing_store() {
 
   # The verification just passed over a destination that is an ext4
   # filesystem root, and `mkfs.ext4` puts this directory in every one it
-  # makes.  The metadata comparison exempts exactly that entry; without
-  # the exemption the destination carries one record the holding
+  # makes.  The holding directory has none, so the rendered shell took
+  # the branch that drops exactly that one entry from the destination
+  # manifest; without it the destination carries one record the holding
   # directory never had, and no correct relocation could ever verify.
+  # Had the holding root carried a `lost+found` of its own, the other
+  # branch would have compared the two like any other pair.
   sudo -n test -d "$store/lost+found" ||
     fail "the reserve carries no lost+found, so the exemption was never exercised"
+  if sudo -n test -e "${store}.migrated/lost+found"; then
+    fail "the holding directory carried a lost+found, so the exemption branch was not the one taken"
+  fi
   pass "the verification passed over a reserve carrying mkfs.ext4's own lost+found"
 
   # The records are on the mounted reserve, with their content and

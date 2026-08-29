@@ -1264,8 +1264,8 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
      ! -type d ! -type f -exec false {} +
    find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
    cd <audit_store_dir>.pre-mount
-   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
-     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' \
+     > "$SCRATCH"/meta.source.raw
    sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
    sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
@@ -1273,8 +1273,14 @@ reinit의 사전 점검은 이 표면의 1단계 거부를 모두 순수 읽기�
    sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
    xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
    cd <audit_store_dir>
-   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
-     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   if [ -d <audit_store_dir>.pre-mount/lost+found ] \
+     && [ ! -L <audit_store_dir>.pre-mount/lost+found ]; then
+     find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' \
+       > "$SCRATCH"/meta.destination.raw
+   else
+     find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+       -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   fi
    sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
    sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
@@ -1367,12 +1373,23 @@ incomplete**를 내고 복사를 렌더링하지 않습니다.
 담으므로, 원본의 한 아이노드를 대상에서 두 개의 독립 파일로 늘린 복사는
 종류·모드·소유권·크기·내용이 모두 일치해도 실패합니다. 디렉터리 크기와
 수정 시각은 제외됩니다. 둘 다 파일 시스템이 다르면 정당하게 달라지기
-때문입니다. `lost+found`도 트리 자신의 뿌리에 있는 디렉터리인 경우에 한해
-제외됩니다. `mkfs.ext4`는 예약량을 만들 때마다 그것을 만들므로, 복사가
-올려놓지 않은 쪽에 서서 올바른 이전마다 실패를 일으킵니다. 제외되는 것은
-그 항목 하나뿐입니다. 그 아래에 있는 것은 여전히 `lost+found/…` 경로로
-비교되므로, 그곳에 넣어 검증을 몰래 통과시킬 수는 없습니다. 불일치는
-출력을 읽어서가 아니라 종료 상태로 판정합니다.
+때문입니다. `lost+found`는 **대상** 목록에서만 빠지며, 그것도 그 트리
+자신의 뿌리에 있는 디렉터리이고 **또한** 원본 뿌리에 같은 이름의
+디렉터리가 없을 때뿐입니다. `mkfs.ext4`는 예약량을 만들 때마다 그것을
+만들므로, 그렇지 않으면 복사가 올려놓지 않은 레코드 때문에 그런 원본이
+실패로 판정되기 때문입니다. 두 대상 순회 중 어느 쪽을 실행할지는 셸이
+실행하는 그 시점에, 곧 비교될 원본을 보고 정합니다. 그래서 원본이
+`lost+found`를 실제로 가진 경우 — [예약량 교체 절차](#changing-the-reserve)의
+살아 있는 저장소가 그 자신 마운트된 예약량이므로 그렇습니다 — 그
+디렉터리의 종류·모드·숫자 uid·숫자 gid·링크 수는 다른 디렉터리와 똑같이
+비교되고, 거기서 어긋나면 마무리 이름 바꾸기 전에 절차가 멈춥니다. 검사를
+`-d`로 쓰되 `-L`이 **아님**까지 함께 쓰는 것은, `test -d`가 심볼릭 링크의
+대상을 두고 답하는데 이 절차는 어떤 링크도 따라가지 않기 때문입니다.
+`find -type d`도 따라가지 않으므로 둘은 같은 답을 냅니다. 빠지는 것은
+언제나 그 항목 하나뿐이고 그 한쪽에서만입니다. 그 아래에 있는 것은 여전히
+`lost+found/…` 경로로 비교되므로 그곳에 넣어 검증을 몰래 통과시킬 수는
+없고, 이름만 같은 일반 파일은 온전히 비교됩니다. 불일치는 출력을
+읽어서가 아니라 종료 상태로 판정합니다.
 
 **재개와 되돌리기.** 둘 다 렌더링되고 둘 다 멱등이며 bootroot는 어느
 것도 수행하지 않습니다.
