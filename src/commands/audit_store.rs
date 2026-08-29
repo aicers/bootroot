@@ -649,10 +649,16 @@ fn plan_audit_store(
 /// path. Every check below is a read, so running it twice costs nothing
 /// and decides nothing.
 ///
+/// Both enforcement modes are covered, each with exactly the refusals
+/// its own init pass raises: `filesystem` mode with phase one, and
+/// `directory` mode with the migration-path read, which raises the same
+/// unreadable-path error there and nothing else.
+///
 /// # Errors
 ///
-/// Returns the endpoint/configuration gate errors and filesystem reserve
-/// phase-one refusals that apply before reinit wipes `OpenBao`.
+/// Returns the endpoint/configuration gate errors, the `filesystem`
+/// reserve phase-one refusals and the `directory`-mode migration-path
+/// read's error that apply before reinit wipes `OpenBao`.
 pub(crate) fn preflight_audit_store(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
@@ -667,7 +673,22 @@ pub(crate) fn preflight_audit_store(
         // is verified and no outcome line is printed — a refusal
         // raised for the first time by the post-wipe `init` pass would
         // land after the OpenBao wipe.
-        if view.enforcement == AuditStoreEnforcement::Filesystem {
+        if view.enforcement == AuditStoreEnforcement::Directory {
+            // The migration paths are read in **both** enforcement
+            // modes, so the mode that raises no outcome of its own
+            // still makes the read here that the post-wipe `init` pass
+            // makes at `apply_audit_store`. What it can raise is the
+            // unreadable-path error — an `lstat` of `.pre-mount` or
+            // `.migrated` failing for anything but `ENOENT` — and
+            // meeting that after the wipe rather than before it is the
+            // trap this whole function exists to close. An open
+            // migration is *not* a refusal here, because it is not one
+            // on the init path either: `directory` mode names it as an
+            // unfinished relocation and provisions as usual, and a
+            // preflight stricter than the pass it precedes would block
+            // reinit on a host bootroot itself is willing to init.
+            reserve::detect_migration(&view.audit_store_dir, &reserve::HostProbe, messages)?;
+        } else {
             let compose_dir = compose_file_dir(inputs.compose_file);
             let compose_file = rendered_path(inputs.compose_file, messages)?;
             let identity = ComposeIdentity::resolve(inputs.compose_file, None, messages)?;
@@ -3392,6 +3413,69 @@ mod tests {
         assert_eq!(
             fs::read(holding.join(RECORDS_SUBDIR).join("audit.log")).expect("the record"),
             b"a record"
+        );
+    }
+
+    /// `directory` mode is preflighted too, with exactly the verdicts
+    /// the init pass it precedes reaches there: the migration-path
+    /// read, and nothing else.
+    ///
+    /// An open migration is **not** a refusal here, because it is not
+    /// one on the init path either — `directory` mode names it as an
+    /// unfinished relocation and provisions as usual, so a preflight
+    /// that refused it would block `reinit` on a host `bootroot init`
+    /// is willing to run, with no rendered sequence in that mode to
+    /// close the migration with. What the read can raise is the
+    /// unreadable-path error, and meeting that after the wipe rather
+    /// than before it is the trap this preflight exists to close.
+    #[test]
+    fn the_reinit_preflight_reads_the_migration_paths_in_directory_mode() {
+        let messages = test_messages();
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_file = fixture.compose_file();
+        let agent_config = fixture.agent_config(true);
+        let holding = holding_dir(&fixture);
+        fs::create_dir_all(holding.join(RECORDS_SUBDIR)).expect("holding");
+        fs::write(holding.join(RECORDS_SUBDIR).join("audit.log"), b"a record").expect("a record");
+        let inputs = Fixture::inputs(Some(&agent_config), &state, true, &compose_file);
+
+        preflight_audit_store(&inputs, &messages).expect("directory mode is not refused");
+        // A pure read: the layout the init pass creates is still absent.
+        assert!(!fixture.store_dir().exists());
+        // And the pass it precedes agrees, so the preflight is not
+        // stricter than the run it is protecting.
+        apply_audit_store(&inputs, &messages).expect("directory mode provisions as usual");
+        assert!(fixture.store_dir().join(RECORDS_SUBDIR).is_dir());
+        assert_eq!(
+            fs::read(holding.join(RECORDS_SUBDIR).join("audit.log")).expect("the record"),
+            b"a record"
+        );
+
+        // The permission bits do nothing for root, so the fixture
+        // below would pass vacuously there.
+        if current_process_euid() == 0 {
+            return;
+        }
+        // A parent the migration paths cannot be `lstat`ed through.
+        // Without the read, `directory` mode returned success here and
+        // the post-wipe init pass raised it.
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_file = fixture.compose_file();
+        let locked = fixture.base.path().join("locked");
+        fs::create_dir(&locked).expect("locked");
+        let agent_config = fixture.agent_config_for(&locked.join("audit-store"), true);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let error = preflight_audit_store(
+            &Fixture::inputs(Some(&agent_config), &state, true, &compose_file),
+            &messages,
+        )
+        .expect_err("the migration paths cannot be read");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
+        assert!(
+            error.to_string().contains("audit-store.pre-mount"),
+            "{error}"
         );
     }
 

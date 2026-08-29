@@ -550,7 +550,7 @@ impl Phase1Facts {
 
     /// Whether the run may render anything that would change the store.
     ///
-    /// Three states withhold everything. A **deferred** phase-1 refusal
+    /// Four states withhold everything. A **deferred** phase-1 refusal
     /// describes a reserve that cannot be made, so no image command, no
     /// unit and no copy over it is right. A store that still holds
     /// content while the holding directory already exists is the
@@ -562,11 +562,20 @@ impl Phase1Facts {
     /// the activation would render acts on that filesystem rather than
     /// on the reserve — `systemctl enable --now` stacks the reserve on
     /// top of it, the copy writes audit records into it, and the
-    /// rollback's `umount` takes it down.
+    /// rollback's `umount` takes it down. An existing
+    /// `<audit_store_dir>.migrated` is the fourth, and it gets the
+    /// same treatment here as it does on the entry into the migration:
+    /// the closing rename cannot target a path that already exists, so
+    /// the copy is refused rather than started against a sequence that
+    /// could never close, leaving the operator to run a maintenance
+    /// window's worth of work with both writers down and the migration
+    /// still open at the end of it. Clearing the named path is the one
+    /// action, and the pass after it renders the whole sequence.
     fn migration_renders_nothing(&self) -> bool {
         !self.deferred.is_empty()
             || self.underlying == UnderlyingState::NotEmpty
             || self.mount_foreign()
+            || self.migration.migrated
     }
 
     /// Whether the rollback may be rendered at all.
@@ -574,10 +583,14 @@ impl Phase1Facts {
     /// It survives a deferred refusal — the store under an open
     /// migration is the empty mount point the aside rename left, and
     /// the way back out of it does not depend on the reserve being
-    /// makeable. It does not survive the other two: onto a store that
-    /// still holds content the restoring rename nests one store inside
-    /// another, and over a foreign mount the `umount` takes down a
-    /// filesystem this migration never put there.
+    /// makeable. It survives a `.migrated` collision for the same
+    /// reason: the restoring rename targets `<audit_store_dir>`, which
+    /// the blocked closing rename says nothing about, and the way back
+    /// out is exactly what an operator who cannot go forward needs. It
+    /// does not survive the other two: onto a store that still holds
+    /// content the restoring rename nests one store inside another,
+    /// and over a foreign mount the `umount` takes down a filesystem
+    /// this migration never put there.
     fn migration_renders_rollback(&self) -> bool {
         self.underlying != UnderlyingState::NotEmpty && !self.mount_foreign()
     }
@@ -2461,10 +2474,13 @@ fn withheld_migration_steps(
 /// wherever [`migration::CopyVerdict::withholds_activation`] says the
 /// list would otherwise create a mount its own rollback cannot undo:
 /// always where the holding path is not a directory, and under an
-/// absent mount for the migration-set refusals too. The rollback is
-/// offered in every case except the two that would have it act on
-/// something this migration did not put there: a store that still
-/// holds content, and a foreign mount.
+/// absent mount for the migration-set refusals too. A
+/// `<audit_store_dir>.migrated` that already exists takes every
+/// host-changing command away ahead of all of that, because the copy
+/// it would render could not be closed. The rollback is offered in
+/// every case except the two that would have it act on something this
+/// migration did not put there: a store that still holds content, and
+/// a foreign mount.
 fn migration_report(
     inputs: &ReserveInputs<'_>,
     facts: &Phase1Facts,
@@ -2495,13 +2511,15 @@ fn migration_report(
         findings.push(messages.audit_reserve_finding_migration_path_exists(&migrated));
     }
     if facts.migration_renders_nothing() {
-        // None of the three leaves an activation or a copy that would
+        // None of the four leaves an activation or a copy that would
         // be right to render: the deferred refusal describes a reserve
         // that cannot be made, the collision describes a store whose
         // records a mount would hide and a copy would not be reading,
-        // and the foreign mount describes a filesystem that is not
-        // this migration's to mount over, copy into or unmount. The
-        // rollback survives the first alone.
+        // the foreign mount describes a filesystem that is not this
+        // migration's to mount over, copy into or unmount, and an
+        // existing `.migrated` describes a copy with no closing rename
+        // at the far end of it. The rollback survives the first and
+        // the last.
         let steps =
             withheld_migration_steps(inputs, facts, facts.migration_renders_rollback(), messages);
         return Ok(ReserveReport::MigrationIncomplete { findings, steps });
@@ -2529,12 +2547,6 @@ fn migration_report(
         let steps = withheld_migration_steps(inputs, facts, true, messages);
         return Ok(ReserveReport::MigrationIncomplete { findings, steps });
     }
-    // The closing rename cannot be rendered onto a path that already
-    // exists, so the whole copy is refused rather than started against
-    // one and stopped at the far end. Its finding is already in the
-    // list above, where the two withheld states can reach it too.
-    let closing_blocked = facts.migration.migrated;
-
     // The activation comes from the existing phase-2 renderer rather
     // than from a second copy written here, with exactly one step
     // withheld and nothing added. That step is the subdirectory one,
@@ -2579,13 +2591,14 @@ fn migration_report(
             &facts.migration.paths.holding,
             messages,
         ));
-        if !closing_blocked {
-            steps.push(migration::closing_rename_step(
-                &facts.migration.paths.holding,
-                &facts.migration.paths.migrated,
-                messages,
-            ));
-        }
+        // Unconditional here: a `.migrated` path that already exists
+        // is refused above, with the copy this rename closes, so the
+        // copy is never rendered without the rename that finishes it.
+        steps.push(migration::closing_rename_step(
+            &facts.migration.paths.holding,
+            &facts.migration.paths.migrated,
+            messages,
+        ));
     }
     steps.push(rerun_step(inputs, messages));
     steps.push(migration::rollback_step(
@@ -5767,27 +5780,58 @@ mod tests {
         assert!(steps_withheld);
         assert!(findings.iter().any(|finding| finding.contains(MIGRATED)));
 
-        // And mid-migration: the copy is still rendered, but nothing
-        // renames onto the path that already exists.
-        let (base, facts, artifacts) = migrating_host(&fixture, 8);
-        let mut facts = facts;
-        facts.migration.migrated = true;
-        let host = base.file(
-            MIGRATED,
-            FileFacts {
-                ino: 95,
-                ..dir_facts(TEST_UID, 0o700)
-            },
-        );
-        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
-        assert!(steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
-        assert!(
-            !steps
-                .iter()
-                .any(|step| step.kind == Phase2StepKind::ClosingRename),
-            "{steps:?}"
-        );
-        assert!(findings.iter().any(|finding| finding.contains(MIGRATED)));
+        // And mid-migration, under either mount state: the copy is
+        // withheld along with the rename it exists to be closed by,
+        // rather than rendered against a sequence whose far end can
+        // never run. An operator who ran it would spend the whole
+        // maintenance window with both writers down and finish with
+        // the migration still open.
+        let migrated_dir = FileFacts {
+            ino: 95,
+            ..dir_facts(TEST_UID, 0o700)
+        };
+        for mounted in [true, false] {
+            let (host, facts, artifacts) = if mounted {
+                let (base, mut facts, artifacts) = migrating_host(&fixture, 8);
+                facts.migration.migrated = true;
+                (base.file(MIGRATED, migrated_dir), facts, artifacts)
+            } else {
+                let host = with_holding(bare_host(), 8).file(MIGRATED, migrated_dir);
+                let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                let artifacts = render_artifacts(&inputs, &facts);
+                (host, facts, artifacts)
+            };
+            assert_eq!(facts.mount_present(), mounted);
+            assert!(facts.migration.migrated);
+
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert!(findings.iter().any(|finding| finding.contains(MIGRATED)));
+            // Every host-changing command is gone, and the rollback
+            // stays: the restoring rename targets the store, which the
+            // blocked closing rename says nothing about.
+            assert_eq!(
+                steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                "mounted={mounted}: {steps:?}"
+            );
+            let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+            for forbidden in [
+                "mkfs.ext4",
+                "systemctl enable --now",
+                "install -",
+                "cp -a",
+                MIGRATED,
+            ] {
+                assert!(
+                    rendered.iter().all(|command| !command.contains(forbidden)),
+                    "{forbidden} with mounted={mounted}: {rendered:?}"
+                );
+            }
+            assert_eq!(
+                &step_of(&steps, Phase2StepKind::Rollback).commands,
+                &rollback_commands(mounted)
+            );
+        }
     }
 
     #[test]

@@ -1181,7 +1181,7 @@ exists, bootroot renders no rename and fails naming the path: `mv dir
 dir.pre-mount` onto an existing directory does not replace it, it moves
 the source *inside* it, and the next copy would then read the wrong tree.
 
-**Four states put the outcome up and take every command away.** In each
+**Five states put the outcome up and take every command away.** In each
 of them the run still reports **migration incomplete** and still fails;
 what it renders is the re-run alone, or the re-run and the rollback.
 
@@ -1216,6 +1216,19 @@ what it renders is the re-run alone, or the re-run and the rollback.
   Stop both writers, unmount it or move it aside by hand, and run the
   command again. bootroot unmounts nothing, here or anywhere else in
   this procedure.
+- **`<audit_store_dir>.migrated` already exists while the migration is
+  open.** The closing rename is what clears **migration incomplete**,
+  and it cannot target a path that is already there. So the copy is
+  refused rather than started against a sequence whose far end could
+  never run: you would spend the whole maintenance window with both
+  writers down and finish with the migration still open. The activation
+  goes with it, whatever the mount state, for the same reason — no pass
+  reaches a copy while that path stands. The rollback is still offered,
+  because the restoring rename targets `<audit_store_dir>`, which the
+  blocked closing rename says nothing about. Confirm nothing is mounted
+  under the existing `<audit_store_dir>.migrated`, move it aside or
+  remove it by hand, and run the command again; the next pass renders
+  the whole sequence.
 - **A phase-1 refusal raised while the migration is open** — most often
   `audit_store_reserve_bytes` changed mid-window, which the image
   contract refuses outright. **migration incomplete** is reported ahead
