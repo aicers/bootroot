@@ -1152,7 +1152,9 @@ mod rendered_sequence {
         if bootroot::fs_util::current_process_euid() != 0 {
             return;
         }
-        for (uid, gid) in [(Some(1), None), (None, Some(1))] {
+        // Named by the manifest field each case moves, so a failure
+        // says which one without the numeric ids reaching the message.
+        for (field, uid, gid) in [("%U", Some(1), None), ("%G", None, Some(1))] {
             let fixture = fixture();
             plant_lost_and_found(&fixture.source);
             plant_lost_and_found(&fixture.destination);
@@ -1160,10 +1162,7 @@ mod rendered_sequence {
             assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
             std::os::unix::fs::chown(fixture.destination.join("lost+found"), uid, gid)
                 .expect("re-own the copied directory");
-            assert!(
-                !run(&fixture.scratch, &[&verify]),
-                "uid {uid:?} gid {gid:?}"
-            );
+            assert!(!run(&fixture.scratch, &[&verify]), "{field}");
         }
     }
 
