@@ -2027,6 +2027,79 @@ None of the four certificate paths is reloadable. A `SIGHUP` that changes
 that changed, and the running daemon is left as it is. Only the
 *contents* at those paths can change under a running daemon.
 
+#### Renewal, and the reload contract on both sides
+
+Both leaves expire, and the daemon renews both itself. Where the endpoint is
+enabled it runs one renewal pass immediately at start and then one per interval,
+under the cadence, lead time and issuance-retry settings of the rendered
+internal agent configuration's single profile — the same values that govern the
+bootroot-internal credential's own renewal. A leaf is renewed when it falls
+inside lead time, or when it no longer chains to `trust.ca_bundle_path`, which
+is what a trust-anchor rotation under a running daemon leaves behind. Where the
+endpoint is disabled nothing of this exists: no pass runs and nothing is asked
+of OpenBao or the CA.
+
+Arming that loop is part of starting. An enabled endpoint whose renewal cannot
+be prepared — a rendered internal agent configuration that is missing or no
+longer loads, a deployment state file that cannot be resolved, a leaf
+certificate on disk that no longer parses — fails the daemon start with a named
+error instead of serving on two certificates nothing would renew.
+
+A renewal is published as a transaction. The replacement is issued, validated
+and turned into a complete next TLS configuration **before** any live file is
+written: its key must be the leaf's, a client replacement must carry the same
+instance, host and domain it already had, and a server replacement must carry
+the exact endpoint SAN and chain to an anchor the endpoint pin file already
+names. The pin file is never rewritten and never gains a leaf fingerprint, so a
+server replacement no pinned caller would accept is discarded rather than
+published. Only then are the merged CA bundle, the certificate and the key
+written; if any of those writes fails, every path the publication reached is
+restored from a snapshot of its bytes, mode and ownership, the endpoint keeps
+serving what it was serving, and the next pass tries again. A rollback that
+itself fails is logged as exactly that — both errors, and no claim that the
+files were put back.
+
+**The server side reloads with no restart.** Once every write has landed, the
+daemon exchanges the whole active TLS configuration at once: the certificate the
+endpoint presents *and* the verifier every client certificate is checked
+against. Replacing only the presented certificate would leave the old verifier
+deciding who may connect, so a trust-anchor rotation would not take effect until
+a restart. The next handshake uses the new configuration; the socket is not
+rebound, its pathname and inode are unchanged, no signal is sent and no
+connection or handshake already in flight is dropped.
+
+**The caller side reloads per dial, and must ride out the torn pair.** The
+certificate and the key are published by two separate renames, so neither file
+is ever half-written but the *pair* is not replaced atomically: a caller reading
+in between sees the new certificate beside the old key, or the old certificate
+beside the new one. Presenting that pair fails the handshake with a signature
+error that says nothing about what happened, so a caller must not present it.
+The contract this repository's own client implements, and the behaviour the
+deployed registrar is expected to match, is:
+
+- **Re-read both files on every dial.** No caching, and no configuration reload
+  or process restart to pick up a renewal — the dial after the publication
+  presents the new pair.
+- **Check that the key is the leaf's** before presenting anything.
+- **On a mismatch, re-read.** Five reads in total, with waits of 1 ms, 2 ms,
+  4 ms and 8 ms after the first four mismatches. A pair that matches on any of
+  the five is used.
+- **After the fifth mismatch, fail with a typed error** naming both paths and
+  the number of reads. That is a misconfiguration — two files that are not each
+  other's — rather than a race, and it is reported instead of being retried
+  further or presented anyway.
+
+This is a fixed local policy of the reader's and is deliberately not the
+daemon's issuance-retry backoff: it is measured against one pair of renames on
+the same host, not against a CA that is down. Any other failure — an absent
+file, an unreadable one, a certificate PEM the parser refuses — is returned at
+once and is not re-read.
+
+The reference implementation is this repository's in-repo registrar endpoint
+client (`src/registrar/endpoint/client.rs`). It has no production consumer here;
+it exists so the caller behaviour this endpoint expects is written down as
+running code.
+
 #### Installing the units
 
 Both units are checked in under `systemd/` in this repository. Copy them

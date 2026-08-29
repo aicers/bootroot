@@ -2968,9 +2968,7 @@ fn the_activated_endpoint_carries_no_handler() {
             "listener: UnixListener,",
             "socket_path: PathBuf,",
             "daemon_uid: u32,",
-            "acceptor: TlsAcceptor,",
-            "// The certificate resolver is retained for exactly one consumer,",
-            "resolver: Arc<EndpointCertResolver>,",
+            "active: RwLock<Arc<ActiveTls>>,",
             "domain: String,",
         ],
         "the adopted endpoint holds the socket, its path, the daemon uid and the TLS material — \
@@ -3524,6 +3522,86 @@ async fn swapping_the_resolver_through_the_activated_endpoint_changes_the_presen
         "the renewed leaf must be presented with no restart: {served:?}"
     );
 
+    running.stop().await;
+}
+
+/// Exchanging the whole active configuration changes both halves of the
+/// handshake at once: what the endpoint presents *and* which client
+/// anchors it accepts.
+///
+/// Replacing the resolver alone could not do this. The acceptor retains
+/// the client verifier it was built with, so a trust-anchor rotation
+/// that widened or narrowed who may connect would go on being decided by
+/// the old verifier until a restart. The whole configuration is
+/// replaced instead, and the accept loop loads it immediately before
+/// each handshake.
+///
+/// The socket is not rebound — its inode is asserted unchanged — no
+/// signal is sent, and a connection established before the swap is still
+/// connected after it.
+#[tokio::test]
+async fn exchanging_the_active_configuration_changes_the_presented_chain_and_the_accepted_anchors()
+{
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
+    let inode_before = std::fs::metadata(&harness.socket_path)
+        .expect("stat the socket")
+        .ino();
+
+    let first = harness.round_trip(&frame_of(b"mint", b"")).await;
+    assert!(!first.is_empty(), "the original configuration serves");
+
+    // A connection opened before the exchange and held across it.
+    let held = tokio::net::UnixStream::connect(&harness.socket_path)
+        .await
+        .expect("connect before the exchange");
+
+    // The next trust generation: new server material for the same
+    // endpoint name, and a client leaf under the new anchor. The old
+    // generation's client is not in the new anchor set at all.
+    let rotated = Pki::new();
+    let (config, resolver) = rotated.conforming();
+    harness.endpoint.swap_active_tls(config, resolver);
+
+    assert_eq!(
+        inode_before,
+        std::fs::metadata(&harness.socket_path)
+            .expect("stat the socket")
+            .ino(),
+        "a TLS replacement never rebinds or replaces the socket"
+    );
+    assert!(
+        held.peer_addr().is_ok(),
+        "a connection already in flight is not dropped"
+    );
+
+    // The caller pinned to the old anchor, presenting the old client
+    // leaf, is refused on both counts.
+    let outcome = tls_connect(&harness.socket_path, harness.pki.registrar_client_config()).await;
+    assert!(
+        outcome.is_err(),
+        "the previous generation must no longer complete a handshake"
+    );
+
+    // The caller of the new generation is accepted: its leaf verifies
+    // against the rebuilt incoming verifier, and the chain it is
+    // presented matches the new pin file.
+    let config = client_config_pinning(
+        &rotated.pin_file_path(),
+        Some(rotated.registrar_client_material()),
+    );
+    let served = tls_round_trip(&harness.socket_path, config, &frame_of(b"mint", b"")).await;
+    assert!(
+        !served.is_empty(),
+        "the exchanged configuration serves the new generation with no restart: {served:?}"
+    );
+
+    drop(held);
     running.stop().await;
 }
 

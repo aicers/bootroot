@@ -1207,7 +1207,9 @@ pub(crate) struct LiveFastPollHooks<F> {
 ///
 /// The CA bundle goes through [`fs_util::write_ca_bundle`] (`0o644` +
 /// cert-group gid policy) so it stays world-readable and cert-group
-/// consistent like the renewal-time bundle; the `agent.toml` rewrite goes
+/// consistent like the renewal-time bundle, under
+/// [`crate::ca_bundle_lock`] so it cannot land inside another in-process
+/// writer's read-merge-write span; the `agent.toml` rewrite goes
 /// through [`fs_util::atomic_write`] at `0o600` (the #613-safe writer) so a
 /// crash cannot leave the daemon's hot-read config half-written. The
 /// `upsert_section_keys` round-trip preserves operator-tuned sections.
@@ -1223,9 +1225,21 @@ async fn apply_trust_to_disk(
         )
     })?;
     let policy = resolve_service_cert_group_policy(settings, service)?;
-    fs_util::write_ca_bundle(ca_bundle_path, &payload.ca_bundle_pem, policy)
-        .await
-        .with_context(|| format!("Failed to write CA bundle to {}", ca_bundle_path.display()))?;
+    // The bundle is shared with the per-profile renewal and with the
+    // registrar surface's renewal transaction, and this write replaces
+    // it wholesale. Landing inside one of their read-merge-write spans
+    // would either be discarded by a rollback or overwrite the merge
+    // that follows it, so it waits for whichever holds the file. The
+    // guard is scoped to this write alone: the `agent.toml` rewrite
+    // below is not the bundle's, and no other writer touches it.
+    {
+        let _bundle = crate::ca_bundle_lock::hold(ca_bundle_path).await;
+        fs_util::write_ca_bundle(ca_bundle_path, &payload.ca_bundle_pem, policy)
+            .await
+            .with_context(|| {
+                format!("Failed to write CA bundle to {}", ca_bundle_path.display())
+            })?;
+    }
 
     let current = fs::read_to_string(config_path)
         .await
@@ -3578,6 +3592,58 @@ mod tests {
         assert_eq!(
             loaded.last_responder_hmac_seen_version.get("edge-proxy"),
             Some(&6)
+        );
+    }
+
+    /// The fast-poll trust apply replaces the shared bundle wholesale,
+    /// so it waits for whichever in-process writer holds it rather than
+    /// landing inside that writer's read-merge-write span.
+    #[tokio::test]
+    async fn apply_trust_to_disk_waits_for_the_shared_bundle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_path = dir.path().join("ca-bundle.pem");
+        let config_path = dir.path().join("agent.toml");
+        std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+        std::fs::write(&bundle_path, "ORIGINAL\n").unwrap();
+
+        let payload = TrustPayload {
+            trusted_ca_sha256: vec!["a".repeat(64)],
+            ca_bundle_pem: "-----BEGIN CERTIFICATE-----\npem\n-----END CERTIFICATE-----\n"
+                .to_string(),
+        };
+
+        let held = crate::ca_bundle_lock::hold(&bundle_path).await;
+        let apply = tokio::spawn({
+            let bundle_path = bundle_path.clone();
+            async move {
+                let mut settings = test_settings("edge-proxy");
+                settings.trust.ca_bundle_path = Some(bundle_path);
+                apply_trust_to_disk(&settings, &config_path, "edge-proxy", &payload).await
+            }
+        });
+        // The task is parked on the mutex and cannot finish while the
+        // guard is alive; this only gives it the chance to get there.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            !apply.is_finished(),
+            "the trust apply waits for whichever writer holds the shared bundle"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bundle_path).unwrap(),
+            "ORIGINAL\n",
+            "the bundle is not replaced while another writer holds it"
+        );
+
+        drop(held);
+        apply.await.unwrap().expect("apply trust");
+        assert!(
+            std::fs::read_to_string(&bundle_path)
+                .unwrap()
+                .contains("BEGIN CERTIFICATE"),
+            "the trust apply lands once the bundle is free"
         );
     }
 

@@ -53,7 +53,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   material is in date starts having asked nothing of `OpenBao` or of the
   CA, and its certificates and keys survive the restart byte-identically.
   An already-expired leaf is repaired at start, before the endpoint's TLS
-  material loads, rather than at the first renewal tick.
+  material loads, rather than at the first renewal tick. Both leaves are
+  then kept valid on the daemon's own loop, under the cadence, lead time
+  and retry settings of the bootroot-internal profile: a leaf is replaced
+  when it falls inside lead time or stops chaining to `[trust]
+  ca_bundle_path`, and the replacement is issued off to one side and
+  fully validated — its key, its name, and for the endpoint leaf an
+  anchor the endpoint pin file already names — before anything live is
+  written. A publication that fails restores every file it reached, and
+  the endpoint keeps serving what it was serving. A successful one
+  exchanges the whole active TLS configuration at once, so the next
+  handshake presents the renewed leaf and accepts callers under the
+  renewed trust anchors with no restart, no signal, no socket rebind and
+  no dropped connection. The endpoint pin file is never rewritten and
+  never gains a leaf fingerprint. A caller reloads per dial: it rereads
+  the pair every time and, because the two files are published by
+  separate renames, retries a momentarily mismatched pair up to five
+  reads before failing rather than presenting it. A host that enables the
+  endpoint but cannot arm that loop — no usable internal agent
+  configuration, or a leaf on disk that no longer parses — now fails to
+  start and says so, instead of serving certificates nothing would renew.
 - `bootroot-agent` now rotates `OpenBao`'s file audit device on a host
   whose registrar endpoint is enabled, so the deployment no longer needs
   an external rotator against it. Every 60 seconds the daemon renames the
@@ -365,6 +384,20 @@ byte for byte.
 
 ### Fixed
 
+- Two of the daemon's own loops writing the CA bundle at the same moment
+  can no longer lose one of them. Up to three profiles issue
+  concurrently by default, and each publication reads
+  `[trust] ca_bundle_path`, merges its issued chain into it and writes
+  the result back; the fast-poll loop replaces the same file wholesale
+  when a trust update arrives. Nothing serialised them, so a merge
+  computed from bytes another writer had already replaced overwrote that
+  writer's anchor, leaving the host serving and validating against a
+  bundle missing a CA it had been told to trust, with nothing recording
+  that it went missing. Every in-process writer now holds one lock per
+  bundle path across its whole read-merge-write span. Hosts are
+  otherwise unaffected: the file's contents, mode and owner are what
+  they were, and a writer waits only for another writer of the same
+  bundle.
 - Prometheus can now scrape step-ca. The bundled monitoring stack has
   always declared a `step-ca` scrape target, but step-ca serves metrics
   only when its `ca.json` carries a top-level `metricsAddress`, nothing

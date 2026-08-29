@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 pub mod acme;
 pub mod agent_args;
+pub(crate) mod ca_bundle_lock;
 pub mod cert_chain;
 pub mod cert_group;
 pub mod config;
@@ -19,6 +20,10 @@ pub mod openbao;
 pub mod profile;
 pub mod registrar;
 pub(crate) mod registrar_certs;
+// The renewal adapter drives the activated endpoint's TLS swap, and the
+// endpoint exists on Linux alone.
+#[cfg(target_os = "linux")]
+pub(crate) mod registrar_renewal;
 pub mod secret;
 pub mod service_material;
 pub mod tls;

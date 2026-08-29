@@ -1474,6 +1474,98 @@ async fn the_published_key_is_never_group_or_world_readable() {
     }
 }
 
+/// The off-live issuance the renewal path runs returns the chain, the
+/// candidate certificate and a fresh key, and writes nothing: neither
+/// configured path and not the CA bundle.
+///
+/// This is the property the whole renewal transaction rests on. If this
+/// call published anything, a candidate that later failed validation
+/// would already have replaced material a running endpoint and a running
+/// caller are reading.
+#[tokio::test]
+async fn the_off_live_issuance_returns_material_and_publishes_nothing() {
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    host.provision_both_pairs();
+    let bundle_path = host
+        .settings
+        .trust
+        .ca_bundle_path
+        .clone()
+        .expect("a configured bundle");
+    let before_bundle = digest_of(&bundle_path);
+
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let inputs = openbao_inputs();
+    for pair in &pairs {
+        let before_cert = digest_of(&pair.cert_path);
+        let before_key = digest_of(&pair.key_path);
+
+        let material = issue_surface_pair_material(&host.settings, pair, TEST_HOST, &inputs, false)
+            .await
+            .expect("the off-live issuance produces material");
+
+        assert_eq!(
+            single_dns_san(&pem_to_der(&material.cert_pem)).expect("one DNS SAN"),
+            pair.name,
+            "the candidate carries the reserved name for its pair"
+        );
+        assert!(
+            !material.chain.is_empty(),
+            "the issuer chain comes back so the merged bundle can be staged"
+        );
+        assert!(
+            material.cert_pem.matches("BEGIN CERTIFICATE").count() >= 2,
+            "the candidate is published as the leaf followed by its issuer chain"
+        );
+        assert_eq!(
+            before_cert,
+            digest_of(&pair.cert_path),
+            "the live certificate must be untouched"
+        );
+        assert_eq!(
+            before_key,
+            digest_of(&pair.key_path),
+            "the live key must be untouched"
+        );
+        assert_eq!(
+            before_bundle,
+            digest_of(&bundle_path),
+            "the live CA bundle must be untouched"
+        );
+    }
+}
+
+/// Every off-live issuance generates its own key, so a renewal can never
+/// republish the key the leaf it is replacing was minted under.
+#[tokio::test]
+async fn two_off_live_issuances_of_the_same_name_produce_different_keys() {
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    let inputs = openbao_inputs();
+
+    let first = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs, false)
+        .await
+        .expect("first candidate");
+    let second = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs, false)
+        .await
+        .expect("second candidate");
+
+    assert_ne!(
+        first.key_pem.expose(),
+        second.key_pem.expose(),
+        "each issuance must generate a key"
+    );
+    assert_ne!(first.cert_pem, second.cert_pem);
+}
+
 /// Issuance leaves the endpoint anchor pin file untouched. The pin is
 /// over trust **anchors**, not over the leaf, and is written once by the
 /// provisioning tool.

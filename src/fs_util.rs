@@ -1053,9 +1053,11 @@ pub enum StagedOwner {
 /// The owner is an input rather than a constant so the real staging,
 /// chown and rename path can be driven in a test that is not root. It
 /// is not an input an operator can reach: [`FixedOwner::root`] is the
-/// only constructor outside `cfg(test)`, so no configuration key,
-/// environment variable or public API can move a protected file off
-/// uid 0 / gid 0.
+/// only `pub` constructor, so no configuration key, environment
+/// variable or public API can move a protected file off uid 0 / gid 0.
+/// `restored` is `pub(crate)` and states nothing of its own — it carries
+/// back the ids a rollback snapshot read off the file it is putting
+/// back — and `current_process` is `cfg(test)`-gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedOwner {
     uid: u32,
@@ -1083,6 +1085,28 @@ impl FixedOwner {
             uid: current_process_euid(),
             gid: crate::cert_group::current_process_egid(),
         }
+    }
+
+    /// The uid and gid a rollback snapshot recorded off the file it is
+    /// about to put back.
+    ///
+    /// The one production owner that is not stated as `root:root`, and
+    /// it states nothing of its own: restoring a file means restoring
+    /// the owner it had, so the ids come off the file that was
+    /// captured rather than from a policy. A publish that cannot
+    /// establish them fails and leaves the destination untouched,
+    /// which is what a rollback that cannot restore has to do.
+    ///
+    /// `pub(crate)` rather than `pub`: it is reached from the registrar
+    /// renewal's rollback and from nowhere else, and widening it would
+    /// hand a caller outside this crate the one way to publish a
+    /// protected file under an owner that is not root.
+    // That one caller is the renewal adapter, which exists on Linux
+    // alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn restored(uid: u32, gid: u32) -> Self {
+        Self { uid, gid }
     }
 
     /// Whether this owner is `root:root`, which is what every
@@ -1613,6 +1637,12 @@ pub async fn write_cert_and_key(
 /// already applied. The agent re-reads this file to rebuild its trust
 /// store while a rotation may be rewriting it, so the destination name
 /// must never hold a truncated chain.
+///
+/// This is one write and takes no lock. Serialising it against the
+/// other in-process writers of the same bundle is the caller's, because
+/// only the caller knows where its read-merge-write span begins; the
+/// lock to take is `crate::ca_bundle_lock`, and taking it here as well
+/// would deadlock every caller that already holds it.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created, the bundle

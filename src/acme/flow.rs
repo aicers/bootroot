@@ -12,6 +12,7 @@ use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
 use crate::cert_group::CertGroupPolicy;
 use crate::fs_util;
+use crate::registrar::internal::PrivateKeyPem;
 
 fn contact_from_email(email: &str) -> String {
     if email.starts_with("mailto:") {
@@ -187,7 +188,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn verify_chain_fingerprints(chain: &[Vec<u8>], trusted: &[String]) -> Result<()> {
+pub(crate) fn verify_chain_fingerprints(chain: &[Vec<u8>], trusted: &[String]) -> Result<()> {
     let allowed: HashSet<String> = trusted
         .iter()
         .map(|value| value.to_ascii_lowercase())
@@ -212,7 +213,7 @@ fn verify_chain_fingerprints(chain: &[Vec<u8>], trusted: &[String]) -> Result<()
 /// existing bundle and keeping every block whose fingerprint is in
 /// `trusted` preserves the root across issuances while still filtering
 /// out any junk left behind by an earlier misconfiguration.
-fn merge_ca_bundle(
+pub(crate) fn merge_ca_bundle(
     existing_bundle: Option<&[u8]>,
     new_chain: &[Vec<u8>],
     trusted: &[String],
@@ -262,12 +263,20 @@ fn merge_ca_bundle(
 /// intermediate-only state this PR hardens against would silently
 /// reappear whenever mode/ACL/ownership drift makes the file
 /// unreadable but still writeable.
-async fn write_merged_ca_bundle(
+///
+/// The read and the write are one transaction, held under
+/// [`crate::ca_bundle_lock`] for the whole span. The bundle is shared
+/// with the registrar surface's renewal and with the fast-poll trust
+/// apply, and a merge computed from bytes another writer has already
+/// replaced would publish a bundle missing an anchor this host was told
+/// to trust.
+pub(crate) async fn write_merged_ca_bundle(
     bundle_path: &Path,
     chain: &[Vec<u8>],
     trusted: &[String],
     policy: CertGroupPolicy,
 ) -> Result<()> {
+    let _bundle = crate::ca_bundle_lock::hold(bundle_path).await;
     let existing = match tokio::fs::read(bundle_path).await {
         Ok(bytes) => Some(bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -497,6 +506,73 @@ pub async fn issue_certificate_with(
         .await
 }
 
+/// Everything one ACME issuance produced, before a single byte of it has
+/// been written anywhere.
+///
+/// The value [`issue_certificate_material`] returns, and the value
+/// [`issue_certificate_with_bootstrap`] publishes. Splitting the two
+/// apart is what lets a renewal validate a candidate — its key, its SAN,
+/// its issuer chain — before it touches the pair a running endpoint and
+/// a running caller are reading.
+#[derive(Debug)]
+pub(crate) struct IssuedMaterial {
+    /// The certificate file's PEM, already in the shape
+    /// [`IssuanceOptions::leaf_publication`] selects.
+    pub(crate) cert_pem: String,
+    /// The private key, as PEM. Every issuance generates a fresh one.
+    ///
+    /// Wrapped rather than bare, because this value is now carried in a
+    /// struct: the `Debug` above would otherwise print the key of every
+    /// certificate this crate issues into whatever log line, trace field
+    /// or error chain first rendered one.
+    pub(crate) key_pem: PrivateKeyPem,
+    /// The issuer chain the CA returned, as DER, with the leaf removed.
+    ///
+    /// Empty when `trust.ca_bundle_path` is unconfigured, where the
+    /// whole response is published as the leaf and there is no bundle to
+    /// merge into.
+    pub(crate) chain: Vec<Vec<u8>>,
+}
+
+/// Runs one ACME issuance and returns what it produced, writing nothing.
+///
+/// The same outbound path [`issue_certificate_with_bootstrap`] runs —
+/// the same account registration, the same HTTP-01 validation, the same
+/// CSR shape and the same fresh key — stopped immediately before
+/// publication. It does not verify the returned chain against
+/// `trust.trusted_ca_sha256`, does not read or merge
+/// `trust.ca_bundle_path`, and does not write `profile.paths`.
+///
+/// `Ok(None)` is an order that finalized without a certificate, which is
+/// the one non-error outcome that produces no material.
+///
+/// # Errors
+///
+/// Returns an error if the ACME protocol fails or the returned PEM
+/// cannot be split into a leaf and its chain.
+// The only production caller is the registrar surface's renewal
+// adapter, which needs the activated endpoint and so exists on Linux
+// alone. Elsewhere this is reached from tests only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) async fn issue_certificate_material(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    insecure_mode: bool,
+    options: IssuanceOptions,
+    bootstrap_pins: Option<&[String]>,
+) -> Result<Option<IssuedMaterial>> {
+    run_issuance(
+        settings,
+        profile,
+        eab_creds,
+        insecure_mode,
+        options,
+        bootstrap_pins,
+    )
+    .await
+}
+
 /// Issues a registrar-surface certificate with optional pin-only bootstrap
 /// TLS while the configured output bundle is being repaired.
 pub(crate) async fn issue_certificate_with_bootstrap(
@@ -507,6 +583,82 @@ pub(crate) async fn issue_certificate_with_bootstrap(
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
 ) -> Result<()> {
+    let Some(material) = run_issuance(
+        settings,
+        profile,
+        eab_creds,
+        insecure_mode,
+        options,
+        bootstrap_pins,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    publish_issued_material(settings, profile, &material).await
+}
+
+/// Publishes what an issuance produced at the configured paths.
+///
+/// The chain first, the leaf after. An unpinned fingerprint or a CA
+/// bundle that cannot be read fails here, before anything is published,
+/// so no consumer is left holding a leaf whose issuer this host does not
+/// trust. With `ca_bundle_path` unconfigured there is nothing to verify
+/// or merge, and with an empty chain the bundle is left alone with a
+/// warning; neither is a refusal.
+async fn publish_issued_material(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    material: &IssuedMaterial,
+) -> Result<()> {
+    let policy = crate::cert_group::CertGroupPolicy {
+        gid: profile.cert_group_gid,
+    };
+    if let Some(bundle_path) = &settings.trust.ca_bundle_path {
+        if material.chain.is_empty() {
+            warn!("Certificate chain not present; CA bundle not updated.");
+        } else {
+            verify_chain_fingerprints(&material.chain, &settings.trust.trusted_ca_sha256)?;
+            write_merged_ca_bundle(
+                bundle_path,
+                &material.chain,
+                &settings.trust.trusted_ca_sha256,
+                policy,
+            )
+            .await?;
+            info!("CA bundle saved to: {:?}", bundle_path);
+        }
+    }
+
+    // Each file is staged and `rename(2)`d, so neither destination
+    // ever holds a truncated PEM. The *pair* is not atomic: the two
+    // renames are separate, so a reader landing between them sees the
+    // new leaf with the old key, or the old leaf with the new key.
+    // Closing that window is the reader's side of the contract — a
+    // bounded retry on a mismatched pair — and is not done here.
+    fs_util::write_cert_and_key(
+        &profile.paths.cert,
+        &profile.paths.key,
+        &material.cert_pem,
+        material.key_pem.expose(),
+        policy,
+    )
+    .await?;
+    info!("Certificate saved to: {:?}", profile.paths.cert);
+    info!("Private key saved to: {:?}", profile.paths.key);
+    Ok(())
+}
+
+/// Everything from the ACME directory through the downloaded
+/// certificate, with no write of any kind.
+async fn run_issuance(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    eab_creds: Option<crate::eab::EabCredentials>,
+    insecure_mode: bool,
+    options: IssuanceOptions,
+    bootstrap_pins: Option<&[String]>,
+) -> Result<Option<IssuedMaterial>> {
     // `--insecure` remains its existing explicit override.  Bootstrap mode
     // never changes that mode's ACME or responder transport behavior.
     let bootstrap_pins = (!insecure_mode).then_some(bootstrap_pins).flatten();
@@ -555,78 +707,38 @@ pub(crate) async fn issue_certificate_with_bootstrap(
     let finalized_order =
         wait_for_order_completion(settings, &mut client, &order, finalized_order).await?;
 
-    if let Some(cert_url) = finalized_order.certificate {
-        info!("Downloading certificate from: {}", cert_url);
-        let cert_pem = client.download_certificate(&cert_url).await?;
-        info!("Certificate received. Saving to files...");
-
-        let (leaf_pem, chain) = if settings.trust.ca_bundle_path.is_some() {
-            split_leaf_and_chain(&cert_pem)?
-        } else {
-            (cert_pem.clone(), Vec::new())
-        };
-        let key_pem = cert_key.serialize_pem();
-        let policy = crate::cert_group::CertGroupPolicy {
-            gid: profile.cert_group_gid,
-        };
-
-        // The chain first, the leaf after. An unpinned fingerprint or a
-        // CA bundle that cannot be read fails here, before anything is
-        // published, so no consumer is left holding a leaf whose issuer
-        // this host does not trust. With `ca_bundle_path` unconfigured
-        // there is nothing to verify or merge, and with an empty chain
-        // the bundle is left alone with a warning; neither is a refusal.
-        if let Some(bundle_path) = &settings.trust.ca_bundle_path {
-            if chain.is_empty() {
-                warn!("Certificate chain not present; CA bundle not updated.");
-            } else {
-                verify_chain_fingerprints(&chain, &settings.trust.trusted_ca_sha256)?;
-                write_merged_ca_bundle(
-                    bundle_path,
-                    &chain,
-                    &settings.trust.trusted_ca_sha256,
-                    policy,
-                )
-                .await?;
-                info!("CA bundle saved to: {:?}", bundle_path);
-            }
-        }
-
-        let cert_file_pem = match options.leaf_publication {
-            LeafPublication::LeafOnly => leaf_pem,
-            LeafPublication::LeafWithChain => {
-                let mut published = leaf_pem;
-                for der in &chain {
-                    published.push_str(&encode_cert_pem(der));
-                }
-                published
-            }
-        };
-
-        // Each file is staged and `rename(2)`d, so neither destination
-        // ever holds a truncated PEM. The *pair* is not atomic: the two
-        // renames are separate, so a reader landing between them sees
-        // the new leaf with the old key, or the old leaf with the new
-        // key. Closing that window is the reader's side of the contract
-        // — a bounded retry on a mismatched pair — and is not done here.
-        fs_util::write_cert_and_key(
-            &profile.paths.cert,
-            &profile.paths.key,
-            &cert_file_pem,
-            &key_pem,
-            policy,
-        )
-        .await?;
-        info!("Certificate saved to: {:?}", profile.paths.cert);
-        info!("Private key saved to: {:?}", profile.paths.key);
-    } else {
+    let Some(cert_url) = finalized_order.certificate else {
         info!(
             "Order finalized, but certificate not yet ready (or failed). Status: {:?}",
             finalized_order.status
         );
-    }
+        return Ok(None);
+    };
+    info!("Downloading certificate from: {}", cert_url);
+    let cert_pem = client.download_certificate(&cert_url).await?;
+    info!("Certificate received.");
 
-    Ok(())
+    let (leaf_pem, chain) = if settings.trust.ca_bundle_path.is_some() {
+        split_leaf_and_chain(&cert_pem)?
+    } else {
+        (cert_pem.clone(), Vec::new())
+    };
+    let cert_pem = match options.leaf_publication {
+        LeafPublication::LeafOnly => leaf_pem,
+        LeafPublication::LeafWithChain => {
+            let mut published = leaf_pem;
+            for der in &chain {
+                published.push_str(&encode_cert_pem(der));
+            }
+            published
+        }
+    };
+
+    Ok(Some(IssuedMaterial {
+        cert_pem,
+        key_pem: PrivateKeyPem::new(cert_key.serialize_pem()),
+        chain,
+    }))
 }
 
 #[cfg(test)]

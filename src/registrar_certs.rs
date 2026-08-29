@@ -126,7 +126,7 @@ const SURFACE_LEAF_PUBLICATION: LeafPublication = LeafPublication::LeafWithChain
 /// The two are evaluated and issued independently: one being usable is
 /// never a reason to leave the other unusable, and one needing issuance
 /// is never a reason to re-issue the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum SurfaceLeaf {
     /// The leaf the endpoint presents. A server certificate, so it takes
     /// the ordinary CSR shape and requests no extended key usage.
@@ -174,6 +174,17 @@ impl SurfaceLeaf {
             Self::RegistrarClient => {
                 registrar_client_identity(REGISTRAR_SURFACE_INSTANCE, host, domain)
             }
+        }
+    }
+
+    /// How this leaf is named in a log line or a state entry.
+    // Read by the renewal adapter, which exists on Linux alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[must_use]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::EndpointServer => "the endpoint server leaf",
+            Self::RegistrarClient => "the registrar client leaf",
         }
     }
 
@@ -800,6 +811,71 @@ pub(crate) async fn issue_surface_pair(
     .with_context(|| {
         format!(
             "issuing {} to {} and {}",
+            pair.name,
+            pair.cert_path.display(),
+            pair.key_path.display()
+        )
+    })
+}
+
+/// Issues one pair **off-live**: the issuer chain, the candidate
+/// certificate and a fresh key, with nothing written anywhere.
+///
+/// The renewal path's issuance step. It runs the same outbound ACME
+/// path [`issue_surface_pair`] runs, under the same reserved-name
+/// profile and the same bootstrap-pin rule, and stops immediately before
+/// publication: it writes neither the configured pair nor
+/// `trust.ca_bundle_path`, so a candidate that turns out to be
+/// unusable — a key that is not the leaf's, a SAN that drifted, a chain
+/// that reaches no pinned anchor — costs the running endpoint and the
+/// running caller nothing at all.
+///
+/// Every call produces a fresh key. There is no reuse path and no
+/// option to ask for one.
+///
+/// # Errors
+///
+/// Returns an error naming both configured paths and the failure,
+/// including an order that finalized without a certificate — which is
+/// merely "nothing yet" to a start-time issuance and is a failed
+/// renewal attempt here.
+// Called by the renewal adapter, which exists on Linux alone, and by
+// this module's own tests everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) async fn issue_surface_pair_material(
+    settings: &Settings,
+    pair: &SurfacePairPaths,
+    host: &str,
+    inputs: &SurfaceAcmeInputs,
+    insecure_mode: bool,
+) -> Result<crate::acme::IssuedMaterial> {
+    let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
+    let profile = issuance
+        .profiles
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
+    let bootstrap_pins = bootstrap_pins_for_mode(&issuance.trust, insecure_mode);
+    let material = crate::acme::issue_certificate_material(
+        &issuance,
+        profile,
+        inputs.eab.clone(),
+        insecure_mode,
+        pair.leaf.issuance_options(),
+        bootstrap_pins,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "issuing a replacement {} for {} and {}",
+            pair.name,
+            pair.cert_path.display(),
+            pair.key_path.display()
+        )
+    })?;
+    material.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the order for {} finalized without a certificate, so there is no candidate to \
+             validate for {} and {}",
             pair.name,
             pair.cert_path.display(),
             pair.key_path.display()
