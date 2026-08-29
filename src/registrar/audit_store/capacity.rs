@@ -384,6 +384,11 @@ pub(crate) trait WalkOps {
 
     /// Stats an open directory.
     ///
+    /// This is what classifies every directory the walk reaches, the
+    /// store root included: the identity and the blocks come from the
+    /// descriptor the walk holds, so the object counted is the object
+    /// traversed.
+    ///
     /// # Errors
     ///
     /// Returns the underlying error.
@@ -667,27 +672,60 @@ fn step_directory<O: WalkOps>(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        if facts.dev != state.root_dev {
-            continue;
-        }
-        if !state.seen.insert((facts.dev, facts.ino)) {
-            continue;
-        }
-        state.total = state.total.saturating_add(allocated_bytes(facts.blocks));
         if !facts.is_dir {
             // Nothing else is opened or read: a FIFO cannot block the
             // walk, and a symbolic link contributes its own entry's
-            // blocks with its target left unresolved.
+            // blocks with its target left unresolved, so what its own
+            // `fstatat` reported is the whole of its accounting.
+            account_for(state, &facts);
             continue;
         }
-        match ops.open_dir(Some(dir), &name) {
-            Ok(child) => return Ok(Some(child)),
+        // Directories are opened because opening them is the only
+        // race-free way to enumerate them — and the descriptor's own
+        // `fstat` is then what classifies the entry, so the object
+        // counted and dedup-ed is the object traversed. Taking the
+        // identity from the `fstatat` above would let a directory
+        // substituted between the two calls be counted as one object and
+        // walked as another.
+        let child = match ops.open_dir(Some(dir), &name) {
+            Ok(child) => child,
             // The same vanished-entry carve-out: a generation rotated
             // away between its `fstatat` and its `openat`.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
+        };
+        let child_facts = match ops.stat_dir(&child) {
+            Ok(child_facts) => child_facts,
+            // An `fstat` on a descriptor this walk holds open cannot
+            // report a vanished entry, so any failure here is a failed
+            // probe.
+            Err(error) => {
+                ops.close_dir(child);
+                return Err(error);
+            }
+        };
+        if !account_for(state, &child_facts) {
+            ops.close_dir(child);
+            continue;
         }
+        return Ok(Some(child));
     }
+}
+
+/// Counts one entry's allocated blocks, unless it is off the store's
+/// device or has already been counted under another name.
+///
+/// Returns whether the entry was counted, which for a directory is also
+/// whether it is to be descended into: usage summed across a nested
+/// mount would be weighed against available bytes for a different
+/// filesystem, and two paths hard-linked to one file consume one file's
+/// blocks.
+fn account_for(state: &mut WalkState, facts: &EntryFacts) -> bool {
+    if facts.dev != state.root_dev || !state.seen.insert((facts.dev, facts.ino)) {
+        return false;
+    }
+    state.total = state.total.saturating_add(allocated_bytes(facts.blocks));
+    true
 }
 
 /// Sums the allocated blocks of everything below an open store root.

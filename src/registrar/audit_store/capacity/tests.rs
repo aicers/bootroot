@@ -868,6 +868,27 @@ fn a_failed_root_stat_fails_the_probe_and_closes_the_root() {
     assert!(probe.ops.balanced());
 }
 
+/// A directory is classified from the descriptor the walk holds open,
+/// not from the `fstatat` that decided to open it, so that a directory
+/// substituted between the two calls cannot be counted as one object and
+/// walked as another. Asserted by failing the descriptor stat on an
+/// enumerated subdirectory: nothing else in the walk performs that call,
+/// so the injection can only fire if the rule holds.
+#[test]
+fn an_enumerated_directory_is_classified_from_its_own_descriptor() {
+    let (_parent, store) = seam_fixture();
+    let (outcome, probe) = measure_through(
+        &store,
+        RecordingWalkOps::failing(SeamOp::StatDir, "openbao", libc::EIO),
+    );
+    let error = outcome.expect_err("a subdirectory that cannot be stat-ed fails the probe");
+    assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    assert!(
+        probe.ops.balanced(),
+        "the descriptor whose stat failed was closed before the failure propagated"
+    );
+}
+
 #[test]
 fn a_successful_walk_closes_every_directory_it_opened() {
     let (_parent, store) = seam_fixture();
