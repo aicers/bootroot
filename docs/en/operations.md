@@ -1427,9 +1427,9 @@ bootroot performs neither.
   <!-- markdownlint-disable MD013 -->
 
   ```sh
-  if [ -e <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
-  if [ -e <audit_store_dir>.pre-mount ] && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
-  if [ -e <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
+  if { [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; } && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
   ```
 
   <!-- markdownlint-enable MD013 -->
@@ -1450,6 +1450,15 @@ bootroot performs neither.
   recreated `<audit_store_dir>`, and a `rmdir` of a directory that is
   not there would stop the sequence before the rename that carries the
   rollback.
+
+  The guard is `-e` **or** `-L` because the two disagree about one
+  entry. bootroot decides the migration is open from an `lstat`, which
+  sees a dangling symbolic link at the holding path; `test -e` answers
+  for that link's absent target and reads the same path as closed. A
+  guard spelled `-e` alone would skip all three lines and exit 0 having
+  restored nothing, leaving the next run reporting **migration
+  incomplete** over a rollback that reported success. `-L` answers from
+  the link itself, so the shell and bootroot agree on every entry.
 
 **After the closing rename**, `<audit_store_dir>.migrated` holds a
 redundant second copy outside the reserve. It clears **migration

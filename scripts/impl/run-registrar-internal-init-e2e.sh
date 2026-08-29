@@ -1166,10 +1166,13 @@ assert_the_rendered_steps_activate_the_reserve() {
 # needs; and the rollback's commands, which are the way *out* of the
 # migration and would undo the sequence.  Those three are each guarded
 # on the holding path, which is what makes the rollback idempotent and
-# what gives the filter one prefix to drop them all by -- the `umount`
-# among them included, which is rendered only where the reserve is
-# mounted.  The closing rename is not one of them -- it renames onto
-# `.migrated` rather than back onto the store, and carries no guard.
+# what gives the filter one substring to drop them all by -- the
+# `umount` among them included, which is rendered only where the reserve
+# is mounted.  The substring is the guard's two tests rather than the
+# line's opening `if`, because the `rmdir` line brace-groups them before
+# it adds its own test of the mount point.  The closing rename is not
+# one of them -- it renames onto `.migrated` rather than back onto the
+# store, and carries no guard.
 #
 # `|| true` on every filter, and it is `pipefail` that makes it
 # necessary: `grep -v` exits non-zero when it emits nothing, which would
@@ -1180,7 +1183,7 @@ rendered_migration_commands() {
     { grep -v '^docker compose .* stop$' || true; } |
     { grep -vxF "systemctl stop bootroot-registrar.service" || true; } |
     { grep -v '^bootroot ' || true; } |
-    { grep -vF "if [ -e '${store}.pre-mount' ]" || true; }
+    { grep -vF "[ -e '${store}.pre-mount' ] || [ -L '${store}.pre-mount' ]" || true; }
 }
 
 # Runs those commands as **one** shell, stopping at the first non-zero

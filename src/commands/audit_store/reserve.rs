@@ -4646,17 +4646,18 @@ mod tests {
     const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
 
     /// The three rollback commands as they are rendered, each guarded
-    /// on the holding path still being there so a second run is a
+    /// on the holding path still being there — by `-e` or by `-L`, so a
+    /// dangling link is as open as a directory — so a second run is a
     /// no-op. Spelled once here rather than in every test that pins
     /// them.
     fn rollback_commands(mounted: bool) -> Vec<String> {
-        let open = format!("[ -e '{HOLDING}' ]");
+        let open = format!("[ -e '{HOLDING}' ] || [ -L '{HOLDING}' ]");
         let mut commands = Vec::new();
         if mounted {
             commands.push(format!("if {open}; then umount '{STORE}'; fi"));
         }
         commands.push(format!(
-            "if {open} && [ -d '{STORE}' ]; then rmdir '{STORE}'; fi"
+            "if {{ {open}; }} && [ -d '{STORE}' ]; then rmdir '{STORE}'; fi"
         ));
         commands.push(format!("if {open}; then mv '{HOLDING}' '{STORE}'; fi"));
         commands
@@ -4948,9 +4949,13 @@ mod tests {
             ]
         );
         // No pipe anywhere, no `diff -r`, no recursive delete, and no
-        // field after `%P`.
+        // field after `%P`. `||` is removed before the pipe check
+        // rather than exempted line by line: the rollback's guard
+        // spells `[ -e … ] || [ -L … ]`, which is a short-circuit
+        // between two commands and carries none of what the ban exists
+        // for, while a real pipeline on the same line is still caught.
         for command in steps.iter().flat_map(|step| &step.commands) {
-            assert!(!command.contains('|'), "{command}");
+            assert!(!command.replace("||", "").contains('|'), "{command}");
             assert!(!command.contains("diff -r"), "{command}");
             assert!(!command.contains("rm -r"), "{command}");
             assert!(!command.contains("rm -f"), "{command}");

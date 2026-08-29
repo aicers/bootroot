@@ -676,6 +676,15 @@ pub(super) fn closing_rename_step(
 /// recreated it on a bring-up path, and `rmdir` over an absent
 /// directory would stop the sequence before the restoring rename.
 ///
+/// That guard is `[ -e … ] || [ -L … ]` rather than `-e` alone because
+/// bootroot decides the migration is open from an `lstat` of the path,
+/// and `test -e` answers for the *target* of a symbolic link. A dangling
+/// link at the holding path is therefore a migration this step is
+/// rendered for and a guard `-e` would read as closed: all three
+/// commands would skip, the list would exit 0 having restored nothing,
+/// and the next run would report **migration incomplete** again. `-L`
+/// answers from the link itself, so the two agree on every entry.
+///
 /// The unmount is rendered only where the store is a mount point. A
 /// migration is open from the aside rename onward, which is two
 /// `bootroot infra up` passes before the mount comes up, and there
@@ -700,16 +709,25 @@ pub(super) fn rollback_step(
 ) -> Phase2Step {
     let store = sh_quote_path(store_dir);
     let holding = sh_quote_path(holding);
-    // `-e` rather than `-d`: the rollback is also rendered where the
-    // holding path is not a directory, and that state is exactly the
-    // one whose entry has to be moved back rather than skipped.
-    let open = format!("[ -e {holding} ]");
+    // Not `-d`: the rollback is also rendered where the holding path is
+    // not a directory, and that state is exactly the one whose entry has
+    // to be moved back rather than skipped. Not `-e` alone either — it
+    // dereferences, so a dangling link is an open migration bootroot
+    // detects by `lstat` and a bare `-e` guard would skip. `-L` answers
+    // from the link itself and closes that gap.
+    let open = format!("[ -e {holding} ] || [ -L {holding} ]");
     let mut commands = Vec::with_capacity(3);
     if mount_present {
         commands.push(format!("if {open}; then umount {store}; fi"));
     }
+    // The brace group says the grouping rather than leaving it to be
+    // derived: `&&` and `||` have equal precedence and associate left,
+    // so the bare form means the same thing — but this line is read by
+    // an operator deciding whether to paste it over their only copy of
+    // the records, and "the holding path is there *and* the mount point
+    // is" should not be something they have to work out.
     commands.push(format!(
-        "if {open} && [ -d {store} ]; then rmdir {store}; fi"
+        "if {{ {open}; }} && [ -d {store} ]; then rmdir {store}; fi"
     ));
     commands.push(format!("if {open}; then mv {holding} {store}; fi"));
     Phase2Step {
@@ -1190,6 +1208,51 @@ mod rendered_sequence {
         );
     }
 
+    /// bootroot decides the migration is open from an `lstat` of the
+    /// holding path, and `lstat` sees a dangling symbolic link — so the
+    /// rollback is rendered for one, as the way back out of a state the
+    /// type guard refuses. `test -e` does not see it: it answers for the
+    /// link's absent target. A guard spelled `-e` alone would skip all
+    /// three commands and exit 0 having restored nothing, leaving the
+    /// next run reporting **migration incomplete** over a rollback that
+    /// reported success.
+    #[test]
+    fn a_dangling_holding_symlink_is_rolled_back_rather_than_skipped() {
+        let root = tempdir().expect("a temporary directory");
+        let store = root.path().join("audit-store");
+        let holding = root.path().join("audit-store.pre-mount");
+        fs::create_dir(&store).expect("the empty mount point");
+        symlink(root.path().join("nowhere"), &holding).expect("a dangling holding link");
+        assert!(
+            fs::symlink_metadata(&holding).is_ok() && !holding.exists(),
+            "the fixture has to be a link whose target is absent"
+        );
+
+        let step = rollback_step(&store, &holding, false, &test_messages());
+        assert!(run(root.path(), &[&step]));
+        // The entry `lstat` saw was moved back under the store's own
+        // name rather than skipped, and nothing is left at the aside
+        // path.
+        assert!(fs::symlink_metadata(&holding).is_err());
+        assert!(
+            fs::symlink_metadata(&store)
+                .expect("the entry is back at the store's name")
+                .file_type()
+                .is_symlink()
+        );
+
+        // And the same list run a second time is the no-op the
+        // directory case is: the holding path is gone, so all three
+        // skip.
+        assert!(run(root.path(), &[&step]));
+        assert!(
+            fs::symlink_metadata(&store)
+                .expect("the entry survived the second run")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
     /// The fixture with the mount point removed: the aside rename has
     /// run and nothing has recreated `<audit_store_dir>` yet.
     fn fixture_with_no_mount_point() -> Fixture {
@@ -1277,10 +1340,13 @@ mod manuals {
                 "cmp \"$SCRATCH\"/content.source \"$SCRATCH\"/content.destination",
                 "mv <audit_store_dir>.pre-mount <audit_store_dir>.migrated",
                 // Rollback: an unmount, a non-recursive rmdir and the
-                // reverse rename.
+                // reverse rename, every line guarded on the holding
+                // path by the two tests that together answer for a
+                // dangling link as well as a directory.
                 "umount <audit_store_dir>",
                 "rmdir <audit_store_dir>",
                 "mv <audit_store_dir>.pre-mount <audit_store_dir>",
+                "[ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]",
                 // The window, the figures and the prerequisites.
                 "create_host_path: false",
                 "16 MiB",
@@ -1349,12 +1415,25 @@ mod manuals {
                 // read as a clean tree.
                 let blocks = command_blocks(passage);
                 for line in blocks.lines() {
-                    for forbidden in ["--apparent-size", "rm -r", "rm -f", "|"] {
+                    for forbidden in ["--apparent-size", "rm -r", "rm -f"] {
                         assert!(
                             !line.contains(forbidden),
                             "{page}/{heading}: {forbidden:?} in {line:?}"
                         );
                     }
+                    // The pipeline ban is on `|`, and the rollback's
+                    // guard spells `[ -e … ] || [ -L … ]`. `||` is a
+                    // short-circuit between two commands and carries
+                    // none of what the ban exists for: nothing runs in
+                    // a subshell, and the status is the last command
+                    // that actually ran. So it is removed before the
+                    // check rather than exempting the whole line, which
+                    // would let a real pipeline in beside it.
+                    let piped = line.replace("||", "");
+                    assert!(
+                        !piped.contains('|'),
+                        "{page}/{heading}: a pipeline in {line:?}"
+                    );
                     if line.contains("du ") {
                         assert!(line.contains(" -x "), "{page}/{heading}: du without -x");
                     }

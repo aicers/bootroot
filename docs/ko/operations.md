@@ -1349,9 +1349,9 @@ incomplete**를 내고 복사를 렌더링하지 않습니다.
   <!-- markdownlint-disable MD013 -->
 
   ```sh
-  if [ -e <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
-  if [ -e <audit_store_dir>.pre-mount ] && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
-  if [ -e <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
+  if { [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; } && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
   ```
 
   <!-- markdownlint-enable MD013 -->
@@ -1370,6 +1370,15 @@ incomplete**를 내고 복사를 렌더링하지 않습니다.
   `<audit_store_dir>`가 다시 만들어져 있지 않을 수 있고, 없는 디렉터리에
   대한 `rmdir`은 되돌리기를 실제로 수행하는 이름 바꾸기 앞에서 흐름을
   멈춰 세우기 때문입니다.
+
+  조건이 `-e` **또는** `-L`인 것은 그 둘이 한 가지 항목에 대해 다르게
+  답하기 때문입니다. bootroot는 이전이 열려 있는지를 `lstat`으로
+  판단하고, `lstat`은 보관 경로에 놓인 끊어진 심볼릭 링크를 봅니다.
+  반면 `test -e`는 그 링크가 가리키는 없는 대상을 보고 같은 경로를 닫힌
+  것으로 읽습니다. `-e`만으로 쓴 조건은 세 줄을 모두 건너뛰고 아무것도
+  되돌리지 못한 채 0으로 끝나며, 성공을 보고한 되돌리기 뒤에서 다음
+  실행이 다시 **migration incomplete**를 보고하게 만듭니다. `-L`은 링크
+  자체를 보므로 셸과 bootroot가 모든 항목에 대해 같은 답을 냅니다.
 
 **마무리 이름 바꾸기 이후** `<audit_store_dir>.migrated`는 예약량 바깥에
 중복 사본을 담고 있습니다. 그것은 **migration incomplete**를 해소하며,
