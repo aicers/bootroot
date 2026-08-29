@@ -19,7 +19,11 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
 };
+use rustls::ClientConfig;
+use rustls::pki_types::ServerName;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_rustls::TlsConnector;
 
 use super::*;
 use crate::acme::IssuedMaterial;
@@ -28,6 +32,7 @@ use crate::registrar::endpoint;
 use crate::registrar::endpoint::activation::ActivationContract;
 use crate::registrar::endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE;
 use crate::registrar::internal::PrivateKeyPem;
+use crate::registrar::verbs::outcome::CallerIdentity;
 
 const TEST_DOMAIN: &str = "corp.example.internal";
 const TEST_HOST: &str = "bootroot-01";
@@ -1499,31 +1504,204 @@ async fn a_stop_before_the_first_pass_runs_none() {
 }
 
 // ---------------------------------------------------------------------
-// The reload contract, end to end over the socket
+// The reload contract, end to end over a served socket
 // ---------------------------------------------------------------------
 
-/// The renewed server leaf is presented, and a caller under the rotated
-/// anchor is accepted, from the next handshake onwards — with no
-/// restart, no signal, the same socket inode, and a connection already
-/// in flight left alone.
+/// The handler the served endpoint dispatches to, which answers with
+/// the caller identity the transport authenticated.
+///
+/// The payload is never decoded: what these tests drive is the TLS
+/// material, not the protocol. Answering with the identity is what
+/// makes acceptance assertable — those bytes are written only after the
+/// incoming verifier accepted the caller's chain and the accept loop
+/// recognized its SAN, so a round trip that returns them is proof that
+/// both halves of the active configuration admitted the caller.
+struct EchoingCallerIdentity;
+
+impl endpoint::handler::RegistrarRequestHandler for EchoingCallerIdentity {
+    fn handle<'a>(
+        &'a self,
+        _operation: endpoint::frame::Operation,
+        _payload: &'a [u8],
+        caller: CallerIdentity,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, endpoint::handler::HandlerRefusal>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(caller.as_str().as_bytes().to_vec()) })
+    }
+}
+
+/// The harness endpoint with the production accept loop running over
+/// it.
+///
+/// The loop is the one the daemon spawns, over the same
+/// [`ActivatedEndpoint`] the renewal adapter holds, so a swap performed
+/// by a publication is observed exactly where a real caller would
+/// observe it: on the next handshake.
+struct Serving {
+    shutdown: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Serving {
+    fn start(harness: &Harness) -> Self {
+        let (shutdown, receiver) = watch::channel(false);
+        let endpoint = Arc::clone(&harness.endpoint);
+        let handle = tokio::spawn(async move {
+            endpoint::serve::run(endpoint, Arc::new(EchoingCallerIdentity), receiver).await
+        });
+        Self { shutdown, handle }
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown.send(true);
+        self.handle
+            .await
+            .expect("the accept task joins")
+            .expect("the accept loop ends cleanly");
+    }
+}
+
+/// A caller's TLS stream over the endpoint's `AF_UNIX` socket.
+type CallerStream = tokio_rustls::client::TlsStream<tokio::net::UnixStream>;
+
+/// The pinned, authenticating configuration one dial builds from the
+/// pair at `certificate_path` and `key_path`.
+///
+/// Composed by [`endpoint::client::build_client_config`], the one place
+/// in this tree the registrar caller's TLS configuration is built, over
+/// material read from the paths a publication writes to. A dial after a
+/// renewal therefore presents whatever the renewal published, with no
+/// caller state carried across.
+fn dial_config(harness: &Harness, certificate_path: &Path, key_path: &Path) -> ClientConfig {
+    let chain = crate::tls::parse_pem_to_cert_list(
+        &std::fs::read(certificate_path).expect("read the caller's chain"),
+    )
+    .expect("the caller's chain parses");
+    let key_bytes = std::fs::read(key_path).expect("read the caller's key");
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_bytes.as_slice()))
+        .expect("the caller's key parses")
+        .expect("the caller's key file holds a key");
+    endpoint::client::build_client_config(
+        &harness.pin_file(),
+        &harness.pair(SurfaceLeaf::EndpointServer).name,
+        chain,
+        key,
+    )
+    .expect("a pinned, authenticating caller")
+}
+
+/// Connects and completes the handshake, leaving the request unsent.
+///
+/// The dial name is a placeholder: over `AF_UNIX` there is no
+/// meaningful server name, and the pinned verifier decides on the
+/// presented leaf's SAN instead of on this.
+async fn dial(socket_path: &Path, config: ClientConfig) -> std::io::Result<CallerStream> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    TlsConnector::from(Arc::new(config))
+        .connect(
+            ServerName::try_from("localhost").expect("a valid dial name"),
+            stream,
+        )
+        .await
+}
+
+/// The end-entity certificate the endpoint presented on this stream,
+/// as its DER fingerprint.
+///
+/// A fingerprint rather than the DER itself so that a failure names two
+/// digests instead of printing two certificates at each other.
+fn presented_leaf(stream: &CallerStream) -> String {
+    stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(<[_]>::first)
+        .map(|leaf| crate::tls::sha256_hex(leaf.as_ref()))
+        .expect("the endpoint presents a leaf on every completed handshake")
+}
+
+/// The DER fingerprint of the first certificate in `pem`.
+fn leaf_fingerprint(pem: &str) -> String {
+    crate::tls::sha256_hex(&pem_to_der(pem))
+}
+
+/// Sends one request over an already-handshaken stream and reads the
+/// answer.
+///
+/// In TLS 1.3 the client finishes its own handshake before the server
+/// has validated the client certificate, so a refused caller learns of
+/// the refusal here rather than at [`dial`]. Acceptance is therefore
+/// asserted through a round trip and never through a connect.
+async fn round_trip(stream: &mut CallerStream) -> std::io::Result<Vec<u8>> {
+    let name = endpoint::frame::Operation::Mint.as_str();
+    let mut request = 0u32.to_be_bytes().to_vec();
+    request.push(u8::try_from(name.len()).expect("a short operation name"));
+    request.extend_from_slice(name.as_bytes());
+    stream.write_all(&request).await?;
+    stream.flush().await?;
+
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).await?;
+    let declared = usize::try_from(u32::from_be_bytes(prefix)).expect("a test answer fits usize");
+    let mut body = vec![0u8; declared];
+    stream.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+/// One whole exchange: handshake, one request, one answer. Returns the
+/// leaf the endpoint presented alongside what it answered.
+async fn exchange(socket_path: &Path, config: ClientConfig) -> std::io::Result<(String, Vec<u8>)> {
+    let mut stream = dial(socket_path, config).await?;
+    let presented = presented_leaf(&stream);
+    let answer = round_trip(&mut stream).await?;
+    Ok((presented, answer))
+}
+
+/// The identity the accept loop renders for the caller `name`.
+fn caller_of(name: &str) -> String {
+    format!("registrar-client:{}", name.to_ascii_lowercase())
+}
+
+/// The next handshake over the running endpoint presents the renewed
+/// server leaf — same socket inode, no restart, no signal — and a
+/// connection that handshook before the swap keeps the configuration it
+/// handshook under and is not dropped.
+///
+/// This runs the production accept loop and completes real handshakes,
+/// so it fails if a publication renews the live files and leaves the
+/// active acceptor alone: the certificate the second caller is
+/// presented is read off the wire, not off the disk.
 #[tokio::test]
-async fn the_next_handshake_uses_the_renewed_material_without_a_restart() {
+async fn the_next_handshake_presents_the_renewed_server_leaf() {
     let harness = Harness::build();
     let renewal = harness.renewal().await;
-    let pair = harness.pair(SurfaceLeaf::EndpointServer);
+    let serving = Serving::start(&harness);
+    let server = harness.pair(SurfaceLeaf::EndpointServer);
+    let client = harness.pair(SurfaceLeaf::RegistrarClient);
+    let live_leaf =
+        leaf_fingerprint(&std::fs::read_to_string(&server.cert_path).expect("read the leaf"));
     let inode_before = std::fs::metadata(&harness.socket_path)
         .expect("stat the socket")
         .ino();
 
-    // A connection established before the swap, held open across it.
-    let held = tokio::net::UnixStream::connect(&harness.socket_path)
-        .await
-        .expect("connect before the swap");
+    // Handshaken before the swap and held open across it, with its
+    // request still unsent.
+    let mut in_flight = dial(
+        &harness.socket_path,
+        dial_config(&harness, &client.cert_path, &client.key_path),
+    )
+    .await
+    .expect("the endpoint serves the caller it was provisioned for");
+    assert_eq!(
+        presented_leaf(&in_flight),
+        live_leaf,
+        "before the renewal the endpoint presents the leaf it was activated with"
+    );
 
-    let material = harness.ca.material(&pair.name, -1, 60);
-    let artifacts = Artifacts::create(&pair.key_path).expect("artifacts");
+    let material = harness.ca.material(&server.name, -1, 60);
+    let artifacts = Artifacts::create(&server.key_path).expect("artifacts");
     renewal
-        .publish_candidate(&pair, &material, &artifacts)
+        .publish_candidate(&server, &material, &artifacts)
         .await
         .expect("the candidate publishes");
     artifacts.close().expect("artifacts are removed");
@@ -1535,25 +1713,111 @@ async fn the_next_handshake_uses_the_renewed_material_without_a_restart() {
             .ino(),
         "a TLS replacement never rebinds or replaces the socket"
     );
-    assert!(
-        held.peer_addr().is_ok(),
-        "a connection already in flight is not dropped"
+    assert_eq!(
+        String::from_utf8(
+            round_trip(&mut in_flight)
+                .await
+                .expect("a connection already in flight is not dropped by the swap")
+        )
+        .expect("the caller identity is UTF-8"),
+        caller_of(&client.name),
+        "the connection that handshook before the swap finishes under its own configuration"
     );
 
-    // The acceptor the next handshake would load presents the renewed
-    // leaf: the resolver behind it is the one built from the candidate.
-    let renewed_leaf = std::fs::read_to_string(&pair.cert_path).expect("read the published leaf");
-    assert!(
-        renewed_leaf.contains(
-            material
-                .cert_pem
-                .lines()
-                .nth(1)
-                .expect("the leaf PEM has a body line")
-        ),
-        "the published certificate is the candidate that was validated"
+    let (presented, answer) = exchange(
+        &harness.socket_path,
+        dial_config(&harness, &client.cert_path, &client.key_path),
+    )
+    .await
+    .expect("the next handshake completes without a restart");
+    assert_eq!(
+        presented,
+        leaf_fingerprint(&material.cert_pem),
+        "the next handshake is served the renewed leaf, from the acceptor the swap installed"
     );
-    drop(held);
+    assert_ne!(
+        presented, live_leaf,
+        "the renewed leaf is not the one the endpoint was activated with"
+    );
+    assert_eq!(
+        String::from_utf8(answer).expect("the caller identity is UTF-8"),
+        caller_of(&client.name),
+        "the renewed configuration still admits the caller it was serving"
+    );
+
+    serving.stop().await;
+}
+
+/// A caller under a rotated anchor is refused before the client leaf is
+/// renewed and accepted after it, over the same running endpoint.
+///
+/// The rebuilt incoming verifier is the only thing that changes: the
+/// anchor is pinned in configuration from the start and reaches the
+/// bundle the verifier is built from only when the publication stages
+/// it. The caller that is accepted afterwards is the renewed pair
+/// itself, read off the live paths by the same dial-time load a
+/// production caller performs.
+#[tokio::test]
+async fn the_next_handshake_accepts_a_caller_under_the_rebuilt_anchor() {
+    let mut harness = Harness::build();
+    let rotated = TestCa::new("Bootroot Rotated Anchor CA");
+    let settings = also_trusting(&harness, &rotated);
+    harness.settings = settings;
+    let renewal = harness.renewal().await;
+    let serving = Serving::start(&harness);
+    let client = harness.pair(SurfaceLeaf::RegistrarClient);
+    let server = harness.pair(SurfaceLeaf::EndpointServer);
+    let live_leaf =
+        leaf_fingerprint(&std::fs::read_to_string(&server.cert_path).expect("read the leaf"));
+
+    // The renewed client pair, staged where the live one is not yet, so
+    // the same material can be dialled with before it is published.
+    let material = rotated.material(&client.name, -1, 60);
+    let staged_cert = harness.dir.path().join("rotated-client.crt");
+    let staged_key = harness.dir.path().join("rotated-client.key");
+    std::fs::write(&staged_cert, &material.cert_pem).expect("stage the rotated chain");
+    std::fs::write(&staged_key, material.key_pem.expose()).expect("stage the rotated key");
+
+    let refused = exchange(
+        &harness.socket_path,
+        dial_config(&harness, &staged_cert, &staged_key),
+    )
+    .await
+    .expect_err("the live verifier has no anchor for the rotated generation");
+    assert!(
+        format!("{refused:?}").contains("UnknownCA"),
+        "the endpoint refuses the rotated generation as an issuer its verifier has no anchor for, \
+         which is the state the publication has to change: {refused:?}"
+    );
+
+    let artifacts = Artifacts::create(&client.key_path).expect("artifacts");
+    renewal
+        .publish_candidate(&client, &material, &artifacts)
+        .await
+        .expect("a conforming client candidate publishes");
+    artifacts.close().expect("artifacts are removed");
+
+    let (presented, answer) = exchange(
+        &harness.socket_path,
+        dial_config(&harness, &client.cert_path, &client.key_path),
+    )
+    .await
+    .expect("the rebuilt verifier admits the renewed caller without a restart");
+    assert_eq!(
+        String::from_utf8(answer).expect("the caller identity is UTF-8"),
+        caller_of(&client.name),
+        "the caller refused a moment ago is accepted under the anchor the publication staged"
+    );
+    assert_eq!(
+        presented, live_leaf,
+        "renewing the client leaf leaves the server leaf the endpoint presents alone"
+    );
+    assert!(
+        bundle_fingerprints(&harness.bundle_path()).contains(&rotated.fingerprint()),
+        "the anchor the verifier was rebuilt from is the one the publication merged"
+    );
+
+    serving.stop().await;
 }
 
 // ---------------------------------------------------------------------
