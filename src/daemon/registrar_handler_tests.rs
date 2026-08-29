@@ -210,6 +210,35 @@ fn configure_valid_profile_certificate(settings: &mut Settings, deployment: &Dep
     settings.profiles[0].paths.cert = certificate;
 }
 
+/// Provisions the four registrar surface material paths an enabled
+/// endpoint has by the time `run_daemon` is reached.
+///
+/// A production start reaches the daemon only through
+/// `ensure_registrar_surface_certificates`, which has already made both
+/// pairs usable; a test that calls `run_daemon` directly bypasses that
+/// step, and the renewal adapter — which reads both certificates before
+/// the endpoint serves — refuses an endpoint it cannot observe. What is
+/// written is a parsable self-signed pair per path, because
+/// initialization records a lifetime and validates nothing else.
+fn configure_registrar_surface_material(settings: &mut Settings, deployment: &Deployment) {
+    let key = KeyPair::generate().expect("generate surface material key");
+    let certificate_pem = CertificateParams::new(Vec::new())
+        .expect("build surface certificate")
+        .self_signed(&key)
+        .expect("self-sign surface certificate")
+        .pem();
+    let key_pem = key.serialize_pem();
+    let write = |name: &str, contents: &str| {
+        let path = deployment.path().join(name);
+        std::fs::write(&path, contents).expect("write surface material");
+        path
+    };
+    settings.registrar_endpoint.server_cert_path = Some(write("endpoint.crt", &certificate_pem));
+    settings.registrar_endpoint.server_key_path = Some(write("endpoint.key", &key_pem));
+    settings.registrar_endpoint.client_cert_path = Some(write("client.crt", &certificate_pem));
+    settings.registrar_endpoint.client_key_path = Some(write("client.key", &key_pem));
+}
+
 /// The projection reads exactly three members and tolerates every other
 /// one, so the CLI's inventory can grow a field without breaking a
 /// daemon that never looks at it.
@@ -763,6 +792,7 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
     settings.registrar.audit_record_dir = unmounted_store.join("records");
 
     configure_valid_profile_certificate(&mut settings, &deployment);
+    configure_registrar_surface_material(&mut settings, &deployment);
 
     let role_id = deployment.path().join("role-id");
     let secret_id = deployment.path().join("secret-id");
@@ -1131,6 +1161,7 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
     settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
     settings.registrar.open_audit_store_as_test_user = true;
     configure_valid_profile_certificate(&mut settings, &deployment);
+    configure_registrar_surface_material(&mut settings, &deployment);
     let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
         .expect("bind a test endpoint through the production adoption seam");
 
@@ -1210,6 +1241,56 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
         .await
         .expect("the directory daemon task joins")
         .expect("the directory daemon shuts down cleanly");
+}
+
+/// An enabled endpoint whose certificate renewal cannot be armed is a
+/// daemon failure too, and for the same reason the handler's own
+/// dependencies are: the endpoint owes both leaves an adapter and both
+/// accessor entries, and one that served without them would run two
+/// certificates to expiry under a daemon that never noticed. The
+/// refusal happens before anything is spawned, so the accept task is
+/// never reached.
+#[tokio::test]
+async fn an_unarmable_registrar_renewal_stops_the_daemon() {
+    let deployment = Deployment::arrange();
+    let mut settings = deployment.settings_with_endpoint(true);
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    settings.registrar.open_audit_store_as_test_user = true;
+    configure_valid_profile_certificate(&mut settings, &deployment);
+    configure_registrar_surface_material(&mut settings, &deployment);
+
+    // The one thing start-time issuance guarantees, taken back: a leaf
+    // on disk whose lifetime cannot be observed.
+    let client_cert = settings
+        .registrar_endpoint
+        .client_cert_path
+        .clone()
+        .expect("the fixture configured a client certificate");
+    std::fs::write(&client_cert, "not a certificate\n").expect("clobber the client leaf");
+
+    let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+    let error = run_daemon(DaemonInvocation {
+        settings: Arc::new(settings),
+        default_eab: None,
+        eab_refresh_path: None,
+        config_path: Some(deployment.path().join("agent.toml")),
+        insecure_mode: false,
+        cli_overrides: crate::config::CliOverrides::default(),
+        shutdown: DaemonShutdown::new(),
+        registrar_endpoint: endpoint.registrar_endpoint(),
+    })
+    .await
+    .expect_err("an endpoint whose renewal cannot be armed must stop the daemon");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("arming certificate renewal for the enabled registrar endpoint"),
+        "the failure names what could not be armed: {rendered}"
+    );
+    assert!(
+        rendered.contains(&client_cert.display().to_string()),
+        "the failure names the leaf it could not observe: {rendered}"
+    );
 }
 
 /// A production audit-store failure remains a daemon failure: directory mode

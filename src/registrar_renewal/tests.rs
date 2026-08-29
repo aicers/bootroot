@@ -480,6 +480,36 @@ async fn initialization_records_both_leaves_without_attempting_anything() {
     }
 }
 
+/// An enabled endpoint owes both leaves an entry, and a failed attempt
+/// has no lifetime to make a missing one with. A leaf that cannot be
+/// observed therefore refuses the adapter, so the daemon refuses to
+/// serve rather than running an endpoint one of whose certificates
+/// nothing tracks.
+#[tokio::test]
+async fn a_leaf_that_cannot_be_observed_refuses_the_adapter() {
+    let harness = Harness::build();
+    let pair = harness.pair(SurfaceLeaf::RegistrarClient);
+    std::fs::write(&pair.cert_path, "not a certificate\n").expect("clobber the live leaf");
+
+    let refusal = RegistrarCertRenewal::try_for_test(
+        Arc::clone(&harness.settings),
+        harness.plan.clone(),
+        Arc::clone(&harness.endpoint),
+        cadence(),
+    )
+    .await;
+
+    let Err(error) = refusal else {
+        panic!("a leaf that cannot be observed must refuse the adapter");
+    };
+
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&pair.cert_path.display().to_string()),
+        "the refusal names the certificate it could not observe: {rendered}"
+    );
+}
+
 /// The accessor is empty until something initializes it, which is what a
 /// disabled endpoint leaves behind: no adapter is built, so no entry
 /// exists and nothing is ever asked of `OpenBao` or the CA.
@@ -547,6 +577,104 @@ fn a_failure_retains_the_lifetime_a_success_replaces() {
         }
     );
     assert_eq!(entry.attempted_at, Some(failed_at));
+}
+
+/// The adapter is armed before the invocation spawns anything, which is
+/// what makes the refusal above a refusal to serve: `run_daemon` cannot
+/// reach the accept task with a preparation it could not complete. The
+/// same guarantee `the_registrar_service_is_resolved_before_anything_is_spawned`
+/// makes about the handler, asserted the same way, because the ordering
+/// lives in one function and nothing else can observe it.
+#[test]
+fn the_adapter_is_armed_before_anything_is_spawned() {
+    let source = include_str!("../daemon.rs");
+    let body = source
+        .split("pub(crate) async fn run_daemon")
+        .nth(1)
+        .expect("run_daemon is in that file");
+    let armed_at = body
+        .find("prepare_registrar_cert_renewal(")
+        .expect("run_daemon arms the renewal adapter");
+    let first_spawn = body
+        .find("tokio::spawn")
+        .expect("run_daemon spawns something");
+    assert!(
+        armed_at < first_spawn,
+        "renewal is armed before anything is spawned, so an endpoint whose adapter could not \
+         be prepared never reaches the accept task"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The cadence
+// ---------------------------------------------------------------------
+
+/// Writes the rendered internal agent config the cadence is read off,
+/// with `extra` appended to its sole profile.
+fn write_internal_agent_config(secrets_dir: &Path, extra: &str) {
+    let paths = InternalPaths::new(secrets_dir);
+    std::fs::create_dir_all(paths.agent_config().parent().expect("a config directory"))
+        .expect("create the internal credential directory");
+    let base = crate::registrar::internal::render_internal_agent_config(
+        &paths,
+        &crate::registrar::internal::InternalAgentConfigParams {
+            email: "ops@example.internal",
+            server: "https://127.0.0.1:1/acme/acme/directory",
+            domain: TEST_DOMAIN,
+            hostname: TEST_HOST,
+            responder_url: "http://127.0.0.1:1",
+            responder_hmac: &"hmac".into(),
+            eab_kid: None,
+            eab_hmac: None,
+            trusted_ca_sha256: &["a".repeat(64)],
+        },
+    );
+    std::fs::write(paths.agent_config(), format!("{base}{extra}"))
+        .expect("write the internal agent config");
+}
+
+/// The interval, the jitter and the lead time come off the sole
+/// profile, and the retry budget is the daemon's own selection: a
+/// `[profiles.retry]` there wins over the config's top-level `[retry]`,
+/// exactly as it does for a `[[profiles]]` entry the daemon renews.
+#[test]
+fn the_cadence_takes_the_profiles_own_retry_budget() {
+    let dir = TempDir::new().expect("tempdir");
+    write_internal_agent_config(
+        dir.path(),
+        "\n[profiles.daemon]\ncheck_interval = \"2h\"\ncheck_jitter = \"30s\"\n\
+         renew_before = \"24h\"\n\n[profiles.retry]\nbackoff_secs = [7, 11]\n",
+    );
+
+    let cadence = RenewalCadence::from_internal_config(dir.path())
+        .expect("the rendered internal config loads");
+
+    assert_eq!(
+        cadence.retry_backoff,
+        vec![7, 11],
+        "the profile's own retry budget governs registrar issuance"
+    );
+    assert_eq!(cadence.check_interval, Duration::from_hours(2));
+    assert_eq!(cadence.check_jitter, Duration::from_secs(30));
+    assert_eq!(cadence.renew_before, Duration::from_hours(24));
+}
+
+/// Without one, the top-level `[retry]` is the budget — the same
+/// fallback the daemon applies, and no second policy of this module's
+/// own.
+#[test]
+fn the_cadence_falls_back_to_the_top_level_retry_budget() {
+    let dir = TempDir::new().expect("tempdir");
+    write_internal_agent_config(dir.path(), "");
+
+    let cadence = RenewalCadence::from_internal_config(dir.path())
+        .expect("the rendered internal config loads");
+
+    assert_eq!(
+        cadence.retry_backoff,
+        vec![5, 15, 60],
+        "the rendered config's own [retry] table is the fallback"
+    );
 }
 
 // ---------------------------------------------------------------------

@@ -69,7 +69,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   never gains a leaf fingerprint. A caller reloads per dial: it rereads
   the pair every time and, because the two files are published by
   separate renames, retries a momentarily mismatched pair up to five
-  reads before failing rather than presenting it.
+  reads before failing rather than presenting it. A host that enables the
+  endpoint but cannot arm that loop — no usable internal agent
+  configuration, or a leaf on disk that no longer parses — now fails to
+  start and says so, instead of serving certificates nothing would renew.
 - `bootroot-agent` now rotates `OpenBao`'s file audit device on a host
   whose registrar endpoint is enabled, so the deployment no longer needs
   an external rotator against it. Every 60 seconds the daemon renames the

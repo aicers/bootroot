@@ -2021,6 +2021,12 @@ is what a trust-anchor rotation under a running daemon leaves behind. Where the
 endpoint is disabled nothing of this exists: no pass runs and nothing is asked
 of OpenBao or the CA.
 
+Arming that loop is part of starting. An enabled endpoint whose renewal cannot
+be prepared — a rendered internal agent configuration that is missing or no
+longer loads, a deployment state file that cannot be resolved, a leaf
+certificate on disk that no longer parses — fails the daemon start with a named
+error instead of serving on two certificates nothing would renew.
+
 A renewal is published as a transaction. The replacement is issued, validated
 and turned into a complete next TLS configuration **before** any live file is
 written: its key must be the leaf's, a client replacement must carry the same

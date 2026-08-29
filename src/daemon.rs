@@ -194,7 +194,19 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
 
     #[cfg(target_os = "linux")]
-    let registrar_service = resolve_registrar_service(&registrar_endpoint, &settings).await?;
+    let registrar_service = match resolve_registrar_service(&registrar_endpoint, &settings).await? {
+        // Armed here, beside the other dependency the accept task cannot
+        // run without, and before anything at all is spawned: an enabled
+        // endpoint owes both leaves a renewal adapter and both accessor
+        // entries, so one that cannot arm them fails the invocation
+        // rather than serving without them.
+        Some((endpoint, built)) => {
+            let renewal =
+                prepare_registrar_cert_renewal(&settings, &endpoint, insecure_mode).await?;
+            Some((endpoint, built, renewal))
+        }
+        None => None,
+    };
     #[cfg(not(target_os = "linux"))]
     let _ = &registrar_endpoint;
     let profile_locks = Arc::new(ProfileLocks::new());
@@ -219,23 +231,16 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     let mut handles = Vec::new();
 
     #[cfg(target_os = "linux")]
-    let registrar_maintenance = if let Some((endpoint, built)) = registrar_service {
+    let registrar_maintenance = if let Some((endpoint, built, renewal)) = registrar_service {
         let BuiltRegistrarHandler {
             handler,
             maintenance,
         } = built;
-        // Before the accept task, deliberately: the adapter initializes
-        // the per-leaf renewal state from the certificates start-time
-        // issuance has already made usable, and that reading happens
-        // before the endpoint begins serving.
-        spawn_registrar_cert_renewal(
-            &mut handles,
-            &settings,
-            Arc::clone(&endpoint),
-            insecure_mode,
-            &shutdown_rx,
-        )
-        .await;
+        // Before the accept task, deliberately: the adapter has already
+        // initialized the per-leaf renewal state from the certificates
+        // start-time issuance made usable, and its loop starts before
+        // the endpoint begins serving.
+        spawn_registrar_cert_renewal(&mut handles, renewal, &shutdown_rx);
         spawn_registrar_endpoint(
             &mut handles,
             endpoint,
@@ -860,48 +865,54 @@ fn spawn_registrar_endpoint(
     }));
 }
 
-/// Spawns the adapter that keeps the registrar surface's two leaves
+/// Arms the adapter that keeps the registrar surface's two leaves
 /// valid, when the endpoint is enabled.
 ///
-/// Called with the endpoint already activated and *before* the accept
-/// task is spawned, so the per-leaf renewal state is initialized from
-/// the certificates start-time issuance ensured, and is initialized
-/// before the endpoint serves anything. The handle joins with every
-/// other daemon task, and the adapter takes the same shutdown watch.
+/// Called with the endpoint already activated and **before** anything is
+/// spawned, for the reason [`resolve_registrar_service`] gives about its
+/// own `?`: an enabled endpoint owes both leaves a renewal adapter and
+/// both accessor entries, and one that serves without them is a surface
+/// whose two certificates expire under a daemon that will never notice.
+/// A rendered internal `agent.toml` that is missing or malformed, a
+/// deployment state file that cannot be resolved or a leaf whose
+/// certificate no longer parses is therefore a loud, named startup
+/// failure and not a warning over a running endpoint.
 ///
-/// A preparation that fails is logged and not a refused start: the
-/// endpoint is already up on material that is usable today, and taking
-/// it down because renewal could not be armed would turn a future
-/// problem into an immediate outage. Nothing is renewed until the next
-/// daemon start in that case, which is what the error line says.
+/// Preparing here also does the reading the ordering requires: the
+/// per-leaf renewal state is initialized from the certificates start-time
+/// issuance ensured, before the endpoint serves anything.
 ///
-/// Where the endpoint is disabled this is never reached at all: no
-/// adapter, no state entry, no renewal work, no `OpenBao` request and no
-/// CA request.
+/// # Errors
+///
+/// Returns whatever [`crate::registrar_renewal::RegistrarCertRenewal::prepare`]
+/// could not resolve or observe.
 #[cfg(target_os = "linux")]
-async fn spawn_registrar_cert_renewal(
-    handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+async fn prepare_registrar_cert_renewal(
     settings: &Arc<config::Settings>,
-    endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    endpoint: &Arc<crate::registrar::endpoint::ActivatedEndpoint>,
     insecure_mode: bool,
-    shutdown_rx: &watch::Receiver<bool>,
-) {
-    let renewal = match crate::registrar_renewal::RegistrarCertRenewal::prepare(
+) -> anyhow::Result<crate::registrar_renewal::RegistrarCertRenewal> {
+    crate::registrar_renewal::RegistrarCertRenewal::prepare(
         Arc::clone(settings),
-        endpoint,
+        Arc::clone(endpoint),
         insecure_mode,
     )
     .await
-    {
-        Ok(renewal) => renewal,
-        Err(err) => {
-            error!(
-                "Registrar certificate renewal could not be armed, so neither registrar leaf \
-                 will be renewed under this daemon: {err:#}"
-            );
-            return;
-        }
-    };
+    .context("arming certificate renewal for the enabled registrar endpoint")
+}
+
+/// Spawns the already-armed renewal adapter's loop.
+///
+/// The handle joins with every other daemon task, and the adapter takes
+/// the same shutdown watch. Where the endpoint is disabled this is never
+/// reached at all: no adapter, no state entry, no renewal work, no
+/// `OpenBao` request and no CA request.
+#[cfg(target_os = "linux")]
+fn spawn_registrar_cert_renewal(
+    handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    renewal: crate::registrar_renewal::RegistrarCertRenewal,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
     let shutdown_rx = shutdown_rx.clone();
     handles.push(tokio::spawn(renewal.run(shutdown_rx)));
 }
@@ -1267,7 +1278,14 @@ fn reload_profile_or_fallback(
     }
 }
 
-fn select_retry_backoff<'a>(
+/// Returns the issuance backoff one profile is renewed under.
+///
+/// The profile's own `[profiles.retry]` wins where it has one, and the
+/// top-level `[retry]` is the fallback. Shared with the registrar
+/// surface's renewal adapter, whose two leaves have no `[[profiles]]`
+/// entry of their own but are governed by the same policy read off the
+/// rendered internal agent config's sole profile.
+pub(crate) fn select_retry_backoff<'a>(
     settings: &'a config::Settings,
     profile: &'a config::DaemonProfileSettings,
 ) -> &'a [u64] {

@@ -82,7 +82,7 @@ use anyhow::{Context as _, Result};
 use rustls::pki_types::{CertificateDer, UnixTime};
 use time::OffsetDateTime;
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::cert_group::{CERT_FILE_MODE, CertGroupPolicy, KEY_FILE_MODE_DEFAULT};
 use crate::config::Settings;
@@ -191,10 +191,11 @@ impl RegistrarCertRenewalState {
 
     /// Records a successful attempt: the new `notAfter`, and when it ran.
     ///
-    /// Creates the entry when initialization could not read the
-    /// certificate that was there — that leaf has no lifetime to retain
-    /// and no entry, and this attempt has just given it one. Every other
-    /// write updates in place.
+    /// Written as an insert rather than an in-place update because it is
+    /// the one write that carries its own lifetime; initialization has
+    /// already made the entry on every enabled endpoint, since an
+    /// adapter whose accessor was missing one is refused before the
+    /// endpoint serves.
     pub(crate) fn record_success(
         &self,
         leaf: SurfaceLeaf,
@@ -222,7 +223,9 @@ impl RegistrarCertRenewalState {
     ///
     /// A leaf with no entry gets none here: the entry's whole content is
     /// a lifetime a failure retains, and a failed attempt has no
-    /// lifetime to put in one.
+    /// lifetime to put in one. Nothing in the daemon reaches that case —
+    /// preparation refuses an endpoint whose leaves it could not
+    /// observe, so both entries exist before the first pass.
     pub(crate) fn record_failure(&self, leaf: SurfaceLeaf, reason: &str, at: OffsetDateTime) {
         self.with(|entries| {
             if let Some(entry) = entries.get_mut(&leaf) {
@@ -688,7 +691,10 @@ pub(crate) struct RenewalCadence {
     pub(crate) check_jitter: Duration,
     /// How far ahead of `notAfter` a leaf becomes due.
     pub(crate) renew_before: Duration,
-    /// The issuance backoff, in seconds per retry.
+    /// The issuance backoff, in seconds per retry: the sole profile's
+    /// own `[profiles.retry]` where it has one, and the config's
+    /// top-level `[retry]` otherwise, selected exactly as the daemon
+    /// selects it for a `[[profiles]]` entry.
     pub(crate) retry_backoff: Vec<u64>,
 }
 
@@ -719,7 +725,13 @@ impl RenewalCadence {
             check_interval: profile.daemon.check_interval,
             check_jitter: profile.daemon.check_jitter,
             renew_before: profile.daemon.renew_before,
-            retry_backoff: internal.retry.backoff_secs.clone(),
+            // The daemon's own selection, not a copy of the top-level
+            // table: the loader lets that profile carry a
+            // `[profiles.retry]` of its own, and a registrar leaf issued
+            // under a different budget from the profile it takes every
+            // other cadence value from would be a second retry policy
+            // wearing the first one's name.
+            retry_backoff: daemon::select_retry_backoff(&internal, profile).to_vec(),
         })
     }
 }
@@ -744,17 +756,23 @@ impl RegistrarCertRenewal {
     /// Initialization is not an attempt: it reads each enabled leaf's
     /// valid certificate, records its `notAfter` against
     /// [`RenewalAttempt::NeverAttempted`] with no timestamp, and
-    /// contacts neither `OpenBao` nor the CA. A leaf whose certificate
-    /// cannot be read or parsed gets no entry and is left to the first
-    /// pass, which finds it due and issues a replacement — start-time
-    /// issuance has already ensured usable material, so reaching that is
-    /// a file that changed underneath the daemon.
+    /// contacts neither `OpenBao` nor the CA.
+    ///
+    /// A leaf whose certificate cannot be read or parsed fails the
+    /// preparation instead of being left to the first pass. An enabled
+    /// endpoint owes both leaves an entry, and a failure has no lifetime
+    /// to create one with — so tolerating it here is how an endpoint
+    /// comes to serve with a leaf nothing reports on. Start-time
+    /// issuance has already made both pairs usable, so reaching this is
+    /// a file that changed underneath the daemon, and the caller's
+    /// refusal to serve names it.
     ///
     /// # Errors
     ///
     /// Returns an error when the deployment state file, the rendered
     /// internal agent config or the configured material paths cannot be
-    /// resolved.
+    /// resolved, or when either leaf's certificate cannot be read or
+    /// parsed.
     pub(crate) async fn prepare(
         settings: Arc<Settings>,
         endpoint: Arc<ActivatedEndpoint>,
@@ -763,7 +781,7 @@ impl RegistrarCertRenewal {
         let plan = resolve_surface_plan(&settings)
             .context("resolving the registrar surface renewal plan")?;
         let cadence = RenewalCadence::from_internal_config(&plan.secrets_dir)?;
-        Ok(Self::assemble(settings, plan, endpoint, cadence, insecure_mode).await)
+        Self::assemble(settings, plan, endpoint, cadence, insecure_mode).await
     }
 
     /// Initializes the accessor and assembles the adapter around an
@@ -773,26 +791,31 @@ impl RegistrarCertRenewal {
     /// production initialization, pass and publication paths over a plan
     /// it wrote under `tempfile::tempdir()`, without a deployment state
     /// file to resolve them from.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a leaf's certificate cannot be read or
+    /// parsed, so that no adapter exists whose accessor is missing one
+    /// of the two entries an enabled endpoint owes.
     async fn assemble(
         settings: Arc<Settings>,
         plan: SurfacePlan,
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
         insecure_mode: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         let state = RegistrarCertRenewalState::default();
         for pair in &plan.pairs {
-            match observed_not_after(&pair.cert_path).await {
-                Ok(not_after) => state.initialize(pair.leaf, not_after),
-                Err(err) => warn!(
-                    "Registrar renewal could not read {} at {} to record its lifetime ({err:#}); \
-                     the first pass will treat it as due.",
+            let not_after = observed_not_after(&pair.cert_path).await.with_context(|| {
+                format!(
+                    "recording the lifetime of the {} at {}",
                     pair.leaf.label(),
                     pair.cert_path.display()
-                ),
-            }
+                )
+            })?;
+            state.initialize(pair.leaf, not_after);
         }
-        Self {
+        Ok(Self {
             settings,
             plan,
             endpoint,
@@ -800,7 +823,7 @@ impl RegistrarCertRenewal {
             cadence,
             insecure_mode,
             live: Box::new(FilesystemPaths::new()),
-        }
+        })
     }
 
     /// The assembly step alone, for a test that has its own plan.
@@ -811,6 +834,24 @@ impl RegistrarCertRenewal {
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
     ) -> Self {
+        Self::try_for_test(settings, plan, endpoint, cadence)
+            .await
+            .expect("the fixture writes both leaves before the adapter reads them")
+    }
+
+    /// The same step, for a test that drives its refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`RegistrarCertRenewal::assemble`] could not
+    /// observe.
+    #[cfg(test)]
+    pub(crate) async fn try_for_test(
+        settings: Arc<Settings>,
+        plan: SurfacePlan,
+        endpoint: Arc<ActivatedEndpoint>,
+        cadence: RenewalCadence,
+    ) -> Result<Self> {
         Self::assemble(settings, plan, endpoint, cadence, false).await
     }
 
