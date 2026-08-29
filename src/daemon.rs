@@ -224,6 +224,18 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
             handler,
             maintenance,
         } = built;
+        // Before the accept task, deliberately: the adapter initializes
+        // the per-leaf renewal state from the certificates start-time
+        // issuance has already made usable, and that reading happens
+        // before the endpoint begins serving.
+        spawn_registrar_cert_renewal(
+            &mut handles,
+            &settings,
+            Arc::clone(&endpoint),
+            insecure_mode,
+            &shutdown_rx,
+        )
+        .await;
         spawn_registrar_endpoint(
             &mut handles,
             endpoint,
@@ -848,6 +860,52 @@ fn spawn_registrar_endpoint(
     }));
 }
 
+/// Spawns the adapter that keeps the registrar surface's two leaves
+/// valid, when the endpoint is enabled.
+///
+/// Called with the endpoint already activated and *before* the accept
+/// task is spawned, so the per-leaf renewal state is initialized from
+/// the certificates start-time issuance ensured, and is initialized
+/// before the endpoint serves anything. The handle joins with every
+/// other daemon task, and the adapter takes the same shutdown watch.
+///
+/// A preparation that fails is a warning and not a refused start: the
+/// endpoint is already up on material that is usable today, and taking
+/// it down because renewal could not be armed would turn a future
+/// problem into an immediate outage. Nothing is renewed until the next
+/// daemon start in that case, which is what the warning says.
+///
+/// Where the endpoint is disabled this is never reached at all: no
+/// adapter, no state entry, no renewal work, no `OpenBao` request and no
+/// CA request.
+#[cfg(target_os = "linux")]
+async fn spawn_registrar_cert_renewal(
+    handles: &mut Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    settings: &Arc<config::Settings>,
+    endpoint: Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    insecure_mode: bool,
+    shutdown_rx: &watch::Receiver<bool>,
+) {
+    let renewal = match crate::registrar_renewal::RegistrarCertRenewal::prepare(
+        Arc::clone(settings),
+        endpoint,
+        insecure_mode,
+    )
+    .await
+    {
+        Ok(renewal) => renewal,
+        Err(err) => {
+            error!(
+                "Registrar certificate renewal could not be armed, so neither registrar leaf \
+                 will be renewed under this daemon: {err:#}"
+            );
+            return;
+        }
+    };
+    let shutdown_rx = shutdown_rx.clone();
+    handles.push(tokio::spawn(renewal.run(shutdown_rx)));
+}
+
 /// Spawns the task that rotates `OpenBao`'s file audit device, when
 /// this host is one whose device the daemon owns.
 ///
@@ -1278,7 +1336,30 @@ pub(crate) async fn should_renew(
     trust: &config::TrustSettings,
     renew_before: Duration,
 ) -> anyhow::Result<bool> {
-    let cert_bytes = match tokio::fs::read(&profile.paths.cert).await {
+    should_renew_certificate(&profile.paths.cert, trust, renew_before).await
+}
+
+/// The same rule, over a certificate path alone.
+///
+/// Split out so the registrar surface's two leaves — which have no
+/// `[[profiles]]` entry and never will — are judged by this predicate
+/// rather than by a second one written beside it. The lead-time gate,
+/// the chain-drift gate and the `ca_bundle_path`-unconfigured opt-out
+/// are all this function's, so there is one eligibility rule in the
+/// daemon and not two.
+///
+/// # Errors
+///
+/// Returns an error if the certificate cannot be parsed or read for
+/// reasons other than `NotFound`. Chain-verification failures or a
+/// missing/unreadable bundle force a reissue rather than abort the
+/// renewal loop.
+pub(crate) async fn should_renew_certificate(
+    cert_path: &Path,
+    trust: &config::TrustSettings,
+    renew_before: Duration,
+) -> anyhow::Result<bool> {
+    let cert_bytes = match tokio::fs::read(cert_path).await {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             info!("Certificate file not found. Issuing a new certificate.");
@@ -1287,7 +1368,7 @@ pub(crate) async fn should_renew(
         Err(err) => {
             return Err(anyhow::anyhow!(
                 "Failed to read certificate file {}: {err}",
-                profile.paths.cert.display()
+                cert_path.display()
             ));
         }
     };
@@ -1311,7 +1392,7 @@ pub(crate) async fn should_renew(
                 Ok(false) => {
                     warn!(
                         "Certificate at {} no longer chains to CA bundle at {}; reissuing.",
-                        profile.paths.cert.display(),
+                        cert_path.display(),
                         bundle_path.display()
                     );
                     return Ok(true);
@@ -1319,7 +1400,7 @@ pub(crate) async fn should_renew(
                 Err(err) => {
                     warn!(
                         "Chain verification of {} against {} failed ({err}); reissuing.",
-                        profile.paths.cert.display(),
+                        cert_path.display(),
                         bundle_path.display()
                     );
                     return Ok(true);

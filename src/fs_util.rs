@@ -1085,6 +1085,20 @@ impl FixedOwner {
         }
     }
 
+    /// The uid and gid a rollback snapshot recorded off the file it is
+    /// about to put back.
+    ///
+    /// The one production owner that is not stated as `root:root`, and
+    /// it states nothing of its own: restoring a file means restoring
+    /// the owner it had, so the ids come off the file that was
+    /// captured rather than from a policy. A publish that cannot
+    /// establish them fails and leaves the destination untouched,
+    /// which is what a rollback that cannot restore has to do.
+    #[must_use]
+    pub fn restored(uid: u32, gid: u32) -> Self {
+        Self { uid, gid }
+    }
+
     /// Whether this owner is `root:root`, which is what every
     /// production caller asks for and what the failure message names.
     fn is_root(self) -> bool {

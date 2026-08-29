@@ -381,7 +381,13 @@ async fn handshake(
     accepted_at: Instant,
 ) -> Option<tokio_rustls::server::TlsStream<UnixStream>> {
     let deadline = accepted_at + HANDSHAKE_TIMEOUT;
-    match timeout_at(deadline, endpoint.tls_acceptor().accept(stream)).await {
+    // Loaded here, immediately before the handshake, rather than held
+    // for the life of the accept loop: a renewal that exchanged the
+    // active configuration is in force from this connection onwards,
+    // and one that lands while this handshake runs leaves it on the
+    // configuration it started with.
+    let acceptor = endpoint.tls_acceptor();
+    match timeout_at(deadline, acceptor.accept(stream)).await {
         Ok(Ok(tls)) => Some(tls),
         Ok(Err(err)) => {
             warn!(

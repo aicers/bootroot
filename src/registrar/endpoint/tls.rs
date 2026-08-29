@@ -31,13 +31,22 @@
 //!   the outbound path applies. It is never built with
 //!   `allow_unauthenticated()`: a caller presenting no certificate
 //!   fails the handshake rather than arriving unauthenticated.
-//! - **The swap seam.** [`EndpointCertResolver`] holds the presented
-//!   [`CertifiedKey`] behind an `RwLock` and swaps it under the next
-//!   handshake with no restart. [`rustls::ServerConfig`] keeps only an
+//! - **The swap seam.** A renewal replaces the endpoint's *whole*
+//!   configuration rather than the material it presents, through
+//!   [`super::ActivatedEndpoint::swap_active_tls`]: the old acceptor
+//!   retains the old client verifier, so replacing only the presented
+//!   certificate would leave a trust-anchor rotation undecided until a
+//!   restart. [`build_server_config_from_staged`] is what builds that
+//!   replacement, from a pair and from the exact bytes the merged CA
+//!   bundle *will* hold, so the whole configuration exists before any
+//!   live path changes.
+//!
+//!   [`EndpointCertResolver`] is the typed handle inside it.
+//!   [`rustls::ServerConfig`] keeps only an
 //!   `Arc<dyn ResolvesServerCert>` and the trait does not extend `Any`,
-//!   so the typed handle is returned alongside the configuration and
-//!   retained by [`super::ActivatedEndpoint`]; there is no way back to
-//!   it from a built configuration.
+//!   so it is returned alongside the configuration and retained beside
+//!   the acceptor it built; there is no way back to it from a built
+//!   configuration.
 //!
 //! # Where a refusal is decided
 //!
@@ -258,10 +267,17 @@ impl EndpointCertResolver {
     /// Replaces the certificate and key presented from the next
     /// handshake onwards, with no restart and without disturbing a
     /// connection already established.
-    // Certificate renewal for the endpoint leaf is a sibling issue, so
-    // until it lands the only caller of the seam is the test that
-    // proves it is reachable from the `ActivatedEndpoint` the daemon
-    // holds.
+    ///
+    /// This is **not** what a renewal uses, and it is documented here so
+    /// that stays visible: the acceptor around this resolver keeps the
+    /// client verifier it was built with, so a swap here changes what
+    /// the endpoint presents and nothing about who may connect. A
+    /// renewal exchanges the whole configuration through
+    /// [`super::ActivatedEndpoint::swap_active_tls`] instead.
+    // Nothing in production replaces the presented material alone, for
+    // the reason above; the method stays because it is the resolver's
+    // whole reason for being a typed handle, and it is exercised where
+    // that handle is reached from the endpoint the daemon holds.
     #[allow(dead_code)]
     pub(crate) fn swap(&self, certified_key: CertifiedKey) {
         let mut guard = self
@@ -332,10 +348,80 @@ pub(crate) fn build_server_config(
             setting: TRUSTED_CA_SETTING,
         });
     }
-    let pin_set: HashSet<String> = pins.iter().map(|pin| pin.to_ascii_lowercase()).collect();
-    let anchors = pinned_bundle_anchors(bundle_path, &pin_set)?;
+    let bundle_bytes = read_file(bundle_path, CA_BUNDLE_SETTING)?;
+    assemble_server_config(
+        certified_key,
+        &expected_name,
+        cert_path,
+        bundle_path,
+        &bundle_bytes,
+        pins,
+    )
+}
 
-    self_check(&certified_key, cert_path, &expected_name, &pin_set)?;
+/// Builds the endpoint's *next* configuration from material a renewal
+/// already has in hand, without reading the live CA bundle.
+///
+/// The difference from [`build_server_config`] is the bundle: this takes
+/// the exact bytes the merged bundle *will* hold once publication
+/// succeeds, so the incoming client verifier is built from the
+/// post-merge anchor set and the whole configuration is finished before
+/// any live path changes. Everything else — the pair load, the key
+/// match, the endpoint-SAN rule, the pinned-anchor restriction and the
+/// caller's own self-check — is the same code on the same rules.
+///
+/// The anchor set is still exactly the pinned subset of those bytes.
+/// The endpoint pin file decides whether a *replacement server leaf* is
+/// safe for pinned callers and is not consulted here; the returned
+/// issuer chain on its own, the unpinned remainder of the bundle and
+/// the system roots are all equally not anchors.
+///
+/// # Errors
+///
+/// The same [`EndpointTlsError`]s [`build_server_config`] returns,
+/// except the ones about reading the bundle file: those bytes arrived
+/// as an argument.
+pub(crate) fn build_server_config_from_staged(
+    server_cert_path: &Path,
+    server_key_path: &Path,
+    ca_bundle_path: &Path,
+    ca_bundle_bytes: &[u8],
+    pins: &[String],
+    domain: &str,
+) -> Result<(Arc<ServerConfig>, Arc<EndpointCertResolver>), EndpointTlsError> {
+    tls::install_crypto_provider();
+
+    let certified_key = load_certified_key(server_cert_path, server_key_path)?;
+    let expected_name = endpoint_san(&certified_key, server_cert_path, domain)?;
+    if pins.is_empty() {
+        return Err(EndpointTlsError::MissingSetting {
+            setting: TRUSTED_CA_SETTING,
+        });
+    }
+    assemble_server_config(
+        certified_key,
+        &expected_name,
+        server_cert_path,
+        ca_bundle_path,
+        ca_bundle_bytes,
+        pins,
+    )
+}
+
+/// The half both builders share: the pinned anchor set, the caller's own
+/// self-check, and the mutually-authenticated configuration itself.
+fn assemble_server_config(
+    certified_key: CertifiedKey,
+    expected_name: &str,
+    cert_path: &Path,
+    bundle_path: &Path,
+    bundle_bytes: &[u8],
+    pins: &[String],
+) -> Result<(Arc<ServerConfig>, Arc<EndpointCertResolver>), EndpointTlsError> {
+    let pin_set: HashSet<String> = pins.iter().map(|pin| pin.to_ascii_lowercase()).collect();
+    let anchors = pinned_bundle_anchors(bundle_path, bundle_bytes, &pin_set)?;
+
+    self_check(&certified_key, cert_path, expected_name, &pin_set)?;
 
     let roots =
         tls::certs_to_root_store(&anchors).map_err(|err| EndpointTlsError::ClientVerifier {
@@ -444,11 +530,11 @@ fn leaf_of<'a>(
 /// has no meaning for client authentication.
 fn pinned_bundle_anchors(
     bundle_path: &Path,
+    contents: &[u8],
     pins: &HashSet<String>,
 ) -> Result<Vec<CertificateDer<'static>>, EndpointTlsError> {
-    let contents = read_file(bundle_path, CA_BUNDLE_SETTING)?;
     let certs =
-        tls::parse_pem_to_cert_list(&contents).map_err(|_| EndpointTlsError::Unparsable {
+        tls::parse_pem_to_cert_list(contents).map_err(|_| EndpointTlsError::Unparsable {
             setting: CA_BUNDLE_SETTING,
             path: bundle_path.to_path_buf(),
         })?;

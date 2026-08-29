@@ -107,6 +107,31 @@ const DIAL_NAME: &str = "registrar-endpoint.invalid";
 /// The one response member success and refusal are told apart by.
 const REFUSAL_DISCRIMINATOR: &str = "class";
 
+/// How many times one dial reads the client pair before it gives up on
+/// finding a matching one.
+///
+/// The writer publishes the pair with two separate renames, so a reader
+/// that lands between them sees the new certificate beside the old key,
+/// or the old certificate beside the new key. That window is the
+/// writer's whole publication step and is over in microseconds, so what
+/// closes it is a short bounded retry rather than a lock: the reader
+/// re-reads both files and keeps whichever read finds a matching pair.
+const CLIENT_MATERIAL_READS: usize = 5;
+
+/// The waits between those reads — one after each of the first four
+/// mismatches, and none after the fifth, which is the read the typed
+/// mismatch is reported from.
+///
+/// This is a fixed local policy of the reader's, and deliberately not
+/// the daemon's issuance-retry backoff: it is measured against one
+/// `rename(2)` pair on the same host, not against a CA that is down.
+const CLIENT_MATERIAL_BACKOFF: [Duration; CLIENT_MATERIAL_READS - 1] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+    Duration::from_millis(8),
+];
+
 /// Which half of the exchange an I/O failure interrupted.
 ///
 /// The one thing an [`io::Error`] cannot say by itself: whether the
@@ -188,6 +213,26 @@ pub(crate) enum ClientMaterialError {
     NoPrivateKey {
         /// The path that was handed to the client.
         path: PathBuf,
+    },
+    /// Every read of the pair found a key that is not the leaf's.
+    ///
+    /// A renewal in flight leaves that state for the length of one
+    /// `rename(2)`, and the bounded re-read above is what rides it out;
+    /// reaching this means the two files disagreed on every read, which
+    /// is a misconfiguration rather than a race. Neither path's bytes
+    /// are named: one of them is key material.
+    #[error(
+        "registrar client certificate {} and key {} did not match on any of {reads} reads",
+        .certificate_path.display(),
+        .key_path.display()
+    )]
+    KeyMismatch {
+        /// The certificate path that was handed to the client.
+        certificate_path: PathBuf,
+        /// The key path that was handed to the client.
+        key_path: PathBuf,
+        /// How many reads found a mismatch.
+        reads: usize,
     },
     /// The pair parsed but `rustls` will not authenticate with it.
     #[error(
@@ -712,8 +757,12 @@ fn load_dial_config(
     certificate_path: &Path,
     key_path: &Path,
 ) -> Result<ClientConfig, ExchangeError> {
-    let (chain, key) = load_client_material(certificate_path, key_path)
-        .map_err(|source| ExchangeError::Material { source })?;
+    // `std::thread::sleep` because this whole function is already on
+    // Tokio's blocking pool, where blocking the thread is what the pool
+    // is for. The waits are microseconds against one `rename(2)` pair.
+    let (chain, key) =
+        load_matching_client_material(certificate_path, key_path, std::thread::sleep)
+            .map_err(|source| ExchangeError::Material { source })?;
     build_client_config(pin_file, expected_endpoint_name, chain, key).map_err(|err| match err {
         ClientConfigError::Pin(source) => ExchangeError::Pin { source },
         ClientConfigError::ClientAuth(source) => ExchangeError::Material {
@@ -758,13 +807,89 @@ pub(crate) fn build_client_config(
         .map_err(ClientConfigError::ClientAuth)
 }
 
+/// Reads the pair until the key is the leaf's, or reports that it never
+/// was.
+///
+/// This is the reader's half of the publication contract. The writer
+/// stages the certificate and the key and `rename(2)`s them one after
+/// the other, so the pair is not published atomically even though
+/// neither file is ever truncated: a dial landing between the two
+/// renames sees a certificate and a key that are not each other's.
+/// Presenting that pair would fail the handshake with a signature error
+/// that says nothing about what really happened, so it is never
+/// presented — the reader re-reads instead, up to
+/// [`CLIENT_MATERIAL_READS`] times with the
+/// [`CLIENT_MATERIAL_BACKOFF`] waits between them, and returns the
+/// typed [`ClientMaterialError::KeyMismatch`] only once every read has
+/// disagreed.
+///
+/// `wait` is a parameter so the policy is drivable without real waits:
+/// a test asserts the exact delays it is asked for, and can publish a
+/// matching pair from inside one of them.
+///
+/// A read that fails for any *other* reason — an absent file, an
+/// unreadable one, a certificate PEM the parser refuses — is returned
+/// at once and is not retried. Those are not races, and re-reading them
+/// only delays the diagnostic.
+///
+/// # Errors
+///
+/// Returns whatever [`load_client_material`] reported, or
+/// [`ClientMaterialError::KeyMismatch`] when every read found a key
+/// that is not the leaf's.
+fn load_matching_client_material(
+    certificate_path: &Path,
+    key_path: &Path,
+    mut wait: impl FnMut(Duration),
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ClientMaterialError> {
+    for read in 0..CLIENT_MATERIAL_READS {
+        let (chain, key) = load_client_material(certificate_path, key_path)?;
+        if client_pair_matches(&chain, &key) {
+            return Ok((chain, key));
+        }
+        debug!(
+            certificate = %certificate_path.display(),
+            read = read + 1,
+            "The registrar client pair did not match; re-reading it."
+        );
+        if let Some(delay) = CLIENT_MATERIAL_BACKOFF.get(read) {
+            wait(*delay);
+        }
+    }
+    Err(ClientMaterialError::KeyMismatch {
+        certificate_path: certificate_path.to_path_buf(),
+        key_path: key_path.to_path_buf(),
+        reads: CLIENT_MATERIAL_READS,
+    })
+}
+
+/// Reports whether the loaded key is the loaded leaf's.
+///
+/// The proof is a signature, through the same helper the endpoint's own
+/// loader uses, so there is one matching rule on both sides of the
+/// connection rather than two.
+///
+/// A key `rustls` cannot sign with at all is *not* reported as a
+/// mismatch: re-reading it would find the same key five times and then
+/// blame a race that never happened, so it is passed through for
+/// `with_client_auth_cert` to refuse with
+/// [`ClientMaterialError::Unusable`], which names the real fault.
+fn client_pair_matches(chain: &[CertificateDer<'static>], key: &PrivateKeyDer<'static>) -> bool {
+    let Some(leaf) = chain.first() else {
+        return false;
+    };
+    let Ok(signing_key) = rustls::crypto::ring::sign::any_supported_type(key) else {
+        return true;
+    };
+    crate::tls::cert_key_matches(leaf, signing_key.as_ref())
+}
+
 /// Loads the registrar client leaf and its key from disk.
 ///
-/// The single seam every dial's material comes through. It does the
-/// plain load and nothing more: it does not verify that the key matches
-/// the leaf, does not retry a pair that is momentarily torn by a
-/// renewal, and does not inspect `notAfter`. Later work that owns those
-/// reasons adds them here rather than restructuring the dial path.
+/// The plain load, and nothing more: it does not decide whether the key
+/// is the leaf's and it does not inspect `notAfter`. The matching rule
+/// and the bounded re-read that rides out a renewal's torn pair live in
+/// [`load_matching_client_material`], which is what the dial path calls.
 ///
 /// # Errors
 ///

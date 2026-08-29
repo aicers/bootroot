@@ -35,7 +35,12 @@
 //! - [`tls`] is the mutually-authenticated transport the connection is
 //!   wrapped in: the server material the endpoint presents, the
 //!   verifier every client certificate is built against, and the
-//!   resolver a renewal swaps new material through.
+//!   assembly a renewal builds a whole replacement configuration with.
+//!   The replacement is exchanged here, through
+//!   [`ActivatedEndpoint::swap_active_tls`], and the accept loop loads
+//!   the active configuration immediately before each handshake — so a
+//!   renewal takes effect from the next connection with no restart, no
+//!   signal and no socket rebind.
 //! - [`serve`] is the accept loop, the bounded connection fleet and the
 //!   drain-then-abort shutdown.
 //! - [`client`] is the other end of all of it: this repository's
@@ -109,7 +114,7 @@ mod tests;
 
 use std::os::unix::io::{FromRawFd as _, RawFd};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -218,15 +223,29 @@ pub(crate) struct ActivatedEndpoint {
     listener: UnixListener,
     socket_path: PathBuf,
     daemon_uid: u32,
-    acceptor: TlsAcceptor,
-    // The certificate resolver is retained for exactly one consumer,
-    // and that consumer — renewal for the endpoint leaf — is a sibling
-    // issue. It has to be retained now because there is no way back to
-    // the concrete resolver from a built `ServerConfig`, so a build
-    // that dropped it would leave renewal with nothing to swap
-    // through. Reachability is asserted through `cert_resolver`.
-    resolver: Arc<EndpointCertResolver>,
+    // The acceptor and the resolver that built it, replaced together
+    // and never one without the other. Replacing only the resolver
+    // would leave the old acceptor — and with it the old *client*
+    // verifier — deciding every later handshake, so a trust-anchor
+    // rotation that changed who may connect would not take effect until
+    // a restart. One `Arc` is swapped wholesale instead, under a lock
+    // that is taken and released inside a synchronous accessor.
+    active: RwLock<Arc<ActiveTls>>,
     domain: String,
+}
+
+/// The endpoint's live TLS configuration: what a handshake is run
+/// against, and the typed resolver inside it.
+///
+/// The resolver is retained beside the acceptor because
+/// [`rustls::ServerConfig`] keeps only an `Arc<dyn ResolvesServerCert>`
+/// and the trait does not extend `Any`, so there is no way back to the
+/// concrete type from a built configuration. Keeping the two together
+/// is what makes [`ActivatedEndpoint::cert_resolver`] always the
+/// resolver of the acceptor that is actually serving.
+pub(crate) struct ActiveTls {
+    acceptor: TlsAcceptor,
+    resolver: Arc<EndpointCertResolver>,
 }
 
 impl ActivatedEndpoint {
@@ -245,25 +264,64 @@ impl ActivatedEndpoint {
         self.daemon_uid
     }
 
+    /// Returns the configuration in force at the moment of the call.
+    ///
+    /// Loaded immediately before each handshake rather than held for the
+    /// life of the accept loop, so a renewal that exchanged the active
+    /// configuration is in force from the very next handshake with no
+    /// restart. The read lock is taken and released inside this
+    /// synchronous call and never held across an `.await`; what comes
+    /// out is one `Arc`, so a swap concurrent with this call publishes
+    /// the whole replacement or none of it.
+    ///
+    /// A poisoned lock recovers the guard instead of panicking: a panic
+    /// elsewhere in the process must not take the endpoint's handshakes
+    /// down with it, and the value behind the lock is replaced wholesale
+    /// so there is no half-written state to inherit.
+    pub(crate) fn active_tls(&self) -> Arc<ActiveTls> {
+        Arc::clone(&self.active.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
     /// Returns the acceptor every accepted connection is handed to.
-    pub(crate) fn tls_acceptor(&self) -> &TlsAcceptor {
-        &self.acceptor
+    pub(crate) fn tls_acceptor(&self) -> TlsAcceptor {
+        self.active_tls().acceptor.clone()
     }
 
     /// Returns the resolver that decides which certificate the next
     /// handshake presents.
     ///
-    /// This is the whole of the renewal seam. [`rustls::ServerConfig`]
-    /// keeps only an `Arc<dyn ResolvesServerCert>`, and the trait does
-    /// not extend `Any`, so code holding the configuration or the
-    /// acceptor cannot reach the concrete resolver at all — it survives
-    /// here or nowhere.
-    // The renewal work that calls this is a sibling issue, so until it
-    // lands nothing outside a test reaches the accessor. It exists now
-    // so that work needs nothing from this one.
+    /// Always the resolver of the acceptor currently serving, because
+    /// the two are swapped together.
+    // Renewal replaces the whole configuration rather than the
+    // presented material alone — the old acceptor would otherwise keep
+    // the old client verifier — so nothing outside a test reaches this
+    // accessor. It stays because it is the one way back to the concrete
+    // resolver, which a built `ServerConfig` does not offer.
     #[allow(dead_code)]
-    pub(crate) fn cert_resolver(&self) -> &Arc<EndpointCertResolver> {
-        &self.resolver
+    pub(crate) fn cert_resolver(&self) -> Arc<EndpointCertResolver> {
+        Arc::clone(&self.active_tls().resolver)
+    }
+
+    /// Exchanges the whole active configuration, from the next handshake
+    /// onwards.
+    ///
+    /// Infallible by construction: the replacement is built in full by
+    /// the caller before any live file is touched, so by the time this
+    /// runs there is nothing left that can fail. Connections already
+    /// established, and handshakes already in flight, keep the
+    /// configuration they started with; nothing is dropped, the socket
+    /// is not rebound and no signal is sent.
+    pub(crate) fn swap_active_tls(
+        &self,
+        config: Arc<rustls::ServerConfig>,
+        resolver: Arc<EndpointCertResolver>,
+    ) {
+        let replacement = Arc::new(ActiveTls {
+            acceptor: TlsAcceptor::from(config),
+            resolver,
+        });
+        let mut guard = self.active.write().unwrap_or_else(PoisonError::into_inner);
+        *guard = replacement;
     }
 
     /// Returns the configured `network.domain` the presented client
@@ -496,8 +554,10 @@ pub(crate) fn adopt(
         listener,
         socket_path,
         daemon_uid: effective_uid,
-        acceptor: TlsAcceptor::from(server_config),
-        resolver,
+        active: RwLock::new(Arc::new(ActiveTls {
+            acceptor: TlsAcceptor::from(server_config),
+            resolver,
+        })),
         domain,
     }))
 }

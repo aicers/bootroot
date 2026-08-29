@@ -747,6 +747,186 @@ async fn a_pem_key_rustls_will_not_load_fails_before_the_dial() {
     assert_eq!(double.observed().connections, 0);
 }
 
+// ---------------------------------------------------------------------
+// The per-dial reload contract
+// ---------------------------------------------------------------------
+
+/// A reader that lands between the writer's two renames sees a
+/// certificate and a key that are not each other's, and re-reads until
+/// it finds a pair that is — it never presents the mismatch.
+///
+/// The torn state is published from inside the retry's own wait, so the
+/// case is deterministic and costs no wall-clock time: nothing sleeps,
+/// and the pair is repaired at exactly the point the reader is about to
+/// look again.
+#[test]
+fn a_reader_between_the_two_renames_retries_until_the_pair_matches() {
+    let deployment = Deployment::new();
+
+    // The state the *first* rename leaves: the new certificate beside
+    // the old key.
+    let renewed_cert = deployment.pki.path("renewed.crt");
+    let renewed_key = deployment.pki.path("renewed.key");
+    write_leaf_material(
+        &deployment.pki.ca,
+        vec![dns_san(&registrar_client_name())],
+        &renewed_cert,
+        &renewed_key,
+        true,
+    );
+    std::fs::copy(&renewed_cert, &deployment.certificate_path).expect("the first rename");
+
+    let waits = StdMutex::new(Vec::new());
+    let (chain, key) = super::load_matching_client_material(
+        &deployment.certificate_path,
+        &deployment.key_path,
+        |delay| {
+            waits.lock().expect("not poisoned").push(delay);
+            // The second rename, landing while the reader waits.
+            std::fs::copy(&renewed_key, &deployment.key_path).expect("the second rename");
+        },
+    )
+    .expect("the reader finds the matching pair");
+
+    assert_eq!(
+        waits.into_inner().expect("not poisoned"),
+        vec![Duration::from_millis(1)],
+        "one mismatch costs one wait, and the next read finds the pair"
+    );
+    assert!(
+        super::client_pair_matches(&chain, &key),
+        "the loader never returns a pair it knows is mismatched"
+    );
+    assert_eq!(
+        chain.first().map(|leaf| leaf.as_ref().to_vec()),
+        Some(
+            rustls_pemfile::certs(&mut std::io::BufReader::new(
+                std::fs::read(&renewed_cert)
+                    .expect("read the renewed leaf")
+                    .as_slice()
+            ))
+            .next()
+            .expect("one certificate")
+            .expect("it parses")
+            .as_ref()
+            .to_vec()
+        ),
+        "the pair it returns is the renewed one, not the pre-rename one"
+    );
+}
+
+/// A pair that never matches costs exactly five reads and the four
+/// documented waits, and then returns the typed mismatch rather than
+/// presenting anything.
+#[test]
+fn a_permanent_mismatch_reads_five_times_and_returns_the_typed_error() {
+    let deployment = Deployment::new();
+    // A key from a different leaf, and nothing repairs it.
+    let (_certificate, key) =
+        issue_leaf(&deployment.pki.ca, vec![dns_san(&registrar_client_name())]);
+    std::fs::write(&deployment.key_path, key.serialize_pem()).expect("write the foreign key");
+
+    let waits = StdMutex::new(Vec::new());
+    let err = super::load_matching_client_material(
+        &deployment.certificate_path,
+        &deployment.key_path,
+        |delay| waits.lock().expect("not poisoned").push(delay),
+    )
+    .expect_err("a pair that never matches is never presented");
+
+    assert!(
+        matches!(
+            err,
+            ClientMaterialError::KeyMismatch { reads, .. } if reads == super::CLIENT_MATERIAL_READS
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        waits.into_inner().expect("not poisoned"),
+        vec![
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+            Duration::from_millis(8),
+        ],
+        "four waits after the first four of five reads, and none after the fifth"
+    );
+}
+
+/// The mismatch never reaches the socket: a dial whose pair is
+/// permanently torn opens no connection.
+#[tokio::test]
+async fn a_permanently_torn_pair_never_reaches_the_socket() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+    let (_certificate, key) =
+        issue_leaf(&deployment.pki.ca, vec![dns_san(&registrar_client_name())]);
+    std::fs::write(&deployment.key_path, key.serialize_pem()).expect("write the foreign key");
+
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a torn pair is refused before the dial");
+
+    assert!(
+        matches!(
+            err,
+            ExchangeError::Material {
+                source: ClientMaterialError::KeyMismatch { .. }
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(double.observed().connections, 0);
+}
+
+/// The next dial rereads the pair, so a renewal that landed between two
+/// requests is presented without the caller being recreated or told.
+#[tokio::test]
+async fn the_next_dial_presents_a_renewed_pair_without_recreating_the_caller() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+    let client = deployment.client();
+
+    client
+        .mint(register_request())
+        .await
+        .expect("the first exchange succeeds");
+    let first = double
+        .observed()
+        .peer_leaves
+        .first()
+        .cloned()
+        .expect("the double saw the first client leaf");
+
+    // A renewal replaces the pair under the same paths, exactly as the
+    // publication does.
+    write_leaf_material(
+        &deployment.pki.ca,
+        vec![dns_san(&registrar_client_name())],
+        &deployment.certificate_path,
+        &deployment.key_path,
+        true,
+    );
+
+    client
+        .mint(register_request())
+        .await
+        .expect("the second exchange succeeds over the renewed pair");
+    let second = double
+        .observed()
+        .peer_leaves
+        .get(1)
+        .cloned()
+        .expect("the double saw a second client leaf");
+
+    assert_ne!(
+        first, second,
+        "the same client presented the renewed leaf on its next dial"
+    );
+}
+
 #[tokio::test]
 async fn a_request_over_the_frame_bound_is_refused_locally() {
     let deployment = Deployment::new();

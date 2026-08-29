@@ -53,7 +53,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   material is in date starts having asked nothing of `OpenBao` or of the
   CA, and its certificates and keys survive the restart byte-identically.
   An already-expired leaf is repaired at start, before the endpoint's TLS
-  material loads, rather than at the first renewal tick.
+  material loads, rather than at the first renewal tick. Both leaves are
+  then kept valid on the daemon's own loop, under the cadence, lead time
+  and retry settings of the bootroot-internal profile: a leaf is replaced
+  when it falls inside lead time or stops chaining to `[trust]
+  ca_bundle_path`, and the replacement is issued off to one side and
+  fully validated — its key, its name, and for the endpoint leaf an
+  anchor the endpoint pin file already names — before anything live is
+  written. A publication that fails restores every file it reached, and
+  the endpoint keeps serving what it was serving. A successful one
+  exchanges the whole active TLS configuration at once, so the next
+  handshake presents the renewed leaf and accepts callers under the
+  renewed trust anchors with no restart, no signal, no socket rebind and
+  no dropped connection. The endpoint pin file is never rewritten and
+  never gains a leaf fingerprint. A caller reloads per dial: it rereads
+  the pair every time and, because the two files are published by
+  separate renames, retries a momentarily mismatched pair up to five
+  reads before failing rather than presenting it.
 - `bootroot-agent` now rotates `OpenBao`'s file audit device on a host
   whose registrar endpoint is enabled, so the deployment no longer needs
   an external rotator against it. Every 60 seconds the daemon renames the
