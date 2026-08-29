@@ -1336,8 +1336,8 @@ records:
      ! -type d ! -type f -exec false {} +
    find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
    cd <audit_store_dir>.pre-mount
-   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
-     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' \
+     > "$SCRATCH"/meta.source.raw
    sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
    sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
@@ -1345,8 +1345,14 @@ records:
    sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
    xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
    cd <audit_store_dir>
-   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
-     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   if [ -d <audit_store_dir>.pre-mount/lost+found ] \
+     && [ ! -L <audit_store_dir>.pre-mount/lost+found ]; then
+     find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\0' \
+       > "$SCRATCH"/meta.destination.raw
+   else
+     find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+       -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   fi
    sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
    find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
    sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
@@ -1447,13 +1453,25 @@ afterwards. The metadata pass carries the **hard-link count**, so a copy
 that expanded one source inode into two destination files fails even
 though every path matches on type, mode, ownership, size and content.
 Directory sizes and modification times are excluded, both differing
-legitimately between two filesystems. So is `lost+found`, and only where
-it is a directory at a tree's own root: `mkfs.ext4` creates it in every
-reserve it makes, so it stands on a side the copy did not put it on and
-would fault every correct migration. Only that one entry is exempt —
-anything underneath it is still compared under its `lost+found/…` path,
-so nothing is smuggled past the verification by being put there. A
-mismatch is decided by exit status, never by reading output.
+legitimately between two filesystems. `lost+found` is dropped from the
+**destination** manifest alone, and only where it is a directory at that
+tree's own root **and** the source root holds no directory of that name:
+`mkfs.ext4` creates it in every reserve it makes, so a source without one
+would otherwise be faulted for a record the copy did not put there. Which
+of the two destination walks runs is decided by the shell at the moment
+it runs them, from the source it is about to be compared against — so a
+source that *does* carry one, as the live store of
+[the replacement procedure](#changing-the-reserve) does, being itself a
+mounted reserve, has that directory's type, mode, numeric uid and gid and
+link count compared like any other directory's, and a mismatch on it
+stops the sequence before the closing rename. The test is spelled `-d`
+**and not** `-L` because `test -d` answers for a symbolic link's target
+and nothing in this procedure follows one, which is what `find -type d`
+also does. Only ever that one entry, and only on that one side — anything
+underneath it is still compared under its `lost+found/…` path, so nothing
+is smuggled past the verification by being put there, and a regular file
+merely bearing the name is compared in full. A mismatch is decided by exit
+status, never by reading output.
 
 **Resume and rollback.** Both are rendered, both are idempotent, and
 bootroot performs neither.

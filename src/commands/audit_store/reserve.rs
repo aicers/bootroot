@@ -4990,7 +4990,7 @@ mod tests {
                     "find '{STORE}' -xdev -mindepth 1 ! -type d ! -type f -exec false {{}} +"
                 ),
                 format!("cd '{HOLDING}'"),
-                "find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\) -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.source.raw".to_string(),
+                "find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.source.raw".to_string(),
                 "sort -z -o \"$SCRATCH\"/meta.source \"$SCRATCH\"/meta.source.raw".to_string(),
                 "find . -xdev -mindepth 1 -type f -printf '%s %P\\0' > \"$SCRATCH\"/size.source.raw".to_string(),
                 "sort -z -o \"$SCRATCH\"/size.source \"$SCRATCH\"/size.source.raw".to_string(),
@@ -4998,7 +4998,14 @@ mod tests {
                 "sort -z -o \"$SCRATCH\"/files.source \"$SCRATCH\"/files.source.raw".to_string(),
                 "xargs -0 -r sha256sum --binary --zero < \"$SCRATCH\"/files.source > \"$SCRATCH\"/content.source".to_string(),
                 format!("cd '{STORE}'"),
-                "find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\) -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.destination.raw".to_string(),
+                // The one asymmetry: `mke2fs`'s own directory is
+                // dropped from the destination manifest alone, and
+                // only where the source root holds no directory of
+                // that name — decided by the shell against the source
+                // it is about to be compared with.
+                format!(
+                    "if [ -d '{HOLDING}/lost+found' ] && [ ! -L '{HOLDING}/lost+found' ]; then find . -xdev -mindepth 1 -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.destination.raw; else find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\) -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.destination.raw; fi"
+                ),
                 "sort -z -o \"$SCRATCH\"/meta.destination \"$SCRATCH\"/meta.destination.raw".to_string(),
                 "find . -xdev -mindepth 1 -type f -printf '%s %P\\0' > \"$SCRATCH\"/size.destination.raw".to_string(),
                 "sort -z -o \"$SCRATCH\"/size.destination \"$SCRATCH\"/size.destination.raw".to_string(),
