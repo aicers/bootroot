@@ -1053,9 +1053,11 @@ pub enum StagedOwner {
 /// The owner is an input rather than a constant so the real staging,
 /// chown and rename path can be driven in a test that is not root. It
 /// is not an input an operator can reach: [`FixedOwner::root`] is the
-/// only constructor outside `cfg(test)`, so no configuration key,
-/// environment variable or public API can move a protected file off
-/// uid 0 / gid 0.
+/// only `pub` constructor, so no configuration key, environment
+/// variable or public API can move a protected file off uid 0 / gid 0.
+/// `restored` is `pub(crate)` and states nothing of its own — it carries
+/// back the ids a rollback snapshot read off the file it is putting
+/// back — and `current_process` is `cfg(test)`-gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedOwner {
     uid: u32,
@@ -1094,8 +1096,16 @@ impl FixedOwner {
     /// captured rather than from a policy. A publish that cannot
     /// establish them fails and leaves the destination untouched,
     /// which is what a rollback that cannot restore has to do.
+    ///
+    /// `pub(crate)` rather than `pub`: it is reached from the registrar
+    /// renewal's rollback and from nowhere else, and widening it would
+    /// hand a caller outside this crate the one way to publish a
+    /// protected file under an owner that is not root.
+    // That one caller is the renewal adapter, which exists on Linux
+    // alone.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[must_use]
-    pub fn restored(uid: u32, gid: u32) -> Self {
+    pub(crate) fn restored(uid: u32, gid: u32) -> Self {
         Self { uid, gid }
     }
 

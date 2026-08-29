@@ -27,6 +27,7 @@ use crate::config::{RegistrarEndpointSettings, Settings};
 use crate::registrar::endpoint;
 use crate::registrar::endpoint::activation::ActivationContract;
 use crate::registrar::endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE;
+use crate::registrar::internal::PrivateKeyPem;
 
 const TEST_DOMAIN: &str = "corp.example.internal";
 const TEST_HOST: &str = "bootroot-01";
@@ -93,7 +94,7 @@ impl TestCa {
         let (leaf_pem, key_pem) = self.issue(name, not_before_days, not_after_days);
         IssuedMaterial {
             cert_pem: format!("{leaf_pem}{}", self.pem),
-            key_pem,
+            key_pem: PrivateKeyPem::new(key_pem),
             chain: vec![self.der()],
         }
     }
@@ -675,7 +676,7 @@ async fn a_conforming_candidate_is_accepted_for_both_leaves() {
         validate_candidate(
             leaf,
             material.cert_pem.as_bytes(),
-            material.key_pem.as_bytes(),
+            material.key_pem.expose().as_bytes(),
             &pair.name,
             TEST_DOMAIN,
             &harness.pin_file(),
@@ -697,7 +698,7 @@ async fn a_mismatched_key_or_a_drifted_name_is_refused() {
     let rejection = validate_candidate(
         SurfaceLeaf::RegistrarClient,
         material.cert_pem.as_bytes(),
-        other.key_pem.as_bytes(),
+        other.key_pem.expose().as_bytes(),
         &pair.name,
         TEST_DOMAIN,
         &harness.pin_file(),
@@ -715,7 +716,7 @@ async fn a_mismatched_key_or_a_drifted_name_is_refused() {
     let rejection = validate_candidate(
         SurfaceLeaf::RegistrarClient,
         drifted.cert_pem.as_bytes(),
-        drifted.key_pem.as_bytes(),
+        drifted.key_pem.expose().as_bytes(),
         &pair.name,
         TEST_DOMAIN,
         &harness.pin_file(),
@@ -743,7 +744,7 @@ async fn a_server_candidate_under_an_unpinned_anchor_is_refused() {
     let rejection = validate_candidate(
         SurfaceLeaf::EndpointServer,
         material.cert_pem.as_bytes(),
-        material.key_pem.as_bytes(),
+        material.key_pem.expose().as_bytes(),
         &pair.name,
         TEST_DOMAIN,
         &harness.pin_file(),
@@ -763,7 +764,7 @@ async fn a_server_candidate_under_an_unpinned_anchor_is_refused() {
     validate_candidate(
         SurfaceLeaf::RegistrarClient,
         client_material.cert_pem.as_bytes(),
-        client_material.key_pem.as_bytes(),
+        client_material.key_pem.expose().as_bytes(),
         &client.name,
         TEST_DOMAIN,
         &harness.pin_file(),
@@ -1021,6 +1022,51 @@ async fn an_unpinned_server_candidate_changes_no_live_or_active_state() {
     assert!(entry.attempted_at.is_some(), "a refusal stamps its time");
 }
 
+/// A publication that reached the active configuration is recorded as a
+/// success: the accessor takes the *published* certificate's lifetime,
+/// stamps the attempt, and no artifact survives it.
+///
+/// The three injections below drive the same entry point on their
+/// failure halves. This is the other half, and the only place
+/// `record_success` is reached from a real publication rather than from
+/// the accessor's own unit test — the lifetime it writes has to be the
+/// new certificate's and not the one initialization observed.
+#[tokio::test]
+async fn a_published_renewal_records_the_new_lifetime_and_a_success() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let state = renewal.state();
+    let pair = harness.pair(SurfaceLeaf::EndpointServer);
+    let before = state.leaf(pair.leaf).expect("initialization made an entry");
+    assert_eq!(before.attempt, RenewalAttempt::NeverAttempted);
+    assert!(before.attempted_at.is_none());
+
+    // The live leaf runs to 30 days; the candidate to 60.
+    let material = harness.ca.material(&pair.name, -1, 60);
+    renewal
+        .renew_leaf_with_material(&pair, material)
+        .await
+        .expect("a conforming candidate publishes");
+
+    let after = state.leaf(pair.leaf).expect("the entry survives");
+    assert_eq!(after.attempt, RenewalAttempt::Succeeded);
+    assert!(
+        after.not_after > before.not_after,
+        "a success replaces the lifetime with the published certificate's, not the one \
+         initialization observed"
+    );
+    assert!(after.attempted_at.is_some(), "a success stamps its time");
+    assert_eq!(
+        state
+            .leaf(SurfaceLeaf::RegistrarClient)
+            .expect("an entry")
+            .attempt,
+        RenewalAttempt::NeverAttempted,
+        "renewing one leaf is never an attempt against the other"
+    );
+    assert_no_artifacts_left(&pair.key_path);
+}
+
 /// A bundle write that fails restores the bundle, leaves the pair and
 /// the active configuration alone, and cleans every private artifact.
 #[tokio::test]
@@ -1152,6 +1198,38 @@ fn assert_no_artifacts_left(neighbour: &Path) {
     assert!(
         leftovers.is_empty(),
         "private renewal artifacts must be removed on every exit: {leftovers:?}"
+    );
+}
+
+/// A cleanup that fails is reported but does not turn a publication
+/// into a failed attempt.
+///
+/// The leaf really was replaced and the active configuration really was
+/// exchanged; calling that failed would retain the lifetime the *old*
+/// certificate had against the new one, which is the single value the
+/// accessor exists to state correctly. A publication that failed carries
+/// the cleanup's error alongside its own instead.
+#[test]
+fn a_cleanup_failure_does_not_make_a_published_renewal_a_failed_attempt() {
+    fold_cleanup(Ok(()), Ok(()), SurfaceLeaf::EndpointServer).expect("a clean attempt succeeds");
+    fold_cleanup(
+        Ok(()),
+        Err(anyhow::anyhow!("the working directory would not unlink")),
+        SurfaceLeaf::EndpointServer,
+    )
+    .expect("a published renewal is a success whatever the cleanup did");
+
+    let err = fold_cleanup(
+        Err(anyhow::anyhow!("the bundle write failed")),
+        Err(anyhow::anyhow!("the working directory would not unlink")),
+        SurfaceLeaf::EndpointServer,
+    )
+    .expect_err("a failed publication stays failed");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("the bundle write failed"), "{rendered}");
+    assert!(
+        rendered.contains("the working directory would not unlink"),
+        "the cleanup's own failure is reported rather than hidden: {rendered}"
     );
 }
 

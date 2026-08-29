@@ -12,6 +12,7 @@ use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
 use crate::cert_group::CertGroupPolicy;
 use crate::fs_util;
+use crate::registrar::internal::PrivateKeyPem;
 
 fn contact_from_email(email: &str) -> String {
     if email.starts_with("mailto:") {
@@ -511,7 +512,12 @@ pub(crate) struct IssuedMaterial {
     /// [`IssuanceOptions::leaf_publication`] selects.
     pub(crate) cert_pem: String,
     /// The private key, as PEM. Every issuance generates a fresh one.
-    pub(crate) key_pem: String,
+    ///
+    /// Wrapped rather than bare, because this value is now carried in a
+    /// struct: the `Debug` above would otherwise print the key of every
+    /// certificate this crate issues into whatever log line, trace field
+    /// or error chain first rendered one.
+    pub(crate) key_pem: PrivateKeyPem,
     /// The issuer chain the CA returned, as DER, with the leaf removed.
     ///
     /// Empty when `trust.ca_bundle_path` is unconfigured, where the
@@ -626,7 +632,7 @@ async fn publish_issued_material(
         &profile.paths.cert,
         &profile.paths.key,
         &material.cert_pem,
-        &material.key_pem,
+        material.key_pem.expose(),
         policy,
     )
     .await?;
@@ -722,7 +728,7 @@ async fn run_issuance(
 
     Ok(Some(IssuedMaterial {
         cert_pem,
-        key_pem: cert_key.serialize_pem(),
+        key_pem: PrivateKeyPem::new(cert_key.serialize_pem()),
         chain,
     }))
 }

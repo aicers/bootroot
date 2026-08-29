@@ -21,7 +21,11 @@ const FINGERPRINT_HEX_LEN: usize = 64;
 /// The opening of every PEM block header.
 const PEM_OPENING: &str = "-----BEGIN ";
 
-/// The internal leaf's private key, in PEM.
+/// A private key held in memory, in PEM.
+///
+/// Named here because the internal leaf's key was the first of them,
+/// and reached from wherever else this crate carries one — an ACME
+/// issuance's fresh key on its way to publication is the other.
 ///
 /// A newtype whose `Debug` prints `<redacted>`, following the verb
 /// layer's `WrappedSecretIdToken`: a `#[derive(Debug)]` on anything that

@@ -869,11 +869,11 @@ fn spawn_registrar_endpoint(
 /// before the endpoint serves anything. The handle joins with every
 /// other daemon task, and the adapter takes the same shutdown watch.
 ///
-/// A preparation that fails is a warning and not a refused start: the
+/// A preparation that fails is logged and not a refused start: the
 /// endpoint is already up on material that is usable today, and taking
 /// it down because renewal could not be armed would turn a future
 /// problem into an immediate outage. Nothing is renewed until the next
-/// daemon start in that case, which is what the warning says.
+/// daemon start in that case, which is what the error line says.
 ///
 /// Where the endpoint is disabled this is never reached at all: no
 /// adapter, no state entry, no renewal work, no `OpenBao` request and no

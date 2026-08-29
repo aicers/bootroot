@@ -956,26 +956,41 @@ impl RegistrarCertRenewal {
     /// Split at exactly the point the ACME exchange ends, so a test
     /// drives the whole publication path over material it minted itself
     /// without a CA to reach.
+    ///
+    /// The cleanup is not part of the attempt's outcome. A publication
+    /// that reached the active configuration renewed the leaf, and
+    /// recording it as failed because a `0700` directory beside the pair
+    /// would not unlink would retain the *old* `notAfter` against a leaf
+    /// that has just been replaced — which is the one thing the accessor
+    /// exists to state correctly. The removal's own failure is reported
+    /// rather than hidden either way: attached to the error a failed
+    /// attempt already carries, and logged beside the success otherwise.
     async fn renew_leaf_with_material(
         &self,
         pair: &SurfacePairPaths,
         material: crate::acme::IssuedMaterial,
     ) -> Result<()> {
+        // Read off the candidate rather than off the file it becomes,
+        // and read before the publication rather than after it, for the
+        // reason above: these are the exact bytes `write_pair` puts at
+        // `cert_path`, so it is the published certificate's lifetime
+        // either way, but a *read-back* is one more thing that can fail
+        // after the swap has already happened — and a failure there
+        // would record `failed` against a leaf that had in fact just
+        // been replaced.
+        let not_after =
+            daemon::parse_cert_not_after(material.cert_pem.as_bytes()).with_context(|| {
+                format!(
+                    "parsing the candidate {} to record the lifetime a publication would give it",
+                    pair.leaf.label()
+                )
+            })?;
         let artifacts = Artifacts::create(&pair.key_path)?;
         let outcome = self.publish_candidate(pair, &material, &artifacts).await;
-        // Removed on every exit, whatever the outcome was, and the
-        // removal's own failure is reported rather than hidden.
+        // Removed on every exit, whatever the outcome was.
         let cleanup = artifacts.close();
-        let outcome = match (outcome, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(err), Ok(())) | (Ok(()), Err(err)) => Err(err),
-            (Err(err), Err(cleanup)) => Err(err.context(format!(
-                "and the private renewal artifacts could not be removed: {cleanup:#}"
-            ))),
-        };
-        outcome?;
+        fold_cleanup(outcome, cleanup, pair.leaf)?;
 
-        let not_after = observed_not_after(&pair.cert_path).await?;
         self.state
             .record_success(pair.leaf, not_after, OffsetDateTime::now_utc());
         info!(
@@ -1046,7 +1061,7 @@ impl RegistrarCertRenewal {
         validate_candidate(
             pair.leaf,
             material.cert_pem.as_bytes(),
-            material.key_pem.as_bytes(),
+            material.key_pem.expose().as_bytes(),
             &pair.name,
             &self.settings.domain,
             &pin_file,
@@ -1075,7 +1090,7 @@ impl RegistrarCertRenewal {
         )?;
         let candidate_key = artifacts.write(
             CANDIDATE_KEY_FILE,
-            material.key_pem.as_bytes(),
+            material.key_pem.expose().as_bytes(),
             KEY_FILE_MODE_DEFAULT,
         )?;
 
@@ -1116,7 +1131,7 @@ impl RegistrarCertRenewal {
                 &pair.cert_path,
                 &pair.key_path,
                 &material.cert_pem,
-                &material.key_pem,
+                material.key_pem.expose(),
             )
             .await
         {
@@ -1228,6 +1243,35 @@ impl RegistrarCertRenewal {
         error!("Registrar renewal of {} failed: {reason}", leaf.label());
         self.state
             .record_failure(leaf, reason, OffsetDateTime::now_utc());
+    }
+}
+
+/// Folds a publication's outcome and its cleanup's into the attempt's.
+///
+/// The cleanup is not part of the attempt. A publication that reached
+/// the active configuration renewed the leaf, and calling that a failed
+/// attempt because a `0700` directory beside the pair would not unlink
+/// would retain the *old* `notAfter` against a leaf that has just been
+/// replaced — the one thing the accessor exists to state correctly.
+///
+/// The removal's own failure is reported rather than hidden either way:
+/// attached to the error a failed attempt already carries, and logged
+/// beside the success otherwise.
+fn fold_cleanup(publication: Result<()>, cleanup: Result<()>, leaf: SurfaceLeaf) -> Result<()> {
+    match (publication, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(cleanup)) => {
+            error!(
+                "Registrar renewal replaced {} but could not remove its private working \
+                 directory: {cleanup:#}",
+                leaf.label()
+            );
+            Ok(())
+        }
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup)) => Err(err.context(format!(
+            "and the private renewal artifacts could not be removed: {cleanup:#}"
+        ))),
     }
 }
 

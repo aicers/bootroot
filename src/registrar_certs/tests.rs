@@ -1559,7 +1559,8 @@ async fn two_off_live_issuances_of_the_same_name_produce_different_keys() {
         .expect("second candidate");
 
     assert_ne!(
-        first.key_pem, second.key_pem,
+        first.key_pem.expose(),
+        second.key_pem.expose(),
         "each issuance must generate a key"
     );
     assert_ne!(first.cert_pem, second.cert_pem);
