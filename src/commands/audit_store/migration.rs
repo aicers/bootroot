@@ -1171,7 +1171,10 @@ mod rendered_sequence {
     /// inside a compound command, and a compound command is exactly
     /// where a failed walk could be swallowed. An `if` reports the
     /// status of the branch it ran, so the sequence still stops there —
-    /// the same fail-closed direction every other stage carries.
+    /// the same fail-closed direction every other stage carries. Both
+    /// branches carry it, so the source root is given a `lost+found`
+    /// once to reach the unfiltered walk and left without one to reach
+    /// the exempting one.
     #[test]
     fn a_failed_destination_walk_inside_the_conditional_still_fails_closed() {
         // The permission bits do nothing for root, so the fixture would
@@ -1179,38 +1182,83 @@ mod rendered_sequence {
         if bootroot::fs_util::current_process_euid() == 0 {
             return;
         }
-        let fixture = fixture();
-        let (guard, copy, verify) = copy_and_verify(&fixture);
-        assert!(run(&fixture.scratch, &[&guard, &copy]));
-        // Listable but not `stat`able: the type guard answers `-type`
-        // from the directory entry's own `d_type` and still exits 0,
-        // and the restriction is on the destination alone, so every
-        // source stage completes and the conditional is reached.
-        let blocked = fixture.destination.join("records");
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o444))
-            .expect("restrict the destination subdirectory");
-        assert!(!run(&fixture.scratch, &[&verify]));
-        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
-            .expect("restore the subdirectory so the fixture can be removed");
+        for source_lost_and_found in [false, true] {
+            let fixture = fixture();
+            if source_lost_and_found {
+                plant_lost_and_found(&fixture.source);
+            }
+            let (guard, copy, verify) = copy_and_verify(&fixture);
+            assert!(run(&fixture.scratch, &[&guard, &copy]));
+            // Listable but not `stat`able: the type guard answers
+            // `-type` from the directory entry's own `d_type` and still
+            // exits 0, and the restriction is on the destination alone,
+            // so every source stage completes and the conditional is
+            // reached.
+            let blocked = fixture.destination.join("records");
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o444))
+                .expect("restrict the destination subdirectory");
+            assert!(
+                !run(&fixture.scratch, &[&verify]),
+                "source lost+found: {source_lost_and_found}"
+            );
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+                .expect("restore the subdirectory so the fixture can be removed");
+        }
     }
 
+    /// What that directory holds carries its `lost+found/…` path into
+    /// all three manifests, so a difference underneath it is caught
+    /// exactly as anywhere else — and would be even where the directory
+    /// entry itself were exempt. One breakage per pass, each over a
+    /// copy that had already passed.
     #[test]
-    fn content_under_lost_and_found_is_still_compared() {
+    fn everything_under_lost_and_found_is_still_compared() {
+        let stray = |fixture: &Fixture| fixture.destination.join("lost+found").join("stray.log");
+        // Metadata: the same bytes at a mode the source never had.
+        let mode_mismatch = |fixture: &Fixture| {
+            fs::set_permissions(stray(fixture), fs::Permissions::from_mode(0o600))
+                .expect("change the mode under lost+found");
+        };
+        // Size: the size pass is `-type f`, so it reaches here.
+        let size_mismatch = |fixture: &Fixture| {
+            fs::write(stray(fixture), b"stray and then some\n").expect("lengthen the entry");
+        };
+        // Content: a same-sized difference, which only the digests see.
+        let content_mismatch = |fixture: &Fixture| {
+            fs::write(stray(fixture), b"other\n").expect("rewrite the entry under lost+found");
+        };
+        for break_it in [
+            &mode_mismatch as &dyn Fn(&Fixture),
+            &size_mismatch,
+            &content_mismatch,
+        ] {
+            let fixture = fixture();
+            fs::write(
+                plant_lost_and_found(&fixture.source).join("stray.log"),
+                b"stray\n",
+            )
+            .expect("a file under lost+found");
+            plant_lost_and_found(&fixture.destination);
+            let (guard, copy, verify) = copy_and_verify(&fixture);
+            assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
+            break_it(&fixture);
+            assert!(!run(&fixture.scratch, &[&verify]));
+        }
+    }
+
+    /// The other side of the same rule. Where the source root holds no
+    /// directory of that name the destination walk does drop one — but
+    /// the exemption is `-path` *and* `-type d` together, so a
+    /// non-directory planted at the destination root under the
+    /// filesystem's own name is recorded and faulted like anything else
+    /// the copy did not put there.
+    #[test]
+    fn a_non_directory_bearing_the_name_at_the_destination_root_is_not_exempt() {
         let fixture = fixture();
-        let stray = plant_lost_and_found(&fixture.source).join("stray.log");
-        fs::write(&stray, b"stray\n").expect("a file under lost+found");
-        plant_lost_and_found(&fixture.destination);
         let (guard, copy, verify) = copy_and_verify(&fixture);
         assert!(run(&fixture.scratch, &[&guard, &copy, &verify]));
-        // What that directory holds carries its `lost+found/…` path
-        // into all three manifests, so a same-sized difference
-        // underneath it is caught exactly as anywhere else — and would
-        // be even where the directory entry itself were exempt.
-        fs::write(
-            fixture.destination.join("lost+found").join("stray.log"),
-            b"other\n",
-        )
-        .expect("rewrite the entry under lost+found");
+        fs::write(fixture.destination.join("lost+found"), b"planted\n")
+            .expect("a regular file the source never had");
         assert!(!run(&fixture.scratch, &[&verify]));
     }
 
@@ -1231,6 +1279,36 @@ mod rendered_sequence {
         )
         .expect("change the mode on the destination");
         assert!(!run(&fixture.scratch, &[&verify]));
+    }
+
+    /// The third shape the name can take. `test -d` answers for a
+    /// symbolic link's *target*, so a link to a directory would read as
+    /// one and send the destination down the unfiltered walk; the
+    /// predicate carries `! -L` beside `-d` so it does not. It never
+    /// gets that far in practice, because this procedure follows no
+    /// link and the type guard refuses one wherever it stands —
+    /// including at the root, under this name.
+    #[test]
+    fn a_symlink_bearing_the_name_at_the_source_root_is_refused_by_the_guard() {
+        let fixture = fixture();
+        // Pointing at a real directory, so the reading `! -L` exists to
+        // rule out is the one available.
+        symlink(
+            fixture.source.join("records"),
+            fixture.source.join("lost+found"),
+        )
+        .expect("a link bearing the name");
+        let messages = test_messages();
+        let refused = first_forbidden_entry(&fixture.source, &HostProbe, &messages)
+            .expect("walk the holding directory")
+            .expect("the link at the root is refused");
+        assert_eq!(
+            refused,
+            (fixture.source.join("lost+found"), FileKind::Symlink)
+        );
+        let (guard, copy, verify) = copy_and_verify(&fixture);
+        assert!(!run(&fixture.scratch, &[&guard]));
+        assert!(!run(&fixture.scratch, &[&guard, &copy, &verify]));
     }
 
     #[test]
