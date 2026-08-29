@@ -28,10 +28,12 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use super::frame::Operation;
+use crate::config::AuditStoreEnforcement;
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
 use crate::registrar::audit::AuditPhase;
 #[cfg(test)]
 use crate::registrar::audit::AuditStoreError;
+use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::error::RegistrarError;
 #[cfg(test)]
 use crate::registrar::identity::{derive_registration_id, validate_request_labels};
@@ -259,15 +261,21 @@ pub(crate) enum EnrollError {
 /// A snapshot of registrar health supplied by the response caller.
 ///
 /// This container is the single place future endpoint signals are added.
-/// Three members are reserved and each already has an owner: `certificates`
-/// is populated by #769, `limiter` by #787, and `audit_capacity` by #774.
-/// Recording the owners fixes neither a member schema nor a value; the
-/// container carries only the limiter member currently owned by #787.
+/// One member is still reserved and already has an owner: `certificates`
+/// is populated by #769. Recording the owner fixes neither a member schema
+/// nor a value; the container carries the limiter member owned by #787 and
+/// the audit-capacity member owned by #774.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistrarHealth {
     /// Limited invocations counted since this daemon started.
     #[serde(default)]
     pub(crate) limiter: LimiterHealth,
+    /// The reserved audit store's capacity alarm and record signals.
+    ///
+    /// Appended after `limiter` so no existing member's serialized
+    /// position changes.
+    #[serde(default)]
+    pub(crate) audit_capacity: AuditCapacityHealth,
 }
 
 /// Process-lifetime counters for the two limiter checkpoints.
@@ -277,6 +285,90 @@ pub(crate) struct LimiterHealth {
     pub(crate) limited_predecision_refusal: u64,
     /// Limits that produced the retryable admission throttle.
     pub(crate) limited_admission: u64,
+}
+
+/// The reserved audit store's measured capacity and record signals.
+///
+/// The four always-present members come from configuration, so a console
+/// can render the alarm without knowing the daemon's settings. The three
+/// capacity measurements are absent exactly while `state` is
+/// [`AuditCapacityState::Unknown`], and the four record signals are absent
+/// exactly until the first scan succeeds — the probe and the scan fail
+/// independently, which is why each half carries its own timestamp.
+///
+/// The container rides refusals as well as successes on purpose. The store
+/// is a fail-closed control, so a success-only signal would stop carrying
+/// the low-water alarm in exactly the state the alarm exists to announce.
+///
+/// [`Default`] exists only so the enclosing container's derived `Default`
+/// keeps compiling for tests; production builds this member from
+/// configuration before the handler can answer anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AuditCapacityHealth {
+    /// The alarm state, decided by the capacity module's ordered rules.
+    pub(crate) state: AuditCapacityState,
+    /// The configured `audit_store_enforcement`, so a `directory`
+    /// deployment cannot be read as an enforced reserve.
+    pub(crate) enforcement: AuditStoreEnforcement,
+    /// The configured `audit_store_reserve_bytes`.
+    pub(crate) reserve_bytes: u64,
+    /// The configured `audit_store_low_water_bytes`.
+    pub(crate) low_water_bytes: u64,
+    /// The store's measured usage, once a probe has succeeded.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) used_bytes: Option<u64>,
+    /// The headroom left, once a probe has succeeded.
+    ///
+    /// Signed: a store that has overrun its reserve has negative
+    /// headroom, and an unsigned field would clamp that to zero and
+    /// report the overrun as the healthiest possible value.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) headroom_bytes: Option<i64>,
+    /// When the last probe succeeded, RFC 3339 in UTC.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339"
+    )]
+    pub(crate) measured_at: Option<OffsetDateTime>,
+    /// Unpaired intent records over the scan window.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) intent_without_outcome: Option<u64>,
+    /// Lines the scan could not parse, over the same window.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) malformed_records: Option<u64>,
+    /// The reader's `retention_short`: the hard size ceiling is winning
+    /// against the soft retention target, so the look-back window the
+    /// detection argument rests on has quietly shrunk.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) retention_shortfall: Option<bool>,
+    /// When the last record scan succeeded, RFC 3339 in UTC.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339"
+    )]
+    pub(crate) records_measured_at: Option<OffsetDateTime>,
 }
 
 /// A response-wrapping token carried only at the serialization boundary.
@@ -852,6 +944,41 @@ mod rfc3339 {
                 "timestamp must use an RFC 3339 UTC Z suffix",
             ))
         }
+    }
+}
+
+mod optional_rfc3339 {
+    use serde::{Deserializer, Serializer};
+    use time::OffsetDateTime;
+
+    // Serde's `with` callback supplies a reference to the field.
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S>(
+        value: &Option<OffsetDateTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => super::rfc3339::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Reads an optional RFC 3339 UTC timestamp, refusing an explicit
+    /// `null` the way every other optional member on this container does.
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw: Option<String> = super::reject_null_option::deserialize(deserializer)?;
+        raw.map_or(Ok(None), |value| {
+            super::rfc3339::deserialize(serde::de::value::StringDeserializer::<D::Error>::new(
+                value,
+            ))
+            .map(Some)
+        })
     }
 }
 
@@ -2291,7 +2418,12 @@ mod tests {
         let encoded = serde_json::to_string(&response).expect("response serializes");
         assert_eq!(
             encoded,
-            r#"{"protocol_version":1,"request_id":"request","class":"retryable","registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}}"#
+            concat!(
+                r#"{"protocol_version":1,"request_id":"request","class":"retryable","#,
+                r#""registrar_health":{"limiter":{"limited_predecision_refusal":0,"#,
+                r#""limited_admission":0},"audit_capacity":{"state":"unknown","#,
+                r#""enforcement":"filesystem","reserve_bytes":0,"low_water_bytes":0}}}"#
+            )
         );
 
         let with_unknown_member = r#"{"protocol_version":1,"request_id":"request","class":"retryable","registrar_health":{},"future":true}"#;
@@ -2309,11 +2441,170 @@ mod tests {
                 limited_predecision_refusal: 3,
                 limited_admission: 5,
             },
+            ..RegistrarHealth::default()
         };
         let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &health)
             .expect("refusal encodes");
         let decoded = decode_refusal_response(&encoded).expect("refusal decodes");
         assert_eq!(decoded.registrar_health, health);
+    }
+
+    /// The bytes `limiter` occupied before this member existed, so a
+    /// test can assert that adding one changed none of them.
+    const LIMITER_MEMBER: &str =
+        r#""limiter":{"limited_predecision_refusal":0,"limited_admission":0}"#;
+
+    #[test]
+    fn the_audit_capacity_member_round_trips_beside_an_unchanged_limiter() {
+        let health = fixture_health();
+        let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &health)
+            .expect("refusal encodes");
+        let text = String::from_utf8(encoded.clone()).expect("the response is UTF-8 JSON");
+        assert!(
+            text.contains(&format!(
+                r#""registrar_health":{{{LIMITER_MEMBER},"audit_capacity":"#
+            )),
+            "the new member is appended after limiter, whose bytes are unchanged: {text}"
+        );
+
+        let decoded = decode_refusal_response(&encoded).expect("refusal decodes");
+        assert_eq!(
+            decoded.registrar_health, health,
+            "the container round-trips"
+        );
+        assert_eq!(
+            decoded.registrar_health.limiter,
+            LimiterHealth::default(),
+            "no limiter byte changed"
+        );
+
+        let capacity = decoded.registrar_health.audit_capacity;
+        assert_eq!(capacity.state, AuditCapacityState::Ok);
+        assert_eq!(capacity.enforcement, AuditStoreEnforcement::Filesystem);
+        assert_eq!(capacity.reserve_bytes, 2_147_483_648);
+        assert_eq!(capacity.low_water_bytes, 536_870_912);
+        assert_eq!(capacity.used_bytes, Some(786_432_000));
+        assert_eq!(capacity.headroom_bytes, Some(1_361_051_648));
+        assert_eq!(capacity.measured_at, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(capacity.intent_without_outcome, Some(0));
+        assert_eq!(capacity.malformed_records, Some(0));
+        assert_eq!(capacity.retention_shortfall, Some(false));
+        assert_eq!(
+            capacity.records_measured_at,
+            Some(OffsetDateTime::UNIX_EPOCH)
+        );
+
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("response is JSON");
+        let member = value
+            .pointer("/registrar_health/audit_capacity")
+            .and_then(serde_json::Value::as_object)
+            .expect("the capacity member is an object");
+        assert_eq!(member.len(), 11, "every specified member is carried");
+        assert_eq!(
+            member.get("state").and_then(serde_json::Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            member
+                .get("enforcement")
+                .and_then(serde_json::Value::as_str),
+            Some("filesystem")
+        );
+        assert!(
+            member
+                .get("headroom_bytes")
+                .is_some_and(serde_json::Value::is_i64),
+            "headroom is a signed integer"
+        );
+        assert_eq!(
+            member
+                .get("measured_at")
+                .and_then(serde_json::Value::as_str),
+            Some("1970-01-01T00:00:00Z"),
+            "both timestamps are RFC 3339 in UTC"
+        );
+    }
+
+    /// The four record members and the three capacity measurements are
+    /// absent exactly when they have not been measured, and an explicit
+    /// `null` is refused rather than read as that absence.
+    #[test]
+    fn capacity_optional_members_are_omitted_rather_than_null_and_null_is_rejected() {
+        let unmeasured = RegistrarHealth {
+            audit_capacity: AuditCapacityHealth {
+                state: AuditCapacityState::Unknown,
+                enforcement: AuditStoreEnforcement::Directory,
+                reserve_bytes: 1,
+                low_water_bytes: 1,
+                ..AuditCapacityHealth::default()
+            },
+            ..RegistrarHealth::default()
+        };
+        let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &unmeasured)
+            .expect("refusal encodes");
+        let text = String::from_utf8(encoded).expect("the response is UTF-8 JSON");
+        for member in [
+            "used_bytes",
+            "headroom_bytes",
+            "measured_at",
+            "intent_without_outcome",
+            "malformed_records",
+            "retention_shortfall",
+            "records_measured_at",
+        ] {
+            assert!(
+                !text.contains(member),
+                "{member} is omitted, not null: {text}"
+            );
+        }
+        assert!(!text.contains("null"));
+
+        // One optional member of each type, refused as an explicit null.
+        for (member, value) in [
+            ("used_bytes", "null"),
+            ("headroom_bytes", "null"),
+            ("retention_shortfall", "null"),
+            ("measured_at", "null"),
+        ] {
+            let payload = format!(
+                concat!(
+                    r#"{{"protocol_version":1,"request_id":"request","class":"retryable","#,
+                    r#""registrar_health":{{"audit_capacity":{{"state":"unknown","#,
+                    r#""enforcement":"directory","reserve_bytes":1,"low_water_bytes":1,"#,
+                    r#""{}":{}}}}}}}"#
+                ),
+                member, value
+            );
+            assert!(
+                decode_refusal_response(payload.as_bytes()).is_err(),
+                "an explicit null {member} is rejected rather than read as absence"
+            );
+        }
+
+        // The same payloads with the member omitted decode.
+        let omitted = concat!(
+            r#"{"protocol_version":1,"request_id":"request","class":"retryable","#,
+            r#""registrar_health":{"audit_capacity":{"state":"unknown","#,
+            r#""enforcement":"directory","reserve_bytes":1,"low_water_bytes":1}}}"#
+        );
+        let decoded =
+            decode_refusal_response(omitted.as_bytes()).expect("an omitted member decodes");
+        assert_eq!(decoded.registrar_health, unmeasured);
+    }
+
+    /// The mount refusal has no registrar dependencies behind it, so it
+    /// must not claim a capacity snapshot it never measured.
+    #[test]
+    fn the_audit_store_mount_refusal_still_serializes_an_empty_health_object() {
+        let encoded =
+            encode_audit_store_unavailable("request-0001").expect("the mount refusal encodes");
+        let text = String::from_utf8(encoded).expect("the response is UTF-8 JSON");
+        assert!(
+            text.contains(r#""registrar_health":{}"#),
+            "the pre-registrar refusal gained no member: {text}"
+        );
+        assert!(!text.contains("audit_capacity"));
+        assert!(!text.contains("limiter"));
     }
 
     #[test]
@@ -2547,7 +2838,7 @@ mod tests {
             let text = String::from_utf8(first).expect("response is UTF-8 JSON");
             assert!(
                 text.contains(
-                    r#""registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}"#
+                    r#""registrar_health":{"limiter":{"limited_predecision_refusal":0,"limited_admission":0},"#
                 ),
                 "{shape} does not carry the limiter health snapshot"
             );
@@ -2726,8 +3017,33 @@ mod tests {
         )
     }
 
+    /// The health snapshot the response fixtures carry.
+    ///
+    /// `limiter` stays at its default so its bytes are the ones the
+    /// fixtures always held, while `audit_capacity` is fully populated:
+    /// a golden file that omitted every optional member would document
+    /// half the schema.
+    fn fixture_health() -> RegistrarHealth {
+        RegistrarHealth {
+            limiter: LimiterHealth::default(),
+            audit_capacity: AuditCapacityHealth {
+                state: AuditCapacityState::Ok,
+                enforcement: AuditStoreEnforcement::Filesystem,
+                reserve_bytes: 2_147_483_648,
+                low_water_bytes: 536_870_912,
+                used_bytes: Some(786_432_000),
+                headroom_bytes: Some(1_361_051_648),
+                measured_at: Some(OffsetDateTime::UNIX_EPOCH),
+                intent_without_outcome: Some(0),
+                malformed_records: Some(0),
+                retention_shortfall: Some(false),
+                records_measured_at: Some(OffsetDateTime::UNIX_EPOCH),
+            },
+        }
+    }
+
     fn generated_fixtures() -> Vec<(&'static str, Vec<u8>)> {
-        let health = RegistrarHealth::default();
+        let health = fixture_health();
         let register = Request::Register(RegisterRequest {
             protocol_version: ProtocolVersion::current(),
             service_name: "api".to_string(),

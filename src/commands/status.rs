@@ -673,6 +673,162 @@ mod tests {
         );
     }
 
+    /// Writes an agent config naming a store and its retention bounds.
+    fn write_audit_config(dir: &Path, audit_dir: &Path, max_retained_files: u32) -> PathBuf {
+        let config = dir.join("agent.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[registrar]\naudit_store_dir = \"{}\"\naudit_record_dir = \"{}\"\n\
+                 audit_max_retained_files = {max_retained_files}\n",
+                dir.display(),
+                audit_dir.display()
+            ),
+        )
+        .expect("write agent config");
+        config
+    }
+
+    fn intent_line(request_id: &str) -> Vec<u8> {
+        use bootroot::registrar::audit::{AuditRecord, AuditVerb, RequestedIdentity};
+
+        AuditRecord::intent(
+            OffsetDateTime::now_utc() - TimeDuration::minutes(2),
+            request_id.to_string(),
+            AuditVerb::Mint,
+            "caller".to_string(),
+            RequestedIdentity {
+                service_name: "api".to_string(),
+                host: "host".to_string(),
+                instance: None,
+            },
+        )
+        .to_line()
+        .expect("serialize audit record")
+    }
+
+    fn rotated_generation(audit_dir: &Path, ago: TimeDuration, sequence: u32, body: &[u8]) {
+        let utc = (OffsetDateTime::now_utc() - ago).to_offset(time::UtcOffset::UTC);
+        let stamp = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            utc.year(),
+            u8::from(utc.month()),
+            utc.day(),
+            utc.hour(),
+            utc.minute(),
+            utc.second()
+        );
+        std::fs::write(
+            audit_dir.join(format!("registrar-audit-{stamp}-{sequence:06}.jsonl")),
+            body,
+        )
+        .expect("write rotated generation");
+    }
+
+    /// The host-local surface and the relayed one read the same store
+    /// through the same reader, so their malformed counts cannot
+    /// disagree. Asserted against the reader's own output for the same
+    /// store and window, which is what the registrar endpoint's health
+    /// tick relays.
+    #[tokio::test]
+    async fn the_status_surface_reports_the_readers_own_malformed_count() {
+        use bootroot::registrar::audit::ACTIVE_FILE_NAME;
+        use bootroot::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let audit_dir = dir.path().join("registrar-audit");
+        std::fs::create_dir(&audit_dir).expect("create audit directory");
+        let mut active = intent_line("counted");
+        for _ in 0..3 {
+            active.extend_from_slice(b"not JSON\n");
+        }
+        std::fs::write(audit_dir.join(ACTIVE_FILE_NAME), active).expect("write active file");
+        // A surplus generation beyond `audit_max_retained_files`, which
+        // the reader does not select, so neither surface counts it. Its
+        // age derives from the reader's own window.
+        rotated_generation(
+            &audit_dir,
+            AUDIT_SCAN_WINDOW + TimeDuration::days(1),
+            0,
+            b"surplus and unparseable\n",
+        );
+        rotated_generation(&audit_dir, TimeDuration::days(2), 1, &intent_line("kept-1"));
+        rotated_generation(&audit_dir, TimeDuration::days(1), 2, &intent_line("kept-2"));
+
+        let config = write_audit_config(dir.path(), &audit_dir, 2);
+        let messages = test_messages();
+        let status = load_audit_status(&status_args_with_agent_config(config), &messages)
+            .await
+            .expect("load audit status");
+        let AuditStatus::Scan(scan) = &status else {
+            panic!("a configured store must be scanned");
+        };
+
+        let reader = scan_audit_store(
+            &audit_dir,
+            OffsetDateTime::now_utc(),
+            AUDIT_SCAN_WINDOW,
+            2,
+            90,
+        )
+        .expect("the reader scans the store");
+        assert_eq!(scan.malformed_records, 3);
+        assert_eq!(scan.malformed_records, reader.malformed_records);
+        assert!(
+            audit_section_lines(&messages, &status)
+                .contains(&messages.status_audit_malformed_records(3)),
+            "the host-local surface prints the count it read"
+        );
+    }
+
+    /// The same agreement for the retention shortfall, in both
+    /// directions.
+    #[tokio::test]
+    async fn the_status_surface_reports_the_readers_own_retention_shortfall() {
+        use bootroot::registrar::audit::ACTIVE_FILE_NAME;
+        use bootroot::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
+
+        for (max_retained_files, generations, expected) in [(2_u32, 0_u32, false), (2, 2, true)] {
+            let dir = tempfile::tempdir().expect("create test directory");
+            let audit_dir = dir.path().join("registrar-audit");
+            std::fs::create_dir(&audit_dir).expect("create audit directory");
+            std::fs::write(audit_dir.join(ACTIVE_FILE_NAME), intent_line("active"))
+                .expect("write active file");
+            for sequence in 0..generations {
+                rotated_generation(
+                    &audit_dir,
+                    TimeDuration::hours(i64::from(sequence) + 1),
+                    sequence,
+                    &intent_line(&format!("rotated-{sequence}")),
+                );
+            }
+
+            let config = write_audit_config(dir.path(), &audit_dir, max_retained_files);
+            let messages = test_messages();
+            let status = load_audit_status(&status_args_with_agent_config(config), &messages)
+                .await
+                .expect("load audit status");
+            let AuditStatus::Scan(scan) = &status else {
+                panic!("a configured store must be scanned");
+            };
+            let reader = scan_audit_store(
+                &audit_dir,
+                OffsetDateTime::now_utc(),
+                AUDIT_SCAN_WINDOW,
+                max_retained_files,
+                90,
+            )
+            .expect("the reader scans the store");
+            assert_eq!(scan.retention_short, expected);
+            assert_eq!(scan.retention_short, reader.retention_short);
+            assert!(
+                audit_section_lines(&messages, &status)
+                    .contains(&messages.status_audit_retention_shortfall(expected)),
+                "the host-local surface prints the shortfall it read"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn supplied_agent_config_reports_a_populated_store_scan() {
         use bootroot::registrar::audit::{

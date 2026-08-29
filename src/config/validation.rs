@@ -243,6 +243,13 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
             settings.audit_store_reserve_bytes
         );
     }
+    if settings.audit_store_low_water_bytes == 0 {
+        anyhow::bail!(
+            "registrar.audit_store_low_water_bytes must be greater than 0; at zero the low-water \
+             band is empty, so the capacity alarm would step straight from exhausted to ok and \
+             never fire"
+        );
+    }
     if settings.audit_store_low_water_bytes >= settings.audit_store_reserve_bytes {
         anyhow::bail!(
             "registrar.audit_store_low_water_bytes ({}) must be less than \

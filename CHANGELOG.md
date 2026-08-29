@@ -18,6 +18,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   audit records and reports separate process-lifetime counters for permanent
   refusal and admission limits in every response's `registrar_health.limiter`
   member.
+- The registrar endpoint now reports the reserved audit store's remaining
+  capacity in every response's `registrar_health.audit_capacity` member,
+  on refusals as well as successes. An endpoint-enabled daemon measures
+  the store once a minute on the cadence it already runs, and reports the
+  store's usage, its headroom — the smaller of the configured budget's
+  remainder and the backing filesystem's available bytes — and a
+  four-valued alarm state that reads `low_water` at exactly
+  `audit_store_low_water_bytes` of headroom and clears again only above a
+  hysteresis margin. The configured enforcement mode rides beside it, so
+  a `directory`-mode deployment cannot be read as an enforced reserve.
+  The same tick relays the unpaired-intent, malformed-record and
+  retention-shortfall signals `bootroot status` prints host-locally, each
+  half carrying its own measurement timestamp. `audit_store_low_water_bytes
+  = 0` is now refused at configuration load, because at zero the alarm
+  band is empty and the alarm could never fire.
 - `bootroot-agent` can now serve the registrar endpoint. Setting
   `[registrar_endpoint] enabled = true` on a bootroot host makes the
   daemon build the registrar verb layer from its `[registrar]` settings

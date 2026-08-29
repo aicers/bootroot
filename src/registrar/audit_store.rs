@@ -45,6 +45,19 @@
 //!
 //! Every check is over what is at the path when it runs, never over how
 //! it got there.
+//!
+//! The crate-private `capacity` child is the one reader of the store
+//! that measures rather than checks: it reports how much of the
+//! configured reserve is left and decides when the low-water alarm is
+//! on, on the daemon's existing maintenance tick.
+
+// The daemon that drives this measurement is the registrar endpoint's,
+// which is Linux-only, so an unconditional module would be dead code on
+// every other target. `test` is in the gate because the probe itself is
+// portable: its walk, its arithmetic and its alarm are ordinary Unix
+// filesystem work, and their tests run wherever the suite does.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod capacity;
 
 use std::fs::{DirBuilder, Permissions};
 use std::io;

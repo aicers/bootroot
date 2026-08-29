@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use config::builder::DefaultState;
 use config::{Config, ConfigBuilder, ConfigError, Environment, File, FileFormat, FileStoredFormat};
-use serde::Deserialize;
 use serde::de::{Deserializer, Unexpected, Visitor};
+use serde::{Deserialize, Serialize};
 
 use crate::secret::HmacSecret;
 
@@ -449,7 +449,10 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
 }
 
 /// An audit store reserve enforcement mode.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+// `Serialize` as well as `Deserialize`: the registrar endpoint's health
+// snapshot reports the configured mode, and a second enum declared for
+// the wire would let the two spellings drift.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditStoreEnforcement {
     /// A filesystem-provided ceiling: a fully allocated loopback image
@@ -2966,6 +2969,12 @@ audit_store_enforcement = "directory"
             ),
             (
                 Box::new(|settings: &mut Settings| {
+                    settings.registrar.audit_store_low_water_bytes = 0;
+                }),
+                "registrar.audit_store_low_water_bytes",
+            ),
+            (
+                Box::new(|settings: &mut Settings| {
                     settings.registrar.audit_store_low_water_bytes =
                         settings.registrar.audit_store_reserve_bytes;
                 }),
@@ -3022,6 +3031,54 @@ audit_store_enforcement = "directory"
             let err = settings.validate().unwrap_err();
             assert!(err.to_string().contains(expected), "{expected}: {err}");
         }
+    }
+
+    /// A zero threshold empties the low-water band, so the alarm would
+    /// step straight from exhausted to ok and never fire. Disabling it is
+    /// not an offered mode, and a value that silently disables it is
+    /// worse than one that is refused.
+    #[test]
+    fn validation_rejects_a_zero_low_water_threshold_and_keeps_the_existing_bounds() {
+        let zero = RegistrarSettings {
+            audit_store_low_water_bytes: 0,
+            ..RegistrarSettings::default()
+        };
+        let err = validate_registrar_settings(&zero).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("registrar.audit_store_low_water_bytes"),
+            "{err}"
+        );
+
+        let one = RegistrarSettings {
+            audit_store_low_water_bytes: 1,
+            ..RegistrarSettings::default()
+        };
+        validate_registrar_settings(&one).expect("one byte is a usable threshold");
+
+        let at_reserve = RegistrarSettings {
+            audit_store_low_water_bytes: RegistrarSettings::default().audit_store_reserve_bytes,
+            ..RegistrarSettings::default()
+        };
+        assert!(
+            validate_registrar_settings(&at_reserve)
+                .unwrap_err()
+                .to_string()
+                .contains("must be less than"),
+            "the existing upper bound still rejects what it rejected before"
+        );
+
+        let past_signed = RegistrarSettings {
+            audit_store_reserve_bytes: u64::try_from(i64::MAX).expect("i64::MAX fits in u64") + 1,
+            ..RegistrarSettings::default()
+        };
+        assert!(
+            validate_registrar_settings(&past_signed)
+                .unwrap_err()
+                .to_string()
+                .contains("registrar.audit_store_reserve_bytes"),
+            "the existing reserve bound still rejects what it rejected before"
+        );
     }
 
     #[test]

@@ -653,7 +653,14 @@ OpenBao 감사 장치 확인은 그대로입니다.
   [예약량을 바꿀 때](operations.md#changing-the-reserve)에 있습니다.
   [예약량 크기 잡기](operations.md#sizing-the-reserve)도 참고하세요.
 - `audit_store_low_water_bytes` (`u64`, 기본값 `536870912`, 512 MiB) —
-  향후 용량 경보 임계값입니다. reserve보다 작아야 합니다.
+  용량 경보 임계값입니다. 0보다 커야 하고 reserve보다 작아야 합니다. 0은
+  거부됩니다. 0에서는 경보 구간이 비어 이 키가 존재하는 이유인 경보가
+  결코 울릴 수 없기 때문입니다. 엔드포인트가 활성인 데몬은 1분에 한 번
+  저장소를 측정하며, 여유 공간이 정확히 이 바이트일 때 `low_water`를
+  보고하고, 이 값에 그 10분의 1과 1 MiB 중 큰 쪽을 더한 지점에서만 다시
+  해제합니다.
+  [예약량이 차오르는 것 지켜보기](operations.md#watching-the-reserve-fill)를
+  참고하세요.
 - `audit_store_enforcement` (기본값 `filesystem`) —
   `audit_store_reserve_bytes` 뒤에 설 강제 방식을 선택하며, 그렇게 하는
   입력은 이 키 하나뿐입니다. bootroot는 모드를 추론하지 않고, 한쪽에서
