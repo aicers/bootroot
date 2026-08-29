@@ -203,46 +203,55 @@ async fn enforcement_is_always_present_and_mirrors_the_configured_mode() {
     }
 }
 
+/// A symbolic link planted at `audit_store_dir` fails the probe in
+/// **both** modes, because the root open carrying `O_NOFOLLOW` is the
+/// only step `filesystem` mode has and it refuses the link rather than
+/// reporting the target's filesystem.
 #[tokio::test]
 async fn a_failed_probe_leaves_the_previous_state_and_measured_at_intact() {
-    let fixture = store_fixture();
-    let health = cold_snapshot(AuditStoreEnforcement::Directory);
-    let first = OffsetDateTime::now_utc();
-    tick(
-        &health,
-        &inputs_for(&fixture, AuditStoreEnforcement::Directory),
-        first,
-    )
-    .await;
-    let before = capacity_of(&health);
-    assert_eq!(before.state, AuditCapacityState::Ok);
+    for enforcement in [
+        AuditStoreEnforcement::Directory,
+        AuditStoreEnforcement::Filesystem,
+    ] {
+        let fixture = store_fixture();
+        let health = cold_snapshot(enforcement);
+        let first = OffsetDateTime::now_utc();
+        tick(&health, &inputs_for(&fixture, enforcement), first).await;
+        let before = capacity_of(&health);
+        // Not asserted as `ok`: in `filesystem` mode the tempdir's usage
+        // is the whole host filesystem's, which the synthetic reserve
+        // here is smaller than. What matters is that a state was reached
+        // and stamped, so the failure below has something to preserve.
+        assert_ne!(before.state, AuditCapacityState::Unknown);
+        assert!(before.measured_at.is_some());
 
-    // A store root that is a symbolic link fails the probe in either
-    // mode, which is the store contract's own rule about a link planted
-    // there.
-    let link_parent = tempfile::tempdir().expect("a temporary directory");
-    let link = link_parent.path().join("audit-store");
-    std::os::unix::fs::symlink(&fixture.store_dir, &link).expect("the link is planted");
-    let mut broken = inputs_for(&fixture, AuditStoreEnforcement::Directory);
-    broken.store_dir = link;
+        // A store root that is a symbolic link fails the probe in either
+        // mode, which is the store contract's own rule about a link
+        // planted there.
+        let link_parent = tempfile::tempdir().expect("a temporary directory");
+        let link = link_parent.path().join("audit-store");
+        std::os::unix::fs::symlink(&fixture.store_dir, &link).expect("the link is planted");
+        let mut broken = inputs_for(&fixture, enforcement);
+        broken.store_dir = link;
 
-    tick(&health, &broken, first + Duration::minutes(1)).await;
-    let after = capacity_of(&health);
-    assert_eq!(
-        after.state, before.state,
-        "an alarm is not hidden by a failure"
-    );
-    assert_eq!(after.used_bytes, before.used_bytes);
-    assert_eq!(after.headroom_bytes, before.headroom_bytes);
-    assert_eq!(
-        after.measured_at, before.measured_at,
-        "no new measurement was stamped"
-    );
-    assert_eq!(
-        after.records_measured_at,
-        Some(first + Duration::minutes(1)),
-        "the record scan succeeds and fails independently of the probe"
-    );
+        tick(&health, &broken, first + Duration::minutes(1)).await;
+        let after = capacity_of(&health);
+        assert_eq!(
+            after.state, before.state,
+            "an alarm is not hidden by a failure"
+        );
+        assert_eq!(after.used_bytes, before.used_bytes);
+        assert_eq!(after.headroom_bytes, before.headroom_bytes);
+        assert_eq!(
+            after.measured_at, before.measured_at,
+            "no new measurement was stamped"
+        );
+        assert_eq!(
+            after.records_measured_at,
+            Some(first + Duration::minutes(1)),
+            "the record scan succeeds and fails independently of the probe"
+        );
+    }
 }
 
 #[tokio::test]

@@ -575,10 +575,7 @@ fn directory_mode_walks_the_store_and_tracks_a_written_file() {
     let after = measure_directory_mode(&store).expect("the probe succeeds");
     assert_eq!(
         after.used_bytes,
-        before.used_bytes
-            + allocated_of(&store.join("records"))
-            + allocated_of(&payload)
-            + (allocated_of(&store) - before.used_bytes),
+        allocated_of(&store) + allocated_of(&store.join("records")) + allocated_of(&payload),
         "the walk reports the store root plus every entry below it"
     );
     assert!(
