@@ -670,6 +670,32 @@ pub(crate) struct Strings {
     pub(crate) audit_reserve_step_install: &'static str,
     pub(crate) audit_reserve_step_subdirectories: &'static str,
     pub(crate) audit_reserve_step_rerun: &'static str,
+    pub(crate) audit_reserve_outcome_migration_incomplete: &'static str,
+    pub(crate) audit_reserve_directory_migration_open: &'static str,
+    pub(crate) audit_reserve_finding_migration_holding: &'static str,
+    pub(crate) audit_reserve_finding_migration_store_not_empty: &'static str,
+    pub(crate) audit_reserve_finding_migration_path_exists: &'static str,
+    pub(crate) audit_reserve_finding_migration_mount_absent: &'static str,
+    pub(crate) audit_reserve_finding_migration_mount_foreign: &'static str,
+    pub(crate) audit_reserve_finding_migration_mount_point: &'static str,
+    pub(crate) audit_reserve_finding_migration_holding_kind: &'static str,
+    pub(crate) audit_reserve_finding_migration_deferred: &'static str,
+    pub(crate) audit_reserve_finding_migration_forbidden_entry: &'static str,
+    pub(crate) audit_reserve_finding_migration_arithmetic: &'static str,
+    pub(crate) audit_reserve_finding_migration_capacity_fits: &'static str,
+    pub(crate) audit_reserve_finding_migration_capacity_short: &'static str,
+    pub(crate) audit_reserve_note_migrated_reclaimable: &'static str,
+    pub(crate) audit_reserve_note_migrated_reclaimable_unsized: &'static str,
+    pub(crate) audit_reserve_note_retained_image_reclaimable: &'static str,
+    pub(crate) audit_reserve_figure_source_plus_margin: &'static str,
+    pub(crate) audit_reserve_migration_prerequisites: &'static str,
+    pub(crate) audit_reserve_migration_window: &'static str,
+    pub(crate) audit_reserve_step_aside_rename: &'static str,
+    pub(crate) audit_reserve_step_type_guard: &'static str,
+    pub(crate) audit_reserve_step_copy: &'static str,
+    pub(crate) audit_reserve_step_verify: &'static str,
+    pub(crate) audit_reserve_step_closing_rename: &'static str,
+    pub(crate) audit_reserve_step_rollback: &'static str,
 }
 
 /// `Clone` so a message bundle can cross into a `spawn_blocking`
@@ -1011,6 +1037,179 @@ mod tests {
                 unavailable.contains("--openbao-unseal-from-file"),
                 "{locale} missing-source error does not name the flag: {unavailable}"
             );
+        }
+    }
+
+    /// The relocation's own catalog, rendered in both locales.
+    ///
+    /// Every one of these is a verdict about an irreplaceable audit
+    /// trail: the holding directory it names, the entry it refuses, the
+    /// three capacity figures an operator tells "finish the copy" from
+    /// "this will never fit" by. A misspelled placeholder in one table
+    /// ships a literal `{holding}` and drops exactly the value that
+    /// makes the message actionable, and the outcome is decided in Rust
+    /// rather than by reading the text, so nothing else would notice.
+    #[test]
+    // A table of every migration template against every locale: one
+    // entry per message, and the length is the table's rather than a
+    // function that grew.
+    #[allow(clippy::too_many_lines)]
+    fn migration_templates_substitute_in_every_locale() {
+        const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
+        const STORE: &str = "/var/lib/bootroot/audit-store";
+        const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
+        const RETAINED_IMAGE: &str = "/var/lib/bootroot/audit-store.img.old";
+        const REFUSAL: &str = "the image is 1 byte and the reserve is 2.";
+        const AVAILABLE: u64 = 1_000;
+        const SOURCE: u64 = 2_000;
+        const MARGIN: u64 = 3_000;
+
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let figure = m.audit_reserve_figure_available(STORE);
+            let cases: [(String, Vec<String>); 16] = [
+                (
+                    m.audit_reserve_outcome_migration_incomplete(STORE),
+                    vec![STORE.to_string()],
+                ),
+                (
+                    m.audit_reserve_directory_migration_open(HOLDING, STORE),
+                    vec![HOLDING.to_string(), STORE.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_holding(HOLDING, STORE),
+                    vec![HOLDING.to_string(), STORE.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_store_not_empty(STORE, HOLDING),
+                    vec![STORE.to_string(), HOLDING.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_path_exists(MIGRATED),
+                    vec![MIGRATED.to_string()],
+                ),
+                (m.audit_reserve_finding_migration_mount_absent(), Vec::new()),
+                (
+                    m.audit_reserve_finding_migration_mount_foreign(STORE, "a tmpfs", HOLDING),
+                    vec![STORE.to_string(), HOLDING.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_mount_point(HOLDING),
+                    vec![HOLDING.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_forbidden_entry(
+                        HOLDING,
+                        m.audit_reserve_kind_symlink(),
+                    ),
+                    vec![
+                        HOLDING.to_string(),
+                        m.audit_reserve_kind_symlink().to_string(),
+                    ],
+                ),
+                (
+                    m.audit_reserve_finding_migration_holding_kind(
+                        HOLDING,
+                        m.audit_reserve_kind_symlink(),
+                    ),
+                    vec![
+                        HOLDING.to_string(),
+                        m.audit_reserve_kind_symlink().to_string(),
+                    ],
+                ),
+                (
+                    m.audit_reserve_finding_migration_deferred(REFUSAL),
+                    vec![REFUSAL.to_string()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_arithmetic(&figure),
+                    vec![figure.clone()],
+                ),
+                (
+                    m.audit_reserve_finding_migration_capacity_fits(AVAILABLE, SOURCE, MARGIN),
+                    vec![
+                        AVAILABLE.to_string(),
+                        SOURCE.to_string(),
+                        MARGIN.to_string(),
+                    ],
+                ),
+                (
+                    m.audit_reserve_finding_migration_capacity_short(AVAILABLE, SOURCE, MARGIN),
+                    vec![
+                        AVAILABLE.to_string(),
+                        SOURCE.to_string(),
+                        MARGIN.to_string(),
+                    ],
+                ),
+                (
+                    m.audit_reserve_note_migrated_reclaimable(MIGRATED, SOURCE),
+                    vec![MIGRATED.to_string(), SOURCE.to_string()],
+                ),
+                (
+                    m.audit_reserve_note_retained_image_reclaimable(RETAINED_IMAGE, SOURCE),
+                    vec![RETAINED_IMAGE.to_string(), SOURCE.to_string()],
+                ),
+            ];
+            for (rendered, values) in &cases {
+                for value in values {
+                    assert!(
+                        rendered.contains(value.as_str()),
+                        "{locale} message dropped {value:?}: {rendered}"
+                    );
+                }
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// The rest of the same catalog: the three figure names and the
+    /// unsized note, which carry one path each, and the step titles and
+    /// standing paragraphs, which carry none. A placeholder left in any
+    /// of them is a literal an operator reads.
+    #[test]
+    fn migration_figures_and_step_titles_carry_no_placeholder_in_any_locale() {
+        const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
+        const STORE: &str = "/var/lib/bootroot/audit-store";
+        const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
+
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            for (rendered, value) in [
+                (m.audit_reserve_figure_available(STORE), STORE),
+                (m.audit_reserve_figure_underlying(HOLDING), HOLDING),
+                (m.audit_reserve_figure_source_plus_margin(HOLDING), HOLDING),
+                (
+                    m.audit_reserve_note_migrated_reclaimable_unsized(MIGRATED),
+                    MIGRATED,
+                ),
+            ] {
+                assert!(
+                    rendered.contains(value),
+                    "{locale} message dropped {value:?}: {rendered}"
+                );
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+            for text in [
+                m.audit_reserve_migration_window(),
+                m.audit_reserve_migration_prerequisites(),
+                m.audit_reserve_step_aside_rename(),
+                m.audit_reserve_step_type_guard(),
+                m.audit_reserve_step_copy(),
+                m.audit_reserve_step_verify(),
+                m.audit_reserve_step_closing_rename(),
+                m.audit_reserve_step_rollback(),
+            ] {
+                assert!(
+                    !text.contains('{'),
+                    "{locale} left a placeholder in a fixed message: {text}"
+                );
+            }
         }
     }
 }

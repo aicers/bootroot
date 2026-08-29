@@ -646,8 +646,12 @@ OpenBao 감사 장치 확인은 그대로입니다.
   작은 예약량은 아무것도 생성·렌더링되기 전에 거부됩니다.
   `validate_registrar_settings`에는 그로 인한 하한이 추가되지 않습니다.
   최솟값은 엔드포인트가 활성인 `filesystem` 모드의 거부이며, 해당하지 않는
-  배포에는 아무 의미도 없기 때문입니다.
-  [예약량 크기 잡기](operations.md#sizing-the-reserve)를 참고하세요.
+  배포에는 아무 의미도 없기 때문입니다. 이미 프로비저닝된 호스트에서 이
+  값을 바꾸는 일은 어느 방향으로도 크기 변경이 아니라 이미지 **교체**로
+  답합니다. `bootroot infra up`이 두 크기를 지목하는 크기 불일치로
+  실패하며, 그에 답하는 여섯 단계 교체 절차는
+  [예약량을 바꿀 때](operations.md#changing-the-reserve)에 있습니다.
+  [예약량 크기 잡기](operations.md#sizing-the-reserve)도 참고하세요.
 - `audit_store_low_water_bytes` (`u64`, 기본값 `536870912`, 512 MiB) —
   향후 용량 경보 임계값입니다. reserve보다 작아야 합니다.
 - `audit_store_enforcement` (기본값 `filesystem`) —

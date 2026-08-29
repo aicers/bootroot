@@ -778,17 +778,28 @@ endpoint none of it runs, whatever the `audit_store_*` keys say.
   behind it, and an XFS or ext4 project quota applied to
   `audit_store_dir` by hand is the documented route to a real ceiling.
   Nothing bootroot does in this mode derives an image path or a unit
-  name, `stat`s any path the reserve introduces, or names a leftover a
-  previous `filesystem`-mode run may have left behind.
+  name, or names a leftover a previous `filesystem`-mode run may have
+  left behind. It reads exactly one path the reserve introduces — the
+  `<audit_store_dir>.pre-mount` holding directory, which is detected in
+  **both** modes — and here it is only named, as an unfinished
+  relocation, never raised as an outcome of its own.
 
-**The four outcomes.** A run reports exactly one of them.
+**The five outcomes.** A run reports exactly one of them.
 
 | Outcome | Mode | Exit |
 | --- | --- | --- |
+| `migration incomplete` | `filesystem` | **failure**, the run stops |
 | `enforced` | `filesystem` | success, the run continues |
 | `provisioned, not activated` | `filesystem` | **failure**, the run stops |
 | `failed` | `filesystem` | failure, the run stops |
 | `unenforced (directory)` | `directory` | **success**, the run continues |
+
+`migration incomplete` sits **ahead of every other verdict**: a
+`<audit_store_dir>.pre-mount` holding directory means the store's
+contents are part-way onto the reserve, and however complete the image,
+the artifacts and the mount are, the run fails under this outcome and
+never reports the reserve as enforced. See
+[Relocating a store that already holds records](#relocating-a-store-that-already-holds-records).
 
 `enforced` requires four things together: the image's whole contract, all
 three generated artifacts installed and byte-identical to what the run
@@ -1056,9 +1067,13 @@ assume away:
    be started. This is deliberately an outage rather than a quiet audit
    bypass. The key governs creation only: an older host whose underlying
    directory already has `openbao/` still binds that directory and still
-   has this boot-path exposure. Relocating that existing content onto the
-   reserve is what retires it; this command neither moves nor deletes
-   audit records.
+   has this boot-path exposure. Completing
+   [the relocation](#relocating-a-store-that-already-holds-records) is
+   what first makes the guard effective on such a host: the aside rename
+   empties the underlying directory and the copy puts both
+   subdirectories on the mounted filesystem, after which the bind source
+   is absent whenever the mount is. bootroot itself neither moves nor
+   deletes audit records on any path.
 3. **A daemon started with an unmounted store refuses registrar verbs.**
    The daemon makes this decision before opening the record store, so it
    creates neither `audit_store_dir` nor `records/` beneath the empty
@@ -1095,14 +1110,17 @@ A store that is not empty is reported as **provisioned, not activated**.
 The same store is refused by `bootroot infra up` on a live deployment
 before the stack starts, so no container starts. Nothing is deleted, moved
 or mounted over; the three artifacts are still written, because the
-operator will need them; and **no phase-2 command whatever** is rendered,
-because a partial list is an invitation to keep going and the step it ends
-at mounts a filesystem over those records. `create_host_path: false`
+operator will need them; and the only commands rendered are the ones that
+**open** the relocation — both writers stopped, the store renamed aside,
+and an empty mount point in its place. Nothing that mounts a filesystem
+over those records is rendered here, because the step that would comes
+from the next run, once the aside rename has made the underlying
+directory empty. `create_host_path: false`
 governs creation only, so a failed-mount boot still binds an already
 present underlying `openbao/` and writes the audit device on the root
 filesystem until the records are relocated onto the reserve. There are two
-supported ways forward: relocate those records, a separate procedure this
-build does not provide, or configure `audit_store_enforcement =
+supported ways forward: relocate those records by the documented
+procedure below, or configure `audit_store_enforcement =
 "directory"` and run without a kernel-enforced ceiling.
 
 The same refusal reaches `bootroot reinit` **before it wipes anything**.
@@ -1110,14 +1128,389 @@ Reinit's pre-wipe preflight raises this surface's phase-1 refusals — a
 sub-minimum reserve, a store path the artifacts cannot carry, a store
 that would contain the staged artifacts, an image of the wrong type or
 the wrong size, a filesystem with no room for the outstanding
-allocation, an underlying store larger than the reserve, and a store
-that already holds records — as pure reads: nothing is created,
-rendered or installed, no mount is verified and no outcome line is
-printed. So an endpoint-enabled `filesystem`-mode host whose store
-already holds records **cannot reinit** until enforcement is activated or
-`directory` mode is configured. A host that clears every one of them goes
-on to the post-wipe `init` pass, which is an ordinary `bootroot init` run
-carrying all three phases.
+allocation, an underlying store larger than the reserve, a store
+that already holds records, and an open relocation — as pure reads:
+nothing is created, rendered or installed, no mount is verified and no
+outcome line is printed. So an endpoint-enabled `filesystem`-mode host
+whose store already holds records **cannot reinit** until enforcement is
+activated or `directory` mode is configured, and neither can one whose
+`<audit_store_dir>.pre-mount` still exists: the post-wipe pass would
+reach the same verdict, with the records the verdict exists to protect
+having already survived a wipe that had no reason to spare them. A host
+that clears every one of them goes on to the post-wipe `init` pass, which
+is an ordinary `bootroot init` run carrying all three phases.
+
+#### Relocating a store that already holds records
+
+This is the way out of the refusal above. It moves the existing records
+onto the mounted reserve without losing one and without leaving a
+half-finished state that reads as success. **Every step that changes the
+host is yours**: bootroot renders each one as a command to run verbatim,
+verifies the result by reading metadata, and performs none of it — no
+rename, no copy, no verification, no `rmdir` and no unmount, whatever uid
+it runs as.
+
+**What the procedure assumes of its maintenance window.** All four hold
+for its whole duration, and the guarantees below are conditional on
+them.
+
+- **Both writers are stopped throughout** — the Compose stack, so no
+  container holds a bind under the store, and `bootroot-registrar.service`,
+  so no verb record is written into the store while the migration is in
+  flight. Restarting OpenBao afterwards costs a **manual shamir unseal**,
+  so this is a scheduled window rather than something attempted live.
+  Which half is enforced and which is procedural matters: from the aside
+  rename onward `<audit_store_dir>/openbao` does not exist, and the audit
+  bind's `create_host_path: false` is what keeps the OpenBao container
+  out — it fails to start rather than writing into the half-populated
+  store, on the boot path included. **The daemon has no equivalent once
+  the mount is up**, so stopping its service is the only thing that keeps
+  its records out.
+- **The rendered commands are run in the order given**, and the sequence
+  stops at the first non-zero exit.
+- **No privileged mount change is made between a rendering pass and the
+  command it rendered.** `find -xdev` excludes a different-device mount
+  from the measurement, the copy and all three comparisons alike, so they
+  cannot disagree over one. A same-device `mount --bind` is caught only
+  by bootroot's `/proc/self/mountinfo` read, which happens when it
+  renders while you copy afterwards. Under that condition the three cover
+  the same entries — not unconditionally.
+- **Nothing under the source tree changes between a check and the command
+  it authorises.**
+
+**The holding directory is a first-class state.** `<audit_store_dir>.pre-mount`
+is derived, never configured — a sibling of the store in the store's own
+parent, like the image, and outside the filesystem about to be mounted,
+so it stays readable while the mount is up. Its presence is checked
+**before every other verdict, in both enforcement modes**: in
+`filesystem` mode it yields **migration incomplete**, and in `directory`
+mode it is named as an unfinished relocation whose contents may be the
+only copy of those records. **bootroot never deletes, moves or modifies
+it.** Only two operations may change it, both renames and neither
+recursive: the closing rename to `<audit_store_dir>.migrated` once the
+guard and all three comparisons have exited zero, and the rollback rename
+back to `<audit_store_dir>` while the migration is still open. Where
+`<audit_store_dir>.pre-mount` or `<audit_store_dir>.migrated` already
+exists, bootroot renders no rename and fails naming the path: `mv dir
+dir.pre-mount` onto an existing directory does not replace it, it moves
+the source *inside* it, and the next copy would then read the wrong tree.
+
+**Five states put the outcome up and take every command away.** In each
+of them the run still reports **migration incomplete** and still fails;
+what it renders is the re-run alone, or the re-run and the rollback.
+
+- **`<audit_store_dir>.pre-mount` beside a store that still holds
+  content.** Either the aside rename never ran and the path was already
+  occupied, or both writers were left up. Nothing bootroot could render
+  is safe: activating the reserve would mount over those records, the
+  copy would move an unrelated tree onto it, and the rollback would move
+  the holding directory *inside* the store rather than replacing it. Not
+  even the rollback is rendered here. Stop both writers, move whichever
+  of the two paths is not the store's records out of the way by hand,
+  and run the command again.
+- **A holding path that is not a directory.** The copy ends in
+  `<audit_store_dir>.pre-mount/.`, and `cp` resolves that suffix however
+  the path before it is spelled — so a symbolic link there is followed
+  and whatever tree it names is copied into the reserve as audit data.
+  The type guard cannot close it either: `find` neither descends a link
+  named on its command line nor reports the link itself, so it exits
+  zero over exactly the entry that must be refused. bootroot refuses it
+  against an `lstat` of the path itself, before anything is measured,
+  walked or rendered. The activation goes with the copy, whatever the
+  mount state: nothing at that path can ever be copied, so mounting the
+  reserve for it changes the host for no gain. The rollback is still
+  offered.
+- **Something other than the reserve mounted at `<audit_store_dir>`** — a
+  tmpfs, a bind mount, or a loop device backed by another file.
+  Reporting it as "the reserve is not mounted" and rendering the
+  activation would stack the reserve on top of it; the copy would write
+  the store's records into it; and the rollback's `umount` would take
+  down a filesystem this migration never put there. It is named
+  instead, with what is mounted, and none of the three is rendered.
+  Stop both writers, unmount it or move it aside by hand, and run the
+  command again. bootroot unmounts nothing, here or anywhere else in
+  this procedure.
+- **`<audit_store_dir>.migrated` already exists while the migration is
+  open.** The closing rename is what clears **migration incomplete**,
+  and it cannot target a path that is already there. So the copy is
+  refused rather than started against a sequence whose far end could
+  never run: you would spend the whole maintenance window with both
+  writers down and finish with the migration still open. The activation
+  goes with it, whatever the mount state, for the same reason — no pass
+  reaches a copy while that path stands. The rollback is still offered,
+  because the restoring rename targets `<audit_store_dir>`, which the
+  blocked closing rename says nothing about. Confirm nothing is mounted
+  under the existing `<audit_store_dir>.migrated`, move it aside or
+  remove it by hand, and run the command again; the next pass renders
+  the whole sequence.
+- **A phase-1 refusal raised while the migration is open** — most often
+  `audit_store_reserve_bytes` changed mid-window, which the image
+  contract refuses outright. **migration incomplete** is reported ahead
+  of the image contract, the artifacts and the mount and overrides all
+  of them, so the refusal is named as a finding under that outcome
+  rather than being what the run reports. It would otherwise leave you
+  with a size-mismatch error naming neither the holding directory that
+  holds the only copy of those records nor the way back out of it. No
+  activation and no copy is rendered while it stands: the reserve it
+  describes cannot be made. Put the configuration back as it was and run
+  the command again, or take the rollback.
+
+**While a holding directory exists bootroot creates nothing on the
+mounted store, and no rendered step creates anything there either.** The
+subdirectory step — the `mkdir`, `chmod` and `chown` of `records/` and
+`openbao/` — is withheld for the whole window, and their absence on the
+mounted store is not reported as remediation. The copy is one
+whole-subtree operation that recreates both with their original ownership
+and modes. It also settles the mount point's own mode, which is why no
+`chmod` is rendered for it either: `mkfs.ext4` gives the new filesystem's
+root `0755`, and `cp -a <source>/. <destination>/` applies the source
+directory's mode and owner to the destination root, putting the store
+back at the `0700` the store directory contract requires.
+
+**The prerequisites** the rendered commands name: **diffutils**, for
+`cmp`, which a stripped host may lack, and **coreutils 8.25 or newer**,
+where `sha256sum` gained `--zero`.
+
+The sequence, on a `filesystem`-mode host whose store already holds
+records:
+
+1. Stop both writers.
+
+   ```sh
+   docker compose -f <compose file> -p <project> stop
+   systemctl stop bootroot-registrar.service
+   ```
+
+   Both lines are commands, and every rendered list below carries them
+   with the `--compose-file` this run was pointed at and the Compose
+   project it resolved already filled in. The re-run each list closes
+   with names that same `--compose-file`, so every pass below is driven
+   against the deployment whose writers this step stopped rather than
+   against whatever `docker-compose.yml` the operator's current
+   directory happens to hold. Both it and `--agent-config` are rendered
+   as **absolute** paths, whatever spelling the run was given: step 7's
+   verification ends inside `<audit_store_dir>`, so a relative
+   `docker-compose.yml` carried through to step 9 would be looked for
+   under the store rather than where the deployment is.
+
+2. Rename the store aside and recreate the mount point empty and
+   root-owned.
+
+   ```sh
+   mv <audit_store_dir> <audit_store_dir>.pre-mount
+   install -d -m 0700 -o root -g root <audit_store_dir>
+   ```
+
+3. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It finds the holding directory, reports **migration
+   incomplete** and starts no container. The underlying store is empty
+   again, so what it renders here is the outstanding **activation**: the
+   image commands for the state the image is in, the three artifact
+   installs, the `systemctl daemon-reload` and the `systemctl enable
+   --now <escaped audit_store_dir>.mount` — and
+   **not** the creation of `records/` or `openbao/`, which step 6
+   performs instead. bootroot cannot see that the writers are already
+   down, so the stop-both-writers step appears in that list too, with
+   both its commands; step 1 has satisfied it.
+4. Run those commands. The mount is now up and the store on it is empty.
+5. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>` again — the same pair every time. Still **migration
+   incomplete** and still starting no container, it now reports the
+   capacity verdict and renders the copy — or, where the contents do not
+   fit, the two routes out instead.
+6. Run the type guard over the holding directory, and only where it exits
+   0, the copy.
+
+   ```sh
+   find <audit_store_dir>.pre-mount -xdev -mindepth 1 \
+     ! -type d ! -type f -exec false {} +
+   cp -a --one-file-system <audit_store_dir>.pre-mount/. <audit_store_dir>/
+   ```
+
+7. Run the verification: the type guard over **both** trees, then three
+   comparisons. All four must exit zero.
+
+   ```sh
+   SCRATCH="$(mktemp -d)"
+   find <audit_store_dir>.pre-mount -xdev -mindepth 1 \
+     ! -type d ! -type f -exec false {} +
+   find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
+   cd <audit_store_dir>.pre-mount
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.source.raw
+   sort -z -o "$SCRATCH"/meta.source "$SCRATCH"/meta.source.raw
+   find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.source.raw
+   sort -z -o "$SCRATCH"/size.source "$SCRATCH"/size.source.raw
+   find . -xdev -mindepth 1 -type f -print0 > "$SCRATCH"/files.source.raw
+   sort -z -o "$SCRATCH"/files.source "$SCRATCH"/files.source.raw
+   xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.source > "$SCRATCH"/content.source
+   cd <audit_store_dir>
+   find . -xdev -mindepth 1 ! \( -path './lost+found' -type d \) \
+     -printf '%y %m %U %G %n %P\0' > "$SCRATCH"/meta.destination.raw
+   sort -z -o "$SCRATCH"/meta.destination "$SCRATCH"/meta.destination.raw
+   find . -xdev -mindepth 1 -type f -printf '%s %P\0' > "$SCRATCH"/size.destination.raw
+   sort -z -o "$SCRATCH"/size.destination "$SCRATCH"/size.destination.raw
+   find . -xdev -mindepth 1 -type f -print0 > "$SCRATCH"/files.destination.raw
+   sort -z -o "$SCRATCH"/files.destination "$SCRATCH"/files.destination.raw
+   xargs -0 -r sha256sum --binary --zero < "$SCRATCH"/files.destination > "$SCRATCH"/content.destination
+   cmp "$SCRATCH"/meta.source "$SCRATCH"/meta.destination
+   cmp "$SCRATCH"/size.source "$SCRATCH"/size.destination
+   cmp "$SCRATCH"/content.source "$SCRATCH"/content.destination
+   ```
+
+8. Close the migration with a rename, never a deletion, and only once
+   step 7 has passed in full.
+
+   ```sh
+   mv <audit_store_dir>.pre-mount <audit_store_dir>.migrated
+   ```
+
+9. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. With no holding directory left it verifies the store on the
+   mounted filesystem, reports the reserve as **enforced** and starts the
+   Compose stack; then unseal OpenBao and start
+   `bootroot-registrar.service`. The writers
+   have been down since step 1, so nothing wrote into the store while the
+   copy and its verification were in flight.
+
+**The capacity check is against the mounted filesystem, not the
+reserve.** `audit_store_reserve_bytes` is the image's *nominal* size; the
+ext4 filesystem inside it holds less, its journal and metadata being real
+and already allocated, and an existing OpenBao audit log — which nothing
+here bounds and OpenBao does not rotate — can exceed either figure. Once
+the mount is up, bootroot compares the **actual bytes available to an
+unprivileged writer** on the mounted filesystem against the holding
+directory's **allocated** size plus a **16 MiB margin** for block
+rounding and per-directory metadata. That size counts the holding
+directory itself as well as everything under it — the destination's own
+root directory has to grow to hold the same entries — so it is exactly
+what `du -s -x --block-size=1` reports, the figure
+[the replacement procedure](#changing-the-reserve) has an operator
+compute by hand for the same decision. It reports all three figures, so
+"finish the copy" is distinguishable from "this will never fit". Where it
+does not fit, **no copy command is rendered at all**, and the two routes
+out are a larger reserve through
+[the replacement procedure](#changing-the-reserve) or pruning the OpenBao
+audit log before retrying. Every byte figure is checked arithmetic: one
+that cannot be represented reports **migration incomplete** naming the
+figure and renders no copy.
+
+**Refusals that stop the copy being rendered.** Each names the path, is
+reported under **migration incomplete**, and is re-decided on every pass
+rather than answered from an earlier verdict. Both are decided ahead of
+the mount state, so both arise with the reserve not yet mounted — and
+there **the activation goes with the copy**. It is the step that brings
+the mount up, while the rollback rendered beside it carries its `umount`
+only where the store is already a mount point, so a list holding both
+would create the mount and then stop at an `rmdir` of it, short of the
+restoring rename. Clear what the finding names and run the command
+again: with the holding tree clean the next pass renders the activation
+as usual. With the reserve already mounted the activation stands,
+because nothing in that list creates the mount its rollback was rendered
+for.
+
+- **A mount point at or under the holding directory.** The test is mount
+  identity read from `/proc/self/mountinfo`, not a device comparison: a
+  same-device `mount --bind` has the same device id, so `find -xdev` and
+  `cp --one-file-system` would both walk into it and the bind source's
+  contents would be counted, copied into the reserve as audit data and
+  duplicated on the host. Mount points are unescaped (`\040`, `\011`,
+  `\012`, `\134`) and compared by path component, so a sibling like
+  `<audit_store_dir>.pre-mount-other` is not read as being underneath.
+- **A symbolic link, device node, FIFO or socket anywhere in the tree.**
+  This is a **migration rule of its own, stricter than anything the store
+  enforces**: a link is the one entry that can put audit bytes outside
+  the ceiling, `cp -a` recreating it pointing wherever it pointed before,
+  and a manifest recording a path and a link target as two
+  variable-length fields cannot tell `a b` linked to `c` from `a` linked
+  to `b c`. The refusal holds wherever the link points. Nothing in this
+  deployment creates one.
+
+**Why the verification looks the way it does.** bootroot's refusal is a
+render-time verdict and your `cp -a` comes later — `-a` carries
+`--no-dereference` — so an entry planted in between is copied as itself
+and then stands identically on both sides, which the metadata comparison
+cannot fault and the other two passes skip. The type guard run over both
+trees ahead of the comparisons is what catches it, before the closing
+rename. Every manifest is NUL-delimited and compared byte for byte,
+because every filename under `openbao/` is whatever that container wrote
+and a name holding a newline splits a line-delimited manifest into two
+records; the path is the last field of every record, with no second
+variable-length field after it. `--zero` on `sha256sum` is not optional
+for the same reason. **No stage is a pipeline**: a pipeline reports its
+last command's status, so `find … | sort -z` succeeds when the *walk*
+failed and the consumer merely saw a short stream — an incomplete tree
+read as a clean one, the single direction this sequence must never fail
+in. Each stage is its own command over its own file under a `mktemp -d`
+scratch directory outside both trees; remove that directory yourself
+afterwards. The metadata pass carries the **hard-link count**, so a copy
+that expanded one source inode into two destination files fails even
+though every path matches on type, mode, ownership, size and content.
+Directory sizes and modification times are excluded, both differing
+legitimately between two filesystems. So is `lost+found`, and only where
+it is a directory at a tree's own root: `mkfs.ext4` creates it in every
+reserve it makes, so it stands on a side the copy did not put it on and
+would fault every correct migration. Only that one entry is exempt —
+anything underneath it is still compared under its `lost+found/…` path,
+so nothing is smuggled past the verification by being put there. A
+mismatch is decided by exit status, never by reading output.
+
+**Resume and rollback.** Both are rendered, both are idempotent, and
+bootroot performs neither.
+
+- **Resume** is re-running step 6 and step 7 over a partial copy. Nothing
+  about a partial copy makes the source unusable, because the source is
+  never modified.
+- **Rollback** is offered only while the holding directory still carries
+  its `.pre-mount` name; once the closing rename has run the store is
+  authoritative and there is nothing to roll back to. The partial copy is
+  discarded with the unmount, which is safe precisely because the
+  original was never touched.
+
+  <!-- The guards are what make the rollback idempotent; wrapping one
+       of these lines would make it a different command. -->
+  <!-- markdownlint-disable MD013 -->
+
+  ```sh
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then umount <audit_store_dir>; fi
+  if { [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; } && [ -d <audit_store_dir> ]; then rmdir <audit_store_dir>; fi
+  if [ -e <audit_store_dir>.pre-mount ] || [ -L <audit_store_dir>.pre-mount ]; then mv <audit_store_dir>.pre-mount <audit_store_dir>; fi
+  ```
+
+  <!-- markdownlint-enable MD013 -->
+
+  The `umount` is rendered only where the store is a mount point — from
+  step 4 onward. Between step 2 and step 4 the migration is already
+  open with nothing mounted, and there the rendered rollback is the
+  `rmdir` and the rename alone: an `umount` ahead of them would exit
+  non-zero and stop a sequence run verbatim before either.
+
+  **Every line is guarded on the holding path**, which is what makes the
+  rollback idempotent. The holding path is the state that says the
+  migration is still open, so once the rollback has run — or once the
+  closing rename has — the same three lines skip and exit 0, rather than
+  stopping at a `rmdir` of the store they have just put the records
+  back into. The `rmdir` carries a second guard for the mount point's
+  own existence: between step 2 and step 4 nothing has necessarily
+  recreated `<audit_store_dir>`, and a `rmdir` of a directory that is
+  not there would stop the sequence before the rename that carries the
+  rollback.
+
+  The guard is `-e` **or** `-L` because the two disagree about one
+  entry. bootroot decides the migration is open from an `lstat`, which
+  sees a dangling symbolic link at the holding path; `test -e` answers
+  for that link's absent target and reads the same path as closed. A
+  guard spelled `-e` alone would skip all three lines and exit 0 having
+  restored nothing, leaving the next run reporting **migration
+  incomplete** over a rollback that reported success. `-L` answers from
+  the link itself, so the shell and bootroot agree on every entry.
+
+**After the closing rename**, `<audit_store_dir>.migrated` holds a
+redundant second copy outside the reserve. It clears **migration
+incomplete**, and from then on every normal outcome reports its path and
+size as reclaimable. Removing it is later housekeeping and yours to do,
+only after confirming nothing is mounted under it; bootroot renders no
+delete for it, here or anywhere else in this procedure.
 
 #### Changing the reserve
 
@@ -1130,6 +1523,106 @@ Reformatting destroys the records the reserve exists to keep, and a
 silent grow leaves the mount unit, the image and the configuration
 describing three different ceilings. The replacement runs in a
 maintenance window with both writers stopped.
+
+That replacement moves the same records across filesystems as
+[the relocation above](#relocating-a-store-that-already-holds-records),
+so it is held to the same contract — the migration-set refusals, the type
+guard, `cp -a --one-file-system` with the `/.` source suffix, the three
+staged NUL-delimited comparisons and the exit-status rule — **reused
+exactly as they are written there** rather than re-spelled here. It is
+**documented rather than rendered**: a size mismatch is a **failed**
+outcome carrying no rendering, so there is no verdict that could emit
+these commands. bootroot is invoked at the ends, not through the middle:
+steps 2 to 5 are yours, while steps 1 and 6 are `bootroot infra up`
+passes that change nothing on the host.
+
+1. Update `audit_store_reserve_bytes`, then run
+   `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It fails with the size mismatch, naming both sizes and
+   pointing here. A value below the installer's minimum reserve is
+   refused by that check first, so the
+   procedure never starts against a size that cannot be formatted.
+2. Stop both writers — the OpenBao container, a scheduled stop needing a
+   **manual shamir unseal** on restart, and
+   `bootroot-registrar.service`. They stay down until step 5 completes.
+3. Create the new image at `<audit_store_dir>.img.new` — the same parent
+   directory, so the closing rename is atomic within one filesystem — at
+   the new size, fully allocated, uid 0, mode `0600`, and
+   `mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0` it. The free space
+   needed is the **new image's full size**: the old image's bytes are not
+   reclaimed until step 6.
+
+   ```sh
+   install -m 0600 /dev/null <audit_store_dir>.img.new
+   fallocate -l <new size> <audit_store_dir>.img.new
+   mkfs.ext4 -m 0 -E nodiscard,lazy_itable_init=0 <audit_store_dir>.img.new
+   ```
+
+4. Mount the new image at a temporary mount point, then run the
+   **migration-set refusals against the live store and gate the copy on
+   capacity, in that order** — the figure describes the same entries as
+   the copy only if the refusals hold. Read `/proc/self/mountinfo` and
+   refuse any mount point at or under `<audit_store_dir>`, then run the
+   type guard over it, then compare the two figures. The copy proceeds
+   only where the source figure plus the same **16 MiB** margin the
+   activation check adds is at or below the available figure; where it
+   does not fit, stop here with nothing copied, and the two routes out
+   are a larger new reserve or pruning the OpenBao audit log first. A
+   grow is gated by the same comparison and passes it.
+
+   ```sh
+   mkdir -p /mnt/bootroot-audit-new
+   mount -o loop <audit_store_dir>.img.new /mnt/bootroot-audit-new
+   find <audit_store_dir> -xdev -mindepth 1 ! -type d ! -type f -exec false {} +
+   du -s -x --block-size=1 <audit_store_dir>
+   df --block-size=1 --output=avail /mnt/bootroot-audit-new
+   ```
+
+   `-x` on `du` is **not optional**: plain `du` descends into a nested
+   mount and returns a figure for a larger set than the copy will move.
+   `--apparent-size` is excluded, reporting a different and smaller
+   number than the allocated one the copy actually needs.
+5. Run the type guard, the copy and the three comparisons **exactly as
+   written in steps 6 and 7 of the relocation above**, with
+   `<audit_store_dir>` as the source and the temporary mount point as the
+   destination, stopping at the first non-zero exit. Only once all four
+   pass:
+
+   ```sh
+   umount /mnt/bootroot-audit-new
+   systemctl stop '<escaped audit_store_dir>.mount'
+   mv <audit_store_dir>.img <audit_store_dir>.img.old
+   mv <audit_store_dir>.img.new <audit_store_dir>.img
+   systemctl start '<escaped audit_store_dir>.mount'
+   ```
+
+   Then start the OpenBao container, unseal it, and start
+   `bootroot-registrar.service`.
+6. Run `bootroot infra up --compose-file <compose file> --agent-config
+   <path>`. It verifies the image against the updated reserve and
+   reports **enforced**. Only then does `<audit_store_dir>.img.old`
+   become removable, and by you: bootroot
+   renders no delete here either, reporting that file's path and size as
+   reclaimable.
+
+**Resume and rollback, both idempotent and neither performed by
+bootroot.** Resume re-runs the copy over a partial one, then the guard
+and the comparisons; the source is the live store and is never modified.
+Rollback is defined at **both** positions. Before the rename in step 5,
+unmount the temporary mount and delete `<audit_store_dir>.img.new`, the
+live store never having been touched. After it, stop the mount unit,
+rename `<audit_store_dir>.img.old` back and start the unit — which is why
+`.img.old` survives until step 6 reports **enforced**. A failure at any
+step leaves either the old image or a verified new one in place, never
+neither.
+
+**Two facts that stop this being mistaken for a different procedure.** No
+mount-unit directive — `What=`, `Where=`, `Type=`, `Options=` — carries
+the size, so the re-rendered unit is normally byte-identical; where it
+differs, the outstanding `install` and `systemctl daemon-reload` are
+reported as ordinary artifact drift. And a changed `audit_store_dir` is
+not this procedure at all: it moves the mount point rather than the
+image.
 
 #### Removing the reserve
 

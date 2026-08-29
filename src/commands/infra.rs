@@ -171,7 +171,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     // enforced, so Docker cannot start OpenBao against an unmounted store.
     let audit_override = crate::commands::audit_store::prepare_audit_store_for_infra_up(
         &state_path,
-        compose_dir,
+        &args.compose_file.compose_file,
         args.agent_config.as_deref(),
         crate::commands::audit_store::production_uid(),
         messages,

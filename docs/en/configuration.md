@@ -678,7 +678,11 @@ error.
   anything is created or rendered. `validate_registrar_settings` gains no
   lower bound from that: the minimum is a `filesystem`-mode,
   endpoint-enabled refusal, and it would mean nothing for the
-  deployments it does not apply to. See
+  deployments it does not apply to. Changing it on a provisioned host is
+  answered by **replacing** the image, never by a resize in either
+  direction: `bootroot infra up` fails with a size mismatch naming both
+  sizes, and the six-step replacement that answers it is in
+  [Changing the reserve](operations.md#changing-the-reserve). See also
   [Sizing the reserve](operations.md#sizing-the-reserve).
 - `audit_store_low_water_bytes` (`u64`, default `536870912`, 512 MiB) —
   the future capacity-alarm threshold. It must be less than the reserve.

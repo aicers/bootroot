@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use super::migration::{self, MigrationPresence};
 use crate::i18n::Messages;
 
 /// The unit `st_blocks` counts in. Fixed at 512 bytes by POSIX
@@ -69,6 +70,14 @@ const RESERVE_CAP_BYTES: u64 = i64::MAX.unsigned_abs();
 
 /// Suffix appended to `audit_store_dir` to derive the image path.
 const IMAGE_SUFFIX: &str = ".img";
+
+/// Suffix the replacement procedure renames the outgoing image to.
+///
+/// `<audit_store_dir>.img.old` is what a reserve change rolls back to,
+/// so it is kept until a run reports **enforced** against the new size.
+/// bootroot renders no delete for it and never renames it itself; it
+/// reports it, once it is safe to remove, as reclaimable space.
+const RETAINED_IMAGE_SUFFIX: &str = ".old";
 
 /// Mode the loopback image is created at, and held to afterwards. A
 /// principal that can rewrite the image can rewrite the audit
@@ -158,6 +167,10 @@ const DELETED_SUFFIX: &str = " (deleted)";
 /// The mount table this surface reads. `/proc/self/mounts` rather than
 /// `/etc/mtab`: the first is what the kernel says is mounted now.
 const PROC_SELF_MOUNTS: &str = "/proc/self/mounts";
+
+/// The other mount table, read by [`super::migration`] through the same
+/// probe. Named here because [`HostProbe`] is what opens it.
+const PROC_SELF_MOUNTINFO: &str = "/proc/self/mountinfo";
 
 /// Subdirectory of the store holding the daemon's verb records.
 const RECORDS_SUBDIR: &str = bootroot::registrar::audit_store::RECORDS_SUBDIR;
@@ -249,6 +262,22 @@ pub(crate) trait ReserveProbe {
     ///
     /// Returns the underlying error for anything but `ENOENT`.
     fn mounts(&self) -> io::Result<String>;
+
+    /// Reads `/proc/self/mountinfo`. An absent table reads as no
+    /// entries at all.
+    ///
+    /// A second mount table beside [`Self::mounts`] rather than a
+    /// replacement for it: the two answer different questions. The
+    /// reserve's own identity proof needs the source and filesystem
+    /// type `/proc/self/mounts` carries in fixed positions, while the
+    /// migration's "is anything mounted at or under this tree" needs
+    /// every mount regardless of device, which only `mountinfo`'s
+    /// per-mount records answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying error for anything but `ENOENT`.
+    fn mountinfo(&self) -> io::Result<String>;
 
     /// Reads `/sys/dev/block/<major>:<minor>/loop/backing_file`, keyed
     /// on the device numbers rather than on the source string.
@@ -379,6 +408,17 @@ impl ReserveProbe for HostProbe {
         }
     }
 
+    fn mountinfo(&self) -> io::Result<String> {
+        match std::fs::read_to_string(PROC_SELF_MOUNTINFO) {
+            Ok(text) => Ok(text),
+            // Same reading as `mounts`: a host with no `/proc` mounted
+            // has no mount table for any read here to consult. An
+            // `EACCES` still reaches the caller.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+            Err(err) => Err(err),
+        }
+    }
+
     fn loop_backing_file(&self, major: u64, minor: u64) -> io::Result<Option<String>> {
         let path = PathBuf::from(format!("/sys/dev/block/{major}:{minor}/loop/backing_file"));
         match std::fs::read_to_string(&path) {
@@ -396,6 +436,18 @@ pub(crate) struct ReserveInputs<'a> {
     /// The directory the compose file sits in, under which the three
     /// artifacts are staged.
     pub(crate) compose_dir: &'a Path,
+    /// The compose file this run was pointed at, named by the `-f` of
+    /// the Compose stop the stop-both-writers step renders. **Absolute**,
+    /// resolved by the caller against the current directory: the
+    /// rendered verification ends with a `cd` into the store, so a
+    /// relative `-f` in a list run in order would select a deployment
+    /// under the store rather than the one this run stopped.
+    pub(crate) compose_file: &'a Path,
+    /// The Compose project this run resolved, carried as the `-p` of
+    /// that same stop so it reaches the deployment bootroot itself
+    /// would have brought up rather than whichever project Compose
+    /// derives from a directory name.
+    pub(crate) compose_project: &'a str,
     /// `[registrar] audit_store_reserve_bytes`.
     pub(crate) reserve_bytes: u64,
     /// `[registrar] audit_max_file_bytes`.
@@ -479,6 +531,69 @@ impl Phase1Facts {
     pub(crate) fn underlying_not_empty(&self) -> bool {
         self.underlying == UnderlyingState::NotEmpty
     }
+
+    /// Whether a migration is in progress, which overrides every other
+    /// verdict this surface can reach.
+    pub(crate) fn migration_open(&self) -> bool {
+        self.migration.holding
+    }
+
+    /// Whether something other than the reserve is mounted at the
+    /// store.
+    ///
+    /// Distinct from [`Phase1Facts::mount_present`], which any entry
+    /// satisfies: this is the one that says the filesystem at the mount
+    /// point belongs to somebody else.
+    fn mount_foreign(&self) -> bool {
+        matches!(self.mount, MountEvaluation::Foreign { .. })
+    }
+
+    /// Whether the run may render anything that would change the store.
+    ///
+    /// Four states withhold everything. A **deferred** phase-1 refusal
+    /// describes a reserve that cannot be made, so no image command, no
+    /// unit and no copy over it is right. A store that still holds
+    /// content while the holding directory already exists is the
+    /// **collision**: mounting the reserve would hide those records,
+    /// the copy would move an unrelated tree onto it, and the rollback
+    /// would move the holding directory *inside* the store rather than
+    /// replacing it, which is what a rename onto an existing directory
+    /// does. A **foreign mount** at the store is a third: every command
+    /// the activation would render acts on that filesystem rather than
+    /// on the reserve — `systemctl enable --now` stacks the reserve on
+    /// top of it, the copy writes audit records into it, and the
+    /// rollback's `umount` takes it down. An existing
+    /// `<audit_store_dir>.migrated` is the fourth, and it gets the
+    /// same treatment here as it does on the entry into the migration:
+    /// the closing rename cannot target a path that already exists, so
+    /// the copy is refused rather than started against a sequence that
+    /// could never close, leaving the operator to run a maintenance
+    /// window's worth of work with both writers down and the migration
+    /// still open at the end of it. Clearing the named path is the one
+    /// action, and the pass after it renders the whole sequence.
+    fn migration_renders_nothing(&self) -> bool {
+        !self.deferred.is_empty()
+            || self.underlying == UnderlyingState::NotEmpty
+            || self.mount_foreign()
+            || self.migration.migrated
+    }
+
+    /// Whether the rollback may be rendered at all.
+    ///
+    /// It survives a deferred refusal — the store under an open
+    /// migration is the empty mount point the aside rename left, and
+    /// the way back out of it does not depend on the reserve being
+    /// makeable. It survives a `.migrated` collision for the same
+    /// reason: the restoring rename targets `<audit_store_dir>`, which
+    /// the blocked closing rename says nothing about, and the way back
+    /// out is exactly what an operator who cannot go forward needs. It
+    /// does not survive the other two: onto a store that still holds
+    /// content the restoring rename nests one store inside another,
+    /// and over a foreign mount the `umount` takes down a filesystem
+    /// this migration never put there.
+    fn migration_renders_rollback(&self) -> bool {
+        self.underlying != UnderlyingState::NotEmpty && !self.mount_foreign()
+    }
 }
 
 /// What phase 1 found on the filesystem underneath an absent mount.
@@ -514,6 +629,20 @@ pub(crate) struct Phase1Facts {
     pub(crate) mount: MountEvaluation,
     /// What is underneath an absent mount.
     pub(crate) underlying: UnderlyingState,
+    /// What the two derived migration paths hold. Read **first**, so
+    /// no other verdict is reached before it, and carried here so
+    /// every later decision sees the same reading.
+    pub(crate) migration: MigrationPresence,
+    /// Phase-1 refusals a run with an open migration carries instead of
+    /// raising, because **migration incomplete** is reported ahead of
+    /// them and overrides them.
+    ///
+    /// Never non-empty without [`MigrationPresence::holding`], and
+    /// while it is non-empty the migration outcome renders no
+    /// activation and no copy: the reserve those refusals describe
+    /// cannot be made, so every command that assumes it would be wrong,
+    /// and [`Self::image`] carries no meaning of its own.
+    pub(crate) deferred: Vec<String>,
 }
 
 /// One artifact phase 1 renders, staged beside the Compose override
@@ -545,6 +674,20 @@ pub(crate) enum Phase2StepKind {
     Subdirectories,
     /// Run the command the run continues under again.
     ReRun,
+    /// Rename the store aside into the holding directory and recreate
+    /// an empty mount point, which is what opens a migration.
+    AsideRename,
+    /// The type guard over the holding directory, run immediately
+    /// before the copy.
+    TypeGuard,
+    /// The one whole-subtree copy onto the mounted reserve.
+    Copy,
+    /// The type guard over both trees and the three comparisons.
+    Verify,
+    /// The rename that closes the migration.
+    ClosingRename,
+    /// The way back out, while the migration is still open.
+    Rollback,
 }
 
 /// One numbered phase-2 step, separately addressable.
@@ -561,6 +704,17 @@ pub(crate) struct Phase2Step {
 /// The outcome a `filesystem`- or `directory`-mode run reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReserveReport {
+    /// `migration incomplete` — a holding directory exists, so the
+    /// store's contents are part-way onto the reserve. The run
+    /// **fails** under this, and it sits ahead of every other outcome:
+    /// however complete the image, the artifacts and the mount are,
+    /// the reserve is never reported as enforced while it holds.
+    MigrationIncomplete {
+        /// What is outstanding, the holding path named first.
+        findings: Vec<String>,
+        /// The remaining commands, in order.
+        steps: Vec<Phase2Step>,
+    },
     /// `enforced` — all four phase-3 requirements hold.
     Enforced {
         /// Facts worth stating that are not failures, such as a
@@ -571,6 +725,9 @@ pub(crate) enum ReserveReport {
     NotActivated {
         /// What is outstanding.
         findings: Vec<String>,
+        /// Facts worth stating that are not failures, such as a
+        /// `.migrated` directory whose space is reclaimable.
+        notes: Vec<String>,
         /// The remaining commands, in order.
         steps: Vec<Phase2Step>,
         /// Whether an otherwise renderable list was **withheld**
@@ -851,7 +1008,7 @@ pub(super) fn sh_quote_path(path: &Path) -> String {
 /// Renders `path` for a message. Lossy only for a path that is not
 /// valid UTF-8, which the unit *name* still carries byte-exactly
 /// because its escaper works on bytes.
-fn display_path(path: &Path) -> String {
+pub(super) fn display_path(path: &Path) -> String {
     String::from_utf8_lossy(path.as_os_str().as_bytes()).into_owned()
 }
 
@@ -911,7 +1068,7 @@ fn check_reserve_minimum(inputs: &ReserveInputs<'_>, messages: &Messages) -> Res
 /// `lstat`s `path`, naming it and the errno when the read itself
 /// fails. "Cannot see it" is never collapsed into "it is not there",
 /// which reads as an unprovisioned host.
-fn lstat_named(
+pub(super) fn lstat_named(
     probe: &dyn ReserveProbe,
     path: &Path,
     messages: &Messages,
@@ -929,12 +1086,6 @@ fn lstat_named(
 /// preflight that can pass a host with no room.
 fn checked_bytes_mul(left: u64, right: u64, figure: &str, messages: &Messages) -> Result<u64> {
     left.checked_mul(right)
-        .ok_or_else(|| anyhow::anyhow!(messages.error_audit_reserve_arithmetic(figure)))
-}
-
-/// Adds two byte figures, failing the run rather than wrapping.
-fn checked_bytes_add(left: u64, right: u64, figure: &str, messages: &Messages) -> Result<u64> {
-    left.checked_add(right)
         .ok_or_else(|| anyhow::anyhow!(messages.error_audit_reserve_arithmetic(figure)))
 }
 
@@ -996,7 +1147,7 @@ fn evaluate_image(
 }
 
 /// Names one [`FileKind`] for a message.
-fn kind_text(kind: FileKind, messages: &Messages) -> &'static str {
+pub(super) fn kind_text(kind: FileKind, messages: &Messages) -> &'static str {
     match kind {
         FileKind::Regular => messages.audit_reserve_kind_regular(),
         FileKind::Directory => messages.audit_reserve_kind_directory(),
@@ -1036,7 +1187,7 @@ fn parse_mount_table(text: &str) -> Vec<MountEntry> {
 
 /// Decodes the `\NNN` octal escapes the kernel writes for space, tab,
 /// newline and backslash.
-fn decode_mount_field(field: &str) -> Vec<u8> {
+pub(super) fn decode_mount_field(field: &str) -> Vec<u8> {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0usize;
@@ -1157,31 +1308,95 @@ fn evaluate_mount(
     Ok(MountEvaluation::Reserve { stacked })
 }
 
-/// Sums the allocated bytes of everything beneath `root`.
+/// Why an allocated-size walk could not produce a figure.
+///
+/// The two are kept apart because their callers answer them
+/// differently: a read that failed is a **failed** run wherever it
+/// happens, while a figure that cannot be represented is a refusal the
+/// migration reports under its own outcome, naming the figure and
+/// rendering no copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MeasureError {
+    /// A product or a sum that does not fit in a `u64`, named.
+    Arithmetic(String),
+    /// A metadata or listing read that failed, already rendered.
+    Unreadable(String),
+}
+
+impl MeasureError {
+    /// Renders this as the run-failing error a caller with no refusal
+    /// of its own raises.
+    pub(super) fn into_error(self, messages: &Messages) -> anyhow::Error {
+        match self {
+            Self::Arithmetic(figure) => {
+                anyhow::anyhow!(messages.error_audit_reserve_arithmetic(&figure))
+            }
+            Self::Unreadable(rendered) => anyhow::anyhow!(rendered),
+        }
+    }
+}
+
+/// Sums the allocated bytes of `root` and everything beneath it.
 ///
 /// Each `(st_dev, st_ino)` counts once, so a hard-linked pair is not
 /// double-counted, and the walk does not cross a filesystem boundary:
 /// what has to fit inside the reserve is what lives on the underlying
 /// store, not what some other filesystem mounted below it holds.
-fn measure_underlying(root: &Path, probe: &dyn ReserveProbe, messages: &Messages) -> Result<u64> {
-    let Some(root_facts) = lstat_named(probe, root, messages)? else {
+///
+/// The root counts as itself. `cp -a <root>/. <destination>/` links
+/// every one of the root's entries into the destination's own root
+/// directory, which has to grow to hold them, so the blocks the source
+/// root spends on those entries are blocks the destination has to
+/// spend too — and a directory that once held a great many files keeps
+/// that allocation. It is also what `du -s` reports, which is the
+/// figure the manual has an operator compute by hand for the same
+/// decision; a walk that stopped at the children would answer a
+/// question the documented procedure does not ask.
+///
+/// `root` is a parameter rather than the store: the migration's
+/// capacity check calls this against the holding directory, and two
+/// walks that disagree about a hard link would be two different answers
+/// to "does it fit".
+///
+/// # Errors
+///
+/// Returns [`MeasureError::Unreadable`] for a read that failed and
+/// [`MeasureError::Arithmetic`] for a byte figure that cannot be
+/// represented.
+pub(super) fn measure_underlying(
+    root: &Path,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> std::result::Result<u64, MeasureError> {
+    let unreadable = |path: &Path, err: &io::Error| {
+        MeasureError::Unreadable(
+            messages.error_audit_reserve_unreadable(&display_path(path), &err.to_string()),
+        )
+    };
+    let Some(root_facts) = probe.lstat(root).map_err(|err| unreadable(root, &err))? else {
         return Ok(0);
     };
     let figure = messages.audit_reserve_figure_underlying(&display_path(root));
+    let allocated = |facts: &FileFacts| {
+        facts
+            .blocks
+            .checked_mul(ST_BLOCKS_UNIT_BYTES)
+            .ok_or_else(|| MeasureError::Arithmetic(figure.clone()))
+    };
     let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    seen.insert((root_facts.dev, root_facts.ino));
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
-    let mut total = 0u64;
+    let mut total = allocated(&root_facts)?;
     while let Some(dir) = pending.pop() {
         let entries = probe
             .list_dir(&dir)
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    messages.error_audit_reserve_unreadable(&display_path(&dir), &err.to_string())
-                )
-            })?
+            .map_err(|err| unreadable(&dir, &err))?
             .unwrap_or_default();
         for entry in entries {
-            let Some(facts) = lstat_named(probe, &entry, messages)? else {
+            let Some(facts) = probe
+                .lstat(&entry)
+                .map_err(|err| unreadable(&entry, &err))?
+            else {
                 continue;
             };
             if facts.dev != root_facts.dev {
@@ -1190,9 +1405,9 @@ fn measure_underlying(root: &Path, probe: &dyn ReserveProbe, messages: &Messages
             if !seen.insert((facts.dev, facts.ino)) {
                 continue;
             }
-            let allocated =
-                checked_bytes_mul(facts.blocks, ST_BLOCKS_UNIT_BYTES, &figure, messages)?;
-            total = checked_bytes_add(total, allocated, &figure, messages)?;
+            total = total
+                .checked_add(allocated(&facts)?)
+                .ok_or_else(|| MeasureError::Arithmetic(figure.clone()))?;
             if facts.kind == FileKind::Directory {
                 pending.push(entry);
             }
@@ -1234,7 +1449,8 @@ fn evaluate_underlying(
     // No image, no mount and no relocation can make a store that is
     // already larger than the reserve fit inside it, so that is a
     // failure rather than something phase 2 could resolve.
-    let used = measure_underlying(store_dir, probe, messages)?;
+    let used =
+        measure_underlying(store_dir, probe, messages).map_err(|err| err.into_error(messages))?;
     if used > inputs.reserve_bytes {
         anyhow::bail!(messages.error_audit_reserve_underlying_too_large(
             &display_path(store_dir),
@@ -1323,6 +1539,21 @@ fn preflight_free_space(
 /// that outstanding figure; and the underlying store's emptiness and
 /// size, checkable only while the mount is absent.
 ///
+/// **A holding directory changes what those refusals do, never what
+/// they are.** **migration incomplete** is reported before the image
+/// contract, the artifacts and the mount are considered and overrides
+/// all of them, so none of them may be what a run with an open
+/// migration reports: raising one would leave an operator who changed
+/// `audit_store_reserve_bytes` mid-window with a size-mismatch error,
+/// no mention of the holding directory that holds the only copy of
+/// those records, and no rollback. Every refusal from the reserve
+/// minimum onwards is therefore **deferred** while a migration is open
+/// — carried into [`Phase1Facts::deferred`] and reported as a finding
+/// under that outcome, which still fails the run — and only the
+/// derivations everything else is rendered from stay refusals, none of
+/// them reachable with a migration open, since the aside rename that
+/// opens one is itself rendered from them.
+///
 /// `bootroot reinit` raises exactly these refusals before it wipes:
 /// every one of them is a pure read, so running it twice costs nothing
 /// and decides nothing.
@@ -1336,30 +1567,91 @@ fn preflight_free_space(
 /// file or is the wrong size, a filesystem with less room than the
 /// outstanding allocation, an underlying store larger than the
 /// reserve, a read that failed for want of permission, or a byte
-/// figure that cannot be represented.
+/// figure that cannot be represented. With a holding directory
+/// present, every one of those but the derivations is returned in
+/// [`Phase1Facts::deferred`] instead.
 pub(crate) fn evaluate(
     inputs: &ReserveInputs<'_>,
     probe: &dyn ReserveProbe,
     messages: &Messages,
 ) -> Result<Phase1Facts> {
-    check_reserve_minimum(inputs, messages)?;
     let store_dir = simplify_store_path(inputs.store_dir);
+    // First, ahead of every refusal and every other reading. An
+    // operator who completes the aside rename and stops there leaves a
+    // valid image, a valid mount and an empty store; without this
+    // ordering the next run reports the reserve as enforced over an
+    // audit trail stranded in a sibling directory.
+    let migration = migration::detect(&store_dir, probe, messages)?;
+    // The three derivations everything downstream is rendered from,
+    // the migration outcome's own steps included. They stay refusals
+    // whatever the migration state, because there is nothing to render
+    // without them.
     check_store_path_renderable(inputs.store_dir, &store_dir, messages)?;
     check_staging_outside_store(&store_dir, inputs.compose_dir, messages)?;
     let image_path = derive_image_path(&store_dir, messages)?;
     let unit_name = mount_unit_name(&store_dir);
-    let image = evaluate_image(&image_path, inputs, probe, messages)?;
-    preflight_free_space(inputs, &image_path, image, probe, messages)?;
+
+    let mut deferred = Vec::new();
+    let open = migration.holding;
+    if let Err(err) = check_reserve_minimum(inputs, messages) {
+        defer_or_raise(err, open, &mut deferred)?;
+    }
+    // A refused image contract leaves no state to preflight the free
+    // space against: `outstanding_allocation` would answer for an
+    // image that is not the one on disk. So the preflight is skipped
+    // rather than run on a fiction, and the contract's own refusal is
+    // what the outcome names.
+    let image = match evaluate_image(&image_path, inputs, probe, messages) {
+        Ok(image) => Some(image),
+        Err(err) => {
+            defer_or_raise(err, open, &mut deferred)?;
+            None
+        }
+    };
+    if let Some(image) = image
+        && let Err(err) = preflight_free_space(inputs, &image_path, image, probe, messages)
+    {
+        defer_or_raise(err, open, &mut deferred)?;
+    }
     let mount = evaluate_mount(&store_dir, &image_path, probe, messages)?;
-    let underlying = evaluate_underlying(&store_dir, inputs, &mount, probe, messages)?;
+    let underlying = match evaluate_underlying(&store_dir, inputs, &mount, probe, messages) {
+        Ok(state) => state,
+        Err(err) => {
+            defer_or_raise(err, open, &mut deferred)?;
+            // The only refusal it raises over a readable store is that
+            // the store underneath is larger than the reserve, which is
+            // a store that still holds records — the collision the
+            // migration outcome refuses to render anything over.
+            UnderlyingState::NotEmpty
+        }
+    };
     Ok(Phase1Facts {
         store_dir,
         image_path,
         unit_name,
-        image,
+        // Read only where `deferred` is empty: a refused image contract
+        // has no state to report, and every renderer is withheld while
+        // that refusal stands.
+        image: image.unwrap_or(ImageEvaluation::Absent),
         mount,
         underlying,
+        migration,
+        deferred,
     })
+}
+
+/// Carries a phase-1 refusal into the migration outcome, or raises it.
+///
+/// The refusal is the same either way; what an open migration changes
+/// is that **migration incomplete** is reported ahead of it and
+/// overrides it, so it is named as a finding under that outcome rather
+/// than being what the run reports. The run fails under either.
+fn defer_or_raise(err: anyhow::Error, open: bool, deferred: &mut Vec<String>) -> Result<()> {
+    if !open {
+        return Err(err);
+    }
+    deferred.push(err.to_string());
+    Ok(())
 }
 
 /// Returns where the three artifacts are staged.
@@ -1763,15 +2055,7 @@ fn phase2_steps(
 
     let mut steps = Vec::new();
     if !image.is_empty() || mount_outstanding {
-        steps.push(Phase2Step {
-            kind: Phase2StepKind::StopWriters,
-            title: messages.audit_reserve_step_stop_writers().to_string(),
-            // Only the daemon's half is a command this surface can
-            // spell: stopping the Compose stack takes the operator's
-            // own `-f`/`-p` invocation, which nothing here is given,
-            // and a guessed one would stop the wrong deployment.
-            commands: vec![format!("systemctl stop {REGISTRAR_UNIT_NAME}")],
-        });
+        steps.push(stop_writers_step(inputs, messages));
     }
     if !image.is_empty() {
         steps.push(Phase2Step {
@@ -1795,13 +2079,53 @@ fn phase2_steps(
         });
     }
     if !steps.is_empty() {
-        steps.push(Phase2Step {
-            kind: Phase2StepKind::ReRun,
-            title: messages.audit_reserve_step_rerun(inputs.rerun_command),
-            commands: vec![inputs.rerun_command.to_string()],
-        });
+        steps.push(rerun_step(inputs, messages));
     }
     steps
+}
+
+/// The step that stops both writers, shared by the activation sequence
+/// and the migration.
+///
+/// Both halves are commands, in the order the sequence needs them: the
+/// Compose stack first, so no container holds a bind under the store,
+/// then the daemon, so no verb record is written into it. Neither is
+/// prose. An operator running the rendered list verbatim who was left
+/// to infer the Compose stop would rename, copy and verify a store
+/// `OpenBao` was still writing through its existing bind, and the
+/// records written in that window would be outside the verified copy.
+///
+/// The stop is spelled with the `-f` and `-p` this run resolved rather
+/// than a guessed pair: the compose file is the one bootroot was
+/// pointed at, and the project is the one every invocation of this run
+/// is scoped to, so the command reaches that deployment and no
+/// co-located one. It carries no `BOOTROOT_INSTANCE` pin because
+/// `stop` selects containers by the project label Compose already has
+/// from `-p`, and the compose file's own `.env` supplies the variable
+/// while the file is rendered.
+fn stop_writers_step(inputs: &ReserveInputs<'_>, messages: &Messages) -> Phase2Step {
+    Phase2Step {
+        kind: Phase2StepKind::StopWriters,
+        title: messages.audit_reserve_step_stop_writers().to_string(),
+        commands: vec![
+            format!(
+                "docker compose -f {} -p {} stop",
+                sh_quote_path(inputs.compose_file),
+                sh_quote(inputs.compose_project),
+            ),
+            format!("systemctl stop {REGISTRAR_UNIT_NAME}"),
+        ],
+    }
+}
+
+/// The closing step, naming the command the run was actually invoked
+/// under.
+fn rerun_step(inputs: &ReserveInputs<'_>, messages: &Messages) -> Phase2Step {
+    Phase2Step {
+        kind: Phase2StepKind::ReRun,
+        title: messages.audit_reserve_step_rerun(inputs.rerun_command),
+        commands: vec![inputs.rerun_command.to_string()],
+    }
 }
 
 /// The findings the image's own contract raises, one per deviation.
@@ -1917,21 +2241,26 @@ pub(crate) fn verify(
     messages: &Messages,
 ) -> Result<ReserveReport> {
     let store = display_path(&facts.store_dir);
+    let holding = display_path(&facts.migration.paths.holding);
+    let migrated = display_path(&facts.migration.paths.migrated);
 
-    // A store that already holds records is refused rather than
-    // mounted over, and **no phase-2 command whatever** is rendered: a
-    // partial list is an invitation to keep going, and the step it
-    // ends at mounts a filesystem over those records.
+    // Ahead of the image contract, the artifacts and the mount, and
+    // overriding all three: however complete those are, a run with a
+    // holding directory fails under this outcome and never reports the
+    // reserve as enforced.
+    if facts.migration.holding {
+        return migration_report(inputs, facts, artifacts, probe, messages);
+    }
+
     if facts.underlying == UnderlyingState::NotEmpty {
-        return Ok(ReserveReport::NotActivated {
-            findings: vec![messages.audit_reserve_finding_store_not_empty(&store)],
-            steps: Vec::new(),
-            steps_withheld: true,
-        });
+        return Ok(migration_entry_report(
+            inputs, facts, &store, &holding, &migrated, messages,
+        ));
     }
 
     let mut findings = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes = migrated_notes(facts, probe, messages)?;
+    notes.extend(retained_image_notes(facts, probe, messages)?);
     let image_display = display_path(&facts.image_path);
 
     findings.extend(image_findings(
@@ -2006,9 +2335,279 @@ pub(crate) fn verify(
     );
     Ok(ReserveReport::NotActivated {
         findings,
+        notes,
         steps,
         steps_withheld: false,
     })
+}
+
+/// What a store that already holds records is answered with.
+///
+/// It is not mounted over. What is rendered for it is the entry into
+/// the migration and nothing else: both writers stopped, the store
+/// renamed aside, and an empty mount point in its place. The activation
+/// itself comes from the next pass, once the aside rename has made the
+/// underlying directory empty.
+fn migration_entry_report(
+    inputs: &ReserveInputs<'_>,
+    facts: &Phase1Facts,
+    store: &str,
+    holding: &str,
+    migrated: &str,
+    messages: &Messages,
+) -> ReserveReport {
+    let mut findings = vec![messages.audit_reserve_finding_store_not_empty(store, holding)];
+    // Neither rename may target a path that already exists. `mv dir
+    // dir.pre-mount` where the destination is an existing directory
+    // does not replace it — it moves the source *inside* it — and a
+    // `.migrated` left from an earlier migration would block the
+    // closing rename at the far end of the sequence.
+    if facts.migration.migrated {
+        findings.push(messages.audit_reserve_finding_migration_path_exists(migrated));
+        return ReserveReport::NotActivated {
+            findings,
+            notes: Vec::new(),
+            steps: Vec::new(),
+            steps_withheld: true,
+        };
+    }
+    ReserveReport::NotActivated {
+        findings,
+        notes: Vec::new(),
+        steps: vec![
+            stop_writers_step(inputs, messages),
+            migration::aside_rename_step(
+                &facts.store_dir,
+                &facts.migration.paths.holding,
+                SUBDIR_MODE,
+                messages,
+            ),
+            rerun_step(inputs, messages),
+        ],
+        steps_withheld: false,
+    }
+}
+
+/// The note a retained `<audit_store_dir>.migrated` earns under the
+/// normal outcomes.
+///
+/// It holds a redundant second copy outside the reserve, so its path
+/// and size are reported as reclaimable — never as **migration
+/// incomplete**, which it does not raise. Removing it is later operator
+/// housekeeping, and bootroot renders no delete for it.
+fn migrated_notes(
+    facts: &Phase1Facts,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<Vec<String>> {
+    if !facts.migration.migrated {
+        return Ok(Vec::new());
+    }
+    let path = display_path(&facts.migration.paths.migrated);
+    let size = migration::migrated_size(&facts.migration.paths.migrated, probe, messages)?;
+    Ok(vec![match size {
+        Some(bytes) => messages.audit_reserve_note_migrated_reclaimable(&path, bytes),
+        None => messages.audit_reserve_note_migrated_reclaimable_unsized(&path),
+    }])
+}
+
+/// The note a retained `<audit_store_dir>.img.old` earns under the
+/// normal outcomes.
+///
+/// The replacement procedure keeps the outgoing image until a run
+/// reports **enforced** against the updated reserve, because renaming
+/// it back is the rollback. Once that run has happened the file is a
+/// second full-size image nothing reads, so its path and allocated
+/// size are reported as reclaimable and removing it is the operator's.
+/// bootroot renders no delete for it.
+///
+/// A figure that cannot be represented is not a refusal here — nothing
+/// gates on it — so the note is simply not reported.
+fn retained_image_notes(
+    facts: &Phase1Facts,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<Vec<String>> {
+    let path = migration::with_suffix(&facts.image_path, RETAINED_IMAGE_SUFFIX);
+    let Some(retained) = lstat_named(probe, &path, messages)? else {
+        return Ok(Vec::new());
+    };
+    if retained.kind != FileKind::Regular {
+        return Ok(Vec::new());
+    }
+    let Some(bytes) = retained.blocks.checked_mul(ST_BLOCKS_UNIT_BYTES) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![
+        messages.audit_reserve_note_retained_image_reclaimable(&display_path(&path), bytes),
+    ])
+}
+
+/// The step list for a migration state that may change nothing on the
+/// host: the re-run, and the rollback wherever it is safe to offer.
+fn withheld_migration_steps(
+    inputs: &ReserveInputs<'_>,
+    facts: &Phase1Facts,
+    rollback: bool,
+    messages: &Messages,
+) -> Vec<Phase2Step> {
+    let mut steps = vec![rerun_step(inputs, messages)];
+    if rollback {
+        steps.push(migration::rollback_step(
+            &facts.store_dir,
+            &facts.migration.paths.holding,
+            facts.mount_present(),
+            messages,
+        ));
+    }
+    steps
+}
+
+/// The **migration incomplete** outcome.
+///
+/// It names the holding path, states which step is outstanding, and
+/// renders what to run next: where the mount is not yet up, the
+/// outstanding **activation** — taken from the phase-2 renderer with
+/// the subdirectory step withheld, because the copy is what satisfies
+/// it — and where it is, the capacity verdict and either the copy or
+/// the two routes out. The activation is withheld along with the copy
+/// wherever [`migration::CopyVerdict::withholds_activation`] says the
+/// list would otherwise create a mount its own rollback cannot undo:
+/// always where the holding path is not a directory, and under an
+/// absent mount for the migration-set refusals too. A
+/// `<audit_store_dir>.migrated` that already exists takes every
+/// host-changing command away ahead of all of that, because the copy
+/// it would render could not be closed. The rollback is offered in
+/// every case except the two that would have it act on something this
+/// migration did not put there: a store that still holds content, and
+/// a foreign mount.
+fn migration_report(
+    inputs: &ReserveInputs<'_>,
+    facts: &Phase1Facts,
+    artifacts: &[RenderedArtifact],
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<ReserveReport> {
+    let store = display_path(&facts.store_dir);
+    let holding = display_path(&facts.migration.paths.holding);
+    let migrated = display_path(&facts.migration.paths.migrated);
+    let mount_up = matches!(facts.mount, MountEvaluation::Reserve { .. });
+
+    let mut findings = vec![messages.audit_reserve_finding_migration_holding(&holding, &store)];
+    if facts.underlying == UnderlyingState::NotEmpty {
+        findings.push(messages.audit_reserve_finding_migration_store_not_empty(&store, &holding));
+    }
+    if let MountEvaluation::Foreign { description, .. } = &facts.mount {
+        findings.push(messages.audit_reserve_finding_migration_mount_foreign(
+            &store,
+            description,
+            &holding,
+        ));
+    }
+    for refusal in &facts.deferred {
+        findings.push(messages.audit_reserve_finding_migration_deferred(refusal));
+    }
+    if facts.migration.migrated {
+        findings.push(messages.audit_reserve_finding_migration_path_exists(&migrated));
+    }
+    if facts.migration_renders_nothing() {
+        // None of the four leaves an activation or a copy that would
+        // be right to render: the deferred refusal describes a reserve
+        // that cannot be made, the collision describes a store whose
+        // records a mount would hide and a copy would not be reading,
+        // the foreign mount describes a filesystem that is not this
+        // migration's to mount over, copy into or unmount, and an
+        // existing `.migrated` describes a copy with no closing rename
+        // at the far end of it. The rollback survives the first and
+        // the last.
+        let steps =
+            withheld_migration_steps(inputs, facts, facts.migration_renders_rollback(), messages);
+        return Ok(ReserveReport::MigrationIncomplete { findings, steps });
+    }
+
+    let verdict = migration::assess_copy(
+        &facts.store_dir,
+        &facts.migration.paths.holding,
+        mount_up,
+        probe,
+        messages,
+    )?;
+    findings.extend(migration::verdict_findings(&verdict, messages));
+    if verdict.withholds_activation(mount_up) {
+        // The activation is rendered from the store rather than from
+        // the holding path, so a refusal that only withheld the copy
+        // would leave it standing. It must not, wherever the same list
+        // also carries the rollback: `systemctl enable --now` brings
+        // the mount up, and the rollback below it was rendered under
+        // the mount state of *this* pass — with the mount absent it
+        // has no `umount`, so its `rmdir` meets a live mount point,
+        // exits non-zero and stops the sequence before the restoring
+        // rename. One list would then create the mount and make its
+        // own way back out unrunnable.
+        let steps = withheld_migration_steps(inputs, facts, true, messages);
+        return Ok(ReserveReport::MigrationIncomplete { findings, steps });
+    }
+    // The activation comes from the existing phase-2 renderer rather
+    // than from a second copy written here, with exactly one step
+    // withheld and nothing added. That step is the subdirectory one,
+    // and the copy is what satisfies it: `cp -a <source>/. <dest>/`
+    // recreates `records/` and `openbao/` with the source's own
+    // ownership and modes, and applies the source directory's own mode
+    // and owner to the destination root as well — so the `chmod` that
+    // step would render for the mount point is not lost with it. A
+    // directory made by hand ahead of the copy is a set of attributes
+    // the verification then compares against the source's anyway.
+    let mut artifact_states = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        artifact_states.push(evaluate_artifact(artifact, probe, messages)?);
+    }
+    let mut steps = phase2_steps(inputs, facts, artifacts, &artifact_states, &[], messages);
+    steps.retain(|step| {
+        !matches!(
+            step.kind,
+            Phase2StepKind::ReRun | Phase2StepKind::Subdirectories
+        )
+    });
+    if !steps
+        .iter()
+        .any(|step| step.kind == Phase2StepKind::StopWriters)
+    {
+        // Both writers stay down for the whole window, and bootroot
+        // cannot see that they already are.
+        steps.insert(0, stop_writers_step(inputs, messages));
+    }
+    if verdict.renders_copy() {
+        steps.push(migration::type_guard_step(
+            &facts.migration.paths.holding,
+            messages,
+        ));
+        steps.push(migration::copy_step(
+            &facts.store_dir,
+            &facts.migration.paths.holding,
+            messages,
+        ));
+        steps.push(migration::verification_step(
+            &facts.store_dir,
+            &facts.migration.paths.holding,
+            messages,
+        ));
+        // Unconditional here: a `.migrated` path that already exists
+        // is refused above, with the copy this rename closes, so the
+        // copy is never rendered without the rename that finishes it.
+        steps.push(migration::closing_rename_step(
+            &facts.migration.paths.holding,
+            &facts.migration.paths.migrated,
+            messages,
+        ));
+    }
+    steps.push(rerun_step(inputs, messages));
+    steps.push(migration::rollback_step(
+        &facts.store_dir,
+        &facts.migration.paths.holding,
+        facts.mount_present(),
+        messages,
+    ));
+    Ok(ReserveReport::MigrationIncomplete { findings, steps })
 }
 
 /// The `unenforced (directory)` outcome's text.
@@ -2021,9 +2620,40 @@ pub(crate) fn verify(
 pub(crate) fn render_directory_outcome(
     store_dir: &Path,
     reserve_bytes: u64,
+    migration: &MigrationPresence,
     messages: &Messages,
 ) -> String {
-    messages.audit_reserve_outcome_directory(&display_path(store_dir), reserve_bytes)
+    let mut out = messages.audit_reserve_outcome_directory(&display_path(store_dir), reserve_bytes);
+    // None of the enforcement machinery applies here, so a holding
+    // directory raises no outcome of its own — but it is still an
+    // unfinished migration whose contents are the only copy of those
+    // records, and naming it is the difference between that and debris
+    // somebody eventually deletes.
+    if migration.holding {
+        out.push('\n');
+        out.push_str(&messages.audit_reserve_directory_migration_open(
+            &display_path(&migration.paths.holding),
+            &display_path(store_dir),
+        ));
+    }
+    out
+}
+
+/// Reads the two derived migration paths for a `directory`-mode run.
+///
+/// The same check the `filesystem` path makes first, made here too: the
+/// holding directory is detected in **both** enforcement modes.
+///
+/// # Errors
+///
+/// Returns the reserve's unreadable-path error when either `lstat`
+/// fails for anything but `ENOENT`.
+pub(crate) fn detect_migration(
+    store_dir: &Path,
+    probe: &dyn ReserveProbe,
+    messages: &Messages,
+) -> Result<MigrationPresence> {
+    migration::detect(store_dir, probe, messages)
 }
 
 /// A `filesystem`-mode outcome's text.
@@ -2053,8 +2683,39 @@ pub(crate) fn render_filesystem_outcome(
                 out.push_str(note);
             }
         }
+        ReserveReport::MigrationIncomplete { findings, steps } => {
+            out.push_str(&messages.audit_reserve_outcome_migration_incomplete(&store));
+            out.push('\n');
+            out.push_str(messages.audit_reserve_outstanding_header());
+            for finding in findings {
+                out.push_str("\n  - ");
+                out.push_str(finding);
+            }
+            out.push('\n');
+            out.push_str(messages.audit_reserve_artifacts_header());
+            for artifact in artifacts {
+                out.push_str("\n  - ");
+                out.push_str(&display_path(&artifact.staged_path));
+            }
+            out.push('\n');
+            out.push_str(messages.audit_reserve_steps_header());
+            for (index, step) in steps.iter().enumerate() {
+                let _ = write!(out, "\n  {}. {}", index + 1, step.title);
+                for command in &step.commands {
+                    out.push_str("\n       ");
+                    out.push_str(command);
+                }
+            }
+            if steps.iter().any(|step| step.kind == Phase2StepKind::Verify) {
+                out.push('\n');
+                out.push_str(messages.audit_reserve_migration_prerequisites());
+            }
+            out.push('\n');
+            out.push_str(messages.audit_reserve_migration_window());
+        }
         ReserveReport::NotActivated {
             findings,
+            notes,
             steps,
             steps_withheld,
         } => {
@@ -2064,6 +2725,10 @@ pub(crate) fn render_filesystem_outcome(
             for finding in findings {
                 out.push_str("\n  - ");
                 out.push_str(finding);
+            }
+            for note in notes {
+                out.push('\n');
+                out.push_str(note);
             }
             out.push('\n');
             out.push_str(messages.audit_reserve_artifacts_header());
@@ -2123,6 +2788,8 @@ mod tests {
     const IMAGE: &str = "/var/lib/bootroot/audit-store.img";
     const UNIT: &str = "var-lib-bootroot-audit\\x2dstore.mount";
     const RERUN: &str = "bootroot init";
+    const COMPOSE_FILE: &str = "/opt/bootroot/docker-compose.yml";
+    const COMPOSE_PROJECT: &str = "bootroot";
 
     /// A host built entirely out of fixture values, so every decision
     /// this module makes is reachable from a test that is not root and
@@ -2135,6 +2802,7 @@ mod tests {
         space: HashMap<PathBuf, FsSpace>,
         default_space: Option<FsSpace>,
         mounts: String,
+        mountinfo: String,
         backing: HashMap<(u64, u64), String>,
         denied: Vec<PathBuf>,
         mounts_denied: bool,
@@ -2179,6 +2847,11 @@ mod tests {
 
         fn mounts(mut self, text: &str) -> Self {
             self.mounts = text.to_string();
+            self
+        }
+
+        fn mountinfo(mut self, text: &str) -> Self {
+            self.mountinfo = text.to_string();
             self
         }
 
@@ -2230,6 +2903,13 @@ mod tests {
             Ok(self.mounts.clone())
         }
 
+        fn mountinfo(&self) -> io::Result<String> {
+            if self.mounts_denied {
+                return Err(denied_error());
+            }
+            Ok(self.mountinfo.clone())
+        }
+
         fn loop_backing_file(&self, major: u64, minor: u64) -> io::Result<Option<String>> {
             if self.backing_denied {
                 return Err(denied_error());
@@ -2271,6 +2951,8 @@ mod tests {
     struct Fixture {
         store: PathBuf,
         compose: PathBuf,
+        compose_file: PathBuf,
+        compose_project: String,
         reserve_bytes: u64,
         max_file_bytes: u64,
         max_retained_files: u32,
@@ -2281,6 +2963,8 @@ mod tests {
             Self {
                 store: PathBuf::from(STORE),
                 compose: PathBuf::from("/opt/bootroot"),
+                compose_file: PathBuf::from(COMPOSE_FILE),
+                compose_project: COMPOSE_PROJECT.to_string(),
                 reserve_bytes: DEFAULT_RESERVE,
                 max_file_bytes: DEFAULT_MAX_FILE_BYTES,
                 max_retained_files: DEFAULT_MAX_RETAINED,
@@ -2293,6 +2977,8 @@ mod tests {
             ReserveInputs {
                 store_dir: &self.store,
                 compose_dir: &self.compose,
+                compose_file: &self.compose_file,
+                compose_project: &self.compose_project,
                 reserve_bytes: self.reserve_bytes,
                 max_file_bytes: self.max_file_bytes,
                 max_retained_files: self.max_retained_files,
@@ -2402,6 +3088,8 @@ mod tests {
             image: ImageEvaluation::Absent,
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
+            migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         let unit = String::from_utf8(artifacts.first().expect("the unit").contents.clone())
@@ -2469,6 +3157,8 @@ mod tests {
             image: ImageEvaluation::Absent,
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
+            migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         assert_eq!(artifacts.len(), 3);
@@ -2878,6 +3568,8 @@ mod tests {
             image,
             mount: MountEvaluation::Absent,
             underlying: UnderlyingState::Empty,
+            migration: MigrationPresence::none(&fixture.store),
+            deferred: Vec::new(),
         }
     }
 
@@ -3417,6 +4109,8 @@ mod tests {
             image: ImageEvaluation::Correct,
             mount: MountEvaluation::Reserve { stacked: false },
             underlying: UnderlyingState::NotVisible,
+            migration: MigrationPresence::none(Path::new(STORE)),
+            deferred: Vec::new(),
         };
         let artifacts = render_artifacts(&inputs, &facts);
         let mut host = mounted_host("/dev/loop0", "ext4", Some(IMAGE))
@@ -3633,7 +4327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_empty_underlying_store_renders_no_phase_two_command_at_all() {
+    fn a_non_empty_underlying_store_renders_only_the_entry_into_the_migration() {
         let fixture = Fixture::default();
         let inputs = fixture.inputs();
         let messages = test_messages();
@@ -3661,15 +4355,36 @@ mod tests {
                 findings,
                 steps,
                 steps_withheld,
+                ..
             } = &report
             else {
                 panic!("a non-empty store is not activated");
             };
-            assert!(steps.is_empty(), "{steps:?}");
-            // The whole list is *withheld* here rather than absent for
-            // want of anything to say, and the outcome's sentence for
-            // the empty list is chosen off exactly that.
-            assert!(steps_withheld);
+            assert!(!steps_withheld);
+            // Exactly the entry into the migration, and nothing that
+            // would mount a filesystem over what is already there: the
+            // activation comes from the *next* pass, once the aside
+            // rename has made the underlying directory empty.
+            assert_eq!(
+                steps
+                    .iter()
+                    .map(|step| step.kind)
+                    .collect::<Vec<Phase2StepKind>>(),
+                vec![
+                    Phase2StepKind::StopWriters,
+                    Phase2StepKind::AsideRename,
+                    Phase2StepKind::ReRun,
+                ],
+                "{steps:?}"
+            );
+            let aside = steps.get(1).expect("the aside rename");
+            assert_eq!(
+                aside.commands,
+                vec![
+                    format!("mv '{STORE}' '{STORE}.pre-mount'"),
+                    format!("install -d -m 0700 -o root -g root '{STORE}'"),
+                ]
+            );
             assert!(
                 findings
                     .iter()
@@ -3684,7 +4399,9 @@ mod tests {
                     "{text}"
                 );
             }
-            for forbidden in ["mkfs", "install ", "systemctl", "fallocate", "mkdir"] {
+            // Still nothing that creates, formats or mounts anything
+            // on or over the store.
+            for forbidden in ["mkfs", "fallocate", "mkdir", "systemctl enable", "rm "] {
                 assert!(!text.contains(forbidden), "{forbidden} in {text}");
             }
         }
@@ -3712,7 +4429,7 @@ mod tests {
                     "audit device writes on the root filesystem",
                     "until the records are relocated onto the reserve",
                     "Nothing was deleted, moved or mounted over",
-                    "a separate procedure this build does not provide",
+                    "which is what the steps below open",
                     "`audit_store_enforcement = \"directory\"`",
                 ],
             ),
@@ -3723,9 +4440,9 @@ mod tests {
                     "`create_host_path: false`는 생성만 통제합니다",
                     "/var/lib/bootroot/audit-store/openbao가 이미 있고",
                     "audit device는 루트 파일 시스템에 기록합니다",
-                    "레코드를 예약량으로 옮길 때까지 남습니다",
+                    "레코드를 예약량으로 옮길 때까지 남으며",
                     "아무것도 삭제·이동되지 않았고 그 위로 마운트되지도 않았습니다",
-                    "이 빌드가 제공하지 않는 별도 절차입니다",
+                    "아래 단계가 그 절차를 엽니다",
                     "`audit_store_enforcement = \"directory\"`",
                 ],
             ),
@@ -3745,7 +4462,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_existing_records_passages_name_the_live_refusal_without_a_procedure() {
+    fn manual_existing_records_passages_point_at_the_relocation_without_respelling_it() {
         let manuals: [(&str, &str, &[&str]); 2] = [
             (
                 "docs/en/operations.md",
@@ -3756,7 +4473,7 @@ mod tests {
                     "`create_host_path: false` governs creation only",
                     "until the records are relocated onto the reserve.",
                     "Nothing is deleted, moved or mounted over",
-                    "a separate procedure this build does not provide",
+                    "relocate those records by the documented procedure below",
                 ],
             ),
             (
@@ -3768,7 +4485,7 @@ mod tests {
                     "`create_host_path: false`는 생성만 통제하므로",
                     "레코드를 예약량으로 옮길 때까지 이 노출은 남습니다.",
                     "아무것도 삭제·이동되지 않고 그 위로 마운트되지도 않습니다.",
-                    "이 빌드가 제공하지 않는 별도 절차입니다",
+                    "아래 문서화된 절차로 그 레코드를 옮기거나",
                 ],
             ),
         ];
@@ -3792,9 +4509,12 @@ mod tests {
                     "{manual}: missing {required:?}"
                 );
             }
+            // The procedure has one home, in the passage that follows.
+            // Re-spelling any of it here is how two copy procedures over
+            // the same irreplaceable data come to disagree.
             assert!(
                 !passage.contains("\n```"),
-                "{manual}: the existing-records passage must not add a relocation procedure"
+                "{manual}: the existing-records passage must not restate the relocation procedure"
             );
             for command in [
                 "`mv ", "`cp ", "`rsync ", "`rm ", "`mount ", "`umount ", "`find ", "`cmp ",
@@ -3806,8 +4526,9 @@ mod tests {
                 );
             }
             assert!(
-                !passage.contains(".pre-mount"),
-                "{manual}: the existing-records passage must not name the relocation path .pre-mount"
+                after_heading.contains("#relocating-a-store-that-already-holds-records")
+                    || passage.contains("below"),
+                "{manual}: the existing-records passage must point at the relocation procedure"
             );
         }
     }
@@ -3840,9 +4561,12 @@ mod tests {
                     ..image_facts(8192, 8192, TEST_UID, 0o600)
                 },
             );
+        // The store's own 8 blocks, then one 16-block inode for the
+        // hard-linked pair; the different-device entry contributes
+        // nothing however large it is.
         assert_eq!(
             measure_underlying(Path::new(STORE), &host, &messages).expect("measured"),
-            16 * ST_BLOCKS_UNIT_BYTES
+            (8 + 16) * ST_BLOCKS_UNIT_BYTES
         );
     }
 
@@ -3865,8 +4589,9 @@ mod tests {
         );
         let error = evaluate(&fixture.inputs(), &host, &messages).expect_err("refused");
         let text = error.to_string();
+        // The store's own root, eight blocks of it, plus the entry.
         assert!(
-            text.contains(&(MIN_RESERVE_FLOOR_BYTES * 4).to_string()),
+            text.contains(&(MIN_RESERVE_FLOOR_BYTES * 4 + 8 * ST_BLOCKS_UNIT_BYTES).to_string()),
             "{text}"
         );
         assert!(text.contains(&fixture.reserve_bytes.to_string()), "{text}");
@@ -3919,12 +4644,37 @@ mod tests {
 
     #[test]
     fn the_directory_outcome_names_the_store_the_reserve_and_the_quota_route() {
-        let text = render_directory_outcome(Path::new(STORE), DEFAULT_RESERVE, &test_messages());
+        let store = Path::new(STORE);
+        let text = render_directory_outcome(
+            store,
+            DEFAULT_RESERVE,
+            &MigrationPresence::none(store),
+            &test_messages(),
+        );
         assert!(text.contains("unenforced (directory)"), "{text}");
         assert!(text.contains(STORE), "{text}");
         assert!(text.contains(&DEFAULT_RESERVE.to_string()), "{text}");
         assert!(text.contains("project quota"), "{text}");
         assert!(!text.contains(".img"), "{text}");
+        assert!(!text.contains(".pre-mount"), "{text}");
+    }
+
+    #[test]
+    fn a_directory_mode_run_still_names_an_unfinished_migration() {
+        let store = Path::new(STORE);
+        let messages = test_messages();
+        let migration = MigrationPresence {
+            paths: migration::derive_paths(store),
+            holding: true,
+            migrated: false,
+        };
+        let text = render_directory_outcome(store, DEFAULT_RESERVE, &migration, &messages);
+        // A success still: `directory` mode reports no outcome of its
+        // own for this, and the holding directory is named rather than
+        // left to be mistaken for debris.
+        assert!(text.contains("unenforced (directory)"), "{text}");
+        assert!(text.contains(&format!("{STORE}.pre-mount")), "{text}");
+        assert!(text.contains("only copy"), "{text}");
     }
 
     #[test]
@@ -3948,5 +4698,1286 @@ mod tests {
         // Not three octal digits: left exactly as it was.
         assert_eq!(decode_mount_field("a\\09b"), b"a\\09b".to_vec());
         assert_eq!(decode_mount_field("a\\40"), b"a\\40".to_vec());
+    }
+
+    /// The apparent length the holding directory's one file carries,
+    /// chosen to be nothing like its allocation.
+    const SPARSE_APPARENT_BYTES: u64 = 1 << 30;
+
+    const HOLDING: &str = "/var/lib/bootroot/audit-store.pre-mount";
+    const MIGRATED: &str = "/var/lib/bootroot/audit-store.migrated";
+
+    /// The three rollback commands as they are rendered, each guarded
+    /// on the holding path still being there — by `-e` or by `-L`, so a
+    /// dangling link is as open as a directory — so a second run is a
+    /// no-op. Spelled once here rather than in every test that pins
+    /// them.
+    fn rollback_commands(mounted: bool) -> Vec<String> {
+        let open = format!("[ -e '{HOLDING}' ] || [ -L '{HOLDING}' ]");
+        let mut commands = Vec::new();
+        if mounted {
+            commands.push(format!("if {open}; then umount '{STORE}'; fi"));
+        }
+        commands.push(format!(
+            "if {{ {open}; }} && [ -d '{STORE}' ]; then rmdir '{STORE}'; fi"
+        ));
+        commands.push(format!("if {open}; then mv '{HOLDING}' '{STORE}'; fi"));
+        commands
+    }
+
+    /// Adds a holding directory holding one file under `records/`, on
+    /// the device the store's *parent* filesystem uses.
+    fn with_holding(host: FakeProbe, blocks: u64) -> FakeProbe {
+        host.file(
+            HOLDING,
+            FileFacts {
+                ino: 90,
+                ..dir_facts(TEST_UID, 0o700)
+            },
+        )
+        .entries(HOLDING, &[&format!("{HOLDING}/records")])
+        .file(
+            &format!("{HOLDING}/records"),
+            FileFacts {
+                ino: 91,
+                ..dir_facts(TEST_UID, 0o700)
+            },
+        )
+        .entries(
+            &format!("{HOLDING}/records"),
+            &[&format!("{HOLDING}/records/audit.log")],
+        )
+        .file(
+            &format!("{HOLDING}/records/audit.log"),
+            FileFacts {
+                kind: FileKind::Regular,
+                // Apparent length deliberately unrelated to the
+                // allocation, and far larger: the capacity verdict has
+                // to rest on the blocks the copy will actually have to
+                // allocate, so an implementation summing `st_size`
+                // fails every case below rather than agreeing with one.
+                size: SPARSE_APPARENT_BYTES,
+                blocks,
+                uid: TEST_UID,
+                mode: 0o600,
+                dev: 64,
+                ino: 92,
+                rdev: 0,
+            },
+        )
+    }
+
+    /// An activated host on which the operator has renamed the store
+    /// aside: image correct, artifacts installed, mount up, and a
+    /// holding directory beside it.
+    fn migrating_host(
+        fixture: &Fixture,
+        blocks: u64,
+    ) -> (FakeProbe, Phase1Facts, Vec<RenderedArtifact>) {
+        let (host, mut facts, artifacts) = activated_host(fixture);
+        facts.migration = MigrationPresence {
+            paths: migration::derive_paths(Path::new(STORE)),
+            holding: true,
+            migrated: false,
+        };
+        (with_holding(host, blocks), facts, artifacts)
+    }
+
+    fn migration_report_of(
+        fixture: &Fixture,
+        facts: &Phase1Facts,
+        artifacts: &[RenderedArtifact],
+        host: &FakeProbe,
+    ) -> (Vec<String>, Vec<Phase2Step>) {
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let report = verify(&inputs, facts, artifacts, host, &messages).expect("phase 3");
+        match report {
+            ReserveReport::MigrationIncomplete { findings, steps } => (findings, steps),
+            other => panic!("expected migration incomplete, got {other:?}"),
+        }
+    }
+
+    fn step_of(steps: &[Phase2Step], kind: Phase2StepKind) -> &Phase2Step {
+        steps
+            .iter()
+            .find(|step| step.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} step in {steps:?}"))
+    }
+
+    #[test]
+    fn a_holding_directory_overrides_an_otherwise_complete_reserve() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+
+        // The same host, twice: with the holding directory it is
+        // migration incomplete, without it the reserve is enforced.
+        let (host, facts, artifacts) = activated_host(&fixture);
+        assert!(matches!(
+            verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3"),
+            ReserveReport::Enforced { .. }
+        ));
+
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::MigrationIncomplete { findings, .. } = &report else {
+            panic!("a holding directory overrides every other verdict: {report:?}");
+        };
+        assert!(findings.iter().any(|finding| finding.contains(HOLDING)));
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("migration incomplete"), "{text}");
+        assert!(!text.contains("enforced (filesystem)"), "{text}");
+    }
+
+    #[test]
+    fn phase_one_reads_the_holding_directory_before_any_other_verdict() {
+        // A reserve below the minimum is a phase-1 refusal; the
+        // holding-directory read still happens first, so it can never
+        // be a verdict reached after another one.
+        let fixture = Fixture {
+            reserve_bytes: 1,
+            ..Fixture::default()
+        };
+        let inputs = fixture.inputs();
+        let host = with_holding(bare_host(), 8).deny(HOLDING);
+        let error = evaluate(&inputs, &host, &test_messages()).expect_err("refused");
+        assert!(error.to_string().contains(HOLDING), "{error}");
+    }
+
+    #[test]
+    fn the_activation_is_rendered_under_migration_incomplete_without_the_subdirectory_step() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        // The store renamed aside, the mount not yet up: what is
+        // outstanding is the activation itself.
+        let host = with_holding(bare_host(), 8);
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        assert!(facts.migration_open());
+        assert_eq!(facts.underlying, UnderlyingState::Empty);
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        // Exactly the activation, with the subdirectory step withheld
+        // and nothing else changed.
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![
+                Phase2StepKind::StopWriters,
+                Phase2StepKind::Image,
+                Phase2StepKind::InstallUnits,
+                Phase2StepKind::ReRun,
+                Phase2StepKind::Rollback,
+            ],
+            "{steps:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("The reserve is not mounted yet")),
+            "{findings:?}"
+        );
+        let install = step_of(&steps, Phase2StepKind::InstallUnits);
+        assert!(
+            install
+                .commands
+                .iter()
+                .any(|command| command == "systemctl daemon-reload")
+        );
+        assert!(
+            install
+                .commands
+                .iter()
+                .any(|command| command.starts_with("systemctl enable --now "))
+        );
+        assert!(
+            step_of(&steps, Phase2StepKind::Image)
+                .commands
+                .iter()
+                .any(|command| command.contains("mkfs.ext4"))
+        );
+        // Nothing creates, chmods or chowns `records/` or `openbao/`,
+        // and no `chmod` of the mount point is rendered either: the copy
+        // applies the source directory's own mode and owner to the
+        // destination root.
+        let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+        for forbidden in [
+            format!("{STORE}/records"),
+            format!("{STORE}/openbao"),
+            format!("chmod 0700 '{STORE}'"),
+        ] {
+            assert!(
+                rendered.iter().all(|command| !command.contains(&forbidden)),
+                "{forbidden} in {rendered:?}"
+            );
+        }
+        // The same host without a holding directory renders the
+        // subdirectory step as usual.
+        let plain = bare_host();
+        let plain_facts = evaluate(&inputs, &plain, &messages).expect("phase 1");
+        let plain_artifacts = render_artifacts(&inputs, &plain_facts);
+        let report =
+            verify(&inputs, &plain_facts, &plain_artifacts, &plain, &messages).expect("phase 3");
+        let ReserveReport::NotActivated { steps, .. } = report else {
+            panic!("a fresh host is not activated");
+        };
+        assert!(
+            step_of(&steps, Phase2StepKind::Subdirectories)
+                .commands
+                .iter()
+                .any(|command| command == &format!("mkdir '{STORE}/records'")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn the_mounted_pass_renders_the_copy_the_verification_and_the_closing_rename() {
+        let fixture = Fixture::default();
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![
+                Phase2StepKind::StopWriters,
+                Phase2StepKind::TypeGuard,
+                Phase2StepKind::Copy,
+                Phase2StepKind::Verify,
+                Phase2StepKind::ClosingRename,
+                Phase2StepKind::ReRun,
+                Phase2StepKind::Rollback,
+            ],
+            "{steps:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("The contents fit")),
+            "{findings:?}"
+        );
+        // The closing rename is its own step, never chained onto the
+        // copy or the verification.
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::ClosingRename).commands,
+            vec![format!("mv '{HOLDING}' '{MIGRATED}'")]
+        );
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            rollback_commands(true)
+        );
+    }
+
+    #[test]
+    fn the_rendered_migration_commands_are_pinned_exactly() {
+        let fixture = Fixture::default();
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        let guard =
+            format!("find '{HOLDING}' -xdev -mindepth 1 ! -type d ! -type f -exec false {{}} +");
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::TypeGuard).commands,
+            vec![guard.clone()]
+        );
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Copy).commands,
+            vec![format!("cp -a --one-file-system '{HOLDING}/.' '{STORE}/'")]
+        );
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Verify).commands,
+            vec![
+                "SCRATCH=\"$(mktemp -d)\"".to_string(),
+                guard,
+                format!(
+                    "find '{STORE}' -xdev -mindepth 1 ! -type d ! -type f -exec false {{}} +"
+                ),
+                format!("cd '{HOLDING}'"),
+                "find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\) -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.source.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/meta.source \"$SCRATCH\"/meta.source.raw".to_string(),
+                "find . -xdev -mindepth 1 -type f -printf '%s %P\\0' > \"$SCRATCH\"/size.source.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/size.source \"$SCRATCH\"/size.source.raw".to_string(),
+                "find . -xdev -mindepth 1 -type f -print0 > \"$SCRATCH\"/files.source.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/files.source \"$SCRATCH\"/files.source.raw".to_string(),
+                "xargs -0 -r sha256sum --binary --zero < \"$SCRATCH\"/files.source > \"$SCRATCH\"/content.source".to_string(),
+                format!("cd '{STORE}'"),
+                "find . -xdev -mindepth 1 ! \\( -path './lost+found' -type d \\) -printf '%y %m %U %G %n %P\\0' > \"$SCRATCH\"/meta.destination.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/meta.destination \"$SCRATCH\"/meta.destination.raw".to_string(),
+                "find . -xdev -mindepth 1 -type f -printf '%s %P\\0' > \"$SCRATCH\"/size.destination.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/size.destination \"$SCRATCH\"/size.destination.raw".to_string(),
+                "find . -xdev -mindepth 1 -type f -print0 > \"$SCRATCH\"/files.destination.raw".to_string(),
+                "sort -z -o \"$SCRATCH\"/files.destination \"$SCRATCH\"/files.destination.raw".to_string(),
+                "xargs -0 -r sha256sum --binary --zero < \"$SCRATCH\"/files.destination > \"$SCRATCH\"/content.destination".to_string(),
+                "cmp \"$SCRATCH\"/meta.source \"$SCRATCH\"/meta.destination".to_string(),
+                "cmp \"$SCRATCH\"/size.source \"$SCRATCH\"/size.destination".to_string(),
+                "cmp \"$SCRATCH\"/content.source \"$SCRATCH\"/content.destination".to_string(),
+            ]
+        );
+        // No pipe anywhere, no `diff -r`, no recursive delete, and no
+        // field after `%P`. `||` is removed before the pipe check
+        // rather than exempted line by line: the rollback's guard
+        // spells `[ -e … ] || [ -L … ]`, which is a short-circuit
+        // between two commands and carries none of what the ban exists
+        // for, while a real pipeline on the same line is still caught.
+        for command in steps.iter().flat_map(|step| &step.commands) {
+            assert!(!command.replace("||", "").contains('|'), "{command}");
+            assert!(!command.contains("diff -r"), "{command}");
+            assert!(!command.contains("rm -r"), "{command}");
+            assert!(!command.contains("rm -f"), "{command}");
+            assert!(!command.contains("%P "), "{command}");
+        }
+    }
+
+    /// Both writers are stopped by *commands*, not by prose. An
+    /// operator who ran every rendered line and was left to infer the
+    /// Compose stop would rename, copy and verify a store `OpenBao` was
+    /// still writing into through its existing bind.
+    #[test]
+    fn the_stop_both_writers_step_renders_the_compose_stop_ahead_of_the_daemon() {
+        let fixture = Fixture::default();
+        let expected = vec![
+            format!("docker compose -f '{COMPOSE_FILE}' -p '{COMPOSE_PROJECT}' stop"),
+            "systemctl stop bootroot-registrar.service".to_string(),
+        ];
+
+        // The activation, the migration's entry pass and every
+        // migration pass render the same two commands in the same
+        // order.
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let plain = bare_host();
+        let plain_facts = evaluate(&inputs, &plain, &messages).expect("phase 1");
+        let plain_artifacts = render_artifacts(&inputs, &plain_facts);
+        let ReserveReport::NotActivated { steps, .. } =
+            verify(&inputs, &plain_facts, &plain_artifacts, &plain, &messages).expect("phase 3")
+        else {
+            panic!("a fresh host is not activated");
+        };
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        // A store that still holds records: the entry into the
+        // migration, rendered before any holding directory exists.
+        let occupied = bare_host()
+            .entries(STORE, &[&format!("{STORE}/records")])
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 77,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let occupied_facts = evaluate(&inputs, &occupied, &messages).expect("phase 1");
+        let occupied_artifacts = render_artifacts(&inputs, &occupied_facts);
+        let ReserveReport::NotActivated { steps, .. } = verify(
+            &inputs,
+            &occupied_facts,
+            &occupied_artifacts,
+            &occupied,
+            &messages,
+        )
+        .expect("phase 3") else {
+            panic!("a store holding records is not activated");
+        };
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            expected
+        );
+
+        // The `-f` and the `-p` are this run's own, not a guess: a
+        // deployment elsewhere renders its own pair.
+        let elsewhere = Fixture {
+            compose_file: PathBuf::from("/srv/other/stack.yml"),
+            compose_project: "other".to_string(),
+            ..Fixture::default()
+        };
+        let (host, facts, artifacts) = migrating_host(&elsewhere, 8);
+        let (_, steps) = migration_report_of(&elsewhere, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::StopWriters).commands,
+            vec![
+                "docker compose -f '/srv/other/stack.yml' -p 'other' stop".to_string(),
+                "systemctl stop bootroot-registrar.service".to_string(),
+            ]
+        );
+    }
+
+    /// The rollback has to be runnable from the state it is rendered
+    /// in. A migration is open from the aside rename onward, two passes
+    /// before the mount comes up, and `umount` over a store nothing is
+    /// mounted on exits non-zero — stopping a verbatim run before the
+    /// two commands that carry the rollback.
+    #[test]
+    fn the_rollback_carries_the_unmount_only_where_the_reserve_is_mounted() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+
+        // The mount absent: the aside rename has run and the
+        // activation is what is outstanding.
+        let host = with_holding(bare_host(), 8);
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (_, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            rollback_commands(false)
+        );
+
+        // The withheld-render state reached with the mount still
+        // absent renders the same two commands.
+        let halved = Fixture {
+            reserve_bytes: DEFAULT_RESERVE / 2,
+            ..Fixture::default()
+        };
+        let halved_inputs = halved.inputs();
+        let halved_facts = evaluate(&halved_inputs, &host, &messages).expect("phase 1");
+        let halved_artifacts = render_artifacts(&halved_inputs, &halved_facts);
+        let (_, steps) = migration_report_of(&halved, &halved_facts, &halved_artifacts, &host);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            rollback_commands(false)
+        );
+
+        // The mount up: the partial copy on the reserve is discarded
+        // with the unmount, so it leads.
+        let (mounted, mounted_facts, mounted_artifacts) = migrating_host(&fixture, 8);
+        let (_, steps) =
+            migration_report_of(&fixture, &mounted_facts, &mounted_artifacts, &mounted);
+        assert_eq!(
+            step_of(&steps, Phase2StepKind::Rollback).commands,
+            rollback_commands(true)
+        );
+    }
+
+    /// A foreign mount at the store is not the reserve, and nothing
+    /// this outcome would otherwise render belongs to it: the
+    /// activation would stack the reserve on top of it, the copy would
+    /// write the store's records into it, and the rollback's `umount`
+    /// would take it down.
+    #[test]
+    fn a_foreign_mount_under_an_open_migration_takes_every_command_away() {
+        let fixture = Fixture::default();
+        let (host, mut facts, artifacts) = migrating_host(&fixture, 8);
+        let description = "a tmpfs mounted from tmpfs";
+        facts.mount = MountEvaluation::Foreign {
+            description: description.to_string(),
+            stacked: false,
+        };
+        assert!(facts.deferred.is_empty());
+        assert_ne!(facts.underlying, UnderlyingState::NotEmpty);
+
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        // It is named rather than reported as "the reserve is not
+        // mounted", which is what an implementation reading only
+        // `MountEvaluation::Reserve` says of it.
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains(description) && finding.contains(HOLDING)),
+            "{findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.contains("The reserve is not mounted yet")),
+            "{findings:?}"
+        );
+        // The re-run alone: no activation, no copy, and no rollback
+        // whose first command unmounts somebody else's filesystem.
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.kind)
+                .collect::<Vec<Phase2StepKind>>(),
+            vec![Phase2StepKind::ReRun],
+            "{steps:?}"
+        );
+        for command in steps.iter().flat_map(|step| step.commands.iter()) {
+            for forbidden in ["umount", "rmdir", "cp -a", "systemctl enable", "mv "] {
+                assert!(!command.contains(forbidden), "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_capacity_verdict_is_against_the_mounted_filesystem_and_not_the_reserve() {
+        let fixture = Fixture::default();
+        let margin = super::migration::COPY_MARGIN_BYTES;
+        // The holding directory's own root, `records/` and the file
+        // beneath it. The root counts: `cp -a <holding>/.` fills the
+        // destination's root directory with the same entries, so its
+        // allocation has to be there too, and `du -s` reports it.
+        let source = 3 * 8 * ST_BLOCKS_UNIT_BYTES;
+
+        // (available bytes, whether the copy is rendered)
+        let cases: [(u64, bool); 4] = [
+            (source + margin, true),
+            (source + margin - 1, false),
+            // Under `audit_store_reserve_bytes` but over what the
+            // mounted filesystem actually has: the case a check
+            // against the reserve would wrongly pass.
+            (1024, false),
+            (source, false),
+        ];
+        for (available, renders_copy) in cases {
+            let (base, facts, artifacts) = migrating_host(&fixture, 8);
+            let mut host = base;
+            host.space.insert(
+                PathBuf::from(STORE),
+                FsSpace {
+                    blocks_available: available,
+                    fragment_size: 1,
+                },
+            );
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert_eq!(
+                steps.iter().any(|step| step.kind == Phase2StepKind::Copy),
+                renders_copy,
+                "available {available}: {steps:?}"
+            );
+            let joined = findings.join("\n");
+            for figure in [available, source, margin] {
+                assert!(joined.contains(&figure.to_string()), "{joined}");
+            }
+            assert!(fixture.reserve_bytes > available || renders_copy);
+            if !renders_copy {
+                assert!(joined.contains("do not fit"), "{joined}");
+                assert!(joined.contains("audit_store_reserve_bytes"), "{joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_holding_directorys_own_allocation_counts_toward_the_capacity_verdict() {
+        let fixture = Fixture::default();
+        let margin = super::migration::COPY_MARGIN_BYTES;
+        // The tree `with_holding` builds: the root, `records/` and one
+        // file, eight blocks each.
+        let children = 2 * 8 * ST_BLOCKS_UNIT_BYTES;
+        let root = 8 * ST_BLOCKS_UNIT_BYTES;
+
+        // Exactly the children plus the margin is one root directory
+        // short: a walk that began at the root's entries would render
+        // the copy here, against a destination whose own root has to
+        // grow by that much to hold the same entries.
+        for (available, renders_copy) in
+            [(children + margin, false), (children + root + margin, true)]
+        {
+            let (base, facts, artifacts) = migrating_host(&fixture, 8);
+            let mut host = base;
+            host.space.insert(
+                PathBuf::from(STORE),
+                FsSpace {
+                    blocks_available: available,
+                    fragment_size: 1,
+                },
+            );
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert_eq!(
+                steps.iter().any(|step| step.kind == Phase2StepKind::Copy),
+                renders_copy,
+                "available {available}: {steps:?}"
+            );
+            // The figure reported is the one the gate was decided on,
+            // so the operator's own `du -s` agrees with it.
+            assert!(
+                findings.join("\n").contains(&(children + root).to_string()),
+                "{findings:?}"
+            );
+        }
+
+        // The root's own `st_blocks` × 512 is checked like every other
+        // entry's, and overflows before a single child is walked.
+        let (base, facts, artifacts) = migrating_host(&fixture, 8);
+        let host = base.file(
+            HOLDING,
+            FileFacts {
+                ino: 90,
+                blocks: u64::MAX,
+                ..dir_facts(TEST_UID, 0o700)
+            },
+        );
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+        let joined = findings.join("\n");
+        assert!(joined.contains("the size of what"), "{joined}");
+        assert!(
+            joined.contains("cannot be represented as a 64-bit byte count"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn a_forbidden_entry_refuses_the_copy_on_every_pass() {
+        let fixture = Fixture::default();
+        let records = format!("{HOLDING}/records");
+        let openbao = format!("{HOLDING}/openbao");
+        // Both subdirectories, because `openbao/` is the one the layout
+        // contract leaves to the container's entrypoint and so the one
+        // an entry the store itself refuses nothing about can appear
+        // in. Where the link points is not a case of its own: the
+        // verdict is decided from the entry's own type, and the
+        // rendered-sequence fixtures carry one pointing outside the
+        // store and one pointing inside it.
+        for subdir in [&records, &openbao] {
+            for (kind, needle) in [
+                (FileKind::Symlink, "a symbolic link"),
+                (FileKind::Other, "neither a regular file nor a directory"),
+            ] {
+                let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                let planted = format!("{subdir}/planted");
+                let host = base
+                    .entries(HOLDING, &[&records, &openbao])
+                    .file(
+                        &openbao,
+                        FileFacts {
+                            ino: 94,
+                            ..dir_facts(TEST_UID, 0o700)
+                        },
+                    )
+                    .entries(&records, &[&format!("{records}/audit.log")])
+                    .entries(&openbao, &[])
+                    .entries(subdir, &[&planted])
+                    .file(
+                        &planted,
+                        FileFacts {
+                            kind,
+                            ino: 93,
+                            ..dir_facts(TEST_UID, 0o777)
+                        },
+                    );
+                // Twice over, from the same probe: the entry walk is
+                // re-run rather than answered from a cached verdict.
+                for _ in 0..2 {
+                    let (findings, steps) =
+                        migration_report_of(&fixture, &facts, &artifacts, &host);
+                    assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+                    let joined = findings.join("\n");
+                    assert!(joined.contains(&planted), "{joined}");
+                    assert!(joined.contains(needle), "{joined}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_holding_path_beside_a_store_that_still_holds_records_renders_nothing() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        // The collision: `<store>.pre-mount` already there while the
+        // store itself still holds its records. Either the aside
+        // rename never ran and the path was already occupied, or both
+        // writers were left up. The mount is absent, so without this
+        // refusal the activation would be rendered and its
+        // `systemctl enable --now` would mount the reserve over those
+        // records.
+        let host = with_holding(bare_host(), 8)
+            .entries(STORE, &[&format!("{STORE}/records")])
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 40,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        assert!(facts.migration_open());
+        assert_eq!(facts.underlying, UnderlyingState::NotEmpty);
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        // No activation, no copy, no rename in either direction —
+        // mounting would hide the records, the copy would move an
+        // unrelated tree onto the reserve, and `mv <holding> <store>`
+        // onto a directory that exists moves the source inside it.
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![Phase2StepKind::ReRun],
+            "{steps:?}"
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains(HOLDING), "{joined}");
+        assert!(joined.contains(STORE), "{joined}");
+        let report = ReserveReport::MigrationIncomplete { findings, steps };
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("migration incomplete"), "{text}");
+        for forbidden in ["systemctl enable --now", "cp -a", "mv "] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_open_migration_reports_its_outcome_ahead_of_a_phase_one_refusal() {
+        // `audit_store_reserve_bytes` changed while the migration was
+        // open. The image contract refuses that outright, and without
+        // this the operator meets a size-mismatch error naming neither
+        // the holding directory that holds the only copy of those
+        // records nor the way back out of it.
+        let halved = Fixture {
+            reserve_bytes: DEFAULT_RESERVE / 2,
+            ..Fixture::default()
+        };
+        let inputs = halved.inputs();
+        let messages = test_messages();
+        let image = image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE, TEST_UID, IMAGE_FILE_MODE);
+
+        // The same refusal, on the same host, without the holding
+        // directory: still what the run reports.
+        let (base, _, _) = activated_host(&halved);
+        let error = evaluate(&inputs, &base.file(IMAGE, image), &messages).expect_err("refused");
+        assert!(error.to_string().contains(IMAGE), "{error}");
+
+        let (base, _, _) = migrating_host(&halved, 8);
+        let host = base.file(IMAGE, image);
+        let facts = evaluate(&inputs, &host, &messages).expect("the migration outcome overrides");
+        assert!(facts.migration_open());
+        assert_eq!(facts.deferred.len(), 1, "{:?}", facts.deferred);
+        let artifacts = render_artifacts(&inputs, &facts);
+        let (findings, steps) = migration_report_of(&halved, &facts, &artifacts, &host);
+        // The refusal is named, not raised, and what is left is the
+        // rollback: the reserve it describes cannot be made, so no
+        // image command, no unit and no copy over it is right.
+        assert_eq!(
+            steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+            vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+            "{steps:?}"
+        );
+        let joined = findings.join("\n");
+        assert!(joined.contains(HOLDING), "{joined}");
+        assert!(joined.contains(&DEFAULT_RESERVE.to_string()), "{joined}");
+        let report = ReserveReport::MigrationIncomplete { findings, steps };
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("migration incomplete"), "{text}");
+        // Command shapes rather than words: the refusal's own prose
+        // names resizing and reformatting to say they never happen.
+        for forbidden in [
+            "truncate -s",
+            "mkfs.ext4",
+            "systemctl enable --now",
+            "cp -a",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_holding_path_that_is_not_a_directory_refuses_the_copy() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        // `cp -a --one-file-system <holding>/. <store>/` resolves the
+        // `/.`, so a link here is followed and whatever it names is
+        // copied into the reserve. The rendered type guard cannot
+        // catch it: `find <link> -xdev -mindepth 1` neither descends
+        // the link nor reports it, and exits zero.
+        for (kind, needle) in [
+            (FileKind::Symlink, "a symbolic link"),
+            (FileKind::Regular, "a regular file"),
+            (FileKind::Other, "neither a regular file nor a directory"),
+        ] {
+            // The tree under it is intact and would otherwise fit, so
+            // only the root's own type can be what refuses this. Both
+            // mount states, because the activation is rendered from
+            // the store rather than from the holding path and would
+            // otherwise survive this refusal while the mount is down.
+            let root = FileFacts {
+                kind,
+                ino: 90,
+                ..dir_facts(TEST_UID, 0o777)
+            };
+            for mounted in [true, false] {
+                let (host, facts, artifacts) = if mounted {
+                    let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                    (base.file(HOLDING, root), facts, artifacts)
+                } else {
+                    let host = with_holding(bare_host(), 8).file(HOLDING, root);
+                    let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                    let artifacts = render_artifacts(&inputs, &facts);
+                    (host, facts, artifacts)
+                };
+                assert_eq!(facts.mount_present(), mounted);
+                let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+                // Nothing that acts on the store: not the copy it can
+                // never reach, and not the activation that would mount
+                // the reserve for it.
+                assert_eq!(
+                    steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                    vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                    "over a holding path that is {needle}, mounted={mounted}: {steps:?}"
+                );
+                let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+                for forbidden in ["mkfs.ext4", "systemctl enable --now", "cp -a", "install -"] {
+                    assert!(
+                        rendered.iter().all(|command| !command.contains(forbidden)),
+                        "{forbidden} over a holding path that is {needle}: {rendered:?}"
+                    );
+                }
+                // The rollback is the way back out, and its `umount`
+                // still tracks the mount state it was rendered under.
+                assert_eq!(
+                    step_of(&steps, Phase2StepKind::Rollback).commands,
+                    rollback_commands(mounted)
+                );
+                let joined = findings.join("\n");
+                assert!(joined.contains(HOLDING), "{joined}");
+                assert!(joined.contains(needle), "{joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_migration_set_refusal_under_an_absent_mount_withholds_the_activation() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let records = format!("{HOLDING}/records");
+        let log = format!("{records}/audit.log");
+        let bind = format!("{records}/bound");
+        let planted = format!("{records}/planted");
+        let mountinfo = format!("36 35 0:64 / {bind} rw,relatime shared:1 - ext4 /dev/sda1 rw\n");
+
+        // Both refusals are decided ahead of the mount state, so both
+        // arise with the reserve not yet mounted — and there the
+        // activation is what would bring the mount up while the
+        // rollback beside it is rendered without the `umount` an
+        // absent mount withholds. One list would create the mount and
+        // then stop at an `rmdir` of it, short of the restoring
+        // rename.
+        let cases: [(&str, &dyn Fn(FakeProbe) -> FakeProbe); 2] = [
+            (bind.as_str(), &|host: FakeProbe| host.mountinfo(&mountinfo)),
+            (planted.as_str(), &|host: FakeProbe| {
+                host.entries(&records, &[&log, &planted]).file(
+                    &planted,
+                    FileFacts {
+                        kind: FileKind::Symlink,
+                        ino: 93,
+                        ..dir_facts(TEST_UID, 0o777)
+                    },
+                )
+            }),
+        ];
+
+        for (offending, plant) in cases {
+            for mounted in [true, false] {
+                let (host, facts, artifacts) = if mounted {
+                    let (base, facts, artifacts) = migrating_host(&fixture, 8);
+                    (plant(base), facts, artifacts)
+                } else {
+                    let host = plant(with_holding(bare_host(), 8));
+                    let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                    let artifacts = render_artifacts(&inputs, &facts);
+                    (host, facts, artifacts)
+                };
+                assert_eq!(facts.mount_present(), mounted);
+                let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+                assert!(findings.join("\n").contains(offending), "{findings:?}");
+                assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+
+                let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+                let rollback = &step_of(&steps, Phase2StepKind::Rollback).commands;
+                assert_eq!(rollback, &rollback_commands(mounted));
+                // The invariant either state has to hold: no list
+                // brings the mount up unless the rollback rendered in
+                // it can take that mount back down.
+                assert!(
+                    rendered
+                        .iter()
+                        .all(|command| !command.contains("systemctl enable --now"))
+                        || rollback.iter().any(|command| command.contains("umount")),
+                    "{offending}, mounted={mounted}: {rendered:?}"
+                );
+                if !mounted {
+                    assert_eq!(
+                        steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                        vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                        "{offending}: {steps:?}"
+                    );
+                    for forbidden in ["mkfs.ext4", "systemctl enable --now", "install -", "cp -a"] {
+                        assert!(
+                            rendered.iter().all(|command| !command.contains(forbidden)),
+                            "{forbidden} over {offending}: {rendered:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_same_device_bind_mount_under_the_holding_directory_refuses_the_copy() {
+        let fixture = Fixture::default();
+        let bind = format!("{HOLDING}/records/bound");
+        let sibling = format!("{HOLDING}-other");
+        for (mountinfo, refused) in [
+            (
+                format!(
+                    "36 35 0:64 / {bind} rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+                     37 35 0:64 / {sibling} rw,relatime shared:2 - ext4 /dev/sda1 rw\n"
+                ),
+                true,
+            ),
+            (
+                format!("37 35 0:64 / {sibling} rw,relatime shared:2 - ext4 /dev/sda1 rw\n"),
+                false,
+            ),
+        ] {
+            let (base, facts, artifacts) = migrating_host(&fixture, 8);
+            // Same device as the holding directory throughout, which is
+            // exactly what an `st_dev` predicate would pass.
+            let host = base.mountinfo(&mountinfo);
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            let joined = findings.join("\n");
+            if refused {
+                assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+                assert!(joined.contains(&bind), "{joined}");
+            } else {
+                assert!(steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+                assert!(!joined.contains(&sibling), "{joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_byte_figure_the_capacity_verdict_rests_on_is_checked() {
+        let fixture = Fixture::default();
+        let cases: [(FsSpace, u64, &str); 3] = [
+            // `f_bavail` × `f_frsize` past `u64::MAX`.
+            (
+                FsSpace {
+                    blocks_available: u64::MAX,
+                    fragment_size: 2,
+                },
+                8,
+                "the space available on the filesystem",
+            ),
+            // `st_blocks` × 512 past `u64::MAX`.
+            (
+                FsSpace {
+                    blocks_available: 1 << 40,
+                    fragment_size: 4096,
+                },
+                u64::MAX,
+                "the size of what",
+            ),
+            // The sum over unique entries overflowing.
+            (
+                FsSpace {
+                    blocks_available: 1 << 40,
+                    fragment_size: 4096,
+                },
+                u64::MAX / ST_BLOCKS_UNIT_BYTES,
+                "the size of what",
+            ),
+        ];
+        for (space, blocks, needle) in cases {
+            let (base, facts, artifacts) = migrating_host(&fixture, blocks);
+            let mut host = base;
+            host.space.insert(PathBuf::from(STORE), space);
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+            let joined = findings.join("\n");
+            assert!(joined.contains(needle), "{joined}");
+            assert!(
+                joined.contains("cannot be represented as a 64-bit byte count"),
+                "{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_figure_one_below_the_ceiling_refuses_the_copy_on_the_margin() {
+        let fixture = Fixture::default();
+        let (base, mut facts, artifacts) = activated_host(&fixture);
+        facts.migration = MigrationPresence {
+            paths: migration::derive_paths(Path::new(STORE)),
+            holding: true,
+            migrated: false,
+        };
+        // One entry sized so that it plus the holding root's own 8
+        // blocks is representable and that sum plus the margin is not.
+        let host = base
+            .file(
+                HOLDING,
+                FileFacts {
+                    ino: 90,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            )
+            .entries(HOLDING, &[&format!("{HOLDING}/huge")])
+            .file(
+                &format!("{HOLDING}/huge"),
+                FileFacts {
+                    kind: FileKind::Regular,
+                    size: u64::MAX,
+                    blocks: (u64::MAX - 1) / ST_BLOCKS_UNIT_BYTES - 8,
+                    uid: TEST_UID,
+                    mode: 0o600,
+                    dev: 64,
+                    ino: 92,
+                    rdev: 0,
+                },
+            );
+        let mut host = host;
+        host.space.insert(
+            PathBuf::from(STORE),
+            FsSpace {
+                blocks_available: u64::MAX,
+                fragment_size: 1,
+            },
+        );
+        let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+        assert!(!steps.iter().any(|step| step.kind == Phase2StepKind::Copy));
+        assert!(
+            findings.join("\n").contains("plus the copy margin"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_existing_migrated_path_withholds_every_rename() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+
+        // Opening the migration: the entry is refused rather than
+        // started against a closing rename that could never run.
+        let host = bare_host()
+            .entries(STORE, &[&format!("{STORE}/records")])
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 40,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            )
+            .file(
+                MIGRATED,
+                FileFacts {
+                    ino: 95,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+        let artifacts = render_artifacts(&inputs, &facts);
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::NotActivated {
+            findings,
+            steps,
+            steps_withheld,
+            ..
+        } = &report
+        else {
+            panic!("a non-empty store is not activated");
+        };
+        assert!(steps.is_empty(), "{steps:?}");
+        assert!(steps_withheld);
+        assert!(findings.iter().any(|finding| finding.contains(MIGRATED)));
+
+        // And mid-migration, under either mount state: the copy is
+        // withheld along with the rename it exists to be closed by,
+        // rather than rendered against a sequence whose far end can
+        // never run. An operator who ran it would spend the whole
+        // maintenance window with both writers down and finish with
+        // the migration still open.
+        let migrated_dir = FileFacts {
+            ino: 95,
+            ..dir_facts(TEST_UID, 0o700)
+        };
+        for mounted in [true, false] {
+            let (host, facts, artifacts) = if mounted {
+                let (base, mut facts, artifacts) = migrating_host(&fixture, 8);
+                facts.migration.migrated = true;
+                (base.file(MIGRATED, migrated_dir), facts, artifacts)
+            } else {
+                let host = with_holding(bare_host(), 8).file(MIGRATED, migrated_dir);
+                let facts = evaluate(&inputs, &host, &messages).expect("phase 1");
+                let artifacts = render_artifacts(&inputs, &facts);
+                (host, facts, artifacts)
+            };
+            assert_eq!(facts.mount_present(), mounted);
+            assert!(facts.migration.migrated);
+
+            let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);
+            assert!(findings.iter().any(|finding| finding.contains(MIGRATED)));
+            // Every host-changing command is gone, and the rollback
+            // stays: the restoring rename targets the store, which the
+            // blocked closing rename says nothing about.
+            assert_eq!(
+                steps.iter().map(|step| step.kind).collect::<Vec<_>>(),
+                vec![Phase2StepKind::ReRun, Phase2StepKind::Rollback],
+                "mounted={mounted}: {steps:?}"
+            );
+            let rendered: Vec<&String> = steps.iter().flat_map(|step| &step.commands).collect();
+            for forbidden in [
+                "mkfs.ext4",
+                "systemctl enable --now",
+                "install -",
+                "cp -a",
+                MIGRATED,
+            ] {
+                assert!(
+                    rendered.iter().all(|command| !command.contains(forbidden)),
+                    "{forbidden} with mounted={mounted}: {rendered:?}"
+                );
+            }
+            assert_eq!(
+                &step_of(&steps, Phase2StepKind::Rollback).commands,
+                &rollback_commands(mounted)
+            );
+        }
+    }
+
+    #[test]
+    fn a_migrated_directory_clears_the_outcome_and_is_reported_as_reclaimable() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let (base, mut facts, artifacts) = activated_host(&fixture);
+        facts.migration.migrated = true;
+        let host = base
+            .file(
+                MIGRATED,
+                FileFacts {
+                    ino: 95,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            )
+            .entries(MIGRATED, &[&format!("{MIGRATED}/records")])
+            .file(
+                &format!("{MIGRATED}/records"),
+                FileFacts {
+                    ino: 96,
+                    blocks: 16,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            );
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::Enforced { notes } = &report else {
+            panic!("a closed migration does not hold the outcome: {report:?}");
+        };
+        let joined = notes.join("\n");
+        assert!(joined.contains(MIGRATED), "{joined}");
+        // What `rm -rf` on it gives back: its own root as well as the
+        // directory beneath it.
+        assert!(
+            joined.contains(&((8 + 16) * ST_BLOCKS_UNIT_BYTES).to_string()),
+            "{joined}"
+        );
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("Reclaimable"), "{text}");
+        assert!(!text.contains("migration incomplete"), "{text}");
+    }
+
+    /// The replacement procedure keeps `<audit_store_dir>.img.old`
+    /// until a run reports **enforced** against the updated reserve,
+    /// because renaming it back is the rollback. Once that run has
+    /// happened it is a second full-size image nothing reads, and both
+    /// manuals say bootroot reports its path and size as reclaimable
+    /// rather than deleting it.
+    #[test]
+    fn a_retained_replacement_image_is_reported_as_reclaimable() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let retained = format!("{IMAGE}{RETAINED_IMAGE_SUFFIX}");
+        let (base, facts, artifacts) = activated_host(&fixture);
+
+        // Without it, nothing is said.
+        let report = verify(&inputs, &facts, &artifacts, &base, &messages).expect("phase 3");
+        let ReserveReport::Enforced { notes } = &report else {
+            panic!("an activated host is enforced: {report:?}");
+        };
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let host = base.file(
+            &retained,
+            image_facts(DEFAULT_RESERVE, DEFAULT_RESERVE, 0, 0o600),
+        );
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let ReserveReport::Enforced { notes } = &report else {
+            panic!("a retained image does not hold the outcome: {report:?}");
+        };
+        let joined = notes.join("\n");
+        assert!(joined.contains(&retained), "{joined}");
+        assert!(joined.contains(&DEFAULT_RESERVE.to_string()), "{joined}");
+        // Reported, never removed: no delete is rendered for it here or
+        // anywhere else.
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("Reclaimable"), "{text}");
+        assert!(!text.contains("rm "), "{text}");
+    }
+
+    #[test]
+    fn a_partial_copy_re_renders_the_copy_and_the_verification_unchanged() {
+        // Resume is not a separate rendering: the copy and the
+        // verification are idempotent, so a pass over a partially
+        // populated destination renders exactly what the first pass
+        // did, and the holding directory is untouched either way.
+        let fixture = Fixture::default();
+        let (base, facts, artifacts) = migrating_host(&fixture, 8);
+        let (_, fresh) = migration_report_of(&fixture, &facts, &artifacts, &base);
+        let partial = base
+            .file(
+                &format!("{STORE}/records"),
+                FileFacts {
+                    ino: 70,
+                    ..dir_facts(TEST_UID, 0o700)
+                },
+            )
+            .entries(
+                &format!("{STORE}/records"),
+                &[&format!("{STORE}/records/audit.log")],
+            );
+        let (_, resumed) = migration_report_of(&fixture, &facts, &artifacts, &partial);
+        assert_eq!(fresh, resumed);
+        assert!(resumed.iter().any(|step| step.kind == Phase2StepKind::Copy));
+        assert!(
+            resumed
+                .iter()
+                .any(|step| step.kind == Phase2StepKind::Rollback)
+        );
+    }
+
+    #[test]
+    fn rollback_is_offered_only_while_the_holding_directory_is_open() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        // Once the closing rename has run there is nothing to roll back
+        // to: the store is authoritative.
+        let (base, mut facts, artifacts) = activated_host(&fixture);
+        facts.migration.migrated = true;
+        let host = base.file(
+            MIGRATED,
+            FileFacts {
+                ino: 95,
+                ..dir_facts(TEST_UID, 0o700)
+            },
+        );
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(!text.contains("umount"), "{text}");
+        assert!(!text.contains("rmdir"), "{text}");
+    }
+
+    #[test]
+    fn the_migration_outcome_states_its_window_and_its_prerequisites() {
+        let fixture = Fixture::default();
+        let inputs = fixture.inputs();
+        let messages = test_messages();
+        let (host, facts, artifacts) = migrating_host(&fixture, 8);
+        let report = verify(&inputs, &facts, &artifacts, &host, &messages).expect("phase 3");
+        let text = render_filesystem_outcome(&inputs, &facts, &artifacts, &report, &messages);
+        assert!(text.contains("diffutils"), "{text}");
+        assert!(text.contains("coreutils 8.25"), "{text}");
+        assert!(text.contains("not unconditionally"), "{text}");
+        assert!(text.contains("no privileged mount change"), "{text}");
     }
 }

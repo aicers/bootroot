@@ -463,10 +463,14 @@ impl Messages {
         )
     }
 
-    pub(crate) fn audit_reserve_finding_store_not_empty(&self, store: &str) -> String {
+    pub(crate) fn audit_reserve_finding_store_not_empty(
+        &self,
+        store: &str,
+        holding: &str,
+    ) -> String {
         format_template(
             self.strings().audit_reserve_finding_store_not_empty,
-            &[("store", store)],
+            &[("store", store), ("holding", holding)],
         )
     }
 
@@ -581,6 +585,214 @@ impl Messages {
 
     pub(crate) fn audit_reserve_step_subdirectories(&self) -> &'static str {
         self.strings().audit_reserve_step_subdirectories
+    }
+
+    pub(crate) fn audit_reserve_outcome_migration_incomplete(&self, store: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_outcome_migration_incomplete,
+            &[("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_directory_migration_open(
+        &self,
+        holding: &str,
+        store: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_directory_migration_open,
+            &[("holding", holding), ("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_holding(
+        &self,
+        holding: &str,
+        store: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_holding,
+            &[("holding", holding), ("store", store)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_store_not_empty(
+        &self,
+        store: &str,
+        holding: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .audit_reserve_finding_migration_store_not_empty,
+            &[("store", store), ("holding", holding)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_path_exists(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_path_exists,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_mount_absent(&self) -> String {
+        self.strings()
+            .audit_reserve_finding_migration_mount_absent
+            .to_string()
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_mount_foreign(
+        &self,
+        store: &str,
+        found: &str,
+        holding: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_mount_foreign,
+            &[("store", store), ("found", found), ("holding", holding)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_mount_point(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_mount_point,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_holding_kind(
+        &self,
+        path: &str,
+        found: &str,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_holding_kind,
+            &[("path", path), ("found", found)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_deferred(&self, refusal: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_deferred,
+            &[("refusal", refusal)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_forbidden_entry(
+        &self,
+        path: &str,
+        found: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .audit_reserve_finding_migration_forbidden_entry,
+            &[("path", path), ("found", found)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_arithmetic(&self, figure: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_arithmetic,
+            &[("figure", figure)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_capacity_fits(
+        &self,
+        available: u64,
+        source: u64,
+        margin: u64,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_finding_migration_capacity_fits,
+            &[
+                ("available", &available.to_string()),
+                ("source", &source.to_string()),
+                ("margin", &margin.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_finding_migration_capacity_short(
+        &self,
+        available: u64,
+        source: u64,
+        margin: u64,
+    ) -> String {
+        format_template(
+            self.strings()
+                .audit_reserve_finding_migration_capacity_short,
+            &[
+                ("available", &available.to_string()),
+                ("source", &source.to_string()),
+                ("margin", &margin.to_string()),
+            ],
+        )
+    }
+
+    pub(crate) fn audit_reserve_note_migrated_reclaimable(&self, path: &str, size: u64) -> String {
+        format_template(
+            self.strings().audit_reserve_note_migrated_reclaimable,
+            &[("path", path), ("size", &size.to_string())],
+        )
+    }
+
+    pub(crate) fn audit_reserve_note_migrated_reclaimable_unsized(&self, path: &str) -> String {
+        format_template(
+            self.strings()
+                .audit_reserve_note_migrated_reclaimable_unsized,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_note_retained_image_reclaimable(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> String {
+        format_template(
+            self.strings().audit_reserve_note_retained_image_reclaimable,
+            &[("path", path), ("size", &size.to_string())],
+        )
+    }
+
+    pub(crate) fn audit_reserve_figure_source_plus_margin(&self, path: &str) -> String {
+        format_template(
+            self.strings().audit_reserve_figure_source_plus_margin,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn audit_reserve_migration_prerequisites(&self) -> &'static str {
+        self.strings().audit_reserve_migration_prerequisites
+    }
+
+    pub(crate) fn audit_reserve_migration_window(&self) -> &'static str {
+        self.strings().audit_reserve_migration_window
+    }
+
+    pub(crate) fn audit_reserve_step_aside_rename(&self) -> &'static str {
+        self.strings().audit_reserve_step_aside_rename
+    }
+
+    pub(crate) fn audit_reserve_step_type_guard(&self) -> &'static str {
+        self.strings().audit_reserve_step_type_guard
+    }
+
+    pub(crate) fn audit_reserve_step_copy(&self) -> &'static str {
+        self.strings().audit_reserve_step_copy
+    }
+
+    pub(crate) fn audit_reserve_step_verify(&self) -> &'static str {
+        self.strings().audit_reserve_step_verify
+    }
+
+    pub(crate) fn audit_reserve_step_closing_rename(&self) -> &'static str {
+        self.strings().audit_reserve_step_closing_rename
+    }
+
+    pub(crate) fn audit_reserve_step_rollback(&self) -> &'static str {
+        self.strings().audit_reserve_step_rollback
     }
 
     pub(crate) fn audit_reserve_step_rerun(&self, command: &str) -> String {

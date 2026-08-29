@@ -139,7 +139,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //      outcome reporting and phase-two instructions after the wipe.
     preflight_audit_store(
         &AuditStoreInitInputs {
-            compose_dir: &compose_dir,
+            compose_file,
             agent_config: args.agent_config.as_deref(),
             state_path: &state_path,
             endpoint_recorded: registrar_endpoint_intent(&state_path)?.is_some(),
@@ -2555,7 +2555,7 @@ mod tests {
 
         let err = preflight_audit_store(
             &AuditStoreInitInputs {
-                compose_dir: dir.path(),
+                compose_file: &dir.path().join("docker-compose.yml"),
                 agent_config: None,
                 state_path: &state_path,
                 endpoint_recorded: registrar_endpoint_intent(&state_path)
