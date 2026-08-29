@@ -1273,6 +1273,27 @@ assert_the_rendered_steps_migrate_an_existing_store() {
   RESERVE_IMAGE="$image"
   RESERVE_UNIT_NAME="$unit"
 
+  # The rendered step 1 is the maintenance window itself: stop both
+  # writers before the store moves aside.  `rendered_migration_commands`
+  # drops those two lines -- one would stop this scenario's whole
+  # Compose stack rather than the writer, and the other names a unit no
+  # CI host has installed -- so the OpenBao writer is stopped here, by
+  # service, through the same Compose surface.  It stays down for the
+  # whole window and comes back only on the closing path at the end of
+  # this section, which is the shape of the window an operator opens.
+  instance_compose stop openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not stop the OpenBao writer for the migration window"
+  instance_compose rm -f openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not remove the OpenBao writer for the migration window"
+  # The other writer is `bootroot-registrar.service`, and this is an
+  # assertion rather than a stop: no CI host has that unit installed,
+  # and stopping one this scenario did not install would be a
+  # host-changing step it has no way to undo.
+  if systemctl is-active --quiet bootroot-registrar.service 2>/dev/null; then
+    fail "the registrar writer is running; the migration window needs both writers stopped"
+  fi
+  pass "both writers are stopped before the store moves aside"
+
   run_rendered_migration_commands "$first" "$store"
   sudo -n test -d "${store}.pre-mount" ||
     fail "the aside rename did not create ${store}.pre-mount"
@@ -1308,6 +1329,8 @@ assert_the_rendered_steps_migrate_an_existing_store() {
     fail "records/ was created on the mounted reserve before the copy"
   fi
   pass "the reserve is mounted and the store on it is still empty"
+
+  assert_the_audit_bind_refuses_to_create_its_source_mid_migration "$store" "$unit"
 
   # Pass 3: migration incomplete, now with the capacity verdict, the
   # copy, the verification and the closing rename.
@@ -1418,6 +1441,96 @@ assert_the_rendered_steps_migrate_an_existing_store() {
   sudo_to_log rm -rf "${store}.migrated" || true
   sudo -n rm -rf "$WORK_DIR/audit-store"
   remove_rendered_audit_override
+
+  # The window closes here, and only here.  The OpenBao writer went down
+  # before the store moved aside and stayed down across every pass; it
+  # comes back on its ordinary audit volume, which is what the base
+  # compose file declares now that the override naming this section's
+  # store -- and the store itself -- are gone.
+  instance_compose up -d openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not restart the OpenBao writer after the migration window"
+  wait_for_openbao_listening
+  pass "the writers come back only once the migration has closed"
+}
+
+# The bind guard, inside the migration window rather than beside it.
+#
+# `assert_the_audit_bind_guard_boundaries` proves the same
+# `create_host_path: false` declaration against an unmounted store,
+# which is the state a host reaches by never having activated a
+# reserve.  This window is the other one, and it is the state the guard
+# exists for: the records are aside under `.pre-mount`, the reserve is
+# mounted and still empty, and `<audit_store_dir>/openbao` is the
+# directory the copy has not yet made.  A bring-up here that
+# manufactured it would leave a bind source on the destination side of a
+# copy that has not run -- one the migration did not put there, on a
+# filesystem whose only record of the operator's content is still the
+# holding directory.
+#
+# `bootroot infra up` refuses this state, and that refusal is covered in
+# `src/commands/audit_store.rs`.  It is a different assertion: it says
+# bootroot declines to start containers, not that Docker itself refuses
+# the bind.  The guarantee has to hold for whoever else brings the stack
+# up, so this drives the ordinary Compose surface over the override the
+# operator has on disk at this moment, rather than driving bootroot.
+assert_the_audit_bind_refuses_to_create_its_source_mid_migration() {
+  local store="$1" unit="$2" override log status before after
+  override="$WORK_DIR/secrets/openbao/docker-compose.openbao-audit.yml"
+  log="$ARTIFACT_DIR/compose-up-mid-migration.log"
+
+  # The window itself, restated rather than assumed: a change that
+  # closed it earlier would otherwise turn this into a bring-up against
+  # some other state that happens to pass for the wrong reason.
+  sudo -n test -d "${store}.pre-mount" ||
+    fail "the holding directory is absent, so this is not the migration window"
+  assert_equal "the reserve is mounted for the mid-window bring-up" \
+    "ActiveState=active" "$(sudo -n systemctl show -p ActiveState "$unit")"
+  if sudo -n test -e "$store/openbao"; then
+    fail "the bind source is already on the mounted reserve before the bring-up"
+  fi
+  # What the mounted reserve carries going in, so the assertion after
+  # the bring-up is that it gained nothing rather than that it holds one
+  # particular name.  A fresh `mkfs.ext4` filesystem carries its own
+  # `lost+found` and this window has put nothing beside it.
+  before="$(sudo -n find "$store" -mindepth 1 -maxdepth 1 -printf '[%f]')"
+  log "the mounted store holds ${before} before the mid-migration bring-up"
+
+  # The override the refusal pass rendered is still the one on disk --
+  # a migration-open pass writes none -- and it names the store this
+  # window is open over.
+  grep -qF "source: '$store/openbao'" "$override" ||
+    fail "the rendered override does not bind $store/openbao; see $override"
+  grep -q "create_host_path: false" "$override" ||
+    fail "the rendered override lets Docker create an absent audit bind source"
+
+  # The bring-up's own non-zero exit is the assertion.  One that
+  # returned success having quietly done nothing would satisfy the
+  # absent-source checks below on its own, so the failure is read from
+  # the command and from the error naming the bind source, and only
+  # then from what the reserve does not carry.
+  if instance_compose -f "$override" up -d --no-deps openbao >"$log" 2>&1; then
+    fail "OpenBao started mid-migration over an absent audit bind source; see $log"
+  fi
+  grep -qF "$store/openbao" "$log" ||
+    fail "the bring-up did not fail on the absent audit bind source; see $log"
+  status="$(docker inspect "${INSTANCE}-openbao" --format '{{.State.Status}}' 2>>"$RUN_LOG" || true)"
+  [ "$status" != "running" ] ||
+    fail "OpenBao is running mid-migration despite its absent audit bind source"
+  pass "the mid-migration bring-up fails on the guarded audit bind source"
+
+  # And nothing of the destination was manufactured: no bind source, and
+  # the mounted reserve still carries exactly what `mkfs.ext4` put on it.
+  sudo -n test ! -e "$store/openbao" ||
+    fail "Docker created $store/openbao inside the migration window"
+  after="$(sudo -n find "$store" -mindepth 1 -maxdepth 1 -printf '[%f]')"
+  assert_equal "the refused bring-up added no entry beneath the mounted store" \
+    "$before" "$after"
+
+  # Leave the writers where the window found them.  The refused bring-up
+  # created a container that never started, and it would otherwise be
+  # what the next Compose call over this project adopts.
+  instance_compose rm -f openbao >>"$RUN_LOG" 2>&1 ||
+    fail "could not remove the refused OpenBao container"
 }
 
 # Takes the activation back off the host, in the order the manual's
