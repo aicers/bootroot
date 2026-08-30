@@ -45,6 +45,7 @@ require() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
 stat_mode() { stat -c '%u:%g:%a' "$1" 2>/dev/null || stat -f '%u:%g:%OLp' "$1"; }
 digest_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 compose() { BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" "$@"; }
+bootroot() { (cd "$WORK_DIR" && "$BOOTROOT_BIN" "$@"); }
 
 cleanup() {
   local status=$?
@@ -117,15 +118,15 @@ build_and_initialize() {
   HTTP01_IMAGE="bootroot-http01-responder:registrar-redteam-${RUN_TOKEN}"; export BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE"
   docker build -t "$HTTP01_IMAGE" -f "$BOOTROOT_PROJECT_DIR/docker/http01-responder/Dockerfile" "$BOOTROOT_PROJECT_DIR" >>"$RUN_LOG" 2>&1 || fail "could not build responder image"; HTTP01_IMAGE_BUILT=1
   prepull_third_party_images
-  "$BOOTROOT_BIN" infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 || fail "infra install failed"
+  bootroot infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 || fail "infra install failed"
   for _ in $(seq 1 60); do curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 && break; sleep 1; done
   curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 || fail "OpenBao did not become reachable"
   jq --arg url "http://localhost:${PORT_OPENBAO}" '.registrar_endpoint = {enabled: true, domain: "trusted.domain", host: "redteam"} | .openbao_url = $url' "$WORK_DIR/state.json" >"$WORK_DIR/state.next" || fail "could not seed endpoint predicate"; mv "$WORK_DIR/state.next" "$WORK_DIR/state.json"
-  sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" "$BOOTROOT_BIN" init --compose-file "$WORK_DIR/docker-compose.deploy.yml" --secrets-dir "$WORK_DIR/secrets" --enable auto-generate,show-secrets,db-provision --stepca-password "redteam-${RUN_TOKEN}" --http-hmac "redteam-hmac-${RUN_TOKEN}" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "http://127.0.0.1:${PORT_HTTP01}" --agent-config "$INITIAL_CONFIG" --summary-json "$SUMMARY" </dev/null >"$ARTIFACT_DIR/init.raw.log" 2>&1 || fail "bootroot init failed"
+  sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "redteam-${RUN_TOKEN}" "redteam-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$ARTIFACT_DIR/init.raw.log" 2>&1 || fail "bootroot init failed"
   sed 's/^\(root token: \).*/\1<redacted>/' "$ARTIFACT_DIR/init.raw.log" >"$ARTIFACT_DIR/init.log"
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
   sudo -n sh -c 'printf "header = \\"X-Vault-Token: %s\\"\\n" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
-  "$BOOTROOT_BIN" infra up --compose-file "$WORK_DIR/docker-compose.deploy.yml" --agent-config "$INITIAL_CONFIG" --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 || fail "could not start initialized deployment"
+  bootroot infra up --compose-file "$WORK_DIR/docker-compose.deploy.yml" --agent-config "$INITIAL_CONFIG" --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 || fail "could not start initialized deployment"
   pass "initialized an isolated live TLS OpenBao deployment"
 }
 
