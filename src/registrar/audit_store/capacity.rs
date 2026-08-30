@@ -790,6 +790,11 @@ fn walk_frames<O: WalkOps>(
 /// [`SyscallWalkOps`] and takes exactly one path through it.
 pub(crate) struct HostCapacityProbe<O = SyscallWalkOps> {
     ops: O,
+    // Synthetic `fstatvfs` facts exist only in test builds, where no
+    // filesystem can represent the overflow inputs the arithmetic must
+    // tolerate. Production always calls `fstatvfs` on the root descriptor.
+    #[cfg(test)]
+    test_space: Option<FsSpaceFacts>,
 }
 
 impl HostCapacityProbe<SyscallWalkOps> {
@@ -798,6 +803,8 @@ impl HostCapacityProbe<SyscallWalkOps> {
     pub(crate) const fn new() -> Self {
         Self {
             ops: SyscallWalkOps,
+            #[cfg(test)]
+            test_space: None,
         }
     }
 }
@@ -812,7 +819,23 @@ impl<O: WalkOps> HostCapacityProbe<O> {
     /// Returns a probe over a substituted operation set.
     #[cfg(test)]
     const fn with_ops(ops: O) -> Self {
-        Self { ops }
+        Self {
+            ops,
+            test_space: None,
+        }
+    }
+
+    /// Returns a test-only probe with synthetic filesystem space facts.
+    ///
+    /// A real filesystem cannot report block counts whose byte product
+    /// overflows `u64`, so probe-level overflow coverage supplies those
+    /// facts while preserving the real root-open and walk paths.
+    #[cfg(test)]
+    const fn with_ops_and_space(ops: O, space: FsSpaceFacts) -> Self {
+        Self {
+            ops,
+            test_space: Some(space),
+        }
     }
 }
 
@@ -834,7 +857,13 @@ impl<O: WalkOps> CapacityProbe for HostCapacityProbe<O> {
                 return Err(error);
             }
         };
-        let space = match filesystem_space(root.as_fd()) {
+        #[cfg(not(test))]
+        let space = filesystem_space(root.as_fd());
+        #[cfg(test)]
+        let space = self
+            .test_space
+            .map_or_else(|| filesystem_space(root.as_fd()), Ok);
+        let space = match space {
             Ok(space) => space,
             Err(error) => {
                 self.ops.close_dir(root);
