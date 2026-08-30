@@ -8,9 +8,11 @@
 //! behaviours that are a race, a privilege assumption or a
 //! process-global observation go through [`RecordingWalkOps`].
 
-use std::cell::Cell;
-use std::ffi::CString;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
@@ -210,6 +212,93 @@ impl WalkOps for RecordingWalkOps {
     fn close_dir(&self, dir: Self::Dir) {
         self.closes.set(self.closes.get() + 1);
         self.inner.close_dir(dir.inner);
+    }
+}
+
+/// An open directory for [`FactWalkOps`].
+///
+/// The file is only a descriptor-shaped stand-in for the root open. The
+/// test-only space source means this fixture never supplies it to
+/// `fstatvfs`; the scripted facts below control every value the walk uses.
+struct FactDir {
+    file: fs::File,
+}
+
+impl AsFd for FactDir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
+/// A controlled walk fixture for entry facts that a real filesystem cannot
+/// represent, such as an overflowing `st_blocks * 512` product.
+struct FactWalkOps {
+    root: EntryFacts,
+    entries: RefCell<VecDeque<OsString>>,
+    entry_facts: HashMap<OsString, EntryFacts>,
+    entries_read: Cell<u32>,
+}
+
+impl FactWalkOps {
+    fn root_only(root: EntryFacts) -> Self {
+        Self {
+            root,
+            entries: RefCell::new(VecDeque::new()),
+            entry_facts: HashMap::new(),
+            entries_read: Cell::new(0),
+        }
+    }
+
+    fn with_entry(root: EntryFacts, name: &str, facts: EntryFacts) -> Self {
+        let name = OsString::from(name);
+        let mut entry_facts = HashMap::new();
+        entry_facts.insert(name.clone(), facts);
+        Self {
+            root,
+            entries: RefCell::new(VecDeque::from([name])),
+            entry_facts,
+            entries_read: Cell::new(0),
+        }
+    }
+
+    fn entries_read(&self) -> u32 {
+        self.entries_read.get()
+    }
+}
+
+impl WalkOps for FactWalkOps {
+    type Dir = FactDir;
+
+    fn open_dir(&self, parent: Option<&Self::Dir>, name: &OsStr) -> io::Result<Self::Dir> {
+        if parent.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the overflow fixture has no child directories",
+            ));
+        }
+        fs::File::open(Path::new(name)).map(|file| FactDir { file })
+    }
+
+    fn next_entry(&self, _dir: &mut Self::Dir) -> io::Result<Option<OsString>> {
+        self.entries_read.set(self.entries_read.get() + 1);
+        Ok(self.entries.borrow_mut().pop_front())
+    }
+
+    fn stat_dir(&self, _dir: &Self::Dir) -> io::Result<EntryFacts> {
+        Ok(self.root)
+    }
+
+    fn stat_entry(&self, _parent: &Self::Dir, name: &OsStr) -> io::Result<EntryFacts> {
+        self.entry_facts.get(name).copied().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "the overflow fixture has no facts for this entry",
+            )
+        })
+    }
+
+    fn close_dir(&self, dir: Self::Dir) {
+        drop(dir);
     }
 }
 
@@ -513,6 +602,102 @@ fn every_block_count_product_saturates_rather_than_wrapping() {
         ),
         AuditCapacityState::Ok
     );
+}
+
+#[test]
+fn the_host_probe_succeeds_when_available_bytes_overflow() {
+    let (_parent, store) = store_under_parent();
+    let space = FsSpaceFacts {
+        blocks: 1,
+        blocks_free: 1,
+        blocks_available: u64::MAX,
+        fragment_size: 2,
+    };
+    let probe = HostCapacityProbe::with_ops_and_space(
+        FactWalkOps::root_only(EntryFacts {
+            dev: 1,
+            ino: 1,
+            blocks: 0,
+            is_dir: true,
+        }),
+        space,
+    );
+
+    let measured = probe
+        .measure(&store, AuditStoreEnforcement::Filesystem)
+        .expect("an overflowing f_bavail product does not fail the probe");
+
+    assert_eq!(measured.available_bytes, u64::MAX);
+    assert_eq!(
+        probe.ops.entries_read(),
+        0,
+        "filesystem mode does not enumerate the store"
+    );
+}
+
+#[test]
+fn the_host_probe_succeeds_when_filesystem_used_bytes_overflow() {
+    let (_parent, store) = store_under_parent();
+    let space = FsSpaceFacts {
+        blocks: u64::MAX,
+        blocks_free: 0,
+        blocks_available: 1,
+        fragment_size: 2,
+    };
+    let probe = HostCapacityProbe::with_ops_and_space(
+        FactWalkOps::root_only(EntryFacts {
+            dev: 1,
+            ino: 1,
+            blocks: 0,
+            is_dir: true,
+        }),
+        space,
+    );
+
+    let measured = probe
+        .measure(&store, AuditStoreEnforcement::Filesystem)
+        .expect("an overflowing f_blocks product does not fail the probe");
+
+    assert_eq!(measured.used_bytes, u64::MAX);
+    assert_eq!(
+        probe.ops.entries_read(),
+        0,
+        "filesystem mode does not enumerate the store"
+    );
+}
+
+#[test]
+fn the_host_probe_succeeds_when_a_walked_entry_bytes_overflow() {
+    let (_parent, store) = store_under_parent();
+    let probe = HostCapacityProbe::with_ops_and_space(
+        FactWalkOps::with_entry(
+            EntryFacts {
+                dev: 1,
+                ino: 1,
+                blocks: 0,
+                is_dir: true,
+            },
+            "audit.log",
+            EntryFacts {
+                dev: 1,
+                ino: 2,
+                blocks: u64::MAX,
+                is_dir: false,
+            },
+        ),
+        FsSpaceFacts {
+            blocks: 1,
+            blocks_free: 1,
+            blocks_available: 1,
+            fragment_size: 1,
+        },
+    );
+
+    let measured = probe
+        .measure(&store, AuditStoreEnforcement::Directory)
+        .expect("an overflowing walked entry does not fail the probe");
+
+    assert_eq!(measured.used_bytes, u64::MAX);
 }
 
 #[test]
