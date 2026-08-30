@@ -121,7 +121,10 @@ build_and_initialize() {
   bootroot infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 || fail "infra install failed"
   for _ in $(seq 1 60); do curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 && break; sleep 1; done
   curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 || fail "OpenBao did not become reachable"
-  jq --arg url "http://localhost:${PORT_OPENBAO}" '.registrar_endpoint = {enabled: true, domain: "trusted.domain", host: "redteam"} | .openbao_url = $url' "$WORK_DIR/state.json" >"$WORK_DIR/state.next" || fail "could not seed endpoint predicate"; mv "$WORK_DIR/state.next" "$WORK_DIR/state.json"
+  # A fresh `infra install` deliberately creates no state inventory. Seed
+  # the one endpoint predicate `init` must preserve while it writes the
+  # complete state record after provisioning.
+  jq -n --arg url "http://localhost:${PORT_OPENBAO}" '{openbao_url: $url, kv_mount: "secret", registrar_endpoint: {enabled: true, domain: "trusted.domain", host: "redteam"}}' >"$WORK_DIR/state.json" || fail "could not seed endpoint predicate"
   sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "redteam-${RUN_TOKEN}" "redteam-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$ARTIFACT_DIR/init.raw.log" 2>&1 || fail "bootroot init failed"
   sed 's/^\(root token: \).*/\1<redacted>/' "$ARTIFACT_DIR/init.raw.log" >"$ARTIFACT_DIR/init.log"
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
