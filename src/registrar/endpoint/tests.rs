@@ -44,7 +44,8 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
-use wiremock::MockServer;
+use wiremock::matchers::{method, path as request_path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::activation::{
     ActivationContract, ActivationError, ActivationValues, DescriptorError, DescriptorFacts,
@@ -83,6 +84,7 @@ use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::identity::RequestedSpec;
 use crate::registrar::internal::InternalCredential;
+use crate::registrar::verbs::binding::{BindingRecord, REGISTRAR_BINDING_KV_SUFFIX};
 use crate::registrar::verbs::limiter::{
     CountingLimitedInvocationSink, LimiterBucket, NoopLimitedInvocationSink, VerbRateLimiter,
     VerbRateLimiterSettings,
@@ -93,6 +95,7 @@ use crate::registrar::verbs::{
     DeregisterRequest, MintRequest, RegistrarVerbs, RegistrarVerbsConfig,
 };
 use crate::registrar::{RegistrarIdentityError, ReloadSpec, registrar_client_identity};
+use crate::service_material::{service_kv_path, service_policy_name, service_role_name};
 
 /// A pid no test process can have, for the mismatch arm.
 const OTHER_PID: u32 = 424_242;
@@ -958,12 +961,72 @@ fn register_payload(service_name: &str, host: &str, idempotency_key: &str) -> Ve
         "spec": {
             "component": service_name,
             "service_name": service_name,
-            "reload": "any-form-at-all",
+            "reload": r#"{ kind = "systemd", target = "roxyd.service" }"#,
         },
         "wrap_ttl": 300,
         "idempotency_key": idempotency_key,
     }))
     .expect("the payload encodes")
+}
+
+fn roxyd_requested_spec() -> RequestedSpec {
+    RequestedSpec {
+        component: Some("roxyd".to_string()),
+        service_name: Some("roxyd".to_string()),
+        reload: ReloadSpec::new(crate::registrar::ReloadKind::Systemd, "roxyd.service"),
+        cert_group: None,
+    }
+}
+
+/// Mounts the `OpenBao` responses a first `roxyd` mint requires after its
+/// binding read has returned the ordinary absent response.
+async fn mock_first_roxyd_mint(server: &MockServer, registration_id: &str) {
+    let role_name = service_role_name(registration_id);
+    let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+    Mock::given(method("POST"))
+        .and(request_path(format!("/v1/secret/data/{binding_path}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "version": 1 }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path(format!(
+            "/v1/sys/policies/acl/{}",
+            service_policy_name(registration_id)
+        )))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path(format!("/v1/auth/approle/role/{role_name}")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(request_path(format!(
+            "/v1/auth/approle/role/{role_name}/role-id"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "data": { "role_id": "role-id-1" } })),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(request_path(format!(
+            "/v1/auth/approle/role/{role_name}/secret-id"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "wrap_info": {
+                "token": "hvs.wrap-token",
+                "ttl": 300,
+                "creation_time": "2026-08-23T12:00:00Z",
+                "creation_path": format!("auth/approle/role/{role_name}/secret-id"),
+            }
+        })))
+        .mount(server)
+        .await;
 }
 
 /// Builds one deregister payload at the endpoint's v1 protocol.
@@ -2717,14 +2780,11 @@ async fn limited_events_reach_responses_only_after_daemon_maintenance() {
 /// successful mint and deregister read up to the store's full ceiling.
 /// Asserted on a snapshot the handler's own store could not have
 /// produced: the response follows the snapshot, so no scan of its own
-/// ran. Driven over the deregister and refusal shapes, which is every
-/// shape this build's production handler encodes end to end —
-/// `Operation::Mint` is still refused at the spec conversion with no
-/// response bytes, so the mint arm's own relay is asserted over the
-/// two halves it is made of by
-/// `production::tests::a_mint_response_relays_the_last_snapshot_without_scanning_the_store`,
-/// and that no arm can scan at all by
-/// `production::tests::no_request_path_arm_reads_the_audit_store`.
+/// ran. Driven over deregister and refusal shapes; the mint relay is
+/// separately covered by
+/// `production::tests::a_mint_response_relays_the_last_snapshot_without_scanning_the_store`.
+/// `production::tests::no_request_path_arm_reads_the_audit_store` proves
+/// no handler arm scans the store.
 #[tokio::test]
 async fn responses_relay_the_last_capacity_snapshot_without_scanning_the_store() {
     use crate::config::AuditStoreEnforcement;
@@ -2980,25 +3040,24 @@ async fn an_undecodable_payload_is_zero_bytes_and_the_fixed_transport_line() {
     }
 }
 
-/// The mint path stops at the wire `spec`, because the grammar its two
-/// strings are spelled under is settled nowhere. What the caller sees is
-/// the ordinary undecodable-payload answer; what the handler logs is its
-/// own line saying which conversion failed, on its own side of the call.
+/// A malformed owner-controlled wire spec remains an endpoint refusal,
+/// rather than becoming a new wire error or reaching the verb layer.
 #[tokio::test]
-async fn a_mint_refuses_until_the_wire_spec_grammar_is_settled() {
+async fn an_invalid_mint_spec_is_a_zero_byte_clean_close() {
     let (logs, _guard) = capture_logs();
     let server = MockServer::start().await;
     let (_dir, _audit, handler) = production_handler(&server);
     let harness = Harness::bind().expect("harness");
     let running = RunningEndpoint::start(&harness.endpoint, handler);
 
-    let observed = harness
-        .round_trip(&frame_of(
-            b"mint",
-            &register_payload("roxyd", "h1", "key-1"),
-        ))
-        .await;
-    assert!(observed.is_empty(), "a refused mint writes no bytes");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&register_payload("roxyd", "h1", "key-1")).expect("json");
+    payload["spec"]["reload"] =
+        serde_json::json!(r#"{kind = "systemd", target = "roxyd.service" }"#);
+    let payload = serde_json::to_vec(&payload).expect("the invalid payload encodes");
+
+    let observed = harness.round_trip(&frame_of(b"mint", &payload)).await;
+    assert!(observed.is_empty(), "an invalid mint writes no bytes");
     running.stop().await;
 
     // The transport's line is the unchanged fixed one, and the
@@ -3010,7 +3069,7 @@ async fn a_mint_refuses_until_the_wire_spec_grammar_is_settled() {
         "the transport's line is byte-for-byte the fixed one: {transport:?}"
     );
     assert!(
-        !transport.message.contains("registrar-wire-contract.md"),
+        !transport.message.contains("spec.reload"),
         "nothing the handler knows reaches the transport's line: {transport:?}"
     );
     let handler_line = logs
@@ -3020,8 +3079,8 @@ async fn a_mint_refuses_until_the_wire_spec_grammar_is_settled() {
         .expect("the handler logs what it knows on its own side of the call")
         .clone();
     assert!(
-        handler_line.message.contains("registrar-wire-contract.md"),
-        "the handler's line must point at the settlement: {}",
+        handler_line.message.contains("spec.reload"),
+        "the handler's line must name the invalid field: {}",
         handler_line.message
     );
     assert!(
@@ -3035,7 +3094,116 @@ async fn a_mint_refuses_until_the_wire_spec_grammar_is_settled() {
             .await
             .expect("the mock records requests")
             .is_empty(),
-        "a mint refused before the verb creates nothing"
+        "an invalid spec is refused before the verb creates anything"
+    );
+}
+
+/// A canonical socket mint reaches the real verb layer under the mTLS-derived
+/// caller identity. The CA anchor is deliberately read for each mint, so a
+/// rewritten `bootroot/ca` object reaches the next response without restart.
+#[tokio::test]
+async fn a_socket_mint_returns_freshly_read_anchor_material() {
+    let (logs, _guard) = capture_logs();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/v1/auth/cert/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "auth": { "client_token": "s.internal-token", "lease_duration": 900 }
+        })))
+        .mount(&server)
+        .await;
+
+    let registration_id = "h1-roxyd";
+    let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+    mock_first_roxyd_mint(&server, registration_id).await;
+
+    let first_ca = valid_ca();
+    let first_fingerprint = crate::tls::sha256_hex(first_ca.der().as_ref());
+    let first_anchor = Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": {
+                "trusted_ca_sha256": [first_fingerprint.clone()],
+                "ca_bundle_pem": first_ca.pem(),
+            }}
+        })))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let (_dir, audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+    let first_wire = harness
+        .round_trip(&frame_of(
+            b"mint",
+            &register_payload("roxyd", "h1", "first-key"),
+        ))
+        .await;
+    assert!(
+        !first_wire.is_empty(),
+        "the canonical mint must answer: {:?}",
+        logs.events()
+    );
+    let first = protocol::decode_mint_response(&decode_response(&first_wire))
+        .expect("the canonical mint response decodes");
+    assert_eq!(first.registration_id, registration_id);
+    assert_eq!(
+        protocol::decode_ca_anchor(first.material.ca_anchor.as_str())
+            .expect("the first anchor decodes")
+            .trusted_ca_sha256,
+        vec![first_fingerprint]
+    );
+    drop(first_anchor);
+
+    let requested = roxyd_requested_spec();
+    let active = BindingRecord::creating("h1", &requested).activated(&requested);
+    Mock::given(method("GET"))
+        .and(request_path(format!("/v1/secret/data/{binding_path}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": active.encode().expect("the active binding encodes") }
+        })))
+        .mount(&server)
+        .await;
+    let second_ca = valid_ca();
+    let second_fingerprint = crate::tls::sha256_hex(second_ca.der().as_ref());
+    let _second_anchor = Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": {
+                "trusted_ca_sha256": [second_fingerprint.clone()],
+                "ca_bundle_pem": second_ca.pem(),
+            }}
+        })))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let second = protocol::decode_mint_response(&decode_response(
+        &harness
+            .round_trip(&frame_of(
+                b"mint",
+                &register_payload("roxyd", "h1", "second-key"),
+            ))
+            .await,
+    ))
+    .expect("the re-mint response decodes");
+    running.stop().await;
+    assert_eq!(second.registration_id, registration_id);
+    assert_eq!(
+        protocol::decode_ca_anchor(second.material.ca_anchor.as_str())
+            .expect("the rewritten anchor decodes")
+            .trusted_ca_sha256,
+        vec![second_fingerprint]
+    );
+
+    let caller = caller_identity(&registrar_client_name());
+    let intent = audit_trail(&audit)
+        .into_iter()
+        .find(|line| line["request_id"] == serde_json::json!(first.request_id))
+        .expect("the mint writes an intent record under the transport caller");
+    assert_eq!(
+        intent["caller_identity"],
+        serde_json::json!(caller.as_str())
     );
 }
 

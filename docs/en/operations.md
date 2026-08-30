@@ -1988,16 +1988,13 @@ whole daemon invocation is rebuilt; the listening socket is not, so the
 socket inode is unchanged and `[registrar_endpoint] enabled` stays fixed
 for the process lifetime.
 
-!!! warning "`mint` is not servable yet"
-    Deregistration is served end to end. Minting is not: a mint request
-    carries a `spec` whose `reload` and `cert_group` are opaque strings,
-    and the wire spelling of those two is owned outside this repository
-    and has not been settled or transcribed into
-    `docs/reference/registrar-wire-contract.md`. Until it is, every mint
-    is refused before the verb runs — zero response bytes and a clean
-    close, the endpoint's ordinary undecodable-payload answer — and the
-    daemon logs which conversion failed. Nothing is minted, and no
-    spelling is guessed at.
+!!! note "`mint` is served"
+    Both `mint` and `deregister` are served end to end. A mint request's
+    `spec.reload` and optional `spec.cert_group` must use the canonical
+    bootler spellings recorded in
+    `docs/reference/registrar-wire-contract.md` §8.3; another TOML
+    spelling is rejected before the verb runs with zero response bytes
+    and a clean close. The endpoint does not normalize caller input.
 
 #### The socket, and who owns it
 

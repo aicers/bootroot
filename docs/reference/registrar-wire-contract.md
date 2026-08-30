@@ -39,6 +39,7 @@ obtained any other way carry their own pointer in the `Provenance` column.
 | `RFC-F §5.1` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.1 Restricted registrar mint verb | this repository, working tree |
 | `RFC-F §5.6` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.6 Audit record for both verbs | this repository, working tree |
 | `BR#759` | `aicers/bootroot` | issue [#759](https://github.com/aicers/bootroot/issues/759) body | Scope | this repository's own expectation, **not** transcribed from the source |
+| `BL#308` | `aicers/bootler` | `core/src/provisioning_file.rs` | module documentation, `Wire spelling` | `008bbb458b0b` (PR [#309](https://github.com/aicers/bootler/pull/309), issue [#308](https://github.com/aicers/bootler/issues/308)) |
 | `bootroot` | `aicers/bootroot` | source paths cited per row | — | this repository, working tree |
 
 The source document has exactly one commit in its history — `7a6c7e2`, the
@@ -63,8 +64,8 @@ version.
 | `ServiceSpec` | struct | review-protocol (contents externally owned, see §8.3) | `RFC-C §5` |
 | `DeliveryMode` | enum | review-protocol | `RFC-C §5` |
 | `BootstrapMaterial` | struct | review-protocol (`ca_anchor` contents bootroot-owned, see §8.1) | `RFC-C §5` |
-| `ReloadHook` | newtype over `String`, opaque | review-protocol | `RP#218` |
-| `CertGroup` | newtype over `String`, opaque | review-protocol | `RP#218` |
+| `ReloadHook` | newtype over `String`; exact spelling in §8.3 | review-protocol type, bootler spelling | `RP#218`, `BL#308` |
+| `CertGroup` | newtype over `String`; exact spelling in §8.3 | review-protocol type, bootler spelling | `RP#218`, `BL#308` |
 | `AgentInfo` | struct (handshake), not part of the `node.enroll` family | review-protocol | `RFC-C §7`, `RFC-C §8` |
 
 `RFC-C §5` names the six typed errors in prose bullets and does **not** spell
@@ -128,8 +129,8 @@ review-protocol nor bootroot. There is deliberately **no** privilege field.
 | --- | --- | --- | --- | --- |
 | `component` | `String` | bootler (`ServiceRegistration`) | Canonical package id. **Not** validated against the safe-set. | `RFC-C §5` |
 | `service_name` | `String` | bootler (`ServiceRegistration`) | The component's plain keyword. **Not** validated against the safe-set. | `RFC-C §5` |
-| `reload` | `ReloadHook` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5`, `RFC-F §5.1` |
-| `cert_group` | `Option<CertGroup>` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set. | `RFC-C §5`, `RFC-F §5.1` |
+| `reload` | `ReloadHook` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set; canonical wire spelling in §8.3. | `RFC-C §5`, `RFC-F §5.1`, `BL#308` |
+| `cert_group` | `Option<CertGroup>` | bootler (`ServiceRegistration`) | Validated against the registrar's rendered safe-set; canonical wire spelling in §8.3. | `RFC-C §5`, `RFC-F §5.1`, `BL#308` |
 
 What the pinned source states is the safe-set half: `RFC-C §5` and `RFC-F §5.1`
 both say the registrar safe-set validates **`cert_group` and `reload`** and
@@ -356,6 +357,20 @@ bootroot's local serialization and are **not** the wire encoding.
 Recorded in §4.4: the field name is review-protocol's, the four-field shape is
 bootler's `ServiceRegistration`, and neither is this repository's to change.
 
+The two values the wire carries as strings have the following **complete,
+canonical** productions. They are transcribed from `aicers/bootler`
+`core/src/provisioning_file.rs`, module documentation section `Wire spelling`,
+at immutable revision `008bbb458b0b` (bootler
+[#308](https://github.com/aicers/bootler/issues/308), merged by PR
+[#309](https://github.com/aicers/bootler/pull/309)). `bootroot` accepts only
+these rendered strings; it does not parse general TOML or normalize a caller's
+input.
+
+| Wire field | Accepted form | Rejected forms | Canonicalization | Provenance |
+| --- | --- | --- | --- | --- |
+| `spec.reload` | Exactly `{ kind = "none" }`, or exactly `{ kind = "<kind>", target = "<target>" }`, where `<kind>` is one of `sighup`, `systemd`, or `docker-restart`, and `<target>` is non-empty. | Every other whitespace or member order; an unknown kind; a missing, empty, or forbidden target; an unquoted target; an unescaped `"` or `\`; or any TOML escape other than `\"` and `\\`. | This is the byte-exact rendered value text: one space after `{`, around each `=`, after `,`, and before `}`. `<target>` uses bootler's `toml_string`: surround it with `"`, escape every `\` as `\\` and every `"` as `\"`, and make no other rewrite. `none` omits `target`. | `BL#308` |
+| `spec.cert_group` | Absent, or an ASCII decimal `u32`: `0` or a non-zero digit followed by zero or more ASCII digits, at most `4294967295`. | `null`, empty text, a sign, whitespace, leading zero, separator, non-ASCII digit, non-digit, or an out-of-range number. | When present, the bytes are the canonical decimal form bootler renders after `cert_group =` followed by one ASCII space: no sign and no leading zero. The member is absent exactly when the provisioning key is omitted. | `BL#308` |
+
 ## 9. `AgentInfo` tail — `audit_health`
 
 Mirrored on the same terms as everything above, so this repository has the
@@ -381,7 +396,7 @@ the control plane's. Only the registrar populates it.
 Nothing in this repository writes or decodes that tail, so the discrepancy is
 recorded rather than resolved; resolving it is `aicers/review-protocol`'s.
 
-## 10. Resolved local item
+## 10. Resolved items
 
 The pinned source types `ca_anchor` as `Vec<u8>` and delegates its contents to
 this repository. The registrar endpoint's v1 codec resolves that byte framing.
@@ -389,6 +404,7 @@ this repository. The registrar endpoint's v1 codec resolves that byte framing.
 | Item | State | Owner | Where it is decided |
 | --- | --- | --- | --- |
 | `ca_anchor` byte framing | resolved — compact UTF-8 JSON `{"trusted_ca_sha256":[...],"ca_bundle_pem":"..."}` in that member order, standard padded RFC 4648 base64 encoded for the wire | `aicers/bootroot` | `src/registrar/endpoint/protocol.rs` |
+| `spec.reload` and `spec.cert_group` wire spelling | resolved — the two canonical productions in §8.3 | `aicers/bootler` | `core/src/provisioning_file.rs`, `Wire spelling`, `008bbb458b0b` (`BL#308`) |
 
 The JSON requires both non-empty members, one lowercase SHA-256 DER digest per
 PEM certificate in the same order, LF-only PEM with one trailing LF, and no
@@ -417,8 +433,9 @@ unquoted unsigned `u32`, and the lifetime is an unquoted non-negative whole
 second integer. Optional `instance` and `spec.cert_group` are omitted rather
 than `null`. The delivery-mode spelling and every member name remain the
 transcribed source vocabulary in §4; this endpoint does not recase or
-interpret them. In particular, the idempotency key is opaque and the reload
-and certificate-group strings are passed through without validation.
+interpret them. The idempotency key is opaque; before mint reaches the verb
+layer, the reload and certificate-group strings must match the canonical owner
+productions in §8.3.
 
 The canonical response member orders are:
 

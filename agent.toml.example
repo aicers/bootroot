@@ -45,8 +45,9 @@ http_responder_token_ttl_secs = 300
 # handler over it.  [registrar] state_file is REQUIRED when this is
 # true, and a missing provisioning config, state file, internal
 # credential or audit store fails startup with a named diagnostic.
-# Deregistration is served end to end; a mint is refused until the wire
-# spelling of a request's spec is settled by the contract that owns it.
+# Both registrar verbs are served end to end. Mint requests must carry
+# the canonical spec.reload and optional spec.cert_group spellings in
+# docs/reference/registrar-wire-contract.md section 8.3.
 #
 # Every key here is fixed for the process lifetime.  The listening
 # descriptor is inherited, and the certificate material at all four

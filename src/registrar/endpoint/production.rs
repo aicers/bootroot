@@ -29,8 +29,8 @@
 //! connection diagnostic id and writes no bytes. Nothing this module
 //! knows can reach that line, so the detail is emitted here instead,
 //! before the refusal is returned — at `warn` for a deployment fault and
-//! `debug` for a caller-supplied one. The unsettled `spec` grammar is
-//! neither, and takes `warn` for the reason given at its own refusal.
+//! `debug` for a caller-supplied one. A malformed wire `spec` is caller
+//! supplied, so its conversion refusal is logged at `debug`.
 //! That event carries no connection id, because
 //! [`RegistrarRequestHandler::handle`] receives none; the
 //! two lines are correlated by the caller identity both carry and by
@@ -52,6 +52,7 @@ use super::protocol::{
     RegistrarHealth, Request, WireServiceSpec,
 };
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
+use crate::registrar::config::{ReloadKind, ReloadSpec};
 use crate::registrar::identity::RequestedSpec;
 use crate::registrar::internal::InternalCredential;
 use crate::registrar::verbs::outcome::CallerIdentity;
@@ -344,17 +345,8 @@ fn mint_request(
             );
             HandlerRefusal
         })?;
-    // `warn`, not `debug`, and deliberately outside the rule the
-    // module doc states. That rule splits a deployment fault from a
-    // caller-supplied one, and the unsettled grammar is neither: no
-    // payload a caller can send makes this succeed, so every mint on a
-    // correctly provisioned deployment stops here. At the daemon's
-    // default level the operator would otherwise see only the
-    // transport's `handler-rejected-payload` line and nothing saying
-    // the endpoint cannot serve mint at all. It returns to `debug` for
-    // the caller-supplied faults a settled grammar will have.
     let spec = requested_spec(&request.spec).map_err(|error| {
-        warn!(
+        debug!(
             caller = caller.as_str(),
             "Registrar endpoint could not convert the wire spec: {error}"
         );
@@ -385,55 +377,128 @@ fn normalize_bundle(bundle: &str) -> String {
 /// Why a wire `spec` could not be converted into a [`RequestedSpec`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpecConversionError {
-    /// The wire spelling of `reload` and `cert_group` is recorded
-    /// nowhere, so there is no grammar to read either string under.
-    #[error(
-        "the wire spelling of spec.reload and spec.cert_group is not recorded in \
-         docs/reference/registrar-wire-contract.md; until the owner of the \
-         provisioning-config contract settles it and it is transcribed there, no form of \
-         either string can be accepted"
-    )]
-    GrammarNotSettled,
+    /// `reload` differs from every canonical rendered reload value.
+    #[error("spec.reload is not a canonical rendered reload value")]
+    ReloadGrammar,
+    /// A reload style that needs a target omitted it.
+    #[error("spec.reload's {kind} kind requires a non-empty target")]
+    ReloadTargetRequired {
+        /// The rendered reload kind.
+        kind: ReloadKind,
+    },
+    /// The target-free `none` reload supplied a target.
+    #[error("spec.reload's none kind must omit target")]
+    ReloadTargetForbidden,
+    /// `cert_group` is not a canonical decimal unsigned integer.
+    #[error("spec.cert_group is not canonical decimal u32 text")]
+    CertGroupGrammar,
+    /// `cert_group` is canonical decimal text but exceeds `u32::MAX`.
+    #[error("spec.cert_group exceeds u32::MAX")]
+    CertGroupOutOfRange,
 }
 
 /// Converts the wire `spec` into the verb layer's [`RequestedSpec`].
 ///
-/// # This conversion is deliberately not implemented
-///
-/// [`RequestedSpec`] needs `reload: ReloadSpec { kind, target }` and
-/// `cert_group: Option<u32>`, because that is what the safe-set
-/// comparison compares against. The wire carries both as opaque strings,
-/// and **no repository records how either is spelled**: the reference's
-/// transcribed half types them as opaque `String` newtypes owned by
-/// review-protocol and says nothing about their contents, the
-/// provisioning tool renders its `ReloadHook` only into `bootroot
-/// service add` flags, and the rendered provisioning config has no
-/// counterpart at all for its container-`SIGHUP` variant.
-///
-/// The grammar is not bootroot's to choose, and needing to parse a value
-/// does not confer authorship of it. A spelling chosen here would
-/// satisfy this repository's tests by construction — the fixtures and
-/// the conversion would agree because the same change wrote both — and
-/// diverge the first time a real caller sent one, in production, with no
-/// test on either side able to catch it. `src/registrar/config.rs` takes
-/// exactly that position for the file this spec is compared against, and
-/// `docs/reference/registrar-provisioning-config.md` §3.2 rules that a
-/// registration the rendered vocabulary cannot express is a coordinated
-/// format change in the provisioning repository rather than something
-/// this side pattern-matches around.
-///
-/// So every wire `spec` is refused until the reference's transcribed
-/// half records one row for `spec.reload` and one for `spec.cert_group`,
-/// with provenance, and its open-items section lists neither. Filling
-/// this function in from those rows is then mechanical, and is the whole
-/// of what remains: the accepted and rejected forms are enumerated from
-/// the reference, never from a decision made here.
+/// The accepted forms are transcribed in
+/// `docs/reference/registrar-wire-contract.md` §8.3 from bootler's
+/// immutable provisioning-file contract. This stays a strict parser:
+/// accepting another TOML spelling would turn a request grammar owned by
+/// bootler into one bootroot silently broadens.
 ///
 /// # Errors
 ///
-/// Returns [`SpecConversionError::GrammarNotSettled`] for every input.
-fn requested_spec(_spec: &WireServiceSpec) -> Result<RequestedSpec, SpecConversionError> {
-    Err(SpecConversionError::GrammarNotSettled)
+/// Returns [`SpecConversionError`] when either opaque wire value is not
+/// exactly an owner-recorded canonical spelling.
+fn requested_spec(spec: &WireServiceSpec) -> Result<RequestedSpec, SpecConversionError> {
+    Ok(RequestedSpec {
+        component: Some(spec.component.clone()),
+        service_name: Some(spec.service_name.clone()),
+        reload: parse_reload(&spec.reload)?,
+        cert_group: spec
+            .cert_group
+            .as_deref()
+            .map(parse_cert_group)
+            .transpose()?,
+    })
+}
+
+const NONE_RELOAD: &str = r#"{ kind = "none" }"#;
+const RELOAD_PREFIX: &str = "{ kind = \"";
+const TARGET_PREFIX: &str = "\", target = \"";
+const RELOAD_SUFFIX: &str = r#"" }"#;
+
+fn parse_reload(value: &str) -> Result<ReloadSpec, SpecConversionError> {
+    if value == NONE_RELOAD {
+        return Ok(ReloadSpec::none());
+    }
+
+    let Some(remainder) = value.strip_prefix(RELOAD_PREFIX) else {
+        return Err(SpecConversionError::ReloadGrammar);
+    };
+    let Some((kind, remainder)) = remainder.split_once(TARGET_PREFIX) else {
+        return parse_targetless_reload(remainder);
+    };
+    let kind = parse_reload_kind(kind)?;
+    if matches!(kind, ReloadKind::None) {
+        return Err(SpecConversionError::ReloadTargetForbidden);
+    }
+    let Some(encoded_target) = remainder.strip_suffix(RELOAD_SUFFIX) else {
+        return Err(SpecConversionError::ReloadGrammar);
+    };
+    let target = decode_toml_string(encoded_target).ok_or(SpecConversionError::ReloadGrammar)?;
+    if target.is_empty() {
+        return Err(SpecConversionError::ReloadTargetRequired { kind });
+    }
+    Ok(ReloadSpec::new(kind, &target))
+}
+
+fn parse_targetless_reload(remainder: &str) -> Result<ReloadSpec, SpecConversionError> {
+    let Some(kind) = remainder.strip_suffix(RELOAD_SUFFIX) else {
+        return Err(SpecConversionError::ReloadGrammar);
+    };
+    match parse_reload_kind(kind)? {
+        ReloadKind::None => Err(SpecConversionError::ReloadGrammar),
+        kind => Err(SpecConversionError::ReloadTargetRequired { kind }),
+    }
+}
+
+fn parse_reload_kind(value: &str) -> Result<ReloadKind, SpecConversionError> {
+    match value {
+        "sighup" => Ok(ReloadKind::Sighup),
+        "systemd" => Ok(ReloadKind::Systemd),
+        "docker-restart" => Ok(ReloadKind::DockerRestart),
+        "none" => Ok(ReloadKind::None),
+        _ => Err(SpecConversionError::ReloadGrammar),
+    }
+}
+
+fn decode_toml_string(value: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return None,
+            '\\' => match characters.next()? {
+                '"' => decoded.push('"'),
+                '\\' => decoded.push('\\'),
+                _ => return None,
+            },
+            _ => decoded.push(character),
+        }
+    }
+    Some(decoded)
+}
+
+fn parse_cert_group(value: &str) -> Result<u32, SpecConversionError> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(SpecConversionError::CertGroupGrammar);
+    }
+    value
+        .parse()
+        .map_err(|_| SpecConversionError::CertGroupOutOfRange)
 }
 
 #[cfg(test)]

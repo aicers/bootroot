@@ -334,15 +334,13 @@ startup. Any one of them missing or unusable fails the invocation with a
 named diagnostic rather than leaving the socket adopted with nothing
 accepting on it.
 
-!!! warning "`mint` is not servable yet"
-    Deregistration is served end to end. Minting is not: a mint request
-    carries a `spec` whose `reload` and `cert_group` are opaque strings,
-    and the wire spelling of those two is owned outside this repository
-    and has not been settled or transcribed into
-    `docs/reference/registrar-wire-contract.md`. Until it is, every mint
-    is refused before the verb runs — zero response bytes and a clean
-    close — and the daemon logs which conversion failed. Nothing is
-    minted and nothing is guessed at.
+!!! note "`mint` is served"
+    Both `mint` and `deregister` are served end to end. A mint request's
+    `spec.reload` and optional `spec.cert_group` must use the canonical
+    bootler spellings recorded in
+    `docs/reference/registrar-wire-contract.md` §8.3; another TOML
+    spelling is rejected before the verb runs with zero response bytes
+    and a clean close. The endpoint does not normalize caller input.
 
 There is no socket path here, and no TCP option, by design. systemd
 creates and owns `/run/bootroot/registrar.sock` through the checked-in

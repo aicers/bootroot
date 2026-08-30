@@ -47,9 +47,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   resolved before anything is spawned, so a missing provisioning config,
   state file, internal credential or audit store fails startup with a
   diagnostic that names it rather than leaving a socket nothing is
-  accepting on. Deregistration is served end to end; minting is refused
-  until the wire spelling of a request's `spec` is settled by the
-  contract that owns it.
+  accepting on. Both deregistration and minting are served end to end;
+  mint requests use the canonical `spec.reload` and optional
+  `spec.cert_group` spellings defined by the provisioning contract.
 - An endpoint-enabled `bootroot-agent` now issues the registrar
   surface's own two certificates at start, so neither has to be supplied
   out of band. Four `[registrar_endpoint]` keys name the material —
