@@ -4,3 +4,4 @@ registrar-client.crt
 registrar-client.key
 registrar-endpoint.toml
 registrar-endpoint-anchors.sha256
+registrar-endpoint-ca.pem

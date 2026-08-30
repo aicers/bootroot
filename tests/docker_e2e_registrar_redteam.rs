@@ -10,6 +10,12 @@ mod unix_integration {
     /// The Docker scenario owns live `OpenBao`, process-boundary and
     /// root-owned-socket assertions. Ordinary endpoint round trips remain in
     /// cargo tests and renewal past expiry remains in the endurance suite.
+    ///
+    /// It always invokes the launcher without positional arguments and passes
+    /// the checked-out project root, this checkout's binary, and a unique
+    /// writable artifact directory explicitly. The launcher stages only the
+    /// manifest-defined registrar leak bundle; it does not inspect daemon
+    /// material or the surrounding host filesystem.
     #[test]
     #[ignore = "Requires Docker, root-owned socket activation, and a live OpenBao"]
     fn docker_registrar_redteam() -> Result<()> {

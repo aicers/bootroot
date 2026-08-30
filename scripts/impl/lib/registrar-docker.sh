@@ -58,3 +58,18 @@ registrar_docker_assert_no_backend_credentials() {
     fail "the registrar leak bundle contains an OpenBao or AppRole credential"
   fi
 }
+
+# Creates the minimal deployment tree consumed by registrar Docker scenarios.
+# `docker-compose.deploy.yml` has no build context, but it resolves these two
+# files relative to itself. Keeping the copy rule here means the endurance arm
+# and this per-PR arm cannot slowly grow different private deployments.
+registrar_docker_prepare_deployment_tree() {
+  local project_dir="$1" work_dir="$2"
+  mkdir -p "$work_dir/openbao" || fail "could not create registrar deployment tree"
+  cp "$project_dir/docker-compose.deploy.yml" "$work_dir/" ||
+    fail "could not copy the deploy compose file"
+  cp "$project_dir/openbao/openbao.hcl" "$work_dir/openbao/" ||
+    fail "could not copy the OpenBao configuration"
+  cp "$project_dir/responder.toml.compose" "$work_dir/" ||
+    fail "could not copy the responder configuration"
+}
