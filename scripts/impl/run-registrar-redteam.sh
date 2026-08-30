@@ -51,7 +51,14 @@ cleanup() {
   local status=$?
   log_phase cleanup
   if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then printf 'quit\n' >"$CONTROL_FIFO" 2>/dev/null || true; wait "$SUPERVISOR_PID" 2>/dev/null || true; fi
-  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true; compose down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true; fi
+  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+    compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
+    else
+      compose down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
+    fi
+  fi
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
   [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && sudo -n umount "$AUDIT_DIR" >>"$RUN_LOG" 2>&1 || true
   [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ] && { sudo -n rm -rf "$RUN_ROOT" >>"$RUN_LOG" 2>&1 || rm -rf "$RUN_ROOT" 2>/dev/null || true; }
@@ -129,6 +136,7 @@ build_and_initialize() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$ARTIFACT_DIR/init.raw.log" >"$ARTIFACT_DIR/init.log"
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
   sudo -n sh -c 'printf "header = \\"X-Vault-Token: %s\\"\\n" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
+  sudo -n curl -fsS --cacert "$WORK_DIR/secrets/certs/root_ca.crt" -K "$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >/dev/null || fail "could not record the explicit empty agent EAB"
   bootroot infra up --compose-file "$WORK_DIR/docker-compose.deploy.yml" --agent-config "$INITIAL_CONFIG" --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 || fail "could not start initialized deployment"
   pass "initialized an isolated live TLS OpenBao deployment"
 }
