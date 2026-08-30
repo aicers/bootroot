@@ -52,6 +52,7 @@ use super::protocol::{
     RegistrarHealth, Request, WireServiceSpec,
 };
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
+use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::{ReloadKind, ReloadSpec};
 use crate::registrar::identity::RequestedSpec;
 use crate::registrar::internal::InternalCredential;
@@ -140,6 +141,17 @@ impl ProductionHandler {
         request: &WireRegisterRequest,
         caller: CallerIdentity,
     ) -> Result<Vec<u8>, HandlerRefusal> {
+        let health = self.health_snapshot();
+        if health.audit_capacity.state == AuditCapacityState::Exhausted {
+            return protocol::encode_audit_capacity_exhausted(&request.idempotency_key, &health)
+                .map_err(|error| {
+                    warn!(
+                        caller = caller.as_str(),
+                        "Registrar endpoint could not encode an exhausted-audit refusal: {error}"
+                    );
+                    HandlerRefusal
+                });
+        }
         let request = mint_request(request, caller.clone())?;
 
         // Before the verb, never after. A read that failed after a

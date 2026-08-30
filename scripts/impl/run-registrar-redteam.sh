@@ -19,6 +19,7 @@ RUN_ROOT=
 WORK_DIR=
 SUPERVISOR_PID=
 HTTP01_IMAGE_BUILT=0
+AUDIT_TMPFS_MOUNTED=0
 
 fail() { printf '[fatal][%s] %s\n' "$CURRENT_PHASE" "$1" >>"$RUN_LOG" 2>/dev/null || true; printf '[registrar-redteam][%s] FAIL %s\n' "$CURRENT_PHASE" "$1" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +52,7 @@ cleanup() {
   if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then printf 'quit\n' >"$CONTROL_FIFO" 2>/dev/null || true; wait "$SUPERVISOR_PID" 2>/dev/null || true; fi
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true; compose down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true; fi
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
+  [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && sudo -n umount "$AUDIT_DIR" >>"$RUN_LOG" 2>&1 || true
   [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ] && { sudo -n rm -rf "$RUN_ROOT" >>"$RUN_LOG" 2>&1 || rm -rf "$RUN_ROOT" 2>/dev/null || true; }
   exit "$status"
 }
@@ -73,7 +75,9 @@ prepare_workspace() {
   mkdir -p "$AUDIT_DIR" "$SURFACE_DIR" "$SOCKET_DIR" "$RUN_ROOT/registrar-client-inputs"
   registrar_docker_prepare_deployment_tree "$BOOTROOT_PROJECT_DIR" "$WORK_DIR"
   chmod 0755 "$RUN_ROOT"; sudo -n chown 0:0 "$AUDIT_DIR" "$SOCKET_DIR"; sudo -n chmod 0700 "$AUDIT_DIR"; sudo -n chmod 0755 "$SOCKET_DIR"
-  pass "created run-scoped root-owned scenario directories"
+  sudo -n mount -t tmpfs -o size=16m,mode=0700 tmpfs "$AUDIT_DIR" || fail "could not mount the scenario-local audit tmpfs"
+  AUDIT_TMPFS_MOUNTED=1
+  pass "created run-scoped root-owned directories and audit tmpfs"
 }
 
 allocate_ports() { for name in POSTGRES OPENBAO STEPCA HTTP01; do pick_free_port; printf -v "PORT_${name}" '%s' "$PICKED_PORT"; done; OPENBAO_URL="https://localhost:${PORT_OPENBAO}"; }
@@ -242,7 +246,8 @@ assert_audit_capacity() {
   jq -e '.registrar_health.audit_capacity.state == "low_water"' <<<"$response" >/dev/null || fail "low-water health response was malformed"
   before="$(sudo -n curl -fsS --cacert "$ROOT_CA" -K "$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
   sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-exhausted.fill" bs=1M count=12 status=none
-  response="$(wait_for_capacity_state exhausted "$mint")"
+  wait_for_capacity_state exhausted "$mint" >/dev/null
+  response="$(client --operation mint --payload "$mint")" || fail "exhausted mint exchange failed"
   jq -e '.class != null' <<<"$response" >/dev/null || fail "exhausted audit store accepted a mint"
   after="$(sudo -n curl -fsS --cacert "$ROOT_CA" -K "$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
   [ "$before" = "$after" ] || fail "exhausted mint changed OpenBao role state"
