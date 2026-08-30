@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import socket
 import ssl
 import struct
@@ -56,7 +55,9 @@ def exchange(args: argparse.Namespace) -> bytes:
         # live peer credential is.  Refuse before a TLS byte is sent when a
         # post-bind ownership transition left an unprivileged listener alive.
         if hasattr(socket, "SO_PEERCRED"):
-            _pid, uid, _gid = struct.unpack("3i", raw.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            _pid, uid, _gid = struct.unpack(
+                "3i", raw.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            )
             if uid != 0:
                 raise ValueError(f"registrar endpoint peer uid is {uid}, expected root")
         with context.wrap_socket(raw, server_hostname=args.endpoint_name) as stream:
