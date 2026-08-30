@@ -1,5 +1,5 @@
-//! Tests for the production handler's two grammar-independent halves:
-//! the CA anchor it frames, and the wire `spec` it cannot yet convert.
+//! Tests for the production handler's CA-anchor framing and strict wire-spec
+//! conversion.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -17,7 +17,7 @@ use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
 use crate::registrar::audit::{ACTIVE_FILE_NAME, AuditRecordStore};
 use crate::registrar::audit_store::capacity::AuditCapacityState;
-use crate::registrar::config::RegistrarConfig;
+use crate::registrar::config::{RegistrarConfig, ReloadKind, ReloadSpec};
 use crate::registrar::endpoint::protocol::{
     AuditCapacityHealth, LimiterHealth, RegistrarHealth, WireServiceSpec, decode_ca_anchor,
     decode_mint_response, encode_ca_anchor, encode_mint_response,
@@ -183,24 +183,127 @@ fn the_framed_anchor_carries_the_fixed_member_order() {
     );
 }
 
-/// The wire spelling of `spec.reload` and `spec.cert_group` is recorded
-/// in no repository, so no form of either string is accepted — and, just
-/// as deliberately, no form is named here as valid or invalid. Which
-/// forms are which is exactly what the settlement decides.
+/// The immutable bootler row accepts only the canonical rendered reload
+/// productions and canonical decimal certificate groups. The restated
+/// identity fields are passed to the verb layer unchanged.
 #[test]
-fn every_wire_spec_is_refused_until_the_grammar_is_settled() {
-    let spec = WireServiceSpec {
+fn requested_spec_accepts_every_owner_recorded_production() {
+    let cases = [
+        (r#"{ kind = "none" }"#, None, ReloadSpec::none(), None),
+        (
+            r#"{ kind = "sighup", target = "review" }"#,
+            Some("0"),
+            ReloadSpec::new(ReloadKind::Sighup, "review"),
+            Some(0),
+        ),
+        (
+            r#"{ kind = "systemd", target = "roxyd.service" }"#,
+            Some("4294967295"),
+            ReloadSpec::new(ReloadKind::Systemd, "roxyd.service"),
+            Some(u32::MAX),
+        ),
+        (
+            r#"{ kind = "docker-restart", target = "a\"b\\c" }"#,
+            Some("3000"),
+            ReloadSpec::new(ReloadKind::DockerRestart, "a\"b\\c"),
+            Some(3000),
+        ),
+    ];
+
+    for (reload, cert_group, expected_reload, expected_cert_group) in cases {
+        let spec = wire_spec(reload, cert_group);
+        let requested = requested_spec(&spec).expect("an owner-recorded spelling converts");
+        assert_eq!(requested.component.as_deref(), Some("example-component"));
+        assert_eq!(requested.service_name.as_deref(), Some("example"));
+        assert_eq!(requested.reload, expected_reload);
+        assert_eq!(requested.cert_group, expected_cert_group);
+    }
+}
+
+/// The owner row permits no TOML flexibility: every whitespace, quoting,
+/// escape, kind and target form below is outside its canonical output.
+#[test]
+fn requested_spec_refuses_every_unrecorded_reload_spelling() {
+    let cases = [
+        (r#"{kind = "none" }"#, "spacing"),
+        (r#"{ kind = "none"}"#, "space before closing brace"),
+        (r#"{ target = "x", kind = "systemd" }"#, "member order"),
+        (
+            r#"{ kind = "none", target = "x" }"#,
+            "target forbidden for none",
+        ),
+        (r#"{ kind = "sighup" }"#, "target required for sighup"),
+        (r#"{ kind = "systemd", target = "" }"#, "empty target"),
+        (
+            r#"{ kind = "docker-restart", target = "x\n" }"#,
+            "unrecorded escape",
+        ),
+        (
+            r#"{ kind = "sighup", target = unquoted }"#,
+            "unquoted target",
+        ),
+        (
+            r#"{ kind = "systemd", target = "a\b" }"#,
+            "unescaped backslash",
+        ),
+        (r#"{ kind = "unknown", target = "x" }"#, "unknown kind"),
+        (r#"{ kind = "systemd", target = "a"b" }"#, "unescaped quote"),
+        (
+            r#"{ kind = "sighup", target = "x" } extra"#,
+            "trailing text",
+        ),
+    ];
+
+    for (reload, what) in cases {
+        let error = requested_spec(&wire_spec(reload, None)).expect_err(what);
+        assert!(
+            matches!(
+                error,
+                SpecConversionError::ReloadGrammar
+                    | SpecConversionError::ReloadTargetRequired { .. }
+                    | SpecConversionError::ReloadTargetForbidden
+            ),
+            "{what} must be a typed reload conversion refusal: {error}"
+        );
+    }
+
+    assert!(matches!(
+        requested_spec(&wire_spec(r#"{ kind = "systemd" }"#, None)),
+        Err(SpecConversionError::ReloadTargetRequired {
+            kind: ReloadKind::Systemd
+        })
+    ));
+    assert!(matches!(
+        requested_spec(&wire_spec(r#"{ kind = "none", target = "x" }"#, None)),
+        Err(SpecConversionError::ReloadTargetForbidden)
+    ));
+}
+
+/// Omitted is the only absence spelling. Present values are decimal `u32`
+/// output exactly as the owner renderer emits it.
+#[test]
+fn requested_spec_refuses_noncanonical_certificate_groups() {
+    for value in [
+        "", "00", "01", "+1", "-1", " 1", "1 ", "1_000", "١", "null", "x",
+    ] {
+        assert!(matches!(
+            requested_spec(&wire_spec(r#"{ kind = "none" }"#, Some(value))),
+            Err(SpecConversionError::CertGroupGrammar)
+        ));
+    }
+    assert!(matches!(
+        requested_spec(&wire_spec(r#"{ kind = "none" }"#, Some("4294967296"))),
+        Err(SpecConversionError::CertGroupOutOfRange)
+    ));
+}
+
+fn wire_spec(reload: &str, cert_group: Option<&str>) -> WireServiceSpec {
+    WireServiceSpec {
         component: "example-component".to_string(),
         service_name: "example".to_string(),
-        reload: String::new(),
-        cert_group: None,
-    };
-    let error = requested_spec(&spec).expect_err("the grammar is not settled");
-    assert!(matches!(error, SpecConversionError::GrammarNotSettled));
-    assert!(
-        format!("{error}").contains("registrar-wire-contract.md"),
-        "the refusal must point at the file the settlement is transcribed into: {error}"
-    );
+        reload: reload.to_string(),
+        cert_group: cert_group.map(str::to_string),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -530,10 +633,9 @@ fn relay_anchor() -> TrustPayload {
 /// the value, and `encode_mint_response`, which is what it hands the
 /// value to. The arm calls exactly those and nothing else — pinned by
 /// [`no_request_path_arm_reads_the_audit_store`], which reads this
-/// build's `mint` body — and the whole arm cannot be driven end to end
-/// here because `requested_spec` refuses every wire `spec` until the
-/// grammar is settled, so no payload reaches the encoder through
-/// `handle`.
+/// build's `mint` body. The socket integration test covers the complete
+/// mint path; this focused test alone can seed a store that disagrees
+/// with the daemon-held snapshot, proving the response did not scan it.
 ///
 /// The proof that no scan ran is not that the numbers look untouched:
 /// the reader is run against the handler's own store in the same test
@@ -606,10 +708,9 @@ async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
 /// its health from the one accessor.
 ///
 /// Asserted over this module's source because it is a property of the
-/// arms that exist rather than of any one response: `Operation::Mint` is
-/// refused before the encoder on this build, so a scan added to the mint
-/// arm would be caught by no round trip. The `mint` body is read here
-/// for exactly that reason.
+/// complete request path rather than of any one response. The source
+/// inspection covers both mint and deregister, including any future
+/// control flow a response-level test does not exercise.
 #[test]
 fn no_request_path_arm_reads_the_audit_store() {
     // The test module is a sibling file, so this is the production half

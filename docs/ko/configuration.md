@@ -318,15 +318,13 @@ enabled = false
 사용할 수 없으면, 소켓만 상속한 채 아무도 accept하지 않는 상태로 두는
 대신 원인을 지목하는 진단과 함께 기동이 실패합니다.
 
-!!! warning "`mint`는 아직 제공할 수 없습니다"
-    `deregister`는 끝에서 끝까지 처리됩니다. `mint`는 그렇지 않습니다.
-    mint 요청은 `reload`와 `cert_group`이 불투명한 문자열인 `spec`을
-    싣는데, 이 두 문자열의 와이어 표기법은 이 저장소 밖에서 소유하며
-    아직 확정되지도, `docs/reference/registrar-wire-contract.md`에
-    전사되지도 않았습니다. 확정되기 전까지 모든 mint는 동사가 실행되기
-    전에 거부되고 — 응답 바이트 0, 정상 종료 — 데몬은 어떤 변환이
-    실패했는지를 로그로 남깁니다. 아무것도 발급되지 않으며, 어떤 표기도
-    추측하지 않습니다.
+!!! note "`mint`를 제공합니다"
+    `mint`와 `deregister`는 모두 끝에서 끝까지 처리됩니다. mint 요청의
+    `spec.reload`와 선택적 `spec.cert_group`은
+    `docs/reference/registrar-wire-contract.md` §8.3에 기록된 bootler의
+    정규 표기를 사용해야 합니다. 다른 TOML 표기는 동사가 실행되기 전에
+    거부되며, 응답 바이트는 0개이고 연결은 정상 종료됩니다. 엔드포인트는
+    호출자 입력을 정규화하지 않습니다.
 
 소켓 경로 설정도, TCP 옵션도 의도적으로 없습니다. systemd가 저장소에
 포함된 `systemd/bootroot-registrar.socket` 유닛으로
