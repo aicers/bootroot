@@ -136,7 +136,9 @@ build_and_initialize() {
   sed 's/^\(root token: \).*/\1<redacted>/' "$ARTIFACT_DIR/init.raw.log" >"$ARTIFACT_DIR/init.log"
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
   sudo -n sh -c 'printf "header = \\"X-Vault-Token: %s\\"\\n" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
-  if ! sudo -n curl -fsS --cacert "$WORK_DIR/secrets/certs/root_ca.crt" -K "$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >"$ARTIFACT_DIR/empty-eab-response.json"; then
+  OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"
+  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
+  if ! sudo -n curl -fsS --cacert "$OPENBAO_CA" -K "$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >"$ARTIFACT_DIR/empty-eab-response.json"; then
     cat "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
     fail "could not record the explicit empty agent EAB"
   fi
