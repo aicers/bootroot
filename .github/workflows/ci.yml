@@ -482,6 +482,10 @@ jobs:
             script: run-registrar-internal-init-e2e.sh
             resolution: ""
             artifact: ci-registrar-internal-init
+          - label: registrar-redteam
+            script: run-registrar-redteam.sh
+            resolution: ""
+            artifact: ci-registrar-redteam
     steps:
       - uses: actions/checkout@v7
 
@@ -498,7 +502,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-redteam'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -713,10 +717,80 @@ jobs:
             exit 1
           }
 
+      - name: Run E2E scenario (registrar redteam)
+        if: matrix.scenario.label == 'registrar-redteam'
+        # This is deliberately outside the generic lifecycle runner. Its
+        # launcher contract is explicit so a checkout/binary mismatch cannot
+        # quietly test a different build from the one CI compiled.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          BOOTROOT_PROJECT_DIR="$(pwd)" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-registrar-redteam.sh || {
+            echo "registrar-redteam failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run-scope.log" ] && cat "$ARTIFACT_DIR/run-scope.log" || true
+            [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+
       - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.scenario.artifact }}-${{ github.run_id }}
           path: tmp/e2e/${{ matrix.scenario.artifact }}-${{ github.run_id }}
+          if-no-files-found: warn
+
+  # `test-docker-e2e-matrix` intentionally skips docs-only changes. The
+  # registrar credential boundary is nevertheless an every-PR gate, so this
+  # focused companion runs exactly that scenario (and no unrelated Docker
+  # lifecycle arm) for documentation-only pull requests.
+  test-registrar-redteam-docs:
+    name: Registrar Redteam (docs-only)
+    needs: [check, changes]
+    if: needs.changes.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build bootroot binary
+        # Keep this build identical to the matrix: the red-team scenario
+        # starts the registrar daemon as well as invoking the CLI binary.
+        run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
+
+      - name: Run registrar redteam
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/ci-registrar-redteam-${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          BOOTROOT_PROJECT_DIR="$(pwd)" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-registrar-redteam.sh || {
+            echo "registrar-redteam failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run-scope.log" ] && cat "$ARTIFACT_DIR/run-scope.log" || true
+            [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-registrar-redteam-${{ github.run_id }}
+          path: tmp/e2e/ci-registrar-redteam-${{ github.run_id }}
           if-no-files-found: warn
