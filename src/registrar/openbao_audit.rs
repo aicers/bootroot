@@ -3831,22 +3831,30 @@ pub(crate) async fn run_rotation_loop(
     interval: Duration,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    run_rotation_loop_with_maintenance(rotation, interval, shutdown, || {}).await
+    run_rotation_loop_with_maintenance(rotation, interval, shutdown, || std::future::ready(()))
+        .await
 }
 
 /// Runs one device's rotation and daemon-owned registrar maintenance until
 /// shutdown.
 ///
 /// The maintenance callback shares the rotation loop's existing cadence, so
-/// registrar coalescing adds no second scheduler or per-window task.
-pub(crate) async fn run_rotation_loop_with_maintenance<F>(
+/// registrar coalescing, the audit-store capacity probe and the record scan
+/// add no second scheduler or per-window task.
+///
+/// It is async because two of those are blocking filesystem work that runs
+/// under `spawn_blocking`: the callback awaits its own handles, inside the
+/// same branch body that already awaits the rotation pass, so nothing is
+/// spawned and dropped and no filesystem read lands on a runtime worker.
+pub(crate) async fn run_rotation_loop_with_maintenance<F, Fut>(
     mut rotation: OpenBaoAuditRotation,
     interval: Duration,
     mut shutdown: watch::Receiver<bool>,
     mut maintenance: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(),
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
     loop {
         if *shutdown.borrow() {
@@ -3861,7 +3869,7 @@ where
                 // one.
                 let outcome = rotation.run_pass(OffsetDateTime::now_utc()).await;
                 report_pass(&outcome);
-                maintenance();
+                maintenance().await;
             }
         }
     }

@@ -112,6 +112,27 @@ impl ProductionHandler {
         }
     }
 
+    /// Returns the daemon-held health snapshot every response carries.
+    ///
+    /// Mint success, deregistration success and refusal all read it
+    /// here and nowhere else, so the request path has exactly one
+    /// source for the value and that source is a clone of what the
+    /// maintenance tick last wrote.
+    ///
+    /// Nothing on this path reads the audit store, and the single
+    /// accessor is what keeps it that way. The store's capacity probe
+    /// and its record scan both measure by opening the store's files —
+    /// the scan up to the reserve's full ceiling — so a call from a
+    /// request arm would put that read on every successful mint and
+    /// every successful deregistration. The tick measures; a response
+    /// only relays what the tick last left behind.
+    fn health_snapshot(&self) -> RegistrarHealth {
+        self.health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Serves one mint request.
     async fn mint(
         &self,
@@ -138,11 +159,7 @@ impl ProductionHandler {
             HandlerRefusal
         })?;
 
-        let health = self
-            .health
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let health = self.health_snapshot();
         let encoded = match self.verbs.mint(&request).await {
             Ok(outcome) => protocol::encode_mint_response(outcome, &anchor, &health),
             Err(refusal) => protocol::encode_refusal_response(&refusal, &health),
@@ -178,11 +195,7 @@ impl ProductionHandler {
             instance: request.instance,
         };
 
-        let health = self
-            .health
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let health = self.health_snapshot();
         let encoded = match self.verbs.deregister(&request).await {
             Ok(outcome) => protocol::encode_deregister_response(&outcome, &health),
             Err(refusal) => protocol::encode_refusal_response(&refusal, &health),

@@ -2415,6 +2415,7 @@ async fn the_task_retries_a_failed_pass_on_the_next_tick() {
         shutdown_rx,
         move || {
             observed_ticks.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
         },
     ));
 

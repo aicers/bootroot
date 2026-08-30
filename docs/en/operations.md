@@ -1727,6 +1727,92 @@ flag mandatory. **The store's directories and their contents are never
 touched** by any of this — switching a host off changes what is mounted,
 never what is stored. Removing them is manual.
 
+#### Watching the reserve fill
+
+A ceiling tells nobody it is about to be reached, so an endpoint-enabled
+daemon measures the store on its existing rotation-loop maintenance tick
+— once a minute — and reports what it found in every response's
+`registrar_health.audit_capacity` member. Nothing new is scheduled for
+it, and no measurement runs in the request path.
+
+Each tick reports two numbers for `audit_store_dir`: the store's usage,
+and the bytes the backing filesystem still has for an unprivileged
+writer. Under `filesystem` enforcement the store is its own filesystem,
+so both come from one `statvfs` on the store root. Under `directory`
+enforcement that call would measure the host rather than the store, so
+usage is walked instead, summing each entry's **allocated** blocks. The
+headroom the alarm reads is the smaller of the configured budget's
+remainder and the device's available bytes:
+
+```text
+headroom_bytes = min(audit_store_reserve_bytes - used_bytes, available_bytes)
+```
+
+The `min` is the point. A reserve larger than the device's free space is
+not a reserve, and the alarm has to fire on whichever bound binds first.
+`headroom_bytes` is signed: a store that has overrun its reserve reports
+negative headroom rather than the healthiest possible zero.
+
+`state` is one of four values, and `enforcement` beside it says whether
+the reserve behind them is kernel-enforced or a configured estimate — the
+same headroom number warrants a different response in the two modes.
+
+| `state` | What it means |
+| --- | --- |
+| `unknown` | No probe has succeeded yet |
+| `ok` | Headroom is above `audit_store_low_water_bytes` |
+| `low_water` | The alarm is on, and the reserve is not yet consumed |
+| `exhausted` | Headroom is at or below zero: at or past the reserve |
+
+`unknown` is the only state in which `used_bytes`, `headroom_bytes` and
+`measured_at` are absent, and it exists so that "we have not measured" is
+never reported as healthy. `exhausted` counts zero headroom, not only
+negative: at zero the next write is already past the reserve.
+
+The alarm is **on at exactly** `audit_store_low_water_bytes` — the
+configured number reads as "alarm at 512 MiB left", not "alarm just
+under" — and off at one byte above it from a cold start. Coming back up
+it is held by a hysteresis margin, so a store hovering at the threshold
+does not flap a console: an alarm clears only at
+`audit_store_low_water_bytes + margin`, where the margin is
+`audit_store_low_water_bytes / 10` or 1 MiB, whichever is larger. That
+gate applies to a *return from* an alarm; a store whose headroom reaches
+the clear threshold in one tick goes straight to `ok` without dwelling in
+`low_water`.
+
+The same tick reads the record store's own three signals — the
+`intent_without_outcome`, `malformed_records` and `retention_shortfall`
+values `bootroot status --agent-config` prints host-locally, over the
+same 30-day look-back window — and relays them beside the capacity
+numbers, so a console sees what a host-local operator sees. Those four
+members read `audit_record_dir`, while the capacity numbers read
+`audit_store_dir` as a whole.
+
+**Two timestamps, and what bounds their staleness.** `measured_at` is
+the last successful capacity probe, `records_measured_at` the last
+successful record scan. They are separate because the two fail
+independently: an unreadable record store fails the scan while `statvfs`
+still succeeds. A failure leaves the previous values and the previous
+timestamp in place rather than resetting them, so an alarm is never
+hidden behind the failure of the thing that raises it. Both are RFC 3339
+in UTC, and in a healthy daemon neither is ever more than about a minute
+old, because the maintenance tick that stamps them fires once a minute.
+A timestamp older than that is the signal that the probe or the scan has
+stopped succeeding — read it before you trust the numbers beside it.
+
+The alarm is carried on **refused** responses as well as successful
+ones. The store is a fail-closed control, so as it fills invocations are
+refused; a success-only signal would stop reporting the alarm in exactly
+the state the alarm exists to announce.
+
+A `low_water` or `exhausted` store does not fix itself. What it calls
+for is the sizing arithmetic above, and — because OpenBao's file audit
+device is the unbounded writer — a decision about that device's
+generations. And note what the reserve never promised: it bounds the
+blast radius to the audit artifacts. A full reserve still stops OpenBao
+serving, because its file audit device is mandatory and it fails
+requests it cannot audit.
+
 ## Monitoring operations
 
 - Use `bootroot monitoring up --profile lan|public` to start monitoring.

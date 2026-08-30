@@ -685,7 +685,14 @@ error.
   [Changing the reserve](operations.md#changing-the-reserve). See also
   [Sizing the reserve](operations.md#sizing-the-reserve).
 - `audit_store_low_water_bytes` (`u64`, default `536870912`, 512 MiB) —
-  the future capacity-alarm threshold. It must be less than the reserve.
+  the capacity-alarm threshold. It must be greater than zero and less
+  than the reserve; zero is refused, because at zero the alarm band is
+  empty and the alarm this key exists to raise could never fire.
+  An endpoint-enabled daemon measures the store once a minute and reports
+  `low_water` at exactly this many bytes of headroom, clearing again only
+  at this value plus a margin of one tenth of it or 1 MiB, whichever is
+  larger. See
+  [Watching the reserve fill](operations.md#watching-the-reserve-fill).
 - `audit_store_enforcement` (default `filesystem`) — selects the
   enforcement behind `audit_store_reserve_bytes`, and is the **only**
   input that does: bootroot never infers a mode, never falls back from

@@ -2709,6 +2709,112 @@ async fn limited_events_reach_responses_only_after_daemon_maintenance() {
     );
 }
 
+/// The capacity and record signals reach a response from the daemon's
+/// snapshot and from nowhere else.
+///
+/// The reader computes its counts by reading the store's files on
+/// demand, so calling it inside the request path would make every
+/// successful mint and deregister read up to the store's full ceiling.
+/// Asserted on a snapshot the handler's own store could not have
+/// produced: the response follows the snapshot, so no scan of its own
+/// ran. Driven over the deregister and refusal shapes, which is every
+/// shape this build's production handler encodes end to end —
+/// `Operation::Mint` is still refused at the spec conversion with no
+/// response bytes, so the mint arm's own relay is asserted over the
+/// two halves it is made of by
+/// `production::tests::a_mint_response_relays_the_last_snapshot_without_scanning_the_store`,
+/// and that no arm can scan at all by
+/// `production::tests::no_request_path_arm_reads_the_audit_store`.
+#[tokio::test]
+async fn responses_relay_the_last_capacity_snapshot_without_scanning_the_store() {
+    use crate::config::AuditStoreEnforcement;
+    use crate::registrar::audit_store::capacity::AuditCapacityState;
+
+    let server = MockServer::start().await;
+    let health = Arc::new(StdMutex::new(protocol::RegistrarHealth::default()));
+    let (_dir, audit, handler) = production_handler_with_limiter(
+        &server,
+        VerbRateLimiter::new(
+            VerbRateLimiterSettings::default(),
+            Arc::new(NoopLimitedInvocationSink),
+        ),
+        health.clone(),
+    );
+    let measured_at = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_700_000_000);
+    let snapshot = protocol::AuditCapacityHealth {
+        state: AuditCapacityState::LowWater,
+        enforcement: AuditStoreEnforcement::Directory,
+        reserve_bytes: 2_147_483_648,
+        low_water_bytes: 536_870_912,
+        used_bytes: Some(1_700_000_000),
+        headroom_bytes: Some(447_483_648),
+        measured_at: Some(measured_at),
+        intent_without_outcome: Some(4),
+        malformed_records: Some(7),
+        retention_shortfall: Some(true),
+        records_measured_at: Some(measured_at),
+    };
+    health
+        .lock()
+        .expect("the snapshot lock is not poisoned")
+        .audit_capacity = snapshot.clone();
+
+    let caller = CallerIdentity::new("capacity-relay-test");
+    let response = handler
+        .handle(
+            Operation::Deregister,
+            &deregister_payload("roxyd", "h1", "relay"),
+            caller.clone(),
+        )
+        .await
+        .expect("the deregister response encodes");
+    assert_eq!(
+        response_health(&response).audit_capacity,
+        snapshot,
+        "the response relays the daemon-held snapshot verbatim"
+    );
+
+    // The handler's own store now holds records, and the snapshot does
+    // not change: a response reads no store of its own.
+    assert!(
+        std::fs::read(
+            audit
+                .directory()
+                .join(crate::registrar::audit::ACTIVE_FILE_NAME)
+        )
+        .is_ok_and(|bytes| !bytes.is_empty()),
+        "the invocation wrote to the store the reader would have scanned"
+    );
+    let unchanged = handler
+        .handle(
+            Operation::Deregister,
+            &deregister_payload("roxyd", "h1", "relay-2"),
+            caller.clone(),
+        )
+        .await
+        .expect("the second deregister response encodes");
+    assert_eq!(response_health(&unchanged).audit_capacity, snapshot);
+
+    // Only a maintenance tick moves it.
+    health
+        .lock()
+        .expect("the snapshot lock is not poisoned")
+        .audit_capacity
+        .malformed_records = Some(9);
+    let refreshed = handler
+        .handle(
+            Operation::Deregister,
+            &deregister_payload("roxyd", "h1", "relay-3"),
+            caller,
+        )
+        .await
+        .expect("the third deregister response encodes");
+    assert_eq!(
+        response_health(&refreshed).audit_capacity.malformed_records,
+        Some(9)
+    );
+}
+
 /// The identity that reaches the verb layer is the one the transport
 /// supplied, and no payload member naming an identity influences it.
 /// Asserted on what the verbs carried into the audit trail — which

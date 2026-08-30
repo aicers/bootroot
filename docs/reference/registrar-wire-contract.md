@@ -466,19 +466,51 @@ base64-decodes, parses a `serde_json::Value`, passes it to
 Any failure in that path is a decode error, never a wire refusal.
 
 `registrar_health` is the endpoint-local, snapshot-supplied container. Its
-additive `limiter` member is present on mint-success, deregister-success, and
-refusal responses, in the response position shown above:
+additive `limiter` and `audit_capacity` members are present on mint-success,
+deregister-success, and refusal responses, in the response position shown
+above and in that member order:
 
 ```json
-{"limiter":{"limited_predecision_refusal":0,"limited_admission":0}}
+{"limiter":{"limited_predecision_refusal":0,"limited_admission":0},"audit_capacity":{"state":"ok","enforcement":"filesystem","reserve_bytes":2147483648,"low_water_bytes":536870912,"used_bytes":786432000,"headroom_bytes":1361051648,"measured_at":"1970-01-01T00:00:00Z","intent_without_outcome":0,"malformed_records":0,"retention_shortfall":false,"records_measured_at":"1970-01-01T00:00:00Z"}}
 ```
 
-Both members are JSON `u64` counters since this daemon process started.
-`limited_predecision_refusal` counts suppression after a permanent local
-refusal was known; `limited_admission` counts suppression that produces the
-retryable admission throttle. A response encoder receives one daemon-held
-`RegistrarHealth` snapshot and has no other source for it; the protocol module
-does not read audit, limiter, or certificate state.
+Both `limiter` members are JSON `u64` counters since this daemon process
+started. `limited_predecision_refusal` counts suppression after a permanent
+local refusal was known; `limited_admission` counts suppression that produces
+the retryable admission throttle.
+
+`audit_capacity` reports the reserved audit store the daemon measures on its
+own maintenance cadence. Its member order is the one shown above.
+
+| Member | Type | Presence |
+| --- | --- | --- |
+| `state` | `unknown` \| `ok` \| `low_water` \| `exhausted` | always |
+| `enforcement` | `filesystem` \| `directory` | always |
+| `reserve_bytes` | `u64` | always |
+| `low_water_bytes` | `u64` | always |
+| `used_bytes` | `u64` | once a probe has succeeded |
+| `headroom_bytes` | `i64` | once a probe has succeeded |
+| `measured_at` | RFC 3339 UTC string | once a probe has succeeded |
+| `intent_without_outcome` | `u64` | once a scan has succeeded |
+| `malformed_records` | `u64` | once a scan has succeeded |
+| `retention_shortfall` | `bool` | once a scan has succeeded |
+| `records_measured_at` | RFC 3339 UTC string | once a scan has succeeded |
+
+The three capacity measurements are absent exactly while `state` is
+`unknown`, and `headroom_bytes` is **signed** because a store past its
+reserve has less than none. The four record signals come from the store scan,
+which succeeds and fails independently of the capacity probe, so their
+presence is not governed by `state`: a response may carry `ok` alongside
+absent record signals, or the reverse. Both timestamps are formatted the way
+`material.expires_at` is, as a `Z` string; they are separate so that one half
+of the payload cannot go stale with nothing on the wire to show it. A failed
+probe or a failed scan leaves the previous values and the previous timestamp
+in place rather than resetting them. Optional members are omitted rather than
+serialized as `null`, and an explicit `null` is rejected on decode.
+
+A response encoder receives one daemon-held `RegistrarHealth` snapshot and has
+no other source for it; the protocol module does not read audit, limiter, or
+certificate state.
 
 The refusal mapping is exhaustive over the current bootroot verb errors. Every
 row is an explicit `match` arm; there is no wildcard arm. `none` means the

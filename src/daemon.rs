@@ -517,9 +517,12 @@ pub(crate) async fn build_registrar_handler(
     settings: &config::Settings,
 ) -> anyhow::Result<BuiltRegistrarHandler> {
     use crate::registrar::audit::{AuditRecordStore, AuditStoreSettings};
+    use crate::registrar::audit_store::capacity::AuditCapacityState;
     use crate::registrar::config::RegistrarConfig;
     use crate::registrar::endpoint::production::ProductionHandler;
-    use crate::registrar::endpoint::protocol::{LimiterHealth, RegistrarHealth};
+    use crate::registrar::endpoint::protocol::{
+        AuditCapacityHealth, LimiterHealth, RegistrarHealth,
+    };
     use crate::registrar::internal::{InternalCredential, active_root_fingerprint};
     use crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink;
     use crate::registrar::verbs::limiter::{
@@ -632,6 +635,16 @@ pub(crate) async fn build_registrar_handler(
             limited_predecision_refusal: 0,
             limited_admission: 0,
         },
+        // The three configured members are present from the first
+        // response; the measured ones stay absent until the first tick
+        // succeeds, so "we have not measured" is never encoded as `ok`.
+        audit_capacity: AuditCapacityHealth {
+            state: AuditCapacityState::Unknown,
+            enforcement: registrar.audit_store_enforcement,
+            reserve_bytes: registrar.audit_store_reserve_bytes,
+            low_water_bytes: registrar.audit_store_low_water_bytes,
+            ..AuditCapacityHealth::default()
+        },
     }));
     Ok(BuiltRegistrarHandler {
         handler: Arc::new(ProductionHandler::with_health(
@@ -673,6 +686,117 @@ pub(crate) fn refresh_registrar_health(
         counts.count(crate::registrar::verbs::limiter::LimiterBucket::PredecisionRefusal);
     snapshot.limiter.limited_admission =
         counts.count(crate::registrar::verbs::limiter::LimiterBucket::Admission);
+}
+
+/// The configuration one maintenance tick needs to measure the audit
+/// store and read its record signals.
+///
+/// Cloned into each tick because the callback is `FnMut`; it is four
+/// scalars and two paths, and holding it settles which directory each
+/// half reads — the capacity walk reads the store as a whole, the record
+/// scan reads `audit_record_dir` inside it.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub(crate) struct AuditCapacityInputs {
+    store_dir: PathBuf,
+    record_dir: PathBuf,
+    enforcement: crate::config::AuditStoreEnforcement,
+    reserve_bytes: u64,
+    low_water_bytes: u64,
+    max_retained_files: u32,
+    min_retain_days: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl AuditCapacityInputs {
+    /// Returns the inputs the `[registrar]` table names.
+    pub(crate) fn from_settings(registrar: &config::RegistrarSettings) -> Self {
+        Self {
+            store_dir: registrar.audit_store_dir.clone(),
+            record_dir: registrar.audit_record_dir.clone(),
+            enforcement: registrar.audit_store_enforcement,
+            reserve_bytes: registrar.audit_store_reserve_bytes,
+            low_water_bytes: registrar.audit_store_low_water_bytes,
+            max_retained_files: registrar.audit_max_retained_files,
+            min_retain_days: registrar.audit_min_retain_days,
+        }
+    }
+}
+
+/// Runs the capacity probe and the record scan and writes both into the
+/// shared snapshot.
+///
+/// Both filesystem operations run under `spawn_blocking` and are awaited
+/// here, inside the tick, so no blocking read lands on a runtime worker
+/// and no handle is dropped. The lock is taken twice around them rather
+/// than held across an `.await`.
+///
+/// A failed probe leaves the previous state and `measured_at` in place,
+/// and a failed scan leaves the previous three record values and
+/// `records_measured_at` in place. Resetting either to a healthy-looking
+/// value would hide an alarm behind the failure of the thing that raises
+/// it.
+#[cfg(target_os = "linux")]
+pub(crate) async fn refresh_registrar_audit_capacity(
+    health: &Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    inputs: &AuditCapacityInputs,
+    now: time::OffsetDateTime,
+) {
+    use crate::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store_off_runtime};
+    use crate::registrar::audit_store::capacity;
+
+    let previous = {
+        let snapshot = health.lock().unwrap_or_else(PoisonError::into_inner);
+        snapshot.audit_capacity.state
+    };
+    let measured =
+        capacity::probe_capacity_off_runtime(inputs.store_dir.clone(), inputs.enforcement).await;
+    let scanned = scan_audit_store_off_runtime(
+        &inputs.record_dir,
+        now,
+        AUDIT_SCAN_WINDOW,
+        inputs.max_retained_files,
+        inputs.min_retain_days,
+    )
+    .await;
+
+    let mut snapshot = health.lock().unwrap_or_else(PoisonError::into_inner);
+    match measured {
+        Ok(measurement) => {
+            let reading = capacity::evaluate(
+                previous,
+                measurement,
+                inputs.reserve_bytes,
+                inputs.low_water_bytes,
+            );
+            snapshot.audit_capacity.state = reading.state;
+            snapshot.audit_capacity.used_bytes = Some(reading.used_bytes);
+            snapshot.audit_capacity.headroom_bytes = Some(reading.headroom_bytes);
+            snapshot.audit_capacity.measured_at = Some(now);
+        }
+        Err(error) => {
+            warn!(
+                store = %inputs.store_dir.display(),
+                %error,
+                "the audit-store capacity probe failed; the previous reading stands"
+            );
+        }
+    }
+    match scanned {
+        Ok(scan) => {
+            snapshot.audit_capacity.intent_without_outcome = Some(scan.intent_without_outcome);
+            snapshot.audit_capacity.malformed_records = Some(scan.malformed_records);
+            snapshot.audit_capacity.retention_shortfall = Some(scan.retention_short);
+            snapshot.audit_capacity.records_measured_at = Some(now);
+        }
+        Err(error) => {
+            warn!(
+                records = %inputs.record_dir.display(),
+                %error,
+                "the audit-record scan failed; the previous counts stand"
+            );
+        }
+    }
 }
 
 /// The adopted endpoint and the handler that will answer on it, or
@@ -955,14 +1079,29 @@ fn spawn_openbao_audit_rotation(
     let shutdown_rx = shutdown_rx.clone();
     #[cfg(target_os = "linux")]
     if let Some(maintenance) = registrar_maintenance {
+        let capacity = AuditCapacityInputs::from_settings(registrar);
+        // `Arc` so each tick's future owns what it reads: the callback is
+        // `FnMut`, and the future it returns outlives the call that made
+        // it.
+        let maintenance = Arc::new(maintenance);
         handles.push(tokio::spawn(
             crate::registrar::openbao_audit::run_rotation_loop_with_maintenance(
                 rotation,
                 crate::registrar::openbao_audit::ROTATION_INTERVAL,
                 shutdown_rx,
                 move || {
-                    maintenance.coalescing.maintain();
-                    refresh_registrar_health(&maintenance.health, &maintenance.counts);
+                    let maintenance = Arc::clone(&maintenance);
+                    let capacity = capacity.clone();
+                    async move {
+                        maintenance.coalescing.maintain();
+                        refresh_registrar_health(&maintenance.health, &maintenance.counts);
+                        refresh_registrar_audit_capacity(
+                            &maintenance.health,
+                            &capacity,
+                            time::OffsetDateTime::now_utc(),
+                        )
+                        .await;
+                    }
                 },
             ),
         ));
@@ -1592,6 +1731,8 @@ async fn wait_for_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod audit_capacity_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod registrar_handler_tests;
 
