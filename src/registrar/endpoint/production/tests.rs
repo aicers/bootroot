@@ -633,10 +633,9 @@ fn relay_anchor() -> TrustPayload {
 /// the value, and `encode_mint_response`, which is what it hands the
 /// value to. The arm calls exactly those and nothing else — pinned by
 /// [`no_request_path_arm_reads_the_audit_store`], which reads this
-/// build's `mint` body — and the whole arm cannot be driven end to end
-/// here because `requested_spec` refuses every wire `spec` until the
-/// grammar is settled, so no payload reaches the encoder through
-/// `handle`.
+/// build's `mint` body. The socket integration test covers the complete
+/// mint path; this focused test alone can seed a store that disagrees
+/// with the daemon-held snapshot, proving the response did not scan it.
 ///
 /// The proof that no scan ran is not that the numbers look untouched:
 /// the reader is run against the handler's own store in the same test
