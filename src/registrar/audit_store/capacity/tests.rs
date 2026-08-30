@@ -236,6 +236,7 @@ struct FactWalkOps {
     root: EntryFacts,
     entries: RefCell<VecDeque<OsString>>,
     entry_facts: HashMap<OsString, EntryFacts>,
+    entries_read: Cell<u32>,
 }
 
 impl FactWalkOps {
@@ -244,6 +245,7 @@ impl FactWalkOps {
             root,
             entries: RefCell::new(VecDeque::new()),
             entry_facts: HashMap::new(),
+            entries_read: Cell::new(0),
         }
     }
 
@@ -255,7 +257,12 @@ impl FactWalkOps {
             root,
             entries: RefCell::new(VecDeque::from([name])),
             entry_facts,
+            entries_read: Cell::new(0),
         }
+    }
+
+    fn entries_read(&self) -> u32 {
+        self.entries_read.get()
     }
 }
 
@@ -273,6 +280,7 @@ impl WalkOps for FactWalkOps {
     }
 
     fn next_entry(&self, _dir: &mut Self::Dir) -> io::Result<Option<OsString>> {
+        self.entries_read.set(self.entries_read.get() + 1);
         Ok(self.entries.borrow_mut().pop_front())
     }
 
@@ -620,6 +628,11 @@ fn the_host_probe_succeeds_when_available_bytes_overflow() {
         .expect("an overflowing f_bavail product does not fail the probe");
 
     assert_eq!(measured.available_bytes, u64::MAX);
+    assert_eq!(
+        probe.ops.entries_read(),
+        0,
+        "filesystem mode does not enumerate the store"
+    );
 }
 
 #[test]
@@ -646,6 +659,11 @@ fn the_host_probe_succeeds_when_filesystem_used_bytes_overflow() {
         .expect("an overflowing f_blocks product does not fail the probe");
 
     assert_eq!(measured.used_bytes, u64::MAX);
+    assert_eq!(
+        probe.ops.entries_read(),
+        0,
+        "filesystem mode does not enumerate the store"
+    );
 }
 
 #[test]
