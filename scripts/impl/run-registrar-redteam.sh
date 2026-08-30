@@ -135,11 +135,16 @@ build_and_initialize() {
   sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "redteam-${RUN_TOKEN}" "redteam-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$ARTIFACT_DIR/init.raw.log" 2>&1 || fail "bootroot init failed"
   sed 's/^\(root token: \).*/\1<redacted>/' "$ARTIFACT_DIR/init.raw.log" >"$ARTIFACT_DIR/init.log"
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
-  sudo -n sh -c 'printf "header = \\"X-Vault-Token: %s\\"\\n" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
+  # A header file keeps the init root token out of the process arguments.
+  # `curl --header @file` consumes the literal HTTP field line, unlike a
+  # curl config file where an extra escape would change the field name.
+  sudo -n sh -c 'printf "%s: %s\n" "X-Vault-Token" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
   OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"
   sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
-  if ! sudo -n curl -fsS --cacert "$OPENBAO_CA" -K "$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >"$ARTIFACT_DIR/empty-eab-response.json"; then
-    cat "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
+  EMPTY_EAB_STATUS="$(sudo -n curl -sS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' --dump-header "$ARTIFACT_DIR/empty-eab-headers.txt" --output "$ARTIFACT_DIR/empty-eab-response.json" --write-out '%{http_code}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab")" || EMPTY_EAB_STATUS="curl-failed"
+  printf '%s\n' "$EMPTY_EAB_STATUS" >"$ARTIFACT_DIR/empty-eab-status.txt"
+  if [ "$EMPTY_EAB_STATUS" != "200" ]; then
+    cat "$ARTIFACT_DIR/empty-eab-status.txt" "$ARTIFACT_DIR/empty-eab-headers.txt" "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
     fail "could not record the explicit empty agent EAB"
   fi
   bootroot infra up --compose-file "$WORK_DIR/docker-compose.deploy.yml" --agent-config "$INITIAL_CONFIG" --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 || fail "could not start initialized deployment"
