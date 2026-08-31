@@ -1494,17 +1494,30 @@ fn a_verifier_rejection_selects_the_pin_refusal_variant() {
 fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure() {
     let deployment = Deployment::new();
     let expired_at = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1));
-    for verdict in [
-        rustls::Error::from(EndpointVerifyRejection::PresentedCertificateExpired),
-        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
-        rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
-            time: rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(2)),
-            not_after: expired_at,
-        }),
+    // Each verdict is named rather than rendered into the failure
+    // message: a certificate value formatted into a message is what a
+    // secret-in-the-log scanner reads, and the label identifies the case
+    // just as precisely.
+    for (spelling, verdict) in [
+        (
+            "the verifier's own presented-leaf rejection",
+            rustls::Error::from(EndpointVerifyRejection::PresentedCertificateExpired),
+        ),
+        (
+            "the bare rustls expiry verdict",
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        ),
+        (
+            "the rustls expiry verdict carrying timestamps",
+            rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+                time: rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(2)),
+                not_after: expired_at,
+            }),
+        ),
     ] {
         let err = deployment
             .client()
-            .classify_handshake(io::Error::other(verdict.clone()));
+            .classify_handshake(io::Error::other(verdict));
         assert!(
             matches!(
                 err,
@@ -1512,7 +1525,7 @@ fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure
                     leaf: SurfaceLeaf::EndpointServer
                 }
             ),
-            "expected the endpoint_server lapse for {verdict:?}, saw {err:?}"
+            "expected the endpoint_server lapse for {spelling}"
         );
         let rendered = err.to_string();
         assert!(

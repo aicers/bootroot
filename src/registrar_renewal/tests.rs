@@ -646,9 +646,12 @@ async fn the_preparation_seed_is_two_never_attempted_health_entries() {
             CertificateHealth::remaining_seconds(observed, now),
             "the seconds left are calculated against the tick's clock"
         );
+        // Not `{entry:?}`: a certificate record rendered into a failure
+        // message is what a secret-in-the-log scanner reads, and the
+        // assertions above already say which leaf this is.
         assert!(
             entry.remaining_seconds > 0,
-            "the fixture's leaves are live: {entry:?}"
+            "the fixture's leaves are live rather than already lapsed"
         );
     }
 }
@@ -772,11 +775,13 @@ async fn a_refresh_replaces_the_whole_sequence() {
 
     let entries = certificates_of(&health);
     assert_eq!(entries.len(), 2, "neither stale nor accumulated");
-    assert!(
+    assert_eq!(
         entries
             .iter()
-            .all(|entry| entry.last_renewal_outcome == RenewalOutcome::NeverAttempted),
-        "the planted entry is gone: {entries:?}"
+            .map(|entry| entry.last_renewal_outcome)
+            .collect::<Vec<_>>(),
+        vec![RenewalOutcome::NeverAttempted; 2],
+        "the planted entry is gone"
     );
 }
 
