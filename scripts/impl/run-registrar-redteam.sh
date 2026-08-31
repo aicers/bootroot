@@ -370,7 +370,7 @@ assert_post_bind_peer_fixture() {
   sudo -n mkdir -p "$fixture_dir"
   sudo -n chown "$uid:$gid" "$fixture_dir"
   sudo -n chmod 0700 "$fixture_dir"
-  sudo -n -u "$(id -un "$uid" 2>/dev/null || printf nobody)" python3 -c '
+  sudo -n -u "#${uid}" -g "#${gid}" python3 -c '
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[1]); s.listen(1)
