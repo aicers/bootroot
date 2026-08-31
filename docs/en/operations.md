@@ -2183,6 +2183,109 @@ client (`src/registrar/endpoint/client.rs`). It has no production consumer here;
 it exists so the caller behaviour this endpoint expects is written down as
 running code.
 
+#### Watching the two leaves, and reading a lapse
+
+A renewal that stops working is silent until something expires, so the endpoint
+reports both leaves on every response that carries a health snapshot — mint
+success, deregister success, and refusal alike. The
+`registrar_health.certificates` member is an array of exactly two entries,
+always `registrar_client` first and `endpoint_server` second:
+
+```json
+"certificates": [
+  {
+    "leaf": "registrar_client",
+    "not_after": "2026-09-30T11:04:00Z",
+    "remaining_seconds": 2591940,
+    "last_renewal_outcome": "succeeded",
+    "last_renewal_at": "2026-08-31T11:04:00Z"
+  },
+  {
+    "leaf": "endpoint_server",
+    "not_after": "2026-09-02T11:04:00Z",
+    "remaining_seconds": 172740,
+    "last_renewal_outcome": "failed",
+    "last_renewal_at": "2026-08-31T11:05:00Z"
+  }
+]
+```
+
+`remaining_seconds` is signed and is the whole seconds left, rounded **down**:
+`0` at the exact instant of expiry, where the leaf is still valid, and negative
+from the first instant after it — `-1` for a leaf that expired less than a
+second ago. A leaf that has lapsed therefore reads as a negative number rather
+than as a zero that could be mistaken for the last healthy moment.
+
+`last_renewal_outcome` is `never_attempted`, `succeeded`, or `failed`, and
+`last_renewal_at` is present for the last two and omitted for the first. Both
+entries are populated before the endpoint serves its first request: preparing
+the renewal loop reads each certificate already on disk and records its
+`notAfter` with `never_attempted` and no timestamp. That seed contacts neither
+OpenBao nor the CA and is not a renewal attempt, so a first response showing
+`never_attempted` for both leaves is the normal shape of a daemon that has just
+started, not evidence that renewal is broken.
+
+**The reading that matters is `failed` while `remaining_seconds` is still
+positive.** The leaf is valid, callers are unaffected, and the interval between
+now and `not_after` is the whole window in which the problem can be fixed
+quietly. Alert on it, and read the daemon's own renewal errors in the journal
+for what to fix.
+
+`never_attempted` persisting on a long-running daemon is not itself a fault: a
+pass attempts nothing for a leaf that is not inside its lead time and has not
+stopped chaining to `[trust] ca_bundle_path`, so the outcome stays at the seed
+until a leaf actually comes due. What tells you renewal has stopped is
+`remaining_seconds` falling through the lead time with the outcome still
+`never_attempted`.
+
+Serving a request never reads a certificate file. The daemon copies both entries
+into the shared snapshot on the same maintenance cadence it uses for the
+audit-store capacity signals, so the values move at that cadence and not at
+request time.
+
+##### When a leaf has already lapsed
+
+An expired leaf reaches a caller as a typed error naming which side lapsed,
+never as a generic connection or handshake failure, and never as something a
+retry will clear:
+
+- **`registrar_client`** — the caller's own certificate is past its `notAfter`.
+  The client detects this while loading its per-dial material and returns before
+  it opens the socket, so no connection is attempted at all. This outranks an
+  unavailable daemon: with a lapsed leaf you get the lapse even when nothing is
+  listening.
+- **`endpoint_server`** — the endpoint's certificate is past its `notAfter`, and
+  TLS verification said so. Reported only once a connection got as far as the
+  handshake.
+
+Both are distinct from the retryable connection failures beside them, and
+neither is repaired by the caller. Every other handshake verdict — an unpinned
+anchor, a wrong SAN, a chain that does not build — keeps the behaviour it always
+had.
+
+**Recovery depends on whether the leaf is expired or merely failing to renew,
+and the two need different things:**
+
+- **The leaf has already expired and the daemon is stopped.** Start the daemon.
+  Start-time issuance runs before the endpoint loads its material and reissues
+  an unusable pair, so the leaf is repaired *before* the endpoint begins serving
+  — one `systemctl start bootroot-agent` and the surface comes back with valid
+  certificates.
+- **The leaf is still valid and its last renewal failed.** Starting anything
+  changes nothing: the daemon is already running and the certificate on disk is
+  still usable, so start-time issuance has nothing to reissue. What repairs it is
+  the *next* renewal pass succeeding, which means fixing whatever the failure
+  named — OpenBao unreachable, the internal credential expired or superseded, the
+  CA refusing issuance, a trust-anchor rotation that left the pin file naming an
+  anchor the replacement cannot chain to. Fix that, and the running daemon's next
+  pass publishes the replacement and swaps the active TLS configuration with no
+  restart.
+
+Do **not** re-provision the host for either. Both leaves are certificates the
+daemon issues and renews by itself, and a lapse says that maintenance stopped,
+not that the deployment is wrong. Reinitialising the deployment would discard a
+working PKI, every enrolled service identity and the audit trail, to fix a timer.
+
 #### Installing the units
 
 Both units are checked in under `systemd/` in this repository. Copy them

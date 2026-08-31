@@ -240,6 +240,22 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
         // initialized the per-leaf renewal state from the certificates
         // start-time issuance made usable, and its loop starts before
         // the endpoint begins serving.
+        //
+        // The same ordering is what puts both certificate entries on the
+        // very first response. Copying the accessor here is not a
+        // renewal attempt and not an early tick: it reads the two values
+        // preparation already observed, so the endpoint starts serving
+        // with a populated `certificates` member instead of an empty one
+        // that the first maintenance tick would fill in minutes later.
+        let maintenance = maintenance.map(|maintenance| {
+            let state = renewal.state();
+            refresh_registrar_certificates(
+                &maintenance.health,
+                &state,
+                time::OffsetDateTime::now_utc(),
+            );
+            maintenance.with_renewal(state)
+        });
         spawn_registrar_cert_renewal(&mut handles, renewal, &shutdown_rx);
         spawn_registrar_endpoint(
             &mut handles,
@@ -645,6 +661,11 @@ pub(crate) async fn build_registrar_handler(
             low_water_bytes: registrar.audit_store_low_water_bytes,
             ..AuditCapacityHealth::default()
         },
+        // Empty for exactly as long as it takes `run_daemon` to arm the
+        // renewal adapter and copy the two entries preparation seeded,
+        // which happens before the accept task is spawned. No response
+        // is served from this value.
+        certificates: Vec::new(),
     }));
     Ok(BuiltRegistrarHandler {
         handler: Arc::new(ProductionHandler::with_health(
@@ -657,6 +678,7 @@ pub(crate) async fn build_registrar_handler(
             coalescing,
             health,
             counts,
+            renewal: None,
         }),
     })
 }
@@ -673,6 +695,26 @@ struct RegistrarMaintenance {
     coalescing: Arc<crate::registrar::verbs::coalescing::CoalescingLimitedInvocationSink>,
     health: Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
     counts: Arc<crate::registrar::verbs::limiter::CountingLimitedInvocationSink>,
+    /// The renewal adapter's accessor, once one has been armed.
+    ///
+    /// `None` until [`run_daemon`] hands the prepared adapter's accessor
+    /// over: the handler is composed before the adapter is armed, and
+    /// this member is what the two are joined by. A composition that
+    /// never reaches the arming step reports no certificates rather than
+    /// inventing them.
+    renewal: Option<crate::registrar_renewal::RegistrarCertRenewalState>,
+}
+
+#[cfg(target_os = "linux")]
+impl RegistrarMaintenance {
+    /// Attaches the armed adapter's accessor.
+    fn with_renewal(
+        mut self,
+        renewal: crate::registrar_renewal::RegistrarCertRenewalState,
+    ) -> Self {
+        self.renewal = Some(renewal);
+        self
+    }
 }
 
 /// Copies the limiter's process-lifetime counters into the shared snapshot.
@@ -686,6 +728,56 @@ pub(crate) fn refresh_registrar_health(
         counts.count(crate::registrar::verbs::limiter::LimiterBucket::PredecisionRefusal);
     snapshot.limiter.limited_admission =
         counts.count(crate::registrar::verbs::limiter::LimiterBucket::Admission);
+}
+
+/// Copies both leaves' renewal state into the shared health snapshot.
+///
+/// The whole of this issue's reporting path, and it touches no
+/// filesystem: every value comes from
+/// [`crate::registrar_renewal::RegistrarCertRenewalState`], whose
+/// entries preparation seeds before the endpoint serves and whose
+/// renewal tick is the sole writer afterwards. The only thing calculated
+/// here is `remaining_seconds`, against `now`, because the observed
+/// `notAfter` does not change between ticks but the time left over does.
+///
+/// The two entries are written in
+/// [`crate::registrar::endpoint::protocol::CERTIFICATE_LEAF_ORDER`] and the
+/// vector is replaced wholesale, so a refresh cannot append a third
+/// entry or leave a stale one behind. A leaf the accessor has no entry
+/// for contributes nothing: that is the disabled-endpoint shape, where
+/// no adapter was ever armed, and it is never the enabled one, which
+/// preparation refuses to leave without both entries.
+#[cfg(target_os = "linux")]
+pub(crate) fn refresh_registrar_certificates(
+    health: &Arc<StdMutex<crate::registrar::endpoint::protocol::RegistrarHealth>>,
+    renewal: &crate::registrar_renewal::RegistrarCertRenewalState,
+    now: time::OffsetDateTime,
+) {
+    use crate::registrar::endpoint::protocol::{
+        CERTIFICATE_LEAF_ORDER, CertificateHealth, RenewalOutcome,
+    };
+    use crate::registrar_renewal::RenewalAttempt;
+
+    let entries = CERTIFICATE_LEAF_ORDER
+        .into_iter()
+        .filter_map(|leaf| {
+            let state = renewal.leaf(leaf)?;
+            let outcome = match state.attempt {
+                RenewalAttempt::NeverAttempted => RenewalOutcome::NeverAttempted,
+                RenewalAttempt::Succeeded => RenewalOutcome::Succeeded,
+                RenewalAttempt::Failed { .. } => RenewalOutcome::Failed,
+            };
+            Some(CertificateHealth::new(
+                leaf,
+                state.not_after,
+                outcome,
+                state.attempted_at,
+                now,
+            ))
+        })
+        .collect();
+    let mut snapshot = health.lock().unwrap_or_else(PoisonError::into_inner);
+    snapshot.certificates = entries;
 }
 
 /// The configuration one maintenance tick needs to measure the audit
@@ -1093,14 +1185,13 @@ fn spawn_openbao_audit_rotation(
                     let maintenance = Arc::clone(&maintenance);
                     let capacity = capacity.clone();
                     async move {
+                        let now = time::OffsetDateTime::now_utc();
                         maintenance.coalescing.maintain();
                         refresh_registrar_health(&maintenance.health, &maintenance.counts);
-                        refresh_registrar_audit_capacity(
-                            &maintenance.health,
-                            &capacity,
-                            time::OffsetDateTime::now_utc(),
-                        )
-                        .await;
+                        if let Some(renewal) = maintenance.renewal.as_ref() {
+                            refresh_registrar_certificates(&maintenance.health, renewal, now);
+                        }
+                        refresh_registrar_audit_capacity(&maintenance.health, &capacity, now).await;
                     }
                 },
             ),

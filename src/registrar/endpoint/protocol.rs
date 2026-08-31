@@ -1,9 +1,11 @@
 //! The versioned JSON payload protocol for the registrar endpoint.
 //!
-//! This module owns only the payload boundary.  It deliberately knows
-//! nothing about the listener, audit store, limiter, or certificate state:
-//! callers decode a request before invoking a verb and hand a health snapshot
-//! back when encoding a response.
+//! This module owns only the payload boundary.  It deliberately reads
+//! nothing from the listener, the audit store, the limiter, or the
+//! certificates on disk: callers decode a request before invoking a verb
+//! and hand a health snapshot back when encoding a response.  What it
+//! does own is the *shape* those signals take on the wire, the
+//! certificate entries included.
 
 // This module is the codec for *both* ends of the wire, and this daemon
 // is only one of them: it decodes a request and encodes a response. The
@@ -45,6 +47,7 @@ use crate::registrar::verbs::outcome::{
     DeregisterKind, DeregisterOutcome, MintKind, MintOutcome, VerbError, VerbRefusal,
 };
 use crate::registrar::verbs::wrap_ttl::WrapTtlRefusal;
+use crate::registrar_certs::SurfaceLeaf;
 #[cfg(test)]
 use crate::service_material::TeardownReport;
 
@@ -261,10 +264,10 @@ pub(crate) enum EnrollError {
 /// A snapshot of registrar health supplied by the response caller.
 ///
 /// This container is the single place future endpoint signals are added.
-/// One member is still reserved and already has an owner: `certificates`
-/// is populated by #769. Recording the owner fixes neither a member schema
-/// nor a value; the container carries the limiter member owned by #787 and
-/// the audit-capacity member owned by #774.
+/// It carries the limiter member owned by #787, the audit-capacity member
+/// owned by #774, and the certificate member owned by #769. Members are
+/// appended, never reordered, so a member's serialized position outlives
+/// every later addition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistrarHealth {
     /// Limited invocations counted since this daemon started.
@@ -276,6 +279,143 @@ pub(crate) struct RegistrarHealth {
     /// position changes.
     #[serde(default)]
     pub(crate) audit_capacity: AuditCapacityHealth,
+    /// The registrar surface's two leaves, their remaining lifetimes and
+    /// their last renewal outcomes.
+    ///
+    /// Appended after `audit_capacity`, for the same reason that member
+    /// was appended after `limiter`.
+    ///
+    /// A daemon that has prepared an enabled endpoint fills this with
+    /// exactly the two entries [`CERTIFICATE_LEAF_ORDER`] names, in that
+    /// order, and does so before the endpoint serves its first request.
+    /// It is a sequence rather than two named members because the entries
+    /// are uniform: each names its own leaf, so a reader iterates rather
+    /// than knowing the pair by name. Empty is what
+    /// [`RegistrarHealth::default()`] leaves behind and is never a
+    /// production shape.
+    #[serde(default)]
+    pub(crate) certificates: Vec<CertificateHealth>,
+}
+
+/// The fixed order the `certificates` entries are encoded in.
+///
+/// The caller-facing leaf first: a lapsed registrar client leaf is the
+/// one an enrolling caller is refused by before it reaches the socket at
+/// all.
+pub(crate) const CERTIFICATE_LEAF_ORDER: [SurfaceLeaf; 2] =
+    [SurfaceLeaf::RegistrarClient, SurfaceLeaf::EndpointServer];
+
+/// How the last renewal attempt for one leaf ended, on the wire.
+///
+/// A closed enum of three, and deliberately not an optional outcome:
+/// "nothing has been attempted" is a state of its own, is what
+/// preparation records, and is the only one of the three that carries no
+/// timestamp.
+///
+/// The daemon-side [`crate::registrar_renewal::RenewalAttempt`] this is
+/// copied from carries a failure's reason as well. That reason stays off
+/// the wire: it names local paths and local dependencies, and a caller
+/// can act on neither.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RenewalOutcome {
+    /// Preparation observed the leaf and nothing has been attempted
+    /// since.
+    #[default]
+    NeverAttempted,
+    /// The last attempt published a replacement.
+    Succeeded,
+    /// The last attempt failed and the leaf still holds what it held.
+    Failed,
+}
+
+/// One registrar surface leaf's remaining lifetime and last renewal
+/// outcome.
+///
+/// Every value here is copied from the daemon's renewal accessor on its
+/// maintenance cadence. Nothing on the request path reads, stats or
+/// parses a certificate to produce one: a member that did would put
+/// filesystem work behind an endpoint a caller can drive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CertificateHealth {
+    /// Which of the two leaves this entry describes.
+    pub(crate) leaf: SurfaceLeaf,
+    /// The `notAfter` of the certificate currently at the leaf's
+    /// configured path, RFC 3339 in UTC.
+    #[serde(with = "rfc3339")]
+    pub(crate) not_after: OffsetDateTime,
+    /// Whole seconds left before `not_after`, floored.
+    ///
+    /// Signed, because the interesting reading is the one past zero: an
+    /// unsigned field would clamp a lapsed leaf to the healthiest value
+    /// it can hold. See [`CertificateHealth::remaining_seconds`] for the
+    /// exact rule the value follows.
+    pub(crate) remaining_seconds: i64,
+    /// How the last renewal attempt for this leaf ended.
+    pub(crate) last_renewal_outcome: RenewalOutcome,
+    /// When that attempt ran, RFC 3339 in UTC.
+    ///
+    /// Omitted — never `null` — exactly while `last_renewal_outcome` is
+    /// `never_attempted`, and present for the other two.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339"
+    )]
+    pub(crate) last_renewal_at: Option<OffsetDateTime>,
+}
+
+impl CertificateHealth {
+    /// Builds one entry, calculating `remaining_seconds` against `now`.
+    #[must_use]
+    pub(crate) fn new(
+        leaf: SurfaceLeaf,
+        not_after: OffsetDateTime,
+        last_renewal_outcome: RenewalOutcome,
+        last_renewal_at: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> Self {
+        Self {
+            leaf,
+            not_after,
+            remaining_seconds: Self::remaining_seconds(not_after, now),
+            last_renewal_outcome,
+            last_renewal_at,
+        }
+    }
+
+    /// The mathematical floor of `not_after - now`, in whole seconds.
+    ///
+    /// The floor is taken with [`i128::div_euclid`] over the exact
+    /// nanosecond difference, and deliberately not with a whole-seconds
+    /// accessor: `time::Duration::whole_seconds` truncates *toward zero*,
+    /// so a leaf that expired 100 ms ago would report `0` — the same
+    /// value as a leaf expiring exactly now — and a lapse would read as
+    /// the last healthy instant for its first second.
+    ///
+    /// So the value is `0` at `now == not_after`, where the leaf is not
+    /// yet lapsed; `-1` for a leaf expired by anything less than one
+    /// second; and strictly negative at every later instant. Before
+    /// expiry, flooring is also what keeps the value from ever
+    /// overstating the time left: 1.9 s remaining reports `1`.
+    ///
+    /// An [`OffsetDateTime`] spans years ±9999, so the widest difference
+    /// two of them can produce is around 6×10^11 seconds and the
+    /// narrowing back to `i64` cannot lose a value any certificate
+    /// produces. It is saturated rather than truncated all the same: a
+    /// wrap would turn a vast positive lifetime into a lapse.
+    #[must_use]
+    pub(crate) fn remaining_seconds(not_after: OffsetDateTime, now: OffsetDateTime) -> i64 {
+        const NANOS_PER_SECOND: i128 = 1_000_000_000;
+        let floored = (not_after - now)
+            .whole_nanoseconds()
+            .div_euclid(NANOS_PER_SECOND);
+        i64::try_from(floored).unwrap_or(if floored.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        })
+    }
 }
 
 /// Process-lifetime counters for the two limiter checkpoints.
@@ -2422,7 +2562,8 @@ mod tests {
                 r#"{"protocol_version":1,"request_id":"request","class":"retryable","#,
                 r#""registrar_health":{"limiter":{"limited_predecision_refusal":0,"#,
                 r#""limited_admission":0},"audit_capacity":{"state":"unknown","#,
-                r#""enforcement":"filesystem","reserve_bytes":0,"low_water_bytes":0}}}"#
+                r#""enforcement":"filesystem","reserve_bytes":0,"low_water_bytes":0},"#,
+                r#""certificates":[]}}"#
             )
         );
 
@@ -2592,6 +2733,307 @@ mod tests {
         assert_eq!(decoded.registrar_health, unmeasured);
     }
 
+    /// The whole top-level member order, asserted as a sequence.
+    ///
+    /// Two members already assert their own append; this asserts the
+    /// sequence they form, so a member added between two existing ones
+    /// fails here even when each neighbour's own case still passes.
+    #[test]
+    fn registrar_health_serializes_its_members_in_the_fixed_order() {
+        let encoded = encode_refusal(
+            "request",
+            None,
+            RefusalClass::Retryable,
+            None,
+            &fixture_health(),
+        )
+        .expect("refusal encodes");
+        let text = String::from_utf8(encoded).expect("the response is UTF-8 JSON");
+        let health = text
+            .split(r#""registrar_health":"#)
+            .nth(1)
+            .expect("the response carries the health container");
+        let mut cursor = 0;
+        for member in [r#""limiter""#, r#""audit_capacity""#, r#""certificates""#] {
+            let at = health
+                .get(cursor..)
+                .and_then(|rest| rest.find(member))
+                .unwrap_or_else(|| panic!("{member} follows the members before it: {text}"));
+            cursor += at + member.len();
+        }
+        assert!(
+            health.starts_with(&format!("{{{LIMITER_MEMBER},")),
+            "limiter is still first and its bytes are unchanged: {text}"
+        );
+        assert!(
+            health.contains(r#","certificates":[{"leaf":"registrar_client""#),
+            "certificates is appended after audit_capacity: {text}"
+        );
+    }
+
+    /// The `certificates` entries' complete shape: two of them, in the
+    /// fixed order, with the exact member names, enum spellings,
+    /// timestamp representation and optional-timestamp rule.
+    #[test]
+    fn the_certificates_member_carries_two_ordered_entries_with_the_specified_shape() {
+        let health = fixture_health();
+        let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &health)
+            .expect("refusal encodes");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("response is JSON");
+        let entries = value
+            .pointer("/registrar_health/certificates")
+            .and_then(serde_json::Value::as_array)
+            .expect("the certificates member is an array");
+        assert_eq!(entries.len(), 2, "exactly the two surface leaves");
+
+        let client = entries.first().expect("the first entry").clone();
+        assert_eq!(
+            client,
+            serde_json::json!({
+                "leaf": "registrar_client",
+                "not_after": "1970-01-31T00:00:00Z",
+                "remaining_seconds": 2_592_000,
+                "last_renewal_outcome": "succeeded",
+                "last_renewal_at": "1970-01-01T00:00:00Z",
+            }),
+            "an attempted leaf carries all five members"
+        );
+
+        let server = entries.get(1).expect("the second entry").clone();
+        assert_eq!(
+            server,
+            serde_json::json!({
+                "leaf": "endpoint_server",
+                "not_after": "1969-12-31T23:59:59Z",
+                "remaining_seconds": -1,
+                "last_renewal_outcome": "never_attempted",
+            }),
+            "a never-attempted leaf omits the timestamp rather than nulling it"
+        );
+
+        let text = String::from_utf8(encoded.clone()).expect("the response is UTF-8 JSON");
+        let certificates = text
+            .split(r#""certificates":"#)
+            .nth(1)
+            .expect("the response carries the certificates member");
+        assert!(
+            !certificates.contains("null"),
+            "no member is encoded as null: {text}"
+        );
+
+        let decoded = decode_refusal_response(&encoded).expect("refusal decodes");
+        assert_eq!(
+            decoded.registrar_health, health,
+            "the container round-trips"
+        );
+    }
+
+    /// The third outcome spelling, and the failure case the member
+    /// exists for: a renewal that failed while the leaf is still valid.
+    #[test]
+    fn a_failed_renewal_is_reported_beside_a_leaf_that_is_still_valid() {
+        let attempted_at = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1);
+        let health = RegistrarHealth {
+            certificates: vec![CertificateHealth {
+                leaf: SurfaceLeaf::EndpointServer,
+                not_after: OffsetDateTime::UNIX_EPOCH + time::Duration::days(3),
+                remaining_seconds: 259_200,
+                last_renewal_outcome: RenewalOutcome::Failed,
+                last_renewal_at: Some(attempted_at),
+            }],
+            ..RegistrarHealth::default()
+        };
+        let encoded = encode_refusal("request", None, RefusalClass::Retryable, None, &health)
+            .expect("refusal encodes");
+        let text = String::from_utf8(encoded.clone()).expect("the response is UTF-8 JSON");
+        assert!(
+            text.contains(
+                r#""certificates":[{"leaf":"endpoint_server","not_after":"1970-01-04T00:00:00Z","#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""remaining_seconds":259200,"last_renewal_outcome":"failed","#),
+            "a failure keeps the retained lifetime and reports the third spelling: {text}"
+        );
+        assert!(
+            text.contains(r#""last_renewal_at":"1970-01-01T01:00:00Z""#),
+            "a failed attempt carries its timestamp: {text}"
+        );
+        assert_eq!(
+            decode_refusal_response(&encoded)
+                .expect("refusal decodes")
+                .registrar_health,
+            health
+        );
+    }
+
+    /// `last_renewal_at` is omitted, never `null`, and an explicit
+    /// `null` is refused on decode the way every other optional member
+    /// on this container refuses one.
+    #[test]
+    fn a_null_last_renewal_at_is_rejected_rather_than_read_as_absence() {
+        let payload = concat!(
+            r#"{"protocol_version":1,"request_id":"request","class":"retryable","#,
+            r#""registrar_health":{"certificates":[{"leaf":"registrar_client","#,
+            r#""not_after":"1970-01-01T00:00:00Z","remaining_seconds":0,"#,
+            r#""last_renewal_outcome":"never_attempted","last_renewal_at":null}]}}"#
+        );
+        assert!(
+            decode_refusal_response(payload.as_bytes()).is_err(),
+            "an explicit null attempt timestamp is rejected"
+        );
+
+        let omitted = concat!(
+            r#"{"protocol_version":1,"request_id":"request","class":"retryable","#,
+            r#""registrar_health":{"certificates":[{"leaf":"registrar_client","#,
+            r#""not_after":"1970-01-01T00:00:00Z","remaining_seconds":0,"#,
+            r#""last_renewal_outcome":"never_attempted"}]}}"#
+        );
+        let decoded =
+            decode_refusal_response(omitted.as_bytes()).expect("an omitted member decodes");
+        let entry = decoded
+            .registrar_health
+            .certificates
+            .first()
+            .expect("the entry decodes");
+        assert_eq!(entry.leaf, SurfaceLeaf::RegistrarClient);
+        assert_eq!(entry.last_renewal_outcome, RenewalOutcome::NeverAttempted);
+        assert_eq!(entry.last_renewal_at, None);
+    }
+
+    /// Both closed enums reject a spelling that is not one of theirs.
+    #[test]
+    fn the_certificate_enums_are_closed() {
+        for member in [
+            r#""leaf":"registrar-client","not_after":"1970-01-01T00:00:00Z","remaining_seconds":0,"last_renewal_outcome":"never_attempted""#,
+            r#""leaf":"openbao","not_after":"1970-01-01T00:00:00Z","remaining_seconds":0,"last_renewal_outcome":"never_attempted""#,
+            r#""leaf":"registrar_client","not_after":"1970-01-01T00:00:00Z","remaining_seconds":0,"last_renewal_outcome":"pending""#,
+        ] {
+            let payload = format!(
+                concat!(
+                    r#"{{"protocol_version":1,"request_id":"request","class":"retryable","#,
+                    r#""registrar_health":{{"certificates":[{{{member}}}]}}}}"#
+                ),
+                member = member
+            );
+            assert!(
+                decode_refusal_response(payload.as_bytes()).is_err(),
+                "an unknown spelling is refused: {payload}"
+            );
+        }
+    }
+
+    /// `remaining_seconds` is the mathematical floor of the exact
+    /// difference, which is what makes the value honest on both sides of
+    /// zero.
+    ///
+    /// The three rows that matter are pinned by name: exactly at expiry,
+    /// expired by less than a second, and a live lifetime with a
+    /// fraction on it. A truncation toward zero would report `0` for the
+    /// second and would round the third up.
+    #[test]
+    fn remaining_seconds_is_the_floor_of_the_exact_difference() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(365 * 30);
+        for (label, offset, expected) in [
+            ("exactly at expiry", time::Duration::ZERO, 0),
+            (
+                "one nanosecond past expiry",
+                time::Duration::nanoseconds(-1),
+                -1,
+            ),
+            ("100 ms past expiry", time::Duration::milliseconds(-100), -1),
+            (
+                "one nanosecond before a whole second has passed",
+                time::Duration::seconds(-1) + time::Duration::nanoseconds(1),
+                -1,
+            ),
+            (
+                "exactly one second past expiry",
+                time::Duration::seconds(-1),
+                -1,
+            ),
+            (
+                "just past one second expired",
+                time::Duration::seconds(-1) - time::Duration::nanoseconds(1),
+                -2,
+            ),
+            (
+                "a fractional live lifetime",
+                time::Duration::milliseconds(1_900),
+                1,
+            ),
+            (
+                "a live lifetime a hair under the next second",
+                time::Duration::seconds(2) - time::Duration::nanoseconds(1),
+                1,
+            ),
+            ("a whole live second", time::Duration::seconds(2), 2),
+        ] {
+            assert_eq!(
+                CertificateHealth::remaining_seconds(now + offset, now),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// The floor is taken over sub-second precision, not over a
+    /// whole-seconds accessor.
+    ///
+    /// Asserted as a difference from what the forbidden operation would
+    /// have produced, so the case fails if the implementation is ever
+    /// changed to one: `time::Duration::whole_seconds` truncates toward
+    /// zero, and these are exactly the inputs where the two disagree.
+    #[test]
+    fn remaining_seconds_does_not_truncate_a_negative_duration_toward_zero() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        for millis in [-1_i64, -100, -999] {
+            let not_after = now + time::Duration::milliseconds(millis);
+            assert_eq!(
+                (not_after - now).whole_seconds(),
+                0,
+                "the truncating accessor is the thing being avoided"
+            );
+            assert_eq!(
+                CertificateHealth::remaining_seconds(not_after, now),
+                -1,
+                "a leaf expired by {millis} ms is reported as lapsed"
+            );
+        }
+    }
+
+    /// The constructor calculates the reported value rather than taking
+    /// one, and copies the other four through unchanged.
+    #[test]
+    fn the_entry_constructor_calculates_the_remaining_seconds() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let not_after = now + time::Duration::hours(48) + time::Duration::milliseconds(500);
+        let attempted_at = now - time::Duration::minutes(5);
+        let entry = CertificateHealth::new(
+            SurfaceLeaf::EndpointServer,
+            not_after,
+            RenewalOutcome::Succeeded,
+            Some(attempted_at),
+            now,
+        );
+        assert_eq!(entry.leaf, SurfaceLeaf::EndpointServer);
+        assert_eq!(entry.not_after, not_after);
+        assert_eq!(entry.remaining_seconds, 172_800);
+        assert_eq!(entry.last_renewal_outcome, RenewalOutcome::Succeeded);
+        assert_eq!(entry.last_renewal_at, Some(attempted_at));
+    }
+
+    /// The fixed entry order is a constant the reporting side reads,
+    /// rather than a convention each writer restates.
+    #[test]
+    fn the_certificate_leaf_order_is_the_caller_facing_leaf_first() {
+        assert_eq!(
+            CERTIFICATE_LEAF_ORDER,
+            [SurfaceLeaf::RegistrarClient, SurfaceLeaf::EndpointServer]
+        );
+    }
+
     /// The mount refusal has no registrar dependencies behind it, so it
     /// must not claim a capacity snapshot it never measured.
     #[test]
@@ -2605,6 +3047,7 @@ mod tests {
         );
         assert!(!text.contains("audit_capacity"));
         assert!(!text.contains("limiter"));
+        assert!(!text.contains("certificates"));
     }
 
     #[test]
@@ -3023,6 +3466,15 @@ mod tests {
     /// fixtures always held, while `audit_capacity` is fully populated:
     /// a golden file that omitted every optional member would document
     /// half the schema.
+    ///
+    /// `certificates` is built the same way, out of the two entries that
+    /// between them exercise every rule the member has: both leaf
+    /// spellings in their fixed order, a positive and a negative
+    /// `remaining_seconds`, a present `last_renewal_at` beside an
+    /// omitted one, and the two outcomes those go with. Each entry's
+    /// `remaining_seconds` is the floor of its own `not_after` against
+    /// the epoch, so the golden file is internally consistent about one
+    /// clock rather than pinning three unrelated numbers.
     fn fixture_health() -> RegistrarHealth {
         RegistrarHealth {
             limiter: LimiterHealth::default(),
@@ -3039,6 +3491,22 @@ mod tests {
                 retention_shortfall: Some(false),
                 records_measured_at: Some(OffsetDateTime::UNIX_EPOCH),
             },
+            certificates: vec![
+                CertificateHealth {
+                    leaf: SurfaceLeaf::RegistrarClient,
+                    not_after: OffsetDateTime::UNIX_EPOCH + time::Duration::days(30),
+                    remaining_seconds: 2_592_000,
+                    last_renewal_outcome: RenewalOutcome::Succeeded,
+                    last_renewal_at: Some(OffsetDateTime::UNIX_EPOCH),
+                },
+                CertificateHealth {
+                    leaf: SurfaceLeaf::EndpointServer,
+                    not_after: OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1),
+                    remaining_seconds: -1,
+                    last_renewal_outcome: RenewalOutcome::NeverAttempted,
+                    last_renewal_at: None,
+                },
+            ],
         }
     }
 

@@ -30,6 +30,7 @@ use crate::acme::IssuedMaterial;
 use crate::config::{RegistrarEndpointSettings, Settings};
 use crate::registrar::endpoint;
 use crate::registrar::endpoint::activation::ActivationContract;
+use crate::registrar::endpoint::protocol::{CertificateHealth, RegistrarHealth, RenewalOutcome};
 use crate::registrar::endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE;
 use crate::registrar::internal::PrivateKeyPem;
 use crate::registrar::verbs::outcome::CallerIdentity;
@@ -582,6 +583,284 @@ fn a_failure_retains_the_lifetime_a_success_replaces() {
         }
     );
     assert_eq!(entry.attempted_at, Some(failed_at));
+}
+
+// ---------------------------------------------------------------------
+// What the accessor becomes on the endpoint's health wire
+// ---------------------------------------------------------------------
+
+/// A fresh shared health snapshot, the way the daemon holds one.
+fn health_holder() -> Arc<std::sync::Mutex<RegistrarHealth>> {
+    Arc::new(std::sync::Mutex::new(RegistrarHealth::default()))
+}
+
+fn certificates_of(health: &Arc<std::sync::Mutex<RegistrarHealth>>) -> Vec<CertificateHealth> {
+    health
+        .lock()
+        .expect("the snapshot lock is not poisoned")
+        .certificates
+        .clone()
+}
+
+/// The preparation seed alone is enough to populate `certificates`.
+///
+/// This is the first-response case: the copy runs with the accessor in
+/// exactly the state preparation left it — both leaves observed, nothing
+/// attempted — and it happens before any maintenance tick, so the entries
+/// a caller sees on the very first response are these.
+#[tokio::test]
+async fn the_preparation_seed_is_two_never_attempted_health_entries() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let health = health_holder();
+    let now = OffsetDateTime::now_utc();
+
+    crate::daemon::refresh_registrar_certificates(&health, &renewal.state(), now);
+
+    let entries = certificates_of(&health);
+    assert_eq!(entries.len(), 2, "both seeded leaves are reported");
+    assert_eq!(
+        entries.iter().map(|entry| entry.leaf).collect::<Vec<_>>(),
+        vec![SurfaceLeaf::RegistrarClient, SurfaceLeaf::EndpointServer],
+        "the fixed entry order is the caller-facing leaf first"
+    );
+    for entry in &entries {
+        assert_eq!(
+            entry.last_renewal_outcome,
+            RenewalOutcome::NeverAttempted,
+            "the seed is not an attempt"
+        );
+        assert_eq!(
+            entry.last_renewal_at, None,
+            "a never-attempted leaf carries no timestamp at all"
+        );
+        let observed = observed_not_after(&harness.pair(entry.leaf).cert_path)
+            .await
+            .expect("the fixture leaf parses");
+        assert_eq!(
+            entry.not_after, observed,
+            "the reported lifetime is the one preparation observed"
+        );
+        assert_eq!(
+            entry.remaining_seconds,
+            CertificateHealth::remaining_seconds(observed, now),
+            "the seconds left are calculated against the tick's clock"
+        );
+        // Not `{entry:?}`: a certificate record rendered into a failure
+        // message is what a secret-in-the-log scanner reads, and the
+        // assertions above already say which leaf this is.
+        assert!(
+            entry.remaining_seconds > 0,
+            "the fixture's leaves are live rather than already lapsed"
+        );
+    }
+}
+
+/// A failure while the leaf is still valid is exactly the state the
+/// member exists to announce, and the next refresh carries it.
+///
+/// The retained `notAfter` is the point: the leaf has not lapsed, so a
+/// reader has the whole interval between this refresh and that timestamp
+/// to repair the renewal quietly.
+#[tokio::test]
+async fn a_failed_renewal_while_valid_reaches_the_next_health_refresh() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let state = renewal.state();
+    let health = health_holder();
+    let now = OffsetDateTime::now_utc();
+
+    crate::daemon::refresh_registrar_certificates(&health, &state, now);
+    let seeded = certificates_of(&health);
+
+    let failed_at = now + time::Duration::minutes(1);
+    state.record_failure(SurfaceLeaf::EndpointServer, "the CA said no", failed_at);
+    crate::daemon::refresh_registrar_certificates(&health, &state, failed_at);
+
+    let entries = certificates_of(&health);
+    assert_eq!(entries.len(), 2, "a failure loses neither entry");
+    let client = entries.first().expect("the client entry");
+    assert_eq!(client.leaf, SurfaceLeaf::RegistrarClient);
+    assert_eq!(
+        client.last_renewal_outcome,
+        RenewalOutcome::NeverAttempted,
+        "the other leaf is untouched by this one's failure"
+    );
+
+    let server = entries.get(1).expect("the server entry");
+    assert_eq!(server.leaf, SurfaceLeaf::EndpointServer);
+    assert_eq!(server.last_renewal_outcome, RenewalOutcome::Failed);
+    assert_eq!(server.last_renewal_at, Some(failed_at));
+    let seeded_server = seeded.get(1).expect("the seeded server entry");
+    assert_eq!(
+        server.not_after, seeded_server.not_after,
+        "a failed attempt retains the lifetime the leaf still has"
+    );
+    assert!(
+        server.remaining_seconds > 0,
+        "the failure is reported while the leaf is still valid: {server:?}"
+    );
+    assert!(
+        server.remaining_seconds < seeded_server.remaining_seconds,
+        "the seconds left follow the tick's clock rather than being copied"
+    );
+
+    // The reason stays off the wire: it names local paths and local
+    // dependencies, and no caller can act on one.
+    let encoded =
+        serde_json::to_string(&*health.lock().expect("the snapshot lock is not poisoned"))
+            .expect("the snapshot serializes");
+    assert!(
+        !encoded.contains("the CA said no"),
+        "the failure reason is not published: {encoded}"
+    );
+}
+
+/// A success replaces both the lifetime and the outcome on the wire.
+#[tokio::test]
+async fn a_successful_renewal_replaces_the_reported_lifetime() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let state = renewal.state();
+    let health = health_holder();
+    let now = OffsetDateTime::now_utc();
+
+    crate::daemon::refresh_registrar_certificates(&health, &state, now);
+    let seeded = certificates_of(&health);
+    let before = seeded.first().expect("the client entry").not_after;
+
+    let renewed = before + time::Duration::days(30);
+    state.record_success(SurfaceLeaf::RegistrarClient, renewed, now);
+    crate::daemon::refresh_registrar_certificates(&health, &state, now);
+
+    let entry = certificates_of(&health)
+        .first()
+        .cloned()
+        .expect("the client entry");
+    assert_eq!(entry.leaf, SurfaceLeaf::RegistrarClient);
+    assert_eq!(entry.not_after, renewed);
+    assert_eq!(entry.last_renewal_outcome, RenewalOutcome::Succeeded);
+    assert_eq!(entry.last_renewal_at, Some(now));
+    assert_eq!(
+        entry.remaining_seconds,
+        CertificateHealth::remaining_seconds(renewed, now)
+    );
+}
+
+/// A refresh replaces the whole sequence, so a stale entry cannot
+/// survive one and a repeated refresh cannot accumulate entries.
+#[tokio::test]
+async fn a_refresh_replaces_the_whole_sequence() {
+    let harness = Harness::build();
+    let renewal = harness.renewal().await;
+    let health = health_holder();
+    health
+        .lock()
+        .expect("the snapshot lock is not poisoned")
+        .certificates = vec![CertificateHealth {
+        leaf: SurfaceLeaf::EndpointServer,
+        not_after: OffsetDateTime::UNIX_EPOCH,
+        remaining_seconds: i64::MIN,
+        last_renewal_outcome: RenewalOutcome::Failed,
+        last_renewal_at: Some(OffsetDateTime::UNIX_EPOCH),
+    }];
+
+    for _ in 0..3 {
+        crate::daemon::refresh_registrar_certificates(
+            &health,
+            &renewal.state(),
+            OffsetDateTime::now_utc(),
+        );
+    }
+
+    let entries = certificates_of(&health);
+    assert_eq!(entries.len(), 2, "neither stale nor accumulated");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.last_renewal_outcome)
+            .collect::<Vec<_>>(),
+        vec![RenewalOutcome::NeverAttempted; 2],
+        "the planted entry is gone"
+    );
+}
+
+/// An accessor nobody initialized reports nothing rather than inventing
+/// a lifetime. That is the disabled-endpoint shape, where no adapter was
+/// ever built.
+#[test]
+fn an_uninitialized_accessor_reports_no_certificates() {
+    let health = health_holder();
+    crate::daemon::refresh_registrar_certificates(
+        &health,
+        &RegistrarCertRenewalState::default(),
+        OffsetDateTime::now_utc(),
+    );
+    assert!(certificates_of(&health).is_empty());
+}
+
+/// The reporting path reads the accessor and nothing else.
+///
+/// Asserted over the function's own source because it is a property of
+/// the whole body rather than of any one value: a filesystem read added
+/// here would put a stat and a PEM parse on the daemon's tick, and — via
+/// the shared snapshot the handler clones — behind an endpoint a caller
+/// can drive.
+#[test]
+fn the_certificate_refresh_reads_no_certificate_file() {
+    let source = include_str!("../daemon.rs");
+    let body = source
+        .split("pub(crate) fn refresh_registrar_certificates")
+        .nth(1)
+        .expect("the refresh function is in the daemon source");
+    let end = body
+        .find("\n}\n")
+        .expect("the refresh function has a closing brace at column zero");
+    let refresh = body.get(..end).expect("the body slice is in bounds");
+    for reader in [
+        "std::fs",
+        "tokio::fs",
+        "observed_not_after",
+        "parse_cert_not_after",
+        "cert_path",
+        "read(",
+        "metadata",
+    ] {
+        assert!(
+            !refresh.contains(reader),
+            "the refresh must not touch the filesystem ({reader})"
+        );
+    }
+    assert!(
+        refresh.contains("renewal.leaf("),
+        "every value comes through the accessor"
+    );
+}
+
+/// The two seeded entries reach the shared snapshot before the accept
+/// task exists, so the first response a caller can possibly receive
+/// already carries them.
+///
+/// Asserted over `run_daemon`'s source for the same reason
+/// `the_adapter_is_armed_before_anything_is_spawned` is: the ordering
+/// lives in one function and nothing else can observe it.
+#[test]
+fn the_seed_reaches_the_snapshot_before_the_endpoint_serves() {
+    let source = include_str!("../daemon.rs");
+    let body = source
+        .split("pub(crate) async fn run_daemon")
+        .nth(1)
+        .expect("run_daemon is in that file");
+    let seeded_at = body
+        .find("refresh_registrar_certificates(")
+        .expect("run_daemon copies the seeded certificate state");
+    let served_at = body
+        .find("spawn_registrar_endpoint(")
+        .expect("run_daemon spawns the accept task");
+    assert!(
+        seeded_at < served_at,
+        "the snapshot is seeded before the endpoint begins serving"
+    );
 }
 
 /// The adapter is armed before the invocation spawns anything, which is

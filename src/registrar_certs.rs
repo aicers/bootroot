@@ -126,7 +126,17 @@ const SURFACE_LEAF_PUBLICATION: LeafPublication = LeafPublication::LeafWithChain
 /// The two are evaluated and issued independently: one being usable is
 /// never a reason to leave the other unusable, and one needing issuance
 /// is never a reason to re-issue the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// The variants carry the endpoint's wire spelling for a leaf as well:
+/// `serde` renders them `endpoint_server` and `registrar_client`, which
+/// is the closed enum the health snapshot's `certificates` entries and
+/// the endpoint client's lapse diagnostic both name a leaf with. One
+/// type rather than two keeps a wire spelling from drifting from the
+/// leaf it reports on.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SurfaceLeaf {
     /// The leaf the endpoint presents. A server certificate, so it takes
     /// the ordinary CSR shape and requests no extended key usage.
@@ -137,6 +147,21 @@ pub(crate) enum SurfaceLeaf {
 }
 
 impl SurfaceLeaf {
+    /// The one spelling of this leaf's name on the endpoint's health
+    /// wire, which [`Display`](std::fmt::Display) also renders.
+    ///
+    /// Distinct from [`SurfaceLeaf::label`], which is the prose phrase a
+    /// daemon log sentence reads with. This is the token an operator
+    /// greps: the same string the `certificates` entries carry in `leaf`
+    /// and the lapse diagnostic names, so one search finds both.
+    #[must_use]
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::EndpointServer => "endpoint_server",
+            Self::RegistrarClient => "registrar_client",
+        }
+    }
+
     /// The reserved service label this leaf's name carries.
     #[must_use]
     pub(crate) fn service_label(self) -> &'static str {
@@ -204,6 +229,12 @@ impl SurfaceLeaf {
             Self::EndpointServer => "[registrar_endpoint] server_key_path",
             Self::RegistrarClient => "[registrar_endpoint] client_key_path",
         }
+    }
+}
+
+impl std::fmt::Display for SurfaceLeaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
     }
 }
 

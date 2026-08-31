@@ -141,13 +141,13 @@ pub(crate) enum RenewalAttempt {
 
 /// What the accessor holds about one leaf.
 ///
-/// These three values are exactly what the reporting sibling publishes,
-/// so they are written here and read there. Until that sibling lands
-/// nothing outside a test reads them, and they carry the same
+/// These three values are exactly what the endpoint's health snapshot
+/// publishes, so they are written here and read there — by
+/// [`crate::daemon::refresh_registrar_certificates`], on the daemon's
+/// maintenance cadence and never on a request path. They carry the same
 /// justification [`RegistrarCertRenewalState::leaf`] records: a reader
 /// that re-derived a lifetime from disk is the thing this seam exists
 /// to forbid.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct LeafRenewalState {
     /// The `notAfter` of the certificate currently at the leaf's
@@ -240,13 +240,10 @@ impl RegistrarCertRenewalState {
     /// Returns one leaf's state, or `None` where the endpoint is
     /// disabled and no entry was ever made.
     ///
-    /// The read side of the accessor. Its consumer — the reporting
-    /// sibling that publishes these three values in the endpoint health
-    /// container — is a separate issue, so nothing outside a test reads
-    /// it yet. It exists now because the accessor is the whole interface
-    /// between the two, and a reader that had to re-derive a lifetime
+    /// The read side of the accessor, and the whole interface between
+    /// the renewal loop and the endpoint health container that publishes
+    /// these three values. A reader that had to re-derive a lifetime
     /// from disk is exactly what that seam forbids.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn leaf(&self, leaf: SurfaceLeaf) -> Option<LeafRenewalState> {
         self.with(|entries| entries.get(&leaf).cloned())
@@ -857,10 +854,9 @@ impl RegistrarCertRenewal {
 
     /// Returns the accessor this adapter writes.
     ///
-    /// Handed to the reporting sibling when it lands; until then only a
-    /// test reads it, for the same reason [`RegistrarCertRenewalState::leaf`]
-    /// records.
-    #[allow(dead_code)]
+    /// Handed to the daemon's maintenance state once the adapter is
+    /// armed, so the endpoint's health snapshot reports both leaves from
+    /// the same values this loop maintains.
     pub(crate) fn state(&self) -> RegistrarCertRenewalState {
         self.state.clone()
     }

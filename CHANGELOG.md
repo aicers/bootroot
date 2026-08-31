@@ -33,6 +33,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   half carrying its own measurement timestamp. `audit_store_low_water_bytes
   = 0` is now refused at configuration load, because at zero the alarm
   band is empty and the alarm could never fire.
+- The registrar endpoint now reports both of its own certificates in every
+  response's `registrar_health.certificates` member, on refusals as well as
+  successes. The two entries — `registrar_client` first, then
+  `endpoint_server` — each carry the leaf's `not_after`, the signed whole
+  seconds left before it, the last renewal's outcome
+  (`never_attempted`, `succeeded` or `failed`) and, once something has been
+  attempted, when that attempt ran. The seconds left are floored, so a leaf
+  that expired a moment ago reads as `-1` rather than as the `0` that means
+  "expiring exactly now". Both entries are present from the first response an
+  endpoint serves, seeded from the certificates already on disk without
+  contacting `OpenBao` or the CA, and are refreshed on the maintenance
+  cadence the daemon already runs — serving a request reads no certificate
+  file. A `failed` outcome beside a still-positive remaining lifetime is the
+  signal the member exists for: the leaf is valid, callers are unaffected,
+  and the interval before `not_after` is the window in which the renewal can
+  be repaired quietly. A caller that finds either leaf already expired now
+  gets a typed lapse error naming which side lapsed, rather than an
+  undifferentiated material or handshake failure: an expired registrar client
+  leaf is reported before a socket is opened, and a TLS expiry verdict on the
+  endpoint's leaf is reported as the lapse it is. Neither is retryable, and
+  the diagnostic points at restoring the daemon's certificate maintenance
+  rather than at re-provisioning the host.
 - `bootroot-agent` can now serve the registrar endpoint. Setting
   `[registrar_endpoint] enabled = true` on a bootroot host makes the
   daemon build the registrar verb layer from its `[registrar]` settings
