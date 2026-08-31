@@ -45,6 +45,7 @@ log_phase() { CURRENT_PHASE="$1"; printf '{"ts":"%s","phase":"%s"}\n' "$(date -u
 pass() { printf '[registrar-redteam][%s] PASS %s\n' "$CURRENT_PHASE" "$1" | tee -a "$RUN_LOG"; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
 stat_mode() { stat -c '%u:%g:%a' "$1" 2>/dev/null || stat -f '%u:%g:%OLp' "$1"; }
+root_stat_mode() { sudo -n stat -c '%u:%g:%a' "$1" 2>/dev/null || sudo -n stat -f '%u:%g:%OLp' "$1"; }
 digest_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 certificate_der_digest() { if command -v sha256sum >/dev/null; then openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'; else openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'; fi; }
 compose() { BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" "$@"; }
@@ -381,8 +382,8 @@ while True:
     time.sleep(1)
 ' "$fixture_socket" >>"$ARTIFACT_DIR/unprivileged-peer.log" 2>&1 &
   fixture_pid=$!
-  for _ in $(seq 1 10); do [ -S "$fixture_socket" ] && break; sleep 1; done
-  if [ ! -S "$fixture_socket" ]; then
+  for _ in $(seq 1 10); do sudo -n test -S "$fixture_socket" && break; sleep 1; done
+  if ! sudo -n test -S "$fixture_socket"; then
     if kill -0 "$fixture_pid" 2>/dev/null; then
       sudo -n ps -o pid=,uid=,gid=,stat=,args= -p "$fixture_pid" >>"$ARTIFACT_DIR/unprivileged-peer.log" 2>&1 || true
     else
@@ -392,8 +393,8 @@ while True:
   fi
   sudo -n chown 0:0 "$fixture_dir" "$fixture_socket"
   sudo -n chmod 0700 "$fixture_dir" "$fixture_socket"
-  [ "$(stat_mode "$fixture_dir")" = "0:0:700" ] || fail "post-bind fixture directory metadata is wrong"
-  [ "$(stat_mode "$fixture_socket")" = "0:0:700" ] || fail "post-bind fixture socket metadata is wrong"
+  [ "$(root_stat_mode "$fixture_dir")" = "0:0:700" ] || fail "post-bind fixture directory metadata is wrong"
+  [ "$(root_stat_mode "$fixture_socket")" = "0:0:700" ] || fail "post-bind fixture socket metadata is wrong"
   if sudo -n python3 "$DRIVER" --socket "$fixture_socket" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$RUN_ROOT/empty.json"; then
     kill "$fixture_pid" 2>/dev/null || true
     fail "caller accepted a root-looking socket served by an unprivileged peer"
