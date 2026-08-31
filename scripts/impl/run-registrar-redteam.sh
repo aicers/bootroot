@@ -481,7 +481,10 @@ assert_socket_refusals() {
   before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
   nobody="$(id -un 65534 2>/dev/null || printf nobody)"; control stop; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
-  sudo -n python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("registrar-client.key", "missing-client.key"))' "$DAEMON_CONFIG"
+  # The registrar client key is issued during startup but is not needed to
+  # serve the already-running endpoint. Break the endpoint server key, which
+  # its TLS listener must load before the inherited socket can accept calls.
+  sudo -n python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("registrar-endpoint.key", "missing-endpoint.key"))' "$DAEMON_CONFIG"
   control restart
   # The supervisor starts the child as root. An unprivileged `kill -0` sees
   # EPERM for a live child, which is not evidence that the bad configuration
