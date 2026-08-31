@@ -46,6 +46,7 @@ pass() { printf '[registrar-redteam][%s] PASS %s\n' "$CURRENT_PHASE" "$1" | tee 
 require() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
 stat_mode() { stat -c '%u:%g:%a' "$1" 2>/dev/null || stat -f '%u:%g:%OLp' "$1"; }
 digest_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+certificate_der_digest() { if command -v sha256sum >/dev/null; then openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'; else openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'; fi; }
 compose() { BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" "$@"; }
 bootroot() { (cd "$WORK_DIR" && "$BOOTROOT_BIN" "$@"); }
 
@@ -252,7 +253,7 @@ start_daemon() {
   SUPERVISOR_PID=$!
   for _ in $(seq 1 90); do [ -S "$SOCKET_PATH" ] && [ -s "$RUN_ROOT/agent.pid" ] && [ -s "$SURFACE_DIR/registrar-client.crt" ] && break; sleep 1; done
   [ -s "$SURFACE_DIR/registrar-client.crt" ] || fail "daemon did not issue registrar surface material"
-  printf '%s\n' "$(digest_file "$ROOT_CA")" >"$SURFACE_DIR/registrar-endpoint-anchors.sha256"
+  printf '%s\n' "$(certificate_der_digest "$ROOT_CA")" >"$SURFACE_DIR/registrar-endpoint-anchors.sha256"
 }
 
 stage_bundle() {
@@ -406,7 +407,7 @@ assert_socket_refusals() {
 main() {
   : >"$RUN_LOG"; : >"$PHASE_LOG"; trap cleanup EXIT
   log_phase validate
-  for command in docker jq curl cargo python3 sudo; do require "$command"; done
+  for command in docker jq curl cargo openssl python3 sudo; do require "$command"; done
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
