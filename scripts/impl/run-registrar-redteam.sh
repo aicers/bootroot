@@ -166,7 +166,8 @@ build_and_initialize() {
 }
 
 apply_endpoint_dns_alias() {
-  local alias="001.bootroot-registrar-endpoint.redteam.trusted.domain"
+  local client_alias="001.bootroot-registrar.redteam.trusted.domain"
+  local endpoint_alias="001.bootroot-registrar-endpoint.redteam.trusted.domain"
   local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml"
   local responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
   cat >"$override" <<EOF
@@ -175,18 +176,21 @@ services:
     networks:
       default:
         aliases:
-          - ${alias}
+          - ${client_alias}
+          - ${endpoint_alias}
 EOF
   [ -f "$responder_override" ] || fail "init did not render the responder compose override"
   BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 || fail "could not apply the registrar endpoint DNS alias"
-  for _ in $(seq 1 15); do
-    if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
-      pass "step-ca can reach the registrar endpoint through its DNS alias"
-      return
-    fi
-    sleep 1
+  for alias in "$client_alias" "$endpoint_alias"; do
+    for _ in $(seq 1 15); do
+      if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+    docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1 || fail "step-ca cannot reach registrar hostname ${alias} through its DNS alias"
   done
-  fail "step-ca cannot reach the registrar endpoint through its DNS alias"
+  pass "step-ca can reach both registrar hostnames through DNS aliases"
 }
 
 write_daemon_config() {
