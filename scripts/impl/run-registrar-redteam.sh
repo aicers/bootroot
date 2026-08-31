@@ -481,10 +481,11 @@ assert_socket_refusals() {
   before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
   nobody="$(id -un 65534 2>/dev/null || printf nobody)"; control stop; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
-  # The registrar client key is issued during startup but is not needed to
-  # serve the already-running endpoint. Break the endpoint server key, which
-  # its TLS listener must load before the inherited socket can accept calls.
-  sudo -n python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("registrar-endpoint.key", "missing-endpoint.key"))' "$DAEMON_CONFIG"
+  # Startup repairs an unusable surface key before endpoint activation. The
+  # trust bundle is outside that issuance step but mandatory for the TLS
+  # listener, so a missing configured bundle proves a failed start instead of
+  # exercising self-repair.
+  sudo -n python3 -c 'import pathlib,re,sys; p=pathlib.Path(sys.argv[1]); source=p.read_text(); changed,count=re.subn(r"(?m)^(ca_bundle_path[ \\t]*=[ \\t]*)[^\\n]+$", r"\\1" + chr(34) + "/nonexistent/registrar-redteam-ca.pem" + chr(34), source, count=1); assert count == 1, "missing trust ca_bundle_path"; p.write_text(changed)' "$DAEMON_CONFIG"
   control restart
   # The supervisor starts the child as root. An unprivileged `kill -0` sees
   # EPERM for a live child, which is not evidence that the bad configuration
