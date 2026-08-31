@@ -1313,7 +1313,8 @@ impl OpenBaoClient {
     /// Creates or converges the one trusted `auth/cert` entry.
     ///
     /// `ca_pem` is the deployment root the entry trusts, `allowed_dns`
-    /// the single DNS SAN it accepts, and `policies` the exact token
+    /// and its matching common name constrain the one internal leaf it
+    /// accepts, and `policies` the exact token
     /// policy set. `token_no_default_policy` is set, so the issued token
     /// carries the allowlist and nothing else.
     ///
@@ -1332,6 +1333,7 @@ impl OpenBaoClient {
         struct CertEntryRequest<'a> {
             certificate: &'a str,
             allowed_dns_sans: &'a str,
+            allowed_common_names: &'a str,
             token_policies: &'a [&'a str],
             token_no_default_policy: bool,
             token_ttl: &'a str,
@@ -1343,6 +1345,7 @@ impl OpenBaoClient {
             &CertEntryRequest {
                 certificate: ca_pem,
                 allowed_dns_sans: allowed_dns,
+                allowed_common_names: allowed_dns,
                 token_policies: policies,
                 token_no_default_policy: true,
                 token_ttl,
@@ -2531,13 +2534,13 @@ mod cert_auth_tests {
         let body = captured.lock().expect("capture").clone().expect("a body");
         assert_eq!(body["certificate"], ROOT_PEM);
         assert_eq!(body["allowed_dns_sans"], SAN);
+        assert_eq!(body["allowed_common_names"], SAN);
         assert_eq!(body["token_policies"], json!([ENTRY]));
         assert_eq!(body["token_no_default_policy"], json!(true));
         assert_eq!(body["token_ttl"], "1h");
         assert_eq!(body["token_max_ttl"], "1h");
         // Nothing that would widen the entry beyond the one name.
         for widened in [
-            "allowed_common_names",
             "allowed_organizational_units",
             "allowed_uri_sans",
             "allowed_email_sans",
