@@ -371,16 +371,25 @@ assert_post_bind_peer_fixture() {
   sudo -n chown "$uid:$gid" "$fixture_dir"
   sudo -n chmod 0700 "$fixture_dir"
   sudo -n setpriv --reuid="$uid" --regid="$gid" --clear-groups python3 -c '
-import socket, sys, time
+import os, socket, sys, time
+print(f"starting unprivileged peer fixture uid={os.getuid()} gid={os.getgid()}", flush=True)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[1]); s.listen(1)
+print(f"listening on {sys.argv[1]}", flush=True)
 while True:
     conn, _ = s.accept()
     time.sleep(1)
 ' "$fixture_socket" >>"$ARTIFACT_DIR/unprivileged-peer.log" 2>&1 &
   fixture_pid=$!
   for _ in $(seq 1 10); do [ -S "$fixture_socket" ] && break; sleep 1; done
-  [ -S "$fixture_socket" ] || fail "unprivileged peer fixture did not bind"
+  if [ ! -S "$fixture_socket" ]; then
+    if kill -0 "$fixture_pid" 2>/dev/null; then
+      sudo -n ps -o pid=,uid=,gid=,stat=,args= -p "$fixture_pid" >>"$ARTIFACT_DIR/unprivileged-peer.log" 2>&1 || true
+    else
+      wait "$fixture_pid" 2>>"$ARTIFACT_DIR/unprivileged-peer.log" || true
+    fi
+    fail "unprivileged peer fixture did not bind"
+  fi
   sudo -n chown 0:0 "$fixture_dir" "$fixture_socket"
   sudo -n chmod 0700 "$fixture_dir" "$fixture_socket"
   [ "$(stat_mode "$fixture_dir")" = "0:0:700" ] || fail "post-bind fixture directory metadata is wrong"
