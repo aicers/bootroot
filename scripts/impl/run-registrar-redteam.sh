@@ -50,7 +50,18 @@ bootroot() { (cd "$WORK_DIR" && "$BOOTROOT_BIN" "$@"); }
 cleanup() {
   local status=$?
   log_phase cleanup
-  if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then printf 'quit\n' >"$CONTROL_FIFO" 2>/dev/null || true; wait "$SUPERVISOR_PID" 2>/dev/null || true; fi
+  if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+    printf 'quit\n' >"$CONTROL_FIFO" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+      kill -0 "$SUPERVISOR_PID" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
+      [ -s "$RUN_ROOT/agent.pid" ] && sudo -n kill -TERM "$(cat "$RUN_ROOT/agent.pid")" 2>/dev/null || true
+      kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+    fi
+    wait "$SUPERVISOR_PID" 2>/dev/null || true
+  fi
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
     compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
     if command -v timeout >/dev/null 2>&1; then
@@ -147,7 +158,10 @@ build_and_initialize() {
     cat "$ARTIFACT_DIR/empty-eab-status.txt" "$ARTIFACT_DIR/empty-eab-headers.txt" "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
     fail "could not record the explicit empty agent EAB"
   fi
-  bootroot infra up --compose-file "$WORK_DIR/docker-compose.deploy.yml" --agent-config "$INITIAL_CONFIG" --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 || fail "could not start initialized deployment"
+  # `init` has already recreated the responder with its rendered HMAC and
+  # started the OpenBao agents. Replaying `infra up` here races that rendered
+  # configuration with the base image and leaves the registrar's pre-issued
+  # HMAC unable to authenticate to the responder.
   pass "initialized an isolated live TLS OpenBao deployment"
 }
 
