@@ -485,7 +485,7 @@ assert_socket_refusals() {
   # trust bundle is outside that issuance step but mandatory for the TLS
   # listener, so a missing configured bundle proves a failed start instead of
   # exercising self-repair.
-  sudo -n python3 -c 'import pathlib,re,sys; p=pathlib.Path(sys.argv[1]); source=p.read_text(); changed,count=re.subn(r"(?m)^(ca_bundle_path[ \\t]*=[ \\t]*)[^\\n]+$", r"\\1" + chr(34) + "/nonexistent/registrar-redteam-ca.pem" + chr(34), source, count=1); assert count == 1, "missing trust ca_bundle_path"; p.write_text(changed)' "$DAEMON_CONFIG"
+  sudo -n python3 -c 'import pathlib,re,sys; p=pathlib.Path(sys.argv[1]); source=p.read_text(); changed,count=re.subn(r"(?m)^(ca_bundle_path[ \t]*=[ \t]*)[^\n]+$", r"\1" + chr(34) + "/nonexistent/registrar-redteam-ca.pem" + chr(34), source, count=1); assert count == 1, "missing trust ca_bundle_path"; p.write_text(changed)' "$DAEMON_CONFIG"
   control restart
   # The supervisor starts the child as root. An unprivileged `kill -0` sees
   # EPERM for a live child, which is not evidence that the bad configuration
