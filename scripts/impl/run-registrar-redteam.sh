@@ -275,7 +275,11 @@ client() { python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-e
 write_mint() { jq -n --argjson group "$2" '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:"review",service_name:"review",reload:"docker-restart",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
 
 assert_escalation_denied() {
-  local status policies; status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -X POST "$OPENBAO_URL/v1/auth/cert/login" || true)"; [ "$status" -ge 400 ] || fail "registrar leaf authenticated through auth/cert"
+  local status policies
+  # The daemon's credential always names its fixed cert-auth role. Supply that
+  # public role name to exercise the same privileged role explicitly.
+  status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -H 'Content-Type: application/json' -X POST -d '{"name":"bootroot-registrar-internal"}' "$OPENBAO_URL/v1/auth/cert/login" || true)"
+  [ "$status" -ge 400 ] || fail "registrar leaf authenticated through bootroot-internal auth/cert role"
   policies="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$POLICIES")"
   for endpoint in auth/approle/role/redteam-escalation sys/policies/acl/redteam-escalation; do status="$(curl -sS -o "$ARTIFACT_DIR/unauth-${endpoint//\//-}.json" -w '%{http_code}' -X POST -d "{\"token_policies\":${policies},\"policy\":\"path \\\"*\\\" { capabilities = [\\\"sudo\\\"] }\"}" "$OPENBAO_URL/v1/$endpoint" || true)"; [ "$status" -ge 400 ] || fail "unauthenticated attacker wrote $endpoint"; done
   for path in bootroot/ca bootroot/infra/responder_hmac bootroot/infra/agent_eab bootroot/services/redteam-review/secret_id; do status="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" "$OPENBAO_URL/v1/secret/data/$path" || true)"; [ "$status" -ge 400 ] || fail "registrar material read $path directly"; done
