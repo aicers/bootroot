@@ -319,7 +319,7 @@ assert_functionality_and_audit() {
   sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-role.json" 2>&1 && fail "refused mint created an AppRole"
   sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/sys/policies/acl/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-policy.json" 2>&1 && fail "refused mint created a policy"
   sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/secret/data/bootroot/services/redteam-review/secret_id" >"$ARTIFACT_DIR/refused-kv.json" 2>&1 && fail "refused mint wrote service KV"
-  jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-deregister"}' >"$deregister"; for expected in identity_removed idempotent_already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
+  jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-deregister"}' >"$deregister"; for expected in removed already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
   assert_openbao_audit_log "${INSTANCE}-openbao" /openbao/audit/audit.log
   pass "mint/deregister are idempotent, refusal is audited, and OpenBao writes are contained"
 }
