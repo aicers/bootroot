@@ -274,7 +274,7 @@ assert_socket_contract() {
 }
 
 client() { python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
-write_mint() { jq -n --argjson group "$2" '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:"review",service_name:"review",reload:"docker-restart",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
+write_mint() { jq -n --arg group "$2" '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
 
 assert_escalation_denied() {
   local status policies
@@ -301,7 +301,10 @@ assert_escalation_denied() {
 
 assert_functionality_and_audit() {
   local mint="$RUN_ROOT/mint.json" refused="$RUN_ROOT/refused.json" reserved="$RUN_ROOT/reserved.json" deregister="$RUN_ROOT/deregister.json" first second role policies before after result
-  write_mint "$mint" 3000; first="$(client --operation mint --payload "$mint")" || fail "first mint failed"; second="$(client --operation mint --payload "$mint")" || fail "idempotent mint failed"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
+  write_mint "$mint" 3000
+  client --operation mint --payload "$mint" >"$ARTIFACT_DIR/first-mint.json" 2>"$ARTIFACT_DIR/first-mint.err" || { cat "$ARTIFACT_DIR/first-mint.err" >>"$RUN_LOG"; fail "first mint failed"; }
+  client --operation mint --payload "$mint" >"$ARTIFACT_DIR/idempotent-mint.json" 2>"$ARTIFACT_DIR/idempotent-mint.err" || { cat "$ARTIFACT_DIR/idempotent-mint.err" >>"$RUN_LOG"; fail "idempotent mint failed"; }
+  first="$(cat "$ARTIFACT_DIR/first-mint.json")"; second="$(cat "$ARTIFACT_DIR/idempotent-mint.json")"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
   REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"; role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/$REGISTRATION_ID")"; policies="$(jq -c '.data.token_policies | sort' <<<"$role")"; [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"
   jq '.service_name = "bootroot-registrar" | .spec.service_name = "bootroot-registrar"' "$mint" >"$reserved"; client --operation mint --payload "$reserved" >"$ARTIFACT_DIR/reserved-identity.json" || fail "reserved identity refusal exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/reserved-identity.json" >/dev/null || fail "registrar leaf was accepted as a service identity"
   write_mint "$refused" 999; before="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; client --operation mint --payload "$refused" >"$ARTIFACT_DIR/refused-mint.json" || fail "refused mint exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/refused-mint.json" >/dev/null || fail "unsafe mint was not refused"; after="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; [ "$after" -gt "$before" ] || fail "refused mint wrote no audit record"; grep -R '"phase":"intent"' "$RECORD_DIR" >/dev/null && grep -R '"phase":"outcome"' "$RECORD_DIR" >/dev/null || fail "refused mint lacks paired audit records"
