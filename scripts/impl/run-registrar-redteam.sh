@@ -54,7 +54,7 @@ cleanup() {
   local status=$?
   log_phase cleanup
   if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-    printf 'quit\n' >"$CONTROL_FIFO" 2>/dev/null || true
+    control quit || true
     for _ in $(seq 1 15); do
       kill -0 "$SUPERVISOR_PID" 2>/dev/null || break
       sleep 1
@@ -279,6 +279,7 @@ assert_socket_contract() {
 # path-occupation checks below prove that an unprivileged caller cannot reach
 # this socket at all.
 client() { sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
+control() { printf '%s\n' "$1" | sudo -n tee "$CONTROL_FIFO" >/dev/null; }
 write_mint() { jq -n --arg group "$2" '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
 
 assert_escalation_denied() {
@@ -398,16 +399,16 @@ assert_socket_refusals() {
   printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-empty || fail "unknown socket operation was served"
   printf '%064d\n' 0 >"$wrong"; if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
   if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
-  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; printf 'restart\n' >"$CONTROL_FIFO"; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
-  nobody="$(id -un 65534 2>/dev/null || printf nobody)"; printf 'stop\n' >"$CONTROL_FIFO"; sleep 1
+  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
+  nobody="$(id -un 65534 2>/dev/null || printf nobody)"; control stop; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
   sudo -n python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("registrar-client.key", "missing-client.key"))' "$DAEMON_CONFIG"
-  printf 'restart\n' >"$CONTROL_FIFO"
+  control restart
   for _ in $(seq 1 10); do kill -0 "$(cat "$RUN_ROOT/agent.pid")" 2>/dev/null || break; sleep 1; done
   if kill -0 "$(cat "$RUN_ROOT/agent.pid")" 2>/dev/null; then fail "deliberately invalid daemon configuration did not fail startup"; fi
   if sudo -n -u "$nobody" python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$SOCKET_PATH"; then fail "unprivileged peer connected while daemon stopped"; fi
   if sudo -n -u "$nobody" python3 -c 'import os,socket,sys; os.unlink(sys.argv[1]); socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SOCKET_PATH"; then fail "unprivileged peer occupied stopped socket path"; fi
-  sudo -n mv "$RUN_ROOT/registrar-agent.good.toml" "$DAEMON_CONFIG"; printf 'restart\n' >"$CONTROL_FIFO"
+  sudo -n mv "$RUN_ROOT/registrar-agent.good.toml" "$DAEMON_CONFIG"; control restart
   pass "all non-verbs, pin failures, restart behavior, and path occupation attempts are refused"
 }
 
