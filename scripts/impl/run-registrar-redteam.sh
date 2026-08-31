@@ -38,6 +38,8 @@ MANIFEST="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/registrar-leak-manifest.txt"
 POLICIES="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/privileged-policies.txt"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
 BOOTROOT_AGENT_BIN="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
+CERT_AUTH_ROLE=bootroot-registrar-internal
+INTERNAL_IDENTITY=001.bootroot-registrar-internal.redteam.trusted.domain
 
 log_phase() { CURRENT_PHASE="$1"; printf '{"ts":"%s","phase":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >>"$PHASE_LOG"; printf '[registrar-redteam][%s]\n' "$1" | tee -a "$RUN_LOG"; }
 pass() { printf '[registrar-redteam][%s] PASS %s\n' "$CURRENT_PHASE" "$1" | tee -a "$RUN_LOG"; }
@@ -276,9 +278,20 @@ write_mint() { jq -n --argjson group "$2" '{protocol_version:1,service_name:"rev
 
 assert_escalation_denied() {
   local status policies
+  sudo -n curl -fsS --cacert "$ROOT_CA" -K "$TOKEN_CURL" "$OPENBAO_URL/v1/auth/cert/certs/$CERT_AUTH_ROLE" >"$ARTIFACT_DIR/cert-auth-entry.json" || fail "could not read the bootroot-internal cert-auth role"
+  jq -e --arg identity "$INTERNAL_IDENTITY" '
+    def contains_identity:
+      if type == "array" then index($identity) != null else . == $identity end;
+    .data.allowed_common_names | contains_identity
+  ' "$ARTIFACT_DIR/cert-auth-entry.json" >/dev/null || fail "bootroot-internal cert-auth role does not constrain its common name"
+  jq -e --arg identity "$INTERNAL_IDENTITY" '
+    def contains_identity:
+      if type == "array" then index($identity) != null else . == $identity end;
+    .data.allowed_dns_sans | contains_identity
+  ' "$ARTIFACT_DIR/cert-auth-entry.json" >/dev/null || fail "bootroot-internal cert-auth role does not constrain its DNS SAN"
   # The daemon's credential always names its fixed cert-auth role. Supply that
   # public role name to exercise the same privileged role explicitly.
-  status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -H 'Content-Type: application/json' -X POST -d '{"name":"bootroot-registrar-internal"}' "$OPENBAO_URL/v1/auth/cert/login" || true)"
+  status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -H 'Content-Type: application/json' -X POST -d "{\"name\":\"$CERT_AUTH_ROLE\"}" "$OPENBAO_URL/v1/auth/cert/login" || true)"
   [ "$status" -ge 400 ] || fail "registrar leaf authenticated through bootroot-internal auth/cert role"
   policies="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$POLICIES")"
   for endpoint in auth/approle/role/redteam-escalation sys/policies/acl/redteam-escalation; do status="$(curl -sS -o "$ARTIFACT_DIR/unauth-${endpoint//\//-}.json" -w '%{http_code}' -X POST -d "{\"token_policies\":${policies},\"policy\":\"path \\\"*\\\" { capabilities = [\\\"sudo\\\"] }\"}" "$OPENBAO_URL/v1/$endpoint" || true)"; [ "$status" -ge 400 ] || fail "unauthenticated attacker wrote $endpoint"; done
