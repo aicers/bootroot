@@ -40,6 +40,7 @@ def assert_anchor_is_pinned(ca_path: Path, pins_path: Path) -> None:
 def exchange(args: argparse.Namespace) -> bytes:
     assert_anchor_is_pinned(args.ca, args.pins)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(args.ca))
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.check_hostname = True
     context.load_cert_chain(certfile=str(args.cert), keyfile=str(args.key))
     payload = args.payload.read_bytes()
