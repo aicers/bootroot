@@ -274,7 +274,11 @@ assert_socket_contract() {
   pass "socket is root:root 0700 and parent denies group/other writes by bitmask"
 }
 
-client() { python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
+# The deployed listener is root-only by design. Run the leaked registrar
+# material from a root caller just as the host registrar does; the separate
+# path-occupation checks below prove that an unprivileged caller cannot reach
+# this socket at all.
+client() { sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
 write_mint() { jq -n --arg group "$2" '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
 
 assert_escalation_denied() {
@@ -377,7 +381,7 @@ while True:
   sudo -n chmod 0700 "$fixture_dir" "$fixture_socket"
   [ "$(stat_mode "$fixture_dir")" = "0:0:700" ] || fail "post-bind fixture directory metadata is wrong"
   [ "$(stat_mode "$fixture_socket")" = "0:0:700" ] || fail "post-bind fixture socket metadata is wrong"
-  if python3 "$DRIVER" --socket "$fixture_socket" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$RUN_ROOT/empty.json"; then
+  if sudo -n python3 "$DRIVER" --socket "$fixture_socket" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$RUN_ROOT/empty.json"; then
     kill "$fixture_pid" 2>/dev/null || true
     fail "caller accepted a root-looking socket served by an unprivileged peer"
   fi
@@ -389,8 +393,8 @@ while True:
 assert_socket_refusals() {
   local payload="$RUN_ROOT/empty.json" wrong="$RUN_ROOT/wrong-pins" before after nobody
   printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-empty || fail "unknown socket operation was served"
-  printf '%064d\n' 0 >"$wrong"; if python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
-  if python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
+  printf '%064d\n' 0 >"$wrong"; if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
+  if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
   before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; printf 'restart\n' >"$CONTROL_FIFO"; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
   nobody="$(id -un 65534 2>/dev/null || printf nobody)"; printf 'stop\n' >"$CONTROL_FIFO"; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
