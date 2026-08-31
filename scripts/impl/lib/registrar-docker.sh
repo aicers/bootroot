@@ -30,6 +30,21 @@ registrar_docker_run_token() {
   printf '%s\n' "$token"
 }
 
+# Reads a single-line Rust string constant so a Docker scenario can use the
+# production spelling without maintaining a second path list. The caller owns
+# the constant name; this helper only accepts the declaration form used by the
+# repository's path constants.
+registrar_docker_rust_string_constant() {
+  local source_file="$1" constant_name="$2" value
+  value="$(awk -F '"' -v constant_name="$constant_name" '
+    $0 ~ "const[[:space:]]+" constant_name "[[:space:]]*:" { print $2 }
+  ' "$source_file")"
+  [ -n "$value" ] || fail "could not read Rust string constant ${constant_name} from ${source_file}"
+  [ "$(printf '%s\n' "$value" | wc -l | tr -d ' ')" = 1 ] ||
+    fail "Rust string constant ${constant_name} is ambiguous in ${source_file}"
+  printf '%s\n' "$value"
+}
+
 # Stages the bounded registrar-leak model. The manifest is intentionally
 # evaluated before the recursive credential scan: a missing input is a test
 # setup error, never an excuse to scan a wider host or container filesystem.
@@ -54,7 +69,7 @@ registrar_docker_assert_no_backend_credentials() {
   # These are credential values, not filenames. Restricting find to the
   # read-only bundle is the threat-model boundary; daemon material is never
   # an attacker input in this scenario.
-  if grep -RInE '(X-Vault-Token|OPENBAO_TOKEN|role_id[[:space:]]*=|secret_id[[:space:]]*=)' "$bundle_dir"; then
+  if grep -RIniE "(X-Vault-Token|OPENBAO_TOKEN|VAULT_TOKEN|[\"']?(role_id|secret_id)[\"']?[[:space:]]*[:=])" "$bundle_dir"; then
     fail "the registrar leak bundle contains an OpenBao or AppRole credential"
   fi
 }

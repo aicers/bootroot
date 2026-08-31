@@ -238,6 +238,7 @@ ARTIFACT_DIR="$ARTIFACT_DIR" \
 BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
 BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 "$ROOT_DIR/scripts/impl/run-registrar-redteam.sh"
+cat "$ARTIFACT_DIR/wall-clock.json"
 
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"

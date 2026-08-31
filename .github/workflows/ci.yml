@@ -737,6 +737,7 @@ jobs:
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
             exit 1
           }
+          cat "$ARTIFACT_DIR/wall-clock.json"
 
       - name: Upload Artifacts
         if: always()
@@ -786,6 +787,7 @@ jobs:
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
             exit 1
           }
+          cat "$ARTIFACT_DIR/wall-clock.json"
 
       - name: Upload Artifacts
         if: always()
