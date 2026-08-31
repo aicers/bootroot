@@ -1482,8 +1482,8 @@ fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure
             "the diagnostic directs the operator at renewal: {rendered}"
         );
         assert!(
-            !rendered.contains("re-provisioning the host\n"),
-            "the diagnostic rules host re-provisioning out rather than asking for it"
+            rendered.contains("rather than re-provisioning the host"),
+            "the diagnostic rules host re-provisioning out rather than asking for it: {rendered}"
         );
     }
 }
