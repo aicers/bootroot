@@ -1566,8 +1566,15 @@ mod live {
         /// Material carrying a leaf whose only DNS SAN is `san`.
         fn leaf(&self, san: &str) -> InternalMaterial {
             let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
-            let leaf_params =
+            let mut leaf_params =
                 rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
+            // Production issuance sets the CN to the reserved DNS identity
+            // as well as placing it in the leaf's sole DNS SAN. Model both
+            // entry constraints here: the live backend rejects rcgen's
+            // default CN before it can exercise the SAN allowlist.
+            leaf_params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, san);
             let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
             let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
             InternalMaterial {

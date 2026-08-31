@@ -1,0 +1,7 @@
+# Files deliberately handed to the registrar client in the red-team fixture.
+# Paths are relative to the staged, read-only attacker filesystem.
+registrar-client.crt
+registrar-client.key
+registrar-endpoint.toml
+registrar-endpoint-anchors.sha256
+registrar-endpoint-ca.pem

@@ -13,7 +13,9 @@ PR-critical CI (`.github/workflows/ci.yml`) runs:
 
 - `test-core`: unit/integration smoke path
 - `test-docker-e2e-matrix`: Docker E2E test set for end-to-end flow +
-  rotation/recovery (11 scenarios run in parallel via matrix strategy)
+  rotation/recovery (14 scenarios run in parallel via matrix strategy)
+- `test-registrar-redteam-docs`: the focused registrar credential-boundary
+  gate for documentation-only pull requests
 
 Extended E2E (`.github/workflows/e2e-extended.yml`) runs separately:
 
@@ -80,6 +82,9 @@ PR-critical Docker test set validates:
 - the registrar's mint and deregister verbs against a live OpenBao (durable
   bindings, the KV v2 compare-and-set claim, re-mint, wrong-host refusal, the
   absent-binding sweep and both concurrency properties)
+- the registrar credential boundary against live OpenBao, including the
+  manifest-defined read-only leak bundle, unauthorised escalation attempts,
+  audit capacity, and root-owned inherited-socket protections
 
 Primary scripts:
 
@@ -94,6 +99,7 @@ Primary scripts:
 - `scripts/impl/run-registrar-verbs-e2e.sh`
 - `scripts/impl/run-registrar-internal-e2e.sh`
 - `scripts/impl/run-registrar-internal-init-e2e.sh`
+- `scripts/impl/run-registrar-redteam.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -113,6 +119,15 @@ project, no secrets wiring and none of the bootroot binaries.
 `registrar::verbs::tests` library tests, and `run-registrar-internal-e2e.sh`
 for the `#[ignore]`d `registrar::internal::tests::live` ones. Both pass the
 container's connection details in on the child process's environment.
+
+`run-registrar-redteam.sh` instead provisions a full run-scoped deployment and
+uses a live OpenBao plus a root-owned socket. It is the credential-boundary
+gate: its attacker model is only the manifest-defined registrar client bundle,
+not daemon credentials or the surrounding host. Code-changing pull requests
+run it in the Docker matrix; documentation-only pull requests run the focused
+companion job, so every pull request has exactly one such gate. Ordinary wire
+and listener round trips remain in cargo tests, while certificate renewal and
+the no-AppRole renewal check remain in the scheduled endurance suite.
 
 The internal-credential scenario differs in one respect: its container serves
 TLS. `auth/cert` authenticates a *client certificate*, so there has to be a

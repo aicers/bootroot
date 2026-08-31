@@ -738,6 +738,19 @@ pub(super) fn encode_audit_store_unavailable(request_id: &str) -> Result<Vec<u8>
     serde_json::to_vec(&response).map_err(Into::into)
 }
 
+/// Encodes the fail-closed answer for a mint stopped by an exhausted audit
+/// reserve before the verb can create any backend state.
+pub(super) fn encode_audit_capacity_exhausted(
+    request_id: &str,
+    health: &RegistrarHealth,
+) -> Result<Vec<u8>, CodecError> {
+    let class = RefusalClass::Permanent;
+    let error = Some(EnrollError::RegistrarUnavailable {
+        reason: RegistrarUnavailableReason::AuditUnwritable,
+    });
+    encode_refusal(request_id, None, class, error, health)
+}
+
 fn encode_refusal(
     request_id: &str,
     registration_id: Option<&str>,
@@ -3048,6 +3061,30 @@ mod tests {
         assert!(!text.contains("audit_capacity"));
         assert!(!text.contains("limiter"));
         assert!(!text.contains("certificates"));
+    }
+
+    /// An exhaustion refusal happens after the daemon has measured health, so
+    /// it must expose that measurement rather than using the mount-time
+    /// placeholder health object.
+    #[test]
+    fn an_exhausted_audit_refusal_preserves_the_health_snapshot() {
+        let mut health = RegistrarHealth::default();
+        health.audit_capacity.state = AuditCapacityState::Exhausted;
+        health.audit_capacity.reserve_bytes = 10;
+        health.audit_capacity.low_water_bytes = 8;
+
+        let encoded = encode_audit_capacity_exhausted("request-0001", &health)
+            .expect("the exhaustion refusal encodes");
+        let decoded = decode_refusal_response(&encoded).expect("the exhaustion refusal decodes");
+
+        assert_eq!(decoded.class, RefusalClass::Permanent);
+        assert_eq!(
+            decoded.error,
+            Some(EnrollError::RegistrarUnavailable {
+                reason: RegistrarUnavailableReason::AuditUnwritable,
+            })
+        );
+        assert_eq!(decoded.registrar_health, health);
     }
 
     #[test]

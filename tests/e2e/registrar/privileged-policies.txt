@@ -1,0 +1,7 @@
+bootroot-agent
+bootroot-infra-rotate
+bootroot-registrar-internal
+bootroot-responder
+bootroot-runtime-rotate
+bootroot-runtime-service-add
+bootroot-stepca

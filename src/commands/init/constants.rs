@@ -210,6 +210,48 @@ mod tests {
     };
     use crate::commands::container_name::BootrootContainer;
 
+    /// The `AppRole` escalation fixture is data rather than a second list in
+    /// its Docker runner. Keep it exact: a missing policy silently narrows
+    /// the attack and an extra one makes the fixture claim a policy exists
+    /// when the installer never creates it.
+    #[test]
+    fn registrar_redteam_privileged_policy_fixture_matches_constants() {
+        use std::collections::BTreeSet;
+
+        // This test intentionally derives the expected values from the
+        // declaration source instead of maintaining a hand-written second
+        // list. Adding a POLICY_BOOTROOT_* constant therefore fails before
+        // Docker starts unless the sole attack fixture is updated too.
+        let expected = include_str!("constants.rs")
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("pub(crate) const POLICY_BOOTROOT_")
+                    .and_then(|_| line.split_once("= \""))
+                    .and_then(|(_, value)| value.strip_suffix("\";"))
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !expected.is_empty(),
+            "could not find POLICY_BOOTROOT_* declarations in constants.rs"
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/e2e/registrar/privileged-policies.txt");
+        let fixture = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+        let actual = fixture
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            actual, expected,
+            "privileged policy fixture drifted from POLICY_BOOTROOT_* constants"
+        );
+    }
+
     /// The interpolation prefix every `container_name:` in the shipped
     /// compose files now carries.
     const CONTAINER_NAME_INTERPOLATION: &str = "${BOOTROOT_INSTANCE:-bootroot}";

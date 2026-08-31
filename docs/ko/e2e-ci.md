@@ -13,7 +13,9 @@ PR 필수 CI(`.github/workflows/ci.yml`)는 다음을 실행합니다.
 
 - `test-core`: 단위/통합 스모크 경로
 - `test-docker-e2e-matrix`: 전체 흐름 + 회전/복구 Docker E2E 조합 검증
-  (11개 시나리오가 matrix 전략으로 병렬 실행)
+  (14개 시나리오가 matrix 전략으로 병렬 실행)
+- `test-registrar-redteam-docs`: 문서 전용 pull request를 위한 집중 registrar
+  자격 증명 경계 게이트
 
 확장 E2E(`.github/workflows/e2e-extended.yml`)는 별도 실행됩니다.
 
@@ -78,6 +80,8 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - 실제 OpenBao를 상대로 한 registrar의 mint/deregister 동사(영속 바인딩,
   KV v2 compare-and-set 클레임, 재발급, 호스트 불일치 거부, 바인딩 없는
   정리, 두 가지 동시성 속성)
+- 실제 OpenBao를 상대로 한 registrar 자격 증명 경계(매니페스트로 정의한 읽기 전용
+  유출 번들, 무단 권한 상승 시도, 감사 용량, root 소유 상속 소켓 보호)
 
 주요 스크립트:
 
@@ -92,6 +96,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-registrar-verbs-e2e.sh`
 - `scripts/impl/run-registrar-internal-e2e.sh`
 - `scripts/impl/run-registrar-internal-init-e2e.sh`
+- `scripts/impl/run-registrar-redteam.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -111,6 +116,15 @@ bootroot 바이너리도 전혀 필요하지 않습니다. `run-registrar-verbs-
 `run-registrar-internal-e2e.sh`는 `registrar::internal::tests::live`의
 게이트입니다. 둘 다 컨테이너의 접속 정보를 자식 프로세스의 환경 변수로
 넘겨 테스트를 실행합니다.
+
+`run-registrar-redteam.sh`는 대신 실행마다 범위를 정한 전체 배포를
+프로비저닝하고 실제 OpenBao 및 root 소유 소켓을 사용합니다. 공격자 모델은
+매니페스트가 정의한 registrar 클라이언트 번들뿐이며 daemon 자격 증명이나
+주변 호스트는 포함하지 않는 자격 증명 경계 게이트입니다. 코드 변경 pull
+request는 Docker matrix에서, 문서 전용 pull request는 집중 companion job에서
+실행하므로 모든 pull request가 정확히 하나의 이 게이트를 가집니다. 일반
+wire/리스너 왕복은 cargo 테스트에, 인증서 갱신과 갱신 중 AppRole 미사용 확인은
+예약된 endurance 스위트에 남습니다.
 
 내부 자격 증명 시나리오는 한 가지가 다릅니다. 컨테이너가 TLS를 제공합니다.
 `auth/cert`는 *클라이언트 인증서*를 인증하므로 그것을 제시할 핸드셰이크가

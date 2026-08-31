@@ -27,6 +27,7 @@ Runs the same Docker E2E matrix steps used in CI:
 11) registrar mint/deregister verbs against a live OpenBao
 12) the bootroot-internal credential's auth/cert contract against a live TLS OpenBao
 13) bootroot init on an endpoint-enabled loopback host, end to end
+14) registrar credential-boundary red-team gate
 
 Step 13 runs `bootroot init` as root through `sudo -n`, because an
 endpoint-enabled `init` publishes the bootroot-internal credential root-owned
@@ -230,6 +231,15 @@ echo "[ci-local-e2e] run registrar internal credential init (issue #766)"
 ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-internal-init-${RUN_ID}" \
 "$ROOT_DIR/scripts/impl/run-registrar-internal-init-e2e.sh"
 
+echo "[ci-local-e2e] run registrar redteam (issue #782)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-redteam-${RUN_ID}"
+mkdir -p "$ARTIFACT_DIR"
+ARTIFACT_DIR="$ARTIFACT_DIR" \
+BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+"$ROOT_DIR/scripts/impl/run-registrar-redteam.sh"
+cat "$ARTIFACT_DIR/wall-clock.json"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -245,3 +255,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-two-instance-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-init-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-redteam-${RUN_ID}"
