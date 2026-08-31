@@ -310,10 +310,13 @@ assert_functionality_and_audit() {
   client --operation mint --payload "$mint" >"$ARTIFACT_DIR/first-mint.json" 2>"$ARTIFACT_DIR/first-mint.err" || { cat "$ARTIFACT_DIR/first-mint.err" >>"$RUN_LOG"; fail "first mint failed"; }
   client --operation mint --payload "$mint" >"$ARTIFACT_DIR/idempotent-mint.json" 2>"$ARTIFACT_DIR/idempotent-mint.err" || { cat "$ARTIFACT_DIR/idempotent-mint.err" >>"$RUN_LOG"; fail "idempotent mint failed"; }
   first="$(cat "$ARTIFACT_DIR/first-mint.json")"; second="$(cat "$ARTIFACT_DIR/idempotent-mint.json")"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
-  REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"; role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/$REGISTRATION_ID")"; policies="$(jq -c '.data.token_policies | sort' <<<"$role")"; [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"
+  REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"
+  role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${REGISTRATION_ID}")" || fail "could not read the minted derived AppRole"
+  policies="$(jq -c '.data.token_policies | sort' <<<"$role")" || fail "minted AppRole has no policy list"
+  [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"
   jq '.service_name = "bootroot-registrar" | .spec.service_name = "bootroot-registrar"' "$mint" >"$reserved"; client --operation mint --payload "$reserved" >"$ARTIFACT_DIR/reserved-identity.json" || fail "reserved identity refusal exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/reserved-identity.json" >/dev/null || fail "registrar leaf was accepted as a service identity"
   write_mint "$refused" 999; before="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; client --operation mint --payload "$refused" >"$ARTIFACT_DIR/refused-mint.json" || fail "refused mint exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/refused-mint.json" >/dev/null || fail "unsafe mint was not refused"; after="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; [ "$after" -gt "$before" ] || fail "refused mint wrote no audit record"; grep -R '"phase":"intent"' "$RECORD_DIR" >/dev/null && grep -R '"phase":"outcome"' "$RECORD_DIR" >/dev/null || fail "refused mint lacks paired audit records"
-  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" >"$ARTIFACT_DIR/refused-role.json" 2>&1 && fail "refused mint created an AppRole"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-role.json" 2>&1 && fail "refused mint created an AppRole"
   sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/sys/policies/acl/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-policy.json" 2>&1 && fail "refused mint created a policy"
   sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/secret/data/bootroot/services/redteam-review/secret_id" >"$ARTIFACT_DIR/refused-kv.json" 2>&1 && fail "refused mint wrote service KV"
   jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-deregister"}' >"$deregister"; for expected in identity_removed idempotent_already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
@@ -343,12 +346,12 @@ assert_audit_capacity() {
   sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-low-water.fill" bs=1M count=4 status=none
   response="$(wait_for_capacity_state low_water "$mint")"
   jq -e '.registrar_health.audit_capacity.state == "low_water"' <<<"$response" >/dev/null || fail "low-water health response was malformed"
-  before="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
+  before="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-redteam-review" 2>/dev/null || true)"
   sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-exhausted.fill" bs=1M count=12 status=none
   wait_for_capacity_state exhausted "$mint" >/dev/null
   response="$(client --operation mint --payload "$mint")" || fail "exhausted mint exchange failed"
   jq -e '.class != null' <<<"$response" >/dev/null || fail "exhausted audit store accepted a mint"
-  after="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
+  after="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-redteam-review" 2>/dev/null || true)"
   [ "$before" = "$after" ] || fail "exhausted mint changed OpenBao role state"
   pass "low-water precedes exhaustion and exhausted mint creates no OpenBao state"
 }
