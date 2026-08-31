@@ -475,7 +475,7 @@ while True:
 
 assert_socket_refusals() {
   local payload="$RUN_ROOT/empty.json" wrong="$RUN_ROOT/wrong-pins" before after nobody
-  printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-empty || fail "unknown socket operation was served"
+  printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-unknown-operation || fail "unknown socket operation was not explicitly refused"
   printf '%064d\n' 0 >"$wrong"; if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
   if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
   before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"

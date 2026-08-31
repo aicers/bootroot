@@ -29,10 +29,11 @@
 //! and no handshake, and it answers a different question from the
 //! certificate's.
 //!
-//! Every exit before the verb runs goes through [`refusal::refuse`], and
-//! every exit at all closes the stream — except a handshake that never
-//! completed, which has no application stream to close and is dropped
-//! after being logged.
+//! Every exit before the verb runs goes through [`refusal::refuse`], except
+//! an unrecognized operation, which sends its fixed observable marker through
+//! [`refusal::refuse_unrecognized_operation`]. Every exit closes the stream —
+//! except a handshake that never completed, which has no application stream
+//! to close and is dropped after being logged.
 //!
 //! Taking the permit before the spawn is what makes
 //! [`MAX_CONCURRENT_CONNECTIONS`] a bound on the daemon and not only on
@@ -616,7 +617,7 @@ where
         }
     };
     let Some(operation) = Operation::from_name(name) else {
-        refusal::refuse(
+        refusal::refuse_unrecognized_operation(
             stream,
             connection,
             &Refusal::transport(TransportRefusalReason::UnrecognizedOperation)
