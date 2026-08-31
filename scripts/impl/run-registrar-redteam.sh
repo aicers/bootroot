@@ -421,9 +421,9 @@ main() {
   log_phase deployment; prepare_workspace; allocate_ports; write_configs; build_and_initialize; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
   log_phase containment; assert_escalation_denied
   log_phase functionality; assert_functionality_and_audit
-  log_phase capacity; assert_audit_capacity
   log_phase socket; assert_socket_refusals
   log_phase peer-credentials; assert_post_bind_peer_fixture
+  log_phase capacity; assert_audit_capacity
   log_phase done; pass "registrar red-team scenario completed"
 }
 main
