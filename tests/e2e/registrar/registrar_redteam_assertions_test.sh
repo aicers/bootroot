@@ -67,6 +67,16 @@ assert_rejected() {
   fi
 }
 
+assert_accepted() {
+  local content="$1"
+  chmod u+w "$BUNDLE/registrar-endpoint.toml"
+  printf '%s\n' "$content" >"$BUNDLE/registrar-endpoint.toml"
+  if ! registrar_docker_assert_no_backend_credentials "$BUNDLE"; then
+    printf 'non-credential was rejected: %s\n' "$content" >&2
+    exit 1
+  fi
+}
+
 assert_rejected 'X-Vault-Token: hvs.labelled_token_value'
 assert_rejected 'role_id = "123e4567-e89b-12d3-a456-426614174000"'
 assert_rejected 'secret_id = "123e4567-e89b-12d3-a456-426614174001"'
@@ -80,3 +90,5 @@ assert_rejected 'SeCrEt_Id = "labelled-secret-id"'
 assert_rejected 'hvs.bare_openbao_token_value'
 assert_rejected '123e4567-e89b-12d3-a456-426614174002'
 assert_rejected '123e4567-e89b-12d3-a456-426614174003'
+# A bare token prefix is intentionally exact; only credential labels ignore case.
+assert_accepted 'HVS.not_a_supported_prefix'
