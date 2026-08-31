@@ -65,14 +65,19 @@ registrar_docker_stage_leak_bundle() {
 }
 
 registrar_docker_assert_no_backend_credentials() {
-  local bundle_dir="$1"
+  local bundle_dir="$1" label_pattern bare_value_pattern
   # These are credential values, not filenames. An AppRole identifier is a
   # UUID and OpenBao issues `hvs.`, `hvb.`, and legacy `s.` tokens. Match
   # those values directly as well as conventional labels, because copied
   # material need not retain the field name it had when it was created.
   # Restricting the recursive scan to the read-only bundle is the threat-model
   # boundary; daemon material is never an attacker input in this scenario.
-  if LC_ALL=C grep -RInE "(X-(Vault|OpenBao)-Token|OPENBAO_TOKEN|VAULT_TOKEN|[\"']?(role_id|secret_id)[\"']?[[:space:]]*[:=]|hvs\.[[:alnum:]_-]{8,}|hvb\.[[:alnum:]_-]{8,}|s\.[[:alnum:]_-]{8,}|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$bundle_dir"; then
+  # Only labels are case-insensitive. Token prefixes remain the explicitly
+  # supported bare-value forms rather than accepting a new casing variant.
+  label_pattern="(X-(Vault|OpenBao)-Token|OPENBAO_TOKEN|VAULT_TOKEN|[\"']?(role_id|secret_id)[\"']?[[:space:]]*[:=])"
+  bare_value_pattern="(hvs\.[[:alnum:]_-]{8,}|hvb\.[[:alnum:]_-]{8,}|s\.[[:alnum:]_-]{8,}|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})"
+  if LC_ALL=C grep -RInEi "$label_pattern" "$bundle_dir" ||
+    LC_ALL=C grep -RInE "$bare_value_pattern" "$bundle_dir"; then
     fail "the registrar leak bundle contains an OpenBao or AppRole credential"
     return 1
   fi
