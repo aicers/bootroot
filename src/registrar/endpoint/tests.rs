@@ -1516,8 +1516,8 @@ async fn every_transport_reason_refuses_through_the_common_helper() {
     labels.dedup();
     assert_eq!(
         labels.len(),
-        7,
-        "the taxonomy is closed at seven distinct labels: {labels:?}"
+        6,
+        "the silent transport taxonomy is closed at six distinct labels: {labels:?}"
     );
 }
 
