@@ -18,10 +18,11 @@
 //! belongs to the payload, which is the protocol sibling's to define; a
 //! second version negotiation in the envelope would be a second place
 //! for the two ends to disagree. A status field would be a wire error,
-//! and this endpoint deliberately answers a pre-verb refusal with a
-//! clean close and nothing else — a refused caller learns that it was
-//! refused and learns nothing it did not already know about the daemon's
-//! internals.
+//! and this endpoint answers pre-verb refusals with a clean close. A
+//! syntactically valid unknown operation is the one deliberate exception:
+//! it receives a fixed response body identifying that fact, so a caller can
+//! distinguish it from an unrelated empty exchange without learning about
+//! the daemon's other internals.
 
 use super::MAX_FRAME_PAYLOAD_BYTES;
 

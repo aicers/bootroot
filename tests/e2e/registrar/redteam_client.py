@@ -18,6 +18,8 @@ import struct
 import sys
 from pathlib import Path
 
+UNKNOWN_OPERATION_REFUSAL = b"unrecognized-operation"
+
 
 def pin_set(path: Path) -> set[str]:
     values: set[str] = set()
@@ -72,6 +74,23 @@ def exchange(args: argparse.Namespace) -> bytes:
     return bytes(response)
 
 
+def assert_response(response: bytes, expect_unknown_operation: bool) -> str | None:
+    if expect_unknown_operation:
+        if (
+            response
+            != len(UNKNOWN_OPERATION_REFUSAL).to_bytes(4, "big") + UNKNOWN_OPERATION_REFUSAL
+        ):
+            raise ValueError("endpoint did not identify the unknown operation as refused")
+        return None
+    if len(response) < 4:
+        raise ValueError("endpoint closed without a complete response frame")
+    declared = int.from_bytes(response[:4], "big")
+    body = response[4:]
+    if declared != len(body):
+        raise ValueError("endpoint response length does not match its frame prefix")
+    return body.decode("utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", type=Path, required=True)
@@ -82,21 +101,14 @@ def main() -> int:
     parser.add_argument("--endpoint-name", required=True)
     parser.add_argument("--operation", required=True)
     parser.add_argument("--payload", type=Path, required=True)
-    parser.add_argument("--expect-empty", action="store_true")
+    expected = parser.add_mutually_exclusive_group()
+    expected.add_argument("--expect-unknown-operation", action="store_true")
     args = parser.parse_args()
     try:
         response = exchange(args)
-        if args.expect_empty:
-            if response:
-                raise ValueError("endpoint returned application bytes for a refused operation")
-            return 0
-        if len(response) < 4:
-            raise ValueError("endpoint closed without a complete response frame")
-        declared = int.from_bytes(response[:4], "big")
-        body = response[4:]
-        if declared != len(body):
-            raise ValueError("endpoint response length does not match its frame prefix")
-        print(body.decode("utf-8"))
+        body = assert_response(response, args.expect_unknown_operation)
+        if body is not None:
+            print(body)
         return 0
     except Exception as error:  # a scenario failure needs a compact diagnostic
         print(f"registrar red-team client: {error}", file=sys.stderr)

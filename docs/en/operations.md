@@ -2057,11 +2057,14 @@ connection slots open.
 
 #### Reading a refused connection in the log
 
-**A caller learns nothing about why it was refused, so the daemon's log
-is the only diagnosis there is.** A failed handshake reaches the caller
-only as a TLS alert, and a post-handshake refusal reaches it as a clean
-close with no bytes. Every line carries the connection id that correlates
-the rest of that connection's lines, and a `reason` field:
+**A caller learns nothing about why it was refused, except that its own
+syntactically valid unknown operation is refused.** That one case returns
+the framed body `unrecognized-operation`, which lets a caller distinguish
+the deliberate refusal from an unrelated empty exchange. A failed handshake
+reaches the caller only as a TLS alert, and every other post-handshake
+refusal reaches it as a clean close with no bytes. Every line carries the
+connection id that correlates the rest of that connection's lines, and a
+`reason` field:
 
 | `reason` | What happened |
 | --- | --- |

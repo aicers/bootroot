@@ -25,8 +25,10 @@
 //!   connection, four-byte big-endian payload length, one-byte operation
 //!   name length, the name, the payload. No version, no magic, no status.
 //! - [`refusal`] is the single pre-verb refusal path: a closed taxonomy
-//!   of seven reasons, a daemon-generated connection diagnostic id, zero
-//!   response bytes and a clean close.
+//!   of seven reasons and a daemon-generated connection diagnostic id.
+//!   Refusals close cleanly; a syntactically valid unknown operation alone
+//!   receives a fixed framed marker, while the other refusal paths write zero
+//!   response bytes.
 //! - [`handler`] is the seam this module stops at. The endpoint owns the
 //!   transport; [`protocol`] owns the payload schema, its codec and the
 //!   mapping of verb outcomes onto caller-visible responses, and

@@ -9,10 +9,11 @@
 //!   process's environment, and none needs a socket;
 //! - the **stream** tier drives the real connection state machine over
 //!   an in-memory duplex, with `tokio::time` paused, and reads the far
-//!   end to prove that a refusal writes zero bytes and closes cleanly.
-//!   The diagnostic fields are read back out of a captured `tracing`
-//!   subscriber, so "typed logging with the connection diagnostic id" is
-//!   asserted rather than assumed;
+//!   end to prove that silent refusals write zero bytes and close cleanly,
+//!   while an unknown operation returns its fixed marker. The diagnostic
+//!   fields are read back out of a captured `tracing` subscriber, so
+//!   "typed logging with the connection diagnostic id" is asserted rather
+//!   than assumed;
 //! - the **socket** tier binds a listener *in the harness*, under
 //!   `tempfile::tempdir()`, and hands its descriptor through the very
 //!   activation seam production uses. Code under test never binds,
@@ -57,7 +58,7 @@ use super::frame::{
 };
 use super::handler::{HANDLER_REJECTED_PAYLOAD, HandlerRefusal, RegistrarRequestHandler};
 use super::policy::{self, SocketMetadata, SocketPolicyViolation};
-use super::refusal::{ConnectionId, UNREAD_OPERATION, refuse};
+use super::refusal::{ConnectionId, UNREAD_OPERATION, UNRECOGNIZED_OPERATION_RESPONSE, refuse};
 use super::serve::{self, authorize_peer, caller_identity, serve_request};
 use super::test_support::{
     CapturedEvent, CapturedLogs, DIAL_NAME, NEAR_MISS_DOMAIN, Pki, TEST_DOMAIN, TEST_HOST,
@@ -1333,7 +1334,7 @@ async fn a_non_name_byte_is_a_malformed_header_logging_the_escaped_bytes() {
 }
 
 /// Unrecognized applies only to a syntactically valid, complete name,
-/// and the identifier is logged as received.
+/// is logged as received, and has its own observable response marker.
 #[tokio::test]
 async fn an_unknown_but_well_formed_name_is_an_unrecognized_operation() {
     let (logs, _guard) = capture_logs();
@@ -1341,7 +1342,11 @@ async fn an_unknown_but_well_formed_name_is_an_unrecognized_operation() {
         response: Vec::new(),
     };
     let observed = drive(&handler, &frame_of(b"rotate", b"")).await;
-    assert!(observed.is_empty());
+    assert_eq!(
+        decode_response(&observed),
+        UNRECOGNIZED_OPERATION_RESPONSE,
+        "the caller can distinguish an unknown operation from another empty exchange"
+    );
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "unrecognized-operation");
@@ -1414,16 +1419,18 @@ async fn the_refusal_helper_writes_nothing_and_closes() {
     assert!(observed.is_empty());
 }
 
-/// Every one of the seven typed reasons takes the *same* path.
+/// Every silent transport reason takes the same path.
 ///
 /// The tiers above reach six of them by driving a connection into the
 /// state they describe. `UnauthorizedPeer` cannot be reached that way —
 /// it needs a peer running as a second uid, which a test cannot conjure
 /// without privileges — so the closed taxonomy is asserted here at the
 /// helper instead, where each reason is one value. What is asserted is
-/// what the reasons are required to have in common: zero response bytes,
+/// what those reasons are required to have in common: zero response bytes,
 /// a clean close, the daemon-generated connection id, a stable label,
-/// and the explicit unread marker wherever no operation was read.
+/// and the explicit unread marker wherever no operation was read. An
+/// unrecognized operation is deliberately absent because it has its own
+/// observable response marker.
 #[tokio::test]
 async fn every_transport_reason_refuses_through_the_common_helper() {
     use super::refusal::{FrameEnd, PartialStage, Refusal, TransportRefusalReason as Reason};
@@ -1465,7 +1472,6 @@ async fn every_transport_reason_refuses_through_the_common_helper() {
             },
             "malformed-header",
         ),
-        (Reason::UnrecognizedOperation, "unrecognized-operation"),
     ];
 
     let mut labels = Vec::new();
@@ -1510,8 +1516,8 @@ async fn every_transport_reason_refuses_through_the_common_helper() {
     labels.dedup();
     assert_eq!(
         labels.len(),
-        7,
-        "the taxonomy is closed at seven distinct labels: {labels:?}"
+        6,
+        "the silent transport taxonomy is closed at six distinct labels: {labels:?}"
     );
 }
 
@@ -3662,14 +3668,13 @@ async fn a_mismatched_peer_is_refused_even_with_the_registrar_certificate() {
     running.stop().await;
 }
 
-/// The whole pre-verb refusal shape still holds once the stream is TLS.
+/// The unknown-operation refusal marker survives the TLS wrap.
 ///
-/// The caller reads **zero** application bytes and its read ends
-/// cleanly: [`read_tls_until_closed`] fails on an `UnexpectedEof`, which
+/// The caller reads the exact framed unknown-operation marker and its read
+/// ends cleanly: [`read_tls_until_closed`] fails on an `UnexpectedEof`, which
 /// is what a peer that vanished without `close_notify` produces, so an
-/// orderly end is asserted rather than assumed. No error identifier is
-/// emitted, and the typed refusal carries the connection id and the
-/// operation identifier exactly as it arrived.
+/// orderly end is asserted rather than assumed. The typed refusal carries the
+/// connection id and the operation identifier exactly as it arrived.
 #[tokio::test]
 async fn the_pre_verb_refusal_shape_survives_the_tls_wrap() {
     let (logs, _guard) = capture_logs();
@@ -3689,10 +3694,7 @@ async fn the_pre_verb_refusal_shape_survives_the_tls_wrap() {
         .await
         .expect("write the request");
     let observed = read_tls_until_closed(&mut stream).await;
-    assert!(
-        observed.is_empty(),
-        "a refused caller reads zero application bytes: {observed:?}"
-    );
+    assert_eq!(decode_response(&observed), UNRECOGNIZED_OPERATION_RESPONSE);
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "unrecognized-operation");
