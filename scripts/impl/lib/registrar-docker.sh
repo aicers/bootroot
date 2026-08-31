@@ -72,7 +72,7 @@ registrar_docker_assert_no_backend_credentials() {
   # material need not retain the field name it had when it was created.
   # Restricting the recursive scan to the read-only bundle is the threat-model
   # boundary; daemon material is never an attacker input in this scenario.
-  if LC_ALL=C grep -RInE "(X-(Vault|OpenBao)-Token|OPENBAO_TOKEN|VAULT_TOKEN|[\"']?(role_id|secret_id)[\"']?[[:space:]]*[:=]|hvs\.[[:alnum:]_-]{8,}|hvb\.[[:alnum:]_-]{8,}|s\.[[:alnum:]_-]{8,}|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$bundle_dir"; then
+  if LC_ALL=C grep -RInEi "(X-(Vault|OpenBao)-Token|OPENBAO_TOKEN|VAULT_TOKEN|[\"']?(role_id|secret_id)[\"']?[[:space:]]*[:=]|hvs\.[[:alnum:]_-]{8,}|hvb\.[[:alnum:]_-]{8,}|s\.[[:alnum:]_-]{8,}|[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12})" "$bundle_dir"; then
     fail "the registrar leak bundle contains an OpenBao or AppRole credential"
     return 1
   fi

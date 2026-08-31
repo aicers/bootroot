@@ -70,6 +70,13 @@ assert_rejected() {
 assert_rejected 'X-Vault-Token: hvs.labelled_token_value'
 assert_rejected 'role_id = "123e4567-e89b-12d3-a456-426614174000"'
 assert_rejected 'secret_id = "123e4567-e89b-12d3-a456-426614174001"'
+# The values below deliberately do not match any bare token or UUID pattern.
+assert_rejected 'x-vAuLt-tOkEn: labelled-vault-token'
+assert_rejected 'x-oPeNbAo-tOkEn: labelled-openbao-token'
+assert_rejected 'oPeNbAo_ToKeN = "labelled-openbao-token"'
+assert_rejected 'vAuLt_ToKeN = "labelled-vault-token"'
+assert_rejected 'RoLe_Id = "labelled-role-id"'
+assert_rejected 'SeCrEt_Id = "labelled-secret-id"'
 assert_rejected 'hvs.bare_openbao_token_value'
 assert_rejected '123e4567-e89b-12d3-a456-426614174002'
 assert_rejected '123e4567-e89b-12d3-a456-426614174003'
