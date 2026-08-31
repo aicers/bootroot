@@ -999,7 +999,19 @@ fn client_leaf_has_lapsed(chain: &[CertificateDer<'static>], now: OffsetDateTime
     let Ok((_, parsed)) = X509Certificate::from_der(leaf.as_ref()) else {
         return false;
     };
-    now.unix_timestamp() > parsed.validity().not_after.timestamp()
+    // Compared as instants rather than as whole seconds, so the
+    // boundary is `notAfter` itself and not the second it falls in: a
+    // truncating comparison would keep dialling for up to a second after
+    // the endpoint's own `remaining_seconds` had already gone negative.
+    // A `notAfter` no `OffsetDateTime` can hold is not a lapse either,
+    // for the reason above: it is a fault in the certificate, not in its
+    // lifetime.
+    let Ok(not_after) =
+        OffsetDateTime::from_unix_timestamp(parsed.validity().not_after.timestamp())
+    else {
+        return false;
+    };
+    now > not_after
 }
 
 /// Loads the registrar client leaf and its key from disk.

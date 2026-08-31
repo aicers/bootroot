@@ -769,6 +769,48 @@ async fn a_lapsed_client_leaf_outranks_an_unavailable_daemon() {
     );
 }
 
+/// The lapse boundary is `notAfter` itself, to the instant.
+///
+/// Asserted against the predicate directly, because the two sides of the
+/// boundary are a nanosecond apart and no dial can be timed that
+/// finely. It is the same boundary `remaining_seconds` reports on the
+/// wire — `0` and not yet lapsed at `notAfter`, lapsed from the first
+/// instant after it — so a comparison that truncated to whole seconds
+/// would keep this client dialling for up to a second after the endpoint
+/// had already published the leaf as expired.
+#[test]
+fn the_lapse_boundary_is_not_after_itself() {
+    // `issue_leaf_within` takes whole days, so the leaf below expires at
+    // 2021-01-01T00:00:00Z, which is this instant.
+    let not_after = OffsetDateTime::from_unix_timestamp(1_609_459_200)
+        .expect("2021-01-01T00:00:00Z is a representable instant");
+    let ca = valid_ca();
+    let (certificate, _) = issue_leaf_within(
+        &ca,
+        vec![dns_san(&registrar_client_name())],
+        (2020, 1, 1),
+        (2021, 1, 1),
+    );
+    let chain = vec![CertificateDer::from(certificate.der().to_vec())];
+
+    assert!(
+        !client_leaf_has_lapsed(&chain, not_after),
+        "at `notAfter` the leaf is still valid"
+    );
+    assert!(
+        client_leaf_has_lapsed(&chain, not_after + time::Duration::nanoseconds(1)),
+        "one nanosecond later it has lapsed"
+    );
+    assert!(
+        !client_leaf_has_lapsed(&chain, not_after - time::Duration::nanoseconds(1)),
+        "one nanosecond earlier it has not"
+    );
+    assert!(
+        !client_leaf_has_lapsed(&[], not_after),
+        "an empty chain claims no lifetime"
+    );
+}
+
 /// The boundary is `notAfter` itself: a leaf still inside its window
 /// dials, and the check does not reject a certificate merely because its
 /// window is narrow.
