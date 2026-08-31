@@ -141,6 +141,17 @@ pub enum EndpointVerifyRejection {
     /// The pinned anchor's validity window has not started.
     #[error("the pinned trust anchor is not yet valid")]
     AnchorNotYetValid,
+    /// The presented certificate is past its `notAfter`.
+    ///
+    /// Distinct from [`EndpointVerifyRejection::AnchorExpired`], and the
+    /// distinction is the whole reason this variant exists: that one is
+    /// a lapse in the *caller's own pinned anchor*, repaired by rotating
+    /// the trust anchor, while this one is the endpoint's leaf having
+    /// lapsed, repaired by the registrar daemon renewing it. Collapsing
+    /// the two would send an operator to renew a certificate that is
+    /// fine.
+    #[error("the presented endpoint certificate has expired")]
+    PresentedCertificateExpired,
     /// A pinned anchor matched, but the presented chain does not build
     /// to it.
     #[error("the presented chain does not build to a pinned trust anchor")]
@@ -159,10 +170,19 @@ impl From<EndpointVerifyRejection> for rustls::Error {
             | EndpointVerifyRejection::ChainVerificationFailed => {
                 rustls::CertificateError::UnknownIssuer
             }
-            EndpointVerifyRejection::AnchorNotCa => {
+            // `AnchorExpired` joins `AnchorNotCa` rather than taking
+            // `Expired`, which is reserved for the refusal below. All a
+            // caller recovers from the wrapping `io::Error` is the
+            // `CertificateError`, so a pinned anchor that lapsed and an
+            // endpoint leaf that lapsed must not spell themselves the
+            // same way: they name different material, and renewing the
+            // leaf does nothing for a pin file that has gone stale.
+            EndpointVerifyRejection::AnchorNotCa | EndpointVerifyRejection::AnchorExpired => {
                 rustls::CertificateError::ApplicationVerificationFailure
             }
-            EndpointVerifyRejection::AnchorExpired => rustls::CertificateError::Expired,
+            EndpointVerifyRejection::PresentedCertificateExpired => {
+                rustls::CertificateError::Expired
+            }
             EndpointVerifyRejection::AnchorNotYetValid => rustls::CertificateError::NotValidYet,
         };
         Self::InvalidCertificate(error)
@@ -414,6 +434,10 @@ impl RegistrarEndpointVerifier {
         }
 
         let anchors = self.pinned_anchors(end_entity, intermediates, now)?;
+        // After the anchor rules and before the chain build, so an
+        // untrusted peer is still refused as one and only a leaf under a
+        // usable anchor is ever reported as expired.
+        validate_presented_leaf_time(end_entity, now)?;
         let verifier = tls::build_pinned_verifier(&anchors, &self.pins)
             .map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)?;
         verifier
@@ -522,10 +546,7 @@ fn validate_anchor_time(
     cert: &X509Certificate<'_>,
     now: UnixTime,
 ) -> Result<(), EndpointVerifyRejection> {
-    let seconds = i64::try_from(now.as_secs())
-        .map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)?;
-    let now = ASN1Time::from_timestamp(seconds)
-        .map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)?;
+    let now = asn1_now(now)?;
     let validity = cert.validity();
     if now < validity.not_before {
         Err(EndpointVerifyRejection::AnchorNotYetValid)
@@ -534,6 +555,46 @@ fn validate_anchor_time(
     } else {
         Ok(())
     }
+}
+
+/// Refuses a presented end-entity certificate whose `notAfter` has
+/// passed.
+///
+/// Checked here rather than left to the chain build, because the
+/// verifier behind this one reports every chain failure identically: an
+/// expired endpoint leaf arriving as [`ChainVerificationFailed`] cannot
+/// be told from a peer that never chained to the pin, and the two share
+/// no repair — one is the registrar daemon's renewal having stopped,
+/// the other is the wrong peer at the socket. Lifting it out here is
+/// what lets the endpoint client report the lapse as one.
+///
+/// Only the expiry is lifted out. A leaf that is *not yet valid* still
+/// fails the chain build, because a clock short of `notBefore` is not a
+/// certificate that lapsed and renewal is not its repair.
+///
+/// [`ChainVerificationFailed`]: EndpointVerifyRejection::ChainVerificationFailed
+fn validate_presented_leaf_time(
+    certificate: &CertificateDer<'_>,
+    now: UnixTime,
+) -> Result<(), EndpointVerifyRejection> {
+    // The SAN rule parsed this certificate before the caller reached
+    // here, so a parse failure is not a shape this can be entered with;
+    // it keeps the chain failure rather than claiming a lifetime it
+    // could not read.
+    let (_, cert) = X509Certificate::from_der(certificate.as_ref())
+        .map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)?;
+    if asn1_now(now)? > cert.validity().not_after {
+        return Err(EndpointVerifyRejection::PresentedCertificateExpired);
+    }
+    Ok(())
+}
+
+/// `now` as the `ASN1Time` a certificate's validity window is compared
+/// against.
+fn asn1_now(now: UnixTime) -> Result<ASN1Time, EndpointVerifyRejection> {
+    let seconds = i64::try_from(now.as_secs())
+        .map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)?;
+    ASN1Time::from_timestamp(seconds).map_err(|_| EndpointVerifyRejection::ChainVerificationFailed)
 }
 
 #[cfg(test)]
@@ -603,6 +664,27 @@ mod tests {
 
     fn issue_leaf_with_sans(ca: &TestCa, sans: Vec<SanType>) -> CertificateDer<'static> {
         issue_leaf_with_sans_and_key(ca, sans).0
+    }
+
+    /// The same issuance inside an explicit validity window, for the one
+    /// property that needs a closed one: a leaf whose `notAfter` is
+    /// already behind [`test_now`].
+    fn issue_leaf_within(
+        ca: &TestCa,
+        name: &str,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> CertificateDer<'static> {
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params.is_ca = rcgen::IsCa::NoCa;
+        params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
+        params.subject_alt_names = vec![SanType::DnsName(
+            name.to_string().try_into().expect("valid DNS SAN"),
+        )];
+        let leaf = params.signed_by(&key, ca).expect("issued leaf");
+        CertificateDer::from(leaf.der().to_vec())
     }
 
     /// The same issuance, keeping the leaf's private key: a server that
@@ -976,6 +1058,46 @@ mod tests {
         );
     }
 
+    /// An expired *presented leaf* is its own refusal, and not the
+    /// chain failure every other webpki verdict collapses into.
+    ///
+    /// This is the verdict the endpoint client turns into its typed
+    /// `endpoint_server` lapse, so it has to survive both this mapping
+    /// and the trip through `rustls::Error`: the anchor is live here,
+    /// which is what makes the leaf the only thing that can have
+    /// expired.
+    #[test]
+    fn refuses_an_expired_presented_leaf_as_an_expiry() {
+        let ca = valid_ca();
+        let anchor = ca_der(&ca);
+        let leaf = issue_leaf_within(&ca, &endpoint_name(), (2020, 1, 1), (2021, 1, 1));
+        let verifier = verifier_over(&[tls::sha256_hex(anchor.as_ref())], &endpoint_name());
+        assert_eq!(
+            verifier.verify(&leaf, std::slice::from_ref(&anchor), test_now()),
+            Err(EndpointVerifyRejection::PresentedCertificateExpired)
+        );
+        assert_eq!(
+            rustls::Error::from(EndpointVerifyRejection::PresentedCertificateExpired),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired)
+        );
+    }
+
+    /// The two lapses are told apart by everything a caller can recover
+    /// from the wrapping `io::Error`, which is the `CertificateError`
+    /// alone. An anchor that expired is the caller's own pin file going
+    /// stale; the endpoint's leaf is fine, and renewing it repairs
+    /// nothing.
+    #[test]
+    fn an_expired_anchor_and_an_expired_leaf_do_not_share_a_spelling() {
+        assert_ne!(
+            rustls::Error::from(EndpointVerifyRejection::AnchorExpired),
+            rustls::Error::from(EndpointVerifyRejection::PresentedCertificateExpired)
+        );
+        assert!(is_endpoint_verify_rejection(&rustls::Error::from(
+            EndpointVerifyRejection::AnchorExpired
+        )));
+    }
+
     #[test]
     fn refuses_a_not_yet_valid_pinned_anchor() {
         let ca = generate_ca((2100, 1, 1), (2101, 1, 1));
@@ -1054,6 +1176,7 @@ mod tests {
             EndpointVerifyRejection::AnchorNotCa,
             EndpointVerifyRejection::AnchorExpired,
             EndpointVerifyRejection::AnchorNotYetValid,
+            EndpointVerifyRejection::PresentedCertificateExpired,
             EndpointVerifyRejection::ChainVerificationFailed,
         ] {
             assert!(
@@ -1147,6 +1270,7 @@ mod tests {
             EndpointVerifyRejection::AnchorNotCa,
             EndpointVerifyRejection::AnchorExpired,
             EndpointVerifyRejection::AnchorNotYetValid,
+            EndpointVerifyRejection::PresentedCertificateExpired,
             EndpointVerifyRejection::ChainVerificationFailed,
         ];
         for rejection in rejections {
@@ -1168,6 +1292,7 @@ mod tests {
                 | EndpointVerifyRejection::AnchorNotCa
                 | EndpointVerifyRejection::AnchorExpired
                 | EndpointVerifyRejection::AnchorNotYetValid
+                | EndpointVerifyRejection::PresentedCertificateExpired
                 | EndpointVerifyRejection::ChainVerificationFailed => {}
             }
             assert!(

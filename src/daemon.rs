@@ -248,15 +248,13 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
         // with a populated `certificates` member instead of an empty one
         // that the first maintenance tick would fill in minutes later.
         let maintenance = maintenance.map(|maintenance| {
-            let maintenance = maintenance.with_renewal(renewal.state());
-            if let Some(renewal) = maintenance.renewal.as_ref() {
-                refresh_registrar_certificates(
-                    &maintenance.health,
-                    renewal,
-                    time::OffsetDateTime::now_utc(),
-                );
-            }
-            maintenance
+            let state = renewal.state();
+            refresh_registrar_certificates(
+                &maintenance.health,
+                &state,
+                time::OffsetDateTime::now_utc(),
+            );
+            maintenance.with_renewal(state)
         });
         spawn_registrar_cert_renewal(&mut handles, renewal, &shutdown_rx);
         spawn_registrar_endpoint(

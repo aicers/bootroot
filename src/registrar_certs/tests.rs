@@ -414,6 +414,35 @@ fn the_issuance_profile_composes_the_reserved_name_for_its_pair() {
     }
 }
 
+/// A leaf spells its name one way, whether it is being serialized onto
+/// the health wire or rendered into a diagnostic.
+///
+/// Two mechanisms produce that string — `serde`'s `snake_case` rename
+/// and [`SurfaceLeaf::wire_name`], which [`Display`](std::fmt::Display)
+/// writes — and only this holds them together. They are the token an
+/// operator greps for, so a drift between them would mean the
+/// `certificates` entry and the lapse diagnostic naming the same leaf
+/// differently, and one search finding half of it.
+#[test]
+fn a_leafs_wire_spelling_and_its_rendered_name_are_the_same_string() {
+    for (leaf, expected) in [
+        (SurfaceLeaf::RegistrarClient, "registrar_client"),
+        (SurfaceLeaf::EndpointServer, "endpoint_server"),
+    ] {
+        assert_eq!(leaf.wire_name(), expected);
+        assert_eq!(leaf.to_string(), expected);
+        assert_eq!(
+            serde_json::to_string(&leaf).expect("a leaf serializes"),
+            format!("\"{expected}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<SurfaceLeaf>(&format!("\"{expected}\""))
+                .expect("a leaf round-trips"),
+            leaf
+        );
+    }
+}
+
 /// The client leaf selects the `clientAuth` shape and the server leaf
 /// does not: the endpoint's own leaf is a server certificate and needs
 /// no added extended key usage.

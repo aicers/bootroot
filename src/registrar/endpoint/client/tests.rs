@@ -388,7 +388,31 @@ impl Deployment {
     /// and chained to it, and requiring a client certificate this
     /// deployment's CA issued.
     fn acceptor(&self, issuer: &TestCa, san: &str) -> TlsAcceptor {
-        let (certificate, key) = issue_leaf(issuer, vec![dns_san(san)]);
+        self.acceptor_of(issuer, issue_leaf(issuer, vec![dns_san(san)]))
+    }
+
+    /// The same acceptor over a leaf whose `notAfter` is years in the
+    /// past, chained to the pinned CA and carrying the expected SAN. So
+    /// a case using it isolates the endpoint leaf's lapse and nothing
+    /// else: every other pin rule still passes.
+    fn expired_acceptor(&self) -> TlsAcceptor {
+        self.acceptor_of(
+            &self.pki.ca,
+            issue_leaf_within(
+                &self.pki.ca,
+                vec![dns_san(&endpoint_name())],
+                (2020, 1, 1),
+                (2021, 1, 1),
+            ),
+        )
+    }
+
+    fn acceptor_of(
+        &self,
+        issuer: &TestCa,
+        pair: (rcgen::Certificate, rcgen::KeyPair),
+    ) -> TlsAcceptor {
+        let (certificate, key) = pair;
         let chain = vec![
             CertificateDer::from(certificate.der().to_vec()),
             CertificateDer::from(issuer.der().to_vec()),
@@ -417,6 +441,17 @@ impl Deployment {
             &self.socket_path(),
             Script::Tls {
                 acceptor: self.acceptor(issuer, san),
+                reply,
+            },
+        )
+    }
+
+    /// The conforming double presenting an already-expired leaf.
+    fn expired_double(&self, reply: Reply) -> Double {
+        Double::start(
+            &self.socket_path(),
+            Script::Tls {
+                acceptor: self.expired_acceptor(),
                 reply,
             },
         )
@@ -1369,11 +1404,16 @@ fn a_verifier_rejection_selects_the_pin_refusal_variant() {
     // The other half of the rule above, asserted through the same
     // seam: every rejection `endpoint_pin`'s verifier can reach is a
     // pin refusal here, whichever `CertificateError` it maps onto. The
-    // one exception is the expiry verdict, which the case below owns.
+    // one exception is the presented leaf's expiry, which the case
+    // below owns.
     for rejection in [
         EndpointVerifyRejection::SanMismatch,
         EndpointVerifyRejection::AnchorMismatch,
         EndpointVerifyRejection::AnchorNotCa,
+        // The pinned anchor's own lapse stays here: it is the caller's
+        // pin file having gone stale, not the endpoint's leaf, and
+        // renewing that leaf repairs nothing.
+        EndpointVerifyRejection::AnchorExpired,
         EndpointVerifyRejection::AnchorNotYetValid,
         EndpointVerifyRejection::AnchorMalformed,
         EndpointVerifyRejection::ChainVerificationFailed,
@@ -1413,7 +1453,7 @@ fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure
     let deployment = Deployment::new();
     let expired_at = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1));
     for verdict in [
-        rustls::Error::from(EndpointVerifyRejection::AnchorExpired),
+        rustls::Error::from(EndpointVerifyRejection::PresentedCertificateExpired),
         rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
         rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
             time: rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(2)),
@@ -1446,6 +1486,57 @@ fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure
             "the diagnostic rules host re-provisioning out rather than asking for it"
         );
     }
+}
+
+/// The `endpoint_server` lapse over a real handshake, which is the only
+/// thing that proves the verdict is reachable at all.
+///
+/// The case above hands the classifier a `rustls::Error` directly, so it
+/// pins the mapping but says nothing about whether a live TLS
+/// verification can produce that error. This one drives a listener
+/// presenting an expired leaf — chained to the pinned CA, carrying the
+/// expected SAN, so the lapse is the only rule it breaks — and asserts
+/// the client comes back with the typed lapse rather than the pin
+/// refusal every other verdict collapses into. No endpoint is started on
+/// expired material to get there: the listener is this module's double.
+#[tokio::test]
+async fn an_expired_endpoint_leaf_is_the_typed_lapse_over_a_real_handshake() {
+    let deployment = Deployment::new();
+    let double = deployment.expired_double(answered(response_frame(MINT_SUCCESS)));
+
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("an expired endpoint leaf verifies against nothing");
+
+    assert!(
+        matches!(
+            err,
+            ExchangeError::CertificateLapsed {
+                leaf: SurfaceLeaf::EndpointServer
+            }
+        ),
+        "expected the endpoint_server lapse, saw {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("endpoint_server"),
+        "the diagnostic names the leaf that lapsed: {rendered}"
+    );
+    assert!(
+        rendered.contains("certificate maintenance"),
+        "the diagnostic directs the operator at renewal: {rendered}"
+    );
+    let observed = double.observed();
+    assert_eq!(
+        observed.connections, 1,
+        "the lapse is reached only once a connection got to verification"
+    );
+    assert_eq!(
+        observed.request_bytes, 0,
+        "no request byte reaches a peer whose leaf has lapsed"
+    );
 }
 
 /// The lapse is distinct from every retryable connection failure, and a

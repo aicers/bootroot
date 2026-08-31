@@ -399,10 +399,11 @@ impl CertificateHealth {
     /// expiry, flooring is also what keeps the value from ever
     /// overstating the time left: 1.9 s remaining reports `1`.
     ///
-    /// The `i128` nanosecond difference spans about ±5×10^21 seconds, so
-    /// the narrowing cannot lose a value any real certificate produces.
-    /// It is saturated rather than truncated all the same: a wrap would
-    /// turn a vast positive lifetime into a lapse.
+    /// An [`OffsetDateTime`] spans years ±9999, so the widest difference
+    /// two of them can produce is around 6×10^11 seconds and the
+    /// narrowing back to `i64` cannot lose a value any certificate
+    /// produces. It is saturated rather than truncated all the same: a
+    /// wrap would turn a vast positive lifetime into a lapse.
     #[must_use]
     pub(crate) fn remaining_seconds(not_after: OffsetDateTime, now: OffsetDateTime) -> i64 {
         const NANOS_PER_SECOND: i128 = 1_000_000_000;

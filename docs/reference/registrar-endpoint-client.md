@@ -110,13 +110,18 @@ variant of its own, carrying which local role lapsed:
   daemon. Exactly at `notAfter` the leaf is still valid. A certificate file
   whose leaf will not parse is not reported as lapsed: it keeps the
   material variant that names the real fault.
-- **`endpoint_server`.** A TLS expiry verdict on the peer — `Expired`, and the
-  `ExpiredContext` spelling `rustls` documents as the same thing with
-  timestamps attached — is classified as the lapse rather than as a pin refusal
-  or a generic handshake failure. It is reachable only once a connection got as
-  far as verification. The revocation-list expiries beside it are not asked:
-  an expired CRL is a fault in the revocation data, and renewing a certificate
-  does not fix one.
+- **`endpoint_server`.** A TLS expiry verdict on the certificate the peer
+  presented — `Expired`, and the `ExpiredContext` spelling `rustls` documents as
+  the same thing with timestamps attached — is classified as the lapse rather
+  than as a pin refusal or a generic handshake failure. It is reachable only
+  once a connection got as far as verification. `endpoint_pin` reserves that
+  spelling for the presented leaf and reports it out of `verify` as its own
+  rejection, rather than letting it collapse into the chain failure every other
+  verdict shares; the *pinned anchor* expiring is a different fault — the
+  caller's pin file has gone stale, and renewing the endpoint's leaf repairs
+  nothing — so it keeps its own spelling and stays a pin refusal. The
+  revocation-list expiries are out for the same reason: an expired CRL is a
+  fault in the revocation data, and renewing a certificate does not fix one.
 
 Neither is retryable, and the diagnostic points at restoring the daemon's
 certificate maintenance rather than at re-provisioning the host. Every

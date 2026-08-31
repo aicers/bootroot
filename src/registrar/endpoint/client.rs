@@ -748,13 +748,17 @@ impl RegistrarEndpointClient {
     /// for, so the predicate that owns the rejection mapping decides it
     /// instead of the wrapper.
     ///
-    /// An expiry verdict is taken out ahead of both. It is the one
-    /// certificate verdict whose repair is neither a pin file nor a
-    /// dial: the endpoint's leaf is past its `notAfter` and only the
-    /// registrar daemon's renewal puts that right, so it is reported as
+    /// An expiry verdict on the presented certificate is taken out ahead
+    /// of both. It is the one certificate verdict whose repair is
+    /// neither a pin file nor a dial: the endpoint's leaf is past its
+    /// `notAfter` and only the registrar daemon's renewal puts that
+    /// right, so it is reported as
     /// [`ExchangeError::CertificateLapsed`] for `endpoint_server`
     /// instead of as a pin refusal or a generic handshake failure. Every
-    /// other verdict keeps exactly the arm it had.
+    /// other verdict keeps exactly the arm it had, the pinned anchor's
+    /// own expiry included: that one is the caller's pin file having
+    /// gone stale, and it stays a pin refusal because renewing the
+    /// endpoint's leaf would not repair it.
     fn classify_handshake(&self, err: io::Error) -> ExchangeError {
         match err
             .get_ref()
@@ -775,7 +779,7 @@ impl RegistrarEndpointClient {
 }
 
 /// Reports whether a recovered `rustls::Error` is an expiry verdict on
-/// the presented certificate.
+/// the certificate the peer presented.
 ///
 /// Both spellings count. `rustls` documents
 /// [`rustls::CertificateError::ExpiredContext`] as semantically the same
@@ -784,9 +788,13 @@ impl RegistrarEndpointClient {
 /// asked for one of them would answer differently for the same fault
 /// depending on which the verifier happened to build.
 ///
-/// It is deliberately not asked of the *revocation* expiries beside
-/// them: an expired CRL is a fault in the revocation data, not in
-/// either leaf's lifetime, and renewing a certificate does not fix one.
+/// It is asked of the *presented* certificate alone, which is what
+/// `endpoint_pin` reserves this spelling for. A pinned anchor that has
+/// itself expired is a different fault with a different repair — the
+/// caller's pin file, not the endpoint's leaf — so it keeps its own
+/// spelling and stays a pin refusal. The *revocation* expiries are out
+/// for the same reason: an expired CRL is a fault in the revocation
+/// data, and renewing a certificate does not fix one.
 fn is_expiry_verdict(error: &rustls::Error) -> bool {
     matches!(
         error,
