@@ -165,6 +165,30 @@ build_and_initialize() {
   pass "initialized an isolated live TLS OpenBao deployment"
 }
 
+apply_endpoint_dns_alias() {
+  local alias="001.bootroot-registrar-endpoint.redteam.trusted.domain"
+  local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml"
+  local responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
+  cat >"$override" <<EOF
+services:
+  bootroot-http01:
+    networks:
+      default:
+        aliases:
+          - ${alias}
+EOF
+  [ -f "$responder_override" ] || fail "init did not render the responder compose override"
+  BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 || fail "could not apply the registrar endpoint DNS alias"
+  for _ in $(seq 1 15); do
+    if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
+      pass "step-ca can reach the registrar endpoint through its DNS alias"
+      return
+    fi
+    sleep 1
+  done
+  fail "step-ca cannot reach the registrar endpoint through its DNS alias"
+}
+
 write_daemon_config() {
   INTERNAL_DIR="$WORK_DIR/secrets/registrar-internal"; ROOT_CA="$WORK_DIR/secrets/certs/root_ca.crt"
   cat >"$RUN_ROOT/endpoint.toml" <<EOF
@@ -363,7 +387,7 @@ main() {
   require strace
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
-  log_phase deployment; prepare_workspace; allocate_ports; write_configs; build_and_initialize; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
+  log_phase deployment; prepare_workspace; allocate_ports; write_configs; build_and_initialize; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
   log_phase containment; assert_escalation_denied
   log_phase functionality; assert_functionality_and_audit
   log_phase capacity; assert_audit_capacity
