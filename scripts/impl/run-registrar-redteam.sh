@@ -347,7 +347,7 @@ assert_audit_capacity() {
   response="$(wait_for_capacity_state low_water "$mint")"
   jq -e '.registrar_health.audit_capacity.state == "low_water"' <<<"$response" >/dev/null || fail "low-water health response was malformed"
   before="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-redteam-review" 2>/dev/null || true)"
-  sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-exhausted.fill" bs=1M count=12 status=none
+  sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-exhausted.fill" bs=1M count=6 status=none
   wait_for_capacity_state exhausted "$mint" >/dev/null
   response="$(client --operation mint --payload "$mint")" || fail "exhausted mint exchange failed"
   jq -e '.class != null' <<<"$response" >/dev/null || fail "exhausted audit store accepted a mint"
