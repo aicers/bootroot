@@ -358,8 +358,9 @@ assert_audit_capacity() {
 }
 
 assert_post_bind_peer_fixture() {
-  local uid fixture_dir fixture_socket fixture_pid
+  local uid gid fixture_dir fixture_socket fixture_pid
   uid="$(id -u nobody 2>/dev/null || printf 65534)"
+  gid="$(id -g nobody 2>/dev/null || printf 65534)"
   fixture_dir="$RUN_ROOT/unprivileged-peer"
   fixture_socket="$fixture_dir/registrar.sock"
   # The sequence is intentionally ordered: the unprivileged process owns
@@ -367,9 +368,9 @@ assert_post_bind_peer_fixture() {
   # final metadata is indistinguishable from deployment, while SO_PEERCRED
   # still exposes the accepting process's real uid.
   sudo -n mkdir -p "$fixture_dir"
-  sudo -n chown "$uid" "$fixture_dir"
+  sudo -n chown "$uid:$gid" "$fixture_dir"
   sudo -n chmod 0700 "$fixture_dir"
-  sudo -n -u "#${uid}" python3 -c '
+  sudo -n setpriv --reuid="$uid" --regid="$gid" --clear-groups python3 -c '
 import socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[1]); s.listen(1)
@@ -414,7 +415,7 @@ assert_socket_refusals() {
 main() {
   : >"$RUN_LOG"; : >"$PHASE_LOG"; trap cleanup EXIT
   log_phase validate
-  for command in docker jq curl cargo openssl python3 sudo; do require "$command"; done
+  for command in docker jq curl cargo openssl python3 setpriv sudo; do require "$command"; done
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
