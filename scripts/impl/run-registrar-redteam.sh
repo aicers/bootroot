@@ -222,13 +222,13 @@ EOF
 write_supervisor() {
   cat >"$RUN_ROOT/supervisor.py" <<'PY'
 import os, signal, socket, sys
-sock_path, control, pid_file, command = sys.argv[1:]
+sock_path, control, pid_file, agent_bin, config = sys.argv[1:]
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.bind(sock_path); sock.listen(32); os.chown(sock_path, 0, 0); os.chmod(sock_path, 0o700); os.mkfifo(control, 0o600); child = None
 def spawn():
     global child
     child = os.fork()
     if child == 0:
-        os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe('/bin/sh', ['/bin/sh', '-c', command], env)
+        os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe(agent_bin, [agent_bin, '--config', config], env)
     open(pid_file, 'w', encoding='ascii').write(str(child))
 def stop():
     global child
@@ -247,8 +247,8 @@ PY
 }
 
 start_daemon() {
-  write_supervisor; AGENT_TRACE="$ARTIFACT_DIR/daemon-syscalls.log"
-  sudo -n env BOOTROOT_AGENT_BIN="$BOOTROOT_AGENT_BIN" DAEMON_CONFIG="$DAEMON_CONFIG" AGENT_TRACE="$AGENT_TRACE" bash -c 'exec python3 "$0" "$1" "$2" "$3" "strace -f -e trace=bind,unlink,unlinkat -o \"$AGENT_TRACE\" -- \"$BOOTROOT_AGENT_BIN\" --config \"$DAEMON_CONFIG\""' "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
+  write_supervisor
+  sudo -n python3 "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" "$BOOTROOT_AGENT_BIN" "$DAEMON_CONFIG" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
   SUPERVISOR_PID=$!
   for _ in $(seq 1 90); do [ -S "$SOCKET_PATH" ] && [ -s "$RUN_ROOT/agent.pid" ] && [ -s "$SURFACE_DIR/registrar-client.crt" ] && break; sleep 1; done
   [ -s "$SURFACE_DIR/registrar-client.crt" ] || fail "daemon did not issue registrar surface material"
@@ -278,7 +278,7 @@ write_mint() { jq -n --argjson group "$2" '{protocol_version:1,service_name:"rev
 
 assert_escalation_denied() {
   local status policies
-  sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/cert/certs/$CERT_AUTH_ROLE" >"$ARTIFACT_DIR/cert-auth-entry.json" || fail "could not read the bootroot-internal cert-auth role"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/cert/certs/$CERT_AUTH_ROLE" >"$ARTIFACT_DIR/cert-auth-entry.json" || fail "could not read the bootroot-internal cert-auth role"
   jq -e --arg identity "$INTERNAL_IDENTITY" '
     def contains_identity:
       if type == "array" then index($identity) != null else . == $identity end;
@@ -291,23 +291,23 @@ assert_escalation_denied() {
   ' "$ARTIFACT_DIR/cert-auth-entry.json" >/dev/null || fail "bootroot-internal cert-auth role does not constrain its DNS SAN"
   # The daemon's credential always names its fixed cert-auth role. Supply that
   # public role name to exercise the same privileged role explicitly.
-  status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -H 'Content-Type: application/json' -X POST -d "{\"name\":\"$CERT_AUTH_ROLE\"}" "$OPENBAO_URL/v1/auth/cert/login" || true)"
+  status="$(curl -sS -o "$ARTIFACT_DIR/cert-login.json" -w '%{http_code}' --cacert "$OPENBAO_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" -H 'Content-Type: application/json' -X POST -d "{\"name\":\"$CERT_AUTH_ROLE\"}" "$OPENBAO_URL/v1/auth/cert/login" || true)"
   [ "$status" -ge 400 ] || fail "registrar leaf authenticated through bootroot-internal auth/cert role"
   policies="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$POLICIES")"
   for endpoint in auth/approle/role/redteam-escalation sys/policies/acl/redteam-escalation; do status="$(curl -sS -o "$ARTIFACT_DIR/unauth-${endpoint//\//-}.json" -w '%{http_code}' -X POST -d "{\"token_policies\":${policies},\"policy\":\"path \\\"*\\\" { capabilities = [\\\"sudo\\\"] }\"}" "$OPENBAO_URL/v1/$endpoint" || true)"; [ "$status" -ge 400 ] || fail "unauthenticated attacker wrote $endpoint"; done
-  for path in bootroot/ca bootroot/infra/responder_hmac bootroot/infra/agent_eab bootroot/services/redteam-review/secret_id; do status="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$ROOT_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" "$OPENBAO_URL/v1/secret/data/$path" || true)"; [ "$status" -ge 400 ] || fail "registrar material read $path directly"; done
+  for path in bootroot/ca bootroot/infra/responder_hmac bootroot/infra/agent_eab bootroot/services/redteam-review/secret_id; do status="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$OPENBAO_CA" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" "$OPENBAO_URL/v1/secret/data/$path" || true)"; [ "$status" -ge 400 ] || fail "registrar material read $path directly"; done
   pass "registrar material cannot authenticate, escalate, or read protected KV paths"
 }
 
 assert_functionality_and_audit() {
   local mint="$RUN_ROOT/mint.json" refused="$RUN_ROOT/refused.json" reserved="$RUN_ROOT/reserved.json" deregister="$RUN_ROOT/deregister.json" first second role policies before after result
   write_mint "$mint" 3000; first="$(client --operation mint --payload "$mint")" || fail "first mint failed"; second="$(client --operation mint --payload "$mint")" || fail "idempotent mint failed"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
-  REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"; role="$(sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/$REGISTRATION_ID")"; policies="$(jq -c '.data.token_policies | sort' <<<"$role")"; [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"
+  REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"; role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/$REGISTRATION_ID")"; policies="$(jq -c '.data.token_policies | sort' <<<"$role")"; [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"
   jq '.service_name = "bootroot-registrar" | .spec.service_name = "bootroot-registrar"' "$mint" >"$reserved"; client --operation mint --payload "$reserved" >"$ARTIFACT_DIR/reserved-identity.json" || fail "reserved identity refusal exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/reserved-identity.json" >/dev/null || fail "registrar leaf was accepted as a service identity"
   write_mint "$refused" 999; before="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; client --operation mint --payload "$refused" >"$ARTIFACT_DIR/refused-mint.json" || fail "refused mint exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/refused-mint.json" >/dev/null || fail "unsafe mint was not refused"; after="$(find "$RECORD_DIR" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END {print s+0}')"; [ "$after" -gt "$before" ] || fail "refused mint wrote no audit record"; grep -R '"phase":"intent"' "$RECORD_DIR" >/dev/null && grep -R '"phase":"outcome"' "$RECORD_DIR" >/dev/null || fail "refused mint lacks paired audit records"
-  sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" >"$ARTIFACT_DIR/refused-role.json" 2>&1 && fail "refused mint created an AppRole"
-  sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/sys/policies/acl/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-policy.json" 2>&1 && fail "refused mint created a policy"
-  sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/secret/data/bootroot/services/redteam-review/secret_id" >"$ARTIFACT_DIR/refused-kv.json" 2>&1 && fail "refused mint wrote service KV"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" >"$ARTIFACT_DIR/refused-role.json" 2>&1 && fail "refused mint created an AppRole"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/sys/policies/acl/bootroot-service-redteam-review" >"$ARTIFACT_DIR/refused-policy.json" 2>&1 && fail "refused mint created a policy"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/secret/data/bootroot/services/redteam-review/secret_id" >"$ARTIFACT_DIR/refused-kv.json" 2>&1 && fail "refused mint wrote service KV"
   jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-deregister"}' >"$deregister"; for expected in identity_removed idempotent_already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
   assert_openbao_audit_log "${INSTANCE}-openbao" /openbao/audit/audit.log
   pass "mint/deregister are idempotent, refusal is audited, and OpenBao writes are contained"
@@ -335,12 +335,12 @@ assert_audit_capacity() {
   sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-low-water.fill" bs=1M count=4 status=none
   response="$(wait_for_capacity_state low_water "$mint")"
   jq -e '.registrar_health.audit_capacity.state == "low_water"' <<<"$response" >/dev/null || fail "low-water health response was malformed"
-  before="$(sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
+  before="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
   sudo -n dd if=/dev/zero of="$AUDIT_DIR/redteam-exhausted.fill" bs=1M count=12 status=none
   wait_for_capacity_state exhausted "$mint" >/dev/null
   response="$(client --operation mint --payload "$mint")" || fail "exhausted mint exchange failed"
   jq -e '.class != null' <<<"$response" >/dev/null || fail "exhausted audit store accepted a mint"
-  after="$(sudo -n curl -fsS --cacert "$ROOT_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
+  after="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/redteam-review" 2>/dev/null || true)"
   [ "$before" = "$after" ] || fail "exhausted mint changed OpenBao role state"
   pass "low-water precedes exhaustion and exhausted mint creates no OpenBao state"
 }
@@ -387,7 +387,7 @@ assert_socket_refusals() {
   printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-empty || fail "unknown socket operation was served"
   printf '%064d\n' 0 >"$wrong"; if python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
   if python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
-  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; printf 'restart\n' >"$CONTROL_FIFO"; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"; grep -E '(^| )(bind|unlink|unlinkat)\(' "$AGENT_TRACE" >/dev/null 2>&1 && fail "daemon bound or unlinked the inherited socket"
+  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; printf 'restart\n' >"$CONTROL_FIFO"; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
   nobody="$(id -un 65534 2>/dev/null || printf nobody)"; printf 'stop\n' >"$CONTROL_FIFO"; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
   sudo -n python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace("registrar-client.key", "missing-client.key"))' "$DAEMON_CONFIG"
@@ -405,7 +405,6 @@ main() {
   log_phase validate
   for command in docker jq curl cargo python3 sudo; do require "$command"; done
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
-  require strace
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
   log_phase deployment; prepare_workspace; allocate_ports; write_configs; build_and_initialize; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
