@@ -43,8 +43,8 @@ use tokio_rustls::TlsAcceptor;
 
 use super::*;
 use crate::registrar::endpoint::test_support::{
-    CapturedEvent, Pki, TestCa, capture_logs, dns_san, endpoint_name, issue_leaf, key_der,
-    registrar_client_name, valid_ca, write_leaf_material,
+    CapturedEvent, Pki, TestCa, capture_logs, dns_san, endpoint_name, issue_leaf,
+    issue_leaf_within, key_der, registrar_client_name, valid_ca, write_leaf_material,
 };
 use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 
@@ -355,6 +355,23 @@ impl Deployment {
         self.pki.path("registrar.sock")
     }
 
+    /// Replaces the deployment's client pair with one whose `notAfter`
+    /// is years in the past, leaving every other property intact: the
+    /// same issuer, the same SAN, and a key that is the leaf's. So a
+    /// case using it isolates the lapse and nothing else.
+    fn write_expired_client_pair(&self) {
+        let (certificate, key) = issue_leaf_within(
+            &self.pki.ca,
+            vec![dns_san(&registrar_client_name())],
+            (2020, 1, 1),
+            (2021, 1, 1),
+        );
+        let mut pem = certificate.pem();
+        pem.push_str(&self.pki.ca.pem());
+        std::fs::write(&self.certificate_path, pem).expect("write the expired leaf chain");
+        std::fs::write(&self.key_path, key.serialize_pem()).expect("write the expired leaf key");
+    }
+
     /// A client wired to this deployment, constructed from paths under
     /// the temporary directory and from nothing else.
     fn client(&self) -> RegistrarEndpointClient {
@@ -627,6 +644,142 @@ async fn a_missing_client_key_fails_before_the_dial() {
             }
         ),
         "{err:?}"
+    );
+    assert_eq!(double.observed().connections, 0);
+}
+
+/// An expired registrar client leaf is the typed lapse, reported before
+/// the socket is opened.
+///
+/// The listener is the ordinary conforming double, and it is here for
+/// one assertion: it counts every connection it accepts, so
+/// `connections == 0` is the proof that no dial was attempted rather
+/// than an inference from the variant that came back.
+#[tokio::test]
+async fn an_expired_client_leaf_is_the_typed_lapse_before_any_dial() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+    deployment.write_expired_client_pair();
+
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a lapsed leaf authenticates nothing");
+
+    assert!(
+        matches!(
+            err,
+            ExchangeError::CertificateLapsed {
+                leaf: SurfaceLeaf::RegistrarClient
+            }
+        ),
+        "{err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("registrar_client"),
+        "the diagnostic names the local role that lapsed: {rendered}"
+    );
+    assert!(
+        rendered.contains("no retry can repair it"),
+        "the diagnostic says the error is not retryable: {rendered}"
+    );
+    assert!(
+        rendered.contains("certificate maintenance"),
+        "the diagnostic directs the operator at renewal: {rendered}"
+    );
+    assert_eq!(
+        double.observed().connections,
+        0,
+        "the listener saw no connection attempt"
+    );
+}
+
+/// The precedence the call sequence implies, asserted end to end.
+///
+/// A lapsed client leaf is reported even when the daemon is not there at
+/// all, and a valid one over the same absent daemon is reported as the
+/// connect failure. So the lapse is not merely returned first by
+/// accident of ordering — it is returned instead of the failure a caller
+/// would otherwise retry.
+#[tokio::test]
+async fn a_lapsed_client_leaf_outranks_an_unavailable_daemon() {
+    let deployment = Deployment::new();
+
+    let unavailable = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("nothing is listening on the socket");
+    assert!(
+        matches!(unavailable, ExchangeError::Connect { .. }),
+        "valid material reaches the connect step: {unavailable:?}"
+    );
+
+    deployment.write_expired_client_pair();
+    let lapsed = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a lapsed leaf authenticates nothing");
+    assert!(
+        matches!(
+            lapsed,
+            ExchangeError::CertificateLapsed {
+                leaf: SurfaceLeaf::RegistrarClient
+            }
+        ),
+        "the lapse is reported ahead of the same connect failure: {lapsed:?}"
+    );
+}
+
+/// The boundary is `notAfter` itself: a leaf still inside its window
+/// dials, and the check does not reject a certificate merely because its
+/// window is narrow.
+#[tokio::test]
+async fn a_leaf_inside_its_window_is_not_reported_as_lapsed() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+
+    let reply = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect("a live leaf completes the exchange");
+    assert!(matches!(reply, MintReply::Success(_)));
+    assert_eq!(double.observed().connections, 1);
+}
+
+/// A certificate file whose leaf will not parse keeps the fault it has.
+///
+/// The lapse check reads the leaf, so it is the one place that could
+/// turn an unparseable file into a claim about a lifetime. It does not:
+/// the unusable-material variant, which names the real fault, still
+/// wins.
+#[tokio::test]
+async fn an_unparseable_leaf_is_not_reported_as_lapsed() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(MINT_SUCCESS)));
+    std::fs::write(
+        &deployment.certificate_path,
+        "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write a PEM block that is not an X.509 certificate");
+
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a certificate that is not X.509 cannot be presented");
+
+    assert!(
+        matches!(err, ExchangeError::Material { .. }),
+        "the unparseable leaf keeps its material variant: {err:?}"
+    );
+    assert!(
+        !matches!(err, ExchangeError::CertificateLapsed { .. }),
+        "a file that will not parse is not a claim about a lifetime: {err:?}"
     );
     assert_eq!(double.observed().connections, 0);
 }
@@ -1215,12 +1368,12 @@ fn a_verifier_rejection_selects_the_pin_refusal_variant() {
     let deployment = Deployment::new();
     // The other half of the rule above, asserted through the same
     // seam: every rejection `endpoint_pin`'s verifier can reach is a
-    // pin refusal here, whichever `CertificateError` it maps onto.
+    // pin refusal here, whichever `CertificateError` it maps onto. The
+    // one exception is the expiry verdict, which the case below owns.
     for rejection in [
         EndpointVerifyRejection::SanMismatch,
         EndpointVerifyRejection::AnchorMismatch,
         EndpointVerifyRejection::AnchorNotCa,
-        EndpointVerifyRejection::AnchorExpired,
         EndpointVerifyRejection::AnchorNotYetValid,
         EndpointVerifyRejection::AnchorMalformed,
         EndpointVerifyRejection::ChainVerificationFailed,
@@ -1238,6 +1391,87 @@ fn a_verifier_rejection_selects_the_pin_refusal_variant() {
         assert_eq!(expected_name, endpoint_name());
         assert_eq!(source, rustls::Error::from(rejection));
     }
+}
+
+/// A TLS expiry verdict on the peer is the endpoint server leaf having
+/// lapsed, and is neither a pin refusal nor a generic handshake failure.
+///
+/// Driven through `classify_handshake` rather than through a live
+/// handshake on purpose. An endpoint cannot be started on expired server
+/// material — startup renewal repairs it before the loader ever sees it
+/// — so the only honest way to reach the verdict is to hand the
+/// classifier the `rustls::Error` a verifier produces, which is exactly
+/// what `tokio_rustls` would have wrapped.
+///
+/// Both spellings of the verdict are asserted: `rustls` documents
+/// `ExpiredContext` as `Expired` with timestamps attached, and it
+/// reaches the generic handshake arm rather than the pin one, so a
+/// classification that recognised only the bare form would answer
+/// differently for the same fault.
+#[test]
+fn a_tls_expiry_verdict_is_the_endpoint_server_lapse_and_not_a_handshake_failure() {
+    let deployment = Deployment::new();
+    let expired_at = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1));
+    for verdict in [
+        rustls::Error::from(EndpointVerifyRejection::AnchorExpired),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+        rustls::Error::InvalidCertificate(rustls::CertificateError::ExpiredContext {
+            time: rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(2)),
+            not_after: expired_at,
+        }),
+    ] {
+        let err = deployment
+            .client()
+            .classify_handshake(io::Error::other(verdict.clone()));
+        assert!(
+            matches!(
+                err,
+                ExchangeError::CertificateLapsed {
+                    leaf: SurfaceLeaf::EndpointServer
+                }
+            ),
+            "expected the endpoint_server lapse for {verdict:?}, saw {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("endpoint_server"),
+            "the diagnostic names the leaf that lapsed: {rendered}"
+        );
+        assert!(
+            rendered.contains("certificate maintenance"),
+            "the diagnostic directs the operator at renewal: {rendered}"
+        );
+        assert!(
+            !rendered.contains("re-provisioning the host\n"),
+            "the diagnostic rules host re-provisioning out rather than asking for it"
+        );
+    }
+}
+
+/// The lapse is distinct from every retryable connection failure, and a
+/// non-expiry certificate verdict is untouched by it.
+#[tokio::test]
+async fn the_lapse_is_not_one_of_the_retryable_connection_failures() {
+    let deployment = Deployment::new();
+    // Nothing is listening, so this is the connect failure a caller may
+    // sensibly retry. It must not be confused with the lapse.
+    let err = deployment
+        .client()
+        .mint(register_request())
+        .await
+        .expect_err("a socket nothing listens on fails the exchange");
+    assert!(
+        matches!(err, ExchangeError::Connect { .. }),
+        "an unavailable daemon keeps its own variant: {err:?}"
+    );
+
+    let handshake = deployment.client().classify_handshake(io::Error::other(
+        rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidYet),
+    ));
+    assert!(
+        matches!(handshake, ExchangeError::PinRefused { .. }),
+        "a not-yet-valid verdict is not an expiry: {handshake:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

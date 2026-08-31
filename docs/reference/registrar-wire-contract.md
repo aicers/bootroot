@@ -483,12 +483,12 @@ base64-decodes, parses a `serde_json::Value`, passes it to
 Any failure in that path is a decode error, never a wire refusal.
 
 `registrar_health` is the endpoint-local, snapshot-supplied container. Its
-additive `limiter` and `audit_capacity` members are present on mint-success,
-deregister-success, and refusal responses, in the response position shown
-above and in that member order:
+additive `limiter`, `audit_capacity`, and `certificates` members are present on
+mint-success, deregister-success, and refusal responses, in the response
+position shown above and in that member order:
 
 ```json
-{"limiter":{"limited_predecision_refusal":0,"limited_admission":0},"audit_capacity":{"state":"ok","enforcement":"filesystem","reserve_bytes":2147483648,"low_water_bytes":536870912,"used_bytes":786432000,"headroom_bytes":1361051648,"measured_at":"1970-01-01T00:00:00Z","intent_without_outcome":0,"malformed_records":0,"retention_shortfall":false,"records_measured_at":"1970-01-01T00:00:00Z"}}
+{"limiter":{"limited_predecision_refusal":0,"limited_admission":0},"audit_capacity":{"state":"ok","enforcement":"filesystem","reserve_bytes":2147483648,"low_water_bytes":536870912,"used_bytes":786432000,"headroom_bytes":1361051648,"measured_at":"1970-01-01T00:00:00Z","intent_without_outcome":0,"malformed_records":0,"retention_shortfall":false,"records_measured_at":"1970-01-01T00:00:00Z"},"certificates":[{"leaf":"registrar_client","not_after":"1970-01-31T00:00:00Z","remaining_seconds":2592000,"last_renewal_outcome":"succeeded","last_renewal_at":"1970-01-01T00:00:00Z"},{"leaf":"endpoint_server","not_after":"1969-12-31T23:59:59Z","remaining_seconds":-1,"last_renewal_outcome":"never_attempted"}]}
 ```
 
 Both `limiter` members are JSON `u64` counters since this daemon process
@@ -524,6 +524,46 @@ of the payload cannot go stale with nothing on the wire to show it. A failed
 probe or a failed scan leaves the previous values and the previous timestamp
 in place rather than resetting them. Optional members are omitted rather than
 serialized as `null`, and an explicit `null` is rejected on decode.
+
+`certificates` reports the two certificate/key pairs the registrar endpoint
+runs on: the registrar client leaf a caller authenticates with, and the
+endpoint server leaf the daemon presents. It is a JSON array of exactly two
+entries, always in this order — `registrar_client`, then `endpoint_server` —
+and both entries are present from the first response the endpoint serves.
+Their member order is the one shown above.
+
+| Member | Type | Presence |
+| --- | --- | --- |
+| `leaf` | `registrar_client` \| `endpoint_server` | always |
+| `not_after` | RFC 3339 UTC string | always |
+| `remaining_seconds` | `i64` | always |
+| `last_renewal_outcome` | `never_attempted` \| `succeeded` \| `failed` | always |
+| `last_renewal_at` | RFC 3339 UTC string | absent exactly while `last_renewal_outcome` is `never_attempted` |
+
+`not_after` is the `notAfter` of the certificate currently at that leaf's
+configured path, formatted the way `material.expires_at` is. A successful
+renewal replaces it; a failed one leaves it in place, which is what makes a
+`failed` outcome beside a positive `remaining_seconds` the readable state it
+is — the leaf is still valid and the renewal that would have kept it that way
+is not working.
+
+`remaining_seconds` is **signed** and is the mathematical floor of the exact
+`not_after - now` difference over sub-second precision: `0` at the instant of
+expiry, where the leaf is not yet lapsed; `-1` for a leaf expired by anything
+less than one second; strictly negative at every later instant; and, before
+expiry, never an overstatement of the time left. It is not a truncation
+toward zero, which would report `0` for a leaf that has already lapsed.
+
+`last_renewal_at` is omitted rather than serialized as `null`, and an explicit
+`null` is rejected on decode, exactly as on `audit_capacity`. Both closed
+enums reject any spelling outside their sets.
+
+The values are copied from the daemon's renewal state on its own maintenance
+cadence, and the endpoint's preparation seeds that state — from the
+certificates already on disk, contacting neither OpenBao nor the CA — before
+it serves anything. So the first response carries both entries with the
+observed `not_after`, `never_attempted`, and no `last_renewal_at`. Serving a
+request reads, stats, and parses no certificate file.
 
 A response encoder receives one daemon-held `RegistrarHealth` snapshot and has
 no other source for it; the protocol module does not read audit, limiter, or

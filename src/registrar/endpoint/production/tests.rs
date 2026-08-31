@@ -19,8 +19,9 @@ use crate::registrar::audit::{ACTIVE_FILE_NAME, AuditRecordStore};
 use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::{RegistrarConfig, ReloadKind, ReloadSpec};
 use crate::registrar::endpoint::protocol::{
-    AuditCapacityHealth, LimiterHealth, RegistrarHealth, WireServiceSpec, decode_ca_anchor,
-    decode_mint_response, encode_ca_anchor, encode_mint_response,
+    AuditCapacityHealth, CertificateHealth, LimiterHealth, RegistrarHealth, RenewalOutcome,
+    WireServiceSpec, decode_ca_anchor, decode_mint_response, encode_ca_anchor,
+    encode_mint_response,
 };
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{InternalCredential, active_root_cert_path};
@@ -33,6 +34,7 @@ use crate::registrar::verbs::outcome::{
 };
 use crate::registrar::verbs::wrap_ttl::WrapTtlPolicy;
 use crate::registrar::verbs::{RegistrarVerbs, RegistrarVerbsConfig};
+use crate::registrar_certs::SurfaceLeaf;
 
 /// The KV mount the anchor harness resolves. The daemon resolves it one
 /// level up and passes it down; nothing in this layer knows where it was
@@ -594,6 +596,22 @@ fn relay_snapshot() -> RegistrarHealth {
             retention_shortfall: Some(true),
             records_measured_at: Some(measured_at),
         },
+        certificates: vec![
+            CertificateHealth {
+                leaf: SurfaceLeaf::RegistrarClient,
+                not_after: measured_at + time::Duration::days(30),
+                remaining_seconds: 2_592_000,
+                last_renewal_outcome: RenewalOutcome::Succeeded,
+                last_renewal_at: Some(measured_at),
+            },
+            CertificateHealth {
+                leaf: SurfaceLeaf::EndpointServer,
+                not_after: measured_at + time::Duration::days(2),
+                remaining_seconds: 172_800,
+                last_renewal_outcome: RenewalOutcome::Failed,
+                last_renewal_at: Some(measured_at),
+            },
+        ],
     }
 }
 
@@ -704,8 +722,8 @@ async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
     );
 }
 
-/// No arm of the request path reads the audit store, and every arm takes
-/// its health from the one accessor.
+/// No arm of the request path reads the audit store or a certificate
+/// file, and every arm takes its health from the one accessor.
 ///
 /// Asserted over this module's source because it is a property of the
 /// complete request path rather than of any one response. The source
@@ -726,6 +744,24 @@ fn no_request_path_arm_reads_the_audit_store() {
         assert!(
             !source.contains(reader),
             "the request path must not read the audit store ({reader})"
+        );
+    }
+
+    // The same bar for the certificate entries: they are copied onto the
+    // shared snapshot by the daemon's tick, so nothing here may stat,
+    // read or parse a leaf to produce one.
+    for reader in [
+        "cert_path",
+        "not_after",
+        "observed_not_after",
+        "parse_cert_not_after",
+        "X509Certificate",
+        "std::fs",
+        "tokio::fs",
+    ] {
+        assert!(
+            !source.contains(reader),
+            "the request path must not read a certificate ({reader})"
         );
     }
 

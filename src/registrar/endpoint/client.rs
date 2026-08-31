@@ -14,7 +14,16 @@
 //! expected endpoint name. This module composes that verifier with its
 //! own per-dial identity and holds no second copy of either rule. It
 //! never parses the peer's certificate — not to extract a SAN, not to
-//! enrich an error — and it never reads `notAfter` on either leaf.
+//! enrich an error — so what it knows about the *server* leaf's lifetime
+//! is only what the handshake's own verdict says.
+//!
+//! Its own leaf is the exception, and a narrow one: the per-dial load
+//! reads that leaf's `notAfter` so that a lapsed registrar client
+//! certificate is reported as the lapse it is, before a socket is
+//! opened, instead of as a handshake the endpoint refused for reasons
+//! this client would have to guess at. It reads nothing else out of the
+//! certificate, and it repairs nothing — restoring a lapsed leaf is the
+//! registrar daemon's certificate maintenance, not a caller's.
 //!
 //! It implements no retry of any kind. A refusal the endpoint encoded is
 //! a *successful exchange* here and is returned in the `Ok` position,
@@ -53,16 +62,19 @@ use std::time::Duration;
 
 use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
+use x509_parser::prelude::{FromDer as _, X509Certificate};
 
 use super::frame::{self, Operation};
 use super::protocol::{self, CodecError};
 use crate::registrar::endpoint;
 use crate::registrar::endpoint_pin::{self, EndpointPinError};
+use crate::registrar_certs::SurfaceLeaf;
 
 /// Largest response this client will read off the wire, prefix
 /// included — 65,540 bytes as the endpoint's constants stand.
@@ -334,6 +346,30 @@ pub(crate) enum ExchangeError {
     ReadTimeout {
         /// The budget that elapsed.
         timeout: Duration,
+    },
+    /// One of the registrar surface's two leaves has expired.
+    ///
+    /// Not a transport failure and not retryable: the material this
+    /// dial would present, or the material the endpoint presented, is
+    /// past its `notAfter`, and every retry with it produces the same
+    /// verdict. Nothing here repairs it — issuing, renewing and
+    /// publishing a leaf is the registrar daemon's certificate
+    /// maintenance, and a caller that re-provisioned the host over this
+    /// would replace a working deployment to fix a stopped timer.
+    ///
+    /// Which leaf lapsed decides which end is at fault, so it is
+    /// carried: `registrar_client` is this caller's own material, found
+    /// expired while the dial was being configured; `endpoint_server`
+    /// is the peer's, and is only ever reached once a connection got as
+    /// far as TLS verification.
+    #[error(
+        "the registrar surface's {leaf} certificate has expired; no retry can repair it — \
+         restore the registrar daemon's certificate maintenance so the leaf is renewed, \
+         rather than re-provisioning the host"
+    )]
+    CertificateLapsed {
+        /// The local role whose leaf is past its `notAfter`.
+        leaf: SurfaceLeaf,
     },
     /// The handshake failed for a reason the pin did not cause.
     #[error("the registrar endpoint TLS handshake failed: {source}")]
@@ -642,17 +678,22 @@ impl RegistrarEndpointClient {
             })
             .await,
         );
-        if let Err(ExchangeError::Material { source }) = &loaded {
-            // Emitted here rather than inside the closure: a
-            // `tracing` subscriber installed for one thread — which is
-            // what `tracing::subscriber::set_default` gives, and what
-            // this module's tests capture with — does not see an event
-            // a blocking-pool thread records.
-            warn!(
+        // Emitted here rather than inside the closure: a `tracing`
+        // subscriber installed for one thread — which is what
+        // `tracing::subscriber::set_default` gives, and what this
+        // module's tests capture with — does not see an event a
+        // blocking-pool thread records.
+        match &loaded {
+            Err(ExchangeError::Material { source }) => warn!(
                 certificate = %self.certificate_path.display(),
                 key = %self.key_path.display(),
                 "Registrar client material could not be loaded: {source}"
-            );
+            ),
+            Err(error @ ExchangeError::CertificateLapsed { .. }) => warn!(
+                certificate = %self.certificate_path.display(),
+                "No dial was attempted: {error}"
+            ),
+            _ => {}
         }
         loaded
     }
@@ -706,11 +747,22 @@ impl RegistrarEndpointClient {
     /// pin did not cause, which is exactly what the generic variant is
     /// for, so the predicate that owns the rejection mapping decides it
     /// instead of the wrapper.
+    ///
+    /// An expiry verdict is taken out ahead of both. It is the one
+    /// certificate verdict whose repair is neither a pin file nor a
+    /// dial: the endpoint's leaf is past its `notAfter` and only the
+    /// registrar daemon's renewal puts that right, so it is reported as
+    /// [`ExchangeError::CertificateLapsed`] for `endpoint_server`
+    /// instead of as a pin refusal or a generic handshake failure. Every
+    /// other verdict keeps exactly the arm it had.
     fn classify_handshake(&self, err: io::Error) -> ExchangeError {
         match err
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<rustls::Error>())
         {
+            Some(source) if is_expiry_verdict(source) => ExchangeError::CertificateLapsed {
+                leaf: SurfaceLeaf::EndpointServer,
+            },
             Some(source) if endpoint_pin::is_endpoint_verify_rejection(source) => {
                 ExchangeError::PinRefused {
                     expected_name: self.expected_endpoint_name.clone(),
@@ -720,6 +772,28 @@ impl RegistrarEndpointClient {
             _ => ExchangeError::Handshake { source: err },
         }
     }
+}
+
+/// Reports whether a recovered `rustls::Error` is an expiry verdict on
+/// the presented certificate.
+///
+/// Both spellings count. `rustls` documents
+/// [`rustls::CertificateError::ExpiredContext`] as semantically the same
+/// as [`rustls::CertificateError::Expired`], differing only by the
+/// timestamps it carries for a diagnostic, so a classification that
+/// asked for one of them would answer differently for the same fault
+/// depending on which the verifier happened to build.
+///
+/// It is deliberately not asked of the *revocation* expiries beside
+/// them: an expired CRL is a fault in the revocation data, not in
+/// either leaf's lifetime, and renewing a certificate does not fix one.
+fn is_expiry_verdict(error: &rustls::Error) -> bool {
+    matches!(
+        error,
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. }
+        )
+    )
 }
 
 /// Turns the blocking load's join result into this dial's outcome.
@@ -763,6 +837,16 @@ fn load_dial_config(
     let (chain, key) =
         load_matching_client_material(certificate_path, key_path, std::thread::sleep)
             .map_err(|source| ExchangeError::Material { source })?;
+    // Between the load and the pin decision on purpose. A lapsed leaf is
+    // a property of the material this dial would present, so it is
+    // settled with the rest of the material, and it is settled here
+    // rather than at the handshake so that no socket is opened for a
+    // pair that cannot authenticate anything.
+    if client_leaf_has_lapsed(&chain, OffsetDateTime::now_utc()) {
+        return Err(ExchangeError::CertificateLapsed {
+            leaf: SurfaceLeaf::RegistrarClient,
+        });
+    }
     build_client_config(pin_file, expected_endpoint_name, chain, key).map_err(|err| match err {
         ClientConfigError::Pin(source) => ExchangeError::Pin { source },
         ClientConfigError::ClientAuth(source) => ExchangeError::Material {
@@ -882,6 +966,32 @@ fn client_pair_matches(chain: &[CertificateDer<'static>], key: &PrivateKeyDer<'s
         return true;
     };
     crate::tls::cert_key_matches(leaf, signing_key.as_ref())
+}
+
+/// Reports whether the registrar client leaf is past its `notAfter`.
+///
+/// The one place this client reads a lifetime, and it reads its own
+/// leaf's alone: the first certificate in the loaded chain, which is the
+/// one it would present. The issuer certificates behind it are not
+/// asked, because an expired anchor is a trust-chain fault the peer
+/// decides about and not this caller's leaf lapsing.
+///
+/// The boundary matches the `remaining_seconds` the endpoint reports:
+/// exactly *at* `notAfter` the leaf is still valid and this is `false`,
+/// and it becomes `true` at the first instant past it.
+///
+/// A chain whose leaf will not parse is **not** reported as lapsed. It
+/// has a fault of its own, and `with_client_auth_cert` a few lines later
+/// names it; claiming an expiry over an unparseable file would send an
+/// operator to renew a certificate that is not the problem.
+fn client_leaf_has_lapsed(chain: &[CertificateDer<'static>], now: OffsetDateTime) -> bool {
+    let Some(leaf) = chain.first() else {
+        return false;
+    };
+    let Ok((_, parsed)) = X509Certificate::from_der(leaf.as_ref()) else {
+        return false;
+    };
+    now.unix_timestamp() > parsed.validity().not_after.timestamp()
 }
 
 /// Loads the registrar client leaf and its key from disk.

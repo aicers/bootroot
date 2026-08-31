@@ -202,11 +202,27 @@ pub(super) fn valid_ca() -> TestCa {
 /// The validity window is wide open because these handshakes run against
 /// the real clock.
 pub(super) fn issue_leaf(ca: &TestCa, sans: Vec<SanType>) -> (rcgen::Certificate, KeyPair) {
+    issue_leaf_within(ca, sans, (2020, 1, 1), (2099, 1, 1))
+}
+
+/// Issues a leaf carrying exactly `sans` inside an explicit validity
+/// window, signed by `ca`.
+///
+/// The window is a parameter for the one property that needs a closed
+/// one: a leaf whose `notAfter` is already in the past, which is what a
+/// lapse case presents. Everything else takes [`issue_leaf`]'s open
+/// window, because it is verified against the real clock.
+pub(super) fn issue_leaf_within(
+    ca: &TestCa,
+    sans: Vec<SanType>,
+    not_before: (i32, u8, u8),
+    not_after: (i32, u8, u8),
+) -> (rcgen::Certificate, KeyPair) {
     let key = KeyPair::generate().expect("generate key");
     let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
     params.is_ca = rcgen::IsCa::NoCa;
-    params.not_before = date_time_ymd(2020, 1, 1);
-    params.not_after = date_time_ymd(2099, 1, 1);
+    params.not_before = date_time_ymd(not_before.0, not_before.1, not_before.2);
+    params.not_after = date_time_ymd(not_after.0, not_after.1, not_after.2);
     params.subject_alt_names = sans;
     let certificate = params.signed_by(&key, ca).expect("issued leaf");
     (certificate, key)

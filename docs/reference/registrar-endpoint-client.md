@@ -98,6 +98,30 @@ already accepted the chain, and a bad one is reported as
 cause, so it reaches the generic handshake variant. The predicate lives beside
 the rejection mapping in `endpoint_pin`, so the two move together.
 
+One verdict is taken out ahead of both, in each direction. A certificate that
+is past its `notAfter` is not something a dial, a pin file or a retry can put
+right — only the registrar daemon's renewal can — so it gets a typed lapse
+variant of its own, carrying which local role lapsed:
+
+- **`registrar_client`.** The per-dial load reads its own leaf's `notAfter`.
+  This is the one lifetime the client reads, it reads it on the leaf it would
+  present and on no issuer behind it, and an expired one fails the dial **before
+  the socket is opened** — ahead of the pin decision and ahead of an unavailable
+  daemon. Exactly at `notAfter` the leaf is still valid. A certificate file
+  whose leaf will not parse is not reported as lapsed: it keeps the
+  material variant that names the real fault.
+- **`endpoint_server`.** A TLS expiry verdict on the peer — `Expired`, and the
+  `ExpiredContext` spelling `rustls` documents as the same thing with
+  timestamps attached — is classified as the lapse rather than as a pin refusal
+  or a generic handshake failure. It is reachable only once a connection got as
+  far as verification. The revocation-list expiries beside it are not asked:
+  an expired CRL is a fault in the revocation data, and renewing a certificate
+  does not fix one.
+
+Neither is retryable, and the diagnostic points at restoring the daemon's
+certificate maintenance rather than at re-provisioning the host. Every
+non-expiry verdict keeps exactly the arm it had.
+
 ## 4. The two timeouts and the response bound
 
 | Bound | Value | What it covers |
