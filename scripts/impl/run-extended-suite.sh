@@ -128,6 +128,17 @@ case_reinit_recovery() {
   "$ROOT_DIR/scripts/impl/run-reinit-recovery.sh"
 }
 
+case_registrar_endurance() {
+  local case_dir="$ARTIFACT_DIR/registrar-endurance"
+  # Renewal past expiry is an extended-tier property. The launcher owns its
+  # 20-minute deadline, run-scoped Docker deployment, and trace artifacts.
+  BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
+  BOOTROOT_BIN="$BOOTROOT_BIN" \
+  ARTIFACT_DIR="$case_dir" \
+  RUN_TOKEN="registrar-endurance-$$" \
+  "$ROOT_DIR/scripts/impl/run-registrar-endurance.sh"
+}
+
 case_runner_cron() {
   local case_dir="$ARTIFACT_DIR/runner-cron"
   ARTIFACT_DIR="$case_dir" \
@@ -189,6 +200,13 @@ main() {
   fi
 
   if line="$(run_case "infra-lifecycle" case_infra_lifecycle)"; then
+    lines+=("$line")
+  else
+    lines+=("$line")
+    overall_status="fail"
+  fi
+
+  if line="$(run_case "registrar-endurance" case_registrar_endurance)"; then
     lines+=("$line")
   else
     lines+=("$line")
