@@ -37,6 +37,8 @@ TIMED_OUT=0
 fail() { printf '[fatal][%s] %s\n' "$CURRENT_PHASE" "$1" >>"$RUN_LOG" 2>/dev/null || true; printf '[registrar-endurance][%s] FAIL %s\n' "$CURRENT_PHASE" "$1" >&2; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/lib/registrar-docker.sh"
+# shellcheck source=lib/leftovers.sh
+. "$SCRIPT_DIR/lib/leftovers.sh"
 . "$SCRIPT_DIR/lib/ports.sh"
 
 registrar_docker_require_launcher_contract
@@ -72,6 +74,7 @@ timeout_report() {
 
 cleanup() {
   local status=$?
+  local cleanup_status=0
   log_phase cleanup
   [ "$TIMED_OUT" -eq 0 ] || printf '{"timeout":"20m","artifacts":"%s"}\n' "$ARTIFACT_DIR" >"$ARTIFACT_DIR/timeout.json" || true
   if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
@@ -83,18 +86,96 @@ cleanup() {
     fi
     wait "$SUPERVISOR_PID" 2>/dev/null || true
   fi
-  if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
+  # Keep all teardown failures visible: a test pass is not a clean scenario
+  # if it leaves run-scoped Docker state, a mounted tmpfs, or its responder
+  # image on the host. `teardown_instance` still tries each resource class
+  # after `compose down` fails, so the following leftover queries are useful.
+  if ! teardown_instance; then
+    echo "[registrar-endurance][cleanup] teardown of ${INSTANCE} failed; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  fi
+  if [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && ! docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1; then
+    echo "[registrar-endurance][cleanup] could not remove ${HTTP01_IMAGE}; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  fi
+  # shellcheck disable=SC2024 # the invoking user owns the scenario log.
+  if [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && ! sudo -n umount "$AUDIT_DIR" >>"$RUN_LOG" 2>&1; then
+    echo "[registrar-endurance][cleanup] could not unmount ${AUDIT_DIR}; see ${RUN_LOG}" >&2
+    cleanup_status=1
+  fi
+  if [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ]; then
+    # shellcheck disable=SC2024 # the invoking user owns the scenario log.
+    if ! sudo -n rm -rf "$RUN_ROOT" >>"$RUN_LOG" 2>&1 && ! rm -rf "$RUN_ROOT" >>"$RUN_LOG" 2>&1; then
+      echo "[registrar-endurance][cleanup] could not remove ${RUN_ROOT}; see ${RUN_LOG}" >&2
+      cleanup_status=1
+    fi
+  fi
+  report_project_leftovers "$INSTANCE" "registrar-endurance cleanup" || cleanup_status=1
+  report_project_network_leftovers || cleanup_status=1
+  if [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && ! assert_image_removed; then
+    cleanup_status=1
+  fi
+  if [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && [ -d "$AUDIT_DIR" ] && mountpoint -q "$AUDIT_DIR"; then
+    echo "[registrar-endurance][cleanup] tmpfs remains mounted at ${AUDIT_DIR}" >&2
+    cleanup_status=1
+  fi
+  if [ -n "$RUN_ROOT" ] && [ -e "$RUN_ROOT" ]; then
+    echo "[registrar-endurance][cleanup] run root survived: ${RUN_ROOT}" >&2
+    cleanup_status=1
+  fi
+  exit_with_cleanup_status "$status" "$cleanup_status"
+}
+
+teardown_instance() {
+  local ids status=0
+  if [ -n "$WORK_DIR" ] && [ -f "$WORK_DIR/docker-compose.deploy.yml" ]; then
     compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
     compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
     # Early failures precede `init`, so its generated Compose environment is
     # absent. These values only satisfy interpolation while `down` resolves
     # the copied manifest; it never creates or reconfigures a service.
-    timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" POSTGRES_PASSWORD=cleanup-only GRAFANA_ADMIN_PASSWORD=cleanup-only docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
+    timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" POSTGRES_PASSWORD=cleanup-only GRAFANA_ADMIN_PASSWORD=cleanup-only docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || status=1
   fi
-  [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
-  [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && sudo -n umount "$AUDIT_DIR" >>"$RUN_LOG" 2>&1 || true
-  [ -n "$RUN_ROOT" ] && [ -d "$RUN_ROOT" ] && { sudo -n rm -rf "$RUN_ROOT" >>"$RUN_LOG" 2>&1 || rm -rf "$RUN_ROOT" 2>/dev/null || true; }
-  exit "$status"
+  if ids="$(docker ps -aq --filter "label=com.docker.compose.project=${INSTANCE}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do docker rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1; done
+  else
+    status=1
+  fi
+  if ids="$(docker volume ls -q --filter "label=com.docker.compose.project=${INSTANCE}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do docker volume rm -f "$id" >>"$RUN_LOG" 2>&1 || status=1; done
+  else
+    status=1
+  fi
+  if ids="$(docker network ls -q --filter "label=com.docker.compose.project=${INSTANCE}" 2>>"$RUN_LOG")"; then
+    for id in $ids; do docker network rm "$id" >>"$RUN_LOG" 2>&1 || status=1; done
+  else
+    status=1
+  fi
+  return "$status"
+}
+
+report_project_network_leftovers() {
+  local networks
+  if ! networks="$(docker network ls -q --filter "label=com.docker.compose.project=${INSTANCE}" 2>>"$RUN_LOG")"; then
+    echo "[registrar-endurance cleanup] cannot list networks of project ${INSTANCE}; leftovers were not checked for" >&2
+    return 1
+  fi
+  [ -z "$networks" ] || {
+    echo "[registrar-endurance cleanup] networks survived for project ${INSTANCE}: ${networks}" >&2
+    return 1
+  }
+}
+
+assert_image_removed() {
+  local image_ids
+  if ! image_ids="$(docker image ls -q "$HTTP01_IMAGE" 2>>"$RUN_LOG")"; then
+    echo "[registrar-endurance cleanup] cannot check whether ${HTTP01_IMAGE} survived" >&2
+    return 1
+  fi
+  [ -z "$image_ids" ] || {
+    echo "[registrar-endurance cleanup] image survived: ${HTTP01_IMAGE}" >&2
+    return 1
+  }
 }
 
 on_timeout() { timeout_report; exit 124; }
@@ -424,7 +505,7 @@ assert_daemon_trace() {
 main() {
   : >"$RUN_LOG"; : >"$PHASE_LOG"; trap cleanup EXIT; trap on_timeout TERM
   log_phase validate
-  for command in docker jq curl openssl python3 sudo strace timeout; do require "$command"; done
+  for command in docker jq curl mountpoint openssl python3 sudo strace timeout; do require "$command"; done
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"
   [ -f "$DRIVER" ] || fail "registrar external client wrapper is missing"
