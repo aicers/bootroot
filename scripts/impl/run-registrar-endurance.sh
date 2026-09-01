@@ -13,14 +13,16 @@ set -euo pipefail
 [ "$#" -eq 0 ] || { echo "run-registrar-endurance.sh takes no positional arguments" >&2; exit 2; }
 
 # Keep setup, renewal, and post-expiry assertions inside the extended job's
-# budget. The inner shell owns cleanup, so timeout leaves the scenario logs and
-# strace files in ARTIFACT_DIR instead of relying on the workflow timeout.
+# budget. On expiry, `timeout` sends TERM and the inner shell enters cleanup.
+# Cleanup has a separate five-minute grace period: `compose down` alone is
+# bounded at 90 seconds, and teardown must reach its leftover checks rather
+# than being cut off before it can remove a failed run's resources.
 if [ "${REGISTRAR_ENDURANCE_INNER:-}" != "1" ]; then
   command -v timeout >/dev/null 2>&1 || {
     echo "run-registrar-endurance.sh requires GNU timeout for its 20-minute deadline" >&2
     exit 2
   }
-  exec timeout --signal=TERM --kill-after=30 20m \
+  exec timeout --signal=TERM --kill-after=5m 20m \
     env REGISTRAR_ENDURANCE_INNER=1 "$0"
 fi
 
@@ -424,7 +426,10 @@ control() { printf '%s\n' "$1" | sudo -n tee "$CONTROL_FIFO" >/dev/null; }
 
 start_daemon_trace() {
   write_supervisor
-  sudo -n strace -ff -e trace=open,openat,openat2 -o "$ARTIFACT_DIR/daemon-trace" python3 "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" "$BOOTROOT_AGENT_BIN" "$DAEMON_CONFIG" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
+  # This test-only value is inert in the submitted binary. It makes the
+  # documented temporary AppRole-routing mutation reproducible: that variant
+  # reads exactly the two root-owned control paths that this trace watches.
+  sudo -n env BOOTROOT_REGISTRAR_ENDURANCE_APPROLE_DIR="$APPROLES_DIR" strace -ff -e trace=open,openat,openat2 -o "$ARTIFACT_DIR/daemon-trace" python3 "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" "$BOOTROOT_AGENT_BIN" "$DAEMON_CONFIG" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
   SUPERVISOR_PID=$!
   for _ in $(seq 1 90); do [ -S "$SOCKET_PATH" ] && [ -s "$RUN_ROOT/agent.pid" ] && sudo -n test -s "$SURFACE_DIR/registrar-client.crt" && sudo -n test -s "$SURFACE_DIR/registrar-endpoint.crt" && break; sleep 1; done
   sudo -n test -s "$SURFACE_DIR/registrar-client.crt" && sudo -n test -s "$SURFACE_DIR/registrar-endpoint.crt" || fail "daemon did not issue registrar surface material"
