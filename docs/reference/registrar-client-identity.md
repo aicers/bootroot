@@ -244,6 +244,20 @@ bundle the server sends alongside its leaf, whose fingerprints are exactly what
 rotation, keep both generations in the file until the endpoint's leaf has been
 reissued under the new anchor.
 
+That anchor arrives on the wire because bootroot puts it there. An ACME response
+commonly stops at an intermediate, so publishing a surface leaf with the response
+chain alone would leave a correctly renewed endpoint presenting nothing a
+root-anchor pin could chain to — and this file is written once, at install, by a
+tool that does not run again when a leaf is renewed. `append_configured_anchors`
+(`src/acme/flow.rs`) therefore adds the configured trust anchors the issuer did
+not return, so an **unchanged** pin keeps accepting the endpoint across renewal.
+It is gated on `trust.ca_bundle_path`: with no bundle configured there is no
+chain to add to, and what is published is what the CA returned. It lives in the
+shared `LeafPublication::LeafWithChain` arm rather than in registrar-specific
+code, so any future consumer of that variant inherits it; today the sole consumer
+is `SURFACE_LEAF_PUBLICATION` in `src/registrar_certs.rs`, which publishes both
+registrar surface leaves. Ordinary service issuance is `LeafOnly` and unaffected.
+
 ## 5. Observed extended key usage on issued certificates
 
 The CSR is where this repository's decision ends. On the CSR

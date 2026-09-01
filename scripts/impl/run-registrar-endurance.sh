@@ -49,18 +49,8 @@ ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 RUN_LOG="$ARTIFACT_DIR/run.log"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_TOKEN="$(registrar_docker_run_token)"
-# `infra install` accepts instance names up to 39 characters. Keep the token
-# tail: suite tokens end in the launcher PID, which is the part that differs
-# between concurrent runs with the same scenario prefix. A token already
-# within the 19-character budget remains whole; Bash's negative substring
-# offset otherwise yields an empty string for it. The complete token still
-# scopes artifacts and image tags below.
-if [ "${#RUN_TOKEN}" -le 19 ]; then
-  INSTANCE_TOKEN="$RUN_TOKEN"
-else
-  INSTANCE_TOKEN="${RUN_TOKEN: -19}"
-fi
-INSTANCE="registrar-endurance-${INSTANCE_TOKEN}"
+SCENARIO_SLUG=endurance
+INSTANCE="$(registrar_docker_instance_name "registrar-${SCENARIO_SLUG}-" "$RUN_TOKEN")"
 BOOTROOT_AGENT_BIN="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
 ENDPOINT_NAME="001.bootroot-registrar-endpoint.endurance.trusted.domain"
@@ -69,13 +59,9 @@ CLIENT_NAME="001.bootroot-registrar.endurance.trusted.domain"
 log_phase() { CURRENT_PHASE="$1"; printf '{"ts":"%s","phase":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >>"$PHASE_LOG"; printf '[registrar-endurance][%s]\n' "$1" | tee -a "$RUN_LOG"; }
 pass() { printf '[registrar-endurance][%s] PASS %s\n' "$CURRENT_PHASE" "$1" | tee -a "$RUN_LOG"; }
 require() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
-digest_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 root_digest_file() { sudo -n sh -c 'if command -v sha256sum >/dev/null; then sha256sum "$1" | awk "{print \$1}"; else shasum -a 256 "$1" | awk "{print \$1}"; fi' _ "$1"; }
-certificate_der_digest() { if command -v sha256sum >/dev/null; then openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'; else openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'; fi; }
 root_certificate_der_digest() { if command -v sha256sum >/dev/null; then sudo -n openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'; else sudo -n openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'; fi; }
 certificate_not_after_epoch() { sudo -n openssl x509 -in "$1" -noout -enddate | python3 -c 'import datetime, sys; value=sys.stdin.read().strip().split("=", 1)[1]; print(int(datetime.datetime.strptime(value, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=datetime.timezone.utc).timestamp()))'; }
-compose() { BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" "$@"; }
-bootroot() { (cd "$WORK_DIR" && "$BOOTROOT_BIN" "$@"); }
 
 timeout_report() {
   TIMED_OUT=1
@@ -87,15 +73,7 @@ cleanup() {
   local cleanup_status=0
   log_phase cleanup
   [ "$TIMED_OUT" -eq 0 ] || printf '{"timeout":"20m","artifacts":"%s"}\n' "$ARTIFACT_DIR" >"$ARTIFACT_DIR/timeout.json" || true
-  if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-    control quit || true
-    for _ in $(seq 1 15); do kill -0 "$SUPERVISOR_PID" 2>/dev/null || break; sleep 1; done
-    if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-      [ -s "$RUN_ROOT/agent.pid" ] && sudo -n kill -TERM "$(cat "$RUN_ROOT/agent.pid")" 2>/dev/null || true
-      kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
-    fi
-    wait "$SUPERVISOR_PID" 2>/dev/null || true
-  fi
+  registrar_docker_stop_supervisor
   # Keep all teardown failures visible: a test pass is not a clean scenario
   # if it leaves run-scoped Docker state, a mounted tmpfs, or its responder
   # image on the host. `teardown_instance` still tries each resource class
@@ -139,8 +117,8 @@ cleanup() {
 teardown_instance() {
   local ids status=0
   if [ -n "$WORK_DIR" ] && [ -f "$WORK_DIR/docker-compose.deploy.yml" ]; then
-    compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
-    compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+    registrar_docker_compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
+    registrar_docker_compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
     # Early failures precede `init`, so its generated Compose environment is
     # absent. These values only satisfy interpolation while `down` resolves
     # the copied manifest; it never creates or reconfigures a service.
@@ -191,16 +169,14 @@ assert_image_removed() {
 on_timeout() { timeout_report; exit 124; }
 
 prepare_workspace() {
-  RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bootroot-registrar-endurance-XXXXXX")"
-  WORK_DIR="$RUN_ROOT/bootroot"; AUDIT_DIR="$RUN_ROOT/audit"; RECORD_DIR="$AUDIT_DIR/records"; SURFACE_DIR="$RUN_ROOT/surface"; SOCKET_DIR="$RUN_ROOT/socket"; SOCKET_PATH="$SOCKET_DIR/registrar.sock"; CONTROL_FIFO="$RUN_ROOT/agent-control"; DAEMON_CONFIG="$RUN_ROOT/registrar-agent.toml"; PROVISIONING="$RUN_ROOT/provisioning.toml"; INITIAL_CONFIG="$WORK_DIR/operator-agent.toml"; SUMMARY="$RUN_ROOT/init-summary.json"; TOKEN_FILE="$RUN_ROOT/openbao-root-token"; TOKEN_CURL="$RUN_ROOT/openbao-curl.conf"; APPROLES_DIR="$RUN_ROOT/approle-control"; EMPTY_PAYLOAD="$RUN_ROOT/empty.json"
-  mkdir -p "$AUDIT_DIR" "$SURFACE_DIR" "$SOCKET_DIR" "$APPROLES_DIR"
-  registrar_docker_prepare_deployment_tree "$BOOTROOT_PROJECT_DIR" "$WORK_DIR"
-  chmod 0755 "$RUN_ROOT"; sudo -n chown 0:0 "$AUDIT_DIR" "$SOCKET_DIR" "$APPROLES_DIR"; sudo -n chmod 0700 "$AUDIT_DIR" "$APPROLES_DIR"; sudo -n chmod 0755 "$SOCKET_DIR"
-  sudo -n mount -t tmpfs -o size=16m,mode=0700 tmpfs "$AUDIT_DIR" || fail "could not mount the scenario-local audit tmpfs"
-  AUDIT_TMPFS_MOUNTED=1
+  registrar_docker_prepare_run_root "$SCENARIO_SLUG"
+  # The two root-owned AppRole control credentials the renewal trace watches
+  # are this scenario's alone, and so is the payload its post-expiry
+  # unknown-operation exchange sends.
+  APPROLES_DIR="$RUN_ROOT/approle-control"; EMPTY_PAYLOAD="$RUN_ROOT/empty.json"
+  mkdir -p "$APPROLES_DIR"
+  sudo -n chown 0:0 "$APPROLES_DIR"; sudo -n chmod 0700 "$APPROLES_DIR"
 }
-
-allocate_ports() { for name in POSTGRES OPENBAO STEPCA HTTP01; do pick_free_port; printf -v "PORT_${name}" '%s' "$PICKED_PORT"; done; OPENBAO_URL="https://localhost:${PORT_OPENBAO}"; }
 
 write_configs() {
   local body="$RUN_ROOT/provisioning.body"
@@ -213,68 +189,7 @@ multiplicity = "one-per-deployment"
 cert_group = 3000
 reload = { kind = "docker-restart", target = "review" }
 EOF
-  printf 'fingerprint = "%s"\n' "$(digest_file "$body")" >"$PROVISIONING"; cat "$body" >>"$PROVISIONING"; rm -f "$body"
-  cat >"$INITIAL_CONFIG" <<EOF
-[registrar]
-audit_store_dir = "${AUDIT_DIR}"
-audit_store_enforcement = "directory"
-
-[registrar_endpoint]
-enabled = true
-EOF
-}
-
-prepull_third_party_images() {
-  POSTGRES_PASSWORD=prepull-only GRAFANA_ADMIN_PASSWORD=prepull-only compose pull openbao postgres step-ca >>"$RUN_LOG" 2>&1 || fail "could not pre-pull third-party deployment images"
-}
-
-build_and_initialize() {
-  local init_raw_log="$RUN_ROOT/init.raw.log"
-  HTTP01_IMAGE="bootroot-http01-responder:registrar-endurance-${RUN_TOKEN}"; export BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE"
-  docker build -t "$HTTP01_IMAGE" -f "$BOOTROOT_PROJECT_DIR/docker/http01-responder/Dockerfile" "$BOOTROOT_PROJECT_DIR" >>"$RUN_LOG" 2>&1 || fail "could not build responder image"; HTTP01_IMAGE_BUILT=1
-  prepull_third_party_images
-  bootroot infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 || fail "infra install failed"
-  for _ in $(seq 1 60); do curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 && break; sleep 1; done
-  curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 || fail "OpenBao did not become reachable"
-  jq -n --arg url "http://localhost:${PORT_OPENBAO}" '{openbao_url: $url, kv_mount: "secret", registrar_endpoint: {enabled: true, domain: "trusted.domain", host: "endurance"}}' >"$WORK_DIR/state.json"
-  if ! sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "endurance-${RUN_TOKEN}" "endurance-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$init_raw_log" 2>&1; then
-    sed 's/^\(root token: \).*/\1<redacted>/' "$init_raw_log" >"$ARTIFACT_DIR/init.log" || true
-    fail "bootroot init failed"
-  fi
-  sed 's/^\(root token: \).*/\1<redacted>/' "$init_raw_log" >"$ARTIFACT_DIR/init.log"
-  sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
-  sudo -n sh -c 'printf "%s: %s\n" "X-Vault-Token" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
-  OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"; sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
-  # `--no-eab` leaves this key absent. The registrar's production reader
-  # distinguishes an explicit clear EAB payload from a missing KV entry, so
-  # create the former in the isolated deployment before starting the daemon.
-  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >/dev/null || fail "could not record the explicit empty agent EAB"
-  pass "initialized an isolated live TLS OpenBao deployment"
-}
-
-load_openbao_paths() {
-  KV_MOUNT="$(jq -er '.kv_mount' "$WORK_DIR/state.json")" || fail "init did not record the KV mount"
-  RESPONDER_HMAC_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/commands/init/constants.rs" PATH_RESPONDER_HMAC)"
-  AGENT_EAB_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/commands/init/constants.rs" PATH_AGENT_EAB)"
-}
-
-apply_endpoint_dns_alias() {
-  local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml" responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
-  cat >"$override" <<EOF
-services:
-  bootroot-http01:
-    networks:
-      default:
-        aliases:
-          - ${CLIENT_NAME}
-          - ${ENDPOINT_NAME}
-EOF
-  [ -f "$responder_override" ] || fail "init did not render the responder compose override"
-  BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 || fail "could not apply registrar DNS aliases"
-  for alias in "$CLIENT_NAME" "$ENDPOINT_NAME"; do
-    for _ in $(seq 1 15); do docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1 && break; sleep 1; done
-    docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1 || fail "step-ca cannot reach registrar hostname ${alias}"
-  done
+  registrar_docker_write_configs "$body"
 }
 
 patch_duration_template() {
@@ -296,7 +211,7 @@ PY
   docker restart "$sidecar" >>"$RUN_LOG" 2>&1 || fail "could not restart run-scoped Step CA OpenBao Agent sidecar ${sidecar}"
   for _ in $(seq 1 60); do sudo -n jq -e '.authority.provisioners[] | select(.type == "ACME" and .name == "acme") | .claims.defaultTLSCertDuration == "6m"' "$rendered" >/dev/null 2>&1 && break; sleep 1; done
   sudo -n jq -e '.authority.provisioners[] | select(.type == "ACME" and .name == "acme") | .claims.defaultTLSCertDuration == "6m"' "$rendered" >/dev/null || fail "Step CA sidecar did not render the 6-minute copied template"
-  compose restart step-ca >>"$RUN_LOG" 2>&1 || fail "could not restart Step CA onto rendered 6-minute configuration"
+  registrar_docker_compose restart step-ca >>"$RUN_LOG" 2>&1 || fail "could not restart Step CA onto rendered 6-minute configuration"
   for _ in $(seq 1 60); do curl -kfsS "https://localhost:${PORT_STEPCA}/health" >/dev/null 2>&1 && break; sleep 1; done
   curl -kfsS "https://localhost:${PORT_STEPCA}/health" >/dev/null || fail "Step CA did not become ready after the template and sidecar sequence"
   sudo -n cp "$template" "$ARTIFACT_DIR/ca.json.ctmpl"; sudo -n cp "$rendered" "$ARTIFACT_DIR/ca.json"
@@ -315,28 +230,6 @@ check_jitter = "0s"
 EOF
   sudo -n grep -q 'check_interval = "5s"' "$internal" && sudo -n grep -q 'renew_before = "4m"' "$internal" && sudo -n grep -q 'check_jitter = "0s"' "$internal" || fail "could not set the rendered internal renewal cadence"
   sudo -n cp "$internal" "$ARTIFACT_DIR/registrar-internal-agent.toml"; sudo -n chown "$(id -u):$(id -g)" "$ARTIFACT_DIR/registrar-internal-agent.toml"
-}
-
-write_daemon_config() {
-  INTERNAL_DIR="$WORK_DIR/secrets/registrar-internal"; ROOT_CA="$WORK_DIR/secrets/certs/root_ca.crt"
-  cat >"$RUN_ROOT/endpoint.toml" <<EOF
-
-[registrar]
-state_file = "${WORK_DIR}/state.json"
-provisioning_config_path = "${PROVISIONING}"
-audit_store_dir = "${AUDIT_DIR}"
-audit_record_dir = "${RECORD_DIR}"
-audit_store_enforcement = "directory"
-
-[registrar_endpoint]
-enabled = true
-server_cert_path = "${SURFACE_DIR}/registrar-endpoint.crt"
-server_key_path = "${SURFACE_DIR}/registrar-endpoint.key"
-client_cert_path = "${SURFACE_DIR}/registrar-client.crt"
-client_key_path = "${SURFACE_DIR}/registrar-client.key"
-EOF
-  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 600 "$3"; chown 0:0 "$3"' _ "$INTERNAL_DIR/agent.toml" "$RUN_ROOT/endpoint.toml" "$DAEMON_CONFIG"
-  sudo -n mkdir -p "$RECORD_DIR"; sudo -n chown 0:0 "$RECORD_DIR"; sudo -n chmod 0700 "$RECORD_DIR"
 }
 
 prepare_anchor_pin() {
@@ -403,44 +296,15 @@ PY
   pass "shared strace parser reports exactly two watched control opens and ignores unrelated opens"
 }
 
-write_supervisor() {
-  cat >"$RUN_ROOT/supervisor.py" <<'PY'
-import os, signal, socket, sys
-sock_path, control, pid_file, agent_bin, config = sys.argv[1:]
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.bind(sock_path); sock.listen(32); os.chown(sock_path, 0, 0); os.chmod(sock_path, 0o700); os.mkfifo(control, 0o600); child = None
-def spawn():
-    global child
-    child = os.fork()
-    if child == 0:
-        os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe(agent_bin, [agent_bin, '--config', config], env)
-    open(pid_file, 'w', encoding='ascii').write(str(child))
-def stop():
-    global child
-    if child is not None:
-        try: os.kill(child, signal.SIGTERM)
-        except ProcessLookupError: pass
-        os.waitpid(child, 0); child = None
-spawn()
-while True:
-    with open(control, encoding='ascii') as stream:
-        for line in stream:
-            if line.strip() == 'restart': stop(); spawn()
-            elif line.strip() == 'stop': stop()
-            elif line.strip() == 'quit': stop(); sys.exit(0)
-PY
-}
-
-control() { printf '%s\n' "$1" | sudo -n tee "$CONTROL_FIFO" >/dev/null; }
-
 start_daemon_trace() {
-  write_supervisor
   # This test-only value is inert in the submitted binary. It makes the
   # documented temporary AppRole-routing mutation reproducible: that variant
   # reads exactly the two root-owned control paths that this trace watches.
-  sudo -n env BOOTROOT_REGISTRAR_ENDURANCE_APPROLE_DIR="$APPROLES_DIR" strace -ff -e trace=open,openat,openat2 -o "$ARTIFACT_DIR/daemon-trace" python3 "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" "$BOOTROOT_AGENT_BIN" "$DAEMON_CONFIG" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
-  SUPERVISOR_PID=$!
-  for _ in $(seq 1 90); do [ -S "$SOCKET_PATH" ] && [ -s "$RUN_ROOT/agent.pid" ] && sudo -n test -s "$SURFACE_DIR/registrar-client.crt" && sudo -n test -s "$SURFACE_DIR/registrar-endpoint.crt" && break; sleep 1; done
-  sudo -n test -s "$SURFACE_DIR/registrar-client.crt" && sudo -n test -s "$SURFACE_DIR/registrar-endpoint.crt" || fail "daemon did not issue registrar surface material"
+  registrar_docker_start_supervisor \
+    env BOOTROOT_REGISTRAR_ENDURANCE_APPROLE_DIR="$APPROLES_DIR" \
+    strace -ff -e trace=open,openat,openat2 -o "$ARTIFACT_DIR/daemon-trace"
+  registrar_docker_await_surface_material \
+    "$SURFACE_DIR/registrar-client.crt" "$SURFACE_DIR/registrar-endpoint.crt"
 }
 
 record_original_leaves() {
@@ -504,9 +368,9 @@ assert_post_expiry_endpoint() {
 }
 
 assert_daemon_trace() {
-  control quit || true
-  for _ in $(seq 1 15); do kill -0 "$SUPERVISOR_PID" 2>/dev/null || break; sleep 1; done
-  wait "$SUPERVISOR_PID" 2>/dev/null || true
+  # The trace has to cover the whole renewal window and be flushed before it
+  # is read, so the daemon is stopped here rather than left to cleanup.
+  registrar_docker_stop_supervisor
   parse_watched_opens "$ARTIFACT_DIR/daemon-trace" "$ARTIFACT_DIR/daemon-trace-matches.log"
   if [ -s "$ARTIFACT_DIR/daemon-trace-matches.log" ]; then
     cat "$ARTIFACT_DIR/daemon-trace-matches.log" >>"$RUN_LOG"
@@ -524,9 +388,17 @@ main() {
   [ -f "$DRIVER" ] || fail "registrar external client wrapper is missing"
 
   log_phase deployment
-  prepare_workspace; allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias
+  prepare_workspace
+  registrar_docker_allocate_ports
+  write_configs
+  registrar_docker_build_and_initialize "$SCENARIO_SLUG"
+  pass "initialized an isolated live TLS OpenBao deployment"
+  registrar_docker_load_openbao_paths
+  registrar_docker_apply_endpoint_dns_alias "$CLIENT_NAME" "$ENDPOINT_NAME"
   log_phase overrides
-  patch_duration_template; set_internal_cadence; write_daemon_config; prepare_anchor_pin; create_approle_control; assert_control_trace
+  patch_duration_template; set_internal_cadence
+  registrar_docker_write_daemon_config
+  prepare_anchor_pin; create_approle_control; assert_control_trace
   log_phase renewal-window
   start_daemon_trace; record_original_leaves; assert_post_expiry_client; assert_post_expiry_endpoint; assert_daemon_trace
   log_phase "done"
