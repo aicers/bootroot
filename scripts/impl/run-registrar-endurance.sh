@@ -362,7 +362,7 @@ wait_until_after() {
 }
 
 write_mint() {
-  jq -n '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"endurance",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:3000},wrap_ttl:60,idempotency_key:"endurance-post-expiry-mint"}' >"$RUN_ROOT/mint.json"
+  jq -n '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"endurance",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:"3000"},wrap_ttl:60,idempotency_key:"endurance-post-expiry-mint"}' >"$RUN_ROOT/mint.json"
 }
 
 socket_mint() {
