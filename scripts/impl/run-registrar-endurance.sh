@@ -51,9 +51,16 @@ PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_TOKEN="$(registrar_docker_run_token)"
 # `infra install` accepts instance names up to 39 characters. Keep the token
 # tail: suite tokens end in the launcher PID, which is the part that differs
-# between concurrent runs with the same scenario prefix. The complete token
-# still scopes artifacts and image tags below.
-INSTANCE="registrar-endurance-${RUN_TOKEN: -19}"
+# between concurrent runs with the same scenario prefix. A token already
+# within the 19-character budget remains whole; Bash's negative substring
+# offset otherwise yields an empty string for it. The complete token still
+# scopes artifacts and image tags below.
+if [ "${#RUN_TOKEN}" -le 19 ]; then
+  INSTANCE_TOKEN="$RUN_TOKEN"
+else
+  INSTANCE_TOKEN="${RUN_TOKEN: -19}"
+fi
+INSTANCE="registrar-endurance-${INSTANCE_TOKEN}"
 BOOTROOT_AGENT_BIN="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
 ENDPOINT_NAME="001.bootroot-registrar-endpoint.endurance.trusted.domain"

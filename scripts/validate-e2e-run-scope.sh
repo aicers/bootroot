@@ -314,6 +314,21 @@ check_truncation_keeps_the_discriminating_tail() {
   ok "a truncated identifier keeps its tail, so runs differing only there stay distinct"
 }
 
+# The registrar endurance scenario has a shorter instance-name budget than
+# the lifecycle harnesses. Its suite token is deliberately short, while a
+# manual run can supply a long CI token. Both must remain run-scoped: Bash's
+# `${token: -N}` expands to an empty string when the token is shorter than N.
+check_registrar_endurance_token_budget() {
+  local script="$IMPL_DIR/run-registrar-endurance.sh"
+  grep -Fq "if [ \"\${#RUN_TOKEN}\" -le 19 ]; then" "$script" \
+    || die "registrar endurance does not preserve short run tokens"
+  grep -Fq "INSTANCE_TOKEN=\"\$RUN_TOKEN\"" "$script" \
+    || die "registrar endurance does not retain its whole short run token"
+  grep -Fq "INSTANCE_TOKEN=\"\${RUN_TOKEN: -19}\"" "$script" \
+    || die "registrar endurance does not retain long run-token tails"
+  ok "registrar endurance retains short tokens and long-token PID tails"
+}
+
 # The separation only holds because the binary ranks the exported
 # project above the declared instance, and applies it to the project
 # alone. That ranking lives in `src/commands/compose_project.rs`, is
@@ -1413,6 +1428,7 @@ check_harness_namespaces_are_declared
 check_no_namespace_can_name_the_default_identity
 check_project_derivation_rejects_what_compose_would
 check_truncation_keeps_the_discriminating_tail
+check_registrar_endurance_token_budget
 check_derivation_rejects_what_it_cannot_derive
 check_the_binary_ranks_the_override_above_the_flag
 check_markers
