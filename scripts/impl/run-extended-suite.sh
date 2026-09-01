@@ -135,7 +135,9 @@ case_registrar_endurance() {
   BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   ARTIFACT_DIR="$case_dir" \
-  RUN_TOKEN="registrar-endurance-$$" \
+  # The short token fits the endurance instance-name budget intact. Its PID
+  # remains distinct for every concurrently running suite process.
+  RUN_TOKEN="e-$$" \
   "$ROOT_DIR/scripts/impl/run-registrar-endurance.sh"
 }
 

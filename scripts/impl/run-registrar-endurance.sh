@@ -49,10 +49,11 @@ ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 RUN_LOG="$ARTIFACT_DIR/run.log"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_TOKEN="$(registrar_docker_run_token)"
-# `infra install` accepts instance names up to 39 characters. Keep enough
-# of the run token to make concurrent deployments distinct while preserving
-# the full token for artifacts and image tags below.
-INSTANCE="registrar-endurance-${RUN_TOKEN:0:19}"
+# `infra install` accepts instance names up to 39 characters. Keep the token
+# tail: suite tokens end in the launcher PID, which is the part that differs
+# between concurrent runs with the same scenario prefix. The complete token
+# still scopes artifacts and image tags below.
+INSTANCE="registrar-endurance-${RUN_TOKEN: -19}"
 BOOTROOT_AGENT_BIN="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
 ENDPOINT_NAME="001.bootroot-registrar-endpoint.endurance.trusted.domain"
