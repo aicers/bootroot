@@ -60,11 +60,12 @@ pub(crate) enum LeafPublication {
     /// written it.
     #[default]
     LeafOnly,
-    /// The leaf followed by the issuer chain the CA returned with it.
+    /// The leaf followed by the issuer chain and configured trust anchors.
     ///
-    /// With `[trust].ca_bundle_path` unconfigured there is no split to
-    /// make and this is what the leaf-only arm writes anyway, so the two
-    /// coincide there.
+    /// The anchors let callers pin an issuing root even when the ACME
+    /// response stops at an intermediate. With `[trust].ca_bundle_path`
+    /// unconfigured there is no split to make and this is what the
+    /// leaf-only arm writes anyway, so the two coincide there.
     LeafWithChain,
 }
 
@@ -718,7 +719,7 @@ async fn run_issuance(
     let cert_pem = client.download_certificate(&cert_url).await?;
     info!("Certificate received.");
 
-    let (leaf_pem, chain) = if settings.trust.ca_bundle_path.is_some() {
+    let (leaf_pem, mut chain) = if settings.trust.ca_bundle_path.is_some() {
         split_leaf_and_chain(&cert_pem)?
     } else {
         (cert_pem.clone(), Vec::new())
@@ -726,6 +727,9 @@ async fn run_issuance(
     let cert_pem = match options.leaf_publication {
         LeafPublication::LeafOnly => leaf_pem,
         LeafPublication::LeafWithChain => {
+            if let Some(bundle_path) = &settings.trust.ca_bundle_path {
+                append_configured_anchors(&mut chain, bundle_path);
+            }
             let mut published = leaf_pem;
             for der in &chain {
                 published.push_str(&encode_cert_pem(der));
@@ -739,6 +743,33 @@ async fn run_issuance(
         key_pem: PrivateKeyPem::new(cert_key.serialize_pem()),
         chain,
     }))
+}
+
+/// Adds configured trust anchors the issuer did not return to a chain.
+///
+/// The endpoint pin verifier can only select an anchor the endpoint
+/// presents. ACME responses commonly stop at an intermediate, so a
+/// root anchor selected from the configured bundle must travel with a
+/// registrar-surface certificate too.
+fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) {
+    // A missing, malformed, or unreadable bundle remains on the existing
+    // bootstrap/repair path. `write_merged_ca_bundle` is still the sole
+    // authority for rejecting an unreadable replacement target, and it runs
+    // before this material is published.
+    let Ok(bundle) = std::fs::read_to_string(bundle_path) else {
+        return;
+    };
+    let Ok(anchors) = crate::tls::parse_pem_to_cert_list(bundle.as_bytes()) else {
+        return;
+    };
+    for anchor in anchors {
+        if !chain
+            .iter()
+            .any(|certificate| certificate.as_slice() == anchor.as_ref())
+        {
+            chain.push(anchor.to_vec());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1300,6 +1331,31 @@ mod tests {
         }
         assert_eq!(with_chain.matches("BEGIN CERTIFICATE").count(), 3);
         assert_eq!(parse_pem_der(&leaf_pem), parse_pem_der(&with_chain));
+    }
+
+    #[test]
+    fn leaf_with_chain_adds_missing_configured_anchors() {
+        let temp = tempdir().expect("temp dir");
+        let bundle_path = temp.path().join("ca-bundle.pem");
+        let intermediate_pem = test_cert_pem("intermediate.example");
+        let root_pem = test_cert_pem("root.example");
+        std::fs::write(&bundle_path, format!("{root_pem}{intermediate_pem}"))
+            .expect("write configured bundle");
+
+        let intermediate_der = parse_pem_der(&intermediate_pem);
+        let root_der = parse_pem_der(&root_pem);
+        let mut chain = vec![intermediate_der];
+        append_configured_anchors(&mut chain, &bundle_path);
+
+        assert_eq!(chain.len(), 2);
+        assert!(chain.iter().any(|certificate| certificate == &root_der));
+        assert_eq!(
+            chain
+                .iter()
+                .filter(|certificate| *certificate == &parse_pem_der(&intermediate_pem))
+                .count(),
+            1
+        );
     }
 
     /// `write_merged_ca_bundle` must fail closed when the existing

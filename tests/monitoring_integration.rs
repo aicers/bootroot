@@ -3,6 +3,7 @@ mod support;
 
 #[cfg(unix)]
 mod unix_integration {
+    use std::env;
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
@@ -15,10 +16,28 @@ mod unix_integration {
 
     use crate::support::polling::wait_for;
 
-    /// Host ports the stack this test brings up publishes on `127.0.0.1`:
-    /// `OpenBao` (8200), step-ca (9000), the HTTP-01 responder (8080),
-    /// Grafana under the `lan` profile (3000) and `PostgreSQL` (5433).
-    const MONITORING_PORTS: [u16; 5] = [8200, 9000, 8080, 3000, 5433];
+    /// Resolves a host port from the Compose override or its documented
+    /// default.
+    fn host_port(name: &str, default: u16) -> Result<u16> {
+        match env::var(name) {
+            Ok(value) if !value.is_empty() => value
+                .parse()
+                .with_context(|| format!("parsing {name} as a host port")),
+            Ok(_) | Err(env::VarError::NotPresent) => Ok(default),
+            Err(error) => Err(error).with_context(|| format!("reading {name}")),
+        }
+    }
+
+    /// Host ports the stack this test brings up publishes on `127.0.0.1`.
+    fn monitoring_ports() -> Result<[u16; 5]> {
+        Ok([
+            host_port("OPENBAO_HOST_PORT", 8200)?,
+            host_port("STEPCA_HOST_PORT", 9000)?,
+            host_port("HTTP01_ADMIN_HOST_PORT", 8080)?,
+            3000,
+            host_port("POSTGRES_HOST_PORT", 5433)?,
+        ])
+    }
 
     /// Grafana admin password given to `monitoring up`, injected into
     /// compose, and used to authenticate against the Grafana API. One
@@ -505,7 +524,7 @@ mod unix_integration {
     }
 
     #[tokio::test]
-    #[ignore = "Brings the Docker monitoring stack up on fixed host ports; run with --include-ignored and 8200, 9000, 8080, 3000 and 5433 free"]
+    #[ignore = "Brings the Docker monitoring stack up; run with --include-ignored and its configured host ports free"]
     async fn monitoring_stack_is_ready() -> Result<()> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -513,10 +532,10 @@ mod unix_integration {
             .as_secs();
         let project = format!("bootroot-itest-{nonce}");
         // A conflict is a failure, not a skip: the stack publishes these on
-        // 127.0.0.1 from the repo compose file, so there is no port left to
-        // fall back to, and reporting success here is how this test spent
-        // its life being green without running.
-        let bound = bound_ports(&MONITORING_PORTS);
+        // 127.0.0.1 from the repo compose file. Reporting success here is
+        // how this test spent its life being green without running.
+        let ports = monitoring_ports()?;
+        let bound = bound_ports(&ports);
         if !bound.is_empty() {
             let ports = bound
                 .iter()
@@ -525,8 +544,8 @@ mod unix_integration {
                 .join(", ");
             anyhow::bail!(
                 "Required host ports are already in use: {ports}. \
-                 Free them and re-run; this test publishes the monitoring \
-                 stack on 127.0.0.1 at fixed ports."
+                 Free them, or choose the documented host-port overrides, \
+                 and re-run."
             );
         }
         ensure_secrets_dir()?;
