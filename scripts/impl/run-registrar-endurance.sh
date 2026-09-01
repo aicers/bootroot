@@ -48,7 +48,7 @@ RUN_TOKEN="$(registrar_docker_run_token)"
 # `infra install` accepts instance names up to 39 characters. Keep enough
 # of the run token to make concurrent deployments distinct while preserving
 # the full token for artifacts and image tags below.
-INSTANCE="registrar-endurance-${RUN_TOKEN:0:20}"
+INSTANCE="registrar-endurance-${RUN_TOKEN:0:19}"
 BOOTROOT_AGENT_BIN="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
 ENDPOINT_NAME="001.bootroot-registrar-endpoint.endurance.trusted.domain"
