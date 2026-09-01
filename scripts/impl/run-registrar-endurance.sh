@@ -154,6 +154,10 @@ build_and_initialize() {
   sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
   sudo -n sh -c 'printf "%s: %s\n" "X-Vault-Token" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
   OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"; sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
+  # `--no-eab` leaves this key absent. The registrar's production reader
+  # distinguishes an explicit clear EAB payload from a missing KV entry, so
+  # create the former in the isolated deployment before starting the daemon.
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab" >/dev/null || fail "could not record the explicit empty agent EAB"
   pass "initialized an isolated live TLS OpenBao deployment"
 }
 
