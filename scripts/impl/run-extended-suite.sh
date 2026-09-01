@@ -132,11 +132,11 @@ case_registrar_endurance() {
   local case_dir="$ARTIFACT_DIR/registrar-endurance"
   # Renewal past expiry is an extended-tier property. The launcher owns its
   # 20-minute deadline, run-scoped Docker deployment, and trace artifacts.
+  # The short token fits the endurance instance-name budget intact. Its PID
+  # remains distinct for every concurrently running suite process.
   BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
   BOOTROOT_BIN="$BOOTROOT_BIN" \
   ARTIFACT_DIR="$case_dir" \
-  # The short token fits the endurance instance-name budget intact. Its PID
-  # remains distinct for every concurrently running suite process.
   RUN_TOKEN="e-$$" \
   "$ROOT_DIR/scripts/impl/run-registrar-endurance.sh"
 }
