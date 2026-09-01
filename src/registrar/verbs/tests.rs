@@ -5,6 +5,9 @@
 //! binding record's JSON, and the wrap-TTL policy. Where a client is
 //! needed at all it is a canned-response Wiremock, and the assertion is
 //! usually that *no request was made*.
+//! Every socket this module's fast tier opens is the in-process loopback
+//! socket a `wiremock::MockServer` owns and stops with the test process;
+//! it binds and dials no externally supplied address.
 //!
 //! **Ignored tier.** Everything whose outcome depends on a prior
 //! `OpenBao` write: durable bindings, the compare-and-set, re-mint,
@@ -35,6 +38,7 @@ use super::binding::{
     BINDING_SCHEMA_VERSION, BindingRecord, BindingReloadKind, BindingSpec, BindingState,
     REGISTRAR_BINDING_KV_SUFFIX,
 };
+use super::coalescing::CoalescingLimitedInvocationSink;
 use super::limiter::{
     CountingLimitedInvocationSink, LimitedInvocation, LimitedInvocationSink, LimiterBucket,
     VerbRateLimiter, VerbRateLimiterSettings,
@@ -2604,6 +2608,89 @@ async fn a_pre_decision_flood_is_limited_without_writing_a_record() {
     assert_untouched(&server).await;
 }
 
+/// The shipped pre-decision limiter bound remains durable when the real
+/// verb path feeds its limited events through the coalescing sink.
+///
+/// The flood remains inside one paused Tokio-time coalescing window, so
+/// differing traffic volume changes the aggregate count but not the number
+/// of durable records it creates.
+#[tokio::test(start_paused = true)]
+async fn pre_decision_refusal_floods_coalesce_at_the_shipped_bound() {
+    const FLOODS: [u32; 2] = [40, 256];
+    const WINDOW_SECONDS: u64 = 60;
+    const EXPECTED_RECORDS: usize = 2 * 32 + 1;
+    let settings = VerbRateLimiterSettings::default();
+    assert_eq!(settings.predecision_refusal_burst, 32);
+    assert_eq!(settings.predecision_refusal_refill_interval_ms, 1_000);
+
+    let mut record_totals = Vec::new();
+    for flood in FLOODS {
+        let server = MockServer::start().await;
+        let (_dir, config) = load_fixture(&base_fixture());
+        let audit_store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+        let counts = Arc::new(CountingLimitedInvocationSink::new());
+        let sink = Arc::new(CoalescingLimitedInvocationSink::new(
+            Arc::clone(&counts),
+            audit_store.clone(),
+            WINDOW_SECONDS,
+        ));
+        let verbs = verbs_with_limiter(
+            mock_client(&server),
+            "secret",
+            config,
+            audit_store,
+            VerbRateLimiter::new(settings, sink.clone()),
+        );
+
+        for _ in 0..flood {
+            let refusal = verbs
+                .mint(&mint_request("not a label", "h1", None))
+                .await
+                .expect_err("an invalid service name must be refused");
+            assert_envelope(&refusal, ProducingArm::PreDerivation);
+            assert!(matches!(
+                refusal.error(),
+                VerbError::Registrar(RegistrarError::InvalidServiceName { .. })
+            ));
+        }
+        sink.flush();
+
+        let records = trail(&verbs);
+        assert_eq!(records.len(), EXPECTED_RECORDS, "flood of {flood}");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["phase"] == json!("intent"))
+                .count(),
+            32,
+            "the admitted requests each write one intent"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["phase"] == json!("outcome"))
+                .count(),
+            32,
+            "the admitted requests each write one refusal outcome"
+        );
+        let limited: Vec<_> = records
+            .iter()
+            .filter(|record| record["phase"] == json!("limited"))
+            .collect();
+        assert_eq!(limited.len(), 1, "one coalesced limited record");
+        assert_eq!(limited[0]["limited_bucket"], json!("predecision_refusal"));
+        assert_eq!(limited[0]["count"], json!(flood - 32));
+        assert_eq!(
+            counts.count(LimiterBucket::PredecisionRefusal),
+            u64::from(flood - 32)
+        );
+        assert_eq!(counts.count(LimiterBucket::Admission), 0);
+        assert_untouched(&server).await;
+        record_totals.push(records.len());
+    }
+    assert_eq!(record_totals, vec![EXPECTED_RECORDS; FLOODS.len()]);
+}
+
 /// Driven pairwise across the whole pre-decision refusal set: the
 /// `VerbError`, the mapped wire identifier — or its absence — and the
 /// `RefusalClass` are equal whether the invocation was limited or not,
@@ -3471,6 +3558,89 @@ async fn a_second_host_is_refused_before_the_spec_comparison_across_instances() 
         .deregister(&deregister_request("web", &host_a, Some(1)))
         .await
         .expect("cleanup");
+}
+
+/// The fixture-backed non-injective identity is refused through the binding
+/// path without needing the durable `OpenBao` tier: a canned binding response
+/// represents the first claim, and the second request must stop at it.
+#[tokio::test]
+async fn colliding_fixture_identities_refuse_on_the_binding_arm() {
+    let fixture = RegistrarConfigFixture::new()
+        .with_multiplicity("web", Multiplicity::ManyPerHost)
+        .with_multiplicity("aimer-web", Multiplicity::ManyPerHost);
+    let (_dir, config) = load_fixture(&fixture);
+    let expected_spec = RegistrationSpec {
+        cert_group: None,
+        reload: ReloadSpec::none(),
+    };
+    for component in ["web", "aimer-web"] {
+        let entry = config
+            .component(component)
+            .expect("fixture component exists");
+        assert_eq!(entry.multiplicity(), Multiplicity::ManyPerHost);
+        assert_eq!(entry.spec(), &expected_spec);
+    }
+    let first_request = MintRequest {
+        caller: CallerIdentity::new(CALLER),
+        service_name: "web".to_string(),
+        host: "h1-aimer".to_string(),
+        instance: Some(1),
+        spec: requested(&expected_spec),
+        wrap_ttl: Duration::minutes(5),
+    };
+    let second_request = MintRequest {
+        caller: CallerIdentity::new(CALLER),
+        service_name: "aimer-web".to_string(),
+        host: "h1".to_string(),
+        instance: Some(1),
+        spec: requested(&expected_spec),
+        wrap_ttl: Duration::minutes(5),
+    };
+    let registration_id = "h1-aimer-web-001";
+    for request in [&first_request, &second_request] {
+        assert_eq!(
+            crate::registrar::identity::derive_registration_id(
+                Multiplicity::ManyPerHost,
+                &request.service_name,
+                &request.host,
+                request.instance,
+            )
+            .expect("the fixture identity derives"),
+            registration_id
+        );
+    }
+
+    let server = MockServer::start().await;
+    mock_first_mint(&server, registration_id).await;
+    let verbs = verbs_with(mock_client(&server), "secret", config);
+    let first = verbs
+        .mint(&first_request)
+        .await
+        .expect("first claim succeeds");
+    assert_eq!(first.kind(), MintKind::FirstMint);
+
+    let active = BindingRecord::creating("h1-aimer", &requested(&expected_spec))
+        .activated(&requested(&expected_spec));
+    mock_binding_read(&server, registration_id, &active).await;
+    let refusal = verbs
+        .mint(&second_request)
+        .await
+        .expect_err("the second host must be refused by the binding");
+    assert!(matches!(
+        refusal.error(),
+        VerbError::RegistrationIdCollision { stored_host, .. } if stored_host == "h1-aimer"
+    ));
+    assert_eq!(refusal.context().arm(), ProducingArm::Binding);
+    let outcome = assert_pair(
+        &verbs,
+        refusal.context().request_id().as_str(),
+        &Asked::new("mint", "aimer-web", "h1", Some(1)),
+    );
+    assert_eq!(
+        outcome["outcome"]["reason"],
+        json!("registration_id_collision")
+    );
+    assert_eq!(outcome["registration_id"], json!(registration_id));
 }
 
 /// Safe-set refusal and stored-spec conflict are distinct, and neither

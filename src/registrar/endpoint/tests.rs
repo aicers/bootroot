@@ -18,6 +18,9 @@
 //!   `tempfile::tempdir()`, and hands its descriptor through the very
 //!   activation seam production uses. Code under test never binds,
 //!   unlinks or chmods anything.
+//!   Its only other sockets are the loopback listeners
+//!   `wiremock::MockServer` owns and stops in the test process; this module
+//!   neither binds nor dials any external address.
 //!
 //! The certificate material the last two tiers rest on, and the
 //! `tracing` capture the stream tier reads its diagnostics back out of,
@@ -77,6 +80,7 @@ use super::{
 };
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::AuditRecordStore;
+use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::RegistrarConfig;
 use crate::registrar::endpoint::production::ProductionHandler;
 use crate::registrar::endpoint::protocol;
@@ -1025,6 +1029,31 @@ async fn mock_first_roxyd_mint(server: &MockServer, registration_id: &str) {
                 "creation_time": "2026-08-23T12:00:00Z",
                 "creation_path": format!("auth/approle/role/{role_name}/secret-id"),
             }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Mounts the process-owned loopback responses a socket-carried successful
+/// mint needs, including the deployment trust anchor it reads before verbs.
+async fn mock_socket_mint_dependencies(server: &MockServer, registration_id: &str) {
+    Mock::given(method("POST"))
+        .and(request_path("/v1/auth/cert/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "auth": { "client_token": "s.internal-token", "lease_duration": 900 }
+        })))
+        .mount(server)
+        .await;
+    mock_first_roxyd_mint(server, registration_id).await;
+    let anchor = valid_ca();
+    let fingerprint = crate::tls::sha256_hex(anchor.der().as_ref());
+    Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": {
+                "trusted_ca_sha256": [fingerprint],
+                "ca_bundle_pem": anchor.pem(),
+            }}
         })))
         .mount(server)
         .await;
@@ -2639,6 +2668,101 @@ async fn a_socket_carried_deregister_returns_a_framed_codec_response() {
     );
 
     running.stop().await;
+}
+
+/// An exhausted capacity snapshot stops a valid mint before the verb layer;
+/// the two non-exhausted states use the same socket request and proceed
+/// through the normal mint path instead.
+#[tokio::test]
+async fn a_socket_mint_obeys_the_audit_capacity_snapshot() {
+    let request = frame_of(b"mint", &register_payload("roxyd", "h1", "capacity-key"));
+
+    let server = MockServer::start().await;
+    let health = Arc::new(StdMutex::new(protocol::RegistrarHealth::default()));
+    health
+        .lock()
+        .expect("the health lock is not poisoned")
+        .audit_capacity
+        .state = AuditCapacityState::Exhausted;
+    let (_dir, audit, handler) = production_handler_with_limiter(
+        &server,
+        VerbRateLimiter::new(
+            VerbRateLimiterSettings::default(),
+            Arc::new(NoopLimitedInvocationSink),
+        ),
+        Arc::clone(&health),
+    );
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+    let response =
+        protocol::decode_refusal_response(&decode_response(&harness.round_trip(&request).await))
+            .expect("the exhausted response decodes");
+    assert_eq!(response.request_id, "capacity-key");
+    assert_eq!(response.registration_id, None);
+    assert_eq!(response.class, protocol::RefusalClass::Permanent);
+    assert_eq!(
+        response.error,
+        Some(protocol::EnrollError::RegistrarUnavailable {
+            reason: protocol::RegistrarUnavailableReason::AuditUnwritable,
+        })
+    );
+    assert_eq!(
+        response.registrar_health.audit_capacity.state,
+        AuditCapacityState::Exhausted
+    );
+    assert!(
+        audit_trail(&audit).is_empty(),
+        "the capacity gate writes no intent"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock server records requests")
+            .is_empty(),
+        "the capacity gate reaches no role, policy, KV, binding, or anchor request"
+    );
+    running.stop().await;
+
+    for state in [AuditCapacityState::LowWater, AuditCapacityState::Unknown] {
+        let server = MockServer::start().await;
+        mock_socket_mint_dependencies(&server, "h1-roxyd").await;
+        let health = Arc::new(StdMutex::new(protocol::RegistrarHealth::default()));
+        health
+            .lock()
+            .expect("the health lock is not poisoned")
+            .audit_capacity
+            .state = state;
+        let (_dir, audit, handler) = production_handler_with_limiter(
+            &server,
+            VerbRateLimiter::new(
+                VerbRateLimiterSettings::default(),
+                Arc::new(NoopLimitedInvocationSink),
+            ),
+            Arc::clone(&health),
+        );
+        let harness = Harness::bind().expect("harness");
+        let running = RunningEndpoint::start(&harness.endpoint, handler);
+        let response =
+            protocol::decode_mint_response(&decode_response(&harness.round_trip(&request).await))
+                .expect("a non-exhausted snapshot reaches the mint path");
+        assert_eq!(response.registration_id, "h1-roxyd");
+        assert_eq!(response.registrar_health.audit_capacity.state, state);
+        assert_eq!(
+            audit_trail(&audit).len(),
+            2,
+            "the mint writes an intent/outcome pair"
+        );
+        assert!(
+            !server
+                .received_requests()
+                .await
+                .expect("the mock server records requests")
+                .is_empty(),
+            "a non-exhausted snapshot reaches the normal verb path"
+        );
+        running.stop().await;
+    }
 }
 
 /// A typed verb refusal is framed as a wire refusal carrying its
