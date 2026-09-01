@@ -355,6 +355,45 @@ fn assert_refusal_pair(verbs: &RegistrarVerbs, refusal: &VerbRefusal, asked: &As
         .to_string()
 }
 
+/// Asserts that the limiter-admitted invalid-label refusals each left their
+/// own complete audit pair.
+fn assert_durable_invalid_service_name_pairs(
+    verbs: &RegistrarVerbs,
+    refusals: &[VerbRefusal],
+    flood: u32,
+    expected_count: usize,
+) {
+    let recorded: Vec<_> = refusals
+        .iter()
+        .filter(|refusal| !lines_for(verbs, refusal.context().request_id().as_str()).is_empty())
+        .collect();
+    let recorded_request_ids: std::collections::HashSet<_> = recorded
+        .iter()
+        .map(|refusal| refusal.context().request_id().as_str())
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        expected_count,
+        "flood of {flood} admits exactly {expected_count} requests"
+    );
+    assert_eq!(
+        recorded_request_ids.len(),
+        expected_count,
+        "flood of {flood} gives each durable pair a distinct request id"
+    );
+    for refusal in recorded {
+        assert_eq!(
+            assert_refusal_pair(
+                verbs,
+                refusal,
+                &Asked::new("mint", "not a label", "h1", None),
+            ),
+            "invalid_service_name",
+            "each admitted request carries its own invalid-service-name refusal"
+        );
+    }
+}
+
 /// A store over a directory the caller keeps alive, so a test can pick
 /// its size limit and reach its fault switches.
 ///
@@ -2618,7 +2657,8 @@ async fn a_pre_decision_flood_is_limited_without_writing_a_record() {
 async fn pre_decision_refusal_floods_coalesce_at_the_shipped_bound() {
     const FLOODS: [u32; 2] = [40, 256];
     const WINDOW_SECONDS: u64 = 60;
-    const EXPECTED_RECORDS: usize = 2 * 32 + 1;
+    const ADMITTED_REQUESTS: usize = 32;
+    const EXPECTED_RECORDS: usize = 2 * ADMITTED_REQUESTS + 1;
     let settings = VerbRateLimiterSettings::default();
     assert_eq!(settings.predecision_refusal_burst, 32);
     assert_eq!(settings.predecision_refusal_refill_interval_ms, 1_000);
@@ -2642,6 +2682,7 @@ async fn pre_decision_refusal_floods_coalesce_at_the_shipped_bound() {
             VerbRateLimiter::new(settings, sink.clone()),
         );
 
+        let mut refusals = Vec::new();
         for _ in 0..flood {
             let refusal = verbs
                 .mint(&mint_request("not a label", "h1", None))
@@ -2652,6 +2693,7 @@ async fn pre_decision_refusal_floods_coalesce_at_the_shipped_bound() {
                 refusal.error(),
                 VerbError::Registrar(RegistrarError::InvalidServiceName { .. })
             ));
+            refusals.push(refusal);
         }
         sink.flush();
 
@@ -2673,6 +2715,7 @@ async fn pre_decision_refusal_floods_coalesce_at_the_shipped_bound() {
             32,
             "the admitted requests each write one refusal outcome"
         );
+        assert_durable_invalid_service_name_pairs(&verbs, &refusals, flood, ADMITTED_REQUESTS);
         let limited: Vec<_> = records
             .iter()
             .filter(|record| record["phase"] == json!("limited"))
