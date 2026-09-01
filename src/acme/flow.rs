@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use tracing::{info, warn};
@@ -728,7 +728,7 @@ async fn run_issuance(
         LeafPublication::LeafOnly => leaf_pem,
         LeafPublication::LeafWithChain => {
             if let Some(bundle_path) = &settings.trust.ca_bundle_path {
-                append_configured_anchors(&mut chain, bundle_path)?;
+                append_configured_anchors(&mut chain, bundle_path);
             }
             let mut published = leaf_pem;
             for der in &chain {
@@ -751,14 +751,18 @@ async fn run_issuance(
 /// presents. ACME responses commonly stop at an intermediate, so a
 /// root anchor selected from the configured bundle must travel with a
 /// registrar-surface certificate too.
-fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) -> Result<()> {
-    let bundle = std::fs::read_to_string(bundle_path).with_context(|| {
-        format!(
-            "reading configured CA bundle from {}",
-            bundle_path.display()
-        )
-    })?;
-    for anchor in crate::tls::parse_pem_to_cert_list(bundle.as_bytes())? {
+fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) {
+    // A missing, malformed, or unreadable bundle remains on the existing
+    // bootstrap/repair path. `write_merged_ca_bundle` is still the sole
+    // authority for rejecting an unreadable replacement target, and it runs
+    // before this material is published.
+    let Ok(bundle) = std::fs::read_to_string(bundle_path) else {
+        return;
+    };
+    let Ok(anchors) = crate::tls::parse_pem_to_cert_list(bundle.as_bytes()) else {
+        return;
+    };
+    for anchor in anchors {
         if !chain
             .iter()
             .any(|certificate| certificate.as_slice() == anchor.as_ref())
@@ -766,7 +770,6 @@ fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) -> Re
             chain.push(anchor.to_vec());
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1342,7 +1345,7 @@ mod tests {
         let intermediate_der = parse_pem_der(&intermediate_pem);
         let root_der = parse_pem_der(&root_pem);
         let mut chain = vec![intermediate_der];
-        append_configured_anchors(&mut chain, &bundle_path).expect("append configured anchors");
+        append_configured_anchors(&mut chain, &bundle_path);
 
         assert_eq!(chain.len(), 2);
         assert!(chain.iter().any(|certificate| certificate == &root_der));
