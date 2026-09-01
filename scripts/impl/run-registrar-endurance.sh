@@ -86,7 +86,10 @@ cleanup() {
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
     compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
     compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
-    timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
+    # Early failures precede `init`, so its generated Compose environment is
+    # absent. These values only satisfy interpolation while `down` resolves
+    # the copied manifest; it never creates or reconfigures a service.
+    timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" POSTGRES_PASSWORD=cleanup-only GRAFANA_ADMIN_PASSWORD=cleanup-only docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
   fi
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
   [ "$AUDIT_TMPFS_MOUNTED" -eq 1 ] && sudo -n umount "$AUDIT_DIR" >>"$RUN_LOG" 2>&1 || true
