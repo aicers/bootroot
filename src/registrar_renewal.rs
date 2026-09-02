@@ -742,7 +742,6 @@ pub(crate) struct RegistrarCertRenewal {
     endpoint: Arc<ActivatedEndpoint>,
     state: RegistrarCertRenewalState,
     cadence: RenewalCadence,
-    insecure_mode: bool,
     live: Box<dyn LivePaths>,
 }
 
@@ -773,12 +772,11 @@ impl RegistrarCertRenewal {
     pub(crate) async fn prepare(
         settings: Arc<Settings>,
         endpoint: Arc<ActivatedEndpoint>,
-        insecure_mode: bool,
     ) -> Result<Self> {
         let plan = resolve_surface_plan(&settings)
             .context("resolving the registrar surface renewal plan")?;
         let cadence = RenewalCadence::from_internal_config(&plan.secrets_dir)?;
-        Self::assemble(settings, plan, endpoint, cadence, insecure_mode).await
+        Self::assemble(settings, plan, endpoint, cadence).await
     }
 
     /// Initializes the accessor and assembles the adapter around an
@@ -799,7 +797,6 @@ impl RegistrarCertRenewal {
         plan: SurfacePlan,
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
-        insecure_mode: bool,
     ) -> Result<Self> {
         let state = RegistrarCertRenewalState::default();
         for pair in &plan.pairs {
@@ -818,7 +815,6 @@ impl RegistrarCertRenewal {
             endpoint,
             state,
             cadence,
-            insecure_mode,
             live: Box::new(FilesystemPaths::new()),
         })
     }
@@ -849,7 +845,7 @@ impl RegistrarCertRenewal {
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
     ) -> Result<Self> {
-        Self::assemble(settings, plan, endpoint, cadence, false).await
+        Self::assemble(settings, plan, endpoint, cadence).await
     }
 
     /// Returns the accessor this adapter writes.
@@ -1052,14 +1048,9 @@ impl RegistrarCertRenewal {
         let produced: Mutex<Option<crate::acme::IssuedMaterial>> = Mutex::new(None);
         utils::retry_with_backoff_and_sleep(
             || async {
-                let material = issue_surface_pair_material(
-                    &self.settings,
-                    pair,
-                    &self.plan.host,
-                    inputs,
-                    self.insecure_mode,
-                )
-                .await?;
+                let material =
+                    issue_surface_pair_material(&self.settings, pair, &self.plan.host, inputs)
+                        .await?;
                 // The guard is taken and dropped inside this statement;
                 // nothing holds it across an `.await`.
                 *produced.lock().unwrap_or_else(PoisonError::into_inner) = Some(material);

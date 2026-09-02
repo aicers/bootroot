@@ -591,14 +591,15 @@ updates and `rotate eab-clear` are silent no-ops for that agent. See
 [Operations > systemd operations procedure](operations.md#systemd-operations-procedure-recommended-for-bootroot-agent)
 for a hardened unit example.
 
-TLS verification override:
+TLS verification:
 
 For detailed behavior and the recommended operating flow, see
 [Configuration > Trust](configuration.md#trust).
 
-- `--insecure` disables verification for that run (**insecure**, overrides
-  normal behavior). In the normal managed onboarding flow, trust is prepared
-  before the first `bootroot-agent` run so verification can already be on.
+- bootroot-agent always verifies the ACME server's certificate, and there is
+  no flag that turns that off. In the normal managed onboarding flow, trust is
+  prepared before the first `bootroot-agent` run, so the first run verifies
+  against material that is already in place.
 
 #### CA bundle consumer permissions
 
@@ -611,20 +612,35 @@ service under the same user or group.
 bootroot-agent has no container image: it always runs as a host process, so
 there is nothing to `docker compose up`. To exercise a **one-shot** issuance
 against the compose stack, build the binary and point it at the ports the
-stack publishes to the host:
+stack publishes to the host.
+
+The compose stack's CA is self-signed and nothing skips verifying it, so
+prepare the trust material first from the deployment's own certificates:
+
+```bash
+mkdir -p certs
+cat secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt \
+  > certs/compose-ca-bundle.pem
+for cert in secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt; do
+  openssl x509 -in "$cert" -noout -fingerprint -sha256 \
+    | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z'
+done
+```
+
+Put those two fingerprints in `agent.toml.compose` under
+`trust.trusted_ca_sha256`, then run:
 
 ```bash
 cargo build --bin bootroot-agent
-./target/debug/bootroot-agent --oneshot --insecure --config agent.toml.compose
+./target/debug/bootroot-agent --oneshot --config agent.toml.compose
 ```
 
 `agent.toml.compose` is the config for exactly this run model — a native
-binary talking to the compose stack over `localhost`. `--insecure` is needed
-because the compose stack's CA is self-signed and this config carries no
-trust bundle; the managed onboarding flow prepares trust first and does not
-need it. This is a demo/smoke path, not an onboarding path: production
-services run the bootroot-agent host daemon described above with the config
-`bootroot service add` writes.
+binary talking to the compose stack over `localhost`, verifying step-ca
+against the bundle and pins prepared above. This is a demo/smoke path, not an
+onboarding path: production services run the bootroot-agent host daemon
+described above with the config `bootroot service add` writes, and
+`bootroot service add` prepares the same two trust keys for them.
 
 `scripts/preflight/extra/agent-scenarios.sh` drives the same binary the same
 way across its scenarios.

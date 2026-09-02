@@ -1507,7 +1507,6 @@ mod tests {
             eab_hmac: None,
             eab_file: None,
             oneshot: false,
-            insecure: false,
         };
 
         settings.merge_with_args(&args);

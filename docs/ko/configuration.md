@@ -221,8 +221,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 - `trusted_ca_sha256`: 신뢰할 CA 인증서 지문 목록(SHA-256 hex)
 - trust 두 값이 모두 있으면 bootroot-agent가 해당 번들과 지문으로
   ACME 서버를 검증합니다
-- trust가 비어 있으면 `--insecure`를 쓰지 않는 한 시스템 CA 저장소로
-  일반 검증을 수행합니다
+- trust가 비어 있으면 시스템 CA 저장소로 일반 검증을 수행합니다. 검증
+  수준을 그 아래로 낮추는 플래그는 없습니다
 
 `trusted_ca_sha256`는 임의 값이 아니라 실제 CA 인증서 지문이어야 합니다.
 
@@ -238,8 +238,11 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 #### 4) 실행 플래그 동작
 
-- `--insecure`: 해당 실행에서만 ACME 서버 TLS 검증 비활성화
-- 오버라이드가 없으면: 구성된 trust 또는 시스템 CA 저장소로 일반 검증
+- ACME 서버 TLS 검증을 비활성화하거나 완화하는 실행 플래그는 없습니다.
+  bootroot-agent는 `[trust]`가 설정돼 있으면 그 trust 자료로, 아니면
+  시스템 CA 저장소로 항상 검증합니다
+- 핸드셰이크가 실패하면 trust 앵커, 인증서 SAN, 시계를 바로잡아
+  해결합니다. 인증서를 그대로 수용하는 우회 경로는 없습니다
 
 #### 5) 권장 운영 절차
 
@@ -253,9 +256,9 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
      `ca-bundle.pem`을 로컬에 기록합니다.
    - `remote-bootstrap`: `bootroot-remote bootstrap`을 1회 실행해 같은
      trust payload를 원격 호스트에 반영합니다.
-4. `--insecure` 없이 `bootroot-agent`를 시작합니다. managed onboarding
-   흐름에서는 이미 정상 검증에 필요한 trust가 준비돼 있어야 합니다.
-5. `--insecure`는 임시 진단이나 break-glass 상황에서만 사용합니다.
+4. `bootroot-agent`를 시작합니다. managed onboarding 흐름에서는 이미 정상
+   검증에 필요한 trust가 준비돼 있어야 합니다. trust 반영 전에 시작한
+   실행은 검증 없이 진행되지 않고 ACME 핸드셰이크에서 실패합니다.
 
 기본 Bootroot 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인증서를 직접
 제시할 수 있습니다. `trusted_ca_sha256`가 설정되면 bootroot-agent는
@@ -264,7 +267,8 @@ mTLS 신뢰와 **ACME 서버 TLS 검증**을 함께 다루는 섹션입니다.
 
 #### 6) 실패/주의 사항
 
-- `--insecure` 실행은 해당 실행에서만 검증을 우회
+- ACME 서버 TLS 실패는 trust 자료가 없거나 잘못됐다는 뜻입니다. 우회
+  수단을 찾는 대신 trust를 반영하고 다시 실행합니다
 - 단일 step-ca 환경에서는 mTLS 번들과 ACME 검증에 같은 `ca_bundle_path` 재사용 가능
 
 #### 7) 점검 체크리스트
@@ -1110,7 +1114,6 @@ backoff_secs = [5, 10, 30]
 - `--eab-hmac <HMAC>`: EAB HMAC Key
 - `--eab-file <PATH>`: EAB JSON 파일 경로
 - `--oneshot`: 1회 발급 후 종료(데몬 루프 비활성화, 기본값 `false`)
-- `--insecure`: ACME 서버 TLS 검증 비활성화(기본값 `false`)
 
 그 외 설정(프로필, 재시도, 스케줄러, 훅, CA 번들 경로 등)은
 `agent.toml`에 정의해야 합니다.

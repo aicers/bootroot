@@ -274,6 +274,23 @@ service host. For a component installed once per deployment, reusing its
 old `service_name` as the key reproduces every previous path and name
 byte for byte.
 
+### Removed
+
+- `bootroot-agent --insecure` is gone. The flag disabled TLS certificate
+  verification for the ACME server, so a run that carried it accepted any
+  certificate at all, and the daemon offered no narrower way to get past a
+  handshake failure. Certificate verification now has no off switch: the
+  agent verifies against `[trust]` when it is configured and against the
+  system CA store otherwise, and a run that passes `--insecure` is refused
+  at argument parsing rather than starting with verification off. A
+  deployment that relied on the flag needs its trust material in place
+  before the first run — `bootroot service add` and `bootroot-remote
+  bootstrap` already write `trust.ca_bundle_path` and
+  `trust.trusted_ca_sha256` for the managed onboarding flow. The compose
+  smoke path is the one place that ran without them, and
+  `agent.toml.compose` now carries a `[trust]` section to fill in from
+  `secrets/certs/`.
+
 ### Security
 
 - Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258

@@ -1356,7 +1356,7 @@ async fn the_client_pair_is_issued_with_every_name_invariant_and_the_client_auth
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
         .await
         .expect("the client pair is issued");
 
@@ -1414,7 +1414,7 @@ async fn the_server_pair_is_issued_in_the_ordinary_shape_and_is_the_endpoint_ide
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::EndpointServer)
         .expect("the server pair");
-    issue_surface_pair(&host.settings, server, TEST_HOST, &openbao_inputs(), false)
+    issue_surface_pair(&host.settings, server, TEST_HOST, &openbao_inputs())
         .await
         .expect("the server pair is issued");
 
@@ -1459,14 +1459,14 @@ async fn two_issuances_of_the_same_name_produce_different_keys() {
         .expect("the client pair");
     let inputs = openbao_inputs();
 
-    issue_surface_pair(&host.settings, client, TEST_HOST, &inputs, false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &inputs)
         .await
         .expect("first issuance");
     let (cert_path, key_path) = host.client_pair();
     let first_key = std::fs::read_to_string(&key_path).expect("read key");
     let first_cert = std::fs::read_to_string(&cert_path).expect("read cert");
 
-    issue_surface_pair(&host.settings, client, TEST_HOST, &inputs, false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &inputs)
         .await
         .expect("second issuance");
     let second_key = std::fs::read_to_string(&key_path).expect("read key");
@@ -1490,7 +1490,7 @@ async fn the_published_key_is_never_group_or_world_readable() {
     let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
     let inputs = openbao_inputs();
     for pair in &pairs {
-        issue_surface_pair(&host.settings, pair, TEST_HOST, &inputs, false)
+        issue_surface_pair(&host.settings, pair, TEST_HOST, &inputs)
             .await
             .expect("issued");
         let key_mode = std::fs::metadata(&pair.key_path)
@@ -1531,7 +1531,7 @@ async fn the_off_live_issuance_returns_material_and_publishes_nothing() {
         let before_cert = digest_of(&pair.cert_path);
         let before_key = digest_of(&pair.key_path);
 
-        let material = issue_surface_pair_material(&host.settings, pair, TEST_HOST, &inputs, false)
+        let material = issue_surface_pair_material(&host.settings, pair, TEST_HOST, &inputs)
             .await
             .expect("the off-live issuance produces material");
 
@@ -1580,10 +1580,10 @@ async fn two_off_live_issuances_of_the_same_name_produce_different_keys() {
         .expect("the client pair");
     let inputs = openbao_inputs();
 
-    let first = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs, false)
+    let first = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs)
         .await
         .expect("first candidate");
-    let second = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs, false)
+    let second = issue_surface_pair_material(&host.settings, client, TEST_HOST, &inputs)
         .await
         .expect("second candidate");
 
@@ -1614,7 +1614,7 @@ async fn issuance_never_writes_the_endpoint_pin_file() {
     let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
     let inputs = openbao_inputs();
     for pair in &pairs {
-        issue_surface_pair(&host.settings, pair, TEST_HOST, &inputs, false)
+        issue_surface_pair(&host.settings, pair, TEST_HOST, &inputs)
             .await
             .expect("issued");
     }
@@ -1650,7 +1650,7 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
         .await
         .expect("issued");
 
@@ -1723,57 +1723,18 @@ async fn the_supplied_acme_inputs_reach_the_wire_and_the_local_ones_do_not() {
     );
 }
 
-/// The chain is verified and the bundle merged **before** the leaf is
-/// published, so a CA bundle the merge refuses to overwrite fails the
-/// issuance with nothing on disk and the bundle byte-identical.
+/// An unreadable output bundle is not bootstrap-eligible, so issuance
+/// refuses while constructing its ordinary TLS client before it can send
+/// ACME traffic or publish either material file.
 ///
-/// Run with `insecure_mode`, which is the daemon's own `--insecure`
-/// flag, so the outbound transport does not read the bundle and the
-/// merge's own refusal is what is under test. The transport's separate,
-/// pre-existing use of the same file is covered by
-/// [`an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic`].
+/// There is no mode in which this file goes uninspected: the only
+/// transports the daemon builds are the configured trust and the
+/// pin-only bootstrap one, and neither accepts a certificate this
+/// bundle cannot anchor. The merge gate's own refusal, on a bundle that
+/// becomes unreadable after the client was built, is covered by
+/// `acme::flow`'s `test_write_merged_ca_bundle_fails_when_existing_unreadable`.
 #[tokio::test]
-async fn an_unreadable_ca_bundle_fails_at_merge_before_anything_is_published() {
-    let mut host = Host::new();
-    let acme = start_acme(Arc::clone(&host.ca)).await;
-    aim_at(&mut host.settings, &acme);
-
-    // A directory at the bundle path is a non-NotFound read error on
-    // every platform, without depending on chmod semantics that root in
-    // CI can bypass.
-    let bundle = host.dir.path().join("unreadable-bundle.pem");
-    std::fs::create_dir_all(&bundle).expect("directory at the bundle path");
-    host.settings.trust.ca_bundle_path = Some(bundle.clone());
-
-    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
-    let client = pairs
-        .iter()
-        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
-        .expect("the client pair");
-    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), true)
-        .await
-        .expect_err("an unreadable bundle must fail the issuance");
-    let rendered = format!("{error:#}");
-    assert!(
-        rendered.contains("refusing to overwrite unreadable CA bundle"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(&bundle.display().to_string()),
-        "{rendered}"
-    );
-
-    let (cert_path, key_path) = host.client_pair();
-    assert!(!cert_path.exists(), "no leaf may be published");
-    assert!(!key_path.exists(), "no key may be published");
-    assert!(bundle.is_dir(), "the bundle must be left exactly as it was");
-}
-
-/// An unreadable output bundle is not bootstrap-eligible, so normal-mode
-/// issuance refuses while constructing its ordinary TLS client before it can
-/// send ACME traffic or publish either material file.
-#[tokio::test]
-async fn an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic() {
+async fn an_unreadable_ca_bundle_stops_issuance_before_acme_traffic() {
     let mut host = Host::new();
     let acme = start_acme(Arc::clone(&host.ca)).await;
     aim_at(&mut host.settings, &acme);
@@ -1790,9 +1751,9 @@ async fn an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic() {
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
         .await
-        .expect_err("an unreadable bundle must stop normal-mode issuance");
+        .expect_err("an unreadable bundle must stop issuance");
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("Failed to read CA bundle at"),
@@ -1814,25 +1775,45 @@ async fn an_unreadable_ca_bundle_stops_normal_mode_before_acme_traffic() {
     assert!(bundle.is_dir(), "the bundle must be left exactly as it was");
 }
 
-/// `--insecure` retains its existing transport behavior: it bypasses TLS
-/// verification without probing a bundle that only normal-mode bootstrap can
-/// repair.
+/// Pin-only bootstrap trust is the one alternative to the configured
+/// bundle, and it is still verification: it is selected only for a
+/// bundle that is absent or holds no parseable certificate, and it
+/// carries the configured pins rather than accepting any certificate.
 #[test]
-fn insecure_mode_does_not_select_bootstrap_pins() {
+fn bootstrap_pins_are_selected_only_for_a_repairable_bundle() {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let trust = crate::config::TrustSettings {
+    let pin = "00".repeat(32);
+    let missing = crate::config::TrustSettings {
         ca_bundle_path: Some(dir.path().join("missing-bundle.pem")),
-        trusted_ca_sha256: vec!["00".repeat(32)],
+        trusted_ca_sha256: vec![pin.clone()],
     };
-
-    assert!(
-        bootstrap_pins_for_mode(&trust, false).is_some(),
-        "normal mode selects bootstrap pins"
+    assert_eq!(
+        bootstrap_pins(&missing),
+        Some(std::slice::from_ref(&pin)),
+        "a missing bundle is repaired over the configured pins"
     );
-    let bootstrap_pins = bootstrap_pins_for_mode(&trust, true);
+
+    let usable_path = dir.path().join("usable-bundle.pem");
+    let ca = TestCa::new("anchor.example");
+    std::fs::write(&usable_path, &ca.root_pem).expect("write bundle");
+    let usable = crate::config::TrustSettings {
+        ca_bundle_path: Some(usable_path),
+        trusted_ca_sha256: vec![pin.clone()],
+    };
     assert!(
-        bootstrap_pins.is_none(),
-        "insecure mode must not select or inspect bootstrap trust"
+        bootstrap_pins(&usable).is_none(),
+        "a usable bundle stays on the configured trust path"
+    );
+
+    let unreadable_path = dir.path().join("unreadable-bundle.pem");
+    std::fs::create_dir_all(&unreadable_path).expect("directory at the bundle path");
+    let unreadable = crate::config::TrustSettings {
+        ca_bundle_path: Some(unreadable_path),
+        trusted_ca_sha256: vec![pin],
+    };
+    assert!(
+        bootstrap_pins(&unreadable).is_none(),
+        "an unreadable bundle is refused rather than repaired"
     );
 }
 
@@ -1856,7 +1837,7 @@ async fn a_missing_or_unparseable_bundle_still_publishes() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
             .await
             .unwrap_or_else(|err| panic!("seed {seed:?} must still publish: {err:#}"));
 
@@ -1892,7 +1873,7 @@ async fn tls_bootstrap_repairs_missing_or_unparseable_bundles() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
             .await
             .unwrap_or_else(|error| {
                 panic!("TLS bootstrap seed {seed:?} must complete issuance: {error:#}")
@@ -1933,7 +1914,7 @@ async fn tls_bootstrap_rejects_empty_or_mismatched_pins_before_acme_traffic() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
             .await
             .expect_err("untrusted bootstrap transport must fail the issuance");
 
@@ -1990,7 +1971,7 @@ async fn tls_bootstrap_uses_pins_for_an_https_responder() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -2046,7 +2027,7 @@ async fn tls_bootstrap_rejects_an_unpinned_https_responder() {
             .iter()
             .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
             .expect("the client pair");
-        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
             .await
             .expect_err("an unpinned HTTPS responder must fail bootstrap issuance");
 
@@ -2101,7 +2082,7 @@ async fn a_missing_bundle_uses_pinned_bootstrap_and_is_repaired() {
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
         .await
         .expect("the pinned bootstrap transport repairs a missing bundle");
 
@@ -2131,7 +2112,7 @@ async fn a_write_that_cannot_land_is_a_failure_naming_the_path() {
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
         .expect("the client pair");
-    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs(), false)
+    let error = issue_surface_pair(&host.settings, client, TEST_HOST, &openbao_inputs())
         .await
         .expect_err("a certificate path that cannot be replaced must fail the start");
     let rendered = format!("{error:#}");
@@ -2156,7 +2137,7 @@ async fn a_failed_acme_flow_refuses_and_names_the_material_paths() {
         .iter()
         .find(|pair| pair.leaf == SurfaceLeaf::EndpointServer)
         .expect("the server pair");
-    let error = issue_surface_pair(&host.settings, server, TEST_HOST, &openbao_inputs(), false)
+    let error = issue_surface_pair(&host.settings, server, TEST_HOST, &openbao_inputs())
         .await
         .expect_err("an unreachable CA must refuse the start");
     let rendered = format!("{error:#}");
@@ -2200,7 +2181,7 @@ async fn a_disabled_endpoint_issues_nothing_and_reads_nothing() {
     // all would be a failure rather than a silent success.
     settings.server = "http://127.0.0.1:1/directory".to_string();
 
-    ensure_registrar_surface_certificates(&settings, false)
+    ensure_registrar_surface_certificates(&settings)
         .await
         .expect("a disabled endpoint does nothing");
 
@@ -2233,7 +2214,7 @@ async fn both_pairs_usable_starts_with_openbao_unreachable_and_touches_nothing()
     // proof that none was made.
     settings.server = "http://127.0.0.1:1/directory".to_string();
 
-    ensure_registrar_surface_certificates(&settings, false)
+    ensure_registrar_surface_certificates(&settings)
         .await
         .expect("usable material starts with OpenBao down");
 
@@ -2278,7 +2259,7 @@ async fn one_usable_pair_is_left_alone_while_the_other_is_issued() {
         let pending = pending_pairs(&plan, host.settings.trust.ca_bundle_path.as_deref()).await;
         assert_eq!(pending.len(), 1, "exactly one pair needs issuing");
         for pair in &pending {
-            issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs(), false)
+            issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs())
                 .await
                 .expect("the unusable pair is issued");
         }
@@ -2323,7 +2304,7 @@ async fn an_expired_leaf_on_either_pair_is_repaired_rather_than_refused() {
     let pending = pending_pairs(&plan, host.settings.trust.ca_bundle_path.as_deref()).await;
     assert_eq!(pending.len(), 2, "both expired pairs need issuing");
     for pair in &pending {
-        issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs())
             .await
             .expect("an expired pair is repaired by issuing");
         assert_eq!(
@@ -2809,7 +2790,7 @@ async fn a_failed_openbao_read_out_of_the_issuance_unit_names_the_pending_materi
     // its own — but the OpenBao read is reached first.
     settings.server = "http://127.0.0.1:1/directory".to_string();
 
-    let error = ensure_registrar_surface_certificates(&settings, false)
+    let error = ensure_registrar_surface_certificates(&settings)
         .await
         .expect_err("an unreachable OpenBao must refuse the start");
     let rendered = format!("{error:#}");
@@ -2857,7 +2838,7 @@ async fn a_resolution_failure_names_the_configured_material_paths() {
         .expect("a state file");
     std::fs::remove_file(&state_file).expect("remove the state file");
 
-    let error = ensure_registrar_surface_certificates(&host.settings, false)
+    let error = ensure_registrar_surface_certificates(&host.settings)
         .await
         .expect_err("an unreadable state file must refuse the start");
     let rendered = format!("{error:#}");
@@ -2920,7 +2901,7 @@ async fn run_issuance(host: &Host) -> Vec<SurfacePairPaths> {
     let plan = resolve_surface_plan(&host.settings).expect("the plan resolves");
     let pending = pending_pairs(&plan, host.settings.trust.ca_bundle_path.as_deref()).await;
     for pair in &pending {
-        issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs(), false)
+        issue_surface_pair(&host.settings, pair, &plan.host, &openbao_inputs())
             .await
             .expect("the pending pair is issued");
     }

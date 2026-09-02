@@ -3087,8 +3087,8 @@ bootroot rotate \
 - bootroot-agent는 기본적으로 ACME 서버(step-ca)의 TLS 인증서를
   검증합니다. trust 설정이 있으면 관리되는 번들과 지문을 사용하고,
   없으면 시스템 CA 저장소를 사용합니다.
-- CLI 오버라이드: `bootroot-agent --insecure`
-  (해당 실행에서만 검증 비활성화).
+- 이 검증을 비활성화하는 CLI 오버라이드는 없습니다. trust 자료가 없거나
+  잘못된 실행은 검증 없이 진행되지 않고 핸드셰이크에서 실패합니다.
 - managed onboarding 흐름에서는 첫 `bootroot-agent` 실행 전에 trust를
   준비합니다.
   - `local-file`: `bootroot service add`가 trust 설정과

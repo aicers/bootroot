@@ -118,9 +118,8 @@ impl AcmeClient {
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
-        insecure_mode: bool,
     ) -> Result<Self> {
-        Self::new_with_bootstrap(directory_url, settings, trust, insecure_mode, None)
+        Self::new_with_bootstrap(directory_url, settings, trust, None)
     }
 
     /// Creates an ACME client for the registrar bundle-repair path.
@@ -131,7 +130,6 @@ impl AcmeClient {
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
-        insecure_mode: bool,
         bootstrap_pins: Option<&[String]>,
     ) -> Result<Self> {
         let rng = ring::rand::SystemRandom::new();
@@ -145,11 +143,11 @@ impl AcmeClient {
         let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng)
             .map_err(|_| anyhow::anyhow!("Failed to parse the ACME account key"))?;
         let client = match bootstrap_pins {
-            Some(pins) if !insecure_mode => Client::builder()
+            Some(pins) => Client::builder()
                 .use_preconfigured_tls(build_bootstrap_client_config(pins)?)
                 .build()
                 .context("Failed to build bootstrap HTTP client")?,
-            _ => build_http_client(trust, insecure_mode)?,
+            None => build_http_client(trust)?,
         };
 
         Ok(Self {
@@ -636,7 +634,6 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
-            false,
         );
         assert!(client.is_ok());
     }
@@ -647,7 +644,6 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let token = "test_token_123_xyz";
@@ -672,7 +668,6 @@ mod tests {
             "http://example.com".to_string(),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"test-secret");
@@ -748,7 +743,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         client
@@ -832,7 +826,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         client.fetch_directory().await.unwrap();
@@ -865,7 +858,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let nonce = client.get_nonce().await.unwrap();
@@ -914,7 +906,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let order = client
@@ -943,7 +934,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let err = client.fetch_directory().await.unwrap_err();
@@ -977,7 +967,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let err = client.get_nonce().await.unwrap_err();
@@ -1016,7 +1005,6 @@ mod tests {
             format!("{}/directory", server.uri()),
             &test_settings(),
             &test_trust(),
-            false,
         )
         .unwrap();
         let err = client
@@ -1212,21 +1200,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn allows_insecure_when_disabled() -> Result<()> {
-            let server = start_tls_server().await?;
-            let trust = TrustSettings::default();
-            let mut client = AcmeClient::new(
-                format!("{}/directory", server.url()),
-                &trust_test_settings(),
-                &trust,
-                true,
-            )?;
-            client.fetch_directory().await?;
-            server.handle.abort();
-            Ok(())
-        }
-
-        #[tokio::test]
         async fn rejects_self_signed_without_trust() -> Result<()> {
             let server = start_tls_server().await?;
             let trust = TrustSettings::default();
@@ -1234,7 +1207,6 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
-                false,
             )?;
             assert!(client.fetch_directory().await.is_err());
             assert_eq!(
@@ -1260,7 +1232,6 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
-                false,
             )?;
             client.fetch_directory().await?;
             server.handle.abort();
@@ -1279,7 +1250,6 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
-                false,
                 Some(&trust.trusted_ca_sha256),
             )?;
             client.fetch_directory().await?;
@@ -1297,7 +1267,6 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
-                false,
                 Some(&pins),
             )?;
             assert!(client.fetch_directory().await.is_err());
@@ -1312,7 +1281,6 @@ mod tests {
                 "https://localhost/directory".to_string(),
                 &trust_test_settings(),
                 &trust,
-                false,
                 Some(&[]),
             );
             let Err(error) = result else {
@@ -1339,7 +1307,6 @@ mod tests {
                 format!("{}/directory", server.url()),
                 &trust_test_settings(),
                 &trust,
-                false,
             )?;
             assert!(client.fetch_directory().await.is_err());
             server.handle.abort();

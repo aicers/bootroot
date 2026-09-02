@@ -230,7 +230,7 @@ This section covers both mTLS trust and **ACME server TLS verification**.
 - when both trust keys are configured, bootroot-agent verifies the ACME
   server with that bundle and fingerprint set
 - when trust is not configured, bootroot-agent falls back to the system CA
-  store unless `--insecure` is used for a one-off override
+  store; there is no flag that relaxes verification below that
 
 `trusted_ca_sha256` must match real CA certificate fingerprints (not
 arbitrary values).
@@ -247,9 +247,11 @@ arbitrary values).
 
 #### 4) Runtime flag behavior
 
-- `--insecure`: disable ACME server TLS verification for that run only
-- no override flag: verify normally using the configured trust material or
-  the system CA store
+- there is no runtime flag that disables or relaxes ACME server TLS
+  verification. bootroot-agent always verifies, using the configured trust
+  material when `[trust]` is set and the system CA store otherwise
+- a handshake that fails is fixed by correcting the trust anchors, the SANs
+  or the clock, never by accepting the certificate anyway
 
 #### 5) Recommended operating flow
 
@@ -264,9 +266,10 @@ enabled"
      `ca-bundle.pem` locally.
    - `remote-bootstrap`: run `bootroot-remote bootstrap` once to apply the
      same trust payload on the remote host.
-4. Start `bootroot-agent` without `--insecure`; in the managed onboarding
-   flow trust should already be in place for normal verification.
-5. Reserve `--insecure` for temporary diagnosis or other break-glass cases.
+4. Start `bootroot-agent`; in the managed onboarding flow trust should
+   already be in place for normal verification. A run that starts before
+   trust is applied fails the ACME handshake instead of proceeding
+   unverified.
 
 In the default Bootroot deployment, step-ca may present its CA certificate
 directly on the HTTPS endpoint. When `trusted_ca_sha256` is configured,
@@ -276,7 +279,8 @@ bundle or a directly presented certificate whose fingerprint is pinned in
 
 #### 6) Failure/caution notes
 
-- `--insecure` bypasses verification only for that run
+- a TLS failure against the ACME server means the trust material is wrong or
+  missing; apply it and retry rather than looking for a bypass
 - in single-step-ca setups, reusing one `ca_bundle_path` for both mTLS and
   ACME verification is acceptable
 
@@ -1067,7 +1071,6 @@ Options:
 - `--eab-hmac <HMAC>`: EAB HMAC key
 - `--eab-file <PATH>`: EAB JSON file path
 - `--oneshot`: issue once and exit (disable daemon loop, default `false`)
-- `--insecure`: disable ACME server TLS verification (default `false`)
 
 All other settings (profiles, retry, scheduler, hooks, CA bundle paths, etc.)
 must be defined in `agent.toml`.

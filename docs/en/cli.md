@@ -1101,8 +1101,9 @@ automatically as part of onboarding.
 - `remote-bootstrap`: `bootroot service add` prepares the service trust
   payload in OpenBao, and `bootroot-remote bootstrap` applies it on the
   remote host.
-- `--insecure` is a per-run break-glass override. For full rules and
-  operating flow, see [Configuration > Trust](configuration.md#trust).
+- There is no override that skips verifying the ACME server. Trust must be in
+  place before the first run. For full rules and operating flow, see
+  [Configuration > Trust](configuration.md#trust).
 
 #### 4-3) Preview mode (`--print-only`/`--dry-run`)
 

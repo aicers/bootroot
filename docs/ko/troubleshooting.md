@@ -247,7 +247,10 @@ bootroot service add \
 
 - `server` URL이 `https://`인지 확인 (`http://` 거부)
 - 시스템 trust 또는 `trust.ca_bundle_path`가 올바른지 확인
-- 임시 진단 용도로만 `bootroot-agent --insecure` 사용 (운영 비권장)
+- 검증은 끌 수 없습니다. trust 앵커, 인증서 SAN, 시계를 바로잡습니다.
+  에이전트에 설정한 앵커가 ACME 서버 인증서를 서명한 앵커와 같은지
+  확인하세요:
+  `openssl s_client -connect <host>:<port> -showcerts </dev/null`
 
 ### `rotate infra-cert`가 `permission denied`로 실패 (이전 빌드)
 

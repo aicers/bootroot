@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub mod acme;
@@ -60,8 +59,6 @@ pub async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
 pub async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
-    config_path: Option<PathBuf>,
-    insecure_mode: bool,
 ) -> anyhow::Result<()> {
-    daemon::run_oneshot(settings, default_eab, config_path, insecure_mode).await
+    daemon::run_oneshot(settings, default_eab).await
 }

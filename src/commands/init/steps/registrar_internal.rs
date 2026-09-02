@@ -413,7 +413,7 @@ pub(crate) async fn issue_internal_material(
         kid: creds.kid.clone(),
         hmac: creds.hmac.clone(),
     });
-    bootroot::acme::issue_certificate(&settings, profile, eab, false)
+    bootroot::acme::issue_certificate(&settings, profile, eab)
         .await
         .context("issuing the bootroot-internal leaf through step-ca's ACME endpoint")?;
 

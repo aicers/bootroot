@@ -3258,8 +3258,9 @@ This section covers how to operate two trust settings together:
 - bootroot-agent normally verifies the ACME server (step-ca) TLS
   certificate. If trust settings are configured, it uses the managed CA
   bundle and pins; otherwise it uses the system CA store.
-- CLI override: `bootroot-agent --insecure` disables verification only for
-  that run.
+- There is no CLI override that disables that verification. A run whose trust
+  material is missing or wrong fails the handshake rather than continuing
+  unverified.
 - In the managed onboarding flow, trust is prepared before the first
   `bootroot-agent` run:
   - `local-file`: `bootroot service add` writes trust settings and

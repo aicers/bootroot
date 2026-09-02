@@ -26,6 +26,27 @@ http_responder_hmac = "CHANGE-ME"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 
+# The compose stack's step-ca is self-signed, and nothing in bootroot-agent
+# skips verifying it, so this run needs the deployment's own trust material.
+# Build the bundle and read the two fingerprints out of secrets/certs/:
+#
+#   mkdir -p certs
+#   cat secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt \
+#     > certs/compose-ca-bundle.pem
+#   for cert in secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt; do
+#     openssl x509 -in "$cert" -noout -fingerprint -sha256 \
+#       | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z'
+#   done
+#
+# trusted_ca_sha256 must hold those two values before deployment. The
+# placeholders below are not 64 hex characters, so a run that leaves them
+# in place is refused while the config is validated, before any connection
+# is attempted.
+# scripts/preflight/extra/agent-scenarios.sh stamps both in for its own runs.
+[trust]
+ca_bundle_path = "certs/compose-ca-bundle.pem"
+trusted_ca_sha256 = ["CHANGE-ME-ROOT", "CHANGE-ME-INTERMEDIATE"]
+
 [retry]
 backoff_secs = [5, 10, 30]
 

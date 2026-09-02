@@ -501,10 +501,7 @@ fn unset_path(setting: &str) -> anyhow::Error {
 /// composed from is known, names the four configured paths.
 /// There is no fallback on any of these: no self-signed leaf, no
 /// borrowed one, and no second source for either ACME input.
-pub async fn ensure_registrar_surface_certificates(
-    settings: &Settings,
-    insecure_mode: bool,
-) -> Result<()> {
+pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Result<()> {
     if !settings.registrar_endpoint.enabled {
         return Ok(());
     }
@@ -533,7 +530,7 @@ pub async fn ensure_registrar_surface_certificates(
             )
         })?;
     for pair in pending {
-        issue_surface_pair(settings, &pair, &plan.host, &inputs, insecure_mode).await?;
+        issue_surface_pair(settings, &pair, &plan.host, &inputs).await?;
     }
     Ok(())
 }
@@ -819,22 +816,17 @@ pub(crate) async fn issue_surface_pair(
     pair: &SurfacePairPaths,
     host: &str,
     inputs: &SurfaceAcmeInputs,
-    insecure_mode: bool,
 ) -> Result<()> {
     let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
     let profile = issuance
         .profiles
         .first()
         .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
-    // `--insecure` is an explicit transport override.  It must retain its
-    // established behavior and not inspect the output bundle before the
-    // existing post-issuance merge gate does.
-    let bootstrap_pins = bootstrap_pins_for_mode(&issuance.trust, insecure_mode);
+    let bootstrap_pins = bootstrap_pins(&issuance.trust);
     crate::acme::issue_certificate_with_bootstrap(
         &issuance,
         profile,
         inputs.eab.clone(),
-        insecure_mode,
         pair.leaf.issuance_options(),
         bootstrap_pins,
     )
@@ -878,19 +870,17 @@ pub(crate) async fn issue_surface_pair_material(
     pair: &SurfacePairPaths,
     host: &str,
     inputs: &SurfaceAcmeInputs,
-    insecure_mode: bool,
 ) -> Result<crate::acme::IssuedMaterial> {
     let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
     let profile = issuance
         .profiles
         .first()
         .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
-    let bootstrap_pins = bootstrap_pins_for_mode(&issuance.trust, insecure_mode);
+    let bootstrap_pins = bootstrap_pins(&issuance.trust);
     let material = crate::acme::issue_certificate_material(
         &issuance,
         profile,
         inputs.eab.clone(),
-        insecure_mode,
         pair.leaf.issuance_options(),
         bootstrap_pins,
     )
@@ -935,17 +925,6 @@ fn bootstrap_pins(trust: &crate::config::TrustSettings) -> Option<&[String]> {
         }
         Err(_) | Ok(_) => None,
     }
-}
-
-/// Selects bootstrap trust only for normal-mode issuance.
-///
-/// `--insecure` deliberately does not inspect the configured output bundle
-/// before the existing merge gate, preserving its established behavior.
-fn bootstrap_pins_for_mode(
-    trust: &crate::config::TrustSettings,
-    insecure_mode: bool,
-) -> Option<&[String]> {
-    (!insecure_mode).then(|| bootstrap_pins(trust)).flatten()
 }
 
 /// Builds the settings one surface issuance runs under.

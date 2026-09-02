@@ -1070,9 +1070,9 @@ EAB 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히 무시�
 - `remote-bootstrap`: `bootroot service add`가 OpenBao에 서비스 trust
   payload를 준비하고, `bootroot-remote bootstrap`이 원격 호스트에
   반영합니다.
-- `--insecure`는 실행 단위 break-glass 오버라이드입니다. 자세한
-  규칙/운영 흐름은 [설정 > 신뢰](configuration.md#신뢰) 섹션을
-  참고하세요.
+- ACME 서버 검증을 건너뛰는 오버라이드는 없습니다. 첫 실행 전에 trust가
+  준비돼 있어야 합니다. 자세한 규칙/운영 흐름은
+  [설정 > 신뢰](configuration.md#신뢰) 섹션을 참고하세요.
 
 #### 4-3) preview 모드(`--print-only`/`--dry-run`)
 

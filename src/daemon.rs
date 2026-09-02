@@ -97,7 +97,6 @@ impl Default for DaemonShutdown {
 #[derive(Clone)]
 struct IssuanceRuntime {
     config_path: PathBuf,
-    insecure_mode: bool,
     cli_overrides: config::CliOverrides,
 }
 
@@ -161,8 +160,6 @@ pub struct DaemonInvocation {
     pub eab_refresh_path: Option<PathBuf>,
     /// The agent config path, for reload-driven rewrites.
     pub config_path: Option<PathBuf>,
-    /// Whether certificate verification is relaxed for local testing.
-    pub insecure_mode: bool,
     /// CLI overrides that must survive a config reload.
     pub cli_overrides: config::CliOverrides,
     /// The stop signal, held by the caller across reloads.
@@ -185,7 +182,6 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
         default_eab,
         eab_refresh_path,
         config_path,
-        insecure_mode,
         cli_overrides,
         shutdown,
         registrar_endpoint,
@@ -201,8 +197,7 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
         // entries, so one that cannot arm them fails the invocation
         // rather than serving without them.
         Some((endpoint, built)) => {
-            let renewal =
-                prepare_registrar_cert_renewal(&settings, &endpoint, insecure_mode).await?;
+            let renewal = prepare_registrar_cert_renewal(&settings, &endpoint).await?;
             Some((endpoint, built, renewal))
         }
         None => None,
@@ -213,7 +208,6 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     let shutdown_rx = shutdown.receiver();
     let runtime = IssuanceRuntime {
         config_path: resolve_config_path(config_path.as_deref()),
-        insecure_mode,
         cli_overrides,
     };
 
@@ -1106,12 +1100,10 @@ fn spawn_registrar_endpoint(
 async fn prepare_registrar_cert_renewal(
     settings: &Arc<config::Settings>,
     endpoint: &Arc<crate::registrar::endpoint::ActivatedEndpoint>,
-    insecure_mode: bool,
 ) -> anyhow::Result<crate::registrar_renewal::RegistrarCertRenewal> {
     crate::registrar_renewal::RegistrarCertRenewal::prepare(
         Arc::clone(settings),
         Arc::clone(endpoint),
-        insecure_mode,
     )
     .await
     .context("arming certificate renewal for the enabled registrar endpoint")
@@ -1273,26 +1265,18 @@ async fn run_profile_daemon(
 pub(crate) async fn run_oneshot(
     settings: Arc<config::Settings>,
     default_eab: Option<eab::EabCredentials>,
-    config_path: Option<PathBuf>,
-    insecure_mode: bool,
 ) -> anyhow::Result<()> {
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let runtime = IssuanceRuntime {
-        config_path: resolve_config_path(config_path.as_deref()),
-        insecure_mode,
-        cli_overrides: config::CliOverrides::default(),
-    };
     let mut handles = Vec::new();
 
     for profile in settings.profiles.clone() {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let default_eab = default_eab.clone();
-        let runtime = runtime.clone();
 
         handles.push(tokio::spawn(async move {
-            run_profile_oneshot(settings, profile, default_eab, semaphore, runtime).await
+            run_profile_oneshot(settings, profile, default_eab, semaphore).await
         }));
     }
 
@@ -1362,7 +1346,6 @@ async fn run_profile_oneshot(
     profile: config::DaemonProfileSettings,
     default_eab: Option<eab::EabCredentials>,
     semaphore: Arc<Semaphore>,
-    runtime: IssuanceRuntime,
 ) -> anyhow::Result<()> {
     let profile_label = config::profile_domain(&settings, &profile);
     if let Some(err) = refuse_stale_internal_root(&settings, &profile, &profile_label).await {
@@ -1372,8 +1355,7 @@ async fn run_profile_oneshot(
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
 
-    let result =
-        acme::issue_certificate(&settings, &profile, profile_eab, runtime.insecure_mode).await;
+    let result = acme::issue_certificate(&settings, &profile, profile_eab).await;
     handle_issuance_result(&result, &settings, &profile, &profile_label).await?;
     result
 }
@@ -1426,7 +1408,6 @@ async fn issue_with_retry(
     let profile_domain = config::profile_domain(settings, profile);
     let config_path_owned = runtime.config_path.clone();
     let cli_overrides = runtime.cli_overrides.clone();
-    let insecure_mode = runtime.insecure_mode;
     let fallback = (settings.clone(), profile.clone());
     issue_with_retry_inner(
         || {
@@ -1439,7 +1420,7 @@ async fn issue_with_retry(
                 let (fresh, fresh_profile) =
                     reload_profile_or_fallback(&path, &overrides, &domain, fallback);
                 let fresh_eab = profile::resolve_profile_eab(&fresh_profile, eab);
-                acme::issue_certificate(&fresh, &fresh_profile, fresh_eab, insecure_mode).await
+                acme::issue_certificate(&fresh, &fresh_profile, fresh_eab).await
             }
         },
         |duration| tokio::time::sleep(duration),
@@ -2220,7 +2201,6 @@ mod tests {
             lead,
             &IssuanceRuntime {
                 config_path: paths.agent_config(),
-                insecure_mode: false,
                 cli_overrides: config::CliOverrides::default(),
             },
         )

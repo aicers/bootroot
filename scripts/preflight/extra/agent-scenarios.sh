@@ -35,6 +35,9 @@ RESPONDER_ADMIN_CONTAINER_PORT=8080
 # Resolved from the running stack by compose_up.
 CA_ENDPOINT=""
 RESPONDER_ENDPOINT=""
+# The trust bundle every scenario's agent run verifies step-ca against,
+# rebuilt from secrets/certs/ by ensure_compose_ca_bundle.
+COMPOSE_CA_BUNDLE="$ROOT_DIR/certs/compose-ca-bundle.pem"
 
 # The compose agent service ran with RUST_LOG=info. Nothing sets it for a host
 # process, and the agent's default filter emits ERROR only, so without this the
@@ -121,7 +124,16 @@ published_endpoint() {
   if [ -z "$addr" ]; then
     fail "$service does not publish container port $container_port; is the stack up?"
   fi
-  printf '%s\n' "${addr/#0.0.0.0:/localhost:}"
+  # Name the loopback rather than address it. step-ca's certificate carries
+  # `localhost` as a DNS SAN and no IP SAN at all, so an agent dialling
+  # `https://127.0.0.1:<port>` fails hostname verification against the very
+  # certificate it was configured to trust. The compose file binds these
+  # ports to 127.0.0.1, so that is the mapping Compose reports.
+  addr="${addr/#0.0.0.0:/localhost:}"
+  addr="${addr/#127.0.0.1:/localhost:}"
+  addr="${addr/#\[::\]:/localhost:}"
+  addr="${addr/#\[::1\]:/localhost:}"
+  printf '%s\n' "$addr"
 }
 
 # Renders a runtime agent config for the native binary.
@@ -161,6 +173,68 @@ materialize_agent_config() {
     -e "s|\"/app/certs/|\"$ROOT_DIR/certs/|g" \
     -e "s|^http_responder_hmac = \".*\"$|http_responder_hmac = \"$responder_hmac\"|" \
     "$src" > "$dest"
+
+  stamp_trust_block "$dest"
+}
+
+# Points a runtime config at the stack's own CA material.
+#
+# There is no flag that skips verifying step-ca, so every agent run below
+# needs real trust. The compose stack's CA is self-signed, and the only
+# copy of it that exists is the one `bootroot init` rendered under
+# secrets/certs/, so build the bundle and the pins from there.
+#
+# Both certificates are pinned, not just the root: step-ca serves a leaf
+# chaining to the intermediate in the ordinary case, and a deployment that
+# presents the intermediate directly is still verified rather than
+# accepted blindly.
+#
+# The block is appended, so a `[trust]` the source config already carries
+# would be a duplicate table the parser rejects. Drop it first and let
+# this be the single writer.
+stamp_trust_block() {
+  local dest="$1"
+
+  ensure_compose_ca_bundle
+
+  local stripped="$dest.notrust"
+  awk '
+    /^\[trust\]$/ { skip = 1; next }
+    /^\[/ { skip = 0 }
+    skip != 1 { print }
+  ' "$dest" > "$stripped"
+  mv "$stripped" "$dest"
+
+  {
+    printf '\n[trust]\n'
+    printf 'ca_bundle_path = "%s"\n' "$COMPOSE_CA_BUNDLE"
+    printf 'trusted_ca_sha256 = ["%s", "%s"]\n' \
+      "$(cert_sha256 "$ROOT_DIR/secrets/certs/root_ca.crt")" \
+      "$(cert_sha256 "$ROOT_DIR/secrets/certs/intermediate_ca.crt")"
+  } >> "$dest"
+}
+
+# Rebuilds the trust bundle from secrets/certs/ before every run.
+#
+# Rebuilt rather than reused: issuance merges the ACME response chain into
+# this same file, so a bundle left over from an earlier run is output as
+# much as input. Starting from the deployment's own two certificates keeps
+# what the agent verifies against pinned to what `init` actually rendered.
+ensure_compose_ca_bundle() {
+  local cert
+  for cert in root_ca.crt intermediate_ca.crt; do
+    [ -f "$ROOT_DIR/secrets/certs/$cert" ] || fail "Missing secrets/certs/$cert"
+  done
+  mkdir -p "$(dirname "$COMPOSE_CA_BUNDLE")"
+  cat "$ROOT_DIR/secrets/certs/root_ca.crt" \
+    "$ROOT_DIR/secrets/certs/intermediate_ca.crt" > "$COMPOSE_CA_BUNDLE"
+}
+
+# Prints a certificate's SHA-256 fingerprint as lowercase hex, which is
+# the spelling trust.trusted_ca_sha256 compares against.
+cert_sha256() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 \
+    | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z'
 }
 
 run_agent_oneshot() {
@@ -170,9 +244,9 @@ run_agent_oneshot() {
   ensure_agent_binary
   materialize_agent_config "$cfg" "$runtime"
 
-  # The compose stack uses a local self-signed CA, so verification is off for
-  # these runs exactly as the old container override had it.
-  (cd "$ROOT_DIR" && "$AGENT_BIN" --oneshot --insecure --config="$runtime")
+  # The compose stack uses a local self-signed CA, so the runtime config
+  # materialize_agent_config just wrote pins it; verification stays on.
+  (cd "$ROOT_DIR" && "$AGENT_BIN" --oneshot --config="$runtime")
 }
 
 run_agent_expect_fail() {
@@ -269,6 +343,9 @@ wait_for_file() {
 check_prereqs() {
   require_cmd docker
   require_cmd grep
+  # Every run verifies step-ca, and the pins come from the deployment's
+  # own certificates.
+  require_cmd openssl
   # Only the build path needs cargo; an operator supplying their own binary
   # through BOOTROOT_AGENT_BIN does not.
   [ -n "${BOOTROOT_AGENT_BIN:-}" ] || require_cmd cargo
@@ -284,6 +361,8 @@ check_prereqs() {
   [ -f "$ROOT_DIR/secrets/config/ca.json" ] || fail "Missing secrets/config/ca.json"
   [ -f "$ROOT_DIR/secrets/password.txt" ] || fail "Missing secrets/password.txt"
   [ -f "$ROOT_DIR/secrets/certs/root_ca.crt" ] || fail "Missing secrets/certs/root_ca.crt"
+  [ -f "$ROOT_DIR/secrets/certs/intermediate_ca.crt" ] \
+    || fail "Missing secrets/certs/intermediate_ca.crt"
 
   # Build here, in the parent shell, before any scenario runs. The failure
   # scenarios invoke the agent inside `output="$(... 2>&1)"`, and a build
@@ -381,7 +460,7 @@ TOML
   # Without it bash forks a child and the kill below would only reap the
   # subshell, leaving a daemon renewing into certs/ for the later scenarios.
   local agent_pid
-  (cd "$ROOT_DIR" && exec "$AGENT_BIN" --insecure --config="$runtime" \
+  (cd "$ROOT_DIR" && exec "$AGENT_BIN" --config="$runtime" \
     >"$TMP_DIR/agent.renewal.log" 2>&1) &
   agent_pid=$!
 
