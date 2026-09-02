@@ -1063,25 +1063,33 @@ mod tests {
         );
     }
 
+    /// The configs an operator copies into place.
+    const SHIPPED_AGENT_CONFIG_TEMPLATES: [&str; 2] = ["agent.toml.example", "agent.toml.compose"];
+
+    /// Loads a shipped template the way an operator would.
+    ///
+    /// The templates ship under `.example` / `.compose` suffixes, which
+    /// the config loader cannot infer a format from, so stage a
+    /// byte-identical copy at a `.toml` name and read that.
+    fn load_shipped_template(name: &str) -> crate::config::Settings {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let contents =
+            std::fs::read_to_string(&source).unwrap_or_else(|err| panic!("read {name}: {err}"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, &contents).expect("stage template");
+        crate::config::Settings::from_file(Some(path))
+            .unwrap_or_else(|err| panic!("{name} must deserialize: {err}"))
+    }
+
     /// Every shipped `[[profiles]]` template must deserialize and pass
     /// `validate_profile`. The templates are what an operator copies, so
     /// one that omits the now-required `registration_id` would hand them
     /// a config the agent refuses to load.
     #[test]
     fn shipped_agent_config_templates_carry_a_valid_profile() {
-        for name in ["agent.toml.example", "agent.toml.compose"] {
-            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-            let contents =
-                std::fs::read_to_string(&source).unwrap_or_else(|err| panic!("read {name}: {err}"));
-            // The templates ship under `.example` / `.compose` suffixes,
-            // which the config loader cannot infer a format from; stage a
-            // byte-identical copy at a `.toml` name so this reads exactly
-            // what an operator would copy into place.
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("agent.toml");
-            std::fs::write(&path, &contents).expect("stage template");
-            let settings = crate::config::Settings::from_file(Some(path))
-                .unwrap_or_else(|err| panic!("{name} must deserialize: {err}"));
+        for name in SHIPPED_AGENT_CONFIG_TEMPLATES {
+            let settings = load_shipped_template(name);
             assert!(!settings.profiles.is_empty(), "{name} must ship a profile");
             for profile in &settings.profiles {
                 assert!(
@@ -1109,15 +1117,8 @@ mod tests {
     /// being present at all.
     #[test]
     fn shipped_agent_config_templates_carry_both_trust_keys() {
-        for name in ["agent.toml.example", "agent.toml.compose"] {
-            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
-            let contents =
-                std::fs::read_to_string(&source).unwrap_or_else(|err| panic!("read {name}: {err}"));
-            let dir = tempfile::tempdir().expect("tempdir");
-            let path = dir.path().join("agent.toml");
-            std::fs::write(&path, &contents).expect("stage template");
-            let settings = crate::config::Settings::from_file(Some(path))
-                .unwrap_or_else(|err| panic!("{name} must deserialize: {err}"));
+        for name in SHIPPED_AGENT_CONFIG_TEMPLATES {
+            let settings = load_shipped_template(name);
             assert!(
                 settings.trust.ca_bundle_path.is_some(),
                 "{name} must set trust.ca_bundle_path"
