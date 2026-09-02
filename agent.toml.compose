@@ -38,8 +38,10 @@ http_responder_token_ttl_secs = 300
 #       | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z'
 #   done
 #
-# trusted_ca_sha256 must hold those two values before deployment; the
-# placeholders below match nothing and fail the handshake closed.
+# trusted_ca_sha256 must hold those two values before deployment. The
+# placeholders below are not 64 hex characters, so a run that leaves them
+# in place is refused while the config is validated, before any connection
+# is attempted.
 # scripts/preflight/extra/agent-scenarios.sh stamps both in for its own runs.
 [trust]
 ca_bundle_path = "certs/compose-ca-bundle.pem"

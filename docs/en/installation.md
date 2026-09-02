@@ -612,7 +612,7 @@ service under the same user or group.
 bootroot-agent has no container image: it always runs as a host process, so
 there is nothing to `docker compose up`. To exercise a **one-shot** issuance
 against the compose stack, build the binary and point it at the ports the
-stack publishes to the host:
+stack publishes to the host.
 
 The compose stack's CA is self-signed and nothing skips verifying it, so
 prepare the trust material first from the deployment's own certificates:
