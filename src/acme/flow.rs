@@ -466,16 +466,8 @@ pub async fn issue_certificate(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    insecure_mode: bool,
 ) -> Result<()> {
-    issue_certificate_with(
-        settings,
-        profile,
-        eab_creds,
-        insecure_mode,
-        IssuanceOptions::default(),
-    )
-    .await
+    issue_certificate_with(settings, profile, eab_creds, IssuanceOptions::default()).await
 }
 
 /// Issues a certificate via ACME protocol under `options`.
@@ -500,11 +492,9 @@ pub async fn issue_certificate_with(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    insecure_mode: bool,
     options: IssuanceOptions,
 ) -> Result<()> {
-    issue_certificate_with_bootstrap(settings, profile, eab_creds, insecure_mode, options, None)
-        .await
+    issue_certificate_with_bootstrap(settings, profile, eab_creds, options, None).await
 }
 
 /// Everything one ACME issuance produced, before a single byte of it has
@@ -559,19 +549,10 @@ pub(crate) async fn issue_certificate_material(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    insecure_mode: bool,
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
 ) -> Result<Option<IssuedMaterial>> {
-    run_issuance(
-        settings,
-        profile,
-        eab_creds,
-        insecure_mode,
-        options,
-        bootstrap_pins,
-    )
-    .await
+    run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await
 }
 
 /// Issues a registrar-surface certificate with optional pin-only bootstrap
@@ -580,19 +561,11 @@ pub(crate) async fn issue_certificate_with_bootstrap(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    insecure_mode: bool,
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
 ) -> Result<()> {
-    let Some(material) = run_issuance(
-        settings,
-        profile,
-        eab_creds,
-        insecure_mode,
-        options,
-        bootstrap_pins,
-    )
-    .await?
+    let Some(material) =
+        run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await?
     else {
         return Ok(());
     };
@@ -656,18 +629,13 @@ async fn run_issuance(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
-    insecure_mode: bool,
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
 ) -> Result<Option<IssuedMaterial>> {
-    // `--insecure` remains its existing explicit override.  Bootstrap mode
-    // never changes that mode's ACME or responder transport behavior.
-    let bootstrap_pins = (!insecure_mode).then_some(bootstrap_pins).flatten();
     let mut client = AcmeClient::new_with_bootstrap(
         settings.server.clone(),
         &settings.acme,
         &settings.trust,
-        insecure_mode,
         bootstrap_pins,
     )?;
 

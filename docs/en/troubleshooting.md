@@ -249,7 +249,10 @@ older builds, add `http_responder_hmac` to the `[acme]` section of
 
 - Ensure `server` URL is `https://` (`http://` is rejected)
 - Validate system trust or `trust.ca_bundle_path`
-- Use `bootroot-agent --insecure` only for temporary diagnosis
+- Verification cannot be turned off: fix the trust anchors, the certificate's
+  SANs, or the clock. Confirm the anchor the agent is configured with matches
+  the one that signed the ACME server's certificate:
+  `openssl s_client -connect <host>:<port> -showcerts </dev/null`
 
 ### `rotate infra-cert` fails with `permission denied` (older builds)
 

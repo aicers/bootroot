@@ -20,14 +20,7 @@ async fn main() -> anyhow::Result<()> {
 
     if args.oneshot {
         let (settings, final_eab) = load_settings(&args).await?;
-        match run_oneshot(
-            Arc::new(settings),
-            final_eab,
-            args.config.clone(),
-            args.insecure,
-        )
-        .await
-        {
+        match run_oneshot(Arc::new(settings), final_eab).await {
             Ok(()) => info!("Successfully issued certificate!"),
             Err(err) => {
                 error!("Failed to issue certificate: {err:?}");
@@ -69,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // has to be material this call has already ensured. On a host where
     // the endpoint is disabled this does nothing at all — no path
     // created, nothing asked of the CA or of OpenBao.
-    ensure_registrar_surface_certificates(&initial_settings, args.insecure).await?;
+    ensure_registrar_surface_certificates(&initial_settings).await?;
     let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
 
@@ -86,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
             default_eab: final_eab,
             eab_refresh_path: eab_refresh_path.clone(),
             config_path: args.config.clone(),
-            insecure_mode: args.insecure,
             cli_overrides: cli_overrides.clone(),
             shutdown: shutdown.clone(),
             registrar_endpoint: registrar_endpoint.clone(),

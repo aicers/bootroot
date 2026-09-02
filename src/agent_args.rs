@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::Parser;
 
 use crate::secret::HmacSecret;
 
@@ -47,10 +47,6 @@ pub struct Args {
     /// Run once and exit (disable daemon loop)
     #[arg(long)]
     pub oneshot: bool,
-
-    /// Disable TLS certificate verification for this run only (INSECURE break-glass override)
-    #[arg(long, action = ArgAction::SetTrue)]
-    pub insecure: bool,
 }
 
 #[cfg(test)]
@@ -59,16 +55,29 @@ mod tests {
 
     use super::*;
 
+    /// No supported runtime mode accepts an unverifiable certificate.
+    ///
+    /// The daemon's TLS trust comes from `[trust]` alone — the
+    /// configured CA bundle, its optional pins, or the system roots.
+    /// There is no flag that relaxes it, so neither the help text nor
+    /// the parser may offer one.
     #[test]
-    fn help_describes_insecure_override_semantics() {
+    fn no_flag_disables_certificate_verification() {
         let mut command = Args::command();
         let mut help = Vec::new();
         command.write_long_help(&mut help).expect("write help");
         let help = String::from_utf8(help).expect("help is utf-8");
 
+        assert!(!help.contains("--insecure"));
         assert!(!help.contains("--verify-certificates"));
-        assert!(help.contains("--insecure"));
-        assert!(help.contains("for this run only"));
-        assert!(help.contains("break-glass override"));
+        assert!(!help.to_lowercase().contains("break-glass"));
+    }
+
+    #[test]
+    fn insecure_flag_is_rejected() {
+        let error = Args::command()
+            .try_get_matches_from(["bootroot-agent", "--oneshot", "--insecure"])
+            .expect_err("--insecure must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

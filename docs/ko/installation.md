@@ -597,15 +597,14 @@ EAB 회전이 적용되려면 `--eab-file`이 필수입니다 — 없으면 EAB 
 방법은 **설정** 섹션과 [운영 > systemd 운영 절차](operations.md)의
 하드닝된 유닛 예시를 참고하세요.
 
-TLS 검증 오버라이드:
+TLS 검증:
 
 자세한 동작 원리와 권장 운용 순서는 [설정 > 신뢰](configuration.md)를
 참고하세요.
 
-- `--insecure`: 해당 실행에서만 ACME 서버 TLS 검증 비활성화
-  (비보안 오버라이드). 일반적인 managed onboarding 흐름에서는 첫
-  `bootroot-agent` 실행 전에 trust가 준비되므로 처음부터 검증을 켤 수
-  있습니다.
+- bootroot-agent는 ACME 서버 인증서를 항상 검증하며, 이를 끄는 플래그는
+  없습니다. 일반적인 managed onboarding 흐름에서는 첫 `bootroot-agent`
+  실행 전에 trust가 준비되므로, 첫 실행부터 이미 반영된 자료로 검증합니다.
 
 #### CA 번들 소비 서비스 권한
 
@@ -620,18 +619,33 @@ bootroot-agent에는 컨테이너 이미지가 없습니다. 항상 호스트 �
 상대로 **1회 발급**(`--oneshot`)을 확인하려면 바이너리를 빌드한 뒤 스택이
 호스트에 게시한 포트로 연결합니다:
 
+compose 스택의 CA는 자체 서명이고 이를 건너뛰는 수단은 없으므로, 배포가
+가진 인증서로 trust 자료를 먼저 준비합니다:
+
+```bash
+mkdir -p certs
+cat secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt \
+  > certs/compose-ca-bundle.pem
+for cert in secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt; do
+  openssl x509 -in "$cert" -noout -fingerprint -sha256 \
+    | cut -d= -f2 | tr -d ':' | tr 'A-Z' 'a-z'
+done
+```
+
+출력된 두 지문을 `agent.toml.compose`의 `trust.trusted_ca_sha256`에 넣은 뒤
+실행합니다:
+
 ```bash
 cargo build --bin bootroot-agent
-./target/debug/bootroot-agent --oneshot --insecure --config agent.toml.compose
+./target/debug/bootroot-agent --oneshot --config agent.toml.compose
 ```
 
 `agent.toml.compose`는 바로 이 실행 모델(네이티브 바이너리가 `localhost`로
-compose 스택에 접속)을 위한 설정입니다. compose 스택의 CA는 자체 서명이고
-이 설정에는 trust 번들이 없으므로 `--insecure`가 필요합니다. managed
-onboarding 흐름은 trust를 먼저 준비하므로 이 옵션이 필요하지 않습니다.
-데모/스모크 경로일 뿐 온보딩 경로가 **아니며**, 운영 서비스는 위에서 설명한
-대로 `bootroot service add`가 작성한 설정으로 bootroot-agent 호스트 데몬을
-실행합니다.
+compose 스택에 접속)을 위한 설정이며, 위에서 준비한 번들과 핀으로 step-ca를
+검증합니다. 데모/스모크 경로일 뿐 온보딩 경로가 **아니며**, 운영 서비스는
+위에서 설명한 대로 `bootroot service add`가 작성한 설정으로 bootroot-agent
+호스트 데몬을 실행합니다. `bootroot service add`도 같은 trust 두 값을
+준비해 줍니다.
 
 `scripts/preflight/extra/agent-scenarios.sh`도 동일한 바이너리를 같은 방식으로
 실행합니다.

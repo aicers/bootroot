@@ -32,32 +32,25 @@ pub(crate) const OPENBAO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const OPENBAO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Builds a [`reqwest::Client`] configured according to the given
-/// [`TrustSettings`] and runtime TLS override.
+/// [`TrustSettings`].
 ///
-/// Three modes:
-/// - **Insecure override** (`--insecure`): accepts any certificate.
+/// Two modes:
 /// - **System roots** (no `ca_bundle_path`): default webpki verification.
 /// - **Custom CA bundle** (with optional SHA-256 pinning): loads the bundle
 ///   and optionally enforces certificate pins.
+///
+/// There is no third mode. Certificate verification is never disabled:
+/// a peer this client cannot verify against the configured trust fails
+/// the handshake, and the fix is the trust anchors, the SANs or the
+/// clock rather than an override.
 ///
 /// # Errors
 ///
 /// Returns an error if the CA bundle cannot be read or parsed, if
 /// certificate pins are specified without a CA bundle path, or if the
 /// HTTP client fails to build.
-pub fn build_http_client(trust: &TrustSettings, insecure_mode: bool) -> Result<Client> {
+pub fn build_http_client(trust: &TrustSettings) -> Result<Client> {
     install_crypto_provider();
-    if insecure_mode {
-        // CodeQL flags `danger_accept_invalid_certs(true)` as
-        // rust/disabled-certificate-check.  This is intentional: during
-        // break-glass recovery or explicit diagnostics the caller may opt in
-        // to an insecure ACME TLS client via `--insecure`. Dismiss the alert
-        // as a false positive because the override is explicit and temporary.
-        return Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .context("Failed to build insecure HTTP client");
-    }
 
     let Some(bundle_path) = trust.ca_bundle_path.as_ref() else {
         if !trust.trusted_ca_sha256.is_empty() {

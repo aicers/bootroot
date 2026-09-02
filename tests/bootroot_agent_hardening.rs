@@ -300,9 +300,14 @@ key = "{key_path}"{trust_block}
     Ok((config_path, cert_path, bundle_path))
 }
 
-async fn run_agent_oneshot(config_path: &Path, ca_url: &str, insecure: bool) -> Output {
+async fn run_agent_oneshot(config_path: &Path, ca_url: &str) -> Output {
+    run_agent_oneshot_with(config_path, ca_url, &[]).await
+}
+
+async fn run_agent_oneshot_with(config_path: &Path, ca_url: &str, extra: &[&str]) -> Output {
     let config_path = config_path.to_path_buf();
     let ca_url = ca_url.to_string();
+    let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_string()).collect();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bootroot-agent"));
         cmd.args([
@@ -313,9 +318,7 @@ async fn run_agent_oneshot(config_path: &Path, ca_url: &str, insecure: bool) -> 
         if !ca_url.is_empty() {
             cmd.args(["--ca-url", ca_url.as_str()]);
         }
-        if insecure {
-            cmd.arg("--insecure");
-        }
+        cmd.args(&extra);
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -364,7 +367,7 @@ async fn oneshot_normal_run_uses_prestaged_trust_without_rewriting_config() -> R
     )?;
     let before = fs::read_to_string(&config_path).context("read config before run")?;
 
-    let output = run_agent_oneshot(&config_path, "", false).await;
+    let output = run_agent_oneshot(&config_path, "").await;
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",
@@ -381,8 +384,15 @@ async fn oneshot_normal_run_uses_prestaged_trust_without_rewriting_config() -> R
     Ok(())
 }
 
+/// There is no runtime mode that accepts an untrusted server.
+///
+/// `--insecure` used to be one, and a build that reintroduced it would
+/// still pass every other assertion in this file: the untrusted-server
+/// run below fails, and a flag that made it succeed would simply not be
+/// exercised. So assert on the flag itself — the binary must refuse to
+/// start rather than issue against a certificate it cannot verify.
 #[tokio::test]
-async fn oneshot_insecure_override_allows_untrusted_server() -> Result<()> {
+async fn oneshot_rejects_an_insecure_override_flag() -> Result<()> {
     let fixture = start_acme_tls_fixture().await?;
     assert_fixture_reachable(&fixture.directory_url(), fixture.ca_pem()).await;
     let tmp = tempdir().context("create tempdir")?;
@@ -390,20 +400,21 @@ async fn oneshot_insecure_override_allows_untrusted_server() -> Result<()> {
     mount_responder_admin_mock(&responder).await;
     let (config_path, cert_path, bundle_path) =
         write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri(), None)?;
-    let before = fs::read_to_string(&config_path).context("read config before run")?;
 
-    let output = run_agent_oneshot(&config_path, "", true).await;
+    let output = run_agent_oneshot_with(&config_path, "", &["--insecure"]).await;
     assert!(
-        output.status.success(),
+        !output.status.success(),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let after = fs::read_to_string(&config_path).context("read config after run")?;
-    assert_eq!(before, after);
-    assert!(cert_path.exists());
-    assert!(!bundle_path.exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--insecure'"),
+        "{stderr}"
+    );
+    assert!(!cert_path.exists(), "no leaf may be issued");
+    assert!(!bundle_path.exists(), "no bundle may be written");
 
     fixture.handle.abort();
     Ok(())
@@ -419,7 +430,7 @@ async fn oneshot_normal_run_without_trust_fails() -> Result<()> {
     let (config_path, _cert_path, _bundle_path) =
         write_agent_config(tmp.path(), &fixture.directory_url(), &responder.uri(), None)?;
 
-    let output = run_agent_oneshot(&config_path, "", false).await;
+    let output = run_agent_oneshot(&config_path, "").await;
     assert!(
         !output.status.success(),
         "stdout: {}\nstderr: {}",
