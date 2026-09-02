@@ -43,6 +43,13 @@ export BOOTROOT_E2E_HOSTS_LOCK="$WORK_DIR/hosts.lock"
 # shellcheck source=impl/lib/run-scope.sh
 . "$IMPL_DIR/lib/run-scope.sh"
 
+# The registrar scenarios derive their identity through their own library
+# rather than this one: they install a whole deployment under a run-scoped
+# instance but write no marker and take no hosts lock. The one rule they share
+# is the length limit, and the checks below hold both to it.
+# shellcheck source=impl/lib/registrar-docker.sh
+. "$IMPL_DIR/lib/registrar-docker.sh"
+
 # The library aborts through `fail`, which its callers define. Here it
 # raises a status the checks can catch, so a derivation that is supposed
 # to be rejected can be asserted on rather than taking this script down.
@@ -314,19 +321,55 @@ check_truncation_keeps_the_discriminating_tail() {
   ok "a truncated identifier keeps its tail, so runs differing only there stay distinct"
 }
 
-# The registrar endurance scenario has a shorter instance-name budget than
-# the lifecycle harnesses. Its suite token is deliberately short, while a
-# manual run can supply a long CI token. Both must remain run-scoped: Bash's
-# `${token: -N}` expands to an empty string when the token is shorter than N.
-check_registrar_endurance_token_budget() {
-  local script="$IMPL_DIR/run-registrar-endurance.sh"
-  grep -Fq "if [ \"\${#RUN_TOKEN}\" -le 19 ]; then" "$script" \
-    || die "registrar endurance does not preserve short run tokens"
-  grep -Fq "INSTANCE_TOKEN=\"\$RUN_TOKEN\"" "$script" \
-    || die "registrar endurance does not retain its whole short run token"
-  grep -Fq "INSTANCE_TOKEN=\"\${RUN_TOKEN: -19}\"" "$script" \
-    || die "registrar endurance does not retain long run-token tails"
-  ok "registrar endurance retains short tokens and long-token PID tails"
+# The two registrar scenarios, and the slug each derives its instance prefix
+# from. Read out of the shipped scripts, so a renamed scenario cannot leave
+# this file validating a prefix nothing derives.
+REGISTRAR_SCENARIO_SCRIPTS=(
+  run-registrar-redteam.sh
+  run-registrar-endurance.sh
+)
+
+registrar_scenario_slug() {
+  local script="$1" slug
+  slug="$(sed -n 's/^SCENARIO_SLUG=\(.*\)$/\1/p' "$IMPL_DIR/$script")"
+  [ -n "$slug" ] || die "${script} declares no SCENARIO_SLUG"
+  printf '%s' "$slug"
+}
+
+# Both registrar scenarios have a shorter instance-name budget than the
+# lifecycle harnesses, because their prefixes are longer, and both derive the
+# name through one shared helper. A suite token is deliberately short, while a
+# manual run can supply a long CI token. Both must stay run-scoped: Bash's
+# `${token: -N}` expands to an empty string when the token is shorter than N,
+# and a name derived past the limit is one `infra install` rejects outright.
+check_registrar_instance_name_budget() {
+  local script slug prefix short long first second
+  [ "$REGISTRAR_DOCKER_MAX_INSTANCE_NAME_LEN" -eq "$BOOTROOT_MAX_INSTANCE_NAME_LEN" ] \
+    || die "lib/registrar-docker.sh caps instance names at ${REGISTRAR_DOCKER_MAX_INSTANCE_NAME_LEN}, but the limit the binary derives is ${BOOTROOT_MAX_INSTANCE_NAME_LEN}"
+  long="$(printf 'a%.0s' $(seq 1 120))"
+  for script in "${REGISTRAR_SCENARIO_SCRIPTS[@]}"; do
+    grep -Fq 'registrar_docker_instance_name "registrar-${SCENARIO_SLUG}-" "$RUN_TOKEN"' \
+      "$IMPL_DIR/$script" \
+      || die "${script} does not derive its instance name through the shared registrar helper"
+    slug="$(registrar_scenario_slug "$script")"
+    prefix="registrar-${slug}-"
+    short="$(registrar_docker_instance_name "$prefix" "e4242")"
+    [ "$short" = "${prefix}e4242" ] \
+      || die "${script} does not retain its whole short run token: '${short}'"
+    instance_name_is_valid "$short" \
+      || die "${script} derives '${short}' from a short run token, which infra install would reject"
+    first="$(registrar_docker_instance_name "$prefix" "${long}-4242")"
+    second="$(registrar_docker_instance_name "$prefix" "${long}-4243")"
+    instance_name_is_valid "$first" \
+      || die "${script} derives '${first}' from a long run token, which infra install would reject"
+    [ "$first" != "$second" ] \
+      || die "${script} derives the same instance '${first}' for two tokens differing only in their tail"
+    case "$first" in
+      *4242) ;;
+      *) die "${script} dropped the tail: '${first}' does not end in the pid" ;;
+    esac
+  done
+  ok "both registrar scenarios retain short tokens and long-token PID tails, within the instance-name limit"
 }
 
 # The separation only holds because the binary ranks the exported
@@ -1428,7 +1471,7 @@ check_harness_namespaces_are_declared
 check_no_namespace_can_name_the_default_identity
 check_project_derivation_rejects_what_compose_would
 check_truncation_keeps_the_discriminating_tail
-check_registrar_endurance_token_budget
+check_registrar_instance_name_budget
 check_derivation_rejects_what_it_cannot_derive
 check_the_binary_ranks_the_override_above_the_flag
 check_markers

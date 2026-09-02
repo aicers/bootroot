@@ -751,6 +751,40 @@ async fn run_issuance(
 /// presents. ACME responses commonly stop at an intermediate, so a
 /// root anchor selected from the configured bundle must travel with a
 /// registrar-surface certificate too.
+///
+/// # Why a renewal needs it
+///
+/// The pin file is over trust **anchors**, it carries digests and no
+/// certificate material, and it is written once by the provisioning
+/// tool at install — see `docs/reference/registrar-client-identity.md`
+/// §4. Nothing in this repository rewrites it, and a leaf renewal must
+/// not need it rewritten: every issuance generates a fresh key pair, so
+/// the pinned root is the one thing about the endpoint that does not
+/// change across renewal. A caller can only build a chain to a pinned
+/// anchor the server actually presented, so if a renewed leaf were
+/// published with the ACME response's chain alone — commonly leaf and
+/// intermediate, stopping short of the root — a caller holding an
+/// unchanged root-anchor pin would be refused by a correctly renewed
+/// endpoint. Appending the configured anchors is what keeps that pin
+/// valid across renewal.
+///
+/// # What it is gated on
+///
+/// `[trust].ca_bundle_path`. With no bundle configured there is no
+/// split to make: the caller above hands the whole downloaded PEM over
+/// as the leaf, the chain is empty, and this never runs. So this
+/// publishes only anchors the deployment already configured as its
+/// trust, and never a certificate the ACME response introduced.
+///
+/// # Who inherits it
+///
+/// The behaviour lives in the shared [`LeafPublication::LeafWithChain`]
+/// arm rather than in registrar-specific code, so any future consumer
+/// of that variant inherits it. Today there is exactly one:
+/// `SURFACE_LEAF_PUBLICATION` in `src/registrar_certs.rs`, which
+/// publishes both registrar surface leaves. `LeafPublication::LeafOnly`
+/// — every ordinary service issuance — is unaffected, and reaches its
+/// consumers' trust through `[trust].ca_bundle_path` as it always has.
 fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) {
     // A missing, malformed, or unreadable bundle remains on the existing
     // bootstrap/repair path. `write_merged_ca_bundle` is still the sole

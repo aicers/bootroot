@@ -35,7 +35,8 @@ ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 RUN_LOG="$ARTIFACT_DIR/run.log"
 PHASE_LOG="$ARTIFACT_DIR/phases.log"
 RUN_TOKEN="$(registrar_docker_run_token)"
-INSTANCE="registrar-redteam-${RUN_TOKEN}"
+SCENARIO_SLUG=redteam
+INSTANCE="$(registrar_docker_instance_name "registrar-${SCENARIO_SLUG}-" "$RUN_TOKEN")"
 MANIFEST="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/registrar-leak-manifest.txt"
 POLICIES="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/privileged-policies.txt"
 DRIVER="$BOOTROOT_PROJECT_DIR/tests/e2e/registrar/redteam_client.py"
@@ -48,10 +49,7 @@ pass() { printf '[registrar-redteam][%s] PASS %s\n' "$CURRENT_PHASE" "$1" | tee 
 require() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required"; }
 stat_mode() { stat -c '%u:%g:%a' "$1" 2>/dev/null || stat -f '%u:%g:%OLp' "$1"; }
 root_stat_mode() { sudo -n stat -c '%u:%g:%a' "$1" 2>/dev/null || sudo -n stat -f '%u:%g:%OLp' "$1"; }
-digest_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 certificate_der_digest() { if command -v sha256sum >/dev/null; then openssl x509 -in "$1" -outform DER | sha256sum | awk '{print $1}'; else openssl x509 -in "$1" -outform DER | shasum -a 256 | awk '{print $1}'; fi; }
-compose() { BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" "$@"; }
-bootroot() { (cd "$WORK_DIR" && "$BOOTROOT_BIN" "$@"); }
 
 record_wall_clock() {
   local finished_at finished_epoch elapsed
@@ -68,24 +66,13 @@ cleanup() {
   local status=$?
   log_phase cleanup
   record_wall_clock
-  if [ -n "$SUPERVISOR_PID" ] && kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-    control quit || true
-    for _ in $(seq 1 15); do
-      kill -0 "$SUPERVISOR_PID" 2>/dev/null || break
-      sleep 1
-    done
-    if kill -0 "$SUPERVISOR_PID" 2>/dev/null; then
-      [ -s "$RUN_ROOT/agent.pid" ] && sudo -n kill -TERM "$(cat "$RUN_ROOT/agent.pid")" 2>/dev/null || true
-      kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
-    fi
-    wait "$SUPERVISOR_PID" 2>/dev/null || true
-  fi
+  registrar_docker_stop_supervisor
   if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
-    compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+    registrar_docker_compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
     if command -v timeout >/dev/null 2>&1; then
       timeout --kill-after=10 90 env BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
     else
-      compose down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
+      registrar_docker_compose down --volumes --remove-orphans >>"$RUN_LOG" 2>&1 || true
     fi
   fi
   [ "$HTTP01_IMAGE_BUILT" -eq 1 ] && docker image rm -f "$HTTP01_IMAGE" >>"$RUN_LOG" 2>&1 || true
@@ -107,17 +94,12 @@ run_policy_guard() {
 }
 
 prepare_workspace() {
-  RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/bootroot-registrar-redteam-XXXXXX")"
-  WORK_DIR="$RUN_ROOT/bootroot"; AUDIT_DIR="$RUN_ROOT/audit"; RECORD_DIR="$AUDIT_DIR/records"; SURFACE_DIR="$RUN_ROOT/surface"; SOCKET_DIR="$RUN_ROOT/socket"; SOCKET_PATH="$SOCKET_DIR/registrar.sock"; CONTROL_FIFO="$RUN_ROOT/agent-control"; DAEMON_CONFIG="$RUN_ROOT/registrar-agent.toml"; PROVISIONING="$RUN_ROOT/provisioning.toml"; INITIAL_CONFIG="$WORK_DIR/operator-agent.toml"; SUMMARY="$RUN_ROOT/init-summary.json"; TOKEN_FILE="$RUN_ROOT/openbao-root-token"; TOKEN_CURL="$RUN_ROOT/openbao-curl.conf"
-  mkdir -p "$AUDIT_DIR" "$SURFACE_DIR" "$SOCKET_DIR" "$RUN_ROOT/registrar-client-inputs"
-  registrar_docker_prepare_deployment_tree "$BOOTROOT_PROJECT_DIR" "$WORK_DIR"
-  chmod 0755 "$RUN_ROOT"; sudo -n chown 0:0 "$AUDIT_DIR" "$SOCKET_DIR"; sudo -n chmod 0700 "$AUDIT_DIR"; sudo -n chmod 0755 "$SOCKET_DIR"
-  sudo -n mount -t tmpfs -o size=16m,mode=0700 tmpfs "$AUDIT_DIR" || fail "could not mount the scenario-local audit tmpfs"
-  AUDIT_TMPFS_MOUNTED=1
+  registrar_docker_prepare_run_root "$SCENARIO_SLUG"
+  # The staging area the attacker bundle is copied out of is this
+  # scenario's alone: the endurance arm models no leak.
+  mkdir -p "$RUN_ROOT/registrar-client-inputs"
   pass "created run-scoped root-owned directories and audit tmpfs"
 }
-
-allocate_ports() { for name in POSTGRES OPENBAO STEPCA HTTP01; do pick_free_port; printf -v "PORT_${name}" '%s' "$PICKED_PORT"; done; OPENBAO_URL="https://localhost:${PORT_OPENBAO}"; }
 
 write_configs() {
   local body="$RUN_ROOT/provisioning.body"
@@ -140,158 +122,41 @@ multiplicity = "one-per-deployment"
 cert_group = 3000
 reload = { kind = "docker-restart", target = "review" }
 EOF
-  printf 'fingerprint = "%s"\n' "$(digest_file "$body")" >"$PROVISIONING"; cat "$body" >>"$PROVISIONING"; rm -f "$body"
-  cat >"$INITIAL_CONFIG" <<EOF
-[registrar]
-audit_store_dir = "${AUDIT_DIR}"
-audit_store_enforcement = "directory"
-
-[registrar_endpoint]
-enabled = true
-EOF
-}
-
-prepull_third_party_images() {
-  # `infra install --no-build` deliberately passes `--pull never`. Pull the
-  # three non-repository images through this copied compose file so its tags
-  # remain the only source of truth for the deployment under test.
-  POSTGRES_PASSWORD=prepull-only GRAFANA_ADMIN_PASSWORD=prepull-only \
-    compose pull openbao postgres step-ca >>"$RUN_LOG" 2>&1 ||
-    fail "could not pre-pull third-party deployment images"
+  registrar_docker_write_configs "$body"
 }
 
 build_and_initialize() {
-  local init_raw_log="$RUN_ROOT/init.raw.log"
-  HTTP01_IMAGE="bootroot-http01-responder:registrar-redteam-${RUN_TOKEN}"; export BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE"
-  docker build -t "$HTTP01_IMAGE" -f "$BOOTROOT_PROJECT_DIR/docker/http01-responder/Dockerfile" "$BOOTROOT_PROJECT_DIR" >>"$RUN_LOG" 2>&1 || fail "could not build responder image"; HTTP01_IMAGE_BUILT=1
-  prepull_third_party_images
-  bootroot infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 || fail "infra install failed"
-  for _ in $(seq 1 60); do curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 && break; sleep 1; done
-  curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 || fail "OpenBao did not become reachable"
-  # A fresh `infra install` deliberately creates no state inventory. Seed
-  # the one endpoint predicate `init` must preserve while it writes the
-  # complete state record after provisioning.
-  jq -n --arg url "http://localhost:${PORT_OPENBAO}" '{openbao_url: $url, kv_mount: "secret", registrar_endpoint: {enabled: true, domain: "trusted.domain", host: "redteam"}}' >"$WORK_DIR/state.json" || fail "could not seed endpoint predicate"
-  if ! sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "redteam-${RUN_TOKEN}" "redteam-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$init_raw_log" 2>&1; then
-    sed 's/^\(root token: \).*/\1<redacted>/' "$init_raw_log" >"$ARTIFACT_DIR/init.log" || true
-    fail "bootroot init failed"
-  fi
-  sed 's/^\(root token: \).*/\1<redacted>/' "$init_raw_log" >"$ARTIFACT_DIR/init.log"
-  sudo -n jq -r '.root_token // empty' "$SUMMARY" | sudo -n sh -c 'umask 077; cat >"$1"' _ "$TOKEN_FILE"; sudo -n test -s "$TOKEN_FILE" || fail "init did not write a root token"
-  # A header file keeps the init root token out of the process arguments.
-  # `curl --header @file` consumes the literal HTTP field line, unlike a
-  # curl config file where an extra escape would change the field name.
-  sudo -n sh -c 'printf "%s: %s\n" "X-Vault-Token" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
-  OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"
-  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
-  EMPTY_EAB_STATUS="$(sudo -n curl -sS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST --data '{"data":{"kid":"","hmac":""}}' --dump-header "$ARTIFACT_DIR/empty-eab-headers.txt" --output "$ARTIFACT_DIR/empty-eab-response.json" --write-out '%{http_code}' "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab")" || EMPTY_EAB_STATUS="curl-failed"
-  printf '%s\n' "$EMPTY_EAB_STATUS" >"$ARTIFACT_DIR/empty-eab-status.txt"
-  if [ "$EMPTY_EAB_STATUS" != "200" ]; then
-    cat "$ARTIFACT_DIR/empty-eab-status.txt" "$ARTIFACT_DIR/empty-eab-headers.txt" "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
-    fail "could not record the explicit empty agent EAB"
-  fi
-  # `init` has already recreated the responder with its rendered HMAC and
-  # started the OpenBao agents. Replaying `infra up` here races that rendered
-  # configuration with the base image and leaves the registrar's pre-issued
-  # HMAC unable to authenticate to the responder.
+  registrar_docker_build_and_initialize "$SCENARIO_SLUG"
   pass "initialized an isolated live TLS OpenBao deployment"
 }
 
 load_openbao_paths() {
-  KV_MOUNT="$(jq -er '.kv_mount' "$WORK_DIR/state.json")" || fail "init did not record the KV mount"
+  registrar_docker_load_openbao_paths
+  # The three paths only this scenario reaches for: the trust anchor and the
+  # minted-service material its direct-KV attack must be refused at.
   CA_TRUST_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" CA_TRUST_KV_PATH)"
   SERVICE_KV_BASE="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_KV_BASE)"
   SERVICE_SECRET_ID_SUFFIX="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_SECRET_ID_KV_SUFFIX)"
-  RESPONDER_HMAC_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/commands/init/constants.rs" PATH_RESPONDER_HMAC)"
-  AGENT_EAB_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/commands/init/constants.rs" PATH_AGENT_EAB)"
   pass "loaded the configured KV mount and production path constants"
 }
 
 apply_endpoint_dns_alias() {
-  local client_alias="001.bootroot-registrar.redteam.trusted.domain"
-  local endpoint_alias="001.bootroot-registrar-endpoint.redteam.trusted.domain"
-  local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml"
-  local responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
-  cat >"$override" <<EOF
-services:
-  bootroot-http01:
-    networks:
-      default:
-        aliases:
-          - ${client_alias}
-          - ${endpoint_alias}
-EOF
-  [ -f "$responder_override" ] || fail "init did not render the responder compose override"
-  BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 || fail "could not apply the registrar endpoint DNS alias"
-  for alias in "$client_alias" "$endpoint_alias"; do
-    for _ in $(seq 1 15); do
-      if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
-        break
-      fi
-      sleep 1
-    done
-    docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1 || fail "step-ca cannot reach registrar hostname ${alias} through its DNS alias"
-  done
+  registrar_docker_apply_endpoint_dns_alias \
+    "001.bootroot-registrar.redteam.trusted.domain" \
+    "001.bootroot-registrar-endpoint.redteam.trusted.domain"
   pass "step-ca can reach both registrar hostnames through DNS aliases"
 }
 
 write_daemon_config() {
-  INTERNAL_DIR="$WORK_DIR/secrets/registrar-internal"; ROOT_CA="$WORK_DIR/secrets/certs/root_ca.crt"
-  cat >"$RUN_ROOT/endpoint.toml" <<EOF
-
-[registrar]
-state_file = "${WORK_DIR}/state.json"
-provisioning_config_path = "${PROVISIONING}"
-audit_store_dir = "${AUDIT_DIR}"
-audit_record_dir = "${RECORD_DIR}"
-audit_store_enforcement = "directory"
-audit_store_reserve_bytes = 10485760
-audit_store_low_water_bytes = 8388608
-
-[registrar_endpoint]
-enabled = true
-server_cert_path = "${SURFACE_DIR}/registrar-endpoint.crt"
-server_key_path = "${SURFACE_DIR}/registrar-endpoint.key"
-client_cert_path = "${SURFACE_DIR}/registrar-client.crt"
-client_key_path = "${SURFACE_DIR}/registrar-client.key"
-EOF
-  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 600 "$3"; chown 0:0 "$3"' _ "$INTERNAL_DIR/agent.toml" "$RUN_ROOT/endpoint.toml" "$DAEMON_CONFIG"
-  sudo -n mkdir -p "$RECORD_DIR"; sudo -n chown 0:0 "$RECORD_DIR"; sudo -n chmod 0700 "$RECORD_DIR"
-}
-
-write_supervisor() {
-  cat >"$RUN_ROOT/supervisor.py" <<'PY'
-import os, signal, socket, sys
-sock_path, control, pid_file, agent_bin, config = sys.argv[1:]
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.bind(sock_path); sock.listen(32); os.chown(sock_path, 0, 0); os.chmod(sock_path, 0o700); os.mkfifo(control, 0o600); child = None
-def spawn():
-    global child
-    child = os.fork()
-    if child == 0:
-        os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe(agent_bin, [agent_bin, '--config', config], env)
-    open(pid_file, 'w', encoding='ascii').write(str(child))
-def stop():
-    global child
-    if child is not None:
-        try: os.kill(child, signal.SIGTERM)
-        except ProcessLookupError: pass
-        os.waitpid(child, 0); child = None
-spawn()
-while True:
-    with open(control, encoding='ascii') as stream:
-        for line in stream:
-            if line.strip() == 'restart': stop(); spawn()
-            elif line.strip() == 'stop': stop()
-            elif line.strip() == 'quit': stop(); sys.exit(0)
-PY
+  # Only this scenario drives the audit store to its low-water and
+  # exhausted states, so only this scenario bounds the budget.
+  registrar_docker_write_daemon_config 'audit_store_reserve_bytes = 10485760
+audit_store_low_water_bytes = 8388608'
 }
 
 start_daemon() {
-  write_supervisor
-  sudo -n python3 "$RUN_ROOT/supervisor.py" "$SOCKET_PATH" "$CONTROL_FIFO" "$RUN_ROOT/agent.pid" "$BOOTROOT_AGENT_BIN" "$DAEMON_CONFIG" >>"$ARTIFACT_DIR/agent.log" 2>&1 &
-  SUPERVISOR_PID=$!
-  for _ in $(seq 1 90); do [ -S "$SOCKET_PATH" ] && [ -s "$RUN_ROOT/agent.pid" ] && [ -s "$SURFACE_DIR/registrar-client.crt" ] && break; sleep 1; done
-  [ -s "$SURFACE_DIR/registrar-client.crt" ] || fail "daemon did not issue registrar surface material"
+  registrar_docker_start_supervisor
+  registrar_docker_await_surface_material "$SURFACE_DIR/registrar-client.crt"
   printf '%s\n' "$(certificate_der_digest "$ROOT_CA")" >"$SURFACE_DIR/registrar-endpoint-anchors.sha256"
 }
 
@@ -320,7 +185,6 @@ assert_socket_contract() {
 # path-occupation checks below prove that an unprivileged caller cannot reach
 # this socket at all.
 client() { sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
-control() { printf '%s\n' "$1" | sudo -n tee "$CONTROL_FIFO" >/dev/null; }
 write_mint() { local service_name="${3:-review}"; jq -n --arg group "$2" --arg service_name "$service_name" '{protocol_version:1,service_name:$service_name,delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:$service_name,service_name:$service_name,reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
 
 assert_escalation_denied() {
@@ -478,14 +342,14 @@ assert_socket_refusals() {
   printf '{}' >"$payload"; client --operation enumerate --payload "$payload" --expect-unknown-operation || fail "unknown socket operation was not explicitly refused"
   printf '%064d\n' 0 >"$wrong"; if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$wrong" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a fingerprint mismatch"; fi
   if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
-  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
-  nobody="$(id -un 65534 2>/dev/null || printf nobody)"; control stop; sleep 1
+  before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; registrar_docker_control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
+  nobody="$(id -un 65534 2>/dev/null || printf nobody)"; registrar_docker_control stop; sleep 1
   sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
   # Startup repairs unusable surface material before endpoint activation. An
   # unset material path instead fails settings validation before any repair or
   # endpoint work begins, which gives this fixture a deterministic failed start.
   sudo -n python3 -c 'import pathlib,re,sys; p=pathlib.Path(sys.argv[1]); source=p.read_text(); changed,count=re.subn(r"(?m)^server_key_path[ \t]*=[^\n]*\n?", "", source, count=1); assert count == 1, "missing registrar endpoint server_key_path"; p.write_text(changed)' "$DAEMON_CONFIG"
-  control restart
+  registrar_docker_control restart
   # The supervisor starts the child as root. An unprivileged `kill -0` sees
   # EPERM for a live child, which is not evidence that the bad configuration
   # made it exit. A root-owned zombie is also an exited child waiting for the
@@ -500,7 +364,7 @@ assert_socket_refusals() {
   case "$agent_state" in ''|Z*) ;; *) fail "deliberately invalid daemon configuration did not fail startup" ;; esac
   if sudo -n -u "$nobody" python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$SOCKET_PATH"; then fail "unprivileged peer connected while daemon stopped"; fi
   if sudo -n -u "$nobody" python3 -c 'import os,socket,sys; os.unlink(sys.argv[1]); socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$SOCKET_PATH"; then fail "unprivileged peer occupied stopped socket path"; fi
-  sudo -n mv "$RUN_ROOT/registrar-agent.good.toml" "$DAEMON_CONFIG"; control restart
+  sudo -n mv "$RUN_ROOT/registrar-agent.good.toml" "$DAEMON_CONFIG"; registrar_docker_control restart
   pass "all non-verbs, pin failures, restart behavior, and path occupation attempts are refused"
 }
 
@@ -513,7 +377,7 @@ main() {
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
-  log_phase deployment; prepare_workspace; allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
+  log_phase deployment; prepare_workspace; registrar_docker_allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
   log_phase containment; assert_escalation_denied
   log_phase functionality; assert_functionality_and_audit
   log_phase socket; assert_socket_refusals
