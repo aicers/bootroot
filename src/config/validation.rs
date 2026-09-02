@@ -1093,4 +1093,39 @@ mod tests {
             }
         }
     }
+
+    /// Every shipped template must carry both `[trust]` keys.
+    ///
+    /// Nothing in the agent skips verifying the ACME server, so a
+    /// template that ships without them hands an operator a config whose
+    /// only route to a handshake is the system CA store -- which cannot
+    /// anchor a self-signed step-ca. `agent.toml.compose` is the one
+    /// that used to be run with `--insecure` instead, so it is the one a
+    /// revert would quietly return to being unverifiable.
+    ///
+    /// The values are placeholders and are deliberately not checked
+    /// here: `validate_trust_settings` is what rejects them, and
+    /// `from_file` does not run it. What must not regress is the keys
+    /// being present at all.
+    #[test]
+    fn shipped_agent_config_templates_carry_both_trust_keys() {
+        for name in ["agent.toml.example", "agent.toml.compose"] {
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            let contents =
+                std::fs::read_to_string(&source).unwrap_or_else(|err| panic!("read {name}: {err}"));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("agent.toml");
+            std::fs::write(&path, &contents).expect("stage template");
+            let settings = crate::config::Settings::from_file(Some(path))
+                .unwrap_or_else(|err| panic!("{name} must deserialize: {err}"));
+            assert!(
+                settings.trust.ca_bundle_path.is_some(),
+                "{name} must set trust.ca_bundle_path"
+            );
+            assert!(
+                !settings.trust.trusted_ca_sha256.is_empty(),
+                "{name} must set trust.trusted_ca_sha256"
+            );
+        }
+    }
 }
