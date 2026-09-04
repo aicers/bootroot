@@ -23,7 +23,14 @@ env:
 jobs:
   changes:
     name: Change Filter
-    runs-on: ubuntu-latest
+    # This repository is public and anyone may fork it, and a pull request from
+    # a fork runs the fork's own copy of this file. Routing that onto the
+    # self-hosted host would put unreviewed code on a machine inside the office
+    # network, so fork pull requests stay on the hosted image; everything else
+    # runs on our runners. `Linux` and `X64` are load-bearing rather than
+    # decorative: the aicers self-hosted pool also holds macOS runners, and a
+    # bare `self-hosted` would let these jobs land on one.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
     outputs:
       docs_only: ${{ steps.decide.outputs.docs_only }}
     steps:
@@ -80,7 +87,8 @@ jobs:
 
   check:
     name: Quality Check
-    runs-on: ubuntu-latest
+    # Fork pull requests stay hosted; see `changes` above.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -158,12 +166,18 @@ jobs:
     name: Unit & CLI Smoke
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    # Fork pull requests stay hosted; see `changes` above.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
-      - name: Free port 5432 (runner PostgreSQL)
+      - name: Free port 5432 (hosted PostgreSQL)
+        # Only the hosted image ships a PostgreSQL that squats on 5432. The
+        # self-hosted host has no postgres unit, no postgres binary and nothing
+        # listening on the port, and its runner account holds no sudo at all,
+        # so this both cannot run and need not run there.
+        if: runner.environment == 'github-hosted'
         run: sudo systemctl stop postgresql || true
 
       - name: Setup Rust Toolchain
@@ -188,15 +202,31 @@ jobs:
         run: |
           set -euo pipefail
           GROUP_NAME="bootroot-e2e-certgrp"
+          # A hosted run gets a fresh VM and must build the fixture every time.
+          # A self-hosted runner is persistent: an operator provisions the group
+          # and the membership once, and the runner service inherits the group
+          # when it starts, so this process already holds the gid and every
+          # child it spawns does too. Reach for sudo only when the fixture is
+          # genuinely missing -- the self-hosted accounts hold none, so calling
+          # it unconditionally would fail the job outright.
           if ! getent group "$GROUP_NAME" >/dev/null; then
             sudo groupadd "$GROUP_NAME"
           fi
           GID="$(getent group "$GROUP_NAME" | cut -d: -f3)"
-          sudo usermod -aG "$GROUP_NAME" "$USER"
+          # `id -G` is this process's own group list, not the passwd database's:
+          # the question is whether `cargo test` will inherit the gid, which a
+          # database lookup cannot answer right after a `usermod`.
+          if id -G | tr ' ' '\n' | grep -qx "$GID"; then
+            echo "CERT_GROUP_INHERITED=1" >> "$GITHUB_ENV"
+            echo "Inherited $GROUP_NAME (gid=$GID) from the runner account"
+          else
+            sudo usermod -aG "$GROUP_NAME" "$USER"
+            echo "CERT_GROUP_INHERITED=0" >> "$GITHUB_ENV"
+            echo "Provisioned $GROUP_NAME (gid=$GID) and added $USER as supplementary member"
+          fi
           echo "BOOTROOT_E2E_CERT_GROUP_GID=$GID" >> "$GITHUB_ENV"
           echo "BOOTROOT_E2E_REQUIRE_CERT_GROUP=1" >> "$GITHUB_ENV"
           echo "BOOTROOT_E2E_CERT_GROUP_NAME=$GROUP_NAME" >> "$GITHUB_ENV"
-          echo "Provisioned $GROUP_NAME (gid=$GID) and added $USER as supplementary member"
 
       - name: Run Unit Tests
         # `usermod -aG` updates /etc/group but the current shell process
@@ -223,15 +253,47 @@ jobs:
         # CI environment produce a green build. Pass them through
         # --preserve-env so the require-flag actually reaches the test
         # process.
+        #
+        # None of that applies when the membership predates this process: the
+        # gid is already in the inherited group list, so the test runs directly
+        # and the self-hosted accounts need no sudo.
         run: |
-          CARGO_BIN="$(command -v cargo)"
-          sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME,BOOTROOT_E2E_CERT_GROUP_GID,BOOTROOT_E2E_REQUIRE_CERT_GROUP,BOOTROOT_E2E_CERT_GROUP_NAME \
-            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-            -- "$CARGO_BIN" test
+          if [ "${CERT_GROUP_INHERITED:-0}" = "1" ]; then
+            cargo test
+          else
+            CARGO_BIN="$(command -v cargo)"
+            sudo --preserve-env=HOME,PATH,CARGO_HOME,RUSTUP_HOME,BOOTROOT_E2E_CERT_GROUP_GID,BOOTROOT_E2E_REQUIRE_CERT_GROUP,BOOTROOT_E2E_CERT_GROUP_NAME \
+              setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+              -- "$CARGO_BIN" test
+          fi
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory
         run: echo "BOOTROOT_SECRETS_DIR=$GITHUB_WORKSPACE/secrets" >> "$GITHUB_ENV"
+
+      - name: Name this run's compose project and container instance
+        # Every aicers self-hosted runner instance shares one rootless Docker
+        # daemon, so the default identity would make two runs of this job fight
+        # over `bootroot-openbao`, `bootroot-ca` and the rest. A hosted run owns
+        # a private VM and never needed this; naming per run is right on both.
+        # The attempt number is part of it so a re-run cannot inherit a previous
+        # attempt's leftovers.
+        run: |
+          instance="bootroot-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "BOOTROOT_INSTANCE=$instance" >> "$GITHUB_ENV"
+          echo "COMPOSE_PROJECT_NAME=$instance" >> "$GITHUB_ENV"
+
+      - name: Select the step-ca container user for this daemon
+        # step-ca is pinned to `${BOOTROOT_STEPCA_USER:-1000:1000}` against a
+        # writable `./secrets` mount. Under rootless Docker that uid maps into
+        # the account's subordinate range and cannot write the mount, whereas
+        # in-container root *is* the unprivileged account and can. Leave the
+        # rootful default untouched.
+        run: |
+          if docker info --format '{{.SecurityOptions}}' | grep -q 'name=rootless'; then
+            echo "BOOTROOT_STEPCA_USER=0:0" >> "$GITHUB_ENV"
+            echo "rootless daemon: step-ca will run as in-container root"
+          fi
 
       - name: Monitoring Integration Test (E2E)
         # `--include-ignored` because `monitoring_stack_is_ready` — the one
@@ -252,7 +314,7 @@ jobs:
         run: ./scripts/preflight/ci/deploy-no-build-smoke.sh
 
       - name: Install Infrastructure
-        run: cargo run --bin bootroot -- infra install
+        run: cargo run --bin bootroot -- infra install --instance-name "$BOOTROOT_INSTANCE"
 
       - name: Zero-config Init (answer n, no show-secrets)
         run: |
@@ -273,7 +335,7 @@ jobs:
       - name: Clean and Reinstall
         run: |
           cargo run --bin bootroot -- clean -y
-          cargo run --bin bootroot -- infra install
+          cargo run --bin bootroot -- infra install --instance-name "$BOOTROOT_INSTANCE"
 
       - name: CLI Init (Smoke)
         run: |
@@ -386,7 +448,7 @@ jobs:
             echo "Waiting for CA health..."
             sleep 3
           done
-          docker logs bootroot-ca
+          docker logs "${BOOTROOT_INSTANCE:-bootroot}-ca"
           exit 1
 
       - name: Verify Agent Success (E2E)
