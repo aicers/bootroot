@@ -30,7 +30,7 @@ jobs:
     # runs on our runners. `Linux` and `X64` are load-bearing rather than
     # decorative: the aicers self-hosted pool also holds macOS runners, and a
     # bare `self-hosted` would let these jobs land on one.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux"]') }}
     outputs:
       docs_only: ${{ steps.decide.outputs.docs_only }}
     steps:
@@ -88,7 +88,7 @@ jobs:
   check:
     name: Quality Check
     # Fork pull requests stay hosted; see `changes` above.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -167,7 +167,7 @@ jobs:
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
     # Fork pull requests stay hosted; see `changes` above.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux"]') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
