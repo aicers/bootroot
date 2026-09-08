@@ -115,6 +115,22 @@ fn pem_to_der(pem: &str) -> Vec<u8> {
     parsed.contents
 }
 
+/// Returns the `notAfter` the published leaf itself carries.
+///
+/// The reported expiry is read off the leaf rather than computed, so
+/// the value a caller is handed is only right if it is that one: a
+/// summary or a body carrying any other future instant would satisfy a
+/// range check and still be reporting the wrong certificate's lifetime.
+fn published_leaf_not_after(cert_pem: &str) -> time::OffsetDateTime {
+    let (_, pem) =
+        x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).expect("a PEM certificate");
+    pem.parse_x509()
+        .expect("an X.509 certificate")
+        .validity()
+        .not_after
+        .to_datetime()
+}
+
 // ---------------------------------------------------------------------
 // capabilities, and the two usage exits
 // ---------------------------------------------------------------------
@@ -1013,6 +1029,11 @@ async fn issue_writes_a_recognized_registrar_client_credential() {
     // The leaf is the composed identity, and the endpoint's own rule
     // accepts it under this deployment's domain and no other.
     let cert_pem = std::fs::read_to_string(host.cert_path()).expect("the certificate");
+    assert_eq!(
+        not_after,
+        published_leaf_not_after(&cert_pem),
+        "the body must report the published leaf's own expiry"
+    );
     let leaf_der = pem_to_der(&cert_pem);
     let identity =
         recognize_registrar_client(&leaf_der, TEST_DOMAIN).expect("the issued leaf is recognized");
@@ -1142,13 +1163,17 @@ async fn issue_without_json_summarizes_what_it_issued() {
     );
     let not_after = rfc3339_token(&stdout)
         .unwrap_or_else(|| panic!("the summary must carry an RFC 3339 expiry: {stdout}"));
-    assert!(
-        not_after > time::OffsetDateTime::now_utc(),
-        "the credential's expiry must lie in the future: {stdout}"
-    );
     assert!(host.cert_path().exists());
     assert!(host.key_path().exists());
     assert!(host.bundle_path().exists());
+    // The expiry the prose reports is the one the published leaf
+    // carries, not merely some instant that has not passed yet.
+    let cert_pem = std::fs::read_to_string(host.cert_path()).expect("the certificate");
+    assert_eq!(
+        not_after,
+        published_leaf_not_after(&cert_pem),
+        "the summary must report the published leaf's own expiry: {stdout}"
+    );
 }
 
 /// A host that `bootroot init` has not provisioned yet carries no
