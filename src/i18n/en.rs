@@ -389,7 +389,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_registrar_internal_complete: "The bootroot-internal registrar credential has been repaired; its agent was signalled to reload.",
     rotate_registrar_internal_up_to_date: "The bootroot-internal registrar credential is complete and was issued under the active root; nothing to repair. Pass --force to replace it anyway.",
     registrar_capabilities_summary: "Registrar surface {api_version}: served on {socket_path}, carrying {verbs}.",
-    registrar_issue_complete: "Issued the registrar client credential {identity}, valid until {not_after}.",
+    registrar_issue_complete: "Registrar surface {api_version}: issued the registrar client credential {identity}, valid until {not_after}.",
     prompt_rotate_registrar_internal: "Replace the bootroot-internal registrar credential (auth entry, leaf and stored root fingerprint)?",
     rotate_ca_key_phase_reissue: "[Phase 5] Re-issuing service certificates...",
     rotate_ca_key_phase_finalize: "[Phase 6] Finalizing trust (subtractive)...",

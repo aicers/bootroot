@@ -806,6 +806,46 @@ mod tests {
         }
     }
 
+    /// The registrar surface's two summaries are what an operator gets
+    /// without `--json`, and both carry the wire token the surface is
+    /// versioned by.  That token is protocol rather than prose, so
+    /// neither locale may translate or decorate it, and a misspelled
+    /// placeholder in one table would drop the one field an operator
+    /// cannot otherwise discover without asking for a JSON body.
+    #[test]
+    fn registrar_surface_summaries_carry_the_api_version_in_every_locale() {
+        const API_VERSION: &str = "bootroot.registrar.v1";
+        const SOCKET_PATH: &str = "/run/bootroot/registrar.sock";
+        const VERBS: &str = "capabilities, issue";
+        const IDENTITY: &str = "registrar.host.example.com";
+        const NOT_AFTER: &str = "2026-01-02T03:04:05.678Z";
+
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let capabilities = m.registrar_capabilities_summary(API_VERSION, SOCKET_PATH, VERBS);
+            let issued = m.registrar_issue_complete(API_VERSION, IDENTITY, NOT_AFTER);
+
+            for value in [API_VERSION, SOCKET_PATH, VERBS] {
+                assert!(
+                    capabilities.contains(value),
+                    "{locale} capabilities summary dropped {value:?}: {capabilities}"
+                );
+            }
+            for value in [API_VERSION, IDENTITY, NOT_AFTER] {
+                assert!(
+                    issued.contains(value),
+                    "{locale} issue summary dropped {value:?}: {issued}"
+                );
+            }
+            for rendered in [&capabilities, &issued] {
+                assert!(
+                    !rendered.contains('{'),
+                    "{locale} left an unsubstituted placeholder: {rendered}"
+                );
+            }
+        }
+    }
+
     /// The recovery command an operator is handed has to name a
     /// container that exists for their instance.
     #[test]

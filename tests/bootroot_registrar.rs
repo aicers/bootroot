@@ -95,6 +95,21 @@ fn staging_leftovers(secrets_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Returns the one RFC 3339 instant a prose summary carries, or `None`
+/// when it carries none.
+///
+/// The summary is localized, so the surrounding words are not something
+/// to assert on; the timestamp is the wire spelling the JSON body uses
+/// and is found by parsing rather than by position. Sentence-final
+/// punctuation is trimmed because a template may end on the value.
+fn rfc3339_token(text: &str) -> Option<time::OffsetDateTime> {
+    text.split_whitespace()
+        .map(|word| word.trim_end_matches(['.', ',', ')']))
+        .find_map(|word| {
+            time::OffsetDateTime::parse(word, &time::format_description::well_known::Rfc3339).ok()
+        })
+}
+
 fn pem_to_der(pem: &str) -> Vec<u8> {
     let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("a PEM certificate");
     parsed.contents
@@ -1087,8 +1102,11 @@ async fn a_failed_issuance_publishes_nothing() {
     );
 }
 
-/// Without `--json` the issuance reports the identity it composed and
-/// the expiry in prose, and publishes the same three files.
+/// Without `--json` the issuance reports the surface version, the
+/// identity it composed and the expiry in prose, and publishes the same
+/// three files.  The prose carries every field the body does: an
+/// operator who did not ask for JSON still learns which surface version
+/// minted the credential.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_without_json_summarizes_what_it_issued() {
     let ca = Arc::new(TestCa::new());
@@ -1106,6 +1124,17 @@ async fn issue_without_json_summarizes_what_it_issued() {
     assert!(
         stdout.contains(&identity),
         "the summary must name the composed identity: {stdout}"
+    );
+    // The wire token, spelled exactly as the JSON body spells it.
+    assert!(
+        stdout.contains("bootroot.registrar.v1"),
+        "the summary must name the surface version: {stdout}"
+    );
+    let not_after = rfc3339_token(&stdout)
+        .unwrap_or_else(|| panic!("the summary must carry an RFC 3339 expiry: {stdout}"));
+    assert!(
+        not_after > time::OffsetDateTime::now_utc(),
+        "the credential's expiry must lie in the future: {stdout}"
     );
     assert!(host.cert_path().exists());
     assert!(host.key_path().exists());

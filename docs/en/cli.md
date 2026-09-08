@@ -2852,6 +2852,11 @@ With `--json`, one JSON object on stdout:
 }
 ```
 
+Without it, one localized sentence carrying the same three values — the surface
+version `bootroot.registrar.v1` in its wire spelling, the composed identity, and
+the leaf's expiry as an RFC 3339 instant — so an operator who did not ask for a
+body still learns which surface version minted the credential.
+
 ### Behavior
 
 - The three destinations are held to being distinct before anything is issued.

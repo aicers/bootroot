@@ -24,20 +24,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot registrar issue --host <label> --domain <domain> --cert-path <p>
   --key-path <p> --json` issues the registrar's client credential into those
   paths with the CA bundle as the certificate path's sibling, at the modes
-  `service add` establishes, and reports the identity it composed together
-  with the leaf's expiry. The identity is composed by bootroot from the host
-  label and the domain — no flag accepts a composed name — so the certificate
-  and the endpoint's own recognition rule cannot disagree. The three output
-  destinations must be distinct files, checked before anything is issued. The
-  material is staged and published only once all of it exists, and a
-  publication that fails part-way puts back every destination it had already
-  replaced — its contents, at the permission bits and under the ownership it
-  carried — so a run that fails leaves no half-written pair. Publications into
-  the same paths are serialised against each other across processes — the
-  daemon takes the same lock when it issues this pair at start-up and when it
-  renews it — so no two writers can leave one's certificate beside the
-  other's key while both report success. Only the initial credential is
-  issued; renewal remains the daemon's, under its own internal credential.
+  `service add` establishes, and reports the wire version, the identity it
+  composed and the leaf's expiry — as that JSON body, or as a localized prose
+  summary carrying the same three values without `--json`. The identity is
+  composed by bootroot from the host label and the domain — no flag accepts a
+  composed name — so the certificate and the endpoint's own recognition rule
+  cannot disagree. The three output destinations must be distinct files,
+  checked before anything is issued. The material is staged and published only
+  once all of it exists, and a publication that fails part-way puts back every
+  destination it had already replaced — its contents, at the permission bits
+  and under the ownership it carried — so a run that fails leaves no
+  half-written pair. Publications into the same paths are serialised against
+  each other across processes — the daemon takes the same lock when it issues
+  this pair at start-up and when it renews it — so no two writers can leave
+  one's certificate beside the other's key while both report success. Only the
+  initial credential is issued; renewal remains the daemon's, under its own
+  internal credential.
 - An enabled registrar endpoint now remains responsive when its
   filesystem-backed audit store is not mounted. It refuses mint and
   deregister requests permanently with `registrar_unavailable` /
