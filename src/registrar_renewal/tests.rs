@@ -2389,3 +2389,182 @@ async fn an_interleaved_profile_merge_survives_a_registrar_rollback() {
         "the failed publication leaves the live pair as it was"
     );
 }
+
+// ---------------------------------------------------------------------
+// The cross-process publication lock
+// ---------------------------------------------------------------------
+
+/// The production writer with every write and every restore preceded by
+/// a non-blocking attempt on the publication lock.
+///
+/// The daemon is not the only writer of this pair: `bootroot registrar
+/// issue` re-issues the same registrar client leaf into the same
+/// configured paths from a CLI invocation of its own. A directory that
+/// answers *free* from inside this transaction is one that run could be
+/// publishing into between this one's certificate and its key, which is
+/// how both succeed over a pair that matches neither.
+///
+/// The probe opens a descriptor of its own, and `flock(2)` binds a lock
+/// to the open file description rather than to the process, so the
+/// refusal another process would meet is the refusal it meets. Nothing
+/// here waits on anything.
+struct LockProbingPaths {
+    inner: FilesystemPaths,
+    /// Every directory found unheld, by the step that found it.
+    unheld: Arc<Mutex<Vec<String>>>,
+    /// How many of the three hooks ran, so a test cannot pass on a
+    /// publication that never reached them.
+    probes: Arc<AtomicUsize>,
+    fail_pair: bool,
+}
+
+/// The probing writer and the two observations a test asserts through:
+/// every directory found unheld, and how many hooks ran.
+type ProbedWriter = (
+    Box<dyn LivePaths>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+);
+
+impl LockProbingPaths {
+    /// Not `Self`: the seam is a `Box<dyn LivePaths>`, and the two
+    /// observations beside it are what a test asserts through.
+    #[allow(clippy::new_ret_no_self)]
+    fn new(fail_pair: bool) -> ProbedWriter {
+        let unheld = Arc::new(Mutex::new(Vec::new()));
+        let probes = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(Self {
+                inner: FilesystemPaths::new(),
+                unheld: Arc::clone(&unheld),
+                probes: Arc::clone(&probes),
+                fail_pair,
+            }),
+            unheld,
+            probes,
+        )
+    }
+
+    /// Records every destination of `paths` whose directory is not held
+    /// by this publication.
+    fn probe(&self, step: &str, paths: &[&Path]) {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        let free = crate::publication_lock::unlocked_directories(paths);
+        if free.is_empty() {
+            return;
+        }
+        let mut unheld = self.unheld.lock().unwrap_or_else(PoisonError::into_inner);
+        for dir in free {
+            unheld.push(format!("{step}: {}", dir.display()));
+        }
+    }
+}
+
+impl LivePaths for LockProbingPaths {
+    fn write_bundle<'a>(&'a self, path: &'a Path, contents: &'a str) -> LiveWrite<'a> {
+        self.probe("the bundle write", &[path]);
+        self.inner.write_bundle(path, contents)
+    }
+
+    fn write_pair<'a>(
+        &'a self,
+        cert_path: &'a Path,
+        key_path: &'a Path,
+        cert_pem: &'a str,
+        key_pem: &'a str,
+    ) -> LiveWrite<'a> {
+        self.probe("the pair write", &[cert_path, key_path]);
+        if self.fail_pair {
+            return Box::pin(async { anyhow::bail!("injected certificate and key write failure") });
+        }
+        self.inner
+            .write_pair(cert_path, key_path, cert_pem, key_pem)
+    }
+
+    fn restore<'a>(&'a self, snapshot: &'a Snapshot) -> LiveWrite<'a> {
+        self.probe("the rollback", &[snapshot.path()]);
+        self.inner.restore(snapshot)
+    }
+}
+
+/// A daemon renewal publishes under the same cross-process lock a
+/// `bootroot registrar issue` takes, for its whole span.
+///
+/// The rollback answers only for a failure of its own transaction, so
+/// two writers that both succeed have nothing to put back: the lock is
+/// the only thing that stops a CLI issuance landing between this
+/// transaction's certificate and its key. The registrar client leaf is
+/// the one both write.
+#[tokio::test]
+async fn a_renewal_publication_holds_the_lock_a_cli_issuance_takes() {
+    let harness = Harness::build();
+    let (live, unheld, probes) = LockProbingPaths::new(false);
+    let renewal = harness.renewal().await.with_live_paths(live);
+    let pair = harness.pair(SurfaceLeaf::RegistrarClient);
+    let material = harness.ca.material(&pair.name, -1, 60);
+
+    renewal
+        .renew_leaf_with_material(&pair, material)
+        .await
+        .expect("the candidate publishes");
+
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        2,
+        "both live writes are probed"
+    );
+    // Copied out from under one guard: naming the mutex twice in an
+    // `assert!` would deadlock the failure path against itself.
+    let unheld = unheld
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert!(
+        unheld.is_empty(),
+        "a CLI issuance could publish into {unheld:?} while this transaction was writing"
+    );
+    assert_eq!(
+        crate::publication_lock::unlocked_directories(&[&pair.cert_path, &pair.key_path]).len(),
+        2,
+        "the lock is released with the publication"
+    );
+}
+
+/// The lock is held past the rollback too, not merely past the writes.
+///
+/// A transaction that releases before it restores hands the next writer
+/// a window in which the files are the failed run's, and puts its own
+/// snapshot back over whatever that writer published.
+#[tokio::test]
+async fn a_rolled_back_publication_holds_the_lock_through_the_restore() {
+    let harness = Harness::build();
+    let (live, unheld, probes) = LockProbingPaths::new(true);
+    let renewal = harness.renewal().await.with_live_paths(live);
+    let pair = harness.pair(SurfaceLeaf::RegistrarClient);
+    let material = harness.ca.material(&pair.name, -1, 60);
+
+    let err = renewal
+        .renew_leaf_with_material(&pair, material)
+        .await
+        .expect_err("the injected pair write fails the publication");
+    assert!(
+        format!("{err:#}").contains("injected certificate and key write failure"),
+        "{err:#}"
+    );
+
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        5,
+        "the bundle write, the pair write and all three restores are probed"
+    );
+    // Copied out from under one guard: naming the mutex twice in an
+    // `assert!` would deadlock the failure path against itself.
+    let unheld = unheld
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert!(
+        unheld.is_empty(),
+        "a CLI issuance could publish into {unheld:?} while this transaction was rolling back"
+    );
+}

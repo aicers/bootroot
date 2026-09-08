@@ -77,6 +77,7 @@
 //! loader's, performed a few lines later, and its acceptance rule is
 //! strictly stronger than this one.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -808,6 +809,14 @@ pub(crate) async fn read_acme_inputs_with(
 /// prerequisite for issuing the certificate it presents, which is what
 /// lets a first start mint the server pair with nothing listening.
 ///
+/// The exchange and the publication are separate steps here rather than
+/// the one call that used to run both, because only the publication may
+/// be locked: see [`publish_surface_material`].
+///
+/// An order that finalizes without a certificate publishes nothing and
+/// is not an error — a start-time issuance has simply not got one yet,
+/// and the next pass asks again.
+///
 /// # Errors
 ///
 /// Returns an error naming both configured paths and the failure.
@@ -823,7 +832,15 @@ pub(crate) async fn issue_surface_pair(
         .first()
         .ok_or_else(|| anyhow::anyhow!("the registrar surface issuance profile was not built"))?;
     let bootstrap_pins = bootstrap_pins(&issuance.trust);
-    crate::acme::issue_certificate_with_bootstrap(
+    let describe = || {
+        format!(
+            "issuing {} to {} and {}",
+            pair.name,
+            pair.cert_path.display(),
+            pair.key_path.display()
+        )
+    };
+    let Some(material) = crate::acme::issue_certificate_material(
         &issuance,
         profile,
         inputs.eab.clone(),
@@ -831,14 +848,62 @@ pub(crate) async fn issue_surface_pair(
         bootstrap_pins,
     )
     .await
-    .with_context(|| {
-        format!(
-            "issuing {} to {} and {}",
-            pair.name,
-            pair.cert_path.display(),
-            pair.key_path.display()
-        )
-    })
+    .with_context(describe)?
+    else {
+        return Ok(());
+    };
+    publish_surface_material(
+        &issuance,
+        profile,
+        crate::acme::publish_issued_material(&issuance, profile, &material),
+    )
+    .await
+    .with_context(describe)
+}
+
+/// Publishes one surface pair's material under the cross-process
+/// publication lock.
+///
+/// The lock covers every write this makes — the merged CA bundle, the
+/// certificate and the key — and nothing before it. The three writers
+/// of this material are not all in one process: this start-time
+/// issuance, the renewal in `crate::registrar_renewal` and
+/// `bootroot registrar issue` in the CLI all replace the same
+/// configured paths, and two of them publishing at once leave one's
+/// certificate beside the other's key with both reporting success.
+/// [`crate::publication_lock`] is what they share; see its module
+/// documentation for why the ACME exchange stays outside it.
+///
+/// `publish` is a future this awaits rather than a call made here.
+/// Nothing in it runs before it is awaited, so building it at the call
+/// site costs the lock nothing, and taking it as a parameter is what
+/// lets a test assert *from inside the publication* that the lock is
+/// held while it runs — the property the lock exists for, and one no
+/// assertion made afterwards can see.
+///
+/// # Errors
+///
+/// Returns an error when the lock cannot be taken, or whatever
+/// `publish` returns.
+async fn publish_surface_material<Fut>(
+    issuance: &Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    publish: Fut,
+) -> Result<()>
+where
+    Fut: Future<Output = Result<()>>,
+{
+    let mut destinations: Vec<&Path> = Vec::with_capacity(3);
+    // Only when it is configured: with no bundle path there is no
+    // bundle write to serialise, and locking a directory nothing is
+    // written into would make two unrelated publications wait.
+    if let Some(bundle) = issuance.trust.ca_bundle_path.as_deref() {
+        destinations.push(bundle);
+    }
+    destinations.push(&profile.paths.cert);
+    destinations.push(&profile.paths.key);
+    let _lock = crate::publication_lock::hold(&destinations).await?;
+    publish.await
 }
 
 /// Issues one pair **off-live**: the issuer chain, the candidate

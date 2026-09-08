@@ -12,7 +12,8 @@ mod test_support;
 use clap::Parser;
 
 use crate::cli::args::{
-    CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, ServiceCommand,
+    CaCommand, Cli, CliCommand, InfraCommand, MonitoringCommand, OpenbaoCommand, RegistrarCommand,
+    ServiceCommand,
 };
 use crate::commands::rotate::RotateOutcome;
 use crate::i18n::Messages;
@@ -155,6 +156,16 @@ fn run(cli: Cli, messages: &Messages) -> Result<ExitCode> {
         CliCommand::Ca(CaCommand::Restart(args)) => {
             commands::ca::run_ca_restart(&args, messages)
                 .with_context(|| "ca restart failed".to_string())?;
+        }
+        CliCommand::Registrar(RegistrarCommand::Capabilities(args)) => {
+            commands::registrar::run_registrar_capabilities(&args, messages)
+                .with_context(|| "registrar capabilities failed".to_string())?;
+        }
+        CliCommand::Registrar(RegistrarCommand::Issue(args)) => {
+            with_runtime("registrar issue", messages, |rt| {
+                rt.block_on(commands::registrar::run_registrar_issue(&args, messages))
+            })?
+            .with_context(|| "registrar issue failed".to_string())?;
         }
     }
     Ok(ExitCode::SUCCESS)

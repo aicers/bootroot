@@ -8,6 +8,36 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot registrar` provisions the registrar surface a deployment tool
+  drives before the host-local endpoint can be used.
+  `bootroot registrar capabilities --json` reports the wire version, the
+  pathname the endpoint is served on and the verbs the surface carries
+  (`registrar.issue`, `registrar.mint`, `registrar.deregister`, in that
+  order). It is read-only and describes the surface rather than the runtime,
+  so it answers with the endpoint disabled and with no daemon running; the
+  pathname is the installed socket unit's effective `ListenStream=`, resolved
+  as systemd resolves it — the unit directories in systemd's own precedence
+  order, with every drop-in systemd would apply merged on top (the unit's own
+  `.d`, its dash-truncated prefix, and the type-wide `socket.d`), so a
+  `systemctl edit` override is reflected — falling back to the unit bootroot
+  ships when no unit is installed.
+  `bootroot registrar issue --host <label> --domain <domain> --cert-path <p>
+  --key-path <p> --json` issues the registrar's client credential into those
+  paths with the CA bundle as the certificate path's sibling, at the modes
+  `service add` establishes, and reports the identity it composed together
+  with the leaf's expiry. The identity is composed by bootroot from the host
+  label and the domain — no flag accepts a composed name — so the certificate
+  and the endpoint's own recognition rule cannot disagree. The three output
+  destinations must be distinct files, checked before anything is issued. The
+  material is staged and published only once all of it exists, and a
+  publication that fails part-way puts back every destination it had already
+  replaced — its contents, at the permission bits and under the ownership it
+  carried — so a run that fails leaves no half-written pair. Publications into
+  the same paths are serialised against each other across processes — the
+  daemon takes the same lock when it issues this pair at start-up and when it
+  renews it — so no two writers can leave one's certificate beside the
+  other's key while both report success. Only the initial credential is
+  issued; renewal remains the daemon's, under its own internal credential.
 - An enabled registrar endpoint now remains responsive when its
   filesystem-backed audit store is not mounted. It refuses mint and
   deregister requests permanently with `registrar_unavailable` /

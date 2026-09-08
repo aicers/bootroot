@@ -131,6 +131,83 @@ pub(crate) enum CliCommand {
     /// so a configuration change takes effect.
     #[command(subcommand)]
     Ca(CaCommand),
+    /// Provisions the registrar surface a deployment tool drives before
+    /// the host-local endpoint can be used.
+    ///
+    /// `capabilities` reports what this build carries; `issue` mints the
+    /// registrar's own client credential. Neither is a way into the
+    /// endpoint's mint and deregister verbs, which are served over the
+    /// host-local socket and never over this CLI.
+    #[command(subcommand)]
+    Registrar(RegistrarCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RegistrarCommand {
+    /// Reports the registrar surface: its wire version, the pathname the
+    /// host-local endpoint is served on, and the verbs it carries.
+    ///
+    /// Read-only, with no side effects. It describes the surface rather
+    /// than the runtime, so it answers whether or not
+    /// `registrar_endpoint.enabled` is set on this host and whether or
+    /// not the daemon is running. The socket pathname is read from the
+    /// installed socket unit — no configuration key names one, and the
+    /// daemon learns its own path from the descriptor systemd hands it.
+    Capabilities(RegistrarCapabilitiesArgs),
+    /// Issues the registrar's client leaf into the caller's paths, with
+    /// the CA bundle as the certificate path's sibling.
+    ///
+    /// The identity is composed here from the parts below — the caller
+    /// never supplies a composed name — and the composed name is
+    /// reported back so the caller learns what was issued rather than
+    /// asserting it. This is the initial credential only: renewal stays
+    /// the daemon's, under its own internal credential.
+    Issue(RegistrarIssueArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RegistrarCapabilitiesArgs {
+    /// Socket unit to read `ListenStream=` from, instead of searching
+    /// the systemd unit directories for `bootroot-registrar.socket`.
+    ///
+    /// For a host whose unit is installed somewhere the search does not
+    /// cover. With no unit installed anywhere and none named here, the
+    /// answer is the `ListenStream=` of the unit this build ships.
+    #[arg(long)]
+    pub(crate) socket_unit: Option<PathBuf>,
+
+    /// Print the machine-readable JSON body instead of a human summary.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct RegistrarIssueArgs {
+    /// Host label the identity is composed on: the bootroot host's
+    /// single DNS label, never a composed name and never an FQDN.
+    #[arg(long)]
+    pub(crate) host: String,
+
+    /// Deployment domain the identity is composed under, as a suffix of
+    /// whatever label count it carries (`internal`, `example.internal`).
+    #[arg(long)]
+    pub(crate) domain: String,
+
+    /// Certificate output path. The CA bundle is written as this path's
+    /// sibling `ca-bundle.pem`, exactly as `service add` places it.
+    #[arg(long)]
+    pub(crate) cert_path: PathBuf,
+
+    /// Private key output path.
+    #[arg(long)]
+    pub(crate) key_path: PathBuf,
+
+    #[command(flatten)]
+    pub(crate) secrets_dir: SecretsDirArgs,
+
+    /// Print the machine-readable JSON body instead of a human summary.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Subcommand, Debug)]

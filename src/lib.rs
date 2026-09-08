@@ -17,6 +17,7 @@ pub mod kv_payload;
 pub mod locale;
 pub mod openbao;
 pub mod profile;
+pub mod publication_lock;
 pub mod registrar;
 pub(crate) mod registrar_certs;
 // The renewal adapter drives the activated endpoint's TLS swap, and the

@@ -1088,6 +1088,20 @@ impl RegistrarCertRenewal {
     /// it a profile merge landing after this snapshot is thrown away by
     /// this rollback, and one landing after this staged read is
     /// overwritten by this publication.
+    ///
+    /// That lock is process-wide, and the writers of this pair are not
+    /// all in this process: `bootroot registrar issue` re-issues the
+    /// same client leaf into the same configured paths from a CLI
+    /// invocation of its own. So the whole publication — the three
+    /// snapshots, the two writes and any rollback — also runs under
+    /// [`crate::publication_lock`], which every writer of this material
+    /// shares. Without it a CLI run can publish its certificate between
+    /// this one's certificate and key, and both report success over a
+    /// pair that matches neither.
+    ///
+    /// The two are taken in one order everywhere they meet — the
+    /// publication lock first, the bundle lock inside it — so no pair of
+    /// writers can each hold what the other waits for.
     async fn publish_candidate(
         &self,
         pair: &SurfacePairPaths,
@@ -1115,6 +1129,13 @@ impl RegistrarCertRenewal {
                  set to be rebuilt from and no registrar leaf can be published"
                 )
             })?;
+        // Taken before the first destination is read back and held
+        // past the last restore a failure can perform, so no writer in
+        // another process can land inside the transaction. Outside the
+        // bundle lock, in the one order every writer takes them.
+        let _publication =
+            crate::publication_lock::hold(&[bundle_path, &pair.cert_path, &pair.key_path]).await?;
+
         // Taken before the read the merge is computed from and held
         // past the last restore a failure can perform, so no other
         // writer can move the file inside the transaction. The

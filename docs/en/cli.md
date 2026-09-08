@@ -31,6 +31,8 @@ Primary commands:
 - `bootroot clean`
 - `bootroot openbao save-unseal-keys`
 - `bootroot openbao delete-unseal-keys`
+- `bootroot registrar capabilities`
+- `bootroot registrar issue`
 - `bootroot monitoring`
 - `bootroot-remote bootstrap`
 - `bootroot-remote apply-secret-id`
@@ -2737,6 +2739,178 @@ Deletes the previously saved unseal keys file.
 
 ```bash
 bootroot openbao delete-unseal-keys
+```
+
+## bootroot registrar capabilities
+
+Reports the registrar surface this build carries, for a provisioning tool that
+has to decide whether bootroot can issue the registrar's credential yet.
+
+Read-only, with no side effects. It describes the *surface*, not the runtime, so
+it answers whether or not `[registrar_endpoint] enabled` is set on this host and
+whether or not `bootroot-agent` is running.
+
+### Inputs
+
+- `--socket-unit`: socket unit to read `ListenStream=` from, instead of
+  searching the systemd unit directories for `bootroot-registrar.socket`
+- `--json`: print the machine-readable body instead of a human summary
+
+### Outputs
+
+With `--json`, one JSON object on stdout:
+
+```json
+{
+  "api_version": "bootroot.registrar.v1",
+  "socket_path": "/run/bootroot/registrar.sock",
+  "verbs": ["registrar.issue", "registrar.mint", "registrar.deregister"]
+}
+```
+
+- `api_version` is a wire identifier and is never translated
+- `socket_path` is the effective `ListenStream=` of the installed socket unit,
+  resolved the way systemd resolves it. The unit directories are searched in
+  systemd's own precedence order (`/etc/systemd/system`, `/run/systemd/system`,
+  `/usr/local/lib/systemd/system`, `/lib/systemd/system`,
+  `/usr/lib/systemd/system`); the first unit file found masks the ones below it,
+  and every drop-in systemd would apply to it is merged on top, from every unit
+  directory — the unit's own `bootroot-registrar.socket.d/*.conf`, where
+  `systemctl edit bootroot-registrar.socket` writes its override, the
+  dash-truncated `bootroot-.socket.d/*.conf`, and the type-wide `socket.d/*.conf`
+  that alters every socket unit on the host. Drop-ins of the same filename are
+  one drop-in, the more specific directory winning, and a drop-in symlinked to
+  `/dev/null` masks the ones below it without contributing a setting. With no
+  unit installed anywhere,
+  the answer is the `ListenStream=` of the unit this build ships. No
+  configuration key names the endpoint's path, and the daemon learns its own
+  from the descriptor systemd hands it.
+- `verbs` lists every verb the surface carries, in this fixed order
+
+### Failure conditions
+
+- `--socket-unit` names a file that cannot be read, or one carrying no `[Socket]
+  ListenStream=`
+- The installed unit, or one of its drop-ins, cannot be read
+- The installed unit binds nothing once its drop-ins are merged
+
+### Examples
+
+```bash
+bootroot registrar capabilities --json
+```
+
+## bootroot registrar issue
+
+Issues the registrar's client credential —
+`001.bootroot-registrar.<host>.<domain>` — into the paths a provisioning tool
+chose, with the CA bundle as the certificate path's sibling `ca-bundle.pem`,
+exactly where `bootroot service add --cert-path` places it.
+
+This is the **initial** credential only. Renewal is the daemon's, under its own
+bootroot-internal credential; this command installs no timer, no AppRole and no
+agent profile.
+
+The identity is composed by bootroot from the parts below. There is no flag that
+takes a composed name, so the certificate's identity and the one the endpoint's
+verifier recognizes cannot disagree.
+
+### Inputs
+
+- `--host`: the bootroot host's single DNS label (required) — never a composed
+  name and never an FQDN
+- `--domain`: the deployment domain, as a suffix of whatever label count it
+  carries (required)
+- `--cert-path`: certificate output path (required)
+- `--key-path`: private key output path (required)
+- `--secrets-dir`: secrets directory (default `secrets`)
+- `--json`: print the machine-readable body instead of a human summary
+
+The ACME inputs — the step-ca directory URL, the contact email, the HTTP-01
+responder endpoint and its HMAC, and the account EAB — are read from the
+rendered bootroot-internal registrar configuration under `<secrets-dir>`, and
+the trust anchors from the deployment's own CA certificates beside it. No
+OpenBao token is needed.
+
+### Outputs
+
+Three files, at the modes `service add` establishes:
+
+| file | mode |
+| --- | --- |
+| `--cert-path` (leaf followed by its issuer chain) | `0644` |
+| `--key-path` | `0600` |
+| `ca-bundle.pem`, beside `--cert-path` | `0644` |
+
+With `--json`, one JSON object on stdout:
+
+```json
+{
+  "api_version": "bootroot.registrar.v1",
+  "identity": "001.bootroot-registrar.h1.example.internal",
+  "not_after": "2026-10-08T12:00:00.000Z"
+}
+```
+
+### Behavior
+
+- The three destinations are held to being distinct before anything is issued.
+  `--cert-path` and `--key-path` naming one file, or either of them landing on
+  the `ca-bundle.pem` derived beside the certificate, is a refusal — otherwise
+  the last write would replace what the previous one published and the run would
+  report success. Two spellings of one file (`certs/leaf.pem` and
+  `certs/../certs/leaf.pem`) are one destination. A directory that does not
+  exist yet is resolved as well, because the publication creates it: with
+  `/srv/link` a symlink to `/srv/real` and neither carrying a `new/` yet,
+  `--cert-path /srv/link/new/registrar.pem` and `--key-path
+  /srv/real/new/registrar.pem` name the one file they would become, and are
+  refused
+- The material is issued into a staging directory below `--secrets-dir` and
+  published only once every byte of it is in hand, so a run that fails part-way
+  leaves no half-written pair at the caller's paths
+- Publication is reversible. The three destinations are read back before the
+  first is replaced — their bytes, their permission bits and their ownership —
+  and a failure part-way through puts every one that was already replaced back
+  as it was: the contents it held, at the permission bits it carried (setuid,
+  setgid and the sticky bit included, re-applied after the ownership because
+  `chown` clears them) and under the uid and gid that owned it, and removing, on
+  a first provisioning, the files the failed run created. A certificate
+  tightened by hand does not come back at this verb's own `0644`, and a key
+  another account owned does not come back owned by the run that failed. A
+  rollback that cannot complete names the files to check by hand in the error
+- Publications into the same paths are serialised against each other, including
+  the daemon's. A run holds an exclusive `flock` on
+  `.bootroot-registrar-publish.lock` in each directory it writes into, from
+  before it reads the destinations back until after its last write, so another
+  writer waits and then publishes the whole set rather than into the middle of
+  the first. The daemon takes the same lock at the same destinations when it
+  issues this pair at start-up and when it renews it, so a run of this command
+  on a host whose daemon is running cannot land between the daemon's certificate
+  and its key, or the daemon between this run's. The lock file is empty, created
+  `0600`, and left in place; the kernel releases the lock when the process
+  exits. The issuance ahead of the publication is not serialised — it writes
+  only into a staging directory named for the process
+- Re-invocation re-issues into the same paths, with a fresh key every time
+
+### Failure conditions
+
+- `--host` is not a single DNS label, or `--domain` is not a DNS name
+- Two of the three output destinations are the same file
+- An output destination is named `.bootroot-registrar-publish.lock`, the
+  publication lock this command takes in every directory it writes into
+- This host carries no bootroot-internal registrar configuration to take the
+  ACME inputs from
+- The deployment's CA certificates cannot be read
+- The issuance fails, or the returned chain carries an unpinned fingerprint
+
+### Examples
+
+```bash
+bootroot registrar issue \
+  --host h1 --domain example.internal \
+  --cert-path /opt/roxyd/registrar/registrar-cert.pem \
+  --key-path /opt/roxyd/registrar/registrar-key.pem \
+  --json
 ```
 
 ## bootroot-remote (remote bootstrap binary)
