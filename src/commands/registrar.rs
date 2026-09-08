@@ -54,11 +54,14 @@
 //! are also held to being distinct before anything is issued, because a
 //! caller that passed one path twice would otherwise be told the
 //! issuance succeeded while the key sat where the certificate should
-//! be. Two runs publishing at once are serialised against each other by
+//! be. Publications are serialised against one another by
 //! [`publication_lock`], because the rollback answers only for a
 //! failure of its own run: an interleaving in which both succeed leaves
-//! one run's certificate beside the other's key with nothing to put
-//! back. Re-invocation re-issues into the same paths.
+//! one writer's certificate beside the other's key with nothing to put
+//! back. That lock is the daemon's too — its start-time issuance and
+//! its renewal of this same leaf take it at the same destinations — so
+//! a run of this verb cannot land in the middle of one of theirs
+//! either. Re-invocation re-issues into the same paths.
 //!
 //! Only the **initial** credential is issued here. Renewal stays the
 //! daemon's, under its own bootroot-internal credential
@@ -77,14 +80,12 @@ use bootroot::registrar::internal::{InternalPaths, PrivateKeyPem, load_internal_
 use bootroot::registrar::{
     REGISTRAR_CLIENT_LABEL, REGISTRAR_SURFACE_INSTANCE, registrar_client_identity,
 };
-use bootroot::{acme, fs_util};
+use bootroot::{acme, fs_util, publication_lock};
 use serde::Serialize;
 
 use crate::cli::args::{RegistrarCapabilitiesArgs, RegistrarIssueArgs};
 use crate::commands::init::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use crate::i18n::Messages;
-
-mod publication_lock;
 
 /// The wire identifier every response on this surface carries, exactly.
 ///
@@ -1055,10 +1056,13 @@ async fn publish_material(
 ///
 /// The whole span — the snapshot, every step and any rollback — runs
 /// under [`publication_lock`], because the rollback answers only for a
-/// failure of *this* run. Two runs publishing at once both succeed and
+/// failure of *this* run. Two publications at once both succeed and
 /// still leave a pair drawn from either, and neither has anything to
 /// put back; the lock is what makes the second one publish over the
-/// first whole rather than into the middle of it.
+/// first whole rather than into the middle of it. The other writer is
+/// as likely to be the daemon — issuing this pair at start-up or
+/// renewing it — as a second run of this verb, which is why the lock
+/// lives in the library rather than here.
 async fn publish_with_steps(
     dest: &Destinations,
     material: &StagedMaterial,

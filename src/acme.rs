@@ -6,10 +6,12 @@ pub(crate) mod types;
 
 // The selectable outbound path and its options belong to the registrar
 // surface issuance, which is inside this crate; only the ordinary
-// `issue_certificate` is reached from the binary crates.
+// `issue_certificate` is reached from the binary crates. That issuance
+// reaches the exchange and the publication separately, so it can hold
+// `crate::publication_lock` across the second and not the first.
 pub(crate) use flow::{
     CsrShape, IssuanceOptions, IssuedMaterial, LeafPublication, issue_certificate_material,
-    issue_certificate_with_bootstrap,
+    publish_issued_material,
 };
 pub use flow::{build_registrar_client_csr_params, issue_certificate};
 // The two publication helpers a renewal stages its merged CA bundle

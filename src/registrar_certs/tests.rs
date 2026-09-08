@@ -3198,3 +3198,120 @@ fn no_superseded_passage_survives_in_the_configuration_surface() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// The cross-process publication lock
+// ---------------------------------------------------------------------
+
+/// A start-time issuance publishes under the same cross-process lock a
+/// `bootroot registrar issue` takes, over every path it writes.
+///
+/// The daemon and the CLI are separate processes writing the same
+/// registrar client leaf — the daemon at `[registrar_endpoint]
+/// client_cert_path`, the CLI at whatever a provisioning tool passed at
+/// the same file. Neither has anything to put back when both succeed,
+/// so an interleaved certificate and key is a state nothing on disk
+/// records; the lock is what makes the second publish over the first
+/// whole.
+///
+/// Asserted from inside the publication, with a non-blocking attempt on
+/// a descriptor of its own. `flock(2)` binds a lock to the open file
+/// description rather than to the process, so the refusal a second
+/// process meets is the refusal this probe meets, and nothing here
+/// waits on anything.
+#[tokio::test]
+async fn a_start_time_publication_holds_the_lock_a_cli_issuance_takes() {
+    let host = Host::new();
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    let inputs = openbao_inputs();
+    let issuance = issuance_settings(&host.settings, client, TEST_HOST, &inputs.responder_hmac);
+    let profile = issuance.profiles.first().expect("the issuance profile");
+
+    // Every path the publication writes: the merged bundle, the
+    // certificate and the key. A directory missing from the lock is one
+    // a CLI run could be writing into mid-transaction.
+    let destinations: Vec<&Path> = vec![
+        issuance
+            .trust
+            .ca_bundle_path
+            .as_deref()
+            .expect("the harness configures a bundle"),
+        &profile.paths.cert,
+        &profile.paths.key,
+    ];
+
+    let observed: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
+    publish_surface_material(&issuance, profile, async {
+        // The guard is taken and dropped inside this statement; nothing
+        // holds it across an await.
+        *observed.lock().expect("not poisoned") =
+            Some(crate::publication_lock::unlocked_directories(&destinations));
+        Ok(())
+    })
+    .await
+    .expect("the publication runs");
+
+    let unheld = observed
+        .into_inner()
+        .expect("not poisoned")
+        .expect("the publication ran");
+    assert!(
+        unheld.is_empty(),
+        "a CLI issuance could publish into {unheld:?} while this one was writing"
+    );
+    assert_eq!(
+        crate::publication_lock::unlocked_directories(&destinations).len(),
+        destinations.len(),
+        "every destination's directory is released with the publication"
+    );
+}
+
+/// With no CA bundle configured the lock covers the pair and nothing
+/// else.
+///
+/// Locking a directory the publication never writes into would make two
+/// unrelated writers wait on each other, and this path writes no bundle
+/// at all.
+#[tokio::test]
+async fn a_publication_with_no_bundle_locks_only_the_pair() {
+    let mut host = Host::new();
+    host.settings.trust.ca_bundle_path = None;
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    let client = pairs
+        .iter()
+        .find(|pair| pair.leaf == SurfaceLeaf::RegistrarClient)
+        .expect("the client pair");
+    let inputs = openbao_inputs();
+    let issuance = issuance_settings(&host.settings, client, TEST_HOST, &inputs.responder_hmac);
+    let profile = issuance.profiles.first().expect("the issuance profile");
+    let elsewhere = TempDir::new().expect("tempdir");
+    let unrelated = elsewhere.path().join("someone-elses.pem");
+
+    let observed: Mutex<Option<(Vec<PathBuf>, Vec<PathBuf>)>> = Mutex::new(None);
+    publish_surface_material(&issuance, profile, async {
+        let pair: Vec<&Path> = vec![&profile.paths.cert, &profile.paths.key];
+        let other: Vec<&Path> = vec![unrelated.as_path()];
+        *observed.lock().expect("not poisoned") = Some((
+            crate::publication_lock::unlocked_directories(&pair),
+            crate::publication_lock::unlocked_directories(&other),
+        ));
+        Ok(())
+    })
+    .await
+    .expect("the publication runs");
+
+    let (pair, other) = observed
+        .into_inner()
+        .expect("not poisoned")
+        .expect("the publication ran");
+    assert!(pair.is_empty(), "the pair is held: {pair:?}");
+    assert_eq!(
+        other.len(),
+        1,
+        "a directory this publication never writes into is left free"
+    );
+}

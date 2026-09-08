@@ -580,7 +580,23 @@ pub(crate) async fn issue_certificate_with_bootstrap(
 /// trust. With `ca_bundle_path` unconfigured there is nothing to verify
 /// or merge, and with an empty chain the bundle is left alone with a
 /// warning; neither is a refusal.
-async fn publish_issued_material(
+///
+/// Reachable on its own so the registrar surface's issuance can take
+/// [`crate::publication_lock`] around exactly this half and no more:
+/// the lock has to cover every write and none of the ACME exchange
+/// ahead of it, and [`issue_certificate_with_bootstrap`] leaves no
+/// seam between the two.
+///
+/// It takes no publication lock itself. A caller that has already taken
+/// one goes on to call this, and a second acquisition here would
+/// deadlock it against itself.
+///
+/// # Errors
+///
+/// Returns an error when the returned chain carries a fingerprint that
+/// is not pinned, when the CA bundle cannot be read or merged, or when
+/// the leaf and key cannot be written.
+pub(crate) async fn publish_issued_material(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     material: &IssuedMaterial,

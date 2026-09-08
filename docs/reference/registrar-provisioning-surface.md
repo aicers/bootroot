@@ -202,22 +202,39 @@ hand in the error, and does not replace the reason the run failed.
 
 Re-invocation re-issues into the same paths, with a fresh key every time.
 
-### 3.5 Two runs at once
+### 3.5 Two writers at once
 
 The rollback answers for a failure of its own run, and cannot answer for two
-runs that both succeed. Publishing the three destinations is three writes, so
-two `bootroot registrar issue` runs against the same paths could otherwise
-publish certificate A, then certificate B and key B, then key A: certificate B
-beside key A, both runs reporting success, neither with anything to put back and
-nothing on disk recording it.
+writers that both succeed. Publishing the three destinations is three writes, so
+two publications against the same paths could otherwise publish certificate A,
+then certificate B and key B, then key A: certificate B beside key A, both
+reporting success, neither with anything to put back and nothing on disk
+recording it.
 
-So a run holds an exclusive `flock(2)` on `.bootroot-registrar-publish.lock` in
-each directory it publishes into, from before it reads the destinations back
-until after its last write or restore. A second run waits for it and then
-publishes the whole set over what the first left, rather than into the middle of
-it. The lock is taken on the resolved directory, so two spellings of one
-directory are one lock, and on at most two directories in sorted order, so two
-runs naming them in opposite roles cannot each hold what the other waits for.
+The other writer is not necessarily a second run of this verb. Three writers
+replace this material, and they are not all in one process:
+
+- `bootroot registrar issue`, at the caller's paths;
+- the daemon's start-time issuance of the surface pairs, at
+  `[registrar_endpoint] client_cert_path` and `client_key_path`;
+- the daemon's renewal of that same leaf.
+
+A deployment points this verb at the paths the daemon is configured with — that
+is the point of provisioning the credential the daemon then maintains — so a run
+of this verb on a host whose daemon is running is two processes writing one
+pair.
+
+So every publication holds an exclusive `flock(2)` on
+`.bootroot-registrar-publish.lock` in each directory it writes into, from before
+it reads the destinations back until after its last write or restore. Another
+writer waits for it and then publishes the whole set over what the first left,
+rather than into the middle of it. The lock is taken on the resolved directory,
+so two spellings of one directory are one lock, and the directories are taken in
+sorted order, so two writers naming the same ones in opposite roles cannot each
+hold what the other waits for. This verb writes into at most two — the
+certificate and its sibling bundle in one, the key in the other — and the daemon
+into at most three, since its `[trust] ca_bundle_path` need not sit beside
+either.
 
 The lock file is a name to lock and never a record: it is empty, it is created
 `0600`, and it is left in place afterwards, because unlinking it would hand the
@@ -227,10 +244,12 @@ lock. A `--cert-path` or `--key-path` naming that file is refused, for the same
 reason: a publication over the lock leaves the run holding an inode that is no
 longer at that name.
 
-The issuance ahead of the publication is not serialised. It writes only into the
-run's own staging directory, which is named per process for exactly that reason,
-and holding a lock across an ACME round trip would make one run wait out
-another's network exchange rather than its three writes.
+The issuance ahead of the publication is not serialised, in this verb or in the
+daemon. It writes only into the run's own staging directory — named per process
+for exactly that reason — or into nothing at all, and holding a lock across an
+ACME round trip would make one writer wait out another's network exchange rather
+than its three writes. Each writer therefore takes the lock once it has the
+material in hand and immediately before the first destination is read back.
 
 ## 4. Exit codes
 

@@ -2868,11 +2868,15 @@ With `--json`, one JSON object on stdout:
   tightened by hand does not come back at this verb's own `0644`, and a key
   another account owned does not come back owned by the run that failed. A
   rollback that cannot complete names the files to check by hand in the error
-- Two runs publishing into the same paths are serialised against each other. A
-  run holds an exclusive `flock` on `.bootroot-registrar-publish.lock` in each
-  directory it writes into, from before it reads the destinations back until
-  after its last write, so a second run waits and then publishes the whole set
-  rather than into the middle of the first. The lock file is empty, created
+- Publications into the same paths are serialised against each other, including
+  the daemon's. A run holds an exclusive `flock` on
+  `.bootroot-registrar-publish.lock` in each directory it writes into, from
+  before it reads the destinations back until after its last write, so another
+  writer waits and then publishes the whole set rather than into the middle of
+  the first. The daemon takes the same lock at the same destinations when it
+  issues this pair at start-up and when it renews it, so a run of this command
+  on a host whose daemon is running cannot land between the daemon's certificate
+  and its key, or the daemon between this run's. The lock file is empty, created
   `0600`, and left in place; the kernel releases the lock when the process
   exits. The issuance ahead of the publication is not serialised — it writes
   only into a staging directory named for the process
