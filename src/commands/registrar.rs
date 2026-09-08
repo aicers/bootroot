@@ -537,6 +537,10 @@ async fn sweep_staging(staging: &Path) {
         return;
     }
     if let Err(err) = tokio::fs::remove_dir_all(staging).await {
+        // codeql[rust/cleartext-logging]: output is a filesystem path
+        // below `--secrets-dir`, not a secret value. The path is the
+        // point of the warning: it names the directory whose unpublished
+        // key an operator has to remove by hand.
         eprintln!(
             "Warning: failed to remove the staging directory {}: {err}",
             staging.display()
