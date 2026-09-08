@@ -17,10 +17,19 @@ impl Messages {
         )
     }
 
-    pub(crate) fn registrar_issue_complete(&self, identity: &str, not_after: &str) -> String {
+    pub(crate) fn registrar_issue_complete(
+        &self,
+        api_version: &str,
+        identity: &str,
+        not_after: &str,
+    ) -> String {
         format_template(
             self.strings().registrar_issue_complete,
-            &[("identity", identity), ("not_after", not_after)],
+            &[
+                ("api_version", api_version),
+                ("identity", identity),
+                ("not_after", not_after),
+            ],
         )
     }
 }

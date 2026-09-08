@@ -778,7 +778,11 @@ pub(crate) async fn run_registrar_issue(
     } else {
         println!(
             "{}",
-            messages.registrar_issue_complete(&response.identity, &response.not_after)
+            messages.registrar_issue_complete(
+                response.api_version,
+                &response.identity,
+                &response.not_after
+            )
         );
     }
     Ok(())

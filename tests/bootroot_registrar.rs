@@ -95,9 +95,40 @@ fn staging_leftovers(secrets_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Returns the one RFC 3339 instant a prose summary carries, or `None`
+/// when it carries none.
+///
+/// The summary is localized, so the surrounding words are not something
+/// to assert on; the timestamp is the wire spelling the JSON body uses
+/// and is found by parsing rather than by position. Sentence-final
+/// punctuation is trimmed because a template may end on the value.
+fn rfc3339_token(text: &str) -> Option<time::OffsetDateTime> {
+    text.split_whitespace()
+        .map(|word| word.trim_end_matches(['.', ',', ')']))
+        .find_map(|word| {
+            time::OffsetDateTime::parse(word, &time::format_description::well_known::Rfc3339).ok()
+        })
+}
+
 fn pem_to_der(pem: &str) -> Vec<u8> {
     let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("a PEM certificate");
     parsed.contents
+}
+
+/// Returns the `notAfter` the published leaf itself carries.
+///
+/// The reported expiry is read off the leaf rather than computed, so
+/// the value a caller is handed is only right if it is that one: a
+/// summary or a body carrying any other future instant would satisfy a
+/// range check and still be reporting the wrong certificate's lifetime.
+fn published_leaf_not_after(cert_pem: &str) -> time::OffsetDateTime {
+    let (_, pem) =
+        x509_parser::pem::parse_x509_pem(cert_pem.as_bytes()).expect("a PEM certificate");
+    pem.parse_x509()
+        .expect("an X.509 certificate")
+        .validity()
+        .not_after
+        .to_datetime()
 }
 
 // ---------------------------------------------------------------------
@@ -969,6 +1000,16 @@ async fn issue_writes_a_recognized_registrar_client_credential() {
     let body: serde_json::Value = serde_json::from_str(stdout.trim()).expect("a JSON body");
     let expected_identity =
         registrar_client_identity(REGISTRAR_SURFACE_INSTANCE, TEST_HOST, TEST_DOMAIN);
+    // The body is these three fields and no others: a caller reads the
+    // surface by field name, so a field silently gained or renamed is a
+    // wire change whether or not the three below still answer.
+    let fields: Vec<&str> = body
+        .as_object()
+        .expect("the body is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(fields, ["api_version", "identity", "not_after"]);
     assert_eq!(body["api_version"], "bootroot.registrar.v1");
     assert_eq!(body["identity"], expected_identity);
     let not_after = body["not_after"].as_str().expect("not_after is a string");
@@ -988,6 +1029,11 @@ async fn issue_writes_a_recognized_registrar_client_credential() {
     // The leaf is the composed identity, and the endpoint's own rule
     // accepts it under this deployment's domain and no other.
     let cert_pem = std::fs::read_to_string(host.cert_path()).expect("the certificate");
+    assert_eq!(
+        not_after,
+        published_leaf_not_after(&cert_pem),
+        "the body must report the published leaf's own expiry"
+    );
     let leaf_der = pem_to_der(&cert_pem);
     let identity =
         recognize_registrar_client(&leaf_der, TEST_DOMAIN).expect("the issued leaf is recognized");
@@ -1087,8 +1133,11 @@ async fn a_failed_issuance_publishes_nothing() {
     );
 }
 
-/// Without `--json` the issuance reports the identity it composed and
-/// the expiry in prose, and publishes the same three files.
+/// Without `--json` the issuance reports the surface version, the
+/// identity it composed and the expiry in prose, and publishes the same
+/// three files.  The prose carries every field the body does: an
+/// operator who did not ask for JSON still learns which surface version
+/// minted the credential.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_without_json_summarizes_what_it_issued() {
     let ca = Arc::new(TestCa::new());
@@ -1107,9 +1156,24 @@ async fn issue_without_json_summarizes_what_it_issued() {
         stdout.contains(&identity),
         "the summary must name the composed identity: {stdout}"
     );
+    // The wire token, spelled exactly as the JSON body spells it.
+    assert!(
+        stdout.contains("bootroot.registrar.v1"),
+        "the summary must name the surface version: {stdout}"
+    );
+    let not_after = rfc3339_token(&stdout)
+        .unwrap_or_else(|| panic!("the summary must carry an RFC 3339 expiry: {stdout}"));
     assert!(host.cert_path().exists());
     assert!(host.key_path().exists());
     assert!(host.bundle_path().exists());
+    // The expiry the prose reports is the one the published leaf
+    // carries, not merely some instant that has not passed yet.
+    let cert_pem = std::fs::read_to_string(host.cert_path()).expect("the certificate");
+    assert_eq!(
+        not_after,
+        published_leaf_not_after(&cert_pem),
+        "the summary must report the published leaf's own expiry: {stdout}"
+    );
 }
 
 /// A host that `bootroot init` has not provisioned yet carries no
