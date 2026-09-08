@@ -985,6 +985,87 @@ fn two_spellings_of_one_file_are_refused() {
     assert!(err.to_string().contains("--key-path"), "unexpected: {err}");
 }
 
+/// A directory the publication is about to *create* is a destination
+/// like any other. `--cert-path <symlink>/new/registrar.pem` and
+/// `--key-path <target>/new/registrar.pem` name one file the moment
+/// `new/` is created through the link, which is what the publication
+/// does; comparing them against the nearest ancestor that exists is
+/// what sees it before a certificate is minted.
+#[test]
+fn two_spellings_through_a_link_to_a_directory_not_yet_created_are_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).expect("create the material directory");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link the material directory");
+
+    let cert = link.join("new").join("registrar.pem");
+    let key = real.join("new").join("registrar.pem");
+
+    let err = ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect_err("one file below a link");
+
+    assert!(err.to_string().contains("--key-path"), "unexpected: {err}");
+}
+
+/// The bundle derived beside a certificate below an unborn directory is
+/// held to the same rule: `--key-path` naming it through the link is
+/// the private key published `0644` into the trust store.
+#[test]
+fn a_key_path_on_the_bundle_through_a_link_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).expect("create the material directory");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link the material directory");
+
+    let cert = real.join("new").join("registrar.pem");
+    let key = link.join("new").join(CA_BUNDLE_FILE);
+
+    let err = ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect_err("the key on the bundle below a link");
+
+    assert!(
+        err.to_string().contains(CA_BUNDLE_FILE),
+        "unexpected: {err}"
+    );
+}
+
+/// Two genuinely different destinations below directories that do not
+/// exist yet stay two: resolving the nearest existing ancestor must not
+/// collapse paths that only share one.
+#[test]
+fn distinct_destinations_below_unborn_directories_are_accepted() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join("certs").join("deep").join("registrar.pem");
+    let key = dir
+        .path()
+        .join("keys")
+        .join("deep")
+        .join("registrar-key.pem");
+
+    ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect("two destinations below unborn directories");
+}
+
+/// The components below the nearest existing ancestor are normalised
+/// lexically, `..` included. They cannot be anything else: a directory
+/// that is not there is not a symlink, so `..` past it can only be the
+/// level above.
+#[test]
+fn the_unborn_tail_is_normalised_onto_the_resolved_ancestor() {
+    let dir = TempDir::new().expect("tempdir");
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).expect("create the material directory");
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("link the material directory");
+
+    let resolved = resolve_existing_ancestor(&link.join("a").join("b").join("..").join("c"));
+
+    let anchor = std::fs::canonicalize(&real).expect("canonicalize the material directory");
+    assert_eq!(resolved, anchor.join("a").join("c"));
+}
+
 // ---------------------------------------------------------------------
 // Publication and rollback
 // ---------------------------------------------------------------------

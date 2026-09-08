@@ -2859,7 +2859,12 @@ With `--json`, one JSON object on stdout:
   the `ca-bundle.pem` derived beside the certificate, is a refusal — otherwise
   the last write would replace what the previous one published and the run would
   report success. Two spellings of one file (`certs/leaf.pem` and
-  `certs/../certs/leaf.pem`) are one destination
+  `certs/../certs/leaf.pem`) are one destination. A directory that does not
+  exist yet is resolved as well, because the publication creates it: with
+  `/srv/link` a symlink to `/srv/real` and neither carrying a `new/` yet,
+  `--cert-path /srv/link/new/registrar.pem` and `--key-path
+  /srv/real/new/registrar.pem` name the one file they would become, and are
+  refused
 - The material is issued into a staging directory below `--secrets-dir` and
   published only once every byte of it is in hand, so a run that fails part-way
   leaves no half-written pair at the caller's paths

@@ -582,13 +582,18 @@ fn ca_bundle_path_for(cert_path: &Path) -> PathBuf {
 
 /// Reduces an output path to the form two destinations are compared in.
 ///
-/// Absolute, with the containing directory resolved through symlinks
-/// when it already exists, so `certs/leaf.pem` and
-/// `/srv/certs/../certs/leaf.pem` are recognised as the one file they
-/// are. The leaf name is joined back on afterwards rather than
-/// canonicalised with the rest: these paths routinely do not exist yet,
-/// and a destination that is a symlink is the file it points at only
-/// after it has been published, not before.
+/// Absolute, with the containing directory resolved through symlinks,
+/// so `certs/leaf.pem` and `/srv/certs/../certs/leaf.pem` are
+/// recognised as the one file they are. The leaf name is joined back on
+/// afterwards rather than canonicalised with the rest: these paths
+/// routinely do not exist yet, and a destination that is a symlink is
+/// the file it points at only after it has been published, not before.
+///
+/// The directory is resolved by [`resolve_existing_ancestor`], which
+/// answers for a directory the publication is about to create as well
+/// as for one already there — the publication creates every missing
+/// level of it, and through whatever symlink the path traverses on the
+/// way.
 ///
 /// # Errors
 ///
@@ -600,8 +605,59 @@ fn output_identity(label: &str, path: &Path) -> Result<PathBuf> {
     let (parent, name) = absolute.parent().zip(absolute.file_name()).ok_or_else(|| {
         anyhow::anyhow!("{label} must name a file: `{}` does not", path.display())
     })?;
-    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-    Ok(parent.join(name))
+    Ok(resolve_existing_ancestor(parent).join(name))
+}
+
+/// Resolves `dir` as far as the filesystem can, and normalises the rest
+/// lexically.
+///
+/// Canonicalising the directory itself answers only for a directory
+/// that is already there, and the levels below a caller's `--cert-path`
+/// routinely are not: the publication creates them. Resolving nothing
+/// in that case compares the two paths as typed, so `/link/new/leaf.pem`
+/// and `/real/new/leaf.pem` with `/link -> /real` are taken for two
+/// destinations, the publication then creates `new/` through the
+/// symlink, and the key overwrites the certificate at the one file they
+/// were always going to share.
+///
+/// So the nearest ancestor that *does* exist is canonicalised — every
+/// symlink on the path to it followed — and the components below it are
+/// applied to that. Applying them lexically is sound precisely because
+/// they do not exist: a component that is not there is not a symlink,
+/// so a `..` past it can only mean the level above.
+fn resolve_existing_ancestor(dir: &Path) -> PathBuf {
+    let mut unresolved: Vec<std::path::Component<'_>> = Vec::new();
+    let mut base = dir;
+    loop {
+        if let Ok(resolved) = std::fs::canonicalize(base) {
+            return unresolved
+                .iter()
+                .rev()
+                .fold(resolved, |mut path, component| {
+                    match component {
+                        std::path::Component::ParentDir => {
+                            path.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        other => path.push(other.as_os_str()),
+                    }
+                    path
+                });
+        }
+        let mut components = base.components();
+        // The root itself, and any prefix above it, are where the walk
+        // stops: nothing else can be stripped, and a root that cannot
+        // be canonicalised leaves the path as it was typed.
+        match components.next_back() {
+            Some(
+                component @ (std::path::Component::Normal(_)
+                | std::path::Component::ParentDir
+                | std::path::Component::CurDir),
+            ) => unresolved.push(component),
+            _ => return dir.to_path_buf(),
+        }
+        base = components.as_path();
+    }
 }
 
 /// Holds the three destinations one issuance publishes to distinct

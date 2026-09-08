@@ -181,6 +181,17 @@ Two spellings of one file are one destination. The comparison is made on the
 absolute path with the containing directory resolved through symlinks, so
 `certs/leaf.pem` and `certs/../certs/leaf.pem` collide.
 
+A directory that does not exist yet is resolved too, because the publication
+creates it — every missing level of it, and through whatever symlink the path
+traverses on the way. The nearest ancestor that *does* exist is resolved, and
+the components below it are applied to that, so with `/srv/link` a symlink to
+`/srv/real` and neither carrying a `new/` yet, `--cert-path
+/srv/link/new/registrar.pem` and `--key-path /srv/real/new/registrar.pem` are
+the one file they would become and are refused. Applying the unborn components
+without following them is sound precisely because they are not there: a
+directory that does not exist is not a symlink, so a `..` past it can only mean
+the level above.
+
 ### 3.4 Atomicity
 
 The material is issued into a staging directory below `--secrets-dir` and

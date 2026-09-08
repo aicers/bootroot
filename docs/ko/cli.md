@@ -2714,7 +2714,11 @@ ACME 입력(step-ca 디렉터리 URL, 연락 이메일, HTTP-01 응답기 엔드
   `--cert-path`와 `--key-path`가 같은 파일을 가리키거나, 둘 중 하나가 인증서
   옆에 만들어지는 `ca-bundle.pem`과 겹치면 거부합니다. 그렇지 않으면 마지막
   기록이 앞선 기록을 덮어쓴 채로 성공을 보고하게 됩니다. 한 파일을 가리키는 두
-  표기(`certs/leaf.pem`과 `certs/../certs/leaf.pem`)도 같은 대상으로 봅니다
+  표기(`certs/leaf.pem`과 `certs/../certs/leaf.pem`)도 같은 대상으로 봅니다.
+  아직 없는 디렉터리도 게시가 직접 만들기 때문에 함께 해석합니다. `/srv/link`가
+  `/srv/real`을 가리키는 심볼릭 링크이고 양쪽에 아직 `new/`가 없다면,
+  `--cert-path /srv/link/new/registrar.pem`과 `--key-path
+  /srv/real/new/registrar.pem`은 결국 같은 파일이 되므로 거부합니다
 - 자재는 `--secrets-dir` 아래 스테이징 디렉터리에 발급된 뒤 모든 내용이 준비된
   후에만 게시되므로, 중간에 실패해도 호출자 경로에 반쯤 기록된 쌍이 남지 않습니다
 - 게시는 되돌릴 수 있습니다. 첫 파일을 교체하기 전에 대상 세 개의 내용과 권한
