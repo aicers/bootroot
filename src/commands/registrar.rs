@@ -16,15 +16,17 @@
 //! the surface this build carries rather than what is listening right
 //! now.
 //!
-//! Its `socket_path` is read from the **installed socket unit**, in
-//! systemd's own unit-directory precedence order, and falls back to the
-//! `ListenStream=` of the unit this repository ships — embedded here at
-//! compile time by [`SHIPPED_SOCKET_UNIT`], so the reported value cannot
-//! drift from the file an operator installs. It is never read from
-//! configuration and never from a running daemon: no configuration key
-//! names the endpoint's path, and the daemon learns its own from the
-//! descriptor systemd hands it
-//! (`bootroot::registrar::endpoint::activation`).
+//! Its `socket_path` is read from the **installed socket unit** and the
+//! drop-ins that override it, resolved the way systemd resolves them:
+//! the highest-precedence unit file masks the ones below it, and the
+//! `.d/` drop-ins from every unit directory are merged on top. With no
+//! unit installed anywhere, it falls back to the `ListenStream=` of the
+//! unit this repository ships — embedded here at compile time by
+//! [`SHIPPED_SOCKET_UNIT`], so the reported value cannot drift from the
+//! file an operator installs. It is never read from configuration and
+//! never from a running daemon: no configuration key names the
+//! endpoint's path, and the daemon learns its own from the descriptor
+//! systemd hands it (`bootroot::registrar::endpoint::activation`).
 //!
 //! # `issue`
 //!
@@ -42,8 +44,15 @@
 //!
 //! The material is issued into a staging directory and published only
 //! once every byte of it is in hand, so a failed run leaves no
-//! half-written pair at the caller's paths. Re-invocation re-issues into
-//! the same paths.
+//! half-written pair at the caller's paths. Publication itself is
+//! reversible: the three destinations are read back before the first is
+//! replaced, and a failure part-way through puts every one that was
+//! already replaced back as it was, so a run that fails does not leave
+//! a new certificate beside the previous key. The three destinations
+//! are also held to being distinct before anything is issued, because a
+//! caller that passed one path twice would otherwise be told the
+//! issuance succeeded while the key sat where the certificate should
+//! be. Re-invocation re-issues into the same paths.
 //!
 //! Only the **initial** credential is issued here. Renewal stays the
 //! daemon's, under its own bootroot-internal credential
@@ -94,6 +103,16 @@ const SURFACE_VERBS: [&str; 3] = [VERB_ISSUE, VERB_MINT, VERB_DEREGISTER];
 
 /// The basename of the socket unit `socket_path` is read from.
 const SOCKET_UNIT_FILE: &str = "bootroot-registrar.socket";
+
+/// The suffix of the drop-in directory beside a unit —
+/// `bootroot-registrar.socket.d`, which is where
+/// `systemctl edit bootroot-registrar.socket` writes its override.
+const DROPIN_DIR_SUFFIX: &str = ".d";
+
+/// The extension a drop-in file must carry to be read at all. systemd
+/// ignores every other name in a `.d` directory, so a `.conf.bak` left
+/// behind by an editor overrides nothing and is not merged here either.
+const DROPIN_FILE_SUFFIX: &str = ".conf";
 
 /// The socket unit this repository ships, embedded at compile time.
 ///
@@ -157,7 +176,9 @@ struct IssueResponse {
 /// # Errors
 ///
 /// Returns an error when `--socket-unit` names a file that cannot be
-/// read or carries no `ListenStream=`, or when the response cannot be
+/// read or carries no `ListenStream=`, when the installed unit or one
+/// of its drop-ins cannot be read, when the installed unit binds
+/// nothing once its drop-ins are merged, or when the response cannot be
 /// serialized. A host with no unit installed is not an error: the
 /// shipped unit answers.
 pub(crate) fn run_registrar_capabilities(
@@ -190,7 +211,9 @@ pub(crate) fn run_registrar_capabilities(
 /// # Errors
 ///
 /// Returns an error when `explicit` cannot be read or carries no
-/// `ListenStream=` in its `[Socket]` section.
+/// `ListenStream=` in its `[Socket]` section, or when the installed
+/// unit found by the search — or one of its drop-ins — cannot be read
+/// or binds nothing.
 fn capabilities(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result<CapabilitiesResponse> {
     Ok(CapabilitiesResponse {
         api_version: REGISTRAR_API_VERSION,
@@ -200,15 +223,37 @@ fn capabilities(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result<Capabi
 }
 
 /// Resolves the pathname the endpoint is served on from the installed
-/// socket unit.
+/// socket unit and the drop-ins that override it.
 ///
 /// An explicitly named unit is authoritative and its failures are
-/// refusals — an operator who named a file meant that file. The search
-/// is not: a directory with no unit in it, or a unit that does not parse
-/// as one, is passed over, and the shipped unit answers when nothing in
-/// the search does. That is what keeps the verb answering on a host
-/// where bootroot's units have not been installed yet, which is exactly
-/// the host a provisioning tool probes.
+/// refusals — an operator who named a file meant that file, and only
+/// that file: a path handed in directly is not a unit systemd has
+/// loaded, so nothing is merged onto it.
+///
+/// The search is systemd's. The first directory in
+/// [`UNIT_DIRECTORIES`] carrying [`SOCKET_UNIT_FILE`] provides the
+/// unit, and that file **masks** the ones below it rather than being
+/// passed over when it binds nothing: systemd loads exactly one unit
+/// file, so falling through to a lower-precedence one would report a
+/// pathname this host does not bind. On top of it go the `.d/`
+/// drop-ins from every unit directory, which is how an override written
+/// by `systemctl edit` reaches the answer — without them a deployment
+/// that moved the socket in a drop-in would be told the packaged path
+/// while systemd bound another, and the caller would connect to a
+/// socket that is not there.
+///
+/// Only a host with no unit file anywhere falls back to the shipped
+/// unit. That is what keeps the verb answering on a host where
+/// bootroot's units have not been installed yet, which is exactly the
+/// host a provisioning tool probes; drop-ins are not merged onto it,
+/// because a drop-in with no unit to extend is inert in systemd too.
+///
+/// # Errors
+///
+/// Returns an error when `explicit` cannot be read, when a unit
+/// directory or a drop-in that is present cannot be read, or when the
+/// resolved unit carries no `ListenStream=` once its drop-ins are
+/// merged.
 fn resolve_socket_path(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result<String> {
     if let Some(path) = explicit {
         let unit = std::fs::read_to_string(path)
@@ -220,21 +265,126 @@ fn resolve_socket_path(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result
             )
         });
     }
-    for dir in unit_dirs {
-        let candidate = dir.join(SOCKET_UNIT_FILE);
-        let Ok(unit) = std::fs::read_to_string(&candidate) else {
-            continue;
-        };
-        if let Some(value) = listen_stream(&unit) {
-            return Ok(value);
-        }
+    let Some((unit_path, unit)) = installed_unit(unit_dirs)? else {
+        return listen_stream(SHIPPED_SOCKET_UNIT).ok_or_else(|| {
+            anyhow::anyhow!("the socket unit this build ships carries no [Socket] ListenStream=")
+        });
+    };
+    let mut texts = vec![unit];
+    for dropin in dropin_paths(unit_dirs)? {
+        texts.push(std::fs::read_to_string(&dropin).with_context(|| {
+            format!(
+                "reading the registrar socket drop-in at {}",
+                dropin.display()
+            )
+        })?);
     }
-    listen_stream(SHIPPED_SOCKET_UNIT).ok_or_else(|| {
-        anyhow::anyhow!("the socket unit this build ships carries no [Socket] ListenStream=")
+    let merged: Vec<&str> = texts.iter().map(String::as_str).collect();
+    listen_stream_merged(&merged).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the installed registrar socket unit at {} carries no [Socket] ListenStream= once \
+             its drop-ins are merged",
+            unit_path.display()
+        )
     })
 }
 
-/// Reads `[Socket] ListenStream=` out of a systemd unit.
+/// Returns the unit file systemd would load, with its path, or `None`
+/// when no unit directory carries one.
+///
+/// The first directory carrying the name wins outright. A file that is
+/// there and cannot be read is a refusal rather than an absence: it is
+/// the unit systemd loads, and guessing past it answers for a host this
+/// is not.
+fn installed_unit(unit_dirs: &[PathBuf]) -> Result<Option<(PathBuf, String)>> {
+    for dir in unit_dirs {
+        let candidate = dir.join(SOCKET_UNIT_FILE);
+        match std::fs::read_to_string(&candidate) {
+            Ok(unit) => return Ok(Some((candidate, unit))),
+            // The one directory of the five that simply does not carry
+            // the unit: the search moves on to the next.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "reading the installed registrar socket unit at {}",
+                    candidate.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Returns the drop-in files that apply to the socket unit, in the
+/// order systemd applies them.
+///
+/// systemd collects `*.conf` from every `<unit-dir>/<unit>.d/`, keeps
+/// the highest-precedence directory's copy of a given filename and
+/// discards the rest, then applies what is left sorted by that
+/// filename. Both halves matter: the dedup is what lets an operator
+/// neutralise a packaged drop-in by putting an empty file of the same
+/// name under `/etc`, and the sort is what makes `10-` land before
+/// `20-` wherever each came from.
+///
+/// The unit-specific directory alone. systemd also honours the
+/// type-wide `socket.d/`, which every socket unit on the host shares;
+/// a `ListenStream=` there would bind every one of them to the same
+/// path, so it is not a configuration this reports for.
+///
+/// # Errors
+///
+/// Returns an error when a drop-in directory that exists cannot be
+/// listed.
+fn dropin_paths(unit_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let dropin_dir_name = format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}");
+    let mut found: Vec<(std::ffi::OsString, PathBuf)> = Vec::new();
+    for dir in unit_dirs {
+        let dropin_dir = dir.join(&dropin_dir_name);
+        let entries = match std::fs::read_dir(&dropin_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "reading the registrar socket drop-in directory {}",
+                    dropin_dir.display()
+                )));
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!(
+                    "reading the registrar socket drop-in directory {}",
+                    dropin_dir.display()
+                )
+            })?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().ends_with(DROPIN_FILE_SUFFIX) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if found.iter().any(|(seen, _)| *seen == name) {
+                continue;
+            }
+            found.push((name, path));
+        }
+    }
+    found.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(found.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Reads `[Socket] ListenStream=` out of a single systemd unit file.
+///
+/// The one-file case of [`listen_stream_merged`]: an explicitly named
+/// unit and the shipped fallback, neither of which any drop-in extends.
+fn listen_stream(unit: &str) -> Option<String> {
+    listen_stream_merged(&[unit])
+}
+
+/// Reads `[Socket] ListenStream=` out of a unit file followed by the
+/// drop-ins that override it.
 ///
 /// Parsed the way systemd reads a unit: `[Section]` headers, `Key=Value`
 /// lines, `#` and `;` comments, and a key that may legally repeat. An
@@ -243,12 +393,22 @@ fn resolve_socket_path(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result
 /// first value still standing afterwards is the one the endpoint is
 /// served on.
 ///
-/// The unit file alone, which is what this surface reports: `.d/`
-/// drop-ins beside it are not read. A deployment that moves the socket
-/// moves it in the unit, and a caller is told what that unit binds.
-fn listen_stream(unit: &str) -> Option<String> {
-    let mut section = String::new();
+/// The drop-ins are appended to the same list rather than parsed apart,
+/// because that is what makes the reset work across files: a drop-in
+/// that opens with a bare `ListenStream=` drops everything the unit
+/// bound and the value it assigns next is the only one left.
+fn listen_stream_merged(units: &[&str]) -> Option<String> {
     let mut values: Vec<String> = Vec::new();
+    for unit in units {
+        collect_listen_streams(unit, &mut values);
+    }
+    values.into_iter().next()
+}
+
+/// Folds one unit file's `[Socket] ListenStream=` assignments into
+/// `values`, honouring the empty assignment as a reset.
+fn collect_listen_streams(unit: &str, values: &mut Vec<String>) {
+    let mut section = String::new();
     for line in unit.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
@@ -277,7 +437,6 @@ fn listen_stream(unit: &str) -> Option<String> {
             values.push(value.to_string());
         }
     }
-    values.into_iter().next()
 }
 
 /// Composes the registrar client identity from the identity's parts.
@@ -333,21 +492,93 @@ fn ca_bundle_path_for(cert_path: &Path) -> PathBuf {
         .join(CA_BUNDLE_FILE)
 }
 
+/// Reduces an output path to the form two destinations are compared in.
+///
+/// Absolute, with the containing directory resolved through symlinks
+/// when it already exists, so `certs/leaf.pem` and
+/// `/srv/certs/../certs/leaf.pem` are recognised as the one file they
+/// are. The leaf name is joined back on afterwards rather than
+/// canonicalised with the rest: these paths routinely do not exist yet,
+/// and a destination that is a symlink is the file it points at only
+/// after it has been published, not before.
+///
+/// # Errors
+///
+/// Returns an error when `path` names no file — a filesystem root, or a
+/// path ending in `..`.
+fn output_identity(label: &str, path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("resolving {label} {}", path.display()))?;
+    let (parent, name) = absolute.parent().zip(absolute.file_name()).ok_or_else(|| {
+        anyhow::anyhow!("{label} must name a file: `{}` does not", path.display())
+    })?;
+    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    Ok(parent.join(name))
+}
+
+/// Holds the three destinations one issuance publishes to distinct
+/// files.
+///
+/// Checked before anything is issued, because every one of these writes
+/// replaces whatever is at its path: `--cert-path` and `--key-path`
+/// given the same value publish the certificate and then overwrite it
+/// with the private key, and the run reports success. The derived
+/// bundle is in the check for the same reason — a `--key-path` of
+/// `ca-bundle.pem` beside the certificate is a private key written
+/// world-readable into the deployment's trust store.
+///
+/// # Errors
+///
+/// Returns an error naming the two flags that collided, and the path
+/// they both resolve to.
+fn ensure_distinct_outputs(cert_path: &Path, key_path: &Path, bundle_path: &Path) -> Result<()> {
+    let destinations = [
+        ("--cert-path", cert_path),
+        ("--key-path", key_path),
+        ("the CA bundle derived beside --cert-path", bundle_path),
+    ];
+    let mut resolved: Vec<(&str, PathBuf)> = Vec::with_capacity(destinations.len());
+    for (label, path) in destinations {
+        resolved.push((label, output_identity(label, path)?));
+    }
+    for (index, (label, path)) in resolved.iter().enumerate() {
+        for (other_label, other_path) in resolved.iter().skip(index + 1) {
+            if path == other_path {
+                anyhow::bail!(
+                    "{label} and {other_label} must name different files: both resolve to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Issues the registrar client leaf into the caller's paths.
 ///
 /// # Errors
 ///
-/// Returns an error when the identity's parts are invalid, when this
-/// host carries no bootroot-internal registrar configuration to take the
+/// Returns an error when the identity's parts are invalid, when two of
+/// the three output destinations are the same file, when this host
+/// carries no bootroot-internal registrar configuration to take the
 /// ACME inputs from, when the deployment's CA certificates cannot be
 /// read, when the issuance fails, or when the material cannot be
 /// published. Nothing is written at the caller's paths unless every one
-/// of those steps succeeded.
+/// of those steps succeeded: the destinations that a failed publication
+/// had already replaced are put back as they were.
 pub(crate) async fn run_registrar_issue(
     args: &RegistrarIssueArgs,
     messages: &Messages,
 ) -> Result<()> {
     let identity = compose_identity(&args.host, &args.domain)?;
+    // Before the issuance, not after it: a caller that passed one path
+    // twice is refused without a certificate having been minted for an
+    // identity whose material cannot be published.
+    ensure_distinct_outputs(
+        &args.cert_path,
+        &args.key_path,
+        &ca_bundle_path_for(&args.cert_path),
+    )?;
     let secrets_dir = args.secrets_dir.secrets_dir.as_path();
 
     let staging = staging_dir(secrets_dir);
@@ -498,33 +729,238 @@ async fn issue_into_staging(
     })
 }
 
-/// Publishes the staged material at the caller's paths.
+/// The three destinations one issuance publishes to.
+struct Destinations {
+    /// The CA bundle, the certificate path's sibling.
+    bundle: PathBuf,
+    /// The leaf followed by its issuer chain.
+    cert: PathBuf,
+    /// The private key.
+    key: PathBuf,
+}
+
+impl Destinations {
+    /// Derives the three destinations from the caller's flags.
+    fn from_args(args: &RegistrarIssueArgs) -> Self {
+        Self {
+            bundle: ca_bundle_path_for(&args.cert_path),
+            cert: args.cert_path.clone(),
+            key: args.key_path.clone(),
+        }
+    }
+}
+
+/// A future one publication step or one rollback write runs as.
+///
+/// Boxed so a step can be held as an ordinary function pointer, which
+/// is what lets [`publish_with_steps`] be driven with a step that fails
+/// on purpose.
+type PublishFuture<'a> = std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+/// One step of a publication: everything it writes, or nothing.
+type PublishStep = for<'a> fn(&'a Destinations, &'a StagedMaterial) -> PublishFuture<'a>;
+
+/// The publication, in order.
 ///
 /// The bundle first, then the pair, which is the order the daemon's own
 /// publication uses: a leaf whose issuer this host cannot verify is of
-/// no use to the process that reads it. `write_cert_and_key` and
-/// `write_ca_bundle` establish the modes — `0644` certificate, `0600`
-/// key, `0644` bundle — so this path and `service add`'s cannot disagree
-/// about them.
+/// no use to the process that reads it.
+const PUBLISH_STEPS: [PublishStep; 2] = [publish_bundle, publish_pair];
+
+/// Writes the CA bundle at the certificate path's sibling.
+fn publish_bundle<'a>(dest: &'a Destinations, material: &'a StagedMaterial) -> PublishFuture<'a> {
+    Box::pin(async move {
+        fs_util::write_ca_bundle(&dest.bundle, &material.bundle_pem, CertGroupPolicy::none())
+            .await
+            .with_context(|| format!("writing the CA bundle to {}", dest.bundle.display()))
+    })
+}
+
+/// Writes the certificate and the key at the caller's paths.
+///
+/// `write_cert_and_key` establishes the modes — `0644` certificate,
+/// `0600` key — so this path and `service add`'s cannot disagree about
+/// them.
+fn publish_pair<'a>(dest: &'a Destinations, material: &'a StagedMaterial) -> PublishFuture<'a> {
+    Box::pin(async move {
+        fs_util::write_cert_and_key(
+            &dest.cert,
+            &dest.key,
+            &material.cert_pem,
+            material.key_pem.expose(),
+            CertGroupPolicy::none(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "writing the certificate and key to {} and {}",
+                dest.cert.display(),
+                dest.key.display()
+            )
+        })
+    })
+}
+
+/// What was at a destination before this run replaced it.
+enum PriorState {
+    /// Nothing was there. A rollback removes what this run published.
+    Absent,
+    /// The bytes that were there. A rollback writes them back.
+    ///
+    /// Held as [`PrivateKeyPem`] for all three destinations and not
+    /// only for the key: the wrapper's hand-written `Debug` is what
+    /// keeps a snapshot of a private key out of any formatted value,
+    /// and one type for the three means a destination added later
+    /// cannot quietly be the one that is not wrapped.
+    Present(PrivateKeyPem),
+}
+
+/// A destination, what it held, and the writer that puts that back.
+struct Restorable {
+    /// The destination this run replaces.
+    path: PathBuf,
+    /// What it held beforehand.
+    prior: PriorState,
+    /// The writer that republishes `prior` at the mode the file needs —
+    /// the same one that published over it, so a rolled-back file comes
+    /// back at the mode it had rather than at whatever a generic write
+    /// would give it.
+    restore: for<'a> fn(&'a Path, &'a str) -> PublishFuture<'a>,
+}
+
+/// Republishes a CA bundle, at `0644`.
+fn restore_bundle<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
+    Box::pin(async move { fs_util::write_ca_bundle(path, contents, CertGroupPolicy::none()).await })
+}
+
+/// Republishes a certificate, at `0644`.
+fn restore_cert<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
+    Box::pin(async move {
+        bootroot::cert_group::write_cert_file(path, contents, CertGroupPolicy::none()).await
+    })
+}
+
+/// Republishes a private key, at `0600`.
+fn restore_key<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
+    Box::pin(async move {
+        bootroot::cert_group::write_key_file(path, contents, CertGroupPolicy::none()).await
+    })
+}
+
+/// Reads a destination back before it is replaced.
+///
+/// # Errors
+///
+/// Returns an error when the path is there and cannot be read. A
+/// destination that does not exist is not an error — it is the first
+/// provisioning, and the rollback for it is a removal.
+async fn snapshot_destination(path: &Path) -> Result<PriorState> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => Ok(PriorState::Present(PrivateKeyPem::new(contents))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PriorState::Absent),
+        Err(err) => Err(anyhow::Error::new(err).context(format!(
+            "reading the existing {} back before replacing it",
+            path.display()
+        ))),
+    }
+}
+
+/// Publishes the staged material at the caller's paths, or leaves them
+/// as they were.
+///
+/// Every destination is read back before the first is written, so a
+/// step that fails part-way can be undone: the issue requires that a
+/// run never leave a half-written pair, and three independent writes
+/// satisfy that only if the ones that already landed can be taken back.
+/// Without it, a key write that fails after the certificate write
+/// succeeded leaves the new leaf beside the previous key — a pair that
+/// is complete, readable and useless, with nothing on disk saying so.
 async fn publish_material(
     args: &RegistrarIssueArgs,
     material: &StagedMaterial,
     messages: &Messages,
 ) -> Result<()> {
-    let bundle_path = ca_bundle_path_for(&args.cert_path);
-    fs_util::write_ca_bundle(&bundle_path, &material.bundle_pem, CertGroupPolicy::none())
-        .await
-        .with_context(|| messages.error_write_file_failed(&bundle_path.display().to_string()))?;
-    fs_util::write_cert_and_key(
-        &args.cert_path,
-        &args.key_path,
-        &material.cert_pem,
-        material.key_pem.expose(),
-        CertGroupPolicy::none(),
+    publish_with_steps(
+        &Destinations::from_args(args),
+        material,
+        &PUBLISH_STEPS,
+        messages,
     )
     .await
-    .with_context(|| messages.error_write_file_failed(&args.cert_path.display().to_string()))?;
+}
+
+/// Runs `steps` over the destinations, rolling back on the first
+/// failure.
+///
+/// Split from [`publish_material`] so a test can append a step that
+/// fails after the real writers have run, which is the failure the
+/// rollback exists for and the one no fixture path can provoke.
+async fn publish_with_steps(
+    dest: &Destinations,
+    material: &StagedMaterial,
+    steps: &[PublishStep],
+    messages: &Messages,
+) -> Result<()> {
+    let prior = vec![
+        Restorable {
+            prior: snapshot_destination(&dest.bundle).await?,
+            path: dest.bundle.clone(),
+            restore: restore_bundle,
+        },
+        Restorable {
+            prior: snapshot_destination(&dest.cert).await?,
+            path: dest.cert.clone(),
+            restore: restore_cert,
+        },
+        Restorable {
+            prior: snapshot_destination(&dest.key).await?,
+            path: dest.key.clone(),
+            restore: restore_key,
+        },
+    ];
+
+    for step in steps {
+        if let Err(err) = step(dest, material).await {
+            let err =
+                err.context(messages.error_write_file_failed(&dest.cert.display().to_string()));
+            return Err(roll_back(&prior, err).await);
+        }
+    }
     Ok(())
+}
+
+/// Puts every destination back as it was and returns the failure that
+/// triggered it.
+///
+/// Reverse publication order — key, certificate, bundle — so the pair
+/// is consistent again before the trust material it is verified against
+/// is. A restore that itself fails is attached to the returned error
+/// rather than replacing it: the caller needs the reason the run
+/// failed, and the list of files that could not be put back is what
+/// tells an operator which ones to look at by hand.
+async fn roll_back(prior: &[Restorable], err: anyhow::Error) -> anyhow::Error {
+    let mut stranded: Vec<String> = Vec::new();
+    for entry in prior.iter().rev() {
+        let outcome = match &entry.prior {
+            PriorState::Present(contents) => (entry.restore)(&entry.path, contents.expose()).await,
+            PriorState::Absent => match tokio::fs::remove_file(&entry.path).await {
+                Err(remove) if remove.kind() != std::io::ErrorKind::NotFound => {
+                    Err(anyhow::Error::new(remove))
+                }
+                _ => Ok(()),
+            },
+        };
+        if outcome.is_err() {
+            stranded.push(entry.path.display().to_string());
+        }
+    }
+    if stranded.is_empty() {
+        return err.context("the caller's paths were left as they were before this run");
+    }
+    err.context(format!(
+        "the caller's paths could not all be put back; check by hand: {}",
+        stranded.join(", ")
+    ))
 }
 
 /// Removes the staging directory, warning rather than failing.

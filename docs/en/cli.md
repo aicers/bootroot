@@ -2769,19 +2769,25 @@ With `--json`, one JSON object on stdout:
 ```
 
 - `api_version` is a wire identifier and is never translated
-- `socket_path` is the `ListenStream=` of the installed socket unit, searched in
+- `socket_path` is the effective `ListenStream=` of the installed socket unit,
+  resolved the way systemd resolves it. The unit directories are searched in
   systemd's own precedence order (`/etc/systemd/system`, `/run/systemd/system`,
   `/usr/local/lib/systemd/system`, `/lib/systemd/system`,
-  `/usr/lib/systemd/system`). With no unit installed anywhere, the answer is the
-  `ListenStream=` of the unit this build ships. No configuration key names the
-  endpoint's path, and the daemon learns its own from the descriptor systemd
-  hands it.
+  `/usr/lib/systemd/system`); the first unit file found masks the ones below it,
+  and the `bootroot-registrar.socket.d/*.conf` drop-ins from every unit
+  directory are merged on top of it, so an override written by `systemctl edit
+  bootroot-registrar.socket` is reflected here. With no unit installed anywhere,
+  the answer is the `ListenStream=` of the unit this build ships. No
+  configuration key names the endpoint's path, and the daemon learns its own
+  from the descriptor systemd hands it.
 - `verbs` lists every verb the surface carries, in this fixed order
 
 ### Failure conditions
 
 - `--socket-unit` names a file that cannot be read, or one carrying no `[Socket]
   ListenStream=`
+- The installed unit, or one of its drop-ins, cannot be read
+- The installed unit binds nothing once its drop-ins are merged
 
 ### Examples
 
@@ -2843,14 +2849,26 @@ With `--json`, one JSON object on stdout:
 
 ### Behavior
 
+- The three destinations are held to being distinct before anything is issued.
+  `--cert-path` and `--key-path` naming one file, or either of them landing on
+  the `ca-bundle.pem` derived beside the certificate, is a refusal — otherwise
+  the last write would replace what the previous one published and the run would
+  report success. Two spellings of one file (`certs/leaf.pem` and
+  `certs/../certs/leaf.pem`) are one destination
 - The material is issued into a staging directory below `--secrets-dir` and
   published only once every byte of it is in hand, so a run that fails part-way
   leaves no half-written pair at the caller's paths
+- Publication is reversible. The three destinations are read back before the
+  first is replaced, and a failure part-way through puts every one that was
+  already replaced back as it was — removing, on a first provisioning, the files
+  the failed run created. A rollback that cannot complete names the files to
+  check by hand in the error
 - Re-invocation re-issues into the same paths, with a fresh key every time
 
 ### Failure conditions
 
 - `--host` is not a single DNS label, or `--domain` is not a DNS name
+- Two of the three output destinations are the same file
 - This host carries no bootroot-internal registrar configuration to take the
   ACME inputs from
 - The deployment's CA certificates cannot be read

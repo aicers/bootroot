@@ -848,6 +848,37 @@ impl Host {
         self.issue_with(domain, true).await
     }
 
+    /// Runs `registrar issue --json` against this host, writing to the
+    /// destinations the caller names rather than this host's.
+    async fn issue_to(
+        &self,
+        domain: &str,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> (String, String, i32) {
+        let args: Vec<String> = vec![
+            "registrar".to_string(),
+            "issue".to_string(),
+            "--host".to_string(),
+            TEST_HOST.to_string(),
+            "--domain".to_string(),
+            domain.to_string(),
+            "--cert-path".to_string(),
+            cert_path.display().to_string(),
+            "--key-path".to_string(),
+            key_path.display().to_string(),
+            "--secrets-dir".to_string(),
+            self.secrets_dir().display().to_string(),
+            "--json".to_string(),
+        ];
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            run(&refs)
+        })
+        .await
+        .expect("the issuance child process is awaited")
+    }
+
     /// Runs `registrar issue` against this host, with or without
     /// `--json`.
     ///
@@ -1091,6 +1122,62 @@ async fn an_unprovisioned_host_is_refused_before_anything_is_written() {
         "the staging directory must not survive a refusal: {:?}",
         staging_leftovers(&host.secrets_dir())
     );
+    assert_eq!(
+        acme.observed.orders.load(Ordering::Relaxed),
+        0,
+        "the ACME path is never reached"
+    );
+}
+
+/// One path for both halves of the pair would publish the certificate
+/// and then overwrite it with the private key, and the run would report
+/// success. It is refused before the ACME path is reached, so no leaf is
+/// minted for material that cannot be published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_path_for_the_certificate_and_the_key_is_refused_before_issuance() {
+    let ca = Arc::new(TestCa::new());
+    let acme = start_acme(Arc::clone(&ca)).await;
+    let host = Host::new(&ca, &acme);
+    let both = host.material_dir().join("registrar.pem");
+
+    let (_stdout, stderr, code) = host.issue_to(TEST_DOMAIN, &both, &both).await;
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("--cert-path") && stderr.contains("--key-path"),
+        "the refusal must name both flags: {stderr}"
+    );
+    assert!(!both.exists(), "nothing is published at the shared path");
+    assert!(
+        staging_leftovers(&host.secrets_dir()).is_empty(),
+        "the staging directory must not survive a refusal"
+    );
+    assert_eq!(
+        acme.observed.orders.load(Ordering::Relaxed),
+        0,
+        "the ACME path is never reached"
+    );
+}
+
+/// A `--key-path` on the bundle derived beside the certificate would
+/// publish a private key `0644` into the deployment's trust store. The
+/// derived destination is in the check for exactly that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_path_on_the_derived_bundle_is_refused_before_issuance() {
+    let ca = Arc::new(TestCa::new());
+    let acme = start_acme(Arc::clone(&ca)).await;
+    let host = Host::new(&ca, &acme);
+
+    let (_stdout, stderr, code) = host
+        .issue_to(TEST_DOMAIN, &host.cert_path(), &host.bundle_path())
+        .await;
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("ca-bundle.pem"),
+        "the refusal must name the derived destination: {stderr}"
+    );
+    assert!(!host.bundle_path().exists(), "no key is published there");
     assert_eq!(
         acme.observed.orders.load(Ordering::Relaxed),
         0,

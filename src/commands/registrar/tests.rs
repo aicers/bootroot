@@ -237,6 +237,176 @@ fn capabilities_is_independent_of_configuration_and_of_a_running_daemon() {
 }
 
 // ---------------------------------------------------------------------
+// Drop-ins
+// ---------------------------------------------------------------------
+
+/// Writes a drop-in `name` beside the unit in `dir`.
+fn write_dropin(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let dropin_dir = dir.join(format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}"));
+    std::fs::create_dir_all(&dropin_dir).expect("create the drop-in directory");
+    let path = dropin_dir.join(name);
+    std::fs::write(&path, body).expect("write the drop-in");
+    path
+}
+
+/// The override `systemctl edit bootroot-registrar.socket` writes: the
+/// unit's value is reset and another is bound. Reporting the unit file
+/// alone would name a socket systemd is not listening on, and the
+/// caller would connect to nothing.
+#[test]
+fn a_drop_in_override_is_merged_onto_the_installed_unit() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        dir.path(),
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/edited/registrar.sock\n",
+    );
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/edited/registrar.sock");
+}
+
+/// A drop-in in a lower-precedence directory still applies to a unit
+/// found higher up: systemd merges the drop-ins from every unit
+/// directory, not only from the one the unit file came from.
+#[test]
+fn a_drop_in_below_the_unit_still_applies() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    write_socket_unit(high.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        low.path(),
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/from-below/registrar.sock\n",
+    );
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let response = capabilities(None, &dirs).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/from-below/registrar.sock");
+}
+
+/// Drop-ins apply sorted by filename, wherever each came from, so `20-`
+/// lands after `10-` even when the `10-` is the one under `/etc`.
+#[test]
+fn drop_ins_apply_in_filename_order_across_directories() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    write_socket_unit(high.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        high.path(),
+        "10-early.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/early/registrar.sock\n",
+    );
+    write_dropin(
+        low.path(),
+        "20-late.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/late/registrar.sock\n",
+    );
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let response = capabilities(None, &dirs).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/late/registrar.sock");
+}
+
+/// Two drop-ins of the same name are one drop-in: the higher-precedence
+/// directory's copy is applied and the other is discarded, which is
+/// what lets an operator neutralise a packaged drop-in with an empty
+/// file of the same name under `/etc`.
+#[test]
+fn a_higher_precedence_drop_in_masks_a_lower_one_of_the_same_name() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    write_socket_unit(low.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        low.path(),
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/masked/registrar.sock\n",
+    );
+    write_dropin(high.path(), "override.conf", "# neutralised\n");
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let response = capabilities(None, &dirs).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/packaged/registrar.sock");
+}
+
+/// systemd reads `*.conf` and nothing else out of a `.d` directory, so
+/// a file an editor left behind overrides nothing here either.
+#[test]
+fn a_drop_in_directory_entry_that_is_not_conf_is_ignored() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        dir.path(),
+        "override.conf.bak",
+        "[Socket]\nListenStream=\nListenStream=/run/backup/registrar.sock\n",
+    );
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/packaged/registrar.sock");
+}
+
+/// A unit named directly is the whole answer. It is not a unit systemd
+/// has loaded, so the host's drop-ins are not its.
+#[test]
+fn a_named_unit_is_not_extended_by_drop_ins() {
+    let dir = TempDir::new().expect("tempdir");
+    let unit = write_socket_unit(dir.path(), "/run/named/registrar.sock");
+    write_dropin(
+        dir.path(),
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/edited/registrar.sock\n",
+    );
+
+    let response = capabilities(Some(&unit), &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/named/registrar.sock");
+}
+
+/// systemd loads exactly one unit file, so the highest-precedence one
+/// masks the rest. A unit under `/etc` that binds nothing means the
+/// host binds nothing, and answering with a packaged unit's path would
+/// name a socket that is not there.
+#[test]
+fn an_installed_unit_binding_nothing_masks_the_ones_below_it() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    std::fs::write(high.path().join(SOCKET_UNIT_FILE), "[Socket]\nAccept=no\n")
+        .expect("write the masking unit");
+    write_socket_unit(low.path(), "/run/packaged/registrar.sock");
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let err = capabilities(None, &dirs).expect_err("a unit that binds nothing");
+
+    assert!(
+        err.to_string().contains("ListenStream"),
+        "unexpected error: {err}"
+    );
+}
+
+/// A drop-in that resets the list and binds nothing after it leaves the
+/// host binding nothing, and that is a refusal rather than a fall-back
+/// to the value the unit file alone carried.
+#[test]
+fn a_drop_in_that_clears_the_list_is_a_refusal() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin(dir.path(), "override.conf", "[Socket]\nListenStream=\n");
+
+    let err = capabilities(None, &[dir.path().to_path_buf()]).expect_err("a cleared list");
+
+    assert!(
+        err.to_string().contains("drop-ins"),
+        "unexpected error: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // The unit parser
 // ---------------------------------------------------------------------
 
@@ -477,4 +647,282 @@ fn not_after_is_read_off_the_leaf_and_not_the_chain() {
 fn a_certificate_that_does_not_parse_has_no_expiry() {
     assert!(leaf_not_after("not a certificate").is_err());
     assert!(leaf_not_after("").is_err());
+}
+
+// ---------------------------------------------------------------------
+// Output destinations
+// ---------------------------------------------------------------------
+
+/// Builds `issue` arguments for the three destinations under test.
+fn issue_args(cert_path: PathBuf, key_path: PathBuf, secrets_dir: PathBuf) -> RegistrarIssueArgs {
+    RegistrarIssueArgs {
+        host: "h1".to_string(),
+        domain: "example.internal".to_string(),
+        cert_path,
+        key_path,
+        secrets_dir: crate::cli::args::SecretsDirArgs { secrets_dir },
+        json: true,
+    }
+}
+
+/// The three ordinary destinations are accepted.
+#[test]
+fn three_distinct_destinations_are_accepted() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join("registrar.pem");
+    let key = dir.path().join("registrar-key.pem");
+
+    ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect("three distinct destinations");
+}
+
+/// One path for both halves of the pair publishes the certificate and
+/// then overwrites it with the private key, and reports success. It is
+/// refused instead.
+#[test]
+fn one_path_for_the_certificate_and_the_key_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let both = dir.path().join("registrar.pem");
+
+    let err = ensure_distinct_outputs(&both, &both, &ca_bundle_path_for(&both))
+        .expect_err("one path for both");
+
+    assert!(err.to_string().contains("--cert-path"), "unexpected: {err}");
+    assert!(err.to_string().contains("--key-path"), "unexpected: {err}");
+}
+
+/// The derived bundle is a destination like the other two: a key
+/// written there is a private key published `0644` into the
+/// deployment's trust store.
+#[test]
+fn a_key_path_on_the_derived_bundle_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join("registrar.pem");
+    let key = dir.path().join(CA_BUNDLE_FILE);
+
+    let err = ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect_err("the key on the bundle");
+
+    assert!(
+        err.to_string().contains(CA_BUNDLE_FILE),
+        "unexpected: {err}"
+    );
+}
+
+/// A certificate path that is itself the bundle collides with the
+/// bundle derived beside it.
+#[test]
+fn a_certificate_path_on_the_bundle_name_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join(CA_BUNDLE_FILE);
+    let key = dir.path().join("registrar-key.pem");
+
+    let err = ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect_err("the certificate on the bundle");
+
+    assert!(err.to_string().contains("--cert-path"), "unexpected: {err}");
+}
+
+/// Two spellings of one file are one destination. Comparing the flags
+/// as they were typed would let `certs/../certs/leaf.pem` through.
+#[test]
+fn two_spellings_of_one_file_are_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let certs = dir.path().join("certs");
+    std::fs::create_dir_all(&certs).expect("create the material directory");
+    let cert = certs.join("registrar.pem");
+    let key = certs.join("..").join("certs").join("registrar.pem");
+
+    let err =
+        ensure_distinct_outputs(&cert, &key, &ca_bundle_path_for(&cert)).expect_err("one file");
+
+    assert!(err.to_string().contains("--key-path"), "unexpected: {err}");
+}
+
+// ---------------------------------------------------------------------
+// Publication and rollback
+// ---------------------------------------------------------------------
+
+/// Material with recognisable contents, so a rollback can be told from
+/// a publication by reading the files back.
+fn staged_material(tag: &str) -> StagedMaterial {
+    StagedMaterial {
+        cert_pem: format!("cert:{tag}\n"),
+        key_pem: PrivateKeyPem::new(format!("key:{tag}\n")),
+        bundle_pem: format!("bundle:{tag}\n"),
+        not_after: "2099-01-01T00:00:00.000Z".to_string(),
+    }
+}
+
+/// The publication step a test appends to induce a failure after the
+/// real writers have already replaced every destination.
+fn fail_after_publishing<'a>(
+    _dest: &'a Destinations,
+    _material: &'a StagedMaterial,
+) -> PublishFuture<'a> {
+    Box::pin(async move { Err(anyhow::anyhow!("induced failure after the last write")) })
+}
+
+/// Returns a file's permission bits.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+}
+
+/// The three files land at the modes `service add` establishes.
+#[tokio::test]
+async fn a_publication_writes_the_three_files_at_their_modes() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("registrar.pem"),
+        dir.path().join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let material = staged_material("new");
+
+    publish_material(&args, &material, &crate::i18n::test_messages())
+        .await
+        .expect("publish");
+
+    let bundle = ca_bundle_path_for(&args.cert_path);
+    assert_eq!(
+        std::fs::read_to_string(&args.cert_path).expect("cert"),
+        material.cert_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args.key_path).expect("key"),
+        material.key_pem.expose()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bundle).expect("bundle"),
+        material.bundle_pem
+    );
+    assert_eq!(mode_of(&args.cert_path), 0o644);
+    assert_eq!(mode_of(&args.key_path), 0o600);
+    assert_eq!(mode_of(&bundle), 0o644);
+}
+
+/// A failure after the last destination has been replaced puts all
+/// three back. Without the rollback the previous key would be left
+/// beside the new certificate — a pair that is complete, readable and
+/// useless, with nothing on disk saying so.
+#[tokio::test]
+async fn a_late_publication_failure_puts_every_destination_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("registrar.pem"),
+        dir.path().join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let previous = staged_material("previous");
+    publish_material(&args, &previous, &crate::i18n::test_messages())
+        .await
+        .expect("the previous publication");
+
+    let steps: Vec<PublishStep> = vec![publish_bundle, publish_pair, fail_after_publishing];
+    let err = publish_with_steps(
+        &Destinations::from_args(&args),
+        &staged_material("new"),
+        &steps,
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .expect_err("the induced failure");
+
+    assert!(
+        format!("{err:#}").contains("left as they were"),
+        "unexpected error: {err:#}"
+    );
+    let bundle = ca_bundle_path_for(&args.cert_path);
+    assert_eq!(
+        std::fs::read_to_string(&args.cert_path).expect("cert"),
+        previous.cert_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args.key_path).expect("key"),
+        previous.key_pem.expose()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bundle).expect("bundle"),
+        previous.bundle_pem
+    );
+    assert_eq!(mode_of(&args.cert_path), 0o644);
+    assert_eq!(mode_of(&args.key_path), 0o600);
+    assert_eq!(mode_of(&bundle), 0o644);
+}
+
+/// On a first provisioning there is nothing to put back, so the
+/// rollback removes what the failed run published rather than leaving a
+/// key on a host whose certificate never arrived.
+#[tokio::test]
+async fn a_late_publication_failure_removes_what_the_run_created() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("material").join("registrar.pem"),
+        dir.path().join("material").join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+
+    let steps: Vec<PublishStep> = vec![publish_bundle, publish_pair, fail_after_publishing];
+    publish_with_steps(
+        &Destinations::from_args(&args),
+        &staged_material("new"),
+        &steps,
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .expect_err("the induced failure");
+
+    assert!(!args.cert_path.exists(), "the certificate was left behind");
+    assert!(!args.key_path.exists(), "the key was left behind");
+    assert!(
+        !ca_bundle_path_for(&args.cert_path).exists(),
+        "the bundle was left behind"
+    );
+}
+
+/// A failure in the middle of the pair is the one the issue's
+/// "never leaves a half-written pair" is about: the certificate has
+/// already been replaced and the key has not.
+#[tokio::test]
+async fn a_failure_writing_the_key_puts_the_certificate_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("registrar.pem"),
+        dir.path().join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let previous = staged_material("previous");
+    publish_material(&args, &previous, &crate::i18n::test_messages())
+        .await
+        .expect("the previous publication");
+
+    // The key's parent is a regular file, so the pair's directory
+    // preparation fails once the bundle has already been replaced.
+    let blocked = dir.path().join("blocked");
+    std::fs::write(&blocked, "not a directory").expect("write the blocking file");
+    let dest = Destinations {
+        bundle: ca_bundle_path_for(&args.cert_path),
+        cert: args.cert_path.clone(),
+        key: blocked.join("registrar-key.pem"),
+    };
+
+    publish_with_steps(
+        &dest,
+        &staged_material("new"),
+        &PUBLISH_STEPS,
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .expect_err("the pair could not be written");
+
+    assert_eq!(
+        std::fs::read_to_string(&dest.bundle).expect("bundle"),
+        previous.bundle_pem,
+        "the bundle was not put back"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args.cert_path).expect("cert"),
+        previous.cert_pem
+    );
 }

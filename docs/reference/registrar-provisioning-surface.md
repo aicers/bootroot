@@ -77,13 +77,37 @@ one under `/usr`:
 /usr/lib/systemd/system
 ```
 
-The first unit found carrying a `[Socket] ListenStream=` answers, read from the
-unit file alone — `.d/` drop-ins beside it are not merged. With none installed
-anywhere, the answer is the `ListenStream=` of the unit this build ships
-(`systemd/bootroot-registrar.socket`, embedded at compile time), which is
-`/run/bootroot/registrar.sock`. `--socket-unit <path>` names a unit directly and
-is authoritative: a file that cannot be read, or one carrying no
-`ListenStream=`, is a refusal rather than a fall-through.
+The answer is the **effective** `ListenStream=`, resolved the way systemd
+resolves it rather than read off one file:
+
+- The first directory in that list carrying `bootroot-registrar.socket` provides
+  the unit, and that file **masks** the ones below it. systemd loads exactly one
+  unit file, so a higher-precedence unit that binds nothing is not passed over —
+  reporting a lower-precedence unit's path would name a socket this host does not
+  bind.
+- The `bootroot-registrar.socket.d/*.conf` drop-ins from **every** directory in
+  that list are merged on top of it, which is how an override written by
+  `systemctl edit bootroot-registrar.socket` reaches the answer. Two drop-ins of
+  the same filename are one drop-in: the highest-precedence directory's copy
+  applies and the rest are discarded, and what is left applies sorted by
+  filename. A bare `ListenStream=` resets the list, as it does in systemd, so a
+  drop-in that resets and rebinds wins outright.
+- An installed unit that binds nothing once its drop-ins are merged is a
+  refusal, as is a unit or a drop-in that is present and cannot be read.
+
+With no unit file installed anywhere, the answer is the `ListenStream=` of the
+unit this build ships (`systemd/bootroot-registrar.socket`, embedded at compile
+time), which is `/run/bootroot/registrar.sock`. Drop-ins are not merged onto
+that fallback: a drop-in with no unit to extend is inert in systemd too.
+
+`--socket-unit <path>` names a unit directly and is authoritative: it is not a
+unit systemd has loaded, so no drop-in is merged onto it, and a file that cannot
+be read or one carrying no `ListenStream=` is a refusal rather than a
+fall-through.
+
+The type-wide `socket.d/` drop-in directory, which every socket unit on the host
+shares, is not read. A `ListenStream=` there would bind every socket unit on the
+host to one path, so it is not a configuration this reports for.
 
 **A caller reports what bootroot answers rather than comparing it against a
 value derived from its own layout.** The answer is what is true of this host.
@@ -139,12 +163,36 @@ label.
 - It is not a way into `registrar.mint` or `registrar.deregister`. Those ship,
   are served over the socket, and are untouched by this surface.
 
-### 3.3 Atomicity
+### 3.3 The three destinations are distinct
+
+`--cert-path`, `--key-path` and the `ca-bundle.pem` derived beside the
+certificate are three independent writes, each of which replaces whatever is at
+its path. They are held to being distinct **before anything is issued**: two of
+them naming one file would publish one and then overwrite it with another, and
+the run would report success — a `--key-path` equal to `--cert-path` leaves the
+private key where the certificate belongs, and one equal to the derived bundle
+publishes a private key `0644` into the deployment's trust store.
+
+Two spellings of one file are one destination. The comparison is made on the
+absolute path with the containing directory resolved through symlinks, so
+`certs/leaf.pem` and `certs/../certs/leaf.pem` collide.
+
+### 3.4 Atomicity
 
 The material is issued into a staging directory below `--secrets-dir` and
 published only once every byte of it is in hand, so a run that fails part-way
-leaves no half-written pair at the caller's paths. Re-invocation re-issues into
-the same paths, with a fresh key every time.
+leaves no half-written pair at the caller's paths.
+
+Publication itself is reversible. The three destinations are read back before
+the first is replaced, and a failure part-way through puts every one that was
+already replaced back as it was — at the mode it had, and removing, on a first
+provisioning, the files the failed run created. Without that, a key write
+failing after the certificate write succeeded would leave the new leaf beside
+the previous key: a pair that is complete, readable and useless, with nothing on
+disk saying so. A rollback that cannot itself complete names the files to check
+by hand in the error, and does not replace the reason the run failed.
+
+Re-invocation re-issues into the same paths, with a fresh key every time.
 
 ## 4. Exit codes
 
