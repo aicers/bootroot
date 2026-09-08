@@ -186,12 +186,14 @@ leaves no half-written pair at the caller's paths.
 Publication itself is reversible. The three destinations are read back before
 the first is replaced — their bytes, their permission bits and their ownership —
 and a failure part-way through puts every one that was already replaced back as
-it was: the contents it held, at the mode it carried and under the uid and gid
-that owned it, and removing, on a first provisioning, the files the failed run
-created. What was there is restored rather than republished: a certificate an
-operator had tightened to `0640` does not come back world-readable because that
-is the mode this verb writes at, and a key some other account owned does not
-come back owned by the process whose run failed. Without any of that, a key
+it was: the contents it held, at the permission bits it carried — setuid,
+setgid and the sticky bit included, which are re-applied after the ownership
+because `chown(2)` clears them — and under the uid and gid that owned it, and
+removing, on a first provisioning, the files the failed run created. What was
+there is restored rather than republished: a certificate an operator had
+tightened to `0640` does not come back world-readable because that is the mode
+this verb writes at, and a key some other account owned does not come back
+owned by the process whose run failed. Without any of that, a key
 write failing after the certificate write succeeded would leave the new leaf
 beside the previous key: a pair that is complete, readable and useless, with
 nothing on disk saying so. A rollback that cannot itself complete — including
@@ -199,6 +201,36 @@ one whose `chown` an unprivileged run is refused — names the files to check by
 hand in the error, and does not replace the reason the run failed.
 
 Re-invocation re-issues into the same paths, with a fresh key every time.
+
+### 3.5 Two runs at once
+
+The rollback answers for a failure of its own run, and cannot answer for two
+runs that both succeed. Publishing the three destinations is three writes, so
+two `bootroot registrar issue` runs against the same paths could otherwise
+publish certificate A, then certificate B and key B, then key A: certificate B
+beside key A, both runs reporting success, neither with anything to put back and
+nothing on disk recording it.
+
+So a run holds an exclusive `flock(2)` on `.bootroot-registrar-publish.lock` in
+each directory it publishes into, from before it reads the destinations back
+until after its last write or restore. A second run waits for it and then
+publishes the whole set over what the first left, rather than into the middle of
+it. The lock is taken on the resolved directory, so two spellings of one
+directory are one lock, and on at most two directories in sorted order, so two
+runs naming them in opposite roles cannot each hold what the other waits for.
+
+The lock file is a name to lock and never a record: it is empty, it is created
+`0600`, and it is left in place afterwards, because unlinking it would hand the
+next two runs an inode each and serialise neither. `flock` is released by the
+kernel when the descriptor closes, so a run killed mid-publication strands no
+lock. A `--cert-path` or `--key-path` naming that file is refused, for the same
+reason: a publication over the lock leaves the run holding an inode that is no
+longer at that name.
+
+The issuance ahead of the publication is not serialised. It writes only into the
+run's own staging directory, which is named per process for exactly that reason,
+and holding a lock across an ACME round trip would make one run wait out
+another's network exchange rather than its three writes.
 
 ## 4. Exit codes
 

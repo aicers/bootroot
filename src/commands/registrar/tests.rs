@@ -1050,3 +1050,303 @@ async fn a_rollback_re_establishes_the_ownership_it_captured() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// Special permission bits
+// ---------------------------------------------------------------------
+
+/// Returns a file's permission bits including setuid, setgid and the
+/// sticky bit, which [`mode_of`] deliberately masks off.
+fn full_mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).expect("stat").permissions().mode() & 0o7777
+}
+
+/// Returns a gid this process may hand a file to and that differs from
+/// `current`, or `None` on a host that offers the test neither.
+///
+/// Root may hand a file to any gid, so the neighbouring one will do.
+/// An unprivileged process may only name a group it is a member of.
+fn a_gid_this_process_can_chown_to(current: u32) -> Option<u32> {
+    if bootroot::fs_util::current_process_euid() == 0 {
+        return Some(current.wrapping_add(1));
+    }
+    bootroot::cert_group::one_supplementary_test_gid().filter(|gid| *gid != current)
+}
+
+/// A rollback puts back a mode carrying a special bit, which the chown
+/// that follows the rename clears. Restoring the bits with the rename
+/// and then re-owning the file loses them silently: the file comes back
+/// at its access bits alone, and nothing says the rest went missing.
+///
+/// The `chown` has to actually run for the loss to happen, so the
+/// captured ownership names a gid this process can grant and that the
+/// file does not already carry. A host that offers neither cannot
+/// exercise the path at all, and says so rather than asserting nothing.
+#[tokio::test]
+async fn a_rollback_puts_back_a_mode_carrying_a_special_bit() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("registrar-key.pem");
+    std::fs::write(&path, "previous").expect("seed the destination");
+
+    // setuid on a file its owner may not execute: the bit is preserved
+    // by chmod on both platforms this crate builds for, where the
+    // sticky bit on a regular file is the superuser's alone.
+    chmod(&path, 0o4600);
+    if full_mode_of(&path) != 0o4600 {
+        eprintln!("skipping: this host's chmod does not keep setuid on a regular file");
+        return;
+    }
+    let (uid, gid) = owner_of(&path);
+    let Some(other_gid) = a_gid_this_process_can_chown_to(gid) else {
+        eprintln!("skipping: this process has no second gid to restore ownership to");
+        return;
+    };
+
+    let PriorState::Present(mut prior) = snapshot_destination(&path).await.expect("snapshot")
+    else {
+        panic!("an existing destination was captured as absent");
+    };
+    assert_eq!(
+        prior.mode, 0o4600,
+        "the captured mode carries the setuid bit"
+    );
+    prior.uid = uid;
+    prior.gid = other_gid;
+
+    chmod(&path, 0o644);
+    std::fs::write(&path, "the failed run's file").expect("replace the destination");
+    restore_prior(&path, &prior).await.expect("restore");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), "previous");
+    assert_eq!(
+        owner_of(&path).1,
+        other_gid,
+        "the captured ownership was not re-established"
+    );
+    assert_eq!(
+        full_mode_of(&path),
+        0o4600,
+        "the chown cleared the setuid bit the snapshot captured"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Concurrent publications
+// ---------------------------------------------------------------------
+
+/// Attempts the publication lock in `dir` without waiting, and answers
+/// whether it was granted.
+///
+/// The attempt is made on a descriptor of its own, which is what a
+/// second `bootroot registrar issue` opens: `flock(2)` associates a
+/// lock with the open file description rather than with the process, so
+/// a lock held on another descriptor refuses this one exactly as it
+/// refuses another process's. That is what lets a single-process test
+/// assert the property the fix is about.
+fn publication_lock_is_free(dir: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let path = dir.join(publication_lock::LOCK_FILE_NAME);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return false;
+    };
+    // SAFETY: `file` owns an open descriptor that outlives the call, and
+    // `flock` dereferences nothing. The lock, if taken, is released as
+    // `file` is dropped at the end of this function.
+    let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    outcome == 0
+}
+
+/// A publication step that refuses unless the publication is holding
+/// the lock on every directory it writes into.
+fn require_the_lock_is_held<'a>(
+    dest: &'a Destinations,
+    _material: &'a StagedMaterial,
+) -> PublishFuture<'a> {
+    Box::pin(async move {
+        for dir in [dest.bundle.parent(), dest.cert.parent(), dest.key.parent()]
+            .into_iter()
+            .flatten()
+        {
+            if publication_lock_is_free(dir) {
+                anyhow::bail!(
+                    "the publication is not holding the lock in {}",
+                    dir.display()
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+/// One destination set is one lock, and a disjoint one is another.
+///
+/// Asserted with a non-blocking attempt rather than by watching a
+/// second acquisition fail to finish: whether a queued acquisition has
+/// had time to reach its `flock` is a question about the scheduler, and
+/// `LOCK_NB` answers the question about the lock instead.
+#[tokio::test]
+async fn one_destination_set_is_one_lock_and_two_are_two() {
+    let dir = TempDir::new().expect("tempdir");
+    let material = dir.path().join("material");
+    let elsewhere = dir.path().join("elsewhere");
+
+    let held = publication_lock::hold(&[
+        &material.join("registrar.pem"),
+        &material.join("registrar-key.pem"),
+    ])
+    .await
+    .expect("the acquisition");
+
+    assert!(
+        !publication_lock_is_free(&material),
+        "a second run must not take a lock this one holds"
+    );
+    // A second spelling of the one directory is the one lock: the lock
+    // is taken on the resolved path, so `material/../material` cannot
+    // hand a concurrent run a lock of its own.
+    assert!(
+        !publication_lock_is_free(&material.join("..").join("material")),
+        "a second spelling of the directory took a lock of its own"
+    );
+    publication_lock::hold(&[&elsewhere.join("registrar.pem")])
+        .await
+        .expect("a disjoint destination set is a different lock");
+
+    drop(held);
+    assert!(
+        publication_lock_is_free(&material),
+        "the lock was not released"
+    );
+}
+
+/// The publication holds that lock across every one of its steps, which
+/// is what stops two runs interleaving into a mismatched set: one run
+/// publishing certificate A, another publishing certificate B and key
+/// B, and the first then publishing key A leaves certificate B beside
+/// key A with both runs reporting success and neither having anything
+/// to roll back.
+///
+/// Asserted from inside the publication, by a step that tries the lock
+/// on its own descriptor and refuses if it is granted. A publication
+/// that took no lock fails this at its first step.
+#[tokio::test]
+async fn a_publication_holds_the_lock_across_every_step() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("material").join("registrar.pem"),
+        dir.path().join("keys").join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let dest = Destinations::from_args(&args);
+
+    let steps: Vec<PublishStep> = vec![
+        require_the_lock_is_held,
+        publish_bundle,
+        require_the_lock_is_held,
+        publish_pair,
+        require_the_lock_is_held,
+    ];
+    publish_with_steps(
+        &dest,
+        &staged_material("new"),
+        &steps,
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .expect("the publication holds its lock from before the snapshot to after the last write");
+
+    assert!(
+        publication_lock_is_free(dest.cert.parent().expect("the certificate's directory")),
+        "the certificate's directory stayed locked after the publication"
+    );
+    assert!(
+        publication_lock_is_free(dest.key.parent().expect("the key's directory")),
+        "the key's directory stayed locked after the publication"
+    );
+}
+
+/// A publication that had to wait publishes the whole set once it is
+/// let through, rather than failing or landing in the middle of the run
+/// it waited for.
+#[tokio::test]
+async fn a_publication_that_waited_publishes_every_destination() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("material").join("registrar.pem"),
+        dir.path().join("material").join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let bundle = ca_bundle_path_for(&args.cert_path);
+    let held = publication_lock::hold(&[&bundle, &args.cert_path, &args.key_path])
+        .await
+        .expect("the other run's lock");
+
+    let publishing = tokio::spawn({
+        let args = issue_args(
+            args.cert_path.clone(),
+            args.key_path.clone(),
+            args.secrets_dir.secrets_dir.clone(),
+        );
+        async move {
+            publish_material(
+                &args,
+                &staged_material("new"),
+                &crate::i18n::test_messages(),
+            )
+            .await
+        }
+    });
+    // Nothing of the waiting run can have landed: it is queued on the
+    // lock, which the previous test asserts it takes before its first
+    // snapshot.
+    assert!(!args.cert_path.exists(), "the certificate was published");
+    assert!(!args.key_path.exists(), "the key was published");
+    assert!(!bundle.exists(), "the bundle was published");
+
+    drop(held);
+    publishing
+        .await
+        .expect("the publication task")
+        .expect("the publication proceeds once the lock is released");
+
+    let material = staged_material("new");
+    assert_eq!(
+        std::fs::read_to_string(&args.cert_path).expect("cert"),
+        material.cert_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args.key_path).expect("key"),
+        material.key_pem.expose()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bundle).expect("bundle"),
+        material.bundle_pem
+    );
+}
+
+/// The lock file is not a destination. Publishing over it would leave
+/// this run's `flock` on an inode no longer at that name, so the next
+/// run would create a fresh one and take it while this one still holds
+/// the old — two runs holding "the" lock at once.
+#[test]
+fn a_destination_naming_the_publication_lock_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join("registrar.pem");
+    let key = dir.path().join(publication_lock::LOCK_FILE_NAME);
+    let err = ensure_no_destination_is_the_lock(&cert, &key, &ca_bundle_path_for(&cert))
+        .expect_err("a destination on the lock file");
+    assert!(
+        format!("{err:#}").contains("--key-path"),
+        "unexpected error: {err:#}"
+    );
+    ensure_no_destination_is_the_lock(&cert, &dir.path().join("k.pem"), &ca_bundle_path_for(&cert))
+        .expect("three ordinary destinations");
+}

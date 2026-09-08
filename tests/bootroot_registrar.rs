@@ -321,6 +321,42 @@ fn a_composed_name_in_the_host_flag_is_refused() {
     assert!(!key.exists(), "nothing may be written on a refusal");
 }
 
+/// A destination named after the publication lock is refused before
+/// anything is issued.
+///
+/// The lock is the file this verb takes in every directory it writes
+/// into, so a publication over it would leave the run holding an inode
+/// that is no longer at that name — and the next run would create a
+/// fresh one and take it while this one still held the old.
+#[test]
+fn a_destination_on_the_publication_lock_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = dir.path().join("registrar-cert.pem");
+    let key = dir.path().join(".bootroot-registrar-publish.lock");
+
+    let (_stdout, stderr, code) = run(&[
+        "registrar",
+        "issue",
+        "--host",
+        "bootroot-01",
+        "--domain",
+        TEST_DOMAIN,
+        "--cert-path",
+        cert.to_str().expect("a UTF-8 path"),
+        "--key-path",
+        key.to_str().expect("a UTF-8 path"),
+        "--json",
+    ]);
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains(".bootroot-registrar-publish.lock"),
+        "the refusal must name the lock file: {stderr}"
+    );
+    assert!(!cert.exists(), "nothing may be written on a refusal");
+    assert!(!key.exists(), "nothing may be written on a refusal");
+}
+
 /// Nothing about the daemon's own path handling changes: `capabilities`
 /// reads the installed unit, and the configuration table that describes
 /// the endpoint still names four material paths and an enable flag and

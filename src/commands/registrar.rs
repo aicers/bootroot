@@ -54,14 +54,18 @@
 //! are also held to being distinct before anything is issued, because a
 //! caller that passed one path twice would otherwise be told the
 //! issuance succeeded while the key sat where the certificate should
-//! be. Re-invocation re-issues into the same paths.
+//! be. Two runs publishing at once are serialised against each other by
+//! [`publication_lock`], because the rollback answers only for a
+//! failure of its own run: an interleaving in which both succeed leaves
+//! one run's certificate beside the other's key with nothing to put
+//! back. Re-invocation re-issues into the same paths.
 //!
 //! Only the **initial** credential is issued here. Renewal stays the
 //! daemon's, under its own bootroot-internal credential
 //! (`bootroot::registrar_certs`), and nothing in this module registers a
 //! timer, an `AppRole` or an agent profile.
 
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -79,6 +83,8 @@ use serde::Serialize;
 use crate::cli::args::{RegistrarCapabilitiesArgs, RegistrarIssueArgs};
 use crate::commands::init::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use crate::i18n::Messages;
+
+mod publication_lock;
 
 /// The wire identifier every response on this surface carries, exactly.
 ///
@@ -558,6 +564,43 @@ fn ensure_distinct_outputs(cert_path: &Path, key_path: &Path, bundle_path: &Path
     Ok(())
 }
 
+/// Holds the three destinations off the publication lock's own name.
+///
+/// The lock is a file in each directory this verb writes into, and a
+/// destination published over it is a destination that stops
+/// serialising anything: the run's own `flock` would be left on an
+/// inode no longer at that name, and the next run would create a fresh
+/// one and take it while this one still holds the old. Refusing the
+/// name is cheaper than making the lock survive being overwritten, and
+/// no caller wants a certificate there.
+///
+/// # Errors
+///
+/// Returns an error naming the flag whose path is the lock file.
+fn ensure_no_destination_is_the_lock(
+    cert_path: &Path,
+    key_path: &Path,
+    bundle_path: &Path,
+) -> Result<()> {
+    for (label, path) in [
+        ("--cert-path", cert_path),
+        ("--key-path", key_path),
+        ("the CA bundle derived beside --cert-path", bundle_path),
+    ] {
+        if path
+            .file_name()
+            .is_some_and(|name| name == publication_lock::LOCK_FILE_NAME)
+        {
+            anyhow::bail!(
+                "{label} must not be `{}`: that name is this verb's publication lock, taken in \
+                 every directory it writes into",
+                publication_lock::LOCK_FILE_NAME
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Issues the registrar client leaf into the caller's paths.
 ///
 /// # Errors
@@ -579,11 +622,9 @@ pub(crate) async fn run_registrar_issue(
     // Before the issuance, not after it: a caller that passed one path
     // twice is refused without a certificate having been minted for an
     // identity whose material cannot be published.
-    ensure_distinct_outputs(
-        &args.cert_path,
-        &args.key_path,
-        &ca_bundle_path_for(&args.cert_path),
-    )?;
+    let bundle_path = ca_bundle_path_for(&args.cert_path);
+    ensure_distinct_outputs(&args.cert_path, &args.key_path, &bundle_path)?;
+    ensure_no_destination_is_the_lock(&args.cert_path, &args.key_path, &bundle_path)?;
     let secrets_dir = args.secrets_dir.secrets_dir.as_path();
 
     let staging = staging_dir(secrets_dir);
@@ -849,26 +890,43 @@ struct Restorable {
     prior: PriorState,
 }
 
-/// Puts one captured file back: its bytes at its own mode, then its own
-/// ownership.
+/// The nine bits a rename can carry: owner, group and other.
+const PERMISSION_BITS: u32 = 0o777;
+
+/// The three bits a `chown` can take away: setuid, setgid and sticky.
+const SPECIAL_BITS: u32 = 0o7000;
+
+/// Puts one captured file back: its bytes at its own access bits, then
+/// its own ownership, then whichever special bits the chown would have
+/// cleared.
 ///
-/// The mode travels with the staged inode and lands with the rename, so
-/// the destination is never observable at a mode wider than the one it
-/// is being restored to. The ownership is re-established afterwards —
-/// the staging publisher's arm that states a uid and a gid is the
-/// library's protected-file policy and is not reachable from here — and
-/// a chown that would change nothing is skipped, so a root run putting
-/// back a root-owned file makes no privileged call at all. The window
-/// in between carries this process's own ownership at the file's own
-/// mode, which is what a rollback that did not restore ownership would
-/// leave behind permanently.
+/// The access bits travel with the staged inode and land with the
+/// rename, so the destination is never observable at a mode wider than
+/// the one it is being restored to. The ownership is re-established
+/// afterwards — the staging publisher's arm that states a uid and a gid
+/// is the library's protected-file policy and is not reachable from
+/// here — and a chown that would change nothing is skipped, so a root
+/// run putting back a root-owned file makes no privileged call at all.
+/// The window in between carries this process's own ownership at the
+/// file's own access bits, which is what a rollback that did not
+/// restore ownership would leave behind permanently.
+///
+/// setuid, setgid and the sticky bit cannot ride the rename with the
+/// rest, which is why they are applied last rather than as part of the
+/// one mode: `chown(2)` clears them, so a mode carrying one and a
+/// restore that changes the owner cannot both happen in that order.
+/// Applying them after the chown is also what keeps the window narrow —
+/// a setuid bit is never on the file while it is still owned by the
+/// process that failed. [`restore_special_bits`] is a no-op for the
+/// ordinary file that carries none, so nothing pays a syscall for it.
 ///
 /// # Errors
 ///
-/// Returns an error when the bytes cannot be republished or when the
+/// Returns an error when the bytes cannot be republished, when the
 /// ownership cannot be put back — the `EPERM` an unprivileged run gets
-/// for a file some other account owned. Either leaves the path named in
-/// the rollback's own diagnostic.
+/// for a file some other account owned — or when the special bits
+/// cannot be re-applied. Each leaves the path named in the rollback's
+/// own diagnostic.
 async fn restore_prior(path: &Path, prior: &PriorFile) -> Result<()> {
     let dest = path.to_path_buf();
     let contents = prior.contents.clone();
@@ -877,15 +935,34 @@ async fn restore_prior(path: &Path, prior: &PriorFile) -> Result<()> {
         fs_util::publish_staged_blocking(
             &dest,
             contents.expose().as_bytes(),
-            StagedMode::Policy(mode),
+            StagedMode::Policy(mode & PERMISSION_BITS),
             StagedOwner::WritingProcess,
             StagedDurability::RenameOnly,
         )
         .with_context(|| format!("restoring {} from its snapshot", dest.display()))?;
-        restore_ownership(&dest, uid, gid)
+        restore_ownership(&dest, uid, gid)?;
+        restore_special_bits(&dest, mode)
     })
     .await
     .context("the rollback restore task panicked")?
+}
+
+/// Re-applies the setuid, setgid and sticky bits the snapshot captured,
+/// for the file that carried any.
+///
+/// # Errors
+///
+/// Returns an error when the `chmod` is refused.
+fn restore_special_bits(path: &Path, mode: u32) -> Result<()> {
+    if mode & SPECIAL_BITS == 0 {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).with_context(|| {
+        format!(
+            "restoring the permission bits {mode:04o} of {}",
+            path.display()
+        )
+    })
 }
 
 /// Puts a restored file back under the uid and gid it was owned by.
@@ -975,12 +1052,21 @@ async fn publish_material(
 /// Split from [`publish_material`] so a test can append a step that
 /// fails after the real writers have run, which is the failure the
 /// rollback exists for and the one no fixture path can provoke.
+///
+/// The whole span — the snapshot, every step and any rollback — runs
+/// under [`publication_lock`], because the rollback answers only for a
+/// failure of *this* run. Two runs publishing at once both succeed and
+/// still leave a pair drawn from either, and neither has anything to
+/// put back; the lock is what makes the second one publish over the
+/// first whole rather than into the middle of it.
 async fn publish_with_steps(
     dest: &Destinations,
     material: &StagedMaterial,
     steps: &[PublishStep],
     messages: &Messages,
 ) -> Result<()> {
+    let _lock = publication_lock::hold(&[&dest.bundle, &dest.cert, &dest.key]).await?;
+
     let prior = vec![
         Restorable {
             prior: snapshot_destination(&dest.bundle).await?,

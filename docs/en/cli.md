@@ -2861,18 +2861,29 @@ With `--json`, one JSON object on stdout:
 - Publication is reversible. The three destinations are read back before the
   first is replaced — their bytes, their permission bits and their ownership —
   and a failure part-way through puts every one that was already replaced back
-  as it was: the contents it held, at the mode it carried and under the uid and
-  gid that owned it, and removing, on a first provisioning, the files the failed
-  run created. A certificate tightened by hand does not come back at this verb's
-  own `0644`, and a key another account owned does not come back owned by the
-  run that failed. A rollback that cannot complete names the files to check by
-  hand in the error
+  as it was: the contents it held, at the permission bits it carried (setuid,
+  setgid and the sticky bit included, re-applied after the ownership because
+  `chown` clears them) and under the uid and gid that owned it, and removing, on
+  a first provisioning, the files the failed run created. A certificate
+  tightened by hand does not come back at this verb's own `0644`, and a key
+  another account owned does not come back owned by the run that failed. A
+  rollback that cannot complete names the files to check by hand in the error
+- Two runs publishing into the same paths are serialised against each other. A
+  run holds an exclusive `flock` on `.bootroot-registrar-publish.lock` in each
+  directory it writes into, from before it reads the destinations back until
+  after its last write, so a second run waits and then publishes the whole set
+  rather than into the middle of the first. The lock file is empty, created
+  `0600`, and left in place; the kernel releases the lock when the process
+  exits. The issuance ahead of the publication is not serialised — it writes
+  only into a staging directory named for the process
 - Re-invocation re-issues into the same paths, with a fresh key every time
 
 ### Failure conditions
 
 - `--host` is not a single DNS label, or `--domain` is not a DNS name
 - Two of the three output destinations are the same file
+- An output destination is named `.bootroot-registrar-publish.lock`, the
+  publication lock this command takes in every directory it writes into
 - This host carries no bootroot-internal registrar configuration to take the
   ACME inputs from
 - The deployment's CA certificates cannot be read
