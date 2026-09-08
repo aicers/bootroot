@@ -46,9 +46,11 @@
 //! once every byte of it is in hand, so a failed run leaves no
 //! half-written pair at the caller's paths. Publication itself is
 //! reversible: the three destinations are read back before the first is
-//! replaced, and a failure part-way through puts every one that was
-//! already replaced back as it was, so a run that fails does not leave
-//! a new certificate beside the previous key. The three destinations
+//! replaced — their bytes, their modes and their ownership — and a
+//! failure part-way through puts every one that was already replaced
+//! back as it was, so a run that fails does not leave a new certificate
+//! beside the previous key, nor a file an operator had tightened
+//! reopened at this surface's own mode. The three destinations
 //! are also held to being distinct before anything is issued, because a
 //! caller that passed one path twice would otherwise be told the
 //! issuance succeeded while the key sat where the certificate should
@@ -59,11 +61,13 @@
 //! (`bootroot::registrar_certs`), and nothing in this module registers a
 //! timer, an `AppRole` or an agent profile.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::cert_group::CertGroupPolicy;
 use bootroot::config::{DaemonProfileSettings, Paths, Settings};
+use bootroot::fs_util::{StagedDurability, StagedMode, StagedOwner};
 use bootroot::input_validation::{validate_dns_label, validate_domain_name};
 use bootroot::registrar::internal::{InternalPaths, PrivateKeyPem, load_internal_config};
 use bootroot::registrar::{
@@ -565,7 +569,8 @@ fn ensure_distinct_outputs(cert_path: &Path, key_path: &Path, bundle_path: &Path
 /// read, when the issuance fails, or when the material cannot be
 /// published. Nothing is written at the caller's paths unless every one
 /// of those steps succeeded: the destinations that a failed publication
-/// had already replaced are put back as they were.
+/// had already replaced are put back as they were, at the modes and
+/// under the ownership they carried.
 pub(crate) async fn run_registrar_issue(
     args: &RegistrarIssueArgs,
     messages: &Messages,
@@ -750,7 +755,7 @@ impl Destinations {
     }
 }
 
-/// A future one publication step or one rollback write runs as.
+/// A future one publication step runs as.
 ///
 /// Boxed so a step can be held as an ordinary function pointer, which
 /// is what lets [`publish_with_steps`] be driven with a step that fails
@@ -805,45 +810,105 @@ fn publish_pair<'a>(dest: &'a Destinations, material: &'a StagedMaterial) -> Pub
 enum PriorState {
     /// Nothing was there. A rollback removes what this run published.
     Absent,
-    /// The bytes that were there. A rollback writes them back.
+    /// The file that was there. A rollback puts it back.
+    Present(PriorFile),
+}
+
+/// The file one destination held, captured whole.
+///
+/// The bytes alone are not the file. A rollback that wrote them back
+/// through this surface's own writers would republish them at *this
+/// surface's* modes and under the invoking process's ownership, which
+/// is a change and not a restoration: a certificate an operator had
+/// tightened to `0640` comes back world-readable, and a key a service
+/// account owned comes back owned by root. The mode and the ownership
+/// are captured beside the contents so what a failed run puts back is
+/// the file that was there.
+struct PriorFile {
+    /// The bytes that were there.
     ///
     /// Held as [`PrivateKeyPem`] for all three destinations and not
     /// only for the key: the wrapper's hand-written `Debug` is what
     /// keeps a snapshot of a private key out of any formatted value,
     /// and one type for the three means a destination added later
     /// cannot quietly be the one that is not wrapped.
-    Present(PrivateKeyPem),
+    contents: PrivateKeyPem,
+    /// The permission bits it carried.
+    mode: u32,
+    /// The uid that owned it.
+    uid: u32,
+    /// The gid that owned it.
+    gid: u32,
 }
 
-/// A destination, what it held, and the writer that puts that back.
+/// A destination and what it held.
 struct Restorable {
     /// The destination this run replaces.
     path: PathBuf,
     /// What it held beforehand.
     prior: PriorState,
-    /// The writer that republishes `prior` at the mode the file needs —
-    /// the same one that published over it, so a rolled-back file comes
-    /// back at the mode it had rather than at whatever a generic write
-    /// would give it.
-    restore: for<'a> fn(&'a Path, &'a str) -> PublishFuture<'a>,
 }
 
-/// Republishes a CA bundle, at `0644`.
-fn restore_bundle<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
-    Box::pin(async move { fs_util::write_ca_bundle(path, contents, CertGroupPolicy::none()).await })
-}
-
-/// Republishes a certificate, at `0644`.
-fn restore_cert<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
-    Box::pin(async move {
-        bootroot::cert_group::write_cert_file(path, contents, CertGroupPolicy::none()).await
+/// Puts one captured file back: its bytes at its own mode, then its own
+/// ownership.
+///
+/// The mode travels with the staged inode and lands with the rename, so
+/// the destination is never observable at a mode wider than the one it
+/// is being restored to. The ownership is re-established afterwards —
+/// the staging publisher's arm that states a uid and a gid is the
+/// library's protected-file policy and is not reachable from here — and
+/// a chown that would change nothing is skipped, so a root run putting
+/// back a root-owned file makes no privileged call at all. The window
+/// in between carries this process's own ownership at the file's own
+/// mode, which is what a rollback that did not restore ownership would
+/// leave behind permanently.
+///
+/// # Errors
+///
+/// Returns an error when the bytes cannot be republished or when the
+/// ownership cannot be put back — the `EPERM` an unprivileged run gets
+/// for a file some other account owned. Either leaves the path named in
+/// the rollback's own diagnostic.
+async fn restore_prior(path: &Path, prior: &PriorFile) -> Result<()> {
+    let dest = path.to_path_buf();
+    let contents = prior.contents.clone();
+    let (mode, uid, gid) = (prior.mode, prior.uid, prior.gid);
+    tokio::task::spawn_blocking(move || {
+        fs_util::publish_staged_blocking(
+            &dest,
+            contents.expose().as_bytes(),
+            StagedMode::Policy(mode),
+            StagedOwner::WritingProcess,
+            StagedDurability::RenameOnly,
+        )
+        .with_context(|| format!("restoring {} from its snapshot", dest.display()))?;
+        restore_ownership(&dest, uid, gid)
     })
+    .await
+    .context("the rollback restore task panicked")?
 }
 
-/// Republishes a private key, at `0600`.
-fn restore_key<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
-    Box::pin(async move {
-        bootroot::cert_group::write_key_file(path, contents, CertGroupPolicy::none()).await
+/// Puts a restored file back under the uid and gid it was owned by.
+///
+/// # Errors
+///
+/// Returns an error when the restored file cannot be stat'ed, or when
+/// the `chown` is refused.
+fn restore_ownership(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    let current = std::fs::metadata(path).with_context(|| {
+        format!(
+            "reading the ownership back off the restored {}",
+            path.display()
+        )
+    })?;
+    if current.uid() == uid && current.gid() == gid {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| {
+        format!(
+            "restoring the ownership of {} to uid {uid} gid {gid}",
+            path.display()
+        )
     })
 }
 
@@ -851,18 +916,33 @@ fn restore_key<'a>(path: &'a Path, contents: &'a str) -> PublishFuture<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error when the path is there and cannot be read. A
-/// destination that does not exist is not an error — it is the first
-/// provisioning, and the rollback for it is a removal.
+/// Returns an error when the path is there and its contents, mode or
+/// ownership cannot be read. A destination that does not exist is not
+/// an error — it is the first provisioning, and the rollback for it is
+/// a removal.
 async fn snapshot_destination(path: &Path) -> Result<PriorState> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(contents) => Ok(PriorState::Present(PrivateKeyPem::new(contents))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PriorState::Absent),
-        Err(err) => Err(anyhow::Error::new(err).context(format!(
-            "reading the existing {} back before replacing it",
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(PriorState::Absent),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "reading the existing {} back before replacing it",
+                path.display()
+            )));
+        }
+    };
+    let metadata = tokio::fs::metadata(path).await.with_context(|| {
+        format!(
+            "reading the mode and ownership of the existing {} before replacing it",
             path.display()
-        ))),
-    }
+        )
+    })?;
+    Ok(PriorState::Present(PriorFile {
+        contents: PrivateKeyPem::new(contents),
+        mode: metadata.mode() & 0o7777,
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+    }))
 }
 
 /// Publishes the staged material at the caller's paths, or leaves them
@@ -905,17 +985,14 @@ async fn publish_with_steps(
         Restorable {
             prior: snapshot_destination(&dest.bundle).await?,
             path: dest.bundle.clone(),
-            restore: restore_bundle,
         },
         Restorable {
             prior: snapshot_destination(&dest.cert).await?,
             path: dest.cert.clone(),
-            restore: restore_cert,
         },
         Restorable {
             prior: snapshot_destination(&dest.key).await?,
             path: dest.key.clone(),
-            restore: restore_key,
         },
     ];
 
@@ -942,7 +1019,7 @@ async fn roll_back(prior: &[Restorable], err: anyhow::Error) -> anyhow::Error {
     let mut stranded: Vec<String> = Vec::new();
     for entry in prior.iter().rev() {
         let outcome = match &entry.prior {
-            PriorState::Present(contents) => (entry.restore)(&entry.path, contents.expose()).await,
+            PriorState::Present(prior) => restore_prior(&entry.path, prior).await,
             PriorState::Absent => match tokio::fs::remove_file(&entry.path).await {
                 Err(remove) if remove.kind() != std::io::ErrorKind::NotFound => {
                     Err(anyhow::Error::new(remove))

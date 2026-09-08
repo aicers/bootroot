@@ -926,3 +926,127 @@ async fn a_failure_writing_the_key_puts_the_certificate_back() {
         previous.cert_pem
     );
 }
+
+/// Returns a file's uid and gid.
+fn owner_of(path: &Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).expect("stat");
+    (meta.uid(), meta.gid())
+}
+
+/// Sets a file's permission bits.
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// A rollback restores the mode each destination actually carried, not
+/// the one this surface's writers establish. An operator who tightened
+/// the certificate, or a deployment whose key is `0400`, gets that file
+/// back — the previous test cannot see the difference, because every
+/// file it starts from was written by those same fixed-mode writers.
+#[tokio::test]
+async fn a_late_publication_failure_puts_back_the_modes_the_files_had() {
+    let dir = TempDir::new().expect("tempdir");
+    let args = issue_args(
+        dir.path().join("registrar.pem"),
+        dir.path().join("registrar-key.pem"),
+        dir.path().join("secrets"),
+    );
+    let previous = staged_material("previous");
+    publish_material(&args, &previous, &crate::i18n::test_messages())
+        .await
+        .expect("the previous publication");
+
+    // None of the three is the mode `publish_bundle` and `publish_pair`
+    // write, so a rollback that went back through them is visible.
+    let bundle = ca_bundle_path_for(&args.cert_path);
+    chmod(&args.cert_path, 0o640);
+    chmod(&args.key_path, 0o400);
+    chmod(&bundle, 0o600);
+
+    let steps: Vec<PublishStep> = vec![publish_bundle, publish_pair, fail_after_publishing];
+    publish_with_steps(
+        &Destinations::from_args(&args),
+        &staged_material("new"),
+        &steps,
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .expect_err("the induced failure");
+
+    assert_eq!(
+        std::fs::read_to_string(&args.cert_path).expect("cert"),
+        previous.cert_pem
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args.key_path).expect("key"),
+        previous.key_pem.expose()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bundle).expect("bundle"),
+        previous.bundle_pem
+    );
+    assert_eq!(mode_of(&args.cert_path), 0o640, "the certificate's mode");
+    assert_eq!(mode_of(&args.key_path), 0o400, "the key's mode");
+    assert_eq!(mode_of(&bundle), 0o600, "the bundle's mode");
+}
+
+/// The snapshot carries the ownership beside the mode, and a rollback
+/// re-establishes it. An unprivileged test cannot hand a file to
+/// another account, so what is asserted here is the restore's own
+/// contract: putting back the ids the snapshot captured is a no-op
+/// exactly when they are the ones the file already carries, and any
+/// other pair reaches the `chown` — which is the call that would have
+/// been absent altogether before.
+#[tokio::test]
+async fn a_rollback_re_establishes_the_ownership_it_captured() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("registrar-key.pem");
+    std::fs::write(&path, "previous").expect("seed the destination");
+    chmod(&path, 0o400);
+
+    let PriorState::Present(prior) = snapshot_destination(&path).await.expect("snapshot") else {
+        panic!("an existing destination was captured as absent");
+    };
+    assert_eq!(prior.mode, 0o400, "the captured mode");
+    assert_eq!(
+        (prior.uid, prior.gid),
+        owner_of(&path),
+        "the captured ownership"
+    );
+
+    chmod(&path, 0o644);
+    std::fs::write(&path, "the failed run's file").expect("replace the destination");
+    restore_prior(&path, &prior).await.expect("restore");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("read"), "previous");
+    assert_eq!(mode_of(&path), 0o400);
+
+    // A uid the file does not carry is what an operator-owned
+    // destination looks like to a rollback. An unprivileged process
+    // cannot grant it, and the refusal is what puts the path in the
+    // "check by hand" list rather than leaving it silently re-owned.
+    // Root can grant it, so the assertion is the one that holds for the
+    // process actually running the test.
+    let elsewhere = PriorFile {
+        contents: prior.contents.clone(),
+        mode: prior.mode,
+        uid: prior.uid.wrapping_add(1),
+        gid: prior.gid,
+    };
+    let outcome = restore_prior(&path, &elsewhere).await;
+    if bootroot::fs_util::current_process_euid() == 0 {
+        outcome.expect("root can hand the file to another uid");
+        assert_eq!(
+            owner_of(&path),
+            (elsewhere.uid, elsewhere.gid),
+            "the captured ownership was not re-established"
+        );
+    } else {
+        assert!(
+            outcome.is_err(),
+            "an unprivileged chown to another uid must be reported, not skipped"
+        );
+    }
+}

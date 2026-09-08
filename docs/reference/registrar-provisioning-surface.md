@@ -184,13 +184,19 @@ published only once every byte of it is in hand, so a run that fails part-way
 leaves no half-written pair at the caller's paths.
 
 Publication itself is reversible. The three destinations are read back before
-the first is replaced, and a failure part-way through puts every one that was
-already replaced back as it was — at the mode it had, and removing, on a first
-provisioning, the files the failed run created. Without that, a key write
-failing after the certificate write succeeded would leave the new leaf beside
-the previous key: a pair that is complete, readable and useless, with nothing on
-disk saying so. A rollback that cannot itself complete names the files to check
-by hand in the error, and does not replace the reason the run failed.
+the first is replaced — their bytes, their permission bits and their ownership —
+and a failure part-way through puts every one that was already replaced back as
+it was: the contents it held, at the mode it carried and under the uid and gid
+that owned it, and removing, on a first provisioning, the files the failed run
+created. What was there is restored rather than republished: a certificate an
+operator had tightened to `0640` does not come back world-readable because that
+is the mode this verb writes at, and a key some other account owned does not
+come back owned by the process whose run failed. Without any of that, a key
+write failing after the certificate write succeeded would leave the new leaf
+beside the previous key: a pair that is complete, readable and useless, with
+nothing on disk saying so. A rollback that cannot itself complete — including
+one whose `chown` an unprivileged run is refused — names the files to check by
+hand in the error, and does not replace the reason the run failed.
 
 Re-invocation re-issues into the same paths, with a fresh key every time.
 

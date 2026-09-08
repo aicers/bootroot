@@ -30,7 +30,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   destinations must be distinct files, checked before anything is issued. The
   material is staged and published only once all of it exists, and a
   publication that fails part-way puts back every destination it had already
-  replaced, so a run that fails leaves no half-written pair. Only the initial
+  replaced — its contents, at the mode and under the ownership it carried — so
+  a run that fails leaves no half-written pair. Only the initial
   credential is issued;
   renewal remains the daemon's, under its own internal credential.
 - An enabled registrar endpoint now remains responsive when its

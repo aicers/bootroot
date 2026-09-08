@@ -2859,10 +2859,14 @@ With `--json`, one JSON object on stdout:
   published only once every byte of it is in hand, so a run that fails part-way
   leaves no half-written pair at the caller's paths
 - Publication is reversible. The three destinations are read back before the
-  first is replaced, and a failure part-way through puts every one that was
-  already replaced back as it was — removing, on a first provisioning, the files
-  the failed run created. A rollback that cannot complete names the files to
-  check by hand in the error
+  first is replaced — their bytes, their permission bits and their ownership —
+  and a failure part-way through puts every one that was already replaced back
+  as it was: the contents it held, at the mode it carried and under the uid and
+  gid that owned it, and removing, on a first provisioning, the files the failed
+  run created. A certificate tightened by hand does not come back at this verb's
+  own `0644`, and a key another account owned does not come back owned by the
+  run that failed. A rollback that cannot complete names the files to check by
+  hand in the error
 - Re-invocation re-issues into the same paths, with a fresh key every time
 
 ### Failure conditions
