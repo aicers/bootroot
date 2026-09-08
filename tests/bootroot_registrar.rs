@@ -40,6 +40,11 @@ const TEST_DOMAIN: &str = "corp.example.internal";
 const OTHER_DOMAIN: &str = "other.internal";
 const TEST_EMAIL: &str = "ops@example.internal";
 
+/// The EAB a deployment provisioned through `bootroot-remote bootstrap`
+/// carries in its bootroot-internal registrar configuration.
+const TEST_EAB_KID: &str = "registrar-provisioning-eab-kid";
+const TEST_EAB_HMAC: &str = "cmVnaXN0cmFyLXByb3Zpc2lvbmluZy1lYWI";
+
 /// clap's exit code for a usage error, the code a caller tells a surface
 /// that disagrees from one that has not shipped by.
 const USAGE_EXIT: i32 = 2;
@@ -505,6 +510,31 @@ impl Drop for TlsAcmeProxy {
 struct Observed {
     csrs: Mutex<Vec<Vec<u8>>>,
     orders: AtomicUsize,
+    /// The decoded payload of every `newAccount` registration, so a test
+    /// can assert what the issuance bound its account with.
+    accounts: Mutex<Vec<serde_json::Value>>,
+}
+
+/// Records the account registration payload and answers as step-ca does.
+struct AccountResponder {
+    observed: Arc<Observed>,
+    location: String,
+}
+
+impl Respond for AccountResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if let Some(payload) = decode_jws_payload(&request.body) {
+            self.observed
+                .accounts
+                .lock()
+                .expect("the account log is intact")
+                .push(payload);
+        }
+        ResponseTemplate::new(201)
+            .insert_header("replay-nonce", "nonce")
+            .insert_header("Location", self.location.as_str())
+            .set_body_json(serde_json::json!({ "status": "valid" }))
+    }
 }
 
 /// Pending on the first fetch, so the HTTP-01 challenge is published,
@@ -602,11 +632,21 @@ impl Respond for OrderResponder {
 }
 
 fn decode_jws_field(body: &[u8], field: &str) -> Option<Vec<u8>> {
-    let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let payload = envelope.get("payload")?.as_str()?;
-    let decoded = base64_url_decode(payload)?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let value = decode_jws_payload(body)?;
     base64_url_decode(value.get(field)?.as_str()?)
+}
+
+/// Decodes a JWS envelope's `payload` as JSON.
+fn decode_jws_payload(body: &[u8]) -> Option<serde_json::Value> {
+    let envelope: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let decoded = base64_url_decode(envelope.get("payload")?.as_str()?)?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// Decodes a JWS envelope's `protected` header as JSON.
+fn decode_jws_protected(envelope: &serde_json::Value) -> Option<serde_json::Value> {
+    let decoded = base64_url_decode(envelope.get("protected")?.as_str()?)?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 fn base64_url_decode(value: &str) -> Option<Vec<u8>> {
@@ -652,12 +692,10 @@ async fn start_acme(ca: Arc<TestCa>) -> AcmeFixture {
 
     Mock::given(method("POST"))
         .and(path_matcher("/new-account"))
-        .respond_with(
-            ResponseTemplate::new(201)
-                .insert_header("replay-nonce", "nonce")
-                .insert_header("Location", format!("{base}/account/1").as_str())
-                .set_body_json(serde_json::json!({ "status": "valid" })),
-        )
+        .respond_with(AccountResponder {
+            observed: Arc::clone(&observed),
+            location: format!("{base}/account/1"),
+        })
         .mount(&acme)
         .await;
 
@@ -736,6 +774,13 @@ struct Host {
 
 impl Host {
     fn new(ca: &TestCa, acme: &AcmeFixture) -> Self {
+        Self::with_eab(ca, acme, None)
+    }
+
+    /// The same host, with an `[eab]` in its bootroot-internal registrar
+    /// configuration — the state `bootroot-remote bootstrap` leaves on a
+    /// deployment whose step-ca requires external account binding.
+    fn with_eab(ca: &TestCa, acme: &AcmeFixture, eab: Option<(&str, &str)>) -> Self {
         let dir = TempDir::new().expect("tempdir");
         let secrets = dir.path().join("secrets");
 
@@ -750,6 +795,7 @@ impl Host {
 
         let internal = InternalPaths::new(&secrets);
         std::fs::create_dir_all(internal.dir()).expect("the internal directory");
+        let eab_hmac = eab.map(|(_, hmac)| bootroot::secret::HmacSecret::from(hmac));
         std::fs::write(
             internal.agent_config(),
             render_internal_agent_config(
@@ -761,8 +807,8 @@ impl Host {
                     hostname: TEST_HOST,
                     responder_url: &acme.responder_url,
                     responder_hmac: &"registrar-provisioning-hmac".into(),
-                    eab_kid: None,
-                    eab_hmac: None,
+                    eab_kid: eab.map(|(kid, _)| kid),
+                    eab_hmac: eab_hmac.as_ref(),
                     trusted_ca_sha256: &ca.fingerprints(),
                 },
             ),
@@ -1024,6 +1070,19 @@ async fn an_unprovisioned_host_is_refused_before_anything_is_written() {
         stderr.contains("bootroot-internal registrar configuration"),
         "the refusal must name what is missing: {stderr}"
     );
+    assert!(
+        stderr.contains(&internal.agent_config().display().to_string()),
+        "the refusal must name the file that is not there: {stderr}"
+    );
+    // Absence, not malformation. `load_internal_config` cannot tell the
+    // two apart — an absent config source deserializes as an empty one —
+    // so a host that has never been provisioned would otherwise be
+    // reported as a file "expected exactly one profile, found 0", which
+    // describes contents no file has.
+    assert!(
+        !stderr.contains("expected exactly one profile"),
+        "an absent configuration must not be reported as a malformed one: {stderr}"
+    );
     assert!(!host.cert_path().exists(), "no certificate is published");
     assert!(!host.key_path().exists(), "no key is published");
     assert!(!host.bundle_path().exists(), "no bundle is published");
@@ -1036,6 +1095,108 @@ async fn an_unprovisioned_host_is_refused_before_anything_is_written() {
         acme.observed.orders.load(Ordering::Relaxed),
         0,
         "the ACME path is never reached"
+    );
+}
+
+/// A configuration that is present but no longer describes the internal
+/// identity is a different refusal from an absent one: the file is
+/// named, and the reason is what is wrong with its contents.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_internal_configuration_is_refused_on_its_contents() {
+    let ca = Arc::new(TestCa::new());
+    let acme = start_acme(Arc::clone(&ca)).await;
+    let host = Host::new(&ca, &acme);
+
+    let secrets = host.secrets_dir();
+    let internal = InternalPaths::new(&secrets);
+    let config = std::fs::read_to_string(internal.agent_config()).expect("the configuration");
+    // The one profile removed, leaving a file that parses and describes
+    // no identity — the shape an absent file must not be reported as.
+    let truncated = config
+        .split_once("[[profiles]]")
+        .expect("the generated configuration carries a profile")
+        .0
+        .to_string();
+    std::fs::write(internal.agent_config(), truncated).expect("rewrite the configuration");
+
+    let (_stdout, stderr, code) = host.issue(TEST_DOMAIN).await;
+
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("expected exactly one profile"),
+        "a present configuration is refused on its contents: {stderr}"
+    );
+    assert!(!host.cert_path().exists(), "no certificate is published");
+    assert!(!host.key_path().exists(), "no key is published");
+    assert_eq!(
+        acme.observed.orders.load(Ordering::Relaxed),
+        0,
+        "the ACME path is never reached"
+    );
+}
+
+/// A deployment whose step-ca requires external account binding carries
+/// an `[eab]` in its bootroot-internal registrar configuration, and that
+/// is the one the issuance registers its account with.
+///
+/// The verb drops `[eab]` from the settings it builds and passes the
+/// credentials as an argument instead, so that there is one source for
+/// them rather than a second that could go stale invisibly. This asserts
+/// the argument arrives: without it, an account registration on a real
+/// EAB-requiring step-ca would be rejected, and every assertion in the
+/// other issuance tests would still pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_eab_binds_the_issuances_account() {
+    let ca = Arc::new(TestCa::new());
+    let acme = start_acme(Arc::clone(&ca)).await;
+    let host = Host::with_eab(&ca, &acme, Some((TEST_EAB_KID, TEST_EAB_HMAC)));
+
+    let (_stdout, stderr, code) = host.issue(TEST_DOMAIN).await;
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let accounts = acme
+        .observed
+        .accounts
+        .lock()
+        .expect("the account log is intact");
+    let payload = accounts.first().expect("the account was registered");
+    let binding = payload
+        .get("externalAccountBinding")
+        .expect("the registration carries an externalAccountBinding");
+    let protected =
+        decode_jws_protected(binding).expect("the binding's protected header decodes as JSON");
+    assert_eq!(
+        protected["kid"], TEST_EAB_KID,
+        "the binding names the configured EAB key: {protected}"
+    );
+    assert_eq!(
+        payload["contact"],
+        serde_json::json!([format!("mailto:{TEST_EMAIL}")]),
+        "the contact is the deployment's, from the same configuration"
+    );
+}
+
+/// With no `[eab]` in the configuration the registration carries no
+/// binding, so the field is not fabricated on a deployment that
+/// registered none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unconfigured_eab_binds_nothing() {
+    let ca = Arc::new(TestCa::new());
+    let acme = start_acme(Arc::clone(&ca)).await;
+    let host = Host::new(&ca, &acme);
+
+    let (_stdout, stderr, code) = host.issue(TEST_DOMAIN).await;
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let accounts = acme
+        .observed
+        .accounts
+        .lock()
+        .expect("the account log is intact");
+    let payload = accounts.first().expect("the account was registered");
+    assert!(
+        payload.get("externalAccountBinding").is_none(),
+        "no binding is sent when none is configured: {payload}"
     );
 }
 

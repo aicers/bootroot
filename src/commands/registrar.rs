@@ -239,9 +239,13 @@ fn resolve_socket_path(explicit: Option<&Path>, unit_dirs: &[PathBuf]) -> Result
 /// Parsed the way systemd reads a unit: `[Section]` headers, `Key=Value`
 /// lines, `#` and `;` comments, and a key that may legally repeat. An
 /// **empty** assignment resets the list, which is systemd's own
-/// semantics and the one way a later drop-in cancels an earlier value;
-/// the first value still standing afterwards is the one the endpoint is
+/// semantics — the form a drop-in cancels an earlier value with; the
+/// first value still standing afterwards is the one the endpoint is
 /// served on.
+///
+/// The unit file alone, which is what this surface reports: `.d/`
+/// drop-ins beside it are not read. A deployment that moves the socket
+/// moves it in the unit, and a caller is told what that unit binds.
 fn listen_stream(unit: &str) -> Option<String> {
     let mut section = String::new();
     let mut values: Vec<String> = Vec::new();
@@ -405,7 +409,25 @@ async fn issue_into_staging(
     identity: &str,
     messages: &Messages,
 ) -> Result<StagedMaterial> {
-    let internal = load_internal_config(&InternalPaths::new(secrets_dir)).with_context(|| {
+    let internal_paths = InternalPaths::new(secrets_dir);
+    // Absence is its own refusal, and is separated from malformation
+    // here because `load_internal_config` cannot tell them apart: a
+    // config source that is not there deserializes as an empty one, so
+    // an unprovisioned host is reported as a file "expected exactly one
+    // profile, found 0" — a diagnostic about the contents of a file that
+    // does not exist. This is the state a provisioning tool finds when
+    // it probes before `bootroot init` has enabled the endpoint, and it
+    // is the one it must be able to act on.
+    let config_path = internal_paths.agent_config();
+    if !config_path.exists() {
+        anyhow::bail!(
+            "this host carries no bootroot-internal registrar configuration at {}, so there are \
+             no ACME inputs to issue {identity} from; run `bootroot init` with \
+             `[registrar_endpoint] enabled = true` first",
+            config_path.display()
+        );
+    }
+    let internal = load_internal_config(&internal_paths).with_context(|| {
         format!(
             "reading the ACME inputs for {identity} from the bootroot-internal registrar \
              configuration below {}",

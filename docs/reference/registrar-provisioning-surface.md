@@ -77,9 +77,10 @@ one under `/usr`:
 /usr/lib/systemd/system
 ```
 
-The first unit found carrying a `[Socket] ListenStream=` answers. With none
-installed anywhere, the answer is the `ListenStream=` of the unit this build
-ships (`systemd/bootroot-registrar.socket`, embedded at compile time), which is
+The first unit found carrying a `[Socket] ListenStream=` answers, read from the
+unit file alone — `.d/` drop-ins beside it are not merged. With none installed
+anywhere, the answer is the `ListenStream=` of the unit this build ships
+(`systemd/bootroot-registrar.socket`, embedded at compile time), which is
 `/run/bootroot/registrar.sock`. `--socket-unit <path>` names a unit directly and
 is authoritative: a file that cannot be read, or one carrying no
 `ListenStream=`, is a refusal rather than a fall-through.
