@@ -2633,9 +2633,14 @@ registrar 자격 증명을 발급받을 수 있는 상태인지 판단할 때 �
   우선순위(`/etc/systemd/system`, `/run/systemd/system`,
   `/usr/local/lib/systemd/system`, `/lib/systemd/system`,
   `/usr/lib/systemd/system`)로 탐색하고, 가장 먼저 발견한 유닛 파일이 그 아래
-  유닛들을 가립니다. 그 위에 모든 유닛 디렉터리의
-  `bootroot-registrar.socket.d/*.conf` 드롭인을 병합하므로,
-  `systemctl edit bootroot-registrar.socket`으로 작성한 재정의도 반영됩니다.
+  유닛들을 가립니다. 그 위에는 systemd가 그 유닛에 적용할 모든 드롭인을 모든
+  유닛 디렉터리에서 병합합니다. 유닛 자체의
+  `bootroot-registrar.socket.d/*.conf`(`systemctl edit
+  bootroot-registrar.socket`이 재정의를 쓰는 곳), 유닛 이름에서 파생되는
+  `bootroot-.socket.d/*.conf`, 그리고 호스트의 모든 소켓 유닛에 적용되는
+  타입 전역 `socket.d/*.conf`가 여기에 해당합니다. 이름이 같은 드롭인은 하나로
+  취급하여 더 구체적인 디렉터리 쪽이 이기며, `/dev/null`을 가리키는 심볼릭 링크
+  드롭인은 설정을 더하지 않은 채 아래쪽 동명 드롭인을 가립니다.
   설치된 유닛이 아무 데도 없으면 이 빌드가 포함한 유닛의 `ListenStream=`으로
   답합니다. 엔드포인트 경로를 지정하는 설정 키는 없으며, 데몬은 systemd가
   전달한 디스크립터에서 자신의 경로를 학습합니다.

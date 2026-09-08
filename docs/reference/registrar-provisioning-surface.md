@@ -85,13 +85,21 @@ resolves it rather than read off one file:
   unit file, so a higher-precedence unit that binds nothing is not passed over —
   reporting a lower-precedence unit's path would name a socket this host does not
   bind.
-- The `bootroot-registrar.socket.d/*.conf` drop-ins from **every** directory in
-  that list are merged on top of it, which is how an override written by
-  `systemctl edit bootroot-registrar.socket` reaches the answer. Two drop-ins of
-  the same filename are one drop-in: the highest-precedence directory's copy
-  applies and the rest are discarded, and what is left applies sorted by
-  filename. A bare `ListenStream=` resets the list, as it does in systemd, so a
-  drop-in that resets and rebinds wins outright.
+- Every drop-in systemd would apply to that unit is merged on top of it, from
+  **every** directory in that list: the unit's own
+  `bootroot-registrar.socket.d/*.conf`, which is where `systemctl edit
+  bootroot-registrar.socket` writes its override; the dash-truncated
+  `bootroot-.socket.d/*.conf` systemd derives from the unit's name; and the
+  type-wide `socket.d/*.conf` that alters every socket unit on the host. Two
+  drop-ins of the same filename are one drop-in: the highest-precedence
+  directory's copy applies and the rest are discarded, with a name-specific
+  directory outranking the type-wide one and a unit directory earlier in the
+  list outranking a later one. What is left applies sorted by filename,
+  wherever each came from. A drop-in symlinked to `/dev/null` is systemd's own
+  mask: it takes the name out of the merge without contributing a setting,
+  which is how a type-wide drop-in is cancelled for this unit alone. A bare
+  `ListenStream=` resets the list, as it does in systemd, so a drop-in that
+  resets and rebinds wins outright.
 - An installed unit that binds nothing once its drop-ins are merged is a
   refusal, as is a unit or a drop-in that is present and cannot be read.
 
@@ -104,10 +112,6 @@ that fallback: a drop-in with no unit to extend is inert in systemd too.
 unit systemd has loaded, so no drop-in is merged onto it, and a file that cannot
 be read or one carrying no `ListenStream=` is a refusal rather than a
 fall-through.
-
-The type-wide `socket.d/` drop-in directory, which every socket unit on the host
-shares, is not read. A `ListenStream=` there would bind every socket unit on the
-host to one path, so it is not a configuration this reports for.
 
 **A caller reports what bootroot answers rather than comparing it against a
 value derived from its own layout.** The answer is what is true of this host.

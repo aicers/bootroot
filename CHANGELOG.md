@@ -17,9 +17,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   so it answers with the endpoint disabled and with no daemon running; the
   pathname is the installed socket unit's effective `ListenStream=`, resolved
   as systemd resolves it — the unit directories in systemd's own precedence
-  order, with the `.d` drop-ins merged on top, so a `systemctl edit` override
-  is reflected — falling back to the unit bootroot ships when no unit is
-  installed.
+  order, with every drop-in systemd would apply merged on top (the unit's own
+  `.d`, its dash-truncated prefix, and the type-wide `socket.d`), so a
+  `systemctl edit` override is reflected — falling back to the unit bootroot
+  ships when no unit is installed.
   `bootroot registrar issue --host <label> --domain <domain> --cert-path <p>
   --key-path <p> --json` issues the registrar's client credential into those
   paths with the CA bundle as the certificate path's sibling, at the modes

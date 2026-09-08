@@ -2774,9 +2774,14 @@ With `--json`, one JSON object on stdout:
   systemd's own precedence order (`/etc/systemd/system`, `/run/systemd/system`,
   `/usr/local/lib/systemd/system`, `/lib/systemd/system`,
   `/usr/lib/systemd/system`); the first unit file found masks the ones below it,
-  and the `bootroot-registrar.socket.d/*.conf` drop-ins from every unit
-  directory are merged on top of it, so an override written by `systemctl edit
-  bootroot-registrar.socket` is reflected here. With no unit installed anywhere,
+  and every drop-in systemd would apply to it is merged on top, from every unit
+  directory — the unit's own `bootroot-registrar.socket.d/*.conf`, where
+  `systemctl edit bootroot-registrar.socket` writes its override, the
+  dash-truncated `bootroot-.socket.d/*.conf`, and the type-wide `socket.d/*.conf`
+  that alters every socket unit on the host. Drop-ins of the same filename are
+  one drop-in, the more specific directory winning, and a drop-in symlinked to
+  `/dev/null` masks the ones below it without contributing a setting. With no
+  unit installed anywhere,
   the answer is the `ListenStream=` of the unit this build ships. No
   configuration key names the endpoint's path, and the daemon learns its own
   from the descriptor systemd hands it.

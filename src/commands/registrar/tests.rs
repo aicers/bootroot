@@ -240,14 +240,31 @@ fn capabilities_is_independent_of_configuration_and_of_a_running_daemon() {
 // Drop-ins
 // ---------------------------------------------------------------------
 
-/// Writes a drop-in `name` beside the unit in `dir`.
-fn write_dropin(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let dropin_dir = dir.join(format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}"));
+/// Writes a drop-in `name` into `dropin_dir` under the unit directory
+/// `dir` — the unit's own `.d`, a dash-truncated one, or the type-wide
+/// `socket.d`.
+fn write_dropin_in(dir: &Path, dropin_dir: &str, name: &str, body: &str) -> PathBuf {
+    let dropin_dir = dir.join(dropin_dir);
     std::fs::create_dir_all(&dropin_dir).expect("create the drop-in directory");
     let path = dropin_dir.join(name);
     std::fs::write(&path, body).expect("write the drop-in");
     path
 }
+
+/// Writes a drop-in `name` into the unit's own `.d` directory in `dir`.
+fn write_dropin(dir: &Path, name: &str, body: &str) -> PathBuf {
+    write_dropin_in(
+        dir,
+        &format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}"),
+        name,
+        body,
+    )
+}
+
+/// The type-wide drop-in directory every socket unit on the host
+/// shares, and the dash-truncated one this unit's name generates.
+const TYPE_DROPIN_DIR: &str = "socket.d";
+const DASH_DROPIN_DIR: &str = "bootroot-.socket.d";
 
 /// The override `systemctl edit bootroot-registrar.socket` writes: the
 /// unit's value is reset and another is bound. Reporting the unit file
@@ -366,6 +383,235 @@ fn a_named_unit_is_not_extended_by_drop_ins() {
     let response = capabilities(Some(&unit), &[dir.path().to_path_buf()]).expect("capabilities");
 
     assert_eq!(response.socket_path, "/run/named/registrar.sock");
+}
+
+/// systemd honours a top-level `socket.d/`, which alters every socket
+/// unit on the host. An operator who resets and rebinds
+/// `ListenStream=` there has moved this host's socket, and reporting
+/// the unit's own path would name one nothing is listening on.
+#[test]
+fn a_type_wide_drop_in_rebinds_the_socket() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin_in(
+        dir.path(),
+        TYPE_DROPIN_DIR,
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/type-wide/registrar.sock\n",
+    );
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/type-wide/registrar.sock");
+}
+
+/// A type-wide drop-in in a lower-precedence directory reaches a unit
+/// found higher up, exactly as a unit-specific one does.
+#[test]
+fn a_type_wide_drop_in_below_the_unit_still_applies() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    write_socket_unit(high.path(), "/run/packaged/registrar.sock");
+    write_dropin_in(
+        low.path(),
+        TYPE_DROPIN_DIR,
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/type-below/registrar.sock\n",
+    );
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let response = capabilities(None, &dirs).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/type-below/registrar.sock");
+}
+
+/// The dash-truncated `bootroot-.socket.d/`, which systemd derives from
+/// the unit's own name, applies too.
+#[test]
+fn a_dash_prefix_drop_in_applies() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin_in(
+        dir.path(),
+        DASH_DROPIN_DIR,
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/dash-prefix/registrar.sock\n",
+    );
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/dash-prefix/registrar.sock");
+}
+
+/// Equally named drop-ins are one drop-in, and the more specific
+/// directory wins: the unit's own beats the dash-truncated one, which
+/// beats the type-wide one.
+#[test]
+fn the_more_specific_drop_in_directory_wins_the_name() {
+    for (weaker, expected) in [
+        (DASH_DROPIN_DIR, "/run/from-the-unit/registrar.sock"),
+        (TYPE_DROPIN_DIR, "/run/from-the-unit/registrar.sock"),
+    ] {
+        let dir = TempDir::new().expect("tempdir");
+        write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+        write_dropin(
+            dir.path(),
+            "override.conf",
+            "[Socket]\nListenStream=\nListenStream=/run/from-the-unit/registrar.sock\n",
+        );
+        write_dropin_in(
+            dir.path(),
+            weaker,
+            "override.conf",
+            "[Socket]\nListenStream=\nListenStream=/run/from-the-generic/registrar.sock\n",
+        );
+
+        let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+        assert_eq!(response.socket_path, expected, "weaker directory {weaker}");
+    }
+}
+
+/// A type-wide drop-in is ordered among the rest by filename, wherever
+/// it came from: a `20-` in `socket.d/` lands after a `10-` in the
+/// unit's own directory.
+#[test]
+fn a_type_wide_drop_in_applies_in_filename_order() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        dir.path(),
+        "10-early.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/early/registrar.sock\n",
+    );
+    write_dropin_in(
+        dir.path(),
+        TYPE_DROPIN_DIR,
+        "20-late.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/late/registrar.sock\n",
+    );
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/late/registrar.sock");
+}
+
+/// systemd's own way of cancelling a drop-in for one unit is a symlink
+/// to `/dev/null` of the same name in a higher-precedence directory. It
+/// masks by occupying the name, so the type-wide file below it never
+/// applies and the unit's own value stands.
+#[test]
+fn a_dev_null_symlink_masks_a_type_wide_drop_in() {
+    let dir = TempDir::new().expect("tempdir");
+    write_socket_unit(dir.path(), "/run/packaged/registrar.sock");
+    write_dropin_in(
+        dir.path(),
+        TYPE_DROPIN_DIR,
+        "10-all.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/type-wide/registrar.sock\n",
+    );
+    let masked = dir
+        .path()
+        .join(format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}"))
+        .join("10-all.conf");
+    std::fs::create_dir_all(masked.parent().expect("the drop-in directory"))
+        .expect("create the drop-in directory");
+    std::os::unix::fs::symlink("/dev/null", &masked).expect("mask the drop-in");
+
+    let response = capabilities(None, &[dir.path().to_path_buf()]).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/packaged/registrar.sock");
+}
+
+/// The same mask reaches a lower-precedence directory's copy of the
+/// name: a `/dev/null` symlink under `/etc` neutralises the packaged
+/// drop-in below it, and the unit's own value stands.
+#[test]
+fn a_dev_null_mask_neutralises_a_lower_precedence_drop_in() {
+    let high = TempDir::new().expect("tempdir");
+    let low = TempDir::new().expect("tempdir");
+    write_socket_unit(low.path(), "/run/packaged/registrar.sock");
+    write_dropin(
+        low.path(),
+        "override.conf",
+        "[Socket]\nListenStream=\nListenStream=/run/masked/registrar.sock\n",
+    );
+    let masked = high
+        .path()
+        .join(format!("{SOCKET_UNIT_FILE}{DROPIN_DIR_SUFFIX}"))
+        .join("override.conf");
+    std::fs::create_dir_all(masked.parent().expect("the drop-in directory"))
+        .expect("create the drop-in directory");
+    std::os::unix::fs::symlink("/dev/null", &masked).expect("mask the drop-in");
+
+    let dirs = vec![high.path().to_path_buf(), low.path().to_path_buf()];
+    let response = capabilities(None, &dirs).expect("capabilities");
+
+    assert_eq!(response.socket_path, "/run/packaged/registrar.sock");
+}
+
+/// The drop-in directory names, in systemd's own order: the unit's own
+/// first, then the names generated by truncating after each dash, and
+/// the type-wide one is not among them because it is searched apart,
+/// after every unit directory has contributed these.
+#[test]
+fn the_drop_in_names_follow_systemds_prefix_hierarchy() {
+    assert_eq!(
+        unit_dropin_names(SOCKET_UNIT_FILE),
+        vec![SOCKET_UNIT_FILE.to_string(), "bootroot-.socket".to_string()]
+    );
+    assert_eq!(
+        unit_dropin_names("foo-bar-baz.service"),
+        vec![
+            "foo-bar-baz.service".to_string(),
+            "foo-bar-.service".to_string(),
+            "foo-.service".to_string()
+        ]
+    );
+    // A trailing dash is chopped once rather than emitted, and a
+    // leading one ends the hierarchy.
+    assert_eq!(
+        unit_dropin_names("foo--.service"),
+        vec!["foo--.service".to_string(), "foo-.service".to_string()]
+    );
+    assert_eq!(
+        unit_dropin_names("-foo.service"),
+        vec!["-foo.service".to_string()]
+    );
+    assert_eq!(
+        unit_dropin_names("plain.service"),
+        vec!["plain.service".to_string()]
+    );
+}
+
+/// Every directory systemd would search, in the order it searches them:
+/// each unit directory contributes the unit's own `.d` and then its
+/// dash-truncated prefixes, and the type-wide directories come last
+/// across all of them, because that one is meant to be overridden by
+/// anything named after the unit.
+#[test]
+fn the_drop_in_directories_are_in_systemds_precedence_order() {
+    let dirs = vec![
+        PathBuf::from("/etc/systemd/system"),
+        PathBuf::from("/run/systemd/system"),
+    ];
+
+    let resolved: Vec<String> = dropin_dirs(&dirs)
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+
+    assert_eq!(
+        resolved,
+        vec![
+            "/etc/systemd/system/bootroot-registrar.socket.d",
+            "/etc/systemd/system/bootroot-.socket.d",
+            "/run/systemd/system/bootroot-registrar.socket.d",
+            "/run/systemd/system/bootroot-.socket.d",
+            "/etc/systemd/system/socket.d",
+            "/run/systemd/system/socket.d",
+        ]
+    );
 }
 
 /// systemd loads exactly one unit file, so the highest-precedence one
