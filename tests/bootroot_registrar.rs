@@ -984,6 +984,16 @@ async fn issue_writes_a_recognized_registrar_client_credential() {
     let body: serde_json::Value = serde_json::from_str(stdout.trim()).expect("a JSON body");
     let expected_identity =
         registrar_client_identity(REGISTRAR_SURFACE_INSTANCE, TEST_HOST, TEST_DOMAIN);
+    // The body is these three fields and no others: a caller reads the
+    // surface by field name, so a field silently gained or renamed is a
+    // wire change whether or not the three below still answer.
+    let fields: Vec<&str> = body
+        .as_object()
+        .expect("the body is a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(fields, ["api_version", "identity", "not_after"]);
     assert_eq!(body["api_version"], "bootroot.registrar.v1");
     assert_eq!(body["identity"], expected_identity);
     let not_after = body["not_after"].as_str().expect("not_after is a string");
