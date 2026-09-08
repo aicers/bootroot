@@ -388,6 +388,8 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_ca_key_registrar_internal_repair: "[4단계 후속] 새 루트로 bootroot 내부 registrar 자격 증명을 교체합니다...",
     rotate_registrar_internal_complete: "bootroot 내부 registrar 자격 증명을 복구했습니다. 에이전트에 재로드 신호를 보냈습니다.",
     rotate_registrar_internal_up_to_date: "bootroot 내부 registrar 자격 증명이 완전하며 현재 루트로 발급되었습니다. 복구할 항목이 없습니다. 그래도 교체하려면 --force를 사용하세요.",
+    registrar_capabilities_summary: "registrar 표면 {api_version}: {socket_path}에서 제공되며 {verbs} 동사를 포함합니다.",
+    registrar_issue_complete: "registrar 클라이언트 자격 증명 {identity}을(를) 발급했습니다. 만료: {not_after}.",
     prompt_rotate_registrar_internal: "bootroot 내부 registrar 자격 증명(인증 항목, 리프, 저장된 루트 지문)을 교체할까요?",
     rotate_ca_key_phase_reissue: "[5단계] 서비스 인증서 재발급 중...",
     rotate_ca_key_phase_finalize: "[6단계] trust 확정 중(축소)...",

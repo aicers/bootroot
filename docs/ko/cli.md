@@ -29,6 +29,8 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 - `bootroot clean`
 - `bootroot openbao save-unseal-keys`
 - `bootroot openbao delete-unseal-keys`
+- `bootroot registrar capabilities`
+- `bootroot registrar issue`
 - `bootroot monitoring`
 - `bootroot-remote bootstrap`
 - `bootroot-remote apply-secret-id`
@@ -2596,6 +2598,125 @@ bootroot openbao save-unseal-keys
 
 ```bash
 bootroot openbao delete-unseal-keys
+```
+
+## bootroot registrar capabilities
+
+이 빌드가 제공하는 registrar 표면을 보고합니다. 프로비저닝 도구가 bootroot에서
+registrar 자격 증명을 발급받을 수 있는 상태인지 판단할 때 사용합니다.
+
+읽기 전용이며 부수 효과가 없습니다. 런타임이 아니라 *표면*을 설명하므로, 이
+호스트에서 `[registrar_endpoint] enabled` 설정 여부나 `bootroot-agent` 실행
+여부와 관계없이 응답합니다.
+
+### 입력
+
+- `--socket-unit`: systemd 유닛 디렉터리에서 `bootroot-registrar.socket`을 찾는
+  대신 `ListenStream=`을 읽어 올 소켓 유닛 경로
+- `--json`: 사람이 읽는 요약 대신 기계 판독용 본문 출력
+
+### 출력
+
+`--json`을 주면 stdout에 JSON 객체 하나를 출력합니다.
+
+```json
+{
+  "api_version": "bootroot.registrar.v1",
+  "socket_path": "/run/bootroot/registrar.sock",
+  "verbs": ["registrar.issue", "registrar.mint", "registrar.deregister"]
+}
+```
+
+- `api_version`은 와이어 식별자이며 번역하지 않습니다
+- `socket_path`는 설치된 소켓 유닛의 `ListenStream=` 값이며, systemd 자체 우선
+  순위(`/etc/systemd/system`, `/run/systemd/system`,
+  `/usr/local/lib/systemd/system`, `/lib/systemd/system`,
+  `/usr/lib/systemd/system`)로 탐색합니다. 설치된 유닛이 없으면 이 빌드가
+  포함한 유닛의 `ListenStream=`으로 답합니다. 엔드포인트 경로를 지정하는 설정
+  키는 없으며, 데몬은 systemd가 전달한 디스크립터에서 자신의 경로를 학습합니다.
+- `verbs`는 표면이 제공하는 모든 동사를 고정된 순서로 나열합니다
+
+### 실패 조건
+
+- `--socket-unit`이 읽을 수 없는 파일이거나 `[Socket] ListenStream=`이 없는
+  유닛을 가리키는 경우
+
+### 예시
+
+```bash
+bootroot registrar capabilities --json
+```
+
+## bootroot registrar issue
+
+registrar의 클라이언트 자격 증명
+(`001.bootroot-registrar.<host>.<domain>`)을 프로비저닝 도구가 지정한 경로에
+발급하고, CA 번들은 인증서 경로의 형제 파일 `ca-bundle.pem`으로 기록합니다.
+`bootroot service add --cert-path`와 동일한 배치입니다.
+
+**최초** 자격 증명만 발급합니다. 갱신은 데몬이 자체 bootroot 내부 자격 증명으로
+수행하며, 이 명령은 타이머·AppRole·에이전트 프로필을 설치하지 않습니다.
+
+식별자는 아래 구성 요소로부터 bootroot가 직접 조합합니다. 조합된 이름을 받는
+플래그는 존재하지 않으므로, 인증서의 식별자와 엔드포인트 검증기가 인식하는
+식별자가 어긋날 수 없습니다.
+
+### 입력
+
+- `--host`: bootroot 호스트의 단일 DNS 레이블 (필수) — 조합된 이름이나 FQDN이
+  아닙니다
+- `--domain`: 배포 도메인 (필수). 레이블 개수와 무관한 접미사입니다
+- `--cert-path`: 인증서 출력 경로 (필수)
+- `--key-path`: 개인 키 출력 경로 (필수)
+- `--secrets-dir`: 시크릿 디렉터리 (기본값 `secrets`)
+- `--json`: 사람이 읽는 요약 대신 기계 판독용 본문 출력
+
+ACME 입력(step-ca 디렉터리 URL, 연락 이메일, HTTP-01 응답기 엔드포인트와 HMAC,
+계정 EAB)은 `<secrets-dir>` 아래의 렌더링된 bootroot 내부 registrar 설정에서,
+신뢰 앵커는 그 옆의 배포 CA 인증서에서 읽습니다. OpenBao 토큰은 필요하지
+않습니다.
+
+### 출력
+
+`service add`가 정하는 모드로 파일 세 개를 기록합니다.
+
+| 파일 | 모드 |
+| --- | --- |
+| `--cert-path` (리프 + 발급자 체인) | `0644` |
+| `--key-path` | `0600` |
+| `--cert-path` 옆의 `ca-bundle.pem` | `0644` |
+
+`--json`을 주면 stdout에 JSON 객체 하나를 출력합니다.
+
+```json
+{
+  "api_version": "bootroot.registrar.v1",
+  "identity": "001.bootroot-registrar.h1.example.internal",
+  "not_after": "2026-10-08T12:00:00.000Z"
+}
+```
+
+### 동작
+
+- 자재는 `--secrets-dir` 아래 스테이징 디렉터리에 발급된 뒤 모든 내용이 준비된
+  후에만 게시되므로, 중간에 실패해도 호출자 경로에 반쯤 기록된 쌍이 남지 않습니다
+- 재실행하면 같은 경로에 재발급하며, 키는 매번 새로 생성됩니다
+
+### 실패 조건
+
+- `--host`가 단일 DNS 레이블이 아니거나 `--domain`이 유효한 DNS 이름이 아닌 경우
+- 이 호스트에 ACME 입력을 읽어 올 bootroot 내부 registrar 설정이 없는 경우
+- 배포 CA 인증서를 읽을 수 없는 경우
+- 발급이 실패하거나, 반환된 체인에 고정되지 않은 지문이 포함된 경우
+
+### 예시
+
+```bash
+bootroot registrar issue \
+  --host h1 --domain example.internal \
+  --cert-path /opt/roxyd/registrar/registrar-cert.pem \
+  --key-path /opt/roxyd/registrar/registrar-key.pem \
+  --json
 ```
 
 ## bootroot-remote (원격 bootstrap 실행 파일)

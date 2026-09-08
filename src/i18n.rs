@@ -6,6 +6,7 @@ pub(crate) mod en;
 pub(crate) mod infra;
 pub(crate) mod init;
 pub(crate) mod ko;
+pub(crate) mod registrar;
 pub(crate) mod reinit;
 pub(crate) mod rotate;
 pub(crate) mod service;
@@ -401,6 +402,8 @@ pub(crate) struct Strings {
     pub(crate) rotate_ca_key_registrar_internal_repair: &'static str,
     pub(crate) rotate_registrar_internal_complete: &'static str,
     pub(crate) rotate_registrar_internal_up_to_date: &'static str,
+    pub(crate) registrar_capabilities_summary: &'static str,
+    pub(crate) registrar_issue_complete: &'static str,
     pub(crate) prompt_rotate_registrar_internal: &'static str,
     pub(crate) rotate_ca_key_phase_reissue: &'static str,
     pub(crate) rotate_ca_key_phase_finalize: &'static str,
