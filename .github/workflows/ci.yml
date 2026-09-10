@@ -62,12 +62,69 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           fi
 
+  markdown:
+    name: Markdown
+    runs-on: ubuntu-latest
+    steps:
+      # Standalone and ungated, which is how every other consumer of
+      # aicers/agent-instructions carries this. Both steps used to be part
+      # of `check`, thirteenth and last of some twenty steps, behind `cargo
+      # clippy`, `cargo doc`, `ruff` and `biome ci` -- so any of those
+      # failing hid the Markdown result entirely, and a change that broke
+      # two things was told about one.
+      #
+      # No `needs:` and no `if:`, and here that is not a precaution but the
+      # point. `changes` counts `**/*.md` as documentation and AGENTS.md
+      # matches it, so a pull request confined to a generated region is
+      # docs-only -- `test-core` and the Docker E2E matrix skip,
+      # `test-registrar-redteam-docs` is gated the other way, and a drift
+      # check behind any of them would be skipped on exactly the change that
+      # causes drift.
+      #
+      # `biome ci`, `ruff` and `check-docs.sh` stay in `check`. Keeping
+      # biome there is the fleet's arrangement rather than an oversight --
+      # agentcoop, aice-web-next and aimer-web all do it while keeping a
+      # separate `Markdown` job -- and `check-docs.sh` builds the manual,
+      # which is not a lint.
+      #
+      # `ubuntu-latest`, like every other job here. This is not a runner
+      # move: the self-hosted fleet is for the private repositories, where
+      # hosted minutes cost money.
+      - uses: actions/checkout@v7
+        id: checkout
+
+      # Recursive. The action's default glob is `*.{md,markdown}` --
+      # repository root only -- so anything added under a directory would
+      # go unlinted without this.
+      - name: Run Markdown Lint
+        uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: "**/*.md"
+
+      # The drift check moved here from `check` with the same reference and
+      # the same guard. `@main` because the scripts are mechanism and come
+      # from wherever this reference points, while the blocks are content
+      # and come from the pin in `.agent-instructions.toml`; no `with:`
+      # block because both the release to compare against and the blocks to
+      # compare are read from that one file.
+      #
+      # Guarded rather than left to the default `success()`, which would
+      # skip it whenever the lint above failed. The two are independent -- a
+      # drifted block is drift whether or not some other Markdown file also
+      # breaks a rule -- and a short-circuit would hide drift on the changes
+      # that touch the most Markdown. `!cancelled()` rather than `always()`,
+      # because a cancelled run should stop. The `checkout` clause keeps a
+      # failed checkout from being reported as drift: the action fails
+      # outright when it cannot read the pin file, and in an empty workspace
+      # that message names the pin for a problem that is not the pin's.
+      - uses: aicers/agent-instructions/check-drift@main
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+
   check:
     name: Quality Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        id: checkout
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -110,11 +167,6 @@ jobs:
       - name: Run Biome (Config/JSON Check)
         run: biome ci --error-on-warnings .
 
-      - name: Run Markdown Lint
-        uses: DavidAnson/markdownlint-cli2-action@v24
-        with:
-          globs: "**/*.md"
-
       - name: Check Docs
         run: ./scripts/check-docs.sh
 
@@ -138,56 +190,6 @@ jobs:
 
       - name: Run Security Audit
         run: cargo audit
-
-      # The shared instruction-block drift check, which used to be a job of
-      # its own calling `check-drift.yml` as a reusable workflow. Actions is
-      # free on a public repository, so nothing was being billed for it;
-      # what it cost was a job -- a scheduling slot and a row in every run,
-      # and this is the busiest consumer on the list -- for nine seconds of
-      # byte comparison. As a step it runs inside a job that already exists,
-      # and the fleet's other consumers carry it the same way.
-      #
-      # `check` rather than one of the test jobs, because the step must not
-      # inherit the `docs_only` gate. `changes` counts `**/*.md` as
-      # documentation and AGENTS.md is a `.md` file, so a pull request that
-      # edits only a generated region is docs-only by that reckoning:
-      # `test-core` and the Docker E2E matrix would skip the check on
-      # exactly the changes that cause drift, and
-      # `test-registrar-redteam-docs`, gated the other way, would skip it on
-      # every pull request that touches any code. This job carries no `if:`
-      # at all, and it is already where the Markdown lint runs. There is no
-      # `Markdown` job here to put it in, as there is in the other
-      # consumers.
-      #
-      # Last in the job, after `cargo audit`, and guarded rather than left
-      # to the default `success()` -- which would skip it whenever any of
-      # the twenty steps above failed, clippy, ruff, biome, the validation
-      # scripts and the audit among them. As a job it reported regardless,
-      # and it should: a drifted block is drift whether or not something
-      # else is also unhappy. This job has more ways to fail before reaching
-      # this step than any other in the fleet, which is why the guard
-      # matters more here.
-      #
-      # `!cancelled()` rather than `always()`: a cancelled run should stop,
-      # not keep checking. The `checkout` clause is what keeps a failed
-      # checkout from being reported as drift -- the action fails outright
-      # when it cannot read `.agent-instructions.toml`, and in an empty
-      # workspace that message names the pin for a problem that is not the
-      # pin's.
-      #
-      # `@main`, as the workflow reference was. The scripts are mechanism
-      # and come from wherever this reference points; the blocks are content
-      # and come from the pin in `.agent-instructions.toml`. Pinning the
-      # action to a release would freeze the check's implementation at
-      # whatever shipped beside those blocks.
-      #
-      # No `with:` block. The release to compare against and the blocks to
-      # compare are both read from `.agent-instructions.toml`, so they have
-      # one source rather than two that can disagree, and the apply job that
-      # rewrites them never has to touch `.github/workflows/` -- which the
-      # default GITHUB_TOKEN may not push to.
-      - uses: aicers/agent-instructions/check-drift@main
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
 
   test-core:
     name: Unit & CLI Smoke
