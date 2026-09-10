@@ -62,27 +62,12 @@ jobs:
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # Ungated and unconditional: AGENTS.md is itself Markdown, so a
-  # documentation-only change is exactly the change that can edit a
-  # generated region.
-  #
-  # No `with:` block. The release to compare against and the blocks to
-  # compare are both read from `.agents/instructions.toml`, so they have one
-  # source rather than two that can disagree, and the apply job that
-  # rewrites them never has to touch `.github/workflows/` -- which the
-  # default GITHUB_TOKEN may not push to. The pin is a release tag rather
-  # than a branch, so an edit upstream reaches this repository through the
-  # pull request that moves it instead of turning every unrelated pull
-  # request red.
-  instructions:
-    name: Instructions
-    uses: aicers/agent-instructions/.github/workflows/check-drift.yml@main
-
   check:
     name: Quality Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        id: checkout
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -153,6 +138,56 @@ jobs:
 
       - name: Run Security Audit
         run: cargo audit
+
+      # The shared instruction-block drift check, which used to be a job of
+      # its own calling `check-drift.yml` as a reusable workflow. Actions is
+      # free on a public repository, so nothing was being billed for it;
+      # what it cost was a job -- a scheduling slot and a row in every run,
+      # and this is the busiest consumer on the list -- for nine seconds of
+      # byte comparison. As a step it runs inside a job that already exists,
+      # and the fleet's other consumers carry it the same way.
+      #
+      # `check` rather than one of the test jobs, because the step must not
+      # inherit the `docs_only` gate. `changes` counts `**/*.md` as
+      # documentation and AGENTS.md is a `.md` file, so a pull request that
+      # edits only a generated region is docs-only by that reckoning:
+      # `test-core` and the Docker E2E matrix would skip the check on
+      # exactly the changes that cause drift, and
+      # `test-registrar-redteam-docs`, gated the other way, would skip it on
+      # every pull request that touches any code. This job carries no `if:`
+      # at all, and it is already where the Markdown lint runs. There is no
+      # `Markdown` job here to put it in, as there is in the other
+      # consumers.
+      #
+      # Last in the job, after `cargo audit`, and guarded rather than left
+      # to the default `success()` -- which would skip it whenever any of
+      # the twenty steps above failed, clippy, ruff, biome, the validation
+      # scripts and the audit among them. As a job it reported regardless,
+      # and it should: a drifted block is drift whether or not something
+      # else is also unhappy. This job has more ways to fail before reaching
+      # this step than any other in the fleet, which is why the guard
+      # matters more here.
+      #
+      # `!cancelled()` rather than `always()`: a cancelled run should stop,
+      # not keep checking. The `checkout` clause is what keeps a failed
+      # checkout from being reported as drift -- the action fails outright
+      # when it cannot read `.agent-instructions.toml`, and in an empty
+      # workspace that message names the pin for a problem that is not the
+      # pin's.
+      #
+      # `@main`, as the workflow reference was. The scripts are mechanism
+      # and come from wherever this reference points; the blocks are content
+      # and come from the pin in `.agent-instructions.toml`. Pinning the
+      # action to a release would freeze the check's implementation at
+      # whatever shipped beside those blocks.
+      #
+      # No `with:` block. The release to compare against and the blocks to
+      # compare are both read from `.agent-instructions.toml`, so they have
+      # one source rather than two that can disagree, and the apply job that
+      # rewrites them never has to touch `.github/workflows/` -- which the
+      # default GITHUB_TOKEN may not push to.
+      - uses: aicers/agent-instructions/check-drift@main
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
 
   test-core:
     name: Unit & CLI Smoke

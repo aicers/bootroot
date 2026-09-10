@@ -2,7 +2,7 @@ name: Update shared instructions
 
 # Proposes the latest release of aicers/agent-instructions as a pull
 # request: it rewrites the marked regions in AGENTS.md and moves the pin in
-# `.agents/instructions.toml`. A run that finds this repository already on
+# `.agent-instructions.toml`. A run that finds this repository already on
 # the latest release opens nothing.
 #
 # No `with:` and no `secrets:`, deliberately. Which blocks this repository
