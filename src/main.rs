@@ -289,3 +289,10 @@ mod tests {
         assert!(error.to_string().contains("symbolic link"));
     }
 }
+
+// Temporary: a deliberate clippy failure, so CI can be observed reporting it
+// alongside a Markdown lint failure in the same push. Reverted next commit.
+fn _ci_probe() -> i32 {
+    let x = 1;
+    x + 0
+}
