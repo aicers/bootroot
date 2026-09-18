@@ -325,6 +325,8 @@ byte for byte.
 
 ### Security
 
+- Updated `rustls` to 0.23.45 so TLS 1.3 handshakes reject messages that
+  cross encryption-level boundaries within the same record.
 - Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258
   (unbounded buffering of empty HTTP/2 DATA frames, which lets a peer
   drive a connection's memory use without bound).
