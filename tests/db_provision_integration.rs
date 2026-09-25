@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+#[path = "../src/runtime_image_declaration.rs"]
+mod runtime_image_declaration;
+
 mod unix_integration {
     use std::net::TcpListener;
     use std::process::{Command, Output};
@@ -11,6 +14,9 @@ mod unix_integration {
     use bootroot::utils::generate_secret;
     use postgres::NoTls;
 
+    /// The `PostgreSQL` image step-ca's database runs, per the runtime
+    /// declaration.
+    const POSTGRES_IMAGE: &str = "postgres:18.4";
     const DB_USER: &str = "itest";
     const DB_NAME: &str = "postgres";
     const PROVISION_DB_USER: &str = "stepca_user";
@@ -81,7 +87,7 @@ mod unix_integration {
                 &format!("POSTGRES_DB={DB_NAME}"),
                 "-p",
                 &port_mapping,
-                "postgres:18.4",
+                POSTGRES_IMAGE,
             ]))?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -171,7 +177,16 @@ mod unix_integration {
     }
 
     #[test]
-    #[ignore = "Requires local Docker and postgres:18.4 image"]
+    fn the_test_image_is_the_declared_postgres_image() {
+        super::runtime_image_declaration::assert_declared_image(
+            "postgres",
+            POSTGRES_IMAGE,
+            "tests/db_provision_integration.rs POSTGRES_IMAGE",
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires local Docker and the declared PostgreSQL image"]
     fn provision_db_sync_creates_and_updates_role_password() -> Result<()> {
         let container = PostgresContainer::start()?;
         let admin_dsn = container.admin_dsn();

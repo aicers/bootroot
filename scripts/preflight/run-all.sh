@@ -11,6 +11,12 @@ echo "--- ci/check.sh ---"
 echo "--- validate-deploy-compose.sh ---"
 "$SCRIPT_DIR/../validate-deploy-compose.sh"
 
+echo "--- validate-runtime-images.sh ---"
+"$SCRIPT_DIR/../validate-runtime-images.sh"
+
+echo "--- validate-deploy-no-build-smoke.sh ---"
+"$SCRIPT_DIR/../validate-deploy-no-build-smoke.sh"
+
 echo "--- validate-compose-instance-names.sh ---"
 "$SCRIPT_DIR/../validate-compose-instance-names.sh"
 

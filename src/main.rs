@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 mod cli;
 mod commands;
 mod i18n;
+#[cfg(test)]
+mod runtime_image_declaration;
 mod state;
 #[cfg(test)]
 mod test_support;

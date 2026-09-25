@@ -15,6 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[cfg(unix)]
 mod support;
 
+#[path = "../src/runtime_image_declaration.rs"]
+mod runtime_image_declaration;
+
 const SERVICE_NAME: &str = "edge-proxy";
 const ROLE_NAME: &str = "bootroot-service-edge-proxy";
 const ROLE_ID: &str = "role-edge-proxy";
@@ -90,13 +93,23 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
         .copied()
         .collect::<Vec<_>>();
     assert_eq!(change_pass_lines.len(), 2, "docker log:\n{docker_args_log}");
-    for line in change_pass_lines {
+    for line in &change_pass_lines {
         assert!(line.contains(" -f"), "docker log line missing -f: {line}");
         assert!(
             line.contains("--password-file") && line.contains("--new-password-file"),
             "docker log line missing password file args: {line}"
         );
     }
+    // Both helper calls — the root key's and the intermediate key's —
+    // run the declared step-ca image.
+    assert_eq!(
+        change_pass_keys_on_declared_image(&change_pass_lines),
+        vec![
+            "/home/step/secrets/root_ca_key",
+            "/home/step/secrets/intermediate_ca_key"
+        ],
+        "docker log:\n{docker_args_log}"
+    );
 
     // Verify restart OBA-stepca comes BEFORE compose restart step-ca
     let oba_restart_idx = lines
@@ -128,6 +141,33 @@ async fn test_rotate_stepca_password_passes_force_flag_to_change_pass() {
     let rendered =
         fs::read_to_string(secrets_dir.join("password.txt")).expect("read rendered password.txt");
     assert_eq!(rendered, "new-pass-123");
+}
+
+/// Returns the key path each `step crypto change-pass` line re-encrypts,
+/// asserting that the image each one ran, read back from the argv it
+/// actually passed to docker, is the declared step-ca image.
+fn change_pass_keys_on_declared_image<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    lines
+        .iter()
+        .map(|line| {
+            let args: Vec<&str> = line.split_whitespace().collect();
+            let image = args
+                .iter()
+                .skip_while(|arg| **arg != "-v")
+                .nth(2)
+                .unwrap_or_else(|| panic!("no image after the `-v <mount>` pair: {line}"));
+            runtime_image_declaration::assert_declared_image(
+                "step-ca",
+                image,
+                "rotate stepca-password change-pass",
+            );
+            args.iter()
+                .skip_while(|arg| **arg != "change-pass")
+                .nth(1)
+                .copied()
+                .unwrap_or_else(|| panic!("no key path after change-pass: {line}"))
+        })
+        .collect()
 }
 
 #[cfg(unix)]

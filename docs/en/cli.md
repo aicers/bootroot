@@ -597,25 +597,79 @@ random PostgreSQL password) and creates the `secrets/` and `certs/`
 directories.
 
 Every image reference in the deploy compose is interpolated from an
-environment variable so an installer can pin an exact release tag or a
-`@sha256:` digest — for example `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
-`BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE`. Set them in `.env`
-or the process environment; unset variables fall back to the release-built
-defaults. `BOOTROOT_HTTP01_IMAGE` is read by the default
-`docker-compose.yml` too, where it names the tag the responder build is
-written to — that is how two installs on one host avoid building over each
-other's image; unset, it is `bootroot-http01-responder:latest` as before.
-
-For production and air-gapped installs, pin
-`BOOTROOT_STEP_CA_IMAGE` to a `@sha256:` digest rather than the `0.30.2`
-tag: step-ca is the CA, its default is now a third-party image under a
-mutable tag, and smallstep publishes cosign signatures for its images, so a
-digest gives you an immutable, verifiable reference.
+environment variable — `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
+`BOOTROOT_STEP_CA_IMAGE`, and `BOOTROOT_HTTP01_IMAGE` — so an installer can
+name the images its archives restore. Set them in `.env` or the process
+environment; unset variables fall back to the release defaults.
+`BOOTROOT_HTTP01_IMAGE` is read by the default `docker-compose.yml` too,
+where it names the tag the responder build is written to — that is how two
+installs on one host avoid building over each other's image; unset, it is
+`bootroot-http01-responder:latest` as before.
 
 `--no-build` implies `--pull never`, so `infra install` never contacts a
 registry in this mode: an absent image fails the install loudly rather than
 being silently fetched from the network (defeating the air gap) or
 substituted for the preloaded release payload.
+
+#### Runtime image pins
+
+The registry images the default stack runs are pinned in
+`deploy/runtime-images.json`, one entry per runtime role:
+
+- `openbao` — `docker.io/openbao/openbao`, tag `2.5.5`: the OpenBao server
+  and the `openbao-agent-stepca` / `openbao-agent-responder` sidecars
+  `init` generates.
+- `postgres` — `docker.io/library/postgres`, tag `18.4`: step-ca's
+  database.
+- `step-ca` — `docker.io/smallstep/step-ca`, tag `0.30.2`: the CA server,
+  and the init, TLS, rotation and ownership helper containers.
+
+Each entry also records a SemVer comparison version (`18.4.0` for
+PostgreSQL's `18.4` tag), the approved registry index digest, and the
+supported platforms. The pins live there, not in the Compose values:
+
+- Release preparation pulls each image by its digest for the release
+  platform (`docker pull --platform linux/amd64 <repository>@<digest>`),
+  tags it with the lookup tag the Compose defaults and the helper
+  containers name (`openbao/openbao:2.5.5`, `postgres:18.4`,
+  `smallstep/step-ca:0.30.2`), and saves the archive from that tag.
+- An offline install runs exactly the tags the archives restore. Leave the
+  image variables unset or set them to those tags. Do not put a `@sha256:`
+  reference in `BOOTROOT_STEP_CA_IMAGE` or any other image variable for an
+  offline install: `docker save` / `docker load` does not guarantee that the
+  registry digest survives as a RepoDigest, so the reference may not
+  resolve against the loaded image. Digest references remain fine for
+  online Docker use outside this flow.
+- These lookup tags are today's names. bootler's release tooling will
+  later normalize offline image references to per-product aliases
+  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<full-config-hash>`);
+  bootroot does not implement that migration yet, and the OpenBao Agent and
+  step-ca helper images are still the fixed lookup tags above.
+
+The declaration covers the default production stack only. The monitoring
+services (`prometheus`, `grafana`, `grafana-public`, behind the `lan` and
+`public` profiles) are outside it and their images are not declared;
+shipping monitoring would need its own product decision and declaration.
+The HTTP-01 responder image is built by bootroot rather than pulled, and the
+responder Dockerfile's `rust` and `debian` bases are build inputs, so none
+of them is declared. The initial pins support `linux/amd64` only: an
+`aarch64` release is blocked until arm64 is selected, evidenced and tested
+explicitly.
+
+`scripts/validate-runtime-images.sh` checks the declaration's format and
+that every default Compose service, and each image reference bootroot runs
+itself, matches it. A service running a declared role must pull its image,
+not build it, and must not request a platform other than `linux/amd64`. It
+reads no registry.
+
+Changing a pin — a new tag, or a new digest for the same tag — is a source
+change: edit `deploy/runtime-images.json` in a new commit, together with the
+Compose defaults and code references for a tag change. Approving pins for a
+product release is a separate gate. The product owners approve the exact
+bootroot revision and pins after exact-image compatibility tests (PostgreSQL
+provisioning; step-ca issuance, renewal and database rotation; OpenBao
+server, Agent template rendering and credential rotation). A successful
+pull, a matching version or a passing schema check is not that approval.
 
 ## bootroot init
 

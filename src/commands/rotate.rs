@@ -27,6 +27,9 @@ pub(super) const ROLE_ID_FILENAME: &str = "role_id";
 /// ownership sweep reuses it so it adds no dependency the flow did not
 /// already have (unlike the compose step-ca *server* image, which is not
 /// present on the air-gapped rotate host).
+///
+/// It is the `step-ca` entry of `deploy/runtime-images.json`; a test
+/// holds it to the declaration.
 pub(super) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca:0.30.2";
 pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 pub(super) const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
@@ -415,6 +418,18 @@ mod tests {
             .status()
             .expect("the fake docker must be spawnable");
         assert!(status.success(), "the fake docker must exit 0");
+    }
+
+    /// Every `rotate` flow's `step` helpers and ownership sweep run
+    /// `STEP_CA_HELPER_IMAGE`, and `init`'s TLS helpers reuse it, so it
+    /// must be the step-ca image the runtime declaration approves.
+    #[test]
+    fn the_step_ca_helper_image_is_the_declared_step_ca_image() {
+        crate::runtime_image_declaration::assert_declared_image(
+            "step-ca",
+            super::STEP_CA_HELPER_IMAGE,
+            "rotate::STEP_CA_HELPER_IMAGE",
+        );
     }
 
     /// A space-joined encoding cannot tell one argument holding a space

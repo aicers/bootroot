@@ -39,9 +39,10 @@ use crate::i18n::Messages;
 
 const INIT_AGENT_TOKEN_PATH: &str = "/openbao/secrets/openbao/token";
 const OPENBAO_AGENT_SECRETS_MOUNT: &str = "/openbao/secrets";
-// Keep in sync with the `openbao` service image in docker-compose.yml and
-// docker-compose.deploy.yml so the Agents run the same OpenBao build as the
-// server they authenticate against.
+// The `openbao` entry of deploy/runtime-images.json, which the `openbao`
+// service defaults in docker-compose.yml and docker-compose.deploy.yml also
+// follow, so the Agents run the same OpenBao build as the server they
+// authenticate against. A test holds it to the declaration.
 const OPENBAO_AGENT_IMAGE: &str = "openbao/openbao:2.5.5";
 
 pub(super) async fn bootstrap_openbao(
@@ -1236,6 +1237,58 @@ services:
         // Loopback / no-TLS path keeps http and adds no CA env.
         assert!(contents.contains("VAULT_ADDR=http://openbao:8200"));
         assert!(!contents.contains("VAULT_CACERT"));
+    }
+
+    /// The `OpenBao` Agent sidecars run the `OpenBao` image the runtime
+    /// declaration approves: both the constant and every `image:` the
+    /// generated Compose override actually carries.
+    #[tokio::test]
+    async fn generated_agent_sidecars_run_the_declared_openbao_image() {
+        crate::runtime_image_declaration::assert_declared_image(
+            "openbao",
+            OPENBAO_AGENT_IMAGE,
+            "init OPENBAO_AGENT_IMAGE",
+        );
+
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(
+            &compose_file,
+            "services:\n  openbao:\n    image: openbao/openbao\n",
+        )
+        .unwrap();
+
+        let override_path = write_openbao_agent_compose_override(
+            &compose_file,
+            &secrets_dir,
+            "http://openbao:8200",
+            &ComposeIdentity::for_instance("bootroot"),
+            &test_messages(),
+        )
+        .await
+        .unwrap()
+        .expect("override path");
+        let contents = fs::read_to_string(&override_path).unwrap();
+
+        let images: Vec<&str> = contents
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("image:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            images.len(),
+            2,
+            "one image per sidecar (stepca, responder): {contents}"
+        );
+        for image in images {
+            crate::runtime_image_declaration::assert_declared_image(
+                "openbao",
+                image,
+                "init OpenBao Agent compose override",
+            );
+        }
     }
 
     #[test]

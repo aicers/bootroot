@@ -580,24 +580,79 @@ bootroot infra install \
 PostgreSQL 비밀번호 포함) 생성과 `secrets/`, `certs/` 디렉터리 생성은
 `infra install`이 직접 수행합니다.
 
-배포용 compose의 모든 이미지 참조는 환경 변수에서 주입되므로, 설치
-도구가 정확한 릴리스 태그나 `@sha256:` 다이제스트를 고정할 수
-있습니다 — 예를 들어 `OPENBAO_IMAGE`, `POSTGRES_IMAGE`,
-`BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE`. `.env`나 프로세스
-환경에 설정하며, 설정하지 않은 변수는 릴리스 빌드 기본값으로
-대체됩니다. `BOOTROOT_HTTP01_IMAGE`는 기본 `docker-compose.yml`도 읽습니다.
-그곳에서는 응답기 빌드가 기록되는 태그 이름이 되며, 한 호스트의 두 설치가
-서로의 이미지를 덮어쓰지 않는 방법입니다. 설정하지 않으면 이전과 같이
-`bootroot-http01-responder:latest`입니다. 운영 및 에어갭 설치에서는 `BOOTROOT_STEP_CA_IMAGE`를
-`0.30.2` 태그가 아니라 `@sha256:` 다이제스트로 고정하세요. step-ca는
-CA이며, 이제 기본값이 변경 가능한 태그의 서드파티 이미지이고, smallstep은
-이미지에 대한 cosign 서명을 게시하므로, 다이제스트로 고정하면 변하지 않는
-검증 가능한 참조를 얻을 수 있습니다.
+배포용 compose의 모든 이미지 참조는 환경 변수 — `OPENBAO_IMAGE`,
+`POSTGRES_IMAGE`, `BOOTROOT_STEP_CA_IMAGE`, `BOOTROOT_HTTP01_IMAGE` —
+에서 주입되므로, 설치 도구가 아카이브로 복원한 이미지를 지정할 수
+있습니다. `.env`나 프로세스 환경에 설정하며, 설정하지 않은 변수는 릴리스
+기본값으로 대체됩니다. `BOOTROOT_HTTP01_IMAGE`는 기본
+`docker-compose.yml`도 읽습니다. 그곳에서는 응답기 빌드가 기록되는 태그
+이름이 되며, 한 호스트의 두 설치가 서로의 이미지를 덮어쓰지 않는
+방법입니다. 설정하지 않으면 이전과 같이
+`bootroot-http01-responder:latest`입니다.
 
 `--no-build`는 `--pull never`를 함의하므로 이 모드에서 `infra install`은
 레지스트리에 접근하지 않습니다. 누락된 이미지는 네트워크에서 조용히
 가져오거나(에어갭 무력화) 미리 로드한 릴리스 페이로드를 대체하지 않고,
 설치를 명확히 실패시킵니다.
+
+#### 런타임 이미지 고정
+
+기본 스택이 실행하는 레지스트리 이미지는 `deploy/runtime-images.json`에
+런타임 역할별 항목 하나씩으로 고정되어 있습니다.
+
+- `openbao` — `docker.io/openbao/openbao`, 태그 `2.5.5`: OpenBao 서버와
+  `init`이 생성하는 `openbao-agent-stepca` / `openbao-agent-responder`
+  사이드카.
+- `postgres` — `docker.io/library/postgres`, 태그 `18.4`: step-ca의
+  데이터베이스.
+- `step-ca` — `docker.io/smallstep/step-ca`, 태그 `0.30.2`: CA 서버, 그리고
+  init·TLS·회전·소유권 헬퍼 컨테이너.
+
+각 항목에는 SemVer 비교 버전(PostgreSQL의 `18.4` 태그는 `18.4.0`), 승인된
+레지스트리 인덱스 다이제스트, 지원 플랫폼도 기록되어 있습니다. 고정값은
+Compose 값이 아니라 이 파일에 있습니다.
+
+- 릴리스 준비 단계는 각 이미지를 릴리스 플랫폼용으로 다이제스트로
+  받고(`docker pull --platform linux/amd64 <repository>@<digest>`),
+  Compose 기본값과 헬퍼 컨테이너가 가리키는 조회 태그
+  (`openbao/openbao:2.5.5`, `postgres:18.4`, `smallstep/step-ca:0.30.2`)를
+  붙인 뒤, 그 태그로 아카이브를 저장합니다.
+- 오프라인 설치는 아카이브가 복원한 태그를 그대로 실행합니다. 이미지
+  변수는 설정하지 않거나 그 태그로 설정하세요. 오프라인 설치에서
+  `BOOTROOT_STEP_CA_IMAGE`나 다른 이미지 변수에 `@sha256:` 참조를 넣지
+  마세요. `docker save` / `docker load`는 레지스트리 다이제스트가
+  RepoDigest로 남는다고 보장하지 않으므로, 그 참조가 로드된 이미지로
+  해석되지 않을 수 있습니다. 이 흐름 밖의 온라인 Docker 사용에서는
+  다이제스트 참조를 그대로 써도 됩니다.
+- 이 조회 태그는 현재의 이름입니다. bootler 릴리스 도구는 이후 오프라인
+  이미지 참조를 제품별 별칭
+  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<full-config-hash>`)
+  으로 정규화할 예정입니다. bootroot는 아직 그 전환을 구현하지 않았으며,
+  OpenBao Agent와 step-ca 헬퍼 이미지는 여전히 위의 고정 조회 태그입니다.
+
+이 선언은 기본 운영 스택만 다룹니다. 모니터링 서비스(`lan`, `public`
+프로필 뒤의 `prometheus`, `grafana`, `grafana-public`)는 범위 밖이며 그
+이미지는 선언하지 않습니다. 모니터링을 배포하려면 별도의 제품 결정과
+선언이 필요합니다. HTTP-01 응답기 이미지는 받아 오는 것이 아니라
+bootroot가 빌드하고, 응답기 Dockerfile의 `rust`, `debian` 베이스는 빌드
+입력이므로 어느 것도 선언하지 않습니다. 초기 고정값은 `linux/amd64`만
+지원합니다. arm64를 명시적으로 선택하고 근거를 갖추고 테스트하기
+전까지 `aarch64` 릴리스는 막혀 있습니다.
+
+`scripts/validate-runtime-images.sh`는 선언의 형식과, 모든 기본 Compose
+서비스 및 bootroot가 직접 실행하는 각 이미지 참조가 선언과 일치하는지
+검사합니다. 선언된 역할을 실행하는 서비스는 이미지를 빌드하지 않고 받아
+와야 하며, `linux/amd64`가 아닌 플랫폼을 요청해서는 안 됩니다. 레지스트리는
+읽지 않습니다.
+
+고정값을 바꾸는 것 — 새 태그든, 같은 태그의 새 다이제스트든 — 은 소스
+변경입니다. 새 커밋에서 `deploy/runtime-images.json`을 수정하고, 태그가
+바뀌면 Compose 기본값과 코드 참조도 함께 수정합니다. 제품 릴리스를 위한
+고정값 승인은 별도의 관문입니다. 제품 담당자가 정확한 이미지로 호환성
+테스트(PostgreSQL 프로비저닝, step-ca 발급·갱신·DB 회전, OpenBao 서버와
+Agent 템플릿 렌더링 및 자격 증명 회전)를 거친 뒤 정확한 bootroot 리비전과
+고정값을 승인합니다. 이미지를 받아 오는 데 성공했거나, 버전이 맞거나,
+스키마 검사를 통과했다고 해서 그 승인이 되는 것은 아닙니다.
 
 ## bootroot init
 

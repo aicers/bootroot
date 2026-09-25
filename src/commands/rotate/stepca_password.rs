@@ -56,8 +56,8 @@ pub(super) async fn rotate_stepca_password(
     // rotation would otherwise become unreadable to it. The sweep repairs
     // that first, keeping this flow working exactly as it does today, and
     // is a no-op when ownership is already correct. It reuses the
-    // `smallstep/step-ca:0.30.2` image the `step` helpers already run, so it
-    // adds no new dependency.
+    // `STEP_CA_HELPER_IMAGE` the `step` helpers already run, so it adds no
+    // new dependency.
     crate::commands::infra::sweep_secrets_ownership(
         ctx.paths.secrets_dir(),
         STEP_CA_HELPER_IMAGE,
@@ -147,7 +147,7 @@ pub(super) fn change_stepca_passphrase(
         "--rm",
         "-v",
         &*mount,
-        "smallstep/step-ca:0.30.2",
+        STEP_CA_HELPER_IMAGE,
         "step",
         "crypto",
         "change-pass",
@@ -214,7 +214,7 @@ mod tests {
             "--rm",
             "-v",
             expected_mount.as_str(),
-            "smallstep/step-ca:0.30.2",
+            STEP_CA_HELPER_IMAGE,
             "step",
             "crypto",
             "change-pass",
@@ -226,6 +226,17 @@ mod tests {
             "-f",
         ];
         assert_eq!(invocations, vec![expected]);
+        // The image the change-pass container actually ran, read back from
+        // the recorded argv, is the declared step-ca image.
+        let image = invocations
+            .first()
+            .and_then(|args| args.iter().skip_while(|arg| *arg != "-v").nth(2))
+            .expect("the image follows the `-v <mount>` pair");
+        crate::runtime_image_declaration::assert_declared_image(
+            "step-ca",
+            image,
+            "rotate stepca-password change-pass",
+        );
     }
 
     #[test]
