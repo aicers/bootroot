@@ -658,7 +658,9 @@ explicitly.
 
 `scripts/validate-runtime-images.sh` checks the declaration's format and
 that every default Compose service, and each image reference bootroot runs
-itself, matches it. It reads no registry.
+itself, matches it. A service running a declared role must pull its image,
+not build it, and must not request a platform other than `linux/amd64`. It
+reads no registry.
 
 Changing a pin — a new tag, or a new digest for the same tag — is a source
 change: edit `deploy/runtime-images.json` in a new commit, together with the

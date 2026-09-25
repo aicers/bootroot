@@ -444,6 +444,49 @@ expect_fail "OpenBao Agent sidecar drift" \
   "'openbao-agent-stepca' image 'openbao/openbao:2.5.4': tag '2.5.4'" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$SIDECAR_DRIFT"
 
+# A local build keeps the approved lookup tag while running other
+# content, since installs run Compose with `--build`.
+BUILT_ROLE="$(override built-role '
+services:
+  postgres:
+    build: ./docker/http01-responder
+    pull_policy: build')"
+expect_fail "declared role replaced by a local build" \
+  "service 'postgres' has a build section" \
+  --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$BUILT_ROLE"
+
+BUILD_POLICY="$(override build-policy '
+services:
+  postgres:
+    pull_policy: build')"
+expect_fail "declared role with pull_policy build" "service 'postgres' sets pull_policy 'build'" \
+  --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$BUILD_POLICY"
+
+BUILT_SIDECAR="$(override built-sidecar '
+services:
+  openbao-agent-responder:
+    image: openbao/openbao:2.5.5
+    build: ./docker/http01-responder
+    command: ["agent", "-config=/dev/null"]')"
+expect_fail "OpenBao Agent sidecar replaced by a local build" \
+  "service 'openbao-agent-responder' has a build section" \
+  --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$BUILT_SIDECAR"
+
+ARM_PLATFORM="$(override arm-platform '
+services:
+  postgres:
+    platform: linux/arm64')"
+expect_fail "declared role requesting an unselected platform" \
+  "service 'postgres' requests platform 'linux/arm64', not the selected release platform 'linux/amd64'" \
+  --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$ARM_PLATFORM"
+
+AMD64_PLATFORM="$(override amd64-platform '
+services:
+  step-ca:
+    platform: linux/amd64')"
+expect_pass "declared role pinned to the selected platform" \
+  --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$AMD64_PLATFORM"
+
 RENAMED_RESPONDER="$(override renamed-responder '
 services:
   bootroot-http01:

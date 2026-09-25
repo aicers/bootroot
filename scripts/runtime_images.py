@@ -6,7 +6,9 @@ revision of bootroot approves as runtime dependencies of its default
 production stack. bootler reads it at an immutable bootroot revision
 and binds its release recipes to it; this module is the bootroot side of
 that contract: schema-1 format checks, and consistency of the declared
-repository/tag with what the Compose sources actually run.
+repository/tag with what the Compose sources actually run. A declared
+role's service must also pull rather than build, and must not request a
+platform other than the selected release platform.
 
 Subcommands:
 
@@ -482,7 +484,36 @@ def validate_profile_selection(selected_profiles):
         raise ValidationError("\n".join(errors))
 
 
-def validate_compose_set(label, services, declared):
+def check_registry_service_content(service, definition, selected_platform):
+    """Returns findings for a declared role's service that would not run the pin.
+
+    The image string alone does not decide what runs. A `build` section
+    makes Compose build local content and tag it with that image name
+    (and `bootroot` installs with `--build`), so the approved lookup tag
+    would carry an unreviewed build. An explicit `platform` other than
+    the selected release platform asks the daemon for a variant the
+    declaration never approved. The platform is compared by its exact
+    rendered spelling: Compose accepts aliases such as `linux/x86_64`,
+    but a source must use the canonical one, as the declaration does.
+    """
+    problems = []
+    if "build" in definition:
+        problems.append(
+            "has a build section; a declared registry role must run the pulled image, "
+            "not a local build under its tag"
+        )
+    if definition.get("pull_policy") == "build":
+        problems.append("sets pull_policy 'build'; a declared registry role is never built")
+    platform = definition.get("platform")
+    if platform is not None and platform != selected_platform:
+        problems.append(
+            f"requests platform {platform!r}, not the selected release platform "
+            f"{selected_platform!r}"
+        )
+    return [f"service {service!r} {problem}" for problem in problems]
+
+
+def validate_compose_set(label, services, declared, selected_platform):
     """Checks one rendered model against the declaration, returning findings."""
     errors = []
     active_roles = {}
@@ -537,6 +568,7 @@ def validate_compose_set(label, services, declared):
         if entry is None:
             errors.append(f"service {service!r} runs role {role!r}, which is not declared")
             continue
+        errors.extend(check_registry_service_content(service, definition, selected_platform))
         if not isinstance(image, str):
             errors.append(f"service {service!r} has no image")
             continue
@@ -562,7 +594,7 @@ def command_check(args):
     for compose_set in args.compose_set or []:
         label = " + ".join(compose_set)
         services = render_compose_model(compose_set, args.docker)
-        found = validate_compose_set(label, services, declared)
+        found = validate_compose_set(label, services, declared, args.platform)
         if found:
             errors.extend(found)
         else:

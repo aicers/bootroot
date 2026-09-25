@@ -641,7 +641,9 @@ bootroot가 빌드하고, 응답기 Dockerfile의 `rust`, `debian` 베이스는 
 
 `scripts/validate-runtime-images.sh`는 선언의 형식과, 모든 기본 Compose
 서비스 및 bootroot가 직접 실행하는 각 이미지 참조가 선언과 일치하는지
-검사합니다. 레지스트리는 읽지 않습니다.
+검사합니다. 선언된 역할을 실행하는 서비스는 이미지를 빌드하지 않고 받아
+와야 하며, `linux/amd64`가 아닌 플랫폼을 요청해서는 안 됩니다. 레지스트리는
+읽지 않습니다.
 
 고정값을 바꾸는 것 — 새 태그든, 같은 태그의 새 다이제스트든 — 은 소스
 변경입니다. 새 커밋에서 `deploy/runtime-images.json`을 수정하고, 태그가
