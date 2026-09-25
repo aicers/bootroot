@@ -36,6 +36,10 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 BIN_DIR="$WORK_DIR/bin"
 mkdir -p "$BIN_DIR"
+# The smoke's lock directory, so no case here contends with a real smoke
+# running on this host.
+LOCK_DIR="$WORK_DIR/lock"
+mkdir -m 700 "$LOCK_DIR"
 ln -s "$FAKE_DOCKER" "$BIN_DIR/docker"
 
 # `infra install --no-build`, as far as the smoke can observe it: load
@@ -191,6 +195,7 @@ run_smoke() {
     PATH="$BIN_DIR:$PATH" \
       FAKE_DOCKER_STATE="$STATE" \
       FAKE_DOCKER_BUILD_BASE="$BUILD_BASE" \
+      BOOTROOT_DEPLOY_SMOKE_LOCK_DIR="${SMOKE_LOCK_DIR:-$LOCK_DIR}" \
       BOOTROOT_BIN="$BIN_DIR/bootroot" \
       COMPOSE_PROJECT_NAME=deploy-smoke-fake \
       OPENBAO_HOST_PORT="$PORT_A" STEPCA_HOST_PORT="$PORT_B" \
@@ -326,6 +331,25 @@ FAKE_DOCKER_FAIL_ON='^save .*/step-ca\.tar ' run_smoke
 expect_status "partial preparation failure" 1
 expect_restored "partial preparation failure"
 ok "a failure after tags changed restores them"
+
+# The snapshot creates a backup tag for postgres's prior image, and the
+# command then fails or is interrupted: the backup is still this run's to
+# remove. `expect_restored` sees backup tags, so one left behind fails it.
+BACKUP_POSTGRES="^tag $(id_of postgres-moving-tag) bootroot-deploy-smoke-backup:[^ ]+\$"
+new_state backup-fails-after
+seed_mixed
+FAKE_DOCKER_AFTER_ON="$BACKUP_POSTGRES=FAIL" run_smoke
+expect_status "backup tag failure after creating it" 1
+expect_no_output "backup tag failure after creating it" "after cleanup the backup tag"
+expect_restored "backup tag failure after creating it"
+ok "a backup tag created by a command that then failed is removed"
+
+new_state backup-int-after
+seed_mixed
+FAKE_DOCKER_AFTER_ON="$BACKUP_POSTGRES=INT" run_smoke
+expect_status "INT after a backup tag was created" 130
+expect_restored "INT after a backup tag was created"
+ok "a backup tag created just before INT is removed"
 
 # The build names its private tag, then fails: whatever that tag names
 # is this run's to remove.
@@ -491,5 +515,67 @@ FAKE_DOCKER_FOREIGN_ON="^load -i .*/postgres\.tar\$=$STEPCA_TAG=$FOREIGN" \
   FAKE_DOCKER_AFTER_ON='^load -i .*/postgres\.tar$=FAIL' run_smoke
 expect_foreign_kept "lookup tag changed during a failed install" "$STEPCA_TAG"
 ok "a lookup tag another writer changed during a failed install is left alone"
+
+# ---------------------------------------------------------------------------
+# Only one smoke runs at a time
+# ---------------------------------------------------------------------------
+
+# Another run holds the smoke's lock: this one is refused before it runs
+# a single `docker` command, so it neither stops that run's stack nor
+# changes a tag it is using.
+new_state lock-held
+seed_mixed
+READY_FIFO="$WORK_DIR/lock-ready.fifo"
+RELEASE_FIFO="$WORK_DIR/lock-release.fifo"
+mkfifo "$READY_FIFO" "$RELEASE_FIFO"
+# Both opened read-write, which never blocks, so a holder that dies
+# early makes the `read` below time out rather than hang.
+exec 7<>"$READY_FIFO" 6<>"$RELEASE_FIFO"
+python3 - "$LOCK_DIR/deploy-no-build-smoke.lock" "$READY_FIFO" "$RELEASE_FIFO" <<'EOF' &
+import fcntl
+import sys
+
+lock, ready, release = sys.argv[1:]
+handle = open(lock, "a")
+fcntl.flock(handle, fcntl.LOCK_EX)
+with open(ready, "w") as signal:
+    signal.write("held\n")
+with open(release) as wait:
+    wait.readline()
+EOF
+HOLDER_PID=$!
+read -t 30 -r _ <&7 || die "lock held: the holder never took the lock"
+run_smoke
+echo release >&6
+wait "$HOLDER_PID" || die "lock held: the holder failed"
+exec 6>&- 7>&-
+expect_status "lock held" 1
+expect_output "lock held" "another deploy no-build smoke run holds"
+[ ! -s "$STATE/argv.log" ] || {
+  cat "$STATE/argv.log" >&2
+  die "lock held: the refused run invoked docker"
+}
+expect_restored "lock held"
+ok "a smoke started while another holds the lock is refused before touching docker"
+
+# Released when the holder ends, so the next run takes it.
+new_state lock-released
+seed_mixed
+run_smoke
+expect_status "lock released" 0
+expect_restored "lock released"
+ok "the lock is free again once its holder ends"
+
+# A lock directory others can write to is one where the lock file's
+# inode can be swapped, so it is refused.
+new_state lock-dir-open
+seed_mixed
+mkdir "$WORK_DIR/open-lock"
+chmod 777 "$WORK_DIR/open-lock"
+SMOKE_LOCK_DIR="$WORK_DIR/open-lock" run_smoke
+expect_status "lock directory open to others" 1
+expect_output "lock directory open to others" "is not a directory private to this user"
+[ ! -s "$STATE/argv.log" ] || die "lock directory open to others: the refused run invoked docker"
+ok "a lock directory open to other users is refused"
 
 echo "[$LABEL] OK: pinned preparation and tag restoration behave on every path"

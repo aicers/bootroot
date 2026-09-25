@@ -35,14 +35,28 @@
 # Dockerfile's base images under their tags; the base tags stay in the
 # snapshot so that a builder which did change them is reported rather
 # than restored over. The mappings are read back after cleanup and the
-# smoke fails unless they equal the snapshot. A test stack that cannot be
-# stopped fails the smoke too. SIGKILL cannot be caught, and nothing is
-# promised for it.
+# smoke fails unless they equal the snapshot and no backup tag is left.
+# A backup's name is recorded before the command creating it runs, so a
+# backup whose creation failed or was interrupted is still removed. A
+# test stack that cannot be stopped fails the smoke too. SIGKILL cannot
+# be caught, and nothing is promised for it.
 #
 # Pulling by digest leaves a `repository@digest` reference behind. It is
 # not removed: in the containerd image store, removing a digest reference
 # removes every tag naming the same image, including tags that predate
 # this run.
+#
+# Two smoke runs would repoint the same lookup tags, and the second
+# would snapshot the first's changes as prior state; cleanup can report a
+# foreign mapping still present at the end, not one this run has already
+# overwritten. So one smoke runs at a time: a run takes an exclusive
+# `flock(2)` before it stops any stack or changes any tag, and a second
+# run is refused rather than queued. The kernel releases the lock when
+# the run's descriptors close, SIGKILL included, so nothing stale is left
+# to recover. The lock file sits in a directory private to this user,
+# where nobody else can swap the inode it locks; runs by another user or
+# from another host sharing the daemon are not serialised by it, and
+# only the cleanup's conflict check stands between them.
 #
 # `down -v` on the test project is destructive. Never point this at a
 # live installation's Compose project.
@@ -52,6 +66,7 @@ SMOKE_PLATFORM="linux/amd64"
 BACKUP_REPOSITORY="bootroot-deploy-smoke-backup"
 RESPONDER_REPOSITORY="bootroot-http01-responder"
 RESPONDER_DOCKERFILE="docker/http01-responder/Dockerfile"
+LOCK_NAME="deploy-no-build-smoke.lock"
 
 log() {
   printf "[deploy-no-build-smoke] %s\n" "$*"
@@ -85,6 +100,11 @@ init_smoke() {
   # `bootroot`, so mirror that order here rather than hard-coding one side.
   COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-bootroot}"
 
+  # Overriding the lock directory is for validate-deploy-no-build-smoke.sh,
+  # whose fake runs must not contend with a real smoke on this host.
+  local tmp="${TMPDIR:-/tmp}"
+  LOCK_DIR="${BOOTROOT_DEPLOY_SMOKE_LOCK_DIR:-${tmp%/}/bootroot-deploy-smoke-$(id -u)}"
+
   STAGE_DIR="$(mktemp -d)"
   ARCHIVE_DIR="$STAGE_DIR/images"
   SHIM_DIR="$STAGE_DIR/bin"
@@ -112,6 +132,40 @@ init_smoke() {
   SELECTED_ROLES=()
   SELECTED_IDS=()
   CLEANED=0
+}
+
+# Takes the smoke's exclusive lock on fd 9 for the rest of the run, or
+# fails. The directory is created private to this user and refused when
+# it is anyone else's or open to others, since whoever can write there
+# can replace the lock file with a different inode.
+acquire_smoke_lock() {
+  python3 - "$LOCK_DIR" <<'EOF' ||
+import os
+import stat
+import sys
+
+directory = sys.argv[1]
+try:
+    os.mkdir(directory, 0o700)
+except FileExistsError:
+    pass
+info = os.lstat(directory)
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+    sys.exit(1)
+EOF
+    fail "the smoke lock directory $LOCK_DIR is not a directory private to this user"
+  exec 9>>"$LOCK_DIR/$LOCK_NAME" ||
+    fail "cannot open the smoke lock $LOCK_DIR/$LOCK_NAME"
+  python3 -c '
+import fcntl
+import sys
+
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+' || fail "another deploy no-build smoke run holds $LOCK_DIR/$LOCK_NAME; smoke runs repoint the same tags, so they run one at a time — wait for it to finish"
+  log "lock: holding $LOCK_DIR/$LOCK_NAME"
 }
 
 lookup_tag_of() {
@@ -214,28 +268,49 @@ managed_tag_list() {
 # Captures every managed tag's current image ID, or its absence, before
 # anything can change one. A tag that exists gets a backup tag on the
 # same image so the image survives being untagged in the meantime.
+#
+# An entry's fields are filled in before its tag is, and the tag before
+# the backup is created: cleanup walks `MANAGED_TAGS`, so it sees only
+# complete entries, and it already knows a backup's name when the
+# command creating it fails or is interrupted after doing so.
 snapshot_tags() {
-  local tag id backup
+  local tag id backup index
   while IFS= read -r tag; do
     [ -n "$tag" ] || continue
     if managed_index_of "$tag" >/dev/null; then
       continue
     fi
     id="$(image_id_of "$tag")" || fail "cannot read the image $tag names before the smoke"
+    index="${#MANAGED_TAGS[@]}"
     backup=""
     if [ -n "$id" ]; then
-      backup="$BACKUP_REPOSITORY:$RUN_ID-${#MANAGED_TAGS[@]}"
+      backup="$BACKUP_REPOSITORY:$RUN_ID-$index"
     fi
-    MANAGED_TAGS+=("$tag")
-    PRIOR_IDS+=("$id")
-    BACKUP_TAGS+=("")
-    OURS_IDS+=("")
+    PRIOR_IDS[index]="$id"
+    BACKUP_TAGS[index]="$backup"
+    OURS_IDS[index]=""
+    MANAGED_TAGS[index]="$tag"
     if [ -n "$backup" ]; then
       docker tag "$id" "$backup" || fail "cannot hold $tag's prior image $id under $backup"
-      BACKUP_TAGS[${#BACKUP_TAGS[@]} - 1]="$backup"
     fi
     log "snapshot: $tag -> ${id:-<absent>}"
   done < <(managed_tag_list)
+}
+
+# Removes a backup tag by name, when it exists: its creation may have
+# failed, or been interrupted, before it took. Returns nonzero, having
+# reported why, when it cannot.
+remove_backup_tag() {
+  local backup="$1" held
+  if ! held="$(image_id_of "$backup")"; then
+    printf '[deploy-no-build-smoke] ERROR: cannot read the backup tag %s\n' "$backup" >&2
+    return 1
+  fi
+  [ -n "$held" ] || return 0
+  if ! docker image rm "$backup" >/dev/null; then
+    printf '[deploy-no-build-smoke] ERROR: cannot remove the backup tag %s\n' "$backup" >&2
+    return 1
+  fi
 }
 
 # Puts every managed tag back the way the snapshot found it. Returns
@@ -274,20 +349,21 @@ restore_tags() {
         continue
       fi
     fi
-    if [ -n "$backup" ] && ! docker image rm "$backup" >/dev/null; then
-      printf '[deploy-no-build-smoke] ERROR: cannot remove the backup tag %s\n' "$backup" >&2
+    if [ -n "$backup" ] && ! remove_backup_tag "$backup"; then
       failed=1
     fi
   done
   return "$failed"
 }
 
-# Reads every managed tag back and compares it with the snapshot.
+# Reads every managed tag back and compares it with the snapshot, and
+# checks that no backup tag this run created is left.
 verify_restored_tags() {
-  local i tag prior current failed=0
+  local i tag prior backup current failed=0
   for i in "${!MANAGED_TAGS[@]}"; do
     tag="${MANAGED_TAGS[$i]}"
     prior="${PRIOR_IDS[$i]}"
+    backup="${BACKUP_TAGS[$i]}"
     if ! current="$(image_id_of "$tag")"; then
       failed=1
       continue
@@ -295,6 +371,14 @@ verify_restored_tags() {
     if [ "$current" != "$prior" ]; then
       printf '[deploy-no-build-smoke] ERROR: after cleanup %s names %s, not its prior %s\n' \
         "$tag" "${current:-<absent>}" "${prior:-<absent>}" >&2
+      failed=1
+    fi
+    [ -n "$backup" ] || continue
+    if ! current="$(image_id_of "$backup")"; then
+      failed=1
+    elif [ -n "$current" ]; then
+      printf '[deploy-no-build-smoke] ERROR: after cleanup the backup tag %s still names %s\n' \
+        "$backup" "$current" >&2
       failed=1
     fi
   done
@@ -542,6 +626,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  acquire_smoke_lock
   reset_existing_stack
   ensure_install_ports_free
   build_bootroot_binary
