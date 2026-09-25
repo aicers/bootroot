@@ -29,7 +29,11 @@ space-joined argv:
 - `FAKE_DOCKER_SIGNAL_ON` — `<regex>=<SIGNAME>`: signal the parent
   (the smoke's shell) and exit 1;
 - `FAKE_DOCKER_FOREIGN_ON` — `<regex>=<tag>=<id>`: another writer points
-  `<tag>` at `<id>` just before the command runs.
+  `<tag>` at `<id>` just before the command runs;
+- `FAKE_DOCKER_AFTER_ON` — `<regex>=FAIL` or `<regex>=<SIGNAME>`: run the
+  command, keeping every change it made to the store, then exit 1, having
+  signalled the smoke first for a signal name — a build that pulled its
+  base before failing, or was interrupted after it had.
 
 Every invocation is appended to `argv.log`.
 """
@@ -285,6 +289,19 @@ def inject(argv_text, tags, images):
             tags[tag] = image_id
 
 
+def inject_after(argv_text):
+    after_on = os.environ.get("FAKE_DOCKER_AFTER_ON")
+    if not after_on:
+        return
+    pattern, _, action = after_on.rpartition("=")
+    if not re.search(pattern, argv_text):
+        return
+    if action != "FAIL":
+        os.kill(smoke_pid(), getattr(signal, f"SIG{action}"))
+        die(f"fake docker: sent {action} after: {argv_text}")
+    die(f"fake docker: injected failure after: {argv_text}")
+
+
 def main(argv):
     argv_text = " ".join(argv)
     with open(path("argv.log"), "a", encoding="utf-8") as handle:
@@ -323,6 +340,7 @@ def main(argv):
         die(f"fake docker: unsupported command: {argv_text}")
     store("tags.json", tags)
     store("images.json", images)
+    inject_after(argv_text)
 
 
 if __name__ == "__main__":

@@ -23,10 +23,13 @@
 # a tag that existed is pointed back at its prior image, one this run
 # created is removed by name. Prior images are held by a backup tag for
 # the duration, and nothing is ever deleted by image ID, force-removed or
-# pruned. A tag some other writer changed during the run is reported and
-# left alone. The mappings are read back after cleanup and the smoke
-# fails unless they equal the snapshot. SIGKILL cannot be caught, and
-# nothing is promised for it.
+# pruned. Each command that may repoint a managed tag is bracketed, so a
+# tag it changed before failing or being interrupted still counts as
+# this run's. A tag some other writer changed during the run is reported
+# and left alone. The mappings are read back after cleanup and the smoke
+# fails unless they equal the snapshot. A test stack that cannot be
+# stopped fails the smoke too. SIGKILL cannot be caught, and nothing is
+# promised for it.
 #
 # Pulling by digest leaves a `repository@digest` reference behind. It is
 # not removed: in the containerd image store, removing a digest reference
@@ -97,6 +100,8 @@ init_smoke() {
   # Per declared dependency, the image ID selected for the platform.
   SELECTED_ROLES=()
   SELECTED_IDS=()
+  # The managed tags the command now running may repoint; see `mutating`.
+  IN_FLIGHT_TAGS=()
   CLEANED=0
 }
 
@@ -180,10 +185,39 @@ record_ours() {
   OURS_IDS[index]="${OURS_IDS[index]} $2"
 }
 
-record_current_as_ours() {
-  local id
-  id="$(image_id_of "$1")" || fail "cannot read the image $1 now names"
-  [ -z "$id" ] || record_ours "$1" "$id"
+# Records whatever the in-flight tags now name as this run's. Returns
+# nonzero, having reported why, when a tag cannot be read; the restore
+# that follows reports that tag again.
+claim_in_flight_tags() {
+  local tag id failed=0
+  [ "${#IN_FLIGHT_TAGS[@]}" -gt 0 ] || return 0
+  for tag in "${IN_FLIGHT_TAGS[@]}"; do
+    if ! id="$(image_id_of "$tag")"; then
+      printf '[deploy-no-build-smoke] ERROR: cannot read the image %s now names\n' "$tag" >&2
+      failed=1
+      continue
+    fi
+    [ -z "$id" ] || record_ours "$tag" "$id"
+  done
+  IN_FLIGHT_TAGS=()
+  return "$failed"
+}
+
+# mutating <tag>... -- <command>...: runs a command that may repoint the
+# named managed tags and records what they then name as this run's. The
+# tags are marked in flight first, so a command that changes one and
+# then fails, or is interrupted by INT or TERM, leaves cleanup to record
+# them: its change is this run's to undo, not another writer's.
+mutating() {
+  local tags=()
+  while [ "$1" != "--" ]; do
+    tags+=("$1")
+    shift
+  done
+  shift
+  IN_FLIGHT_TAGS=("${tags[@]}")
+  "$@"
+  claim_in_flight_tags || fail "cannot record the tags $* changed"
 }
 
 managed_tag_list() {
@@ -285,15 +319,22 @@ verify_restored_tags() {
   return "$failed"
 }
 
+# Stops the staged test stack. Returns nonzero, having reported why,
+# when `down` fails: its containers may still be running.
 stop_test_stack() {
-  if [ -f "$STAGE_DIR/docker-compose.deploy.yml" ]; then
-    (
-      cd "$STAGE_DIR"
+  local out status=0
+  [ -f "$STAGE_DIR/docker-compose.deploy.yml" ] || return 0
+  out="$(
+    cd "$STAGE_DIR" &&
       POSTGRES_PASSWORD=cleanup-only \
         GRAFANA_ADMIN_PASSWORD=cleanup-only \
-        "$REAL_DOCKER" compose -p "$COMPOSE_PROJECT" -f docker-compose.deploy.yml down -v --remove-orphans \
-        >/dev/null 2>&1 || true
-    )
+        "$REAL_DOCKER" compose -p "$COMPOSE_PROJECT" -f docker-compose.deploy.yml down -v --remove-orphans 2>&1
+  )" || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf '%s\n' "$out" >&2
+    printf '[deploy-no-build-smoke] ERROR: cannot stop the test stack (Compose project %s); its containers and volumes may remain\n' \
+      "$COMPOSE_PROJECT" >&2
+    return 1
   fi
 }
 
@@ -303,7 +344,8 @@ cleanup() {
   local status=0
   [ "$CLEANED" -eq 0 ] || return 0
   CLEANED=1
-  stop_test_stack
+  stop_test_stack || status=1
+  claim_in_flight_tags || status=1
   if [ "${#MANAGED_TAGS[@]}" -gt 0 ]; then
     restore_tags || status=1
     verify_restored_tags || status=1
@@ -316,7 +358,7 @@ on_exit() {
   local status=$?
   set +e
   if ! cleanup; then
-    printf '[deploy-no-build-smoke] ERROR: image tag restoration failed; see above\n' >&2
+    printf '[deploy-no-build-smoke] ERROR: smoke cleanup failed; see above\n' >&2
     [ "$status" -ne 0 ] || status=1
   fi
   exit "$status"
@@ -367,8 +409,7 @@ prepare_registry_images() {
     [ "$platform" = "$SMOKE_PLATFORM" ] ||
       fail "pinned image $pinned resolved to platform $platform, not $SMOKE_PLATFORM"
 
-    docker tag "$pinned" "$lookup"
-    record_current_as_ours "$lookup"
+    mutating "$lookup" -- docker tag "$pinned" "$lookup"
     # The archive restores the selected platform's image, which a
     # containerd store names by its manifest rather than by the index.
     record_ours "$lookup" "$id"
@@ -380,9 +421,7 @@ prepare_registry_images() {
   done <<<"$PINS"
 }
 
-prepare_responder_image() {
-  local base
-  log "building responder image"
+build_responder_image() {
   # `docker-compose.yml` interpolates the responder's `image:` from
   # `BOOTROOT_HTTP01_IMAGE`, and a caller may have exported one, so the
   # build's tag is pinned here rather than left to the environment.
@@ -390,13 +429,19 @@ prepare_responder_image() {
     GRAFANA_ADMIN_PASSWORD=build-only \
     BOOTROOT_HTTP01_IMAGE="$RESPONDER_BUILD_TAG" \
     docker compose -f docker-compose.yml build bootroot-http01
-  record_current_as_ours "$RESPONDER_BUILD_TAG"
-  while IFS= read -r base; do
-    [ -n "$base" ] && record_current_as_ours "$base"
-  done < <(awk 'toupper($1) == "FROM" { print $2 }' "$RESPONDER_DOCKERFILE")
+}
 
-  docker tag "$RESPONDER_BUILD_TAG" "$RESPONDER_RELEASE_TAG"
-  record_current_as_ours "$RESPONDER_RELEASE_TAG"
+prepare_responder_image() {
+  local base build_tags=("$RESPONDER_BUILD_TAG")
+  log "building responder image"
+  # The build may pull or refresh its base images before it fails, and
+  # a containerd store records those under their tags.
+  while IFS= read -r base; do
+    [ -z "$base" ] || build_tags+=("$base")
+  done < <(awk 'toupper($1) == "FROM" { print $2 }' "$RESPONDER_DOCKERFILE")
+  mutating "${build_tags[@]}" -- build_responder_image
+
+  mutating "$RESPONDER_RELEASE_TAG" -- docker tag "$RESPONDER_BUILD_TAG" "$RESPONDER_RELEASE_TAG"
   docker save -o "$ARCHIVE_DIR/http01.tar" "$RESPONDER_RELEASE_TAG"
 }
 
@@ -419,6 +464,15 @@ EOF
 }
 
 run_install() {
+  local lookup load_tags=("$RESPONDER_RELEASE_TAG")
+  # Loading the archives repoints the lookup tags and the release tag.
+  while IFS= read -r lookup; do
+    load_tags+=("$lookup")
+  done < <(cut -f5 <<<"$PINS")
+  mutating "${load_tags[@]}" -- install_staged_payload
+}
+
+install_staged_payload() {
   log "running deploy compose install from staged directory"
   (
     cd "$STAGE_DIR"
@@ -515,7 +569,7 @@ main() {
   assert_no_build_contract
   assert_running_images
 
-  cleanup || fail "image tag restoration failed; see above"
+  cleanup || fail "smoke cleanup failed; see above"
   log "deploy compose no-build smoke passed"
 }
 

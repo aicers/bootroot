@@ -324,6 +324,34 @@ expect_status "partial preparation failure" 1
 expect_restored "partial preparation failure"
 ok "a failure after tags changed restores them"
 
+# The build refreshes its base tag, then fails before the smoke can
+# record what it changed: that change is still this run's to undo, not
+# another writer's.
+new_state build-fails-after-base
+seed_mixed
+FAKE_DOCKER_AFTER_ON='^compose .* build bootroot-http01$=FAIL' run_smoke
+expect_status "build failure after a base refresh" 1
+expect_no_output "build failure after a base refresh" "which this run never set"
+expect_restored "build failure after a base refresh"
+ok "a build that changed its base tags and then failed restores them"
+
+new_state retag-fails-after
+seed_mixed
+FAKE_DOCKER_AFTER_ON="^tag [^ ]*@sha256:[0-9a-f]+ $STEPCA_TAG\$=FAIL" run_smoke
+expect_status "retag failure after the change" 1
+expect_no_output "retag failure after the change" "which this run never set"
+expect_restored "retag failure after the change"
+ok "a retag that changed its tag and then failed restores it"
+
+# The install loads an archive, repointing its lookup tag, then fails.
+new_state load-fails-after
+seed_mixed
+FAKE_DOCKER_AFTER_ON='^load -i .*/postgres\.tar$=FAIL' run_smoke
+expect_status "install failure after a load" 1
+expect_no_output "install failure after a load" "which this run never set"
+expect_restored "install failure after a load"
+ok "an install that loaded archives and then failed restores"
+
 # ---------------------------------------------------------------------------
 # Catchable interruption
 # ---------------------------------------------------------------------------
@@ -341,6 +369,14 @@ FAKE_DOCKER_SIGNAL_ON='^compose .* build bootroot-http01$=INT' run_smoke
 expect_status "INT" 130
 expect_restored "INT"
 ok "INT during the responder build restores"
+
+new_state int-after-base
+seed_mixed
+FAKE_DOCKER_AFTER_ON='^compose .* build bootroot-http01$=INT' run_smoke
+expect_status "INT after a base refresh" 130
+expect_no_output "INT after a base refresh" "which this run never set"
+expect_restored "INT after a base refresh"
+ok "INT after the build changed its base tags restores them"
 
 # ---------------------------------------------------------------------------
 # Restoration failure
@@ -361,7 +397,7 @@ FAKE_DOCKER_SIGNAL_ON='^save .*/step-ca\.tar =TERM' \
   FAKE_DOCKER_FAIL_ON="^tag sha256:[0-9a-f]+ $POSTGRES_TAG\$" run_smoke
 expect_status "restoration failure after TERM" 143
 expect_output "restoration failure after TERM" "cannot point $POSTGRES_TAG back at"
-expect_output "restoration failure after TERM" "image tag restoration failed"
+expect_output "restoration failure after TERM" "smoke cleanup failed"
 ok "a restoration failure keeps the original failure's status"
 
 new_state created-tag-removal-fails
@@ -370,6 +406,29 @@ FAKE_DOCKER_FAIL_ON="^image rm $STEPCA_TAG\$" run_smoke
 expect_status "created tag removal failure" 1
 expect_output "created tag removal failure" "cannot remove $STEPCA_TAG, which this run created"
 ok "failing to remove a created tag is reported"
+
+# ---------------------------------------------------------------------------
+# Teardown failure
+# ---------------------------------------------------------------------------
+
+# The pre-run reset issues the same `down` and tolerates its failure;
+# the teardown of the staged stack must not.
+new_state teardown-fails
+seed_mixed
+FAKE_DOCKER_FAIL_ON='^compose -p [^ ]+ -f docker-compose\.deploy\.yml down ' run_smoke
+expect_status "teardown failure" 1
+expect_output "teardown failure" "cannot stop the test stack (Compose project deploy-smoke-fake)"
+expect_output "teardown failure" "smoke cleanup failed"
+expect_no_output "teardown failure" "deploy compose no-build smoke passed"
+expect_restored "teardown failure"
+ok "a test stack that cannot be stopped fails the smoke"
+
+new_state teardown-fails-after-term
+seed_mixed
+FAKE_DOCKER_SIGNAL_ON='^save .*/step-ca\.tar =TERM' \
+  FAKE_DOCKER_FAIL_ON='^compose -p [^ ]+ -f docker-compose\.deploy\.yml down ' run_smoke
+expect_status "teardown failure after TERM" 143
+ok "a teardown failure keeps the original failure's status"
 
 # ---------------------------------------------------------------------------
 # Another writer changes a managed tag during the smoke
