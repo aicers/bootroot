@@ -5,21 +5,11 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      cargo-minor-patch-prod:
-        dependency-type: "production"
+      cargo-minor-patch:
         update-types:
           - "minor"
           - "patch"
-      cargo-minor-patch-dev:
-        dependency-type: "development"
-        update-types:
-          - "minor"
-          - "patch"
-      cargo-security-prod:
-        dependency-type: "production"
-        applies-to: "security-updates"
-      cargo-security-dev:
-        dependency-type: "development"
+      cargo-security:
         applies-to: "security-updates"
     labels:
       - "dependencies"
@@ -31,21 +21,11 @@ updates:
     schedule:
       interval: "weekly"
     groups:
-      github-actions-minor-patch-prod:
-        dependency-type: "production"
+      github-actions-minor-patch:
         update-types:
           - "minor"
           - "patch"
-      github-actions-minor-patch-dev:
-        dependency-type: "development"
-        update-types:
-          - "minor"
-          - "patch"
-      github-actions-security-prod:
-        dependency-type: "production"
-        applies-to: "security-updates"
-      github-actions-security-dev:
-        dependency-type: "development"
+      github-actions-security:
         applies-to: "security-updates"
     labels:
       - "dependencies"
