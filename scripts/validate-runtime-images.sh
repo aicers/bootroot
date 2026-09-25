@@ -227,6 +227,12 @@ DIGEST_ONLY="$(mutate digest-only.json "by_role['postgres']['digest'] = '$OTHER_
 expect_pass "a digest-only change needs no Compose change" \
   --declaration "$DIGEST_ONLY" check "${REAL_SETS[@]}"
 
+# The comparison version is reviewed, not derived from the tag, so a
+# SemVer value the tag's spelling does not suggest is still accepted.
+REVIEWED_VERSION="$(mutate reviewed-version.json "by_role['postgres']['version'] = '18.4.1'")"
+expect_pass "a reviewed version is not checked against the tag" \
+  --declaration "$REVIEWED_VERSION" check --compose-set "$DEPLOY"
+
 NULL_VERSION="$(mutate null-version.json "by_role['step-ca']['version'] = None")"
 expect_pass "an explicit null version is accepted" \
   --declaration "$NULL_VERSION" check --compose-set "$DEPLOY"
@@ -273,8 +279,6 @@ fail_declaration "placeholder digest" "is a placeholder" \
 fail_declaration "missing version" "is missing fields: version" "del by_role['postgres']['version']"
 fail_declaration "non-SemVer version" "version '18.4' must be a canonical SemVer" \
   "by_role['postgres']['version'] = '18.4'"
-fail_declaration "version disagreeing with a numeric tag" "its comparison version is '18.4.0'" \
-  "by_role['postgres']['version'] = '18.5.0'"
 fail_declaration "missing platforms" "is missing fields: platforms" \
   "del by_role['step-ca']['platforms']"
 fail_declaration "empty platforms" "platforms must be a nonempty list" \

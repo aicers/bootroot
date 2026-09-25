@@ -150,10 +150,6 @@ SEMVER_RE = re.compile(
     r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$",
     re.ASCII,
 )
-# A plain numeric release tag, whose SemVer spelling is fully determined:
-# `18.4` compares as `18.4.0`. Tags with any other shape carry no
-# inferable version, and none is inferred.
-NUMERIC_TAG_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?$")
 INTERPOLATION_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -258,14 +254,6 @@ def parse_image_reference(reference):
     return name, tag, digest
 
 
-def expected_version_for_tag(tag):
-    match = NUMERIC_TAG_RE.fullmatch(tag)
-    if match is None:
-        return None
-    major, minor, patch = match.group(1), match.group(2), match.group(3) or "0"
-    return f"{major}.{minor}.{patch}"
-
-
 def validate_entry(index, entry, selected_platform, errors):
     where = f"dependencies[{index}]"
     if not isinstance(entry, dict):
@@ -314,22 +302,16 @@ def validate_entry(index, entry, selected_platform, errors):
     tag = entry.get("tag")
     if "tag" in entry and (not isinstance(tag, str) or not TAG_RE.fullmatch(tag)):
         errors.append(f"{label}.tag {tag!r} is not a valid image tag")
-        tag = None
 
+    # The comparison version is reviewed independently of the tag: no
+    # version is inferred from the upstream label, and none is checked
+    # against it.
     if "version" in entry:
         version = entry["version"]
-        if version is not None:
-            if not isinstance(version, str) or not SEMVER_RE.fullmatch(version):
-                errors.append(
-                    f"{label}.version {version!r} must be a canonical SemVer string or null"
-                )
-            elif isinstance(tag, str):
-                expected = expected_version_for_tag(tag)
-                if expected is not None and expected != version:
-                    errors.append(
-                        f"{label}.version {version!r} does not match tag {tag!r}; "
-                        f"its comparison version is {expected!r}"
-                    )
+        if version is not None and (
+            not isinstance(version, str) or not SEMVER_RE.fullmatch(version)
+        ):
+            errors.append(f"{label}.version {version!r} must be a canonical SemVer string or null")
 
     if "digest" in entry:
         digest = entry["digest"]
