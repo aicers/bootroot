@@ -11,6 +11,8 @@ updates:
           - "patch"
       cargo-security:
         applies-to: "security-updates"
+        patterns:
+          - "*"
     labels:
       - "dependencies"
       - "rust"
@@ -27,6 +29,8 @@ updates:
           - "patch"
       github-actions-security:
         applies-to: "security-updates"
+        patterns:
+          - "*"
     labels:
       - "dependencies"
       - "github-actions"
