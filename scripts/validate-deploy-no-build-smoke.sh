@@ -77,11 +77,12 @@ VERSION="$(awk -F' = ' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' C
 OPENBAO_TAG="$(awk -F'\t' '$1 == "openbao" { print $5 }' <<<"$PINS")"
 POSTGRES_TAG="$(awk -F'\t' '$1 == "postgres" { print $5 }' <<<"$PINS")"
 STEPCA_TAG="$(awk -F'\t' '$1 == "step-ca" { print $5 }' <<<"$PINS")"
-RESPONDER_BUILD="bootroot-http01-responder:latest"
+# The shared tag a source build writes; the smoke builds under a tag
+# private to its run instead, and must leave this one alone.
+RESPONDER_LATEST="bootroot-http01-responder:latest"
 RESPONDER_RELEASE="bootroot-http01-responder:$VERSION"
 # The responder Dockerfile's two stages: the build base, which the fake
-# build refreshes the way a containerd store records a pulled base, and
-# the runtime base, which it leaves alone.
+# build refreshes only under the classic builder, and the runtime base.
 BASES="$(awk 'toupper($1) == "FROM" { print $2 }' docker/http01-responder/Dockerfile)"
 BUILD_BASE="$(sed -n 1p <<<"$BASES")"
 RUNTIME_BASE="$(sed -n 2p <<<"$BASES")"
@@ -248,11 +249,11 @@ expect_digest_pulls_only() {
 seed_mixed() {
   # Present before: openbao's lookup tag on an unrelated image, postgres's
   # on the registry's moving tag (a stale tag pull), the responder's
-  # build tag and the build base. Absent before: step-ca's lookup tag,
+  # `:latest` and the build base. Absent before: step-ca's lookup tag,
   # the responder release tag and the runtime base.
   seed "$OPENBAO_TAG" "$(id_of prior-openbao)"
   seed "$POSTGRES_TAG" "$(id_of postgres-moving-tag)"
-  seed "$RESPONDER_BUILD" "$(id_of prior-responder)"
+  seed "$RESPONDER_LATEST" "$(id_of prior-responder)"
   seed "$BUILD_BASE" "$(id_of prior-build-base)"
   BEFORE="$(tag_map)"
 }
@@ -269,10 +270,12 @@ expect_output "success" "deploy compose no-build smoke passed"
 expect_output "success" "restored: every managed tag maps as before the smoke"
 expect_restored "success"
 expect_digest_pulls_only "success"
-for tag in "$OPENBAO_TAG" "$POSTGRES_TAG" "$STEPCA_TAG" "$RESPONDER_BUILD" \
-  "$RESPONDER_RELEASE" "$BUILD_BASE" "$RUNTIME_BASE"; do
-  expect_output "success" "snapshot: $tag ->"
+for tag in "$OPENBAO_TAG" "$POSTGRES_TAG" "$STEPCA_TAG" \
+  "bootroot-http01-responder:smoke-build-" "$RESPONDER_RELEASE" "$BUILD_BASE" "$RUNTIME_BASE"; do
+  expect_output "success" "snapshot: $tag"
 done
+grep -qE "^compose .* build bootroot-http01$" "$STATE/argv.log" ||
+  die "success: the responder was not built"
 ok "success restores present tags and removes created ones"
 
 # The moving tag never replaced the pin: postgres's lookup tag was saved
@@ -324,16 +327,24 @@ expect_status "partial preparation failure" 1
 expect_restored "partial preparation failure"
 ok "a failure after tags changed restores them"
 
-# The build refreshes its base tag, then fails before the smoke can
-# record what it changed: that change is still this run's to undo, not
-# another writer's.
-new_state build-fails-after-base
+# The build names its private tag, then fails: whatever that tag names
+# is this run's to remove.
+new_state build-fails-after
 seed_mixed
 FAKE_DOCKER_AFTER_ON='^compose .* build bootroot-http01$=FAIL' run_smoke
-expect_status "build failure after a base refresh" 1
-expect_no_output "build failure after a base refresh" "which this run never set"
-expect_restored "build failure after a base refresh"
-ok "a build that changed its base tags and then failed restores them"
+expect_status "build failure after tagging" 1
+expect_no_output "build failure after tagging" "which this run never set"
+expect_restored "build failure after tagging"
+ok "a build that tagged its image and then failed restores"
+
+# A caller asking for the classic builder, which would refresh the base
+# tags, does not get it: the smoke builds with BuildKit.
+new_state classic-builder-requested
+seed_mixed
+DOCKER_BUILDKIT=0 run_smoke
+expect_status "classic builder requested" 0
+expect_restored "classic builder requested"
+ok "the build runs under BuildKit whatever the caller exported"
 
 new_state retag-fails-after
 seed_mixed
@@ -370,13 +381,13 @@ expect_status "INT" 130
 expect_restored "INT"
 ok "INT during the responder build restores"
 
-new_state int-after-base
+new_state int-after-build
 seed_mixed
 FAKE_DOCKER_AFTER_ON='^compose .* build bootroot-http01$=INT' run_smoke
-expect_status "INT after a base refresh" 130
-expect_no_output "INT after a base refresh" "which this run never set"
-expect_restored "INT after a base refresh"
-ok "INT after the build changed its base tags restores them"
+expect_status "INT after the build tagged" 130
+expect_no_output "INT after the build tagged" "which this run never set"
+expect_restored "INT after the build tagged"
+ok "INT after the build tagged its image restores"
 
 # ---------------------------------------------------------------------------
 # Restoration failure
@@ -439,6 +450,9 @@ new_state conflict
 seed_mixed
 FAKE_DOCKER_FOREIGN_ON="^container inspect=$OPENBAO_TAG=$FOREIGN" run_smoke
 expect_status "concurrent writer" 1
+# The lookup tag no longer names the image the container runs, and the
+# smoke compares the two rather than only logging the loaded ID.
+expect_output "concurrent writer" "the loaded openbao image is $FOREIGN, but the openbao container runs $(id_of openbao-amd64)"
 expect_output "concurrent writer" "$OPENBAO_TAG now names $FOREIGN, which this run never set"
 grep -qx "$OPENBAO_TAG $FOREIGN" <<<"$(tag_map)" ||
   die "concurrent writer: the other writer's mapping was overwritten"
@@ -449,5 +463,33 @@ grep -q "^bootroot-deploy-smoke-backup:[^ ]* $(id_of prior-openbao)$" <<<"$(tag_
   "$(grep -v "^$OPENBAO_TAG " <<<"$BEFORE")" ] ||
   die "concurrent writer: the other tags were not restored"
 ok "a tag another writer changed is reported and left alone"
+
+# Another writer changes a tag a command never reaches, and that command
+# then fails: the change is not this run's, whatever was in progress.
+# `expect_foreign_kept <case> <tag>` checks it was reported and kept,
+# and that every other tag was restored.
+expect_foreign_kept() {
+  local name="$1" tag="$2"
+  expect_status "$name" 1
+  expect_output "$name" "$tag now names $FOREIGN, which this run never set"
+  grep -qx "$tag $FOREIGN" <<<"$(tag_map)" ||
+    die "$name: the other writer's mapping of $tag was overwritten"
+  [ "$(tag_map | grep -v "^$tag ")" = "$(grep -v "^$tag " <<<"$BEFORE")" ] ||
+    die "$name: the other tags were not restored"
+}
+
+new_state conflict-during-failed-build
+seed_mixed
+FAKE_DOCKER_FOREIGN_ON="^compose .* build bootroot-http01\$=$RUNTIME_BASE=$FOREIGN" \
+  FAKE_DOCKER_AFTER_ON='^compose .* build bootroot-http01$=FAIL' run_smoke
+expect_foreign_kept "base changed during a failed build" "$RUNTIME_BASE"
+ok "a base tag another writer changed during a failed build is left alone"
+
+new_state conflict-during-failed-install
+seed_mixed
+FAKE_DOCKER_FOREIGN_ON="^load -i .*/postgres\.tar\$=$STEPCA_TAG=$FOREIGN" \
+  FAKE_DOCKER_AFTER_ON='^load -i .*/postgres\.tar$=FAIL' run_smoke
+expect_foreign_kept "lookup tag changed during a failed install" "$STEPCA_TAG"
+ok "a lookup tag another writer changed during a failed install is left alone"
 
 echo "[$LABEL] OK: pinned preparation and tag restoration behave on every path"

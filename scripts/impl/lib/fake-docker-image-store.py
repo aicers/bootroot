@@ -16,8 +16,9 @@ handling observable without a daemon or a registry:
   wrong one;
 - `save --platform` exports the platform child, and `load` names it,
   so the loaded tag's ID differs from the pre-save index ID;
-- `compose build` writes the responder tag and refreshes the build base
-  named by `FAKE_DOCKER_BUILD_BASE`, as a containerd store records it.
+- `compose build` writes the tag `BOOTROOT_HTTP01_IMAGE` names; under
+  the classic builder (`DOCKER_BUILDKIT=0`) it also refreshes the build
+  base named by `FAKE_DOCKER_BUILD_BASE`, which BuildKit never tags.
 
 Removal by image ID, forced removal and prune are refused outright:
 the smoke must never do any of them.
@@ -32,8 +33,8 @@ space-joined argv:
   `<tag>` at `<id>` just before the command runs;
 - `FAKE_DOCKER_AFTER_ON` — `<regex>=FAIL` or `<regex>=<SIGNAME>`: run the
   command, keeping every change it made to the store, then exit 1, having
-  signalled the smoke first for a signal name — a build that pulled its
-  base before failing, or was interrupted after it had.
+  signalled the smoke first for a signal name — a command that changed a
+  tag before failing, or was interrupted after it had.
 
 Every invocation is appended to `argv.log`.
 """
@@ -208,10 +209,11 @@ def compose(args, tags, images):
         built = f"sha256:{counter:064x}"
         images[built] = {"platform": HOST_PLATFORM}
         tags[os.environ.get("BOOTROOT_HTTP01_IMAGE", "bootroot-http01-responder:latest")] = built
-        # A containerd store records refreshed build bases under their tags.
-        base = f"sha256:{counter + 1000:064x}"
-        images[base] = {"platform": HOST_PLATFORM}
-        tags[os.environ["FAKE_DOCKER_BUILD_BASE"]] = base
+        if os.environ.get("DOCKER_BUILDKIT") == "0":
+            # The classic builder records a pulled base under its tag.
+            base = f"sha256:{counter + 1000:064x}"
+            images[base] = {"platform": HOST_PLATFORM}
+            tags[os.environ["FAKE_DOCKER_BUILD_BASE"]] = base
     elif command == "up":
         services = rest[rest.index("-d") + 1 :]
         for service in services:

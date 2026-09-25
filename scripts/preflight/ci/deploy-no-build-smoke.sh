@@ -23,11 +23,19 @@
 # a tag that existed is pointed back at its prior image, one this run
 # created is removed by name. Prior images are held by a backup tag for
 # the duration, and nothing is ever deleted by image ID, force-removed or
-# pruned. Each command that may repoint a managed tag is bracketed, so a
-# tag it changed before failing or being interrupted still counts as
-# this run's. A tag some other writer changed during the run is reported
-# and left alone. The mappings are read back after cleanup and the smoke
-# fails unless they equal the snapshot. A test stack that cannot be
+# pruned.
+#
+# Before each command that repoints a managed tag, the image ID it will
+# point that tag at is recorded as this run's, so a command that fails or
+# is interrupted after changing a tag leaves nothing unaccounted for. A
+# tag found at cleanup naming any other image was changed by some other
+# writer: it is reported, left alone, and fails the smoke. The responder
+# is built under a tag private to this run, so whatever that tag names
+# is this run's, and with BuildKit, which does not record the
+# Dockerfile's base images under their tags; the base tags stay in the
+# snapshot so that a builder which did change them is reported rather
+# than restored over. The mappings are read back after cleanup and the
+# smoke fails unless they equal the snapshot. A test stack that cannot be
 # stopped fails the smoke too. SIGKILL cannot be caught, and nothing is
 # promised for it.
 #
@@ -66,7 +74,10 @@ init_smoke() {
   BOOTROOT_VERSION="$(
     awk -F' = ' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml
   )"
-  RESPONDER_BUILD_TAG="$RESPONDER_REPOSITORY:latest"
+  RUN_ID="$(date +%s)-$$"
+  # Private to this run, so no other writer can change it, and the
+  # shared `:latest` tag a source build writes is never touched.
+  RESPONDER_BUILD_TAG="$RESPONDER_REPOSITORY:smoke-build-$RUN_ID"
   RESPONDER_RELEASE_TAG="$RESPONDER_REPOSITORY:$BOOTROOT_VERSION"
 
   # The install under test resolves its Compose project from
@@ -79,7 +90,6 @@ init_smoke() {
   SHIM_DIR="$STAGE_DIR/bin"
   DOCKER_LOG="$STAGE_DIR/docker-argv.log"
   REAL_DOCKER="$(command -v docker)"
-  RUN_ID="$(date +%s)-$$"
 
   # One line per declared dependency:
   # role, repository, tag, digest, lookup tag.
@@ -92,7 +102,8 @@ init_smoke() {
 
   # Per managed tag, parallel arrays: the tag, its prior image ID ("" when
   # it did not exist), the backup tag holding that image, and the image
-  # IDs this run itself may have pointed it at.
+  # IDs this run itself may have pointed it at — `*` for a tag private to
+  # this run, which only it can have changed.
   MANAGED_TAGS=()
   PRIOR_IDS=()
   BACKUP_TAGS=()
@@ -100,8 +111,6 @@ init_smoke() {
   # Per declared dependency, the image ID selected for the platform.
   SELECTED_ROLES=()
   SELECTED_IDS=()
-  # The managed tags the command now running may repoint; see `mutating`.
-  IN_FLIGHT_TAGS=()
   CLEANED=0
 }
 
@@ -178,53 +187,27 @@ managed_index_of() {
   return 1
 }
 
-# Adds `id` to the image IDs this run may have pointed `tag` at.
+# Adds `id` to the image IDs this run may point `tag` at. Called before
+# the command that repoints it, so the change is accounted for even when
+# that command then fails or is interrupted.
 record_ours() {
   local index
   index="$(managed_index_of "$1")" || fail "internal: $1 is not a managed tag"
+  [ -n "$2" ] || fail "internal: no image ID to record for $1"
   OURS_IDS[index]="${OURS_IDS[index]} $2"
 }
 
-# Records whatever the in-flight tags now name as this run's. Returns
-# nonzero, having reported why, when a tag cannot be read; the restore
-# that follows reports that tag again.
-claim_in_flight_tags() {
-  local tag id failed=0
-  [ "${#IN_FLIGHT_TAGS[@]}" -gt 0 ] || return 0
-  for tag in "${IN_FLIGHT_TAGS[@]}"; do
-    if ! id="$(image_id_of "$tag")"; then
-      printf '[deploy-no-build-smoke] ERROR: cannot read the image %s now names\n' "$tag" >&2
-      failed=1
-      continue
-    fi
-    [ -z "$id" ] || record_ours "$tag" "$id"
-  done
-  IN_FLIGHT_TAGS=()
-  return "$failed"
-}
-
-# mutating <tag>... -- <command>...: runs a command that may repoint the
-# named managed tags and records what they then name as this run's. The
-# tags are marked in flight first, so a command that changes one and
-# then fails, or is interrupted by INT or TERM, leaves cleanup to record
-# them: its change is this run's to undo, not another writer's.
-mutating() {
-  local tags=()
-  while [ "$1" != "--" ]; do
-    tags+=("$1")
-    shift
-  done
-  shift
-  IN_FLIGHT_TAGS=("${tags[@]}")
-  "$@"
-  claim_in_flight_tags || fail "cannot record the tags $* changed"
+# True when this run may have pointed the managed tag at `index` at `id`.
+is_ours() {
+  local ours=" ${OURS_IDS[$1]} "
+  [[ "$ours" == *" * "* || "$ours" == *" $2 "* ]]
 }
 
 managed_tag_list() {
   cut -f5 <<<"$PINS"
   printf '%s\n' "$RESPONDER_BUILD_TAG" "$RESPONDER_RELEASE_TAG"
-  # The responder build may pull or refresh its base images, and a
-  # containerd image store records those under their tags.
+  # The responder's base images: the BuildKit build leaves their tags
+  # alone, and the snapshot checks that it did.
   awk 'toupper($1) == "FROM" { print $2 }' "$RESPONDER_DOCKERFILE"
 }
 
@@ -269,7 +252,7 @@ restore_tags() {
       continue
     fi
     if [ "$current" != "$prior" ] && [ -n "$current" ] &&
-      ! grep -qwF -- "$current" <<<"${OURS_IDS[$i]}"; then
+      ! is_ours "$i" "$current"; then
       # The backup tag stays: removing it could delete the prior image,
       # which may now have no other name.
       printf '[deploy-no-build-smoke] ERROR: %s now names %s, which this run never set; another writer changed it, so it is left as is (prior: %s%s)\n' \
@@ -345,7 +328,6 @@ cleanup() {
   [ "$CLEANED" -eq 0 ] || return 0
   CLEANED=1
   stop_test_stack || status=1
-  claim_in_flight_tags || status=1
   if [ "${#MANAGED_TAGS[@]}" -gt 0 ]; then
     restore_tags || status=1
     verify_restored_tags || status=1
@@ -396,7 +378,7 @@ ensure_install_ports_free() {
 }
 
 prepare_registry_images() {
-  local role repository tag digest lookup pinned record id platform digests
+  local role repository tag digest lookup pinned record id ref_id platform digests
   mkdir -p "$ARCHIVE_DIR"
   while IFS=$'\t' read -r role repository tag digest lookup; do
     pinned="$repository@$digest"
@@ -409,10 +391,15 @@ prepare_registry_images() {
     [ "$platform" = "$SMOKE_PLATFORM" ] ||
       fail "pinned image $pinned resolved to platform $platform, not $SMOKE_PLATFORM"
 
-    mutating "$lookup" -- docker tag "$pinned" "$lookup"
-    # The archive restores the selected platform's image, which a
-    # containerd store names by its manifest rather than by the index.
+    # The retag points the lookup tag at whatever the pin names — in a
+    # containerd store the whole index. The archive then restores only
+    # the selected platform's image, which such a store names by its
+    # manifest: `infra install` repoints the tag at `id`.
+    ref_id="$(image_id_of "$pinned")" && [ -n "$ref_id" ] ||
+      fail "cannot read the image $pinned names"
+    record_ours "$lookup" "$ref_id"
     record_ours "$lookup" "$id"
+    docker tag "$pinned" "$lookup"
     SELECTED_ROLES+=("$role")
     SELECTED_IDS+=("$id")
 
@@ -421,27 +408,26 @@ prepare_registry_images() {
   done <<<"$PINS"
 }
 
-build_responder_image() {
+prepare_responder_image() {
+  local built
+  log "building responder image"
+  record_ours "$RESPONDER_BUILD_TAG" '*'
   # `docker-compose.yml` interpolates the responder's `image:` from
   # `BOOTROOT_HTTP01_IMAGE`, and a caller may have exported one, so the
   # build's tag is pinned here rather than left to the environment.
+  # BuildKit is required, not left to `DOCKER_BUILDKIT`: the classic
+  # builder records the base images it pulls under their tags, which
+  # would repoint tags this run cannot tell from another writer's.
   POSTGRES_PASSWORD=build-only \
     GRAFANA_ADMIN_PASSWORD=build-only \
     BOOTROOT_HTTP01_IMAGE="$RESPONDER_BUILD_TAG" \
+    DOCKER_BUILDKIT=1 \
     docker compose -f docker-compose.yml build bootroot-http01
-}
 
-prepare_responder_image() {
-  local base build_tags=("$RESPONDER_BUILD_TAG")
-  log "building responder image"
-  # The build may pull or refresh its base images before it fails, and
-  # a containerd store records those under their tags.
-  while IFS= read -r base; do
-    [ -z "$base" ] || build_tags+=("$base")
-  done < <(awk 'toupper($1) == "FROM" { print $2 }' "$RESPONDER_DOCKERFILE")
-  mutating "${build_tags[@]}" -- build_responder_image
-
-  mutating "$RESPONDER_RELEASE_TAG" -- docker tag "$RESPONDER_BUILD_TAG" "$RESPONDER_RELEASE_TAG"
+  built="$(image_id_of "$RESPONDER_BUILD_TAG")" && [ -n "$built" ] ||
+    fail "the responder build left no image under $RESPONDER_BUILD_TAG"
+  record_ours "$RESPONDER_RELEASE_TAG" "$built"
+  docker tag "$RESPONDER_BUILD_TAG" "$RESPONDER_RELEASE_TAG"
   docker save -o "$ARCHIVE_DIR/http01.tar" "$RESPONDER_RELEASE_TAG"
 }
 
@@ -463,16 +449,10 @@ EOF
   chmod +x "$SHIM_DIR/docker"
 }
 
+# Loading the archives repoints the lookup tags at the selected images
+# and the release tag at the saved responder, all recorded as this run's
+# while they were prepared.
 run_install() {
-  local lookup load_tags=("$RESPONDER_RELEASE_TAG")
-  # Loading the archives repoints the lookup tags and the release tag.
-  while IFS= read -r lookup; do
-    load_tags+=("$lookup")
-  done < <(cut -f5 <<<"$PINS")
-  mutating "${load_tags[@]}" -- install_staged_payload
-}
-
-install_staged_payload() {
   log "running deploy compose install from staged directory"
   (
     cd "$STAGE_DIR"
@@ -539,12 +519,16 @@ assert_running_images() {
     [ "$running" = "${SELECTED_IDS[$i]}" ] ||
       fail "$service runs image $running, not the image $role's pin selected: ${SELECTED_IDS[$i]}"
 
+    # The image the archive restored under the lookup tag, as this store
+    # reports it, must be the one the container runs.
     record="$(inspect_selected "$(lookup_tag_of "$role")")" ||
       fail "cannot inspect the loaded $role image"
     IFS=$'\t' read -r id platform digests <<<"$record"
+    [ "$id" = "$running" ] ||
+      fail "the loaded $role image is $id, but the $service container runs $running"
     [ "$platform" = "$SMOKE_PLATFORM" ] ||
       fail "the loaded $role image is $platform, not $SMOKE_PLATFORM"
-    log "running: $service container runs $running ($platform), the selected $role image; loaded image $id repo-digests=${digests:-<none>}"
+    log "running: $service container runs $running ($platform), the selected and loaded $role image; repo-digests=${digests:-<none>}"
   done
 }
 
