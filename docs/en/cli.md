@@ -656,11 +656,41 @@ of them is declared. The initial pins support `linux/amd64` only: an
 `aarch64` release is blocked until arm64 is selected, evidenced and tested
 explicitly.
 
-`scripts/validate-runtime-images.sh` checks the declaration's format and
-that every default Compose service, and each image reference bootroot runs
-itself, matches it. A service running a declared role must pull its image,
-not build it, and must not request a platform other than `linux/amd64`. It
-reads no registry.
+Two commands check the source against the declaration, and neither reads a
+registry.
+
+`scripts/validate-runtime-images.sh` checks the declaration and the Compose
+sources:
+
+- The declaration's schema-1 format: its fields, digests, SemVer versions
+  and platforms.
+- Coverage and consistency across both `docker-compose.yml` and
+  `docker-compose.deploy.yml`: every default service running a declared
+  role names the declared repository and tag, no role runs undeclared, and
+  no declared role goes unrun. A service running a declared role must pull
+  its image, not build it, and must not request a platform other than
+  `linux/amd64`.
+- Environment isolation: each Compose file is rendered with an explicit
+  env file and a scrubbed environment, so neither a checkout's `.env` nor
+  an image or profile variable in the caller's environment stands in for
+  the source default.
+- Profile and service classification: the monitoring services stay behind
+  the `lan` and `public` profiles, the HTTP-01 responder keeps its
+  product-built repository, and any other service or an unknown profile
+  fails the check.
+- The OpenBao image the CI workflow pre-pulls for the real-daemon TLS test
+  must be the declared one.
+
+The image references bootroot compiles in are not checked by that script.
+Rust tests run by `cargo test` read the same declaration and check them:
+`OPENBAO_AGENT_IMAGE` and the `image:` of each OpenBao Agent sidecar in
+the Compose override `init` generates; `STEP_CA_HELPER_IMAGE` and the image
+in the argv the production step-ca helper calls pass to Docker (CA
+initialization, HTTP-01 admin TLS issuance, CA key regeneration and
+step-ca password rotation); and the PostgreSQL and OpenBao image constants
+the integration tests run, along with the image the `bootroot rotate`
+binary's step-ca password helper calls pass. These tests compare the
+repository and tag only.
 
 Changing a pin — a new tag, or a new digest for the same tag — is a source
 change: edit `deploy/runtime-images.json` in a new commit, together with the
