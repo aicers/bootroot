@@ -639,7 +639,7 @@ bootroot가 빌드하고, 응답기 Dockerfile의 `rust`, `debian` 베이스는 
 지원합니다. arm64를 명시적으로 선택하고 근거를 갖추고 테스트하기
 전까지 `aarch64` 릴리스는 막혀 있습니다.
 
-소스가 선언과 맞는지는 두 명령이 검사하며, 어느 쪽도 레지스트리를 읽지
+소스가 선언과 맞는지는 두 명령이 검사하며, 어느 검사도 레지스트리를 읽지
 않습니다.
 
 `scripts/validate-runtime-images.sh`는 선언과 Compose 소스를 검사합니다.
@@ -656,12 +656,13 @@ bootroot가 빌드하고, 응답기 Dockerfile의 `rust`, `debian` 베이스는 
   소스 기본값을 대신하지 못합니다.
 - 프로필과 서비스 분류: 모니터링 서비스는 `lan`, `public` 프로필 뒤에
   머물러야 하고, HTTP-01 응답기는 제품이 빌드하는 저장소 이름을 유지해야
-  하며, 그 밖의 서비스나 알 수 없는 프로필은 검사를 실패시킵니다.
+  하며, 이들도 선언된 역할도 아닌 서비스나 알 수 없는 프로필을 쓰는
+  서비스는 검사를 실패시킵니다.
 - CI 워크플로가 실제 데몬 TLS 테스트를 위해 미리 받는 OpenBao 이미지는
   선언된 이미지여야 합니다.
 
-bootroot에 컴파일되어 들어가는 이미지 참조는 이 스크립트가 검사하지
-않습니다. `cargo test`로 실행되는 Rust 테스트가 같은 선언을 읽어 검사합니다.
+Rust 소스 속 이미지 참조는 이 스크립트가 검사하지 않습니다. `cargo test`로
+실행되는 Rust 테스트가 같은 선언을 읽어 검사합니다.
 `OPENBAO_AGENT_IMAGE`와 `init`이 생성하는 Compose 오버라이드 속 각 OpenBao
 Agent 사이드카의 `image:`, `STEP_CA_HELPER_IMAGE`와 운영 코드의 step-ca
 헬퍼 호출이 Docker에 넘기는 argv 속 이미지(CA 초기화, HTTP-01 관리자 TLS

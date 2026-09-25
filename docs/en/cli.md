@@ -656,8 +656,8 @@ of them is declared. The initial pins support `linux/amd64` only: an
 `aarch64` release is blocked until arm64 is selected, evidenced and tested
 explicitly.
 
-Two commands check the source against the declaration, and neither reads a
-registry.
+Two commands check the source against the declaration; neither check reads
+a registry.
 
 `scripts/validate-runtime-images.sh` checks the declaration and the Compose
 sources:
@@ -676,12 +676,12 @@ sources:
   the source default.
 - Profile and service classification: the monitoring services stay behind
   the `lan` and `public` profiles, the HTTP-01 responder keeps its
-  product-built repository, and any other service or an unknown profile
-  fails the check.
+  product-built repository, and a service that is none of these nor a
+  declared role, or that uses an unknown profile, fails the check.
 - The OpenBao image the CI workflow pre-pulls for the real-daemon TLS test
   must be the declared one.
 
-The image references bootroot compiles in are not checked by that script.
+The image references in Rust source are not checked by that script.
 Rust tests run by `cargo test` read the same declaration and check them:
 `OPENBAO_AGENT_IMAGE` and the `image:` of each OpenBao Agent sidecar in
 the Compose override `init` generates; `STEP_CA_HELPER_IMAGE` and the image
