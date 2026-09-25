@@ -306,6 +306,11 @@ service host. For a component installed once per deployment, reusing its
 old `service_name` as the key reproduces every previous path and name
 byte for byte.
 
+- Air-gapped installation guidance now uses archive-restored image tags
+  instead of recommending a `@sha256:` value for `BOOTROOT_STEP_CA_IMAGE`,
+  because registry digest references are not guaranteed to survive
+  `docker save`/`load`.
+
 ### Removed
 
 - `bootroot-agent --insecure` is gone. The flag disabled TLS certificate

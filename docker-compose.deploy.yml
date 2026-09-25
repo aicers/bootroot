@@ -8,9 +8,16 @@
 # the tagged images are used as-is (no rebuild, no network).
 #
 # Every image reference is interpolated from an environment variable so an
-# installer can pin an exact release tag or a `@sha256:` digest. The defaults
-# match the release-built tags; override them via `.env` or the process
-# environment (e.g. `BOOTROOT_HTTP01_IMAGE=bootroot-http01-responder@sha256:…`).
+# installer can name the images its archives restored; unset, each falls back
+# to the release default. The registry pins behind the `openbao`, `postgres`
+# and `step-ca` defaults live in deploy/runtime-images.json, not here: release
+# preparation pulls each image by its declared digest, tags it with the
+# default tag below and saves it, and an offline install runs exactly the tag
+# the archive restores. Do not set an image variable to a `@sha256:` reference
+# for an offline install: `docker save`/`docker load` does not guarantee the
+# registry digest survives as a RepoDigest. scripts/validate-runtime-images.sh
+# holds these defaults to the declaration. The monitoring services below sit
+# behind the `lan`/`public` profiles, outside the declared production stack.
 #
 # The only source-tree config the default install services still need is
 # `openbao/openbao.hcl` and `responder.toml.compose`; `infra install` itself
