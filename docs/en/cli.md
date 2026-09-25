@@ -642,7 +642,7 @@ supported platforms. The pins live there, not in the Compose values:
   online Docker use outside this flow.
 - These lookup tags are today's names. bootler's release tooling will
   later normalize offline image references to per-product aliases
-  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<config-hash>`);
+  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<full-config-hash>`);
   bootroot does not implement that migration yet, and the OpenBao Agent and
   step-ca helper images are still the fixed lookup tags above.
 

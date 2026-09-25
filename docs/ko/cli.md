@@ -626,7 +626,7 @@ Compose 값이 아니라 이 파일에 있습니다.
   다이제스트 참조를 그대로 써도 됩니다.
 - 이 조회 태그는 현재의 이름입니다. bootler 릴리스 도구는 이후 오프라인
   이미지 참조를 제품별 별칭
-  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<config-hash>`)
+  (`runtime.invalid/<namespace>/<component>/<dependency>:cfg-<full-config-hash>`)
   으로 정규화할 예정입니다. bootroot는 아직 그 전환을 구현하지 않았으며,
   OpenBao Agent와 step-ca 헬퍼 이미지는 여전히 위의 고정 조회 태그입니다.
 
