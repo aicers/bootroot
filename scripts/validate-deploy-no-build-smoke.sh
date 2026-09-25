@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+#
+# Validates the image handling of scripts/preflight/ci/deploy-no-build-smoke.sh
+# without Docker, a registry or a bootroot build.
+#
+# The smoke itself runs against a real daemon, in local preflight and in
+# CI's `test-core`, and a green run there only shows the happy path on
+# that daemon's tag state. What it must also guarantee — that a moving
+# tag can never stand in for a declared digest, and that every tag it
+# touches is put back on failure, on INT/TERM, and is reported rather
+# than silently left changed when that fails — only shows on the paths a
+# green run never takes. Each case here drives the real smoke script
+# against a fake `docker` holding a JSON image store
+# (scripts/impl/lib/fake-docker-image-store.py) and a fake `bootroot`,
+# then compares the tag store before and after.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+LABEL="validate-deploy-no-build-smoke"
+SMOKE="$ROOT_DIR/scripts/preflight/ci/deploy-no-build-smoke.sh"
+FAKE_DOCKER="$ROOT_DIR/scripts/impl/lib/fake-docker-image-store.py"
+
+die() {
+  echo "[$LABEL] FAIL: $1" >&2
+  exit 1
+}
+
+ok() {
+  echo "[$LABEL] ok: $1"
+}
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+BIN_DIR="$WORK_DIR/bin"
+mkdir -p "$BIN_DIR"
+ln -s "$FAKE_DOCKER" "$BIN_DIR/docker"
+
+# `infra install --no-build`, as far as the smoke can observe it: load
+# every archive, then bring the default services up with no pull and no
+# build.
+cat >"$BIN_DIR/bootroot" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" --help "*)
+    echo "      --no-build  Use prebuilt images only"
+    exit 0
+    ;;
+esac
+archive_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --image-archive-dir) archive_dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+for archive in "$archive_dir"/*.tar; do
+  docker load -i "$archive"
+done
+docker compose -f docker-compose.deploy.yml -p "${COMPOSE_PROJECT_NAME:-bootroot}" \
+  up --no-build --pull never -d openbao postgres step-ca bootroot-http01
+EOF
+chmod +x "$BIN_DIR/bootroot"
+
+cat >"$BIN_DIR/cargo" <<'EOF'
+#!/bin/sh
+echo "fake cargo: the smoke must not build during this validation" >&2
+exit 1
+EOF
+chmod +x "$BIN_DIR/cargo"
+
+PINS="$(python3 scripts/runtime_images.py --declaration deploy/runtime-images.json pins)"
+VERSION="$(awk -F' = ' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' Cargo.toml)"
+OPENBAO_TAG="$(awk -F'\t' '$1 == "openbao" { print $5 }' <<<"$PINS")"
+POSTGRES_TAG="$(awk -F'\t' '$1 == "postgres" { print $5 }' <<<"$PINS")"
+STEPCA_TAG="$(awk -F'\t' '$1 == "step-ca" { print $5 }' <<<"$PINS")"
+RESPONDER_BUILD="bootroot-http01-responder:latest"
+RESPONDER_RELEASE="bootroot-http01-responder:$VERSION"
+# The responder Dockerfile's two stages: the build base, which the fake
+# build refreshes the way a containerd store records a pulled base, and
+# the runtime base, which it leaves alone.
+BASES="$(awk 'toupper($1) == "FROM" { print $2 }' docker/http01-responder/Dockerfile)"
+BUILD_BASE="$(sed -n 1p <<<"$BASES")"
+RUNTIME_BASE="$(sed -n 2p <<<"$BASES")"
+[ -n "$BUILD_BASE" ] && [ -n "$RUNTIME_BASE" ] ||
+  die "expected two FROM stages in docker/http01-responder/Dockerfile, found: $BASES"
+
+# Four ports nothing listens on, for the smoke's own port preflight.
+read -r PORT_A PORT_B PORT_C PORT_D < <(python3 -c '
+import socket
+socks = [socket.socket() for _ in range(4)]
+for s in socks:
+    s.bind(("127.0.0.1", 0))
+print(" ".join(str(s.getsockname()[1]) for s in socks))
+')
+
+id_of() {
+  python3 -c 'import hashlib, sys; print("sha256:" + hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
+}
+
+# new_state <case> — a fresh store: the registry serves each declared pin
+# as an amd64+arm64 index, plus a moving tag for postgres that must never
+# be used; the tag store starts empty.
+new_state() {
+  STATE="$WORK_DIR/state-$1"
+  mkdir -p "$STATE"
+  python3 - "$STATE" <<'EOF' "$PINS"
+import hashlib
+import json
+import sys
+
+state, pins = sys.argv[1], sys.argv[2]
+
+
+def digest(text):
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+registry = {}
+for line in pins.splitlines():
+    role, repository, tag, pinned, lookup = line.split("\t")
+    index = pinned
+    amd64, arm64 = digest(f"{role}-amd64"), digest(f"{role}-arm64")
+    registry[f"{repository}@{pinned}"] = {
+        "target": index,
+        "images": {
+            index: {"platform": "index", "children": {"linux/amd64": amd64, "linux/arm64": arm64}},
+            amd64: {"platform": "linux/amd64"},
+            arm64: {"platform": "linux/arm64"},
+        },
+    }
+moving = digest("postgres-moving-tag")
+for ref in ("postgres:18.4", "docker.io/library/postgres:18.4"):
+    registry[ref] = {"target": moving, "images": {moving: {"platform": "linux/amd64"}}}
+with open(f"{state}/registry.json", "w") as handle:
+    json.dump(registry, handle)
+EOF
+}
+
+# seed <tag> <id> — a tag that exists before the smoke.
+seed() {
+  python3 - "$STATE" "$1" "$2" <<'EOF'
+import json
+import sys
+
+state, tag, image_id = sys.argv[1:]
+path = f"{state}/tags.json"
+try:
+    tags = json.load(open(path))
+except FileNotFoundError:
+    tags = {}
+images_path = f"{state}/images.json"
+try:
+    images = json.load(open(images_path))
+except FileNotFoundError:
+    images = {}
+tags[tag] = image_id
+images.setdefault(image_id, {"platform": "linux/amd64"})
+json.dump(tags, open(path, "w"))
+json.dump(images, open(images_path, "w"))
+EOF
+}
+
+# The tag store minus the `repository@digest` references a digest pull
+# leaves behind by design.
+tag_map() {
+  python3 - "$STATE" <<'EOF'
+import json
+import sys
+
+try:
+    tags = json.load(open(f"{sys.argv[1]}/tags.json"))
+except FileNotFoundError:
+    tags = {}
+for name in sorted(tags):
+    if "@" not in name:
+        print(f"{name} {tags[name]}")
+EOF
+}
+
+# run_smoke — runs the smoke against the current state; sets STATUS and
+# OUTPUT. Caller image overrides are exported on purpose: the smoke must
+# ignore every one of them.
+run_smoke() {
+  STATUS=0
+  OUTPUT="$(
+    PATH="$BIN_DIR:$PATH" \
+      FAKE_DOCKER_STATE="$STATE" \
+      FAKE_DOCKER_BUILD_BASE="$BUILD_BASE" \
+      BOOTROOT_BIN="$BIN_DIR/bootroot" \
+      COMPOSE_PROJECT_NAME=deploy-smoke-fake \
+      OPENBAO_HOST_PORT="$PORT_A" STEPCA_HOST_PORT="$PORT_B" \
+      HTTP01_ADMIN_HOST_PORT="$PORT_C" POSTGRES_HOST_PORT="$PORT_D" \
+      OPENBAO_IMAGE=openbao/openbao:9.9.9 \
+      POSTGRES_IMAGE=postgres:99 \
+      BOOTROOT_STEP_CA_IMAGE=smallstep/step-ca:9.9.9 \
+      BOOTROOT_HTTP01_IMAGE=example.invalid/unrelated:1 \
+      bash "$SMOKE" 2>&1
+  )" || STATUS=$?
+}
+
+expect_status() {
+  local name="$1" expected="$2"
+  if [ "$STATUS" -ne "$expected" ]; then
+    printf '%s\n' "$OUTPUT" >&2
+    die "$name: expected exit $expected, got $STATUS"
+  fi
+}
+
+expect_output() {
+  local name="$1" fragment="$2"
+  if ! grep -qF -- "$fragment" <<<"$OUTPUT"; then
+    printf '%s\n' "$OUTPUT" >&2
+    die "$name: output did not contain: $fragment"
+  fi
+}
+
+expect_no_output() {
+  local name="$1" fragment="$2"
+  if grep -qF -- "$fragment" <<<"$OUTPUT"; then
+    printf '%s\n' "$OUTPUT" >&2
+    die "$name: output unexpectedly contained: $fragment"
+  fi
+}
+
+expect_restored() {
+  local name="$1" after
+  after="$(tag_map)"
+  if [ "$after" != "$BEFORE" ]; then
+    printf 'before:\n%s\nafter:\n%s\n' "$BEFORE" "$after" >&2
+    die "$name: the tag store after cleanup differs from before the smoke"
+  fi
+}
+
+# No pull of anything but a declared digest, for the release platform.
+expect_digest_pulls_only() {
+  local name="$1" pulls
+  pulls="$(grep -E '^pull ' "$STATE/argv.log" || true)"
+  if grep -vE '^pull --platform linux/amd64 [^ ]+@sha256:[0-9a-f]{64}$' <<<"$pulls" | grep -q .; then
+    printf '%s\n' "$pulls" >&2
+    die "$name: the smoke pulled something other than a declared digest"
+  fi
+}
+
+seed_mixed() {
+  # Present before: openbao's lookup tag on an unrelated image, postgres's
+  # on the registry's moving tag (a stale tag pull), the responder's
+  # build tag and the build base. Absent before: step-ca's lookup tag,
+  # the responder release tag and the runtime base.
+  seed "$OPENBAO_TAG" "$(id_of prior-openbao)"
+  seed "$POSTGRES_TAG" "$(id_of postgres-moving-tag)"
+  seed "$RESPONDER_BUILD" "$(id_of prior-responder)"
+  seed "$BUILD_BASE" "$(id_of prior-build-base)"
+  BEFORE="$(tag_map)"
+}
+
+# ---------------------------------------------------------------------------
+# Success, with previously present and previously absent tags
+# ---------------------------------------------------------------------------
+
+new_state success-mixed
+seed_mixed
+run_smoke
+expect_status "success" 0
+expect_output "success" "deploy compose no-build smoke passed"
+expect_output "success" "restored: every managed tag maps as before the smoke"
+expect_restored "success"
+expect_digest_pulls_only "success"
+for tag in "$OPENBAO_TAG" "$POSTGRES_TAG" "$STEPCA_TAG" "$RESPONDER_BUILD" \
+  "$RESPONDER_RELEASE" "$BUILD_BASE" "$RUNTIME_BASE"; do
+  expect_output "success" "snapshot: $tag ->"
+done
+ok "success restores present tags and removes created ones"
+
+# The moving tag never replaced the pin: postgres's lookup tag was saved
+# while it named the pin's amd64 image, and the container ran that image.
+POSTGRES_AMD64="$(id_of postgres-amd64)"
+expect_output "moving tag" "record: dependency=postgres pin=docker.io/library/postgres@sha256:"
+expect_output "moving tag" "lookup=$POSTGRES_TAG image-id=$POSTGRES_AMD64"
+expect_output "moving tag" "running: postgres container runs $POSTGRES_AMD64 (linux/amd64)"
+expect_no_output "moving tag" "$(id_of postgres-moving-tag) (linux/amd64)"
+ok "a moving tag cannot replace the digest pull"
+
+# Save and load go through the lookup tags the Compose defaults name.
+for pair in "openbao:$OPENBAO_TAG" "postgres:$POSTGRES_TAG" "step-ca:$STEPCA_TAG"; do
+  role="${pair%%:*}"
+  tag="${pair#*:}"
+  grep -qE "^save --platform linux/amd64 -o [^ ]*/$role\\.tar $tag$" "$STATE/argv.log" ||
+    die "save/load: $role was not saved from its lookup tag $tag"
+  grep -qE "^load -i [^ ]*/$role\\.tar$" "$STATE/argv.log" ||
+    die "save/load: $role.tar was not loaded"
+done
+grep -qE "^save -o [^ ]*/http01\\.tar $RESPONDER_RELEASE$" "$STATE/argv.log" ||
+  die "save/load: the responder was not saved from $RESPONDER_RELEASE"
+ok "save/load use the required lookup tags"
+
+new_state success-absent
+BEFORE="$(tag_map)"
+run_smoke
+expect_status "success from an empty store" 0
+expect_restored "success from an empty store"
+ok "success from an empty store leaves no tag behind"
+
+# ---------------------------------------------------------------------------
+# Failure partway through preparation
+# ---------------------------------------------------------------------------
+
+new_state missing-pin
+seed_mixed
+FAKE_DOCKER_FAIL_ON='^pull .*postgres@sha256:' run_smoke
+expect_status "missing pin" 1
+expect_output "missing pin" "is not available for linux/amd64; there is no fallback to the tag"
+expect_restored "missing pin"
+expect_digest_pulls_only "missing pin"
+ok "a missing pin fails hard, with no tag fallback, and restores"
+
+new_state partial
+seed_mixed
+FAKE_DOCKER_FAIL_ON='^save .*/step-ca\.tar ' run_smoke
+expect_status "partial preparation failure" 1
+expect_restored "partial preparation failure"
+ok "a failure after tags changed restores them"
+
+# ---------------------------------------------------------------------------
+# Catchable interruption
+# ---------------------------------------------------------------------------
+
+new_state term
+seed_mixed
+FAKE_DOCKER_SIGNAL_ON='^save .*/postgres\.tar =TERM' run_smoke
+expect_status "TERM" 143
+expect_restored "TERM"
+ok "TERM mid-preparation restores"
+
+new_state int
+seed_mixed
+FAKE_DOCKER_SIGNAL_ON='^compose .* build bootroot-http01$=INT' run_smoke
+expect_status "INT" 130
+expect_restored "INT"
+ok "INT during the responder build restores"
+
+# ---------------------------------------------------------------------------
+# Restoration failure
+# ---------------------------------------------------------------------------
+
+new_state restore-fails
+seed_mixed
+FAKE_DOCKER_FAIL_ON="^tag sha256:[0-9a-f]+ $POSTGRES_TAG\$" run_smoke
+expect_status "restoration failure" 1
+expect_output "restoration failure" "cannot point $POSTGRES_TAG back at"
+expect_output "restoration failure" "after cleanup $POSTGRES_TAG names"
+expect_no_output "restoration failure" "deploy compose no-build smoke passed"
+ok "a restoration failure is reported and fails a passing smoke"
+
+new_state restore-fails-after-term
+seed_mixed
+FAKE_DOCKER_SIGNAL_ON='^save .*/step-ca\.tar =TERM' \
+  FAKE_DOCKER_FAIL_ON="^tag sha256:[0-9a-f]+ $POSTGRES_TAG\$" run_smoke
+expect_status "restoration failure after TERM" 143
+expect_output "restoration failure after TERM" "cannot point $POSTGRES_TAG back at"
+expect_output "restoration failure after TERM" "image tag restoration failed"
+ok "a restoration failure keeps the original failure's status"
+
+new_state created-tag-removal-fails
+seed_mixed
+FAKE_DOCKER_FAIL_ON="^image rm $STEPCA_TAG\$" run_smoke
+expect_status "created tag removal failure" 1
+expect_output "created tag removal failure" "cannot remove $STEPCA_TAG, which this run created"
+ok "failing to remove a created tag is reported"
+
+# ---------------------------------------------------------------------------
+# Another writer changes a managed tag during the smoke
+# ---------------------------------------------------------------------------
+
+FOREIGN="$(id_of foreign-writer)"
+new_state conflict
+seed_mixed
+FAKE_DOCKER_FOREIGN_ON="^container inspect=$OPENBAO_TAG=$FOREIGN" run_smoke
+expect_status "concurrent writer" 1
+expect_output "concurrent writer" "$OPENBAO_TAG now names $FOREIGN, which this run never set"
+grep -qx "$OPENBAO_TAG $FOREIGN" <<<"$(tag_map)" ||
+  die "concurrent writer: the other writer's mapping was overwritten"
+expect_output "concurrent writer" "still held as bootroot-deploy-smoke-backup:"
+grep -q "^bootroot-deploy-smoke-backup:[^ ]* $(id_of prior-openbao)$" <<<"$(tag_map)" ||
+  die "concurrent writer: the prior image lost the backup tag holding it"
+[ "$(tag_map | grep -v "^$OPENBAO_TAG \|^bootroot-deploy-smoke-backup:")" = \
+  "$(grep -v "^$OPENBAO_TAG " <<<"$BEFORE")" ] ||
+  die "concurrent writer: the other tags were not restored"
+ok "a tag another writer changed is reported and left alone"
+
+echo "[$LABEL] OK: pinned preparation and tag restoration behave on every path"

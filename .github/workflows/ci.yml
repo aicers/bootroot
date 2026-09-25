@@ -177,6 +177,9 @@ jobs:
       - name: Validate Runtime Image Declaration
         run: ./scripts/validate-runtime-images.sh
 
+      - name: Validate Deploy No-Build Smoke Image Handling
+        run: ./scripts/validate-deploy-no-build-smoke.sh
+
       - name: Validate Compose Instance Names
         run: ./scripts/validate-compose-instance-names.sh
 
