@@ -827,7 +827,7 @@ fn build_ownership_sweep_args(
         "--user",
         "root",
         // Run `chown` directly instead of through the image's default
-        // entrypoint. The `rotate` flows reuse the `smallstep/step-ca:0.30.2`
+        // entrypoint. The `rotate` flows reuse the `STEP_CA_HELPER_IMAGE`
         // helper image here, whose entrypoint would otherwise print a
         // spurious "there is no ca.json config file" warning — the sweep
         // deliberately mounts only the secrets subtree, not `/home/step`.
@@ -915,7 +915,7 @@ fn resolve_stepca_image(
 /// image the flow already has on hand so the sweep introduces no new
 /// dependency: the `infra` flows resolve the compose step-ca server image
 /// (see [`resolve_stepca_image`]) after `up` has made it available, while
-/// the `rotate` flows pass the same `smallstep/step-ca:0.30.2` image their
+/// the `rotate` flows pass the same `STEP_CA_HELPER_IMAGE` their
 /// `step` helpers already run.
 pub(crate) fn sweep_secrets_ownership(
     secrets_dir: &Path,

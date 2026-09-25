@@ -14,6 +14,7 @@ use super::super::paths::StepCaTemplatePaths;
 use super::super::types::StepCaInitResult;
 use super::RollbackFile;
 use crate::commands::infra::run_docker;
+use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -664,14 +665,27 @@ pub(super) fn ensure_step_ca_initialized(
     // literals in this list land in `ca.json`'s `dnsNames`, which
     // step-ca splits into `dNSName` and `iPAddress` SANs at boot.
     let dns_arg = dns_names.join(",");
-    let args = vec![
+    let args = step_ca_init_docker_args(&mount, &user_arg, &dns_arg);
+    run_docker(&args, "docker step-ca init", messages)?;
+    Ok(StepCaInitResult::Initialized)
+}
+
+/// Builds the `docker run` argv that initializes the CA as the
+/// secrets-directory owner. Kept pure so tests can assert the helper
+/// image it runs.
+fn step_ca_init_docker_args<'a>(
+    mount: &'a str,
+    user_arg: &'a str,
+    dns_arg: &'a str,
+) -> Vec<&'a str> {
+    vec![
         "run",
         "--user",
-        &user_arg,
+        user_arg,
         "--rm",
         "-v",
-        &*mount,
-        "smallstep/step-ca:0.30.2",
+        mount,
+        STEP_CA_HELPER_IMAGE,
         "step",
         "ca",
         "init",
@@ -680,7 +694,7 @@ pub(super) fn ensure_step_ca_initialized(
         "--provisioner",
         DEFAULT_CA_PROVISIONER,
         "--dns",
-        &dns_arg,
+        dns_arg,
         "--address",
         DEFAULT_CA_ADDRESS,
         "--password-file",
@@ -688,9 +702,7 @@ pub(super) fn ensure_step_ca_initialized(
         "--provisioner-password-file",
         "/home/step/password.txt",
         "--acme",
-    ];
-    run_docker(&args, "docker step-ca init", messages)?;
-    Ok(StepCaInitResult::Initialized)
+    ]
 }
 
 #[cfg(test)]
@@ -868,6 +880,23 @@ mod tests {
         .unwrap();
         let patched = set_acme_cert_duration(&mut value, "48h", Some("nonexistent"));
         assert!(!patched);
+    }
+
+    /// The CA initialization helper container runs the step-ca image the
+    /// runtime declaration approves.
+    #[test]
+    fn step_ca_init_runs_the_declared_step_ca_image() {
+        let args = step_ca_init_docker_args("/host/secrets:/home/step", "1000:1000", "localhost");
+        let image = args
+            .iter()
+            .skip_while(|arg| **arg != "-v")
+            .nth(2)
+            .expect("the image follows the `-v <mount>` pair");
+        crate::runtime_image_declaration::assert_declared_image(
+            "step-ca",
+            image,
+            "init step-ca init",
+        );
     }
 
     #[test]

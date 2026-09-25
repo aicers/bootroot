@@ -56,6 +56,9 @@ use serde_json::json;
 use tempfile::{TempDir, tempdir};
 use tokio::time::sleep;
 
+#[path = "../src/runtime_image_declaration.rs"]
+mod runtime_image_declaration;
+
 const SERVICE_NAME: &str = "edge-proxy";
 const HOSTNAME: &str = "edge-node-02";
 const DOMAIN: &str = "trusted.domain";
@@ -79,6 +82,17 @@ struct TestCa {
     issuer: Issuer<'static, KeyPair>,
     pem: String,
     der: Vec<u8>,
+}
+
+/// The daemon these tests run, and CI pre-pulls, is the `OpenBao` image the
+/// runtime declaration approves.
+#[test]
+fn the_real_daemon_image_is_the_declared_openbao_image() {
+    runtime_image_declaration::assert_declared_image(
+        "openbao",
+        OPENBAO_IMAGE,
+        "tests/e2e_multi_host_tls_real_daemon.rs OPENBAO_IMAGE",
+    );
 }
 
 #[allow(clippy::struct_field_names)] // explicit _pem suffix disambiguates from DER variants

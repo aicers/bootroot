@@ -118,8 +118,8 @@ pub(super) async fn rotate_ca_key(
     // cannot even read, which would fail the host-side Phase 1 backup
     // below and, on resume, the later key reads. The sweep repairs that in
     // place and is a no-op when ownership is already correct. It reuses the
-    // `smallstep/step-ca:0.30.2` image the `step` helpers already run, so it
-    // adds no new dependency. Runs unconditionally (not gated on `start_phase`)
+    // `STEP_CA_HELPER_IMAGE` the `step` helpers already run, so it adds no
+    // new dependency. Runs unconditionally (not gated on `start_phase`)
     // so a resumed rotation converges too.
     crate::commands::infra::sweep_secrets_ownership(
         ctx.paths.secrets_dir(),
@@ -547,7 +547,7 @@ fn generate_root_docker_args(mount: &str, user_arg: &str) -> Vec<String> {
         "--rm",
         "-v",
         mount,
-        "smallstep/step-ca:0.30.2",
+        STEP_CA_HELPER_IMAGE,
         "step",
         "certificate",
         "create",
@@ -576,7 +576,7 @@ fn generate_intermediate_docker_args(mount: &str, user_arg: &str) -> Vec<String>
         "--rm",
         "-v",
         mount,
-        "smallstep/step-ca:0.30.2",
+        STEP_CA_HELPER_IMAGE,
         "step",
         "certificate",
         "create",
@@ -1687,7 +1687,7 @@ mod tests {
             Some("1000:1000")
         );
         assert!(!args.iter().any(|a| a == "root"));
-        assert!(args.iter().any(|a| a == "smallstep/step-ca:0.30.2"));
+        assert!(args.iter().any(|a| a == STEP_CA_HELPER_IMAGE));
     }
 
     /// The intermediate-CA regeneration container must likewise run as the
@@ -1704,7 +1704,32 @@ mod tests {
             Some("1000:1000")
         );
         assert!(!args.iter().any(|a| a == "root"));
-        assert!(args.iter().any(|a| a == "smallstep/step-ca:0.30.2"));
+        assert!(args.iter().any(|a| a == STEP_CA_HELPER_IMAGE));
+    }
+
+    /// Both CA regeneration containers run the step-ca image the runtime
+    /// declaration approves: the argv production hands to docker, not
+    /// just the constant it is built from.
+    #[test]
+    fn ca_regeneration_runs_the_declared_step_ca_image() {
+        let mount = "/host/secrets:/home/step";
+        for (source, args) in [
+            (
+                "rotate ca-key root regeneration",
+                generate_root_docker_args(mount, "1000:1000"),
+            ),
+            (
+                "rotate ca-key intermediate regeneration",
+                generate_intermediate_docker_args(mount, "1000:1000"),
+            ),
+        ] {
+            let image = args
+                .iter()
+                .skip_while(|arg| *arg != "-v")
+                .nth(2)
+                .expect("the image follows the `-v <mount>` pair");
+            crate::runtime_image_declaration::assert_declared_image("step-ca", image, source);
+        }
     }
 
     /// `owner_user_arg` resolves the `uid:gid` from the secrets directory

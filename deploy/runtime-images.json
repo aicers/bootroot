@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "dependencies": [
+    {
+      "dependency": "openbao",
+      "repository": "docker.io/openbao/openbao",
+      "tag": "2.5.5",
+      "version": "2.5.5",
+      "digest": "sha256:6150c4a6b62067db6141c8da7a6a6b5763f4f47c315343d0c848b40fecdfd452",
+      "platforms": ["linux/amd64"]
+    },
+    {
+      "dependency": "postgres",
+      "repository": "docker.io/library/postgres",
+      "tag": "18.4",
+      "version": "18.4.0",
+      "digest": "sha256:32ca0af8e77bfb8c6610c488e4691f83f972a3e9e64d3b02facf3ab111ad5500",
+      "platforms": ["linux/amd64"]
+    },
+    {
+      "dependency": "step-ca",
+      "repository": "docker.io/smallstep/step-ca",
+      "tag": "0.30.2",
+      "version": "0.30.2",
+      "digest": "sha256:a2b17872915c193259b75a5474c398326f41bd199f0842093e52cf4182bc8270",
+      "platforms": ["linux/amd64"]
+    }
+  ]
+}

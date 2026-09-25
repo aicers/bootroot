@@ -13,6 +13,7 @@ use crate::commands::init::{
     HTTP01_ADMIN_TLS_CERT_REL_PATH, HTTP01_ADMIN_TLS_DEFAULT_NOT_AFTER,
     HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE, HTTP01_ADMIN_TLS_KEY_REL_PATH,
 };
+use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 
@@ -56,7 +57,7 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         &secrets_mount,
         "-v",
         &tls_mount,
-        "smallstep/step-ca:0.30.2",
+        STEP_CA_HELPER_IMAGE,
         "step",
         "certificate",
         "create",
@@ -350,6 +351,40 @@ mod tests {
         assert!(
             log.contains("insight-http01"),
             "the fallback SAN list must name the instance's container, got: {log}"
+        );
+    }
+
+    /// The certificate-issuing helper container runs the step-ca image
+    /// the runtime declaration approves.
+    #[test]
+    fn issuance_runs_the_declared_step_ca_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let secrets_dir = dir.path().join("secrets");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        let messages = crate::i18n::test_messages();
+        issue_http01_admin_tls_cert(&secrets_dir, &["localhost"], &fake, &messages)
+            .expect("issuance must succeed against the fake docker");
+
+        let log = std::fs::read_to_string(&args_log).unwrap();
+        let args: Vec<&str> = log.split_whitespace().collect();
+        let image = args
+            .iter()
+            .position(|arg| *arg == "step")
+            .and_then(|step| step.checked_sub(1))
+            .and_then(|index| args.get(index))
+            .expect("the image precedes the `step` command");
+        crate::runtime_image_declaration::assert_declared_image(
+            "step-ca",
+            image,
+            "init http01 admin TLS issuance",
         );
     }
 
