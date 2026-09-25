@@ -56,7 +56,10 @@
 # to recover. The lock file sits in a directory private to this user,
 # where nobody else can swap the inode it locks; runs by another user or
 # from another host sharing the daemon are not serialised by it, and
-# only the cleanup's conflict check stands between them.
+# only the cleanup's conflict check stands between them. The lock sits
+# at a fixed path, `/tmp/bootroot-deploy-smoke-<uid>/`, whatever
+# `$TMPDIR` says, so every run by that user on that host contends for
+# the same one.
 #
 # `down -v` on the test project is destructive. Never point this at a
 # live installation's Compose project.
@@ -66,6 +69,7 @@ SMOKE_PLATFORM="linux/amd64"
 BACKUP_REPOSITORY="bootroot-deploy-smoke-backup"
 RESPONDER_REPOSITORY="bootroot-http01-responder"
 RESPONDER_DOCKERFILE="docker/http01-responder/Dockerfile"
+LOCK_ROOT="/tmp"
 LOCK_NAME="deploy-no-build-smoke.lock"
 
 log() {
@@ -100,10 +104,12 @@ init_smoke() {
   # `bootroot`, so mirror that order here rather than hard-coding one side.
   COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-bootroot}"
 
-  # Overriding the lock directory is for validate-deploy-no-build-smoke.sh,
-  # whose fake runs must not contend with a real smoke on this host.
-  local tmp="${TMPDIR:-/tmp}"
-  LOCK_DIR="${BOOTROOT_DEPLOY_SMOKE_LOCK_DIR:-${tmp%/}/bootroot-deploy-smoke-$(id -u)}"
+  # A fixed root, never `$TMPDIR`: that is per-session on macOS and
+  # anyone's to set, and two runs resolving different lock files would
+  # both repoint the shared tags. Overriding the root is for
+  # validate-deploy-no-build-smoke.sh, whose fake runs must not contend
+  # with a real smoke on this host.
+  LOCK_DIR="${BOOTROOT_DEPLOY_SMOKE_LOCK_ROOT:-$LOCK_ROOT}/bootroot-deploy-smoke-$(id -u)"
 
   STAGE_DIR="$(mktemp -d)"
   ARCHIVE_DIR="$STAGE_DIR/images"
@@ -642,4 +648,8 @@ main() {
   log "deploy compose no-build smoke passed"
 }
 
-main "$@"
+# Sourced, it only defines the functions, so validate-deploy-no-build-smoke.sh
+# can check where `init_smoke` puts the lock without taking it.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

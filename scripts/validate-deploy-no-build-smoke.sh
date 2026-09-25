@@ -36,10 +36,11 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 BIN_DIR="$WORK_DIR/bin"
 mkdir -p "$BIN_DIR"
-# The smoke's lock directory, so no case here contends with a real smoke
-# running on this host.
-LOCK_DIR="$WORK_DIR/lock"
-mkdir -m 700 "$LOCK_DIR"
+# The root of the smoke's lock directory, so no case here contends with
+# a real smoke running on this host.
+LOCK_ROOT="$WORK_DIR/lock-root"
+LOCK_DIR="$LOCK_ROOT/bootroot-deploy-smoke-$(id -u)"
+mkdir -m 700 "$LOCK_ROOT" "$LOCK_DIR"
 ln -s "$FAKE_DOCKER" "$BIN_DIR/docker"
 
 # `infra install --no-build`, as far as the smoke can observe it: load
@@ -195,7 +196,8 @@ run_smoke() {
     PATH="$BIN_DIR:$PATH" \
       FAKE_DOCKER_STATE="$STATE" \
       FAKE_DOCKER_BUILD_BASE="$BUILD_BASE" \
-      BOOTROOT_DEPLOY_SMOKE_LOCK_DIR="${SMOKE_LOCK_DIR:-$LOCK_DIR}" \
+      BOOTROOT_DEPLOY_SMOKE_LOCK_ROOT="${SMOKE_LOCK_ROOT:-$LOCK_ROOT}" \
+      TMPDIR="${SMOKE_TMPDIR:-${TMPDIR:-/tmp}}" \
       BOOTROOT_BIN="$BIN_DIR/bootroot" \
       COMPOSE_PROJECT_NAME=deploy-smoke-fake \
       OPENBAO_HOST_PORT="$PORT_A" STEPCA_HOST_PORT="$PORT_B" \
@@ -520,18 +522,18 @@ ok "a lookup tag another writer changed during a failed install is left alone"
 # Only one smoke runs at a time
 # ---------------------------------------------------------------------------
 
-# Another run holds the smoke's lock: this one is refused before it runs
-# a single `docker` command, so it neither stops that run's stack nor
-# changes a tag it is using.
-new_state lock-held
-seed_mixed
-READY_FIFO="$WORK_DIR/lock-ready.fifo"
-RELEASE_FIFO="$WORK_DIR/lock-release.fifo"
-mkfifo "$READY_FIFO" "$RELEASE_FIFO"
-# Both opened read-write, which never blocks, so a holder that dies
-# early makes the `read` below time out rather than hang.
-exec 7<>"$READY_FIFO" 6<>"$RELEASE_FIFO"
-python3 - "$LOCK_DIR/deploy-no-build-smoke.lock" "$READY_FIFO" "$RELEASE_FIFO" <<'EOF' &
+# run_smoke_while_locked <lock file> — runs the smoke while another
+# process holds an exclusive `flock` on `lock file`, releasing it once
+# the run has ended.
+run_smoke_while_locked() {
+  local lock="$1" ready="$WORK_DIR/lock-ready.fifo" release="$WORK_DIR/lock-release.fifo"
+  local holder
+  rm -f "$ready" "$release"
+  mkfifo "$ready" "$release"
+  # Both opened read-write, which never blocks, so a holder that dies
+  # early makes the `read` below time out rather than hang.
+  exec 7<>"$ready" 6<>"$release"
+  python3 - "$lock" "$ready" "$release" <<'EOF' &
 import fcntl
 import sys
 
@@ -543,20 +545,67 @@ with open(ready, "w") as signal:
 with open(release) as wait:
     wait.readline()
 EOF
-HOLDER_PID=$!
-read -t 30 -r _ <&7 || die "lock held: the holder never took the lock"
-run_smoke
-echo release >&6
-wait "$HOLDER_PID" || die "lock held: the holder failed"
-exec 6>&- 7>&-
-expect_status "lock held" 1
-expect_output "lock held" "another deploy no-build smoke run holds"
-[ ! -s "$STATE/argv.log" ] || {
-  cat "$STATE/argv.log" >&2
-  die "lock held: the refused run invoked docker"
+  holder=$!
+  read -t 30 -r _ <&7 || die "the lock holder never took $lock"
+  run_smoke
+  echo release >&6
+  wait "$holder" || die "the lock holder for $lock failed"
+  exec 6>&- 7>&-
 }
-expect_restored "lock held"
+
+# expect_refused_by_lock <name> — the run was refused on the lock before
+# it ran a single `docker` command.
+expect_refused_by_lock() {
+  local name="$1"
+  expect_status "$name" 1
+  expect_output "$name" "another deploy no-build smoke run holds"
+  [ ! -s "$STATE/argv.log" ] || {
+    cat "$STATE/argv.log" >&2
+    die "$name: the refused run invoked docker"
+  }
+  expect_restored "$name"
+}
+
+# Another run holds the smoke's lock: this one is refused before it runs
+# a single `docker` command, so it neither stops that run's stack nor
+# changes a tag it is using.
+new_state lock-held
+seed_mixed
+run_smoke_while_locked "$LOCK_DIR/deploy-no-build-smoke.lock"
+expect_refused_by_lock "lock held"
 ok "a smoke started while another holds the lock is refused before touching docker"
+
+# The lock's path does not follow `$TMPDIR`, which differs per session on
+# macOS: a run under one takes the lock that a run under another is then
+# refused on.
+new_state lock-tmpdir-a
+seed_mixed
+mkdir -p "$WORK_DIR/tmpdir-a" "$WORK_DIR/tmpdir-b"
+SMOKE_TMPDIR="$WORK_DIR/tmpdir-a" run_smoke
+expect_status "lock under one TMPDIR" 0
+HELD_LOCK="$(sed -n 's/^\[deploy-no-build-smoke\] lock: holding //p' <<<"$OUTPUT")"
+[ "$HELD_LOCK" = "$LOCK_DIR/deploy-no-build-smoke.lock" ] || {
+  printf '%s\n' "$OUTPUT" >&2
+  die "lock under one TMPDIR: held '$HELD_LOCK', not the fixed lock path"
+}
+# Nor does the default, which no case above reaches: resolved under two
+# TMPDIR values with no root override, it is the same fixed path. Only
+# resolved, never taken, so a real smoke holding it is undisturbed.
+default_lock_dir() {
+  # shellcheck disable=SC2016 # expanded by the child shell, not here
+  env -u BOOTROOT_DEPLOY_SMOKE_LOCK_ROOT TMPDIR="$1" PATH="$BIN_DIR:$PATH" \
+    bash -c 'source "$1" && init_smoke && rm -rf "$STAGE_DIR" && printf "%s" "$LOCK_DIR"' \
+    _ "$SMOKE"
+}
+DEFAULT_A="$(default_lock_dir "$WORK_DIR/tmpdir-a")" || die "default lock: init_smoke failed"
+DEFAULT_B="$(default_lock_dir "$WORK_DIR/tmpdir-b")" || die "default lock: init_smoke failed"
+[ "$DEFAULT_A" = "/tmp/bootroot-deploy-smoke-$(id -u)" ] && [ "$DEFAULT_B" = "$DEFAULT_A" ] ||
+  die "default lock: resolved '$DEFAULT_A' and '$DEFAULT_B', not /tmp/bootroot-deploy-smoke-$(id -u) for both"
+new_state lock-tmpdir-b
+seed_mixed
+SMOKE_TMPDIR="$WORK_DIR/tmpdir-b" run_smoke_while_locked "$HELD_LOCK"
+expect_refused_by_lock "lock under another TMPDIR"
+ok "runs under different TMPDIR values contend for the same lock"
 
 # Released when the holder ends, so the next run takes it.
 new_state lock-released
@@ -570,9 +619,9 @@ ok "the lock is free again once its holder ends"
 # inode can be swapped, so it is refused.
 new_state lock-dir-open
 seed_mixed
-mkdir "$WORK_DIR/open-lock"
-chmod 777 "$WORK_DIR/open-lock"
-SMOKE_LOCK_DIR="$WORK_DIR/open-lock" run_smoke
+mkdir -p "$WORK_DIR/open-root/bootroot-deploy-smoke-$(id -u)"
+chmod 777 "$WORK_DIR/open-root/bootroot-deploy-smoke-$(id -u)"
+SMOKE_LOCK_ROOT="$WORK_DIR/open-root" run_smoke
 expect_status "lock directory open to others" 1
 expect_output "lock directory open to others" "is not a directory private to this user"
 [ ! -s "$STATE/argv.log" ] || die "lock directory open to others: the refused run invoked docker"

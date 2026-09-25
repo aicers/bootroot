@@ -1038,8 +1038,13 @@ It repoints the daemon's shared image lookup tags for the duration of the
 run and restores them afterwards, so only one runs at a time. A second
 run started by the same user on the same host while one is in progress
 is refused before it runs any `docker` command; start it again once the
-first has finished. Runs by another user or from another host sharing
-the daemon are not serialised, so do not start them concurrently.
+first has finished. The lock is
+`/tmp/bootroot-deploy-smoke-<uid>/deploy-no-build-smoke.lock` whatever
+`TMPDIR` is set to, so runs from different shells or sessions still
+contend for it. The smoke refuses to run if that directory belongs to
+another user or is writable by others. Runs by another user or from
+another host sharing the daemon are not serialised, so do not start them
+concurrently.
 
 Local-only extras (not in any CI workflow):
 
