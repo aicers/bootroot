@@ -1974,11 +1974,10 @@ each service's trust data by writing the trust payload to every
 registered service's per-service KV path, and to that of every
 registrar-managed identity (a registration id carrying a
 `registrar_binding` record). The summary names each id written. Local
-and remote services
-converge the same way: each service's `bootroot-agent` fast-poll loop
-reads the updated payload, rewrites the `[trust]` section in its agent
-config, and rewrites the CA bundle PEM on disk. The command itself
-touches no service files.
+and remote services converge the same way: each service's
+`bootroot-agent` fast-poll loop reads the updated payload, rewrites the
+`[trust]` section in its agent config, and rewrites the CA bundle PEM
+on disk. The command itself touches no service files.
 
 No additional arguments.
 
@@ -2061,11 +2060,10 @@ Phases:
   OpenBao — `bootroot/ca`, every `state.json` service and every
   registrar-managed identity — removing old fingerprints, then restart
   the infra OpenBao Agents (`openbao-agent-stepca` /
-  `openbao-agent-responder`) so they
-  stop serving the transitional pin list immediately. Service agents
-  converge on their own: each bootroot-agent's fast-poll loop applies
-  the finalized `agent.toml` trust pins and `ca-bundle.pem` within
-  `fast_poll_interval`
+  `openbao-agent-responder`) so they stop serving the transitional pin
+  list immediately. Service agents converge on their own: each
+  bootroot-agent's fast-poll loop applies the finalized `agent.toml`
+  trust pins and `ca-bundle.pem` within `fast_poll_interval`
 - Phase 7 — Cleanup: delete `rotation-state.json` and optionally remove
   backup files
 
