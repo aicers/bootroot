@@ -651,9 +651,11 @@ pub(crate) enum RotateCommand {
     /// **remote-bootstrap** services the control plane publishes a
     /// versioned reissue request to the service's `OpenBao` KV path,
     /// which the remote agent picks up on its fast-poll interval (as
-    /// `rotate force-reissue` does). It does not wait for the remote
-    /// agent, and the finalize phase does not verify remote reissuance
-    /// (remote-bootstrap services are skipped when checking for
+    /// `rotate force-reissue` does). The same request is published to
+    /// every registrar-managed identity, which `state.json` does not
+    /// record. It does not wait for the remote agents, and the finalize
+    /// phase does not verify their reissuance (remote-bootstrap services
+    /// and registrar-managed identities are skipped when checking for
     /// unmigrated certs). Skipped phases (`--skip reissue,finalize`)
     /// are not deferred: the cleanup phase still removes the rotation
     /// state, so a later run starts a new rotation rather than resuming

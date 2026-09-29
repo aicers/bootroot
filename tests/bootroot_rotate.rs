@@ -4478,6 +4478,14 @@ fn prepare_remote_services_state(
     names: &[&str],
 ) -> anyhow::Result<()> {
     write_state_file(root, openbao_url)?;
+    add_remote_services(root, names)?;
+    fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
+    Ok(())
+}
+
+/// Appends each of `names` to an existing `state.json` as a
+/// `remote-bootstrap` service whose leaf lives at `certs/<name>.crt`.
+fn add_remote_services(root: &Path, names: &[&str]) -> anyhow::Result<()> {
     let state_path = root.join("state.json");
     let contents = fs::read_to_string(&state_path).context("read state")?;
     let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
@@ -4502,7 +4510,6 @@ fn prepare_remote_services_state(
         });
     }
     fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
-    fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
     Ok(())
 }
 
@@ -5705,6 +5712,7 @@ async fn stub_ca_key_rotation_with_registrar(server: &MockServer) {
     stub_openbao_for_ca_key_rotation(server).await;
     stub_reissue_write(server, SERVICE_NAME, 200).await;
     stub_registrar_bindings(server, support::ROOT_TOKEN).await;
+    stub_reissue_write(server, REGISTRAR_ID, 200).await;
 }
 
 #[cfg(unix)]
@@ -5751,10 +5759,32 @@ async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
         );
     }
     assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
-    assert_eq!(
-        listing_positions(&requests).len(),
-        2,
-        "Phases 3 and 6 each enumerate"
+    let listing = listing_positions(&requests);
+    assert_eq!(listing.len(), 3, "Phases 3, 5 and 6 each enumerate");
+
+    // Phase 5 publishes the same reissue request to the registrar
+    // identity as to the `state.json` remote service, after it.
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &reissue_kv_path(id));
+        assert_eq!(payloads.len(), 1, "{id}: one reissue request");
+        assert_reissue_payload(&payloads[0]);
+    }
+    assert!(posted_payloads(&requests, &reissue_kv_path(STRAY_ID)).is_empty());
+    assert!(
+        stdout.contains(&format!("{REGISTRAR_ID}: reissue requested at")),
+        "phase 5 should report the registrar identity's request: {stdout}"
+    );
+    let state_publish =
+        position_of(&requests, "POST", &reissue_kv_path(SERVICE_NAME)).expect("state publish");
+    let registrar_publish =
+        position_of(&requests, "POST", &reissue_kv_path(REGISTRAR_ID)).expect("registrar publish");
+    assert!(
+        state_publish < registrar_publish,
+        "state.json services are published before registrar identities"
+    );
+    assert!(
+        listing[1] < state_publish,
+        "Phase 5 enumerates before it publishes anything"
     );
 }
 
@@ -5771,11 +5801,11 @@ async fn test_rotate_ca_key_phase_6_listing_failure_resumes_at_phase_6() {
     let envs = stage_ca_key_rotation(temp_dir.path());
 
     stub_ca_key_rotation_with_registrar(&openbao).await;
-    // Phase 3's listing succeeds; Phase 6's is refused.
+    // Phase 3's and Phase 5's listings succeed; Phase 6's is refused.
     Mock::given(method("GET"))
         .and(path(SERVICES_LIST_PATH))
         .respond_with(services_listing_response())
-        .up_to_n_times(1)
+        .up_to_n_times(2)
         .mount(&openbao)
         .await;
     stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
@@ -5788,13 +5818,13 @@ async fn test_rotate_ca_key_phase_6_listing_failure_resumes_at_phase_6() {
 
     let requests = received(&openbao).await;
     let listing = listing_positions(&requests);
-    assert_eq!(listing.len(), 2, "Phases 3 and 6 each listed");
+    assert_eq!(listing.len(), 3, "Phases 3, 5 and 6 each listed");
     let transitional = posted_payloads(&requests, &service_record_path(REGISTRAR_ID, "trust"));
     assert_eq!(transitional.len(), 1, "only Phase 3 reached the identity");
     assert_eq!(trusted_fingerprints(&transitional[0]).len(), 3);
     let after_failure: Vec<String> = requests
         .iter()
-        .skip(listing[1])
+        .skip(listing[2])
         .filter(|req| req.method.as_str() == "POST")
         .map(|req| req.url.path().to_string())
         .collect();
@@ -7024,5 +7054,300 @@ async fn test_rotate_all_services_listing_failure_still_rotates_state_services()
     assert!(
         !self_mint_requested(&requests),
         "a failure withholds the self-mint"
+    );
+}
+
+/// Returns the path of every reissue request written, in arrival order.
+fn reissue_write_paths(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path().ends_with("/reissue"))
+        .map(|req| req.url.path().to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_reissue_publishes_once_to_id_in_state_and_bound() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    // The `state.json` service also carries a binding, overriding the
+    // helper's 404 for it.
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(SERVICE_NAME)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": { "schema_version": 1, "state": "active" },
+                "metadata": { "version": 1 }
+            }
+        })))
+        .with_priority(1)
+        .mount(&openbao)
+        .await;
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    assert!(
+        position_of(&requests, "GET", &binding_kv_path(SERVICE_NAME)).is_some(),
+        "the enumeration should have found the state.json service's binding"
+    );
+    let state_requests = posted_payloads(&requests, &reissue_kv_path(SERVICE_NAME));
+    assert_eq!(
+        state_requests.len(),
+        1,
+        "an id in both sets is published once, by the state.json loop: {state_requests:?}"
+    );
+    assert_reissue_payload(&state_requests[0]);
+    assert_eq!(
+        posted_payloads(&requests, &reissue_kv_path(REGISTRAR_ID)).len(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_phase_5_listing_failure_resumes_at_phase_5() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "local-file")
+        .expect("prepare state");
+    add_remote_services(temp_dir.path(), &["svc-remote"]).expect("add remote service");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+    write_rotation_state_at_phase(temp_dir.path(), 4);
+
+    // A local leaf the new intermediate did not sign, which Phase 5 would
+    // delete if it got that far.
+    let certs_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    let local_cert = certs_dir.join("edge-proxy.crt");
+    let local_key = certs_dir.join("edge-proxy.key");
+    fs::write(&local_cert, generate_test_cert_pem("old-leaf.example")).expect("write local cert");
+    fs::write(&local_key, "old key").expect("write local key");
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_reissue_write(&openbao, "svc-remote", 200).await;
+    stub_reissue_write(&openbao, REGISTRAR_ID, 200).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), json!(4));
+    let requests = received(&openbao).await;
+    let reissues = reissue_write_paths(&requests);
+    assert!(
+        reissues.is_empty(),
+        "no reissue request may precede enumeration: {reissues:?}"
+    );
+    assert!(local_cert.exists(), "the local cert must not be deleted");
+    assert!(local_key.exists(), "the local key must not be deleted");
+
+    // Migrate the local leaf, so the re-run's Phase 5 skips it and
+    // Phase 6's migration check passes without `--force`.
+    fs::copy(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("certs")
+            .join("intermediate_ca.crt"),
+        &local_cert,
+    )
+    .expect("write migrated leaf");
+
+    openbao.reset().await;
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_reissue_write(&openbao, "svc-remote", 200).await;
+    stub_reissue_write(&openbao, REGISTRAR_ID, 200).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 4"),
+        "the re-run should resume after phase 4: {stdout}"
+    );
+    let requests = received(&openbao).await;
+    for id in ["svc-remote", REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &reissue_kv_path(id));
+        assert_eq!(payloads.len(), 1, "{id}: one reissue request");
+        assert_reissue_payload(&payloads[0]);
+    }
+    let remote_publish =
+        position_of(&requests, "POST", &reissue_kv_path("svc-remote")).expect("remote publish");
+    let registrar_publish =
+        position_of(&requests, "POST", &reissue_kv_path(REGISTRAR_ID)).expect("registrar publish");
+    assert!(
+        remote_publish < registrar_publish,
+        "state.json services are published before registrar identities"
+    );
+    assert!(!temp_dir.path().join("rotation-state.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_registrar_reissue_publish_failure_resumes_at_phase_5() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 200).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_reissue_write(&openbao, REGISTRAR_ID, 500).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a failed reissue publish must fail the rotation; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(REGISTRAR_ID),
+        "the error should name the identity whose request failed: {stderr}"
+    );
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), json!(4));
+    let requests = received(&openbao).await;
+    assert_eq!(
+        posted_payloads(&requests, &reissue_kv_path(SERVICE_NAME)).len(),
+        1
+    );
+
+    openbao.reset().await;
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 4"),
+        "the re-run should resume after phase 4: {stdout}"
+    );
+    let requests = received(&openbao).await;
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &reissue_kv_path(id));
+        assert_eq!(payloads.len(), 1, "{id}: republished on resume");
+        assert_reissue_payload(&payloads[0]);
+    }
+    assert!(!temp_dir.path().join("rotation-state.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_skip_reissue_publishes_no_registrar_request() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(
+        temp_dir.path(),
+        &openbao.uri(),
+        &envs,
+        &["--skip", "reissue"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed with --skip reissue; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let reissues = reissue_write_paths(&requests);
+    assert!(
+        reissues.is_empty(),
+        "--skip reissue must publish no reissue request: {reissues:?}"
+    );
+    assert_eq!(
+        listing_positions(&requests).len(),
+        2,
+        "only Phases 3 and 6 enumerate"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_reissue_without_registrar_endpoint_enumerates_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 200).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = reissue_requests(&openbao, SERVICE_NAME).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "one reissue request expected: {requests:?}"
+    );
+    assert_reissue_payload(&requests[0]);
+    assert!(
+        stdout.contains(&format!("{SERVICE_NAME}: reissue requested at")),
+        "phase 5 should report the published request: {stdout}"
+    );
+    assert_no_registrar_enumeration(&received(&openbao).await);
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
     );
 }

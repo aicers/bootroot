@@ -3218,8 +3218,20 @@ same `http_responder_hmac`, `eab` or `trust` payload to every listed
 registration id that carries a binding. A subtree with neither a
 `state.json` entry nor a binding is never written. The identity's host
 picks the new value up through its `bootroot-agent` fast-poll loop,
-exactly like any remote-bootstrap service. Without a
-`registrar_endpoint` entry nothing is listed.
+exactly like any remote-bootstrap service. `rotate ca-key` Phase 5
+lists too, and publishes the same versioned
+`bootroot/services/<registration_id>/reissue` request it publishes to a
+remote-bootstrap service to every listed registration id that carries a
+binding and is absent from `state.json`. A bound id that `state.json`
+also names is handled by its `state.json` entry alone, like any other
+`state.json` service: a non-migrated remote-bootstrap entry gets one
+request, a non-migrated `local-file` entry has its certificate deleted
+and its agent signalled instead, and a migrated one is skipped. The
+host picks the request up through fast-poll and attempts a renewal onto
+the new intermediate; an attempt made before the host has applied
+Phase 3's transitional trust can fail and is retried on a later tick.
+Phase 6 does not wait for the renewal. Without a `registrar_endpoint`
+entry nothing is listed.
 
 The identity's `secret_id` is renewed the same way.
 `rotate approle-secret-id --all-services --agent-config <path>` issues
@@ -3241,7 +3253,8 @@ The listing needs `list` on `<kv>/metadata/bootroot/services/`, which
 `bootroot init` writes into the `bootroot-runtime-rotate` policy. A
 deployment whose runtime-rotate policy predates that grant must re-run
 `bootroot init` to refresh it, or run these rotations with the root
-token. The listing runs before a step's first OpenBao write, so a
+token. The listing runs before a step's first OpenBao write (and, in
+`rotate ca-key` Phase 5, before any local certificate is removed), so a
 refused listing fails that step with nothing written; `rotate ca-key`
 resumes at the failed phase when re-run.
 

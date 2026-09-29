@@ -3045,7 +3045,17 @@ binding이 있는 모든 registration id에 동일한 `http_responder_hmac`,
 `eab`, `trust` 페이로드를 기록합니다. `state.json` 항목도 binding도 없는
 하위 트리에는 기록하지 않습니다. 해당 identity의 호스트는 다른
 remote-bootstrap 서비스와 똑같이 `bootroot-agent` fast-poll 루프로 새 값을
-가져옵니다. `registrar_endpoint` 항목이 없으면 아무것도 나열하지 않습니다.
+가져옵니다. `rotate ca-key` Phase 5도 나열을 수행하며, binding이 있고
+`state.json`에 없는 모든 registration id에 remote-bootstrap 서비스와
+동일한 버전 관리 `bootroot/services/<registration_id>/reissue` 요청을
+기록합니다. binding이 있으면서 `state.json`에도 있는 id는 `state.json`
+항목만으로, 다른 `state.json` 서비스와 똑같이 처리됩니다. 마이그레이션되지
+않은 remote-bootstrap 항목은 요청을 한 번 받고, 마이그레이션되지 않은
+`local-file` 항목은 요청 대신 인증서가 삭제되고 agent에 시그널이 전달되며,
+이미 마이그레이션된 항목은 건너뜁니다. 호스트는 fast-poll로 이 요청을 가져와 새 intermediate로 갱신을
+시도합니다. 호스트가 Phase 3의 전환 trust를 적용하기 전에 한 시도는 실패할
+수 있으며, 이후 tick에서 다시 시도합니다. Phase 6은 갱신을 기다리지
+않습니다. `registrar_endpoint` 항목이 없으면 아무것도 나열하지 않습니다.
 
 identity의 `secret_id`도 같은 방식으로 갱신됩니다.
 `rotate approle-secret-id --all-services --agent-config <path>`는 나열된
@@ -3067,7 +3077,8 @@ identity는 자격증명을 받은 적이 없으므로 건너뜀으로 보고되
 필요하며, `bootroot init`이 이를 `bootroot-runtime-rotate` 정책에
 기록합니다. runtime-rotate 정책이 이 권한보다 오래된 배포는
 `bootroot init`을 다시 실행해 정책을 갱신하거나, 이 회전들을 root 토큰으로
-실행해야 합니다. 나열은 각 단계의 첫 OpenBao 쓰기보다 먼저 실행되므로,
+실행해야 합니다. 나열은 각 단계의 첫 OpenBao 쓰기보다(`rotate ca-key`
+Phase 5에서는 로컬 인증서를 삭제하기보다도) 먼저 실행되므로,
 나열이 거부되면 아무것도 기록하지 않은 채 그 단계가 실패하고,
 `rotate ca-key`는 다시 실행하면 실패한 phase부터 재개합니다.
 
