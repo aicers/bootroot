@@ -6648,6 +6648,74 @@ async fn test_rotate_all_services_creating_binding_alone_needs_no_agent_config()
     );
 }
 
+/// A binding deregistered between the listing and the re-read is
+/// skipped, not failed, and the other targets are still rotated.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_skips_a_binding_gone_before_it_is_reread() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    stub_state_service_rotation(&openbao).await;
+    // The listing's presence read finds the binding; the re-read that
+    // classifies it finds it gone. Mounted first, these win over the
+    // standing answer `stub_registrar_identities` mounts for the id.
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(PIGLET_ID)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": binding_record("active"), "metadata": { "version": 1 } }
+        })))
+        .up_to_n_times(1)
+        .mount(&openbao)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(PIGLET_ID)))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })))
+        .mount(&openbao)
+        .await;
+    stub_registrar_identities(
+        &openbao,
+        &[
+            (REGISTRAR_ID, binding_record("active")),
+            (PIGLET_ID, binding_record("active")),
+        ],
+    )
+    .await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+    stub_registrar_rotation(&openbao, PIGLET_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a vanished binding is not a failure; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    assert!(
+        requests_to(&requests, "POST", &registrar_secret_id_path(PIGLET_ID)).is_empty(),
+        "a vanished binding gets no secret-id request"
+    );
+    assert_registrar_issued_and_pushed(&requests, REGISTRAR_ID, &json!({ "num_uses": 0 }));
+    assert!(
+        stdout.contains(&format!("{SKIPPED_LINE} {PIGLET_ID}"))
+            && stdout.contains("no longer exists"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("services skipped: 1"), "stdout:\n{stdout}");
+}
+
 #[cfg(unix)]
 #[allow(clippy::too_many_lines)] // four sequential CLI runs against one mock
 #[tokio::test]
