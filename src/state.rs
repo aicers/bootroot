@@ -400,7 +400,7 @@ mod tests {
     /// registrar endpoint, and nothing else in either crate would say
     /// so.
     #[test]
-    fn the_three_members_the_daemon_reads_keep_their_names() {
+    fn the_members_the_daemon_reads_keep_their_names() {
         let state = StateFile {
             openbao_url: "https://openbao.example:8200".to_string(),
             kv_mount: "secret".to_string(),

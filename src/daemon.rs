@@ -382,7 +382,7 @@ const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 ///
 /// It derives [`serde::Deserialize`] and **not** `Serialize` on purpose:
 /// a serializer here is how a later edit comes to write an operator's
-/// state file back out with three fields and lose the rest.
+/// state file back out with four fields and lose the rest.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RegistrarStateProjection {
     /// The URL `bootroot init` recorded for this deployment's

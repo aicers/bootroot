@@ -309,18 +309,18 @@ fn the_artifact_openbao_url_prefers_the_recorded_advertise_address() {
     }
 }
 
-/// The projection reads exactly three members and tolerates every other
+/// The projection reads its named members and tolerates every other
 /// one, so the CLI's inventory can grow a field without breaking a
 /// daemon that never looks at it.
 #[test]
-fn the_projection_reads_three_members_and_tolerates_the_rest() {
+fn the_projection_reads_its_members_and_tolerates_the_rest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = write_state_file(
         dir.path(),
         &state_json("https://openbao.example:8200", "kv", Some("/srv/secrets")),
     );
 
-    let state = read_registrar_state(&path).expect("the three members are readable");
+    let state = read_registrar_state(&path).expect("the named members are readable");
     assert_eq!(state.openbao_url, "https://openbao.example:8200");
     assert_eq!(state.kv_mount, "kv");
     assert_eq!(
@@ -331,7 +331,7 @@ fn the_projection_reads_three_members_and_tolerates_the_rest() {
 
 /// The projection derives `Deserialize` and **not** `Serialize`: a
 /// serializer here is how a later edit comes to write an operator's
-/// state file back out with three fields and lose the rest.
+/// state file back out with four fields and lose the rest.
 #[test]
 fn the_projection_has_no_serialize_impl() {
     let source = include_str!("../daemon.rs");
@@ -647,7 +647,7 @@ fn nothing_under_the_registrar_module_names_the_state_file() {
 /// The projection is what reaches the factory, so a member the daemon
 /// does not read cannot reach it either.
 #[test]
-fn the_projection_declares_exactly_three_members() {
+fn the_projection_declares_exactly_four_members() {
     let state: RegistrarStateProjection = serde_json::from_str(&state_json(
         "https://openbao.example:8200",
         "secret",
@@ -658,6 +658,7 @@ fn the_projection_declares_exactly_three_members() {
     assert!(debug.contains("openbao_url"));
     assert!(debug.contains("kv_mount"));
     assert!(debug.contains("secrets_dir"));
+    assert!(debug.contains("openbao_advertise_addr"));
     assert!(
         !debug.contains("policies") && !debug.contains("services"),
         "no other member is carried: {debug}"
