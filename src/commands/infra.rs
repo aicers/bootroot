@@ -12,6 +12,7 @@ use bootroot::host_port::{
     resolve_http01_admin_host_port_with_env, resolve_openbao_host_port_with_env,
     resolve_stepca_host_port_with_env,
 };
+use bootroot::input_validation::{validate_dns_label, validate_domain_name};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::INTERNAL_DIR;
 
@@ -44,7 +45,7 @@ use crate::commands::init::{
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
-use crate::state::StateFile;
+use crate::state::{RegistrarEndpointState, StateFile};
 
 const DEFAULT_GRAFANA_ADMIN_PASSWORD: &str = "admin";
 // Keep in sync with docker-compose.yml POSTGRES_USER / POSTGRES_DB.
@@ -371,6 +372,26 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         validate_instance_name(instance_name, messages)?;
     }
 
+    // The registrar endpoint predicate is checked before any work too:
+    // a malformed value, or one that would re-target an endpoint already
+    // recorded as enabled, must leave the host as it found it.  Clap has
+    // already refused one flag without the other.
+    let registrar_endpoint = match (
+        args.registrar_endpoint_host.as_deref(),
+        args.registrar_endpoint_domain.as_deref(),
+    ) {
+        (Some(host), Some(domain)) => {
+            check_registrar_endpoint_request_to(
+                &StateFile::default_path(),
+                host,
+                domain,
+                messages,
+            )?;
+            Some((host, domain))
+        }
+        _ => None,
+    };
+
     ensure_all_services_localhost_binding(&args.compose_file.compose_file, messages)?;
 
     // Validate and resolve OpenBao non-loopback bind intent.
@@ -565,6 +586,23 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         println!("{}", messages.info_stepca_bind_intent_recorded(bind_addr));
     } else {
         clear_stepca_bind_intent(compose_dir, messages)?;
+    }
+
+    // Recorded, never cleared: without the flags the predicate `init`
+    // and `reinit` carry through is left as it is, unlike the bind
+    // intents above.
+    if let Some((host, domain)) = registrar_endpoint {
+        save_registrar_endpoint_predicate_to(
+            &StateFile::default_path(),
+            host,
+            domain,
+            &openbao_url,
+            messages,
+        )?;
+        println!(
+            "{}",
+            messages.info_registrar_endpoint_recorded(host, domain)
+        );
     }
 
     // A host-port-derived endpoint has to reach a pre-existing
@@ -2031,6 +2069,114 @@ fn clear_stepca_bind_intent_to(
     Ok(())
 }
 
+/// Validates a requested registrar endpoint predicate and refuses one
+/// that would re-target an endpoint already recorded as enabled.
+///
+/// Runs before `infra install` does any work.  Both parts pass the
+/// validators `bootroot registrar issue` applies to `--host` and
+/// `--domain`, so a value recorded here is one that verb accepts.
+///
+/// # Errors
+///
+/// Returns an error when `host` is not a single DNS label, `domain` is
+/// not a DNS name, the state file exists but cannot be read or parsed,
+/// or it records an enabled endpoint under a different `host` or
+/// `domain`.
+fn check_registrar_endpoint_request_to(
+    state_path: &Path,
+    host: &str,
+    domain: &str,
+    messages: &Messages,
+) -> Result<()> {
+    validate_dns_label(host)
+        .map_err(|_| anyhow::anyhow!(messages.error_registrar_endpoint_host_invalid(host)))?;
+    validate_domain_name(domain)
+        .map_err(|_| anyhow::anyhow!(messages.error_registrar_endpoint_domain_invalid(domain)))?;
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let state = StateFile::load(state_path)?;
+    registrar_endpoint_needs_write(state.registrar_endpoint.as_ref(), host, domain, messages)
+        .map(|_| ())
+}
+
+/// Decides whether recording `host`/`domain` changes the recorded
+/// predicate.
+///
+/// Returns `false` for an enabled entry with the same parts, and `true`
+/// for an absent or disabled one.
+///
+/// # Errors
+///
+/// Returns an error naming both pairs when an enabled entry records a
+/// different `host` or `domain`: the bootroot-internal credential's SAN
+/// is composed from the recorded pair, so changing it would strand the
+/// credential already issued for it.
+fn registrar_endpoint_needs_write(
+    recorded: Option<&RegistrarEndpointState>,
+    host: &str,
+    domain: &str,
+    messages: &Messages,
+) -> Result<bool> {
+    match recorded {
+        Some(recorded) if recorded.enabled => {
+            if recorded.host == host && recorded.domain == domain {
+                Ok(false)
+            } else {
+                anyhow::bail!(messages.error_registrar_endpoint_conflict(
+                    &recorded.host,
+                    &recorded.domain,
+                    host,
+                    domain,
+                ))
+            }
+        }
+        _ => Ok(true),
+    }
+}
+
+/// Records the registrar endpoint predicate as enabled for `host` and
+/// `domain`.
+///
+/// Creates the state file when there is none, the way
+/// [`save_openbao_bind_intent_to`] does, and otherwise changes nothing
+/// but `registrar_endpoint`.  An enabled entry already recording the
+/// same pair is left alone without a write.
+///
+/// # Errors
+///
+/// Returns an error when an existing state file cannot be read or
+/// parsed, when it records an enabled endpoint under a different pair,
+/// or when the state file cannot be written.
+fn save_registrar_endpoint_predicate_to(
+    state_path: &Path,
+    host: &str,
+    domain: &str,
+    openbao_url: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let mut state = if state_path.exists() {
+        StateFile::load(state_path)?
+    } else {
+        StateFile {
+            openbao_url: openbao_url.to_string(),
+            kv_mount: DEFAULT_KV_MOUNT.to_string(),
+            ..Default::default()
+        }
+    };
+    if !registrar_endpoint_needs_write(state.registrar_endpoint.as_ref(), host, domain, messages)? {
+        return Ok(());
+    }
+    state.registrar_endpoint = Some(RegistrarEndpointState {
+        enabled: true,
+        domain: domain.to_string(),
+        host: host.to_string(),
+    });
+    state
+        .save(state_path)
+        .with_context(|| messages.error_serialize_state_failed())
+}
+
 pub(crate) fn default_infra_services() -> Vec<String> {
     vec![
         "openbao".to_string(),
@@ -2875,6 +3021,8 @@ mod tests {
             openbao_host_port: None,
             stepca_host_port: None,
             http01_admin_host_port: None,
+            registrar_endpoint_host: None,
+            registrar_endpoint_domain: None,
             no_build: false,
         }
     }
@@ -5558,6 +5706,8 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             openbao_host_port: None,
             stepca_host_port: None,
             http01_admin_host_port: None,
+            registrar_endpoint_host: None,
+            registrar_endpoint_domain: None,
             no_build: false,
         };
         let err = run_infra_install(&args, &messages).unwrap_err();
@@ -5623,6 +5773,331 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
                 || err.contains("responder.toml")
                 || err.contains("responder config"),
             "error must reference compose_dir-relative path, got: {err}"
+        );
+    }
+
+    const REGISTRAR_HOST: &str = "bootroot-01";
+    const REGISTRAR_DOMAIN: &str = "trusted.domain";
+    const INSTALL_OPENBAO_URL: &str = "http://localhost:18200";
+
+    fn enabled_registrar_endpoint(host: &str, domain: &str) -> RegistrarEndpointState {
+        RegistrarEndpointState {
+            enabled: true,
+            domain: domain.to_string(),
+            host: host.to_string(),
+        }
+    }
+
+    /// A state file populated well beyond the predicate, so a test can
+    /// tell that recording the predicate changed nothing else.
+    fn populated_state(registrar_endpoint: Option<RegistrarEndpointState>) -> StateFile {
+        StateFile {
+            openbao_url: "https://192.168.1.10:8200".to_string(),
+            kv_mount: "kv-custom".to_string(),
+            secrets_dir: Some(PathBuf::from("/srv/bootroot/secrets")),
+            openbao_bind_addr: Some("192.168.1.10:8200".to_string()),
+            stepca_bind_addr: Some("192.168.1.10:9000".to_string()),
+            rotate_secret_id_ttl: Some("24h".to_string()),
+            last_secret_id_rotation: Some("2026-09-01T00:00:00Z".to_string()),
+            registrar_endpoint,
+            ..Default::default()
+        }
+    }
+
+    /// Writes `state` in a layout `StateFile::save` never produces, so a
+    /// byte-identical file afterwards proves no save happened, not merely
+    /// that one rewrote the same bytes.
+    fn write_state_unsaved_layout(path: &Path, state: &StateFile) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(state).unwrap();
+        bytes.extend_from_slice(b"\n\n");
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn registrar_endpoint_writer_creates_state_when_absent() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        save_registrar_endpoint_predicate_to(
+            &state_path,
+            REGISTRAR_HOST,
+            REGISTRAR_DOMAIN,
+            INSTALL_OPENBAO_URL,
+            &messages,
+        )
+        .unwrap();
+
+        let state = StateFile::load(&state_path).unwrap();
+        assert_eq!(state.openbao_url, INSTALL_OPENBAO_URL);
+        assert_eq!(state.kv_mount, DEFAULT_KV_MOUNT);
+        assert_eq!(
+            state.registrar_endpoint,
+            Some(enabled_registrar_endpoint(REGISTRAR_HOST, REGISTRAR_DOMAIN))
+        );
+    }
+
+    /// Recording the predicate into an existing file with no entry, or
+    /// with a disabled one, changes `registrar_endpoint` and nothing
+    /// else — not even the `OpenBao` URL the bind writers reset.
+    #[test]
+    fn registrar_endpoint_writer_changes_only_the_predicate() {
+        let messages = test_messages();
+        for recorded in [
+            None,
+            Some(RegistrarEndpointState {
+                enabled: false,
+                domain: "old.domain".to_string(),
+                host: "old-host".to_string(),
+            }),
+        ] {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("state.json");
+            let before = populated_state(recorded.clone());
+            before.save(&state_path).unwrap();
+
+            save_registrar_endpoint_predicate_to(
+                &state_path,
+                REGISTRAR_HOST,
+                REGISTRAR_DOMAIN,
+                INSTALL_OPENBAO_URL,
+                &messages,
+            )
+            .unwrap();
+
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+            let mut expected = serde_json::to_value(&before).unwrap();
+            expected["registrar_endpoint"] =
+                serde_json::to_value(enabled_registrar_endpoint(REGISTRAR_HOST, REGISTRAR_DOMAIN))
+                    .unwrap();
+            assert_eq!(after, expected, "recorded {recorded:?}");
+        }
+    }
+
+    #[test]
+    fn registrar_endpoint_writer_does_not_save_an_identical_entry() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let before = write_state_unsaved_layout(
+            &state_path,
+            &populated_state(Some(enabled_registrar_endpoint(
+                REGISTRAR_HOST,
+                REGISTRAR_DOMAIN,
+            ))),
+        );
+
+        check_registrar_endpoint_request_to(
+            &state_path,
+            REGISTRAR_HOST,
+            REGISTRAR_DOMAIN,
+            &messages,
+        )
+        .unwrap();
+        save_registrar_endpoint_predicate_to(
+            &state_path,
+            REGISTRAR_HOST,
+            REGISTRAR_DOMAIN,
+            INSTALL_OPENBAO_URL,
+            &messages,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    }
+
+    /// A different `host` or `domain` on an enabled entry is refused by
+    /// the pre-work check and by the writer alike, naming both pairs, and
+    /// the file is left as it was.
+    #[test]
+    fn registrar_endpoint_conflict_is_refused_and_leaves_state_unchanged() {
+        let messages = test_messages();
+        for (host, domain) in [
+            ("bootroot-02", REGISTRAR_DOMAIN),
+            (REGISTRAR_HOST, "other.domain"),
+        ] {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("state.json");
+            let before = write_state_unsaved_layout(
+                &state_path,
+                &populated_state(Some(enabled_registrar_endpoint(
+                    REGISTRAR_HOST,
+                    REGISTRAR_DOMAIN,
+                ))),
+            );
+
+            let check = check_registrar_endpoint_request_to(&state_path, host, domain, &messages)
+                .unwrap_err()
+                .to_string();
+            let write = save_registrar_endpoint_predicate_to(
+                &state_path,
+                host,
+                domain,
+                INSTALL_OPENBAO_URL,
+                &messages,
+            )
+            .unwrap_err()
+            .to_string();
+            for err in [&check, &write] {
+                for value in [REGISTRAR_HOST, REGISTRAR_DOMAIN, host, domain] {
+                    assert!(err.contains(value), "{err} must name `{value}`");
+                }
+            }
+            assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        }
+    }
+
+    /// The pre-work check accepts a request over no file, no entry, or
+    /// a disabled entry — the three cases the writer records.
+    #[test]
+    fn registrar_endpoint_check_accepts_the_recordable_cases() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        check_registrar_endpoint_request_to(
+            &state_path,
+            REGISTRAR_HOST,
+            REGISTRAR_DOMAIN,
+            &messages,
+        )
+        .unwrap();
+        assert!(!state_path.exists(), "the check must not create a file");
+
+        for recorded in [
+            None,
+            Some(RegistrarEndpointState {
+                enabled: false,
+                domain: "old.domain".to_string(),
+                host: "old-host".to_string(),
+            }),
+        ] {
+            populated_state(recorded).save(&state_path).unwrap();
+            check_registrar_endpoint_request_to(
+                &state_path,
+                REGISTRAR_HOST,
+                REGISTRAR_DOMAIN,
+                &messages,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn registrar_endpoint_check_refuses_invalid_values() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        for host in ["bootroot-01.trusted.domain", "", "Bootroot_01", "-bootroot"] {
+            let err =
+                check_registrar_endpoint_request_to(&state_path, host, REGISTRAR_DOMAIN, &messages)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("--registrar-endpoint-host"),
+                "{host:?} must be refused as a host: {err}"
+            );
+        }
+        for domain in ["", "trusted..domain", "trusted_domain", ".trusted.domain"] {
+            let err =
+                check_registrar_endpoint_request_to(&state_path, REGISTRAR_HOST, domain, &messages)
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                err.contains("--registrar-endpoint-domain"),
+                "{domain:?} must be refused as a domain: {err}"
+            );
+        }
+    }
+
+    /// A rejected value stops `infra install` before it creates the
+    /// install directories or any file.
+    #[test]
+    fn install_rejects_an_invalid_registrar_endpoint_before_any_work() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(&compose_path, COMPOSE_WITHOUT_STEPCA).unwrap();
+
+        for (host, domain) in [
+            ("bootroot-01.trusted.domain", REGISTRAR_DOMAIN),
+            ("", REGISTRAR_DOMAIN),
+            (REGISTRAR_HOST, "trusted..domain"),
+        ] {
+            let mut args = install_args(compose_path.clone());
+            args.registrar_endpoint_host = Some(host.to_string());
+            args.registrar_endpoint_domain = Some(domain.to_string());
+            let err = run_infra_install(&args, &messages).unwrap_err().to_string();
+            assert!(
+                err.contains("--registrar-endpoint-"),
+                "({host:?}, {domain:?}) must be refused by the predicate check: {err}"
+            );
+            assert!(!dir.path().join(".env").exists());
+            assert!(!dir.path().join("secrets").exists());
+            assert!(!dir.path().join("certs").exists());
+        }
+    }
+
+    /// Without the flags, the writers a plain `infra install` runs carry
+    /// the recorded predicate through unchanged, enabled or not — unlike
+    /// the bind intents they clear.
+    #[test]
+    fn install_writers_without_the_flags_preserve_the_predicate() {
+        let messages = test_messages();
+        for recorded in [
+            Some(enabled_registrar_endpoint(REGISTRAR_HOST, REGISTRAR_DOMAIN)),
+            Some(RegistrarEndpointState {
+                enabled: false,
+                domain: REGISTRAR_DOMAIN.to_string(),
+                host: REGISTRAR_HOST.to_string(),
+            }),
+            None,
+        ] {
+            let dir = tempdir().unwrap();
+            let state_path = dir.path().join("state.json");
+            let mut state = populated_state(recorded.clone());
+            state.http01_admin_bind_addr = Some("192.168.1.10:8080".to_string());
+            state.save(&state_path).unwrap();
+
+            clear_openbao_bind_intent_to(&state_path, dir.path(), INSTALL_OPENBAO_URL, &messages)
+                .unwrap();
+            clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+            clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+            sync_state_openbao_url_to(&state_path, "http://localhost:28200", &messages).unwrap();
+
+            let after = StateFile::load(&state_path).unwrap();
+            assert!(after.openbao_bind_addr.is_none(), "the bind intents clear");
+            assert!(after.stepca_bind_addr.is_none(), "the bind intents clear");
+            assert_eq!(after.registrar_endpoint, recorded);
+        }
+    }
+
+    /// A predicate recorded by `infra install` is the one `init` reads,
+    /// and composes the SAN the internal credential is issued for.
+    #[test]
+    fn recorded_registrar_endpoint_round_trips_through_init() {
+        let messages = test_messages();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        save_registrar_endpoint_predicate_to(
+            &state_path,
+            REGISTRAR_HOST,
+            REGISTRAR_DOMAIN,
+            INSTALL_OPENBAO_URL,
+            &messages,
+        )
+        .unwrap();
+
+        let intent =
+            crate::commands::init::registrar_internal::registrar_endpoint_intent(&state_path)
+                .unwrap()
+                .expect("the recorded predicate is enabled");
+        assert_eq!(intent.host, REGISTRAR_HOST);
+        assert_eq!(intent.domain, REGISTRAR_DOMAIN);
+        assert_eq!(
+            intent.san(),
+            bootroot::registrar::registrar_internal_identity(REGISTRAR_HOST, REGISTRAR_DOMAIN)
         );
     }
 }

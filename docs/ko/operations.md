@@ -1853,6 +1853,19 @@ WantedBy=multi-user.target
 `registrar_endpoint.enabled = true`이면 데몬이 기동하여 요청을
 처리합니다.
 
+호스트 활성화는 설치 시점에 시작합니다. 먼저
+`bootroot infra install --registrar-endpoint-host <label>
+--registrar-endpoint-domain <domain>`으로 엔드포인트 술어를 기록합니다.
+값은 bootroot 호스트의 단일 DNS 레이블과, bootroot 내부 SAN을 구성할 배포
+도메인입니다. 그다음 `[registrar_endpoint] enabled = true`인 데몬 설정
+파일로 `bootroot init --agent-config <path>`를 root로 실행합니다. `init`은
+기록된 술어에 따라 내부 자격 증명을 프로비저닝하고 OpenBao를 TLS로
+전환하며, 술어와 어긋나는 데몬 설정은 거부합니다. 술어가 이미 기록된
+경우 `infra install`이 어떻게 동작하는지는
+[레지스트라 엔드포인트 술어](cli.md#레지스트라-엔드포인트-술어)를 참고하세요.
+호스트를 다시 끄는 방법은 [예약량 크기 잡기](#sizing-the-reserve)에 설명된 두 곳을
+수정하는 절차입니다.
+
 #### 활성화된 엔드포인트에 필요한 것, 그리고 빠졌을 때
 
 핸들러를 만드는 데 필요한 모든 것은 작업을 하나라도 spawn하기 **전에**

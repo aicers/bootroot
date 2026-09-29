@@ -129,9 +129,11 @@ service reads.
 
 ## 4. Endpoint gating and TLS
 
-Everything here is gated on the registrar endpoint-enablement predicate. bootroot
-**consumes** that predicate — defining, storing and switching it belongs to the
-registrar endpoint work — and reads it from `state.json`:
+Everything here is gated on the registrar endpoint-enablement predicate, which
+bootroot reads from `state.json`. `bootroot infra install
+--registrar-endpoint-host <label> --registrar-endpoint-domain <domain>` is what
+records it; `bootroot init` and `bootroot reinit` only **consume** it and carry
+the recorded value through, and never set or change it:
 
 ```json
 {
@@ -142,6 +144,13 @@ registrar endpoint work — and reads it from `state.json`:
   }
 }
 ```
+
+`infra install` records the entry when there is none or it is `false`, leaves
+an identical enabled entry alone, and refuses — before any other work — to
+change the `host` or `domain` of an enabled one, since this identity's SAN is
+composed from them. Run without the two flags, it leaves the recorded entry
+exactly as it is. Switching an endpoint off stays the manual procedure the
+operations guide describes.
 
 An absent or `false` entry means the endpoint is off. Such a host keeps its
 plaintext loopback listener and its `http://` `state.openbao_url` exactly as they

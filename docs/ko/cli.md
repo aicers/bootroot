@@ -376,6 +376,57 @@ bootroot infra up
 - `--http01-admin-host-port <N>`: 호스트 측 HTTP-01 응답기 admin API
   게시 포트입니다. `.env`의 `HTTP01_ADMIN_HOST_PORT`와 프로세스 환경
   변수보다 우선합니다. 기본값은 **8080**입니다.
+- `--registrar-endpoint-host <label>`: 이 호스트에서 레지스트라
+  엔드포인트를 활성화합니다(선택). bootroot 호스트의 단일 DNS 레이블이며
+  FQDN이나 조합된 이름은 허용되지 않습니다. `bootroot registrar issue
+  --host`와 같은 규칙으로 검증합니다. `--registrar-endpoint-domain`이
+  함께 필요합니다.
+- `--registrar-endpoint-domain <domain>`: bootroot 내부 SAN을 구성할
+  배포 도메인입니다. `bootroot registrar issue --domain`과 같은 규칙으로
+  검증합니다. `--registrar-endpoint-host`가 함께 필요합니다.
+
+#### 레지스트라 엔드포인트 술어
+
+`--registrar-endpoint-host`와 `--registrar-endpoint-domain`은
+`bootroot init`이 레지스트라 엔드포인트 호스트를 프로비저닝할 때 읽는
+술어, 즉 `registrar_endpoint = { enabled: true, domain, host }`를 작업
+디렉터리의 `state.json`에 기록합니다. 바인딩 플래그가 의도를 기록하는
+바로 그 파일입니다. 두 플래그는 서로를 요구하므로 하나만 넘기면 종료 코드
+`2`의 사용법 오류가 됩니다. 값은 플래그에서만 오며, 머신의 호스트 이름에서
+유도하지 않습니다.
+
+값 검증과 기록된 술어 확인은 무엇이든 생성·시작·기록하기 전에 이루어지므로,
+거부된 실행은 호스트를 처음 상태 그대로 둡니다. 두 플래그를 모두 넘기면
+`infra install`은 `state.json`에 이미 기록된 내용에 따라 다음과 같이
+동작합니다.
+
+1. **아직 `state.json`이 없음**: 설치 시점의 `openbao_url`, 기본
+   `kv_mount`, 활성화된 술어로 파일을 생성합니다.
+2. **`registrar_endpoint`가 없거나 `enabled = false`**: 주어진 값으로
+   활성화된 술어를 기록합니다. 다른 멤버는 그대로 둡니다.
+3. **같은 `host`와 `domain`의 활성화된 항목**: 술어에 대해서는 아무것도
+   쓰지 않고, 재실행도 같은 결과로 읽히도록 같은 "기록됨" 줄을 출력합니다.
+   같은 실행의 바인딩 플래그는 여전히 평소대로 `state.json`을 다시 씁니다.
+4. **다른 `host`나 `domain`의 활성화된 항목**: 기록된 값과 요청된 값을
+   모두 밝히며 거부합니다.
+
+다른 `host`나 `domain`을 거부하는 이유는 bootroot 내부 자격 증명의 SAN인
+`001.bootroot-registrar-internal.<host>.<domain>`이 이 두 값으로 구성되기
+때문입니다. 값을 바꾸면 이미 디스크에 있는 자격 증명이 쓸모없어집니다.
+`infra install`은 이 값을 바꾸는 방법을 제공하지 않습니다.
+
+**두 플래그 모두 없으면 `infra install`은 기록된 `registrar_endpoint`를
+활성화 여부와 관계없이 그대로 둡니다.** 플래그가 없을 때 의도를 지우는
+바인딩 플래그와 일부러 다르게 동작합니다. `init`과 `reinit`은 이 술어를 배포
+의도로 보존하므로, 플래그 없는 재실행에서 이를 지우면 `init --agent-config`가
+거부하는 엔드포인트 호스트가 남습니다. 엔드포인트를 끄는 방법은
+[예약량 크기 잡기](operations.md#sizing-the-reserve)에 설명된 두 곳을 수정하는
+절차 그대로입니다.
+
+여기서 생성된 `state.json`은 바인딩 플래그가 파일을 생성했을 때와 마찬가지로
+`bootroot init`이 덮어쓸지 묻습니다. 비대화식으로 답하려면
+`--overwrite-state`를 넘기세요. `init`은 그 재작성 과정에서도 술어를
+유지합니다.
 
 #### 인스턴스 정체성과 Compose 프로젝트
 

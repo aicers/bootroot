@@ -1863,8 +1863,8 @@ async fn write_state_file_to(
         rotate_bound_cidrs: rotate_bound_cidrs_map,
         rotate_secret_id_ttl: Some(rotate_secret_id_ttl.to_string()),
         last_secret_id_rotation: existing_last_secret_id_rotation,
-        // Preserved verbatim: this predicate is the registrar endpoint
-        // work's to write, and `init` only reads it.
+        // Preserved verbatim: `infra install` is what sets this
+        // predicate, and `init` only reads it.
         registrar_endpoint: existing_registrar_endpoint,
     };
     state

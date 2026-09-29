@@ -79,9 +79,12 @@ impl RegistrarInternalIntent {
 /// Consumes the registrar endpoint-enablement predicate recorded in
 /// `state.json`.
 ///
-/// **This issue consumes the predicate; it does not define, store or
-/// switch it.** An absent or disabled entry means the endpoint is off,
-/// and `init` then alters no listener and creates no internal artifact.
+/// **`init` consumes the predicate; it never sets or changes it.**
+/// `bootroot infra install` records it from `--registrar-endpoint-host`
+/// and `--registrar-endpoint-domain`, and `init` carries the recorded
+/// value through when it rewrites `state.json`. An absent or disabled
+/// entry means the endpoint is off, and `init` then alters no listener
+/// and creates no internal artifact.
 ///
 /// # Errors
 ///
