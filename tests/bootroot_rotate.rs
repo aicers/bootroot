@@ -5571,7 +5571,7 @@ async fn test_rotate_trust_sync_listing_forbidden_writes_nothing() {
         .expect("prepare state");
 
     stub_openbao_for_ca_key_rotation(&openbao).await;
-    stub_services_listing(&openbao, support::ROOT_TOKEN, ResponseTemplate::new(500)).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
 
     let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "trust-sync");
     let stderr = String::from_utf8_lossy(&output.stderr);
