@@ -1961,6 +1961,21 @@ mod list_kv_tests {
     }
 
     #[tokio::test]
+    async fn list_kv_errors_on_server_error() {
+        let server = MockServer::start().await;
+        mount_list(
+            &server,
+            ResponseTemplate::new(500).set_body_json(json!({ "errors": ["boom"] })),
+        )
+        .await;
+
+        client_with_token(&server)
+            .list_kv("secret", "bootroot/services/")
+            .await
+            .expect_err("a 500 must not read as an empty listing");
+    }
+
+    #[tokio::test]
     async fn list_kv_errors_on_body_without_keys() {
         let server = MockServer::start().await;
         mount_list(

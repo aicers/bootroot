@@ -5419,6 +5419,99 @@ async fn test_rotate_responder_hmac_empty_listing_writes_state_services_only() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_responder_hmac_writes_bound_state_service_once() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-both").await;
+    stub_services_listing(
+        &openbao,
+        support::ROOT_TOKEN,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "keys": [format!("{SERVICE_NAME}/"), format!("{REGISTRAR_ID}/")] }
+        })),
+    )
+    .await;
+    // Both ids carry a binding: the `state.json` service is also bound.
+    Mock::given(method("GET"))
+        .and(path_regex(r"/registrar_binding$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": { "schema_version": 1, "state": "active" },
+                "metadata": { "version": 1 }
+            }
+        })))
+        .mount(&openbao)
+        .await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-both",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    let service_writes: Vec<String> = requests
+        .iter()
+        .filter(|req| {
+            req.method.as_str() == "POST"
+                && req
+                    .url
+                    .path()
+                    .starts_with("/v1/secret/data/bootroot/services/")
+        })
+        .map(|req| req.url.path().to_string())
+        .collect();
+    assert_eq!(
+        service_writes,
+        vec![
+            service_record_path(SERVICE_NAME, "http_responder_hmac"),
+            service_record_path(REGISTRAR_ID, "http_responder_hmac"),
+        ],
+        "an id both in state.json and bound is written once, in its state.json position"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_listing_server_error_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-list-500").await;
+    stub_services_listing(
+        &openbao,
+        support::ROOT_TOKEN,
+        ResponseTemplate::new(500).set_body_json(json!({ "errors": ["boom"] })),
+    )
+    .await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-list-500",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_no_secret_writes(&received(&openbao).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_trust_sync_fans_out_to_registrar_identities() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
