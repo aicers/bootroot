@@ -648,14 +648,17 @@ pub(crate) enum RotateCommand {
     /// reissuance for **local-file** services directly: the control
     /// plane removes their existing cert and key files and signals the
     /// local bootroot-agent to reissue on its next cycle. For
-    /// **remote-bootstrap** services the control plane only prints an
-    /// instruction to run `bootroot-remote bootstrap` on the service
-    /// host; their reissuance is the operator's responsibility and is
-    /// not verified by the finalize phase (remote-bootstrap services
-    /// are skipped when checking for unmigrated certs). Skipped phases
-    /// (`--skip reissue,finalize`) leave the rotation paused for
-    /// operator follow-up. Use `--cleanup` to delete backup files
-    /// after a successful full rotation.
+    /// **remote-bootstrap** services the control plane publishes a
+    /// versioned reissue request to the service's `OpenBao` KV path,
+    /// which the remote agent picks up on its fast-poll interval (as
+    /// `rotate force-reissue` does). It does not wait for the remote
+    /// agent, and the finalize phase does not verify remote reissuance
+    /// (remote-bootstrap services are skipped when checking for
+    /// unmigrated certs). Skipped phases (`--skip reissue,finalize`)
+    /// are not deferred: the cleanup phase still removes the rotation
+    /// state, so a later run starts a new rotation rather than resuming
+    /// the skipped phase. Use `--cleanup` to delete backup files after a
+    /// successful full rotation.
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
     /// Renews infrastructure TLS certificates (e.g. `OpenBao` server cert)

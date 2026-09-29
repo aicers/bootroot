@@ -336,6 +336,18 @@ byte for byte.
   `agent.toml.compose` now carries a `[trust]` section to fill in from
   `secrets/certs/`.
 
+### Fixed
+
+- `bootroot rotate ca-key` Phase 5 now publishes a versioned reissue
+  request to OpenBao KV for each `remote-bootstrap` service that is not
+  already on the new intermediate, as documented, so its agent picks the
+  request up on its next fast-poll tick. It used to print a hint to
+  re-run `bootroot-remote bootstrap`, which does not force a renewal and
+  fails with the default wrapped `secret_id` artifact, so nothing asked
+  remote agents to reissue during the rotation. A failed publish now
+  stops the rotation before Phase 5 is recorded, and a re-run publishes
+  again for every remote service.
+
 ### Security
 
 - Updated `rustls` to 0.23.45 so TLS 1.3 handshakes reject messages that

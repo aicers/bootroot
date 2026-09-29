@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::Context;
 use serde_json::json;
 use tempfile::tempdir;
-use wiremock::matchers::{body_json, header, method, path};
+use wiremock::matchers::{body_json, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[cfg(unix)]
@@ -4382,5 +4382,489 @@ async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
     assert!(
         !temp_dir.path().join("rotation-state.json").exists(),
         "rotation-state.json should be cleaned up after completion"
+    );
+}
+
+/// Requester the remote-reissue tests put in the child's `USER`, which
+/// `rotate ca-key` Phase 5 falls back to for the request's `requester`.
+const REISSUE_REQUESTER: &str = "rotation-operator";
+
+/// Registers each of `names` in `state.json` as a `remote-bootstrap`
+/// service whose leaf lives at `certs/<name>.crt`.
+fn prepare_remote_services_state(
+    root: &Path,
+    openbao_url: &str,
+    names: &[&str],
+) -> anyhow::Result<()> {
+    write_state_file(root, openbao_url)?;
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).context("read state")?;
+    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
+    for name in names {
+        state["services"][*name] = json!({
+            "registration_id": name,
+            "service_name": name,
+            "delivery_mode": "remote-bootstrap",
+            "hostname": "edge-node-01",
+            "domain": "trusted.domain",
+            "agent_config_path": "agent.toml",
+            "cert_path": format!("certs/{name}.crt"),
+            "key_path": format!("certs/{name}.key"),
+            "instance_id": "001",
+            "approle": {
+                "role_name": format!("bootroot-service-{name}"),
+                "role_id": format!("role-{name}"),
+                "secret_id_path": format!("secrets/services/{name}/secret_id"),
+                "policy_name": format!("bootroot-service-{name}"),
+                "secret_id_wrap_ttl": "0"
+            }
+        });
+    }
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
+    fs::write(root.join("agent.toml"), "# agent").context("write agent config")?;
+    Ok(())
+}
+
+/// Writes `rotation-state.json` for an intermediate-only rotation that
+/// has completed `phase`, so the next `rotate ca-key` resumes after it.
+fn write_rotation_state_at_phase(root: &Path, phase: u8) {
+    fs::write(
+        root.join("rotation-state.json"),
+        serde_json::to_string_pretty(&json!({
+            "mode": "intermediate-only",
+            "started_at": "2026-03-01T10:00:00Z",
+            "old_root_fp": "aaa",
+            "new_root_fp": "aaa",
+            "old_intermediate_fp": "bbb",
+            "new_intermediate_fp": "ccc",
+            "phase": phase
+        }))
+        .expect("serialize rotation-state.json"),
+    )
+    .expect("write rotation-state.json");
+}
+
+fn recorded_rotation_phase(root: &Path) -> serde_json::Value {
+    let contents =
+        fs::read_to_string(root.join("rotation-state.json")).expect("read rotation-state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&contents).expect("parse rotation-state.json");
+    state["phase"].clone()
+}
+
+/// Stages what a `rotate ca-key` run needs outside `OpenBao` — a compose
+/// file, a new intermediate for Phase 2 to install, and fake `docker` and
+/// `pkill` — and returns the environment the child runs with.
+fn stage_ca_key_rotation(root: &Path) -> Vec<(&'static str, std::ffi::OsString)> {
+    fs::write(
+        root.join("docker-compose.yml"),
+        "version: '3'\nservices:\n  step-ca:\n    image: test\n",
+    )
+    .expect("write compose file");
+
+    let new_cert_staging = root.join("new_intermediate_staged.crt");
+    fs::write(
+        &new_cert_staging,
+        generate_test_cert_pem("new-intermediate.example"),
+    )
+    .expect("write staged cert");
+
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = root.join("docker.log");
+    write_full_rotation_fake_docker(&bin_dir, &docker_log, &new_cert_staging);
+    let pkill_log = root.join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    vec![
+        ("PATH", format!("{}:{path_var}", bin_dir.display()).into()),
+        ("DOCKER_OUTPUT", docker_log.into()),
+        ("PKILL_OUTPUT", pkill_log.into()),
+        (
+            "ROTATION_NEW_CERT_TARGET",
+            root.join("secrets")
+                .join("certs")
+                .join("intermediate_ca.crt")
+                .into(),
+        ),
+        ("USER", REISSUE_REQUESTER.into()),
+    ]
+}
+
+fn run_rotate_ca_key(
+    root: &Path,
+    openbao_url: &str,
+    envs: &[(&'static str, std::ffi::OsString)],
+    extra_args: &[&str],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args([
+            "rotate",
+            "--openbao-url",
+            openbao_url,
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "ca-key",
+        ])
+        .args(extra_args)
+        .envs(envs.iter().map(|(key, value)| (*key, value)))
+        .output()
+        .expect("run rotate ca-key")
+}
+
+fn reissue_kv_path(registration_id: &str) -> String {
+    format!("/v1/secret/data/bootroot/services/{registration_id}/reissue")
+}
+
+/// Stubs the health check and the Phase 3 / Phase 6 trust writes, global
+/// and per service.
+async fn stub_openbao_for_ca_key_rotation(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/v1/secret/data/bootroot/services/[^/]+/trust$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+/// Answers the KV v2 write of `registration_id`'s reissue request with
+/// `status`, carrying a version on success.
+async fn stub_reissue_write(server: &MockServer, registration_id: &str, status: u16) {
+    let response = if status == 200 {
+        ResponseTemplate::new(200).set_body_json(json!({ "data": { "version": 7 } }))
+    } else {
+        ResponseTemplate::new(status).set_body_json(json!({ "errors": ["internal error"] }))
+    };
+    Mock::given(method("POST"))
+        .and(path(reissue_kv_path(registration_id)))
+        .and(header("X-Vault-Token", support::ROOT_TOKEN))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+/// Returns the payloads of every reissue request written for
+/// `registration_id`, in the order they arrived.
+async fn reissue_requests(server: &MockServer, registration_id: &str) -> Vec<serde_json::Value> {
+    let reissue_path = reissue_kv_path(registration_id);
+    server
+        .received_requests()
+        .await
+        .expect("mock server records requests")
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path() == reissue_path)
+        .map(|req| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("parse reissue write body");
+            body["data"].clone()
+        })
+        .collect()
+}
+
+fn assert_reissue_payload(payload: &serde_json::Value) {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let requested_at = payload["requested_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("requested_at missing from {payload}"));
+    OffsetDateTime::parse(requested_at, &Rfc3339)
+        .unwrap_or_else(|err| panic!("requested_at {requested_at} is not RFC 3339: {err}"));
+    assert_eq!(
+        payload["requester"], REISSUE_REQUESTER,
+        "payload: {payload}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_publishes_reissue_request_for_remote_service() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 200).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = reissue_requests(&openbao, SERVICE_NAME).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "one reissue request expected: {requests:?}"
+    );
+    assert_reissue_payload(&requests[0]);
+    assert!(
+        stdout.contains(&format!("{SERVICE_NAME}: reissue requested at")),
+        "phase 5 should report the published request: {stdout}"
+    );
+    assert!(
+        !stdout.contains("bootroot-remote bootstrap"),
+        "phase 5 must not tell the operator to re-run bootstrap: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Consumer reload/restart required"),
+        "remote services stay out of the consumer-reload hint: {stdout}"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_skip_reissue_publishes_no_remote_request() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 200).await;
+
+    let output = run_rotate_ca_key(
+        temp_dir.path(),
+        &openbao.uri(),
+        &envs,
+        &["--skip", "reissue"],
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed with --skip reissue; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = reissue_requests(&openbao, SERVICE_NAME).await;
+    assert!(
+        requests.is_empty(),
+        "--skip reissue must publish no reissue request: {requests:?}"
+    );
+    assert!(
+        !stdout.contains("reissue requested at"),
+        "--skip reissue must not report a request: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_reissue_publish_failure_resumes_at_phase_5() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 500).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a failed reissue publish must fail the rotation; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(SERVICE_NAME),
+        "the error should name the service whose request failed: {stderr}"
+    );
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), 4);
+    assert_eq!(reissue_requests(&openbao, SERVICE_NAME).await.len(), 1);
+
+    openbao.reset().await;
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, SERVICE_NAME, 200).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 4"),
+        "the re-run should resume after phase 4: {stdout}"
+    );
+    let requests = reissue_requests(&openbao, SERVICE_NAME).await;
+    assert_eq!(requests.len(), 1, "the re-run should publish: {requests:?}");
+    assert_reissue_payload(&requests[0]);
+    assert!(
+        stdout.contains(&format!("{SERVICE_NAME}: reissue requested at")),
+        "the re-run should report the published request: {stdout}"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_skips_reissue_request_for_migrated_remote_service() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_remote_services_state(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["svc-migrated", "svc-pending"],
+    )
+    .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+    write_rotation_state_at_phase(temp_dir.path(), 4);
+
+    // The intermediate on disk is self-signed, so a copy of it has the
+    // intermediate's subject as its issuer: a leaf "issued by" it.
+    let certs_dir = temp_dir.path().join("certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    fs::copy(
+        temp_dir
+            .path()
+            .join("secrets")
+            .join("certs")
+            .join("intermediate_ca.crt"),
+        certs_dir.join("svc-migrated.crt"),
+    )
+    .expect("write migrated leaf");
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, "svc-migrated", 200).await;
+    stub_reissue_write(&openbao, "svc-pending", 200).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        reissue_requests(&openbao, "svc-migrated").await.is_empty(),
+        "an already-migrated remote service must get no request"
+    );
+    let pending = reissue_requests(&openbao, "svc-pending").await;
+    assert_eq!(pending.len(), 1, "one request for svc-pending: {pending:?}");
+    assert_reissue_payload(&pending[0]);
+    assert!(
+        stdout.contains("svc-migrated: already issued by new intermediate, skipping"),
+        "phase 5 should report svc-migrated as migrated: {stdout}"
+    );
+    assert!(
+        stdout.contains("svc-pending: reissue requested at"),
+        "phase 5 should report the request for svc-pending: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_partial_reissue_failure_republishes_on_resume() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_remote_services_state(temp_dir.path(), &openbao.uri(), &["svc-a", "svc-b"])
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+    write_rotation_state_at_phase(temp_dir.path(), 4);
+
+    // Services are visited in registration-id order, so svc-a's request
+    // lands before svc-b's fails.
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, "svc-a", 200).await;
+    stub_reissue_write(&openbao, "svc-b", 500).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a failed reissue publish must fail the rotation; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("svc-b"),
+        "the error should name the service whose request failed: {stderr}"
+    );
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), 4);
+    let first_a = reissue_requests(&openbao, "svc-a").await;
+    let first_b = reissue_requests(&openbao, "svc-b").await;
+    assert_eq!(first_a.len(), 1, "svc-a: {first_a:?}");
+    assert_eq!(first_b.len(), 1, "svc-b: {first_b:?}");
+
+    // A reset drops the recorded requests with the 500 stub, so the
+    // first run's counts are carried in `first_a` / `first_b`.
+    openbao.reset().await;
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_reissue_write(&openbao, "svc-a", 200).await;
+    stub_reissue_write(&openbao, "svc-b", 200).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 4"),
+        "the re-run should resume after phase 4: {stdout}"
+    );
+    let second_a = reissue_requests(&openbao, "svc-a").await;
+    let second_b = reissue_requests(&openbao, "svc-b").await;
+    assert_eq!(second_a.len(), 1, "svc-a republished: {second_a:?}");
+    assert_eq!(second_b.len(), 1, "svc-b published: {second_b:?}");
+    assert_eq!(
+        first_a.len() + second_a.len(),
+        2,
+        "svc-a receives the accepted duplicate across the two runs"
+    );
+    assert!(
+        !temp_dir.path().join("rotation-state.json").exists(),
+        "rotation-state.json should be deleted after completion"
     );
 }
