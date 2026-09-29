@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -14,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::init::PATH_CA_TRUST;
 use crate::i18n::Messages;
-use crate::state::ServiceEntry;
 
 const ROTATION_STATE_FILENAME: &str = "rotation-state.json";
 
@@ -206,11 +204,15 @@ pub(crate) fn delete_rotation_state(state_dir: &Path, messages: &Messages) -> Re
 }
 
 /// Writes trust payload (fingerprints and CA bundle PEM) to the `OpenBao`
-/// global CA path and all per-service trust paths.
+/// global CA path, then to the trust path of each registration in
+/// `registration_ids`, in order.
+///
+/// The caller resolves `registration_ids` before calling, so a failure to
+/// enumerate them aborts before the global CA path is written.
 pub(crate) async fn write_trust_to_openbao(
     client: &OpenBaoClient,
     kv_mount: &str,
-    services: &BTreeMap<String, ServiceEntry>,
+    registration_ids: &[String],
     fingerprints: &[String],
     ca_bundle_pem: &str,
     messages: &Messages,
@@ -227,11 +229,11 @@ pub(crate) async fn write_trust_to_openbao(
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
 
-    for entry in services.values() {
+    for registration_id in registration_ids {
         write_service_trust(
             client,
             kv_mount,
-            &entry.registration_id,
+            registration_id,
             fingerprints,
             ca_bundle_pem,
             messages,

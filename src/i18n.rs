@@ -410,6 +410,7 @@ pub(crate) struct Strings {
     pub(crate) rotate_ca_key_phase_cleanup: &'static str,
     pub(crate) rotate_ca_key_skip_migrated: &'static str,
     pub(crate) error_rotate_ca_key_reissue_request_failed: &'static str,
+    pub(crate) error_rotate_registrar_targets_list_failed: &'static str,
     pub(crate) rotate_ca_key_finalize_blocked: &'static str,
     pub(crate) warning_force_finalize: &'static str,
     pub(crate) warning_force_finalize_full: &'static str,

@@ -54,6 +54,15 @@ pub const SERVICE_RESPONDER_HMAC_KV_SUFFIX: &str = "http_responder_hmac";
 ///
 /// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/eab`.
 pub const SERVICE_EAB_KV_SUFFIX: &str = "eab";
+/// KV path suffix, under `bootroot/services/<registration_id>/`, of the
+/// registrar's durable host binding.
+///
+/// Deliberately **not** in any teardown suffix set: the binding outlives
+/// the material it covers, and only the deregister verb deletes it, only
+/// after that material is aggregate-gone.
+///
+/// Full path: `{kv_mount}/data/bootroot/services/<registration_id>/registrar_binding`.
+pub const REGISTRAR_BINDING_KV_SUFFIX: &str = "registrar_binding";
 /// Payload field holding the RFC3339 UTC timestamp of the request.
 pub const REISSUE_REQUESTED_AT_KEY: &str = "requested_at";
 /// Payload field describing who issued the request (operator label).

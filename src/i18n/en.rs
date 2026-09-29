@@ -396,6 +396,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_ca_key_phase_cleanup: "[Phase 7] Cleaning up...",
     rotate_ca_key_skip_migrated: "- {service_name}: already issued by new intermediate, skipping",
     error_rotate_ca_key_reissue_request_failed: "Failed to publish the reissue request for remote-bootstrap service {service_name}",
+    error_rotate_registrar_targets_list_failed: "Failed to enumerate registrar-managed identities under {path}; the runtime-rotate policy needs `list` on {path} (re-run `bootroot init` to refresh it), or re-run the rotation with the root token",
     rotate_ca_key_finalize_blocked: "Cannot finalize: the following services still have certificates issued by the old intermediate: {services}",
     warning_force_finalize: "WARNING: Forcing trust finalization with un-migrated services. These services may lose mTLS connectivity.",
     warning_force_finalize_full: "WARNING: Root fingerprint has changed and {services} remain un-migrated. mTLS will break immediately for these services.",

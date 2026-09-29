@@ -6,6 +6,7 @@ mod helpers;
 mod infra_cert;
 mod openbao_recovery;
 mod registrar_internal;
+mod registrar_targets;
 mod responder_hmac;
 mod stepca_password;
 

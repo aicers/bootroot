@@ -396,6 +396,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_ca_key_phase_cleanup: "[7단계] 정리 중...",
     rotate_ca_key_skip_migrated: "- {service_name}: 이미 새 중간 CA로 발급됨, 건너뜀",
     error_rotate_ca_key_reissue_request_failed: "remote-bootstrap 서비스 {service_name}의 재발급 요청을 기록하지 못했습니다",
+    error_rotate_registrar_targets_list_failed: "{path} 아래의 registrar 관리 identity를 열거하지 못했습니다. runtime-rotate 정책에 {path}에 대한 `list` 권한이 필요합니다(`bootroot init`을 다시 실행해 갱신). 또는 root 토큰으로 rotation을 다시 실행하세요",
     rotate_ca_key_finalize_blocked: "확정할 수 없습니다: 다음 서비스가 아직 이전 중간 CA로 발급된 인증서를 사용 중입니다: {services}",
     warning_force_finalize: "경고: 미이전 서비스가 있는 상태에서 trust를 강제 확정합니다. 해당 서비스는 mTLS 연결이 끊길 수 있습니다.",
     warning_force_finalize_full: "경고: 루트 지문이 변경되었고 {services} 서비스가 미이전 상태입니다. 이 서비스들은 즉시 mTLS 연결이 끊어집니다.",

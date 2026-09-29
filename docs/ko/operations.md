@@ -2977,6 +2977,34 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
 `ca-bundle.pem`을 다시 렌더링하므로 CA/trust 회전도 동일한 방식으로
 전파됩니다.
 
+**registrar 관리 identity.** registrar를 통해 발급된 identity는
+`state.json`에 기록되지 않으며, 유일한 영속 레코드는
+`bootroot/services/<registration_id>/registrar_binding`의 binding입니다.
+따라서 `state.json`에 `registrar_endpoint` 항목이 있는 배포(활성 여부와
+무관)에서는 `rotate responder-hmac`, `rotate eab-clear`,
+`rotate trust-sync`, `rotate ca-key`의 Phase 3과 Phase 6이
+`bootroot/services/`를 나열하고, 모든 `state.json` 서비스와 더불어
+binding이 있는 모든 registration id에 동일한 `http_responder_hmac`,
+`eab`, `trust` 페이로드를 기록합니다. `state.json` 항목도 binding도 없는
+하위 트리에는 기록하지 않습니다. 해당 identity의 호스트는 다른
+remote-bootstrap 서비스와 똑같이 `bootroot-agent` fast-poll 루프로 새 값을
+가져옵니다. `registrar_endpoint` 항목이 없으면 아무것도 나열하지 않습니다.
+
+이 나열에는 `<kv>/metadata/bootroot/services/`에 대한 `list` 권한이
+필요하며, `bootroot init`이 이를 `bootroot-runtime-rotate` 정책에
+기록합니다. runtime-rotate 정책이 이 권한보다 오래된 배포는
+`bootroot init`을 다시 실행해 정책을 갱신하거나, 이 회전들을 root 토큰으로
+실행해야 합니다. 나열은 각 단계의 첫 OpenBao 쓰기보다 먼저 실행되므로,
+나열이 거부되면 아무것도 기록하지 않은 채 그 단계가 실패하고,
+`rotate ca-key`는 다시 실행하면 실패한 phase부터 재개합니다.
+
+같은 identity에 대한 registrar 발급과 회전이 경합하면 그 identity가 이전
+값에 머무를 수 있습니다: 발급은 회전이 기록하기 전에 읽은 control-node
+레코드로 시드하기 때문입니다. 두 프로세스를 아우르는 잠금은 없습니다.
+회전을 다시 실행해 수렴시키세요 — trust는 `rotate trust-sync`, EAB는
+`rotate eab-clear`(멱등), responder HMAC은 `rotate responder-hmac`을 다시
+실행합니다.
+
 `bootroot-remote apply-secret-id`는 정상 상태가 아니라 **복구** 경로입니다:
 `secret_id_ttl`을 넘겨 오프라인 상태였던(자격증명이 이미 만료되어 스스로
 갱신할 수 없는) 에이전트에 새 `secret_id`를 전달합니다:

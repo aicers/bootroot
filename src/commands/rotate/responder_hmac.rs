@@ -5,6 +5,7 @@ use super::helpers::{
     compose_has_responder, confirm_action, reload_compose_service, restart_openbao_agent,
     wait_for_rendered_file,
 };
+use super::registrar_targets::kv_fanout_targets;
 use super::{RENDERED_FILE_TIMEOUT, RotateContext};
 use crate::cli::args::RotateResponderHmacArgs;
 use crate::commands::constants::{
@@ -33,6 +34,10 @@ pub(super) async fn rotate_responder_hmac(
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };
+    // Resolved before the control-node write, so a failure to enumerate
+    // registrar-managed identities leaves every record on the old value
+    // rather than rotating the responder away from the ones it missed.
+    let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
     client
         .write_kv(
             &ctx.kv_mount,
@@ -41,7 +46,7 @@ pub(super) async fn rotate_responder_hmac(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    sync_service_responder_hmac_payloads(ctx, client, &hmac, messages).await?;
+    sync_service_responder_hmac_payloads(ctx, client, &registration_ids, &hmac, messages).await?;
 
     let responder_path = ctx.paths.responder_config();
     restart_openbao_agent(
@@ -73,18 +78,17 @@ pub(super) async fn rotate_responder_hmac(
     Ok(())
 }
 
+/// Writes the rotated HMAC to each registration's `http_responder_hmac`
+/// record, in the order given: the `state.json` services and the
+/// registrar-managed identities alike.
 async fn sync_service_responder_hmac_payloads(
     ctx: &RotateContext,
     client: &OpenBaoClient,
+    registration_ids: &[String],
     hmac: &str,
     messages: &Messages,
 ) -> Result<()> {
-    for registration_id in ctx
-        .state
-        .services
-        .values()
-        .map(|entry| entry.registration_id.as_str())
-    {
+    for registration_id in registration_ids {
         client
             .write_kv(
                 &ctx.kv_mount,

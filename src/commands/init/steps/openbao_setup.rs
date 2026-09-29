@@ -512,6 +512,9 @@ path "{kv_mount}/metadata/{PATH_CA_TRUST}" {{
 path "{kv_mount}/data/bootroot/services/*" {{
   capabilities = ["create", "update", "read"]
 }}
+path "{kv_mount}/metadata/bootroot/services/" {{
+  capabilities = ["list"]
+}}
 path "auth/approle/role/bootroot-service-*" {{
   capabilities = ["create", "update", "read"]
 }}
@@ -1335,6 +1338,33 @@ services:
         assert!(rotate_policy.contains("auth/approle/role/bootroot-service-*/secret-id"));
         assert!(rotate_policy.contains("secret/data/bootroot/ca"));
         assert!(rotate_policy.contains("secret/metadata/bootroot/ca"));
+    }
+
+    #[test]
+    fn test_build_policy_map_runtime_rotate_lists_only_top_level_services() {
+        // The rotations fan trust, responder-HMAC and EAB material out
+        // to registrar-minted identities, which only a listing of
+        // `bootroot/services/` can find. The grant is the one exact path
+        // with no glob, so it lists registration ids and nothing below
+        // them, and no other policy gains it.
+        let policies = build_policy_map("secret");
+        let rotate_policy = policies.get(POLICY_BOOTROOT_RUNTIME_ROTATE).unwrap();
+        assert!(rotate_policy.contains(
+            "path \"secret/metadata/bootroot/services/\" {\n  capabilities = [\"list\"]\n}"
+        ));
+        assert_eq!(
+            rotate_policy.matches("metadata/bootroot/services").count(),
+            1
+        );
+        assert!(!rotate_policy.contains("metadata/bootroot/services/*"));
+        for (name, body) in &policies {
+            if name != POLICY_BOOTROOT_RUNTIME_ROTATE {
+                assert!(
+                    !body.contains("metadata/bootroot/services"),
+                    "{name} must not gain a services listing grant"
+                );
+            }
+        }
     }
 
     #[test]
