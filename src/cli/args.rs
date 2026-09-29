@@ -654,10 +654,11 @@ pub(crate) enum RotateCommand {
     /// `rotate force-reissue` does). It does not wait for the remote
     /// agent, and the finalize phase does not verify remote reissuance
     /// (remote-bootstrap services are skipped when checking for
-    /// unmigrated certs). Skipped phases
-    /// (`--skip reissue,finalize`) leave the rotation paused for
-    /// operator follow-up. Use `--cleanup` to delete backup files
-    /// after a successful full rotation.
+    /// unmigrated certs). Skipped phases (`--skip reissue,finalize`)
+    /// are not deferred: the cleanup phase still removes the rotation
+    /// state, so a later run starts a new rotation rather than resuming
+    /// the skipped phase. Use `--cleanup` to delete backup files after a
+    /// successful full rotation.
     #[command(name = "ca-key")]
     CaKey(RotateCaKeyArgs),
     /// Renews infrastructure TLS certificates (e.g. `OpenBao` server cert)
