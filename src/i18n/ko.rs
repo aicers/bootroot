@@ -395,7 +395,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_ca_key_phase_finalize: "[6단계] trust 확정 중(축소)...",
     rotate_ca_key_phase_cleanup: "[7단계] 정리 중...",
     rotate_ca_key_skip_migrated: "- {service_name}: 이미 새 중간 CA로 발급됨, 건너뜀",
-    rotate_ca_key_reissue_remote_hint: "- {service_name}: remote-bootstrap 서비스 — 서비스 머신에서 `bootroot-remote bootstrap`을 실행하여 재발급하세요",
+    error_rotate_ca_key_reissue_request_failed: "remote-bootstrap 서비스 {service_name}의 재발급 요청을 기록하지 못했습니다",
     rotate_ca_key_finalize_blocked: "확정할 수 없습니다: 다음 서비스가 아직 이전 중간 CA로 발급된 인증서를 사용 중입니다: {services}",
     warning_force_finalize: "경고: 미이전 서비스가 있는 상태에서 trust를 강제 확정합니다. 해당 서비스는 mTLS 연결이 끊길 수 있습니다.",
     warning_force_finalize_full: "경고: 루트 지문이 변경되었고 {services} 서비스가 미이전 상태입니다. 이 서비스들은 즉시 mTLS 연결이 끊어집니다.",

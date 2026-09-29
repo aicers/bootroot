@@ -497,9 +497,9 @@ impl Messages {
         )
     }
 
-    pub(crate) fn rotate_ca_key_reissue_remote_hint(&self, service_name: &str) -> String {
+    pub(crate) fn error_rotate_ca_key_reissue_request_failed(&self, service_name: &str) -> String {
         format_template(
-            self.strings().rotate_ca_key_reissue_remote_hint,
+            self.strings().error_rotate_ca_key_reissue_request_failed,
             &[("service_name", service_name)],
         )
     }

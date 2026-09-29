@@ -320,10 +320,29 @@ pub(super) async fn rotate_ca_key(
                     signal_bootroot_agent(entry, messages)?;
                     reissued_local.push(entry);
                 }
-                Phase5Action::RemoteHint => {
+                Phase5Action::RemoteReissueRequest => {
+                    // Published but not awaited: a rotation must not block
+                    // on the slowest remote agent, and `rotate
+                    // force-reissue --wait` observes one service. A
+                    // failure aborts before Phase 5 is recorded, so a
+                    // re-run republishes for every remote service.
+                    let published = publish_reissue_request(
+                        ctx,
+                        client,
+                        &entry.registration_id,
+                        None,
+                        messages,
+                    )
+                    .await
+                    .with_context(|| {
+                        messages.error_rotate_ca_key_reissue_request_failed(&entry.registration_id)
+                    })?;
                     println!(
                         "{}",
-                        messages.rotate_ca_key_reissue_remote_hint(&entry.registration_id)
+                        messages.rotate_summary_force_reissue_requested(
+                            &entry.registration_id,
+                            &published.requested_at,
+                        )
                     );
                 }
             }
@@ -703,9 +722,10 @@ enum Phase5Action {
     /// Local-file delivery service whose cert needs to be wiped and
     /// re-signaled. Goes into the consumer-reload hint.
     LocalReissue,
-    /// Remote-bootstrap delivery service. Operator gets a remote hint
-    /// but the consumer-reload hint targets local-file consumers only.
-    RemoteHint,
+    /// Remote-bootstrap delivery service. A versioned reissue request is
+    /// published to `OpenBao` KV for its agent's fast-poll loop; the
+    /// consumer-reload hint targets local-file consumers only.
+    RemoteReissueRequest,
 }
 
 fn classify_phase5_action(
@@ -722,7 +742,7 @@ fn classify_phase5_action(
     if matches!(entry.delivery_mode, DeliveryMode::LocalFile) {
         Phase5Action::LocalReissue
     } else {
-        Phase5Action::RemoteHint
+        Phase5Action::RemoteReissueRequest
     }
 }
 
@@ -912,24 +932,32 @@ async fn rotate_force_reissue_local(
     }
 }
 
-async fn rotate_force_reissue_remote(
+/// A reissue request written to a remote-bootstrap service's KV record.
+struct PublishedReissue {
+    kv_path: String,
+    /// KV v2 version assigned by the write, when `OpenBao` reported one.
+    version: Option<u64>,
+    requested_at: String,
+}
+
+/// Publishes a versioned reissue request for a remote-bootstrap service,
+/// which its agent picks up on a fast-poll tick. `requester` falls back
+/// to `USER`, then `LOGNAME`, then `"unknown"`.
+async fn publish_reissue_request(
     ctx: &RotateContext,
     client: &OpenBaoClient,
-    args: &RotateForceReissueArgs,
+    registration_id: &str,
+    requester: Option<&str>,
     messages: &Messages,
-) -> Result<RotateOutcome> {
+) -> Result<PublishedReissue> {
     use bootroot::trust_bootstrap::{
         REISSUE_REQUESTED_AT_KEY, REISSUE_REQUESTER_KEY, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
     };
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
-    let wait_timeout = humantime::parse_duration(&args.wait_timeout)
-        .with_context(|| format!("invalid --wait-timeout value: {}", args.wait_timeout))?;
-
-    let requester = args
-        .requester
-        .clone()
+    let requester = requester
+        .map(str::to_owned)
         .or_else(|| std::env::var("USER").ok())
         .or_else(|| std::env::var("LOGNAME").ok())
         .unwrap_or_else(|| "unknown".to_string());
@@ -938,10 +966,7 @@ async fn rotate_force_reissue_remote(
         .format(&Rfc3339)
         .context("Failed to format requested_at timestamp")?;
 
-    let kv_path = format!(
-        "{SERVICE_KV_BASE}/{}/{SERVICE_REISSUE_KV_SUFFIX}",
-        args.registration_id
-    );
+    let kv_path = format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_REISSUE_KV_SUFFIX}");
 
     // Capture the version assigned by *this* POST directly from the
     // response body. A follow-up GET would race with the agent's own
@@ -949,7 +974,7 @@ async fn rotate_force_reissue_remote(
     // before the CLI's readback, the GET would report version N+1 and
     // `--wait` would then compare `completed_version (N) >= N+1` and
     // hang forever.
-    let request_version = client
+    let version = client
         .write_kv_with_version(
             &ctx.kv_mount,
             &kv_path,
@@ -960,6 +985,35 @@ async fn rotate_force_reissue_remote(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
+
+    Ok(PublishedReissue {
+        kv_path,
+        version,
+        requested_at,
+    })
+}
+
+async fn rotate_force_reissue_remote(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    args: &RotateForceReissueArgs,
+    messages: &Messages,
+) -> Result<RotateOutcome> {
+    let wait_timeout = humantime::parse_duration(&args.wait_timeout)
+        .with_context(|| format!("invalid --wait-timeout value: {}", args.wait_timeout))?;
+
+    let PublishedReissue {
+        kv_path,
+        version: request_version,
+        requested_at,
+    } = publish_reissue_request(
+        ctx,
+        client,
+        &args.registration_id,
+        args.requester.as_deref(),
+        messages,
+    )
+    .await?;
 
     println!("{}", messages.rotate_summary_title());
     println!(
@@ -1805,5 +1859,68 @@ mod tests {
             .collect();
         assert_eq!(reissued.len(), 1);
         assert_eq!(reissued[0].registration_id, "svc-old");
+    }
+
+    /// A remote-bootstrap service gets a KV reissue request in phase 5
+    /// unless the leaf at its `cert_path` already chains to the new
+    /// intermediate: an old-intermediate leaf and a missing file both
+    /// need one.
+    #[test]
+    fn phase5_classifies_unmigrated_remote_services_for_reissue_request() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        let (old_issuer, _old_inter_pem) = build_issuer("Old Intermediate");
+        let (new_issuer, new_inter_pem) = build_issuer("New Intermediate");
+
+        let new_inter_path = dir.path().join("new_intermediate.crt");
+        fs::write(&new_inter_path, &new_inter_pem).expect("write new intermediate");
+
+        let migrated_cert = dir.path().join("svc_new.crt");
+        fs::write(
+            &migrated_cert,
+            sign_leaf_with("svc-new.example", &new_issuer),
+        )
+        .expect("write new leaf");
+        let unmigrated_cert = dir.path().join("svc_old.crt");
+        fs::write(
+            &unmigrated_cert,
+            sign_leaf_with("svc-old.example", &old_issuer),
+        )
+        .expect("write old leaf");
+        let missing_cert = dir.path().join("svc_missing.crt");
+
+        let remote = |name: &str, cert_path: std::path::PathBuf| ServiceEntry {
+            delivery_mode: DeliveryMode::RemoteBootstrap,
+            ..make_local_file_entry(name, cert_path)
+        };
+
+        assert_eq!(
+            classify_phase5_action(
+                &remote("svc-new", migrated_cert),
+                &new_inter_path,
+                &messages
+            ),
+            Phase5Action::SkipMigrated,
+            "remote service already on the new intermediate must be skipped"
+        );
+        assert_eq!(
+            classify_phase5_action(
+                &remote("svc-old", unmigrated_cert),
+                &new_inter_path,
+                &messages
+            ),
+            Phase5Action::RemoteReissueRequest,
+            "remote service still on the old intermediate must get a request"
+        );
+        assert_eq!(
+            classify_phase5_action(
+                &remote("svc-missing", missing_cert),
+                &new_inter_path,
+                &messages
+            ),
+            Phase5Action::RemoteReissueRequest,
+            "remote service with no leaf on disk must get a request"
+        );
     }
 }
