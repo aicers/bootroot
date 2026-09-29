@@ -22,9 +22,9 @@ set -euo pipefail
 #      ignored tests.
 #
 # The connection details and the binary path travel as environment
-# variables on the child process only.  The tests read them and never write them: mutating the
-# process environment from a test is unsound in Rust 2024, and there is
-# no reason to here.
+# variables on the child process only.  The tests read them and never
+# write them: mutating the process environment from a test is unsound in
+# Rust 2024, and there is no reason to here.
 #
 # This is a self-contained OpenBao rather than the full compose stack.
 # The verbs touch no step-ca, no PostgreSQL and no responder — the tests

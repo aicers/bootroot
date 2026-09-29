@@ -114,14 +114,15 @@ install.
 
 The two registrar scenarios are outside that discussion entirely: each stands a
 single OpenBao container up on a free loopback port and needs no compose
-project and no secrets wiring. `run-registrar-internal-e2e.sh` needs none of the
-bootroot binaries either. `run-registrar-verbs-e2e.sh` builds `bootroot-remote`,
-because one of its tests runs `bootroot-remote bootstrap` against a freshly
-minted identity, and passes the binary's path in alongside the connection
-details. `run-registrar-verbs-e2e.sh` is the gate for the `#[ignore]`d
-`registrar::verbs::tests` library tests, and `run-registrar-internal-e2e.sh`
-for the `#[ignore]`d `registrar::internal::tests::live` ones. Both pass the
-container's connection details in on the child process's environment.
+project and no secrets wiring. `run-registrar-verbs-e2e.sh` is the gate for the
+`#[ignore]`d `registrar::verbs::tests` library tests, and
+`run-registrar-internal-e2e.sh` for the `#[ignore]`d
+`registrar::internal::tests::live` ones. Both pass the container's connection
+details in on the child process's environment. `run-registrar-internal-e2e.sh`
+needs none of the bootroot binaries. `run-registrar-verbs-e2e.sh` builds
+`bootroot-remote`, because one of its tests runs `bootroot-remote bootstrap`
+against a freshly minted identity, and passes the binary's path in the same
+way.
 
 `run-registrar-redteam.sh` instead provisions a full run-scoped deployment and
 uses a live OpenBao plus a root-owned socket. It is the credential-boundary
