@@ -2158,7 +2158,9 @@ Phases:
   bootroot-agent host daemon (SIGHUP) to trigger re-issuance with the
   new CA. Remote-bootstrap services publish
   a versioned reissue request to OpenBao KV instead; remote agents pick
-  it up on their fast-poll interval (see `rotate force-reissue`)
+  it up on their fast-poll interval (see `rotate force-reissue`).
+  Every registrar-managed identity gets the same KV reissue request.
+  The rotation does not wait for any of these requests to complete
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
   OpenBao — `bootroot/ca`, every `state.json` service and every
   registrar-managed identity — removing old fingerprints, then restart

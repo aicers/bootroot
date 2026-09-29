@@ -10,7 +10,7 @@ use super::helpers::{
     try_restart_container,
 };
 use super::registrar_internal;
-use super::registrar_targets::kv_fanout_targets;
+use super::registrar_targets::{kv_fanout_targets, registrar_only_targets};
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
     STEP_CA_HELPER_IMAGE,
@@ -309,6 +309,11 @@ pub(super) async fn rotate_ca_key(
     if start_phase < 5 && !args.skip.contains(&RotateSkipPhase::Reissue) {
         println!("{}", messages.rotate_ca_key_phase_reissue());
 
+        // Enumerated before any local file is deleted, agent signalled or
+        // request published, so a listing failure aborts Phase 5 with
+        // nothing done and a re-run resumes here.
+        let registrar_ids = registrar_only_targets(ctx, client, messages).await?;
+
         let new_inter_cert_path = ctx.paths.intermediate_cert();
         let mut reissued_local: Vec<&ServiceEntry> = Vec::new();
         for entry in ctx.state.services.values() {
@@ -351,6 +356,24 @@ pub(super) async fn rotate_ca_key(
                     );
                 }
             }
+        }
+
+        // A registrar-minted identity's leaf lives only on its host, so
+        // there is no migration check to make: every one gets the same
+        // unawaited request as a `remote-bootstrap` service.
+        for registration_id in &registrar_ids {
+            let published = publish_reissue_request(ctx, client, registration_id, None, messages)
+                .await
+                .with_context(|| {
+                    messages.error_rotate_ca_key_reissue_request_failed(registration_id)
+                })?;
+            println!(
+                "{}",
+                messages.rotate_summary_force_reissue_requested(
+                    registration_id,
+                    &published.requested_at,
+                )
+            );
         }
 
         crate::commands::service::print_consumer_reload_hint(

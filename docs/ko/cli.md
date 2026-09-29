@@ -2067,7 +2067,9 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - Phase 5 — 재발급: 서비스 cert/key 삭제 후 bootroot-agent 호스트 데몬에
   시그널(SIGHUP)을 보내 새 CA로 재발급 유도. remote-bootstrap 서비스의
   경우 버전 관리된 재발급 요청을 OpenBao KV에 기록하며, 원격 agent가
-  fast-poll 주기에 이를 처리합니다(`rotate force-reissue` 참고)
+  fast-poll 주기에 이를 처리합니다(`rotate force-reissue` 참고).
+  모든 registrar 관리 identity도 동일한 KV 재발급 요청을 받습니다.
+  회전은 이 요청들의 완료를 기다리지 않습니다
 - Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao
   (`bootroot/ca`, 모든 `state.json` 서비스, 모든 registrar 관리
   identity)에 기록해 기존 fingerprint를 제거한 뒤, 인프라 OpenBao Agent
