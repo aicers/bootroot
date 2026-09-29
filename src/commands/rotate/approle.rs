@@ -492,7 +492,10 @@ async fn classify_registrar_targets(
 ///
 /// Returns the localized refusal when `--agent-config` is absent — the
 /// caller only asks when `active_ids` would be rotated — or when the file
-/// cannot be read, parsed, deserialized or validated.
+/// cannot be read, parsed, deserialized or validated. Those report the
+/// underlying error without any value taken from the file, which also
+/// holds the daemon's responder and EAB HMACs and whose refusal lands in
+/// a scheduled job's logs.
 async fn load_registrar_secret_id_options(
     agent_config: Option<&Path>,
     active_ids: &[&str],
@@ -512,41 +515,18 @@ async fn load_registrar_secret_id_options(
                 messages.error_rotate_agent_config_unreadable(&display, &reason)
             }
             AgentConfigReadError::Malformed(reason) => {
-                messages
-                    .error_rotate_agent_config_malformed(&display, &without_source_lines(&reason))
+                messages.error_rotate_agent_config_malformed(&display, &reason.without_values)
             }
             AgentConfigReadError::Undeserializable(reason) => {
-                messages.error_rotate_agent_config_undeserializable(&display, &reason)
+                messages
+                    .error_rotate_agent_config_undeserializable(&display, &reason.without_values)
             }
             AgentConfigReadError::Rejected(reason) => {
-                messages.error_rotate_agent_config_rejected(&display, &reason)
+                messages.error_rotate_agent_config_rejected(&display, &reason.without_values)
             }
         })
     })?;
     Ok(settings.secret_id_options())
-}
-
-/// Drops the source excerpt a TOML parse error quotes, keeping the
-/// location and the parser's complaint.
-///
-/// The file a rotation reads also carries the daemon's responder and EAB
-/// HMACs, and the excerpt is the offending line verbatim — which is the
-/// secret itself when the syntax error sits on that line.
-fn without_source_lines(reason: &str) -> String {
-    reason
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !is_source_excerpt_line(line))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Reports whether a trimmed line of a TOML parse error is part of its
-/// quoted excerpt: a `|` gutter, optionally preceded by a line number.
-fn is_source_excerpt_line(line: &str) -> bool {
-    line.trim_start_matches(|c: char| c.is_ascii_digit())
-        .trim_start()
-        .starts_with('|')
 }
 
 /// Issues a fresh `secret_id` for a registrar-minted identity and pushes
@@ -1853,36 +1833,6 @@ mod tests {
             !args_log.exists(),
             "service secret_id rotation must not invoke docker: the local \
              agent's fast-poll loop re-reads the secret_id file on re-login"
-        );
-    }
-
-    /// A syntax error on the line holding a secret must not quote that
-    /// line back: the parser's excerpt is dropped, its location and
-    /// complaint kept.
-    #[test]
-    fn a_malformed_agent_config_error_does_not_quote_the_offending_line() {
-        let dir = tempdir().expect("tempdir");
-        let config = dir.path().join("agent.toml");
-        fs::write(
-            &config,
-            "[registrar]\nsecret_id_num_uses = 0\n\n[eab]\nhmac = \"s3cr3t-hmac-value\n",
-        )
-        .expect("write agent config");
-        let Err(AgentConfigReadError::Malformed(reason)) = load_registrar_settings(&config) else {
-            panic!("an unterminated string must be a TOML parse error");
-        };
-        assert!(
-            reason.contains("s3cr3t-hmac-value"),
-            "the raw parser error quotes the line, which is what makes this test bite: {reason}"
-        );
-        let redacted = without_source_lines(&reason);
-        assert!(
-            !redacted.contains("s3cr3t-hmac-value"),
-            "the redacted reason must not quote the secret: {redacted}"
-        );
-        assert!(
-            redacted.contains("line 5"),
-            "the redacted reason keeps the location: {redacted}"
         );
     }
 

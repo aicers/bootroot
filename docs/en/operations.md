@@ -2642,7 +2642,11 @@ invocation per credential surface instead of mixing them:
   registry, services added after the scheduler was written are picked
   up automatically — no per-service unit to keep in sync. It continues
   past per-service failures, prints a per-target summary, and exits
-  non-zero if any target failed; an empty registry is a no-op success.
+  non-zero if any target failed. It is a no-op success only when there
+  is nothing to rotate, skip or fail: no service in `state.json` and no
+  registrar-managed identity listed — an empty `state.json` on an
+  endpoint-enabled host still rotates registrar identities, and a
+  failed enumeration of them still fails the run.
   On an endpoint-enabled host it also renews every registrar-managed
   identity whose binding is `active` (see
   [Rotation propagation to running agents](#rotation-propagation-to-running-agents)),

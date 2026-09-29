@@ -6444,6 +6444,53 @@ async fn test_rotate_all_services_refuses_a_misspelled_registrar_key() {
     );
 }
 
+/// A secret pasted under a key of the wrong type is valid TOML, and the
+/// deserializer's own error would quote it in full; the refusal lands in
+/// a scheduled job's logs, so it must carry the key and not the value.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_type_error_does_not_print_the_value() {
+    const SENTINEL_SECRET: &str = "s3cr3t-hmac-value";
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(
+        temp_dir.path(),
+        &format!("secret_id_num_uses = \"{SENTINEL_SECRET}\""),
+    );
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Refusing to rotate") && stderr.contains("registrar.secret_id_num_uses"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(SENTINEL_SECRET) && !stdout.contains(SENTINEL_SECRET),
+        "nothing from --agent-config is printed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let issued = issuance_paths(&received(&openbao).await);
+    assert!(
+        issued.is_empty(),
+        "no secret_id may be issued for any target: {issued:?}"
+    );
+}
+
 /// Without a `registrar_endpoint` entry nothing is listed or probed and
 /// `--agent-config` is neither required nor read.
 #[cfg(unix)]

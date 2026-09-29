@@ -1964,12 +1964,16 @@ is required:
   `active`. Authenticate with `bootroot-runtime-rotate-role`
   credentials. Designed for scheduled jobs (`--yes`): it continues past
   per-service failures, prints a per-target summary, and exits non-zero
-  if any target failed; an empty service registry is a no-op success.
-  A registrar identity whose binding is still `creating` (or that was
-  deregistered since it was listed) is reported as skipped, and a skip
-  is not a failure. A binding that does not decode is a per-target
-  failure, and so is a failed enumeration of registrar identities — the
-  `state.json` services are rotated either way.
+  if any target failed. A registrar identity whose binding is still
+  `creating` (or that was deregistered since it was listed) is reported
+  as skipped, and a skip is not a failure. A binding that does not
+  decode is a per-target failure, and so is a failed enumeration of
+  registrar identities — the `state.json` services are rotated either
+  way. The run is a no-op success only when it finds nothing to rotate,
+  skip or fail: no service in `state.json`, and no registrar-managed
+  identity listed (or no registrar endpoint recorded). An empty
+  `state.json` alone is not enough — registrar identities are still
+  rotated, and a failed enumeration still fails the run.
   Infra roles are deliberately excluded (separate credential — see
   below); schedule the two `--infra` invocations alongside it.
 - `--agent-config <path>`: the operator's `bootroot-agent`
@@ -1978,8 +1982,10 @@ is required:
   `registrar-internal/agent.toml`. Required whenever the run would
   rotate a registrar-managed identity whose binding is `active`; the
   command then refuses before issuing any `secret_id` for any target if
-  the flag is missing or the file is unreadable or invalid. Otherwise it
-  is neither required nor read. Conflicts with `--infra`.
+  the flag is missing or the file is unreadable or invalid. That refusal
+  names the key and what is wrong with it, but never a value from the
+  file, which also holds the responder and EAB HMACs. Otherwise the
+  file is neither required nor read. Conflicts with `--infra`.
 - `--infra <stepca|responder>`: target infra role
   (`bootroot-stepca-role` / `bootroot-responder-role`). Authenticate
   with `bootroot-infra-rotate-role` credentials via the usual

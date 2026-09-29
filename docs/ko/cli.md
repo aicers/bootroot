@@ -1888,11 +1888,16 @@ AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된
   회전합니다. `bootroot-runtime-rotate-role` 자격증명으로 인증합니다.
   스케줄 작업용으로 설계되었습니다(`--yes`): 서비스별 실패가 있어도
   계속 진행하고, 대상별 요약을 출력하며, 하나라도 실패하면 0이 아닌
-  코드로 종료합니다. 빈 서비스 레지스트리는 no-op 성공입니다. 바인딩이
-  아직 `creating`인(또는 열거 후 등록 해제된) registrar identity는
-  건너뜀으로 보고되며, 건너뜀은 실패가 아닙니다. 해석할 수 없는
-  바인딩은 대상별 실패이고, registrar identity 열거 자체의 실패도
-  실패로 집계됩니다 — 어느 경우든 `state.json` 서비스는 회전됩니다.
+  코드로 종료합니다. 바인딩이 아직 `creating`인(또는 열거 후 등록
+  해제된) registrar identity는 건너뜀으로 보고되며, 건너뜀은 실패가
+  아닙니다. 해석할 수 없는 바인딩은 대상별 실패이고, registrar
+  identity 열거 자체의 실패도 실패로 집계됩니다 — 어느 경우든
+  `state.json` 서비스는 회전됩니다. 회전하거나 건너뛰거나 실패할
+  대상이 하나도 없을 때만 no-op 성공입니다: `state.json`에 서비스가
+  없고, 열거된 registrar 관리 identity도 없는(또는 registrar endpoint가
+  기록되어 있지 않은) 경우입니다. `state.json`이 비어 있는 것만으로는
+  충분하지 않습니다 — registrar identity는 여전히 회전되고, 열거가
+  실패하면 실행도 실패합니다.
   인프라 역할은 의도적으로 제외됩니다(별도 자격증명 — 아래 참고). 두
   `--infra` 호출을 함께 스케줄하세요.
 - `--agent-config <path>`: registrar 데몬이 사용하는 운영자의
@@ -1900,9 +1905,10 @@ AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된
   것과 같은 파일이며, 생성된 `registrar-internal/agent.toml`이
   아닙니다. 바인딩이 `active`인 registrar 관리 identity를 회전하게 될
   때 필요합니다. 이 경우 플래그가 없거나 파일을 읽을 수 없거나 유효하지
-  않으면 어떤 대상에도 `secret_id`를 발급하기 전에 거부합니다. 그 밖의
-  경우에는 필요하지 않으며 읽지도 않습니다. `--infra`와 함께 쓸 수
-  없습니다.
+  않으면 어떤 대상에도 `secret_id`를 발급하기 전에 거부합니다. 이
+  거부 메시지는 키와 무엇이 잘못되었는지를 알려 주지만, responder와
+  EAB HMAC도 담긴 이 파일의 값은 출력하지 않습니다. 그 밖의 경우에는
+  필요하지 않으며 읽지도 않습니다. `--infra`와 함께 쓸 수 없습니다.
 - `--infra <stepca|responder>`: 대상 인프라 역할
   (`bootroot-stepca-role` / `bootroot-responder-role`).
   `bootroot-infra-rotate-role` 자격증명을 기존 `--auth-mode approle`
