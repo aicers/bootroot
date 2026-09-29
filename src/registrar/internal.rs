@@ -52,7 +52,8 @@
 //! one. The internal profile is renewed by an ordinary `bootroot-agent`
 //! process reading [`InternalPaths::agent_config`], on that config's own
 //! `daemon` and `retry` settings, through the same renewal predicate
-//! every other profile uses. The operator supervises that process;
+//! every other profile uses. On an endpoint-enabled host that process
+//! is the registrar endpoint daemon, run by `bootroot-registrar.service`;
 //! `init` does not start it.
 //!
 //! That loop has one precondition, and it is not a scheduler:
@@ -75,9 +76,10 @@ mod tests;
 use std::path::{Path, PathBuf};
 
 pub use agent_config::{
-    InternalAgentConfigParams, build_internal_trust_updates, internal_agent_invocation,
-    internal_registration_id, internal_signal_pattern, load_internal_config,
-    render_internal_agent_config, upsert_internal_trust,
+    EndpointTables, InternalAgentConfigParams, REGISTRAR_ENDPOINT_TABLE, REGISTRAR_TABLE,
+    build_internal_trust_updates, internal_agent_invocation, internal_registration_id,
+    internal_signal_pattern, load_internal_config, render_internal_agent_config,
+    upsert_internal_trust,
 };
 pub use client::{
     InternalCredential, RootAuthority, is_expired_token_error, require_https,

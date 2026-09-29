@@ -627,6 +627,8 @@ pub(crate) struct Strings {
     pub(crate) error_audit_store_agent_config_malformed: &'static str,
     pub(crate) error_audit_store_agent_config_undeserializable: &'static str,
     pub(crate) error_audit_store_agent_config_rejected: &'static str,
+    pub(crate) error_registrar_endpoint_tables_rejected: &'static str,
+    pub(crate) error_registrar_internal_tables_unreadable: &'static str,
     pub(crate) error_audit_store_enablement_mismatch: &'static str,
     pub(crate) error_audit_store_not_privileged: &'static str,
     pub(crate) error_audit_store_override_stale: &'static str,

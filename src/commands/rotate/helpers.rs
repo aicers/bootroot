@@ -222,9 +222,10 @@ const PKILL_NO_PROCESS_MATCHED: i32 = 1;
 /// every other `bootroot-agent` on the host.
 ///
 /// `pkill` status 1 means *no process matched*, and that is a success
-/// here. The operator supervises the internal agent, `init` does not
-/// start it, and a host where it has not been started yet is a host with
-/// nothing to reload — not a failed rotation. Any other non-zero status
+/// here. The internal agent is the registrar endpoint daemon, which
+/// `bootroot-registrar.service` runs and `init` does not start, and a
+/// host where it has not been started yet is a host with nothing to
+/// reload — not a failed rotation. Any other non-zero status
 /// is a real failure and aborts the phase that sent the signal.
 ///
 /// # Errors
@@ -302,10 +303,10 @@ mod internal_signal_tests {
             .expect("the shell must run")
     }
 
-    /// `pkill` status 1 is "no process matched". The operator supervises
-    /// the internal agent and `init` never starts it, so a host where it
-    /// is not running has nothing to reload — that is a successful HUP
-    /// outcome, not a failed rotation phase.
+    /// `pkill` status 1 is "no process matched". The internal agent runs
+    /// under `bootroot-registrar.service` and `init` never starts it, so a
+    /// host where it is not running has nothing to reload — that is a
+    /// successful HUP outcome, not a failed rotation phase.
     #[test]
     fn no_process_matched_is_a_successful_reload() {
         let messages = test_messages();

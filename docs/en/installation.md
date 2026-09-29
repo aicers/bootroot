@@ -498,11 +498,12 @@ Recommended deployment policy:
 ### The bootroot-internal registrar agent
 
 A **bootroot-host** deployment that serves the
-[registrar endpoint](operations.md#registrar-endpoint-linux-only) also runs a
-**second** `bootroot-agent` process, alongside any service agent on that host.
-It renews one certificate: the bootroot-internal credential the daemon
-authenticates to `OpenBao` with in order to run the registrar's `mint` and
-`deregister` verbs.
+[registrar endpoint](operations.md#registrar-endpoint-linux-only) runs the
+endpoint daemon as its own `bootroot-agent` process, alongside any service agent
+on that host. That one process does two jobs: it serves the endpoint, and it
+renews one certificate — the bootroot-internal credential it authenticates to
+`OpenBao` with in order to run the registrar's `mint` and `deregister` verbs.
+There is no second process for the credential.
 
 **Run `bootroot init` as root on this host.** The five files that make up the
 credential — `registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
@@ -529,7 +530,12 @@ enable the endpoint.
 
 `bootroot init` writes its config and its private CA bundle and neither starts it
 nor installs a supervisor for it, exactly as it does not for the service agents.
-Start it under the same supervisor you use for those:
+The config carries the internal profile and the `[registrar]` and
+`[registrar_endpoint]` tables `init` copied from the `--agent-config` file it
+was given, so it is the endpoint daemon's whole configuration.
+`bootroot-registrar.service` runs it, through a drop-in that points the unit's
+`ExecStart` at this path (see
+[Installing the units](operations.md#installing-the-units)):
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml

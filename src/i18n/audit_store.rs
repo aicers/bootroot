@@ -53,6 +53,28 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_registrar_endpoint_tables_rejected(
+        &self,
+        path: &str,
+        reason: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_registrar_endpoint_tables_rejected,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_registrar_internal_tables_unreadable(
+        &self,
+        path: &str,
+        reason: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_registrar_internal_tables_unreadable,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
     pub(crate) fn error_audit_store_enablement_mismatch(
         &self,
         state_path: &str,

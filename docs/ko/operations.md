@@ -1857,10 +1857,21 @@ WantedBy=multi-user.target
 `bootroot infra install --registrar-endpoint-host <label>
 --registrar-endpoint-domain <domain>`으로 엔드포인트 술어를 기록합니다.
 값은 bootroot 호스트의 단일 DNS 레이블과, bootroot 내부 SAN을 구성할 배포
-도메인입니다. 그다음 `[registrar_endpoint] enabled = true`인 데몬 설정
-파일로 `bootroot init --agent-config <path>`를 root로 실행합니다. `init`은
-기록된 술어에 따라 내부 자격 증명을 프로비저닝하고 OpenBao를 TLS로
-전환하며, 술어와 어긋나는 데몬 설정은 거부합니다. 술어가 이미 기록된
+도메인입니다. 그다음 `bootroot init --agent-config <path>`를 root로
+실행합니다. 술어가 활성화되어 있으면 이 파일에는 엔드포인트가 실행될
+`[registrar]`와 `[registrar_endpoint]` 테이블 전체가 들어 있어야 합니다.
+`[registrar_endpoint] enabled = true`, 활성화된 엔드포인트에 필요한 일곱 개의
+키 — `[registrar] state_file`, `agent_server`, `agent_responder_url`, 그리고
+`[registrar_endpoint] server_cert_path`, `server_key_path`,
+`client_cert_path`, `client_key_path` — 그리고 기본값을 쓰지 않을 나머지
+`[registrar]` 키입니다. `init`은 아무것도 만들기 전에 두 테이블을 검증하여
+빠졌거나 잘못된 키를 이름으로 지목해 거부하고, 두 테이블을 엔드포인트 데몬이
+실행되는 설정인 `<secrets-dir>/registrar-internal/agent.toml`에
+렌더링합니다([유닛 설치](#유닛-설치)). 파일의 나머지 내용은 복사하지 않습니다.
+또한 `init`은 기록된 술어에 따라 내부 자격 증명을 프로비저닝하고 OpenBao를
+TLS로 전환하며, 술어와 어긋나는 데몬 설정은 거부합니다. 각 `init`은 그
+실행의 파일에서 두 테이블을 가져오며, 이미 초기화된 호스트에서 `init`을 다시
+실행하는 것은 두 테이블을 바꾸는 방법이 아닙니다. 술어가 이미 기록된
 경우 `infra install`이 어떻게 동작하는지는
 [레지스트라 엔드포인트 술어](cli.md#레지스트라-엔드포인트-술어)를 참고하세요.
 호스트를 다시 끄는 방법은 [예약량 크기 잡기](#sizing-the-reserve)에 설명된 두 곳을
@@ -2191,16 +2202,32 @@ step-ca로 나가는 ACME 경로를 통해서입니다. 프로비저닝 도구�
 
 #### 유닛 설치
 
-두 유닛 모두 이 저장소의 `systemd/` 아래에 포함되어 있습니다.
-`/etc/systemd/system/`에 복사한 뒤 활성화합니다.
+두 유닛 모두 이 저장소의 `systemd/` 아래에 포함되어 있습니다. 엔드포인트
+데몬은 `bootroot init`이 `<secrets-dir>/registrar-internal/agent.toml`에
+렌더링한 설정으로 실행되는데, 이 경로는 배포의 secrets 디렉터리에 따라
+달라집니다. 그래서 서비스 유닛의 `ExecStart`는 자리표시자이며, 설치 도구가
+drop-in으로 덮어써야 합니다. 먼저 빈 `ExecStart=`로 기존 값을 지우고, 이어서
+실제 값을 적습니다. 유닛을 `/etc/systemd/system/`에 복사하고 drop-in을 추가한
+뒤 활성화합니다.
 
 ```sh
 install -m 0644 systemd/bootroot-registrar.socket /etc/systemd/system/
 install -m 0644 systemd/bootroot-registrar.service /etc/systemd/system/
+install -d -m 0755 /etc/systemd/system/bootroot-registrar.service.d
+cat >/etc/systemd/system/bootroot-registrar.service.d/10-config.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/bootroot-agent --config <secrets-dir>/registrar-internal/agent.toml
+EOF
 systemctl daemon-reload
 systemctl enable --now bootroot-registrar.socket
 systemctl enable --now bootroot-registrar.service
 ```
+
+`<secrets-dir>`은 `state.json`에 기록된 secrets 디렉터리(`secrets_dir`)의
+절대 경로로 바꿉니다. 엔드포인트를 위해 따로 작성할 파일은 없습니다. `init`이
+`--agent-config`의 `[registrar]`와 `[registrar_endpoint]` 테이블을 이미 이
+설정에 렌더링했고, 모든 회전이 두 테이블을 그대로 유지합니다.
 
 소켓 유닛은 `ListenStream=/run/bootroot/registrar.sock`,
 `SocketMode=0700`, `SocketUser=root`, `SocketGroup=root`, `Accept=no`,
@@ -2211,8 +2238,8 @@ systemctl enable --now bootroot-registrar.service
 
 서비스 유닛은 `Requires=bootroot-registrar.socket`,
 `After=bootroot-registrar.socket`, `User=root`, `Group=root`,
-`Restart=on-failure`, `WantedBy=multi-user.target`과 다음 `ExecStart`를
-사용합니다.
+`Restart=on-failure`, `WantedBy=multi-user.target`과 다음 자리표시자
+`ExecStart`를 사용하며, 위의 drop-in이 이를 대체합니다.
 
 ```ini
 ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
@@ -2224,7 +2251,7 @@ ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 디스크립터가 존재하고 그것을 상속받게 하기 위한 의존성일 뿐입니다.
 
 다른 에이전트 유닛과 마찬가지로, EAB 자격증명을 회전하는 배포는 실제로
-프로비저닝된 `--eab-file` 경로를 `ExecStart`에 추가해야 합니다. 그렇지
+프로비저닝된 `--eab-file` 경로를 drop-in의 `ExecStart`에 추가해야 합니다. 그렇지
 않으면 EAB KV 갱신과 `rotate eab-clear`가 해당 에이전트에서 조용히
 무시됩니다. 위의
 [systemd 운영 절차](#systemd-운영-절차bootroot-agent-권장)를 참고하세요.
@@ -2244,16 +2271,26 @@ TLS 리스너는 이미 클라이언트 인증서를 요청하며, 여기서 이
 `AppRole` 에이전트와 토큰 인증 명령이 모두 깨집니다.
 
 `bootroot init`이 자격 증명을 프로비저닝하고 상태에 기록된 secrets 디렉터리 아래에
-전용 `registrar-internal/agent.toml`과 전용 CA 번들을 작성합니다. 다른 에이전트와
-마찬가지로 갱신 프로세스는 시작하지 않으므로 운영자가 직접 시작합니다.
+`registrar-internal/agent.toml`과 전용 CA 번들을 작성합니다. 이 설정에는 내부
+프로파일과 `--agent-config`의 `[registrar]`, `[registrar_endpoint]` 테이블이 들어
+있으며, 이 설정으로 실행되는 프로세스가 `bootroot-registrar.service`가 실행하는
+registrar 엔드포인트 데몬입니다([유닛 설치](#유닛-설치)).
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 ```
 
-그때부터 해당 설정의 `daemon`/`retry` 값과 다른 모든 프로파일이 사용하는 동일한
-판정 로직으로 일상적인 갱신이 이뤄집니다. 시작하기 전에는 갱신할 것도, 신호를 보낼
-대상도 없습니다. 회전이 `HUP`을 보냈는데 프로세스가 없으면 성공으로 처리합니다.
+이 하나의 프로세스가 내부 자격 증명을 갱신하고 엔드포인트를 제공합니다. 자격 증명을
+위한 두 번째 `bootroot-agent` 프로세스는 없습니다. 다른 에이전트와 마찬가지로
+`init`은 이 프로세스를 시작하지 않습니다. 서비스가 시작되면 해당 설정의
+`daemon`/`retry` 값과 다른 모든 프로파일이 사용하는 동일한 판정 로직으로 일상적인
+갱신이 이뤄집니다. 시작하기 전에는 갱신할 것도, 신호를 보낼 대상도 없습니다. 회전이
+`HUP`을 보냈는데 프로세스가 없으면 성공으로 처리합니다.
+
+`--no-eab`로 초기화한 배포에서는 `bootroot/agent/eab` 경로가 아직 없으면 `init`이
+비워 둔(cleared) 에이전트 EAB 페이로드를 기록합니다. 데몬의 첫 surface 발급은 항목이
+없으면 거부하므로, 이 기록이 있어야 데몬이 시작할 수 있습니다. 이미 있는 항목은
+그대로 둡니다.
 
 갱신에는 전제 조건이 하나 있습니다. 데몬은 발급을 시작하기 전에 자격 증명 옆에
 기록된 루트가 여전히 배포의 활성 루트인지 확인하고, 아니라면 ACME 요청도 로그인도

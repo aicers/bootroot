@@ -877,6 +877,7 @@ impl Host {
                     eab_kid: eab.map(|(kid, _)| kid),
                     eab_hmac: eab_hmac.as_ref(),
                     trusted_ca_sha256: &ca.fingerprints(),
+                    endpoint_tables: None,
                 },
             ),
         )

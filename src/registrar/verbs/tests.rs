@@ -5423,6 +5423,7 @@ mod internal_factory {
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[ACTIVE_ROOT_FP.to_string()],
+                endpoint_tables: None,
             },
         )
         .replace(
@@ -5592,6 +5593,7 @@ mod internal_factory {
                         eab_kid: None,
                         eab_hmac: None,
                         trusted_ca_sha256: std::slice::from_ref(&root_fingerprint),
+                        endpoint_tables: None,
                     },
                 ),
             )
@@ -5705,6 +5707,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[STORED_ROOT.to_string()],
+                endpoint_tables: None,
             },
         ),
     )

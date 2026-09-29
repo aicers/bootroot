@@ -899,11 +899,23 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
 - `--agent-config <path>`: the operator's `bootroot-agent` configuration
   file — not the bootroot-internal `agent.toml` that `init` generates
   under the internal credential directory. `init` reads exactly two
-  tables from it: `[registrar]`, for `audit_store_dir`, which is the
-  single definition of where the shared audit store lives, and
+  tables from it: `[registrar]`, whose `audit_store_dir` is the single
+  definition of where the shared audit store lives, and
   `[registrar_endpoint]`, whose `enabled` value is cross-checked against
   `state.json`'s `registrar_endpoint.enabled`. A disagreement is a hard
-  error and nothing is created, rendered or deleted. **Required** on a
+  error and nothing is created, rendered or deleted. On a run whose
+  `state.json` records an enabled registrar endpoint, the two tables are
+  also the endpoint daemon's configuration: `init` first holds them to
+  every requirement an enabled endpoint has — `[registrar] state_file`,
+  `agent_server` and `agent_responder_url`, the four
+  `[registrar_endpoint]` material paths, and each value's own rules —
+  refusing a missing or invalid key by name before it creates, renders
+  or deletes anything, and then renders both tables, with the same keys
+  and values, into `registrar-internal/agent.toml`, the configuration
+  the endpoint daemon runs on. Nothing else in the file is copied, and a
+  disabled or absent predicate renders nothing. Each run takes the
+  tables from its own `--agent-config`; re-running `init` is not a way
+  to change them on an initialized host. **Required** on a
   run whose `state.json` records an enabled registrar endpoint, and on a
   run that finds a rendered audit compose override on disk, so the
   daemon's configuration file must exist first. A run that would
@@ -2758,11 +2770,13 @@ operator-managed runbook for those.
 - `--no-eab`: passed through to `init`
 - `--agent-config <path>`: passed through to `init`, which reads
   `[registrar] audit_store_dir` and `[registrar_endpoint] enabled` from
-  it. It carries the same requirement `init` has — mandatory on a host
-  whose `state.json` records an enabled registrar endpoint, and on one
-  that carries a rendered audit compose override — and reinit checks
-  that requirement, and the enablement cross-check, **before any
-  destructive operation**: raising it only in the second init pass would
+  it and, on an endpoint-enabled host, validates and renders both tables
+  into `registrar-internal/agent.toml`. It carries the same requirement
+  `init` has — mandatory on a host whose `state.json` records an enabled
+  registrar endpoint, and on one that carries a rendered audit compose
+  override — and reinit checks that requirement, the endpoint tables'
+  requirements, and the enablement cross-check, **before any destructive
+  operation**: raising it only in the second init pass would
   land it after OpenBao has been wiped, recreating the partial-init trap
   reinit exists to recover from. Nothing is created, rendered or deleted
   by that preflight. It also refuses, for the same reason, an

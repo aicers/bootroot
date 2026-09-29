@@ -221,13 +221,20 @@ PY
 
 set_internal_cadence() {
   local internal="$WORK_DIR/secrets/registrar-internal/agent.toml"
-  sudo -n tee -a "$internal" >/dev/null <<'EOF'
+  # Inserted inside the internal profile, ahead of the `[registrar]` table
+  # `init` rendered from the operator config, so the profile's sub-table sits
+  # with the profile rather than after the endpoint's tables.
+  sudo -n python3 - "$internal" <<'PY' || fail "could not set the rendered internal renewal cadence"
+import pathlib
+import sys
 
-[profiles.daemon]
-check_interval = "5s"
-renew_before = "4m"
-check_jitter = "0s"
-EOF
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+marker = "\n[registrar]\n"
+assert marker in text, "the rendered internal config carries no [registrar] table"
+cadence = '[profiles.daemon]\ncheck_interval = "5s"\nrenew_before = "4m"\ncheck_jitter = "0s"\n'
+path.write_text(text.replace(marker, "\n" + cadence + marker, 1))
+PY
   sudo -n grep -q 'check_interval = "5s"' "$internal" && sudo -n grep -q 'renew_before = "4m"' "$internal" && sudo -n grep -q 'check_jitter = "0s"' "$internal" || fail "could not set the rendered internal renewal cadence"
   sudo -n cp "$internal" "$ARTIFACT_DIR/registrar-internal-agent.toml"; sudo -n chown "$(id -u):$(id -g)" "$ARTIFACT_DIR/registrar-internal-agent.toml"
 }
@@ -397,7 +404,7 @@ main() {
   registrar_docker_apply_endpoint_dns_alias "$CLIENT_NAME" "$ENDPOINT_NAME"
   log_phase overrides
   patch_duration_template; set_internal_cadence
-  registrar_docker_write_daemon_config
+  registrar_docker_prepare_daemon
   prepare_anchor_pin; create_approle_control; assert_control_trace
   log_phase renewal-window
   start_daemon_trace; record_original_leaves; assert_post_expiry_client; assert_post_expiry_endpoint; assert_daemon_trace

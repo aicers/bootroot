@@ -102,6 +102,7 @@ fn write_internal_credential(secrets_dir: &Path, root_fingerprint: &str) {
             eab_kid: None,
             eab_hmac: None,
             trusted_ca_sha256: &[crate::tls::sha256_hex(leaf.der().as_ref())],
+            endpoint_tables: None,
         },
     );
     std::fs::write(paths.agent_config(), rendered).expect("write the internal agent config");

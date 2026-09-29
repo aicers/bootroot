@@ -30,12 +30,12 @@ use super::openbao_tls::{
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
 use super::prompts::{confirm_overwrite, should_confirm};
-use super::registrar_internal::{self, RegistrarInternalIntent};
+use super::registrar_internal::{self, EnabledEndpoint};
 use super::responder_setup::{
     apply_responder_compose_override, verify_responder, write_responder_compose_override,
     write_responder_files,
 };
-use super::secrets::{maybe_register_eab, resolve_init_secrets};
+use super::secrets::{maybe_register_eab, record_cleared_agent_eab, resolve_init_secrets};
 use super::stepca_setup::{
     ensure_step_ca_initialized, reconcile_ca_json_managed_keys, resolve_stepca_ca_dns_names,
     restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
@@ -79,14 +79,19 @@ use crate::state::StateFile;
 /// were moved it would fail the run, and on a host co-located with a
 /// second instance it would reach *that* instance's step-ca and
 /// responder.
+///
+/// The operator's `[registrar]` and `[registrar_endpoint]` tables ride
+/// along from `--agent-config`, already held to every requirement an
+/// enabled endpoint has, so the published config is the endpoint
+/// daemon's whole configuration.
 fn registrar_internal_context(
-    intent: &RegistrarInternalIntent,
+    endpoint: &EnabledEndpoint,
     args: &InitArgs,
     compose_dir: &Path,
     secrets: &InitSecrets,
 ) -> registrar_internal::RegistrarInternalContext {
     registrar_internal::RegistrarInternalContext {
-        intent: intent.clone(),
+        intent: endpoint.intent.clone(),
         secrets_dir: args.secrets_dir.secrets_dir.clone(),
         kv_mount: args.openbao.kv_mount.clone(),
         acme_server: internal_acme_server(&args.stepca_provisioner, compose_dir),
@@ -94,6 +99,7 @@ fn registrar_internal_context(
         responder_url: internal_responder_url(compose_dir),
         responder_hmac: bootroot::secret::HmacSecret::new(secrets.http_hmac.clone()),
         eab: secrets.eab.clone(),
+        endpoint_tables: Some(endpoint.tables.clone()),
     }
 }
 
@@ -329,20 +335,12 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     // the plaintext loopback listener.
     let registrar_intent = registrar_internal::registrar_endpoint_intent(&state_path)?;
 
-    // Provision the shared audit store, or unwind it, before a single
-    // Docker call. `--agent-config` is mandatory on a run whose
-    // predicate is enabled and on one that finds a rendered audit
-    // override, so both provisioning and unwinding are cross-checked
-    // against the daemon's own configuration; both preflight refusals
-    // run before anything is created or rendered.
-    let audit_override = crate::commands::audit_store::apply_audit_store(
-        &crate::commands::audit_store::AuditStoreInitInputs {
-            compose_file: &args.compose.compose_file,
-            agent_config: args.agent_config.as_deref(),
-            state_path: &state_path,
-            endpoint_recorded: registrar_intent.is_some(),
-            expected_uid: crate::commands::audit_store::production_uid(),
-        },
+    let (registrar_endpoint, audit_override) = prepare_endpoint_and_audit_store(
+        registrar_intent,
+        &args.compose.compose_file,
+        args.agent_config.as_deref(),
+        &state_path,
+        crate::commands::audit_store::production_uid(),
         messages,
     )?;
 
@@ -372,7 +370,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
         messages,
         &mut rollback,
         bind_intent,
-        registrar_intent.as_ref(),
+        registrar_endpoint.as_ref(),
         audit_override.as_deref(),
     )
     .await;
@@ -441,6 +439,50 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
             Err(err)
         }
     }
+}
+
+/// Checks the operator's endpoint tables, then provisions the shared
+/// audit store or unwinds it — both before a single Docker call.
+///
+/// The order is the contract. On an enabled predicate the
+/// `--agent-config` file's `[registrar]` and `[registrar_endpoint]`
+/// tables are what `init` renders into the endpoint daemon's config, so
+/// they are held to every requirement an enabled endpoint has first,
+/// while nothing has been created: `apply_audit_store` can create the
+/// audit store and render or delete its Compose override, and a check
+/// placed after it would refuse with those changes already made.
+///
+/// `--agent-config` is mandatory on a run whose predicate is enabled
+/// and on one that finds a rendered audit override, so both
+/// provisioning and unwinding are cross-checked against the daemon's
+/// own configuration; every preflight refusal runs before anything is
+/// created or rendered.
+///
+/// # Errors
+///
+/// Returns the endpoint-table refusal, or any audit-store refusal or
+/// provisioning failure.
+fn prepare_endpoint_and_audit_store(
+    registrar_intent: Option<registrar_internal::RegistrarInternalIntent>,
+    compose_file: &Path,
+    agent_config: Option<&Path>,
+    state_path: &Path,
+    expected_uid: u32,
+    messages: &Messages,
+) -> Result<(Option<EnabledEndpoint>, Option<std::path::PathBuf>)> {
+    let registrar_endpoint =
+        registrar_internal::preflight_endpoint_tables(registrar_intent, agent_config, messages)?;
+    let audit_override = crate::commands::audit_store::apply_audit_store(
+        &crate::commands::audit_store::AuditStoreInitInputs {
+            compose_file,
+            agent_config,
+            state_path,
+            endpoint_recorded: registrar_endpoint.is_some(),
+            expected_uid,
+        },
+        messages,
+    )?;
+    Ok((registrar_endpoint, audit_override))
 }
 
 /// Aborts with operator guidance when the target `OpenBao` is already
@@ -684,7 +726,7 @@ async fn run_init_inner(
     messages: &Messages,
     rollback: &mut InitRollback,
     bind_intent: bool,
-    registrar_intent: Option<&RegistrarInternalIntent>,
+    registrar_endpoint: Option<&EnabledEndpoint>,
     // The rendered audit override, when this host provisioned one.
     // Carried onto the `OpenBao` recreate below so the container comes
     // up on the bind mount rather than the named volume.
@@ -987,7 +1029,7 @@ async fn run_init_inner(
     // left `Running` by the phase-2 apply because nothing in their
     // config had changed, and spent the rest of the deployment speaking
     // HTTP to a TLS port.
-    let tls_required = bind_intent || registrar_intent.is_some();
+    let tls_required = bind_intent || registrar_endpoint.is_some();
     let openbao_agent_paths = setup_openbao_agents(
         &args.compose.compose_file,
         &secrets_dir,
@@ -1090,6 +1132,18 @@ async fn run_init_inner(
     if let Some(eab) = eab_update {
         secrets.eab = Some(eab);
     }
+    // The endpoint daemon's surface issuance reads the agent EAB path
+    // unconditionally and refuses an absent entry, so an endpoint host
+    // that registered no EAB records the explicit cleared payload.
+    record_cleared_agent_eab(
+        client,
+        &args.openbao.kv_mount,
+        registrar_endpoint.is_some(),
+        secrets.eab.as_ref(),
+        rollback,
+        messages,
+    )
+    .await?;
 
     // The bootroot-internal registrar credential, stages 2 and 3. Both
     // run under the init root token, after `OpenBao` bootstrap, step-ca
@@ -1098,8 +1152,8 @@ async fn run_init_inner(
     // and the whole staged directory are registered before they are
     // created. Nothing is published here — the credential is proved over
     // the TLS listener first, below.
-    let internal_context = registrar_intent
-        .map(|intent| registrar_internal_context(intent, args, compose_dir, &secrets));
+    let internal_context = registrar_endpoint
+        .map(|endpoint| registrar_internal_context(endpoint, args, compose_dir, &secrets));
     let staged_internal = match internal_context.as_ref() {
         Some(context) => {
             let inputs = context.inputs();
@@ -2092,6 +2146,90 @@ mod tests {
             rendered.len(),
             "each pre-flight prompt must render its own message"
         );
+    }
+
+    /// A base directory every ancestor of which is world traversable,
+    /// which the audit store's ancestor-chain check requires.
+    fn traversable_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let base = Path::new("/tmp")
+            .canonicalize()
+            .expect("the physical /tmp resolves");
+        let dir = tempfile::Builder::new()
+            .prefix("bootroot-init-endpoint")
+            .tempdir_in(base)
+            .expect("temporary directory");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("world-traversable base");
+        dir
+    }
+
+    /// The endpoint-table check runs before `apply_audit_store`: an
+    /// enabled predicate with an incomplete operator file is refused,
+    /// naming the key, with no audit store and no audit override left
+    /// behind — while the same file made complete does provision both,
+    /// so their absence is the check's doing and not the fixture's.
+    #[test]
+    fn the_endpoint_tables_are_checked_before_the_audit_store_is_touched() {
+        let base = traversable_tempdir();
+        let compose_dir = base.path().join("compose");
+        std::fs::create_dir(&compose_dir).expect("compose dir");
+        let compose_file = compose_dir.join("docker-compose.yml");
+        let store_dir = base.path().join("audit-store");
+        let state_path = base.path().join("state.json");
+        StateFile {
+            registrar_endpoint: Some(crate::state::RegistrarEndpointState {
+                enabled: true,
+                domain: "example.internal".to_string(),
+                host: "bootroot-01".to_string(),
+            }),
+            ..StateFile::default()
+        }
+        .save(&state_path)
+        .expect("state.json");
+        let intent = registrar_internal::registrar_endpoint_intent(&state_path)
+            .expect("read")
+            .expect("enabled");
+        let override_path = crate::commands::audit_store::audit_override_path(&compose_dir);
+        let agent_config = base.path().join("agent.toml");
+        let complete = registrar_internal::endpoint_agent_config(&format!(
+            "audit_store_dir = \"{}\"\naudit_store_enforcement = \"directory\"\n",
+            store_dir.display()
+        ));
+        let uid = fs_util::current_process_euid();
+
+        let incomplete: String = complete
+            .lines()
+            .filter(|line| !line.starts_with("agent_responder_url ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&agent_config, &incomplete).expect("agent config");
+        let err = prepare_endpoint_and_audit_store(
+            Some(intent.clone()),
+            &compose_file,
+            Some(&agent_config),
+            &state_path,
+            uid,
+            &test_messages(),
+        )
+        .expect_err("an incomplete operator file is refused");
+        assert!(err.to_string().contains("agent_responder_url"), "{err}");
+        assert!(!store_dir.exists(), "no audit store may be created");
+        assert!(!override_path.exists(), "no audit override may be rendered");
+
+        std::fs::write(&agent_config, &complete).expect("agent config");
+        let (endpoint, rendered) = prepare_endpoint_and_audit_store(
+            Some(intent),
+            &compose_file,
+            Some(&agent_config),
+            &state_path,
+            uid,
+            &test_messages(),
+        )
+        .expect("a complete operator file provisions");
+        assert!(endpoint.is_some());
+        assert_eq!(rendered.as_deref(), Some(override_path.as_path()));
+        assert!(store_dir.is_dir(), "the same file made complete provisions");
     }
 
     /// Closes #588 §5a: when `OpenBao` is already initialised but no

@@ -110,10 +110,35 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
         validate_openbao_settings(openbao)?;
     }
     validate_registrar_endpoint_settings(&settings.registrar_endpoint)?;
-    validate_registrar_endpoint_material_paths(&settings.registrar_endpoint)?;
-    validate_registrar_settings(&settings.registrar)?;
-    validate_registrar_state_file_requirement(&settings.registrar, &settings.registrar_endpoint)?;
-    validate_registrar_agent_url_requirement(&settings.registrar, &settings.registrar_endpoint)?;
+    validate_registrar_tables(&settings.registrar, &settings.registrar_endpoint)
+}
+
+/// Validates the `[registrar]` and `[registrar_endpoint]` tables against
+/// every rule the daemon holds them to, except the platform rule.
+///
+/// These are the checks [`crate::config::Settings::validate`] runs on the
+/// two tables, in the same order, so a caller that holds only the two
+/// tables — `bootroot init`, which renders them from the operator's
+/// `--agent-config` file into the bootroot-internal agent config the
+/// endpoint daemon runs on — refuses exactly what the daemon would
+/// refuse. The platform rule is left out on purpose: whether this build
+/// can serve an activated socket is a question for the process about to
+/// listen, not for the one writing its configuration.
+///
+/// # Errors
+///
+/// Returns an error naming the offending key when an enabled endpoint
+/// lacks one of its four material paths, `registrar.state_file`,
+/// `registrar.agent_server` or `registrar.agent_responder_url`, or when
+/// any `[registrar]` value breaks its own rule.
+pub fn validate_registrar_tables(
+    registrar: &RegistrarSettings,
+    endpoint: &RegistrarEndpointSettings,
+) -> Result<()> {
+    validate_registrar_endpoint_material_paths(endpoint)?;
+    validate_registrar_settings(registrar)?;
+    validate_registrar_state_file_requirement(registrar, endpoint)?;
+    validate_registrar_agent_url_requirement(registrar, endpoint)?;
     Ok(())
 }
 

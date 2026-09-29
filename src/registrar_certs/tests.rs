@@ -216,6 +216,7 @@ impl Host {
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[ca.root_fingerprint()],
+                endpoint_tables: None,
             },
         );
         std::fs::write(internal.agent_config(), rendered).expect("write the internal config");

@@ -323,6 +323,18 @@ enabled = false
 사용할 수 없으면, 소켓만 상속한 채 아무도 accept하지 않는 상태로 두는
 대신 원인을 지목하는 진단과 함께 기동이 실패합니다.
 
+!!! note "이 테이블을 작성하는 곳"
+    bootroot 호스트에서는 `[registrar_endpoint]`와 아래의 `[registrar]`
+    테이블을 별도의 데몬 설정이 아니라 `bootroot init --agent-config`에
+    넘기는 `bootroot-agent` 설정 파일에 작성합니다. 엔드포인트 데몬은
+    `init`이 렌더링하는 `<secrets-dir>/registrar-internal/agent.toml`로
+    실행됩니다. 기록된 술어가 활성화된 호스트에서 `init`은 두 테이블이 위의
+    모든 요구 조건을 만족하는지 검증한 뒤, 같은 키와 값 그대로 자신이
+    생성하는 내부 프로파일 뒤에 복사합니다. 파일의 나머지 내용은 복사하지
+    않으며, 모든 회전은 두 테이블을 그대로 유지합니다.
+    [레지스트라 엔드포인트 (Linux 전용)](operations.md#registrar-endpoint-linux-only)를
+    참고하십시오.
+
 !!! note "`mint`를 제공합니다"
     `mint`와 `deregister`는 모두 끝에서 끝까지 처리됩니다. mint 요청의
     `spec.reload`와 선택적 `spec.cert_group`은
@@ -754,6 +766,12 @@ OpenBao 감사 장치 확인은 그대로입니다.
 `state_file`, `agent_server`, `agent_responder_url`뿐이며, 방향도
 한쪽입니다. 각각 `[registrar_endpoint] enabled = true`일 때 필수라는
 것입니다.
+
+bootroot 호스트에서는 이 키들도 `[registrar]`의 나머지 키와 마찬가지로
+`bootroot init`이 읽는 `--agent-config` 파일에 작성합니다. `init`은 이
+테이블을 엔드포인트 데몬이 실행되는 설정인 `registrar-internal/agent.toml`로
+옮기며, 기록된 술어가 활성화된 동안 `state_file`, `agent_server`,
+`agent_responder_url` 중 하나라도 빠진 실행은 거부합니다.
 
 ```toml
 [registrar]

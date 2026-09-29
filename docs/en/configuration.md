@@ -339,6 +339,19 @@ startup. Any one of them missing or unusable fails the invocation with a
 named diagnostic rather than leaving the socket adopted with nothing
 accepting on it.
 
+!!! note "Where this table is written"
+    On the bootroot host, write `[registrar_endpoint]` — and the
+    `[registrar]` table below — in the `bootroot-agent` configuration file
+    you pass to `bootroot init --agent-config`, not in a daemon
+    configuration of your own. The endpoint daemon runs on
+    `<secrets-dir>/registrar-internal/agent.toml`, which `init` renders:
+    on a host whose recorded predicate is enabled, `init` validates both
+    tables against every requirement above and copies them, with the same
+    keys and values, after the internal profile it generates. Nothing else
+    in your file is copied, and every rotation keeps the two tables as
+    they are. See
+    [Registrar endpoint (Linux only)](operations.md#registrar-endpoint-linux-only).
+
 !!! note "`mint` is served"
     Both `mint` and `deregister` are served end to end. A mint request's
     `spec.reload` and optional `spec.cert_group` must use the canonical
@@ -791,6 +804,13 @@ configuration error whether or not the endpoint is enabled. Only
 `state_file`, `agent_server` and `agent_responder_url` relate the two
 tables, and only in one direction — each is required when
 `[registrar_endpoint] enabled = true`.
+
+On the bootroot host these keys, like the rest of `[registrar]`, are
+written in the `--agent-config` file `bootroot init` reads; `init` carries
+the table into `registrar-internal/agent.toml`, the configuration the
+endpoint daemon runs on, and refuses a run whose table lacks
+`state_file`, `agent_server` or `agent_responder_url` while the recorded
+predicate is enabled.
 
 ```toml
 [registrar]

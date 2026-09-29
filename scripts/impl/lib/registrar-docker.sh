@@ -198,7 +198,7 @@ registrar_docker_prepare_run_root() {
   SOCKET_DIR="$RUN_ROOT/socket"
   SOCKET_PATH="$SOCKET_DIR/registrar.sock"
   CONTROL_FIFO="$RUN_ROOT/agent-control"
-  DAEMON_CONFIG="$RUN_ROOT/registrar-agent.toml"
+  DAEMON_CONFIG="$WORK_DIR/secrets/registrar-internal/agent.toml"
   PROVISIONING="$RUN_ROOT/provisioning.toml"
   INITIAL_CONFIG="$WORK_DIR/operator-agent.toml"
   SUMMARY="$RUN_ROOT/init-summary.json"
@@ -230,23 +230,43 @@ registrar_docker_allocate_ports() {
 }
 
 # Writes the two configuration files `init` is given: the fingerprinted
-# provisioning config, and the operator agent config naming this run's audit
-# store. The caller owns only the component body — the one part of these that
+# provisioning config, and the operator agent config carrying this run's full
+# `[registrar]` and `[registrar_endpoint]` tables. `init` validates both tables
+# and renders them into `registrar-internal/agent.toml`, the one configuration
+# the endpoint daemon runs on, so nothing is concatenated or copied later.
+#
+# The caller owns the component body — the one part of the provisioning config
 # the two scenarios genuinely differ on — and hands it over as a file, which
-# this consumes.
+# this consumes. `extra_registrar_keys`, when given, is appended inside
+# `[registrar]`: it is where a scenario puts a key only it needs, such as the
+# red-team arm's audit-store budget.
 registrar_docker_write_configs() {
-  local body="$1"
+  local body="$1" extra_registrar_keys="${2:-}"
   printf 'fingerprint = "%s"\n' "$(registrar_docker_sha256_file "$body")" >"$PROVISIONING"
   cat "$body" >>"$PROVISIONING"
   rm -f "$body"
-  cat >"$INITIAL_CONFIG" <<EOF
+  {
+    cat <<EOF
 [registrar]
+state_file = "${WORK_DIR}/state.json"
+agent_server = "https://stepca.registrar-scenario.test:9000/acme/acme/directory"
+agent_responder_url = "http://responder.registrar-scenario.test:8080"
+provisioning_config_path = "${PROVISIONING}"
 audit_store_dir = "${AUDIT_DIR}"
+audit_record_dir = "${RECORD_DIR}"
 audit_store_enforcement = "directory"
+EOF
+    [ -z "$extra_registrar_keys" ] || printf '%s\n' "$extra_registrar_keys"
+    cat <<EOF
 
 [registrar_endpoint]
 enabled = true
+server_cert_path = "${SURFACE_DIR}/registrar-endpoint.crt"
+server_key_path = "${SURFACE_DIR}/registrar-endpoint.key"
+client_cert_path = "${SURFACE_DIR}/registrar-client.crt"
+client_key_path = "${SURFACE_DIR}/registrar-client.key"
 EOF
+  } >"$INITIAL_CONFIG"
 }
 
 # `infra install --no-build` deliberately passes `--pull never`. Pull the
@@ -256,29 +276,6 @@ registrar_docker_prepull_third_party_images() {
   POSTGRES_PASSWORD=prepull-only GRAFANA_ADMIN_PASSWORD=prepull-only \
     registrar_docker_compose pull openbao postgres step-ca >>"$RUN_LOG" 2>&1 ||
     fail "could not pre-pull third-party deployment images"
-}
-
-# Records the explicit empty agent EAB that `init --no-eab` leaves absent.
-#
-# The registrar's production reader distinguishes an explicitly cleared EAB
-# payload from a missing KV entry, so the isolated deployment needs the former
-# written before the daemon starts. The exchange is kept as artifacts because
-# anything other than a 200 here surfaces much later, as a daemon that cannot
-# read a credential rather than as a setup step that did not happen.
-registrar_docker_record_empty_agent_eab() {
-  local status
-  status="$(sudo -n curl -sS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST \
-    --data '{"data":{"kid":"","hmac":""}}' \
-    --dump-header "$ARTIFACT_DIR/empty-eab-headers.txt" \
-    --output "$ARTIFACT_DIR/empty-eab-response.json" \
-    --write-out '%{http_code}' \
-    "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab")" || status="curl-failed"
-  printf '%s\n' "$status" >"$ARTIFACT_DIR/empty-eab-status.txt"
-  if [ "$status" != "200" ]; then
-    cat "$ARTIFACT_DIR/empty-eab-status.txt" "$ARTIFACT_DIR/empty-eab-headers.txt" \
-      "$ARTIFACT_DIR/empty-eab-response.json" >>"$RUN_LOG" 2>/dev/null || true
-    fail "could not record the explicit empty agent EAB"
-  fi
 }
 
 # Builds the responder image, installs the deployment on the allocated ports,
@@ -339,7 +336,6 @@ registrar_docker_build_and_initialize() {
   sudo -n sh -c 'printf "%s: %s\n" "X-Vault-Token" "$(cat "$1")" >"$2"; chmod 600 "$2"' _ "$TOKEN_FILE" "$TOKEN_CURL"
   OPENBAO_CA="$RUN_ROOT/openbao-ca.pem"
   sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ "$WORK_DIR/secrets/certs/root_ca.crt" "$WORK_DIR/secrets/certs/intermediate_ca.crt" "$OPENBAO_CA"
-  registrar_docker_record_empty_agent_eab
 }
 
 # Reads the KV mount `init` recorded and the two production KV paths both
@@ -393,44 +389,38 @@ EOF
   done
 }
 
-# Writes the root-owned daemon configuration: the internal agent config `init`
-# rendered, followed by this run's registrar and endpoint sections.
+# Checks the daemon configuration `init` rendered, and prepares what the daemon
+# writes into.
 #
-# `extra_registrar_keys`, when given, is appended inside `[registrar]`. It is
-# where a scenario puts a key only it needs — the red-team arm's audit-store
-# budget — and it is the only part of this file the two arms differ on.
+# There is no separate daemon configuration to write: the endpoint daemon is
+# the one `bootroot-agent` process that runs on `registrar-internal/agent.toml`
+# (DAEMON_CONFIG), and `init` has already rendered the operator's `[registrar]`
+# and `[registrar_endpoint]` tables into it. This proves they arrived, and that
+# `init` recorded the cleared agent EAB a `--no-eab` endpoint host needs, so
+# neither surfaces later as a daemon that never starts.
 #
 # Leaves set: INTERNAL_DIR, ROOT_CA, and the root-owned RECORD_DIR.
 #
 # shellcheck disable=SC2034 # ROOT_CA is the anchor each scenario then pins.
-registrar_docker_write_daemon_config() {
-  local extra_registrar_keys="${1:-}"
+registrar_docker_prepare_daemon() {
+  local rendered="$ARTIFACT_DIR/registrar-daemon-agent.toml" eab
   INTERNAL_DIR="$WORK_DIR/secrets/registrar-internal"
   ROOT_CA="$WORK_DIR/secrets/certs/root_ca.crt"
-  {
-    cat <<EOF
-
-[registrar]
-state_file = "${WORK_DIR}/state.json"
-agent_server = "https://stepca.registrar-scenario.test:9000/acme/acme/directory"
-agent_responder_url = "http://responder.registrar-scenario.test:8080"
-provisioning_config_path = "${PROVISIONING}"
-audit_store_dir = "${AUDIT_DIR}"
-audit_record_dir = "${RECORD_DIR}"
-audit_store_enforcement = "directory"
-EOF
-    [ -z "$extra_registrar_keys" ] || printf '%s\n' "$extra_registrar_keys"
-    cat <<EOF
-
-[registrar_endpoint]
-enabled = true
-server_cert_path = "${SURFACE_DIR}/registrar-endpoint.crt"
-server_key_path = "${SURFACE_DIR}/registrar-endpoint.key"
-client_cert_path = "${SURFACE_DIR}/registrar-client.crt"
-client_key_path = "${SURFACE_DIR}/registrar-client.key"
-EOF
-  } >"$RUN_ROOT/endpoint.toml"
-  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 600 "$3"; chown 0:0 "$3"' _ "$INTERNAL_DIR/agent.toml" "$RUN_ROOT/endpoint.toml" "$DAEMON_CONFIG"
+  [ "$DAEMON_CONFIG" = "$INTERNAL_DIR/agent.toml" ] ||
+    fail "the daemon must run on the init-rendered internal config"
+  { sudo -n cp "$DAEMON_CONFIG" "$rendered" && sudo -n chown "$(id -u):$(id -g)" "$rendered"; } ||
+    fail "could not read the init-rendered internal config"
+  if ! grep -qx '\[registrar\]' "$rendered" ||
+    ! grep -qx '\[registrar_endpoint\]' "$rendered" ||
+    ! grep -qxF "state_file = \"${WORK_DIR}/state.json\"" "$rendered" ||
+    ! grep -qxF "server_cert_path = \"${SURFACE_DIR}/registrar-endpoint.crt\"" "$rendered"; then
+    fail "init did not render the operator's [registrar] and [registrar_endpoint] tables"
+  fi
+  eab="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" \
+    "$OPENBAO_URL/v1/secret/data/bootroot/agent/eab")" ||
+    fail "init --no-eab left no agent EAB entry on an endpoint host"
+  jq -e '.data.data == {"kid": "", "hmac": ""}' >/dev/null <<<"$eab" ||
+    fail "init --no-eab did not record the cleared agent EAB payload"
   sudo -n mkdir -p "$RECORD_DIR"
   sudo -n chown 0:0 "$RECORD_DIR"
   sudo -n chmod 0700 "$RECORD_DIR"

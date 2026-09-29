@@ -170,9 +170,10 @@ fn the_service_unit_starts_at_boot() {
     assert_directive(&unit, "Install", "WantedBy", "multi-user.target");
 }
 
-/// One `ExecStart`, running the existing agent binary against the
-/// existing config path. A second daemon, a helper process or a
-/// different binary would all show up here.
+/// One `ExecStart`, running the existing agent binary against a
+/// placeholder config path an installer's drop-in replaces. A second
+/// daemon, a helper process or a different binary would all show up
+/// here.
 #[test]
 fn the_service_unit_runs_the_existing_agent_binary() {
     let unit = parse_unit(SERVICE_UNIT);
@@ -182,6 +183,25 @@ fn the_service_unit_runs_the_existing_agent_binary() {
         "ExecStart",
         "/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml",
     );
+}
+
+/// The endpoint daemon runs on the `init`-rendered internal config, whose
+/// path depends on the deployment's secrets directory, so the unit tells
+/// an installer to replace the placeholder `ExecStart` with a drop-in:
+/// an empty `ExecStart=` followed by the real one.
+#[test]
+fn the_service_unit_documents_the_internal_config_drop_in() {
+    let text = std::fs::read_to_string(unit_path(SERVICE_UNIT)).expect("read the service unit");
+    for expected in [
+        "bootroot-registrar.service.d/",
+        "#   ExecStart=\n",
+        "--config <secrets-dir>/registrar-internal/agent.toml",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the unit must show the ExecStart drop-in ({expected:?})"
+        );
+    }
 }
 
 /// Rotating EAB credentials need the provisioned `--eab-file` path added

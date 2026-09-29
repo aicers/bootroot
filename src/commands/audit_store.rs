@@ -90,11 +90,11 @@ const RESERVE_RERUN_COMMAND: &str = "bootroot init";
 /// daemon configuration to learn one path and one boolean is not an
 /// installer's business.
 #[derive(Debug, Deserialize)]
-struct AgentConfigPartial {
+pub(crate) struct AgentConfigPartial {
     #[serde(default)]
-    registrar: bootroot::config::RegistrarSettings,
+    pub(crate) registrar: bootroot::config::RegistrarSettings,
     #[serde(default)]
-    registrar_endpoint: bootroot::config::RegistrarEndpointSettings,
+    pub(crate) registrar_endpoint: bootroot::config::RegistrarEndpointSettings,
 }
 
 /// The readings `--agent-config` carries.
@@ -170,6 +170,34 @@ pub(crate) struct AgentConfigReadReason {
 /// is not an error: the documented defaults apply, because that is the
 /// daemon's own configuration stating them.
 fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentConfigReadError> {
+    let read = read_agent_config_unvalidated(path)?;
+    bootroot::config::validate_registrar_settings(&read.partial.registrar).map_err(|err| {
+        let verbatim = err.to_string();
+        AgentConfigReadError::Rejected(AgentConfigReadReason {
+            without_values: without_values(&verbatim, &read.table_values),
+            verbatim,
+        })
+    })?;
+    Ok(read.partial)
+}
+
+/// The operator's `--agent-config` read, parsed and deserialized, and
+/// not yet validated.
+struct UnvalidatedAgentConfig {
+    /// The file exactly as read.
+    text: String,
+    /// Every value the file sets under the two tables, for scrubbing a
+    /// validation error.
+    table_values: RegistrarTableValues,
+    /// The two tables as deserialized.
+    partial: AgentConfigPartial,
+}
+
+/// Reads, parses and deserializes the operator's `bootroot-agent`
+/// configuration file, stopping short of validation.
+fn read_agent_config_unvalidated(
+    path: &Path,
+) -> Result<UnvalidatedAgentConfig, AgentConfigReadError> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| AgentConfigReadError::Unreadable(err.to_string()))?;
     let built = config::Config::builder()
@@ -189,14 +217,11 @@ fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentCon
             without_values: deserialize_error_without_values(&err),
         })
     })?;
-    bootroot::config::validate_registrar_settings(&partial.registrar).map_err(|err| {
-        let verbatim = err.to_string();
-        AgentConfigReadError::Rejected(AgentConfigReadReason {
-            without_values: without_values(&verbatim, &table_values),
-            verbatim,
-        })
-    })?;
-    Ok(partial)
+    Ok(UnvalidatedAgentConfig {
+        text,
+        table_values,
+        partial,
+    })
 }
 
 /// Drops the source excerpt a TOML parse error quotes, keeping the
@@ -420,22 +445,8 @@ pub(crate) fn load_registrar_settings(
 /// own configuration stating them.
 pub(crate) fn load_agent_config(path: &Path, messages: &Messages) -> Result<AgentConfigView> {
     let display = path.display().to_string();
-    let partial =
-        read_agent_config_partial(path).map_err(|err| {
-            anyhow::anyhow!(match err {
-                AgentConfigReadError::Unreadable(reason) => {
-                    messages.error_audit_store_agent_config_unreadable(&display, &reason)
-                }
-                AgentConfigReadError::Malformed(reason) => {
-                    messages.error_audit_store_agent_config_malformed(&display, &reason.verbatim)
-                }
-                AgentConfigReadError::Undeserializable(reason) => messages
-                    .error_audit_store_agent_config_undeserializable(&display, &reason.verbatim),
-                AgentConfigReadError::Rejected(reason) => {
-                    messages.error_audit_store_agent_config_rejected(&display, &reason.verbatim)
-                }
-            })
-        })?;
+    let partial = read_agent_config_partial(path)
+        .map_err(|err| anyhow::anyhow!(agent_config_read_message(&display, err, messages)))?;
     Ok(AgentConfigView {
         audit_store_dir: partial.registrar.audit_store_dir,
         endpoint_enabled: partial.registrar_endpoint.enabled,
@@ -444,6 +455,54 @@ pub(crate) fn load_agent_config(path: &Path, messages: &Messages) -> Result<Agen
         max_file_bytes: partial.registrar.audit_max_file_bytes,
         max_retained_files: partial.registrar.audit_max_retained_files,
     })
+}
+
+/// Reads the operator's `bootroot-agent` configuration file and
+/// deserializes its `[registrar]` and `[registrar_endpoint]` tables,
+/// returning the file's text beside them.
+///
+/// The text is returned because `init` renders the two tables into the
+/// bootroot-internal agent config as the operator wrote them, and that
+/// has to come from the same bytes the tables were checked against. The
+/// tables are not validated here: `init` holds them to the stricter
+/// rules of an enabled endpoint, which include the daemon's own.
+///
+/// # Errors
+///
+/// Reading, parsing and deserializing are three distinct failures, and
+/// each carries its own message naming the path and the underlying
+/// error.
+pub(crate) fn read_agent_config_text(
+    path: &Path,
+    messages: &Messages,
+) -> Result<(String, AgentConfigPartial)> {
+    let display = path.display().to_string();
+    let read = read_agent_config_unvalidated(path)
+        .map_err(|err| anyhow::anyhow!(agent_config_read_message(&display, err, messages)))?;
+    Ok((read.text, read.partial))
+}
+
+/// Words a failed read of `--agent-config` as an installer reports it,
+/// quoting the underlying error verbatim.
+fn agent_config_read_message(
+    display: &str,
+    err: AgentConfigReadError,
+    messages: &Messages,
+) -> String {
+    match err {
+        AgentConfigReadError::Unreadable(reason) => {
+            messages.error_audit_store_agent_config_unreadable(display, &reason)
+        }
+        AgentConfigReadError::Malformed(reason) => {
+            messages.error_audit_store_agent_config_malformed(display, &reason.verbatim)
+        }
+        AgentConfigReadError::Undeserializable(reason) => {
+            messages.error_audit_store_agent_config_undeserializable(display, &reason.verbatim)
+        }
+        AgentConfigReadError::Rejected(reason) => {
+            messages.error_audit_store_agent_config_rejected(display, &reason.verbatim)
+        }
+    }
 }
 
 /// Returns the rendered audit override's path under `compose_dir`.
