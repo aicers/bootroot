@@ -1877,15 +1877,38 @@ AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된
 역할 중 하나를 대상으로 하며, 세 선택자 중 정확히 하나가 필요합니다:
 
 - `--registration-id`: 대상 등록 키. `bootroot-runtime-rotate-role`
-  자격증명으로 인증합니다.
+  자격증명으로 인증합니다. `registrar_binding`이 `active`인 registrar
+  관리 identity도 받습니다(바인딩을 직접 읽으므로 `list` 권한이
+  필요하지 않습니다). `creating`인 identity는 발급이 끝나지 않았으므로
+  거부됩니다.
 - `--all-services`: `state.json`에 등록된 모든 서비스(`local-file`과
-  `remote-bootstrap` 전달 모드 모두)를 한 번의 호출로 회전합니다.
-  `bootroot-runtime-rotate-role` 자격증명으로 인증합니다. 스케줄
-  작업용으로 설계되었습니다(`--yes`): 서비스별 실패가 있어도 계속
-  진행하고, 대상별 요약을 출력하며, 하나라도 실패하면 0이 아닌 코드로
-  종료합니다. 빈 서비스 레지스트리는 no-op 성공입니다. 인프라 역할은
-  의도적으로 제외됩니다(별도 자격증명 — 아래 참고). 두 `--infra`
-  호출을 함께 스케줄하세요.
+  `remote-bootstrap` 전달 모드 모두)를 한 번의 호출로 회전하고,
+  `state.json`에 registrar endpoint가 기록되어 있으면 이어서
+  `registrar_binding`이 `active`인 모든 registrar 관리 identity를
+  회전합니다. `bootroot-runtime-rotate-role` 자격증명으로 인증합니다.
+  스케줄 작업용으로 설계되었습니다(`--yes`): 서비스별 실패가 있어도
+  계속 진행하고, 대상별 요약을 출력하며, 하나라도 실패하면 0이 아닌
+  코드로 종료합니다. 바인딩이 아직 `creating`인(또는 열거 후 등록
+  해제된) registrar identity는 건너뜀으로 보고되며, 건너뜀은 실패가
+  아닙니다. 해석할 수 없는 바인딩은 대상별 실패이고, registrar
+  identity 열거 자체의 실패도 실패로 집계됩니다 — 어느 경우든
+  `state.json` 서비스는 회전됩니다. 회전하거나 건너뛰거나 실패할
+  대상이 하나도 없을 때만 no-op 성공입니다: `state.json`에 서비스가
+  없고, 열거된 registrar 관리 identity도 없는(또는 registrar endpoint가
+  기록되어 있지 않은) 경우입니다. `state.json`이 비어 있는 것만으로는
+  충분하지 않습니다 — registrar identity는 여전히 회전되고, 열거가
+  실패하면 실행도 실패합니다.
+  인프라 역할은 의도적으로 제외됩니다(별도 자격증명 — 아래 참고). 두
+  `--infra` 호출을 함께 스케줄하세요.
+- `--agent-config <path>`: registrar 데몬이 사용하는 운영자의
+  `bootroot-agent` 설정 파일 — `bootroot init --agent-config`가 받는
+  것과 같은 파일이며, 생성된 `registrar-internal/agent.toml`이
+  아닙니다. 바인딩이 `active`인 registrar 관리 identity를 회전하게 될
+  때 필요합니다. 이 경우 플래그가 없거나 파일을 읽을 수 없거나 유효하지
+  않으면 어떤 대상에도 `secret_id`를 발급하기 전에 거부합니다. 이
+  거부 메시지는 키와 무엇이 잘못되었는지를 알려 주지만, responder와
+  EAB HMAC도 담긴 이 파일의 값은 출력하지 않습니다. 그 밖의 경우에는
+  필요하지 않으며 읽지도 않습니다. `--infra`와 함께 쓸 수 없습니다.
 - `--infra <stepca|responder>`: 대상 인프라 역할
   (`bootroot-stepca-role` / `bootroot-responder-role`).
   `bootroot-infra-rotate-role` 자격증명을 기존 `--auth-mode approle`
@@ -1921,6 +1944,19 @@ secret_id에는 교체할 파일이 없으므로 경고를 출력하고 자체 �
 이를 데드맨 신호로 감시합니다.
 [운영 > rotate 자격증명 자체의 secret_id (자체 재발급)](operations.md#rotate-자격증명-자체의-secret_id-자체-재발급)을
 참고하세요.
+
+registrar 관리 identity의 경우 `[registrar]` 테이블의
+`secret_id_num_uses`, `secret_id_ttl`, `secret_id_token_bound_cidrs` —
+registrar mint가 발급할 때와 같은 옵션 — 로
+`bootroot-service-<registration_id>`에 새 `secret_id`를 발급하고, 이를
+`bootroot/services/<registration_id>/secret_id`에 기록합니다. 호스트의
+fast-poll 루프가 `remote-bootstrap` 서비스와 똑같이 이 값을 가져갑니다.
+응답 래핑은 사용하지 않습니다. 새 값은 CIDR 바인딩도 사용 횟수 제한도
+없을 때(`secret_id_num_uses = 0`)에만 기록 전에 로그인으로 검증합니다.
+로그인은 사용 횟수를 하나 소모하는데, 사용 횟수가 제한된 자격증명은
+그 횟수를 호스트가 써야 하기 때문입니다. 그 밖의 경우에는 검증 없이
+기록하며 로그인 확인 줄을 출력하지 않습니다. 이전 `secret_id`는
+폐기하지 않으며 TTL에 따라 만료됩니다.
 
 인프라 대상의 경우 새 `secret_id`를
 `<secrets_dir>/openbao/<stepca|responder>/secret_id`에 원자적으로(모드

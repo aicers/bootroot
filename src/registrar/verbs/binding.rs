@@ -194,8 +194,12 @@ struct SchemaProbe {
 }
 
 /// Why a stored binding could not be read as this build's record.
+///
+/// Public, and re-exported as [`crate::registrar::BindingDecodeError`],
+/// because [`crate::registrar::registrar_binding_state`] returns it; the
+/// record type itself stays crate-private.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum BindingDecodeError {
+pub enum BindingDecodeError {
     /// The stored JSON does not even carry a readable `schema_version`.
     #[error("stored binding does not declare a readable schema_version: {message}")]
     NoSchemaVersion {

@@ -1953,15 +1953,39 @@ long-running infra OpenBao Agents (`openbao-agent-stepca` /
 is required:
 
 - `--registration-id`: target registration key. Authenticate with
-  `bootroot-runtime-rotate-role` credentials.
+  `bootroot-runtime-rotate-role` credentials. Also accepts a
+  registrar-managed identity whose `registrar_binding` is `active`
+  (read directly, so it needs no `list` grant); a `creating` one is
+  refused because the identity has not finished minting.
 - `--all-services`: rotates every service registered in `state.json`
   (both `local-file` and `remote-bootstrap` delivery modes) in one
-  invocation. Authenticate with `bootroot-runtime-rotate-role`
+  invocation, then — when `state.json` records a registrar endpoint —
+  every registrar-managed identity whose `registrar_binding` is
+  `active`. Authenticate with `bootroot-runtime-rotate-role`
   credentials. Designed for scheduled jobs (`--yes`): it continues past
   per-service failures, prints a per-target summary, and exits non-zero
-  if any target failed; an empty service registry is a no-op success.
+  if any target failed. A registrar identity whose binding is still
+  `creating` (or that was deregistered since it was listed) is reported
+  as skipped, and a skip is not a failure. A binding that does not
+  decode is a per-target failure, and so is a failed enumeration of
+  registrar identities — the `state.json` services are rotated either
+  way. The run is a no-op success only when it finds nothing to rotate,
+  skip or fail: no service in `state.json`, and no registrar-managed
+  identity listed (or no registrar endpoint recorded). An empty
+  `state.json` alone is not enough — registrar identities are still
+  rotated, and a failed enumeration still fails the run.
   Infra roles are deliberately excluded (separate credential — see
   below); schedule the two `--infra` invocations alongside it.
+- `--agent-config <path>`: the operator's `bootroot-agent`
+  configuration file the registrar daemon runs with — the same file
+  `bootroot init --agent-config` takes, not the generated
+  `registrar-internal/agent.toml`. Required whenever the run would
+  rotate a registrar-managed identity whose binding is `active`; the
+  command then refuses before issuing any `secret_id` for any target if
+  the flag is missing or the file is unreadable or invalid. That refusal
+  names the key and what is wrong with it, but never a value from the
+  file, which also holds the responder and EAB HMACs. Otherwise the
+  file is neither required nor read. Conflicts with `--infra`.
 - `--infra <stepca|responder>`: target infra role
   (`bootroot-stepca-role` / `bootroot-responder-role`). Authenticate
   with `bootroot-infra-rotate-role` credentials via the usual
@@ -1999,6 +2023,19 @@ runs never self-mint. Every successful invocation also records
 `last_secret_id_rotation` in `state.json`, which `bootroot status`
 watches as a dead-man signal. See
 [Operations > The rotate credentials' own secret_ids (self-mint)](operations.md#the-rotate-credentials-own-secret_ids-self-mint).
+
+For a registrar-managed identity the command issues a fresh
+`secret_id` on `bootroot-service-<registration_id>` with the
+`[registrar]` table's `secret_id_num_uses`, `secret_id_ttl` and
+`secret_id_token_bound_cidrs` — the options the registrar mint issues
+with — and writes it to `bootroot/services/<registration_id>/secret_id`,
+where the host's fast-poll loop picks it up, exactly as for a
+`remote-bootstrap` service. It is never response-wrapped. The new value
+is login-verified before the write only when it is neither CIDR-bound
+nor use-limited (`secret_id_num_uses = 0`): a login spends one use,
+which a use-limited credential's host needs. Otherwise it is pushed
+unverified and no login-OK line is printed. The previous `secret_id` is
+not revoked; it expires at its TTL.
 
 For infra targets the command writes the new `secret_id` atomically
 (mode `0600`) to `<secrets_dir>/openbao/<stepca|responder>/secret_id`,

@@ -23,7 +23,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
-use bootroot::service_material::list_registrar_managed_ids;
+use bootroot::registrar::{RegistrarBindingState, registrar_binding_state};
+use bootroot::service_material::{list_registrar_managed_ids, service_kv_path};
+use bootroot::trust_bootstrap::REGISTRAR_BINDING_KV_SUFFIX;
 
 use super::RotateContext;
 use crate::commands::constants::SERVICE_KV_BASE;
@@ -87,6 +89,42 @@ pub(super) async fn registrar_only_targets(
         .into_iter()
         .filter(|id| !known.contains(id.as_str()))
         .collect())
+}
+
+/// Reads one registration id's `registrar_binding` and returns the
+/// lifecycle state it decodes to, or `None` when no binding exists.
+///
+/// Unlike the enumeration above, which reads each binding for presence
+/// only, this decodes it: a caller issuing a credential must not act on
+/// a binding that is still `creating`, nor on one the registrar itself
+/// would refuse to read.
+///
+/// # Errors
+///
+/// Returns the localized read error if the KV read fails other than as
+/// a clean not-found, and the localized decode error, carrying the
+/// [`bootroot::registrar::BindingDecodeError`] as its source, if the
+/// stored record is not a readable binding.
+pub(super) async fn read_registrar_binding_state(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    registration_id: &str,
+    messages: &Messages,
+) -> Result<Option<RegistrarBindingState>> {
+    let path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+    let display = format!("{}/{path}", ctx.kv_mount);
+    let Some(value) = client
+        .try_read_kv(&ctx.kv_mount, &path)
+        .await
+        .with_context(|| {
+            messages.error_rotate_registrar_binding_read_failed(registration_id, &display)
+        })?
+    else {
+        return Ok(None);
+    };
+    registrar_binding_state(&value).map(Some).with_context(|| {
+        messages.error_rotate_registrar_binding_undecodable(registration_id, &display)
+    })
 }
 
 /// The `state.json` service ids in the map's order, which is the order

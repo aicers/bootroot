@@ -851,7 +851,13 @@ secret_id_num_uses = 0
 - `role_token_ttl` (default `"1h"`) — the role-level `token_ttl` of the
   `AppRole` a mint creates. Positive whole seconds.
 - `role_secret_id_ttl` (default `"24h"`) — the role-level
-  `secret_id_ttl`. Positive whole seconds.
+  `secret_id_ttl`. Positive whole seconds. Nothing re-mints an installed
+  target, so a registrar identity's credential is renewed only by the
+  scheduled `bootroot rotate approle-secret-id --all-services
+  --agent-config <this file>`, which must run well inside this TTL (at
+  most half of it; see
+  [SecretID TTL and rotation cadence](operations.md#secretid-ttl-and-rotation-cadence)),
+  or inside `secret_id_ttl` when that is set.
 - `secret_id_num_uses` (default `0`) — how many times one issued
   `secret_id` may be used. `0` is unlimited within the TTL, which is what
   an enrolled host needs: its agent re-authenticates by `AppRole` login

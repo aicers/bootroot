@@ -2642,7 +2642,19 @@ invocation per credential surface instead of mixing them:
   registry, services added after the scheduler was written are picked
   up automatically — no per-service unit to keep in sync. It continues
   past per-service failures, prints a per-target summary, and exits
-  non-zero if any target failed; an empty registry is a no-op success.
+  non-zero if any target failed. It is a no-op success only when there
+  is nothing to rotate, skip or fail: no service in `state.json` and no
+  registrar-managed identity listed — an empty `state.json` on an
+  endpoint-enabled host still rotates registrar identities, and a
+  failed enumeration of them still fails the run.
+  On an endpoint-enabled host it also renews every registrar-managed
+  identity whose binding is `active` (see
+  [Rotation propagation to running agents](#rotation-propagation-to-running-agents)),
+  and for that it must be passed `--agent-config <path>` naming the
+  `bootroot-agent` configuration the registrar daemon runs with: the
+  fresh `secret_id` is issued with that file's `[registrar]` options.
+  The rotation job must be able to read that file. Without it the batch
+  refuses before issuing anything.
 - **Two per-target infra invocations** (`--infra stepca`,
   `--infra responder`) under the infra-rotate credential; see
   [Infra AppRole secret_id rotation](#infra-approle-secret_id-rotation-stepca-responder).
@@ -2653,7 +2665,9 @@ invocation per credential surface instead of mixing them:
 With the default `24h` TTL, run the job **every 8–12 hours**. With
 per-service `--secret-id-ttl` overrides, the schedule must satisfy the
 invariant for the **smallest** TTL among all targets (services and
-infra roles alike).
+infra roles alike). Registrar-managed identities count among those
+targets with `[registrar] secret_id_ttl` when it is set, and
+`[registrar] role_secret_id_ttl` (default `24h`) otherwise.
 
 Store each rotate credential's `role_id`/`secret_id` in root-owned
 files (mode `0600`), e.g. `/etc/bootroot/runtime-rotate/{role_id,secret_id}`
@@ -2704,6 +2718,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+On an endpoint-enabled host, add `--agent-config` to the batch
+invocation, e.g. `approle-secret-id --all-services --yes --agent-config
+/etc/bootroot/agent.toml`.
 
 With `Type=oneshot`, a failing `ExecStart` line stops the remaining
 lines and marks the unit failed. Rotation is idempotent (old
@@ -3018,6 +3036,10 @@ credentials and leave services unable to re-authenticate.
 | 12h               | 24h (default)           |
 | 24h               | 48h                     |
 
+The same rule applies to registrar-managed identities, against
+`[registrar] secret_id_ttl` when it is set and
+`[registrar] role_secret_id_ttl` otherwise.
+
 For example, with a 12-hour rotation schedule, the default `24h` TTL
 provides exactly one missed-run buffer. If your automation cannot
 guarantee timely execution, increase the TTL or shorten the rotation
@@ -3157,6 +3179,22 @@ registration id that carries a binding. A subtree with neither a
 picks the new value up through its `bootroot-agent` fast-poll loop,
 exactly like any remote-bootstrap service. Without a
 `registrar_endpoint` entry nothing is listed.
+
+The identity's `secret_id` is renewed the same way.
+`rotate approle-secret-id --all-services --agent-config <path>` issues
+a fresh `secret_id` on `bootroot-service-<registration_id>` for every
+listed identity whose binding is `active`, with the `[registrar]`
+table's `secret_id_num_uses`, `secret_id_ttl` and
+`secret_id_token_bound_cidrs`, and writes it to
+`bootroot/services/<registration_id>/secret_id`, where the host's
+fast-poll loop picks it up. An identity whose binding is still
+`creating` has never been handed a credential and is reported as
+skipped; a binding that does not decode is a failure. Nothing else
+renews a registrar identity's credential: the registrar mint runs only
+when a target is installed, so without the scheduled batch every
+registrar-minted host stops authenticating one `secret_id` TTL after
+bootstrap. A push cannot recover an identity whose `secret_id` has
+already lapsed — its host can no longer log in to read it.
 
 The listing needs `list` on `<kv>/metadata/bootroot/services/`, which
 `bootroot init` writes into the `bootroot-runtime-rotate` policy. A

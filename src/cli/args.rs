@@ -778,11 +778,17 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// one invocation.
     ///
     /// Authenticate with `bootroot-runtime-rotate-role` credentials.
-    /// Infra roles are deliberately excluded (they use the separate
+    /// Covers every `state.json` service and, when `state.json` records a
+    /// registrar endpoint, every registrar-managed identity whose binding
+    /// is `active` (a `creating` one is reported as skipped). Infra roles
+    /// are deliberately excluded (they use the separate
     /// `bootroot-infra-rotate-role` credential); schedule `--infra`
     /// invocations alongside this one. Continues past per-service
-    /// failures and exits non-zero if any target failed. An empty
-    /// service registry is a no-op success.
+    /// failures and exits non-zero if any target failed. The run is a
+    /// no-op success only when there is nothing to rotate, skip or fail:
+    /// no `state.json` service and no registrar-managed identity listed.
+    /// An empty `state.json` alone is not enough — registrar identities
+    /// are still rotated, and a failed enumeration still fails the run.
     #[arg(long)]
     pub(crate) all_services: bool,
 
@@ -828,6 +834,20 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
         conflicts_with_all = ["registration_id", "all_services", "rotate_bound_cidrs"]
     )]
     pub(crate) clear_rotate_bound_cidrs: bool,
+
+    /// Path to the operator's `bootroot-agent` configuration file the
+    /// registrar daemon runs with — the same file `bootroot init
+    /// --agent-config` takes, not the generated
+    /// `registrar-internal/agent.toml`.
+    ///
+    /// Read only when a registrar-managed identity whose binding is
+    /// `active` is about to be rotated: its fresh `secret_id` is issued
+    /// with the `[registrar]` table's `secret_id_num_uses`,
+    /// `secret_id_ttl` and `secret_id_token_bound_cidrs`, exactly as the
+    /// registrar mint issues it. Required in that case; the run refuses
+    /// before issuing any `secret_id` without it.
+    #[arg(long, conflicts_with = "infra")]
+    pub(crate) agent_config: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

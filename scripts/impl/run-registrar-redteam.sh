@@ -268,6 +268,33 @@ assert_runtime_rotate_can_enumerate() {
   pass "the runtime-rotate policy lists the services tree and reads the minted binding"
 }
 
+# A registrar-minted identity's secret_id is renewed only by the scheduled
+# `rotate approle-secret-id --all-services`, which pushes a fresh one into the
+# identity's KV subtree with the daemon's [registrar] issuance options. Held
+# against the live stack: the rotation reads the daemon's own configuration,
+# writes the minted id's KV secret_id, and the minted role_id plus that value
+# log in. The pushed value never leaves the pipes that carry it to the login.
+assert_registrar_secret_id_rotation() {
+  local registration_id="$1" log="$ARTIFACT_DIR/rotate-approle-secret-id.log" status role_id_json
+  if ! sudo -n env BOOTROOT_LANG=en "$BOOTROOT_BIN" rotate \
+    --state-file "$WORK_DIR/state.json" \
+    --openbao-url "$OPENBAO_URL" \
+    --root-token-file "$TOKEN_FILE" \
+    approle-secret-id --all-services --yes --agent-config "$DAEMON_CONFIG" </dev/null >"$log" 2>&1; then
+    tail -n 80 "$log" >>"$RUN_LOG" || true
+    fail "rotate approle-secret-id --all-services failed for the registrar-minted identity"
+  fi
+  grep -q "AppRole secret_id rotated for ${registration_id}:" "$log" || fail "the rotation summary does not name the registrar-minted identity"
+  status="$(sudo -n curl -sS -o /dev/null -w '%{http_code}' --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/${KV_MOUNT}/data/${SERVICE_KV_BASE}/${registration_id}/${SERVICE_SECRET_ID_SUFFIX}" || true)"
+  [ "$status" = 200 ] || fail "the rotation did not write the minted id's ${SERVICE_SECRET_ID_SUFFIX} (HTTP ${status})"
+  role_id_json="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${registration_id}/role-id")" || fail "could not read the minted role_id"
+  sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/${KV_MOUNT}/data/${SERVICE_KV_BASE}/${registration_id}/${SERVICE_SECRET_ID_SUFFIX}" |
+    jq -ec --argjson role "$role_id_json" '{role_id: $role.data.role_id, secret_id: .data.data.secret_id} | select(.role_id != null and .secret_id != null)' |
+    curl -fsS -o /dev/null --cacert "$OPENBAO_CA" -H 'Content-Type: application/json' -X POST --data @- "$OPENBAO_URL/v1/auth/approle/login" ||
+    fail "the minted role_id and the pushed secret_id do not log in"
+  pass "the scheduled rotation pushed a secret_id the minted identity logs in with"
+}
+
 assert_no_registration_state() {
   local registration_id="$1"
   local endpoint status
@@ -297,6 +324,7 @@ assert_functionality_and_audit() {
   REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"
   assert_seeded_trust_material "$REGISTRATION_ID"
   assert_runtime_rotate_can_enumerate "$REGISTRATION_ID"
+  assert_registrar_secret_id_rotation "$REGISTRATION_ID"
   role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${REGISTRATION_ID}")" || fail "could not read the minted derived AppRole"
   policies="$(jq -c '.data.token_policies | sort' <<<"$role")" || fail "minted AppRole has no policy list"
   [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"

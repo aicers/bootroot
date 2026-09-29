@@ -118,14 +118,298 @@ pub(crate) struct AgentConfigView {
     pub(crate) max_retained_files: u32,
 }
 
-/// Reads the two tables `init` needs out of the operator's
-/// `bootroot-agent` configuration file.
+/// Which of the four steps of reading an operator's `--agent-config`
+/// failed, carrying the underlying error text.
+///
+/// Each surface that reads the file words the refusal its own way — an
+/// installer reports that nothing was created, a rotation that no
+/// `secret_id` was issued — so the steps are reported as data and the
+/// caller picks the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentConfigReadError {
+    /// The file could not be read. The I/O error names the failure and
+    /// never any of the file's contents.
+    Unreadable(String),
+    /// The file is not valid TOML.
+    Malformed(AgentConfigReadReason),
+    /// The TOML does not deserialize into the daemon's table shapes.
+    Undeserializable(AgentConfigReadReason),
+    /// `[registrar]` deserialized but the daemon's validation refuses it.
+    Rejected(AgentConfigReadReason),
+}
+
+/// The underlying error of a step that saw the file's values, in two
+/// renderings.
+///
+/// The file also carries the daemon's responder and EAB HMACs, and each
+/// of these errors can quote a value from it: a parse error its
+/// offending line, a type error the value it could not convert, a
+/// validation error the setting it refused. Where one lands next to a
+/// secret, or a secret is pasted under the wrong key, the verbatim text
+/// is the secret itself. A surface whose output goes to a scheduled
+/// job's logs reports `without_values` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentConfigReadReason {
+    /// The error exactly as the parser, deserializer or validator
+    /// worded it.
+    pub(crate) verbatim: String,
+    /// The same error with every value taken out of the file removed,
+    /// keeping the location, the key and the complaint.
+    pub(crate) without_values: String,
+}
+
+/// Reads, parses, deserializes and validates the `[registrar]` and
+/// `[registrar_endpoint]` tables of the operator's `bootroot-agent`
+/// configuration file.
 ///
 /// Deliberately not [`bootroot::config::Settings::new`]: that requires
 /// a non-empty `[[profiles]]` block, and not
 /// `Settings::file_builder` either, which marks the file
 /// `required(false)` so a nonexistent path would silently deserialize
-/// into defaults instead of failing.
+/// into defaults instead of failing. A file with no `[registrar]` table
+/// is not an error: the documented defaults apply, because that is the
+/// daemon's own configuration stating them.
+fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentConfigReadError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| AgentConfigReadError::Unreadable(err.to_string()))?;
+    let built = config::Config::builder()
+        .add_source(config::File::from_str(&text, config::FileFormat::Toml))
+        .build()
+        .map_err(|err| {
+            let verbatim = err.to_string();
+            AgentConfigReadError::Malformed(AgentConfigReadReason {
+                without_values: without_source_lines(&verbatim),
+                verbatim,
+            })
+        })?;
+    let table_values = registrar_table_values(&built);
+    let partial: AgentConfigPartial = built.try_deserialize().map_err(|err| {
+        AgentConfigReadError::Undeserializable(AgentConfigReadReason {
+            verbatim: err.to_string(),
+            without_values: deserialize_error_without_values(&err),
+        })
+    })?;
+    bootroot::config::validate_registrar_settings(&partial.registrar).map_err(|err| {
+        let verbatim = err.to_string();
+        AgentConfigReadError::Rejected(AgentConfigReadReason {
+            without_values: without_values(&verbatim, &table_values),
+            verbatim,
+        })
+    })?;
+    Ok(partial)
+}
+
+/// Drops the source excerpt a TOML parse error quotes, keeping the
+/// location and the parser's complaint.
+///
+/// The excerpt is the offending line verbatim — which is the secret
+/// itself when the syntax error sits on that line.
+fn without_source_lines(reason: &str) -> String {
+    reason
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_source_excerpt_line(line))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reports whether a trimmed line of a TOML parse error is part of its
+/// quoted excerpt: a `|` gutter, optionally preceded by a line number.
+fn is_source_excerpt_line(line: &str) -> bool {
+    line.trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start()
+        .starts_with('|')
+}
+
+/// Renders a deserialization error from its structure, never from the
+/// value it failed on.
+///
+/// A type error keeps what was expected and the key, and drops what was
+/// found — `config` prints a string it could not convert in full. A
+/// serde message is kept only in the forms that name a key and nothing
+/// else. Every other message can quote a value — `invalid value` and
+/// `unknown variant` both do — and is replaced with a fixed text: the
+/// rendering is an allowlist, so a message form not foreseen here is
+/// withheld rather than printed.
+fn deserialize_error_without_values(err: &config::ConfigError) -> String {
+    const KEY_ONLY_MESSAGES: [&str; 3] =
+        ["unknown field `", "missing field `", "duplicate field `"];
+    const VALUE_WITHHELD: &str = "the value does not have the type or form this key requires \
+         (the value itself is not shown)";
+    let for_key = |text: String, key: Option<&String>| match key {
+        Some(key) => format!("{text} for key `{key}`"),
+        None => text,
+    };
+    match err {
+        config::ConfigError::Type { expected, key, .. } => for_key(
+            format!("invalid type: expected {expected} (the value itself is not shown)"),
+            key.as_ref(),
+        ),
+        config::ConfigError::At { error, key, .. } => {
+            for_key(deserialize_error_without_values(error), key.as_ref())
+        }
+        config::ConfigError::NotFound(_) => err.to_string(),
+        config::ConfigError::Message(message)
+            if KEY_ONLY_MESSAGES
+                .iter()
+                .any(|prefix| message.starts_with(prefix)) =>
+        {
+            message.clone()
+        }
+        _ => VALUE_WITHHELD.to_string(),
+    }
+}
+
+/// The values the file sets under `[registrar]` and `[registrar_endpoint]`,
+/// in the spellings the daemon's validation can quote them in.
+#[derive(Debug, Default)]
+struct RegistrarTableValues {
+    /// Every string, and the humantime rendering of each value that
+    /// parses as a duration, longest first.
+    strings: Vec<String>,
+    /// Every non-string value as typed, and every integer any value
+    /// converts to.
+    numbers: Vec<String>,
+}
+
+/// Collects every value the file sets under `[registrar]` and
+/// `[registrar_endpoint]`.
+///
+/// The daemon's validation quotes the settings it refuses by value — a
+/// path, an agent URL, a byte count, a duration re-rendered by
+/// humantime — and a string field accepts whatever was typed there, a
+/// pasted secret included. Taking the values from the parsed tables
+/// rather than from the validator's wording keeps the scrub correct for
+/// a message this reader has never seen.
+///
+/// Validation quotes the *deserialized* setting, which is not always
+/// the value as typed: `config` coerces a float, a boolean or a numeric
+/// string into an integer field, so `12345.6` is refused as `12346` and
+/// `"+12"` as `12`. Each value is therefore also recorded as the
+/// integer and the string it converts to, through the very conversions
+/// the deserializer applies, rather than through a second copy of their
+/// rules.
+fn registrar_table_values(built: &config::Config) -> RegistrarTableValues {
+    fn collect(value: &config::Value, out: &mut RegistrarTableValues) {
+        match &value.kind {
+            config::ValueKind::Table(table) => {
+                for value in table.values() {
+                    collect(value, out);
+                }
+                return;
+            }
+            config::ValueKind::Array(values) => {
+                for value in values {
+                    collect(value, out);
+                }
+                return;
+            }
+            config::ValueKind::Nil => return,
+            config::ValueKind::String(text) => {
+                if !text.is_empty() {
+                    out.strings.push(text.clone());
+                }
+            }
+            _ => {
+                if let Ok(text) = value.clone().into_string() {
+                    out.numbers.push(text);
+                }
+            }
+        }
+        if let Ok(text) = value.clone().into_string()
+            && let Ok(duration) = humantime::parse_duration(&text)
+        {
+            out.strings
+                .push(humantime::format_duration(duration).to_string());
+        }
+        if let Ok(number) = value.clone().into_uint() {
+            out.numbers.push(number.to_string());
+        }
+        if let Ok(number) = value.clone().into_int() {
+            out.numbers.push(number.to_string());
+        }
+    }
+    let mut values = RegistrarTableValues::default();
+    for table in ["registrar", "registrar_endpoint"] {
+        if let Ok(table) = built.get_table(table) {
+            for value in table.values() {
+                collect(value, &mut values);
+            }
+        }
+    }
+    // Longest first, so a value that contains another is replaced whole.
+    values
+        .strings
+        .sort_unstable_by_key(|text| std::cmp::Reverse(text.len()));
+    values
+}
+
+/// Replaces every occurrence of each of `values` in `reason`.
+///
+/// A string is replaced wherever it occurs. A number is replaced only as
+/// a whole token, so a value of `0` does not also take the digits out of
+/// a key name or a constant the message states.
+fn without_values(reason: &str, values: &RegistrarTableValues) -> String {
+    let text = values
+        .strings
+        .iter()
+        .fold(reason.to_string(), |text, value| {
+            text.replace(value.as_str(), "<redacted>")
+        });
+    values
+        .numbers
+        .iter()
+        .fold(text, |text, number| without_number_token(&text, number))
+}
+
+/// Replaces each occurrence of `number` in `text` that is not part of a
+/// longer word or number.
+///
+/// A `.` continues a number before it, and after it only when a digit
+/// follows, so a value closing a sentence is still replaced.
+fn without_number_token(text: &str, number: &str) -> String {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(number) {
+        let (before, from) = rest.split_at(at);
+        // `find` returned a match of `number` starting at `at`.
+        let after = &from[number.len()..];
+        let joined_before = out
+            .chars()
+            .chain(before.chars())
+            .next_back()
+            .is_some_and(|c| is_word_char(c) || c == '.');
+        let mut following = after.chars();
+        let joined_after = match following.next() {
+            Some('.') => following.next().is_some_and(|c| c.is_ascii_digit()),
+            Some(c) => is_word_char(c),
+            None => false,
+        };
+        let bounded = !joined_before && !joined_after;
+        out.push_str(before);
+        out.push_str(if bounded { "<redacted>" } else { number });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Returns the validated `[registrar]` table of the operator's
+/// `bootroot-agent` configuration file, read exactly as
+/// [`load_agent_config`] reads it.
+///
+/// # Errors
+///
+/// Returns which of the four steps failed, with the underlying error.
+pub(crate) fn load_registrar_settings(
+    path: &Path,
+) -> Result<bootroot::config::RegistrarSettings, AgentConfigReadError> {
+    read_agent_config_partial(path).map(|partial| partial.registrar)
+}
+
+/// Reads the two tables `init` needs out of the operator's
+/// `bootroot-agent` configuration file.
 ///
 /// # Errors
 ///
@@ -136,29 +420,22 @@ pub(crate) struct AgentConfigView {
 /// own configuration stating them.
 pub(crate) fn load_agent_config(path: &Path, messages: &Messages) -> Result<AgentConfigView> {
     let display = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_unreadable(&display, &err.to_string())
-        )
-    })?;
-    let built = config::Config::builder()
-        .add_source(config::File::from_str(&text, config::FileFormat::Toml))
-        .build()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                messages.error_audit_store_agent_config_malformed(&display, &err.to_string())
-            )
+    let partial =
+        read_agent_config_partial(path).map_err(|err| {
+            anyhow::anyhow!(match err {
+                AgentConfigReadError::Unreadable(reason) => {
+                    messages.error_audit_store_agent_config_unreadable(&display, &reason)
+                }
+                AgentConfigReadError::Malformed(reason) => {
+                    messages.error_audit_store_agent_config_malformed(&display, &reason.verbatim)
+                }
+                AgentConfigReadError::Undeserializable(reason) => messages
+                    .error_audit_store_agent_config_undeserializable(&display, &reason.verbatim),
+                AgentConfigReadError::Rejected(reason) => {
+                    messages.error_audit_store_agent_config_rejected(&display, &reason.verbatim)
+                }
+            })
         })?;
-    let partial: AgentConfigPartial = built.try_deserialize().map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_undeserializable(&display, &err.to_string())
-        )
-    })?;
-    bootroot::config::validate_registrar_settings(&partial.registrar).map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_rejected(&display, &err.to_string())
-        )
-    })?;
     Ok(AgentConfigView {
         audit_store_dir: partial.registrar.audit_store_dir,
         endpoint_enabled: partial.registrar_endpoint.enabled,
@@ -1565,6 +1842,221 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains(&path.display().to_string()), "{rendered}");
         assert!(rendered.contains("absolute path"), "{rendered}");
+    }
+
+    // ---------------------------------------------------------------
+    // The value-free renderings a rotation reports
+    // ---------------------------------------------------------------
+
+    const SENTINEL_SECRET: &str = "s3cr3t-hmac-value";
+
+    /// A syntax error on the line holding a secret must not quote that
+    /// line back: the parser's excerpt is dropped, its location and
+    /// complaint kept.
+    #[test]
+    fn a_malformed_file_is_reported_without_the_offending_line() {
+        let dir = traversable_tempdir();
+        let path = write_agent_config(
+            dir.path(),
+            &format!("[registrar]\nsecret_id_num_uses = 0\n\n[eab]\nhmac = \"{SENTINEL_SECRET}\n"),
+        );
+        let Err(AgentConfigReadError::Malformed(reason)) = load_registrar_settings(&path) else {
+            panic!("an unterminated string must be a TOML parse error");
+        };
+        assert!(
+            reason.verbatim.contains(SENTINEL_SECRET),
+            "the raw parser error quotes the line, which is what makes this test bite: {reason:?}"
+        );
+        assert!(
+            !reason.without_values.contains(SENTINEL_SECRET),
+            "{reason:?}"
+        );
+        assert!(reason.without_values.contains("line 5"), "{reason:?}");
+    }
+
+    /// A secret pasted under a key of the wrong type is valid TOML, and
+    /// `config` quotes the string it could not convert in full.
+    #[test]
+    fn a_type_error_is_reported_without_the_value() {
+        let dir = traversable_tempdir();
+        let path = write_agent_config(
+            dir.path(),
+            &format!("[registrar]\nsecret_id_num_uses = \"{SENTINEL_SECRET}\"\n"),
+        );
+        let Err(AgentConfigReadError::Undeserializable(reason)) = load_registrar_settings(&path)
+        else {
+            panic!("a string under an integer key must fail deserialization");
+        };
+        assert!(
+            reason.verbatim.contains(SENTINEL_SECRET),
+            "the raw error quotes the value, which is what makes this test bite: {reason:?}"
+        );
+        assert!(
+            !reason.without_values.contains(SENTINEL_SECRET),
+            "{reason:?}"
+        );
+        assert!(
+            reason
+                .without_values
+                .contains("registrar.secret_id_num_uses"),
+            "the key is kept: {reason:?}"
+        );
+    }
+
+    /// serde's own messages quote a value too — here an enum variant
+    /// that does not exist.
+    #[test]
+    fn a_value_quoting_message_is_withheld() {
+        let dir = traversable_tempdir();
+        let path = write_agent_config(
+            dir.path(),
+            &format!("[registrar]\naudit_store_enforcement = \"{SENTINEL_SECRET}\"\n"),
+        );
+        let Err(AgentConfigReadError::Undeserializable(reason)) = load_registrar_settings(&path)
+        else {
+            panic!("an unknown variant must fail deserialization");
+        };
+        assert!(
+            reason.verbatim.contains(SENTINEL_SECRET),
+            "the raw error quotes the value: {reason:?}"
+        );
+        assert!(
+            !reason.without_values.contains(SENTINEL_SECRET),
+            "{reason:?}"
+        );
+        assert!(
+            reason.without_values.contains("audit_store_enforcement"),
+            "{reason:?}"
+        );
+    }
+
+    /// A misspelled key is still named: it is a key, not a value, and it
+    /// is what the operator needs to find.
+    #[test]
+    fn an_unknown_key_is_still_named() {
+        let dir = traversable_tempdir();
+        let path = write_agent_config(dir.path(), "[registrar]\nsecret_id_num_use = 0\n");
+        let Err(AgentConfigReadError::Undeserializable(reason)) = load_registrar_settings(&path)
+        else {
+            panic!("an unknown key must fail deserialization");
+        };
+        assert!(
+            reason
+                .without_values
+                .contains("unknown field `secret_id_num_use`"),
+            "{reason:?}"
+        );
+    }
+
+    /// The daemon's validation quotes a refused path or URL by value.
+    #[test]
+    fn a_rejection_is_reported_without_the_refused_value() {
+        let dir = traversable_tempdir();
+        for (key, expected) in [
+            ("audit_store_dir", "absolute path"),
+            ("agent_server", "absolute URL"),
+        ] {
+            let path = write_agent_config(
+                dir.path(),
+                &format!("[registrar]\n{key} = \"{SENTINEL_SECRET}\"\n"),
+            );
+            let Err(AgentConfigReadError::Rejected(reason)) = load_registrar_settings(&path) else {
+                panic!("{key}: the value must fail validation");
+            };
+            assert!(
+                reason.verbatim.contains(SENTINEL_SECRET),
+                "{key}: the raw error quotes the value: {reason:?}"
+            );
+            assert!(
+                !reason.without_values.contains(SENTINEL_SECRET),
+                "{key}: {reason:?}"
+            );
+            assert!(
+                reason.without_values.contains(&format!("registrar.{key}"))
+                    && reason.without_values.contains(expected),
+                "{key}: the key and the complaint are kept: {reason:?}"
+            );
+        }
+    }
+
+    /// The validation quotes a refused number or duration by value too,
+    /// and a duration in humantime's spelling rather than the file's.
+    #[test]
+    fn a_rejected_number_or_duration_is_reported_without_the_value() {
+        let dir = traversable_tempdir();
+        for (body, key, typed, rendered) in [
+            (
+                "audit_max_file_bytes = 12345\n",
+                "registrar.audit_max_file_bytes",
+                "12345",
+                "12345",
+            ),
+            (
+                "audit_store_reserve_bytes = 123456789\naudit_store_low_water_bytes = 987654321\n",
+                "registrar.audit_store_low_water_bytes",
+                "987654321",
+                "987654321",
+            ),
+            (
+                "role_token_ttl = \"1500ms\"\n",
+                "registrar.role_token_ttl",
+                "1500ms",
+                "1s 500ms",
+            ),
+            // `config` rounds a float into an integer field, so the
+            // refusal quotes a value that was never typed.
+            (
+                "audit_max_file_bytes = 12345.6\n",
+                "registrar.audit_max_file_bytes",
+                "12345.6",
+                "12346",
+            ),
+            // And parses a string into one, dropping a leading sign.
+            (
+                "audit_max_file_bytes = \"+12345\"\n",
+                "registrar.audit_max_file_bytes",
+                "+12345",
+                "12345",
+            ),
+            // A boolean converts to 0 or 1.
+            (
+                "audit_store_reserve_bytes = true\n",
+                "registrar.audit_store_low_water_bytes",
+                "true",
+                "(1)",
+            ),
+        ] {
+            let path = write_agent_config(dir.path(), &format!("[registrar]\n{body}"));
+            let Err(AgentConfigReadError::Rejected(reason)) = load_registrar_settings(&path) else {
+                panic!("{key}: the value must fail validation");
+            };
+            assert!(
+                reason.verbatim.contains(rendered),
+                "{key}: the raw error quotes the value: {reason:?}"
+            );
+            assert!(
+                !reason.without_values.contains(typed) && !reason.without_values.contains(rendered),
+                "{key}: {reason:?}"
+            );
+            assert!(
+                reason.without_values.contains(key),
+                "{key}: the key is kept: {reason:?}"
+            );
+        }
+    }
+
+    /// A number is taken out as a whole token only, so a small value
+    /// does not also take the digits out of the message's own wording.
+    #[test]
+    fn a_number_is_redacted_as_a_whole_token() {
+        let values = RegistrarTableValues {
+            strings: Vec::new(),
+            numbers: vec!["64".to_string(), "5".to_string()],
+        };
+        assert_eq!(
+            without_values("x (64) must not exceed i64::MAX; 1.5 or 15 or 5.", &values),
+            "x (<redacted>) must not exceed i64::MAX; 1.5 or 15 or <redacted>."
+        );
     }
 
     // ---------------------------------------------------------------

@@ -100,6 +100,7 @@ pub use identity::{
     DerivedIdentity, RequestedSpec, check_instance_shape, check_spec_identity, compose_san,
     derive_registration_id, validate_request_labels,
 };
+pub use verbs::binding::BindingDecodeError;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::FromDer;
@@ -158,6 +159,42 @@ const REGISTRAR_INTERNAL_INSTANCE: u32 = 1;
 /// label count is never hard-coded — it is always this plus the label
 /// count of the configured domain.
 const IDENTITY_LEADING_LABELS: usize = 3;
+
+/// Where a registrar-managed identity's binding is in its lifecycle, as
+/// read back from its `bootroot/services/<registration_id>/registrar_binding`
+/// KV record by a caller outside the registrar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrarBindingState {
+    /// The claim won, but the role, policy and the active transition
+    /// have not all completed. No credential was ever issued for it.
+    Creating,
+    /// Role and policy are converged; credentials are issued from here.
+    Active,
+}
+
+/// Decodes a stored registrar binding record and returns its lifecycle
+/// state.
+///
+/// This is a read-only decoder of a record any holder of `read` on the
+/// service's KV subtree can already fetch. It applies exactly the
+/// registrar's own gates — schema version first, then the body against
+/// this build's shape, unknown fields refused — so a caller never acts
+/// on a record the registrar itself would refuse.
+///
+/// # Errors
+///
+/// Returns [`BindingDecodeError`] when the value declares no readable
+/// `schema_version`, declares one this build does not implement, or is
+/// not this build's record shape.
+pub fn registrar_binding_state(
+    value: &serde_json::Value,
+) -> Result<RegistrarBindingState, BindingDecodeError> {
+    let record = verbs::binding::BindingRecord::decode(value)?;
+    Ok(match record.state {
+        verbs::binding::BindingState::Creating => RegistrarBindingState::Creating,
+        verbs::binding::BindingState::Active => RegistrarBindingState::Active,
+    })
+}
 
 /// Reports whether `value` falls inside bootroot's reserved
 /// [`RESERVED_SERVICE_NAME_PREFIX`] namespace.
@@ -1133,5 +1170,70 @@ mod recognition_tests {
             assert_eq!(identity.domain, domain);
             assert_eq!(identity.host, "h1");
         }
+    }
+}
+
+#[cfg(test)]
+mod binding_state_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn record(state: &str) -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "host": "h1",
+            "state": state,
+            "requested_spec": null,
+            "applied_spec": null
+        })
+    }
+
+    #[test]
+    fn a_creating_record_decodes_as_creating() {
+        assert_eq!(
+            registrar_binding_state(&record("creating")),
+            Ok(RegistrarBindingState::Creating)
+        );
+    }
+
+    #[test]
+    fn an_active_record_decodes_as_active() {
+        assert_eq!(
+            registrar_binding_state(&record("active")),
+            Ok(RegistrarBindingState::Active)
+        );
+    }
+
+    #[test]
+    fn an_unsupported_schema_version_is_refused() {
+        let mut value = record("active");
+        value["schema_version"] = json!(99);
+        assert_eq!(
+            registrar_binding_state(&value),
+            Err(BindingDecodeError::UnsupportedSchemaVersion {
+                found: 99,
+                supported: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_schema_version_is_refused() {
+        let value = json!({ "host": "h1", "state": "active" });
+        assert!(matches!(
+            registrar_binding_state(&value),
+            Err(BindingDecodeError::NoSchemaVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_field_is_refused_as_malformed() {
+        let mut value = record("active");
+        value["surprise"] = json!(true);
+        assert!(matches!(
+            registrar_binding_state(&value),
+            Err(BindingDecodeError::Malformed { .. })
+        ));
     }
 }
