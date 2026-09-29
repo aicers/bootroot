@@ -438,7 +438,7 @@ absent: `init` and `reinit` preserve the predicate as deployment intent,
 and clearing it on a flagless re-run would leave an endpoint host that
 `init --agent-config` refuses. Switching an endpoint off stays the
 two-edit procedure under
-[The shared audit store](operations.md#the-shared-audit-store).
+[Sizing the reserve](operations.md#sizing-the-reserve).
 
 A `state.json` created here is one `bootroot init` then asks to
 overwrite, as it does after a bind flag created one; pass

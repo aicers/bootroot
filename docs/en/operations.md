@@ -1965,7 +1965,7 @@ daemon configuration that disagrees with it. See
 [Registrar endpoint predicate](cli.md#registrar-endpoint-predicate) for what
 `infra install` does when a predicate is already recorded; switching a host off
 again is the two-edit procedure under
-[The shared audit store](#the-shared-audit-store).
+[Sizing the reserve](#sizing-the-reserve).
 
 #### What an enabled endpoint needs, and what a missing piece does
 
