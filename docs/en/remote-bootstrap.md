@@ -81,6 +81,21 @@ wrapping is enabled (the default):
 | `role_id` | `secrets/services/<registration_id>/role_id` | AppRole identity (long-lived) |
 | `secret_id` | `secrets/services/<registration_id>/secret_id` | AppRole credential (**sensitive**) |
 
+The `role_id` (and, with `--no-wrap`, the `secret_id`) goes to the path
+the artifact names in `role_id_path` (and `secret_id_path`) on the remote
+host. Choose that location with `--secret-id-path` on `service add`: with
+`remote-bootstrap` delivery it names the absolute path of `secret_id` **on
+the target host**, and the artifact carries it with `role_id` and
+`eab.json` beside it, just as it carries the target paths given to
+`--agent-config`, `--cert-path`, and `--key-path`. Put them wherever the
+target's `bootroot-agent` account can read them — beside its
+`agent.toml`, say. The control node keeps its own copies at the source
+paths in the tables above either way. Without the flag, the artifact
+repeats the control node's layout, relative to the control node's working
+directory when `<secrets_dir>` is relative; a `bootroot-agent` run under
+systemd resolves such a path against `/`, so pass the flag for any
+remote host.
+
 Response wrapping (the default) works with **every** delivery mechanism
 below — SSH, systemd-credentials, Ansible, and cloud-init all carry the
 wrapped `bootstrap.json` just as easily as a raw `secret_id`. It is the
@@ -115,9 +130,13 @@ CONTROL_SECRETS=./secrets
 REMOTE_HOST=edge-node-02
 REMOTE_USER=deploy
 REMOTE_BASE=/srv/bootroot
+# Where the remote host keeps role_id, secret_id and eab.json
+REMOTE_CREDS="$REMOTE_BASE/secrets/services/$SERVICE"
 ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 
-# 1. Register the service on the control node
+# 1. Register the service on the control node. --secret-id-path names
+#    the target-host path the artifact carries; role_id and eab.json
+#    sit beside it.
 bootroot service add \
   --registration-id "$SERVICE" \
   --service-name "$SERVICE" \
@@ -127,16 +146,17 @@ bootroot service add \
   --agent-config "$REMOTE_BASE/agent.toml" \
   --cert-path "$REMOTE_BASE/certs/$SERVICE.crt" \
   --key-path "$REMOTE_BASE/certs/$SERVICE.key" \
+  --secret-id-path "$REMOTE_CREDS/secret_id" \
   --root-token "$OPENBAO_ROOT_TOKEN"
 
 # 2. Create the destination directory and ship the artifact + role_id
 ssh "$REMOTE_USER@$REMOTE_HOST" \
-  mkdir -p "$REMOTE_BASE/secrets/services/$SERVICE"
+  mkdir -p "$REMOTE_CREDS"
 
 scp -p \
   "$ARTIFACT" \
   "$CONTROL_SECRETS/services/$SERVICE/role_id" \
-  "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
+  "$REMOTE_USER@$REMOTE_HOST:$REMOTE_CREDS/"
 
 # 3. Validate schema_version before running bootstrap
 SCHEMA_OK='.schema_version >= 5 and .schema_version <= 5'
@@ -150,7 +170,7 @@ fi
 #    to obtain secret_id at runtime.
 ssh "$REMOTE_USER@$REMOTE_HOST" \
   bootroot-remote bootstrap \
-    --artifact "$REMOTE_BASE/secrets/services/$SERVICE/bootstrap.json" \
+    --artifact "$REMOTE_CREDS/bootstrap.json" \
     --output json
 ```
 
@@ -537,6 +557,11 @@ an updated `bootstrap.json` containing a new `wrap_token`. The operator
 must transfer the updated artifact to the remote host and re-run
 `bootroot-remote bootstrap`.
 
+A rerun must repeat the same `--secret-id-path`, or omit it if the first
+run did: the artifact's credential paths follow it, so a rerun that names
+a different target path, or drops or adds the flag, is refused as a
+duplicate service rather than silently moving them.
+
 If the rerun arguments differ only in policy fields (`--secret-id-ttl`,
 `--secret-id-wrap-ttl`, `--no-wrap`), the command rejects the request
 and directs the operator to use `bootroot service update` instead.
@@ -686,9 +711,9 @@ one. Re-run `bootroot service add` to re-emit the artifact.
 | `kv_mount` | `string` | OpenBao KV v2 mount path | `--kv-mount` |
 | `registration_id` | `string` | Deployment-wide unique registration key. Names the KV subtree, the managed `agent.toml` block, the fast-poll state filename and the default cert/key filenames. Never part of the certificate SAN. | `--registration-id` |
 | `service_name` | `string` | Second label of the certificate SAN | `--service-name` |
-| `role_id_path` | `string` | Path to AppRole `role_id` file on the remote host | `--role-id-path` |
-| `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host | `--secret-id-path` |
-| `eab_file_path` | `string` | Path to EAB credentials JSON file. Bootroot writes this file only when the operator has provisioned EAB credentials in OpenBao KV. When the KV entry is absent, bootroot removes any stale `eab.json` left by a prior bootstrap so `bootroot-agent --eab-file` cannot forward obsolete credentials: the eab apply step reports `applied` when a stale file was removed and `skipped` when no file existed to begin with. | `--eab-file-path` |
+| `role_id_path` | `string` | Path to AppRole `role_id` file on the remote host. The `role_id` sibling of `secret_id_path`. | `--role-id-path` |
+| `secret_id_path` | `string` | Path to AppRole `secret_id` file on the remote host. The path given to `service add --secret-id-path`; without it, the control node's `<secrets_dir>/services/<registration_id>/secret_id`. | `--secret-id-path` |
+| `eab_file_path` | `string` | Path to EAB credentials JSON file on the remote host, the `eab.json` sibling of `secret_id_path`. Bootroot writes this file only when the operator has provisioned EAB credentials in OpenBao KV. When the KV entry is absent, bootroot removes any stale `eab.json` left by a prior bootstrap so `bootroot-agent --eab-file` cannot forward obsolete credentials: the eab apply step reports `applied` when a stale file was removed and `skipped` when no file existed to begin with. | `--eab-file-path` |
 | `agent_config_path` | `string` | Path to `agent.toml` on the remote host | `--agent-config-path` |
 | `ca_bundle_path` | `string` | Path to CA trust bundle PEM file on the remote host | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | Inline PEM content of the control-plane CA trust anchor. Written to `ca_bundle_path` during bootstrap. When `openbao_url` uses HTTPS, this CA is used as the TLS trust anchor instead of the system trust store. Shared primitive — also consumed by the http01 admin client (#514). | Internal (TLS trust) |

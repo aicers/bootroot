@@ -489,6 +489,7 @@ mod tests {
             agent_responder_url: None,
             cert_group_gid: None,
             secret_id_path_override: None,
+            remote_secret_id_path: None,
         }
     }
 

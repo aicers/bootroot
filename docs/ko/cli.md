@@ -1219,16 +1219,33 @@ post-renew 훅이 컨테이너를 리로드합니다
 - `--agent-config`: bootroot-agent 설정 파일 경로
 - `--cert-path`: 인증서 출력 경로
 - `--key-path`: 개인키 출력 경로
-- `--secret-id-path`: 서비스 `secret_id`를 기록할 절대 경로(`local-file`
-  전달 방식에서만 적용). `secret_id`, 형제 `role_id`, `eab.json`을 root
-  소유 `<secrets_dir>/services/<svc>/` 트리 밖의 에이전트 계정 소유
-  디렉터리로 재배치하여, 같은 호스트의 비-root `bootroot-agent`가
-  `role_id`/`eab.json`을 읽고 `secret_id`를 다시 쓸 수 있도록 합니다.
-  상위 디렉터리는 미리 존재하고 에이전트 소유여야 하며 `<secrets_dir>`
-  밖으로 해석되어야 합니다. `remote-bootstrap` 전달 방식, 마지막 경로
-  구성요소가 `role_id`인 경우(파생된 형제 파일과 충돌), 또는
-  `<secrets_dir>` 내부로 해석되는 경우에는 거부됩니다. 생략하면 기본값인
-  `<secrets_dir>/services/<svc>/` 아래에 유지됩니다.
+- `--secret-id-path`: 서비스 `secret_id`의 절대 경로. `role_id`와
+  `eab.json`은 항상 그 형제 파일로 파생됩니다. 생략하면 기본값인
+  `<secrets_dir>/services/<svc>/` 아래에 유지됩니다. 두 전달 방식 모두
+  상대 경로와, 마지막 경로 구성요소가 `role_id` 또는 `eab.json`인 경로를
+  거부합니다. 파생된 형제 파일과 같은 파일을 가리키게 되어 자격 증명을
+  덮어쓰기 때문입니다. 경로의 의미는 전달 방식에 따라 다릅니다.
+  - `local-file`: 컨트롤 노드가 자격 증명을 기록하는 위치입니다.
+    `secret_id`, `role_id`, `eab.json`을 root 소유
+    `<secrets_dir>/services/<svc>/` 트리 밖의 에이전트 계정 소유
+    디렉터리로 재배치하여, 같은 호스트의 비-root `bootroot-agent`가
+    `role_id`/`eab.json`을 읽고 `secret_id`를 다시 쓸 수 있도록 합니다.
+    상위 디렉터리는 미리 존재하고 에이전트 소유여야 하며
+    `<secrets_dir>` 밖으로 해석되어야 합니다. `<secrets_dir>` 내부로
+    해석되는 경로는 거부됩니다.
+  - `remote-bootstrap`: **대상 호스트**가 자격 증명을 두는 위치입니다.
+    이 경로는 부트스트랩 아티팩트에 `secret_id_path`로 기록되고,
+    `role_id_path`와 `eab_file_path`는 그 옆 경로가 됩니다.
+    `--agent-config`, `--cert-path`, `--key-path`가 대상 경로를
+    가리키는 것과 같습니다. 컨트롤 노드의 파일 시스템에 대해서는
+    검사하지 않으며, 대상 호스트 소유자가 `bootroot-remote bootstrap`
+    실행 전에 상위 디렉터리를 준비합니다. 컨트롤 노드는 플래그가 없을
+    때와 같이 자체 `role_id`/`secret_id` 사본을
+    `<secrets_dir>/services/<svc>/` 아래에 유지하며, 회전과
+    `service remove --delete-artifacts`는 이 사본에만 작용합니다.
+    `service add`를 다시 실행할 때 멱등으로 처리되려면 같은
+    `--secret-id-path`를 반복해야 하며, 다르거나 빠진 경우 중복으로
+    거부됩니다.
 - `--instance-id`: 서비스 instance_id
   - 숫자만 허용됩니다 (`001`, `42` 등)
 - `--auth-mode`: 런타임 인증 모드 (`auto`, `root`, `approle`, 기본값 `auto`)

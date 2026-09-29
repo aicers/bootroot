@@ -318,6 +318,17 @@ pub(crate) struct ServiceEntry {
     /// workarounds — see issue #593.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cert_group_gid: Option<u32>,
+    /// Target-host `secret_id` path a `remote-bootstrap` registration
+    /// named with `--secret-id-path`. It goes into the bootstrap
+    /// artifact only, with `role_id` and `eab.json` as its siblings;
+    /// the control node's own copies stay at
+    /// [`ServiceRoleEntry::secret_id_path`]. `None` for local-file
+    /// registrations and for remote ones added without the flag, whose
+    /// artifact carries the control-side path. Persisted so an
+    /// idempotent re-run reissues the artifact with the same target
+    /// paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_secret_id_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -715,6 +726,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            remote_secret_id_path: None,
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");
         let parsed: ServiceEntry = serde_json::from_str(&json).expect("deserialize");
@@ -723,6 +735,46 @@ mod tests {
         assert_eq!(
             parsed.post_renew_hooks[0].on_failure,
             HookFailurePolicyEntry::Stop
+        );
+    }
+
+    /// A `state.json` written before `remote_secret_id_path` existed
+    /// loads with the field `None`, and saving it again does not add the
+    /// key, so the file stays byte-identical for registrations without
+    /// a target `--secret-id-path`.
+    #[test]
+    fn service_entry_without_remote_secret_id_path_round_trips_unchanged() {
+        let json = r#"{
+            "registration_id": "edge-svc-001",
+            "service_name": "svc",
+            "delivery_mode": "remote-bootstrap",
+            "hostname": "h",
+            "domain": "d.com",
+            "agent_config_path": "agent.toml",
+            "cert_path": "cert.pem",
+            "key_path": "key.pem",
+            "approle": {
+                "role_name": "r",
+                "role_id": "id",
+                "secret_id_path": "secrets/services/edge-svc-001/secret_id",
+                "policy_name": "p"
+            }
+        }"#;
+        let parsed: ServiceEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(parsed.remote_secret_id_path.is_none());
+        let saved = serde_json::to_string(&parsed).expect("serialize");
+        assert!(
+            !saved.contains("remote_secret_id_path"),
+            "an unset target path must not be written: {saved}"
+        );
+
+        let mut with_target = parsed;
+        with_target.remote_secret_id_path = Some(PathBuf::from("/srv/agent/svc/secret_id"));
+        let saved = serde_json::to_string(&with_target).expect("serialize");
+        let reparsed: ServiceEntry = serde_json::from_str(&saved).expect("deserialize");
+        assert_eq!(
+            reparsed.remote_secret_id_path.as_deref(),
+            Some(std::path::Path::new("/srv/agent/svc/secret_id"))
         );
     }
 
