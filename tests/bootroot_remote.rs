@@ -759,12 +759,12 @@ impl BootstrapPaths {
 
 /// Stubs a service KV subtree the way a registrar mint seeds it: `eab`
 /// is the explicit empty shape, `http_responder_hmac` and `trust` are
-/// present unless `with_responder_hmac` is false, and the `secret_id`
+/// present except for the one named by `absent`, and the `secret_id`
 /// record answers `secret_id`.
 async fn stub_seeded_subtree(
     server: &MockServer,
     secret_id: ResponseTemplate,
-    with_responder_hmac: bool,
+    absent: Option<&str>,
 ) {
     Mock::given(method("POST"))
         .and(path("/v1/auth/approle/login"))
@@ -789,7 +789,7 @@ async fn stub_seeded_subtree(
         })))
         .mount(server)
         .await;
-    if with_responder_hmac {
+    if absent != Some("http_responder_hmac") {
         Mock::given(method("GET"))
             .and(path(
                 "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac",
@@ -801,14 +801,16 @@ async fn stub_seeded_subtree(
             .mount(server)
             .await;
     }
-    Mock::given(method("GET"))
-        .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
-        .and(header("X-Vault-Token", "remote-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "data": { "data": valid_trust_payload() }
-        })))
-        .mount(server)
-        .await;
+    if absent != Some("trust") {
+        Mock::given(method("GET"))
+            .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
+            .and(header("X-Vault-Token", "remote-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "data": valid_trust_payload() }
+            })))
+            .mount(server)
+            .await;
+    }
 }
 
 /// A subtree with no `secret_id` — always the case for a registrar-minted
@@ -818,7 +820,7 @@ async fn stub_seeded_subtree(
 async fn test_bootroot_remote_keeps_its_secret_id_when_kv_holds_none() {
     let paths = BootstrapPaths::new();
     let server = MockServer::start().await;
-    stub_seeded_subtree(&server, ResponseTemplate::new(404), true).await;
+    stub_seeded_subtree(&server, ResponseTemplate::new(404), None).await;
 
     let output = paths.run_json(&server.uri());
 
@@ -849,7 +851,7 @@ async fn test_bootroot_remote_fails_when_secret_id_read_errors() {
     for status in [500, 403] {
         let paths = BootstrapPaths::new();
         let server = MockServer::start().await;
-        stub_seeded_subtree(&server, ResponseTemplate::new(status), true).await;
+        stub_seeded_subtree(&server, ResponseTemplate::new(status), None).await;
 
         let output = paths.run_json(&server.uri());
 
@@ -874,7 +876,7 @@ async fn test_bootroot_remote_fails_when_secret_id_payload_is_malformed() {
         ResponseTemplate::new(200).set_body_json(json!({
             "data": { "data": { "unexpected": "value" } }
         })),
-        true,
+        None,
     )
     .await;
 
@@ -888,22 +890,31 @@ async fn test_bootroot_remote_fails_when_secret_id_payload_is_malformed() {
     );
 }
 
-/// `http_responder_hmac` stays required: with no `secret_id` either, a
-/// missing responder record still fails closed.
+/// `http_responder_hmac` and `trust` stay required: with no `secret_id`
+/// either, a missing responder or trust record still fails closed.
 #[tokio::test]
-async fn test_bootroot_remote_fails_when_responder_hmac_missing() {
-    let paths = BootstrapPaths::new();
-    let server = MockServer::start().await;
-    stub_seeded_subtree(&server, ResponseTemplate::new(404), false).await;
+async fn test_bootroot_remote_fails_when_a_required_record_is_missing() {
+    for (absent, message) in [
+        (
+            "http_responder_hmac",
+            "Failed to read service responder hmac from OpenBao",
+        ),
+        ("trust", "Failed to read service trust data from OpenBao"),
+    ] {
+        let paths = BootstrapPaths::new();
+        let server = MockServer::start().await;
+        stub_seeded_subtree(&server, ResponseTemplate::new(404), Some(absent)).await;
 
-    let output = paths.run_json(&server.uri());
+        let output = paths.run_json(&server.uri());
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Failed to read service responder hmac from OpenBao"),
-        "stderr: {stderr}"
-    );
+        assert!(!output.status.success(), "a missing {absent} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{absent}: stderr: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&paths.secret_id).expect("read secret_id"),
+            "old-secret\n"
+        );
+    }
 }
 
 /// Returns a valid trust bundle (a real self-signed CA PEM and the matching
