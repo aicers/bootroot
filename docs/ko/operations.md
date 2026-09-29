@@ -2506,7 +2506,13 @@ Agent 로그인이 `403 invalid role or secret ID`로 실패하기 시작합니�
   추가된 서비스도 자동으로 포함됩니다 — 서비스별 유닛을 동기화할
   필요가 없습니다. 서비스별 실패가 있어도 계속 진행하고, 대상별 요약을
   출력하며, 하나라도 실패하면 0이 아닌 코드로 종료합니다. 빈
-  레지스트리는 no-op 성공입니다.
+  레지스트리는 no-op 성공입니다. endpoint가 활성화된 호스트에서는
+  바인딩이 `active`인 모든 registrar 관리 identity도 갱신하며
+  ([실행 중인 에이전트로의 회전 전파](#실행-중인-에이전트로의-회전-전파)
+  참고), 이를 위해 registrar 데몬이 사용하는 `bootroot-agent` 설정을
+  `--agent-config <path>`로 전달해야 합니다. 새 `secret_id`는 그 파일의
+  `[registrar]` 옵션으로 발급됩니다. 회전 작업은 그 파일을 읽을 수 있어야
+  합니다. 이 플래그가 없으면 배치는 아무것도 발급하기 전에 거부합니다.
 - **인프라 대상별 호출 2회** (`--infra stepca`, `--infra responder`)는
   infra-rotate 자격증명을 사용합니다.
   [인프라 AppRole secret_id 회전](#인프라-approle-secret_id-회전-stepca-responder)을
@@ -2517,6 +2523,9 @@ Agent 로그인이 `403 invalid role or secret ID`로 실패하기 시작합니�
 기본 `24h` TTL이라면 작업을 **8–12시간마다** 실행하세요. 서비스별
 `--secret-id-ttl` 재정의가 있으면 모든 대상(서비스와 인프라 역할 모두)
 중 **가장 작은** TTL에 대해 불변식을 만족하도록 스케줄해야 합니다.
+registrar 관리 identity도 이 대상에 포함되며, 그 TTL은
+`[registrar] secret_id_ttl`이 설정되어 있으면 그 값, 아니면
+`[registrar] role_secret_id_ttl`(기본 `24h`)입니다.
 
 각 rotate 자격증명의 `role_id`/`secret_id`는 root 소유 파일(모드
 `0600`)에 저장하세요. 예:
@@ -2567,6 +2576,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
+
+endpoint가 활성화된 호스트에서는 배치 호출에 `--agent-config`를
+추가하세요. 예: `approle-secret-id --all-services --yes --agent-config
+/etc/bootroot/agent.toml`.
 
 `Type=oneshot`에서는 실패한 `ExecStart` 라인이 나머지 라인을 중단시키고
 유닛을 실패로 표시합니다. 회전은 멱등이고(기존 `secret_id`는 TTL까지
@@ -2860,6 +2873,10 @@ reload/restart required" 안내를 출력합니다. 훅이 없는 서비스는
 | 12시간    | 24시간 (기본값) |
 | 24시간    | 48시간          |
 
+registrar 관리 identity에도 같은 규칙이 적용되며, 기준은
+`[registrar] secret_id_ttl`이 설정되어 있으면 그 값, 아니면
+`[registrar] role_secret_id_ttl`입니다.
+
 예를 들어, 12시간 회전 스케줄에서 기본 `24h` TTL은 정확히 한 번의 누락
 버퍼를 제공합니다. 자동화가 적시 실행을 보장할 수 없다면 TTL을 늘리거나
 회전 주기를 줄이세요.
@@ -2989,6 +3006,22 @@ binding이 있는 모든 registration id에 동일한 `http_responder_hmac`,
 하위 트리에는 기록하지 않습니다. 해당 identity의 호스트는 다른
 remote-bootstrap 서비스와 똑같이 `bootroot-agent` fast-poll 루프로 새 값을
 가져옵니다. `registrar_endpoint` 항목이 없으면 아무것도 나열하지 않습니다.
+
+identity의 `secret_id`도 같은 방식으로 갱신됩니다.
+`rotate approle-secret-id --all-services --agent-config <path>`는 나열된
+identity 중 binding이 `active`인 모든 identity에 대해 `[registrar]`
+테이블의 `secret_id_num_uses`, `secret_id_ttl`,
+`secret_id_token_bound_cidrs`로 `bootroot-service-<registration_id>`에 새
+`secret_id`를 발급하고, 이를
+`bootroot/services/<registration_id>/secret_id`에 기록하며, 호스트의
+fast-poll 루프가 이 값을 가져갑니다. binding이 아직 `creating`인
+identity는 자격증명을 받은 적이 없으므로 건너뜀으로 보고되고, 해석할 수
+없는 binding은 실패입니다. registrar identity의 자격증명을 갱신하는
+경로는 이것뿐입니다: registrar mint는 대상이 설치될 때만 실행되므로,
+스케줄된 배치가 없으면 registrar로 발급된 모든 호스트가 bootstrap 후
+`secret_id` TTL 한 번이 지나면 인증에 실패합니다. 이미 `secret_id`가
+만료된 identity는 push로 복구할 수 없습니다 — 그 호스트는 더 이상
+로그인해 값을 읽을 수 없습니다.
 
 이 나열에는 `<kv>/metadata/bootroot/services/`에 대한 `list` 권한이
 필요하며, `bootroot init`이 이를 `bootroot-runtime-rotate` 정책에

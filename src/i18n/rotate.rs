@@ -511,6 +511,100 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_rotate_agent_config_required(&self, names: &str) -> String {
+        format_template(
+            self.strings().error_rotate_agent_config_required,
+            &[("names", names)],
+        )
+    }
+
+    pub(crate) fn error_rotate_agent_config_unreadable(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().error_rotate_agent_config_unreadable,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_rotate_agent_config_malformed(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().error_rotate_agent_config_malformed,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_rotate_agent_config_undeserializable(
+        &self,
+        path: &str,
+        reason: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_agent_config_undeserializable,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_rotate_agent_config_rejected(&self, path: &str, reason: &str) -> String {
+        format_template(
+            self.strings().error_rotate_agent_config_rejected,
+            &[("path", path), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn rotate_all_target_skipped(&self, service_name: &str, reason: &str) -> String {
+        format_template(
+            self.strings().rotate_all_target_skipped,
+            &[("service_name", service_name), ("reason", reason)],
+        )
+    }
+
+    pub(crate) fn rotate_skip_reason_binding_creating(&self) -> &'static str {
+        self.strings().rotate_skip_reason_binding_creating
+    }
+
+    pub(crate) fn rotate_skip_reason_binding_gone(&self) -> &'static str {
+        self.strings().rotate_skip_reason_binding_gone
+    }
+
+    pub(crate) fn rotate_all_skipped_result(&self, skipped: usize) -> String {
+        format_template(
+            self.strings().rotate_all_skipped_result,
+            &[("skipped", &skipped.to_string())],
+        )
+    }
+
+    pub(crate) fn rotate_registrar_listing_target(&self) -> &'static str {
+        self.strings().rotate_registrar_listing_target
+    }
+
+    pub(crate) fn error_rotate_registrar_identity_not_minted(&self, service_name: &str) -> String {
+        format_template(
+            self.strings().error_rotate_registrar_identity_not_minted,
+            &[("service_name", service_name)],
+        )
+    }
+
+    pub(crate) fn error_rotate_registrar_binding_read_failed(
+        &self,
+        service_name: &str,
+        path: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_registrar_binding_read_failed,
+            &[("service_name", service_name), ("path", path)],
+        )
+    }
+
+    pub(crate) fn error_rotate_registrar_binding_undecodable(
+        &self,
+        service_name: &str,
+        path: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_registrar_binding_undecodable,
+            &[("service_name", service_name), ("path", path)],
+        )
+    }
+
     pub(crate) fn rotate_ca_key_finalize_blocked(&self, services: &str) -> String {
         format_template(
             self.strings().rotate_ca_key_finalize_blocked,

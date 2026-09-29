@@ -536,6 +536,42 @@ impl Default for RegistrarSettings {
     }
 }
 
+impl RegistrarSettings {
+    /// Returns the fixed per-issuance `secret_id` options every
+    /// registrar-identity credential is issued with.
+    ///
+    /// Both issuers read them from here: the registrar mint, and
+    /// `bootroot rotate approle-secret-id` when it renews a
+    /// registrar-minted identity. One derivation keeps a rotation from
+    /// silently dropping the CIDR binding or the use limit an operator
+    /// configured for the mint.
+    ///
+    /// `metadata` is deliberately not exposed and is fixed to `None`.
+    /// `OpenBao` echoes metadata back on lookup, and bootroot's own record
+    /// of who asked for what is the audit trail the daemon writes; a
+    /// second, operator-typed, unvalidated one attached to every issued
+    /// `secret_id` is not a knob this endpoint grows. `ttl` is absent
+    /// unless `secret_id_ttl` is set, which leaves the role-level TTL
+    /// governing.
+    #[must_use]
+    pub fn secret_id_options(&self) -> crate::openbao::SecretIdOptions {
+        crate::openbao::SecretIdOptions {
+            ttl: self.secret_id_ttl.map(openbao_duration),
+            num_uses: Some(self.secret_id_num_uses),
+            metadata: None,
+            token_bound_cidrs: self.secret_id_token_bound_cidrs.clone(),
+        }
+    }
+}
+
+/// Renders a configured duration as the `<n>s` form `OpenBao` parses.
+///
+/// Validation has already held every one of these to a whole number of
+/// seconds, so nothing is truncated here.
+pub(crate) fn openbao_duration(value: Duration) -> String {
+    format!("{}s", value.as_secs())
+}
+
 /// The host-local registrar endpoint's settings.
 ///
 /// The endpoint is a Linux-only, systemd-socket-activated `AF_UNIX`
@@ -1237,6 +1273,53 @@ mod tests {
         assert_eq!(profile.daemon.check_jitter, Duration::from_secs(0));
         assert!(profile.hooks.post_renew.success.is_empty());
         assert!(profile.hooks.post_renew.failure.is_empty());
+    }
+
+    /// The registrar `secret_id` options come from exactly four keys,
+    /// and `metadata` is not one of them. The defaults are unlimited
+    /// uses, the role-level TTL and no CIDR binding.
+    #[test]
+    fn the_registrar_secret_id_options_default_to_unlimited_uses_and_no_metadata() {
+        let options = RegistrarSettings::default().secret_id_options();
+        assert!(options.metadata.is_none(), "metadata is fixed to None");
+        assert_eq!(
+            options.num_uses,
+            Some(0),
+            "an enrolled host logs in again on every renewal, so a single-use credential strands it"
+        );
+        assert!(
+            options.ttl.is_none(),
+            "an absent secret_id_ttl leaves the role-level TTL governing"
+        );
+        assert!(options.token_bound_cidrs.is_none());
+    }
+
+    /// Configured values pass through, the TTL in `OpenBao`'s spelling.
+    #[test]
+    fn the_registrar_secret_id_options_carry_the_configured_values() {
+        let configured = RegistrarSettings {
+            secret_id_ttl: Some(Duration::from_mins(10)),
+            secret_id_num_uses: 3,
+            secret_id_token_bound_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
+            ..RegistrarSettings::default()
+        };
+        let options = configured.secret_id_options();
+        assert!(options.metadata.is_none(), "no key can set metadata");
+        assert_eq!(options.num_uses, Some(3));
+        assert_eq!(options.ttl.as_deref(), Some("600s"));
+        assert_eq!(
+            options.token_bound_cidrs.as_deref(),
+            Some(["10.0.0.0/8".to_string()].as_slice())
+        );
+    }
+
+    /// The role TTLs are handed over in `OpenBao`'s own `<n>s` spelling,
+    /// never in the humantime form the operator typed.
+    #[test]
+    fn a_configured_duration_is_rendered_in_openbaos_spelling() {
+        assert_eq!(openbao_duration(Duration::from_hours(1)), "3600s");
+        assert_eq!(openbao_duration(Duration::from_hours(24)), "86400s");
+        assert_eq!(openbao_duration(Duration::from_mins(30)), "1800s");
     }
 
     /// Every `[registrar]` key but `state_file` carries a default, and

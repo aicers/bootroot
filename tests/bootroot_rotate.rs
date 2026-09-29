@@ -5885,3 +5885,1028 @@ async fn test_rotate_ca_key_phase_3_listing_failure_resumes_at_phase_3() {
     );
     assert!(!temp_dir.path().join("rotation-state.json").exists());
 }
+
+// ---------------------------------------------------------------------------
+// `approle-secret-id` rotation of registrar-minted identities.
+//
+// A registrar-minted identity's `secret_id` is renewed by pushing a fresh
+// one to `bootroot/services/<id>/secret_id`, issued with the `[registrar]`
+// options of `--agent-config`. Only an `active` binding is rotated; a
+// `creating` one is skipped and an undecodable one fails.
+// ---------------------------------------------------------------------------
+
+/// A second registrar-bound id, used with a `creating` or undecodable binding.
+const PIGLET_ID: &str = "h1-piglet-001";
+const REGISTRAR_SECRET: &str = "registrar-secret-new";
+const STATE_SECRET: &str = "secret-new";
+const RUNTIME_ROTATE_ROLE_NAME: &str = "bootroot-runtime-rotate-role";
+const AGENT_CONFIG_REQUIRED_ERROR: &str = "`--agent-config <path>` is required";
+const NOT_MINTED_ERROR: &str = "has not finished minting";
+const SKIPPED_LINE: &str = "AppRole secret_id rotation skipped for";
+
+fn registrar_secret_id_path(registration_id: &str) -> String {
+    format!("/v1/auth/approle/role/bootroot-service-{registration_id}/secret-id")
+}
+
+fn registrar_role_id_path(registration_id: &str) -> String {
+    format!("/v1/auth/approle/role/bootroot-service-{registration_id}/role-id")
+}
+
+fn registrar_role_id(registration_id: &str) -> String {
+    format!("role-{registration_id}")
+}
+
+/// A decodable schema-1 binding record in `state`.
+fn binding_record(state: &str) -> serde_json::Value {
+    json!({ "schema_version": 1, "host": "h1", "state": state })
+}
+
+/// Writes an operator `bootroot-agent` configuration holding `registrar`
+/// as its `[registrar]` table, beside tables the rotation must ignore.
+fn write_registrar_agent_config(root: &Path, registrar: &str) -> PathBuf {
+    let path = root.join("registrar-agent.toml");
+    fs::write(
+        &path,
+        format!(
+            "email = \"admin@example.com\"\n\n[registrar]\n{registrar}\n\n[eab]\nkid = \"kid\"\nhmac = \"eab-hmac\"\n"
+        ),
+    )
+    .expect("write registrar agent config");
+    path
+}
+
+/// A `state.json` with a `registrar_endpoint` entry and no services.
+fn prepare_registrar_only_state(root: &Path, openbao_url: &str) {
+    write_state_file(root, openbao_url).expect("write state");
+    add_registrar_endpoint(root).expect("add registrar endpoint");
+}
+
+/// Lists the `state.json` service (unbound) and each given id, and
+/// answers each id's binding read with its record.
+async fn stub_registrar_identities(server: &MockServer, bindings: &[(&str, serde_json::Value)]) {
+    let mut keys = vec![format!("{SERVICE_NAME}/")];
+    keys.extend(bindings.iter().map(|(id, _)| format!("{id}/")));
+    Mock::given(method("GET"))
+        .and(path(SERVICES_LIST_PATH))
+        .and(wiremock::matchers::query_param("list", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": { "keys": keys } })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(SERVICE_NAME)))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })))
+        .mount(server)
+        .await;
+    for (id, record) in bindings {
+        Mock::given(method("GET"))
+            .and(path(binding_kv_path(id)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "data": record, "metadata": { "version": 1 } }
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Stubs the `state.json` service's remote-bootstrap rotation under any
+/// token: issuance, verification login and the KV push.
+async fn stub_state_service_rotation(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": STATE_SECRET }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(
+            json!({ "role_id": ROLE_ID, "secret_id": STATE_SECRET }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "client-token" }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(service_record_path(SERVICE_NAME, "secret_id")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+/// Stubs one registrar identity's issuance (answering `status`),
+/// `role_id` read, verification login and KV push.
+async fn stub_registrar_rotation(server: &MockServer, registration_id: &str, status: u16) {
+    let issued = if status == 200 {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": REGISTRAR_SECRET }
+        }))
+    } else {
+        ResponseTemplate::new(status).set_body_json(json!({ "errors": ["internal error"] }))
+    };
+    Mock::given(method("POST"))
+        .and(path(registrar_secret_id_path(registration_id)))
+        .respond_with(issued)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(registrar_role_id_path(registration_id)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": registrar_role_id(registration_id) }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": registrar_role_id(registration_id),
+            "secret_id": REGISTRAR_SECRET
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "registrar-client-token" }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(service_record_path(registration_id, "secret_id")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+/// Stages a file-based `bootroot-runtime-rotate-role` credential, stubs
+/// its login, self-mint and verification, and returns the auth flags.
+async fn stage_runtime_rotate_auth(root: &Path, server: &MockServer) -> Vec<String> {
+    let cred_path = root.join("rotate-secret-id");
+    fs::write(&cred_path, "old-rotate-secret\n").expect("seed rotate credential");
+    stub_openbao_for_runtime_approle_login(
+        server,
+        "rr-role-id",
+        "old-rotate-secret",
+        "rotate-token",
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/auth/approle/role/{RUNTIME_ROTATE_ROLE_NAME}/secret-id"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "self-minted-secret" }
+        })))
+        .mount(server)
+        .await;
+    stub_openbao_for_runtime_approle_login(server, "rr-role-id", "self-minted-secret", "verified")
+        .await;
+    vec![
+        "--auth-mode".to_string(),
+        "approle".to_string(),
+        "--approle-role-id".to_string(),
+        "rr-role-id".to_string(),
+        "--approle-secret-id-file".to_string(),
+        cred_path.to_string_lossy().into_owned(),
+    ]
+}
+
+fn root_auth() -> Vec<String> {
+    vec!["--root-token".to_string(), support::ROOT_TOKEN.to_string()]
+}
+
+fn run_approle_secret_id(
+    root: &Path,
+    openbao_url: &str,
+    auth_args: &[String],
+    target_args: &[&str],
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(["rotate", "--openbao-url", openbao_url])
+        .args(auth_args)
+        .args(["--yes", "approle-secret-id"])
+        .args(target_args)
+        .output()
+        .expect("run rotate approle-secret-id")
+}
+
+fn requests_to<'a>(
+    requests: &'a [wiremock::Request],
+    http_method: &str,
+    request_path: &str,
+) -> Vec<&'a wiremock::Request> {
+    requests
+        .iter()
+        .filter(|req| req.method.as_str() == http_method && req.url.path() == request_path)
+        .collect()
+}
+
+fn secret_id_issuances(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path().ends_with("/secret-id"))
+        .map(|req| req.url.path().to_string())
+        .collect()
+}
+
+/// The position of the login that presented `secret_id`, if any.
+fn login_position(requests: &[wiremock::Request], secret_id: &str) -> Option<usize> {
+    requests.iter().position(|req| {
+        req.method.as_str() == "POST"
+            && req.url.path() == "/v1/auth/approle/login"
+            && serde_json::from_slice::<serde_json::Value>(&req.body)
+                .is_ok_and(|body| body["secret_id"] == secret_id)
+    })
+}
+
+fn self_mint_requested(requests: &[wiremock::Request]) -> bool {
+    !requests_to(
+        requests,
+        "POST",
+        &format!("/v1/auth/approle/role/{RUNTIME_ROTATE_ROLE_NAME}/secret-id"),
+    )
+    .is_empty()
+}
+
+/// Asserts the registrar identity's one issuance carried `expected` as
+/// its body and no wrap header, and that the minted value was pushed.
+fn assert_registrar_issued_and_pushed(
+    requests: &[wiremock::Request],
+    registration_id: &str,
+    expected: &serde_json::Value,
+) {
+    let issued = requests_to(requests, "POST", &registrar_secret_id_path(registration_id));
+    assert_eq!(issued.len(), 1, "one issuance for {registration_id}");
+    let body: serde_json::Value =
+        serde_json::from_slice(&issued[0].body).expect("parse issuance body");
+    assert_eq!(&body, expected, "issuance options for {registration_id}");
+    assert!(
+        issued[0].headers.get("X-Vault-Wrap-TTL").is_none(),
+        "a registrar identity's secret_id is never wrapped"
+    );
+    assert_eq!(
+        posted_payloads(requests, &service_record_path(registration_id, "secret_id")),
+        vec![json!({ "secret_id": REGISTRAR_SECRET })],
+        "the minted value is pushed to {registration_id}'s KV secret_id"
+    );
+}
+
+fn assert_registrar_not_login_verified(requests: &[wiremock::Request], registration_id: &str) {
+    assert!(
+        requests_to(requests, "GET", &registrar_role_id_path(registration_id)).is_empty(),
+        "no role_id read for {registration_id}"
+    );
+    assert!(
+        login_position(requests, REGISTRAR_SECRET).is_none(),
+        "no login may spend a use of {registration_id}'s pushed secret_id"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_pushes_cidr_bound_registrar_secret_id_unverified() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(
+        temp_dir.path(),
+        "secret_id_token_bound_cidrs = [\"10.0.0.0/8\"]",
+    );
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    assert_registrar_issued_and_pushed(
+        &requests,
+        REGISTRAR_ID,
+        &json!({ "num_uses": 0, "token_bound_cidrs": ["10.0.0.0/8"] }),
+    );
+    assert_registrar_not_login_verified(&requests, REGISTRAR_ID);
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(SERVICE_NAME, "secret_id")),
+        vec![json!({ "secret_id": STATE_SECRET })],
+        "the state.json service is rotated as before"
+    );
+    assert!(
+        stdout.contains(&format!("AppRole secret_id rotated for {SERVICE_NAME}")),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "AppRole secret_id rotated for {REGISTRAR_ID}: secret/bootroot/services/{REGISTRAR_ID}/secret_id"
+        )),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2 succeeded, 0 failed (total 2)"),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(REGISTRAR_SECRET) && !stderr.contains(REGISTRAR_SECRET),
+        "the pushed secret_id is never printed"
+    );
+    assert!(
+        !stdout.contains("eab-hmac") && !stderr.contains("eab-hmac"),
+        "nothing from --agent-config is printed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_login_verifies_unbound_unlimited_registrar_secret_id() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(
+        temp_dir.path(),
+        "secret_id_num_uses = 0\nsecret_id_ttl = \"12h\"",
+    );
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    assert_registrar_issued_and_pushed(
+        &requests,
+        REGISTRAR_ID,
+        &json!({ "num_uses": 0, "ttl": "43200s" }),
+    );
+    let role_id_read = position_of(&requests, "GET", &registrar_role_id_path(REGISTRAR_ID))
+        .expect("the role_id is read for the verification login");
+    let login =
+        login_position(&requests, REGISTRAR_SECRET).expect("the new secret_id is login-verified");
+    let push = position_of(
+        &requests,
+        "POST",
+        &service_record_path(REGISTRAR_ID, "secret_id"),
+    )
+    .expect("the new secret_id is pushed");
+    assert!(
+        role_id_read < login && login < push,
+        "verification precedes the KV write: role-id {role_id_read}, login {login}, push {push}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_use_limited_registrar_secret_id_is_not_login_verified() {
+    for num_uses in [1, 5] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let openbao = MockServer::start().await;
+        prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+            .expect("prepare state");
+        let agent_config = write_registrar_agent_config(
+            temp_dir.path(),
+            &format!("secret_id_num_uses = {num_uses}"),
+        );
+        stub_state_service_rotation(&openbao).await;
+        stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+        stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+        let output = run_approle_secret_id(
+            temp_dir.path(),
+            &openbao.uri(),
+            &root_auth(),
+            &[
+                "--all-services",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "num_uses {num_uses}; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let requests = received(&openbao).await;
+        assert_registrar_issued_and_pushed(
+            &requests,
+            REGISTRAR_ID,
+            &json!({ "num_uses": num_uses }),
+        );
+        assert_registrar_not_login_verified(&requests, REGISTRAR_ID);
+        assert!(
+            !stdout.contains(&format!("AppRole login OK for {REGISTRAR_ID}")),
+            "num_uses {num_uses}; stdout:\n{stdout}"
+        );
+    }
+}
+
+/// The single-id path prints a login-ok line only for a verified value,
+/// so a use-limited one gets none, and an unlimited one does.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_registration_id_prints_login_ok_only_when_verified() {
+    for (registrar, verified) in [("secret_id_num_uses = 1", false), ("", true)] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let openbao = MockServer::start().await;
+        prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+            .expect("prepare state");
+        let agent_config = write_registrar_agent_config(temp_dir.path(), registrar);
+        stub_state_service_rotation(&openbao).await;
+        stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+        stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+        let output = run_approle_secret_id(
+            temp_dir.path(),
+            &openbao.uri(),
+            &root_auth(),
+            &[
+                "--registration-id",
+                REGISTRAR_ID,
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{registrar:?}; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.contains(&format!("AppRole login OK for {REGISTRAR_ID}")),
+            verified,
+            "{registrar:?}; stdout:\n{stdout}"
+        );
+        assert_eq!(
+            login_position(&received(&openbao).await, REGISTRAR_SECRET).is_some(),
+            verified,
+            "{registrar:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_requires_agent_config_for_an_active_registrar_id() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &["--all-services"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(AGENT_CONFIG_REQUIRED_ERROR) && stderr.contains(REGISTRAR_ID),
+        "stderr:\n{stderr}"
+    );
+    let issued = secret_id_issuances(&received(&openbao).await);
+    assert!(
+        issued.is_empty(),
+        "no secret_id may be issued for any target: {issued:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_refuses_a_misspelled_registrar_key() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "secret_id_num_use = 0");
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Refusing to rotate") && stderr.contains("secret_id_num_use"),
+        "stderr:\n{stderr}"
+    );
+    let issued = secret_id_issuances(&received(&openbao).await);
+    assert!(
+        issued.is_empty(),
+        "no secret_id may be issued for any target: {issued:?}"
+    );
+}
+
+/// Without a `registrar_endpoint` entry nothing is listed or probed and
+/// `--agent-config` is neither required nor read.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_without_registrar_endpoint_is_unchanged() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_state_service_rotation(&openbao).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &["--all-services"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    assert_no_registrar_enumeration(&requests);
+    let paths: Vec<(String, String)> = requests
+        .iter()
+        .map(|req| (req.method.to_string(), req.url.path().to_string()))
+        .filter(|(_, p)| p != "/v1/sys/health")
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            (
+                "POST".to_string(),
+                format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")
+            ),
+            ("POST".to_string(), "/v1/auth/approle/login".to_string()),
+            (
+                "POST".to_string(),
+                service_record_path(SERVICE_NAME, "secret_id")
+            ),
+        ],
+        "exactly the requests a rotation sent before registrar identities existed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_skips_a_creating_registrar_binding() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    let auth = stage_runtime_rotate_auth(temp_dir.path(), &openbao).await;
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(
+        &openbao,
+        &[
+            (REGISTRAR_ID, binding_record("active")),
+            (PIGLET_ID, binding_record("creating")),
+        ],
+    )
+    .await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+    stub_registrar_rotation(&openbao, PIGLET_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &auth,
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a creating binding is not a failure; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    assert!(
+        requests_to(&requests, "POST", &registrar_secret_id_path(PIGLET_ID)).is_empty(),
+        "a creating binding gets no secret-id request"
+    );
+    assert!(
+        posted_payloads(&requests, &service_record_path(PIGLET_ID, "secret_id")).is_empty(),
+        "nothing is pushed for a creating binding"
+    );
+    assert_registrar_issued_and_pushed(&requests, REGISTRAR_ID, &json!({ "num_uses": 0 }));
+    assert!(
+        stdout.contains(&format!("{SKIPPED_LINE} {PIGLET_ID}")) && stdout.contains("creating"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("services skipped: 1"), "stdout:\n{stdout}");
+    assert!(
+        self_mint_requested(&requests),
+        "a skipped target does not withhold the self-mint"
+    );
+    let state = fs::read_to_string(temp_dir.path().join("state.json")).expect("read state");
+    assert!(state.contains("last_secret_id_rotation"), "state:\n{state}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_fails_an_undecodable_registrar_binding() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    let auth = stage_runtime_rotate_auth(temp_dir.path(), &openbao).await;
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(
+        &openbao,
+        &[
+            (REGISTRAR_ID, binding_record("active")),
+            (
+                PIGLET_ID,
+                json!({ "schema_version": 99, "host": "h1", "state": "active" }),
+            ),
+        ],
+    )
+    .await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+    stub_registrar_rotation(&openbao, PIGLET_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &auth,
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "AppRole secret_id rotation FAILED for {PIGLET_ID}"
+        )) && stdout.contains("schema_version 99"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stderr.contains(PIGLET_ID), "stderr:\n{stderr}");
+    let requests = received(&openbao).await;
+    assert!(requests_to(&requests, "POST", &registrar_secret_id_path(PIGLET_ID)).is_empty());
+    assert_registrar_issued_and_pushed(&requests, REGISTRAR_ID, &json!({ "num_uses": 0 }));
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(SERVICE_NAME, "secret_id")).len(),
+        1,
+        "the state.json service is still rotated"
+    );
+    assert!(
+        !self_mint_requested(&requests),
+        "a failure withholds the self-mint"
+    );
+}
+
+/// With nothing `active`, `--agent-config` is not required.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_creating_binding_alone_needs_no_agent_config() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_registrar_only_state(temp_dir.path(), &openbao.uri());
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(PIGLET_ID, binding_record("creating"))]).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &["--all-services"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        secret_id_issuances(&received(&openbao).await).is_empty(),
+        "nothing is rotated"
+    );
+    assert_eq!(
+        stdout.matches(SKIPPED_LINE).count(),
+        1,
+        "one skipped line; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("No services are registered"),
+        "a skipped id is not \"no services\"; stdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)] // four sequential CLI runs against one mock
+#[tokio::test]
+async fn test_rotate_registration_id_targets_registrar_identities() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(
+        &openbao,
+        &[
+            (REGISTRAR_ID, binding_record("active")),
+            (PIGLET_ID, binding_record("creating")),
+        ],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path("nope")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })))
+        .mount(&openbao)
+        .await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+    stub_registrar_rotation(&openbao, PIGLET_ID, 200).await;
+    let agent_config_arg = agent_config.to_string_lossy().into_owned();
+
+    // An active id alone is rotated, without the enumeration's listing.
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--registration-id",
+            REGISTRAR_ID,
+            "--agent-config",
+            &agent_config_arg,
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    assert_eq!(
+        secret_id_issuances(&requests),
+        vec![registrar_secret_id_path(REGISTRAR_ID)],
+        "only that identity is rotated"
+    );
+    assert!(
+        listing_positions(&requests).is_empty(),
+        "rotating one identity needs no list grant"
+    );
+    assert_registrar_issued_and_pushed(&requests, REGISTRAR_ID, &json!({ "num_uses": 0 }));
+    assert!(
+        stdout.contains(&format!("AppRole login OK for {REGISTRAR_ID}")),
+        "stdout:\n{stdout}"
+    );
+
+    // A creating id is refused.
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--registration-id",
+            PIGLET_ID,
+            "--agent-config",
+            &agent_config_arg,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(NOT_MINTED_ERROR) && stderr.contains(PIGLET_ID),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        requests_to(
+            &received(&openbao).await,
+            "POST",
+            &registrar_secret_id_path(PIGLET_ID)
+        )
+        .is_empty()
+    );
+
+    // An unknown id keeps today's not-found error.
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--registration-id",
+            "nope",
+            "--agent-config",
+            &agent_config_arg,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Service not found: nope"),
+        "stderr:\n{stderr}"
+    );
+
+    // An id the registrar could never derive is not looked up in KV.
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--registration-id",
+            "../escape",
+            "--agent-config",
+            &agent_config_arg,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("Service not found: ../escape"),
+        "stderr:\n{stderr}"
+    );
+    let probed: Vec<String> = received(&openbao)
+        .await
+        .iter()
+        .map(|req| req.url.path().to_string())
+        .filter(|p| p.contains("escape"))
+        .collect();
+    assert!(probed.is_empty(), "no KV path is built from it: {probed:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_continues_past_a_registrar_issuance_failure() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    let auth = stage_runtime_rotate_auth(temp_dir.path(), &openbao).await;
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 500).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &auth,
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "AppRole secret_id rotation FAILED for {REGISTRAR_ID}"
+        )),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 succeeded, 1 failed (total 2)"),
+        "stdout:\n{stdout}"
+    );
+    let requests = received(&openbao).await;
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(SERVICE_NAME, "secret_id")).len(),
+        1,
+        "the state.json service is still rotated"
+    );
+    assert!(
+        posted_payloads(&requests, &service_record_path(REGISTRAR_ID, "secret_id")).is_empty(),
+        "nothing is pushed after a failed issuance"
+    );
+    assert!(
+        !self_mint_requested(&requests),
+        "a failure withholds the self-mint"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_rotates_a_registrar_id_with_no_state_services() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_registrar_only_state(temp_dir.path(), &openbao.uri());
+    let agent_config = write_registrar_agent_config(temp_dir.path(), "");
+    stub_state_service_rotation(&openbao).await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    stub_registrar_rotation(&openbao, REGISTRAR_ID, 200).await;
+
+    let output = run_approle_secret_id(
+        temp_dir.path(),
+        &openbao.uri(),
+        &root_auth(),
+        &[
+            "--all-services",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("No services are registered"),
+        "stdout:\n{stdout}"
+    );
+    assert_registrar_issued_and_pushed(
+        &received(&openbao).await,
+        REGISTRAR_ID,
+        &json!({ "num_uses": 0 }),
+    );
+}
+
+/// A failed enumeration never aborts the `state.json` rotations: it is
+/// one failure, reported with the grant it needs.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_all_services_listing_failure_still_rotates_state_services() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let auth = stage_runtime_rotate_auth(temp_dir.path(), &openbao).await;
+    stub_state_service_rotation(&openbao).await;
+    Mock::given(method("GET"))
+        .and(path(SERVICES_LIST_PATH))
+        .respond_with(forbidden())
+        .mount(&openbao)
+        .await;
+
+    let output = run_approle_secret_id(temp_dir.path(), &openbao.uri(), &auth, &["--all-services"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains(REGISTRAR_LIST_ERROR), "stdout:\n{stdout}");
+    let requests = received(&openbao).await;
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(SERVICE_NAME, "secret_id")).len(),
+        1,
+        "the state.json service is still rotated"
+    );
+    assert!(
+        !self_mint_requested(&requests),
+        "a failure withholds the self-mint"
+    );
+}

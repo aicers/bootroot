@@ -2,12 +2,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::input_validation::validate_registration_id;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
+use bootroot::registrar::RegistrarBindingState;
+use bootroot::service_material::service_role_name;
 
 use super::helpers::{confirm_action, restart_container, write_secret_id_atomic};
+use super::registrar_targets::{read_registrar_binding_state, registrar_only_targets};
 use super::{ROLE_ID_FILENAME, RotateContext};
 use crate::cli::args::{InfraRoleTarget, RotateAppRoleSecretIdArgs};
 use crate::cli::output::display_secret;
+use crate::commands::audit_store::{AgentConfigReadError, load_registrar_settings};
 use crate::commands::constants::{SERVICE_KV_BASE, SERVICE_SECRET_ID_KEY};
 use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::init::{
@@ -93,7 +98,14 @@ pub(super) async fn rotate_approle_secret_id(
         .await?;
         AppRoleLabel::InfraRotate
     } else if args.all_services {
-        rotate_all_service_approle_secret_ids(ctx, client, auto_confirm, messages).await?;
+        rotate_all_service_approle_secret_ids(
+            ctx,
+            client,
+            args.agent_config.as_deref(),
+            auto_confirm,
+            messages,
+        )
+        .await?;
         AppRoleLabel::RuntimeRotate
     } else {
         let registration_id = args.registration_id.as_deref().ok_or_else(|| {
@@ -101,8 +113,15 @@ pub(super) async fn rotate_approle_secret_id(
             // callers that construct the args directly.
             anyhow::anyhow!(messages.error_value_required())
         })?;
-        rotate_service_approle_secret_id(ctx, client, registration_id, auto_confirm, messages)
-            .await?;
+        rotate_service_approle_secret_id(
+            ctx,
+            client,
+            registration_id,
+            args.agent_config.as_deref(),
+            auto_confirm,
+            messages,
+        )
+        .await?;
         AppRoleLabel::RuntimeRotate
     };
 
@@ -223,20 +242,76 @@ struct ServiceRotationReport {
     login_verified: bool,
 }
 
+/// How `--all-services` treats one registrar-managed identity, decided
+/// from its binding before anything is issued.
+enum RegistrarTarget {
+    /// The binding is `active`: rotate it.
+    Rotate,
+    /// Nothing to rotate, and not a failure: the reason is reported.
+    Skip(&'static str),
+    /// The binding could not be read or decoded, or the enumeration
+    /// itself failed.
+    Fail(anyhow::Error),
+}
+
+/// One target's line in the batch summary.
+enum TargetOutcome {
+    Rotated(ServiceRotationReport),
+    Skipped(&'static str),
+    Failed(anyhow::Error),
+}
+
+impl From<Result<ServiceRotationReport>> for TargetOutcome {
+    fn from(result: Result<ServiceRotationReport>) -> Self {
+        match result {
+            Ok(report) => Self::Rotated(report),
+            Err(error) => Self::Failed(error),
+        }
+    }
+}
+
 async fn rotate_service_approle_secret_id(
     ctx: &RotateContext,
     client: &OpenBaoClient,
     registration_id: &str,
+    agent_config: Option<&Path>,
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
+    // A registrar-minted identity is never in `state.json`; its binding
+    // is read directly, so rotating one identity needs no `list` grant.
+    // An id the registrar could never have derived is not looked up: it
+    // would only name a KV path the operator typed.
+    let registrar_options = if !ctx.state.services.contains_key(registration_id)
+        && ctx.state.registrar_endpoint.is_some()
+        && validate_registration_id(registration_id).is_ok()
+    {
+        match read_registrar_binding_state(ctx, client, registration_id, messages).await? {
+            Some(RegistrarBindingState::Active) => Some(
+                load_registrar_secret_id_options(agent_config, &[registration_id], messages)
+                    .await?,
+            ),
+            Some(RegistrarBindingState::Creating) => {
+                anyhow::bail!(messages.error_rotate_registrar_identity_not_minted(registration_id))
+            }
+            None => anyhow::bail!(messages.error_service_not_found(registration_id)),
+        }
+    } else {
+        None
+    };
+
     confirm_action(
         &messages.prompt_rotate_approle_secret_id(registration_id),
         auto_confirm,
         messages,
     )?;
 
-    let report = rotate_service_secret_id_once(ctx, client, registration_id, messages).await?;
+    let report = match &registrar_options {
+        Some(options) => {
+            rotate_registrar_secret_id_once(ctx, client, registration_id, options, messages).await?
+        }
+        None => rotate_service_secret_id_once(ctx, client, registration_id, messages).await?,
+    };
 
     println!("{}", messages.rotate_summary_title());
     // CodeQL flags this as cleartext-logging, but the second argument is
@@ -255,57 +330,113 @@ async fn rotate_service_approle_secret_id(
 }
 
 /// Rotates every registered service `secret_id` in one invocation so a
-/// single scheduled job stays in sync with the registry. One failing
-/// target must not leave the remaining targets unrotated: failures are
-/// collected, reported per target, and turned into a single non-zero
-/// exit at the end.
+/// single scheduled job stays in sync with the registry: the
+/// `state.json` services, then the registrar-managed identities whose
+/// binding is `active`. One failing target must not leave the remaining
+/// targets unrotated: failures are collected, reported per target, and
+/// turned into a single non-zero exit at the end.
+///
+/// A registrar identity still `creating`, or deregistered since it was
+/// listed, is skipped rather than failed: it has no credential a host is
+/// waiting on, and failing it on every run would withhold the rotate
+/// credential's own self-mint until that lapsed too.
 async fn rotate_all_service_approle_secret_ids(
     ctx: &RotateContext,
     client: &OpenBaoClient,
+    agent_config: Option<&Path>,
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {
     let registration_ids: Vec<String> = ctx.state.services.keys().cloned().collect();
-    if registration_ids.is_empty() {
+    let registrar_targets = classify_registrar_targets(ctx, client, messages).await;
+    if registration_ids.is_empty() && registrar_targets.is_empty() {
         println!("{}", messages.rotate_all_no_services());
         return Ok(());
     }
-    confirm_action(
-        &messages.prompt_rotate_all_approle_secret_ids(registration_ids.len()),
-        auto_confirm,
-        messages,
-    )?;
 
-    let mut outcomes = Vec::with_capacity(registration_ids.len());
-    for registration_id in &registration_ids {
-        let outcome = rotate_service_secret_id_once(ctx, client, registration_id, messages).await;
-        outcomes.push((registration_id.as_str(), outcome));
+    // Loaded before the prompt and before any mint, so a misconfigured
+    // schedule fails with nothing issued for any target.
+    let active_ids: Vec<&str> = registrar_targets
+        .iter()
+        .filter(|(_, target)| matches!(target, RegistrarTarget::Rotate))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let registrar_options = if active_ids.is_empty() {
+        None
+    } else {
+        Some(load_registrar_secret_id_options(agent_config, &active_ids, messages).await?)
+    };
+
+    let rotate_count = registration_ids.len() + active_ids.len();
+    if rotate_count > 0 {
+        confirm_action(
+            &messages.prompt_rotate_all_approle_secret_ids(rotate_count),
+            auto_confirm,
+            messages,
+        )?;
+    }
+
+    let mut outcomes: Vec<(String, TargetOutcome)> =
+        Vec::with_capacity(registration_ids.len() + registrar_targets.len());
+    for registration_id in registration_ids {
+        let outcome = rotate_service_secret_id_once(ctx, client, &registration_id, messages)
+            .await
+            .into();
+        outcomes.push((registration_id, outcome));
+    }
+    for (registration_id, target) in registrar_targets {
+        let outcome = match target {
+            RegistrarTarget::Rotate => {
+                let options = registrar_options
+                    .as_ref()
+                    .expect("the options are loaded above whenever a registrar id is active");
+                rotate_registrar_secret_id_once(ctx, client, &registration_id, options, messages)
+                    .await
+                    .into()
+            }
+            RegistrarTarget::Skip(reason) => TargetOutcome::Skipped(reason),
+            RegistrarTarget::Fail(error) => TargetOutcome::Failed(error),
+        };
+        outcomes.push((registration_id, outcome));
     }
 
     println!("{}", messages.rotate_summary_title());
+    let mut rotated = 0;
+    let mut skipped = 0;
     let mut failed_ids = Vec::new();
     for (registration_id, outcome) in &outcomes {
         match outcome {
-            // The second argument is the secret_id file path, not the secret value.
-            Ok(report) => println!(
-                "{}",
-                messages.rotate_summary_approle_secret_id(registration_id, &report.secret_id_path)
-            ),
-            Err(error) => {
+            // The second argument is the secret_id file or KV path, not the secret value.
+            TargetOutcome::Rotated(report) => {
+                rotated += 1;
+                println!(
+                    "{}",
+                    messages
+                        .rotate_summary_approle_secret_id(registration_id, &report.secret_id_path)
+                );
+            }
+            TargetOutcome::Skipped(reason) => {
+                skipped += 1;
+                println!(
+                    "{}",
+                    messages.rotate_all_target_skipped(registration_id, reason)
+                );
+            }
+            TargetOutcome::Failed(error) => {
                 println!(
                     "{}",
                     messages.rotate_all_target_failed(registration_id, &format!("{error:#}"))
                 );
-                failed_ids.push(*registration_id);
+                failed_ids.push(registration_id.as_str());
             }
         }
     }
-    let total = outcomes.len();
     let failed = failed_ids.len();
-    println!(
-        "{}",
-        messages.rotate_all_result(total - failed, failed, total)
-    );
+    let total = rotated + failed;
+    println!("{}", messages.rotate_all_result(rotated, failed, total));
+    if skipped > 0 {
+        println!("{}", messages.rotate_all_skipped_result(skipped));
+    }
     if !failed_ids.is_empty() {
         anyhow::bail!(messages.error_rotate_all_partial_failure(
             failed,
@@ -314,6 +445,159 @@ async fn rotate_all_service_approle_secret_ids(
         ));
     }
     Ok(())
+}
+
+/// Decides, from each binding, what `--all-services` does with every
+/// registrar-managed identity `state.json` does not already name.
+///
+/// Nothing here aborts the batch. A failed enumeration becomes one
+/// failure entry — so the `state.json` services are still rotated, and
+/// the exit code and the self-mint still see it — and a binding that
+/// cannot be read or decoded becomes a failure for that id alone.
+async fn classify_registrar_targets(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    messages: &Messages,
+) -> Vec<(String, RegistrarTarget)> {
+    let registration_ids = match registrar_only_targets(ctx, client, messages).await {
+        Ok(ids) => ids,
+        Err(error) => {
+            return vec![(
+                messages.rotate_registrar_listing_target().to_string(),
+                RegistrarTarget::Fail(error),
+            )];
+        }
+    };
+    let mut targets = Vec::with_capacity(registration_ids.len());
+    for registration_id in registration_ids {
+        let target =
+            match read_registrar_binding_state(ctx, client, &registration_id, messages).await {
+                Ok(Some(RegistrarBindingState::Active)) => RegistrarTarget::Rotate,
+                Ok(Some(RegistrarBindingState::Creating)) => {
+                    RegistrarTarget::Skip(messages.rotate_skip_reason_binding_creating())
+                }
+                Ok(None) => RegistrarTarget::Skip(messages.rotate_skip_reason_binding_gone()),
+                Err(error) => RegistrarTarget::Fail(error),
+            };
+        targets.push((registration_id, target));
+    }
+    targets
+}
+
+/// Reads the `[registrar]` table of `--agent-config` and returns the
+/// options the registrar mint issues with, which a rotation of a
+/// registrar-minted identity must issue with too.
+///
+/// # Errors
+///
+/// Returns the localized refusal when `--agent-config` is absent — the
+/// caller only asks when `active_ids` would be rotated — or when the file
+/// cannot be read, parsed, deserialized or validated.
+async fn load_registrar_secret_id_options(
+    agent_config: Option<&Path>,
+    active_ids: &[&str],
+    messages: &Messages,
+) -> Result<SecretIdOptions> {
+    let Some(path) = agent_config else {
+        anyhow::bail!(messages.error_rotate_agent_config_required(&active_ids.join(", ")));
+    };
+    let display = path.display().to_string();
+    let owned = path.to_path_buf();
+    let loaded = tokio::task::spawn_blocking(move || load_registrar_settings(&owned))
+        .await
+        .context("joining the --agent-config read")?;
+    let settings = loaded.map_err(|err| {
+        anyhow::anyhow!(match err {
+            AgentConfigReadError::Unreadable(reason) => {
+                messages.error_rotate_agent_config_unreadable(&display, &reason)
+            }
+            AgentConfigReadError::Malformed(reason) => {
+                messages
+                    .error_rotate_agent_config_malformed(&display, &without_source_lines(&reason))
+            }
+            AgentConfigReadError::Undeserializable(reason) => {
+                messages.error_rotate_agent_config_undeserializable(&display, &reason)
+            }
+            AgentConfigReadError::Rejected(reason) => {
+                messages.error_rotate_agent_config_rejected(&display, &reason)
+            }
+        })
+    })?;
+    Ok(settings.secret_id_options())
+}
+
+/// Drops the source excerpt a TOML parse error quotes, keeping the
+/// location and the parser's complaint.
+///
+/// The file a rotation reads also carries the daemon's responder and EAB
+/// HMACs, and the excerpt is the offending line verbatim — which is the
+/// secret itself when the syntax error sits on that line.
+fn without_source_lines(reason: &str) -> String {
+    reason
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_source_excerpt_line(line))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reports whether a trimmed line of a TOML parse error is part of its
+/// quoted excerpt: a `|` gutter, optionally preceded by a line number.
+fn is_source_excerpt_line(line: &str) -> bool {
+    line.trim_start_matches(|c: char| c.is_ascii_digit())
+        .trim_start()
+        .starts_with('|')
+}
+
+/// Issues a fresh `secret_id` for a registrar-minted identity and pushes
+/// it to `bootroot/services/<id>/secret_id`, where the host's fast-poll
+/// picks pushed credentials up — the renewal model every
+/// `remote-bootstrap` service already runs on.
+///
+/// There is no response wrapping: a registrar identity records no wrap
+/// policy, and the value goes straight to KV. The new value is
+/// login-verified before the write only when that costs nothing: a login
+/// spends one use, so under a finite `num_uses` it would spend one the
+/// host needs, and a CIDR binding may not name this host at all.
+async fn rotate_registrar_secret_id_once(
+    ctx: &RotateContext,
+    client: &OpenBaoClient,
+    registration_id: &str,
+    options: &SecretIdOptions,
+    messages: &Messages,
+) -> Result<ServiceRotationReport> {
+    let role_name = service_role_name(registration_id);
+    let new_secret_id = client
+        .create_secret_id(&role_name, options)
+        .await
+        .with_context(|| messages.error_service_secret_id_mint_failed(registration_id))?;
+    let login_verified = options.token_bound_cidrs.is_none() && options.num_uses == Some(0);
+    if login_verified {
+        let role_id = client
+            .read_role_id(&role_name)
+            .await
+            .with_context(|| messages.error_openbao_role_id_failed())?;
+        client
+            .login_approle(&role_id, &new_secret_id)
+            .await
+            .with_context(|| messages.error_openbao_approle_login_failed())?;
+    }
+    write_remote_service_secret_id(
+        client,
+        &ctx.kv_mount,
+        registration_id,
+        &new_secret_id,
+        messages,
+    )
+    .await?;
+    Ok(ServiceRotationReport {
+        secret_id_path: format!(
+            "{}/{}",
+            ctx.kv_mount,
+            remote_service_secret_id_kv_path(registration_id)
+        ),
+        login_verified,
+    })
 }
 
 async fn rotate_service_secret_id_once(
@@ -797,6 +1081,11 @@ async fn write_service_secret_id_file(
     Ok(())
 }
 
+/// The KV path, under the mount, a pushed service `secret_id` lives at.
+fn remote_service_secret_id_kv_path(registration_id: &str) -> String {
+    format!("{SERVICE_KV_BASE}/{registration_id}/secret_id")
+}
+
 async fn write_remote_service_secret_id(
     client: &OpenBaoClient,
     kv_mount: &str,
@@ -807,7 +1096,7 @@ async fn write_remote_service_secret_id(
     client
         .write_kv(
             kv_mount,
-            &format!("{SERVICE_KV_BASE}/{registration_id}/secret_id"),
+            &remote_service_secret_id_kv_path(registration_id),
             serde_json::json!({ SERVICE_SECRET_ID_KEY: secret_id }),
         )
         .await
@@ -1449,7 +1738,7 @@ mod tests {
         let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
-        rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+        rotate_all_service_approle_secret_ids(&ctx, &client, None, true, &messages)
             .await
             .expect("an empty service registry must be a no-op success");
     }
@@ -1490,7 +1779,7 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
-        rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+        rotate_all_service_approle_secret_ids(&ctx, &client, None, true, &messages)
             .await
             .expect("batch rotation should succeed");
 
@@ -1540,7 +1829,7 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
-        let err = rotate_all_service_approle_secret_ids(&ctx, &client, true, &messages)
+        let err = rotate_all_service_approle_secret_ids(&ctx, &client, None, true, &messages)
             .await
             .expect_err("a partial failure must produce a non-zero exit");
 
@@ -1567,6 +1856,36 @@ mod tests {
         );
     }
 
+    /// A syntax error on the line holding a secret must not quote that
+    /// line back: the parser's excerpt is dropped, its location and
+    /// complaint kept.
+    #[test]
+    fn a_malformed_agent_config_error_does_not_quote_the_offending_line() {
+        let dir = tempdir().expect("tempdir");
+        let config = dir.path().join("agent.toml");
+        fs::write(
+            &config,
+            "[registrar]\nsecret_id_num_uses = 0\n\n[eab]\nhmac = \"s3cr3t-hmac-value\n",
+        )
+        .expect("write agent config");
+        let Err(AgentConfigReadError::Malformed(reason)) = load_registrar_settings(&config) else {
+            panic!("an unterminated string must be a TOML parse error");
+        };
+        assert!(
+            reason.contains("s3cr3t-hmac-value"),
+            "the raw parser error quotes the line, which is what makes this test bite: {reason}"
+        );
+        let redacted = without_source_lines(&reason);
+        assert!(
+            !redacted.contains("s3cr3t-hmac-value"),
+            "the redacted reason must not quote the secret: {redacted}"
+        );
+        assert!(
+            redacted.contains("line 5"),
+            "the redacted reason keeps the location: {redacted}"
+        );
+    }
+
     fn approle_args(
         registration_id: Option<&str>,
         all_services: bool,
@@ -1578,6 +1897,7 @@ mod tests {
             infra,
             rotate_bound_cidrs: Vec::new(),
             clear_rotate_bound_cidrs: false,
+            agent_config: None,
         }
     }
 
@@ -2415,7 +2735,7 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("infra-rotate-token".to_string());
         let messages = test_messages();
-        let err = rotate_service_approle_secret_id(&ctx, &client, "alpha", true, &messages)
+        let err = rotate_service_approle_secret_id(&ctx, &client, "alpha", None, true, &messages)
             .await
             .expect_err("permission denied must fail the rotation");
 

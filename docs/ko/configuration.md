@@ -811,7 +811,12 @@ secret_id_num_uses = 0
 - `role_token_ttl` (기본값 `"1h"`) — mint가 만드는 `AppRole`의 역할 수준
   `token_ttl`입니다. 양의 정수 초여야 합니다.
 - `role_secret_id_ttl` (기본값 `"24h"`) — 역할 수준 `secret_id_ttl`입니다.
-  양의 정수 초여야 합니다.
+  양의 정수 초여야 합니다. 이미 설치된 대상을 다시 mint하는 경로는 없으므로
+  registrar identity의 자격 증명은 스케줄된 `bootroot rotate
+  approle-secret-id --all-services --agent-config <이 파일>`로만
+  갱신되며, 이 작업은 이 TTL 안에서 충분히 여유 있게(최대 그 절반 주기로,
+  [SecretID TTL과 회전 주기](operations.md#secretid-ttl과-회전-주기) 참고)
+  실행되어야 합니다. `secret_id_ttl`이 설정되어 있으면 그 값이 기준입니다.
 - `secret_id_num_uses` (기본값 `0`) — 발급된 `secret_id` 하나를 몇 번 쓸 수
   있는지입니다. `0`은 TTL 안에서 무제한을 뜻하며, 등록된 호스트에 필요한
   값이 바로 이것입니다. 그 호스트의 에이전트는 갱신마다, 그리고 fast-poll

@@ -118,14 +118,66 @@ pub(crate) struct AgentConfigView {
     pub(crate) max_retained_files: u32,
 }
 
-/// Reads the two tables `init` needs out of the operator's
-/// `bootroot-agent` configuration file.
+/// Which of the four steps of reading an operator's `--agent-config`
+/// failed, carrying the underlying error text.
+///
+/// Each surface that reads the file words the refusal its own way — an
+/// installer reports that nothing was created, a rotation that no
+/// `secret_id` was issued — so the steps are reported as data and the
+/// caller picks the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentConfigReadError {
+    /// The file could not be read.
+    Unreadable(String),
+    /// The file is not valid TOML.
+    Malformed(String),
+    /// The TOML does not deserialize into the daemon's table shapes.
+    Undeserializable(String),
+    /// `[registrar]` deserialized but the daemon's validation refuses it.
+    Rejected(String),
+}
+
+/// Reads, parses, deserializes and validates the `[registrar]` and
+/// `[registrar_endpoint]` tables of the operator's `bootroot-agent`
+/// configuration file.
 ///
 /// Deliberately not [`bootroot::config::Settings::new`]: that requires
 /// a non-empty `[[profiles]]` block, and not
 /// `Settings::file_builder` either, which marks the file
 /// `required(false)` so a nonexistent path would silently deserialize
-/// into defaults instead of failing.
+/// into defaults instead of failing. A file with no `[registrar]` table
+/// is not an error: the documented defaults apply, because that is the
+/// daemon's own configuration stating them.
+fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentConfigReadError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| AgentConfigReadError::Unreadable(err.to_string()))?;
+    let built = config::Config::builder()
+        .add_source(config::File::from_str(&text, config::FileFormat::Toml))
+        .build()
+        .map_err(|err| AgentConfigReadError::Malformed(err.to_string()))?;
+    let partial: AgentConfigPartial = built
+        .try_deserialize()
+        .map_err(|err| AgentConfigReadError::Undeserializable(err.to_string()))?;
+    bootroot::config::validate_registrar_settings(&partial.registrar)
+        .map_err(|err| AgentConfigReadError::Rejected(err.to_string()))?;
+    Ok(partial)
+}
+
+/// Returns the validated `[registrar]` table of the operator's
+/// `bootroot-agent` configuration file, read exactly as
+/// [`load_agent_config`] reads it.
+///
+/// # Errors
+///
+/// Returns which of the four steps failed, with the underlying error.
+pub(crate) fn load_registrar_settings(
+    path: &Path,
+) -> Result<bootroot::config::RegistrarSettings, AgentConfigReadError> {
+    read_agent_config_partial(path).map(|partial| partial.registrar)
+}
+
+/// Reads the two tables `init` needs out of the operator's
+/// `bootroot-agent` configuration file.
 ///
 /// # Errors
 ///
@@ -136,28 +188,21 @@ pub(crate) struct AgentConfigView {
 /// own configuration stating them.
 pub(crate) fn load_agent_config(path: &Path, messages: &Messages) -> Result<AgentConfigView> {
     let display = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_unreadable(&display, &err.to_string())
-        )
-    })?;
-    let built = config::Config::builder()
-        .add_source(config::File::from_str(&text, config::FileFormat::Toml))
-        .build()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                messages.error_audit_store_agent_config_malformed(&display, &err.to_string())
-            )
-        })?;
-    let partial: AgentConfigPartial = built.try_deserialize().map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_undeserializable(&display, &err.to_string())
-        )
-    })?;
-    bootroot::config::validate_registrar_settings(&partial.registrar).map_err(|err| {
-        anyhow::anyhow!(
-            messages.error_audit_store_agent_config_rejected(&display, &err.to_string())
-        )
+    let partial = read_agent_config_partial(path).map_err(|err| {
+        anyhow::anyhow!(match err {
+            AgentConfigReadError::Unreadable(reason) => {
+                messages.error_audit_store_agent_config_unreadable(&display, &reason)
+            }
+            AgentConfigReadError::Malformed(reason) => {
+                messages.error_audit_store_agent_config_malformed(&display, &reason)
+            }
+            AgentConfigReadError::Undeserializable(reason) => {
+                messages.error_audit_store_agent_config_undeserializable(&display, &reason)
+            }
+            AgentConfigReadError::Rejected(reason) => {
+                messages.error_audit_store_agent_config_rejected(&display, &reason)
+            }
+        })
     })?;
     Ok(AgentConfigView {
         audit_store_dir: partial.registrar.audit_store_dir,

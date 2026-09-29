@@ -17,9 +17,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::{
     DaemonInvocation, DaemonShutdown, RegistrarStateProjection, audit_store_is_mount_point,
     audit_store_mount_unit_name, build_registrar_handler, has_distinct_device_ids,
-    openbao_duration, read_registrar_state, registrar_artifact_deployment,
-    registrar_secret_id_options, resolve_registrar_handler_for_gate, resolve_registrar_service,
-    resolve_secrets_dir, run_daemon,
+    read_registrar_state, registrar_artifact_deployment, resolve_registrar_handler_for_gate,
+    resolve_registrar_service, resolve_secrets_dir, run_daemon,
 };
 use crate::config::{AuditStoreEnforcement, OpenBaoSettings, Settings};
 use crate::registrar::endpoint::client::MintReply;
@@ -1506,58 +1505,6 @@ async fn a_rewritten_state_file_takes_effect_on_the_next_invocation() {
     assert!(
         rendered.contains("rewritten-secrets"),
         "the second invocation follows the rewritten state file: {rendered}"
-    );
-}
-
-/// The `secret_id` options the factory is handed come from exactly four
-/// keys, and `metadata` is not one of them.
-#[test]
-fn the_secret_id_options_carry_no_metadata_and_default_to_unlimited_uses() {
-    let defaults = crate::config::RegistrarSettings::default();
-    let options = registrar_secret_id_options(&defaults);
-    assert!(options.metadata.is_none(), "metadata is fixed to None");
-    assert_eq!(
-        options.num_uses,
-        Some(0),
-        "an enrolled host logs in again on every renewal, so a single-use credential strands it"
-    );
-    assert!(
-        options.ttl.is_none(),
-        "an absent secret_id_ttl leaves the role-level TTL governing"
-    );
-    assert!(options.token_bound_cidrs.is_none());
-
-    let configured = crate::config::RegistrarSettings {
-        secret_id_ttl: Some(std::time::Duration::from_mins(10)),
-        secret_id_num_uses: 3,
-        secret_id_token_bound_cidrs: Some(vec!["10.0.0.0/8".to_string()]),
-        ..crate::config::RegistrarSettings::default()
-    };
-    let options = registrar_secret_id_options(&configured);
-    assert!(options.metadata.is_none(), "no key can set metadata");
-    assert_eq!(options.num_uses, Some(3));
-    assert_eq!(options.ttl.as_deref(), Some("600s"));
-    assert_eq!(
-        options.token_bound_cidrs.as_deref(),
-        Some(["10.0.0.0/8".to_string()].as_slice())
-    );
-}
-
-/// The role TTLs are handed over in `OpenBao`'s own `<n>s` spelling,
-/// never in the humantime form the operator typed.
-#[test]
-fn a_configured_duration_is_rendered_in_openbaos_spelling() {
-    assert_eq!(
-        openbao_duration(std::time::Duration::from_hours(1)),
-        "3600s"
-    );
-    assert_eq!(
-        openbao_duration(std::time::Duration::from_hours(24)),
-        "86400s"
-    );
-    assert_eq!(
-        openbao_duration(std::time::Duration::from_mins(30)),
-        "1800s"
     );
 }
 

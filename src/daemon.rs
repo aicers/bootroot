@@ -18,6 +18,8 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
+use crate::config::openbao_duration;
+#[cfg(target_os = "linux")]
 use crate::registrar::AuditStoreMountGate;
 use crate::registrar::RegistrarEndpoint;
 use crate::{acme, cert_chain, config, eab, fast_poll, hooks, profile, utils};
@@ -477,36 +479,6 @@ pub(crate) fn resolve_secrets_dir(state_file: &Path, recorded: Option<&Path>) ->
     }
 }
 
-/// Renders a configured duration as the `<n>s` form `OpenBao` parses.
-///
-/// Validation has already held every one of these to a whole number of
-/// seconds, so nothing is truncated here.
-#[cfg(target_os = "linux")]
-fn openbao_duration(value: Duration) -> String {
-    format!("{}s", value.as_secs())
-}
-
-/// Builds the fixed per-issuance `secret_id` options the verb layer is
-/// constructed with.
-///
-/// `metadata` is deliberately not exposed and is fixed to `None`.
-/// `OpenBao` echoes metadata back on lookup, and bootroot's own record
-/// of who asked for what is the audit trail this daemon writes; a
-/// second, operator-typed, unvalidated one attached to every issued
-/// `secret_id` is not a knob this endpoint grows. `ttl` is absent unless
-/// `secret_id_ttl` is set, which leaves the role-level TTL governing.
-#[cfg(target_os = "linux")]
-fn registrar_secret_id_options(
-    registrar: &config::RegistrarSettings,
-) -> crate::openbao::SecretIdOptions {
-    crate::openbao::SecretIdOptions {
-        ttl: registrar.secret_id_ttl.map(openbao_duration),
-        num_uses: Some(registrar.secret_id_num_uses),
-        metadata: None,
-        token_bound_cidrs: registrar.secret_id_token_bound_cidrs.clone(),
-    }
-}
-
 /// Builds the production registrar request handler from one
 /// invocation's settings.
 ///
@@ -620,7 +592,7 @@ pub(crate) async fn build_registrar_handler(
         )
     })?;
 
-    let secret_id_options = registrar_secret_id_options(registrar);
+    let secret_id_options = registrar.secret_id_options();
 
     // The shipped counting sink rather than the no-op one: its two
     // counters are what an operator surface reads to tell a stalled
