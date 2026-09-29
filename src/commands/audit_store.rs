@@ -182,7 +182,7 @@ fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentCon
                 verbatim,
             })
         })?;
-    let table_strings = registrar_table_strings(&built);
+    let table_values = registrar_table_values(&built);
     let partial: AgentConfigPartial = built.try_deserialize().map_err(|err| {
         AgentConfigReadError::Undeserializable(AgentConfigReadReason {
             verbatim: err.to_string(),
@@ -192,7 +192,7 @@ fn read_agent_config_partial(path: &Path) -> Result<AgentConfigPartial, AgentCon
     bootroot::config::validate_registrar_settings(&partial.registrar).map_err(|err| {
         let verbatim = err.to_string();
         AgentConfigReadError::Rejected(AgentConfigReadReason {
-            without_values: without_strings(&verbatim, &table_strings),
+            without_values: without_values(&verbatim, &table_values),
             verbatim,
         })
     })?;
@@ -260,18 +260,41 @@ fn deserialize_error_without_values(err: &config::ConfigError) -> String {
     }
 }
 
-/// Collects every string the file sets under `[registrar]` and
-/// `[registrar_endpoint]`, longest first.
+/// The values the file sets under `[registrar]` and `[registrar_endpoint]`,
+/// in the spellings the daemon's validation can quote them in.
+#[derive(Debug, Default)]
+struct RegistrarTableValues {
+    /// Every string, and the humantime rendering of each one that parses
+    /// as a duration, longest first.
+    strings: Vec<String>,
+    /// Every number, as `Display` renders it.
+    numbers: Vec<String>,
+}
+
+/// Collects every value the file sets under `[registrar]` and
+/// `[registrar_endpoint]`.
 ///
-/// The daemon's validation quotes the settings it refuses — a path, an
-/// agent URL — by value, and a string field accepts whatever was typed
-/// there, a pasted secret included. Taking the values from the parsed
-/// tables rather than from the validator's wording keeps the scrub
-/// correct for a message this reader has never seen.
-fn registrar_table_strings(built: &config::Config) -> Vec<String> {
-    fn collect(value: &config::Value, out: &mut Vec<String>) {
+/// The daemon's validation quotes the settings it refuses by value — a
+/// path, an agent URL, a byte count, a duration re-rendered by
+/// humantime — and a string field accepts whatever was typed there, a
+/// pasted secret included. Taking the values from the parsed tables
+/// rather than from the validator's wording keeps the scrub correct for
+/// a message this reader has never seen.
+fn registrar_table_values(built: &config::Config) -> RegistrarTableValues {
+    fn collect(value: &config::Value, out: &mut RegistrarTableValues) {
         match &value.kind {
-            config::ValueKind::String(text) if !text.is_empty() => out.push(text.clone()),
+            config::ValueKind::String(text) if !text.is_empty() => {
+                if let Ok(duration) = humantime::parse_duration(text) {
+                    out.strings
+                        .push(humantime::format_duration(duration).to_string());
+                }
+                out.strings.push(text.clone());
+            }
+            config::ValueKind::I64(number) => out.numbers.push(number.to_string()),
+            config::ValueKind::I128(number) => out.numbers.push(number.to_string()),
+            config::ValueKind::U64(number) => out.numbers.push(number.to_string()),
+            config::ValueKind::U128(number) => out.numbers.push(number.to_string()),
+            config::ValueKind::Float(number) => out.numbers.push(number.to_string()),
             config::ValueKind::Table(table) => {
                 for value in table.values() {
                     collect(value, out);
@@ -285,24 +308,70 @@ fn registrar_table_strings(built: &config::Config) -> Vec<String> {
             _ => {}
         }
     }
-    let mut strings = Vec::new();
+    let mut values = RegistrarTableValues::default();
     for table in ["registrar", "registrar_endpoint"] {
         if let Ok(table) = built.get_table(table) {
             for value in table.values() {
-                collect(value, &mut strings);
+                collect(value, &mut values);
             }
         }
     }
     // Longest first, so a value that contains another is replaced whole.
-    strings.sort_unstable_by_key(|text| std::cmp::Reverse(text.len()));
-    strings
+    values
+        .strings
+        .sort_unstable_by_key(|text| std::cmp::Reverse(text.len()));
+    values
 }
 
 /// Replaces every occurrence of each of `values` in `reason`.
-fn without_strings(reason: &str, values: &[String]) -> String {
-    values.iter().fold(reason.to_string(), |text, value| {
-        text.replace(value.as_str(), "<redacted>")
-    })
+///
+/// A string is replaced wherever it occurs. A number is replaced only as
+/// a whole token, so a value of `0` does not also take the digits out of
+/// a key name or a constant the message states.
+fn without_values(reason: &str, values: &RegistrarTableValues) -> String {
+    let text = values
+        .strings
+        .iter()
+        .fold(reason.to_string(), |text, value| {
+            text.replace(value.as_str(), "<redacted>")
+        });
+    values
+        .numbers
+        .iter()
+        .fold(text, |text, number| without_number_token(&text, number))
+}
+
+/// Replaces each occurrence of `number` in `text` that is not part of a
+/// longer word or number.
+///
+/// A `.` continues a number before it, and after it only when a digit
+/// follows, so a value closing a sentence is still replaced.
+fn without_number_token(text: &str, number: &str) -> String {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(number) {
+        let (before, from) = rest.split_at(at);
+        // `find` returned a match of `number` starting at `at`.
+        let after = &from[number.len()..];
+        let joined_before = out
+            .chars()
+            .chain(before.chars())
+            .next_back()
+            .is_some_and(|c| is_word_char(c) || c == '.');
+        let mut following = after.chars();
+        let joined_after = match following.next() {
+            Some('.') => following.next().is_some_and(|c| c.is_ascii_digit()),
+            Some(c) => is_word_char(c),
+            None => false,
+        };
+        let bounded = !joined_before && !joined_after;
+        out.push_str(before);
+        out.push_str(if bounded { "<redacted>" } else { number });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Returns the validated `[registrar]` table of the operator's
@@ -1887,6 +1956,64 @@ mod tests {
                 "{key}: the key and the complaint are kept: {reason:?}"
             );
         }
+    }
+
+    /// The validation quotes a refused number or duration by value too,
+    /// and a duration in humantime's spelling rather than the file's.
+    #[test]
+    fn a_rejected_number_or_duration_is_reported_without_the_value() {
+        let dir = traversable_tempdir();
+        for (body, key, typed, rendered) in [
+            (
+                "audit_max_file_bytes = 12345\n",
+                "registrar.audit_max_file_bytes",
+                "12345",
+                "12345",
+            ),
+            (
+                "audit_store_reserve_bytes = 123456789\naudit_store_low_water_bytes = 987654321\n",
+                "registrar.audit_store_low_water_bytes",
+                "987654321",
+                "987654321",
+            ),
+            (
+                "role_token_ttl = \"1500ms\"\n",
+                "registrar.role_token_ttl",
+                "1500ms",
+                "1s 500ms",
+            ),
+        ] {
+            let path = write_agent_config(dir.path(), &format!("[registrar]\n{body}"));
+            let Err(AgentConfigReadError::Rejected(reason)) = load_registrar_settings(&path) else {
+                panic!("{key}: the value must fail validation");
+            };
+            assert!(
+                reason.verbatim.contains(rendered),
+                "{key}: the raw error quotes the value: {reason:?}"
+            );
+            assert!(
+                !reason.without_values.contains(typed) && !reason.without_values.contains(rendered),
+                "{key}: {reason:?}"
+            );
+            assert!(
+                reason.without_values.contains(key),
+                "{key}: the key is kept: {reason:?}"
+            );
+        }
+    }
+
+    /// A number is taken out as a whole token only, so a small value
+    /// does not also take the digits out of the message's own wording.
+    #[test]
+    fn a_number_is_redacted_as_a_whole_token() {
+        let values = RegistrarTableValues {
+            strings: Vec::new(),
+            numbers: vec!["64".to_string(), "5".to_string()],
+        };
+        assert_eq!(
+            without_values("x (64) must not exceed i64::MAX; 1.5 or 15 or 5.", &values),
+            "x (<redacted>) must not exceed i64::MAX; 1.5 or 15 or <redacted>."
+        );
     }
 
     // ---------------------------------------------------------------

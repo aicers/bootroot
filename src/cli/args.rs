@@ -784,8 +784,11 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// are deliberately excluded (they use the separate
     /// `bootroot-infra-rotate-role` credential); schedule `--infra`
     /// invocations alongside this one. Continues past per-service
-    /// failures and exits non-zero if any target failed. An empty
-    /// service registry is a no-op success.
+    /// failures and exits non-zero if any target failed. The run is a
+    /// no-op success only when there is nothing to rotate, skip or fail:
+    /// no `state.json` service and no registrar-managed identity listed.
+    /// An empty `state.json` alone is not enough — registrar identities
+    /// are still rotated, and a failed enumeration still fails the run.
     #[arg(long)]
     pub(crate) all_services: bool,
 
