@@ -91,19 +91,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `[registrar_endpoint] enabled = true` on a bootroot host makes the
   daemon build the registrar verb layer from its `[registrar]` settings
   and answer requests on the systemd-activated
-  `/run/bootroot/registrar.sock`. Eight new `[registrar]` keys provision
+  `/run/bootroot/registrar.sock`. Ten new `[registrar]` keys provision
   it: `state_file`, which names the deployment `state.json` the recorded
   `OpenBao` URL, KV mount and secrets directory are read from and which
   is required when the endpoint is enabled;
   `provisioning_config_path`; `max_wrap_ttl`, `role_token_ttl` and
-  `role_secret_id_ttl`; and `secret_id_num_uses`, `secret_id_ttl` and
-  `secret_id_token_bound_cidrs`. Everything the endpoint needs is
-  resolved before anything is spawned, so a missing provisioning config,
-  state file, internal credential or audit store fails startup with a
-  diagnostic that names it rather than leaving a socket nothing is
+  `role_secret_id_ttl`; `secret_id_num_uses`, `secret_id_ttl` and
+  `secret_id_token_bound_cidrs`; and `agent_server` and
+  `agent_responder_url`, the ACME directory and HTTP-01 responder admin
+  URLs a remote-bootstrap target's agent is given, which have no default
+  and are required when the endpoint is enabled. Everything the endpoint
+  needs is resolved before anything is spawned, so a missing provisioning
+  config, state file, internal credential or audit store fails startup
+  with a diagnostic that names it rather than leaving a socket nothing is
   accepting on. Both deregistration and minting are served end to end;
   mint requests use the canonical `spec.reload` and optional
-  `spec.cert_group` spellings defined by the provisioning contract.
+  `spec.cert_group` spellings defined by the provisioning contract. A
+  `RemoteBootstrap` mint carries the seven target-host paths the
+  enrolling host chose, and its response returns the `bootstrap.json`
+  that `bootroot-remote bootstrap --artifact` reads — the same document
+  `bootroot service add --delivery-mode remote-bootstrap` writes, built
+  around those paths and the one wrapped `secret_id` the mint issued.
 - An endpoint-enabled `bootroot-agent` now issues the registrar
   surface's own two certificates at start, so neither has to be supplied
   out of band. Four `[registrar_endpoint]` keys name the material —

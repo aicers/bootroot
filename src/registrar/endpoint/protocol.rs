@@ -48,6 +48,10 @@ use crate::registrar::verbs::outcome::{
 };
 use crate::registrar::verbs::wrap_ttl::WrapTtlRefusal;
 use crate::registrar_certs::SurfaceLeaf;
+use crate::remote_bootstrap::{
+    ArtifactInputs, ArtifactPaths, ArtifactWrap, PostRenewHookEntry, build_artifact,
+    serialize_artifact,
+};
 #[cfg(test)]
 use crate::service_material::TeardownReport;
 
@@ -150,6 +154,204 @@ pub(crate) struct RegisterRequest {
     pub(crate) spec: WireServiceSpec,
     pub(crate) wrap_ttl: u64,
     pub(crate) idempotency_key: String,
+    /// The bootroot-owned target-host paths, flattened so each is a
+    /// top-level member named exactly as the artifact's own key.
+    #[serde(flatten)]
+    pub(crate) target_paths: WireTargetPaths,
+}
+
+/// The seven target-host paths a remote-bootstrap register request
+/// carries, each spelled as the `bootstrap.json` key it is copied into.
+///
+/// The codec carries them as optional strings and nothing more. Whether
+/// they must be present, and in what shape, depends on the request's
+/// `delivery_mode`, so that rule is [`target_paths`]'s, applied before
+/// the verb runs rather than while decoding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+// Each field is spelled as the artifact key it is copied into, and every
+// one of those keys ends in `_path`; renaming the fields would mean a
+// serde rename per member and two spellings of each.
+#[allow(clippy::struct_field_names)]
+pub(crate) struct WireTargetPaths {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) agent_config_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) role_id_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) secret_id_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) eab_file_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) profile_cert_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) profile_key_path: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    pub(crate) ca_bundle_path: Option<String>,
+}
+
+impl WireTargetPaths {
+    /// Returns each member's name beside its value, in wire order.
+    fn members(&self) -> [(&'static str, Option<&str>); 7] {
+        [
+            ("agent_config_path", self.agent_config_path.as_deref()),
+            ("role_id_path", self.role_id_path.as_deref()),
+            ("secret_id_path", self.secret_id_path.as_deref()),
+            ("eab_file_path", self.eab_file_path.as_deref()),
+            ("profile_cert_path", self.profile_cert_path.as_deref()),
+            ("profile_key_path", self.profile_key_path.as_deref()),
+            ("ca_bundle_path", self.ca_bundle_path.as_deref()),
+        ]
+    }
+}
+
+/// Why a register request's target paths are unusable.
+///
+/// Each variant names members, never values: a refusal is logged, and
+/// what a caller's target host looks like is not this daemon's to
+/// record.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum TargetPathError {
+    /// A `LocalFile` request carried a target path.
+    #[error("a LocalFile register request carries the target path member {member}")]
+    ForbiddenForLocalFile {
+        /// The first offending member.
+        member: &'static str,
+    },
+    /// A `RemoteBootstrap` request omitted a target path.
+    #[error("a RemoteBootstrap register request is missing the target path member {member}")]
+    Missing {
+        /// The first absent member.
+        member: &'static str,
+    },
+    /// A target path is the empty string.
+    #[error("the target path member {member} is empty")]
+    Empty {
+        /// The offending member.
+        member: &'static str,
+    },
+    /// A target path contains a NUL byte.
+    #[error("the target path member {member} contains a NUL byte")]
+    ContainsNul {
+        /// The offending member.
+        member: &'static str,
+    },
+    /// A target path is not absolute.
+    #[error("the target path member {member} is not an absolute path")]
+    NotAbsolute {
+        /// The offending member.
+        member: &'static str,
+    },
+    /// Two target paths are the same path.
+    #[error("the target path members {first} and {second} are equal")]
+    Duplicate {
+        /// The earlier member, in wire order.
+        first: &'static str,
+        /// The later member, in wire order.
+        second: &'static str,
+    },
+}
+
+/// Applies the target-path rules a register request's `delivery_mode`
+/// selects, and returns the paths a remote-bootstrap artifact carries.
+///
+/// A `LocalFile` request carries none of the seven members and yields
+/// `None`. A `RemoteBootstrap` request carries all seven, each absolute,
+/// non-empty and free of NUL, and no two equal; it yields them borrowed,
+/// unchanged, for the artifact to copy byte for byte.
+///
+/// These are rules about the paths' shape and nothing more. A target
+/// path names a location on the target host, which the caller owns, so
+/// nothing here compares one against this host's filesystem or its
+/// secrets tree.
+///
+/// # Errors
+///
+/// Returns the first [`TargetPathError`] in wire order: a present member
+/// on `LocalFile`, an absent one on `RemoteBootstrap`, an empty,
+/// NUL-carrying or relative value, or a repeated one.
+pub(crate) fn target_paths(
+    request: &RegisterRequest,
+) -> Result<Option<ArtifactPaths<'_>>, TargetPathError> {
+    let members = request.target_paths.members();
+    if request.delivery_mode == WireDeliveryMode::LocalFile {
+        return match members.iter().find(|(_, value)| value.is_some()) {
+            Some((member, _)) => Err(TargetPathError::ForbiddenForLocalFile { member }),
+            None => Ok(None),
+        };
+    }
+
+    let mut values = [""; 7];
+    for (index, (member, value)) in members.into_iter().enumerate() {
+        let value = value.ok_or(TargetPathError::Missing { member })?;
+        if value.is_empty() {
+            return Err(TargetPathError::Empty { member });
+        }
+        if value.contains('\0') {
+            return Err(TargetPathError::ContainsNul { member });
+        }
+        if !std::path::Path::new(value).is_absolute() {
+            return Err(TargetPathError::NotAbsolute { member });
+        }
+        if let Some((first, _)) = members
+            .iter()
+            .take(index)
+            .find(|(_, earlier)| *earlier == Some(value))
+        {
+            return Err(TargetPathError::Duplicate {
+                first,
+                second: member,
+            });
+        }
+        if let Some(slot) = values.get_mut(index) {
+            *slot = value;
+        }
+    }
+    let [
+        agent_config_path,
+        role_id_path,
+        secret_id_path,
+        eab_file_path,
+        profile_cert_path,
+        profile_key_path,
+        ca_bundle_path,
+    ] = values;
+    Ok(Some(ArtifactPaths {
+        agent_config_path,
+        role_id_path,
+        secret_id_path,
+        eab_file_path,
+        profile_cert_path,
+        profile_key_path,
+        ca_bundle_path,
+    }))
 }
 
 /// The deregister request payload.
@@ -169,6 +371,9 @@ pub(crate) struct DeregisterRequest {
 
 /// A request decoded according to the endpoint operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// One value exists per connection, decoded and dropped within it, so the
+// register arm's seven optional paths cost nothing a box would save.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Request {
     /// A mint request.
     Register(RegisterRequest),
@@ -182,8 +387,8 @@ pub(crate) enum CodecError {
     /// JSON did not match the selected payload shape.
     #[error("registrar protocol JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
-    /// `ca_anchor` was not standard base64.
-    #[error("registrar ca_anchor is not standard base64: {0}")]
+    /// `ca_anchor` or `bootstrap_artifact` was not standard base64.
+    #[error("registrar material is not standard base64: {0}")]
     Base64(#[from] base64::DecodeError),
     /// A time value could not use the required RFC 3339 UTC representation.
     #[error("registrar timestamp is not RFC 3339 UTC: {0}")]
@@ -536,6 +741,49 @@ impl fmt::Debug for WrappedSecretId {
     }
 }
 
+/// A remote-bootstrap artifact carried at the serialization boundary.
+///
+/// The bytes are `bootstrap.json` exactly as `bootroot-remote` reads it,
+/// and they embed the same wrapping token `wrapped_secret_id` carries, so
+/// diagnostics redact them the way they redact that token. On this JSON
+/// wire they travel as a standard padded base64 string, like
+/// `ca_anchor`; a value that is not one fails the decode.
+struct BootstrapArtifact(Vec<u8>);
+
+impl BootstrapArtifact {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for BootstrapArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for BootstrapArtifact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for BootstrapArtifact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(Self)
+            .map_err(|error| de::Error::custom(CodecError::Base64(error)))
+    }
+}
+
 /// Bootstrap material encoded for a mint response.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct BootstrapMaterial {
@@ -544,6 +792,45 @@ pub(crate) struct BootstrapMaterial {
     pub(crate) ca_anchor: String,
     #[serde(with = "rfc3339")]
     pub(crate) expires_at: OffsetDateTime,
+    /// Present exactly on a `RemoteBootstrap` mint.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "reject_null_option::deserialize"
+    )]
+    bootstrap_artifact: Option<BootstrapArtifact>,
+}
+
+impl BootstrapMaterial {
+    /// Returns the decoded `bootstrap.json` bytes a `RemoteBootstrap`
+    /// mint returned, for the caller to relay unchanged.
+    pub(crate) fn bootstrap_artifact(&self) -> Option<&[u8]> {
+        self.bootstrap_artifact
+            .as_ref()
+            .map(BootstrapArtifact::as_bytes)
+    }
+}
+
+/// What a `RemoteBootstrap` mint's artifact is built from, apart from
+/// the members the verb outcome and the CA anchor supply.
+///
+/// `registration_id`, `wrap_token` and `wrap_expires_at` come from the
+/// outcome and `ca_bundle_pem` from the anchor, both of which
+/// [`encode_mint_response`] already holds; everything else is resolved
+/// by the handler and passed in here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArtifactSource<'a> {
+    pub(crate) openbao_url: &'a str,
+    pub(crate) kv_mount: &'a str,
+    pub(crate) service_name: &'a str,
+    pub(crate) paths: ArtifactPaths<'a>,
+    pub(crate) agent_server: &'a str,
+    pub(crate) agent_responder_url: &'a str,
+    pub(crate) agent_domain: &'a str,
+    pub(crate) profile_hostname: &'a str,
+    pub(crate) profile_instance_id: &'a str,
+    pub(crate) post_renew_hooks: &'a [PostRenewHookEntry],
+    pub(crate) cert_group_gid: Option<u32>,
 }
 
 /// A successful mint response.
@@ -629,6 +916,11 @@ struct AuditStoreUnavailableResponse {
 }
 
 /// Decodes and validates a mint response from the registrar endpoint.
+///
+/// `bootstrap_artifact`, when present, is base64-decoded as part of the
+/// JSON decode and refused there if it is not standard base64. Its bytes
+/// are otherwise opaque here: the caller relays them, and
+/// `bootroot-remote` is what parses them.
 pub(crate) fn decode_mint_response(payload: &[u8]) -> Result<MintResponse, CodecError> {
     let response = serde_json::from_slice::<MintResponse>(payload)?;
     decode_ca_anchor(response.material.ca_anchor.as_str())?;
@@ -648,9 +940,18 @@ pub(crate) fn decode_refusal_response(payload: &[u8]) -> Result<RefusalResponse,
 }
 
 /// Encodes a mint outcome with the supplied anchor and health snapshot.
+///
+/// `artifact` is `Some` exactly for a `RemoteBootstrap` mint. The
+/// artifact is built here rather than by the caller because two of its
+/// members — `wrap_token` and `wrap_expires_at` — are the outcome's own
+/// material, and the wrapping token leaves the outcome at this boundary
+/// and nowhere else. The mint issued one wrapped `secret_id`, and the
+/// artifact carries that same token rather than a second one; its one
+/// copy is the second place this response carries it.
 pub(crate) fn encode_mint_response(
     outcome: MintOutcome,
     anchor: &TrustPayload,
+    artifact: Option<&ArtifactSource<'_>>,
     health: &RegistrarHealth,
 ) -> Result<Vec<u8>, CodecError> {
     let expires_at = outcome.expires_at().to_offset(time::UtcOffset::UTC);
@@ -659,23 +960,78 @@ pub(crate) fn encode_mint_response(
         .registration_id()
         .ok_or(CodecError::MissingRegistrationId)?
         .to_string();
+    let request_id = outcome.context().request_id().as_str().to_string();
+    let kind = outcome.kind();
+    let role_id = outcome.role_id().to_string();
+    let wrapped_secret_id = outcome.into_wrapped_secret_id();
+    let bootstrap_artifact = artifact
+        .map(|source| {
+            encode_bootstrap_artifact(
+                source,
+                &registration_id,
+                anchor,
+                &wrapped_secret_id,
+                expires_at,
+            )
+        })
+        .transpose()?;
     let response = MintResponse {
         protocol_version: ProtocolVersion::current(),
-        request_id: outcome.context().request_id().as_str().to_string(),
+        request_id,
         registration_id,
-        outcome: match outcome.kind() {
+        outcome: match kind {
             MintKind::FirstMint => MintWireOutcome::FirstMint,
             MintKind::IdempotentReMint => MintWireOutcome::IdempotentRemint,
         },
         material: BootstrapMaterial {
-            role_id: outcome.role_id().to_string(),
-            wrapped_secret_id: WrappedSecretId::new(outcome.into_wrapped_secret_id()),
+            role_id,
+            wrapped_secret_id: WrappedSecretId::new(wrapped_secret_id),
             ca_anchor: encode_ca_anchor(anchor)?,
             expires_at,
+            bootstrap_artifact,
         },
         registrar_health: health.clone(),
     };
     serde_json::to_vec(&response).map_err(Into::into)
+}
+
+/// Builds and serializes a mint's `bootstrap.json` through the one
+/// builder `service add` also uses, in the byte form it writes.
+fn encode_bootstrap_artifact(
+    source: &ArtifactSource<'_>,
+    registration_id: &str,
+    anchor: &TrustPayload,
+    wrap_token: &str,
+    expires_at: OffsetDateTime,
+) -> Result<BootstrapArtifact, CodecError> {
+    let wrap_expires_at = expires_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|error| CodecError::Timestamp(error.to_string()))?;
+    let artifact = build_artifact(&ArtifactInputs {
+        openbao_url: source.openbao_url,
+        kv_mount: source.kv_mount,
+        registration_id,
+        service_name: source.service_name,
+        paths: source.paths,
+        ca_bundle_pem: &anchor.ca_bundle_pem,
+        // Omitted, as `service add` omits it without `--agent-email`: a
+        // registrar-minted artifact has no operator override to carry.
+        agent_email: None,
+        agent_server: Some(source.agent_server),
+        agent_responder_url: Some(source.agent_responder_url),
+        agent_domain: source.agent_domain,
+        profile_hostname: source.profile_hostname,
+        profile_instance_id: source.profile_instance_id,
+        post_renew_hooks: source.post_renew_hooks,
+        wrap: Some(ArtifactWrap {
+            token: wrap_token,
+            expires_at: &wrap_expires_at,
+        }),
+        cert_group_gid: source.cert_group_gid,
+    });
+    Ok(BootstrapArtifact(
+        serialize_artifact(&artifact)?.into_bytes(),
+    ))
 }
 
 /// Encodes a deregister outcome with the supplied health snapshot.
@@ -1339,6 +1695,60 @@ mod tests {
             },
             wrap_ttl: 60,
             idempotency_key: "opaque-key".to_string(),
+            target_paths: WireTargetPaths::default(),
+        }
+    }
+
+    /// Seven distinct absolute target paths, one per member.
+    fn sample_target_paths() -> WireTargetPaths {
+        WireTargetPaths {
+            agent_config_path: Some("/etc/api/agent.toml".to_string()),
+            role_id_path: Some("/var/lib/api/secrets/role_id".to_string()),
+            secret_id_path: Some("/var/lib/api/secrets/secret_id".to_string()),
+            eab_file_path: Some("/var/lib/api/secrets/eab.json".to_string()),
+            profile_cert_path: Some("/var/lib/api/certs/api.crt".to_string()),
+            profile_key_path: Some("/var/lib/api/certs/api.key".to_string()),
+            ca_bundle_path: Some("/var/lib/api/certs/ca-bundle.pem".to_string()),
+        }
+    }
+
+    /// A remote-bootstrap register request carrying
+    /// [`sample_target_paths`].
+    fn remote_register_request() -> RegisterRequest {
+        RegisterRequest {
+            delivery_mode: WireDeliveryMode::RemoteBootstrap,
+            instance: Some(7),
+            target_paths: sample_target_paths(),
+            ..register_request(Some("opaque group"))
+        }
+    }
+
+    /// The post-renew hooks the fixture artifact carries.
+    fn fixture_hooks() -> Vec<PostRenewHookEntry> {
+        crate::remote_bootstrap::reload_preset_hooks(ReloadKind::Systemd, Some("api.service"))
+            .expect("the systemd preset maps")
+    }
+
+    /// The artifact source a remote-bootstrap fixture mint is encoded
+    /// with, over `request`'s own paths.
+    fn fixture_artifact_source<'a>(
+        request: &'a RegisterRequest,
+        hooks: &'a [PostRenewHookEntry],
+    ) -> ArtifactSource<'a> {
+        ArtifactSource {
+            openbao_url: "https://openbao.example.test:8200",
+            kv_mount: "secret",
+            service_name: &request.service_name,
+            paths: target_paths(request)
+                .expect("the fixture paths are valid")
+                .expect("a remote-bootstrap request carries paths"),
+            agent_server: "https://stepca.example.test:9000/acme/acme/directory",
+            agent_responder_url: "https://responder.example.test:8080",
+            agent_domain: "example.test",
+            profile_hostname: &request.host,
+            profile_instance_id: "007",
+            post_renew_hooks: hooks,
+            cert_group_gid: Some(3000),
         }
     }
 
@@ -2436,6 +2846,7 @@ mod tests {
             },
             wrap_ttl: 60,
             idempotency_key: "opaque-key".to_string(),
+            target_paths: WireTargetPaths::default(),
         };
         let mut register_value = serde_json::to_value(register).expect("register serializes");
         register_value
@@ -2446,6 +2857,37 @@ mod tests {
             "### 4.2 `Register` fields",
             "Register fields",
             &register_value,
+        );
+
+        // A remote-bootstrap request adds exactly the bootroot-owned
+        // endpoint members the reference lists beside the transcribed
+        // table, and nothing else.
+        let mut remote_value =
+            serde_json::to_value(remote_register_request()).expect("register serializes");
+        let remote_members = remote_value.as_object_mut().expect("register is an object");
+        remote_members.remove("protocol_version");
+        let mut path_members = serde_json::Map::new();
+        for name in object_member_names(&register_value) {
+            assert!(
+                remote_members.contains_key(&name),
+                "{name} is still carried"
+            );
+        }
+        for name in object_member_names(&serde_json::Value::Object(remote_members.clone())) {
+            if register_value.get(&name).is_none() {
+                path_members.insert(
+                    name.clone(),
+                    remote_members
+                        .get(&name)
+                        .expect("the member exists")
+                        .clone(),
+                );
+            }
+        }
+        assert_external_members_match_reference(
+            "#### 4.2.1 Bootroot-owned `Register` endpoint members",
+            "Register bootroot-owned endpoint members",
+            &serde_json::Value::Object(path_members),
         );
 
         let deregister = DeregisterRequest {
@@ -2483,6 +2925,7 @@ mod tests {
             wrapped_secret_id: WrappedSecretId::new("wrapped-token".to_string()),
             ca_anchor: "anchor".to_string(),
             expires_at: OffsetDateTime::UNIX_EPOCH,
+            bootstrap_artifact: Some(BootstrapArtifact(b"{}".to_vec())),
         };
         assert_external_members_match_reference(
             "### 5.2 `BootstrapMaterial` fields",
@@ -3212,8 +3655,8 @@ mod tests {
                     WrappedSecretIdToken::new("wrapped-secret".to_string()),
                     expires_at,
                 );
-                let encoded =
-                    encode_mint_response(outcome, &anchor, &health).expect("mint outcome encodes");
+                let encoded = encode_mint_response(outcome, &anchor, None, &health)
+                    .expect("mint outcome encodes");
                 let value: serde_json::Value =
                     serde_json::from_slice(&encoded).expect("mint response is JSON");
                 assert_eq!(
@@ -3285,8 +3728,8 @@ mod tests {
         let shapes = [
             (
                 "mint success",
-                encode_mint_response(mint(), &anchor, &health).expect("mint encodes"),
-                encode_mint_response(mint(), &anchor, &health).expect("mint re-encodes"),
+                encode_mint_response(mint(), &anchor, None, &health).expect("mint encodes"),
+                encode_mint_response(mint(), &anchor, None, &health).expect("mint re-encodes"),
             ),
             (
                 "deregister success",
@@ -3352,6 +3795,7 @@ mod tests {
                 wrapped_secret_id: WrappedSecretId::new("wrapped-token".to_string()),
                 ca_anchor: anchor,
                 expires_at: OffsetDateTime::UNIX_EPOCH,
+                bootstrap_artifact: None,
             },
             registrar_health: RegistrarHealth::default(),
         };
@@ -3379,6 +3823,7 @@ mod tests {
                 wrapped_secret_id: WrappedSecretId::new("wrapped-token".to_string()),
                 ca_anchor: "not-base64".to_string(),
                 expires_at: OffsetDateTime::UNIX_EPOCH,
+                bootstrap_artifact: None,
             },
             registrar_health: RegistrarHealth::default(),
         };
@@ -3404,7 +3849,7 @@ mod tests {
                 WrappedSecretIdToken::new("wrapped-secret".to_string()),
                 OffsetDateTime::UNIX_EPOCH,
             );
-            let encoded = encode_mint_response(outcome, &trust_payload(), &health)
+            let encoded = encode_mint_response(outcome, &trust_payload(), None, &health)
                 .expect("mint outcome encodes");
             assert_eq!(
                 decode_mint_response(&encoded)
@@ -3488,6 +3933,261 @@ mod tests {
         assert!(decode_ca_anchor(&non_json_bytes).is_err());
     }
 
+    #[test]
+    fn a_local_file_request_carries_no_target_path() {
+        let local = register_request(Some("opaque group"));
+        assert_eq!(target_paths(&local), Ok(None));
+
+        let complete = sample_target_paths();
+        for (member, _) in complete.members() {
+            let mut only_one = WireTargetPaths::default();
+            let value = Some("/etc/one".to_string());
+            match member {
+                "agent_config_path" => only_one.agent_config_path = value,
+                "role_id_path" => only_one.role_id_path = value,
+                "secret_id_path" => only_one.secret_id_path = value,
+                "eab_file_path" => only_one.eab_file_path = value,
+                "profile_cert_path" => only_one.profile_cert_path = value,
+                "profile_key_path" => only_one.profile_key_path = value,
+                "ca_bundle_path" => only_one.ca_bundle_path = value,
+                other => panic!("unexpected member {other}"),
+            }
+            let request = RegisterRequest {
+                target_paths: only_one,
+                ..register_request(None)
+            };
+            assert_eq!(
+                target_paths(&request),
+                Err(TargetPathError::ForbiddenForLocalFile { member }),
+                "a LocalFile request carrying {member} is refused"
+            );
+        }
+    }
+
+    /// Replaces one member of a complete set, by name.
+    fn with_member(member: &str, value: Option<&str>) -> RegisterRequest {
+        let mut request = remote_register_request();
+        let value = value.map(str::to_string);
+        let paths = &mut request.target_paths;
+        match member {
+            "agent_config_path" => paths.agent_config_path = value,
+            "role_id_path" => paths.role_id_path = value,
+            "secret_id_path" => paths.secret_id_path = value,
+            "eab_file_path" => paths.eab_file_path = value,
+            "profile_cert_path" => paths.profile_cert_path = value,
+            "profile_key_path" => paths.profile_key_path = value,
+            "ca_bundle_path" => paths.ca_bundle_path = value,
+            other => panic!("unexpected member {other}"),
+        }
+        request
+    }
+
+    #[test]
+    fn a_remote_bootstrap_request_yields_its_paths_unchanged() {
+        let request = remote_register_request();
+        let paths = target_paths(&request)
+            .expect("seven valid paths")
+            .expect("a remote-bootstrap request yields paths");
+        let wire = &request.target_paths;
+        assert_eq!(
+            Some(paths.agent_config_path),
+            wire.agent_config_path.as_deref()
+        );
+        assert_eq!(Some(paths.role_id_path), wire.role_id_path.as_deref());
+        assert_eq!(Some(paths.secret_id_path), wire.secret_id_path.as_deref());
+        assert_eq!(Some(paths.eab_file_path), wire.eab_file_path.as_deref());
+        assert_eq!(
+            Some(paths.profile_cert_path),
+            wire.profile_cert_path.as_deref()
+        );
+        assert_eq!(
+            Some(paths.profile_key_path),
+            wire.profile_key_path.as_deref()
+        );
+        assert_eq!(Some(paths.ca_bundle_path), wire.ca_bundle_path.as_deref());
+
+        // Unusual but absolute spellings are copied, never normalized.
+        let odd = with_member("agent_config_path", Some("/etc//api/./agent toml\u{e9}"));
+        assert_eq!(
+            target_paths(&odd)
+                .expect("an absolute path is accepted")
+                .expect("paths")
+                .agent_config_path,
+            "/etc//api/./agent toml\u{e9}"
+        );
+    }
+
+    #[test]
+    fn a_remote_bootstrap_request_refuses_every_unusable_path() {
+        for (member, _) in sample_target_paths().members() {
+            assert_eq!(
+                target_paths(&with_member(member, None)),
+                Err(TargetPathError::Missing { member }),
+                "{member} is required"
+            );
+            assert_eq!(
+                target_paths(&with_member(member, Some(""))),
+                Err(TargetPathError::Empty { member })
+            );
+            assert_eq!(
+                target_paths(&with_member(member, Some("relative/path"))),
+                Err(TargetPathError::NotAbsolute { member })
+            );
+            assert_eq!(
+                target_paths(&with_member(member, Some("/nul\0inside"))),
+                Err(TargetPathError::ContainsNul { member })
+            );
+        }
+
+        let mut duplicate = remote_register_request();
+        duplicate.target_paths.ca_bundle_path = duplicate.target_paths.role_id_path.clone();
+        assert_eq!(
+            target_paths(&duplicate),
+            Err(TargetPathError::Duplicate {
+                first: "role_id_path",
+                second: "ca_bundle_path",
+            })
+        );
+    }
+
+    #[test]
+    fn target_path_members_reject_null_and_non_strings() {
+        let encoded = encode_request(&Request::Register(remote_register_request()))
+            .expect("register encodes");
+        assert_eq!(
+            decode_request(Operation::Mint, &encoded).expect("register decodes"),
+            Request::Register(remote_register_request())
+        );
+        for replacement in [serde_json::Value::Null, serde_json::json!(7)] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&encoded).expect("register is JSON");
+            value
+                .as_object_mut()
+                .expect("register is an object")
+                .insert("secret_id_path".to_string(), replacement);
+            assert!(
+                decode_request(
+                    Operation::Mint,
+                    &serde_json::to_vec(&value).expect("payload serializes")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_bootstrap_mint_response_carries_the_built_artifact() {
+        let request = remote_register_request();
+        let hooks = fixture_hooks();
+        let source = fixture_artifact_source(&request, &hooks);
+        let anchor = trust_payload();
+        let outcome = MintOutcome::new(
+            fixture_context(Some("registration-1"), ProducingArm::Issuance),
+            MintKind::FirstMint,
+            "api.node.example.test".to_string(),
+            "role-id".to_string(),
+            WrappedSecretIdToken::new("hvs.the-one-wrap-token".to_string()),
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("representable"),
+        );
+        let encoded =
+            encode_mint_response(outcome, &anchor, Some(&source), &RegistrarHealth::default())
+                .expect("mint encodes");
+
+        let decoded = decode_mint_response(&encoded).expect("mint decodes");
+        let bytes = decoded
+            .material
+            .bootstrap_artifact()
+            .expect("a remote-bootstrap mint carries the artifact");
+        let text = std::str::from_utf8(bytes).expect("the artifact is UTF-8 JSON");
+        assert!(
+            text.starts_with("{\n  \"schema_version\": 5,\n"),
+            "the artifact is `service add`'s pretty-printed form: {text}"
+        );
+        let artifact: serde_json::Value = serde_json::from_str(text).expect("artifact JSON");
+        assert_eq!(artifact["registration_id"], "registration-1");
+        assert_eq!(artifact["service_name"], "api");
+        assert_eq!(artifact["profile_hostname"], "node");
+        assert_eq!(artifact["profile_instance_id"], "007");
+        assert_eq!(artifact["ca_bundle_pem"], anchor.ca_bundle_pem.as_str());
+        assert_eq!(
+            artifact["trusted_ca_sha256"],
+            serde_json::json!(crate::remote_bootstrap::fingerprints_from_bundle(
+                &anchor.ca_bundle_pem
+            ))
+        );
+        assert_eq!(
+            artifact["wrap_token"].as_str(),
+            Some(decoded.material.wrapped_secret_id.as_str()),
+            "the artifact carries the one wrapped secret_id the mint issued"
+        );
+        assert_eq!(artifact["wrap_expires_at"], "2023-11-14T22:13:20Z");
+        assert_eq!(artifact["cert_group_gid"], 3000);
+        assert!(artifact.get("agent_email").is_none());
+        assert_eq!(
+            artifact["post_renew_hooks"],
+            serde_json::to_value(&hooks).expect("hooks serialize")
+        );
+        for (member, value) in request.target_paths.members() {
+            assert_eq!(
+                artifact[member].as_str(),
+                value,
+                "{member} is copied byte for byte"
+            );
+        }
+
+        // Neither the token nor the artifact's bytes reach Debug.
+        let debug = format!("{decoded:?}");
+        let encoded_artifact = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert!(!debug.contains("hvs.the-one-wrap-token"), "{debug}");
+        assert!(!debug.contains(&encoded_artifact), "{debug}");
+        assert!(!debug.contains("schema_version"), "{debug}");
+    }
+
+    #[test]
+    fn a_local_file_mint_response_omits_the_artifact() {
+        let outcome = MintOutcome::new(
+            fixture_context(Some("registration-1"), ProducingArm::Issuance),
+            MintKind::FirstMint,
+            "api.node.example.test".to_string(),
+            "role-id".to_string(),
+            WrappedSecretIdToken::new("wrapped-secret".to_string()),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let encoded =
+            encode_mint_response(outcome, &trust_payload(), None, &RegistrarHealth::default())
+                .expect("mint encodes");
+        let text = String::from_utf8(encoded.clone()).expect("UTF-8");
+        assert!(!text.contains("bootstrap_artifact"), "{text}");
+        assert!(
+            decode_mint_response(&encoded)
+                .expect("mint decodes")
+                .material
+                .bootstrap_artifact()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_artifact_member_must_be_standard_base64_and_not_null() {
+        let fixture = committed_fixture("mint-success.json");
+        for replacement in [
+            serde_json::Value::Null,
+            serde_json::json!("not base64!"),
+            serde_json::json!(7),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(fixture).expect("fixture is JSON");
+            value["material"]
+                .as_object_mut()
+                .expect("material is an object")
+                .insert("bootstrap_artifact".to_string(), replacement.clone());
+            assert!(
+                decode_mint_response(&serde_json::to_vec(&value).expect("serializes")).is_err(),
+                "{replacement} is not a bootstrap_artifact"
+            );
+        }
+    }
+
     fn fixture_context(registration_id: Option<&str>, arm: ProducingArm) -> VerbContext {
         VerbContext::new(
             RequestId::for_fixture("request-0001"),
@@ -3549,21 +4249,10 @@ mod tests {
 
     fn generated_fixtures() -> Vec<(&'static str, Vec<u8>)> {
         let health = fixture_health();
-        let register = Request::Register(RegisterRequest {
-            protocol_version: ProtocolVersion::current(),
-            service_name: "api".to_string(),
-            delivery_mode: WireDeliveryMode::RemoteBootstrap,
-            host: "node".to_string(),
-            instance: Some(7),
-            spec: WireServiceSpec {
-                component: "api".to_string(),
-                service_name: "api".to_string(),
-                reload: "opaque reload".to_string(),
-                cert_group: Some("opaque group".to_string()),
-            },
-            wrap_ttl: 60,
-            idempotency_key: "opaque-key".to_string(),
-        });
+        let remote = remote_register_request();
+        let hooks = fixture_hooks();
+        let artifact_source = fixture_artifact_source(&remote, &hooks);
+        let register = Request::Register(remote.clone());
         let deregister = Request::Deregister(DeregisterRequest {
             protocol_version: ProtocolVersion::current(),
             service_name: "api".to_string(),
@@ -3571,14 +4260,16 @@ mod tests {
             instance: None,
             idempotency_key: "opaque-key".to_string(),
         });
-        let mint = MintOutcome::new(
-            fixture_context(Some("registration-1"), ProducingArm::Issuance),
-            MintKind::FirstMint,
-            "api.node.example.test".to_string(),
-            "role-id".to_string(),
-            WrappedSecretIdToken::new("wrapped-secret".to_string()),
-            OffsetDateTime::UNIX_EPOCH,
-        );
+        let mint = || {
+            MintOutcome::new(
+                fixture_context(Some("registration-1"), ProducingArm::Issuance),
+                MintKind::FirstMint,
+                "api.node.example.test".to_string(),
+                "role-id".to_string(),
+                WrappedSecretIdToken::new("wrapped-secret".to_string()),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+        };
         let deregister_outcome = DeregisterOutcome::new(
             fixture_context(Some("registration-1"), ProducingArm::Teardown),
             DeregisterKind::AlreadyAbsent,
@@ -3608,8 +4299,13 @@ mod tests {
             ),
             (
                 "mint-success.json",
-                encode_mint_response(mint, &trust_payload(), &health)
+                encode_mint_response(mint(), &trust_payload(), Some(&artifact_source), &health)
                     .expect("mint fixture encodes"),
+            ),
+            (
+                "mint-success-local-file.json",
+                encode_mint_response(mint(), &trust_payload(), None, &health)
+                    .expect("local-file mint fixture encodes"),
             ),
             (
                 "deregister-success.json",
@@ -3644,6 +4340,9 @@ mod tests {
             "register-request.json" => include_bytes!("fixtures/register-request.json"),
             "deregister-request.json" => include_bytes!("fixtures/deregister-request.json"),
             "mint-success.json" => include_bytes!("fixtures/mint-success.json"),
+            "mint-success-local-file.json" => {
+                include_bytes!("fixtures/mint-success-local-file.json")
+            }
             "deregister-success.json" => include_bytes!("fixtures/deregister-success.json"),
             "refusal-permanent.json" => include_bytes!("fixtures/refusal-permanent.json"),
             "refusal-busy.json" => include_bytes!("fixtures/refusal-busy.json"),
@@ -3666,7 +4365,7 @@ mod tests {
                 .expect("request fixture decodes"),
             )
             .expect("request fixture reencodes"),
-            "mint-success.json" => {
+            "mint-success.json" | "mint-success-local-file.json" => {
                 serde_json::to_vec(&decode_mint_response(fixture).expect("mint fixture decodes"))
                     .expect("mint fixture reencodes")
             }

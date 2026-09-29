@@ -1965,6 +1965,11 @@ answer, which would turn every caller into a hang:
   is **required** when the endpoint is enabled. A failure names the key,
   the path, and which of `openbao_url` or `kv_mount` was absent, empty or
   plaintext.
+- **The remote-bootstrap agent URLs**, from `[registrar] agent_server`
+  and `agent_responder_url` — both **required** when the endpoint is
+  enabled, because a `RemoteBootstrap` mint hands them to the target in
+  the `bootstrap.json` it returns. Configuration validation refuses a
+  missing one and names it.
 - **The secrets directory**, from the state file's `secrets_dir` or
   `secrets` beside it. A failure names the resolved path.
 - **The deployment's active root**, from

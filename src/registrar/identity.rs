@@ -280,8 +280,20 @@ pub fn derive_registration_id(
 /// same reason.
 #[must_use]
 pub fn compose_san(instance: Option<u32>, service_name: &str, host: &str, domain: &str) -> String {
-    let instance = instance.unwrap_or(DEFAULT_SAN_INSTANCE);
-    format!("{instance:03}.{service_name}.{host}.{domain}")
+    let instance = san_instance_label(instance);
+    format!("{instance}.{service_name}.{host}.{domain}")
+}
+
+/// Returns the `<instance>` label a SAN composed from `instance` carries:
+/// the number, or [`DEFAULT_SAN_INSTANCE`] when absent, zero-padded to
+/// three digits.
+///
+/// Split out so a remote-bootstrap artifact's `profile_instance_id` is
+/// the label the registrar's own SAN uses rather than a second
+/// formatting of it. Like the default it applies, it is SAN-only and
+/// never reaches [`derive_registration_id`].
+pub(crate) fn san_instance_label(instance: Option<u32>) -> String {
+    format!("{:03}", instance.unwrap_or(DEFAULT_SAN_INSTANCE))
 }
 
 /// Returns whether a requested spec is the component's single rendered

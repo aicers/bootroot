@@ -367,22 +367,22 @@ fn spawn_shutdown_watcher(shutdown: DaemonShutdown) -> tokio::task::JoinHandle<(
 /// crate fails if `StateFile`'s fallback ever stops being this name.
 const DEFAULT_STATE_SECRETS_DIR: &str = "secrets";
 
-/// The three members the daemon reads out of the deployment's
+/// The four members the daemon reads out of the deployment's
 /// `state.json`, and nothing else about that file.
 ///
-/// `bootroot init` records the `OpenBao` URL, the KV mount and the
-/// secrets directory there, and `StateFile` — the type that owns the
-/// whole inventory — is a module of the **binary** crate, unreachable
-/// from the library where `run_daemon`, the endpoint and the verb layer
-/// live. So this projection crosses that boundary and makes exactly
-/// these three member names a contract between the two binaries; every
-/// other member is deliberately tolerated and ignored, so the CLI's
+/// `bootroot init` records the `OpenBao` URL, its advertise address, the
+/// KV mount and the secrets directory there, and `StateFile` — the type
+/// that owns the whole inventory — is a module of the **binary** crate,
+/// unreachable from the library where `run_daemon`, the endpoint and the
+/// verb layer live. So this projection crosses that boundary and makes
+/// exactly these four member names a contract between the two binaries;
+/// every other member is deliberately tolerated and ignored, so the CLI's
 /// inventory can grow a field without breaking a daemon that never looks
 /// at it.
 ///
 /// It derives [`serde::Deserialize`] and **not** `Serialize` on purpose:
 /// a serializer here is how a later edit comes to write an operator's
-/// state file back out with three fields and lose the rest.
+/// state file back out with four fields and lose the rest.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct RegistrarStateProjection {
     /// The URL `bootroot init` recorded for this deployment's
@@ -396,9 +396,19 @@ pub(crate) struct RegistrarStateProjection {
     /// passed `--secrets-dir`.
     #[serde(default)]
     pub(crate) secrets_dir: Option<PathBuf>,
+    /// The routable `OpenBao` address recorded for a wildcard bind,
+    /// absent otherwise. Read only to choose the `openbao_url` a
+    /// remote-bootstrap artifact carries, by the rule `service add`
+    /// applies to the same two members; the daemon's own connection
+    /// always uses `openbao_url`.
+    // Only the Linux-only endpoint reads it; elsewhere it is parsed and
+    // ignored like every member this projection does not name.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[serde(default)]
+    pub(crate) openbao_advertise_addr: Option<String>,
 }
 
-/// Reads the three members the registrar surface needs out of the
+/// Reads the members the registrar surface needs out of the
 /// `state.json` that `[registrar] state_file` names.
 ///
 /// Every way this can fail names itself: which key, which path and which
@@ -549,6 +559,7 @@ pub(crate) async fn build_registrar_handler(
         )
     })?;
     let state = read_registrar_state(state_file)?;
+    let artifact = registrar_artifact_deployment(registrar, &state)?;
     let secrets_dir = resolve_secrets_dir(state_file, state.secrets_dir.as_deref());
     if !secrets_dir.is_dir() {
         anyhow::bail!(
@@ -666,6 +677,7 @@ pub(crate) async fn build_registrar_handler(
             verbs,
             credential,
             state.kv_mount,
+            artifact,
             health.clone(),
         )),
         maintenance: Some(RegistrarMaintenance {
@@ -674,6 +686,43 @@ pub(crate) async fn build_registrar_handler(
             counts,
             renewal: None,
         }),
+    })
+}
+
+/// Resolves the deployment-level members of the artifact a
+/// remote-bootstrap mint returns.
+///
+/// Settings validation already requires both agent URLs whenever the
+/// endpoint is enabled, so their absence here is refused again rather
+/// than assumed away: this is the enabled path, and a composition that
+/// reached it without them has no value to hand a target.
+///
+/// # Errors
+///
+/// Returns an error naming the `[registrar]` key that is unset.
+#[cfg(target_os = "linux")]
+fn registrar_artifact_deployment(
+    registrar: &config::RegistrarSettings,
+    state: &RegistrarStateProjection,
+) -> anyhow::Result<crate::registrar::endpoint::production::ArtifactDeployment> {
+    let required = |key: &str, value: Option<&String>| {
+        value.cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "registrar.{key} is required when registrar_endpoint.enabled is true, and no \
+                 value was configured"
+            )
+        })
+    };
+    Ok(crate::registrar::endpoint::production::ArtifactDeployment {
+        openbao_url: crate::remote_bootstrap::artifact_openbao_url(
+            &state.openbao_url,
+            state.openbao_advertise_addr.as_deref(),
+        ),
+        agent_server: required("agent_server", registrar.agent_server.as_ref())?,
+        agent_responder_url: required(
+            "agent_responder_url",
+            registrar.agent_responder_url.as_ref(),
+        )?,
     })
 }
 

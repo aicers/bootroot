@@ -604,6 +604,13 @@ impl RegistrarVerbs {
         &self.limiter
     }
 
+    /// Returns the deployment domain of the provisioning config this
+    /// service was constructed with — the one every SAN it mints ends
+    /// in, and so the one a remote-bootstrap artifact's agent is told.
+    pub(crate) fn domain(&self) -> &str {
+        self.config.domain()
+    }
+
     /// Mints — or idempotently re-mints — one service identity and
     /// returns fresh wrap-only material for it.
     pub(crate) async fn mint(&self, request: &MintRequest) -> MintResult {

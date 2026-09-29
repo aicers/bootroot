@@ -113,6 +113,7 @@ pub(crate) fn validate_settings(settings: &Settings) -> Result<()> {
     validate_registrar_endpoint_material_paths(&settings.registrar_endpoint)?;
     validate_registrar_settings(&settings.registrar)?;
     validate_registrar_state_file_requirement(&settings.registrar, &settings.registrar_endpoint)?;
+    validate_registrar_agent_url_requirement(&settings.registrar, &settings.registrar_endpoint)?;
     Ok(())
 }
 
@@ -194,6 +195,55 @@ fn validate_registrar_state_file_requirement(
              daemon reads the deployment's OpenBao URL, KV mount and secrets directory out of \
              the state.json that key names, and has no other source for them"
         );
+    }
+    Ok(())
+}
+
+/// Requires `[registrar] agent_server` and `agent_responder_url` exactly
+/// when the endpoint is enabled.
+///
+/// A remote-bootstrap mint returns an artifact that tells the target's
+/// agent where the CA and the HTTP-01 responder are, and the endpoint
+/// has no other source for either. Checked beside the `state_file`
+/// requirement for the same reason: it relates two tables. Each value's
+/// own shape is checked in [`validate_registrar_settings`].
+fn validate_registrar_agent_url_requirement(
+    registrar: &RegistrarSettings,
+    endpoint: &RegistrarEndpointSettings,
+) -> Result<()> {
+    if !endpoint.enabled {
+        return Ok(());
+    }
+    for (key, value) in [
+        ("registrar.agent_server", &registrar.agent_server),
+        (
+            "registrar.agent_responder_url",
+            &registrar.agent_responder_url,
+        ),
+    ] {
+        if value.is_none() {
+            anyhow::bail!(
+                "{key} is required when registrar_endpoint.enabled is true: a remote-bootstrap \
+                 mint carries it into the artifact it returns, and it has no default"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a registrar agent URL that is not an absolute URL with a
+/// host.
+///
+/// The value is copied into a target host's agent configuration
+/// unchanged, so it is held to the form that configuration can use:
+/// surrounding whitespace is refused rather than trimmed, because a
+/// trimmed value would be a different value from the one copied.
+fn validate_registrar_agent_url(key: &str, value: &str) -> Result<()> {
+    let parsed = (value.trim() == value)
+        .then(|| Url::parse(value).ok())
+        .flatten();
+    if parsed.is_none_or(|url| url.host().is_none()) {
+        anyhow::bail!("{key} ({value}) must be an absolute URL with a host");
     }
     Ok(())
 }
@@ -307,6 +357,23 @@ pub fn validate_registrar_settings(settings: &RegistrarSettings) -> Result<()> {
              is not contracted to be stable under a service supervisor",
             state_file.display()
         );
+    }
+    validate_registrar_agent_urls(settings)?;
+    Ok(())
+}
+
+/// Holds each configured agent URL to [`validate_registrar_agent_url`].
+fn validate_registrar_agent_urls(settings: &RegistrarSettings) -> Result<()> {
+    for (key, value) in [
+        ("registrar.agent_server", &settings.agent_server),
+        (
+            "registrar.agent_responder_url",
+            &settings.agent_responder_url,
+        ),
+    ] {
+        if let Some(value) = value {
+            validate_registrar_agent_url(key, value)?;
+        }
     }
     Ok(())
 }
@@ -941,6 +1008,113 @@ mod tests {
             rendered.contains("registrar_endpoint.enabled"),
             "the refusal must name the enablement that made it required: {rendered}"
         );
+    }
+
+    /// Both agent URLs are required exactly when the endpoint is
+    /// enabled, and each refusal names the key that is missing.
+    #[test]
+    fn agent_urls_are_required_exactly_when_the_endpoint_is_enabled() {
+        let enabled = RegistrarEndpointSettings {
+            enabled: true,
+            ..RegistrarEndpointSettings::default()
+        };
+        let disabled = RegistrarEndpointSettings::default();
+        let complete = RegistrarSettings {
+            agent_server: Some("https://stepca.example:9000/acme/acme/directory".to_string()),
+            agent_responder_url: Some("http://responder.example:8080".to_string()),
+            ..RegistrarSettings::default()
+        };
+
+        validate_registrar_agent_url_requirement(&RegistrarSettings::default(), &disabled)
+            .expect("a disabled endpoint needs neither agent URL");
+        validate_registrar_agent_url_requirement(&complete, &enabled)
+            .expect("an enabled endpoint with both agent URLs is accepted");
+
+        for (key, settings) in [
+            (
+                "registrar.agent_server",
+                RegistrarSettings {
+                    agent_server: None,
+                    ..complete.clone()
+                },
+            ),
+            (
+                "registrar.agent_responder_url",
+                RegistrarSettings {
+                    agent_responder_url: None,
+                    ..complete.clone()
+                },
+            ),
+        ] {
+            let error = validate_registrar_agent_url_requirement(&settings, &enabled)
+                .expect_err("an enabled endpoint missing an agent URL is refused");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(key),
+                "the refusal names {key}: {rendered}"
+            );
+            assert!(
+                rendered.contains("registrar_endpoint.enabled"),
+                "the refusal names the enablement: {rendered}"
+            );
+        }
+    }
+
+    /// Each agent URL must be an absolute URL with a host, and is held
+    /// to that whether or not the endpoint is enabled.
+    #[test]
+    fn agent_urls_must_be_absolute_urls_with_a_host() {
+        for value in [
+            "https://stepca.example:9000/acme/acme/directory",
+            "http://10.0.0.5:8080",
+            "http://[::1]:8080",
+        ] {
+            for settings in [
+                RegistrarSettings {
+                    agent_server: Some(value.to_string()),
+                    ..RegistrarSettings::default()
+                },
+                RegistrarSettings {
+                    agent_responder_url: Some(value.to_string()),
+                    ..RegistrarSettings::default()
+                },
+            ] {
+                validate_registrar_settings(&settings)
+                    .unwrap_or_else(|error| panic!("{value} is usable: {error:#}"));
+            }
+        }
+        for value in [
+            "",
+            "stepca.example:9000",
+            "/acme/directory",
+            "unix:/run/socket",
+            " https://stepca.example",
+            "https://stepca.example ",
+        ] {
+            for (key, settings) in [
+                (
+                    "registrar.agent_server",
+                    RegistrarSettings {
+                        agent_server: Some(value.to_string()),
+                        ..RegistrarSettings::default()
+                    },
+                ),
+                (
+                    "registrar.agent_responder_url",
+                    RegistrarSettings {
+                        agent_responder_url: Some(value.to_string()),
+                        ..RegistrarSettings::default()
+                    },
+                ),
+            ] {
+                let error = validate_registrar_settings(&settings)
+                    .expect_err("an unusable agent URL is refused");
+                assert!(
+                    format!("{error:#}").contains(key),
+                    "{value:?} is refused naming {key}"
+                );
+            }
+        }
     }
 
     /// An absolute `state_file` is accepted and carried through

@@ -5,7 +5,8 @@ use bootroot::input_validation::{
     ValidationError, validate_cidr_list, validate_dns_label, validate_domain_name,
     validate_numeric_instance_id, validate_registration_id,
 };
-use bootroot::registrar::{RESERVED_SERVICE_NAME_PREFIX, is_reserved_service_name};
+use bootroot::registrar::{RESERVED_SERVICE_NAME_PREFIX, ReloadKind, is_reserved_service_name};
+use bootroot::remote_bootstrap::{ReloadPresetError, reload_preset_hooks};
 
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
 use crate::cli::prompt::Prompt;
@@ -593,58 +594,40 @@ pub(super) fn resolve_post_renew_hooks_from_parts(
     Ok(hooks)
 }
 
+/// Resolves a `--reload-style` preset through the library mapping the
+/// registrar mint also uses, so both producers install the same hook for
+/// the same style and target. Only the wording of a refusal is the
+/// CLI's own.
 fn resolve_reload_preset(
     style: ReloadStyle,
     target: Option<&str>,
 ) -> Result<Vec<PostRenewHookEntry>> {
-    match style {
-        ReloadStyle::None => Ok(Vec::new()),
-        ReloadStyle::Systemd => {
-            let unit = target.ok_or_else(|| {
-                anyhow::anyhow!("--reload-style systemd requires --reload-target <unit-name>")
-            })?;
-            Ok(vec![PostRenewHookEntry {
-                command: "systemctl".to_string(),
-                args: vec!["reload".to_string(), unit.to_string()],
-                timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
-                on_failure: HookFailurePolicyEntry::default(),
-            }])
+    let kind = match style {
+        ReloadStyle::None => ReloadKind::None,
+        ReloadStyle::Systemd => ReloadKind::Systemd,
+        ReloadStyle::Sighup => ReloadKind::Sighup,
+        ReloadStyle::DockerRestart => ReloadKind::DockerRestart,
+    };
+    reload_preset_hooks(kind, target).map_err(|error| match error {
+        ReloadPresetError::TargetRequired { kind } => {
+            let placeholder = match kind {
+                ReloadKind::Systemd => "<unit-name>",
+                ReloadKind::Sighup => "<process-name>",
+                ReloadKind::DockerRestart => "<container-name>",
+                // `none` takes no target, so it never reaches this arm.
+                ReloadKind::None => "<target>",
+            };
+            anyhow::anyhow!("--reload-style {kind} requires --reload-target {placeholder}")
         }
-        ReloadStyle::Sighup => {
-            let name = target.ok_or_else(|| {
-                anyhow::anyhow!("--reload-style sighup requires --reload-target <process-name>")
-            })?;
-            if name.contains('/') {
-                anyhow::bail!(
-                    "--reload-target for sighup preset must be a process name, not a path.\n\
-                     Got: {name}\n\
-                     For path-based matching, use the low-level flags:\n    \
-                     --post-renew-command pkill \\\n    \
-                     --post-renew-arg -HUP --post-renew-arg -f \\\n    \
-                     --post-renew-arg <your-path>"
-                );
-            }
-            Ok(vec![PostRenewHookEntry {
-                command: "pkill".to_string(),
-                args: vec!["-HUP".to_string(), name.to_string()],
-                timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
-                on_failure: HookFailurePolicyEntry::default(),
-            }])
-        }
-        ReloadStyle::DockerRestart => {
-            let container = target.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--reload-style docker-restart requires --reload-target <container-name>"
-                )
-            })?;
-            Ok(vec![PostRenewHookEntry {
-                command: "docker".to_string(),
-                args: vec!["restart".to_string(), container.to_string()],
-                timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
-                on_failure: HookFailurePolicyEntry::default(),
-            }])
-        }
-    }
+        ReloadPresetError::SighupTargetIsPath { target } => anyhow::anyhow!(
+            "--reload-target for sighup preset must be a process name, not a path.\n\
+             Got: {target}\n\
+             For path-based matching, use the low-level flags:\n    \
+             --post-renew-command pkill \\\n    \
+             --post-renew-arg -HUP --post-renew-arg -f \\\n    \
+             --post-renew-arg <your-path>"
+        ),
+    })
 }
 
 /// Normalizes a local-file `--agent-config` path to an absolute,

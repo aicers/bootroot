@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+// Moved to the library so the registrar mint resolves an artifact's
+// `OpenBao` URL by the same rule; re-exported for the CLI's call sites.
+pub(crate) use bootroot::remote_bootstrap::client_url_from_bind_addr;
 use x509_parser::pem::parse_x509_pem;
 
 use crate::commands::init::{
@@ -217,25 +220,6 @@ pub(crate) fn reject_advertise_addr_for_specific_bind(
         anyhow::bail!(messages.error_openbao_advertise_addr_specific_bind_rejected());
     }
     Ok(())
-}
-
-/// Derives a usable HTTPS client URL from a bind address.
-///
-/// Wildcard addresses (`0.0.0.0`, `[::]`) are mapped to their loopback
-/// counterparts (`127.0.0.1`, `[::1]`) because `bootroot` commands run
-/// on the CN and can always reach `OpenBao` via loopback.  Specific IPs
-/// are used as-is.
-#[must_use]
-pub(crate) fn client_url_from_bind_addr(bind_addr: &str) -> String {
-    let Some((ip, port)) = bind_addr.rsplit_once(':') else {
-        return format!("https://{bind_addr}");
-    };
-    let client_ip = match ip {
-        "0.0.0.0" => "127.0.0.1",
-        "[::0]" | "[::]" => "[::1]",
-        other => other,
-    };
-    format!("https://{client_ip}:{port}")
 }
 
 /// Validates the `--http01-admin-bind` CLI flag value.

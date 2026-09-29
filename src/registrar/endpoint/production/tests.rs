@@ -9,7 +9,8 @@ use wiremock::matchers::{method, path as request_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{
-    ProductionHandler, SpecConversionError, anchor_from_stored, normalize_bundle, requested_spec,
+    ArtifactDeployment, ProductionHandler, SpecConversionError, anchor_from_stored,
+    normalize_bundle, requested_spec,
 };
 use crate::config::AuditStoreEnforcement;
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
@@ -40,6 +41,15 @@ use crate::registrar_certs::SurfaceLeaf;
 /// level up and passes it down; nothing in this layer knows where it was
 /// recorded.
 const HARNESS_KV_MOUNT: &str = "secret";
+
+/// The deployment-level artifact members the harness handler carries.
+fn harness_artifact_deployment() -> ArtifactDeployment {
+    ArtifactDeployment {
+        openbao_url: "https://openbao.example.test:8200".to_string(),
+        agent_server: "https://stepca.example.test:9000/acme/acme/directory".to_string(),
+        agent_responder_url: "http://responder.example.test:8080".to_string(),
+    }
+}
 
 /// Generates a self-signed CA certificate, returning its PEM and the
 /// lowercase hex SHA-256 of its DER — the `trusted_ca_sha256` form.
@@ -379,7 +389,12 @@ fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler)
     );
     (
         dir,
-        ProductionHandler::new(verbs, credential, HARNESS_KV_MOUNT.to_string()),
+        ProductionHandler::new(
+            verbs,
+            credential,
+            HARNESS_KV_MOUNT.to_string(),
+            harness_artifact_deployment(),
+        ),
     )
 }
 
@@ -394,7 +409,13 @@ fn health_harness(
     let (dir, verbs, credential) = harness_dependencies(server, audit_store);
     (
         dir,
-        ProductionHandler::with_health(verbs, credential, HARNESS_KV_MOUNT.to_string(), health),
+        ProductionHandler::with_health(
+            verbs,
+            credential,
+            HARNESS_KV_MOUNT.to_string(),
+            harness_artifact_deployment(),
+            health,
+        ),
     )
 }
 
@@ -677,7 +698,7 @@ async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
     *health.lock().expect("the snapshot lock is not poisoned") = snapshot.clone();
 
     let anchor = relay_anchor();
-    let encoded = encode_mint_response(mint_outcome(), &anchor, &handler.health_snapshot())
+    let encoded = encode_mint_response(mint_outcome(), &anchor, None, &handler.health_snapshot())
         .expect("the mint response encodes");
     let decoded = decode_mint_response(&encoded).expect("the mint response decodes");
     assert_eq!(
@@ -709,7 +730,7 @@ async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
         .expect("the snapshot lock is not poisoned")
         .audit_capacity
         .malformed_records = Some(9);
-    let refreshed = encode_mint_response(mint_outcome(), &anchor, &handler.health_snapshot())
+    let refreshed = encode_mint_response(mint_outcome(), &anchor, None, &handler.health_snapshot())
         .expect("the second mint response encodes");
     assert_eq!(
         decode_mint_response(&refreshed)

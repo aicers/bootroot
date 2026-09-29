@@ -4,12 +4,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+// The hook entry is shared with the registrar mint, which builds the same
+// artifact from the library; its serialized form in `state.json` is the
+// library type's.
+pub(crate) use bootroot::remote_bootstrap::{
+    DEFAULT_HOOK_TIMEOUT_SECS, HookFailurePolicyEntry, PostRenewHookEntry,
+};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SECRETS_DIR: &str = "secrets";
 const DEFAULT_STATE_FILE: &str = "state.json";
-pub(crate) const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 
 /// Describes how to reload a service after its infrastructure certificate
 /// is renewed.  Keyed by a stable discriminator so the rotation loop can
@@ -343,35 +348,6 @@ pub(crate) struct ServiceRoleEntry {
     pub(crate) token_bound_cidrs: Option<Vec<String>>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum HookFailurePolicyEntry {
-    #[default]
-    Continue,
-    Stop,
-}
-
-impl fmt::Display for HookFailurePolicyEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_serde_string_value(self, formatter)
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub(crate) struct PostRenewHookEntry {
-    pub(crate) command: String,
-    #[serde(default)]
-    pub(crate) args: Vec<String>,
-    #[serde(default = "default_hook_timeout_secs")]
-    pub(crate) timeout_secs: u64,
-    #[serde(default)]
-    pub(crate) on_failure: HookFailurePolicyEntry,
-}
-
-fn default_hook_timeout_secs() -> u64 {
-    DEFAULT_HOOK_TIMEOUT_SECS
-}
-
 fn write_serde_string_value<T: Serialize>(
     value: &T,
     formatter: &mut fmt::Formatter<'_>,
@@ -395,16 +371,36 @@ mod tests {
         }
     }
 
+    /// `openbao_advertise_addr` is the fourth member the daemon's
+    /// `RegistrarStateProjection` reads, to pick the `OpenBao` URL a
+    /// registrar-minted remote-bootstrap artifact carries, so its name is
+    /// part of the same contract.
+    #[test]
+    fn the_advertise_address_the_daemon_reads_keeps_its_name() {
+        let state = StateFile {
+            openbao_advertise_addr: Some("192.168.1.10:8200".to_string()),
+            ..StateFile::default()
+        };
+        let value = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(
+            value
+                .get("openbao_advertise_addr")
+                .and_then(serde_json::Value::as_str),
+            Some("192.168.1.10:8200")
+        );
+    }
+
     /// `openbao_url`, `kv_mount` and `secrets_dir` are a contract
     /// between this binary and `bootroot-agent`, whose
-    /// `RegistrarStateProjection` reads exactly these three member names
-    /// out of the file this type writes and knows nothing else about it.
+    /// `RegistrarStateProjection` reads these member names, and
+    /// `openbao_advertise_addr` above, out of the file this type writes
+    /// and knows nothing else about it.
     /// Renaming one here without renaming it there would leave the
     /// daemon reading an absent member and refusing to serve the
     /// registrar endpoint, and nothing else in either crate would say
     /// so.
     #[test]
-    fn the_three_members_the_daemon_reads_keep_their_names() {
+    fn the_members_the_daemon_reads_keep_their_names() {
         let state = StateFile {
             openbao_url: "https://openbao.example:8200".to_string(),
             kv_mount: "secret".to_string(),

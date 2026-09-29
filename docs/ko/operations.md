@@ -1863,6 +1863,10 @@ WantedBy=multi-user.target
 - **배포 상태 파일** — `[registrar] state_file`에서 옵니다. 엔드포인트가
   활성화되면 **필수**입니다. 실패 시 키와 경로, 그리고 `openbao_url`과
   `kv_mount` 중 무엇이 없거나 비었거나 평문이었는지를 알려줍니다.
+- **원격 부트스트랩 에이전트 URL** — `[registrar] agent_server`와
+  `agent_responder_url`에서 옵니다. `RemoteBootstrap` mint가 돌려주는
+  `bootstrap.json`에 담겨 대상에게 전달되므로, 엔드포인트가 활성화되면 둘
+  다 **필수**입니다. 설정 검증이 빠진 키를 지목하며 거부합니다.
 - **시크릿 디렉터리** — 상태 파일의 `secrets_dir`, 없으면 상태 파일 옆의
   `secrets`입니다. 실패 시 해석된 경로를 알려줍니다.
 - **배포의 활성 루트** — `<secrets_dir>/certs/root_ca.crt`입니다. 실패 시

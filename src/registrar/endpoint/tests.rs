@@ -82,7 +82,7 @@ use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::RegistrarConfig;
-use crate::registrar::endpoint::production::ProductionHandler;
+use crate::registrar::endpoint::production::{ArtifactDeployment, ProductionHandler};
 use crate::registrar::endpoint::protocol;
 use crate::registrar::endpoint::refusing::RefusingHandler;
 use crate::registrar::endpoint_pin::EndpointVerifyRejection;
@@ -918,6 +918,7 @@ fn production_handler_with_limiter(
             verbs,
             credential,
             HARNESS_KV_MOUNT.to_string(),
+            harness_artifact_deployment(),
             health,
         )),
     )
@@ -956,7 +957,18 @@ fn write_harness_root(secrets_dir: &Path) -> String {
     crate::tls::sha256_hex(cert.der().as_ref())
 }
 
-/// Builds one register payload at the endpoint's v1 protocol.
+/// The deployment-level artifact members the production harness is
+/// built with.
+fn harness_artifact_deployment() -> ArtifactDeployment {
+    ArtifactDeployment {
+        openbao_url: "https://openbao.example.test:8200".to_string(),
+        agent_server: "https://stepca.example.test:9000/acme/acme/directory".to_string(),
+        agent_responder_url: "http://responder.example.test:8080".to_string(),
+    }
+}
+
+/// Builds one register payload at the endpoint's v1 protocol, with the
+/// seven target paths a remote-bootstrap request carries.
 fn register_payload(service_name: &str, host: &str, idempotency_key: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "protocol_version": 1,
@@ -970,6 +982,13 @@ fn register_payload(service_name: &str, host: &str, idempotency_key: &str) -> Ve
         },
         "wrap_ttl": 300,
         "idempotency_key": idempotency_key,
+        "agent_config_path": "/etc/roxyd/agent.toml",
+        "role_id_path": "/var/lib/roxyd/secrets/role_id",
+        "secret_id_path": "/var/lib/roxyd/secrets/secret_id",
+        "eab_file_path": "/var/lib/roxyd/secrets/eab.json",
+        "profile_cert_path": "/var/lib/roxyd/certs/roxyd.crt",
+        "profile_key_path": "/var/lib/roxyd/certs/roxyd.key",
+        "ca_bundle_path": "/var/lib/roxyd/certs/ca-bundle.pem",
     }))
     .expect("the payload encodes")
 }
