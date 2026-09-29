@@ -112,6 +112,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   that `bootroot-remote bootstrap --artifact` reads — the same document
   `bootroot service add --delivery-mode remote-bootstrap` writes, built
   around those paths and the one wrapped `secret_id` the mint issued.
+  On the bootroot host the endpoint daemon is the one `bootroot-agent`
+  process that runs on `<secrets-dir>/registrar-internal/agent.toml`,
+  renewing the bootroot-internal credential and serving the endpoint:
+  the operator writes `[registrar]` and `[registrar_endpoint]` in the
+  file passed to `bootroot init --agent-config`, and `init` validates
+  both tables — refusing a missing or invalid required key by name
+  before it creates anything — and renders them into that configuration,
+  where every rotation keeps them. The shipped
+  `bootroot-registrar.service` is pointed at it with an `ExecStart`
+  drop-in. On a deployment initialized with `--no-eab`, `init` records
+  the cleared agent EAB so the daemon's first issuance can start.
 - `bootroot infra install --registrar-endpoint-host <label>
   --registrar-endpoint-domain <domain>` enables the registrar endpoint on
   a bootroot host, recording in `state.json` the predicate `bootroot init`

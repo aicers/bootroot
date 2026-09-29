@@ -1958,10 +1958,21 @@ Enabling a host starts at install time. Record the endpoint predicate with
 `bootroot infra install --registrar-endpoint-host <label>
 --registrar-endpoint-domain <domain>` — the bootroot host's single DNS label
 and the deployment domain the bootroot-internal SAN is composed under — then
-run `bootroot init --agent-config <path>` as root with a daemon configuration
-whose `[registrar_endpoint] enabled = true`. `init` provisions the internal
-credential and moves OpenBao to TLS from the recorded predicate, and refuses a
-daemon configuration that disagrees with it. See
+run `bootroot init --agent-config <path>` as root. On an enabled predicate that
+file must carry the full `[registrar]` and `[registrar_endpoint]` tables the
+endpoint runs with: `[registrar_endpoint] enabled = true`, the seven keys an
+enabled endpoint requires — `[registrar] state_file`, `agent_server` and
+`agent_responder_url`, and `[registrar_endpoint] server_cert_path`,
+`server_key_path`, `client_cert_path` and `client_key_path` — and any other
+`[registrar]` key the endpoint should not take at its default. `init` validates
+both tables before it creates anything, refusing a missing or invalid key by
+name, and renders them into `<secrets-dir>/registrar-internal/agent.toml`, the
+configuration the endpoint daemon runs on
+([Installing the units](#installing-the-units)). Nothing else in the file is
+copied. `init` also provisions the internal credential and moves OpenBao to
+TLS from the recorded predicate, and refuses a daemon configuration that
+disagrees with it. Each `init` takes the two tables from that run's file;
+re-running `init` is not a way to change them on an initialized host. See
 [Registrar endpoint predicate](cli.md#registrar-endpoint-predicate) for what
 `infra install` does when a predicate is already recorded; switching a host off
 again is the two-edit procedure under
@@ -2309,16 +2320,33 @@ working PKI, every enrolled service identity and the audit trail, to fix a timer
 
 #### Installing the units
 
-Both units are checked in under `systemd/` in this repository. Copy them
-to `/etc/systemd/system/` and enable them:
+Both units are checked in under `systemd/` in this repository. The endpoint
+daemon runs on the configuration `bootroot init` rendered at
+`<secrets-dir>/registrar-internal/agent.toml`, and that path depends on the
+deployment's secrets directory, so the service unit's `ExecStart` is a
+placeholder an installer overrides with a drop-in: an empty `ExecStart=`,
+which clears the shipped one, followed by the real one. Copy the units to
+`/etc/systemd/system/`, add the drop-in, and enable them:
 
 ```sh
 install -m 0644 systemd/bootroot-registrar.socket /etc/systemd/system/
 install -m 0644 systemd/bootroot-registrar.service /etc/systemd/system/
+install -d -m 0755 /etc/systemd/system/bootroot-registrar.service.d
+cat >/etc/systemd/system/bootroot-registrar.service.d/10-config.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/bootroot-agent --config <secrets-dir>/registrar-internal/agent.toml
+EOF
 systemctl daemon-reload
 systemctl enable --now bootroot-registrar.socket
 systemctl enable --now bootroot-registrar.service
 ```
+
+Replace `<secrets-dir>` with the secrets directory `state.json` records
+(`secrets_dir`), as an absolute path. There is no other file to write for the
+endpoint: `init` already rendered the `[registrar]` and `[registrar_endpoint]`
+tables from `--agent-config` into that configuration, and every rotation keeps
+them.
 
 The socket unit uses `ListenStream=/run/bootroot/registrar.sock`,
 `SocketMode=0700`, `SocketUser=root`, `SocketGroup=root`, `Accept=no`,
@@ -2329,11 +2357,13 @@ taking the runtime directory with it.
 
 The service unit uses `Requires=bootroot-registrar.socket`,
 `After=bootroot-registrar.socket`, `User=root`, `Group=root`,
-`Restart=on-failure`, `WantedBy=multi-user.target` and
+`Restart=on-failure`, `WantedBy=multi-user.target` and a placeholder
 
 ```ini
 ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 ```
+
+which the drop-in above replaces.
 
 It is **enabled at boot** rather than started lazily by a connection.
 The renewal and fast-poll loops have to run whether or not a registrar
@@ -2341,7 +2371,8 @@ ever connects; the socket unit is a dependency purely so the listening
 descriptor exists before the daemon starts and is inherited by it.
 
 As with every other agent unit, a deployment whose EAB credentials
-rotate must add the real provisioned `--eab-file` path to `ExecStart`.
+rotate must add the real provisioned `--eab-file` path to the drop-in's
+`ExecStart`.
 Without it, EAB KV updates and `rotate eab-clear` are silent no-ops for
 that agent — see the
 [systemd operations procedure](#systemd-operations-procedure-recommended-for-bootroot-agent)
@@ -2363,19 +2394,29 @@ client-certificate option is introduced in either case — the listener already
 requests client certificates, and requiring them there would break the
 certificate-less `AppRole` agents and every token-authenticated command.
 
-`bootroot init` provisions it, writes its dedicated
-`registrar-internal/agent.toml` and its private CA bundle below the
-state-recorded secrets directory, and — as with every other agent — does not
-start the process that renews it. Start it yourself:
+`bootroot init` provisions it, and writes `registrar-internal/agent.toml` and
+its private CA bundle below the state-recorded secrets directory. That
+configuration carries the internal profile and the `[registrar]` and
+`[registrar_endpoint]` tables from `--agent-config`, and the process that runs
+on it is the registrar endpoint daemon, run by `bootroot-registrar.service`
+([Installing the units](#installing-the-units)):
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 ```
 
-Ordinary renewal begins then, on that config's own `daemon` and `retry`
-settings and through the same predicate every other profile uses. Until it is
-started there is nothing to renew and nothing to signal — a rotation that
-`HUP`s it and finds no process treats that as success.
+That one process renews the internal credential and serves the endpoint; there
+is no second `bootroot-agent` process for the credential. As with every other
+agent, `init` does not start it. Ordinary renewal begins once the service
+starts, on that config's own `daemon` and `retry` settings and through the same
+predicate every other profile uses. Until it is started there is nothing to
+renew and nothing to signal — a rotation that `HUP`s it and finds no process
+treats that as success.
+
+On a deployment initialized with `--no-eab`, `init` records the cleared agent
+EAB payload at `bootroot/agent/eab` when that path does not exist yet, so the
+daemon's first surface issuance, which refuses an absent entry, can start. An
+existing entry is left as it is.
 
 Renewal has one precondition: before it issues, the daemon checks that the root
 recorded beside the credential is still the deployment's active root, and

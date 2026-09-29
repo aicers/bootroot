@@ -509,10 +509,11 @@ bootroot verify --registration-id edge-proxy \
 ### bootroot 내부 registrar 에이전트
 
 [registrar 엔드포인트](operations.md#registrar-endpoint-linux-only)를 제공하는 **bootroot
-호스트** 배포에서는 해당 호스트의 서비스 에이전트와 별개로 **두 번째**
-`bootroot-agent` 프로세스를 함께 운영합니다. 이 프로세스가 갱신하는 인증서는
-하나뿐입니다. 데몬이 registrar의 `mint`/`deregister` 동사를 실행하기 위해
-`OpenBao`에 인증할 때 사용하는 bootroot 내부 자격 증명입니다.
+호스트** 배포에서는 해당 호스트의 서비스 에이전트와 별개로 엔드포인트 데몬을 자체
+`bootroot-agent` 프로세스로 운영합니다. 이 하나의 프로세스가 두 가지 일을 합니다.
+엔드포인트를 제공하고, 인증서 하나를 갱신합니다. 그 인증서는 registrar의
+`mint`/`deregister` 동사를 실행하기 위해 `OpenBao`에 인증할 때 사용하는 bootroot
+내부 자격 증명입니다. 자격 증명을 위한 두 번째 프로세스는 없습니다.
 
 **이 호스트에서는 `bootroot init`을 root로 실행하세요.** 자격 증명을 구성하는
 다섯 개 파일(`registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
@@ -536,9 +537,12 @@ Agent 사이드카는 계속 설치 트리의 소유자로 실행되며, root로
 것은 위에 나열한 다섯 개 파일뿐이며, 엔드포인트를 활성화하기 위해 기존 설치의
 소유권을 다시 지정할 필요는 없습니다.
 
-`bootroot init`은 이 설정 파일과 전용 CA 번들을 작성할 뿐, 프로세스를 시작하거나
-감독자(supervisor)를 설치하지 않습니다. 서비스 에이전트와 마찬가지로 운영자가
-같은 감독자 아래에서 시작합니다.
+`bootroot init`은 이 설정 파일과 전용 CA 번들을 작성할 뿐, 서비스 에이전트와
+마찬가지로 프로세스를 시작하거나 감독자(supervisor)를 설치하지 않습니다. 이 설정에는
+내부 프로파일과, `init`이 전달받은 `--agent-config` 파일에서 복사한 `[registrar]`,
+`[registrar_endpoint]` 테이블이 들어 있으므로 엔드포인트 데몬의 설정 전체가 됩니다.
+`bootroot-registrar.service`가 이 프로세스를 실행하며, 유닛의 `ExecStart`를 이
+경로로 바꾸는 drop-in을 사용합니다([유닛 설치](operations.md#유닛-설치) 참고).
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml

@@ -75,6 +75,7 @@ fn generated_config(paths: &InternalPaths) -> String {
             eab_kid: None,
             eab_hmac: None,
             trusted_ca_sha256: &[ROOT_FP.to_string()],
+            endpoint_tables: None,
         },
     )
 }
@@ -761,6 +762,7 @@ fn config_params(pins: &[String]) -> InternalAgentConfigParams<'_> {
         eab_kid: Some("kid-1"),
         eab_hmac: Some(&CONFIG_EAB_HMAC),
         trusted_ca_sha256: pins,
+        endpoint_tables: None,
     }
 }
 

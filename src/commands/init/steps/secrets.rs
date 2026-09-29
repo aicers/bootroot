@@ -2,7 +2,7 @@ use std::io::{self, BufRead};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use bootroot::openbao::OpenBaoClient;
+use bootroot::openbao::{KvCreateIfAbsent, OpenBaoClient};
 
 use super::super::constants::SECRET_BYTES;
 use super::super::constants::openbao_constants::PATH_AGENT_EAB;
@@ -232,10 +232,214 @@ async fn register_eab_secret(
     Ok(())
 }
 
+/// Records the explicit "no EAB" payload at the agent EAB path on an
+/// endpoint-enabled host that registered none, unless the path already
+/// holds an entry.
+///
+/// `endpoint_enabled` is the recorded predicate and `registered` the EAB
+/// this run wrote, if any. A disabled or absent predicate, or a run that
+/// registered an EAB, makes no request at all.
+///
+/// The registrar endpoint daemon's surface issuance reads this path
+/// unconditionally and accepts only a populated payload or the explicit
+/// cleared one; an absent entry is an error it refuses on, on purpose,
+/// because "never written" and "deliberately empty" are different
+/// deployments. A `--no-eab` endpoint host is the second, so `init`
+/// says so here — in the shape `rotate eab-clear` writes — rather than
+/// leaving a daemon that can never start its first issuance.
+///
+/// An existing entry is never overwritten, populated or cleared: it is
+/// a decision someone already recorded. The write is a KV v2
+/// create-if-absent (`cas: 0`) rather than a check followed by a plain
+/// write, so an entry another writer creates between the two cannot be
+/// replaced: `OpenBao` admits the create only while the path carries no
+/// version. The path joins the same KV rollback every other `init` KV
+/// write uses only once this call is the one that created it, so a
+/// failed run removes the cleared payload it wrote and never an entry
+/// someone else did.
+///
+/// # Errors
+///
+/// Returns an error when the create fails for any reason other than the
+/// path already carrying a version.
+pub(super) async fn record_cleared_agent_eab(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    endpoint_enabled: bool,
+    registered: Option<&EabCredentials>,
+    rollback: &mut InitRollback,
+    messages: &Messages,
+) -> Result<()> {
+    if !endpoint_enabled || registered.is_some() {
+        return Ok(());
+    }
+    let outcome = client
+        .create_kv_if_absent(
+            kv_mount,
+            PATH_AGENT_EAB,
+            serde_json::json!({ "kid": "", "hmac": "" }),
+        )
+        .await
+        .with_context(|| messages.error_openbao_kv_write_failed())?;
+    if let KvCreateIfAbsent::Created(_) = outcome {
+        rollback.written_kv_paths.push(PATH_AGENT_EAB.to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
     use super::super::test_support::test_messages;
     use super::*;
+
+    const KV_MOUNT: &str = "secret";
+
+    /// An `OpenBao` whose agent EAB path already carries a version when
+    /// `exists` is set, recording every body posted to it.
+    ///
+    /// A post to an existing path answers with the KV v2 check-and-set
+    /// mismatch, exactly as `OpenBao` does for `cas: 0`, so a writer that
+    /// omitted the option would still see its body recorded.
+    async fn eab_mock_server(exists: bool) -> (MockServer, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let server = MockServer::start().await;
+        let writes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&writes);
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/{KV_MOUNT}/data/{PATH_AGENT_EAB}")))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json");
+                sink.lock().expect("capture").push(body);
+                if exists {
+                    ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                        "errors": ["check-and-set parameter did not match the current version"]
+                    }))
+                } else {
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "data": { "version": 1 } }))
+                }
+            })
+            .mount(&server)
+            .await;
+        (server, writes)
+    }
+
+    /// An absent agent EAB path on an endpoint-enabled host receives
+    /// the cleared payload, in exactly the shape the surface issuance
+    /// reads as a deliberate "no EAB", and the write is registered for
+    /// rollback.
+    #[tokio::test]
+    async fn an_absent_agent_eab_is_recorded_as_cleared() {
+        let (server, writes) = eab_mock_server(false).await;
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let mut rollback = InitRollback::default();
+        record_cleared_agent_eab(
+            &client,
+            KV_MOUNT,
+            true,
+            None,
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect("the cleared payload is recorded");
+
+        let writes = writes.lock().expect("capture").clone();
+        let [body] = writes.as_slice() else {
+            panic!("exactly one write is expected: {writes:?}");
+        };
+        assert_eq!(
+            body.get("options"),
+            Some(&serde_json::json!({ "cas": 0 })),
+            "the write is a create-if-absent"
+        );
+        let data = body.get("data").expect("a KV v2 data envelope");
+        assert_eq!(data, &serde_json::json!({ "kid": "", "hmac": "" }));
+        assert_eq!(
+            bootroot::kv_payload::parse_eab_payload(data).expect("parse"),
+            bootroot::kv_payload::EabPayload::Clear
+        );
+        assert_eq!(rollback.written_kv_paths, vec![PATH_AGENT_EAB.to_string()]);
+    }
+
+    /// An existing entry — populated or already cleared, and whether it
+    /// was there all along or another writer created it a moment ago —
+    /// is a decision already recorded. The only request is a
+    /// create-if-absent `OpenBao` refuses, and the path is not
+    /// registered for rollback, so a failed run cannot delete it.
+    #[tokio::test]
+    async fn an_existing_agent_eab_is_left_untouched() {
+        let (server, writes) = eab_mock_server(true).await;
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let mut rollback = InitRollback::default();
+        record_cleared_agent_eab(
+            &client,
+            KV_MOUNT,
+            true,
+            None,
+            &mut rollback,
+            &test_messages(),
+        )
+        .await
+        .expect("an existing entry is not an error");
+
+        let writes = writes.lock().expect("capture").clone();
+        assert!(
+            writes
+                .iter()
+                .all(|body| body.get("options") == Some(&serde_json::json!({ "cas": 0 }))),
+            "every write is a create-if-absent: {writes:?}"
+        );
+        assert!(rollback.written_kv_paths.is_empty());
+    }
+
+    /// A disabled or absent predicate writes nothing new, and neither
+    /// does a run that registered an EAB of its own: neither run so much
+    /// as asks whether the path exists.
+    #[tokio::test]
+    async fn a_disabled_predicate_or_a_registered_eab_writes_nothing() {
+        let (server, writes) = eab_mock_server(false).await;
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        let registered = EabCredentials {
+            kid: "kid-1".to_string(),
+            hmac: bootroot::secret::HmacSecret::new("aG1hYy1ieXRlcy1mb3ItdGVzdHM".to_string()),
+        };
+        let mut rollback = InitRollback::default();
+        for (enabled, eab) in [
+            (false, None),
+            (false, Some(&registered)),
+            (true, Some(&registered)),
+        ] {
+            record_cleared_agent_eab(
+                &client,
+                KV_MOUNT,
+                enabled,
+                eab,
+                &mut rollback,
+                &test_messages(),
+            )
+            .await
+            .expect("nothing to record is not an error");
+        }
+
+        assert!(writes.lock().expect("capture").is_empty());
+        assert!(rollback.written_kv_paths.is_empty());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording is enabled")
+                .is_empty(),
+            "no request at all is made"
+        );
+    }
 
     #[test]
     fn test_resolve_secret_prefers_value() {

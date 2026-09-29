@@ -122,7 +122,10 @@ multiplicity = "one-per-deployment"
 cert_group = 3000
 reload = { kind = "docker-restart", target = "review" }
 EOF
-  registrar_docker_write_configs "$body"
+  # Only this scenario drives the audit store to its low-water and
+  # exhausted states, so only this scenario bounds the budget.
+  registrar_docker_write_configs "$body" 'audit_store_reserve_bytes = 10485760
+audit_store_low_water_bytes = 8388608'
 }
 
 build_and_initialize() {
@@ -157,11 +160,8 @@ apply_endpoint_dns_alias() {
   pass "step-ca can reach both registrar hostnames through DNS aliases"
 }
 
-write_daemon_config() {
-  # Only this scenario drives the audit store to its low-water and
-  # exhausted states, so only this scenario bounds the budget.
-  registrar_docker_write_daemon_config 'audit_store_reserve_bytes = 10485760
-audit_store_low_water_bytes = 8388608'
+prepare_daemon() {
+  registrar_docker_prepare_daemon
 }
 
 start_daemon() {
@@ -424,7 +424,7 @@ assert_socket_refusals() {
   if sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "wrong.bootroot-registrar-endpoint.redteam.trusted.domain" --operation mint --payload "$payload"; then fail "client accepted a wrong-name endpoint leaf"; fi
   before="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; registrar_docker_control restart; sleep 2; after="$(stat -c '%d:%i' "$SOCKET_PATH" 2>/dev/null || stat -f '%d:%i' "$SOCKET_PATH")"; [ "$before" = "$after" ] || fail "daemon restart changed inherited listener inode"
   nobody="$(id -un 65534 2>/dev/null || printf nobody)"; registrar_docker_control stop; sleep 1
-  sudo -n cp "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
+  sudo -n cp -p "$DAEMON_CONFIG" "$RUN_ROOT/registrar-agent.good.toml"
   # Startup repairs unusable surface material before endpoint activation. An
   # unset material path instead fails settings validation before any repair or
   # endpoint work begins, which gives this fixture a deterministic failed start.
@@ -457,7 +457,7 @@ main() {
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
-  log_phase deployment; prepare_workspace; registrar_docker_allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias; write_daemon_config; start_daemon; assert_socket_contract; stage_bundle
+  log_phase deployment; prepare_workspace; registrar_docker_allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias; prepare_daemon; start_daemon; assert_socket_contract; stage_bundle
   log_phase containment; assert_escalation_denied
   log_phase functionality; assert_functionality_and_audit
   log_phase socket; assert_socket_refusals

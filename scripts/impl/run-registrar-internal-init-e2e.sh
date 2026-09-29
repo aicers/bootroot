@@ -534,6 +534,40 @@ seed_registrar_endpoint_predicate() {
   esac
 }
 
+# The `[registrar]` keys an enabled endpoint requires, one per line, for
+# inside an operator configuration's `[registrar]` table.
+#
+# `init` holds the operator's `[registrar]` and `[registrar_endpoint]`
+# tables to every requirement an enabled endpoint has before it touches
+# anything, because it renders both into `registrar-internal/agent.toml`
+# — the configuration the endpoint daemon runs on.  Every
+# endpoint-enabled `--agent-config` below carries these, and the four
+# material paths in `registrar_endpoint_table`, so each section still
+# reaches the outcome it asserts rather than stopping at that check.
+# Nothing in this scenario starts the daemon, so none of the paths or
+# URLs has to exist or answer.
+registrar_required_keys() {
+  cat <<EOF
+state_file = "${WORK_DIR}/state.json"
+agent_server = "https://stepca.registrar-init.test:9000/acme/acme/directory"
+agent_responder_url = "http://responder.registrar-init.test:8080"
+EOF
+}
+
+# The `[registrar_endpoint]` table of an endpoint-enabled operator
+# configuration, with the four material paths an enabled endpoint
+# requires.  See `registrar_required_keys`.
+registrar_endpoint_table() {
+  cat <<EOF
+[registrar_endpoint]
+enabled = true
+server_cert_path = "${WORK_DIR}/registrar-surface/registrar-endpoint.crt"
+server_key_path = "${WORK_DIR}/registrar-surface/registrar-endpoint.key"
+client_cert_path = "${WORK_DIR}/registrar-surface/registrar-client.crt"
+client_key_path = "${WORK_DIR}/registrar-surface/registrar-client.key"
+EOF
+}
+
 # The operator's `bootroot-agent` configuration file, which `init` reads
 # through `--agent-config`.
 #
@@ -542,9 +576,11 @@ seed_registrar_endpoint_predicate() {
 # cross-checked against the predicate `infra install` recorded — `init`
 # refuses to proceed when the two disagree, so both say `true` here.
 #
-# Nothing in this scenario starts a `bootroot-agent` daemon, so an
-# enabled `[registrar_endpoint]` in a file only the installer reads
-# starts nothing and refuses nothing.
+# `init` renders both tables into `registrar-internal/agent.toml`, the
+# endpoint daemon's configuration, so they carry every key an enabled
+# endpoint requires; `assert_generated_config_is_the_internal_one`
+# checks they arrived there.  Nothing in this scenario starts that
+# daemon, so the rendered tables start nothing and refuse nothing.
 #
 # `audit_store_enforcement = "directory"` is deliberate and is what the
 # rest of this scenario is about: the store's layout, its ownership
@@ -556,16 +592,18 @@ seed_registrar_endpoint_predicate() {
 # asserted separately below, where it needs none of those.
 seed_agent_configuration() {
   AGENT_CONFIG_FILE="$WORK_DIR/operator-agent.toml"
-  cat >"$AGENT_CONFIG_FILE" <<EOF
+  {
+    cat <<EOF
 [registrar]
 audit_store_dir = "${AUDIT_STORE_DIR}"
 audit_store_enforcement = "directory"
-
-[registrar_endpoint]
-enabled = true
 EOF
+    registrar_required_keys
+    echo
+    registrar_endpoint_table
+  } >"$AGENT_CONFIG_FILE"
   [ -s "$AGENT_CONFIG_FILE" ] || fail "could not write $AGENT_CONFIG_FILE"
-  pass "the operator configuration names the audit store and agrees with the predicate"
+  pass "the operator configuration names the audit store, the endpoint's required keys, and agrees with the predicate"
 }
 
 # The `bootroot-agent` configuration a `filesystem`-mode section runs
@@ -579,10 +617,14 @@ EOF
 # a shipped default's.
 #
 # `[registrar_endpoint] enabled` agrees with the predicate recorded in
-# `state.json`; `init` refuses to proceed when the two disagree.
+# `state.json`; `init` refuses to proceed when the two disagree.  Both
+# tables carry every key an enabled endpoint requires, so the run passes
+# `init`'s endpoint-table check and reaches the audit-store outcome the
+# calling section asserts.
 write_reserve_agent_config() {
   local path="$1" store="$2" reserve="$3"
-  cat >"$path" <<EOF
+  {
+    cat <<EOF
 [registrar]
 audit_store_dir = "${store}"
 audit_store_enforcement = "filesystem"
@@ -590,10 +632,11 @@ audit_store_reserve_bytes = ${reserve}
 audit_store_low_water_bytes = 1024
 audit_max_file_bytes = 65536
 audit_max_retained_files = 1
-
-[registrar_endpoint]
-enabled = true
 EOF
+    registrar_required_keys
+    echo
+    registrar_endpoint_table
+  } >"$path"
   [ -s "$path" ] || fail "could not write $path"
 }
 
@@ -1750,6 +1793,21 @@ assert_generated_config_is_the_internal_one() {
   grep -q "http_responder_url = \"http://127.0.0.1:${PORT_HTTP01}\"" <<<"$text" ||
     fail "the generated config does not use this install's responder port"
   pass "the generated config names the fixed identity, its private trust and this install's ports"
+
+  # The endpoint daemon runs on this file, so `init` rendered the
+  # operator's two tables into it, with the operator's values.
+  local line
+  grep -qx '\[registrar\]' <<<"$text" ||
+    fail "the generated config does not carry the operator's [registrar] table"
+  grep -qx '\[registrar_endpoint\]' <<<"$text" ||
+    fail "the generated config does not carry the operator's [registrar_endpoint] table"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    grep -qxF "$line" <<<"$text" ||
+      fail "the generated config does not carry the operator's '$line'"
+  done < <(registrar_required_keys; registrar_endpoint_table;
+    printf 'audit_store_dir = "%s"\n' "$AUDIT_STORE_DIR")
+  pass "the generated config carries the operator's [registrar] and [registrar_endpoint] tables"
 }
 
 assert_leaf_carries_the_fixed_san() {

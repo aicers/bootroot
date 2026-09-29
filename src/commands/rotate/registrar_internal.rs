@@ -47,8 +47,8 @@ use super::RotateContext;
 use super::helpers::signal_internal_registrar_agent;
 use crate::commands::init::registrar_internal::{
     RegistrarInternalContext, RegistrarInternalInputs, RegistrarInternalIntent, StagedInternal,
-    converge_internal_auth, discard_snapshot, issue_internal_material, publish_internal_set,
-    staging_dir, verify_internal_login,
+    converge_internal_auth, current_internal_config, discard_snapshot, issue_internal_material,
+    publish_internal_set, staging_dir, verify_internal_login,
 };
 use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC,
@@ -263,7 +263,7 @@ pub(super) async fn repair_internal_credential(
     // written, with the same typed error the load path uses.
     require_https(&ctx.openbao_url)?;
 
-    let context = repair_context(ctx, client).await?;
+    let context = repair_context(ctx, client, messages).await?;
     replace_internal_credential(client, &context, &ctx.openbao_url, trust, messages).await
 }
 
@@ -531,9 +531,19 @@ async fn sweep_staging(secrets_dir: &Path) {
 /// keeps them. A host whose config was lost falls back to the same
 /// defaults `init` used, and reads the responder HMAC and the EAB out of
 /// `OpenBao` rather than inventing them.
+///
+/// The config is also the only record of the operator's `[registrar]`
+/// and `[registrar_endpoint]` tables, which only `init` takes from the
+/// operator. It is read strictly, whole, and first: a config that
+/// exists but cannot be read or does not parse as the daemon's settings
+/// refuses the repair before anything is issued, converged or
+/// published, rather than letting the republication drop the
+/// endpoint's configuration. The fallbacks are for an absent config
+/// only, never for one that is present and unreadable.
 async fn repair_context(
     ctx: &RotateContext,
     client: &OpenBaoClient,
+    messages: &Messages,
 ) -> Result<RegistrarInternalContext> {
     let recorded = ctx
         .state
@@ -552,7 +562,10 @@ async fn repair_context(
     };
     let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     let paths = InternalPaths::new(&secrets_dir);
-    let existing = bootroot::config::Settings::from_file(Some(paths.agent_config())).ok();
+    let (existing, endpoint_tables) = match current_internal_config(&paths, messages).await? {
+        Some(current) => (Some(current.settings), current.endpoint_tables),
+        None => (None, None),
+    };
     // Only reached when the generated config is gone: the config is the
     // record of what `init` chose, and a repair keeps it. The fallbacks
     // below rebuild those endpoints the same way `init` derived them —
@@ -602,6 +615,7 @@ async fn repair_context(
         ),
         responder_hmac,
         eab,
+        endpoint_tables,
     })
 }
 
@@ -870,6 +884,7 @@ mod tests {
                     eab_kid: None,
                     eab_hmac: None,
                     trusted_ca_sha256: &[ROOT_FP.to_string()],
+                    endpoint_tables: None,
                 },
             ),
         )
@@ -896,6 +911,7 @@ mod tests {
             responder_url: "http://127.0.0.1:1".to_string(),
             responder_hmac: "hmac".into(),
             eab: None,
+            endpoint_tables: None,
         }
     }
 
@@ -1143,6 +1159,211 @@ mod tests {
             std::fs::read_to_string(paths.agent_config()).expect("config"),
             before,
             "nothing may be rewritten before the refusal"
+        );
+    }
+
+    /// The context a repair runs in, over an HTTPS `OpenBao` URL and a
+    /// host whose recorded predicate is enabled.
+    fn endpoint_ctx(dir: &std::path::Path) -> super::RotateContext {
+        super::RotateContext {
+            openbao_url: "https://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            compose_file: dir.join("docker-compose.yml"),
+            state: crate::state::StateFile {
+                registrar_endpoint: Some(crate::state::RegistrarEndpointState {
+                    enabled: true,
+                    domain: "example.internal".to_string(),
+                    host: "bootroot-01".to_string(),
+                }),
+                ..crate::state::StateFile::default()
+            },
+            paths: crate::commands::rotate::StatePaths::new(dir.to_path_buf()),
+            state_dir: dir.to_path_buf(),
+            state_file: dir.join("state.json"),
+            docker: std::path::PathBuf::from(crate::commands::compose_project::DOCKER_BIN),
+        }
+    }
+
+    /// Rewrites a provisioned host's config to carry the operator's two
+    /// tables, as an endpoint-enabled `init` publishes it, and returns
+    /// the bytes written.
+    fn with_endpoint_tables(paths: &InternalPaths) -> String {
+        let tables = bootroot::registrar::internal::EndpointTables::extract(
+            &crate::commands::init::registrar_internal::endpoint_agent_config(
+                "rate_limit_admission_burst = 7\n",
+            ),
+        )
+        .expect("parses");
+        let config = render_internal_agent_config(
+            paths,
+            &InternalAgentConfigParams {
+                email: "ops@example.internal",
+                server: "https://localhost:9000/acme/acme/directory",
+                domain: "example.internal",
+                hostname: "bootroot-01",
+                responder_url: "http://127.0.0.1:8080",
+                responder_hmac: &"hmac".into(),
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[ROOT_FP.to_string()],
+                endpoint_tables: Some(&tables),
+            },
+        );
+        std::fs::write(paths.agent_config(), &config).expect("config");
+        config
+    }
+
+    /// Parses a config's two operator tables the way the daemon does.
+    fn endpoint_tables_of(
+        config: &str,
+    ) -> (
+        bootroot::config::RegistrarSettings,
+        bootroot::config::RegistrarEndpointSettings,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join(AGENT_CONFIG_FILE);
+        std::fs::write(&path, config).expect("write");
+        let settings = bootroot::config::Settings::from_file(Some(path)).expect("deserializes");
+        (settings.registrar, settings.registrar_endpoint)
+    }
+
+    /// Every repair — the `rotate ca-key` Phase-4 tail and
+    /// `rotate registrar-internal-credential` both reach the
+    /// republication through [`repair_internal_credential`] — carries
+    /// the operator's `[registrar]` and `[registrar_endpoint]` over from
+    /// the config it replaces, and republishes a config whose tables
+    /// parse equal to it. A config without them carries none.
+    #[tokio::test]
+    async fn a_repair_republishes_the_tables_it_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/secret/data/{}",
+                crate::commands::init::PATH_RESPONDER_HMAC
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "data": { "value": "hmac" } }
+            })))
+            .mount(&server)
+            .await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let (dir, paths) = provisioned_host();
+        let before = with_endpoint_tables(&paths);
+        let context = super::repair_context(&endpoint_ctx(dir.path()), &client, &test_messages())
+            .await
+            .expect("the repair context builds");
+        let republished = render_internal_agent_config(
+            &paths,
+            &InternalAgentConfigParams {
+                email: &context.email,
+                server: &context.acme_server,
+                domain: &context.intent.domain,
+                hostname: &context.intent.host,
+                responder_url: &context.responder_url,
+                responder_hmac: &context.responder_hmac,
+                eab_kid: None,
+                eab_hmac: None,
+                trusted_ca_sha256: &[ROOT_FP.to_string()],
+                endpoint_tables: context.endpoint_tables.as_ref(),
+            },
+        );
+        assert_eq!(
+            endpoint_tables_of(&republished),
+            endpoint_tables_of(&before)
+        );
+        assert_eq!(republished, before, "nothing else moved either");
+
+        let (plain_dir, _plain_paths) = provisioned_host();
+        let context =
+            super::repair_context(&endpoint_ctx(plain_dir.path()), &client, &test_messages())
+                .await
+                .expect("the repair context builds");
+        assert!(
+            context.endpoint_tables.is_none(),
+            "a config without the tables carries none"
+        );
+    }
+
+    /// Renders a provisioned host's config broken in one particular way.
+    type ConfigBreak = fn(&InternalPaths) -> String;
+
+    /// A config that exists but cannot be parsed refuses the repair
+    /// before anything is read from or written to `OpenBao` or disk:
+    /// publishing over it would silently drop the endpoint's
+    /// configuration. That holds for a file that is not TOML and for a
+    /// TOML file the daemon cannot deserialize — here a bad value
+    /// outside the two tables, which the repair would otherwise have
+    /// read around and replaced with its fallbacks.
+    #[tokio::test]
+    async fn an_unparseable_config_refuses_the_repair_before_anything_moves() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/token/lookup-self"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "policies": ["root"] }
+            })))
+            .mount(&server)
+            .await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let not_toml = |_: &InternalPaths| "[registrar\nstate_file = \"/x\"\n".to_string();
+        let bad_value = |paths: &InternalPaths| {
+            let config = with_endpoint_tables(paths);
+            let broken = config.replacen("poll_attempts = 15", "poll_attempts = \"bad\"", 1);
+            assert_ne!(broken, config, "the fixture edits the rendered value");
+            broken
+        };
+        let cases: [(&str, ConfigBreak); 2] = [
+            ("not TOML", not_toml),
+            ("an undeserializable value", bad_value),
+        ];
+        for (case, broken) in cases {
+            let (dir, paths) = provisioned_host();
+            std::fs::write(paths.agent_config(), broken(&paths)).expect("an unparseable config");
+            let before: Vec<(std::path::PathBuf, Vec<u8>)> = paths
+                .all()
+                .into_iter()
+                .map(|member| {
+                    let bytes = std::fs::read(&member).expect("member");
+                    (member, bytes)
+                })
+                .collect();
+
+            let err = repair_internal_credential(
+                &endpoint_ctx(dir.path()),
+                &client,
+                &InternalTrustState {
+                    fingerprints: vec![ROOT_FP.to_string()],
+                    bundle_pem: bundle_pem("Uk9PVA"),
+                },
+                &test_messages(),
+            )
+            .await
+            .expect_err("an unparseable config refuses the repair");
+            assert!(
+                err.to_string()
+                    .contains(&paths.agent_config().display().to_string()),
+                "{case}: the refusal names the file: {err}"
+            );
+            for (member, bytes) in before {
+                assert_eq!(
+                    std::fs::read(&member).expect("member"),
+                    bytes,
+                    "{case}: {} must be left as it was",
+                    member.display()
+                );
+            }
+            assert!(!staging_dir(&paths).exists(), "{case}: nothing was staged");
+        }
+        let requests = server.received_requests().await.expect("recording");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() == "/v1/auth/token/lookup-self"),
+            "only the authority check reached OpenBao: {requests:?}"
         );
     }
 

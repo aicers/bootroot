@@ -15,6 +15,7 @@ mod validation;
 pub use validation::{
     openbao_url_is_https, openbao_url_is_non_loopback_plaintext, parse_cert_duration,
     validate_cert_duration_vs_default_renew_before, validate_registrar_settings,
+    validate_registrar_tables,
 };
 
 /// CLI-provided overrides that must survive config reloads in daemon mode.
@@ -1118,8 +1119,27 @@ impl Settings {
         // previous behavior instead of becoming a new load failure.
         let contents = String::from_utf8_lossy(strip_utf8_bom(&contents));
 
+        Self::from_str_with_format(&contents, format)
+    }
+
+    /// Creates settings from a TOML document already in memory, without
+    /// an environment overlay.
+    ///
+    /// For a caller that has read the file itself and must judge the
+    /// same bytes it goes on to use, rather than reading the file a
+    /// second time.
+    ///
+    /// # Errors
+    /// Returns an error if the document is not valid TOML or its
+    /// configuration cannot be deserialized.
+    pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
+        Self::from_str_with_format(contents, FileFormat::Toml)
+    }
+
+    /// Deserializes one in-memory document over the defaults.
+    fn from_str_with_format(contents: &str, format: FileFormat) -> Result<Self, ConfigError> {
         defaults::apply_defaults(Config::builder())?
-            .add_source(File::from_str(&contents, format))
+            .add_source(File::from_str(contents, format))
             .build()?
             .try_deserialize()
     }

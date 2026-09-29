@@ -875,7 +875,18 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   위한 `[registrar]`와, `state.json`의 `registrar_endpoint.enabled`와
   교차 확인할 `enabled` 값을 위한 `[registrar_endpoint]`입니다. 두 값이
   다르면 하드 오류이며 아무것도 생성·렌더링·삭제되지 않습니다.
-  `state.json`이 레지스트라 엔드포인트를 활성으로 기록한 실행과,
+  `state.json`이 레지스트라 엔드포인트를 활성으로 기록한 실행에서는 두
+  테이블이 엔드포인트 데몬의 설정이기도 합니다. `init`은 먼저 두 테이블이
+  활성화된 엔드포인트의 모든 요구 조건 — `[registrar] state_file`,
+  `agent_server`, `agent_responder_url`, 네 개의 `[registrar_endpoint]`
+  material 경로, 그리고 각 값의 자체 규칙 — 을 만족하는지 검사하여, 빠졌거나
+  잘못된 키를 이름으로 지목해 아무것도 생성·렌더링·삭제하기 전에 거부합니다.
+  그다음 두 테이블을 같은 키와 값 그대로, 엔드포인트 데몬이 실행되는 설정인
+  `registrar-internal/agent.toml`에 렌더링합니다. 파일의 나머지 내용은
+  복사하지 않으며, 술어가 비활성이거나 없으면 아무것도 렌더링하지 않습니다.
+  각 실행은 자신의 `--agent-config`에서 두 테이블을 가져오며, 이미 초기화된
+  호스트에서 `init`을 다시 실행하는 것은 두 테이블을 바꾸는 방법이
+  아닙니다. `state.json`이 레지스트라 엔드포인트를 활성으로 기록한 실행과,
   렌더링된 audit compose 오버라이드가 디스크에 있는 실행에서는 **필수**
   이므로 데몬의 설정 파일이 먼저 존재해야 합니다. 저장소를 프로비저닝할
   실행은 root여야 합니다. 권한 없는 실행은 아무것도 생성하거나
@@ -2625,10 +2636,12 @@ bootroot clean --openbao-only --yes
   파일은 그대로 읽히기 때문입니다.
 - `--agent-config <path>`: `init`으로 그대로 전달되며, `init`은 이
   파일에서 `[registrar] audit_store_dir`과 `[registrar_endpoint]
-  enabled`를 읽습니다. `init`과 동일한 요구 조건을 가집니다 —
-  `state.json`이 registrar endpoint를 enabled로 기록한 호스트, 그리고
-  렌더링된 audit compose 오버라이드를 가진 호스트에서 필수입니다.
-  reinit은 이 요구 조건과 활성화 교차 확인을 **파괴적 동작 시작 전에**
+  enabled`를 읽고, 엔드포인트 활성 호스트에서는 두 테이블을 검증하여
+  `registrar-internal/agent.toml`에 렌더링합니다. `init`과 동일한 요구
+  조건을 가집니다 — `state.json`이 registrar endpoint를 enabled로 기록한
+  호스트, 그리고 렌더링된 audit compose 오버라이드를 가진 호스트에서
+  필수입니다. reinit은 이 요구 조건, 엔드포인트 테이블의 요구 조건, 활성화
+  교차 확인을 **파괴적 동작 시작 전에**
   검사합니다. 두 번째 init 패스에서야 거부하면 OpenBao가 이미 wipe된
   뒤가 되어, reinit이 복구하려는 partial-init 트랩을 그대로 재현하기
   때문입니다. 이 사전 검사는 아무것도 생성·렌더링·삭제하지 않습니다.

@@ -21,7 +21,9 @@ use crate::commands::compose_project::{
 use crate::commands::container_name::{BootrootContainer, resolve_container_name};
 use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::commands::infra::run_infra_up;
-use crate::commands::init::registrar_internal::registrar_endpoint_intent;
+use crate::commands::init::registrar_internal::{
+    preflight_endpoint_tables, registrar_endpoint_intent,
+};
 use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init};
 use crate::commands::openbao_url::{
     OPENBAO_HOST_PORT_ENV, effective_openbao_url, effective_openbao_url_with_env,
@@ -59,6 +61,42 @@ const STEP_CA_INIT_ARTIFACTS: &[&str] = &[
     "secrets/root_ca_key",
     "secrets/intermediate_ca_key",
 ];
+
+/// Raises, before the wipe, every refusal the post-wipe `init` pass
+/// would raise about the operator's `--agent-config` file.
+///
+/// The endpoint tables first — on an enabled predicate `init` renders
+/// them into the bootroot-internal config and refuses a set an enabled
+/// endpoint could not run on — then the audit-store gates. Met for the
+/// first time after the wipe, either would leave `OpenBao` wiped and
+/// the host uninitialised.
+///
+/// # Errors
+///
+/// Returns the endpoint-table refusal or any audit-store preflight
+/// refusal.
+fn preflight_endpoint_and_audit_store(
+    compose_file: &Path,
+    agent_config: Option<&Path>,
+    state_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let registrar_endpoint = preflight_endpoint_tables(
+        registrar_endpoint_intent(state_path)?,
+        agent_config,
+        messages,
+    )?;
+    preflight_audit_store(
+        &AuditStoreInitInputs {
+            compose_file,
+            agent_config,
+            state_path,
+            endpoint_recorded: registrar_endpoint.is_some(),
+            expected_uid: production_uid(),
+        },
+        messages,
+    )
+}
 
 /// Runs the `bootroot reinit` recovery flow.
 ///
@@ -132,19 +170,16 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         validate_summary_json_output_path(out, messages)?;
     }
 
-    // 4.5. Preflight the audit-store endpoint/configuration gates and
-    //      filesystem reserve phase-one refusals. Every check is a
-    //      read: nothing is created, rendered or deleted by it. The
-    //      normal init pass below handles rendering, verification,
-    //      outcome reporting and phase-two instructions after the wipe.
-    preflight_audit_store(
-        &AuditStoreInitInputs {
-            compose_file,
-            agent_config: args.agent_config.as_deref(),
-            state_path: &state_path,
-            endpoint_recorded: registrar_endpoint_intent(&state_path)?.is_some(),
-            expected_uid: production_uid(),
-        },
+    // 4.5. Preflight the endpoint tables, the audit-store
+    //      endpoint/configuration gates and the filesystem reserve
+    //      phase-one refusals. Every check is a read: nothing is
+    //      created, rendered or deleted by it. The normal init pass
+    //      below handles rendering, verification, outcome reporting and
+    //      phase-two instructions after the wipe.
+    preflight_endpoint_and_audit_store(
+        compose_file,
+        args.agent_config.as_deref(),
+        &state_path,
         messages,
     )?;
 

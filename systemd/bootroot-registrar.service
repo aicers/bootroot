@@ -5,16 +5,31 @@
 # socket unit is a Requires/After dependency purely so the listening
 # descriptor exists before this starts and is inherited as fd 3.
 #
-# Install as /etc/systemd/system/bootroot-registrar.service, then:
+# This daemon is the one bootroot-agent process on an endpoint-enabled
+# host. It runs on the configuration `bootroot init` renders at
+# <secrets-dir>/registrar-internal/agent.toml, which renews the
+# bootroot-internal credential and carries the `[registrar]` and
+# `[registrar_endpoint]` tables `init` copied from its `--agent-config`
+# file. The secrets directory is per deployment, so the ExecStart below
+# is a placeholder: an installer must override it with a drop-in naming
+# the real path, an empty `ExecStart=` first to clear this one:
+#
+#   # /etc/systemd/system/bootroot-registrar.service.d/10-config.conf
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/bootroot-agent --config <secrets-dir>/registrar-internal/agent.toml
+#
+# Install as /etc/systemd/system/bootroot-registrar.service, add the
+# drop-in above, then:
 #
 #   systemctl daemon-reload
 #   systemctl enable --now bootroot-registrar.socket
 #   systemctl enable --now bootroot-registrar.service
 #
 # Deployments whose EAB credentials rotate must add the real provisioned
-# --eab-file path to ExecStart, exactly as the existing agent guidance
-# requires: without it, EAB KV updates and `rotate eab-clear` are silent
-# no-ops for this agent.
+# --eab-file path to the drop-in's ExecStart, exactly as the existing
+# agent guidance requires: without it, EAB KV updates and
+# `rotate eab-clear` are silent no-ops for this agent.
 
 [Unit]
 Description=bootroot agent with the registrar endpoint

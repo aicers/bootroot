@@ -911,6 +911,7 @@ fn write_internal_agent_config(secrets_dir: &Path, extra: &str) {
             eab_kid: None,
             eab_hmac: None,
             trusted_ca_sha256: &["a".repeat(64)],
+            endpoint_tables: None,
         },
     );
     std::fs::write(paths.agent_config(), format!("{base}{extra}"))

@@ -79,7 +79,7 @@ and the four would drift.
 | `registrar-internal/chain.pem` | the leaf and the chain it was issued with | root-owned, `0600` |
 | `registrar-internal/acme-account.json` | the persistent ACME account signing key | root-owned, `0600` |
 | `registrar-internal/root-fingerprint` | SHA-256 of the root the `auth/cert` entry trusts | root-owned, `0600` |
-| `registrar-internal/agent.toml` | the dedicated `bootroot-agent` config | root-owned, `0600` |
+| `registrar-internal/agent.toml` | the endpoint daemon's `bootroot-agent` config | root-owned, `0600` |
 | `registrar-internal/ca-bundle.pem` | this identity's **private** CA bundle | `0644` |
 
 The chain and the stored fingerprint are public certificate data — they
@@ -105,8 +105,9 @@ named `bootroot-registrar-internal` at instance `001`, with
 fixed paths above, `[trust].ca_bundle_path` on the private bundle beside them,
 and a non-empty `[trust].trusted_ca_sha256`. A host that fails any of those is
 refused with `InternalCredentialError::Invalid` naming the file: the six files
-are all present, but the second `bootroot-agent` process that renews this
-certificate cannot start, and serving the privileged verbs over a credential
+are all present, but the `bootroot-agent` process that renews this certificate
+— the registrar endpoint daemon, §7 — cannot start, and serving the privileged
+verbs over a credential
 nothing renews is exactly what the all-or-none rule exists to prevent. The pin
 list and the bundle path are what Phases 3 and 6 rewrite, so they are held to
 their shape rather than to a particular value.
@@ -319,7 +320,9 @@ plus:
   `trusted_ca_sha256` covering every certificate in that copy;
 - one `[[profiles]]` entry naming the fixed identity, with
   `paths.cert = registrar-internal/chain.pem` and
-  `paths.key = registrar-internal/key.pem`.
+  `paths.key = registrar-internal/key.pem`;
+- after everything above, the operator's `[registrar]` and
+  `[registrar_endpoint]` tables.
 
 Two of those values are bearer secrets: the HTTP-01 responder HMAC, which
 authenticates a token placement at the responder, and the `[eab]` HMAC, which
@@ -334,25 +337,74 @@ responder signer and the account binder call. That type is not specific to this
 credential: it is the same wrapper every `bootroot-agent` config's responder and
 EAB HMACs now live in.
 
-The internal profile runs in a **dedicated second `bootroot-agent` host
-process**. It is not added to a service agent config and requires no
-`ServiceEntry`. As with every other `bootroot-agent` host daemon, the operator
-supervises it — `bootroot init` neither starts it nor installs a supervisor:
+The `[registrar]` and `[registrar_endpoint]` tables are the only part of the
+file that comes from the operator. The operator writes them in the
+`bootroot-agent` configuration file `init` is given with `--agent-config`,
+which is mandatory on an endpoint-enabled run, and `init` copies both into this
+file with the same keys and values. A key the operator left out stays out, so it
+keeps its default. Nothing else in the operator's file is copied — its
+`[[profiles]]`, `[acme]`, `[trust]` and top-level keys are ignored — and
+nothing in it can override a key `init` renders, because the two tables are
+disjoint from every other table here.
+
+Before it creates the audit store, renders or deletes its Compose override, or
+makes any Docker call, an endpoint-enabled `init` holds the two tables to every
+requirement an enabled endpoint has: `[registrar] state_file`, `agent_server`
+and `agent_responder_url`, the four `[registrar_endpoint]` material paths
+(`server_cert_path`, `server_key_path`, `client_cert_path`, `client_key_path`),
+and each value's own rules. A missing or invalid key refuses the run, names the
+key, and leaves the host as it found it. These are the daemon's own checks; only
+the platform rule — an enabled endpoint is served on Linux alone — is left to
+the daemon. `bootroot reinit` runs the same check before its wipe. A disabled or
+absent predicate renders no internal config at all, whatever the operator's file
+holds.
+
+Each `init` takes the tables from that run's `--agent-config` file. Re-running
+`init` on an already-initialized host is not a supported way to change them.
+Every other rebuild of this file keeps them, §9.
+
+On an endpoint-enabled host, **the registrar endpoint daemon is the process
+that runs on this file**:
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 ```
 
-**Ordinary renewal begins once the operator starts that process.** A host where
-it has not been started is a host with nothing to reload, which is why a `HUP`
-that matches no process is a successful outcome and not proof that a renewal
-happened.
+One process does both jobs: it renews the internal credential through the one
+profile above, and it serves the registrar endpoint under the operator's two
+tables. There is no second `bootroot-agent` process for the internal credential
+on such a host, and no other file carrying the endpoint's configuration. The
+internal profile is not added to a service agent config and requires no
+`ServiceEntry`.
+
+`bootroot-registrar.service` runs that process. The shipped unit's `ExecStart`
+names a placeholder path, because the secrets directory is per deployment, so an
+installer overrides it with a drop-in — an empty `ExecStart=` followed by the
+real one (see the operations guide's registrar endpoint section). As with every
+other `bootroot-agent` host daemon, `bootroot init` neither starts it nor
+installs the unit.
+
+**Ordinary renewal begins once that process starts.** A host where it has not
+been started is a host with nothing to reload, which is why a `HUP` that matches
+no process is a successful outcome and not proof that a renewal happened.
+
+On a deployment initialized with `--no-eab`, the endpoint daemon's first surface
+issuance reads the agent EAB entry in `OpenBao` and accepts only a populated
+payload or the explicit cleared one, refusing an absent entry. So an
+endpoint-enabled `init` that registers no EAB records the cleared payload
+`{"kid": "", "hmac": ""}` at `bootroot/agent/eab` — the shape
+`bootroot rotate eab-clear` writes — when the path does not exist yet. The
+write is a KV v2 create-if-absent (`cas: 0`), so an existing entry, populated or
+cleared, is never overwritten, even one another writer creates while `init`
+runs; only a payload this run created is removed by its rollback. A disabled or
+absent predicate writes nothing.
 
 ## 8. Renewal
 
 There is no registrar-specific scheduler, registration point, lead-time constant,
 retry policy or failure-reporting path, and there must not be one. The internal
-profile is renewed by the ordinary `bootroot-agent` loop, on its own config's
+profile is renewed by the ordinary `bootroot-agent` loop of the endpoint daemon
+(§7), on its own config's
 `daemon` and `retry` settings, through the same `daemon::should_renew` predicate
 every other profile uses:
 
@@ -404,13 +456,34 @@ failure puts both members back. Only the reload is outside that: a signal that
 fails leaves a pair that is already consistent, and the resume repeats the whole
 phase anyway.
 
+**Every rotation keeps the operator's `[registrar]` and `[registrar_endpoint]`
+tables.** Phases 3 and 6 rewrite the `[trust]` keys in place and leave every
+other byte of the file, both tables included, as it was. The tail after Phase 4
+and `bootroot rotate registrar-internal-credential` instead republish the whole
+set, `agent.toml` rendered afresh; that rebuild carries both tables over from
+the file it replaces, with their values unchanged, and never asks the operator
+for them. A file without them — an endpoint-disabled host — is rebuilt without
+them. A file that exists but cannot be read or parsed refuses the repair, naming
+the file, before anything is issued, converged or published: a republication
+that silently dropped the tables would leave a daemon that no longer serves the
+endpoint. Parsed means what the daemon means by it — the whole file must
+deserialize as the daemon's settings — so a file that is valid TOML but holds a
+value the daemon would reject, in either table or anywhere else, is refused
+rather than carried into a set the daemon cannot start on. The same parse is
+the record of the ACME directory, contact email and responder URL `init` chose,
+which the rebuild keeps; it falls back to rebuilding them the way `init` derived
+them only when the file is absent, never when it is present and does not parse.
+
 ## 10. Signalling
 
 Reloading the internal agent is its own helper. It takes no `ServiceEntry` — the
 internal profile is not a registered service and never will be — and addresses
 the process by the fixed `registrar-internal/agent.toml` path below the
 state-recorded secrets directory, which is the only thing that distinguishes its
-command line from every other `bootroot-agent` on the host:
+command line from every other `bootroot-agent` on the host. On an
+endpoint-enabled host that process is the registrar endpoint daemon, so the one
+signal reaches the one process that both renews the credential and serves the
+endpoint:
 
 ```sh
 pkill -HUP -f <secrets-directory>/registrar-internal/agent.toml
@@ -422,7 +495,9 @@ rotation phase or the recovery that sent it.
 
 `bootroot-agent` already reloads its settings and restarts its daemon task on
 `SIGHUP` without exiting, so a reload picks up rewritten trust pins and replaced
-material in place.
+material in place. No rotation changes a key in the operator's `[registrar]` or
+`[registrar_endpoint]` table (§9), so a rotation's reload never asks the daemon
+to apply a changed endpoint setting.
 
 ## 11. Root mismatch and recovery
 

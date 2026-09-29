@@ -2173,6 +2173,7 @@ mod tests {
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[stale_fp.clone(), active_fp],
+                endpoint_tables: None,
             },
         );
         fs::write(paths.agent_config(), format!("{config}{hook}")).unwrap();
@@ -2263,6 +2264,7 @@ mod tests {
                 eab_kid: None,
                 eab_hmac: None,
                 trusted_ca_sha256: &[],
+                endpoint_tables: None,
             },
         );
         let loop_settings = "\n[profiles.daemon]\ncheck_interval = \"2h\"\nrenew_before = \"24h\"\ncheck_jitter = \"30s\"\n\n[[profiles.hooks.post_renew.failure]]\ncommand = \"/bin/true\"\n";

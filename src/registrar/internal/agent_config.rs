@@ -1,28 +1,36 @@
-//! The dedicated `bootroot-agent` config the internal profile renews
-//! under, and the trust upserts a rotation applies to it.
+//! The `bootroot-agent` config the internal profile renews under, and
+//! the trust upserts a rotation applies to it.
 //!
-//! The internal profile runs in a **second** `bootroot-agent` host
-//! process, supervised by the operator:
+//! On an endpoint-enabled host this file is the registrar endpoint
+//! daemon's configuration. One process does both jobs:
 //!
 //! ```text
 //! bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 //! ```
 //!
-//! `init` writes the config and never starts it, exactly as it never
-//! installs a supervisor for the service agents. Ordinary renewal begins
-//! once the operator starts that process, which is why a `SIGHUP` that
-//! matches no process is a successful outcome rather than proof of
-//! renewal.
+//! renews the internal credential through the one profile below and
+//! serves the registrar endpoint under it. `bootroot-registrar.service`
+//! starts that process; `init` writes the config and never starts it,
+//! exactly as it never installs a supervisor for the service agents,
+//! which is why a `SIGHUP` that matches no process is a successful
+//! outcome rather than proof of renewal.
 //!
-//! The config is bootroot's alone. It is never a service agent config,
-//! it carries no `ServiceEntry`, and its `[trust]` points at the private
-//! [`crate::registrar::internal::CA_BUNDLE_FILE`] copy beside it rather
-//! than the shared `secrets/certs/ca-bundle.pem` — so a rotation can
-//! narrow this identity's trust without touching what a service reads.
+//! The config has one author, bootroot. Most of it is what only `init`
+//! knows — the ACME and responder settings, the account key, the trust
+//! pins and the profile. The `[registrar]` and `[registrar_endpoint]`
+//! tables are what only the operator knows: `init` copies them verbatim
+//! from its `--agent-config` file ([`EndpointTables`]), and every later
+//! rebuild carries them over from the file it replaces. It is never a
+//! service agent config, it carries no `ServiceEntry`, and its `[trust]`
+//! points at the private [`crate::registrar::internal::CA_BUNDLE_FILE`]
+//! copy beside it rather than the shared `secrets/certs/ca-bundle.pem`
+//! — so a rotation can narrow this identity's trust without touching
+//! what a service reads.
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::Settings;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
@@ -35,6 +43,94 @@ pub const INTERNAL_INSTANCE_ID: &str = "001";
 
 /// The `agent.toml` section carrying the profile's trust settings.
 const TRUST_SECTION: &str = "trust";
+
+/// The operator-owned table carrying the registrar verb-layer settings.
+pub const REGISTRAR_TABLE: &str = "registrar";
+
+/// The operator-owned table carrying the registrar endpoint settings.
+pub const REGISTRAR_ENDPOINT_TABLE: &str = "registrar_endpoint";
+
+/// The operator's `[registrar]` and `[registrar_endpoint]` tables, exactly
+/// as written, and nothing else.
+///
+/// Held as TOML rather than as the deserialized settings on purpose: a
+/// key the operator left out has to stay out, so it keeps its default,
+/// and re-serializing [`crate::config::RegistrarSettings`] would spell
+/// every default out instead. Neither table carries a secret.
+///
+/// `init` extracts them from its `--agent-config` file. Every rebuild of
+/// the internal config outside `init` extracts them from the file it is
+/// about to replace, so a rotation keeps them without asking for them
+/// again. Either way the extraction is the same:
+/// [`EndpointTables::extract`].
+#[derive(Debug, Clone, Default)]
+pub struct EndpointTables {
+    registrar: Option<Table>,
+    registrar_endpoint: Option<Table>,
+}
+
+impl EndpointTables {
+    /// Extracts the two tables from a TOML document, ignoring everything
+    /// else in it.
+    ///
+    /// A table the document spells as an inline table or as dotted keys
+    /// is normalized to a standard `[table]`, with the same keys and
+    /// values; the comments above its header, which belong to the
+    /// document it came from, are dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `contents` is not valid TOML, or when either
+    /// key is present but holds something other than a table.
+    pub fn extract(contents: &str) -> Result<Self> {
+        let doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+        Ok(Self {
+            registrar: extract_table(&doc, REGISTRAR_TABLE)?,
+            registrar_endpoint: extract_table(&doc, REGISTRAR_ENDPOINT_TABLE)?,
+        })
+    }
+
+    /// Reports whether neither table is present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.registrar.is_none() && self.registrar_endpoint.is_none()
+    }
+
+    /// Renders the tables present as a TOML fragment, `[registrar]`
+    /// first, or an empty string when there are none.
+    fn render(&self) -> String {
+        let mut doc = DocumentMut::new();
+        for (position, (name, table)) in [
+            (REGISTRAR_TABLE, &self.registrar),
+            (REGISTRAR_ENDPOINT_TABLE, &self.registrar_endpoint),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(table) = table {
+                let mut table = table.clone();
+                table.set_position(isize::try_from(position).ok());
+                doc.insert(name, Item::Table(table));
+            }
+        }
+        doc.to_string()
+    }
+}
+
+/// Takes one top-level table out of `doc` as a standard, header-bearing
+/// table.
+fn extract_table(doc: &DocumentMut, name: &str) -> Result<Option<Table>> {
+    let mut table = match doc.get(name) {
+        None => return Ok(None),
+        Some(Item::Table(table)) => table.clone(),
+        Some(Item::Value(Value::InlineTable(table))) => table.clone().into_table(),
+        Some(_) => anyhow::bail!("`{name}` must be a table"),
+    };
+    table.set_implicit(false);
+    table.set_dotted(false);
+    table.decor_mut().clear();
+    Ok(Some(table))
+}
 
 /// Everything the internal agent config is rendered from.
 ///
@@ -60,6 +156,10 @@ pub struct InternalAgentConfigParams<'a> {
     pub eab_hmac: Option<&'a HmacSecret>,
     /// Fingerprints covering every certificate in the private bundle.
     pub trusted_ca_sha256: &'a [String],
+    /// The operator's `[registrar]` and `[registrar_endpoint]` tables,
+    /// appended after everything `init` renders; `None` on a host whose
+    /// endpoint is disabled.
+    pub endpoint_tables: Option<&'a EndpointTables>,
 }
 
 /// Returns the `registration_id` the internal profile is keyed by.
@@ -78,9 +178,13 @@ pub fn internal_registration_id(hostname: &str) -> String {
 /// Renders the internal profile's complete `agent.toml`.
 ///
 /// Rendered whole rather than upserted: this file has exactly one
-/// author, so there is no operator customisation to preserve and no
-/// reason for it to accumulate a second profile. A rotation edits only
-/// the `[trust]` table, through [`build_internal_trust_updates`].
+/// author, so there is no reason for it to accumulate a second profile.
+/// The one operator input it carries — the `[registrar]` and
+/// `[registrar_endpoint]` tables — is appended after everything this
+/// renders, as [`EndpointTables`] holds it, and cannot override any key
+/// rendered here: the two tables are disjoint from every other table in
+/// the file. A rotation edits only the `[trust]` table, through
+/// [`build_internal_trust_updates`].
 #[must_use]
 pub fn render_internal_agent_config(
     paths: &InternalPaths,
@@ -95,15 +199,24 @@ pub fn render_internal_agent_config(
         ),
         _ => String::new(),
     };
+    let endpoint = params
+        .endpoint_tables
+        .map(EndpointTables::render)
+        .filter(|fragment| !fragment.is_empty())
+        .map(|fragment| format!("\n{fragment}"))
+        .unwrap_or_default();
     format!(
         "# Generated by `bootroot init`. This file is bootroot's own: it\n\
-         # configures the second `bootroot-agent` process that renews the\n\
-         # bootroot-internal registrar credential, and nothing else reads it.\n\
+         # configures the `bootroot-agent` process that renews the\n\
+         # bootroot-internal registrar credential and, on an\n\
+         # endpoint-enabled host, serves the registrar endpoint.\n\
          #\n\
          #   bootroot-agent --config {config}\n\
          #\n\
-         # The operator supervises that process; `bootroot init` does not\n\
-         # start it and installs no supervisor for it.\n\
+         # `bootroot-registrar.service` runs that process; `bootroot init`\n\
+         # does not start it. The `[registrar]` and `[registrar_endpoint]`\n\
+         # tables are copied from the `--agent-config` file `bootroot init`\n\
+         # ran with and carried over unchanged by every rotation.\n\
          email = {email}\n\
          server = {server}\n\
          domain = {domain}\n\
@@ -138,7 +251,8 @@ pub fn render_internal_agent_config(
          \n\
          [profiles.paths]\n\
          cert = {cert}\n\
-         key = {key}\n",
+         key = {key}\n\
+         {endpoint}",
         config = paths.agent_config().display(),
         email = toml_encode_string(params.email),
         server = toml_encode_string(params.server),
@@ -283,8 +397,9 @@ fn render_pin_array(fingerprints: &[String]) -> String {
     )
 }
 
-/// Returns the exact operator invocation that starts the internal
-/// agent, for documentation and for the `init` summary.
+/// Returns the exact invocation that starts the internal agent — on an
+/// endpoint-enabled host, the registrar endpoint daemon — for
+/// documentation and for the `init` summary.
 #[must_use]
 pub fn internal_agent_invocation(paths: &InternalPaths) -> String {
     format!("bootroot-agent --config {}", paths.agent_config().display())
