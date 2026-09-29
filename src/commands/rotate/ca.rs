@@ -10,6 +10,7 @@ use super::helpers::{
     try_restart_container,
 };
 use super::registrar_internal;
+use super::registrar_targets::kv_fanout_targets;
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
     STEP_CA_HELPER_IMAGE,
@@ -221,10 +222,14 @@ pub(super) async fn rotate_ca_key(
         bundle_sources.push(ctx.paths.intermediate_cert_bak());
         bundle_sources.push(ctx.paths.intermediate_cert());
         let ca_bundle_pem = concat_unique_ca_certs(&bundle_sources, messages).await?;
+        // Enumerated here, inside the phase, so a resumed rotation sees
+        // identities minted since the run that failed; a failure aborts
+        // before `bootroot/ca` is written and Phase 3 stays unrecorded.
+        let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
         trust::write_trust_to_openbao(
             client,
             &ctx.kv_mount,
-            &ctx.state.services,
+            &registration_ids,
             &transitional_fps,
             &ca_bundle_pem,
             messages,
@@ -400,10 +405,14 @@ pub(super) async fn rotate_ca_key(
             rot_state.new_intermediate_fp.clone(),
         ];
         let ca_bundle_pem = compute_ca_bundle_pem(ctx.paths.secrets_dir(), messages).await?;
+        // Re-enumerated rather than reused from Phase 3: an identity
+        // minted in between must be narrowed too, and a resumed run may
+        // not have run Phase 3 at all.
+        let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
         trust::write_trust_to_openbao(
             client,
             &ctx.kv_mount,
-            &ctx.state.services,
+            &registration_ids,
             &final_fps,
             &ca_bundle_pem,
             messages,
@@ -803,6 +812,8 @@ pub(super) async fn rotate_trust_sync(
         anyhow::bail!(messages.error_trust_sync_blocked_by_rotation());
     }
 
+    let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
+
     let secrets_dir = ctx.paths.secrets_dir();
     let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
     let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
@@ -810,7 +821,7 @@ pub(super) async fn rotate_trust_sync(
     crate::commands::trust::write_trust_to_openbao(
         client,
         &ctx.kv_mount,
-        &ctx.state.services,
+        &registration_ids,
         &fingerprints,
         &ca_bundle_pem,
         messages,
@@ -822,10 +833,10 @@ pub(super) async fn rotate_trust_sync(
         "{}",
         messages.rotate_summary_trust_sync_global(&fingerprints.join(", "))
     );
-    for entry in ctx.state.services.values() {
+    for registration_id in &registration_ids {
         println!(
             "{}",
-            messages.rotate_summary_trust_sync_service(&entry.registration_id)
+            messages.rotate_summary_trust_sync_service(registration_id)
         );
     }
     Ok(())

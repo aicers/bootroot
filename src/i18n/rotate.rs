@@ -504,6 +504,13 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_rotate_registrar_targets_list_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_rotate_registrar_targets_list_failed,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn rotate_ca_key_finalize_blocked(&self, services: &str) -> String {
         format_template(
             self.strings().rotate_ca_key_finalize_blocked,

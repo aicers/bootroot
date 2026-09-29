@@ -1812,6 +1812,10 @@ OpenBao와 통신해 값을 갱신합니다.
 
 #### `rotate responder-hmac`
 
+새 HMAC을 `bootroot/responder/hmac`과, 모든 `state.json` 서비스 및 모든
+registrar 관리 identity의 `http_responder_hmac` 레코드에 기록합니다
+([실행 중인 에이전트로의 회전 전파](operations.md#실행-중인-에이전트로의-회전-전파) 참고).
+
 - `--hmac`: 새 responder HMAC(선택, 미지정 시 자동 생성)
 
 #### `rotate approle-secret-id`
@@ -1890,8 +1894,10 @@ status`가 `state.json`에서 유도하는 임계값과 계속 일치합니다. 
 #### `rotate trust-sync`
 
 CA 인증서 지문과 번들 PEM을 OpenBao에 동기화하고, 등록된 모든 서비스의
-서비스별 KV 경로에 trust 페이로드를 기록해 각 서비스의 trust 데이터를
-갱신합니다. 로컬과 원격 서비스 모두 같은 방식으로 수렴합니다. 각 서비스의
+서비스별 KV 경로와 모든 registrar 관리 identity(`registrar_binding`
+레코드가 있는 registration id)의 KV 경로에 trust 페이로드를 기록해 각
+서비스의 trust 데이터를 갱신합니다. 요약에는 기록한 id가 모두 표시됩니다.
+로컬과 원격 서비스 모두 같은 방식으로 수렴합니다. 각 서비스의
 `bootroot-agent` fast-poll 루프가 갱신된 페이로드를 읽어 에이전트 설정의
 `[trust]` 섹션과 디스크의 CA 번들 PEM을 다시 기록합니다. 명령 자체는
 서비스 파일을 직접 수정하지 않습니다.
@@ -1955,7 +1961,8 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - Phase 1 — 백업: 현재 cert/key 파일 백업
 - Phase 2 — 생성: 새 CA 키 쌍 및 인증서 생성
 - Phase 3 — 가산적 trust: 전이 trust(기존 + 신규 fingerprint, 두 CA
-  세대를 모두 담은 `ca-bundle.pem`)를 OpenBao에 기록해 서비스가
+  세대를 모두 담은 `ca-bundle.pem`)를 OpenBao(`bootroot/ca`, 모든
+  `state.json` 서비스, 모든 registrar 관리 identity)에 기록해 서비스가
   기존/신규 인증서를 모두 수락하고 회전이 진행 중인 동안에도 `bootroot
   verify`가 통과하도록 함
 - Phase 4 — step-ca 재시작: step-ca 컨테이너를 재시작해 새 키 쌍 적용
@@ -1963,8 +1970,9 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
   시그널(SIGHUP)을 보내 새 CA로 재발급 유도. remote-bootstrap 서비스의
   경우 버전 관리된 재발급 요청을 OpenBao KV에 기록하며, 원격 agent가
   fast-poll 주기에 이를 처리합니다(`rotate force-reissue` 참고)
-- Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao에 기록해
-  기존 fingerprint를 제거한 뒤, 인프라 OpenBao Agent
+- Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao
+  (`bootroot/ca`, 모든 `state.json` 서비스, 모든 registrar 관리
+  identity)에 기록해 기존 fingerprint를 제거한 뒤, 인프라 OpenBao Agent
   (`openbao-agent-stepca` / `openbao-agent-responder`)를 재시작해 전이
   핀 목록 서빙을 즉시 중단시킵니다. 서비스 에이전트는 스스로 수렴합니다:
   각 bootroot-agent의 fast-poll 루프가 `fast_poll_interval` 이내에
@@ -2059,9 +2067,10 @@ CA 번들을 기록된 회전 상태가 가리키는 신뢰 상태로 되돌립�
 
 동작:
 
-- `bootroot/agent/eab` 및 `state.json`에서 열거된 모든
-  `bootroot/services/<svc>/eab` 경로에 빈 `{kid: "", hmac: ""}`을
-  씁니다(KV 목록이 아닌 `state.json`을 기준으로 열거).
+- `bootroot/agent/eab` 및 `state.json`과 `registrar_binding` 레코드가
+  있는 registration id에서 열거된 모든 `bootroot/services/<svc>/eab`
+  경로에 빈 `{kid: "", hmac: ""}`을 씁니다(여전히 무차별적인 KV 목록이
+  아니라 이 두 기준으로 열거). 둘 다 없는 KV 하위 트리는 비우지 않습니다.
 - 전파는 fast-poll의 몫입니다: 각 `bootroot-agent`(로컬 호스트 데몬과
   원격 모두)가 다음 fast-poll 사이클에 비워진 KV 값을 관찰하고 자신의
   `eab.json`을 제거합니다 — 서비스별 프로세스 재시작이나 리로드는

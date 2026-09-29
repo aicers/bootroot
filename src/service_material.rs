@@ -1,7 +1,10 @@
 //! The `OpenBao` material one service registration owns, and the three
 //! operations both of its callers share: provisioning the derived policy
 //! and `AppRole`, seeding the registration's trust material, and tearing
-//! that material down again.
+//! that material down again. A fourth operation, finding the
+//! registrations the registrar manages, has one caller only — the CLI
+//! rotations, which fan control-node material out to them — and lives
+//! here because it is defined by the same KV layout.
 //!
 //! Two callers reach this module and they are deliberately asymmetric:
 //!
@@ -24,6 +27,12 @@
 //! and must never hold the unwrapped secret at all. Putting issuance here
 //! would force one of them onto the other's delivery.
 //!
+//! [`list_registrar_managed_ids`] is the CLI-only operation. A
+//! registrar-minted identity is never in `state.json`, so the rotations
+//! that rewrite every service's `trust`, `http_responder_hmac` or `eab`
+//! record find those identities by the one durable record they have:
+//! the `registrar_binding` under their KV subtree.
+//!
 //! Nothing here reads `state.json`, prompts, or knows a delivery mode.
 //! Every value the operations depend on — the KV mount, the role-level
 //! TTLs, the KV suffixes to sweep — arrives as a parameter, so the two
@@ -37,7 +46,7 @@ use crate::registrar_certs::{PATH_AGENT_EAB, PATH_RESPONDER_HMAC};
 use crate::secret::HmacSecret;
 use crate::trust_bootstrap::{
     CA_BUNDLE_PEM_KEY, CA_TRUST_KV_PATH, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY,
-    SERVICE_EAB_KV_SUFFIX, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
+    REGISTRAR_BINDING_KV_SUFFIX, SERVICE_EAB_KV_SUFFIX, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
     SERVICE_RESPONDER_HMAC_KV_SUFFIX, SERVICE_TRUST_KV_SUFFIX, TRUSTED_CA_KEY,
 };
 
@@ -641,6 +650,57 @@ pub async fn teardown_service_material(
     report
 }
 
+/// Returns the registration ids whose KV subtree carries a registrar
+/// binding, sorted.
+///
+/// Lists `bootroot/services/` and keeps each subtree key (one ending in
+/// `/`) whose `registrar_binding` record reads back present. A key
+/// without the trailing `/` is a leaf record directly under
+/// `bootroot/services/`, not a registration subtree, and is skipped
+/// without a read. The binding is read for presence only and is not
+/// decoded: its state and schema version do not change who owns the id.
+/// Presence is checked on the `data/` path, not `metadata/`, because
+/// that is what the runtime-rotate policy grants `read` on.
+///
+/// A subtree with no binding is not reported. Nothing records who owns
+/// it, and a caller that writes into what it reports must not guess.
+///
+/// # Errors
+///
+/// Returns an error if the listing fails for any reason other than an
+/// empty (not-found) tree — a 403 from a token without `list` on
+/// `<kv>/metadata/bootroot/services/` included — or if any binding read
+/// fails other than as a clean not-found.
+pub async fn list_registrar_managed_ids(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+) -> Result<Vec<String>> {
+    let base = format!("{SERVICE_KV_BASE}/");
+    let keys = client
+        .list_kv(kv_mount, &base)
+        .await
+        .with_context(|| format!("listing KV path {base}"))?;
+
+    let mut ids = Vec::new();
+    for registration_id in keys
+        .iter()
+        .filter_map(|key| key.strip_suffix('/'))
+        .filter(|id| !id.is_empty())
+    {
+        let path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+        if client
+            .try_read_kv(kv_mount, &path)
+            .await
+            .with_context(|| format!("reading KV path {path}"))?
+            .is_some()
+        {
+            ids.push(registration_id.to_string());
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 async fn delete_kv_if_present(client: &OpenBaoClient, mount: &str, path: &str) -> Result<bool> {
     if client
         .kv_exists(mount, path)
@@ -692,7 +752,7 @@ async fn delete_policy_if_present(client: &OpenBaoClient, policy_name: &str) -> 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -1056,5 +1116,98 @@ mod tests {
             report.attempts().last().map(|a| &a.outcome),
             Some(&ResourceOutcome::Failed("boom".to_string()))
         );
+    }
+
+    const SERVICES_LIST_PATH: &str = "/v1/secret/metadata/bootroot/services/";
+
+    async fn mount_listing(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(SERVICES_LIST_PATH))
+            .and(query_param("list", "true"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn listing(keys: &[&str]) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ "data": { "keys": keys } }))
+    }
+
+    fn binding_path(registration_id: &str) -> String {
+        service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX)
+    }
+
+    fn not_found() -> ResponseTemplate {
+        ResponseTemplate::new(404).set_body_json(json!({ "errors": [] }))
+    }
+
+    #[tokio::test]
+    async fn an_empty_services_tree_lists_no_registrar_ids() {
+        let server = MockServer::start().await;
+        mount_listing(&server, not_found()).await;
+
+        let ids = list_registrar_managed_ids(&client(&server), "secret")
+            .await
+            .expect("a not-found listing is empty");
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_bound_subtrees_are_registrar_managed() {
+        let server = MockServer::start().await;
+        mount_listing(&server, listing(&["a/", "b/", "leaf"])).await;
+        mount_read(
+            &server,
+            &binding_path("a"),
+            kv(&json!({ "state": "active" })),
+        )
+        .await;
+        mount_read(&server, &binding_path("b"), not_found()).await;
+
+        let ids = list_registrar_managed_ids(&client(&server), "secret")
+            .await
+            .expect("lists");
+        assert_eq!(ids, vec!["a".to_string()]);
+
+        let requests = server.received_requests().await.expect("recorded");
+        assert!(
+            requests.iter().all(|r| !r.url.path().contains("leaf")),
+            "a leaf key is not a registration subtree and must not be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_binding_read_is_an_error() {
+        let server = MockServer::start().await;
+        mount_listing(&server, listing(&["a/"])).await;
+        mount_read(&server, &binding_path("a"), ResponseTemplate::new(500)).await;
+
+        list_registrar_managed_ids(&client(&server), "secret")
+            .await
+            .expect_err("a 500 on the binding read must not read as unbound");
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_listing_is_an_error() {
+        let server = MockServer::start().await;
+        mount_listing(&server, ResponseTemplate::new(403)).await;
+
+        list_registrar_managed_ids(&client(&server), "secret")
+            .await
+            .expect_err("a 403 must not read as no registrar identities");
+    }
+
+    #[tokio::test]
+    async fn registrar_ids_are_returned_sorted() {
+        let server = MockServer::start().await;
+        mount_listing(&server, listing(&["zeta/", "alpha/", "mid/"])).await;
+        for id in ["zeta", "alpha", "mid"] {
+            mount_read(&server, &binding_path(id), kv(&json!({}))).await;
+        }
+
+        let ids = list_registrar_managed_ids(&client(&server), "secret")
+            .await
+            .expect("lists");
+        assert_eq!(ids, vec!["alpha", "mid", "zeta"]);
     }
 }

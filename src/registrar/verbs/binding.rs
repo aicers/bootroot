@@ -37,14 +37,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::registrar::config::{RegistrationSpec, ReloadKind, ReloadSpec};
 use crate::registrar::identity::RequestedSpec;
-
-/// KV path suffix, under `bootroot/services/<registration_id>/`, of the
-/// registrar's durable host binding.
-///
-/// Deliberately **not** in any teardown suffix set: the binding outlives
-/// the material it covers, and only the deregister verb deletes it, only
-/// after that material is aggregate-gone.
-pub(crate) const REGISTRAR_BINDING_KV_SUFFIX: &str = "registrar_binding";
+/// KV path suffix of the registrar's durable host binding, defined beside
+/// the other per-registration suffixes so the CLI rotations can find
+/// registrar-managed identities by the same spelling.
+pub(crate) use crate::trust_bootstrap::REGISTRAR_BINDING_KV_SUFFIX;
 
 /// The schema version this build writes and reads.
 pub(crate) const BINDING_SCHEMA_VERSION: u32 = 1;

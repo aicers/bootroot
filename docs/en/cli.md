@@ -1883,6 +1883,11 @@ Per subcommand:
 
 #### `rotate responder-hmac`
 
+Writes the new HMAC to `bootroot/responder/hmac` and to the
+`http_responder_hmac` record of every `state.json` service and every
+registrar-managed identity (see
+[Rotation propagation to running agents](operations.md#rotation-propagation-to-running-agents)).
+
 - `--hmac`: new responder HMAC (optional, auto-generated if omitted)
 
 #### `rotate approle-secret-id`
@@ -1966,7 +1971,10 @@ surfaces as a permission error with a hint.
 
 Syncs CA certificate fingerprints and bundle PEM to OpenBao and updates
 each service's trust data by writing the trust payload to every
-registered service's per-service KV path. Local and remote services
+registered service's per-service KV path, and to that of every
+registrar-managed identity (a registration id carrying a
+`registrar_binding` record). The summary names each id written. Local
+and remote services
 converge the same way: each service's `bootroot-agent` fast-poll loop
 reads the updated payload, rewrites the `[trust]` section in its agent
 config, and rewrites the CA bundle PEM on disk. The command itself
@@ -2038,8 +2046,10 @@ Phases:
 - Phase 2 — Generate: create new CA key pair(s) and certificate(s)
 - Phase 3 — Additive trust: write transitional trust (old + new
   fingerprints, with a `ca-bundle.pem` carrying both CA generations) to
-  OpenBao so services accept both old and new certificates and
-  `bootroot verify` passes while the rotation is in flight
+  OpenBao — `bootroot/ca`, every `state.json` service and every
+  registrar-managed identity — so services accept both old and new
+  certificates and `bootroot verify` passes while the rotation is in
+  flight
 - Phase 4 — Restart step-ca: restart the step-ca container so it uses the
   new key pair
 - Phase 5 — Re-issue: delete service cert/key files and signal the
@@ -2048,8 +2058,10 @@ Phases:
   a versioned reissue request to OpenBao KV instead; remote agents pick
   it up on their fast-poll interval (see `rotate force-reissue`)
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
-  OpenBao, removing old fingerprints, then restart the infra OpenBao
-  Agents (`openbao-agent-stepca` / `openbao-agent-responder`) so they
+  OpenBao — `bootroot/ca`, every `state.json` service and every
+  registrar-managed identity — removing old fingerprints, then restart
+  the infra OpenBao Agents (`openbao-agent-stepca` /
+  `openbao-agent-responder`) so they
   stop serving the transitional pin list immediately. Service agents
   converge on their own: each bootroot-agent's fast-poll loop applies
   the finalized `agent.toml` trust pins and `ca-bundle.pem` within
@@ -2155,7 +2167,9 @@ Behavior:
 
 - Writes empty `{kid: "", hmac: ""}` to `bootroot/agent/eab` and to
   every per-service path `bootroot/services/<svc>/eab` enumerated
-  from `state.json` (not from KV listings).
+  from `state.json` plus the registration ids that carry a
+  `registrar_binding` record — still not from a blind KV listing. A
+  KV subtree with neither is never cleared.
 - Propagation is fast-poll's job: each `bootroot-agent` (local host
   daemon and remote alike) observes the cleared KV value on its next
   fast-poll cycle and removes its `eab.json` — no per-service process

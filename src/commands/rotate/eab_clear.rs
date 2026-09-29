@@ -3,6 +3,7 @@ use bootroot::openbao::OpenBaoClient;
 
 use super::RotateContext;
 use super::helpers::confirm_action;
+use super::registrar_targets::kv_fanout_targets;
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
 
@@ -21,7 +22,9 @@ fn service_eab_path(registration_id: &str) -> String {
 /// and remote alike) observes the cleared KV value on its next
 /// fast-poll cycle and removes its `eab.json`, so no per-service
 /// process restart or reload is required. Service enumeration walks the
-/// on-disk state file (not KV listings) per issue #588 §3c.
+/// on-disk state file plus the ids that carry a registrar binding, not
+/// a blind KV listing, per issue #588 §3c: a KV subtree with neither is
+/// never cleared.
 pub(super) async fn rotate_eab_clear(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
@@ -37,6 +40,10 @@ pub(super) async fn rotate_eab_clear(
     let kv_mount = ctx.kv_mount.clone();
     let empty = serde_json::json!({ "kid": "", "hmac": "" });
 
+    // Resolved before the first write, so a failure to enumerate
+    // registrar-managed identities clears nothing at all.
+    let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
+
     // Per issue #588 §3c: write the empty value unconditionally. KV v2
     // writes are PUTs, so creating the path is safe and idempotent, and
     // stale installs / partial-state services are recovered by the same
@@ -47,10 +54,10 @@ pub(super) async fn rotate_eab_clear(
         .with_context(|| messages.error_openbao_kv_write_failed())?;
     println!("Cleared {PATH_AGENT_EAB}");
 
-    // Per-service EAB. Enumerate from state, not KV listings: a stale
-    // KV entry without a state record would be ambiguous to clear
-    // silently.
-    let registration_ids: Vec<String> = ctx.state.services.keys().cloned().collect();
+    // Per-service EAB. Enumerate from state plus registrar bindings, not
+    // a blind KV listing: a stale KV entry with neither a state record
+    // nor a binding has no recorded owner and would be ambiguous to
+    // clear silently.
     for registration_id in &registration_ids {
         let path = service_eab_path(registration_id);
         client

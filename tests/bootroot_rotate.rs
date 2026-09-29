@@ -4949,3 +4949,838 @@ async fn test_rotate_ca_key_partial_reissue_failure_republishes_on_resume() {
         "rotation-state.json should be deleted after completion"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fan-out to registrar-managed identities.
+//
+// A registrar-minted identity is never in `state.json`; the rotations find
+// it by listing `bootroot/services/` for subtrees that carry a
+// `registrar_binding`. The stubs below list the `state.json` service, one
+// bound registrar identity and one unbound stray subtree, plus a leaf key
+// that is not a subtree at all.
+// ---------------------------------------------------------------------------
+
+/// A registration id minted through the registrar: bound, not in `state.json`.
+const REGISTRAR_ID: &str = "h1-roxyd-001";
+/// A subtree under `bootroot/services/` with no binding and no state entry.
+const STRAY_ID: &str = "stray";
+const SERVICES_LIST_PATH: &str = "/v1/secret/metadata/bootroot/services/";
+const SERVICES_METADATA_PREFIX: &str = "/v1/secret/metadata/bootroot/services";
+const REGISTRAR_LIST_ERROR: &str =
+    "Failed to enumerate registrar-managed identities under secret/metadata/bootroot/services/";
+
+/// Records a `registrar_endpoint` entry in `state.json`, which is what
+/// gates the listing.
+fn add_registrar_endpoint(root: &Path) -> anyhow::Result<()> {
+    let state_path = root.join("state.json");
+    let contents = fs::read_to_string(&state_path).context("read state")?;
+    let mut state: serde_json::Value = serde_json::from_str(&contents).context("parse state")?;
+    state["registrar_endpoint"] = json!({
+        "enabled": true,
+        "domain": "trusted.domain",
+        "host": "h1"
+    });
+    fs::write(&state_path, serde_json::to_string_pretty(&state)?).context("write state")?;
+    Ok(())
+}
+
+fn prepare_app_state_with_registrar(
+    root: &Path,
+    openbao_url: &str,
+    delivery_mode: &str,
+) -> anyhow::Result<PathBuf> {
+    let secret_path = prepare_app_state(root, openbao_url, delivery_mode)?;
+    add_registrar_endpoint(root)?;
+    Ok(secret_path)
+}
+
+fn binding_kv_path(registration_id: &str) -> String {
+    format!("/v1/secret/data/bootroot/services/{registration_id}/registrar_binding")
+}
+
+fn service_record_path(registration_id: &str, suffix: &str) -> String {
+    format!("/v1/secret/data/bootroot/services/{registration_id}/{suffix}")
+}
+
+fn services_listing_response() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "data": {
+            "keys": [
+                format!("{SERVICE_NAME}/"),
+                format!("{REGISTRAR_ID}/"),
+                format!("{STRAY_ID}/"),
+                "leaf"
+            ]
+        }
+    }))
+}
+
+fn forbidden() -> ResponseTemplate {
+    ResponseTemplate::new(403).set_body_json(json!({ "errors": ["permission denied"] }))
+}
+
+/// Answers the services listing with `listing`, and the binding reads the
+/// way a real deployment would: bound for [`REGISTRAR_ID`], absent for the
+/// `state.json` service and the stray subtree.
+async fn stub_registrar_bindings(server: &MockServer, token: &str) {
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(REGISTRAR_ID)))
+        .and(header("X-Vault-Token", token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "data": { "schema_version": 1, "state": "active" },
+                "metadata": { "version": 1 }
+            }
+        })))
+        .mount(server)
+        .await;
+    for unbound in [SERVICE_NAME, STRAY_ID] {
+        Mock::given(method("GET"))
+            .and(path(binding_kv_path(unbound)))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })))
+            .mount(server)
+            .await;
+    }
+}
+
+async fn stub_services_listing(server: &MockServer, token: &str, listing: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path(SERVICES_LIST_PATH))
+        .and(wiremock::matchers::query_param("list", "true"))
+        .and(header("X-Vault-Token", token))
+        .respond_with(listing)
+        .mount(server)
+        .await;
+}
+
+/// Accepts every per-service `trust`, `http_responder_hmac` and `eab`
+/// write, so a test asserts on what was sent rather than on a 404.
+async fn stub_service_record_writes(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/v1/secret/data/bootroot/services/[^/]+/(trust|http_responder_hmac|eab)$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+}
+
+async fn received(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .expect("mock server records requests")
+}
+
+/// Returns the `data` payloads written to `request_path`, in arrival order.
+fn posted_payloads(requests: &[wiremock::Request], request_path: &str) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path() == request_path)
+        .map(|req| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("parse write body");
+            body["data"].clone()
+        })
+        .collect()
+}
+
+fn position_of(
+    requests: &[wiremock::Request],
+    http_method: &str,
+    request_path: &str,
+) -> Option<usize> {
+    requests
+        .iter()
+        .position(|req| req.method.as_str() == http_method && req.url.path() == request_path)
+}
+
+fn listing_positions(requests: &[wiremock::Request]) -> Vec<usize> {
+    requests
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.method.as_str() == "GET" && req.url.path() == SERVICES_LIST_PATH)
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn assert_no_secret_writes(requests: &[wiremock::Request]) {
+    let writes: Vec<String> = requests
+        .iter()
+        .filter(|req| req.method.as_str() == "POST" && req.url.path().starts_with("/v1/secret/"))
+        .map(|req| req.url.path().to_string())
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "no OpenBao write expected, got {writes:?}"
+    );
+}
+
+fn assert_no_registrar_enumeration(requests: &[wiremock::Request]) {
+    let listed: Vec<String> = requests
+        .iter()
+        .map(|req| req.url.path().to_string())
+        .filter(|p| p.starts_with(SERVICES_METADATA_PREFIX) || p.ends_with("/registrar_binding"))
+        .collect();
+    assert!(
+        listed.is_empty(),
+        "without a registrar_endpoint entry nothing may be listed or probed: {listed:?}"
+    );
+}
+
+/// Stages the compose file, fake `docker` and responder render source a
+/// `rotate responder-hmac` run needs, then runs it with `auth_args`.
+fn run_responder_hmac(
+    root: &Path,
+    openbao_url: &str,
+    auth_args: &[&str],
+    hmac: &str,
+) -> std::process::Output {
+    let compose_file = root.join("docker-compose.yml");
+    fs::write(&compose_file, "services: {}\n").expect("write compose");
+
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = root.join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+
+    let responder_dir = root.join("secrets").join("responder");
+    fs::create_dir_all(&responder_dir).expect("create responder dir");
+    let render_source = root.join("responder-render-src.toml");
+    fs::write(&render_source, format!("hmac_secret = \"{hmac}\"\n")).expect("write render source");
+
+    let path_var = env::var("PATH").unwrap_or_default();
+    Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(["rotate", "--openbao-url", openbao_url])
+        .args(auth_args)
+        .args([
+            "--compose-file",
+            compose_file.to_string_lossy().as_ref(),
+            "--yes",
+            "responder-hmac",
+            "--hmac",
+            hmac,
+        ])
+        .env("PATH", format!("{}:{path_var}", bin_dir.display()))
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("RENDER_SOURCE", &render_source)
+        .env("RENDER_TARGET", responder_dir.join("responder.toml"))
+        .output()
+        .expect("run rotate responder-hmac")
+}
+
+fn run_rotate_root(root: &Path, openbao_url: &str, subcommand: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args([
+            "rotate",
+            "--openbao-url",
+            openbao_url,
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            subcommand,
+        ])
+        .output()
+        .expect("run rotate")
+}
+
+async fn assert_responder_hmac_fans_out(auth_args: &[&str], token: &str) {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_runtime_approle_login(
+        &openbao,
+        "runtime-role-id",
+        "runtime-secret-id",
+        "runtime-client",
+    )
+    .await;
+    stub_openbao_for_responder_hmac_rotation_with_token(&openbao, "hmac-fanout", token).await;
+    stub_services_listing(&openbao, token, services_listing_response()).await;
+    stub_registrar_bindings(&openbao, token).await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(temp_dir.path(), &openbao.uri(), auth_args, "hmac-fanout");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let expected = json!({ "hmac": "hmac-fanout" });
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &service_record_path(id, "http_responder_hmac"));
+        assert_eq!(
+            payloads,
+            vec![expected.clone()],
+            "{id} is written exactly once"
+        );
+    }
+    assert!(
+        posted_payloads(
+            &requests,
+            &service_record_path(STRAY_ID, "http_responder_hmac")
+        )
+        .is_empty(),
+        "an unbound subtree must not be written"
+    );
+    assert!(
+        requests.iter().all(|req| !req.url.path().contains("/leaf")),
+        "a leaf key is not a registration subtree"
+    );
+
+    let listing = listing_positions(&requests);
+    assert_eq!(listing.len(), 1, "one listing per fan-out step");
+    let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/responder/hmac")
+        .expect("control-node HMAC written");
+    assert!(
+        listing[0] < control_write,
+        "the listing must precede the control-node write"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_fans_out_to_registrar_identities() {
+    assert_responder_hmac_fans_out(&["--root-token", support::ROOT_TOKEN], support::ROOT_TOKEN)
+        .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_fans_out_to_registrar_identities_with_approle() {
+    assert_responder_hmac_fans_out(
+        &[
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+        ],
+        "runtime-client",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_listing_forbidden_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-denied").await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-denied",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("list") && stderr.contains("root token"),
+        "the error names the missing grant and the root-token re-run: {stderr}"
+    );
+    assert_no_secret_writes(&received(&openbao).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_binding_read_failure_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-500").await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/registrar_binding$"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({ "errors": ["boom"] })))
+        .mount(&openbao)
+        .await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-500",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_no_secret_writes(&received(&openbao).await);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_without_registrar_entry_does_not_list() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-plain").await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-plain",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    assert_no_registrar_enumeration(&requests);
+    assert_eq!(
+        posted_payloads(
+            &requests,
+            &service_record_path(SERVICE_NAME, "http_responder_hmac")
+        )
+        .len(),
+        1
+    );
+    assert!(
+        posted_payloads(
+            &requests,
+            &service_record_path(REGISTRAR_ID, "http_responder_hmac")
+        )
+        .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_empty_listing_writes_state_services_only() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-empty").await;
+    stub_services_listing(
+        &openbao,
+        support::ROOT_TOKEN,
+        ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })),
+    )
+    .await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-empty",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let requests = received(&openbao).await;
+    let service_writes: Vec<String> = requests
+        .iter()
+        .filter(|req| {
+            req.method.as_str() == "POST"
+                && req
+                    .url
+                    .path()
+                    .starts_with("/v1/secret/data/bootroot/services/")
+        })
+        .map(|req| req.url.path().to_string())
+        .collect();
+    assert_eq!(
+        service_writes,
+        vec![service_record_path(SERVICE_NAME, "http_responder_hmac")]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_trust_sync_fans_out_to_registrar_identities() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+
+    let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "trust-sync");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let global = posted_payloads(&requests, "/v1/secret/data/bootroot/ca");
+    assert_eq!(global.len(), 1);
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &service_record_path(id, "trust"));
+        assert_eq!(
+            payloads, global,
+            "{id} receives the global trust payload once"
+        );
+        assert!(
+            stdout.contains(&format!("- service trust synced: {id}")),
+            "summary names {id}: {stdout}"
+        );
+    }
+    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert!(!stdout.contains(STRAY_ID), "{stdout}");
+    let listing = listing_positions(&requests);
+    let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/ca")
+        .expect("global trust written");
+    assert!(listing.len() == 1 && listing[0] < control_write);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_trust_sync_listing_forbidden_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_ca_key_rotation(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, ResponseTemplate::new(500)).await;
+
+    let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "trust-sync");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_no_secret_writes(&received(&openbao).await);
+}
+
+async fn stub_eab_clear(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+    stub_service_record_writes(server).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_clears_global_and_state_services() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_eab_clear(&openbao).await;
+
+    let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "eab-clear");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let cleared = json!({ "kid": "", "hmac": "" });
+    assert_eq!(
+        posted_payloads(&requests, "/v1/secret/data/bootroot/agent/eab"),
+        vec![cleared.clone()]
+    );
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(SERVICE_NAME, "eab")),
+        vec![cleared]
+    );
+    assert!(stdout.contains("Cleared bootroot/agent/eab"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Cleared bootroot/services/{SERVICE_NAME}/eab")),
+        "{stdout}"
+    );
+    assert_no_registrar_enumeration(&requests);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_fans_out_to_registrar_identities() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    stub_eab_clear(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+
+    let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "eab-clear");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let cleared = json!({ "kid": "", "hmac": "" });
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        assert_eq!(
+            posted_payloads(&requests, &service_record_path(id, "eab")),
+            vec![cleared.clone()],
+            "{id} is cleared exactly once"
+        );
+        assert!(
+            stdout.contains(&format!("Cleared bootroot/services/{id}/eab")),
+            "{stdout}"
+        );
+    }
+    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "eab")).is_empty());
+    let listing = listing_positions(&requests);
+    let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/agent/eab")
+        .expect("global EAB cleared");
+    assert!(listing.len() == 1 && listing[0] < control_write);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_listing_forbidden_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    stub_eab_clear(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
+
+    let output = run_rotate_root(temp_dir.path(), &openbao.uri(), "eab-clear");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_no_secret_writes(&received(&openbao).await);
+}
+
+fn rotation_state_json(root: &Path) -> serde_json::Value {
+    let contents =
+        fs::read_to_string(root.join("rotation-state.json")).expect("read rotation-state.json");
+    serde_json::from_str(&contents).expect("parse rotation-state.json")
+}
+
+fn trusted_fingerprints(payload: &serde_json::Value) -> Vec<String> {
+    payload["trusted_ca_sha256"]
+        .as_array()
+        .unwrap_or_else(|| panic!("trusted_ca_sha256 missing from {payload}"))
+        .iter()
+        .map(|fp| fp.as_str().expect("fingerprint is a string").to_string())
+        .collect()
+}
+
+/// Mounts everything a registrar-fan-out `rotate ca-key` run needs except
+/// the services listing, which each test answers its own way.
+async fn stub_ca_key_rotation_with_registrar(server: &MockServer) {
+    stub_openbao_for_ca_key_rotation(server).await;
+    stub_reissue_write(server, SERVICE_NAME, 200).await;
+    stub_registrar_bindings(server, support::ROOT_TOKEN).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let requests = received(&openbao).await;
+    let global = posted_payloads(&requests, "/v1/secret/data/bootroot/ca");
+    assert_eq!(
+        global.len(),
+        2,
+        "Phase 3 and Phase 6 each write bootroot/ca"
+    );
+    assert_eq!(
+        trusted_fingerprints(&global[0]).len(),
+        3,
+        "Phase 3 is additive"
+    );
+    assert_eq!(trusted_fingerprints(&global[1]).len(), 2, "Phase 6 narrows");
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        assert_eq!(
+            posted_payloads(&requests, &service_record_path(id, "trust")),
+            global,
+            "{id} receives both the transitional and the final trust"
+        );
+    }
+    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert_eq!(
+        listing_positions(&requests).len(),
+        2,
+        "Phases 3 and 6 each enumerate"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_phase_6_listing_failure_resumes_at_phase_6() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    // Phase 3's listing succeeds; Phase 6's is refused.
+    Mock::given(method("GET"))
+        .and(path(SERVICES_LIST_PATH))
+        .respond_with(services_listing_response())
+        .up_to_n_times(1)
+        .mount(&openbao)
+        .await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), json!(5));
+
+    let requests = received(&openbao).await;
+    let listing = listing_positions(&requests);
+    assert_eq!(listing.len(), 2, "Phases 3 and 6 each listed");
+    let transitional = posted_payloads(&requests, &service_record_path(REGISTRAR_ID, "trust"));
+    assert_eq!(transitional.len(), 1, "only Phase 3 reached the identity");
+    assert_eq!(trusted_fingerprints(&transitional[0]).len(), 3);
+    let after_failure: Vec<String> = requests
+        .iter()
+        .skip(listing[1])
+        .filter(|req| req.method.as_str() == "POST")
+        .map(|req| req.url.path().to_string())
+        .collect();
+    assert!(
+        after_failure.is_empty(),
+        "Phase 6 wrote nothing after its failed listing: {after_failure:?}"
+    );
+
+    // Re-run with the grant fixed: the rotation resumes at Phase 6.
+    let rotation_state = rotation_state_json(temp_dir.path());
+    let final_fps = vec![
+        rotation_state["new_root_fp"]
+            .as_str()
+            .expect("new root fp")
+            .to_string(),
+        rotation_state["new_intermediate_fp"]
+            .as_str()
+            .expect("new intermediate fp")
+            .to_string(),
+    ];
+    openbao.reset().await;
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 5"),
+        "the re-run should resume after phase 5: {stdout}"
+    );
+    let requests = received(&openbao).await;
+    for id in [SERVICE_NAME, REGISTRAR_ID] {
+        let payloads = posted_payloads(&requests, &service_record_path(id, "trust"));
+        assert_eq!(payloads.len(), 1, "{id} receives the final trust once");
+        assert_eq!(trusted_fingerprints(&payloads[0]), final_fps, "{id}");
+    }
+    assert!(!temp_dir.path().join("rotation-state.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_phase_3_listing_failure_resumes_at_phase_3() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    support::create_secrets_dir(temp_dir.path()).expect("create secrets dir");
+    support::write_password_file(&temp_dir.path().join("secrets"), "test-password")
+        .expect("write password");
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    let envs = stage_ca_key_rotation(temp_dir.path());
+
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, forbidden()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    assert_eq!(recorded_rotation_phase(temp_dir.path()), json!(2));
+    assert_no_secret_writes(&received(&openbao).await);
+
+    openbao.reset().await;
+    stub_ca_key_rotation_with_registrar(&openbao).await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+
+    let output = run_rotate_ca_key(temp_dir.path(), &openbao.uri(), &envs, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the re-run should complete; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Resuming CA key rotation from phase 2"),
+        "the re-run should resume after phase 2: {stdout}"
+    );
+    let requests = received(&openbao).await;
+    let global = posted_payloads(&requests, "/v1/secret/data/bootroot/ca");
+    assert_eq!(global.len(), 2, "the resumed run completes Phases 3 and 6");
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(REGISTRAR_ID, "trust")),
+        global
+    );
+    assert!(!temp_dir.path().join("rotation-state.json").exists());
+}

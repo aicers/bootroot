@@ -143,6 +143,10 @@ load_openbao_paths() {
     "$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_RESPONDER_HMAC_KV_SUFFIX)"
     "$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_TRUST_KV_SUFFIX)"
   )
+  # What the CLI rotations enumerate a registrar-minted identity by, and the
+  # policy they run under when scheduled.
+  REGISTRAR_BINDING_SUFFIX="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" REGISTRAR_BINDING_KV_SUFFIX)"
+  RUNTIME_ROTATE_POLICY="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/commands/init/constants.rs" POLICY_BOOTROOT_RUNTIME_ROTATE)"
   pass "loaded the configured KV mount and production path constants"
 }
 
@@ -238,6 +242,32 @@ assert_seeded_trust_material() {
   pass "the mint seeded the service trust material and no secret_id"
 }
 
+# The rotations fan trust, responder-HMAC and EAB material out to
+# registrar-minted identities by listing the services tree for a binding.
+# Held against the live policy `init` wrote: a token carrying only the
+# runtime-rotate policy lists the tree, sees the minted id, and reads its
+# binding. The token is short-lived and revoked by accessor with the root
+# token, since `no_default_policy` leaves it no `revoke-self`.
+assert_runtime_rotate_can_enumerate() {
+  local registration_id="$1" rotate_curl="$RUN_ROOT/runtime-rotate-curl.conf" response accessor status
+  response="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST \
+    --data "$(jq -nc --arg policy "$RUNTIME_ROTATE_POLICY" '{policies: [$policy], no_default_policy: true, ttl: "5m"}')" \
+    "$OPENBAO_URL/v1/auth/token/create")" || fail "could not create a runtime-rotate-only token"
+  accessor="$(jq -er '.auth.accessor' <<<"$response")" || fail "runtime-rotate token has no accessor"
+  ( umask 077; jq -er '"X-Vault-Token: \(.auth.client_token)"' <<<"$response" >"$rotate_curl" ) || fail "could not stage the runtime-rotate token"
+  response=
+  status="$(curl -sS -o "$ARTIFACT_DIR/runtime-rotate-services-list.json" -w '%{http_code}' --cacert "$OPENBAO_CA" --header @"$rotate_curl" "$OPENBAO_URL/v1/${KV_MOUNT}/metadata/${SERVICE_KV_BASE}/?list=true" || true)"
+  [ "$status" = 200 ] || fail "runtime-rotate policy cannot list ${KV_MOUNT}/metadata/${SERVICE_KV_BASE}/ (HTTP ${status})"
+  jq -e --arg key "${registration_id}/" '.data.keys | index($key) != null' "$ARTIFACT_DIR/runtime-rotate-services-list.json" >/dev/null || fail "runtime-rotate listing does not include the minted registration id"
+  status="$(curl -sS -o /dev/null -w '%{http_code}' --cacert "$OPENBAO_CA" --header @"$rotate_curl" "$OPENBAO_URL/v1/${KV_MOUNT}/data/${SERVICE_KV_BASE}/${registration_id}/${REGISTRAR_BINDING_SUFFIX}" || true)"
+  [ "$status" = 200 ] || fail "runtime-rotate policy cannot read the minted ${REGISTRAR_BINDING_SUFFIX} (HTTP ${status})"
+  rm -f "$rotate_curl"
+  sudo -n curl -fsS -o /dev/null --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" -X POST \
+    --data "$(jq -nc --arg accessor "$accessor" '{accessor: $accessor}')" \
+    "$OPENBAO_URL/v1/auth/token/revoke-accessor" || fail "could not revoke the runtime-rotate token"
+  pass "the runtime-rotate policy lists the services tree and reads the minted binding"
+}
+
 assert_no_registration_state() {
   local registration_id="$1"
   local endpoint status
@@ -266,6 +296,7 @@ assert_functionality_and_audit() {
   first="$(cat "$ARTIFACT_DIR/first-mint.json")"; second="$(cat "$ARTIFACT_DIR/idempotent-mint.json")"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
   REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"
   assert_seeded_trust_material "$REGISTRATION_ID"
+  assert_runtime_rotate_can_enumerate "$REGISTRATION_ID"
   role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${REGISTRATION_ID}")" || fail "could not read the minted derived AppRole"
   policies="$(jq -c '.data.token_policies | sort' <<<"$role")" || fail "minted AppRole has no policy list"
   [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"

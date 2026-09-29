@@ -3131,6 +3131,35 @@ without any manual step. The same loop reads
 `[trust]` pins + `ca-bundle.pem`, so a CA/trust rotation propagates the
 same way.
 
+**Registrar-managed identities.** An identity minted through the
+registrar is never recorded in `state.json`; its one durable record is
+the binding at `bootroot/services/<registration_id>/registrar_binding`.
+On a deployment whose `state.json` carries a `registrar_endpoint` entry
+(enabled or not), `rotate responder-hmac`, `rotate eab-clear`,
+`rotate trust-sync` and `rotate ca-key` Phases 3 and 6 therefore list
+`bootroot/services/` and, besides every `state.json` service, write the
+same `http_responder_hmac`, `eab` or `trust` payload to every listed
+registration id that carries a binding. A subtree with neither a
+`state.json` entry nor a binding is never written. The identity's host
+picks the new value up through its `bootroot-agent` fast-poll loop,
+exactly like any remote-bootstrap service. Without a
+`registrar_endpoint` entry nothing is listed.
+
+The listing needs `list` on `<kv>/metadata/bootroot/services/`, which
+`bootroot init` writes into the `bootroot-runtime-rotate` policy. A
+deployment whose runtime-rotate policy predates that grant must re-run
+`bootroot init` to refresh it, or run these rotations with the root
+token. The listing runs before a step's first OpenBao write, so a
+refused listing fails that step with nothing written; `rotate ca-key`
+resumes at the failed phase when re-run.
+
+A rotation racing a registrar mint of the same identity can leave that
+identity on the previous value: the mint seeds from the control-node
+record it read before the rotation wrote it. No lock spans the two
+processes. Re-run the rotation to converge — `rotate trust-sync` for
+trust, `rotate eab-clear` (idempotent) for EAB, and `rotate
+responder-hmac` again for the responder HMAC.
+
 `bootroot-remote apply-secret-id` is the **recovery** path, not the steady
 state: it delivers a fresh `secret_id` to an agent that was offline past
 its `secret_id_ttl` (whose credential already expired, so it cannot

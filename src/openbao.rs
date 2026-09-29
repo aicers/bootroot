@@ -1174,6 +1174,46 @@ impl OpenBaoClient {
         Ok(Some(parsed.data.data))
     }
 
+    /// Lists the keys directly under a KV v2 path.
+    ///
+    /// Sends `GET /v1/<mount>/metadata/<path>?list=true` and returns
+    /// `data.keys` exactly as `OpenBao` returns them, so a key naming a
+    /// subtree keeps its trailing `/` and a leaf record has none. A path
+    /// with nothing under it is a not-found to `OpenBao`, and returns an
+    /// empty `Vec` here.
+    ///
+    /// # Errors
+    /// Returns an error if the request fails, if `OpenBao` answers with
+    /// any status other than success or a clean not-found (a 403 from a
+    /// token lacking `list` included), or if a successful body does not
+    /// carry `data.keys` as an array of strings.
+    pub async fn list_kv(&self, mount: &str, path: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct KvListResponse {
+            data: KvListResponseData,
+        }
+        #[derive(Deserialize)]
+        struct KvListResponseData {
+            keys: Vec<String>,
+        }
+        let full_path = format!("{mount}/metadata/{path}?list=true");
+        let response = self.send_authed(Method::GET, &full_path, None).await?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read OpenBao response body")?;
+        if is_not_found(status, &text) {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            anyhow::bail!("OpenBao API error ({status}): {text}");
+        }
+        let parsed: KvListResponse =
+            serde_json::from_str(&text).context("Failed to parse OpenBao KV list response")?;
+        Ok(parsed.data.keys)
+    }
+
     /// Checks if a KV v2 secret exists.
     ///
     /// # Errors
@@ -1837,6 +1877,102 @@ mod wrap_tests {
             .await
             .expect("create_secret_id_wrapped should succeed");
         assert_eq!(secret_id, "unwrapped-secret-abc");
+    }
+}
+
+/// Canned-response coverage for the KV v2 metadata listing: the request
+/// envelope (a `GET` carrying `list=true`) and the classification of the
+/// reply.
+#[cfg(test)]
+mod list_kv_tests {
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    const LIST_PATH: &str = "/v1/secret/metadata/bootroot/services/";
+
+    fn client_with_token(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client init");
+        client.set_token("root-token".to_string());
+        client
+    }
+
+    async fn mount_list(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(LIST_PATH))
+            .and(query_param("list", "true"))
+            .and(header("X-Vault-Token", "root-token"))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn list_kv_returns_keys_verbatim_on_success() {
+        let server = MockServer::start().await;
+        mount_list(
+            &server,
+            ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "keys": ["a/", "b/", "leaf"] }
+            })),
+        )
+        .await;
+
+        let keys = client_with_token(&server)
+            .list_kv("secret", "bootroot/services/")
+            .await
+            .expect("list should succeed");
+        assert_eq!(keys, vec!["a/", "b/", "leaf"]);
+    }
+
+    #[tokio::test]
+    async fn list_kv_returns_empty_on_not_found() {
+        let server = MockServer::start().await;
+        mount_list(
+            &server,
+            ResponseTemplate::new(404).set_body_json(json!({ "errors": [] })),
+        )
+        .await;
+
+        let keys = client_with_token(&server)
+            .list_kv("secret", "bootroot/services/")
+            .await
+            .expect("a not-found listing is empty, not an error");
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_kv_errors_on_forbidden() {
+        let server = MockServer::start().await;
+        mount_list(
+            &server,
+            ResponseTemplate::new(403).set_body_json(json!({ "errors": ["permission denied"] })),
+        )
+        .await;
+
+        let err = client_with_token(&server)
+            .list_kv("secret", "bootroot/services/")
+            .await
+            .expect_err("a 403 must not read as an empty listing");
+        assert!(err.to_string().contains("403"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_kv_errors_on_body_without_keys() {
+        let server = MockServer::start().await;
+        mount_list(
+            &server,
+            ResponseTemplate::new(200).set_body_json(json!({ "data": {} })),
+        )
+        .await;
+
+        client_with_token(&server)
+            .list_kv("secret", "bootroot/services/")
+            .await
+            .expect_err("a body without data.keys must be an error");
     }
 }
 
