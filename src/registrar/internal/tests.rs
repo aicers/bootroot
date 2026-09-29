@@ -1751,6 +1751,32 @@ mod live {
             .await
             .expect("the CA trust record must be readable");
 
+        // Permitted: the other two control-node records a mint seeds a
+        // registration's trust material from. Absent here too, so "not
+        // found" is the permitted answer and a 403 would fail the read.
+        for seeded_from in ["bootroot/responder/hmac", "bootroot/agent/eab"] {
+            client
+                .try_read_kv(&backend.kv_mount, seeded_from)
+                .await
+                .unwrap_or_else(|err| panic!("{seeded_from} must be readable: {err:#}"));
+        }
+
+        // Permitted: the three trust records a mint seeds into a
+        // registration's own subtree.
+        let registration_id = unique("h1-roxyd");
+        for suffix in ["eab", "http_responder_hmac", "trust"] {
+            client
+                .write_kv(
+                    &backend.kv_mount,
+                    &format!("bootroot/services/{registration_id}/{suffix}"),
+                    serde_json::json!({ "seeded": true }),
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("the {suffix} seeding write must be permitted: {err:#}")
+                });
+        }
+
         // Denied: the CA core secrets a verb has no business reading.
         for denied in ["bootroot/stepca/password", "bootroot/stepca/db_admin"] {
             let err = client

@@ -1435,7 +1435,7 @@ mod tests {
         let mut args = test_bootstrap_args();
         args.agent_config_path = link.clone();
         let pulled = PulledSecrets {
-            secret_id: "secret".to_string(),
+            secret_id: Some("secret".to_string()),
             eab_kid: None,
             eab_hmac: None,
             responder_hmac: "responder-hmac".to_string(),

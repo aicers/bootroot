@@ -705,9 +705,11 @@ jobs:
       - name: Run E2E scenario (registrar verbs)
         if: matrix.scenario.label == 'registrar-verbs'
         # This scenario stands its own single OpenBao up on a free
-        # loopback port, so it needs no compose project, no secrets
-        # wiring and none of the bootroot binaries. It is the gate for
-        # the ignored `registrar::verbs::tests` library tests.
+        # loopback port, so it needs no compose project and no secrets
+        # wiring. Of the bootroot binaries it needs only
+        # `bootroot-remote`, which the script builds itself to bootstrap
+        # a minted identity. It is the gate for the ignored
+        # `registrar::verbs::tests` library tests.
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           ARTIFACT_DIR="$ARTIFACT_DIR" \

@@ -1,6 +1,7 @@
-//! The `OpenBao` material one service registration owns, and the two
+//! The `OpenBao` material one service registration owns, and the three
 //! operations both of its callers share: provisioning the derived policy
-//! and `AppRole`, and tearing that material down again.
+//! and `AppRole`, seeding the registration's trust material, and tearing
+//! that material down again.
 //!
 //! Two callers reach this module and they are deliberately asymmetric:
 //!
@@ -12,13 +13,16 @@
 //!
 //! What is shared is exactly the part that must not drift: the derived
 //! `bootroot-service-<registration_id>` role and policy names, the policy
-//! body, and the delete sequence. What is **not** shared is credential
+//! body, the trust material a registration's KV subtree is seeded with
+//! (`eab`, `http_responder_hmac`, `trust`, read from the control-node
+//! records), and the delete sequence. What is **not** shared is credential
 //! issuance. [`provision_service_role`] never creates a `secret_id` and
-//! never returns one, because the two callers deliver it differently —
-//! the CLI writes a raw value to a file, the registrar hands a
-//! response-wrapping token to a remote caller and must never hold the
-//! unwrapped secret at all. Putting issuance here would force one of
-//! them onto the other's delivery.
+//! never returns one, and [`write_service_trust_material`] never reads,
+//! writes or accepts one, because the two callers deliver it differently
+//! — the CLI writes a raw value to a file (and, for a remote service, to
+//! KV), the registrar hands a response-wrapping token to a remote caller
+//! and must never hold the unwrapped secret at all. Putting issuance here
+//! would force one of them onto the other's delivery.
 //!
 //! Nothing here reads `state.json`, prompts, or knows a delivery mode.
 //! Every value the operations depend on — the KV mount, the role-level
@@ -29,7 +33,13 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 
 use crate::openbao::OpenBaoClient;
-use crate::trust_bootstrap::{SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX};
+use crate::registrar_certs::{PATH_AGENT_EAB, PATH_RESPONDER_HMAC};
+use crate::secret::HmacSecret;
+use crate::trust_bootstrap::{
+    CA_BUNDLE_PEM_KEY, CA_TRUST_KV_PATH, EAB_HMAC_KEY, EAB_KID_KEY, HMAC_KEY,
+    SERVICE_EAB_KV_SUFFIX, SERVICE_KV_BASE, SERVICE_REISSUE_KV_SUFFIX,
+    SERVICE_RESPONDER_HMAC_KV_SUFFIX, SERVICE_TRUST_KV_SUFFIX, TRUSTED_CA_KEY,
+};
 
 /// Prefix of the derived per-registration role and policy names. The two
 /// names are one derivation, so a registration's role and its policy are
@@ -211,6 +221,304 @@ pub async fn provision_service_role(
     })
 }
 
+/// The key the control-node responder HMAC record carries its value
+/// under. The per-service copy is keyed [`HMAC_KEY`] instead.
+const CONTROL_RESPONDER_HMAC_VALUE_KEY: &str = "value";
+
+/// Length in hex characters of a SHA-256 fingerprint.
+const SHA256_FINGERPRINT_HEX_LEN: usize = 64;
+
+/// A required string key missing from, or not a string in, one of the
+/// control-node records [`read_service_trust_material`] reads.
+///
+/// The rendered forms are the diagnostics `service add` reported before
+/// this logic was shared, so the CLI can surface them unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TrustMaterialKey {
+    /// `kid` in `bootroot/agent/eab`.
+    #[error("OpenBao EAB data missing key: kid")]
+    EabKid,
+    /// `hmac` in `bootroot/agent/eab`.
+    #[error("OpenBao EAB data missing key: hmac")]
+    EabHmac,
+    /// `value` in `bootroot/responder/hmac`.
+    #[error("OpenBao responder HMAC data missing key: value")]
+    ResponderHmac,
+    /// `ca_bundle_pem` in `bootroot/ca`.
+    #[error("OpenBao CA trust data missing key: ca_bundle_pem")]
+    CaBundlePem,
+}
+
+/// A failure reading, validating or writing a registration's trust
+/// material.
+///
+/// Typed by failure so each caller can keep its own rendering: the CLI
+/// maps every variant onto the localized diagnostic it reported before
+/// this logic was shared, and the registrar folds it into its one
+/// unclassified unavailability.
+#[derive(Debug, Error)]
+pub enum ServiceTrustError {
+    /// Reading a control-node record failed. A clean not-found on the
+    /// optional EAB record is not a failure and never lands here.
+    #[error("reading KV path {path} failed")]
+    Read {
+        /// The KV path, spelled without the mount.
+        path: &'static str,
+        /// The underlying `OpenBao` failure.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// Writing one of the registration's records failed. The write may
+    /// have reached `OpenBao` before it failed.
+    #[error("writing KV path {path} failed")]
+    Write {
+        /// The KV path, spelled without the mount.
+        path: String,
+        /// The underlying `OpenBao` failure.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// `bootroot/ca` carries no `trusted_ca_sha256` key.
+    #[error("CA trust data missing key: {key}")]
+    CaTrustMissing {
+        /// The missing key.
+        key: &'static str,
+    },
+    /// `trusted_ca_sha256` is an empty list.
+    #[error("CA trust list is empty")]
+    CaTrustEmpty,
+    /// `trusted_ca_sha256` is not a list of 64-hex-character strings.
+    #[error("CA trust list is invalid")]
+    CaTrustInvalid,
+    /// A required string key is missing from a control-node record.
+    #[error(transparent)]
+    MissingKey(#[from] TrustMaterialKey),
+}
+
+/// The trust material a registration's KV subtree is seeded with, as
+/// read from the deployment's control-node records.
+///
+/// There is deliberately no `secret_id` field: credential delivery stays
+/// at each caller's boundary.
+#[derive(Debug, Clone)]
+pub struct ServiceTrustMaterial {
+    /// The shared agent EAB key id, or `None` when the deployment has no
+    /// EAB record.
+    pub eab_kid: Option<String>,
+    /// The shared agent EAB HMAC, present exactly when `eab_kid` is.
+    pub eab_hmac: Option<HmacSecret>,
+    /// The deployment's HTTP-01 responder HMAC.
+    pub responder_hmac: HmacSecret,
+    /// The pinned CA fingerprints, lowercase or uppercase hex as stored.
+    pub trusted_ca_sha256: Vec<String>,
+    /// The CA bundle PEM the fingerprints are drawn from.
+    pub ca_bundle_pem: String,
+}
+
+/// Reads the control-node records a registration's trust material is
+/// assembled from: `bootroot/agent/eab`, `bootroot/responder/hmac` and
+/// `bootroot/ca`, in that order.
+///
+/// The EAB record is optional: it exists only when the operator supplied
+/// EAB credentials, so a clean not-found reads as "no EAB". Every other
+/// failure on it — transport, 5xx, a denied read — propagates, so a
+/// transient outage cannot silently strip EAB from a registration. The
+/// other two records are required.
+///
+/// Only the shapes are checked here. The bundle is not checked against
+/// its fingerprints: each consumer of the seeded `trust` record re-runs
+/// that consistency check on what it reads.
+///
+/// # Errors
+///
+/// Returns [`ServiceTrustError::Read`] when a read fails,
+/// [`ServiceTrustError::CaTrustMissing`], [`ServiceTrustError::CaTrustInvalid`]
+/// or [`ServiceTrustError::CaTrustEmpty`] when `trusted_ca_sha256` is
+/// absent, malformed or empty, and [`ServiceTrustError::MissingKey`] when
+/// a required string key is absent.
+pub async fn read_service_trust_material(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+) -> Result<ServiceTrustMaterial, ServiceTrustError> {
+    let read_failed = |path: &'static str| move |source| ServiceTrustError::Read { path, source };
+    let eab = client
+        .try_read_kv(kv_mount, PATH_AGENT_EAB)
+        .await
+        .map_err(read_failed(PATH_AGENT_EAB))?;
+    let responder_hmac = client
+        .read_kv(kv_mount, PATH_RESPONDER_HMAC)
+        .await
+        .map_err(read_failed(PATH_RESPONDER_HMAC))?;
+    let trust = client
+        .read_kv(kv_mount, CA_TRUST_KV_PATH)
+        .await
+        .map_err(read_failed(CA_TRUST_KV_PATH))?;
+
+    let trusted_ca_sha256 = parse_trusted_ca_list(trust.get(TRUSTED_CA_KEY).ok_or(
+        ServiceTrustError::CaTrustMissing {
+            key: TRUSTED_CA_KEY,
+        },
+    )?)?;
+    if trusted_ca_sha256.is_empty() {
+        return Err(ServiceTrustError::CaTrustEmpty);
+    }
+    let (eab_kid, eab_hmac) = match &eab {
+        Some(data) => (
+            Some(required_string(
+                data,
+                EAB_KID_KEY,
+                TrustMaterialKey::EabKid,
+            )?),
+            Some(HmacSecret::new(required_string(
+                data,
+                EAB_HMAC_KEY,
+                TrustMaterialKey::EabHmac,
+            )?)),
+        ),
+        None => (None, None),
+    };
+    let responder_hmac = HmacSecret::new(required_string(
+        &responder_hmac,
+        CONTROL_RESPONDER_HMAC_VALUE_KEY,
+        TrustMaterialKey::ResponderHmac,
+    )?);
+    let ca_bundle_pem = required_string(&trust, CA_BUNDLE_PEM_KEY, TrustMaterialKey::CaBundlePem)?;
+
+    Ok(ServiceTrustMaterial {
+        eab_kid,
+        eab_hmac,
+        responder_hmac,
+        trusted_ca_sha256,
+        ca_bundle_pem,
+    })
+}
+
+/// Writes a registration's trust material into its KV subtree: `eab`,
+/// then `http_responder_hmac`, then `trust`.
+///
+/// `eab` is written **always**, as `{ "kid": "", "hmac": "" }` when the
+/// deployment has no EAB. The agent's fast-poll loop reads that path on
+/// every cycle, and the explicit empty shape is the durable "no EAB"
+/// representation it applies (removing any stale `eab.json`), whereas a
+/// missing path would be ambiguous between "cleared" and "never
+/// provisioned".
+///
+/// Every write is unconditional, so each call bumps the three records'
+/// KV versions even when their content is unchanged.
+///
+/// # Errors
+///
+/// Returns [`ServiceTrustError::Write`] naming the first write that
+/// failed; the writes after it are not attempted.
+pub async fn write_service_trust_material(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    registration_id: &str,
+    material: &ServiceTrustMaterial,
+) -> Result<(), ServiceTrustError> {
+    let eab_kid = material.eab_kid.as_deref().unwrap_or("");
+    let eab_hmac = material.eab_hmac.as_ref().map_or("", HmacSecret::expose);
+    write_record(
+        client,
+        kv_mount,
+        service_kv_path(registration_id, SERVICE_EAB_KV_SUFFIX),
+        serde_json::json!({
+            EAB_KID_KEY: eab_kid,
+            EAB_HMAC_KEY: eab_hmac,
+        }),
+    )
+    .await?;
+    write_record(
+        client,
+        kv_mount,
+        service_kv_path(registration_id, SERVICE_RESPONDER_HMAC_KV_SUFFIX),
+        serde_json::json!({ HMAC_KEY: material.responder_hmac.expose() }),
+    )
+    .await?;
+    write_service_trust_record(
+        client,
+        kv_mount,
+        registration_id,
+        &material.trusted_ca_sha256,
+        &material.ca_bundle_pem,
+    )
+    .await
+}
+
+/// Writes one registration's `trust` record:
+/// `{ "trusted_ca_sha256": [...], "ca_bundle_pem": <pem> }`.
+///
+/// # Errors
+///
+/// Returns [`ServiceTrustError::Write`] when the write fails.
+pub async fn write_service_trust_record(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    registration_id: &str,
+    trusted_ca_sha256: &[String],
+    ca_bundle_pem: &str,
+) -> Result<(), ServiceTrustError> {
+    write_record(
+        client,
+        kv_mount,
+        service_kv_path(registration_id, SERVICE_TRUST_KV_SUFFIX),
+        serde_json::json!({
+            TRUSTED_CA_KEY: trusted_ca_sha256,
+            CA_BUNDLE_PEM_KEY: ca_bundle_pem,
+        }),
+    )
+    .await
+}
+
+async fn write_record(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    path: String,
+    data: serde_json::Value,
+) -> Result<(), ServiceTrustError> {
+    match client.write_kv(kv_mount, &path, data).await {
+        Ok(()) => Ok(()),
+        Err(source) => Err(ServiceTrustError::Write { path, source }),
+    }
+}
+
+/// Parses a `trusted_ca_sha256` value: an array of 64-hex-character
+/// strings. An empty array parses; whether one is acceptable is the
+/// caller's decision.
+///
+/// # Errors
+///
+/// Returns [`ServiceTrustError::CaTrustInvalid`] when the value is not an
+/// array, or an element is not a 64-hex-character string.
+pub fn parse_trusted_ca_list(value: &serde_json::Value) -> Result<Vec<String>, ServiceTrustError> {
+    let items = value.as_array().ok_or(ServiceTrustError::CaTrustInvalid)?;
+    items
+        .iter()
+        .map(|item| match item.as_str() {
+            Some(fingerprint) if is_valid_sha256_fingerprint(fingerprint) => {
+                Ok(fingerprint.to_string())
+            }
+            _ => Err(ServiceTrustError::CaTrustInvalid),
+        })
+        .collect()
+}
+
+fn is_valid_sha256_fingerprint(value: &str) -> bool {
+    value.len() == SHA256_FINGERPRINT_HEX_LEN && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn required_string(
+    value: &serde_json::Value,
+    key: &str,
+    missing: TrustMaterialKey,
+) -> Result<String, TrustMaterialKey> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(missing)
+}
+
 /// One `OpenBao` resource a teardown attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceResource {
@@ -383,7 +691,274 @@ async fn delete_policy_if_present(client: &OpenBaoClient, policy_name: &str) -> 
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const BUNDLE: &str = "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+
+    fn client(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("test-token".to_string());
+        client
+    }
+
+    async fn mount_read(server: &MockServer, kv_path: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/secret/data/{kv_path}")))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn kv(data: &serde_json::Value) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ "data": { "data": data } }))
+    }
+
+    /// Mounts a well-formed responder HMAC and CA record, and — unless a
+    /// test mounted its own first — no EAB record at all.
+    async fn mount_control_node(server: &MockServer) {
+        mount_read(
+            server,
+            PATH_RESPONDER_HMAC,
+            kv(&json!({ "value": "r-hmac" })),
+        )
+        .await;
+        mount_read(
+            server,
+            CA_TRUST_KV_PATH,
+            kv(&json!({ "trusted_ca_sha256": [FINGERPRINT], "ca_bundle_pem": BUNDLE })),
+        )
+        .await;
+    }
+
+    async fn read_with(
+        eab: Option<ResponseTemplate>,
+        hmac: Option<serde_json::Value>,
+        ca: Option<serde_json::Value>,
+    ) -> Result<ServiceTrustMaterial, ServiceTrustError> {
+        let server = MockServer::start().await;
+        if let Some(eab) = eab {
+            mount_read(&server, PATH_AGENT_EAB, eab).await;
+        }
+        if let Some(hmac) = hmac {
+            mount_read(&server, PATH_RESPONDER_HMAC, kv(&hmac)).await;
+        }
+        if let Some(ca) = ca {
+            mount_read(&server, CA_TRUST_KV_PATH, kv(&ca)).await;
+        }
+        mount_control_node(&server).await;
+        read_service_trust_material(&client(&server), "secret").await
+    }
+
+    #[tokio::test]
+    async fn an_absent_control_node_eab_reads_as_none() {
+        let material = read_with(None, None, None).await.expect("reads");
+        assert!(material.eab_kid.is_none());
+        assert!(material.eab_hmac.is_none());
+        assert_eq!(material.responder_hmac.expose(), "r-hmac");
+        assert_eq!(material.trusted_ca_sha256, [FINGERPRINT]);
+        assert_eq!(material.ca_bundle_pem, BUNDLE);
+    }
+
+    #[tokio::test]
+    async fn a_failed_control_node_eab_read_is_an_error_not_an_absence() {
+        let err = read_with(Some(ResponseTemplate::new(500)), None, None)
+            .await
+            .expect_err("a 500 must not read as no EAB");
+        assert!(
+            matches!(err, ServiceTrustError::Read { path, .. } if path == PATH_AGENT_EAB),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eab_with_empty_strings_is_accepted_and_written_through() {
+        let server = MockServer::start().await;
+        mount_read(
+            &server,
+            PATH_AGENT_EAB,
+            kv(&json!({ "kid": "", "hmac": "" })),
+        )
+        .await;
+        mount_control_node(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+
+        let material = read_service_trust_material(&client, "secret")
+            .await
+            .expect("empty strings are accepted");
+        assert_eq!(material.eab_kid.as_deref(), Some(""));
+        write_service_trust_material(&client, "secret", "h1-roxyd", &material)
+            .await
+            .expect("writes");
+
+        let requests = server.received_requests().await.expect("recorded");
+        let writes: Vec<(String, serde_json::Value)> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .map(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("json body");
+                (request.url.path().to_string(), body["data"].clone())
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                (
+                    "/v1/secret/data/bootroot/services/h1-roxyd/eab".to_string(),
+                    json!({ "kid": "", "hmac": "" })
+                ),
+                (
+                    "/v1/secret/data/bootroot/services/h1-roxyd/http_responder_hmac".to_string(),
+                    json!({ "hmac": "r-hmac" })
+                ),
+                (
+                    "/v1/secret/data/bootroot/services/h1-roxyd/trust".to_string(),
+                    json!({ "trusted_ca_sha256": [FINGERPRINT], "ca_bundle_pem": BUNDLE })
+                ),
+            ]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/secret_id")),
+            "seeding never touches a secret_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_eab_missing_a_key_is_an_error() {
+        let err = read_with(Some(kv(&json!({ "kid": "k" }))), None, None)
+            .await
+            .expect_err("a half EAB is malformed");
+        assert!(matches!(
+            err,
+            ServiceTrustError::MissingKey(TrustMaterialKey::EabHmac)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_responder_hmac_without_its_value_is_an_error() {
+        let err = read_with(None, Some(json!({ "hmac": "wrong-key" })), None)
+            .await
+            .expect_err("the control-node record keys its value as `value`");
+        assert!(matches!(
+            err,
+            ServiceTrustError::MissingKey(TrustMaterialKey::ResponderHmac)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_ca_record_is_a_typed_error() {
+        let err = read_with(
+            None,
+            None,
+            Some(json!({ "trusted_ca_sha256": [], "ca_bundle_pem": BUNDLE })),
+        )
+        .await
+        .expect_err("an empty list is refused");
+        assert!(matches!(err, ServiceTrustError::CaTrustEmpty), "{err:?}");
+
+        let err = read_with(
+            None,
+            None,
+            Some(json!({ "trusted_ca_sha256": ["not-hex"], "ca_bundle_pem": BUNDLE })),
+        )
+        .await
+        .expect_err("a non-hex fingerprint is refused");
+        assert!(matches!(err, ServiceTrustError::CaTrustInvalid), "{err:?}");
+
+        let err = read_with(None, None, Some(json!({ "ca_bundle_pem": BUNDLE })))
+            .await
+            .expect_err("a missing list is refused");
+        assert!(
+            matches!(err, ServiceTrustError::CaTrustMissing { key } if key == TRUSTED_CA_KEY),
+            "{err:?}"
+        );
+
+        let err = read_with(
+            None,
+            None,
+            Some(json!({ "trusted_ca_sha256": [FINGERPRINT] })),
+        )
+        .await
+        .expect_err("a missing bundle is refused");
+        assert!(matches!(
+            err,
+            ServiceTrustError::MissingKey(TrustMaterialKey::CaBundlePem)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_stops_the_sequence_and_names_its_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/secret/data/bootroot/services/h1-roxyd/http_responder_hmac",
+            ))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let material = ServiceTrustMaterial {
+            eab_kid: None,
+            eab_hmac: None,
+            responder_hmac: HmacSecret::new("r-hmac".to_string()),
+            trusted_ca_sha256: vec![FINGERPRINT.to_string()],
+            ca_bundle_pem: BUNDLE.to_string(),
+        };
+
+        let err = write_service_trust_material(&client(&server), "secret", "h1-roxyd", &material)
+            .await
+            .expect_err("the responder write fails");
+        assert!(
+            matches!(&err, ServiceTrustError::Write { path, .. }
+                if path == "bootroot/services/h1-roxyd/http_responder_hmac"),
+            "{err:?}"
+        );
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 2, "the trust write is not attempted");
+    }
+
+    #[test]
+    fn parse_trusted_ca_list_accepts_valid() {
+        let value = json!(["a".repeat(64), "B".repeat(64)]);
+        let parsed = parse_trusted_ca_list(&value).expect("parse list");
+        assert_eq!(parsed, ["a".repeat(64), "B".repeat(64)]);
+        assert_eq!(
+            parse_trusted_ca_list(&json!([])).expect("empty"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_trusted_ca_list_rejects_non_array() {
+        assert!(matches!(
+            parse_trusted_ca_list(&json!("not-array")),
+            Err(ServiceTrustError::CaTrustInvalid)
+        ));
+    }
+
+    #[test]
+    fn parse_trusted_ca_list_rejects_invalid_fingerprint() {
+        for value in [json!(["not-hex"]), json!(["g".repeat(64)]), json!([7])] {
+            assert!(matches!(
+                parse_trusted_ca_list(&value),
+                Err(ServiceTrustError::CaTrustInvalid)
+            ));
+        }
+    }
 
     #[test]
     fn service_policy_grants_write_only_on_reissue_path() {

@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
+use bootroot::service_material::{
+    ServiceTrustError, ServiceTrustMaterial, parse_trusted_ca_list, read_service_trust_material,
+    write_service_trust_material,
+};
 
 use super::resolve::ResolvedServiceAdd;
 use super::{CaTrustMaterial, SERVICE_CA_BUNDLE_PEM_KEY, ServiceSyncMaterial};
-use crate::commands::constants::{
-    CA_TRUST_KEY, SERVICE_EAB_HMAC_KEY, SERVICE_EAB_KID_KEY, SERVICE_KV_BASE,
-    SERVICE_RESPONDER_HMAC_KEY, SERVICE_SECRET_ID_KEY,
-};
-use crate::commands::init::{PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC};
+use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE, SERVICE_SECRET_ID_KEY};
+use crate::commands::init::PATH_CA_TRUST;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, StateFile};
 
@@ -18,15 +19,17 @@ pub(super) async fn sync_service_kv_bundle(
     secret_id: &str,
     messages: &Messages,
 ) -> Result<ServiceSyncMaterial> {
-    let material = read_service_sync_material(client, &state.kv_mount, messages).await?;
-    write_service_kv_secrets(
+    let material = read_service_trust_material(client, &state.kv_mount)
+        .await
+        .map_err(|err| trust_error(err, messages))?;
+    write_service_trust_material(
         client,
         &state.kv_mount,
         &resolved.registration_id,
         &material,
-        messages,
     )
-    .await?;
+    .await
+    .map_err(|err| trust_error(err, messages))?;
     if matches!(resolved.delivery_mode, DeliveryMode::RemoteBootstrap) {
         let base = format!("{SERVICE_KV_BASE}/{}", resolved.registration_id);
         client
@@ -38,7 +41,51 @@ pub(super) async fn sync_service_kv_bundle(
             .await
             .with_context(|| messages.error_openbao_kv_write_failed())?;
     }
-    Ok(material)
+    Ok(ServiceSyncMaterial::from(material))
+}
+
+impl From<ServiceTrustMaterial> for ServiceSyncMaterial {
+    fn from(material: ServiceTrustMaterial) -> Self {
+        let ServiceTrustMaterial {
+            eab_kid,
+            eab_hmac,
+            responder_hmac,
+            trusted_ca_sha256,
+            ca_bundle_pem,
+        } = material;
+        Self {
+            eab_kid,
+            eab_hmac: eab_hmac.map(|hmac| hmac.expose().to_owned()),
+            responder_hmac: responder_hmac.expose().to_owned(),
+            trusted_ca_sha256,
+            ca_bundle_pem,
+        }
+    }
+}
+
+/// Renders a shared trust-material failure as the diagnostic `service
+/// add` reported for it before the logic moved into the library.
+///
+/// Each arm rebuilds the exact error chain the CLI produced then — the
+/// localized message over the `OpenBao` failure, or the bare message —
+/// rather than wrapping the typed error, so no extra cause line appears
+/// under it.
+fn trust_error(err: ServiceTrustError, messages: &Messages) -> anyhow::Error {
+    match err {
+        ServiceTrustError::Read { path, source } => source.context(format!(
+            "{} ({path})",
+            messages.error_openbao_kv_read_failed()
+        )),
+        ServiceTrustError::Write { source, .. } => {
+            source.context(messages.error_openbao_kv_write_failed())
+        }
+        ServiceTrustError::CaTrustMissing { key } => {
+            anyhow::anyhow!(messages.error_ca_trust_missing(key))
+        }
+        ServiceTrustError::CaTrustEmpty => anyhow::anyhow!(messages.error_ca_trust_empty()),
+        ServiceTrustError::CaTrustInvalid => anyhow::anyhow!(messages.error_ca_trust_invalid()),
+        ServiceTrustError::MissingKey(key) => anyhow::anyhow!(key.to_string()),
+    }
 }
 
 fn read_required_string(
@@ -51,132 +98,6 @@ fn read_required_string(
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow::anyhow!(missing_message.to_string()))
-}
-
-async fn read_service_sync_material(
-    client: &OpenBaoClient,
-    kv_mount: &str,
-    messages: &Messages,
-) -> Result<ServiceSyncMaterial> {
-    // The control-node EAB KV entry is optional: it only exists when the
-    // operator explicitly provided EAB credentials. `try_read_kv` returns
-    // `Ok(None)` for a genuine 404 and surfaces every other failure
-    // (transport, 5xx, malformed payload) so a transient OpenBao outage
-    // cannot silently strip EAB from a newly added service.
-    let eab = client
-        .try_read_kv(kv_mount, PATH_AGENT_EAB)
-        .await
-        .with_context(|| {
-            format!(
-                "{} ({PATH_AGENT_EAB})",
-                messages.error_openbao_kv_read_failed()
-            )
-        })?;
-    let responder_hmac = client
-        .read_kv(kv_mount, PATH_RESPONDER_HMAC)
-        .await
-        .with_context(|| {
-            format!(
-                "{} ({PATH_RESPONDER_HMAC})",
-                messages.error_openbao_kv_read_failed()
-            )
-        })?;
-    let trust = client
-        .read_kv(kv_mount, PATH_CA_TRUST)
-        .await
-        .with_context(|| {
-            format!(
-                "{} ({PATH_CA_TRUST})",
-                messages.error_openbao_kv_read_failed()
-            )
-        })?;
-    let trusted_ca_sha256 = parse_trusted_ca_list(
-        trust
-            .get(CA_TRUST_KEY)
-            .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_missing(CA_TRUST_KEY)))?,
-        messages,
-    )?;
-    if trusted_ca_sha256.is_empty() {
-        anyhow::bail!(messages.error_ca_trust_empty());
-    }
-    let (eab_kid, eab_hmac) = match &eab {
-        Some(data) => (
-            Some(read_required_string(
-                data,
-                SERVICE_EAB_KID_KEY,
-                "OpenBao EAB data missing key: kid",
-            )?),
-            Some(read_required_string(
-                data,
-                SERVICE_EAB_HMAC_KEY,
-                "OpenBao EAB data missing key: hmac",
-            )?),
-        ),
-        None => (None, None),
-    };
-    Ok(ServiceSyncMaterial {
-        eab_kid,
-        eab_hmac,
-        responder_hmac: read_required_string(
-            &responder_hmac,
-            "value",
-            "OpenBao responder HMAC data missing key: value",
-        )?,
-        trusted_ca_sha256,
-        ca_bundle_pem: read_required_string(
-            &trust,
-            SERVICE_CA_BUNDLE_PEM_KEY,
-            &format!("OpenBao CA trust data missing key: {SERVICE_CA_BUNDLE_PEM_KEY}"),
-        )?,
-    })
-}
-
-async fn write_service_kv_secrets(
-    client: &OpenBaoClient,
-    kv_mount: &str,
-    registration_id: &str,
-    material: &ServiceSyncMaterial,
-    messages: &Messages,
-) -> Result<()> {
-    let base = format!("{SERVICE_KV_BASE}/{registration_id}");
-    // Always write `<base>/eab`, even when no EAB material is configured
-    // (e.g. `--no-eab` at init, bundled OSS step-ca). The agent's
-    // fast-poll loop reads this path on every cycle; an explicit empty
-    // kid/hmac value is the durable "no EAB" representation it applies
-    // (removing any stale `eab.json`), whereas a missing path would be
-    // ambiguous between "cleared" and "never provisioned". This mirrors
-    // the recovery path provided by `bootroot rotate eab-clear` (#588 §3c).
-    let eab_kid = material.eab_kid.as_deref().unwrap_or("");
-    let eab_hmac = material.eab_hmac.as_deref().unwrap_or("");
-    client
-        .write_kv(
-            kv_mount,
-            &format!("{base}/eab"),
-            serde_json::json!({
-                SERVICE_EAB_KID_KEY: eab_kid,
-                SERVICE_EAB_HMAC_KEY: eab_hmac,
-            }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
-    client
-        .write_kv(
-            kv_mount,
-            &format!("{base}/http_responder_hmac"),
-            serde_json::json!({ SERVICE_RESPONDER_HMAC_KEY: &material.responder_hmac }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
-    crate::commands::trust::write_service_trust(
-        client,
-        kv_mount,
-        registration_id,
-        &material.trusted_ca_sha256,
-        &material.ca_bundle_pem,
-        messages,
-    )
-    .await?;
-    Ok(())
 }
 
 pub(super) async fn read_ca_bundle_pem(
@@ -219,7 +140,7 @@ pub(super) async fn read_ca_trust_material(
     let value = data
         .get(CA_TRUST_KEY)
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_missing(CA_TRUST_KEY)))?;
-    let fingerprints = parse_trusted_ca_list(value, messages)?;
+    let fingerprints = parse_trusted_ca_list(value).map_err(|err| trust_error(err, messages))?;
     if fingerprints.is_empty() {
         anyhow::bail!(messages.error_ca_trust_empty());
     }
@@ -228,58 +149,79 @@ pub(super) async fn read_ca_trust_material(
     }))
 }
 
-pub(super) fn parse_trusted_ca_list(
-    value: &serde_json::Value,
-    messages: &Messages,
-) -> Result<Vec<String>> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_invalid()))?;
-    let mut fingerprints = Vec::with_capacity(items.len());
-    for item in items {
-        let fingerprint = item
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!(messages.error_ca_trust_invalid()))?;
-        if !is_valid_sha256_fingerprint(fingerprint) {
-            anyhow::bail!(messages.error_ca_trust_invalid());
-        }
-        fingerprints.push(fingerprint.to_string());
-    }
-    Ok(fingerprints)
-}
-
-fn is_valid_sha256_fingerprint(value: &str) -> bool {
-    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::i18n::test_messages;
 
+    /// The parser moved into the library; what stays here is that its
+    /// typed failures still render as the localized CA-trust diagnostics.
     #[test]
-    fn test_parse_trusted_ca_list_accepts_valid() {
+    fn test_invalid_trusted_ca_list_keeps_its_cli_message() {
         let messages = test_messages();
-        let value = serde_json::json!(["a".repeat(64), "b".repeat(64)]);
-        let parsed = parse_trusted_ca_list(&value, &messages).expect("parse list");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0], "a".repeat(64));
-        assert_eq!(parsed[1], "b".repeat(64));
+        for value in [
+            serde_json::json!("not-array"),
+            serde_json::json!(["not-hex"]),
+        ] {
+            let err = parse_trusted_ca_list(&value)
+                .map_err(|err| trust_error(err, &messages))
+                .unwrap_err();
+            assert_eq!(err.to_string(), messages.error_ca_trust_invalid());
+            assert!(err.to_string().contains("OpenBao CA trust data"));
+            assert_eq!(err.chain().count(), 1);
+        }
     }
 
     #[test]
-    fn test_parse_trusted_ca_list_rejects_non_array() {
+    fn test_trust_errors_render_the_pre_refactor_messages() {
         let messages = test_messages();
-        let value = serde_json::json!("not-array");
-        let err = parse_trusted_ca_list(&value, &messages).unwrap_err();
-        assert!(err.to_string().contains("OpenBao CA trust data"));
-    }
 
-    #[test]
-    fn test_parse_trusted_ca_list_rejects_invalid_fingerprint() {
-        let messages = test_messages();
-        let value = serde_json::json!(["not-hex"]);
-        let err = parse_trusted_ca_list(&value, &messages).unwrap_err();
-        assert!(err.to_string().contains("OpenBao CA trust data"));
+        let err = trust_error(
+            ServiceTrustError::Read {
+                path: "bootroot/ca",
+                source: anyhow::anyhow!("boom"),
+            },
+            &messages,
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("{} (bootroot/ca)", messages.error_openbao_kv_read_failed())
+        );
+        let causes: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
+        assert_eq!(causes, ["boom"]);
+
+        let err = trust_error(
+            ServiceTrustError::Write {
+                path: "bootroot/services/x/trust".to_string(),
+                source: anyhow::anyhow!("boom"),
+            },
+            &messages,
+        );
+        assert_eq!(err.to_string(), messages.error_openbao_kv_write_failed());
+        assert_eq!(err.chain().count(), 2);
+
+        let err = trust_error(
+            ServiceTrustError::CaTrustMissing { key: CA_TRUST_KEY },
+            &messages,
+        );
+        assert_eq!(
+            err.to_string(),
+            messages.error_ca_trust_missing(CA_TRUST_KEY)
+        );
+
+        let err = trust_error(ServiceTrustError::CaTrustEmpty, &messages);
+        assert_eq!(err.to_string(), messages.error_ca_trust_empty());
+
+        let err = trust_error(
+            ServiceTrustError::MissingKey(
+                bootroot::service_material::TrustMaterialKey::ResponderHmac,
+            ),
+            &messages,
+        );
+        assert_eq!(
+            err.to_string(),
+            "OpenBao responder HMAC data missing key: value"
+        );
+        assert_eq!(err.chain().count(), 1);
     }
 }

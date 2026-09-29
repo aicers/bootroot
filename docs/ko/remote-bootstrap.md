@@ -571,6 +571,12 @@ bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`�
     `secret_id_ttl`이 지나도록 오프라인이어서 자격 증명이 이미 만료된 에이전트를
     복구하는 경로일 뿐입니다. 회전 워크플로우는 [운영](operations.md)을
     참고하세요.
+- **KV에 `secret_id`가 없는 경우**: 서비스의 KV 하위 트리에 `secret_id`가
+    없으면 — registrar를 통해 발급된 정체성은 발급 시 `secret_id`를 기록하지
+    않으므로 항상 이 경우입니다 — `bootroot-remote bootstrap`은 방금 인증에
+    사용한 자격 증명을 그대로 유지하고 `secret_id: skipped`로 보고합니다.
+    이후 그 하위 트리에 `secret_id`가 push되면 다른 원격 서비스와 똑같이
+    반영합니다.
 
 ## 네트워크 요구사항
 
@@ -578,7 +584,7 @@ bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`�
 
 | 엔드포인트 | 프로토콜 | 용도 |
 | --- | --- | --- |
-| OpenBao API (`--openbao-url`) | HTTPS | 부트스트랩 시 시크릿(`secret_id`, 리스폰더 HMAC, trust 번들, EAB가 설정된 경우에만 포함) pull |
+| OpenBao API (`--openbao-url`) | HTTPS | 부트스트랩 시 시크릿(리스폰더 HMAC, trust 번들, 그리고 존재하는 경우에만 `secret_id`와 EAB) pull |
 | step-ca ACME 디렉터리 (`--agent-server`) | HTTPS | `bootroot-agent`에 의한 인증서 발급 및 갱신 |
 | HTTP-01 리스폰더 (`--agent-responder-url`) | HTTP | 도메인 검증을 위한 ACME 챌린지 토큰 게시 |
 

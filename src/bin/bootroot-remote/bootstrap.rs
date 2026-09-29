@@ -7,7 +7,9 @@ use super::io::{
     pull_secrets, read_secret_file, remove_eab_file, write_eab_file, write_secret_file,
 };
 use super::openbao_client::build_openbao_client;
-use super::summary::{ApplyItemSummary, ApplySummary, merge_apply_status, print_summary};
+use super::summary::{
+    ApplyItemSummary, ApplyStatus, ApplySummary, merge_apply_status, print_summary,
+};
 use super::validation::{
     validate_agent_domain, validate_profile_hostname, validate_profile_instance_id,
     validate_registration_id_arg, validate_service_name,
@@ -128,13 +130,18 @@ pub(super) async fn run_bootstrap(args: ResolvedBootstrapArgs, lang: Locale) -> 
     client.set_token(token);
 
     let pulled = pull_secrets(&client, &args.kv_mount, &args.registration_id, lang).await?;
-    let secret_id_status = match write_secret_file(&args.secret_id_path, &pulled.secret_id).await {
-        Ok(status) => ApplyItemSummary::applied(status),
-        Err(err) => ApplyItemSummary::failed(localized(
-            lang,
-            &format!("secret_id apply failed: {err}"),
-            &format!("secret_id 반영 실패: {err}"),
-        )),
+    let secret_id_status = match pulled.secret_id.as_deref() {
+        Some(secret_id) => match write_secret_file(&args.secret_id_path, secret_id).await {
+            Ok(status) => ApplyItemSummary::applied(status),
+            Err(err) => ApplyItemSummary::failed(localized(
+                lang,
+                &format!("secret_id apply failed: {err}"),
+                &format!("secret_id 반영 실패: {err}"),
+            )),
+        },
+        // No `secret_id` was pushed into KV, so there is nothing to apply:
+        // the on-disk value just authenticated and is kept as is.
+        None => ApplyItemSummary::applied(ApplyStatus::Skipped),
     };
     let eab_status = match (pulled.eab_kid.as_deref(), pulled.eab_hmac.as_deref()) {
         (Some(kid), Some(hmac)) => match write_eab_file(&args.eab_file_path, kid, hmac).await {

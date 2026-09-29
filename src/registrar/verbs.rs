@@ -42,7 +42,16 @@
 //!    and performs no `OpenBao` or binding operation at all.
 //! 3. **Per-id work**, under the `registration_id`'s own
 //!    [`tokio::sync::Mutex`], shared by both verbs so a mint and a
-//!    deregister for one identity can never interleave.
+//!    deregister for one identity can never interleave. For a mint that
+//!    reaches issuance this is, in order: converge the derived role and
+//!    policy (first mint and `creating` re-drive only), seed the
+//!    identity's trust material — `eab`, `http_responder_hmac` and
+//!    `trust` under its KV subtree, read from the control-node records —
+//!    activate the binding (again only when it was `creating`), and
+//!    issue the wrap-only `secret_id`. An idempotent re-mint of an
+//!    active binding re-seeds too, before it reads the `role_id`. No
+//!    mint writes a raw `secret_id` anywhere: the target keeps the one
+//!    it unwraps.
 //!
 //! # The limiter in front of those stages
 //!
@@ -188,7 +197,8 @@ use crate::registrar::internal::{InternalCredential, InternalCredentialError};
 use crate::registrar::{check_spec_identity, is_reserved_service_name, validate_request_labels};
 use crate::service_material::{
     ProvisionedServiceRole, ResourceOutcome, ServiceRoleTtls, provision_service_role,
-    service_kv_path, service_role_name, teardown_service_material,
+    read_service_trust_material, service_kv_path, service_role_name, teardown_service_material,
+    write_service_trust_material,
 };
 use crate::trust_bootstrap::{
     SERVICE_EAB_KV_SUFFIX, SERVICE_REISSUE_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX,
@@ -1161,6 +1171,9 @@ impl RegistrarVerbs {
     // threads. Grouping the rest into a struct would restructure the
     // decision procedure this change is required to leave alone.
     #[allow(clippy::too_many_arguments)]
+    // The active arm's seeding step is what tips this over, and it sits
+    // in the ordered procedure it has to be read alongside.
+    #[allow(clippy::too_many_lines)]
     async fn mint_against_binding(
         &self,
         request: &MintRequest,
@@ -1236,13 +1249,27 @@ impl RegistrarVerbs {
 
         match record.state {
             BindingState::Active => {
-                // The role and policy are reused untouched; only the
-                // credential is fresh.
+                // The role and policy are reused untouched; the trust
+                // material is re-seeded and the credential is fresh.
                 let role_name = service_role_name(registration_id);
+                // The first thing this arm now does with the client is
+                // seed, which is a `Provisioning` step, so failing to
+                // acquire it refuses there too and the arm stays
+                // monotone.
                 let client = self
                     .client()
                     .await
-                    .map_err(|err| refuse(ProducingArm::Issuance, err))?;
+                    .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
+                // Seeded before the `role_id` read, whose failure refuses
+                // on `Issuance`: a seeding refusal must not follow a step
+                // later in the order than its own. Re-seeding on every
+                // re-mint is what gives an identity minted before seeding
+                // existed its material, and what keeps a re-driven
+                // install from receiving records older than the control
+                // node's current ones.
+                self.seed_trust_material(&client, registration_id, disposition)
+                    .await
+                    .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
                 let role_id = match client.read_role_id(&role_name).await {
                     Ok(role_id) => role_id,
                     Err(err) => {
@@ -1288,8 +1315,8 @@ impl RegistrarVerbs {
         }
     }
 
-    /// Converges role and policy, flips the binding to active, and only
-    /// then issues.
+    /// Converges role and policy, seeds the identity's trust material,
+    /// flips the binding to active, and only then issues.
     ///
     /// Every failure in here leaves the `creating` binding exactly where
     /// it is. That is the point: whatever half of the role material got
@@ -1354,6 +1381,12 @@ impl RegistrarVerbs {
             }
         };
 
+        // Seeded before activation, so an active binding always implies
+        // seeded material.
+        self.seed_trust_material(&client, registration_id, disposition)
+            .await
+            .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
+
         let active = claim.activated(&request.spec);
         self.write_binding(registration_id, &active, disposition)
             .await
@@ -1371,6 +1404,47 @@ impl RegistrarVerbs {
             disposition,
         )
         .await
+    }
+
+    /// Seeds the identity's trust material — `eab`,
+    /// `http_responder_hmac` and `trust` under its KV subtree — from the
+    /// control-node records, through the same library read and write
+    /// `service add` uses.
+    ///
+    /// No `secret_id` is read, written or passed here: the only
+    /// credential a mint produces is the wrap-only one [`Self::issue`]
+    /// creates. A target that bootstraps from this identity keeps the
+    /// `secret_id` it unwrapped, because its KV subtree holds none.
+    ///
+    /// The three control-node reads change nothing and leave the
+    /// disposition alone. The writes may each have reached `OpenBao`
+    /// even when they failed, so the write step is noted whatever its
+    /// result. Nothing is rolled back on a failure: the records written
+    /// so far are rewritten by the re-drive and swept by deregister.
+    async fn seed_trust_material(
+        &self,
+        client: &OpenBaoClient,
+        registration_id: &str,
+        disposition: &MutationDisposition,
+    ) -> Result<(), VerbError> {
+        let seeded = match read_service_trust_material(client, &self.kv_mount).await {
+            Ok(material) => disposition.note(
+                write_service_trust_material(client, &self.kv_mount, registration_id, &material)
+                    .await,
+            ),
+            Err(err) => Err(err),
+        };
+        match seeded {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let err = anyhow::Error::new(err);
+                self.client.note_failure(&err).await;
+                Err(VerbError::unavailable(
+                    "seeding the service trust material",
+                    err,
+                ))
+            }
+        }
     }
 
     /// Issues wrap-only material and computes the granted deadline.

@@ -106,7 +106,8 @@ pub(crate) enum ProducingArm {
     Binding,
     /// Comparing the requested spec against the rendered safe-set.
     SafeSet,
-    /// Converging the derived role and policy.
+    /// Converging the derived role and policy, and seeding the
+    /// identity's trust material into its KV subtree.
     Provisioning,
     /// Issuing the wrap-only credential.
     Issuance,
@@ -196,12 +197,15 @@ impl fmt::Debug for WrappedSecretIdToken {
 /// Which successful mint arm produced the material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MintKind {
-    /// The identity did not exist: this request claimed the binding,
-    /// converged the role and policy, activated the binding and issued.
+    /// The identity did not exist, or its claim was still `creating`:
+    /// this request claimed the binding (or re-drove the claim),
+    /// converged the role and policy, seeded the trust material,
+    /// activated the binding and issued.
     FirstMint,
     /// The identity already existed, bound to this host with a matching
-    /// spec. The role and policy were reused untouched and only fresh
-    /// wrap-only material was issued.
+    /// spec. The role and policy were reused untouched, the trust
+    /// material was re-seeded from the control node's current records,
+    /// and fresh wrap-only material was issued.
     IdempotentReMint,
 }
 

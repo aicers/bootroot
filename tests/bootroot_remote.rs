@@ -695,6 +695,217 @@ async fn test_bootroot_remote_reports_partial_failure_with_json_output() {
     assert!(summary["responder_hmac"]["error"].is_string());
 }
 
+/// Paths one `bootstrap` run works over, laid out the way the other
+/// tests here lay them out, with a `secret_id` file holding `old-secret`.
+struct BootstrapPaths {
+    _dir: tempfile::TempDir,
+    role_id: std::path::PathBuf,
+    secret_id: std::path::PathBuf,
+    eab_file: std::path::PathBuf,
+    agent_config: std::path::PathBuf,
+    ca_bundle: std::path::PathBuf,
+}
+
+impl BootstrapPaths {
+    fn new() -> Self {
+        let dir = tempdir().expect("create temp dir");
+        let role_id = dir.path().join("secrets").join("role_id");
+        let secret_id = dir.path().join("secrets").join("secret_id");
+        let eab_file = dir.path().join("secrets").join("eab.json");
+        let agent_config = dir.path().join("agent.toml");
+        let ca_bundle = dir.path().join("certs").join("ca-bundle.pem");
+        fs::create_dir_all(role_id.parent().expect("role_id parent")).expect("create secrets dir");
+        fs::write(&role_id, "role-edge-proxy\n").expect("write role_id");
+        fs::write(&secret_id, "old-secret\n").expect("write secret_id");
+        Self {
+            _dir: dir,
+            role_id,
+            secret_id,
+            eab_file,
+            agent_config,
+            ca_bundle,
+        }
+    }
+
+    fn run_json(&self, openbao_url: &str) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+            .args([
+                "bootstrap",
+                "--openbao-url",
+                openbao_url,
+                "--registration-id",
+                "edge-proxy",
+                "--service-name",
+                "edge-proxy",
+                "--role-id-path",
+                self.role_id.to_string_lossy().as_ref(),
+                "--secret-id-path",
+                self.secret_id.to_string_lossy().as_ref(),
+                "--eab-file-path",
+                self.eab_file.to_string_lossy().as_ref(),
+                "--agent-config-path",
+                self.agent_config.to_string_lossy().as_ref(),
+                "--ca-bundle-path",
+                self.ca_bundle.to_string_lossy().as_ref(),
+                "--profile-instance-id",
+                "001",
+                "--output",
+                "json",
+            ])
+            .output()
+            .expect("run bootroot-remote")
+    }
+}
+
+/// Stubs a service KV subtree the way a registrar mint seeds it: `eab`
+/// is the explicit empty shape, `http_responder_hmac` and `trust` are
+/// present unless `with_responder_hmac` is false, and the `secret_id`
+/// record answers `secret_id`.
+async fn stub_seeded_subtree(
+    server: &MockServer,
+    secret_id: ResponseTemplate,
+    with_responder_hmac: bool,
+) {
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "remote-token" }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/v1/secret/data/bootroot/services/edge-proxy/secret_id",
+        ))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(secret_id)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "", "hmac": "" } }
+        })))
+        .mount(server)
+        .await;
+    if with_responder_hmac {
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/secret/data/bootroot/services/edge-proxy/http_responder_hmac",
+            ))
+            .and(header("X-Vault-Token", "remote-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "data": { "hmac": "responder-hmac-1" } }
+            })))
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/trust"))
+        .and(header("X-Vault-Token", "remote-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": valid_trust_payload() }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// A subtree with no `secret_id` — always the case for a registrar-minted
+/// identity — keeps the credential that just logged in and reports the
+/// item skipped, while the rest of the material still applies.
+#[tokio::test]
+async fn test_bootroot_remote_keeps_its_secret_id_when_kv_holds_none() {
+    let paths = BootstrapPaths::new();
+    let server = MockServer::start().await;
+    stub_seeded_subtree(&server, ResponseTemplate::new(404), true).await;
+
+    let output = paths.run_json(&server.uri());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse json summary");
+    assert_eq!(summary["secret_id"]["status"], "skipped");
+    assert!(summary["secret_id"].get("error").is_none());
+    assert_eq!(summary["responder_hmac"]["status"], "applied");
+    assert_eq!(summary["trust_sync"]["status"], "applied");
+    assert_eq!(summary["eab"]["status"], "skipped");
+    assert_eq!(
+        fs::read_to_string(&paths.secret_id).expect("read secret_id"),
+        "old-secret\n"
+    );
+    let (expected_bundle, _) = valid_remote_trust();
+    assert_eq!(
+        fs::read_to_string(&paths.ca_bundle).expect("read ca bundle"),
+        expected_bundle
+    );
+}
+
+/// Only a clean not-found makes the `secret_id` optional: a server error
+/// reading it still fails the bootstrap.
+#[tokio::test]
+async fn test_bootroot_remote_fails_when_secret_id_read_errors() {
+    for status in [500, 403] {
+        let paths = BootstrapPaths::new();
+        let server = MockServer::start().await;
+        stub_seeded_subtree(&server, ResponseTemplate::new(status), true).await;
+
+        let output = paths.run_json(&server.uri());
+
+        assert!(
+            !output.status.success(),
+            "a {status} reading secret_id must fail the bootstrap"
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.secret_id).expect("read secret_id"),
+            "old-secret\n"
+        );
+    }
+}
+
+/// A present but malformed `secret_id` payload still fails the pull.
+#[tokio::test]
+async fn test_bootroot_remote_fails_when_secret_id_payload_is_malformed() {
+    let paths = BootstrapPaths::new();
+    let server = MockServer::start().await;
+    stub_seeded_subtree(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "unexpected": "value" } }
+        })),
+        true,
+    )
+    .await;
+
+    let output = paths.run_json(&server.uri());
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid service secret_id payload"),
+        "stderr: {stderr}"
+    );
+}
+
+/// `http_responder_hmac` stays required: with no `secret_id` either, a
+/// missing responder record still fails closed.
+#[tokio::test]
+async fn test_bootroot_remote_fails_when_responder_hmac_missing() {
+    let paths = BootstrapPaths::new();
+    let server = MockServer::start().await;
+    stub_seeded_subtree(&server, ResponseTemplate::new(404), false).await;
+
+    let output = paths.run_json(&server.uri());
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to read service responder hmac from OpenBao"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Returns a valid trust bundle (a real self-signed CA PEM and the matching
 /// SHA-256 fingerprint), cached so the stub payload and the on-disk-bundle
 /// assertion agree. Post-#695 `parse_trust_payload` rejects a bundle whose

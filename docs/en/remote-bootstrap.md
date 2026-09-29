@@ -594,6 +594,12 @@ Treat it as a short-lived credential:
     `bootroot-remote apply-secret-id` is only a recovery path for an agent
     that was offline past its `secret_id_ttl` and whose credential already
     expired. See [Operations](operations.md) for the rotation workflow.
+- **No `secret_id` in KV**: when the service's KV subtree holds no
+    `secret_id` — which is always the case for an identity minted through
+    the registrar, whose mint never writes one — `bootroot-remote
+    bootstrap` keeps the credential it has just authenticated with and
+    reports `secret_id: skipped`. A `secret_id` later pushed into that
+    subtree is adopted exactly as for any remote service.
 
 ## Network requirements
 
@@ -601,7 +607,7 @@ The remote host must have network connectivity to the following endpoints:
 
 | Endpoint | Protocol | Purpose |
 | --- | --- | --- |
-| OpenBao API (`--openbao-url`) | HTTPS | Pull secrets (`secret_id`, responder HMAC, trust bundle, and EAB when present) during bootstrap |
+| OpenBao API (`--openbao-url`) | HTTPS | Pull secrets (responder HMAC, trust bundle, and `secret_id` and EAB when present) during bootstrap |
 | step-ca ACME directory (`--agent-server`) | HTTPS | Certificate issuance and renewal by `bootroot-agent` |
 | HTTP-01 responder (`--agent-responder-url`) | HTTP | Publish ACME challenge tokens for domain validation |
 

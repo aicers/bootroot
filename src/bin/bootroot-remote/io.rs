@@ -151,7 +151,9 @@ pub(super) async fn remove_eab_file(path: &Path) -> Result<ApplyStatus> {
 
 #[derive(Debug)]
 pub(super) struct PulledSecrets {
-    pub(super) secret_id: String,
+    /// The `secret_id` the control plane pushed into the service's KV
+    /// subtree, or `None` when it holds none.
+    pub(super) secret_id: Option<String>,
     pub(super) eab_kid: Option<String>,
     pub(super) eab_hmac: Option<String>,
     pub(super) responder_hmac: String,
@@ -166,8 +168,18 @@ pub(super) async fn pull_secrets(
     lang: Locale,
 ) -> Result<PulledSecrets> {
     let base = format!("{}/{registration_id}", super::SERVICE_KV_BASE);
+    // The KV `secret_id` is optional. This read runs only after an
+    // `AppRole` login with the on-disk `secret_id` has succeeded, so that
+    // value is a working credential; the KV entry exists only to deliver
+    // a newer one the control plane pushed (`service add` for a remote
+    // service, or `rotate approle-secret-id`). A clean 404 therefore
+    // means no newer credential was pushed — always the case for a
+    // registrar-minted identity, whose mint never writes one — and the
+    // caller keeps the value that just logged in. Transport, 5xx and 403
+    // failures still propagate, and a present but malformed payload
+    // still fails the pull below.
     let secret_id_data = client
-        .read_kv(mount, &format!("{base}/secret_id"))
+        .try_read_kv(mount, &format!("{base}/secret_id"))
         .await
         .with_context(|| {
             localized(
@@ -213,16 +225,21 @@ pub(super) async fn pull_secrets(
             )
         })?;
 
-    let secret_id = bootroot::kv_payload::parse_secret_id(&secret_id_data).map_err(|err| {
-        anyhow::anyhow!(
-            "{}",
-            localized(
-                lang,
-                &format!("Invalid service secret_id payload: {err}"),
-                &format!("서비스 secret_id 페이로드가 올바르지 않습니다: {err}"),
-            )
-        )
-    })?;
+    let secret_id = secret_id_data
+        .as_ref()
+        .map(|data| {
+            bootroot::kv_payload::parse_secret_id(data).map_err(|err| {
+                anyhow::anyhow!(
+                    "{}",
+                    localized(
+                        lang,
+                        &format!("Invalid service secret_id payload: {err}"),
+                        &format!("서비스 secret_id 페이로드가 올바르지 않습니다: {err}"),
+                    )
+                )
+            })
+        })
+        .transpose()?;
     let (eab_kid, eab_hmac) = match eab_data.as_ref() {
         Some(data) => {
             let kid = read_optional_string(data, &[super::EAB_KID_KEY], lang)?;

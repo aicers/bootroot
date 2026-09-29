@@ -15,16 +15,20 @@ set -euo pipefail
 #   1. stand a single OpenBao container up on a free loopback port, at
 #      the image tag `docker-compose.yml` already pins;
 #   2. enable the AppRole auth method the verbs provision into;
-#   3. hand the child `cargo test` the URL, the token and the KV mount
-#      through the environment, and run the ignored tests.
+#   3. build `bootroot-remote`, which the end-to-end bootstrap test runs
+#      against a freshly minted identity;
+#   4. hand the child `cargo test` the URL, the token, the KV mount and
+#      the `bootroot-remote` path through the environment, and run the
+#      ignored tests.
 #
-# The connection details travel as environment variables on the child
-# process only.  The tests read them and never write them: mutating the
+# The connection details and the binary path travel as environment
+# variables on the child process only.  The tests read them and never write them: mutating the
 # process environment from a test is unsound in Rust 2024, and there is
 # no reason to here.
 #
 # This is a self-contained OpenBao rather than the full compose stack.
-# The verbs touch no step-ca, no PostgreSQL and no responder, and a
+# The verbs touch no step-ca, no PostgreSQL and no responder — the tests
+# seed the control-node records a mint reads themselves — and a
 # scenario that stood them up anyway would be slower and would fail for
 # reasons that have nothing to do with what it is testing.
 
@@ -162,11 +166,21 @@ curl -fsS -H "X-Vault-Token: ${OPENBAO_TOKEN}" \
 grep -q '"version": *"2"' "$ARTIFACT_DIR/kv-mount.json" ||
   fail "KV mount ${KV_MOUNT} is not version 2"
 
+# A library test has no `CARGO_BIN_EXE_*`, so the binary is built here
+# and its path handed to the child.  Built before the tests so a build
+# failure is reported as one rather than as a test failure.
+log_phase "build-bootroot-remote"
+cargo build --bin bootroot-remote >>"$RUN_LOG" 2>&1 ||
+  fail "could not build bootroot-remote (see $RUN_LOG)"
+REMOTE_BIN="$ROOT_DIR/target/debug/bootroot-remote"
+[ -x "$REMOTE_BIN" ] || fail "bootroot-remote was not built at $REMOTE_BIN"
+
 log_phase "run-ignored-library-tests"
 set +e
 BOOTROOT_REGISTRAR_TEST_OPENBAO_URL="$OPENBAO_URL" \
 BOOTROOT_REGISTRAR_TEST_OPENBAO_TOKEN="$OPENBAO_TOKEN" \
 BOOTROOT_REGISTRAR_TEST_KV_MOUNT="$KV_MOUNT" \
+BOOTROOT_REGISTRAR_TEST_REMOTE_BIN="$REMOTE_BIN" \
   cargo test --lib registrar::verbs::tests -- --ignored 2>&1 | tee "$TEST_LOG"
 status="${PIPESTATUS[0]}"
 set -e

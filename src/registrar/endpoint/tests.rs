@@ -1004,9 +1004,30 @@ fn roxyd_requested_spec() -> RequestedSpec {
 
 /// Mounts the `OpenBao` responses a first `roxyd` mint requires after its
 /// binding read has returned the ordinary absent response.
+///
+/// The `bootroot/ca` record the verb seeds from is left to the caller,
+/// which mounts the one anchor both the handler and the seeding read. The
+/// agent EAB record stays unmounted and reads as absent.
 async fn mock_first_roxyd_mint(server: &MockServer, registration_id: &str) {
     let role_name = service_role_name(registration_id);
     let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+    Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/responder/hmac"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": { "value": "responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+    for suffix in ["eab", "http_responder_hmac", "trust"] {
+        Mock::given(method("POST"))
+            .and(request_path(format!(
+                "/v1/secret/data/{}",
+                service_kv_path(registration_id, suffix)
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
     Mock::given(method("POST"))
         .and(request_path(format!("/v1/secret/data/{binding_path}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2831,6 +2852,45 @@ async fn a_verb_refusal_is_framed_as_a_wire_refusal_with_its_identifier_and_clas
     );
 }
 
+/// A mint whose trust-material seeding fails reaches the wire as the
+/// unclassified retryable refusal — no `error` member, no new reason —
+/// exactly as a failed role convergence does, and issues nothing.
+#[tokio::test]
+async fn a_seeding_failure_is_the_unclassified_retryable_refusal_on_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/responder/hmac"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mock_socket_mint_dependencies(&server, "h1-roxyd").await;
+    let (_dir, _audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(
+            b"mint",
+            &register_payload("roxyd", "h1", "seed-key"),
+        ))
+        .await;
+    running.stop().await;
+    let response = protocol::decode_refusal_response(&decode_response(&observed))
+        .expect("a seeding failure is a refusal");
+    assert_eq!(response.class, protocol::RefusalClass::Retryable);
+    assert_eq!(response.error, None, "no reason names a seeding failure");
+    assert_eq!(response.registration_id.as_deref(), Some("h1-roxyd"));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("the mock records requests")
+            .iter()
+            .all(|request| !request.url.path().ends_with("/secret-id")),
+        "nothing is issued after a seeding failure"
+    );
+}
+
 /// The daemon refreshes a single health snapshot between requests rather than
 /// assembling limiter values while serializing each response.
 #[tokio::test]
@@ -3250,6 +3310,10 @@ async fn an_invalid_mint_spec_is_a_zero_byte_clean_close() {
 /// A canonical socket mint reaches the real verb layer under the mTLS-derived
 /// caller identity. The CA anchor is deliberately read for each mint, so a
 /// rewritten `bootroot/ca` object reaches the next response without restart.
+///
+/// Each mint reads `bootroot/ca` twice: once in the handler for the
+/// response's anchor, and once inside the verb to seed the identity's
+/// `trust` record. Both reads land on the anchor mounted for that mint.
 #[tokio::test]
 async fn a_socket_mint_returns_freshly_read_anchor_material() {
     let (logs, _guard) = capture_logs();
@@ -3276,7 +3340,7 @@ async fn a_socket_mint_returns_freshly_read_anchor_material() {
                 "ca_bundle_pem": first_ca.pem(),
             }}
         })))
-        .expect(1)
+        .expect(2)
         .mount_as_scoped(&server)
         .await;
 
@@ -3324,7 +3388,7 @@ async fn a_socket_mint_returns_freshly_read_anchor_material() {
                 "ca_bundle_pem": second_ca.pem(),
             }}
         })))
-        .expect(1)
+        .expect(2)
         .mount_as_scoped(&server)
         .await;
     let second = protocol::decode_mint_response(&decode_response(
