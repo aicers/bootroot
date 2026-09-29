@@ -6104,7 +6104,8 @@ fn requests_to<'a>(
         .collect()
 }
 
-fn secret_id_issuances(requests: &[wiremock::Request]) -> Vec<String> {
+/// The path of every `secret-id` issuance request, in the order received.
+fn issuance_paths(requests: &[wiremock::Request]) -> Vec<String> {
     requests
         .iter()
         .filter(|req| req.method.as_str() == "POST" && req.url.path().ends_with("/secret-id"))
@@ -6401,7 +6402,7 @@ async fn test_rotate_all_services_requires_agent_config_for_an_active_registrar_
         stderr.contains(AGENT_CONFIG_REQUIRED_ERROR) && stderr.contains(REGISTRAR_ID),
         "stderr:\n{stderr}"
     );
-    let issued = secret_id_issuances(&received(&openbao).await);
+    let issued = issuance_paths(&received(&openbao).await);
     assert!(
         issued.is_empty(),
         "no secret_id may be issued for any target: {issued:?}"
@@ -6436,7 +6437,7 @@ async fn test_rotate_all_services_refuses_a_misspelled_registrar_key() {
         stderr.contains("Refusing to rotate") && stderr.contains("secret_id_num_use"),
         "stderr:\n{stderr}"
     );
-    let issued = secret_id_issuances(&received(&openbao).await);
+    let issued = issuance_paths(&received(&openbao).await);
     assert!(
         issued.is_empty(),
         "no secret_id may be issued for any target: {issued:?}"
@@ -6633,7 +6634,7 @@ async fn test_rotate_all_services_creating_binding_alone_needs_no_agent_config()
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        secret_id_issuances(&received(&openbao).await).is_empty(),
+        issuance_paths(&received(&openbao).await).is_empty(),
         "nothing is rotated"
     );
     assert_eq!(
@@ -6694,7 +6695,7 @@ async fn test_rotate_registration_id_targets_registrar_identities() {
     );
     let requests = received(&openbao).await;
     assert_eq!(
-        secret_id_issuances(&requests),
+        issuance_paths(&requests),
         vec![registrar_secret_id_path(REGISTRAR_ID)],
         "only that identity is rotated"
     );
