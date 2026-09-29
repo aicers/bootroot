@@ -66,6 +66,10 @@ use crate::registrar::identity::RequestedSpec;
 use crate::service_material::{
     ResourceOutcome, ServiceResource, service_kv_path, service_policy_name, service_role_name,
 };
+use crate::trust_bootstrap::{
+    SERVICE_EAB_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX, SERVICE_SECRET_ID_KV_SUFFIX,
+    SERVICE_TRUST_KV_SUFFIX,
+};
 
 /// Environment variable naming the live `OpenBao` the ignored tier runs
 /// against. Read, never written.
@@ -74,6 +78,10 @@ const ENV_OPENBAO_URL: &str = "BOOTROOT_REGISTRAR_TEST_OPENBAO_URL";
 const ENV_OPENBAO_TOKEN: &str = "BOOTROOT_REGISTRAR_TEST_OPENBAO_TOKEN";
 /// Environment variable naming the KV v2 mount to write under.
 const ENV_KV_MOUNT: &str = "BOOTROOT_REGISTRAR_TEST_KV_MOUNT";
+/// Environment variable naming the `bootroot-remote` binary the scenario
+/// built. A library test has no `CARGO_BIN_EXE_*`, so the path is passed
+/// in. Read, never written.
+const ENV_REMOTE_BIN: &str = "BOOTROOT_REGISTRAR_TEST_REMOTE_BIN";
 
 /// A distinctive caller identity, so a test can prove it survives into an
 /// outcome and reaches nothing else.
@@ -1168,10 +1176,7 @@ fn a_mint_outcome_redacts_its_wrapped_token_in_debug() {
 /// deleted separately.
 #[test]
 fn the_registrar_teardown_set_is_the_five_material_suffixes_and_not_the_binding() {
-    use crate::trust_bootstrap::{
-        SERVICE_EAB_KV_SUFFIX, SERVICE_REISSUE_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX,
-        SERVICE_SECRET_ID_KV_SUFFIX, SERVICE_TRUST_KV_SUFFIX,
-    };
+    use crate::trust_bootstrap::SERVICE_REISSUE_KV_SUFFIX;
 
     assert_eq!(
         REGISTRAR_TEARDOWN_KV_SUFFIXES,
@@ -1267,9 +1272,79 @@ async fn mock_material_present(server: &MockServer, registration_id: &str) {
     }
 }
 
+/// The fingerprint the control-node CA record pins. Seeding checks its
+/// shape only, so it need not match [`CONTROL_CA_BUNDLE_PEM`].
+const CONTROL_CA_FINGERPRINT: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The bundle the control-node CA record carries.
+const CONTROL_CA_BUNDLE_PEM: &str =
+    "-----BEGIN CERTIFICATE-----\nY29udHJvbC1ub2Rl\n-----END CERTIFICATE-----\n";
+/// The deployment's responder HMAC as the control-node record holds it.
+const CONTROL_RESPONDER_HMAC: &str = "control-responder-hmac";
+
+/// The URL path one of a registration's KV records lives at.
+fn service_data_url(registration_id: &str, suffix: &str) -> String {
+    format!(
+        "/v1/secret/data/{}",
+        service_kv_path(registration_id, suffix)
+    )
+}
+
+/// Answers the control-node CA read with `fingerprint` and `bundle`.
+async fn mock_control_ca(server: &MockServer, fingerprint: &str, bundle: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": {
+                "trusted_ca_sha256": [fingerprint],
+                "ca_bundle_pem": bundle,
+            } }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Answers the control-node responder HMAC read with `value`.
+async fn mock_control_responder_hmac(server: &MockServer, value: &str) {
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/responder/hmac"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "value": value } }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Answers the control-node records seeding reads. The agent EAB record
+/// is left unmounted, so it reads as absent — the deployment has none.
+///
+/// Wiremock answers with the first mounted mock that matches, so a test
+/// that wants a different record mounts its own before this.
+async fn mock_control_node_records(server: &MockServer) {
+    mock_control_ca(server, CONTROL_CA_FINGERPRINT, CONTROL_CA_BUNDLE_PEM).await;
+    mock_control_responder_hmac(server, CONTROL_RESPONDER_HMAC).await;
+}
+
+/// Answers the three service trust-material writes as accepted.
+async fn mock_service_trust_writes(server: &MockServer, registration_id: &str) {
+    for suffix in [
+        SERVICE_EAB_KV_SUFFIX,
+        SERVICE_RESPONDER_HMAC_KV_SUFFIX,
+        SERVICE_TRUST_KV_SUFFIX,
+    ] {
+        Mock::given(method("POST"))
+            .and(path(service_data_url(registration_id, suffix)))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
+}
+
 /// Answers everything a first mint needs, through to wrapped material.
 async fn mock_first_mint(server: &MockServer, registration_id: &str) {
     mock_binding_writes(server, registration_id).await;
+    mock_control_node_records(server).await;
+    mock_service_trust_writes(server, registration_id).await;
     let role_name = service_role_name(registration_id);
     Mock::given(method("POST"))
         .and(path(format!(
@@ -2279,6 +2354,485 @@ async fn the_caller_identity_reaches_the_record_unchanged() {
 }
 
 // ---------------------------------------------------------------------
+// Fast tier: seeding the trust material
+// ---------------------------------------------------------------------
+
+/// The URL path of a role's `secret-id` issuance.
+fn secret_id_issue_url(registration_id: &str) -> String {
+    format!(
+        "/v1/auth/approle/role/{}/secret-id",
+        service_role_name(registration_id)
+    )
+}
+
+/// The URL path of a role's `role-id` read.
+fn role_id_url(registration_id: &str) -> String {
+    format!(
+        "/v1/auth/approle/role/{}/role-id",
+        service_role_name(registration_id)
+    )
+}
+
+async fn received(server: &MockServer) -> Vec<wiremock::Request> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock server records requests")
+}
+
+/// Returns the index of the one request with `verb` at `url`.
+fn index_of(requests: &[wiremock::Request], verb: &str, url: &str) -> usize {
+    let matching: Vec<usize> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.method.as_str() == verb && request.url.path() == url)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one {verb} {url}, saw {}",
+        matching.len()
+    );
+    matching[0]
+}
+
+/// Returns the `data` a KV write at `url` sent.
+fn kv_write_body(requests: &[wiremock::Request], url: &str) -> serde_json::Value {
+    let request = &requests[index_of(requests, "POST", url)];
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("a KV write body is JSON");
+    body["data"].clone()
+}
+
+/// Returns the index of the binding write that flipped it to `active`.
+fn activation_index(requests: &[wiremock::Request], registration_id: &str) -> usize {
+    requests
+        .iter()
+        .position(|request| {
+            request.method.as_str() == "POST"
+                && request.url.path() == binding_data_url(registration_id)
+                && serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .is_ok_and(|body| body["data"]["state"] == json!("active"))
+        })
+        .expect("the binding was activated")
+}
+
+fn secret_id_requests(requests: &[wiremock::Request], registration_id: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.url.path() == secret_id_issue_url(registration_id))
+        .count()
+}
+
+/// A first mint reads the three control-node records, writes the three
+/// service records with exactly the shapes `service add` writes, and
+/// only then activates the binding and issues.
+#[tokio::test]
+async fn a_first_mint_seeds_trust_material_before_it_activates_and_issues() {
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let outcome = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a first mint succeeds");
+    assert_eq!(outcome.kind(), MintKind::FirstMint);
+
+    let requests = received(&server).await;
+    let reads = [
+        index_of(&requests, "GET", "/v1/secret/data/bootroot/agent/eab"),
+        index_of(&requests, "GET", "/v1/secret/data/bootroot/responder/hmac"),
+        index_of(&requests, "GET", "/v1/secret/data/bootroot/ca"),
+    ];
+    let eab = service_data_url("h1-roxyd", SERVICE_EAB_KV_SUFFIX);
+    let hmac = service_data_url("h1-roxyd", SERVICE_RESPONDER_HMAC_KV_SUFFIX);
+    let trust = service_data_url("h1-roxyd", SERVICE_TRUST_KV_SUFFIX);
+    let writes = [
+        index_of(&requests, "POST", &eab),
+        index_of(&requests, "POST", &hmac),
+        index_of(&requests, "POST", &trust),
+    ];
+    let activation = activation_index(&requests, "h1-roxyd");
+    let issuance = index_of(&requests, "POST", &secret_id_issue_url("h1-roxyd"));
+
+    assert!(
+        reads.iter().max() < writes.iter().min(),
+        "every control-node read precedes every service write: {reads:?} {writes:?}"
+    );
+    assert!(
+        writes[0] < writes[1] && writes[1] < writes[2],
+        "the writes go eab, http_responder_hmac, trust: {writes:?}"
+    );
+    assert!(
+        writes[2] < activation,
+        "seeded before the binding activates"
+    );
+    assert!(
+        activation < issuance,
+        "activated before the credential issues"
+    );
+
+    // The control node has no EAB, so the explicit empty shape is written.
+    assert_eq!(
+        kv_write_body(&requests, &eab),
+        json!({ "kid": "", "hmac": "" })
+    );
+    assert_eq!(
+        kv_write_body(&requests, &hmac),
+        json!({ "hmac": CONTROL_RESPONDER_HMAC })
+    );
+    assert_eq!(
+        kv_write_body(&requests, &trust),
+        json!({
+            "trusted_ca_sha256": [CONTROL_CA_FINGERPRINT],
+            "ca_bundle_pem": CONTROL_CA_BUNDLE_PEM,
+        })
+    );
+}
+
+/// A control-node EAB is written through as it is stored.
+#[tokio::test]
+async fn a_mint_seeds_the_control_node_eab_when_there_is_one() {
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/secret/data/bootroot/agent/eab"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "data": { "kid": "kid-1", "hmac": "eab-hmac-1" } }
+        })))
+        .mount(&server)
+        .await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a first mint succeeds");
+
+    let requests = received(&server).await;
+    assert_eq!(
+        kv_write_body(
+            &requests,
+            &service_data_url("h1-roxyd", SERVICE_EAB_KV_SUFFIX)
+        ),
+        json!({ "kid": "kid-1", "hmac": "eab-hmac-1" })
+    );
+}
+
+/// The registrar never holds a raw `secret_id`, so no mint — first or
+/// re-mint — sends any request to the identity's `secret_id` record, and
+/// the only `secret-id` request it sends is the wrap-only issuance.
+#[tokio::test]
+async fn no_mint_writes_a_raw_secret_id_to_kv() {
+    let raw = service_data_url("h1-roxyd", SERVICE_SECRET_ID_KV_SUFFIX);
+    let raw_metadata = format!(
+        "/v1/secret/metadata/{}",
+        service_kv_path("h1-roxyd", SERVICE_SECRET_ID_KV_SUFFIX)
+    );
+
+    let (first_server, _first_dir, verbs) = refusal_harness(&base_fixture()).await;
+    mock_first_mint(&first_server, "h1-roxyd").await;
+    verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a first mint succeeds");
+
+    let (remint_server, _remint_dir, verbs) = refusal_harness(&base_fixture()).await;
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&remint_server, "h1-roxyd", &active).await;
+    mock_first_mint(&remint_server, "h1-roxyd").await;
+    let again = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a re-mint succeeds");
+    assert_eq!(again.kind(), MintKind::IdempotentReMint);
+
+    for server in [&first_server, &remint_server] {
+        let requests = received(server).await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != raw && request.url.path() != raw_metadata),
+            "a mint must never address the identity's secret_id record"
+        );
+        let issuance: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url.path().contains("secret-id"))
+            .collect();
+        assert_eq!(issuance.len(), 1, "exactly one secret-id request per mint");
+        assert_eq!(issuance[0].method.as_str(), "POST");
+        assert_eq!(issuance[0].url.path(), secret_id_issue_url("h1-roxyd"));
+        assert!(
+            issuance[0].headers.get("x-vault-wrap-ttl").is_some(),
+            "the one issuance is response-wrapped"
+        );
+    }
+}
+
+/// One way seeding can fail, mounted ahead of the mint's own mocks.
+struct SeedingFault {
+    name: &'static str,
+    verb: &'static str,
+    url: String,
+    response: ResponseTemplate,
+}
+
+fn seeding_faults(registration_id: &str) -> Vec<SeedingFault> {
+    vec![
+        SeedingFault {
+            name: "a control-node EAB read answering 500",
+            verb: "GET",
+            url: "/v1/secret/data/bootroot/agent/eab".to_string(),
+            response: ResponseTemplate::new(500),
+        },
+        SeedingFault {
+            name: "a control-node HMAC read answering 500",
+            verb: "GET",
+            url: "/v1/secret/data/bootroot/responder/hmac".to_string(),
+            response: ResponseTemplate::new(500),
+        },
+        SeedingFault {
+            name: "a control-node CA record with an empty trust list",
+            verb: "GET",
+            url: "/v1/secret/data/bootroot/ca".to_string(),
+            response: ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "data": {
+                    "trusted_ca_sha256": [],
+                    "ca_bundle_pem": CONTROL_CA_BUNDLE_PEM,
+                } }
+            })),
+        },
+        SeedingFault {
+            name: "a trust write answering 500",
+            verb: "POST",
+            url: service_data_url(registration_id, SERVICE_TRUST_KV_SUFFIX),
+            response: ResponseTemplate::new(500),
+        },
+    ]
+}
+
+async fn mount_fault(server: &MockServer, fault: &SeedingFault) {
+    Mock::given(method(fault.verb))
+        .and(path(fault.url.clone()))
+        .respond_with(fault.response.clone())
+        .mount(server)
+        .await;
+}
+
+fn assert_seeding_refusal(refusal: &VerbRefusal, name: &str) {
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::Unavailable { activity, .. }
+                if activity == "seeding the service trust material"
+        ),
+        "{name}: expected a seeding unavailability, got {:?}",
+        refusal.error()
+    );
+    assert_eq!(
+        refusal.context().arm(),
+        ProducingArm::Provisioning,
+        "{name}: seeding refuses on the provisioning arm"
+    );
+}
+
+/// A seeding failure on the converge path refuses on `Provisioning`,
+/// issues nothing, keeps the `creating` claim, and a re-drive from the
+/// same host then completes as a first mint.
+#[tokio::test]
+async fn a_seeding_failure_refuses_before_activation_and_a_re_drive_recovers() {
+    for fault in seeding_faults("h1-roxyd") {
+        let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+        mount_fault(&server, &fault).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+
+        let refusal = verbs
+            .mint(&mint_request("roxyd", "h1", None))
+            .await
+            .expect_err("a seeding failure refuses the mint");
+        assert_seeding_refusal(&refusal, fault.name);
+        assert!(
+            creating_binding_left_behind(&server, "h1-roxyd").await,
+            "{}: the claim is retained through a failed seeding",
+            fault.name
+        );
+        let requests = received(&server).await;
+        assert_eq!(
+            secret_id_requests(&requests, "h1-roxyd"),
+            0,
+            "{}: nothing is issued after a seeding failure",
+            fault.name
+        );
+        assert!(
+            requests.iter().all(|request| {
+                request.url.path() != binding_data_url("h1-roxyd")
+                    || serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .map_or(true, |body| body["data"]["state"] != json!("active"))
+            }),
+            "{}: the binding is never activated",
+            fault.name
+        );
+
+        // The re-drive: the claim is still `creating`, and seeding now
+        // succeeds.
+        server.reset().await;
+        let claim = BindingRecord::creating("h1", &requested(&spec_for("roxyd")));
+        mock_binding_read(&server, "h1-roxyd", &claim).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+        let redriven = verbs
+            .mint(&mint_request("roxyd", "h1", None))
+            .await
+            .expect("a re-drive after a seeding failure succeeds");
+        assert_eq!(redriven.kind(), MintKind::FirstMint, "{}", fault.name);
+        let requests = received(&server).await;
+        index_of(
+            &requests,
+            "POST",
+            &service_data_url("h1-roxyd", SERVICE_TRUST_KV_SUFFIX),
+        );
+        activation_index(&requests, "h1-roxyd");
+    }
+}
+
+/// A re-mint of an active binding re-seeds from the control node's
+/// current records, before it reads the `role_id`.
+#[tokio::test]
+async fn a_remint_reseeds_current_control_node_values_before_the_role_id_read() {
+    const ROTATED_HMAC: &str = "rotated-responder-hmac";
+    const ROTATED_FINGERPRINT: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const ROTATED_BUNDLE: &str =
+        "-----BEGIN CERTIFICATE-----\nUm90YXRlZA==\n-----END CERTIFICATE-----\n";
+
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+    mock_binding_read(&server, "h1-roxyd", &active).await;
+    mock_control_responder_hmac(&server, ROTATED_HMAC).await;
+    mock_control_ca(&server, ROTATED_FINGERPRINT, ROTATED_BUNDLE).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let outcome = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a re-mint succeeds");
+    assert_eq!(outcome.kind(), MintKind::IdempotentReMint);
+
+    let requests = received(&server).await;
+    let hmac = service_data_url("h1-roxyd", SERVICE_RESPONDER_HMAC_KV_SUFFIX);
+    let trust = service_data_url("h1-roxyd", SERVICE_TRUST_KV_SUFFIX);
+    assert_eq!(
+        kv_write_body(&requests, &hmac),
+        json!({ "hmac": ROTATED_HMAC })
+    );
+    assert_eq!(
+        kv_write_body(&requests, &trust),
+        json!({
+            "trusted_ca_sha256": [ROTATED_FINGERPRINT],
+            "ca_bundle_pem": ROTATED_BUNDLE,
+        })
+    );
+    let last_write = index_of(&requests, "POST", &trust);
+    let role_id = index_of(&requests, "GET", &role_id_url("h1-roxyd"));
+    let issuance = index_of(&requests, "POST", &secret_id_issue_url("h1-roxyd"));
+    assert!(
+        index_of(
+            &requests,
+            "POST",
+            &service_data_url("h1-roxyd", SERVICE_EAB_KV_SUFFIX)
+        ) < last_write
+    );
+    assert!(last_write < role_id, "seeded before the role_id read");
+    assert!(role_id < issuance);
+    assert!(
+        requests.iter().all(|request| {
+            request.url.path() != binding_data_url("h1-roxyd")
+                || request.method == wiremock::http::Method::GET
+        }),
+        "a re-mint rewrites no binding"
+    );
+}
+
+/// A re-mint whose seeding fails refuses on `Provisioning` before the
+/// `role_id` read, so it sends neither a `role-id` nor a `secret-id`
+/// request.
+#[tokio::test]
+async fn a_remint_seeding_failure_refuses_before_the_role_id_read() {
+    for fault in seeding_faults("h1-roxyd") {
+        let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+        let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+            .activated(&requested(&spec_for("roxyd")));
+        mock_binding_read(&server, "h1-roxyd", &active).await;
+        mount_fault(&server, &fault).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+
+        let refusal = verbs
+            .mint(&mint_request("roxyd", "h1", None))
+            .await
+            .expect_err("a seeding failure refuses the re-mint");
+        assert_seeding_refusal(&refusal, fault.name);
+        let requests = received(&server).await;
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != role_id_url("h1-roxyd")),
+            "{}: no role-id read after a seeding failure",
+            fault.name
+        );
+        assert_eq!(
+            secret_id_requests(&requests, "h1-roxyd"),
+            0,
+            "{}: nothing is issued after a seeding failure",
+            fault.name
+        );
+    }
+}
+
+/// A re-mint that reached a seeding write has changed `OpenBao` state,
+/// so its failed outcome write owes a teardown even though the verb
+/// itself refused; one that failed on a control-node read changed
+/// nothing and does not.
+#[tokio::test]
+async fn a_remint_seeding_write_sets_the_disposition_and_a_read_does_not() {
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
+        .activated(&requested(&spec_for("roxyd")));
+
+    for fault in seeding_faults("h1-roxyd") {
+        let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+        mock_binding_read(&server, "h1-roxyd", &active).await;
+        mount_fault(&server, &fault).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+
+        let refusal =
+            with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
+                .await
+                .expect_err("the re-mint refuses");
+        if fault.verb == "POST" {
+            assert!(
+                matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+                "{}: a seeding write owes a teardown, got {:?}",
+                fault.name,
+                refusal.error()
+            );
+        } else {
+            assert!(
+                matches!(
+                    refusal.error(),
+                    VerbError::AuditUnwritable {
+                        phase: AuditPhase::Outcome,
+                        ..
+                    }
+                ),
+                "{}: a seeding read changed nothing, got {:?}",
+                fault.name,
+                refusal.error()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Fast tier: the two token buckets in front of both verbs
 // ---------------------------------------------------------------------
 
@@ -3170,7 +3724,81 @@ struct LiveBackend {
     kv_mount: String,
 }
 
+/// The control-node records the live tier seeds once per test process.
+struct LiveControlNode {
+    ca_bundle_pem: String,
+    responder_hmac: String,
+}
+
+/// Seeded at most once per test process, whichever live test gets there
+/// first. The scenario's `OpenBao` is fresh per run, so nothing else has
+/// written these records.
+static LIVE_CONTROL_NODE: tokio::sync::OnceCell<LiveControlNode> =
+    tokio::sync::OnceCell::const_new();
+
 impl LiveBackend {
+    /// Reads the scenario environment and makes sure the control-node
+    /// records every mint seeds from exist.
+    async fn ready() -> Self {
+        let backend = Self::from_env();
+        backend.control_node().await;
+        backend
+    }
+
+    /// Writes `bootroot/ca` and `bootroot/responder/hmac` the way `init`
+    /// does, once per process, and returns what was written. The agent
+    /// EAB record is left absent, which is a deployment without EAB.
+    async fn control_node(&self) -> &'static LiveControlNode {
+        LIVE_CONTROL_NODE
+            .get_or_init(|| async {
+                use base64::Engine as _;
+                use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+                use ring::rand::SecureRandom as _;
+
+                let key = KeyPair::generate().expect("generate the CA key");
+                let mut params = CertificateParams::new(Vec::new()).expect("CA params");
+                params
+                    .distinguished_name
+                    .push(DnType::CommonName, "Registrar Verbs Live CA");
+                params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                let cert = params.self_signed(&key).expect("self-sign the CA");
+                let ca_bundle_pem = cert.pem();
+                let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
+
+                let mut bytes = [0_u8; 32];
+                ring::rand::SystemRandom::new()
+                    .fill(&mut bytes)
+                    .expect("draw the responder HMAC");
+                let responder_hmac = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+                let client = self.client();
+                client
+                    .write_kv(
+                        &self.kv_mount,
+                        "bootroot/ca",
+                        json!({
+                            "trusted_ca_sha256": [fingerprint],
+                            "ca_bundle_pem": ca_bundle_pem,
+                        }),
+                    )
+                    .await
+                    .expect("seed bootroot/ca");
+                client
+                    .write_kv(
+                        &self.kv_mount,
+                        "bootroot/responder/hmac",
+                        json!({ "value": responder_hmac }),
+                    )
+                    .await
+                    .expect("seed bootroot/responder/hmac");
+                LiveControlNode {
+                    ca_bundle_pem,
+                    responder_hmac,
+                }
+            })
+            .await
+    }
+
     fn from_env() -> Self {
         let read = |name: &str| {
             std::env::var(name).unwrap_or_else(|_| {
@@ -3339,7 +3967,7 @@ path "{mount}/metadata/bootroot/services/*" {{
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn first_mint_creates_exactly_the_derived_role_and_policy() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -3433,7 +4061,7 @@ async fn first_mint_creates_exactly_the_derived_role_and_policy() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -3510,12 +4138,201 @@ async fn same_host_rematch_reuses_the_role_and_returns_fresh_material() {
     assert_eq!(removed["outcome"]["class"], json!("identity_removed"));
 }
 
+/// A registrar-minted identity completes `bootroot-remote bootstrap`
+/// end to end: the mint seeds the three trust records and no
+/// `secret_id`, and bootstrap — driven by an artifact built the way the
+/// endpoint builds `material.bootstrap_artifact` — applies the trust and
+/// responder HMAC, keeps the `secret_id` it unwrapped, and leaves a pair
+/// that logs in.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+// One linear scenario, read top to bottom in the steps its comments
+// number; splitting it would scatter the state each step hands the next.
+#[allow(clippy::too_many_lines)]
+async fn a_minted_identity_completes_remote_bootstrap() {
+    use crate::registrar::identity::san_instance_label;
+    use crate::remote_bootstrap::{
+        ArtifactInputs, ArtifactPaths, ArtifactWrap, build_artifact, serialize_artifact,
+    };
+
+    let backend = LiveBackend::ready().await;
+    let control = backend.control_node().await;
+    let remote_bin = std::env::var(ENV_REMOTE_BIN).unwrap_or_else(|_| {
+        panic!("{ENV_REMOTE_BIN} must be set; run scripts/impl/run-registrar-verbs-e2e.sh")
+    });
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    // The production defaults for per-issuance options: no per-issuance
+    // TTL and unlimited uses. The fixture's single-use options would let
+    // bootstrap's own login spend the credential this test logs in with
+    // afterwards.
+    let verbs = RegistrarVerbs::new(RegistrarVerbsConfig {
+        client: backend.client(),
+        kv_mount: backend.kv_mount.clone(),
+        config,
+        secret_id_options: SecretIdOptions {
+            num_uses: Some(0),
+            ..Default::default()
+        },
+        token_ttl: TOKEN_TTL.to_string(),
+        secret_id_ttl: SECRET_ID_TTL.to_string(),
+        wrap_ttl_policy: WrapTtlPolicy::new(Duration::minutes(30)).expect("policy maximum"),
+        audit_store: AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        limiter: VerbRateLimiter::with_counting_sink(VerbRateLimiterSettings::default()).0,
+    });
+    let registration_id = format!("{host}-roxyd");
+
+    // 1. Mint.
+    let outcome = verbs
+        .mint(&mint_request("roxyd", &host, None))
+        .await
+        .expect("the mint succeeds");
+    assert_eq!(outcome.kind(), MintKind::FirstMint);
+    let role_id = outcome.role_id().to_string();
+    let expires_at = outcome
+        .expires_at()
+        .format(&Rfc3339)
+        .expect("the deadline formats");
+    let wrap_token = outcome.into_wrapped_secret_id();
+
+    // 2. The three trust records exist; no `secret_id` does.
+    let root = backend.client();
+    let read = |suffix: &'static str| {
+        let root = root.clone();
+        let path = service_kv_path(&registration_id, suffix);
+        let mount = backend.kv_mount.clone();
+        async move {
+            root.try_read_kv(&mount, &path)
+                .await
+                .expect("a root read of the service subtree")
+        }
+    };
+    assert_eq!(
+        read(SERVICE_EAB_KV_SUFFIX).await,
+        Some(json!({ "kid": "", "hmac": "" }))
+    );
+    assert_eq!(
+        read(SERVICE_RESPONDER_HMAC_KV_SUFFIX).await,
+        Some(json!({ "hmac": control.responder_hmac }))
+    );
+    let trust = read(SERVICE_TRUST_KV_SUFFIX)
+        .await
+        .expect("the trust record exists");
+    assert_eq!(trust["ca_bundle_pem"], json!(control.ca_bundle_pem));
+    assert_eq!(read(SERVICE_SECRET_ID_KV_SUFFIX).await, None);
+
+    // 3. The target's files and its `bootstrap.json`.
+    let target = tempfile::tempdir().expect("tempdir");
+    let at = |name: &str| target.path().join(name).to_string_lossy().into_owned();
+    let secrets = target.path().join("secrets");
+    std::fs::create_dir_all(&secrets).expect("create the secrets dir");
+    let role_id_path = at("secrets/role_id");
+    let secret_id_path = at("secrets/secret_id");
+    let ca_bundle_path = at("certs/ca-bundle.pem");
+    std::fs::write(&role_id_path, format!("{role_id}\n")).expect("write role_id");
+    let paths = ArtifactPaths {
+        agent_config_path: &at("agent.toml"),
+        role_id_path: &role_id_path,
+        secret_id_path: &secret_id_path,
+        eab_file_path: &at("secrets/eab.json"),
+        profile_cert_path: &at("certs/roxyd.crt"),
+        profile_key_path: &at("secrets/roxyd.key"),
+        ca_bundle_path: &ca_bundle_path,
+    };
+    let instance_id = san_instance_label(None);
+    let artifact = build_artifact(&ArtifactInputs {
+        openbao_url: &backend.url,
+        kv_mount: &backend.kv_mount,
+        registration_id: &registration_id,
+        service_name: "roxyd",
+        paths,
+        ca_bundle_pem: &control.ca_bundle_pem,
+        agent_email: None,
+        agent_server: Some("https://stepca.invalid:9000/acme/acme/directory"),
+        agent_responder_url: Some("http://responder.invalid:8080"),
+        agent_domain: verbs.domain(),
+        profile_hostname: &host,
+        profile_instance_id: &instance_id,
+        post_renew_hooks: &[],
+        wrap: Some(ArtifactWrap {
+            token: &wrap_token,
+            expires_at: &expires_at,
+        }),
+        cert_group_gid: None,
+    });
+    let artifact_path = target.path().join("bootstrap.json");
+    std::fs::write(
+        &artifact_path,
+        serialize_artifact(&artifact).expect("the artifact serializes"),
+    )
+    .expect("write bootstrap.json");
+
+    // 4. Bootstrap.
+    let output = tokio::process::Command::new(&remote_bin)
+        .arg("bootstrap")
+        .arg("--artifact")
+        .arg(&artifact_path)
+        .args(["--output", "json"])
+        .output()
+        .await
+        .expect("run bootroot-remote");
+
+    // 5. The summary, the files, and a login with the resulting pair.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "bootstrap failed: {stderr}");
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the summary is JSON");
+    assert_eq!(
+        summary["secret_id"]["status"],
+        json!("skipped"),
+        "{summary}"
+    );
+    assert_eq!(
+        summary["responder_hmac"]["status"],
+        json!("applied"),
+        "{summary}"
+    );
+    assert_eq!(
+        summary["trust_sync"]["status"],
+        json!("applied"),
+        "{summary}"
+    );
+    assert_eq!(summary["eab"]["status"], json!("skipped"), "{summary}");
+    assert_eq!(
+        std::fs::read_to_string(&ca_bundle_path).expect("read the CA bundle"),
+        control.ca_bundle_pem
+    );
+    let on_disk_role_id = std::fs::read_to_string(&role_id_path).expect("read role_id");
+    let on_disk_secret_id = std::fs::read_to_string(&secret_id_path).expect("read secret_id");
+    OpenBaoClient::new(&backend.url)
+        .expect("client")
+        .login_approle(on_disk_role_id.trim(), on_disk_secret_id.trim())
+        .await
+        .expect("the on-disk role_id/secret_id pair logs in");
+
+    // 6. Clean up; the seeded records go with the identity.
+    verbs
+        .deregister(&deregister_request("roxyd", &host, None))
+        .await
+        .expect("cleanup");
+    for suffix in [
+        SERVICE_EAB_KV_SUFFIX,
+        SERVICE_RESPONDER_HMAC_KV_SUFFIX,
+        SERVICE_TRUST_KV_SUFFIX,
+    ] {
+        assert!(
+            !backend.kv_exists(&registration_id, suffix).await,
+            "deregister sweeps {suffix}"
+        );
+    }
+}
+
 /// A request larger than the registrar's maximum is clamped, and the
 /// deadline reported is the granted one — never the requested one.
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_request_over_the_maximum_is_clamped_in_the_granted_expiry() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -3548,7 +4365,7 @@ async fn a_request_over_the_maximum_is_clamped_in_the_granted_expiry() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_second_host_is_refused_before_the_spec_comparison_across_instances() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let stem = unique_label("n");
     // `web` on `<stem>-aimer` and `aimer-web` on `<stem>` derive one id:
     // both a component name and a host label may carry hyphens, so the
@@ -3691,7 +4508,7 @@ async fn colliding_fixture_identities_refuse_on_the_binding_arm() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn safe_set_refusal_and_stored_spec_conflict_are_distinct_no_change_outcomes() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let component = unique_label("c");
     let rendered = sample_spec();
@@ -3794,7 +4611,7 @@ async fn safe_set_refusal_and_stored_spec_conflict_are_distinct_no_change_outcom
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_failed_convergence_retains_its_creating_binding_and_recovers() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let stem = unique_label("r");
     let policy_name = format!("bootroot-test-{stem}");
     install_binding_only_policy(&backend, &policy_name).await;
@@ -3890,7 +4707,7 @@ async fn a_failed_convergence_retains_its_creating_binding_and_recovers() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn wrong_host_deregister_changes_nothing() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let stem = unique_label("w");
     let component = format!("{stem}c");
     let bound_host = format!("{stem}a");
@@ -3950,7 +4767,7 @@ async fn wrong_host_deregister_changes_nothing() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn matching_host_deregister_tears_down_before_it_unbinds() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -4020,7 +4837,7 @@ async fn matching_host_deregister_tears_down_before_it_unbinds() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_failed_teardown_retains_the_binding_and_attempts_every_resource() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let stem = unique_label("f");
     let policy_name = format!("bootroot-test-{stem}");
     install_material_only_policy(&backend, &policy_name).await;
@@ -4112,7 +4929,7 @@ async fn a_failed_teardown_retains_the_binding_and_attempts_every_resource() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn absent_binding_deregister_sweeps_planted_orphans() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -4183,7 +5000,7 @@ async fn absent_binding_deregister_sweeps_planted_orphans() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn deregister_removes_the_binding_after_an_already_absent_teardown() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -4221,7 +5038,7 @@ async fn deregister_removes_the_binding_after_an_already_absent_teardown() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn deregister_is_refused_when_the_component_left_the_configuration() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = backend.verbs(config);
@@ -4277,7 +5094,7 @@ async fn deregister_is_refused_when_the_component_left_the_configuration() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn two_instances_racing_one_id_produce_exactly_one_claimant() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let stem = unique_label("x");
     let component = format!("{stem}c");
     let host_a = format!("{stem}a");
@@ -4335,7 +5152,7 @@ async fn two_instances_racing_one_id_produce_exactly_one_claimant() {
 async fn concurrent_mints_for_one_identity_write_ordered_outcome_lines() {
     const MINTS: usize = 4;
 
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let verbs = Arc::new(backend.verbs(config));
@@ -4415,7 +5232,7 @@ async fn concurrent_mints_for_one_identity_write_ordered_outcome_lines() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_concurrent_mint_and_deregister_never_interleave() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir_one, config_one) = load_fixture(&base_fixture());
     let (_dir_two, config_two) = load_fixture(&base_fixture());
@@ -4928,7 +5745,7 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
 #[tokio::test]
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn a_drained_refusal_bucket_does_not_starve_a_live_mint() {
-    let backend = LiveBackend::from_env();
+    let backend = LiveBackend::ready().await;
     let host = unique_label("h");
     let (_dir, config) = load_fixture(&base_fixture());
     let (verbs, sink) = backend.verbs_with_sink(config, refusal_budget(1));

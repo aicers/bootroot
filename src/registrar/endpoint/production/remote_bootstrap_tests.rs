@@ -129,8 +129,9 @@ fn harness(server: &MockServer) -> Harness {
     }
 }
 
-/// Mounts the login, the anchor read and a first mint's issuance for
-/// `registration_id`, and returns the anchor's PEM.
+/// Mounts the login, the anchor read, the trust-material seeding and a
+/// first mint's issuance for `registration_id`, and returns the anchor's
+/// PEM.
 async fn mock_first_mint(server: &MockServer, registration_id: &str) -> String {
     Mock::given(method("POST"))
         .and(request_path("/v1/auth/cert/login"))
@@ -150,6 +151,27 @@ async fn mock_first_mint(server: &MockServer, registration_id: &str) -> String {
         })))
         .mount(server)
         .await;
+    // The verb seeds the identity's trust material from the anchor above
+    // and the responder HMAC here, and writes its three service records.
+    Mock::given(method("GET"))
+        .and(request_path(format!(
+            "/v1/{KV_MOUNT}/data/bootroot/responder/hmac"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": { "value": "responder-hmac" } }
+        })))
+        .mount(server)
+        .await;
+    for suffix in ["eab", "http_responder_hmac", "trust"] {
+        Mock::given(method("POST"))
+            .and(request_path(format!(
+                "/v1/{KV_MOUNT}/data/{}",
+                service_kv_path(registration_id, suffix)
+            )))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(server)
+            .await;
+    }
 
     let role_name = service_role_name(registration_id);
     let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);

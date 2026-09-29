@@ -137,6 +137,12 @@ load_openbao_paths() {
   CA_TRUST_PATH="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" CA_TRUST_KV_PATH)"
   SERVICE_KV_BASE="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_KV_BASE)"
   SERVICE_SECRET_ID_SUFFIX="$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_SECRET_ID_KV_SUFFIX)"
+  # The three records a mint seeds into the minted service's own subtree.
+  SERVICE_SEEDED_SUFFIXES=(
+    "$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_EAB_KV_SUFFIX)"
+    "$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_RESPONDER_HMAC_KV_SUFFIX)"
+    "$(registrar_docker_rust_string_constant "$BOOTROOT_PROJECT_DIR/src/trust_bootstrap.rs" SERVICE_TRUST_KV_SUFFIX)"
+  )
   pass "loaded the configured KV mount and production path constants"
 }
 
@@ -218,6 +224,20 @@ assert_direct_kv_access_denied() {
   pass "registrar material cannot read protected or minted-service KV paths directly"
 }
 
+# The first mint runs through the production internal credential on a real
+# `bootroot init` stack, so this is where its seeding is held to the live
+# policy: the trust material is there, and no raw secret_id is.
+assert_seeded_trust_material() {
+  local registration_id="$1" suffix status
+  for suffix in "${SERVICE_SEEDED_SUFFIXES[@]}"; do
+    status="$(sudo -n curl -sS -o /dev/null -w '%{http_code}' --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/${KV_MOUNT}/data/${SERVICE_KV_BASE}/${registration_id}/${suffix}" || true)"
+    [ "$status" = 200 ] || fail "the mint did not seed ${suffix} (HTTP ${status})"
+  done
+  status="$(sudo -n curl -sS -o /dev/null -w '%{http_code}' --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/${KV_MOUNT}/data/${SERVICE_KV_BASE}/${registration_id}/${SERVICE_SECRET_ID_SUFFIX}" || true)"
+  [ "$status" = 404 ] || fail "the mint left a raw secret_id in KV (HTTP ${status})"
+  pass "the mint seeded the service trust material and no secret_id"
+}
+
 assert_no_registration_state() {
   local registration_id="$1"
   local endpoint status
@@ -245,6 +265,7 @@ assert_functionality_and_audit() {
   client --operation mint --payload "$mint" >"$ARTIFACT_DIR/idempotent-mint.json" 2>"$ARTIFACT_DIR/idempotent-mint.err" || { cat "$ARTIFACT_DIR/idempotent-mint.err" >>"$RUN_LOG"; fail "idempotent mint failed"; }
   first="$(cat "$ARTIFACT_DIR/first-mint.json")"; second="$(cat "$ARTIFACT_DIR/idempotent-mint.json")"; jq -e '.outcome == "first_mint"' <<<"$first" >/dev/null || fail "first mint was not first_mint"; jq -e '.outcome == "idempotent_remint"' <<<"$second" >/dev/null || fail "second mint was not idempotent_remint"
   REGISTRATION_ID="$(jq -r '.registration_id' <<<"$first")"
+  assert_seeded_trust_material "$REGISTRATION_ID"
   role="$(sudo -n curl -fsS --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${REGISTRATION_ID}")" || fail "could not read the minted derived AppRole"
   policies="$(jq -c '.data.token_policies | sort' <<<"$role")" || fail "minted AppRole has no policy list"
   [ "$policies" = "[\"bootroot-service-${REGISTRATION_ID}\"]" ] || fail "minted role policy set is not exactly the derived service policy"

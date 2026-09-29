@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
+use bootroot::service_material::{ServiceTrustError, write_service_trust_record};
 use bootroot::trust_bootstrap::CA_BUNDLE_PEM_KEY;
 use serde::{Deserialize, Serialize};
 
-use crate::commands::constants::{CA_TRUST_KEY, SERVICE_KV_BASE};
+use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::init::PATH_CA_TRUST;
 use crate::i18n::Messages;
 use crate::state::ServiceEntry;
 
-pub(crate) const SERVICE_TRUST_KV_SUFFIX: &str = "trust";
 const ROTATION_STATE_FILENAME: &str = "rotation-state.json";
 
 /// Mode for `rotation-state.json`. Only the rotation command writes
@@ -251,17 +251,21 @@ pub(crate) async fn write_service_trust(
     ca_bundle_pem: &str,
     messages: &Messages,
 ) -> Result<()> {
-    client
-        .write_kv(
-            kv_mount,
-            &format!("{SERVICE_KV_BASE}/{registration_id}/{SERVICE_TRUST_KV_SUFFIX}"),
-            serde_json::json!({
-                CA_TRUST_KEY: fingerprints,
-                CA_BUNDLE_PEM_KEY: ca_bundle_pem,
-            }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())
+    // The library writer is the one `service add` seeds through, so a
+    // rotation rewrites exactly the record shape a new service gets.
+    write_service_trust_record(
+        client,
+        kv_mount,
+        registration_id,
+        fingerprints,
+        ca_bundle_pem,
+    )
+    .await
+    .map_err(|err| match err {
+        ServiceTrustError::Write { source, .. } => source,
+        other => anyhow::Error::new(other),
+    })
+    .with_context(|| messages.error_openbao_kv_write_failed())
 }
 
 /// Returns `true` if `rotation-state.json` exists in the given directory,

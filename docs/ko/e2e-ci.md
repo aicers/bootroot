@@ -110,12 +110,15 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 호스트에서도 안전하게 실행할 수 있습니다.
 
 registrar 시나리오 두 개는 이 논의 바깥에 있습니다. 둘 다 비어 있는 루프백
-포트에 OpenBao 컨테이너 하나만 띄우므로 compose 프로젝트도, secrets 배선도,
-bootroot 바이너리도 전혀 필요하지 않습니다. `run-registrar-verbs-e2e.sh`는
-`#[ignore]`가 붙은 `registrar::verbs::tests` 라이브러리 테스트의 게이트이고,
+포트에 OpenBao 컨테이너 하나만 띄우므로 compose 프로젝트도, secrets 배선도
+필요하지 않습니다. `run-registrar-verbs-e2e.sh`는 `#[ignore]`가 붙은
+`registrar::verbs::tests` 라이브러리 테스트의 게이트이고,
 `run-registrar-internal-e2e.sh`는 `registrar::internal::tests::live`의
 게이트입니다. 둘 다 컨테이너의 접속 정보를 자식 프로세스의 환경 변수로
-넘겨 테스트를 실행합니다.
+넘겨 테스트를 실행합니다. `run-registrar-internal-e2e.sh`는 bootroot
+바이너리가 전혀 필요하지 않습니다. `run-registrar-verbs-e2e.sh`는 테스트
+하나가 방금 발급한 정체성으로 `bootroot-remote bootstrap`을 실행하므로
+`bootroot-remote`를 빌드하고, 그 바이너리 경로도 같은 방식으로 넘깁니다.
 
 `run-registrar-redteam.sh`는 대신 실행마다 범위를 정한 전체 배포를
 프로비저닝하고 실제 OpenBao 및 root 소유 소켓을 사용합니다. 공격자 모델은
