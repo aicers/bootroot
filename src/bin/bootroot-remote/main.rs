@@ -955,6 +955,72 @@ mod tests {
         assert!(resolved.post_renew_hooks.is_empty());
     }
 
+    /// The artifact a registrar mint returns is one this parser accepts.
+    ///
+    /// Read out of the registrar endpoint's committed `mint-success.json`
+    /// golden fixture, which the endpoint's own tests hold byte-identical to
+    /// what its production codec encodes. So the bytes parsed here are the
+    /// bytes a mint hands a caller to relay, and a change on either side that
+    /// broke the other fails one of the two tests.
+    #[tokio::test]
+    async fn resolve_bootstrap_args_accepts_a_registrar_minted_artifact() {
+        use base64::Engine as _;
+
+        const MINT_SUCCESS: &[u8] =
+            include_bytes!("../../registrar/endpoint/fixtures/mint-success.json");
+        let response: serde_json::Value =
+            serde_json::from_slice(MINT_SUCCESS).expect("the fixture is JSON");
+        let encoded = response["material"]["bootstrap_artifact"]
+            .as_str()
+            .expect("the fixture mint carries an artifact");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("the artifact is standard base64");
+        let artifact = String::from_utf8(bytes).expect("the artifact is UTF-8");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact_path = write_artifact_file(dir.path(), &artifact);
+        let resolved = resolve_bootstrap_args(default_bootstrap_args(artifact_path))
+            .await
+            .expect("bootroot-remote accepts a registrar-minted artifact");
+
+        assert_eq!(resolved.registration_id, "registration-1");
+        assert_eq!(resolved.service_name, "api");
+        assert_eq!(
+            resolved.agent_config_path,
+            PathBuf::from("/etc/api/agent.toml")
+        );
+        assert_eq!(
+            resolved.role_id_path,
+            PathBuf::from("/var/lib/api/secrets/role_id")
+        );
+        assert_eq!(
+            resolved.secret_id_path,
+            PathBuf::from("/var/lib/api/secrets/secret_id")
+        );
+        assert_eq!(
+            resolved.eab_file_path,
+            PathBuf::from("/var/lib/api/secrets/eab.json")
+        );
+        assert_eq!(
+            resolved.profile_cert_path,
+            Some(PathBuf::from("/var/lib/api/certs/api.crt"))
+        );
+        assert_eq!(
+            resolved.profile_key_path,
+            Some(PathBuf::from("/var/lib/api/certs/api.key"))
+        );
+        assert_eq!(
+            resolved.ca_bundle_path,
+            PathBuf::from("/var/lib/api/certs/ca-bundle.pem")
+        );
+        assert_eq!(resolved.profile_instance_id.as_deref(), Some("007"));
+        assert_eq!(resolved.wrap_token.as_deref(), Some("wrapped-secret"));
+        assert_eq!(resolved.cert_group_gid, Some(3000));
+        assert_eq!(resolved.post_renew_hooks.len(), 1);
+        assert!(resolved.agent_email_override.is_none());
+    }
+
     /// Returns `BootstrapArgs` pointing at the given artifact file with all
     /// other fields set to defaults.
     fn default_bootstrap_args(artifact_path: PathBuf) -> BootstrapArgs {

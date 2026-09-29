@@ -2,86 +2,19 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+#[cfg(test)]
+use bootroot::remote_bootstrap::fingerprints_from_bundle;
+use bootroot::remote_bootstrap::{
+    self, ArtifactInputs, ArtifactPaths, ArtifactWrap, RemoteBootstrapArtifact,
+};
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
     REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME, RemoteBootstrapResult,
     SERVICE_ROLE_ID_FILENAME,
 };
-use crate::commands::guardrails::client_url_from_bind_addr;
 use crate::i18n::Messages;
 use crate::state::{PostRenewHookEntry, ServiceEntry, StateFile};
-
-/// Machine-readable bootstrap artifact written to
-/// `secrets/remote-bootstrap/services/<registration_id>/bootstrap.json`.
-///
-/// Downstream automation (shell scripts, Ansible, CI pipelines) can parse
-/// this JSON to drive `bootroot-remote bootstrap` invocations.
-///
-/// # `schema_version` contract
-///
-/// * The field starts at `1` and is bumped whenever the struct gains,
-///   removes, or renames a field in a way that would break existing
-///   parsers.
-/// * Additive changes that only append new *optional* fields (i.e.
-///   fields with `#[serde(default)]` or `skip_serializing_if`) do **not**
-///   require a bump — existing parsers will simply ignore unknown keys.
-/// * Consumers should check `schema_version` before accessing fields and
-///   fail explicitly if the version is higher than what they support.
-#[derive(serde::Serialize)]
-struct RemoteBootstrapArtifact {
-    schema_version: u32,
-    openbao_url: String,
-    kv_mount: String,
-    /// Deployment-wide unique key the remote agent derives its KV
-    /// namespace, managed-block markers and state filename from.
-    registration_id: String,
-    /// SAN label the remote profile requests certificates under. Not a
-    /// namespace key.
-    service_name: String,
-    role_id_path: String,
-    secret_id_path: String,
-    eab_file_path: String,
-    agent_config_path: String,
-    ca_bundle_path: String,
-    ca_bundle_pem: String,
-    /// SHA-256 fingerprints of the certificates in `ca_bundle_pem`, in the
-    /// `trusted_ca_sha256` form. The remote `bootstrap` pins its `OpenBao`
-    /// TLS connection to these anchors (issue #695). Serialized only when
-    /// non-empty; a remote that pre-dates the field ignores it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    trusted_ca_sha256: Vec<String>,
-    /// Operator-supplied override for `email`, carried from
-    /// `bootroot service add --agent-email` so that `bootroot-remote
-    /// bootstrap` can distinguish "explicit override, clobber remote
-    /// value" from "no override, preserve remote operator value".
-    /// `None` is serialized as a missing key so the downstream parser's
-    /// `#[serde(default)]` yields `Option::None`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_email: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_server: Option<String>,
-    agent_domain: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent_responder_url: Option<String>,
-    profile_hostname: String,
-    profile_instance_id: String,
-    profile_cert_path: String,
-    profile_key_path: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    post_renew_hooks: Vec<PostRenewHookEntry>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wrap_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    wrap_expires_at: Option<String>,
-    /// Numeric gid that owns the issued cert/key files and their
-    /// parent directories under `--cert-group`. `None` is serialized
-    /// as a missing key so a downstream remote agent that pre-dates
-    /// the field continues to work without the policy. See
-    /// issue #593.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cert_group_gid: Option<u32>,
-}
 
 /// Wrap-token metadata to embed in the bootstrap artifact.
 pub(super) struct ArtifactWrapInfo {
@@ -112,32 +45,23 @@ impl ArtifactWrapInfo {
     }
 }
 
-/// Returns the `OpenBao` URL to embed in remote bootstrap artifacts.
-///
-/// Prefers `openbao_advertise_addr` (set for wildcard binds) so that
-/// artifacts contain a routable address that remote nodes can reach.
-/// Falls back to `openbao_url` (the CN-side URL) for non-wildcard
-/// binds where the bind address is directly reachable.
+/// Returns the `OpenBao` URL to embed in remote bootstrap artifacts, by
+/// the library rule the registrar mint applies to the same two members.
 fn artifact_openbao_url(state: &StateFile) -> String {
-    state.openbao_advertise_addr.as_ref().map_or_else(
-        || state.openbao_url.clone(),
-        |addr| client_url_from_bind_addr(addr),
+    remote_bootstrap::artifact_openbao_url(
+        &state.openbao_url,
+        state.openbao_advertise_addr.as_deref(),
     )
 }
 
 /// Builds a `RemoteBootstrapArtifact` from common inputs shared by both
 /// the initial service-add and the idempotent re-run paths.
-/// Computes the `trusted_ca_sha256` fingerprints (lowercase hex SHA-256 of
-/// each certificate's DER) for the certificates in a CA bundle PEM. Returns
-/// an empty list when the bundle is empty or unparseable — the remote
-/// bootstrap then falls back to bundle-anchored TLS (no pins).
-fn fingerprints_from_bundle(ca_bundle_pem: &str) -> Vec<String> {
-    if ca_bundle_pem.trim().is_empty() {
-        return Vec::new();
-    }
-    bootroot::tls::ca_bundle_fingerprints(ca_bundle_pem).unwrap_or_default()
-}
-
+///
+/// The artifact itself comes from the library builder the registrar mint
+/// also calls. What stays here is `service add`'s own placement rule for
+/// the three paths it does not take from a flag: `role_id` and
+/// `eab.json` beside `secret_id`, and `ca-bundle.pem` beside the
+/// certificate.
 #[allow(clippy::too_many_arguments)] // mirrors the many fields of RemoteBootstrapArtifact
 fn build_artifact(
     openbao_url: &str,
@@ -167,37 +91,41 @@ fn build_artifact(
         .unwrap_or(Path::new("certs"))
         .join("ca-bundle.pem");
 
-    RemoteBootstrapArtifact {
-        // schema_version 5 split the registry key out of `service_name`
-        // into the required `registration_id`: every namespace the remote
-        // agent derives now comes from that key, while `service_name`
-        // stays the SAN label. A new required field is breaking, so per
-        // the contract above it takes a bump.
-        schema_version: 5,
-        openbao_url: openbao_url.to_string(),
-        kv_mount: kv_mount.to_string(),
-        registration_id: registration_id.to_string(),
-        service_name: service_name.to_string(),
-        role_id_path: role_id_path.display().to_string(),
-        secret_id_path: secret_id_path.display().to_string(),
-        eab_file_path: eab_path.display().to_string(),
-        agent_config_path: agent_config_path.display().to_string(),
-        ca_bundle_path: ca_bundle_path.display().to_string(),
-        trusted_ca_sha256: fingerprints_from_bundle(ca_bundle_pem),
-        ca_bundle_pem: ca_bundle_pem.to_string(),
-        agent_email: agent_email.map(str::to_string),
-        agent_server: agent_server.map(str::to_string),
-        agent_domain: domain.to_string(),
-        agent_responder_url: agent_responder_url.map(str::to_string),
-        profile_hostname: hostname.to_string(),
-        profile_instance_id: instance_id.unwrap_or_default().to_string(),
-        profile_cert_path: cert_path.display().to_string(),
-        profile_key_path: key_path.display().to_string(),
-        post_renew_hooks: post_renew_hooks.to_vec(),
-        wrap_token: wrap_info.map(|w| w.token.clone()),
-        wrap_expires_at: wrap_info.map(|w| w.expires_at.clone()),
+    let agent_config_path = agent_config_path.display().to_string();
+    let role_id_path = role_id_path.display().to_string();
+    let secret_id_path = secret_id_path.display().to_string();
+    let eab_file_path = eab_path.display().to_string();
+    let profile_cert_path = cert_path.display().to_string();
+    let profile_key_path = key_path.display().to_string();
+    let ca_bundle_path = ca_bundle_path.display().to_string();
+    remote_bootstrap::build_artifact(&ArtifactInputs {
+        openbao_url,
+        kv_mount,
+        registration_id,
+        service_name,
+        paths: ArtifactPaths {
+            agent_config_path: &agent_config_path,
+            role_id_path: &role_id_path,
+            secret_id_path: &secret_id_path,
+            eab_file_path: &eab_file_path,
+            profile_cert_path: &profile_cert_path,
+            profile_key_path: &profile_key_path,
+            ca_bundle_path: &ca_bundle_path,
+        },
+        ca_bundle_pem,
+        agent_email,
+        agent_server,
+        agent_responder_url,
+        agent_domain: domain,
+        profile_hostname: hostname,
+        profile_instance_id: instance_id.unwrap_or_default(),
+        post_renew_hooks,
+        wrap: wrap_info.map(|wrap| ArtifactWrap {
+            token: &wrap.token,
+            expires_at: &wrap.expires_at,
+        }),
         cert_group_gid,
-    }
+    })
 }
 
 pub(super) async fn write_remote_bootstrap_artifact(
@@ -281,7 +209,7 @@ async fn write_remote_bootstrap_artifact_file(
     let artifact_dir = secrets_dir.join(REMOTE_BOOTSTRAP_DIR).join(registration_id);
     fs_util::ensure_secrets_dir(&artifact_dir).await?;
     let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
-    let payload = serde_json::to_string_pretty(artifact)
+    let payload = remote_bootstrap::serialize_artifact(artifact)
         .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
     // Published by rename at the policy's `0600`, applied while the file
     // is still at its temporary name so the wrapped token it may carry

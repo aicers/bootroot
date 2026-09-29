@@ -412,6 +412,8 @@ registrar_docker_write_daemon_config() {
 
 [registrar]
 state_file = "${WORK_DIR}/state.json"
+agent_server = "https://stepca.registrar-scenario.test:9000/acme/acme/directory"
+agent_responder_url = "http://responder.registrar-scenario.test:8080"
 provisioning_config_path = "${PROVISIONING}"
 audit_store_dir = "${AUDIT_DIR}"
 audit_record_dir = "${RECORD_DIR}"

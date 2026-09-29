@@ -331,8 +331,9 @@ five keys; an unknown key is a configuration error.
 Enabling it is supported. The daemon registers a production request
 handler that decodes the versioned registrar payload, invokes the verbs
 and encodes their answers, so an enabled endpoint starts and serves. It
-needs the `[registrar]` keys below in place: `state_file` is **required**
-when `enabled = true`, and the provisioning config, the deployment state
+needs the `[registrar]` keys below in place: `state_file`, `agent_server`
+and `agent_responder_url` are **required** when `enabled = true`, and the
+provisioning config, the deployment state
 file, the internal credential and the audit store are all opened at
 startup. Any one of them missing or unusable fails the invocation with a
 named diagnostic rather than leaving the socket adopted with nothing
@@ -544,7 +545,8 @@ At least these remain:
 
 - The **non-Linux platform refusal**, which precedes both of them.
 - The **rest of configuration validation**, including the
-  `[registrar] state_file` requirement and the `[registrar]` and
+  `[registrar] state_file`, `agent_server` and `agent_responder_url`
+  requirements and the `[registrar]` and
   `[trust]` tables' own checks.
 - **Socket activation** — the descriptor, its address, and the socket
   path's ownership and permissions.
@@ -655,9 +657,9 @@ happened. The OpenBao audit check `bootroot init` performs is unchanged.
 The daemon owns the artifact. The registrar cannot read, append to,
 delete, redirect or select it, and no field of a request reaches the
 path, the modes, the rotation policy or the retention policy. An absent
-`[registrar]` table leaves every key at the default above — `state_file`
-excepted, which has no default at all; an unknown key is a configuration
-error.
+`[registrar]` table leaves every key at the default above — `state_file`,
+`agent_server` and `agent_responder_url` excepted, which have no default
+at all; an unknown key is a configuration error.
 
 - `audit_store_dir` (default `/var/lib/bootroot/audit-store`) — the
   absolute directory that holds `records/` for daemon records and
@@ -783,15 +785,18 @@ of `u64::MAX`, which is no bound at all.
 
 #### Verb-layer settings
 
-These eight keys provision the registrar verbs the endpoint serves. They
+These ten keys provision the registrar verbs the endpoint serves. They
 are validated **unconditionally**, on every host: a nonsense value is a
 configuration error whether or not the endpoint is enabled. Only
-`state_file` relates the two tables, and only in one direction — it is
-required when `[registrar_endpoint] enabled = true`.
+`state_file`, `agent_server` and `agent_responder_url` relate the two
+tables, and only in one direction — each is required when
+`[registrar_endpoint] enabled = true`.
 
 ```toml
 [registrar]
 state_file = "/opt/bootroot/state.json"
+agent_server = "https://stepca.internal:9000/acme/acme/directory"
+agent_responder_url = "http://responder.internal:8080"
 provisioning_config_path = "/etc/clumit-security/provisioning.toml"
 max_wrap_ttl = "30m"
 role_token_ttl = "1h"
@@ -804,7 +809,11 @@ secret_id_num_uses = 0
 - `state_file` (**no default**) — the absolute path to the `state.json`
   `bootroot init` wrote. It is the single source for three values the
   verbs need: the recorded `openbao_url`, the `kv_mount`, and the
-  optional `secrets_dir`. There is deliberately no key for any of the
+  optional `secrets_dir`. A fourth member, the optional
+  `openbao_advertise_addr`, is read only to choose the `OpenBao` URL a
+  remote-bootstrap mint's artifact carries, by the rule `bootroot service
+  add` applies: the advertise address when it is recorded, the
+  `openbao_url` otherwise. There is deliberately no key for any of the
   three: one file that `init` and `rotate` keep current is what keeps a
   URL or a mount from being spelled twice and disagreeing. A relative
   path is rejected. An absent `secrets_dir` member resolves to `secrets`,
@@ -815,8 +824,20 @@ secret_id_num_uses = 0
   with the endpoint enabled it is a configuration error naming both keys.
   The file is read once per invocation and only on the enabled path, so a
   rewritten `state.json` takes effect on the next `SIGHUP`, and only
-  three members are read — every other member is ignored and none is ever
-  written back.
+  those four members are read — every other member is ignored and none is
+  ever written back.
+- `agent_server` (**no default**) — the ACME directory URL a
+  remote-bootstrap target's agent is given, carried into the
+  `bootstrap.json` a `RemoteBootstrap` mint returns as its
+  `agent_server`. It must be an absolute URL with a host, with no
+  surrounding whitespace, because it is copied into the target's agent
+  configuration unchanged. There is no default because the address a
+  *target* reaches the CA on is not one this host can guess. Absent, the
+  daemon loads cleanly as long as the endpoint is disabled; with the
+  endpoint enabled it is a configuration error naming the key.
+- `agent_responder_url` (**no default**) — the HTTP-01 responder admin
+  URL a remote-bootstrap target's agent is given, carried into the
+  artifact as its `agent_responder_url`. Same rules as `agent_server`.
 - `provisioning_config_path` (default
   `/etc/clumit-security/provisioning.toml`) — the absolute path to the
   provisioning tool's rendered registrar config. bootroot only reads it;

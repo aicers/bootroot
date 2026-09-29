@@ -193,6 +193,21 @@ pub struct RegistrarSettings {
     /// validation enforces because it is the one level that sees both
     /// tables.
     pub state_file: Option<PathBuf>,
+    /// The ACME directory URL a remote-bootstrap target's agent uses,
+    /// carried into the artifact a registrar mint returns as
+    /// `agent_server`.
+    ///
+    /// No default, for the same reason [`RegistrarSettings::state_file`]
+    /// has none: the address a *target host* reaches the CA on is not
+    /// something this host can guess, and a guessed loopback URL would
+    /// enroll every target against itself. Required exactly when
+    /// `[registrar_endpoint] enabled` is true.
+    pub agent_server: Option<String>,
+    /// The HTTP-01 responder admin URL a remote-bootstrap target's agent
+    /// uses, carried into the artifact a registrar mint returns as
+    /// `agent_responder_url`. No default and required exactly as
+    /// [`RegistrarSettings::agent_server`] is.
+    pub agent_responder_url: Option<String>,
     /// Lets a daemon-composition fixture open its temporary audit store as
     /// the test process rather than uid 0. No configuration input can set
     /// this, and production always uses the root-owned store policy.
@@ -384,6 +399,10 @@ struct RawRegistrarSettings {
     secret_id_token_bound_cidrs: Option<Vec<String>>,
     #[serde(default)]
     state_file: Option<PathBuf>,
+    #[serde(default)]
+    agent_server: Option<String>,
+    #[serde(default)]
+    agent_responder_url: Option<String>,
 }
 
 impl From<RawRegistrarSettings> for RegistrarSettings {
@@ -413,6 +432,8 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             secret_id_ttl,
             secret_id_token_bound_cidrs,
             state_file,
+            agent_server,
+            agent_responder_url,
         } = raw;
         let audit_record_dir =
             audit_record_dir.unwrap_or_else(|| defaults::audit_record_dir_for(&audit_store_dir));
@@ -442,6 +463,8 @@ impl From<RawRegistrarSettings> for RegistrarSettings {
             secret_id_ttl,
             secret_id_token_bound_cidrs,
             state_file,
+            agent_server,
+            agent_responder_url,
             #[cfg(test)]
             open_audit_store_as_test_user: false,
         }
@@ -505,6 +528,8 @@ impl Default for RegistrarSettings {
             secret_id_ttl: None,
             secret_id_token_bound_cidrs: None,
             state_file: None,
+            agent_server: None,
+            agent_responder_url: None,
             #[cfg(test)]
             open_audit_store_as_test_user: false,
         }
@@ -1252,9 +1277,11 @@ mod tests {
             registrar.state_file.is_none(),
             "state_file has no default, so an absent key stays absent"
         );
+        assert!(registrar.agent_server.is_none());
+        assert!(registrar.agent_responder_url.is_none());
         settings
             .validate()
-            .expect("a disabled endpoint with no state_file loads cleanly");
+            .expect("a disabled endpoint with no state_file or agent URL loads cleanly");
     }
 
     /// Every key is read at the spelling the documented table fixes:
@@ -1276,6 +1303,8 @@ mod tests {
             secret_id_ttl = "90m"
             secret_id_token_bound_cidrs = ["10.0.0.0/8", "192.168.1.0/24"]
             state_file = "/var/lib/bootroot/state.json"
+            agent_server = "https://stepca.example:9000/acme/acme/directory"
+            agent_responder_url = "http://responder.example:8080"
         "#
         )
         .unwrap();
@@ -1283,6 +1312,14 @@ mod tests {
 
         let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
         let registrar = &settings.registrar;
+        assert_eq!(
+            registrar.agent_server.as_deref(),
+            Some("https://stepca.example:9000/acme/acme/directory")
+        );
+        assert_eq!(
+            registrar.agent_responder_url.as_deref(),
+            Some("http://responder.example:8080")
+        );
         assert_eq!(
             registrar.provisioning_config_path,
             PathBuf::from("/etc/clumit-security/other.toml")
@@ -3544,12 +3581,58 @@ audit_store_enforcement = "directory"
              server_key_path = \"/etc/bootroot/registrar-endpoint.key\"\n\
              client_cert_path = \"/etc/bootroot/registrar-client.crt\"\n\
              client_key_path = \"/etc/bootroot/registrar-client.key\"\n\
-             \n[registrar]\nstate_file = \"/var/lib/bootroot/state.json\""
+             \n[registrar]\nstate_file = \"/var/lib/bootroot/state.json\"\n\
+             agent_server = \"https://stepca.example:9000/acme/acme/directory\"\n\
+             agent_responder_url = \"http://responder.example:8080\""
         )
         .unwrap();
         file.flush().unwrap();
         let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
         settings.validate().unwrap();
+    }
+
+    /// With the endpoint enabled and everything else configured, either
+    /// agent URL missing fails the load, and the diagnostic names it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_enabled_endpoint_without_an_agent_url_is_refused_naming_it() {
+        const AGENT_URLS: [(&str, &str); 2] = [
+            (
+                "agent_server",
+                "https://stepca.example:9000/acme/acme/directory",
+            ),
+            ("agent_responder_url", "http://responder.example:8080"),
+        ];
+        for omitted in 0..AGENT_URLS.len() {
+            let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+            write_minimal_profile_config(&mut file);
+            writeln!(
+                file,
+                "\n[registrar_endpoint]\nenabled = true\n\
+                 server_cert_path = \"/etc/bootroot/registrar-endpoint.crt\"\n\
+                 server_key_path = \"/etc/bootroot/registrar-endpoint.key\"\n\
+                 client_cert_path = \"/etc/bootroot/registrar-client.crt\"\n\
+                 client_key_path = \"/etc/bootroot/registrar-client.key\"\n\
+                 \n[registrar]\nstate_file = \"/var/lib/bootroot/state.json\""
+            )
+            .unwrap();
+            for (index, (key, value)) in AGENT_URLS.iter().enumerate() {
+                if index != omitted {
+                    writeln!(file, "{key} = \"{value}\"").unwrap();
+                }
+            }
+            file.flush().unwrap();
+            let settings = Settings::from_file(Some(file.path().to_path_buf())).unwrap();
+            let rendered = format!("{:#}", settings.validate().unwrap_err());
+            let missing = AGENT_URLS
+                .get(omitted)
+                .expect("index is inside the array")
+                .0;
+            assert!(
+                rendered.contains(&format!("registrar.{missing}")),
+                "the diagnostic must name {missing}: {rendered}"
+            );
+        }
     }
 
     /// A disabled endpoint validates everywhere, including where it

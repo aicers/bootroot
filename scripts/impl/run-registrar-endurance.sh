@@ -320,7 +320,7 @@ wait_until_after() {
 }
 
 write_mint() {
-  jq -n '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"endurance",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:"3000"},wrap_ttl:60,idempotency_key:"endurance-post-expiry-mint"}' >"$RUN_ROOT/mint.json"
+  jq -n '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"endurance",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:"3000"},wrap_ttl:60,idempotency_key:"endurance-post-expiry-mint",agent_config_path:"/etc/review/agent.toml",role_id_path:"/var/lib/review/secrets/role_id",secret_id_path:"/var/lib/review/secrets/secret_id",eab_file_path:"/var/lib/review/secrets/eab.json",profile_cert_path:"/var/lib/review/certs/cert.pem",profile_key_path:"/var/lib/review/certs/key.pem",ca_bundle_path:"/var/lib/review/certs/ca-bundle.pem"}' >"$RUN_ROOT/mint.json"
 }
 
 socket_mint() {

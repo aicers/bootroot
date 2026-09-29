@@ -317,8 +317,9 @@ enabled = false
 디코딩하고 동사를 호출한 뒤 그 결과를 인코딩하는 프로덕션 요청 핸들러를
 등록하므로, 활성화된 엔드포인트는 정상적으로 기동하고 요청을 처리합니다.
 다만 아래 `[registrar]` 키들이 갖춰져 있어야 합니다. `enabled = true`일 때
-`state_file`은 **필수**이며, 프로비저닝 설정 파일·배포 상태 파일·내부
-자격 증명·감사 저장소는 모두 기동 시점에 열립니다. 그중 하나라도 없거나
+`state_file`, `agent_server`, `agent_responder_url`은 **필수**이며,
+프로비저닝 설정 파일·배포 상태 파일·내부 자격 증명·감사 저장소는 모두
+기동 시점에 열립니다. 그중 하나라도 없거나
 사용할 수 없으면, 소켓만 상속한 채 아무도 accept하지 않는 상태로 두는
 대신 원인을 지목하는 진단과 함께 기동이 실패합니다.
 
@@ -519,7 +520,8 @@ AppRole도, EAB 없이 발급하는 것도 아닙니다. 조용한 대체는 낡
 최소한 다음은 그대로 남습니다.
 
 - **Linux가 아닌 플랫폼 거부.** 위 두 가지보다 앞섭니다.
-- **나머지 설정 검증.** `[registrar] state_file` 요구 사항과
+- **나머지 설정 검증.** `[registrar] state_file`, `agent_server`,
+  `agent_responder_url` 요구 사항과
   `[registrar]`·`[trust]` 테이블 자체의 검사를 포함합니다.
 - **소켓 활성화** — 디스크립터, 그 주소, 소켓 경로의 소유권과 권한.
 - **엔드포인트의 TLS 로더.** 그 수용 규칙은 위의 사용 가능 규칙보다
@@ -626,7 +628,8 @@ OpenBao 감사 장치 확인은 그대로입니다.
 이 산출물의 소유자는 데몬입니다. 레지스트라는 이 파일을 읽거나, 추가하거나,
 삭제하거나, 다른 경로로 돌리거나, 선택할 수 없으며, 요청의 어떤 필드도
 경로·권한·회전 정책·보존 정책에 닿지 않습니다. `[registrar]` 테이블이 아예
-없으면 기본값이 없는 `state_file`을 뺀 모든 키가 위 기본값을 사용하고,
+없으면 기본값이 없는 `state_file`, `agent_server`, `agent_responder_url`을
+뺀 모든 키가 위 기본값을 사용하고,
 알 수 없는 키는 설정 오류입니다.
 
 - `audit_store_dir` (기본값 `/var/lib/bootroot/audit-store`) — 데몬 레코드용
@@ -745,15 +748,18 @@ OpenBao 감사 장치 확인은 그대로입니다.
 
 #### 동사 계층 설정
 
-아래 여덟 개 키는 엔드포인트가 제공하는 레지스트라 동사를 구성합니다. 이
+아래 열 개 키는 엔드포인트가 제공하는 레지스트라 동사를 구성합니다. 이
 키들은 **조건 없이** 모든 호스트에서 검증됩니다. 엔드포인트 활성화 여부와
 무관하게 잘못된 값은 설정 오류입니다. 두 테이블을 잇는 규칙은
-`state_file` 하나뿐이며, 방향도 한쪽입니다. `[registrar_endpoint]
-enabled = true`일 때 필수라는 것입니다.
+`state_file`, `agent_server`, `agent_responder_url`뿐이며, 방향도
+한쪽입니다. 각각 `[registrar_endpoint] enabled = true`일 때 필수라는
+것입니다.
 
 ```toml
 [registrar]
 state_file = "/opt/bootroot/state.json"
+agent_server = "https://stepca.internal:9000/acme/acme/directory"
+agent_responder_url = "http://responder.internal:8080"
 provisioning_config_path = "/etc/clumit-security/provisioning.toml"
 max_wrap_ttl = "30m"
 role_token_ttl = "1h"
@@ -765,7 +771,11 @@ secret_id_num_uses = 0
 
 - `state_file` (**기본값 없음**) — `bootroot init`이 기록한 `state.json`의
   절대 경로입니다. 동사가 필요로 하는 세 값, 즉 기록된 `openbao_url`과
-  `kv_mount`, 그리고 선택적인 `secrets_dir`의 유일한 출처입니다. 이 셋을
+  `kv_mount`, 그리고 선택적인 `secrets_dir`의 유일한 출처입니다. 네 번째
+  멤버인 선택적 `openbao_advertise_addr`는 원격 부트스트랩 mint가 돌려주는
+  아티팩트에 담을 `OpenBao` URL을 고를 때만 읽으며, `bootroot service add`와
+  같은 규칙을 따릅니다. 광고 주소가 기록되어 있으면 그것을, 없으면
+  `openbao_url`을 씁니다. 이 셋을
   위한 개별 키는 의도적으로 없습니다. `init`과 `rotate`가 최신 상태로
   유지하는 파일 하나만 두는 것이, URL이나 마운트가 두 곳에 적혀 서로
   어긋나는 일을 막습니다. 상대 경로는 거부됩니다. `secrets_dir` 멤버가
@@ -776,8 +786,19 @@ secret_id_num_uses = 0
   있으면 정상적으로 로드되며, 활성화된 상태에서는 두 키를 모두 지목하는
   설정 오류가 됩니다. 파일은 활성화된
   경로에서만 실행 단위마다 한 번 읽히므로 다시 쓰인 `state.json`은 다음
-  `SIGHUP`부터 적용되고, 읽는 멤버는 위 셋뿐입니다. 나머지 멤버는 모두
+  `SIGHUP`부터 적용되고, 읽는 멤버는 위 넷뿐입니다. 나머지 멤버는 모두
   무시되며 어떤 멤버도 되쓰지 않습니다.
+- `agent_server` (**기본값 없음**) — 원격 부트스트랩 대상의 에이전트에게
+  주는 ACME 디렉터리 URL입니다. `RemoteBootstrap` mint가 돌려주는
+  `bootstrap.json`에 `agent_server`로 담깁니다. 대상의 에이전트 설정에
+  그대로 복사되므로 호스트가 있는 절대 URL이어야 하며 앞뒤 공백도 허용하지
+  않습니다. *대상*이 CA에 닿는 주소는 이 호스트가 추측할 수 있는 값이
+  아니므로 기본값이 없습니다. 이 키가 없어도 엔드포인트가 비활성화되어
+  있으면 정상적으로 로드되며, 활성화된 상태에서는 키를 지목하는 설정
+  오류가 됩니다.
+- `agent_responder_url` (**기본값 없음**) — 원격 부트스트랩 대상의
+  에이전트에게 주는 HTTP-01 리스폰더 관리 URL이며, 아티팩트에
+  `agent_responder_url`로 담깁니다. 규칙은 `agent_server`와 같습니다.
 - `provisioning_config_path` (기본값
   `/etc/clumit-security/provisioning.toml`) — 프로비저닝 도구가 렌더링한
   레지스트라 설정 파일의 절대 경로입니다. bootroot는 이 파일을 읽기만

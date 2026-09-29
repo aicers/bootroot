@@ -505,6 +505,15 @@ fn register_request() -> protocol::RegisterRequest {
         },
         wrap_ttl: 60,
         idempotency_key: "opaque-key".to_string(),
+        target_paths: protocol::WireTargetPaths {
+            agent_config_path: Some("/etc/api/agent.toml".to_string()),
+            role_id_path: Some("/var/lib/api/secrets/role_id".to_string()),
+            secret_id_path: Some("/var/lib/api/secrets/secret_id".to_string()),
+            eab_file_path: Some("/var/lib/api/secrets/eab.json".to_string()),
+            profile_cert_path: Some("/var/lib/api/certs/api.crt".to_string()),
+            profile_key_path: Some("/var/lib/api/certs/api.key".to_string()),
+            ca_bundle_path: Some("/var/lib/api/certs/ca-bundle.pem".to_string()),
+        },
     }
 }
 
@@ -560,9 +569,39 @@ async fn a_mint_returns_the_success_shape_the_double_encoded() {
     assert_eq!(response.outcome, protocol::MintWireOutcome::FirstMint);
     assert_eq!(response.material.role_id, "role-id");
 
+    // The client decodes the artifact member out of its base64 wire form
+    // into the `bootstrap.json` bytes a caller relays.
+    let artifact: serde_json::Value = serde_json::from_slice(
+        response
+            .material
+            .bootstrap_artifact()
+            .expect("the remote-bootstrap fixture carries an artifact"),
+    )
+    .expect("the relayed bytes are the artifact JSON");
+    assert_eq!(artifact["schema_version"], 5);
+    assert_eq!(artifact["secret_id_path"], "/var/lib/api/secrets/secret_id");
+    assert_eq!(artifact["wrap_token"], "wrapped-secret");
+
     let seen = double.observed();
     assert_eq!(seen.connections, 1);
     assert_eq!(seen.requests.len(), 1);
+
+    // The request it sent carries the seven target paths.
+    let sent = String::from_utf8_lossy(seen.requests.first().expect("one request"));
+    for member in [
+        "agent_config_path",
+        "role_id_path",
+        "secret_id_path",
+        "eab_file_path",
+        "profile_cert_path",
+        "profile_key_path",
+        "ca_bundle_path",
+    ] {
+        assert!(
+            sent.contains(&format!("\"{member}\":\"/")),
+            "{member} is sent"
+        );
+    }
 }
 
 #[tokio::test]

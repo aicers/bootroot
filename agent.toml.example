@@ -42,9 +42,10 @@ http_responder_token_ttl_secs = 300
 #
 # Enabling it is supported.  The daemon builds the registrar verb layer
 # from the [registrar] keys below and registers a production request
-# handler over it.  [registrar] state_file is REQUIRED when this is
-# true, and a missing provisioning config, state file, internal
-# credential or audit store fails startup with a named diagnostic.
+# handler over it.  [registrar] state_file, agent_server and
+# agent_responder_url are REQUIRED when this is true, and a missing
+# provisioning config, state file, internal credential or audit store
+# fails startup with a named diagnostic.
 # Both registrar verbs are served end to end. Mint requests must carry
 # the canonical spec.reload and optional spec.cert_group spellings in
 # docs/reference/registrar-wire-contract.md section 8.3.
@@ -129,7 +130,11 @@ enabled = false
 # seconds.  state_file has no default and is required only when the
 # endpoint is enabled: it names the state.json bootroot init wrote, which
 # is where the recorded OpenBao URL, KV mount and secrets directory come
-# from — there is deliberately no key for any of the three.  There is no
+# from — there is deliberately no key for any of the three.  agent_server
+# and agent_responder_url have no default either and are likewise
+# required only when the endpoint is enabled: they are the ACME directory
+# and HTTP-01 responder admin URLs a remote-bootstrap target's agent is
+# given in the bootstrap.json a RemoteBootstrap mint returns.  There is no
 # key for secret_id metadata either, and none for the active root
 # fingerprint, which is derived from <secrets_dir>/certs/root_ca.crt.
 [registrar]
@@ -141,6 +146,8 @@ openbao_audit_max_file_bytes = 67108864
 openbao_audit_max_retained_files = 7
 openbao_audit_min_retain_days = 90
 # state_file = "/opt/bootroot/state.json"
+# agent_server = "https://stepca.internal:9000/acme/acme/directory"
+# agent_responder_url = "http://responder.internal:8080"
 provisioning_config_path = "/etc/clumit-security/provisioning.toml"
 max_wrap_ttl = "30m"
 role_token_ttl = "1h"

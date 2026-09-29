@@ -39,6 +39,8 @@ obtained any other way carry their own pointer in the `Provenance` column.
 | `RFC-F §5.1` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.1 Restricted registrar mint verb | this repository, working tree |
 | `RFC-F §5.6` | `aicers/bootroot` | `docs/rfcs/0001-registrar-role-and-non-self-propagation.md` | §5.6 Audit record for both verbs | this repository, working tree |
 | `BR#759` | `aicers/bootroot` | issue [#759](https://github.com/aicers/bootroot/issues/759) body | Scope | this repository's own expectation, **not** transcribed from the source |
+| `RP@9400708` | `aicers/review-protocol` | `src/types.rs:1528` | `BootstrapMaterial.bootstrap_artifact` | `9400708` |
+| `RX RFC-0002` | `aicers/roxyd` | RFC 0002 | §5–§6, as amended by [#171](https://github.com/aicers/roxyd/pull/171) | `1be6a4c` |
 | `BL#308` | `aicers/bootler` | `core/src/provisioning_file.rs` | module documentation, `Wire spelling` | `008bbb458b0b` (PR [#309](https://github.com/aicers/bootler/pull/309), issue [#308](https://github.com/aicers/bootler/issues/308)) |
 | `bootroot` | `aicers/bootroot` | source paths cited per row | — | this repository, working tree |
 
@@ -63,7 +65,7 @@ version.
 | `RegistrarUnavailableReason` | enum (closed reason set) | review-protocol | `RP#218` |
 | `ServiceSpec` | struct | review-protocol (contents externally owned, see §8.3) | `RFC-C §5` |
 | `DeliveryMode` | enum | review-protocol | `RFC-C §5` |
-| `BootstrapMaterial` | struct | review-protocol (`ca_anchor` contents bootroot-owned, see §8.1) | `RFC-C §5` |
+| `BootstrapMaterial` | struct | review-protocol (`ca_anchor` and `bootstrap_artifact` contents bootroot-owned, see §8.1 and §8.4) | `RFC-C §5`, `RP@9400708` |
 | `ReloadHook` | newtype over `String`; exact spelling in §8.3 | review-protocol type, bootler spelling | `RP#218`, `BL#308` |
 | `CertGroup` | newtype over `String`; exact spelling in §8.3 | review-protocol type, bootler spelling | `RP#218`, `BL#308` |
 | `AgentInfo` | struct (handshake), not part of the `node.enroll` family | review-protocol | `RFC-C §7`, `RFC-C §8` |
@@ -105,6 +107,41 @@ name.
 | `spec` | `ServiceSpec` | mirrored field name, externally owned contents (§4.4) | Applied on a first mint and compared on a re-register. | `RFC-C §5` |
 | `wrap_ttl` | `Duration` | review-protocol | *Requested* lifetime of the wrapped material; the registrar MAY clamp it. | `RFC-C §5` |
 | `idempotency_key` | `String` | review-protocol | Correlation handle, not a response cache (see §7). | `RFC-C §5` |
+
+#### 4.2.1 Bootroot-owned `Register` endpoint members
+
+Seven members. They are **not** part of review-protocol's `Register`: they
+are bootroot's own members on this endpoint's register request, sent by the
+co-located registrar that calls it (`RX RFC-0002`), and each is named exactly
+as the `bootstrap.json` key it is copied into. They name locations on the
+**target host**, whose layout its owner decides; bootroot copies them into the
+returned artifact (§8.4) byte for byte and interprets them no further.
+
+| Field | Type | Owner | Notes | Provenance |
+| --- | --- | --- | --- | --- |
+| `agent_config_path` | `String` | bootroot | Where the target's agent configuration lives. | `RX RFC-0002`, `bootroot` |
+| `role_id_path` | `String` | bootroot | Where the target writes the `AppRole` `role_id`. | `RX RFC-0002`, `bootroot` |
+| `secret_id_path` | `String` | bootroot | Where the target writes the unwrapped `secret_id`. | `RX RFC-0002`, `bootroot` |
+| `eab_file_path` | `String` | bootroot | Where the target writes its EAB credentials. | `RX RFC-0002`, `bootroot` |
+| `profile_cert_path` | `String` | bootroot | Where the target writes the issued certificate. | `RX RFC-0002`, `bootroot` |
+| `profile_key_path` | `String` | bootroot | Where the target writes the issued private key. | `RX RFC-0002`, `bootroot` |
+| `ca_bundle_path` | `String` | bootroot | Where the target writes the CA bundle. | `RX RFC-0002`, `bootroot` |
+
+The rules, applied before the verb runs:
+
+- With `delivery_mode` `RemoteBootstrap`, all seven are required. With
+  `LocalFile`, any of them present is refused. A partial set is refused.
+- Each is absolute, non-empty and free of NUL, and the seven are pairwise
+  distinct. Nothing else is checked: in particular a path is never compared
+  with this host's filesystem or secrets tree, which say nothing about the
+  target's.
+- A request breaking any rule is a caller-supplied payload fault, refused as
+  a malformed `spec` is: no verb runs, no audit record is written and no
+  response bytes are sent.
+- They are not persisted, not stored in the registration binding, not part of
+  the spec comparison and not written to an audit record. An idempotent
+  re-register with different paths succeeds and returns an artifact carrying
+  the new ones.
 
 ### 4.3 `Deregister` fields
 
@@ -176,7 +213,9 @@ struct for it.
 
 ### 5.2 `BootstrapMaterial` fields
 
-Four fields.
+Five fields. The first four are `RFC-C §5`'s; `bootstrap_artifact` is the one
+review-protocol added at `RP@9400708`, required there and redacted from its
+`Debug`.
 
 | Field | Type | Owner | Notes | Provenance |
 | --- | --- | --- | --- | --- |
@@ -184,6 +223,7 @@ Four fields.
 | `wrapped_secret_id` | `String` | review-protocol | Response-wrapped `secret_id`; single-use, short-TTL, persisted nowhere. | `RFC-C §5` |
 | `ca_anchor` | `Vec<u8>` | mirrored field name, **bootroot-owned contents** (§8.1) | The CA anchor the target verifies with. | `RFC-C §5` |
 | `expires_at` | `DateTime<Utc>` | review-protocol | The **granted absolute deadline** after any registrar clamp — not the requested `wrap_ttl` echoed back. | `RFC-C §5` |
+| `bootstrap_artifact` | `Vec<u8>` | mirrored field name, **bootroot-owned contents** (§8.4) | The `bootstrap.json` a target runs `bootroot-remote bootstrap --artifact` with, relayed byte for byte. | `RP@9400708` |
 
 ## 6. Typed enroll errors
 
@@ -320,8 +360,8 @@ upstream shows up as a change to this file.
 
 ## 8. Locally owned contents inside mirrored field names
 
-Two fields carry names this repository mirrors and contents this repository
-owns. Both are recorded here so the codec narrows neither.
+Three fields carry names this repository mirrors and contents this repository
+owns. All three are recorded here so the codec narrows none of them.
 
 ### 8.1 `ca_anchor` — bootroot-owned contents
 
@@ -371,6 +411,44 @@ input.
 | `spec.reload` | Exactly `{ kind = "none" }`, or exactly `{ kind = "<kind>", target = "<target>" }`, where `<kind>` is one of `sighup`, `systemd`, or `docker-restart`, and `<target>` is non-empty. | Every other whitespace or member order; an unknown kind; a missing, empty, or forbidden target; an unquoted target; an unescaped `"` or `\`; or any TOML escape other than `\"` and `\\`. | This is the byte-exact rendered value text: one space after `{`, around each `=`, after `,`, and before `}`. `<target>` uses bootler's `toml_string`: surround it with `"`, escape every `\` as `\\` and every `"` as `\"`, and make no other rewrite. `none` omits `target`. | `BL#308` |
 | `spec.cert_group` | Absent, or an ASCII decimal `u32`: `0` or a non-zero digit followed by zero or more ASCII digits, at most `4294967295`. | `null`, empty text, a sign, whitespace, leading zero, separator, non-ASCII digit, non-digit, or an out-of-range number. | When present, the bytes are the canonical decimal form bootler renders after `cert_group =` followed by one ASCII space: no sign and no leading zero. The member is absent exactly when the provisioning key is omitted. | `BL#308` |
 
+### 8.4 `bootstrap_artifact` — bootroot-owned contents
+
+The bytes are bootroot's own remote-bootstrap artifact, the `bootstrap.json`
+that `bootroot service add --delivery-mode remote-bootstrap` writes and that
+`bootroot-remote bootstrap --artifact` reads (`src/remote_bootstrap.rs`,
+`RemoteBootstrapArtifact`). Both producers build it with the one builder in
+that module and serialize it with `serde_json::to_string_pretty`, so the bytes
+this endpoint returns are the bytes `service add` would write for the same
+inputs. `schema_version` is `5`, the only version `bootroot-remote` accepts;
+the mint adds and renames no artifact member.
+
+A mint fills each member as follows:
+
+| Member | Source | Provenance |
+| --- | --- | --- |
+| `schema_version` | `5`. | `bootroot` |
+| `openbao_url` | The deployment state file's `openbao_advertise_addr`, as a client URL, when it records one; else its `openbao_url` — `service add`'s rule. | `bootroot` |
+| `kv_mount` | The state file's `kv_mount`. | `bootroot` |
+| `registration_id` | The derived id the response's `registration_id` carries. | `bootroot` |
+| `service_name` | The request's `service_name`. | `bootroot` |
+| `agent_config_path`, `role_id_path`, `secret_id_path`, `eab_file_path`, `profile_cert_path`, `profile_key_path`, `ca_bundle_path` | The request's §4.2.1 members, copied unchanged. | `bootroot` |
+| `ca_bundle_pem` | The `ca_anchor` bundle (§8.1), read once per mint. | `bootroot` |
+| `trusted_ca_sha256` | Computed from that bundle as `service add` computes it. | `bootroot` |
+| `agent_email` | Omitted. | `bootroot` |
+| `agent_server` | `[registrar] agent_server`. | `bootroot` |
+| `agent_responder_url` | `[registrar] agent_responder_url`. | `bootroot` |
+| `agent_domain` | The provisioning config's `domain`. | `bootroot` |
+| `profile_hostname` | The request's `host`. | `bootroot` |
+| `profile_instance_id` | The SAN's three-digit instance label: `instance`, or `1` when absent, formatted `{:03}`. | `bootroot` |
+| `post_renew_hooks` | `spec.reload` through `service add`'s `--reload-style` preset mapping: `none` gives no hook; `systemd`, `sighup` and `docker-restart` give that preset's entry for the target. A `sighup` target containing `/` is refused before the verb. | `bootroot` |
+| `wrap_token` | The same token as `wrapped_secret_id`: a mint issues exactly one wrapped `secret_id`. | `bootroot` |
+| `wrap_expires_at` | `expires_at`, as an RFC 3339 UTC string. | `bootroot` |
+| `cert_group_gid` | The request's `spec.cert_group`, omitted when absent. | `bootroot` |
+
+The artifact embeds the wrapping token, so it is redacted from diagnostics
+exactly as `wrapped_secret_id` is, and it is never written to disk on this
+path. A `LocalFile` mint returns no artifact.
+
 ## 9. `AgentInfo` tail — `audit_health`
 
 Mirrored on the same terms as everything above, so this repository has the
@@ -404,6 +482,7 @@ this repository. The registrar endpoint's v1 codec resolves that byte framing.
 | Item | State | Owner | Where it is decided |
 | --- | --- | --- | --- |
 | `ca_anchor` byte framing | resolved — compact UTF-8 JSON `{"trusted_ca_sha256":[...],"ca_bundle_pem":"..."}` in that member order, standard padded RFC 4648 base64 encoded for the wire | `aicers/bootroot` | `src/registrar/endpoint/protocol.rs` |
+| `bootstrap_artifact` byte framing | resolved — the UTF-8 pretty-printed JSON artifact of §8.4, standard padded RFC 4648 base64 encoded for the wire | `aicers/bootroot` | `src/registrar/endpoint/protocol.rs`, `src/remote_bootstrap.rs` |
 | `spec.reload` and `spec.cert_group` wire spelling | resolved — the two canonical productions in §8.3 | `aicers/bootler` | `core/src/provisioning_file.rs`, `Wire spelling`, `008bbb458b0b` (`BL#308`) |
 
 The JSON requires both non-empty members, one lowercase SHA-256 DER digest per
@@ -427,7 +506,10 @@ implement, whereas an unknown member is an additive extension. The canonical
 version is the `PROTOCOL_VERSION` constant, currently `1`.
 
 Requests carry `protocol_version` followed by the members of §§4.2 and 4.3 in
-their table order, and no bootroot-owned member beyond the version. The
+their table order. The one bootroot-owned addition beyond the version is the
+seven §4.2.1 members on a `RemoteBootstrap` register request, which follow
+`idempotency_key` in that table's order and are absent from a `LocalFile` one;
+§4.2.1 records the rules that govern them. The
 externally owned request strings remain strings in JSON; `instance` is an
 unquoted unsigned `u32`, and the lifetime is an unquoted non-negative whole
 second integer. Optional `instance` and `spec.cert_group` are omitted rather
@@ -447,14 +529,17 @@ The canonical response member orders are:
 
 `request_id` and `registration_id` are JSON strings. The mint and deregister
 `outcome` values and the refusal `class` values are the bootroot-owned
-snake-case vocabulary. `material` contains exactly the §5.2 members in that
-table's order. Its deadline is the granted `MintOutcome::expires_at` instant,
-formatted by `time`'s `Rfc3339` formatter as a UTC `Z` string, not the
-requested lifetime. The optional response members are omitted rather than
-serialized as `null`. An `error` is omitted for an unclassified refusal; when
-present it is the internally tagged object whose `id` and payload members come
-from §6.1. A retry-after value is an unquoted non-negative whole-second
-integer.
+snake-case vocabulary. `material` contains the §5.2 members in that table's
+order — `role_id`, `wrapped_secret_id`, `ca_anchor`, `expires_at`, then
+`bootstrap_artifact` — and `bootstrap_artifact` is present exactly on a
+`RemoteBootstrap` mint and omitted, not `null`, on a `LocalFile` one, whose
+`material` is byte-identical to the four-member form. Its deadline is the
+granted `MintOutcome::expires_at` instant, formatted by `time`'s `Rfc3339`
+formatter as a UTC `Z` string, not the requested lifetime. The optional
+response members are omitted rather than serialized as `null`. An `error` is
+omitted for an unclassified refusal; when present it is the internally tagged
+object whose `id` and payload members come from §6.1. A retry-after value is
+an unquoted non-negative whole-second integer.
 
 The encoder emits those orders byte-stably, while decoders are
 order-insensitive. Serialization emits no members outside the listed shapes;
@@ -481,6 +566,11 @@ directions: it serializes `TrustPayload` to compact JSON and base64, and it
 base64-decodes, parses a `serde_json::Value`, passes it to
 `parse_trust_payload`, and then applies the stricter canonical framing checks.
 Any failure in that path is a decode error, never a wire refusal.
+
+`bootstrap_artifact` is a standard padded RFC 4648 base64 JSON string too. Its
+decoded bytes are the §8.4 artifact exactly as `service add` writes it. A
+decoder base64-decodes it and otherwise relays it opaquely; a value that is not
+standard base64, or an explicit `null`, is a decode error.
 
 `registrar_health` is the endpoint-local, snapshot-supplied container. Its
 additive `limiter`, `audit_capacity`, and `certificates` members are present on
@@ -643,7 +733,8 @@ A transcription that comes up short is incomplete, not a shorter contract.
 | `ServiceSpec` fields | 4 | `RFC-C §5` |
 | `DeliveryMode` variants | 2 | `RFC-C §5` |
 | `NodeEnrollResponse` variants | 2 in the source; 3 with `Failed` | `RFC-C §5`, `RP#218` |
-| `BootstrapMaterial` fields | 4 | `RFC-C §5` |
+| `Register` bootroot-owned endpoint members | 7 | `RX RFC-0002`, `bootroot` |
+| `BootstrapMaterial` fields | 5 | `RFC-C §5`, `RP@9400708` |
 | typed enroll errors | 6 in the source's acceptance count, 7 with `ServiceLabelInvalid` | `RFC-C §8`, `RP#218` |
 | `RegistrarUnavailable` reasons | 6 | `RFC-C §8` |
 | retryable typed errors | 1 | `RFC-C §8` |

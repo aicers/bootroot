@@ -185,7 +185,7 @@ assert_socket_contract() {
 # path-occupation checks below prove that an unprivileged caller cannot reach
 # this socket at all.
 client() { sudo -n python3 "$DRIVER" --socket "$SOCKET_PATH" --pins "$BUNDLE/registrar-endpoint-anchors.sha256" --ca "$BUNDLE/registrar-endpoint-ca.pem" --cert "$BUNDLE/registrar-client.crt" --key "$BUNDLE/registrar-client.key" --endpoint-name "001.bootroot-registrar-endpoint.redteam.trusted.domain" "$@"; }
-write_mint() { local service_name="${3:-review}"; jq -n --arg group "$2" --arg service_name "$service_name" '{protocol_version:1,service_name:$service_name,delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:$service_name,service_name:$service_name,reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint"}' >"$1"; }
+write_mint() { local service_name="${3:-review}"; jq -n --arg group "$2" --arg service_name "$service_name" '{protocol_version:1,service_name:$service_name,delivery_mode:"RemoteBootstrap",host:"redteam",spec:{component:$service_name,service_name:$service_name,reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:$group},wrap_ttl:60,idempotency_key:"redteam-mint",agent_config_path:("/etc/\($service_name)/agent.toml"),role_id_path:("/var/lib/\($service_name)/secrets/role_id"),secret_id_path:("/var/lib/\($service_name)/secrets/secret_id"),eab_file_path:("/var/lib/\($service_name)/secrets/eab.json"),profile_cert_path:("/var/lib/\($service_name)/certs/cert.pem"),profile_key_path:("/var/lib/\($service_name)/certs/key.pem"),ca_bundle_path:("/var/lib/\($service_name)/certs/ca-bundle.pem")}' >"$1"; }
 
 assert_escalation_denied() {
   local status policies

@@ -24,6 +24,7 @@ pub(crate) mod registrar_certs;
 // endpoint exists on Linux alone.
 #[cfg(target_os = "linux")]
 pub(crate) mod registrar_renewal;
+pub mod remote_bootstrap;
 pub mod secret;
 pub mod service_material;
 pub mod tls;

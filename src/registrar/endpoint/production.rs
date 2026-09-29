@@ -30,7 +30,9 @@
 //! knows can reach that line, so the detail is emitted here instead,
 //! before the refusal is returned — at `warn` for a deployment fault and
 //! `debug` for a caller-supplied one. A malformed wire `spec` is caller
-//! supplied, so its conversion refusal is logged at `debug`.
+//! supplied, so its conversion refusal is logged at `debug`, and so are
+//! a register request's target paths when they break the rules its
+//! `delivery_mode` selects.
 //! That event carries no connection id, because
 //! [`RegistrarRequestHandler::handle`] receives none; the
 //! two lines are correlated by the caller identity both carry and by
@@ -48,16 +50,17 @@ use tracing::{debug, warn};
 use super::frame::Operation;
 use super::handler::{HandlerRefusal, RegistrarRequestHandler};
 use super::protocol::{
-    self, DeregisterRequest as WireDeregisterRequest, RegisterRequest as WireRegisterRequest,
-    RegistrarHealth, Request, WireServiceSpec,
+    self, ArtifactSource, DeregisterRequest as WireDeregisterRequest,
+    RegisterRequest as WireRegisterRequest, RegistrarHealth, Request, WireServiceSpec,
 };
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
 use crate::registrar::audit_store::capacity::AuditCapacityState;
 use crate::registrar::config::{ReloadKind, ReloadSpec};
-use crate::registrar::identity::RequestedSpec;
+use crate::registrar::identity::{RequestedSpec, san_instance_label};
 use crate::registrar::internal::InternalCredential;
 use crate::registrar::verbs::outcome::CallerIdentity;
 use crate::registrar::verbs::{DeregisterRequest, MintRequest, RegistrarVerbs};
+use crate::remote_bootstrap::{ArtifactPaths, PostRenewHookEntry, reload_preset_hooks};
 use crate::trust_bootstrap::CA_TRUST_KV_PATH;
 
 /// The production handler, over already-built dependencies.
@@ -78,7 +81,37 @@ pub(crate) struct ProductionHandler {
     /// The KV v2 mount the anchor is read under. The same value the
     /// verbs were built with, resolved once by the daemon.
     kv_mount: String,
+    /// The deployment-level members of a remote-bootstrap artifact.
+    artifact: ArtifactDeployment,
     health: Arc<StdMutex<RegistrarHealth>>,
+}
+
+/// The deployment-level members of the artifact a `RemoteBootstrap` mint
+/// returns, resolved once by the daemon from the state file and the
+/// `[registrar]` table.
+///
+/// Everything else in the artifact is per request — the target's paths,
+/// its host and instance, the spec's reload and group — or comes from a
+/// dependency the handler already holds: the KV mount, the verbs'
+/// provisioning domain, the anchor read per mint and the verb outcome.
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactDeployment {
+    /// The `OpenBao` URL a target reaches, by `service add`'s rule: the
+    /// state file's advertise address when it records one, else its
+    /// `openbao_url`.
+    pub(crate) openbao_url: String,
+    /// `[registrar] agent_server`.
+    pub(crate) agent_server: String,
+    /// `[registrar] agent_responder_url`.
+    pub(crate) agent_responder_url: String,
+}
+
+/// What a `RemoteBootstrap` mint's artifact takes from the request,
+/// derived and checked before the verb runs.
+struct RemoteBootstrapParts<'a> {
+    paths: ArtifactPaths<'a>,
+    post_renew_hooks: Vec<PostRenewHookEntry>,
+    profile_instance_id: String,
 }
 
 impl ProductionHandler {
@@ -90,11 +123,13 @@ impl ProductionHandler {
         verbs: RegistrarVerbs,
         credential: InternalCredential,
         kv_mount: String,
+        artifact: ArtifactDeployment,
     ) -> Self {
         Self::with_health(
             verbs,
             credential,
             kv_mount,
+            artifact,
             Arc::new(StdMutex::new(RegistrarHealth::default())),
         )
     }
@@ -104,12 +139,14 @@ impl ProductionHandler {
         verbs: RegistrarVerbs,
         credential: InternalCredential,
         kv_mount: String,
+        artifact: ArtifactDeployment,
         health: Arc<StdMutex<RegistrarHealth>>,
     ) -> Self {
         Self {
             verbs,
             credential,
             kv_mount,
+            artifact,
             health,
         }
     }
@@ -138,12 +175,12 @@ impl ProductionHandler {
     /// Serves one mint request.
     async fn mint(
         &self,
-        request: &WireRegisterRequest,
+        wire: &WireRegisterRequest,
         caller: CallerIdentity,
     ) -> Result<Vec<u8>, HandlerRefusal> {
         let health = self.health_snapshot();
         if health.audit_capacity.state == AuditCapacityState::Exhausted {
-            return protocol::encode_audit_capacity_exhausted(&request.idempotency_key, &health)
+            return protocol::encode_audit_capacity_exhausted(&wire.idempotency_key, &health)
                 .map_err(|error| {
                     warn!(
                         caller = caller.as_str(),
@@ -152,7 +189,8 @@ impl ProductionHandler {
                     HandlerRefusal
                 });
         }
-        let request = mint_request(request, caller.clone())?;
+        let request = mint_request(wire, caller.clone())?;
+        let remote = remote_bootstrap_parts(wire, &request, &caller)?;
 
         // Before the verb, never after. A read that failed after a
         // successful mint would leave material minted and no response to
@@ -174,7 +212,22 @@ impl ProductionHandler {
 
         let health = self.health_snapshot();
         let encoded = match self.verbs.mint(&request).await {
-            Ok(outcome) => protocol::encode_mint_response(outcome, &anchor, &health),
+            Ok(outcome) => {
+                let artifact = remote.as_ref().map(|parts| ArtifactSource {
+                    openbao_url: &self.artifact.openbao_url,
+                    kv_mount: &self.kv_mount,
+                    service_name: &wire.service_name,
+                    paths: parts.paths,
+                    agent_server: &self.artifact.agent_server,
+                    agent_responder_url: &self.artifact.agent_responder_url,
+                    agent_domain: self.verbs.domain(),
+                    profile_hostname: &wire.host,
+                    profile_instance_id: &parts.profile_instance_id,
+                    post_renew_hooks: &parts.post_renew_hooks,
+                    cert_group_gid: request.spec.cert_group,
+                });
+                protocol::encode_mint_response(outcome, &anchor, artifact.as_ref(), &health)
+            }
             Err(refusal) => protocol::encode_refusal_response(&refusal, &health),
         };
         encoded.map_err(|error| {
@@ -379,6 +432,55 @@ fn mint_request(
     })
 }
 
+/// Checks and derives what a `RemoteBootstrap` mint's artifact takes
+/// from the request, before the verb runs.
+///
+/// `None` for a `LocalFile` request, which returns no artifact. For a
+/// `RemoteBootstrap` one: the seven target paths under the rules
+/// [`protocol::target_paths`] applies, the post-renew hooks the spec's
+/// reload maps to through the preset mapping `service add` uses, and the
+/// SAN's instance label.
+///
+/// Every refusal here is a caller-supplied payload fault, so like the
+/// spec conversion it is logged at `debug` and refused before anything
+/// is minted or recorded. The reload mapping is applied only where it
+/// produces something: a `LocalFile` mint installs no hook, so a reload
+/// the preset would refuse leaves it untouched.
+///
+/// Nothing about a path reaches the verb. The paths are the target
+/// owner's choice, not part of the identity or its spec, so they are
+/// not persisted, not bound, not compared on a re-mint and not audited.
+fn remote_bootstrap_parts<'a>(
+    wire: &'a WireRegisterRequest,
+    request: &MintRequest,
+    caller: &CallerIdentity,
+) -> Result<Option<RemoteBootstrapParts<'a>>, HandlerRefusal> {
+    let paths = protocol::target_paths(wire).map_err(|error| {
+        debug!(
+            caller = caller.as_str(),
+            "Registrar endpoint refused the register request's target paths: {error}"
+        );
+        HandlerRefusal
+    })?;
+    let Some(paths) = paths else {
+        return Ok(None);
+    };
+    let reload = &request.spec.reload;
+    let post_renew_hooks =
+        reload_preset_hooks(reload.kind, reload.target.as_deref()).map_err(|error| {
+            debug!(
+                caller = caller.as_str(),
+                "Registrar endpoint could not map spec.reload onto a post-renew hook: {error}"
+            );
+            HandlerRefusal
+        })?;
+    Ok(Some(RemoteBootstrapParts {
+        paths,
+        post_renew_hooks,
+        profile_instance_id: san_instance_label(request.instance),
+    }))
+}
+
 /// Rewrites a stored bundle with LF line endings and exactly one
 /// trailing LF.
 fn normalize_bundle(bundle: &str) -> String {
@@ -513,5 +615,7 @@ fn parse_cert_group(value: &str) -> Result<u32, SpecConversionError> {
         .map_err(|_| SpecConversionError::CertGroupOutOfRange)
 }
 
+#[cfg(test)]
+mod remote_bootstrap_tests;
 #[cfg(test)]
 mod tests;

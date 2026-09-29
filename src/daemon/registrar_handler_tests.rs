@@ -17,14 +17,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::{
     DaemonInvocation, DaemonShutdown, RegistrarStateProjection, audit_store_is_mount_point,
     audit_store_mount_unit_name, build_registrar_handler, has_distinct_device_ids,
-    openbao_duration, read_registrar_state, registrar_secret_id_options,
-    resolve_registrar_handler_for_gate, resolve_registrar_service, resolve_secrets_dir, run_daemon,
+    openbao_duration, read_registrar_state, registrar_artifact_deployment,
+    registrar_secret_id_options, resolve_registrar_handler_for_gate, resolve_registrar_service,
+    resolve_secrets_dir, run_daemon,
 };
 use crate::config::{AuditStoreEnforcement, OpenBaoSettings, Settings};
 use crate::registrar::endpoint::client::MintReply;
 use crate::registrar::endpoint::protocol::{
     EnrollError, ProtocolVersion, RefusalClass, RegisterRequest, RegistrarUnavailableReason,
-    WireDeliveryMode, WireServiceSpec,
+    WireDeliveryMode, WireServiceSpec, WireTargetPaths,
 };
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{
@@ -183,6 +184,8 @@ audit_store_dir = "{store}"
 audit_record_dir = "{records}"
 provisioning_config_path = "{provisioning}"
 state_file = "{state}"
+agent_server = "https://stepca.example.test:9000/acme/acme/directory"
+agent_responder_url = "http://responder.example.test:8080"
 
 [registrar_endpoint]
 enabled = {enabled}
@@ -237,6 +240,73 @@ fn configure_registrar_surface_material(settings: &mut Settings, deployment: &De
     settings.registrar_endpoint.server_key_path = Some(write("endpoint.key", &key_pem));
     settings.registrar_endpoint.client_cert_path = Some(write("client.crt", &certificate_pem));
     settings.registrar_endpoint.client_key_path = Some(write("client.key", &key_pem));
+}
+
+/// A remote-bootstrap artifact's `openbao_url` follows `service add`'s
+/// rule over the same two state members: the recorded advertise address
+/// as a client URL when present, the recorded `openbao_url` otherwise.
+/// The daemon's own connection is not affected by either.
+#[test]
+fn the_artifact_openbao_url_prefers_the_recorded_advertise_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registrar = crate::config::RegistrarSettings {
+        agent_server: Some("https://stepca.example:9000/acme/acme/directory".to_string()),
+        agent_responder_url: Some("http://responder.example:8080".to_string()),
+        ..crate::config::RegistrarSettings::default()
+    };
+
+    let advertised = write_state_file(
+        dir.path(),
+        r#"{"openbao_url": "https://127.0.0.1:8200", "kv_mount": "secret",
+            "openbao_bind_addr": "0.0.0.0:8200",
+            "openbao_advertise_addr": "192.168.1.10:8200"}"#,
+    );
+    let state = read_registrar_state(&advertised).expect("the state reads");
+    assert_eq!(state.openbao_url, "https://127.0.0.1:8200");
+    let deployment = registrar_artifact_deployment(&registrar, &state).expect("resolves");
+    assert_eq!(deployment.openbao_url, "https://192.168.1.10:8200");
+    assert_eq!(
+        deployment.agent_server,
+        "https://stepca.example:9000/acme/acme/directory"
+    );
+    assert_eq!(
+        deployment.agent_responder_url,
+        "http://responder.example:8080"
+    );
+
+    let plain = write_state_file(
+        dir.path(),
+        &state_json("https://10.0.0.5:8200", "secret", None),
+    );
+    let state = read_registrar_state(&plain).expect("the state reads");
+    assert!(state.openbao_advertise_addr.is_none());
+    assert_eq!(
+        registrar_artifact_deployment(&registrar, &state)
+            .expect("resolves")
+            .openbao_url,
+        "https://10.0.0.5:8200"
+    );
+
+    for (key, without) in [
+        (
+            "registrar.agent_server",
+            crate::config::RegistrarSettings {
+                agent_server: None,
+                ..registrar.clone()
+            },
+        ),
+        (
+            "registrar.agent_responder_url",
+            crate::config::RegistrarSettings {
+                agent_responder_url: None,
+                ..registrar.clone()
+            },
+        ),
+    ] {
+        let error = registrar_artifact_deployment(&without, &state)
+            .expect_err("an unset agent URL has no value to hand a target");
+        assert!(format!("{error:#}").contains(key), "{error:#}");
+    }
 }
 
 /// The projection reads exactly three members and tolerates every other
@@ -839,6 +909,7 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
             },
             wrap_ttl: 300,
             idempotency_key: "caller-key".to_string(),
+            target_paths: WireTargetPaths::default(),
         })
         .await
         .expect("the daemon must answer instead of leaving the activated socket pending");
@@ -1205,6 +1276,7 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
             },
             wrap_ttl: 300,
             idempotency_key: "caller-key".to_string(),
+            target_paths: WireTargetPaths::default(),
         })
         .await;
     assert!(
