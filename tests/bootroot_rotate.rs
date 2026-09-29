@@ -5512,6 +5512,43 @@ async fn test_rotate_responder_hmac_listing_server_error_writes_nothing() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn test_rotate_responder_hmac_binding_read_error_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-binding-500").await;
+    stub_services_listing(&openbao, support::ROOT_TOKEN, services_listing_response()).await;
+    // Mounted ahead of the ordinary bindings so it wins for the registrar
+    // id: a read that fails is not an unbound id.
+    Mock::given(method("GET"))
+        .and(path(binding_kv_path(REGISTRAR_ID)))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({ "errors": ["boom"] })))
+        .mount(&openbao)
+        .await;
+    stub_registrar_bindings(&openbao, support::ROOT_TOKEN).await;
+    stub_service_record_writes(&openbao).await;
+
+    let output = run_responder_hmac(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-binding-500",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
+    let requests = received(&openbao).await;
+    assert!(
+        position_of(&requests, "GET", &binding_kv_path(REGISTRAR_ID)).is_some(),
+        "the failing binding read was sent"
+    );
+    assert_no_secret_writes(&requests);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn test_rotate_trust_sync_fans_out_to_registrar_identities() {
     let temp_dir = tempdir().expect("create temp dir");
     let openbao = MockServer::start().await;
