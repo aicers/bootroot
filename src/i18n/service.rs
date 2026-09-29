@@ -26,11 +26,6 @@ impl Messages {
         )
     }
 
-    pub(crate) fn error_service_secret_id_path_requires_local_file(&self) -> &'static str {
-        self.strings()
-            .error_service_secret_id_path_requires_local_file
-    }
-
     pub(crate) fn error_service_secret_id_path_not_absolute(&self, value: &str) -> String {
         format_template(
             self.strings().error_service_secret_id_path_not_absolute,
@@ -42,6 +37,13 @@ impl Messages {
         format_template(
             self.strings()
                 .error_service_secret_id_path_role_id_collision,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_path_eab_collision(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_path_eab_collision,
             &[("value", value)],
         )
     }

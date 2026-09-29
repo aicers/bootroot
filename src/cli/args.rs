@@ -1524,14 +1524,18 @@ pub(crate) struct ServiceAddArgs {
     #[arg(long)]
     pub(crate) key_path: Option<PathBuf>,
 
-    /// Absolute path to write the service `secret_id` to (local-file
-    /// delivery only). Relocates `secret_id`, its sibling `role_id`, and
-    /// `eab.json` outside the root-owned secrets tree, owned by the
+    /// Absolute path of the service `secret_id`, with `role_id` and
+    /// `eab.json` beside it. With local-file delivery it relocates the
+    /// three files outside the root-owned secrets tree, owned by the
     /// agent account, so a co-located non-root `bootroot-agent` can read
-    /// `role_id`/`eab.json` and rewrite `secret_id`. The parent
-    /// directory must already exist, be agent-owned, and resolve outside
-    /// the secrets tree. Omit to keep the default under
-    /// `<secrets_dir>/services/<registration_id>/`.
+    /// `role_id`/`eab.json` and rewrite `secret_id`; the parent directory
+    /// must already exist, be agent-owned, and resolve outside the
+    /// secrets tree. With remote-bootstrap delivery it names the path on
+    /// the target host, written into the bootstrap artifact; the control
+    /// node keeps its own copies under
+    /// `<secrets_dir>/services/<registration_id>/`. The final component
+    /// must be neither `role_id` nor `eab.json`. Omit to keep the default
+    /// under `<secrets_dir>/services/<registration_id>/`.
     #[arg(long)]
     pub(crate) secret_id_path: Option<PathBuf>,
 

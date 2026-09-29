@@ -318,6 +318,20 @@ byte for byte.
   instead of recommending a `@sha256:` value for `BOOTROOT_STEP_CA_IMAGE`,
   because registry digest references are not guaranteed to survive
   `docker save`/`load`.
+- `bootroot service add --secret-id-path` is now accepted with
+  `--delivery-mode remote-bootstrap`, where it names the absolute path of
+  the `secret_id` on the target host. The bootstrap artifact carries that
+  path as `secret_id_path`, with `role_id_path` and `eab_file_path` as its
+  `role_id` and `eab.json` siblings, so the target's owner chooses where
+  `bootroot-remote bootstrap` puts the credentials and where the agent
+  reads them — an absolute location beside the agent instead of the
+  control node's layout, which is relative when the secrets directory is.
+  The control node keeps its own copies under
+  `<secrets_dir>/services/<registration_id>/`, and rotation and
+  `service remove --delete-artifacts` act on those only. The path is
+  recorded with the service, so a re-run of `service add` must repeat it
+  to be treated as idempotent; a different or missing one is refused as a
+  duplicate. Without the flag the artifact is unchanged.
 
 ### Removed
 
@@ -347,6 +361,12 @@ byte for byte.
   remote agents to reissue during the rotation. A failed publish now
   stops the rotation before Phase 5 is recorded, and a re-run publishes
   again for every remote service.
+- `bootroot service add --secret-id-path` now refuses a path whose final
+  component is `eab.json`, in either delivery mode, as it already refused
+  `role_id`. `eab.json` is derived as the `secret_id` sibling, so such a
+  path named one file for both and the EAB write overwrote the
+  credential — or, when no EAB was provisioned, the stale-file cleanup
+  removed it.
 
 ### Security
 

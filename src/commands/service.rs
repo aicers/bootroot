@@ -592,6 +592,7 @@ fn build_service_entry_from_role(
         agent_server: resolved.agent_server.clone(),
         agent_responder_url: resolved.agent_responder_url.clone(),
         cert_group_gid: resolved.cert_group_gid,
+        remote_secret_id_path: resolved.remote_secret_id_path.clone(),
     }
 }
 
@@ -1258,6 +1259,7 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
         && entry.agent_server == resolved.agent_server
         && entry.agent_responder_url == resolved.agent_responder_url
         && entry.cert_group_gid == resolved.cert_group_gid
+        && entry.remote_secret_id_path == resolved.remote_secret_id_path
 }
 
 fn policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) -> bool {
@@ -1424,6 +1426,7 @@ mod tests {
             agent_responder_url: None,
             cert_group_gid: None,
             secret_id_path_override: None,
+            remote_secret_id_path: None,
         }
     }
 
@@ -1627,6 +1630,31 @@ mod tests {
         // Entry is local-file → no match
         entry.delivery_mode = DeliveryMode::LocalFile;
         assert!(!non_policy_fields_match(&entry, &resolved));
+    }
+
+    /// A remote re-run naming a different target `--secret-id-path`, or
+    /// dropping or adding one, would reissue an artifact that puts the
+    /// credentials somewhere else, so it is a duplicate, not idempotent.
+    #[test]
+    fn non_policy_fields_match_differs_on_remote_secret_id_path() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        resolved.remote_secret_id_path = Some(PathBuf::from("/srv/agent/svc/secret_id"));
+        let entry = sample_entry_from_resolved(&resolved);
+        assert_eq!(entry.remote_secret_id_path, resolved.remote_secret_id_path);
+        assert!(non_policy_fields_match(&entry, &resolved));
+
+        let mut different = sample_entry_from_resolved(&resolved);
+        different.remote_secret_id_path = Some(PathBuf::from("/srv/other/secret_id"));
+        assert!(!non_policy_fields_match(&different, &resolved));
+
+        let mut missing = sample_resolved();
+        missing.delivery_mode = DeliveryMode::RemoteBootstrap;
+        assert!(!non_policy_fields_match(&entry, &missing));
+        assert!(!non_policy_fields_match(
+            &sample_entry_from_resolved(&missing),
+            &resolved
+        ));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use bootroot::remote_bootstrap::{
 
 use super::resolve::ResolvedServiceAdd;
 use super::{
-    REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME, RemoteBootstrapResult,
+    REMOTE_BOOTSTRAP_DIR, REMOTE_BOOTSTRAP_FILENAME, RemoteBootstrapResult, SERVICE_EAB_FILENAME,
     SERVICE_ROLE_ID_FILENAME,
 };
 use crate::i18n::Messages;
@@ -85,7 +85,7 @@ fn build_artifact(
 ) -> RemoteBootstrapArtifact {
     let secret_id_parent = secret_id_path.parent().unwrap_or(Path::new("."));
     let role_id_path = secret_id_parent.join(SERVICE_ROLE_ID_FILENAME);
-    let eab_path = secret_id_parent.join("eab.json");
+    let eab_path = secret_id_parent.join(SERVICE_EAB_FILENAME);
     let ca_bundle_path = cert_path
         .parent()
         .unwrap_or(Path::new("certs"))
@@ -128,11 +128,16 @@ fn build_artifact(
     })
 }
 
+/// Writes the bootstrap artifact for a fresh remote-bootstrap add.
+///
+/// The artifact's credential paths follow the target-host
+/// `--secret-id-path` when one was given, and `control_secret_id_path`
+/// (where the control node keeps its own copy) otherwise.
 pub(super) async fn write_remote_bootstrap_artifact(
     state: &StateFile,
     secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
-    secret_id_path: &Path,
+    control_secret_id_path: &Path,
     wrap_info: Option<&ArtifactWrapInfo>,
     ca_bundle_pem: &str,
     messages: &Messages,
@@ -143,7 +148,10 @@ pub(super) async fn write_remote_bootstrap_artifact(
         &state.kv_mount,
         &resolved.registration_id,
         &resolved.service_name,
-        secret_id_path,
+        resolved
+            .remote_secret_id_path
+            .as_deref()
+            .unwrap_or(control_secret_id_path),
         &resolved.agent_config,
         &resolved.cert_path,
         &resolved.key_path,
@@ -167,6 +175,10 @@ pub(super) async fn write_remote_bootstrap_artifact(
     .await
 }
 
+/// Reissues the bootstrap artifact for a recorded remote-bootstrap
+/// registration, from the recorded target-host `secret_id` path when one
+/// was given at add time and from the control-side path otherwise, so a
+/// re-run carries the same credential paths the first artifact did.
 pub(super) async fn write_remote_bootstrap_artifact_from_entry(
     state: &StateFile,
     secrets_dir: &Path,
@@ -181,7 +193,10 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         &state.kv_mount,
         &entry.registration_id,
         &entry.service_name,
-        &entry.approle.secret_id_path,
+        entry
+            .remote_secret_id_path
+            .as_deref()
+            .unwrap_or(&entry.approle.secret_id_path),
         &entry.agent_config_path,
         &entry.cert_path,
         &entry.key_path,
@@ -1073,6 +1088,110 @@ mod tests {
             super::artifact_openbao_url(&state),
             "https://10.0.0.5:8200",
             "without advertise addr, artifact URL must fall back to openbao_url"
+        );
+    }
+
+    fn remote_entry(remote_secret_id_path: Option<&str>) -> crate::state::ServiceEntry {
+        use std::path::PathBuf;
+
+        use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
+
+        ServiceEntry {
+            registration_id: "edge-svc-001".to_string(),
+            service_name: "edge-svc".to_string(),
+            delivery_mode: DeliveryMode::RemoteBootstrap,
+            hostname: "edge".to_string(),
+            domain: "example.com".to_string(),
+            agent_config_path: PathBuf::from("/srv/agent/agent.toml"),
+            cert_path: PathBuf::from("/srv/agent/certs/cert.pem"),
+            key_path: PathBuf::from("/srv/agent/certs/key.pem"),
+            instance_id: Some("001".to_string()),
+            notes: None,
+            post_renew_hooks: Vec::new(),
+            approle: ServiceRoleEntry {
+                role_name: "bootroot-service-edge-svc-001".to_string(),
+                role_id: "role".to_string(),
+                secret_id_path: PathBuf::from("secrets/services/edge-svc-001/secret_id"),
+                policy_name: "bootroot-service-edge-svc-001".to_string(),
+                secret_id_ttl: None,
+                secret_id_wrap_ttl: None,
+                token_bound_cidrs: None,
+            },
+            agent_email: None,
+            agent_server: None,
+            agent_responder_url: None,
+            cert_group_gid: None,
+            remote_secret_id_path: remote_secret_id_path.map(PathBuf::from),
+        }
+    }
+
+    /// Reissues the artifact for `entry` into a temporary secrets dir and
+    /// returns its `(secret_id_path, role_id_path, eab_file_path)`.
+    async fn reissue_from_entry(entry: &crate::state::ServiceEntry) -> (String, String, String) {
+        use crate::i18n::Messages;
+        use crate::state::StateFile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateFile {
+            openbao_url: "https://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        let messages = Messages::new("en").unwrap();
+        let result = super::write_remote_bootstrap_artifact_from_entry(
+            &state,
+            dir.path(),
+            entry,
+            None,
+            TEST_CA_PEM,
+            &messages,
+        )
+        .await
+        .unwrap();
+        let written = std::fs::read_to_string(&result.bootstrap_file).unwrap();
+        let artifact: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let field = |name: &str| {
+            artifact
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_string()
+        };
+        (
+            field("secret_id_path"),
+            field("role_id_path"),
+            field("eab_file_path"),
+        )
+    }
+
+    /// A re-run of a registration added with a target `--secret-id-path`
+    /// reissues the artifact from the recorded target path, with `role_id`
+    /// and `eab.json` beside it — never the control node's own copies.
+    #[tokio::test]
+    async fn write_from_entry_uses_recorded_remote_secret_id_path() {
+        let paths = reissue_from_entry(&remote_entry(Some("/srv/agent/svc/secret_id"))).await;
+        assert_eq!(
+            paths,
+            (
+                "/srv/agent/svc/secret_id".to_string(),
+                "/srv/agent/svc/role_id".to_string(),
+                "/srv/agent/svc/eab.json".to_string(),
+            )
+        );
+    }
+
+    /// Without a recorded target path the artifact keeps carrying the
+    /// control-side path, exactly as before the flag was accepted.
+    #[tokio::test]
+    async fn write_from_entry_falls_back_to_control_secret_id_path() {
+        let paths = reissue_from_entry(&remote_entry(None)).await;
+        assert_eq!(
+            paths,
+            (
+                "secrets/services/edge-svc-001/secret_id".to_string(),
+                "secrets/services/edge-svc-001/role_id".to_string(),
+                "secrets/services/edge-svc-001/eab.json".to_string(),
+            )
         );
     }
 }

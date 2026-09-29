@@ -100,17 +100,18 @@ async fn test_two_node_remote_bootstrap_happy_path() {
 }
 
 fn run_service_add_remote(control_dir: &Path, service_dir: &Path) -> anyhow::Result<()> {
-    run_service_add_remote_impl(control_dir, service_dir, false)
+    run_service_add_remote_impl(control_dir, service_dir, false, None)
 }
 
 fn run_service_add_remote_no_wrap(control_dir: &Path, service_dir: &Path) -> anyhow::Result<()> {
-    run_service_add_remote_impl(control_dir, service_dir, true)
+    run_service_add_remote_impl(control_dir, service_dir, true, None)
 }
 
 fn run_service_add_remote_impl(
     control_dir: &Path,
     service_dir: &Path,
     no_wrap: bool,
+    target_secret_id_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut args = vec![
         "service".to_string(),
@@ -150,6 +151,10 @@ fn run_service_add_remote_impl(
     ];
     if no_wrap {
         args.push("--no-wrap".to_string());
+    }
+    if let Some(target) = target_secret_id_path {
+        args.push("--secret-id-path".to_string());
+        args.push(target.to_string_lossy().to_string());
     }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
         .current_dir(control_dir)
@@ -710,6 +715,98 @@ async fn test_remote_bootstrap_artifact_invocation() {
         .join(SERVICE_NAME)
         .join("eab.json");
     assert!(eab_path.exists(), "eab should be written after bootstrap");
+}
+
+/// `service add --secret-id-path` with remote-bootstrap delivery names
+/// where the target keeps its credentials. `bootroot-remote bootstrap
+/// --artifact`, given no per-field flags and run from an unrelated
+/// working directory, writes `secret_id` and `eab.json` there and points
+/// `agent.toml` at the target `role_id`/`secret_id`.
+#[tokio::test]
+async fn test_remote_bootstrap_artifact_with_target_secret_id_path() {
+    let temp = tempdir().expect("create tempdir");
+    let control_dir = temp.path().join("target-path-control");
+    let service_dir = temp.path().join("target-path-service");
+    let elsewhere = temp.path().join("unrelated-cwd");
+    fs::create_dir_all(&control_dir).expect("create control dir");
+    fs::create_dir_all(service_dir.join("certs")).expect("create service cert dir");
+    fs::create_dir_all(&elsewhere).expect("create unrelated cwd");
+
+    let target_dir = service_dir.join("agent-home").join(SERVICE_NAME);
+    fs::create_dir_all(&target_dir).expect("create target credential dir");
+    let target_secret_id = target_dir.join("secret_id");
+    let target_role_id = target_dir.join("role_id");
+    let target_eab = target_dir.join("eab.json");
+
+    let server = MockServer::start().await;
+    stub_control_plane_openbao(&server).await;
+    stub_remote_service_secrets(&server).await;
+
+    write_control_state(&control_dir, &server.uri()).expect("write control state");
+    run_service_add_remote_impl(&control_dir, &service_dir, false, Some(&target_secret_id))
+        .expect("service add remote");
+
+    let artifact_path = control_dir
+        .join("secrets")
+        .join("remote-bootstrap")
+        .join("services")
+        .join(SERVICE_NAME)
+        .join("bootstrap.json");
+    let dest_artifact = service_dir.join("bootstrap.json");
+    fs::copy(&artifact_path, &dest_artifact).expect("copy bootstrap artifact");
+    fs::copy(
+        control_dir
+            .join("secrets")
+            .join("services")
+            .join(SERVICE_NAME)
+            .join("role_id"),
+        &target_role_id,
+    )
+    .expect("copy role_id to the target path");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot-remote"))
+        .current_dir(&elsewhere)
+        .args([
+            "bootstrap",
+            "--artifact",
+            dest_artifact.to_string_lossy().as_ref(),
+        ])
+        .output()
+        .expect("run bootroot-remote bootstrap --artifact");
+    assert!(
+        output.status.success(),
+        "remote bootstrap --artifact failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        target_secret_id.exists(),
+        "secret_id must land at the target path"
+    );
+    assert_mode(&target_secret_id, 0o600);
+    let eab_contents = fs::read_to_string(&target_eab).expect("read target eab.json");
+    assert!(eab_contents.contains("\"kid\": \"remote-kid\""));
+    assert!(
+        !elsewhere.join("secrets").exists(),
+        "nothing may be written relative to the bootstrap working directory"
+    );
+
+    let agent_contents =
+        fs::read_to_string(service_dir.join("agent.toml")).expect("read agent config");
+    let doc: toml_edit::DocumentMut = agent_contents.parse().expect("agent.toml must parse");
+    let openbao = doc
+        .get("openbao")
+        .and_then(toml_edit::Item::as_table)
+        .expect("agent.toml must contain an [openbao] table");
+    let get = |key: &str| {
+        openbao
+            .get(key)
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or_else(|| panic!("[openbao].{key} must be a string"))
+            .to_string()
+    };
+    assert_eq!(Path::new(&get("role_id_path")), target_role_id);
+    assert_eq!(Path::new(&get("secret_id_path")), target_secret_id);
 }
 
 #[tokio::test]

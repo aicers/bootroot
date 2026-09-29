@@ -471,6 +471,87 @@ async fn test_rotate_approle_secret_id_remote_sets_pending_status() {
     );
 }
 
+/// A remote-bootstrap registration added with a target `--secret-id-path`
+/// rotates exactly as one without: the new `secret_id` goes to KV for the
+/// target's fast-poll, and nothing is written at the target path on the
+/// control node.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_approle_secret_id_remote_ignores_target_secret_id_path() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    let control_secret_path =
+        prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+            .expect("prepare state");
+    let target = temp_dir
+        .path()
+        .join("target-host")
+        .join("edge-proxy")
+        .join("secret_id");
+    let state_path = temp_dir.path().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["services"][SERVICE_NAME]["remote_secret_id_path"] = json!(target.to_string_lossy());
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+
+    stub_openbao_for_rotation(&openbao, "secret-remote").await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            "approle-secret-id",
+            "--registration-id",
+            SERVICE_NAME,
+        ])
+        .output()
+        .expect("run rotate approle-secret-id");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let kv_path = format!("/v1/secret/data/bootroot/services/{SERVICE_NAME}/secret_id");
+    let requests = openbao
+        .received_requests()
+        .await
+        .expect("mock server records requests");
+    let kv_write = requests
+        .iter()
+        .find(|req| req.method.as_str() == "POST" && req.url.path() == kv_path)
+        .expect("the rotated secret_id must be pushed to KV");
+    let body: serde_json::Value = serde_json::from_slice(&kv_write.body).expect("parse KV body");
+    assert_eq!(body["data"]["secret_id"], "secret-remote");
+
+    assert!(
+        !temp_dir.path().join("target-host").exists(),
+        "rotation must not write at the target path on the control node"
+    );
+    assert!(
+        !control_secret_path.exists(),
+        "remote rotation writes no control-side secret_id file, as before"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["remote_secret_id_path"],
+        target.to_string_lossy().as_ref()
+    );
+}
+
 /// End-to-end self-mint contract (#672): a file-based `AppRole` run
 /// rotates its target, then re-mints its own credential with the
 /// documented `num_uses` cap and atomically replaces the

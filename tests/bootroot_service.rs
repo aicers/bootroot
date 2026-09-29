@@ -454,65 +454,303 @@ async fn test_app_add_secret_id_path_override_relocates_credentials() {
     assert_eq!(std::path::Path::new(get("role_id_path")), override_role_id);
 }
 
-/// Issue #722 — `--secret-id-path` is local-file only; passing it with
-/// `--delivery-mode remote-bootstrap` is rejected before any `OpenBao`
-/// interaction.
-#[cfg(unix)]
-#[tokio::test]
-async fn test_app_add_secret_id_path_rejected_with_remote_bootstrap() {
+/// Runs a remote-bootstrap `service add` for `edge-proxy` in `root`,
+/// with `extra` appended, and returns the process output.
+fn run_remote_bootstrap_add(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
     use support::ROOT_TOKEN;
 
-    let temp_dir = tempdir().expect("create temp dir");
-    let agent_config = temp_dir.path().join("agent.toml");
-    fs::write(&agent_config, "# config").expect("write agent config");
-    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
-    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
-    fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
-    let agent_dir = temp_dir.path().join("agent").join("edge-proxy");
-    fs::create_dir_all(&agent_dir).expect("create agent dir");
-
-    write_state_file(temp_dir.path(), "http://127.0.0.1:1").expect("write state.json");
-
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
-        .current_dir(temp_dir.path())
-        .args([
-            "service",
-            "add",
-            "--registration-id",
-            "edge-proxy",
-            "--service-name",
-            "edge-proxy",
-            "--delivery-mode",
-            "remote-bootstrap",
-            "--hostname",
-            "edge-node-01",
-            "--domain",
-            "trusted.domain",
-            "--agent-config",
-            agent_config.to_string_lossy().as_ref(),
-            "--cert-path",
-            cert_path.to_string_lossy().as_ref(),
-            "--key-path",
-            key_path.to_string_lossy().as_ref(),
-            "--secret-id-path",
-            agent_dir.join("secret_id").to_string_lossy().as_ref(),
-            "--instance-id",
-            "001",
-            "--root-token",
-            ROOT_TOKEN,
-        ])
+    let agent_config = root.join("agent.toml");
+    let cert_path = root.join("certs").join("edge-proxy.crt");
+    let key_path = root.join("certs").join("edge-proxy.key");
+    let agent_config = agent_config.to_string_lossy();
+    let cert_path = cert_path.to_string_lossy();
+    let key_path = key_path.to_string_lossy();
+    let mut args = vec![
+        "service",
+        "add",
+        "--registration-id",
+        "edge-proxy",
+        "--service-name",
+        "edge-proxy",
+        "--delivery-mode",
+        "remote-bootstrap",
+        "--hostname",
+        "edge-node-01",
+        "--domain",
+        "trusted.domain",
+        "--agent-config",
+        agent_config.as_ref(),
+        "--cert-path",
+        cert_path.as_ref(),
+        "--key-path",
+        key_path.as_ref(),
+        "--instance-id",
+        "001",
+        "--root-token",
+        ROOT_TOKEN,
+    ];
+    args.extend_from_slice(extra);
+    std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(&args)
         .output()
-        .expect("run service add");
+        .expect("run service add")
+}
 
+/// Reads `edge-proxy`'s remote-bootstrap artifact under `root`.
+fn read_edge_proxy_artifact(root: &std::path::Path) -> serde_json::Value {
+    let artifact_path = root.join("secrets/remote-bootstrap/services/edge-proxy/bootstrap.json");
+    serde_json::from_str(&fs::read_to_string(&artifact_path).expect("read bootstrap.json"))
+        .expect("parse bootstrap.json")
+}
+
+/// Reads `root`'s `state.json`.
+fn read_state(root: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(root.join("state.json")).expect("read state.json"))
+        .expect("parse state.json")
+}
+
+/// With remote-bootstrap delivery `--secret-id-path` names the target
+/// host's `secret_id`: the artifact carries it, with `role_id` and
+/// `eab.json` beside it, while the control node keeps its own copies
+/// under `<secrets_dir>/services/<registration_id>/` and records the
+/// target path separately. The target parent does not exist on the
+/// control node and is neither checked nor created there.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_remote_bootstrap_secret_id_path_names_target_paths() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    fs::write(root.join("agent.toml"), "# config").expect("write agent config");
+    fs::create_dir_all(root.join("certs")).expect("create cert dir");
+    write_state_file(root, &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+
+    let target_dir = root.join("target-host").join("srv").join("edge-proxy");
+    let target_secret_id = target_dir.join("secret_id");
+    let target = target_secret_id.to_string_lossy().to_string();
+    let output = run_remote_bootstrap_add(root, &["--secret-id-path", &target]);
     assert!(
-        !output.status.success(),
-        "remote-bootstrap override must fail"
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let bootstrap = read_edge_proxy_artifact(root);
+    assert_eq!(bootstrap["secret_id_path"].as_str(), Some(target.as_str()));
+    assert_eq!(
+        bootstrap["role_id_path"].as_str().map(std::path::Path::new),
+        Some(target_dir.join("role_id").as_path())
+    );
+    assert_eq!(
+        bootstrap["eab_file_path"]
+            .as_str()
+            .map(std::path::Path::new),
+        Some(target_dir.join("eab.json").as_path())
+    );
     assert!(
-        stderr.contains("only honoured for local-file delivery"),
-        "stderr must explain the local-file restriction: {stderr}"
+        !root.join("target-host").exists(),
+        "the target path must not be created on the control node"
     );
+
+    let control_dir = root.join("secrets").join("services").join("edge-proxy");
+    assert_eq!(
+        fs::read_to_string(control_dir.join("role_id")).expect("read control role_id"),
+        "role-edge-proxy"
+    );
+    assert_eq!(
+        fs::read_to_string(control_dir.join("secret_id")).expect("read control secret_id"),
+        "secret-edge-proxy"
+    );
+
+    let state = read_state(root);
+    let entry = &state["services"]["edge-proxy"];
+    assert_eq!(
+        entry["approle"]["secret_id_path"],
+        "secrets/services/edge-proxy/secret_id"
+    );
+    assert_eq!(
+        entry["remote_secret_id_path"].as_str(),
+        Some(target.as_str())
+    );
+}
+
+/// The control node's secrets tree says nothing about a target-host
+/// path, so a remote `--secret-id-path` spelled inside it is not refused
+/// the way the local-file form is.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_remote_bootstrap_secret_id_path_not_checked_against_secrets_dir() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize temp dir");
+    let server = MockServer::start().await;
+    fs::write(root.join("agent.toml"), "# config").expect("write agent config");
+    fs::create_dir_all(root.join("certs")).expect("create cert dir");
+    write_state_file(&root, &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+
+    let inside = root.join("secrets").join("agent").join("secret_id");
+    let inside = inside.to_string_lossy().to_string();
+    let output = run_remote_bootstrap_add(&root, &["--secret-id-path", &inside]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_edge_proxy_artifact(&root)["secret_id_path"].as_str(),
+        Some(inside.as_str())
+    );
+}
+
+/// An idempotent remote re-run must name the same target
+/// `--secret-id-path`: the same one reissues the artifact with the same
+/// three paths, while a different one or none at all would move the
+/// credentials, so it is refused as a duplicate.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_remote_bootstrap_rerun_requires_same_secret_id_path() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    fs::write(root.join("agent.toml"), "# config").expect("write agent config");
+    fs::create_dir_all(root.join("certs")).expect("create cert dir");
+    write_state_file(root, &server.uri()).expect("write state.json");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+
+    let target = "/srv/agent/edge-proxy/secret_id";
+    let first = run_remote_bootstrap_add(root, &["--secret-id-path", target]);
+    assert!(
+        first.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_artifact = read_edge_proxy_artifact(root);
+
+    let same = run_remote_bootstrap_add(root, &["--secret-id-path", target]);
+    assert!(
+        same.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&same.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&same.stdout)
+            .contains("existing remote-bootstrap service matched input")
+    );
+    let second_artifact = read_edge_proxy_artifact(root);
+    for field in ["secret_id_path", "role_id_path", "eab_file_path"] {
+        assert_eq!(
+            second_artifact[field], first_artifact[field],
+            "{field} must survive the idempotent re-run"
+        );
+    }
+    assert_eq!(
+        second_artifact["role_id_path"],
+        "/srv/agent/edge-proxy/role_id"
+    );
+    assert_eq!(
+        second_artifact["eab_file_path"],
+        "/srv/agent/edge-proxy/eab.json"
+    );
+
+    for extra in [
+        &["--secret-id-path", "/srv/other/edge-proxy/secret_id"][..],
+        &[][..],
+    ] {
+        let rerun = run_remote_bootstrap_add(root, extra);
+        let stderr = String::from_utf8_lossy(&rerun.stderr);
+        assert!(!rerun.status.success(), "{extra:?} must be refused");
+        assert!(
+            stderr.contains("Service already exists: edge-proxy"),
+            "{extra:?} must be refused as a duplicate: {stderr}"
+        );
+    }
+    assert_eq!(
+        read_state(root)["services"]["edge-proxy"]["remote_secret_id_path"],
+        target
+    );
+    assert_eq!(read_edge_proxy_artifact(root)["secret_id_path"], target);
+}
+
+/// `eab.json` is derived as the `secret_id` sibling, so a
+/// `--secret-id-path` ending in it would name one file for both and the
+/// EAB write would overwrite the credential. Both delivery modes refuse
+/// it before any `OpenBao` request and without recording a service.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_secret_id_path_rejected_eab_json_final_component() {
+    use support::ROOT_TOKEN;
+
+    for mode in ["local-file", "remote-bootstrap"] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+        let server = MockServer::start().await;
+        let agent_config = root.join("agent.toml");
+        let cert_path = root.join("certs").join("edge-proxy.crt");
+        let key_path = root.join("certs").join("edge-proxy.key");
+        fs::create_dir_all(cert_path.parent().unwrap()).expect("create cert dir");
+        let agent_dir = root.join("agent").join("edge-proxy");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        write_state_file(root, &server.uri()).expect("write state.json");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(root)
+            .args([
+                "service",
+                "add",
+                "--registration-id",
+                "edge-proxy",
+                "--service-name",
+                "edge-proxy",
+                "--delivery-mode",
+                mode,
+                "--hostname",
+                "edge-node-01",
+                "--domain",
+                "trusted.domain",
+                "--agent-config",
+                agent_config.to_string_lossy().as_ref(),
+                "--cert-path",
+                cert_path.to_string_lossy().as_ref(),
+                "--key-path",
+                key_path.to_string_lossy().as_ref(),
+                "--secret-id-path",
+                agent_dir.join("eab.json").to_string_lossy().as_ref(),
+                "--instance-id",
+                "001",
+                "--root-token",
+                ROOT_TOKEN,
+            ])
+            .output()
+            .expect("run service add");
+
+        assert!(!output.status.success(), "{mode}: eab.json-final must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("must not end in `eab.json`"),
+            "{mode}: stderr must explain the eab.json collision: {stderr}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "{mode}: no OpenBao request may be made, got {}",
+            requests.len()
+        );
+        let state = read_state(root);
+        assert_eq!(state["services"], json!({}), "{mode}: no service recorded");
+    }
 }
 
 /// Issue #722 — a `--secret-id-path` whose final component is `role_id`

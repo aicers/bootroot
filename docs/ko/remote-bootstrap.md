@@ -79,6 +79,19 @@ bootroot는 의도적으로 원격 호스트로 파일을 **전송하지 않습�
 | `role_id` | `secrets/services/<registration_id>/role_id` | AppRole 식별자 (장기 유효) |
 | `secret_id` | `secrets/services/<registration_id>/secret_id` | AppRole 자격증명 (**민감**) |
 
+`role_id`(`--no-wrap`이면 `secret_id`도)는 원격 호스트에서 아티팩트의
+`role_id_path`(와 `secret_id_path`)가 가리키는 경로에 둡니다. 이 위치는
+`service add`의 `--secret-id-path`로 정합니다. `remote-bootstrap` 전달
+방식에서 이 플래그는 **대상 호스트**의 `secret_id` 절대 경로를 가리키며,
+아티팩트는 `--agent-config`, `--cert-path`, `--key-path`로 받은 대상
+경로와 마찬가지로 이 경로와 그 옆의 `role_id`, `eab.json` 경로를
+담습니다. 대상 호스트의 `bootroot-agent` 계정이 읽을 수 있는 곳, 예를
+들어 `agent.toml` 옆에 두십시오. 어느 경우든 제어 노드는 위 표의 소스
+경로에 자체 사본을 유지합니다. 플래그를 생략하면 아티팩트는 제어 노드의
+배치를 그대로 담으며, `<secrets_dir>`가 상대 경로이면 제어 노드의 작업
+디렉터리 기준 상대 경로가 됩니다. systemd로 실행되는 `bootroot-agent`는
+이런 경로를 `/` 기준으로 해석하므로, 원격 호스트에는 플래그를 지정하십시오.
+
 응답 래핑(기본값)은 아래의 **모든** 전송 메커니즘과 함께 동작합니다.
 SSH, systemd-credentials, Ansible, cloud-init 모두 원본 `secret_id`만큼
 손쉽게 래핑된 `bootstrap.json`을 전달할 수 있습니다. 신규 배포에는
@@ -111,9 +124,12 @@ CONTROL_SECRETS=./secrets
 REMOTE_HOST=edge-node-02
 REMOTE_USER=deploy
 REMOTE_BASE=/srv/bootroot
+# 원격 호스트가 role_id, secret_id, eab.json을 두는 위치
+REMOTE_CREDS="$REMOTE_BASE/secrets/services/$SERVICE"
 ARTIFACT="$CONTROL_SECRETS/remote-bootstrap/services/$SERVICE/bootstrap.json"
 
-# 1. 제어 노드에서 서비스 등록
+# 1. 제어 노드에서 서비스 등록. --secret-id-path는 아티팩트가 담는
+#    대상 호스트 경로이며, role_id와 eab.json은 그 옆에 놓입니다.
 bootroot service add \
   --registration-id "$SERVICE" \
   --service-name "$SERVICE" \
@@ -123,16 +139,17 @@ bootroot service add \
   --agent-config "$REMOTE_BASE/agent.toml" \
   --cert-path "$REMOTE_BASE/certs/$SERVICE.crt" \
   --key-path "$REMOTE_BASE/certs/$SERVICE.key" \
+  --secret-id-path "$REMOTE_CREDS/secret_id" \
   --root-token "$OPENBAO_ROOT_TOKEN"
 
 # 2. 대상 디렉터리 생성 및 아티팩트 + role_id 전송
 ssh "$REMOTE_USER@$REMOTE_HOST" \
-  mkdir -p "$REMOTE_BASE/secrets/services/$SERVICE"
+  mkdir -p "$REMOTE_CREDS"
 
 scp -p \
   "$ARTIFACT" \
   "$CONTROL_SECRETS/services/$SERVICE/role_id" \
-  "$REMOTE_USER@$REMOTE_HOST:$REMOTE_BASE/secrets/services/$SERVICE/"
+  "$REMOTE_USER@$REMOTE_HOST:$REMOTE_CREDS/"
 
 # 3. 부트스트랩 전 schema_version 검증
 SCHEMA_OK='.schema_version >= 5 and .schema_version <= 5'
@@ -146,7 +163,7 @@ fi
 #    런타임에 secret_id를 얻습니다.
 ssh "$REMOTE_USER@$REMOTE_HOST" \
   bootroot-remote bootstrap \
-    --artifact "$REMOTE_BASE/secrets/services/$SERVICE/bootstrap.json" \
+    --artifact "$REMOTE_CREDS/bootstrap.json" \
     --output json
 ```
 
@@ -520,6 +537,11 @@ bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`�
 기록합니다. 운영자는 갱신된 아티팩트를 원격 호스트로 전달한 뒤
 `bootroot-remote bootstrap`을 다시 실행해야 합니다.
 
+재실행에는 같은 `--secret-id-path`를 반복해야 하며, 첫 실행에서 생략했다면
+재실행에서도 생략해야 합니다. 아티팩트의 자격증명 경로가 이 값을 따르므로,
+다른 대상 경로를 지정하거나 플래그를 빼거나 추가한 재실행은 경로를 조용히
+옮기지 않고 중복 서비스로 거부됩니다.
+
 정책 필드(`--secret-id-ttl`, `--secret-id-wrap-ttl`, `--no-wrap`)만
 다른 경우 명령이 거부되며 `bootroot service update` 사용을 안내합니다.
 
@@ -661,9 +683,9 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 | `kv_mount` | `string` | OpenBao KV v2 마운트 경로 | `--kv-mount` |
 | `registration_id` | `string` | 배포 전체에서 고유한 등록 키. KV 서브트리, 관리 `agent.toml` 블록, fast-poll 상태 파일 이름, 기본 cert/key 파일 이름을 결정합니다. 인증서 SAN에는 포함되지 않습니다. | `--registration-id` |
 | `service_name` | `string` | 인증서 SAN의 두 번째 레이블 | `--service-name` |
-| `role_id_path` | `string` | 원격 호스트의 AppRole `role_id` 파일 경로 | `--role-id-path` |
-| `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로 | `--secret-id-path` |
-| `eab_file_path` | `string` | EAB 자격증명 JSON 파일 경로. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. KV 항목이 없는 경우 bootroot는 이전 부트스트랩이 남긴 오래된 `eab.json`을 제거하여 `bootroot-agent --eab-file`이 폐기된 자격증명을 전달하지 못하도록 합니다. 이때 eab 반영 단계는 오래된 파일을 제거한 경우 `applied`로, 애초에 파일이 없었던 경우 `skipped`로 보고합니다. | `--eab-file-path` |
+| `role_id_path` | `string` | 원격 호스트의 AppRole `role_id` 파일 경로. `secret_id_path`의 `role_id` 형제 경로입니다. | `--role-id-path` |
+| `secret_id_path` | `string` | 원격 호스트의 AppRole `secret_id` 파일 경로. `service add --secret-id-path`로 지정한 경로이며, 생략하면 제어 노드의 `<secrets_dir>/services/<registration_id>/secret_id`입니다. | `--secret-id-path` |
+| `eab_file_path` | `string` | 원격 호스트의 EAB 자격증명 JSON 파일 경로로, `secret_id_path`의 `eab.json` 형제 경로입니다. 운영자가 OpenBao KV에 EAB 자격증명을 프로비저닝한 경우에만 bootroot가 이 파일을 기록합니다. KV 항목이 없는 경우 bootroot는 이전 부트스트랩이 남긴 오래된 `eab.json`을 제거하여 `bootroot-agent --eab-file`이 폐기된 자격증명을 전달하지 못하도록 합니다. 이때 eab 반영 단계는 오래된 파일을 제거한 경우 `applied`로, 애초에 파일이 없었던 경우 `skipped`로 보고합니다. | `--eab-file-path` |
 | `agent_config_path` | `string` | 원격 호스트의 `agent.toml` 경로 | `--agent-config-path` |
 | `ca_bundle_path` | `string` | 원격 호스트의 CA trust bundle PEM 파일 경로 | `--ca-bundle-path` |
 | `ca_bundle_pem` | `string` | 제어 노드 CA trust 앵커의 인라인 PEM 콘텐츠. 부트스트랩 시 `ca_bundle_path`에 기록됨. `openbao_url`이 HTTPS인 경우 시스템 trust store 대신 이 CA를 TLS trust 앵커로 사용. 공유 프리미티브 — http01 admin 클라이언트(#514)에서도 사용. | 내부 사용 (TLS trust) |

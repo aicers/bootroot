@@ -8,6 +8,7 @@ use bootroot::input_validation::{
 use bootroot::registrar::{RESERVED_SERVICE_NAME_PREFIX, ReloadKind, is_reserved_service_name};
 use bootroot::remote_bootstrap::{ReloadPresetError, reload_preset_hooks};
 
+use super::{SERVICE_EAB_FILENAME, SERVICE_ROLE_ID_FILENAME};
 use crate::cli::args::{HookFailurePolicyArg, ReloadStyle, ServiceAddArgs};
 use crate::cli::prompt::Prompt;
 use crate::commands::constants::DEFAULT_SECRET_ID_WRAP_TTL;
@@ -66,6 +67,13 @@ pub(crate) struct ResolvedServiceAdd {
     /// its sibling `role_id`, and `eab.json` are relocated there, owned
     /// by the agent account. See issue #722.
     pub(crate) secret_id_path_override: Option<PathBuf>,
+    /// Operator-supplied absolute `--secret-id-path` for remote-bootstrap
+    /// delivery: where the *target host* keeps its `secret_id`, with
+    /// `role_id` and `eab.json` beside it. Used only to build the
+    /// bootstrap artifact; the control node's own copies stay under
+    /// `<secrets_dir>/services/<registration_id>/`, so the origin
+    /// writers never see this value.
+    pub(crate) remote_secret_id_path: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -178,8 +186,10 @@ pub(super) fn resolve_service_add_args(
 
     let cert_group_gid = resolve_cert_group_for_add(args, delivery_mode, messages)?;
 
-    let secret_id_path_override =
-        resolve_secret_id_path_override(args.secret_id_path.as_deref(), delivery_mode, messages)?;
+    let SecretIdPathFlag {
+        local_override: secret_id_path_override,
+        remote: remote_secret_id_path,
+    } = resolve_secret_id_path_override(args.secret_id_path.as_deref(), delivery_mode, messages)?;
 
     Ok(ResolvedServiceAdd {
         registration_id,
@@ -202,31 +212,39 @@ pub(super) fn resolve_service_add_args(
         agent_responder_url,
         cert_group_gid,
         secret_id_path_override,
+        remote_secret_id_path,
     })
 }
 
-/// Filename of a service's `role_id`, always derived as the `secret_id`
-/// sibling. Kept here so the override collision guard rejects a
-/// `--secret-id-path` whose final component matches it.
-const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
+/// A resolved `--secret-id-path`, routed by delivery mode. At most one
+/// side is `Some`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SecretIdPathFlag {
+    /// Local-file delivery: where the control node itself writes the
+    /// relocated credentials.
+    local_override: Option<PathBuf>,
+    /// Remote-bootstrap delivery: where the target host keeps them, used
+    /// only to build the bootstrap artifact.
+    remote: Option<PathBuf>,
+}
 
-/// Resolves the `--secret-id-path` override, applying the checks that do
-/// not require `state`: it is honoured for local-file delivery only, must
-/// be absolute, and must not end in `role_id` (which would collide with
-/// the derived sibling `role_id` file). The secrets-tree containment and
-/// parent-existence checks need `state.secrets_dir()` and run later in
-/// [`validate_secret_id_path_override`].
+/// Resolves `--secret-id-path` and routes it by delivery mode, applying
+/// the checks that hold for both modes and need neither `state` nor the
+/// target host: it must be absolute, and its final component must be
+/// neither `role_id` nor `eab.json`, since both are derived as the
+/// `secret_id` sibling and would then name the same file. For local-file
+/// delivery the secrets-tree containment and parent-existence checks need
+/// `state.secrets_dir()` and run later in
+/// [`validate_secret_id_path_override`]; a remote-bootstrap path names the
+/// target host, so the control node's filesystem says nothing about it.
 fn resolve_secret_id_path_override(
     value: Option<&Path>,
     delivery_mode: DeliveryMode,
     messages: &Messages,
-) -> Result<Option<PathBuf>> {
+) -> Result<SecretIdPathFlag> {
     let Some(path) = value else {
-        return Ok(None);
+        return Ok(SecretIdPathFlag::default());
     };
-    if !matches!(delivery_mode, DeliveryMode::LocalFile) {
-        anyhow::bail!(messages.error_service_secret_id_path_requires_local_file());
-    }
     if !path.is_absolute() {
         anyhow::bail!(
             messages.error_service_secret_id_path_not_absolute(&path.display().to_string())
@@ -237,7 +255,22 @@ fn resolve_secret_id_path_override(
             messages.error_service_secret_id_path_role_id_collision(&path.display().to_string())
         );
     }
-    Ok(Some(path.to_path_buf()))
+    if path.file_name().and_then(|name| name.to_str()) == Some(SERVICE_EAB_FILENAME) {
+        anyhow::bail!(
+            messages.error_service_secret_id_path_eab_collision(&path.display().to_string())
+        );
+    }
+    let path = Some(path.to_path_buf());
+    Ok(match delivery_mode {
+        DeliveryMode::LocalFile => SecretIdPathFlag {
+            local_override: path,
+            remote: None,
+        },
+        DeliveryMode::RemoteBootstrap => SecretIdPathFlag {
+            local_override: None,
+            remote: path,
+        },
+    })
 }
 
 /// Applies the `--secret-id-path` override checks that need
@@ -1187,50 +1220,81 @@ mod tests {
     #[test]
     fn resolve_secret_id_path_override_none_is_ok() {
         let messages = Messages::new("en").unwrap();
-        assert!(
-            resolve_secret_id_path_override(None, DeliveryMode::LocalFile, &messages)
-                .unwrap()
-                .is_none()
-        );
+        for mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            assert_eq!(
+                resolve_secret_id_path_override(None, mode, &messages).unwrap(),
+                SecretIdPathFlag::default()
+            );
+        }
     }
 
     #[test]
-    fn resolve_secret_id_path_override_rejects_remote_bootstrap() {
+    fn resolve_secret_id_path_override_routes_remote_bootstrap_to_remote() {
         let messages = Messages::new("en").unwrap();
-        let err = resolve_secret_id_path_override(
-            Some(Path::new("/etc/agent/svc/secret_id")),
+        let resolved = resolve_secret_id_path_override(
+            Some(Path::new("/srv/agent/svc/secret_id")),
             DeliveryMode::RemoteBootstrap,
             &messages,
         )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("only honoured for local-file delivery")
+        .unwrap();
+        assert_eq!(
+            resolved,
+            SecretIdPathFlag {
+                local_override: None,
+                remote: Some(PathBuf::from("/srv/agent/svc/secret_id")),
+            }
         );
     }
 
     #[test]
     fn resolve_secret_id_path_override_rejects_relative() {
         let messages = Messages::new("en").unwrap();
-        let err = resolve_secret_id_path_override(
-            Some(Path::new("relative/secret_id")),
-            DeliveryMode::LocalFile,
-            &messages,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("must be an absolute path"));
+        for mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            let err = resolve_secret_id_path_override(
+                Some(Path::new("relative/secret_id")),
+                mode,
+                &messages,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("must be an absolute path"),
+                "{mode:?}: {err}"
+            );
+        }
     }
 
     #[test]
     fn resolve_secret_id_path_override_rejects_role_id_final_component() {
         let messages = Messages::new("en").unwrap();
-        let err = resolve_secret_id_path_override(
-            Some(Path::new("/etc/agent/svc/role_id")),
-            DeliveryMode::LocalFile,
-            &messages,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("must not end in `role_id`"));
+        for mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            let err = resolve_secret_id_path_override(
+                Some(Path::new("/etc/agent/svc/role_id")),
+                mode,
+                &messages,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("must not end in `role_id`"),
+                "{mode:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_secret_id_path_override_rejects_eab_json_final_component() {
+        let messages = Messages::new("en").unwrap();
+        for mode in [DeliveryMode::LocalFile, DeliveryMode::RemoteBootstrap] {
+            let err = resolve_secret_id_path_override(
+                Some(Path::new("/etc/agent/svc/eab.json")),
+                mode,
+                &messages,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("must not end in `eab.json`"),
+                "{mode:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1243,8 +1307,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolved.as_deref(),
-            Some(Path::new("/etc/agent/svc/secret_id"))
+            resolved,
+            SecretIdPathFlag {
+                local_override: Some(PathBuf::from("/etc/agent/svc/secret_id")),
+                remote: None,
+            }
         );
     }
 
