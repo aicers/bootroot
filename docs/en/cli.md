@@ -390,6 +390,60 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
 - `--http01-admin-host-port <N>`: host-side HTTP-01 responder admin API
   published port. Overrides `HTTP01_ADMIN_HOST_PORT` from `.env` and the
   process environment. Default **8080**.
+- `--registrar-endpoint-host <label>`: enable the registrar endpoint on
+  this host (optional). The bootroot host's single DNS label — never an
+  FQDN or a composed name — validated as `bootroot registrar issue
+  --host` validates it. Requires `--registrar-endpoint-domain`.
+- `--registrar-endpoint-domain <domain>`: the deployment domain the
+  bootroot-internal SAN is composed under, validated as `bootroot
+  registrar issue --domain` validates it. Requires
+  `--registrar-endpoint-host`.
+
+#### Registrar endpoint predicate
+
+`--registrar-endpoint-host` and `--registrar-endpoint-domain` record the
+predicate `bootroot init` reads to provision a registrar endpoint host:
+`registrar_endpoint = { enabled: true, domain, host }` in the
+`state.json` of the working directory, the same file the bind flags
+record their intent in. Each flag requires the other; passing only one
+is a usage error with exit code `2`. The values come from the flags only
+and are never derived from the machine's hostname.
+
+The values are validated, and the recorded predicate checked, before
+anything is created, started or written, so a refused run leaves the
+host as it found it. With both flags given, what `infra install` does
+depends on what `state.json` already records:
+
+1. **No `state.json` yet**: creates it with the install-time
+   `openbao_url`, the default `kv_mount`, and the enabled predicate.
+2. **No `registrar_endpoint`, or one with `enabled = false`**: records
+   the enabled predicate with the given values. Every other member is
+   left as it was.
+3. **An enabled entry with the same `host` and `domain`**: writes
+   nothing for the predicate, and prints the same "recorded" line so a
+   re-run reads the same. The bind flags on the same run still rewrite
+   `state.json` as they always do.
+4. **An enabled entry with a different `host` or `domain`**: refuses,
+   naming both the recorded and the requested values.
+
+A different `host` or `domain` is refused because the bootroot-internal
+credential's SAN, `001.bootroot-registrar-internal.<host>.<domain>`, is
+composed from them, and changing them would strand the credential
+already on disk. `infra install` offers no way to change them.
+
+**Without either flag, `infra install` leaves the recorded
+`registrar_endpoint` exactly as it is**, enabled or not. This
+deliberately differs from the bind flags, which clear their intent when
+absent: `init` and `reinit` preserve the predicate as deployment intent,
+and clearing it on a flagless re-run would leave an endpoint host that
+`init --agent-config` refuses. Switching an endpoint off stays the
+two-edit procedure under
+[The shared audit store](operations.md#the-shared-audit-store).
+
+A `state.json` created here is one `bootroot init` then asks to
+overwrite, as it does after a bind flag created one; pass
+`--overwrite-state` to answer that prompt non-interactively. `init`
+carries the predicate through that rewrite.
 
 #### Instance identity and the Compose project
 

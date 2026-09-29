@@ -286,7 +286,7 @@ registrar_docker_record_empty_agent_eab() {
 #
 # `slug` is the scenario's own name and the only value that differs between
 # the two runs of this: it scopes the responder image tag, both init secrets,
-# and the endpoint host label the state predicate is seeded with.
+# and the endpoint host label `infra install` records the state predicate with.
 #
 # `init` has already recreated the responder with its rendered HMAC and
 # started the OpenBao agents by the time this returns. Replaying `infra up`
@@ -312,7 +312,9 @@ registrar_docker_build_and_initialize() {
   registrar_docker_bootroot infra install --compose-file "$WORK_DIR/docker-compose.deploy.yml" \
     --instance-name "$INSTANCE" --postgres-host-port "$PORT_POSTGRES" \
     --openbao-host-port "$PORT_OPENBAO" --stepca-host-port "$PORT_STEPCA" \
-    --http01-admin-host-port "$PORT_HTTP01" --no-build >>"$RUN_LOG" 2>&1 ||
+    --http01-admin-host-port "$PORT_HTTP01" \
+    --registrar-endpoint-host "$slug" --registrar-endpoint-domain "trusted.domain" \
+    --no-build >>"$RUN_LOG" 2>&1 ||
     fail "infra install failed"
   for _ in $(seq 1 60); do
     curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 && break
@@ -320,12 +322,10 @@ registrar_docker_build_and_initialize() {
   done
   curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 ||
     fail "OpenBao did not become reachable"
-  # A fresh `infra install` deliberately creates no state inventory. Seed
-  # the one endpoint predicate `init` must preserve while it writes the
-  # complete state record after provisioning.
-  jq -n --arg url "http://localhost:${PORT_OPENBAO}" --arg host "$slug" \
-    '{openbao_url: $url, kv_mount: "secret", registrar_endpoint: {enabled: true, domain: "trusted.domain", host: $host}}' \
-    >"$WORK_DIR/state.json" || fail "could not seed endpoint predicate"
+  # `infra install` recorded the endpoint predicate `init` must preserve
+  # while it writes the complete state record after provisioning.
+  [ "$(jq -r '.registrar_endpoint.enabled' "$WORK_DIR/state.json" 2>/dev/null)" = "true" ] ||
+    fail "infra install did not record the endpoint predicate"
   if ! sudo -n env HOME="$HOME" BOOTROOT_HTTP01_IMAGE="$HTTP01_IMAGE" bash -c 'cd "$1" && exec "$2" init --compose-file "$3" --secrets-dir "$4" --enable auto-generate,show-secrets,db-provision --stepca-password "$5" --http-hmac "$6" --no-eab --save-unseal-keys --overwrite-password --overwrite-ca-json --overwrite-state --confirm-db-provision --db-user step --db-name stepca --responder-url "$7" --agent-config "$8" --summary-json "$9"' _ "$WORK_DIR" "$BOOTROOT_BIN" "$WORK_DIR/docker-compose.deploy.yml" "$WORK_DIR/secrets" "${slug}-${RUN_TOKEN}" "${slug}-hmac-${RUN_TOKEN}" "http://127.0.0.1:${PORT_HTTP01}" "$INITIAL_CONFIG" "$SUMMARY" </dev/null >"$init_raw_log" 2>&1; then
     sed 's/^\(root token: \).*/\1<redacted>/' "$init_raw_log" >"$ARTIFACT_DIR/init.log" || true
     fail "bootroot init failed"

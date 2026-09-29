@@ -146,8 +146,9 @@ that the policy body means to the real ACL engine what it looks like it means.
 
 `run-registrar-internal-init-e2e.sh` is the provisioning half, and needs a whole
 deployment rather than one container: `bootroot init` on an endpoint-enabled
-loopback host, with the endpoint predicate seeded into `state.json` first
-(nothing writes it yet — that belongs to the registrar endpoint work). It
+loopback host, with the endpoint predicate recorded into `state.json` by
+`bootroot infra install --registrar-endpoint-host/--registrar-endpoint-domain`
+first, so the run also shows `init` finding what `infra install` wrote. It
 installs under a run-scoped instance name into a temporary directory on four
 freshly allocated ports, so it is safe beside a default install — and the moved
 ports are the point rather than a concession: on the compose defaults a

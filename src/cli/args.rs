@@ -1061,6 +1061,26 @@ pub(crate) struct InfraInstallArgs {
     #[arg(long = "http01-admin-host-port")]
     pub(crate) http01_admin_host_port: Option<u16>,
 
+    /// Enable the registrar endpoint on this host: records
+    /// `registrar_endpoint = { enabled = true, host, domain }` in
+    /// `state.json` for `bootroot init` to act on. The bootroot host's
+    /// single DNS label, never an FQDN. Requires
+    /// `--registrar-endpoint-domain`. When both are absent, the recorded
+    /// predicate is left exactly as it is
+    #[arg(
+        long = "registrar-endpoint-host",
+        requires = "registrar_endpoint_domain"
+    )]
+    pub(crate) registrar_endpoint_host: Option<String>,
+
+    /// The deployment domain the bootroot-internal SAN is composed
+    /// under. Requires `--registrar-endpoint-host`
+    #[arg(
+        long = "registrar-endpoint-domain",
+        requires = "registrar_endpoint_host"
+    )]
+    pub(crate) registrar_endpoint_domain: Option<String>,
+
     /// Skip building images: run `docker compose up --no-build` so the
     /// already-loaded image is used as-is and the command fails loudly
     /// when a tagged image is absent. The default builds the local
@@ -2591,6 +2611,60 @@ mod tests {
                 assert!(!args.stepca_bind_wildcard);
             }
             _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_infra_install_registrar_endpoint() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "infra",
+            "install",
+            "--registrar-endpoint-host",
+            "bootroot-01",
+            "--registrar-endpoint-domain",
+            "trusted.domain",
+        ]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert_eq!(args.registrar_endpoint_host.as_deref(), Some("bootroot-01"));
+                assert_eq!(
+                    args.registrar_endpoint_domain.as_deref(),
+                    Some("trusted.domain")
+                );
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    #[test]
+    fn test_cli_infra_install_default_no_registrar_endpoint() {
+        let cli = Cli::parse_from(["bootroot", "infra", "install"]);
+        match cli.command {
+            CliCommand::Infra(InfraCommand::Install(args)) => {
+                assert!(args.registrar_endpoint_host.is_none());
+                assert!(args.registrar_endpoint_domain.is_none());
+            }
+            _ => panic!("expected infra install"),
+        }
+    }
+
+    /// Either registrar endpoint flag alone is a usage error, exiting
+    /// with clap's usage code rather than recording half a predicate.
+    #[test]
+    fn test_cli_rejects_one_registrar_endpoint_flag_alone() {
+        for (flag, value) in [
+            ("--registrar-endpoint-host", "bootroot-01"),
+            ("--registrar-endpoint-domain", "trusted.domain"),
+        ] {
+            let err = Cli::try_parse_from(["bootroot", "infra", "install", flag, value])
+                .expect_err("one flag alone must be refused");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{flag} alone: {err}"
+            );
+            assert_eq!(err.exit_code(), 2, "{flag} alone must exit with 2");
         }
     }
 

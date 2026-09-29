@@ -1,6 +1,45 @@
 use super::{Messages, format_template};
 
 impl Messages {
+    pub(crate) fn error_registrar_endpoint_host_invalid(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_registrar_endpoint_host_invalid,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_registrar_endpoint_domain_invalid(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_registrar_endpoint_domain_invalid,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_registrar_endpoint_conflict(
+        &self,
+        recorded_host: &str,
+        recorded_domain: &str,
+        host: &str,
+        domain: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_registrar_endpoint_conflict,
+            &[
+                ("recorded_host", recorded_host),
+                ("recorded_domain", recorded_domain),
+                ("host", host),
+                ("domain", domain),
+            ],
+        )
+    }
+
+    pub(crate) fn info_registrar_endpoint_recorded(&self, host: &str, domain: &str) -> String {
+        format_template(
+            self.strings().info_registrar_endpoint_recorded,
+            &[("host", host), ("domain", domain)],
+        )
+    }
+
     pub(crate) fn infra_up_completed(&self) -> &'static str {
         self.strings().infra_up_completed
     }

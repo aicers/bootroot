@@ -116,10 +116,13 @@ pub(crate) struct StateFile {
     pub(crate) last_secret_id_rotation: Option<String>,
     /// The registrar endpoint's enablement, as recorded on this host.
     ///
-    /// **Read, never written here.** Defining, storing and switching
-    /// this predicate belongs to the registrar endpoint work; this
-    /// repository's internal-credential provisioning only *consumes*
-    /// it. An absent entry means the endpoint is disabled, which is
+    /// **`bootroot infra install` is the one command that sets it**,
+    /// from `--registrar-endpoint-host` and `--registrar-endpoint-domain`.
+    /// `init`, `reinit` and `rotate` never set or change it: they carry
+    /// the recorded value through verbatim whenever they rewrite this
+    /// file, and `init`'s internal-credential provisioning only
+    /// *consumes* it. Switching it off stays a documented manual edit.
+    /// An absent entry means the endpoint is disabled, which is
     /// what every host but a bootroot registrar host wants: `init`
     /// then leaves the plaintext loopback listener and the `http://`
     /// URL exactly as they were and creates none of the internal

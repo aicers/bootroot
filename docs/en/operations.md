@@ -1954,6 +1954,19 @@ Enabling it is supported. The daemon builds the verb layer from its
 `[registrar]` settings and registers a production request handler over
 it, so `registrar_endpoint.enabled = true` starts and serves.
 
+Enabling a host starts at install time. Record the endpoint predicate with
+`bootroot infra install --registrar-endpoint-host <label>
+--registrar-endpoint-domain <domain>` — the bootroot host's single DNS label
+and the deployment domain the bootroot-internal SAN is composed under — then
+run `bootroot init --agent-config <path>` as root with a daemon configuration
+whose `[registrar_endpoint] enabled = true`. `init` provisions the internal
+credential and moves OpenBao to TLS from the recorded predicate, and refuses a
+daemon configuration that disagrees with it. See
+[Registrar endpoint predicate](cli.md#registrar-endpoint-predicate) for what
+`infra install` does when a predicate is already recorded; switching a host off
+again is the two-edit procedure under
+[The shared audit store](#the-shared-audit-store).
+
 #### What an enabled endpoint needs, and what a missing piece does
 
 Everything the handler is built from is resolved **before** any task is

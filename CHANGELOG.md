@@ -112,6 +112,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   that `bootroot-remote bootstrap --artifact` reads — the same document
   `bootroot service add --delivery-mode remote-bootstrap` writes, built
   around those paths and the one wrapped `secret_id` the mint issued.
+- `bootroot infra install --registrar-endpoint-host <label>
+  --registrar-endpoint-domain <domain>` enables the registrar endpoint on
+  a bootroot host, recording in `state.json` the predicate `bootroot init`
+  provisions the host from. Each flag requires the other, and both values
+  are validated as `bootroot registrar issue --host` and `--domain`
+  validate them. Re-running with the same values changes nothing, a
+  different host or domain for an already-enabled endpoint is refused
+  before anything is created or started, and a run without the flags
+  leaves the recorded predicate as it is.
 - An endpoint-enabled `bootroot-agent` now issues the registrar
   surface's own two certificates at start, so neither has to be supplied
   out of band. Four `[registrar_endpoint]` keys name the material —

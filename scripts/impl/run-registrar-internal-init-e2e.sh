@@ -43,9 +43,10 @@ set -euo pipefail
 # plaintext `http://` URL `init` recorded, so a listener that
 # transitioned when it should not have would fail them outright.
 #
-# The predicate is seeded into `state.json` by hand between `install`
-# and `init`.  Defining and writing it belongs to the registrar endpoint
-# work; `init` only consumes it, and consuming it is what is under test.
+# The predicate is recorded into `state.json` by `infra install
+# --registrar-endpoint-host/--registrar-endpoint-domain`, the command
+# that writes it; `init` only consumes it, and consuming what `install`
+# recorded is what is under test.
 #
 # `init` itself runs as root here (#880).  The five protected artifacts
 # below the internal directory are published uid 0 / gid 0, and a
@@ -475,6 +476,8 @@ install_infra() {
     --openbao-host-port "$PORT_OPENBAO" \
     --stepca-host-port "$PORT_STEPCA" \
     --http01-admin-host-port "$PORT_HTTP01" \
+    --registrar-endpoint-host "$HOST_LABEL" \
+    --registrar-endpoint-domain "$DOMAIN" \
     --no-build \
     >>"$RUN_LOG" 2>&1 || fail "infra install failed"
 }
@@ -509,25 +512,19 @@ wait_for_postgres_admin() {
   fail "PostgreSQL did not accept connections on port ${PORT_POSTGRES} before init"
 }
 
-# The predicate `init` consumes.  Written here rather than by a command
-# because no command writes it yet: defining and storing it belongs to
-# the registrar endpoint work, and this scenario is about what `init`
-# does when it finds it.
+# The predicate `init` consumes, as `install_infra` recorded it through
+# `--registrar-endpoint-host/--registrar-endpoint-domain`.  Nothing is
+# written here: the scenario checks that `infra install` recorded what
+# `init` is about to act on.
 seed_registrar_endpoint_predicate() {
-  local state="$WORK_DIR/state.json" tmp="$WORK_DIR/state.json.seed"
-  if [ -f "$state" ]; then
-    jq --arg d "$DOMAIN" --arg h "$HOST_LABEL" \
-      '.registrar_endpoint = {enabled: true, domain: $d, host: $h}' \
-      "$state" >"$tmp" || fail "could not seed the predicate into $state"
-  else
-    jq -n --arg url "http://localhost:${PORT_OPENBAO}" --arg d "$DOMAIN" --arg h "$HOST_LABEL" \
-      '{openbao_url: $url, kv_mount: "secret",
-        registrar_endpoint: {enabled: true, domain: $d, host: $h}}' \
-      >"$tmp" || fail "could not write $state"
-  fi
-  mv "$tmp" "$state"
+  local state="$WORK_DIR/state.json"
+  [ -f "$state" ] || fail "infra install did not record the predicate into $state"
   assert_equal "the predicate is recorded as enabled" \
     "true" "$(jq -r '.registrar_endpoint.enabled' "$state")"
+  assert_equal "the predicate records the requested host" \
+    "$HOST_LABEL" "$(jq -r '.registrar_endpoint.host' "$state")"
+  assert_equal "the predicate records the requested domain" \
+    "$DOMAIN" "$(jq -r '.registrar_endpoint.domain' "$state")"
   # The plaintext URL is the starting point the transition has to move:
   # asserting it here is what makes the `https://` assertion afterwards
   # a change rather than a coincidence.
@@ -542,8 +539,8 @@ seed_registrar_endpoint_predicate() {
 #
 # `[registrar] audit_store_dir` is the only definition of where the
 # shared audit store lives, and `[registrar_endpoint] enabled` is
-# cross-checked against the predicate seeded above — `init` refuses to
-# proceed when the two disagree, so both say `true` here.
+# cross-checked against the predicate `infra install` recorded — `init`
+# refuses to proceed when the two disagree, so both say `true` here.
 #
 # Nothing in this scenario starts a `bootroot-agent` daemon, so an
 # enabled `[registrar_endpoint]` in a file only the installer reads
@@ -581,7 +578,7 @@ EOF
 # defaulted so the figure the refusal would quote is this file's and not
 # a shipped default's.
 #
-# `[registrar_endpoint] enabled` agrees with the predicate seeded into
+# `[registrar_endpoint] enabled` agrees with the predicate recorded in
 # `state.json`; `init` refuses to proceed when the two disagree.
 write_reserve_agent_config() {
   local path="$1" store="$2" reserve="$3"
