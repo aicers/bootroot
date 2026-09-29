@@ -264,10 +264,11 @@ fn deserialize_error_without_values(err: &config::ConfigError) -> String {
 /// in the spellings the daemon's validation can quote them in.
 #[derive(Debug, Default)]
 struct RegistrarTableValues {
-    /// Every string, and the humantime rendering of each one that parses
-    /// as a duration, longest first.
+    /// Every string, and the humantime rendering of each value that
+    /// parses as a duration, longest first.
     strings: Vec<String>,
-    /// Every number, as `Display` renders it.
+    /// Every non-string value as typed, and every integer any value
+    /// converts to.
     numbers: Vec<String>,
 }
 
@@ -280,32 +281,52 @@ struct RegistrarTableValues {
 /// pasted secret included. Taking the values from the parsed tables
 /// rather than from the validator's wording keeps the scrub correct for
 /// a message this reader has never seen.
+///
+/// Validation quotes the *deserialized* setting, which is not always
+/// the value as typed: `config` coerces a float, a boolean or a numeric
+/// string into an integer field, so `12345.6` is refused as `12346` and
+/// `"+12"` as `12`. Each value is therefore also recorded as the
+/// integer and the string it converts to, through the very conversions
+/// the deserializer applies, rather than through a second copy of their
+/// rules.
 fn registrar_table_values(built: &config::Config) -> RegistrarTableValues {
     fn collect(value: &config::Value, out: &mut RegistrarTableValues) {
         match &value.kind {
-            config::ValueKind::String(text) if !text.is_empty() => {
-                if let Ok(duration) = humantime::parse_duration(text) {
-                    out.strings
-                        .push(humantime::format_duration(duration).to_string());
-                }
-                out.strings.push(text.clone());
-            }
-            config::ValueKind::I64(number) => out.numbers.push(number.to_string()),
-            config::ValueKind::I128(number) => out.numbers.push(number.to_string()),
-            config::ValueKind::U64(number) => out.numbers.push(number.to_string()),
-            config::ValueKind::U128(number) => out.numbers.push(number.to_string()),
-            config::ValueKind::Float(number) => out.numbers.push(number.to_string()),
             config::ValueKind::Table(table) => {
                 for value in table.values() {
                     collect(value, out);
                 }
+                return;
             }
             config::ValueKind::Array(values) => {
                 for value in values {
                     collect(value, out);
                 }
+                return;
             }
-            _ => {}
+            config::ValueKind::Nil => return,
+            config::ValueKind::String(text) => {
+                if !text.is_empty() {
+                    out.strings.push(text.clone());
+                }
+            }
+            _ => {
+                if let Ok(text) = value.clone().into_string() {
+                    out.numbers.push(text);
+                }
+            }
+        }
+        if let Ok(text) = value.clone().into_string()
+            && let Ok(duration) = humantime::parse_duration(&text)
+        {
+            out.strings
+                .push(humantime::format_duration(duration).to_string());
+        }
+        if let Ok(number) = value.clone().into_uint() {
+            out.numbers.push(number.to_string());
+        }
+        if let Ok(number) = value.clone().into_int() {
+            out.numbers.push(number.to_string());
         }
     }
     let mut values = RegistrarTableValues::default();
@@ -1981,6 +2002,28 @@ mod tests {
                 "registrar.role_token_ttl",
                 "1500ms",
                 "1s 500ms",
+            ),
+            // `config` rounds a float into an integer field, so the
+            // refusal quotes a value that was never typed.
+            (
+                "audit_max_file_bytes = 12345.6\n",
+                "registrar.audit_max_file_bytes",
+                "12345.6",
+                "12346",
+            ),
+            // And parses a string into one, dropping a leading sign.
+            (
+                "audit_max_file_bytes = \"+12345\"\n",
+                "registrar.audit_max_file_bytes",
+                "+12345",
+                "12345",
+            ),
+            // A boolean converts to 0 or 1.
+            (
+                "audit_store_reserve_bytes = true\n",
+                "registrar.audit_store_low_water_bytes",
+                "true",
+                "(1)",
             ),
         ] {
             let path = write_agent_config(dir.path(), &format!("[registrar]\n{body}"));
