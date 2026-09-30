@@ -5857,6 +5857,18 @@ async fn test_rotate_responder_hmac_without_internal_config_is_unchanged() {
         ]
     );
     assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    let docker_log =
+        fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
+    assert!(
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC: {docker_log}"
+    );
+    assert!(
+        stdout.contains("responder config updated"),
+        "the rotation reports the responder config: {stdout}"
+    );
     assert!(
         !temp_dir
             .path()
@@ -6039,13 +6051,20 @@ fn assert_fanout_failure_ended_the_rotation(
         !stdout.contains(hmac) && !stderr.contains(hmac),
         "the new HMAC is never printed"
     );
-    // The fake docker logs nothing until it is invoked at all.
-    let docker_log = fs::read_to_string(root.join("docker.log")).unwrap_or_default();
+    let docker_log = fs::read_to_string(root.join("docker.log")).expect("read docker log");
     assert!(
         !docker_log
             .lines()
             .any(|line| line.contains("restart") || line.contains("HUP")),
         "the responder is neither restarted nor reloaded: {docker_log}"
+    );
+    assert!(
+        !root
+            .join("secrets")
+            .join("responder")
+            .join("responder.toml")
+            .exists(),
+        "no responder config is rendered for the rotation to wait on"
     );
     assert_eq!(fs::read_to_string(pkill_log).expect("pkill log"), "");
     assert!(
