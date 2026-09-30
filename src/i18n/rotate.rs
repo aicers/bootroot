@@ -31,6 +31,13 @@ impl Messages {
         self.strings().rotate_summary_reload_responder
     }
 
+    pub(crate) fn rotate_summary_internal_config(&self, value: &str) -> String {
+        format_template(
+            self.strings().rotate_summary_internal_config,
+            &[("value", value)],
+        )
+    }
+
     pub(crate) fn rotate_summary_approle_secret_id(
         &self,
         service_name: &str,

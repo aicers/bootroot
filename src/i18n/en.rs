@@ -329,6 +329,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_db_dsn: "- ca.json updated: {value}",
     rotate_summary_responder_config: "- responder config updated: {value}",
     rotate_summary_reload_responder: "- responder: sent SIGHUP",
+    rotate_summary_internal_config: "- registrar endpoint daemon config updated and reloaded: {value}",
     rotate_summary_approle_secret_id: "- AppRole secret_id rotated for {service_name}: {value}",
     rotate_summary_approle_login_ok: "- AppRole login OK for {service_name}",
     rotate_summary_infra_approle_secret_id: "- infra AppRole secret_id rotated for {role_name}: {value}",

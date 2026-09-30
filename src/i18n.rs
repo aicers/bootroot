@@ -343,6 +343,7 @@ pub(crate) struct Strings {
     pub(crate) rotate_summary_db_dsn: &'static str,
     pub(crate) rotate_summary_responder_config: &'static str,
     pub(crate) rotate_summary_reload_responder: &'static str,
+    pub(crate) rotate_summary_internal_config: &'static str,
     pub(crate) rotate_summary_approle_secret_id: &'static str,
     pub(crate) rotate_summary_approle_login_ok: &'static str,
     pub(crate) rotate_summary_infra_approle_secret_id: &'static str,

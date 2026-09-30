@@ -3026,6 +3026,14 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
 이내에 OpenBao KV에서 갱신된 값을 가져오며, 서비스별 프로세스 재시작이나
 리로드는 없습니다.
 
+registrar 엔드포인트 데몬은 예외입니다. 이 데몬은
+`secrets/registrar-internal/agent.toml`로 실행되는데, 이 파일에는
+`[openbao]` 섹션이 없고 아무것도 폴링하지 않습니다. 따라서 이 파일을 가진
+호스트에서는 `rotate responder-hmac`이 파일의 `http_responder_hmac`을 다시
+쓰고 `rotate eab-clear`가 `[eab]` 테이블을 제거한 뒤, 각각 `SIGHUP`으로
+데몬을 리로드합니다. 이 파일은 root 소유이므로 그런 호스트에서는 두 회전을
+root로 실행하세요.
+
 `remote-bootstrap` 서비스의 경우, 회전된 `secret_id`는 서비스별 KV 경로
 (`bootroot/services/<registration_id>/secret_id`)에 기록됩니다. *실행 중인* 원격
 `bootroot-agent`는 운영자 조치가 필요 없습니다: fast-poll 루프가 아직 유효한

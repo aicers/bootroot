@@ -5143,6 +5143,18 @@ fn run_responder_hmac(
     auth_args: &[&str],
     hmac: &str,
 ) -> std::process::Output {
+    run_responder_hmac_with_env(root, openbao_url, auth_args, hmac, &[])
+}
+
+/// [`run_responder_hmac`] with extra environment for the fakes staged
+/// in `root/bin` — `PKILL_OUTPUT` for [`write_fake_pkill`].
+fn run_responder_hmac_with_env(
+    root: &Path,
+    openbao_url: &str,
+    auth_args: &[&str],
+    hmac: &str,
+    extra_env: &[(&str, &Path)],
+) -> std::process::Output {
     let compose_file = root.join("docker-compose.yml");
     fs::write(&compose_file, "services: {}\n").expect("write compose");
 
@@ -5173,6 +5185,7 @@ fn run_responder_hmac(
         .env("DOCKER_OUTPUT", &docker_log)
         .env("RENDER_SOURCE", &render_source)
         .env("RENDER_TARGET", responder_dir.join("responder.toml"))
+        .envs(extra_env.iter().copied())
         .output()
         .expect("run rotate responder-hmac")
 }
@@ -5689,6 +5702,452 @@ async fn test_rotate_eab_clear_listing_forbidden_writes_nothing() {
     assert!(!output.status.success(), "stderr:\n{stderr}");
     assert!(stderr.contains(REGISTRAR_LIST_ERROR), "stderr:\n{stderr}");
     assert_no_secret_writes(&received(&openbao).await);
+}
+
+/// The bootroot-internal config below the test state's `secrets` dir.
+fn internal_config_path(root: &Path) -> PathBuf {
+    root.join("secrets")
+        .join("registrar-internal")
+        .join("agent.toml")
+}
+
+/// Writes `contents` as the bootroot-internal config, the file a
+/// registrar endpoint host carries.
+fn write_internal_config(root: &Path, contents: &str) -> PathBuf {
+    let path = internal_config_path(root);
+    fs::create_dir_all(path.parent().expect("internal dir")).expect("create internal dir");
+    fs::write(&path, contents).expect("write internal config");
+    path
+}
+
+/// An internal config the rotations can parse, with or without `[eab]`.
+fn valid_internal_config(with_eab: bool) -> String {
+    let eab = if with_eab {
+        "\n[eab]\nkid = \"kid-1\"\nhmac = \"eab-hmac\"\n"
+    } else {
+        ""
+    };
+    format!(
+        "email = \"ops@example.internal\"\n\n[acme]\nhttp_responder_hmac = \"old-hmac\"\n\n\
+         [trust]\ntrusted_ca_sha256 = [\"aa\"]\n{eab}"
+    )
+}
+
+/// The internal config's path as the rotation names it: below the
+/// `secrets_dir` the test state records, relative to the run's cwd.
+const INTERNAL_CONFIG_AS_RECORDED: &str = "secrets/registrar-internal/agent.toml";
+
+/// A config that exists but does not parse as TOML.
+const UNPARSEABLE_INTERNAL_CONFIG: &str = "[acme\nhttp_responder_hmac = \"old-hmac\"\n";
+
+/// Stages the fake `pkill` in `root/bin` and returns its log.
+fn stage_fake_pkill(root: &Path) -> PathBuf {
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let log = root.join("pkill.log");
+    write_fake_pkill(&bin_dir, &log).expect("write fake pkill");
+    log
+}
+
+/// Every request the mock received, as `METHOD path`, in order.
+fn request_lines(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .map(|req| format!("{} {}", req.method, req.url.path()))
+        .collect()
+}
+
+/// Runs `rotate <subcommand>` under the root token with the fake `pkill`
+/// staged in `root/bin` on `PATH`.
+fn run_rotate_root_with_pkill(
+    root: &Path,
+    openbao_url: &str,
+    subcommand: &str,
+    pkill_log: &Path,
+) -> std::process::Output {
+    let path_var = env::var("PATH").unwrap_or_default();
+    Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args([
+            "rotate",
+            "--openbao-url",
+            openbao_url,
+            "--root-token",
+            support::ROOT_TOKEN,
+            "--yes",
+            subcommand,
+        ])
+        .env("PATH", format!("{}:{path_var}", root.join("bin").display()))
+        .env("PKILL_OUTPUT", pkill_log)
+        .output()
+        .expect("run rotate")
+}
+
+/// A host whose bootroot-internal config does not parse refuses
+/// `rotate responder-hmac` before the first `OpenBao` write, naming the
+/// file: proceeding would rotate the responder away from the registrar
+/// endpoint daemon.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_unparseable_internal_config_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-internal").await;
+    let config = write_internal_config(temp_dir.path(), UNPARSEABLE_INTERNAL_CONFIG);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-internal",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED),
+        "the refusal names the file: {stderr}"
+    );
+    assert!(
+        !stdout.contains("hmac-internal") && !stderr.contains("hmac-internal"),
+        "the new HMAC is never printed"
+    );
+    assert_no_secret_writes(&received(&openbao).await);
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    assert_eq!(
+        fs::read_to_string(&config).expect("config"),
+        UNPARSEABLE_INTERNAL_CONFIG
+    );
+}
+
+/// On a host without the bootroot-internal config `rotate
+/// responder-hmac` sends exactly the requests it always has, signals no
+/// internal daemon and creates nothing below `secrets/`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_without_internal_config_is_unchanged() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-plain").await;
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-plain",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/responder/hmac".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    assert!(
+        !temp_dir
+            .path()
+            .join("secrets")
+            .join("registrar-internal")
+            .exists(),
+        "a host without the registrar gets no internal directory"
+    );
+    assert!(!stdout.contains("registrar endpoint daemon"), "{stdout}");
+}
+
+/// A readable internal config the invoking user cannot republish — the
+/// config is root-owned in production — fails the rotation after its
+/// `OpenBao` writes, naming the file and both recoveries. The responder
+/// is still handed the new HMAC: `OpenBao` and the service agents are
+/// already on it, and the `--force` recovery issues against it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_reports_an_internal_config_it_cannot_publish() {
+    assert_ne!(
+        bootroot::fs_util::current_process_euid(),
+        0,
+        "this test asserts what an unprivileged process cannot do, so it must not be root"
+    );
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-unpublished").await;
+    let before = valid_internal_config(false);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-unpublished",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED)
+            && stderr.contains("re-run this rotation")
+            && stderr.contains("bootroot rotate registrar-internal-credential --force"),
+        "{stderr}"
+    );
+    assert!(
+        !stdout.contains("hmac-unpublished") && !stderr.contains("hmac-unpublished"),
+        "the new HMAC is never printed"
+    );
+    let requests = received(&openbao).await;
+    assert_eq!(
+        posted_payloads(&requests, "/v1/secret/data/bootroot/responder/hmac"),
+        vec![json!({ "value": "hmac-unpublished" })],
+        "the failure comes after the OpenBao write, which is kept"
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    let docker_log =
+        fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
+    assert!(
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC despite the failure: {docker_log}"
+    );
+    assert!(
+        !stdout.contains("responder config updated"),
+        "no summary claims the rotation finished: {stdout}"
+    );
+}
+
+/// Answers `registration_id`'s per-service `suffix` record write with a
+/// server error, ahead of any stub that would accept it.
+async fn fail_service_record_write(server: &MockServer, registration_id: &str, suffix: &str) {
+    Mock::given(method("POST"))
+        .and(path(service_record_path(registration_id, suffix)))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "errors": ["internal error"]
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A fan-out write that fails after the control-node HMAC write does
+/// not end `rotate responder-hmac` there. `OpenBao` already carries the
+/// new value, so the internal config is still rewritten and the
+/// responder still handed the HMAC — both under the lock, which a
+/// repair waiting to read that value must not see released before the
+/// responder has it — and both failures are reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_fanout_failure_still_hands_over_the_hmac() {
+    assert_ne!(
+        bootroot::fs_util::current_process_euid(),
+        0,
+        "this test asserts what an unprivileged process cannot do, so it must not be root"
+    );
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    fail_service_record_write(&openbao, SERVICE_NAME, "http_responder_hmac").await;
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-fanout").await;
+    let before = valid_internal_config(false);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-fanout",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("OpenBao KV secret write failed"),
+        "the fan-out failure is reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED),
+        "the internal config is still rewritten, and its failure reported too: {stderr}"
+    );
+    assert!(
+        !stdout.contains("hmac-fanout") && !stderr.contains("hmac-fanout"),
+        "the new HMAC is never printed"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/responder/hmac".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    let docker_log =
+        fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
+    assert!(
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC despite the fan-out failure: {docker_log}"
+    );
+    assert!(
+        !stdout.contains("responder config updated"),
+        "no summary claims the rotation finished: {stdout}"
+    );
+}
+
+/// A per-service write that fails after the global EAB is cleared does
+/// not end `rotate eab-clear` there: the internal config is still
+/// brought in step with `OpenBao` under the lock, and both failures are
+/// reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_fanout_failure_still_rewrites_the_internal_config() {
+    assert_ne!(
+        bootroot::fs_util::current_process_euid(),
+        0,
+        "this test asserts what an unprivileged process cannot do, so it must not be root"
+    );
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    fail_service_record_write(&openbao, SERVICE_NAME, "eab").await;
+    stub_eab_clear(&openbao).await;
+    let before = valid_internal_config(true);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output =
+        run_rotate_root_with_pkill(temp_dir.path(), &openbao.uri(), "eab-clear", &pkill_log);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("OpenBao KV secret write failed"),
+        "the fan-out failure is reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED)
+            && stderr.contains("bootroot rotate registrar-internal-credential --force"),
+        "the internal config is still rewritten, and its failure reported too: {stderr}"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/agent/eab".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    assert!(!stdout.contains("EAB clear completed"), "{stdout}");
+}
+
+/// `rotate eab-clear` refuses a host whose internal config does not
+/// parse before it clears anything.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_unparseable_internal_config_writes_nothing() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_eab_clear(&openbao).await;
+    let config = write_internal_config(temp_dir.path(), UNPARSEABLE_INTERNAL_CONFIG);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output =
+        run_rotate_root_with_pkill(temp_dir.path(), &openbao.uri(), "eab-clear", &pkill_log);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED),
+        "the refusal names the file: {stderr}"
+    );
+    assert_no_secret_writes(&received(&openbao).await);
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    assert_eq!(
+        fs::read_to_string(&config).expect("config"),
+        UNPARSEABLE_INTERNAL_CONFIG
+    );
+}
+
+/// On a host without the bootroot-internal config `rotate eab-clear`
+/// sends exactly the requests it always has and signals nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_without_internal_config_is_unchanged() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_eab_clear(&openbao).await;
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output =
+        run_rotate_root_with_pkill(temp_dir.path(), &openbao.uri(), "eab-clear", &pkill_log);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/agent/eab".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    assert!(!stdout.contains("Removed [eab]"), "{stdout}");
+    assert!(stdout.contains("service bootroot-agents apply"), "{stdout}");
+}
+
+/// On a host whose internal config carries no `[eab]`, `rotate
+/// eab-clear` leaves the file alone — same bytes, same inode — and
+/// signals nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_leaves_an_internal_config_without_eab_alone() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_eab_clear(&openbao).await;
+    let before = valid_internal_config(false);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let inode = fs::metadata(&config).expect("meta").ino();
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output =
+        run_rotate_root_with_pkill(temp_dir.path(), &openbao.uri(), "eab-clear", &pkill_log);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    assert_eq!(fs::metadata(&config).expect("meta").ino(), inode);
+    assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    assert!(!stdout.contains("Removed [eab]"), "{stdout}");
 }
 
 fn rotation_state_json(root: &Path) -> serde_json::Value {

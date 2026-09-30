@@ -474,6 +474,84 @@ the record of the ACME directory, contact email and responder URL `init` chose,
 which the rebuild keeps; it falls back to rebuilding them the way `init` derived
 them only when the file is absent, never when it is present and does not parse.
 
+**`rotate responder-hmac` and `rotate eab-clear` touch the config too.** The
+config has no `[openbao]` section and polls nothing, so the fast-poll loop that
+carries a rotated responder HMAC or a cleared EAB to every other agent never
+reaches the endpoint daemon — and a daemon still signing its HTTP-01 token
+placements with the old HMAC fails every issuance it makes, the internal
+credential's renewal and both endpoint surface leaves' included. So, on a host
+that carries the config:
+
+| Rotation | What happens to the config |
+| --- | --- |
+| `rotate responder-hmac` | `[acme].http_responder_hmac` is set to the value written to `bootroot/responder/hmac`, after that write and every fan-out write and before `openbao-agent-responder` is restarted. |
+| `rotate eab-clear` | The `[eab]` table is removed, after the cleared EAB is written everywhere else. A file with no `[eab]` table — including one whose `eab` key holds something other than a table — is left byte for byte as it was, and not rewritten. Removing it keeps the file in agreement with `OpenBao`, from which a repair would rebuild it without `[eab]` anyway. |
+
+Both rewrite that one key in place and keep every other byte of the file — both
+operator tables and the `[trust]` pins included — publish it root-owned at
+`0600` by one rename, and then reload the daemon (§10). Which hosts this applies
+to is decided by reading the file, before the rotation's first `OpenBao` write:
+an absent file means the host has none and the rotation does exactly what it
+does on any other host; a file that exists but cannot be read — including the
+permission error an unprivileged run gets, which the refusal answers by asking
+for a re-run as root — does not parse as TOML, or, for `rotate responder-hmac`,
+has an `acme` that is not a table refuses the rotation, naming the file, with
+nothing written anywhere. `[acme]` is rewritten in whichever form the file
+spells it — a `[acme]` header, dotted `acme.` keys or an inline table — since
+the agent loads all three alike, and only the value is replaced: a comment
+trailing the old HMAC stays where it was. A failure after the `OpenBao` writes is
+reported rather than rolled back: the new value is already the source of
+truth, so re-running the rotation, or running
+`bootroot rotate registrar-internal-credential --force` to re-render the file
+from `OpenBao`, converges it. Once the control-node record —
+`bootroot/responder/hmac` or `bootroot/agent/eab` — carries the new value, every
+remaining step runs even when an earlier one fails, and the rotation reports all
+the failures together:
+a failed fan-out write to one service's record still leaves the config
+rewritten and, for `rotate responder-hmac`, the responder handed the new HMAC.
+`rotate responder-hmac` hands the responder the new HMAC before it reports any
+such failure: the service agents are already converging on it, and the
+`--force` repair issues over ACME with the value it reads from `OpenBao`, which
+a responder left on the old one would refuse.
+
+**Every rotation that writes the config serializes on one lock.** Rotations can
+overlap — scheduled rotation units run on timers — and each writer is a
+read–modify–write that an atomic rename does not make atomic. A repair, for
+example, reads the responder HMAC and the EAB from `OpenBao`, issues over ACME,
+and only then republishes the set: a responder-HMAC rotation landing in between
+would be overwritten with the old value. So `rotate responder-hmac`,
+`rotate eab-clear`, Phases 3 and 6, the tail after Phase 4 and
+`bootroot rotate registrar-internal-credential` each hold an exclusive advisory
+lock on `registrar-internal/agent.toml.lock` from reading the value they will
+write until they have published it:
+
+- Phases 3 and 6 hold it from before reading the config until after the rename,
+  or the restore on failure.
+- A repair holds it from after its root-authority and TLS refusals, before it
+  reads `OpenBao`, until the set is published — across the ACME issuance.
+- `rotate responder-hmac` holds it from before its first `OpenBao` write until
+  it has restarted `openbao-agent-responder`, seen the new value rendered into
+  the responder config and, where the compose file runs a responder, sent the
+  responder `SIGHUP` — including when a fan-out write or the config rewrite
+  failed on the way. A repair waiting on it therefore issues only against a
+  responder that has been handed the HMAC it read. The responder applying that
+  `SIGHUP` is not awaited.
+- `rotate eab-clear` holds it from before its first `OpenBao` write until the
+  config is published and the daemon signalled, including when a per-service
+  write failed on the way.
+
+Under the lock the two rotations re-read the file and apply their change to what
+they read, so a `[trust]` change published while they waited survives them. The
+lock file holds no data, is created `0600` and never removed, and is not a member
+of the internal set; the daemon only reads the config and never takes the lock.
+A host without the config takes no lock.
+
+**`bootroot init` does not take the lock.** `init` provisions the deployment
+the rotations operate on, and running a rotation while `init` is still running
+is not supported for any file `init` writes. If it happens anyway, the config
+can end on the value `init` read; `bootroot rotate registrar-internal-credential
+--force` re-renders it from `OpenBao`.
+
 ## 10. Signalling
 
 Reloading the internal agent is its own helper. It takes no `ServiceEntry` — the
@@ -494,10 +572,11 @@ for the reason in §7. Any other non-zero status is a real failure and aborts th
 rotation phase or the recovery that sent it.
 
 `bootroot-agent` already reloads its settings and restarts its daemon task on
-`SIGHUP` without exiting, so a reload picks up rewritten trust pins and replaced
-material in place. No rotation changes a key in the operator's `[registrar]` or
-`[registrar_endpoint]` table (§9), so a rotation's reload never asks the daemon
-to apply a changed endpoint setting.
+`SIGHUP` without exiting, so a reload picks up rewritten trust pins, a rotated
+responder HMAC, a removed EAB and replaced material in place. No rotation
+changes a key in the operator's `[registrar]` or `[registrar_endpoint]` table
+(§9), so a rotation's reload never asks the daemon to apply a changed endpoint
+setting.
 
 ## 11. Root mismatch and recovery
 

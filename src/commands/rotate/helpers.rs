@@ -274,6 +274,21 @@ pub(super) fn signal_internal_registrar_agent(
     anyhow::bail!(messages.error_command_run_failed("pkill -HUP"));
 }
 
+/// Folds a later step's failure into the one a rotation already
+/// recorded, so the error it returns names every step that failed
+/// rather than only the first. With nothing recorded, the later failure
+/// is returned as it is.
+pub(super) fn fold_failure(
+    earlier: Option<anyhow::Error>,
+    step: &str,
+    later: anyhow::Error,
+) -> anyhow::Error {
+    match earlier {
+        None => later,
+        Some(earlier) => earlier.context(format!("{step} failed as well: {later:#}")),
+    }
+}
+
 pub(super) fn try_restart_container(container: &str) -> Result<()> {
     let status = std::process::Command::new("docker")
         .args(["restart", container])

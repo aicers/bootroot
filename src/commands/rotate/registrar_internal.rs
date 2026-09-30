@@ -29,16 +29,37 @@
 //! its whole body. It repairs expired, interrupted or unusable material
 //! and stale config trust, never re-runs install, and never touches a
 //! service credential.
+//!
+//! `rotate responder-hmac` and `rotate eab-clear` reach the internal
+//! config too, through [`check_internal_config_change`] and
+//! [`apply_internal_config_change`]. The config carries no `[openbao]`
+//! section and polls nothing, so the fast-poll loop that carries those
+//! two values to every other agent never reaches the endpoint daemon:
+//! the rotation rewrites the one key itself and reloads the daemon.
+//!
+//! # The config lock
+//!
+//! Every rotation-time writer of the internal config — Phases 3 and 6,
+//! the repair, and the two rotations above — holds
+//! [`InternalConfigLock`] from reading the value it will write until it
+//! has published it. Two rotations can overlap (scheduled rotation units
+//! run on timers), and each of those writers is a read–modify–write an
+//! atomic rename does not make atomic: a repair that read the responder
+//! HMAC from `OpenBao` before a responder-HMAC rotation and published
+//! after it would put the old value back. `bootroot init` does not take
+//! it; running a rotation during `init` is not supported.
 
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::eab::EabCredentials;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths,
-    MaterialStatus, capture_members, load_material, material_status, require_https,
-    require_root_authority, upsert_internal_trust,
+    MaterialStatus, capture_members, load_material, material_status, remove_internal_eab,
+    require_https, require_root_authority, upsert_internal_responder_hmac, upsert_internal_trust,
 };
 use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, fs_util};
@@ -56,6 +77,310 @@ use crate::commands::init::{
 };
 use crate::commands::trust::RotationMode;
 use crate::i18n::Messages;
+
+/// The lock file, beside the internal config, that every rotation-time
+/// writer of the config holds.
+///
+/// A name to lock and never a record: it holds no data, it is not a
+/// member of the internal set, and it is never removed, because
+/// unlinking it would hand the next two writers a different inode each
+/// and serialize neither.
+const INTERNAL_CONFIG_LOCK_FILE: &str = "agent.toml.lock";
+
+/// The mode the lock file is created at. Nothing reads it; the
+/// descriptor is the lock.
+const INTERNAL_CONFIG_LOCK_MODE: u32 = 0o600;
+
+/// The recovery a failed internal-config update after the `OpenBao`
+/// writes names: the new value is already the source of truth, so either
+/// re-running the rotation or re-rendering the config from `OpenBao`
+/// converges the file on it.
+const INTERNAL_CONFIG_RECOVERY: &str = "the new value is already in OpenBao; re-run this \
+     rotation, or run `bootroot rotate registrar-internal-credential --force` to re-render \
+     the file from OpenBao";
+
+/// Exclusive hold on the internal config's lock, released when dropped.
+///
+/// The kernel releases the lock as the descriptor closes, so a rotation
+/// that fails — or is killed — mid-update strands nothing.
+pub(super) struct InternalConfigLock {
+    /// The open lock file; holding it open is holding the lock.
+    _file: File,
+}
+
+/// Takes the internal config's lock, waiting for whichever rotation
+/// holds it.
+///
+/// The wait is unbounded on purpose: the holder is another rotation's
+/// read–modify–write, and the lock is released by the kernel if it
+/// dies, so there is no stale lock to time out of. The blocking acquire
+/// runs on a blocking thread so the runtime keeps running.
+///
+/// A host whose internal directory is gone — a repair rebuilding it —
+/// gets the directory created with the mode its publication would give
+/// it, since the lock has to live somewhere.
+///
+/// # Errors
+///
+/// Returns an error naming the config the lock guards when the directory
+/// cannot be created, when the lock file cannot be opened, or when the
+/// lock cannot be taken.
+pub(super) async fn acquire_internal_config_lock(secrets_dir: &Path) -> Result<InternalConfigLock> {
+    let paths = InternalPaths::new(secrets_dir);
+    if !tokio::fs::try_exists(paths.dir()).await.unwrap_or(false) {
+        fs_util::ensure_secrets_dir(paths.dir())
+            .await
+            .with_context(|| {
+                format!(
+                    "creating {} to take the lock on the bootroot-internal config at {} in",
+                    paths.dir().display(),
+                    paths.agent_config().display()
+                )
+            })?;
+    }
+    let lock_path = paths.dir().join(INTERNAL_CONFIG_LOCK_FILE);
+    tokio::task::spawn_blocking(move || lock_internal_config_blocking(&lock_path))
+        .await
+        .context("the bootroot-internal config lock task panicked")
+        .and_then(|locked| locked)
+        .with_context(|| {
+            format!(
+                "locking the bootroot-internal config at {} for update",
+                paths.agent_config().display()
+            )
+        })
+}
+
+/// The blocking half of [`acquire_internal_config_lock`].
+fn lock_internal_config_blocking(lock_path: &Path) -> Result<InternalConfigLock> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(INTERNAL_CONFIG_LOCK_MODE)
+        .open(lock_path)
+        .with_context(|| {
+            format!(
+                "opening the bootroot-internal config lock {}",
+                lock_path.display()
+            )
+        })?;
+    file.lock().with_context(|| {
+        format!(
+            "waiting for the bootroot-internal config lock {}",
+            lock_path.display()
+        )
+    })?;
+    Ok(InternalConfigLock { _file: file })
+}
+
+/// One change a rotation makes to the internal config, applied to the
+/// file as it is when the change is made.
+///
+/// Carried as the change rather than as precomputed file contents, so
+/// the contents published are always computed from the file read under
+/// the lock and never from an earlier read another writer has since
+/// moved past.
+#[derive(Clone, Copy)]
+pub(super) enum InternalConfigChange<'a> {
+    /// Sets `[acme].http_responder_hmac`.
+    SetResponderHmac(&'a HmacSecret),
+    /// Removes the `[eab]` table.
+    RemoveEab,
+}
+
+impl InternalConfigChange<'_> {
+    /// Applies the change to `contents`, returning `None` when there is
+    /// nothing to change.
+    ///
+    /// A parse failure is reported without its source: the parser's
+    /// message quotes the offending line, and this file carries the
+    /// responder HMAC and the EAB HMAC. Any other refusal — an `acme`
+    /// that is not a table — quotes nothing from the file and is kept.
+    fn apply(self, contents: &str, config_path: &Path) -> Result<Option<String>> {
+        let applied = match self {
+            Self::SetResponderHmac(hmac) => {
+                upsert_internal_responder_hmac(contents, hmac).map(Some)
+            }
+            Self::RemoveEab => remove_internal_eab(contents),
+        };
+        applied.map_err(|err| {
+            if err.downcast_ref::<toml_edit::TomlError>().is_some() {
+                anyhow::anyhow!(
+                    "the bootroot-internal config at {} does not parse as TOML",
+                    config_path.display()
+                )
+            } else {
+                err.context(format!(
+                    "the bootroot-internal config at {} cannot take this change",
+                    config_path.display()
+                ))
+            }
+        })
+    }
+}
+
+/// What [`check_internal_config_change`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InternalConfigCheck {
+    /// The host has no internal config; the rotation leaves it alone.
+    Absent,
+    /// The config is readable and the change applies to it.
+    Applicable,
+    /// The config is readable and already carries the change — an
+    /// `eab-clear` over a config with no `[eab]` table.
+    Unchanged,
+}
+
+impl InternalConfigCheck {
+    /// Reports whether the host carries an internal config, and so
+    /// whether the rotation takes the lock and applies its change.
+    pub(super) fn found(self) -> bool {
+        self != Self::Absent
+    }
+}
+
+/// Decides, before a rotation's first `OpenBao` write, whether the
+/// internal config is one it can update.
+///
+/// A check only: the rewrite is computed to prove it can be, and then
+/// discarded. What is published is computed again under the lock by
+/// [`apply_internal_config_change`], from the file as it is then.
+///
+/// # Errors
+///
+/// Returns an error naming the file when it exists but cannot be read —
+/// including the permission error an unprivileged invocation gets on
+/// this `root:root` `0600` file — or does not parse as TOML. The
+/// rotation has written nothing at that point, and proceeding would
+/// leave the endpoint daemon on the old value.
+pub(super) async fn check_internal_config_change(
+    secrets_dir: &Path,
+    change: InternalConfigChange<'_>,
+) -> Result<InternalConfigCheck> {
+    let config_path = InternalPaths::new(secrets_dir).agent_config();
+    let contents = match tokio::fs::read_to_string(&config_path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InternalConfigCheck::Absent);
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "reading the bootroot-internal config at {}; this rotation must rewrite that \
+                 file and reload the registrar endpoint daemon, so re-run it with enough \
+                 privilege to rewrite it (as root). Nothing has been written",
+                config_path.display()
+            )));
+        }
+    };
+    let rewritten = change.apply(&contents, &config_path).map_err(|err| {
+        err.context(
+            "this rotation must rewrite the bootroot-internal config and cannot; nothing has \
+             been written",
+        )
+    })?;
+    Ok(if rewritten.is_some() {
+        InternalConfigCheck::Applicable
+    } else {
+        InternalConfigCheck::Unchanged
+    })
+}
+
+/// Re-reads the internal config and applies `change` to what it read.
+///
+/// The pure half of [`apply_internal_config_change`], and the step the
+/// lock exists for: it runs only with the lock held, so the file it
+/// reads is the one the publication replaces.
+///
+/// # Errors
+///
+/// Returns an error when the config has disappeared since the check,
+/// cannot be read, or no longer parses.
+async fn rewrite_internal_config(
+    config_path: &Path,
+    change: InternalConfigChange<'_>,
+    _lock: &InternalConfigLock,
+) -> Result<Option<String>> {
+    let contents = tokio::fs::read_to_string(config_path)
+        .await
+        .with_context(|| {
+            format!(
+                "re-reading the bootroot-internal config at {}",
+                config_path.display()
+            )
+        })?;
+    change.apply(&contents, config_path)
+}
+
+/// Publishes a rewritten internal config, root-owned at `0600`.
+///
+/// One file, one rename: an agent reading it sees the whole previous
+/// version or the whole new one, and there is no second file to hold
+/// in step with it, so no snapshot or restore.
+async fn publish_internal_config(config_path: &Path, contents: &str) -> Result<()> {
+    // Root-owned unconditionally, exactly as `write_trust_pair`: this
+    // is one of the protected files, and a rotation must not be the
+    // publication that hands it to the invoking user.
+    fs_util::atomic_write_fixed_owner(
+        fs_util::Destination::bootroot_owned(config_path),
+        contents.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::FixedOwner::root(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "writing the bootroot-internal config at {}",
+            config_path.display()
+        )
+    })
+}
+
+/// Applies `change` to the internal config and reloads the endpoint
+/// daemon, with the lock already held by the caller.
+///
+/// Re-reads the file under the lock, applies the change to what it
+/// read, publishes the result and signals the daemon. A change that
+/// leaves the file as it is publishes nothing and signals nothing.
+///
+/// Reports whether it published.
+///
+/// # Errors
+///
+/// Returns an error naming the file, and the recovery, when the file
+/// cannot be re-read or re-parsed, cannot be published, or the daemon
+/// cannot be signalled. The rotation's `OpenBao` writes have landed by
+/// then, so the error is reported rather than rolled back.
+pub(super) async fn apply_internal_config_change(
+    secrets_dir: &Path,
+    change: InternalConfigChange<'_>,
+    lock: &InternalConfigLock,
+    messages: &Messages,
+) -> Result<bool> {
+    let config_path = InternalPaths::new(secrets_dir).agent_config();
+    async {
+        let Some(next) = rewrite_internal_config(&config_path, change, lock).await? else {
+            return Ok(false);
+        };
+        publish_internal_config(&config_path, &next).await?;
+        signal_internal_registrar_agent(secrets_dir, messages)?;
+        Ok::<_, anyhow::Error>(true)
+    }
+    .await
+    .with_context(|| {
+        format!(
+            "updating the bootroot-internal config at {}: {INTERNAL_CONFIG_RECOVERY}",
+            config_path.display()
+        )
+    })
+}
+
+/// The path of the internal config below `secrets_dir`, for the
+/// rotations' summaries.
+pub(super) fn internal_config_path(secrets_dir: &Path) -> PathBuf {
+    InternalPaths::new(secrets_dir).agent_config()
+}
 
 /// The trust set the internal bundle and the internal config's pins must
 /// carry.
@@ -147,6 +472,11 @@ async fn write_internal_trust(
 ) -> Result<()> {
     let paths = InternalPaths::new(secrets_dir);
     let config_path = paths.agent_config();
+    // Held from before the read until after the rename or the restore,
+    // so a responder-HMAC or EAB rotation's rewrite cannot land between
+    // them and be put back by this one. Released as it drops, on every
+    // path out.
+    let _lock = acquire_internal_config_lock(secrets_dir).await?;
     let current = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| messages.error_read_file_failed(&config_path.display().to_string()))?;
@@ -263,6 +593,13 @@ pub(super) async fn repair_internal_credential(
     // written, with the same typed error the load path uses.
     require_https(&ctx.openbao_url)?;
 
+    // Held from before the responder HMAC and the EAB are read out of
+    // `OpenBao` until the set carrying them is published — across the
+    // ACME issuance in between, which is the point: the values this
+    // republishes are the ones it read, so a responder-HMAC or EAB
+    // rotation either finishes before the read or waits for the
+    // publication.
+    let _lock = acquire_internal_config_lock(ctx.paths.secrets_dir()).await?;
     let context = repair_context(ctx, client, messages).await?;
     replace_internal_credential(client, &context, &ctx.openbao_url, trust, messages).await
 }
@@ -830,11 +1167,13 @@ mod tests {
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::{
-        CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths, InternalTrustState,
-        POLICY_BOOTROOT_REGISTRAR_INTERNAL, PriorInternalAuth, RegistrarInternalContext,
-        RotationMode, converge_internal_auth, ensure_internal_trust_is,
-        internal_credential_present, internal_rotation_applies, repair_internal_credential,
-        replace_internal_credential, restore_cert_auth_entry, staging_dir, sweep_staging,
+        CERT_AUTH_MOUNT, CERT_AUTH_ROLE, INTERNAL_CONFIG_LOCK_FILE, InternalConfigChange,
+        InternalConfigCheck, InternalPaths, InternalTrustState, POLICY_BOOTROOT_REGISTRAR_INTERNAL,
+        PriorInternalAuth, RegistrarInternalContext, RotationMode, acquire_internal_config_lock,
+        apply_internal_config_change, check_internal_config_change, converge_internal_auth,
+        ensure_internal_trust_is, internal_credential_present, internal_rotation_applies,
+        publish_internal_config, repair_internal_credential, replace_internal_credential,
+        restore_cert_auth_entry, rewrite_internal_config, staging_dir, sweep_staging,
         upsert_internal_trust, write_internal_trust, write_trust_pair,
     };
     use crate::i18n::test_messages;
@@ -1685,5 +2024,522 @@ mod tests {
         .expect("config");
         ensure_internal_trust_is(dir.path(), &additive, &test_messages())
             .expect("the additive set is now in place");
+    }
+
+    /// An HMAC no test output may ever carry.
+    const ROTATED_HMAC: &str = "rotated-hmac-that-must-not-appear";
+
+    /// Reports whether nobody holds the internal config lock, without
+    /// waiting.
+    ///
+    /// `flock` belongs to the open file description, so a hold on
+    /// another descriptor in this process refuses this one exactly as
+    /// another process's would. Test-only: the answer is stale the
+    /// moment it is returned.
+    fn lock_is_free(paths: &InternalPaths) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(paths.dir().join(INTERNAL_CONFIG_LOCK_FILE))
+            .expect("open the lock file");
+        file.try_lock().is_ok()
+    }
+
+    /// The four answers the pre-write check gives, one per kind of
+    /// host.
+    #[tokio::test]
+    async fn the_check_tells_the_four_kinds_of_host_apart() {
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+        let set_hmac = InternalConfigChange::SetResponderHmac(&hmac);
+
+        let bare = TempDir::new().expect("tempdir");
+        for change in [set_hmac, InternalConfigChange::RemoveEab] {
+            assert_eq!(
+                check_internal_config_change(bare.path(), change)
+                    .await
+                    .expect("an absent config is not an error"),
+                InternalConfigCheck::Absent
+            );
+        }
+        assert!(
+            !InternalPaths::new(bare.path()).dir().exists(),
+            "the check creates nothing on a host without the registrar"
+        );
+
+        let (dir, paths) = provisioned_host();
+        assert_eq!(
+            check_internal_config_change(dir.path(), set_hmac)
+                .await
+                .expect("readable"),
+            InternalConfigCheck::Applicable
+        );
+        assert_eq!(
+            check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
+                .await
+                .expect("readable"),
+            InternalConfigCheck::Unchanged,
+            "the fixture renders no [eab], so eab-clear has nothing to change"
+        );
+        let with_eab = format!(
+            "{}\n[eab]\nkid = \"kid-1\"\nhmac = \"eab-hmac\"\n",
+            std::fs::read_to_string(paths.agent_config()).expect("config")
+        );
+        std::fs::write(paths.agent_config(), with_eab).expect("config");
+        assert_eq!(
+            check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
+                .await
+                .expect("readable"),
+            InternalConfigCheck::Applicable
+        );
+
+        // The parser's own message quotes the offending line, and the
+        // line here carries the old HMAC: the refusal names the file and
+        // nothing from inside it.
+        std::fs::write(
+            paths.agent_config(),
+            "[acme\nhttp_responder_hmac = \"old-hmac-that-must-not-appear\"\n",
+        )
+        .expect("config");
+        for change in [set_hmac, InternalConfigChange::RemoveEab] {
+            let report = format!(
+                "{:#}",
+                check_internal_config_change(dir.path(), change)
+                    .await
+                    .expect_err("an unparseable config is refused")
+            );
+            assert!(
+                report.contains(&paths.agent_config().display().to_string()),
+                "the refusal names the file: {report}"
+            );
+            assert!(
+                !report.contains("old-hmac-that-must-not-appear") && !report.contains(ROTATED_HMAC),
+                "no HMAC reaches the refusal: {report}"
+            );
+        }
+        assert!(
+            !paths.dir().join(INTERNAL_CONFIG_LOCK_FILE).exists(),
+            "the check takes no lock"
+        );
+    }
+
+    /// An `[acme]` spelled as an inline table is one the check finds
+    /// applicable and the rewrite under the lock carries the new HMAC
+    /// into; an `acme` that is not a table refuses the rotation before
+    /// its first write rather than letting it report a rewrite it did
+    /// not make.
+    #[tokio::test]
+    async fn the_check_and_the_rewrite_reach_an_inline_acme() {
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+        let set_hmac = InternalConfigChange::SetResponderHmac(&hmac);
+        let (dir, paths) = provisioned_host();
+        let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(paths.agent_config())
+            .expect("config")
+            .parse()
+            .expect("valid TOML");
+        let acme = doc
+            .remove("acme")
+            .and_then(|item| item.into_table().ok())
+            .expect("the [acme] table");
+        doc.insert(
+            "acme",
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(acme.into_inline_table())),
+        );
+        std::fs::write(paths.agent_config(), doc.to_string()).expect("config");
+
+        assert_eq!(
+            check_internal_config_change(dir.path(), set_hmac)
+                .await
+                .expect("readable"),
+            InternalConfigCheck::Applicable
+        );
+        let lock = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the lock");
+        let rewritten = rewrite_internal_config(&paths.agent_config(), set_hmac, &lock)
+            .await
+            .expect("the rewrite")
+            .expect("the HMAC changes the file");
+        std::fs::write(paths.agent_config(), rewritten).expect("config");
+        assert_eq!(
+            bootroot::registrar::internal::load_internal_config(&paths)
+                .expect("loads")
+                .acme
+                .http_responder_hmac
+                .expose(),
+            ROTATED_HMAC
+        );
+        drop(lock);
+
+        std::fs::write(paths.agent_config(), "acme = \"old-hmac-in-a-string\"\n").expect("config");
+        let report = format!(
+            "{:#}",
+            check_internal_config_change(dir.path(), set_hmac)
+                .await
+                .expect_err("a non-table acme is refused")
+        );
+        assert!(
+            report.contains(&paths.agent_config().display().to_string())
+                && report.contains("must be a table")
+                && report.contains("nothing has been written"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("old-hmac-in-a-string") && !report.contains(ROTATED_HMAC),
+            "{report}"
+        );
+    }
+
+    /// A lock that cannot be taken fails naming the config it guards,
+    /// not only the lock file beside it.
+    #[tokio::test]
+    async fn a_lock_failure_names_the_internal_config() {
+        let (dir, paths) = provisioned_host();
+        // A directory where the lock file goes cannot be opened as one.
+        std::fs::create_dir(paths.dir().join(INTERNAL_CONFIG_LOCK_FILE)).expect("mkdir");
+        let err = acquire_internal_config_lock(dir.path())
+            .await
+            .err()
+            .expect("the lock cannot be taken");
+        let report = format!("{err:#}");
+        // The lock file's path starts with the config's, so the config
+        // is looked for as a path of its own, not as a prefix.
+        assert!(
+            report.contains(&format!(
+                "bootroot-internal config at {} for update",
+                paths.agent_config().display()
+            )) && report.contains(INTERNAL_CONFIG_LOCK_FILE),
+            "{report}"
+        );
+    }
+
+    /// A config the invoking user cannot read — the permission error a
+    /// non-root run gets on the `root:root` `0600` file — refuses the
+    /// rotation with an error that names the file and asks for root.
+    #[tokio::test]
+    async fn an_unreadable_config_refuses_the_rotation_and_asks_for_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "root reads a 0000 file, so this test must not run as root"
+        );
+        let (dir, paths) = provisioned_host();
+        std::fs::set_permissions(paths.agent_config(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        let err = check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
+            .await
+            .expect_err("an unreadable config is refused");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(&paths.agent_config().display().to_string())
+                && report.contains("as root")
+                && report.contains("Nothing has been written"),
+            "{report}"
+        );
+    }
+
+    /// An apply waits for the lock before it reads, so a `[trust]`
+    /// change another writer publishes while holding it survives the
+    /// apply's rewrite.
+    ///
+    /// The pure re-read-and-apply step is what is driven: the publish
+    /// after it is root-only, which the test below covers. The result is
+    /// the proof — a rewrite computed from a read taken before the lock
+    /// was released could not carry the `[trust]` edit made under it.
+    #[tokio::test]
+    async fn an_apply_reads_only_once_the_lock_is_released() {
+        let (dir, paths) = provisioned_host();
+        let secrets_dir = dir.path().to_path_buf();
+        let held = acquire_internal_config_lock(&secrets_dir)
+            .await
+            .expect("the test takes the lock");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let config_path = paths.agent_config();
+        let applying = tokio::spawn(async move {
+            let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+            let _ = started_tx.send(());
+            let lock = acquire_internal_config_lock(&secrets_dir)
+                .await
+                .expect("the apply takes the lock");
+            rewrite_internal_config(
+                &config_path,
+                InternalConfigChange::SetResponderHmac(&hmac),
+                &lock,
+            )
+            .await
+        });
+        started_rx.await.expect("the apply started");
+        tokio::task::yield_now().await;
+        assert!(!applying.is_finished(), "the apply waits for the lock");
+
+        // What `rotate ca-key` Phase 3 does under the lock.
+        let additive = vec![OLD_ROOT_FP.to_string(), ROOT_FP.to_string()];
+        std::fs::write(
+            paths.agent_config(),
+            upsert_internal_trust(
+                &std::fs::read_to_string(paths.agent_config()).expect("config"),
+                &paths,
+                &additive,
+            )
+            .expect("the additive pins"),
+        )
+        .expect("config");
+        drop(held);
+
+        let rewritten = applying
+            .await
+            .expect("the apply task")
+            .expect("the rewrite")
+            .expect("the HMAC changes the file");
+        let settings = {
+            std::fs::write(paths.agent_config(), &rewritten).expect("config");
+            bootroot::registrar::internal::load_internal_config(&paths).expect("loads")
+        };
+        assert_eq!(
+            settings.trust.trusted_ca_sha256, additive,
+            "the [trust] change made under the lock survives"
+        );
+        assert_eq!(settings.acme.http_responder_hmac.expose(), ROTATED_HMAC);
+    }
+
+    /// The new writer's publication is root-only, exactly like
+    /// `write_trust_pair`: an unprivileged run fails naming the file and
+    /// the ownership requirement, and leaves the bytes it found.
+    #[tokio::test]
+    async fn publishing_the_internal_config_is_root_only() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let (_dir, paths) = provisioned_host();
+        let before = std::fs::read(paths.agent_config()).expect("config");
+
+        let err = publish_internal_config(&paths.agent_config(), "email = \"x\"\n")
+            .await
+            .expect_err("an unprivileged process cannot publish the protected config");
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(AGENT_CONFIG_FILE) && report.contains("root-owned"),
+            "the refusal must name the root-ownership requirement and the file: {report}"
+        );
+        assert_eq!(std::fs::read(paths.agent_config()).expect("config"), before);
+    }
+
+    /// An apply whose publication fails reports the file and the
+    /// recovery, carries no HMAC, and leaves the file and the lock as a
+    /// later run needs them.
+    #[tokio::test]
+    async fn a_failed_apply_names_the_recovery_and_releases_the_lock() {
+        assert_ne!(
+            current_process_euid(),
+            0,
+            "this test asserts what an unprivileged process cannot do, so it must not be root"
+        );
+        let (dir, paths) = provisioned_host();
+        let before = std::fs::read(paths.agent_config()).expect("config");
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+
+        let outcome = {
+            let lock = acquire_internal_config_lock(dir.path())
+                .await
+                .expect("the lock");
+            assert!(!lock_is_free(&paths), "held while the apply runs");
+            apply_internal_config_change(
+                dir.path(),
+                InternalConfigChange::SetResponderHmac(&hmac),
+                &lock,
+                &test_messages(),
+            )
+            .await
+        };
+        let report = format!("{:#}", outcome.expect_err("the publication is root-only"));
+        assert!(
+            report.contains(&paths.agent_config().display().to_string())
+                && report.contains("root-owned")
+                && report.contains("re-run this rotation")
+                && report.contains("bootroot rotate registrar-internal-credential --force"),
+            "{report}"
+        );
+        assert!(!report.contains(ROTATED_HMAC), "{report}");
+        assert_eq!(std::fs::read(paths.agent_config()).expect("config"), before);
+        assert!(lock_is_free(&paths), "a failed apply leaves the lock free");
+    }
+
+    /// An `eab-clear` apply over a config with no `[eab]` publishes
+    /// nothing: same bytes, same inode, no signal to send.
+    #[tokio::test]
+    async fn an_eab_apply_over_a_config_without_eab_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, paths) = provisioned_host();
+        let before = std::fs::read(paths.agent_config()).expect("config");
+        let inode = std::fs::metadata(paths.agent_config()).expect("meta").ino();
+
+        let lock = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the lock");
+        let published = apply_internal_config_change(
+            dir.path(),
+            InternalConfigChange::RemoveEab,
+            &lock,
+            &test_messages(),
+        )
+        .await
+        .expect("nothing to change is a success, even unprivileged");
+        assert!(!published);
+        assert_eq!(std::fs::read(paths.agent_config()).expect("config"), before);
+        assert_eq!(
+            std::fs::metadata(paths.agent_config()).expect("meta").ino(),
+            inode
+        );
+    }
+
+    /// A config that disappeared between the check and the apply fails
+    /// the apply naming the file.
+    #[tokio::test]
+    async fn an_apply_over_a_vanished_config_names_the_file() {
+        let (dir, paths) = provisioned_host();
+        let lock = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the lock");
+        std::fs::remove_file(paths.agent_config()).expect("remove");
+        let err = apply_internal_config_change(
+            dir.path(),
+            InternalConfigChange::RemoveEab,
+            &lock,
+            &test_messages(),
+        )
+        .await
+        .expect_err("a vanished config fails the apply");
+        assert!(
+            format!("{err:#}").contains(&paths.agent_config().display().to_string()),
+            "{err:#}"
+        );
+    }
+
+    /// Phase 3's writer holds the lock across its read–modify–write and
+    /// releases it on the way out, failure included.
+    #[tokio::test]
+    async fn the_trust_writer_waits_for_and_releases_the_lock() {
+        let (dir, paths) = provisioned_host();
+        let held = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the test takes the lock");
+        let secrets_dir = dir.path().to_path_buf();
+        let writing = tokio::spawn(async move {
+            write_internal_trust(
+                &secrets_dir,
+                &InternalTrustState {
+                    fingerprints: vec![OLD_ROOT_FP.to_string()],
+                    bundle_pem: bundle_pem("QURESVRJVkU"),
+                },
+                &test_messages(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!writing.is_finished(), "the writer waits for the lock");
+        drop(held);
+        // Unprivileged, so the root-only publication fails; what is
+        // asserted is that the failure released the lock.
+        let _ = writing.await.expect("the writer task");
+        assert!(
+            lock_is_free(&paths),
+            "the writer's failure released the lock"
+        );
+    }
+
+    /// A repair holds the lock from before it reads `OpenBao`: while a
+    /// responder-HMAC or EAB rotation holds it, the repair sends no read
+    /// of the responder HMAC, and once it is released the read arrives.
+    #[tokio::test]
+    async fn a_repair_reads_openbao_only_once_the_lock_is_released() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let released = Arc::new(AtomicBool::new(false));
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let (authority_tx, mut authority_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/token/lookup-self"))
+            .respond_with(move |_: &Request| {
+                let _ = authority_tx.send(());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": { "policies": ["root"] }
+                }))
+            })
+            .mount(&server)
+            .await;
+        let flag = Arc::clone(&released);
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/secret/data/{}",
+                crate::commands::init::PATH_RESPONDER_HMAC
+            )))
+            .respond_with(move |_: &Request| {
+                // Whether the rotation had released the lock when this
+                // read arrived — the ordering under test.
+                let _ = seen_tx.send(flag.load(Ordering::SeqCst));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": { "data": { "value": "hmac" } }
+                }))
+            })
+            .mount(&server)
+            .await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let (dir, paths) = provisioned_host();
+        let held = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the rotation holds the lock");
+
+        let ctx = endpoint_ctx(dir.path());
+        let repairing = tokio::spawn(async move {
+            repair_internal_credential(
+                &ctx,
+                &client,
+                &InternalTrustState {
+                    fingerprints: vec![ROOT_FP.to_string()],
+                    bundle_pem: bundle_pem("Uk9PVA"),
+                },
+                &test_messages(),
+            )
+            .await
+        });
+        authority_rx
+            .recv()
+            .await
+            .expect("the repair passed its authority check");
+        // Bounding a negative observation, not synchronizing: with the
+        // lock held the read must not arrive at all, and a repair that
+        // did not wait would send it straight after the check above.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), seen_rx.recv())
+                .await
+                .is_err(),
+            "the repair read the responder HMAC while the rotation held the lock"
+        );
+
+        released.store(true, Ordering::SeqCst);
+        drop(held);
+        assert_eq!(
+            seen_rx.recv().await,
+            Some(true),
+            "the repair reads the responder HMAC once the lock is released, and not before"
+        );
+        // No CA material below the secrets directory, so the repair
+        // then fails at issuance; the lock goes with it.
+        repairing
+            .await
+            .expect("the repair task")
+            .expect_err("issuance fails without CA material");
+        assert!(lock_is_free(&paths), "the failed repair released the lock");
     }
 }
