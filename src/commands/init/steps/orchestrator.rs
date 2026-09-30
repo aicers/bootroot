@@ -72,13 +72,16 @@ use crate::state::StateFile;
 /// Every value is one `init` already resolved. The ACME server and the
 /// responder URL are the *host-side* ones, because the internal profile
 /// is an ordinary host daemon and not a container on the compose
-/// network — and both follow this install's own published ports rather
-/// than the compose defaults. `init` itself issues the internal leaf
-/// through them, so a hard-coded `:9000` or `:8080` would not merely
-/// write a config pointing at the wrong place: on a host whose ports
-/// were moved it would fail the run, and on a host co-located with a
-/// second instance it would reach *that* instance's step-ca and
-/// responder.
+/// network — and both follow where this install actually publishes
+/// step-ca and the responder: the recorded `--stepca-bind` /
+/// `--http01-admin-bind` address when there is one, which replaces the
+/// loopback publication, and otherwise loopback on this install's own
+/// published ports rather than the compose defaults. `init` itself
+/// issues the internal leaf through them, so an address nothing listens
+/// on would not merely write a config pointing at the wrong place: it
+/// would fail the run, and on a host co-located with a second instance
+/// a hard-coded `:9000` or `:8080` would reach *that* instance's
+/// step-ca and responder.
 ///
 /// The operator's `[registrar]` and `[registrar_endpoint]` tables ride
 /// along from `--agent-config`, already held to every requirement an
@@ -88,49 +91,27 @@ fn registrar_internal_context(
     endpoint: &EnabledEndpoint,
     args: &InitArgs,
     compose_dir: &Path,
+    state: &StateFile,
     secrets: &InitSecrets,
 ) -> registrar_internal::RegistrarInternalContext {
     registrar_internal::RegistrarInternalContext {
         intent: endpoint.intent.clone(),
         secrets_dir: args.secrets_dir.secrets_dir.clone(),
         kv_mount: args.openbao.kv_mount.clone(),
-        acme_server: internal_acme_server(&args.stepca_provisioner, compose_dir),
+        acme_server: registrar_internal::internal_acme_server(
+            &args.stepca_provisioner,
+            state.stepca_bind_addr.as_deref(),
+            compose_dir,
+        ),
         email: crate::commands::service::DEFAULT_AGENT_EMAIL.to_string(),
-        responder_url: internal_responder_url(compose_dir),
+        responder_url: registrar_internal::internal_responder_url(
+            state.http01_admin_bind_addr.as_deref(),
+            compose_dir,
+        ),
         responder_hmac: bootroot::secret::HmacSecret::new(secrets.http_hmac.clone()),
         eab: secrets.eab.clone(),
         endpoint_tables: Some(endpoint.tables.clone()),
     }
-}
-
-/// The step-ca ACME directory URL the internal profile enrols against.
-///
-/// Follows the configured provisioner name rather than hard-coding
-/// `acme`: an install that renamed the ACME provisioner would otherwise
-/// have `init` enrol against a directory step-ca does not serve. The
-/// port follows `STEPCA_HOST_PORT` — the process environment, then this
-/// compose directory's `.env`, then the compose default — for the same
-/// reason.
-fn internal_acme_server(provisioner: &str, compose_dir: &Path) -> String {
-    internal_acme_server_with_env(
-        provisioner,
-        compose_dir,
-        std::env::var(bootroot::host_port::STEPCA_HOST_PORT_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// [`internal_acme_server`] with the `STEPCA_HOST_PORT` value supplied
-/// by the caller instead of read from the process environment, so the
-/// precedence can be exercised without a process-global environment.
-fn internal_acme_server_with_env(
-    provisioner: &str,
-    compose_dir: &Path,
-    env_value: Option<&str>,
-) -> String {
-    let port = bootroot::host_port::resolve_stepca_host_port_with_env(env_value, compose_dir);
-    format!("https://localhost:{port}/acme/{provisioner}/directory")
 }
 
 /// Attaches the bootroot-internal SAN to the running responder as a
@@ -174,27 +155,6 @@ fn register_internal_dns_alias(identity: &ComposeIdentity, messages: &Messages) 
              resolve the bootroot-internal identity and its certificate cannot be issued"
         ),
     }
-}
-
-/// The HTTP-01 responder admin URL the internal profile drives its
-/// challenges through.
-///
-/// Loopback, because the internal agent is a host process, and on this
-/// install's published admin port rather than the compose default.
-fn internal_responder_url(compose_dir: &Path) -> String {
-    internal_responder_url_with_env(
-        compose_dir,
-        std::env::var(bootroot::host_port::HTTP01_ADMIN_HOST_PORT_ENV)
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// [`internal_responder_url`] with the `HTTP01_ADMIN_HOST_PORT` value
-/// supplied by the caller.
-fn internal_responder_url_with_env(compose_dir: &Path, env_value: Option<&str>) -> String {
-    let port = bootroot::host_port::resolve_http01_admin_host_port_with_env(env_value, compose_dir);
-    format!("http://127.0.0.1:{port}")
 }
 
 /// The loopback bind address an endpoint-enabled install issues its
@@ -1156,9 +1116,21 @@ async fn run_init_inner(
     // rollback envelope: the `auth/cert` mount, the policy, the entry
     // and the whole staged directory are registered before they are
     // created. Nothing is published here — the credential is proved over
-    // the TLS listener first, below.
+    // the TLS listener first, below. The state is read for the step-ca
+    // and responder bind intents `infra install` recorded, which decide
+    // the addresses the leaf is issued through.
     let internal_context = registrar_endpoint
-        .map(|endpoint| registrar_internal_context(endpoint, args, compose_dir, &secrets));
+        .map(|endpoint| -> Result<_> {
+            let state = StateFile::load(&StateFile::default_path())?;
+            Ok(registrar_internal_context(
+                endpoint,
+                args,
+                compose_dir,
+                &state,
+                &secrets,
+            ))
+        })
+        .transpose()?;
     let staged_internal = match internal_context.as_ref() {
         Some(context) => {
             let inputs = context.inputs();
@@ -3469,83 +3441,5 @@ mod registrar_tls_gate_tests {
                 "{url}: recorded {recorded} does not name the bound port {port}"
             );
         }
-    }
-}
-
-/// The two host-side endpoints the internal profile is provisioned
-/// against. `init` issues the internal leaf through both, so neither may
-/// be assumed to be on the compose default.
-#[cfg(test)]
-mod internal_endpoint_tests {
-    use super::{internal_acme_server_with_env, internal_responder_url_with_env};
-
-    /// An install that recorded moved ports in its `.env` is reached on
-    /// the ports it actually published. A hard-coded `:9000`/`:8080`
-    /// would fail the run here, and on a host co-located with a second
-    /// instance it would reach that instance's step-ca and responder
-    /// instead.
-    #[test]
-    fn both_endpoints_follow_the_recorded_published_ports() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join(".env"),
-            "STEPCA_HOST_PORT=19000\nHTTP01_ADMIN_HOST_PORT=18080\n",
-        )
-        .expect("write .env");
-        assert_eq!(
-            internal_acme_server_with_env("acme", dir.path(), None),
-            "https://localhost:19000/acme/acme/directory"
-        );
-        assert_eq!(
-            internal_responder_url_with_env(dir.path(), None),
-            "http://127.0.0.1:18080"
-        );
-    }
-
-    /// The process environment outranks the recorded `.env`, matching
-    /// every other host-port derivation in the binary.
-    #[test]
-    fn the_environment_outranks_the_recorded_env_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(
-            dir.path().join(".env"),
-            "STEPCA_HOST_PORT=19000\nHTTP01_ADMIN_HOST_PORT=18080\n",
-        )
-        .expect("write .env");
-        assert_eq!(
-            internal_acme_server_with_env("acme", dir.path(), Some("29000")),
-            "https://localhost:29000/acme/acme/directory"
-        );
-        assert_eq!(
-            internal_responder_url_with_env(dir.path(), Some("28080")),
-            "http://127.0.0.1:28080"
-        );
-    }
-
-    /// With nothing recorded, both fall back to the ports the compose
-    /// files interpolate.
-    #[test]
-    fn both_endpoints_fall_back_to_the_compose_defaults() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(
-            internal_acme_server_with_env("acme", dir.path(), None),
-            "https://localhost:9000/acme/acme/directory"
-        );
-        assert_eq!(
-            internal_responder_url_with_env(dir.path(), None),
-            "http://127.0.0.1:8080"
-        );
-    }
-
-    /// The provisioner name is still followed: an install that renamed
-    /// the ACME provisioner would otherwise enrol against a directory
-    /// step-ca does not serve.
-    #[test]
-    fn the_acme_directory_follows_the_configured_provisioner() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(
-            internal_acme_server_with_env("bootroot-acme", dir.path(), None),
-            "https://localhost:9000/acme/bootroot-acme/directory"
-        );
     }
 }
