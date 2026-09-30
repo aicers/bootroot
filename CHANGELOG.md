@@ -387,6 +387,14 @@ byte for byte.
 
 ### Fixed
 
+- `bootroot rotate ca-key` now treats a service certificate as already on
+  the new CA only when the new intermediate's key signed it, not merely
+  when it names an intermediate with the same name. Every rotation creates
+  its intermediate under the same name, so from a deployment's second
+  rotation onward the previous name comparison matched every existing
+  certificate: Phase 5 re-issued no `local-file` service, and Phase 6
+  narrowed trust to the new CA while those services still presented
+  certificates from the old one.
 - `bootroot rotate ca-key` Phase 5 now publishes a versioned reissue
   request to OpenBao KV for each `remote-bootstrap` service that is not
   already on the new intermediate, as documented, so its agent picks the

@@ -3053,10 +3053,12 @@ without a hook are flagged explicitly and accompanied by the
 
 For `rotate ca-key` specifically, the hint only lists services whose
 cert was actually wiped and re-signaled by this invocation. Services
-already issued by the new intermediate (the skip-migrated branch on
-resumed or retried rotations) are not included, since this rotation
-did not change their on-disk leaf and their consumers do not need to
-reload.
+already issued by the new intermediate — their certificate names it as
+issuer and is signed by its key (the skip-migrated branch on resumed or
+retried rotations) — are not included, since this rotation did not
+change their on-disk leaf and their consumers do not need to reload. A
+certificate from a previous intermediate of the same name is not signed
+by the new key, so its service is re-issued and listed.
 
 `bootroot reinit` wipes the service registry rather than the cert
 files — its completion hint reminds the operator to re-register each

@@ -2168,7 +2168,14 @@ Phases:
   a versioned reissue request to OpenBao KV instead; remote agents pick
   it up on their fast-poll interval (see `rotate force-reissue`).
   Every registrar-managed identity gets the same KV reissue request.
-  The rotation does not wait for any of these requests to complete
+  The rotation does not wait for any of these requests to complete.
+  A service counts as already migrated, and is skipped, only when its
+  certificate names the new intermediate as its issuer *and* is signed
+  by that intermediate's key. The name alone does not decide: every
+  rotation creates its intermediate under the same name, so a
+  certificate from the previous generation names it too. Every other
+  service is re-issued here, and the `local-file` ones among them block
+  Phase 6 until their new certificate is in place
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
   OpenBao — `bootroot/ca`, every `state.json` service and every
   registrar-managed identity — removing old fingerprints, then restart
@@ -2269,7 +2276,9 @@ Inputs:
 - `--skip <phase,...>`: skip optional phases (comma-separated).
   Values: `reissue` (Phase 5 — service certificate re-issuance),
   `finalize` (Phase 6 — trust finalization)
-- `--force`: force Phase 6 even when un-migrated services remain
+- `--force`: force Phase 6 even when un-migrated services remain — services
+  whose certificate does not both name the new intermediate as its issuer
+  and carry that intermediate's signature
 - `--cleanup`: delete backup files on completion (Phase 7)
 - `--registrar-socket-unit <path>`: socket unit to read the registrar
   endpoint's `ListenStream=` from, exactly as
