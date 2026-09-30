@@ -316,7 +316,7 @@ assert_audit_pair() {
 }
 
 assert_functionality_and_audit() {
-  local mint="$RUN_ROOT/mint.json" refused="$RUN_ROOT/refused.json" reserved="$RUN_ROOT/reserved.json" deregister="$RUN_ROOT/deregister.json" first second role policies audit_before audit_after refused_request_id refused_registration_id result
+  local mint="$RUN_ROOT/mint.json" refused="$RUN_ROOT/refused.json" reserved="$RUN_ROOT/reserved.json" deregister="$RUN_ROOT/deregister.json" stale_deregister="$RUN_ROOT/stale-deregister.json" first second role policies audit_before audit_after refused_request_id refused_registration_id result
   write_mint "$mint" 3000
   client --operation mint --payload "$mint" >"$ARTIFACT_DIR/first-mint.json" 2>"$ARTIFACT_DIR/first-mint.err" || { cat "$ARTIFACT_DIR/first-mint.err" >>"$RUN_LOG"; fail "first mint failed"; }
   client --operation mint --payload "$mint" >"$ARTIFACT_DIR/idempotent-mint.json" 2>"$ARTIFACT_DIR/idempotent-mint.err" || { cat "$ARTIFACT_DIR/idempotent-mint.err" >>"$RUN_LOG"; fail "idempotent mint failed"; }
@@ -331,7 +331,10 @@ assert_functionality_and_audit() {
   assert_direct_kv_access_denied "$REGISTRATION_ID"
   jq '.service_name = "bootroot-registrar" | .spec.service_name = "bootroot-registrar"' "$mint" >"$reserved"; client --operation mint --payload "$reserved" >"$ARTIFACT_DIR/reserved-identity.json" || fail "reserved identity refusal exchange failed"; jq -e '.class != null' "$ARTIFACT_DIR/reserved-identity.json" >/dev/null || fail "registrar leaf was accepted as a service identity"
   write_mint "$refused" 999 refused; audit_before="$(sudo -n find "$RECORD_DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')"; client --operation mint --payload "$refused" >"$ARTIFACT_DIR/refused-mint.json" || fail "refused mint exchange failed"; jq -e '.class == "permanent"' "$ARTIFACT_DIR/refused-mint.json" >/dev/null || fail "unsafe mint was not refused"; refused_request_id="$(jq -er '.request_id' "$ARTIFACT_DIR/refused-mint.json")" || fail "unsafe mint refusal did not name its request"; refused_registration_id="$(jq -er '.registration_id' "$ARTIFACT_DIR/refused-mint.json")" || fail "unsafe mint refusal did not name its derived registration"; assert_no_registration_state "$refused_registration_id"; audit_after="$(sudo -n find "$RECORD_DIR" -type f -printf '%s\n' | awk '{s+=$1} END {print s+0}')"; [ "$audit_after" -gt "$audit_before" ] || fail "refused mint wrote no audit record"; assert_audit_pair "$refused_request_id"
-  jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-deregister"}' >"$deregister"; for expected in removed already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
+  # A deregister carrying a key other than the mint's names a generation
+  # that is gone: it removes nothing and is answered already_absent.
+  jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-stale-generation"}' >"$stale_deregister"; result="$(client --operation deregister --payload "$stale_deregister")" || fail "stale-generation deregister failed"; jq -e '.outcome == "already_absent"' <<<"$result" >/dev/null || fail "stale-generation deregister was not already_absent"; sudo -n curl -fsS -o /dev/null --cacert "$OPENBAO_CA" --header @"$TOKEN_CURL" "$OPENBAO_URL/v1/auth/approle/role/bootroot-service-${REGISTRATION_ID}" || fail "stale-generation deregister removed the minted AppRole"
+  jq -n '{protocol_version:1,service_name:"review",host:"redteam",idempotency_key:"redteam-mint"}' >"$deregister"; for expected in removed already_absent; do result="$(client --operation deregister --payload "$deregister")" || fail "deregister failed"; jq -e --arg expected "$expected" '.outcome == $expected' <<<"$result" >/dev/null || fail "deregister was not $expected"; done
   assert_openbao_audit_log "${INSTANCE}-openbao" /openbao/audit/audit.log
   pass "mint/deregister are idempotent, refusal is audited, and OpenBao writes are contained"
 }

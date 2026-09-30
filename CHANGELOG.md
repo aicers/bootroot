@@ -122,7 +122,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   where every rotation keeps them. The shipped
   `bootroot-registrar.service` is pointed at it with an `ExecStart`
   drop-in. On a deployment initialized with `--no-eab`, `init` records
-  the cleared agent EAB so the daemon's first issuance can start.
+  the cleared agent EAB so the daemon's first issuance can start. A
+  deregistration whose idempotency key differs from the key the
+  identity's latest registration carried removes nothing and is answered
+  as already absent, so a late deregistration for an earlier generation
+  cannot remove a newer identity registered under the same name; the
+  audit trail records it under its own `stale_generation` outcome class.
 - `bootroot infra install --registrar-endpoint-host <label>
   --registrar-endpoint-domain <domain>` enables the registrar endpoint on
   a bootroot host, recording in `state.json` the predicate `bootroot init`

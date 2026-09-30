@@ -1205,6 +1205,23 @@ mod binding_state_tests {
         );
     }
 
+    /// A generation key is a member of the same version-1 record, so a
+    /// reader of the state sees a keyed and a keyless record alike.
+    #[test]
+    fn a_keyed_and_a_keyless_record_decode_to_the_same_state() {
+        for state in ["creating", "active"] {
+            let keyless = record(state);
+            let mut keyed = record(state);
+            keyed["generation_key"] = json!("install-key-7");
+            assert_eq!(
+                registrar_binding_state(&keyed),
+                registrar_binding_state(&keyless),
+                "{state}"
+            );
+            assert!(registrar_binding_state(&keyed).is_ok(), "{state}");
+        }
+    }
+
     #[test]
     fn an_unsupported_schema_version_is_refused() {
         let mut value = record("active");

@@ -976,8 +976,11 @@ one line.
   one; the daemon refuses to write a record that pairs them the other
   way, so the two never disagree in a file. It is an object tagged by
   `class`: `first_mint`, `idempotent_remint`, `identity_removed`,
-  `idempotent_already_absent`, or `refused`. A refusal adds `reason`
-  and, when there is one, `detail`.
+  `idempotent_already_absent`, `stale_generation`, or `refused`. A
+  refusal adds `reason` and, when there is one, `detail`.
+  `stale_generation` is a deregistration whose key did not match the
+  key of the identity's latest registration; it removed nothing, and
+  the identity stays live.
 - `truncated` is present only when something was shortened. Its keys are
   the field paths `caller_identity`, `requested.service_name`,
   `requested.host` and `outcome.detail`; each value is

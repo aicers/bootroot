@@ -740,12 +740,17 @@ impl RegistrarRequestHandler for BlockingHandler {
 ///
 /// Its payload shape is internal to these tests and is deliberately not
 /// a protocol: `service_name|host|instance`, with an empty instance
-/// meaning none. The versioned request and response schemas belong to
-/// the protocol module, and this transport-focused test handler must not
-/// invent a second wire format.
+/// meaning none, and every request carrying [`VERB_HANDLER_KEY`]. The
+/// versioned request and response schemas belong to the protocol module,
+/// and this transport-focused test handler must not invent a second wire
+/// format.
 struct VerbHandler {
     verbs: RegistrarVerbs,
 }
+
+/// The one `idempotency_key` every [`VerbHandler`] request carries, so a
+/// mint and a deregister it drives always name one generation.
+const VERB_HANDLER_KEY: &str = "verb-handler-key";
 
 impl RegistrarRequestHandler for VerbHandler {
     fn handle<'a>(
@@ -784,6 +789,7 @@ impl RegistrarRequestHandler for VerbHandler {
                         instance,
                         spec: RequestedSpec::new(ReloadSpec::none(), None),
                         wrap_ttl: Duration::minutes(5),
+                        idempotency_key: VERB_HANDLER_KEY.to_string(),
                     };
                     match self.verbs.mint(&request).await {
                         Ok(_) => "mint|minted|".to_string(),
@@ -800,6 +806,7 @@ impl RegistrarRequestHandler for VerbHandler {
                         service_name: service_name.to_string(),
                         host: host.to_string(),
                         instance,
+                        idempotency_key: VERB_HANDLER_KEY.to_string(),
                     };
                     match self.verbs.deregister(&request).await {
                         Ok(_) => "deregister|torn-down|".to_string(),
@@ -3128,12 +3135,36 @@ async fn the_verb_sees_the_transport_identity_and_not_a_payload_field() {
     }
 }
 
-/// Two requests differing only in `idempotency_key` produce identical
-/// verb inputs: the same entry point, the same arguments and the same
-/// recorded request, differing in nothing but the per-invocation request
-/// id the verb layer generates.
+/// Every request body the mock received, as text, paired with its
+/// method and path.
+async fn openbao_bodies(server: &MockServer) -> Vec<(String, String, String)> {
+    server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .map(|request| {
+            (
+                request.method.to_string(),
+                request.url.path().to_string(),
+                String::from_utf8_lossy(&request.body).into_owned(),
+            )
+        })
+        .collect()
+}
+
+/// The key a register in these tests carries, and so the generation key
+/// its binding holds.
+const REGISTER_KEY: &str = "install-attempt-generation-key";
+
+/// The wire `idempotency_key` reaches exactly one place: the verb
+/// request's own `idempotency_key`, and through it the binding's
+/// `generation_key` and the deregister guard (the two tests after this
+/// one). It reaches no audit record and no other `OpenBao` request, and
+/// for a deregister that finds no binding it changes nothing at all: two
+/// such requests differing only in their key are the same invocation.
 #[tokio::test]
-async fn the_idempotency_key_reaches_nothing_downstream() {
+async fn without_a_binding_the_idempotency_key_changes_nothing() {
     let server = MockServer::start().await;
     let (_dir, audit, handler) = production_handler(&server);
     let harness = Harness::bind().expect("harness");
@@ -3157,48 +3188,201 @@ async fn the_idempotency_key_reaches_nothing_downstream() {
     let (first, second) = (&responses[0], &responses[1]);
     assert_eq!(first.registration_id, second.registration_id);
     assert_eq!(first.outcome, second.outcome);
+    assert_eq!(
+        first.outcome,
+        protocol::DeregisterWireOutcome::AlreadyAbsent
+    );
     assert_ne!(
         first.request_id, second.request_id,
         "the request id is per invocation and is not the idempotency key"
     );
 
-    // The intent line is what the verb was handed. Blanking the one
-    // per-invocation member leaves two records that must be identical:
-    // the difference between the two requests survived in nothing the
-    // handler built.
-    let normalized: Vec<serde_json::Value> = [first, second]
+    // Blanking the per-invocation members leaves two identical pairs:
+    // the key survived in no record the invocation wrote.
+    let normalized: Vec<Vec<serde_json::Value>> = [first, second]
         .iter()
         .map(|response| {
-            let mut line = audit_trail(&audit)
+            audit_trail(&audit)
                 .into_iter()
-                .find(|line| {
-                    line["request_id"] == serde_json::json!(response.request_id)
-                        && line["phase"] == serde_json::json!("intent")
+                .filter(|line| line["request_id"] == serde_json::json!(response.request_id))
+                .map(|mut line| {
+                    line["request_id"] = serde_json::json!("");
+                    line["ts"] = serde_json::json!("");
+                    line
                 })
-                .expect("every invocation writes an intent line");
-            line["request_id"] = serde_json::json!("");
-            line["ts"] = serde_json::json!("");
-            line
+                .collect()
         })
         .collect();
+    assert_eq!(normalized[0].len(), 2, "an intent and an outcome");
     assert_eq!(
         normalized[0], normalized[1],
-        "two requests differing only in idempotency_key produce identical verb inputs"
+        "with no binding, two requests differing only in idempotency_key are the same invocation"
+    );
+    for (method, path, body) in openbao_bodies(&server).await {
+        assert!(
+            !body.contains("key-one") && !body.contains("a-completely-different-key"),
+            "a deregister's key reaches no OpenBao request: {method} {path} {body}"
+        );
+    }
+}
+
+/// A register's wire key is recorded verbatim as the generation key on
+/// both binding writes, and reaches no other `OpenBao` request and no
+/// audit record.
+#[tokio::test]
+async fn a_register_key_reaches_only_the_binding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(request_path("/v1/auth/cert/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "auth": { "client_token": "s.internal-token", "lease_duration": 900 }
+        })))
+        .mount(&server)
+        .await;
+    let registration_id = "h1-roxyd";
+    let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
+    let binding_url = format!("/v1/secret/data/{binding_path}");
+    mock_first_roxyd_mint(&server, registration_id).await;
+    let ca = valid_ca();
+    Mock::given(method("GET"))
+        .and(request_path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": {
+                "trusted_ca_sha256": [crate::tls::sha256_hex(ca.der().as_ref())],
+                "ca_bundle_pem": ca.pem(),
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let (_dir, audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+    let minted = protocol::decode_mint_response(&decode_response(
+        &harness
+            .round_trip(&frame_of(
+                b"mint",
+                &register_payload("roxyd", "h1", REGISTER_KEY),
+            ))
+            .await,
+    ))
+    .expect("the mint response decodes");
+    running.stop().await;
+    assert_eq!(minted.registration_id, registration_id);
+
+    let mut binding_writes = 0;
+    for (method, path, body) in openbao_bodies(&server).await {
+        if method == "POST" && path == binding_url {
+            let body: serde_json::Value =
+                serde_json::from_str(&body).expect("a binding write is JSON");
+            assert_eq!(
+                body["data"]["generation_key"],
+                serde_json::json!(REGISTER_KEY),
+                "every binding write carries the wire key verbatim: {body}"
+            );
+            binding_writes += 1;
+        } else {
+            assert!(
+                !body.contains(REGISTER_KEY),
+                "the key reaches no other OpenBao request: {method} {path} {body}"
+            );
+        }
+    }
+    assert_eq!(binding_writes, 2, "the claim and the activation");
+    let trail = audit_trail(&audit);
+    assert!(!trail.is_empty());
+    for line in &trail {
+        assert!(
+            !line.to_string().contains(REGISTER_KEY),
+            "the key reaches no audit record: {line}"
+        );
+    }
+}
+
+/// A deregister's wire key reaches the guard: against a binding holding
+/// [`REGISTER_KEY`] a stale key removes nothing and answers
+/// `already_absent`, and the stored key removes the identity. Neither
+/// key reaches an `OpenBao` request or an audit record.
+#[tokio::test]
+async fn a_deregister_key_reaches_the_generation_guard() {
+    const STALE_KEY: &str = "an-earlier-generation-key";
+
+    let server = MockServer::start().await;
+    let binding_path = service_kv_path("h1-roxyd", REGISTRAR_BINDING_KV_SUFFIX);
+    let binding_url = format!("/v1/secret/data/{binding_path}");
+    let requested = roxyd_requested_spec();
+    let active =
+        BindingRecord::creating("h1", &requested, REGISTER_KEY).activated(&requested, REGISTER_KEY);
+    Mock::given(method("GET"))
+        .and(request_path(binding_url.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "data": active.encode().expect("the active binding encodes") }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(request_path(format!("/v1/secret/metadata/{binding_path}")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let (_dir, audit, handler) = production_handler(&server);
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+    let stale = protocol::decode_deregister_response(&decode_response(
+        &harness
+            .round_trip(&frame_of(
+                b"deregister",
+                &deregister_payload("roxyd", "h1", STALE_KEY),
+            ))
+            .await,
+    ))
+    .expect("the stale deregister response decodes");
+    assert_eq!(
+        stale.outcome,
+        protocol::DeregisterWireOutcome::AlreadyAbsent
+    );
+    let after_stale = openbao_bodies(&server).await;
+    assert!(
+        after_stale
+            .iter()
+            .all(|(method, path, _)| method == "GET" && *path == binding_url),
+        "a stale deregister reads the binding and nothing else: {after_stale:?}"
+    );
+    let stale_outcome = audit_trail(&audit)
+        .into_iter()
+        .find(|line| {
+            line["request_id"] == serde_json::json!(stale.request_id)
+                && line["phase"] == serde_json::json!("outcome")
+        })
+        .expect("the stale deregister writes an outcome line");
+    assert_eq!(
+        stale_outcome["outcome"],
+        serde_json::json!({ "class": "stale_generation" })
     );
 
-    let bodies: Vec<String> = server
-        .received_requests()
-        .await
-        .expect("the mock records requests")
-        .iter()
-        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
-        .collect();
-    assert!(
-        bodies
-            .iter()
-            .all(|body| !body.contains("key-one") && !body.contains("a-completely-different-key")),
-        "no idempotency key may reach OpenBao: {bodies:?}"
-    );
+    let current = protocol::decode_deregister_response(&decode_response(
+        &harness
+            .round_trip(&frame_of(
+                b"deregister",
+                &deregister_payload("roxyd", "h1", REGISTER_KEY),
+            ))
+            .await,
+    ))
+    .expect("the matching deregister response decodes");
+    running.stop().await;
+    assert_eq!(current.outcome, protocol::DeregisterWireOutcome::Removed);
+    for (method, path, body) in openbao_bodies(&server).await {
+        assert!(
+            !body.contains(REGISTER_KEY) && !body.contains(STALE_KEY),
+            "a deregister's key reaches no OpenBao request: {method} {path} {body}"
+        );
+    }
+    for line in audit_trail(&audit) {
+        let text = line.to_string();
+        assert!(
+            !text.contains(REGISTER_KEY) && !text.contains(STALE_KEY),
+            "the key reaches no audit record: {text}"
+        );
+    }
 }
 
 /// A payload the codec cannot decode is a [`HandlerRefusal`]: zero
@@ -3370,7 +3554,10 @@ async fn a_socket_mint_returns_freshly_read_anchor_material() {
     drop(first_anchor);
 
     let requested = roxyd_requested_spec();
-    let active = BindingRecord::creating("h1", &requested).activated(&requested);
+    // The first mint wrote its own key, so the second one, carrying
+    // another, records its key on the binding before it re-mints.
+    let active =
+        BindingRecord::creating("h1", &requested, "first-key").activated(&requested, "first-key");
     Mock::given(method("GET"))
         .and(request_path(format!("/v1/secret/data/{binding_path}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

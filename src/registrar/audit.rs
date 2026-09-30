@@ -384,6 +384,12 @@ pub enum AuditOutcome {
     /// idempotence the class is named for.
     #[serde(rename = "idempotent_already_absent")]
     AlreadyAbsent,
+    /// `DeregisterKind::StaleGeneration`: the binding's generation key
+    /// did not match the request's, so nothing was removed and the
+    /// identity stays live. Its own class rather than
+    /// `idempotent_already_absent`, which would record an identity as
+    /// absent that is not.
+    StaleGeneration,
     /// The request was refused.
     Refused {
         /// Which refusal, flattened from the verb layer's three
@@ -893,6 +899,7 @@ pub(crate) mod bridge {
         match kind {
             DeregisterKind::IdentityRemoved => AuditOutcome::IdentityRemoved,
             DeregisterKind::AlreadyAbsent => AuditOutcome::AlreadyAbsent,
+            DeregisterKind::StaleGeneration => AuditOutcome::StaleGeneration,
         }
     }
 

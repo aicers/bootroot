@@ -1180,6 +1180,48 @@ mod tests {
         assert_eq!(scan.intent_without_outcome, 0);
     }
 
+    /// A deregister the generation guard answered leaves an ordinary
+    /// pair: its `stale_generation` outcome is a well-formed record that
+    /// settles its intent.
+    #[test]
+    fn a_stale_generation_outcome_pairs_its_intent() {
+        let dir = audit_store();
+        let now = OffsetDateTime::now_utc();
+        let request_id = "stale-generation".to_string();
+        append_record(
+            dir.path(),
+            &AuditRecord::intent(
+                now - Duration::minutes(2),
+                request_id.clone(),
+                AuditVerb::Deregister,
+                "caller".to_string(),
+                identity(),
+            ),
+        );
+        append_record(
+            dir.path(),
+            &AuditRecord::outcome(
+                now - Duration::minutes(1),
+                request_id,
+                AuditVerb::Deregister,
+                "caller".to_string(),
+                identity(),
+                Some("host-api".to_string()),
+                AuditOutcome::StaleGeneration,
+            ),
+        );
+        let text = fs::read_to_string(dir.path().join(ACTIVE_FILE_NAME)).expect("read store");
+        assert!(
+            text.contains(r#""outcome":{"class":"stale_generation"}"#),
+            "{text}"
+        );
+
+        let scan = scan_audit_store(dir.path(), now, AUDIT_SCAN_WINDOW, 16, 90)
+            .expect("scan a stale-generation pair");
+        assert_eq!(scan.malformed_records, 0);
+        assert_eq!(scan.intent_without_outcome, 0);
+    }
+
     #[tokio::test]
     async fn reads_records_written_by_the_audit_store() {
         let parent = tempfile::tempdir().expect("create store parent");

@@ -87,6 +87,12 @@ const ENV_REMOTE_BIN: &str = "BOOTROOT_REGISTRAR_TEST_REMOTE_BIN";
 /// outcome and reaches nothing else.
 const CALLER: &str = "spiffe://review/manager#7f3a";
 
+/// The `idempotency_key` every request helper carries by default, and the
+/// generation key every binding fixture is written under, so a fixture
+/// and the request driven against it name one generation unless a test
+/// says otherwise.
+const IDEMPOTENCY_KEY: &str = "generation-key-1";
+
 const TOKEN_TTL: &str = "1h";
 const SECRET_ID_TTL: &str = "24h";
 
@@ -209,6 +215,21 @@ fn mint_request(service_name: &str, host: &str, instance: Option<u32>) -> MintRe
         instance,
         spec: requested(&spec_for(service_name)),
         wrap_ttl: Duration::minutes(5),
+        idempotency_key: IDEMPOTENCY_KEY.to_string(),
+    }
+}
+
+/// As [`mint_request`], carrying `idempotency_key` instead of the
+/// suite's default key.
+fn keyed_mint_request(
+    service_name: &str,
+    host: &str,
+    instance: Option<u32>,
+    idempotency_key: &str,
+) -> MintRequest {
+    MintRequest {
+        idempotency_key: idempotency_key.to_string(),
+        ..mint_request(service_name, host, instance)
     }
 }
 
@@ -218,6 +239,21 @@ fn deregister_request(service_name: &str, host: &str, instance: Option<u32>) -> 
         service_name: service_name.to_string(),
         host: host.to_string(),
         instance,
+        idempotency_key: IDEMPOTENCY_KEY.to_string(),
+    }
+}
+
+/// As [`deregister_request`], carrying `idempotency_key` instead of the
+/// suite's default key.
+fn keyed_deregister_request(
+    service_name: &str,
+    host: &str,
+    instance: Option<u32>,
+    idempotency_key: &str,
+) -> DeregisterRequest {
+    DeregisterRequest {
+        idempotency_key: idempotency_key.to_string(),
+        ..deregister_request(service_name, host, instance)
     }
 }
 
@@ -728,7 +764,7 @@ fn binding_spec_for(kind: ReloadKind) -> BindingSpec {
 #[test]
 fn binding_record_round_trips_its_version_one_json() {
     let spec = requested(&sample_spec());
-    let creating = BindingRecord::creating("h1", &spec);
+    let creating = BindingRecord::creating("h1", &spec, IDEMPOTENCY_KEY);
     let encoded = creating.encode().expect("encode");
     assert_eq!(
         encoded,
@@ -740,17 +776,97 @@ fn binding_record_round_trips_its_version_one_json() {
                 "cert_group": 3001,
                 "reload": { "kind": "docker-restart", "target": "piglet" }
             },
-            "applied_spec": null
+            "applied_spec": null,
+            "generation_key": IDEMPOTENCY_KEY
         })
     );
     assert_eq!(BindingRecord::decode(&encoded).expect("decode"), creating);
 
-    let active = creating.activated(&spec);
+    let active = creating.activated(&spec, IDEMPOTENCY_KEY);
     let encoded = active.encode().expect("encode");
     assert_eq!(encoded["state"], json!("active"));
     assert_eq!(encoded["applied_spec"], encoded["requested_spec"]);
     assert_eq!(BindingRecord::decode(&encoded).expect("decode"), active);
     assert_eq!(active.state, BindingState::Active);
+    assert_eq!(encoded["generation_key"], json!(IDEMPOTENCY_KEY));
+
+    // Activation records the activating request's key, not the claim's.
+    let reactivated = creating.activated(&spec, "generation-key-2");
+    assert_eq!(
+        reactivated.generation_key.as_deref(),
+        Some("generation-key-2")
+    );
+}
+
+/// A version-1 record written before the generation key existed — with
+/// the member absent, or explicitly `null` — decodes as keyless, and a
+/// keyless record encodes to exactly that older shape, so it round-trips
+/// byte for byte through a build that does not rewrite it.
+#[test]
+fn a_keyless_version_one_record_decodes_without_a_generation_key() {
+    let old_shape = json!({
+        "schema_version": 1,
+        "host": "h1",
+        "state": "active",
+        "requested_spec": {
+            "cert_group": 3001,
+            "reload": { "kind": "docker-restart", "target": "piglet" }
+        },
+        "applied_spec": {
+            "cert_group": 3001,
+            "reload": { "kind": "docker-restart", "target": "piglet" }
+        }
+    });
+    let decoded = BindingRecord::decode(&old_shape).expect("a keyless v1 record decodes");
+    assert_eq!(decoded.generation_key, None);
+    assert_eq!(decoded.state, BindingState::Active);
+    assert_eq!(decoded.encode().expect("encode"), old_shape);
+
+    let mut explicit_null = old_shape.clone();
+    explicit_null["generation_key"] = serde_json::Value::Null;
+    let decoded = BindingRecord::decode(&explicit_null).expect("an explicit null decodes");
+    assert_eq!(decoded.generation_key, None);
+    assert_eq!(decoded.encode().expect("encode"), old_shape);
+}
+
+/// A keyed record round-trips, the key is kept verbatim — the empty
+/// string included, which is an ordinary value — and the in-place rewrite
+/// changes the key and nothing else.
+#[test]
+fn a_keyed_record_round_trips_and_its_key_rewrite_changes_nothing_else() {
+    let spec = requested(&sample_spec());
+    for key in ["", " Key-With Spaces ", "K1"] {
+        let active = BindingRecord::creating("h1", &spec, key).activated(&spec, key);
+        let encoded = active.encode().expect("encode");
+        assert_eq!(encoded["generation_key"], json!(key));
+        let decoded = BindingRecord::decode(&encoded).expect("decode");
+        assert_eq!(decoded, active);
+        assert!(decoded.has_generation_key(key));
+    }
+
+    let active = BindingRecord::creating("h1", &spec, "K1").activated(&spec, "K1");
+    assert!(active.has_generation_key("K1"));
+    assert!(!active.has_generation_key("k1"), "no case folding");
+    assert!(!active.has_generation_key("K1 "), "no trimming");
+    assert!(!active.has_generation_key(""));
+
+    let rekeyed = active.with_generation_key("K2");
+    assert_eq!(rekeyed.generation_key.as_deref(), Some("K2"));
+    assert_eq!(
+        BindingRecord {
+            generation_key: active.generation_key.clone(),
+            ..rekeyed.clone()
+        },
+        active,
+        "the rewrite keeps host, state and both specs"
+    );
+
+    let keyless = BindingRecord {
+        generation_key: None,
+        ..active
+    };
+    assert!(!keyless.has_generation_key(""));
+    assert!(!keyless.has_generation_key("K1"));
 }
 
 /// Every reload kind round-trips, and each local spelling is the one the
@@ -776,6 +892,7 @@ fn binding_reload_kinds_round_trip_and_match_the_registrar_spellings() {
             state: BindingState::Active,
             requested_spec: Some(spec.clone()),
             applied_spec: Some(spec.clone()),
+            generation_key: Some(IDEMPOTENCY_KEY.to_string()),
         };
         let encoded = record.encode().expect("encode");
         assert_eq!(
@@ -790,7 +907,7 @@ fn binding_reload_kinds_round_trip_and_match_the_registrar_spellings() {
 
 #[test]
 fn binding_record_rejects_an_unknown_field() {
-    let mut encoded = BindingRecord::creating("h1", &requested(&sample_spec()))
+    let mut encoded = BindingRecord::creating("h1", &requested(&sample_spec()), IDEMPOTENCY_KEY)
         .encode()
         .expect("encode");
     encoded["intent"] = json!("mint");
@@ -799,15 +916,29 @@ fn binding_record_rejects_an_unknown_field() {
         format!("{err}").contains("intent"),
         "the refusal must name the unknown field, got: {err}"
     );
+    assert!(
+        matches!(err, super::binding::BindingDecodeError::Malformed { .. }),
+        "an unknown field beside a generation key is still malformed, got: {err:?}"
+    );
 }
 
 #[test]
 fn binding_record_rejects_an_unknown_schema_version() {
-    let mut encoded = BindingRecord::creating("h1", &requested(&sample_spec()))
+    let mut encoded = BindingRecord::creating("h1", &requested(&sample_spec()), IDEMPOTENCY_KEY)
         .encode()
         .expect("encode");
     encoded["schema_version"] = json!(2);
     let err = BindingRecord::decode(&encoded).expect_err("a newer schema must be refused");
+    assert!(
+        matches!(
+            err,
+            super::binding::BindingDecodeError::UnsupportedSchemaVersion {
+                found: 2,
+                supported: 1
+            }
+        ),
+        "a newer keyed record is a version problem, got: {err:?}"
+    );
     assert!(
         format!("{err}").contains("schema_version 2"),
         "the refusal must name the version it found, got: {err}"
@@ -1528,8 +1659,8 @@ async fn the_mint_only_pre_lock_refusals_write_their_pairs() {
 async fn a_registration_id_collision_writes_a_complete_pair() {
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
     let registration_id = "h1-roxyd";
-    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, registration_id, &bound).await;
 
     let refusal = verbs
@@ -1593,8 +1724,8 @@ async fn a_recorded_mint_returns_its_material_on_both_arms() {
     // The same identity, answered by an active binding: the re-mint arm,
     // through the same outcome write.
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &active).await;
     mock_first_mint(&server, "h1-roxyd").await;
 
@@ -1749,8 +1880,8 @@ async fn a_failed_outcome_write_tells_a_read_refusal_from_one_that_wrote() {
     // Decided from a read: the binding exists, is bound to this host,
     // and carries a different spec.
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let stored =
-        BindingRecord::creating("h1", &requested(&conflicting)).activated(&requested(&conflicting));
+    let stored = BindingRecord::creating("h1", &requested(&conflicting), IDEMPOTENCY_KEY)
+        .activated(&requested(&conflicting), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &stored).await;
     let refusal =
         with_outcome_append_failure(&verbs, verbs.mint(&mint_request("roxyd", "h1", None)))
@@ -1927,8 +2058,8 @@ async fn a_lost_claim_race_leaves_the_disposition_clear() {
 #[tokio::test]
 async fn a_failed_outcome_write_after_a_remint_owes_a_teardown() {
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &active).await;
     mock_first_mint(&server, "h1-roxyd").await;
 
@@ -1969,8 +2100,8 @@ async fn a_failed_outcome_write_after_a_remint_owes_a_teardown() {
 #[tokio::test]
 async fn a_failed_outcome_write_after_an_identity_removal_re_drives() {
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &bound).await;
     mock_material_present(&server, "h1-roxyd").await;
     mock_binding_delete(&server, "h1-roxyd").await;
@@ -2034,8 +2165,8 @@ async fn a_failed_outcome_write_after_an_identity_removal_re_drives() {
 async fn a_failed_outcome_write_on_a_no_change_refusal_carries_the_outcome_phase() {
     // Decided from a read, before the sweep.
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let bound = BindingRecord::creating("h2", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &bound).await;
     let refusal = with_outcome_append_failure(
         &verbs,
@@ -2087,8 +2218,8 @@ async fn a_failed_outcome_write_on_a_no_change_refusal_carries_the_outcome_phase
 #[tokio::test]
 async fn a_failed_outcome_write_after_a_failed_teardown_owes_a_teardown() {
     let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
-    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let bound = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &bound).await;
     mock_material_present(&server, "h1-roxyd").await;
     // The role read fails outright, so the sweep records a `Failed`
@@ -2286,8 +2417,8 @@ async fn three_close_refusals_produce_three_distinct_reasons() {
     let (server, _dir, _store_root, verbs) =
         audit_harness(&base_fixture().with_component("roxyd", Multiplicity::OnePerHost, &widened))
             .await;
-    let stored = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let stored = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &stored).await;
     let mut conflicting = mint_request("roxyd", "h1", None);
     conflicting.spec = requested(&widened);
@@ -2538,8 +2669,8 @@ async fn no_mint_writes_a_raw_secret_id_to_kv() {
         .expect("a first mint succeeds");
 
     let (remint_server, _remint_dir, verbs) = refusal_harness(&base_fixture()).await;
-    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&remint_server, "h1-roxyd", &active).await;
     mock_first_mint(&remint_server, "h1-roxyd").await;
     let again = verbs
@@ -2677,7 +2808,7 @@ async fn a_seeding_failure_refuses_before_activation_and_a_re_drive_recovers() {
         // The re-drive: the claim is still `creating`, and seeding now
         // succeeds.
         server.reset().await;
-        let claim = BindingRecord::creating("h1", &requested(&spec_for("roxyd")));
+        let claim = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
         mock_binding_read(&server, "h1-roxyd", &claim).await;
         mock_first_mint(&server, "h1-roxyd").await;
         let redriven = verbs
@@ -2706,8 +2837,8 @@ async fn a_remint_reseeds_current_control_node_values_before_the_role_id_read() 
         "-----BEGIN CERTIFICATE-----\nUm90YXRlZA==\n-----END CERTIFICATE-----\n";
 
     let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
-    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
     mock_binding_read(&server, "h1-roxyd", &active).await;
     mock_control_responder_hmac(&server, ROTATED_HMAC).await;
     mock_control_ca(&server, ROTATED_FINGERPRINT, ROTATED_BUNDLE).await;
@@ -2761,8 +2892,8 @@ async fn a_remint_reseeds_current_control_node_values_before_the_role_id_read() 
 async fn a_remint_seeding_failure_refuses_before_the_role_id_read() {
     for fault in seeding_faults("h1-roxyd") {
         let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
-        let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-            .activated(&requested(&spec_for("roxyd")));
+        let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+            .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
         mock_binding_read(&server, "h1-roxyd", &active).await;
         mount_fault(&server, &fault).await;
         mock_first_mint(&server, "h1-roxyd").await;
@@ -2795,8 +2926,8 @@ async fn a_remint_seeding_failure_refuses_before_the_role_id_read() {
 /// nothing and does not.
 #[tokio::test]
 async fn a_remint_seeding_write_sets_the_disposition_and_a_read_does_not() {
-    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")))
-        .activated(&requested(&spec_for("roxyd")));
+    let active = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY)
+        .activated(&requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
 
     for fault in seeding_faults("h1-roxyd") {
         let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
@@ -2829,6 +2960,517 @@ async fn a_remint_seeding_write_sets_the_disposition_and_a_read_does_not() {
                 refusal.error()
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Fast tier: the generation guard
+// ---------------------------------------------------------------------
+
+/// The key a newer generation's `Register` carries, against fixtures
+/// written under [`IDEMPOTENCY_KEY`].
+const NEWER_KEY: &str = "generation-key-2";
+
+/// An active `h1-roxyd` binding for `host`, written under `key` — or
+/// under no key at all, which is a binding that predates the guard.
+fn roxyd_binding(host: &str, key: Option<&str>) -> BindingRecord {
+    let spec = requested(&spec_for("roxyd"));
+    BindingRecord {
+        generation_key: key.map(str::to_string),
+        ..BindingRecord::creating(host, &spec, IDEMPOTENCY_KEY).activated(&spec, IDEMPOTENCY_KEY)
+    }
+}
+
+/// Every POST the mock received at the binding's data path, as the
+/// `data` each one wrote, in order.
+fn binding_writes(requests: &[wiremock::Request], registration_id: &str) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST"
+                && request.url.path() == binding_data_url(registration_id)
+        })
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("a KV write body is JSON");
+            body["data"].clone()
+        })
+        .collect()
+}
+
+/// Asserts that the only request the mock saw was the binding read.
+fn assert_binding_read_only(requests: &[wiremock::Request], registration_id: &str) {
+    assert_eq!(
+        requests.len(),
+        1,
+        "the binding read and nothing else, saw {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(requests[0].method, wiremock::http::Method::GET);
+    assert_eq!(requests[0].url.path(), binding_data_url(registration_id));
+}
+
+/// A deregister whose key differs from the binding's generation key
+/// removes nothing: after the binding read it makes no `OpenBao` call at
+/// all — no teardown client, no material sweep, no binding delete —
+/// answers `StaleGeneration` on the binding arm with an empty report,
+/// and leaves a pair recording the `stale_generation` class. It holds
+/// for a `creating` binding exactly as for an active one, and for a
+/// stored empty key, which is an ordinary value rather than "no key".
+#[tokio::test]
+async fn a_stale_deregister_removes_nothing_and_records_its_own_class() {
+    let spec = requested(&spec_for("roxyd"));
+    for binding in [
+        roxyd_binding("h1", Some(IDEMPOTENCY_KEY)),
+        BindingRecord::creating("h1", &spec, IDEMPOTENCY_KEY),
+        roxyd_binding("h1", Some("")),
+    ] {
+        let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+        mock_binding_read(&server, "h1-roxyd", &binding).await;
+        mock_material_present(&server, "h1-roxyd").await;
+        mock_binding_delete(&server, "h1-roxyd").await;
+
+        let outcome = verbs
+            .deregister(&keyed_deregister_request("roxyd", "h1", None, NEWER_KEY))
+            .await
+            .expect("a stale deregister succeeds");
+        assert_eq!(outcome.kind(), DeregisterKind::StaleGeneration);
+        assert_eq!(outcome.context().arm(), ProducingArm::Binding);
+        assert_eq!(outcome.context().registration_id(), Some("h1-roxyd"));
+        assert!(
+            outcome.teardown().attempts().is_empty(),
+            "nothing was attempted: {:?}",
+            outcome.teardown().attempts()
+        );
+
+        assert_binding_read_only(&received(&server).await, "h1-roxyd");
+        let line = assert_pair(
+            &verbs,
+            outcome.context().request_id().as_str(),
+            &Asked::new("deregister", "roxyd", "h1", None),
+        );
+        assert_eq!(line["outcome"], json!({ "class": "stale_generation" }));
+        assert_eq!(line["registration_id"], json!("h1-roxyd"));
+        let rendered = trail(&verbs)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            !rendered.contains(NEWER_KEY) && !rendered.contains(IDEMPOTENCY_KEY),
+            "no key reaches the trail: {rendered}"
+        );
+    }
+}
+
+/// A stale deregister changed nothing, so a failed outcome write after
+/// it is an ordinary unwritable record rather than a teardown
+/// obligation.
+#[tokio::test]
+async fn a_stale_deregister_leaves_the_disposition_clear() {
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_binding_read(
+        &server,
+        "h1-roxyd",
+        &roxyd_binding("h1", Some(IDEMPOTENCY_KEY)),
+    )
+    .await;
+
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.deregister(&keyed_deregister_request("roxyd", "h1", None, NEWER_KEY)),
+    )
+    .await
+    .expect_err("a failed outcome write refuses");
+    assert!(
+        matches!(
+            refusal.error(),
+            VerbError::AuditUnwritable {
+                phase: AuditPhase::Outcome,
+                ..
+            }
+        ),
+        "a stale deregister owes no teardown, got {:?}",
+        refusal.error()
+    );
+    assert_binding_read_only(&received(&server).await, "h1-roxyd");
+}
+
+/// A deregister whose key equals the stored one, or that finds a binding
+/// with no stored key whatever key it carries, tears down and unbinds
+/// exactly as before the guard. The empty string is an ordinary key on
+/// both sides of the comparison.
+#[tokio::test]
+async fn a_matching_or_keyless_deregister_removes_the_identity() {
+    for (name, stored, sent) in [
+        ("matching key", Some(IDEMPOTENCY_KEY), IDEMPOTENCY_KEY),
+        ("keyless binding", None, NEWER_KEY),
+        ("keyless binding, empty key", None, ""),
+        ("empty key on both sides", Some(""), ""),
+    ] {
+        let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+        mock_binding_read(&server, "h1-roxyd", &roxyd_binding("h1", stored)).await;
+        mock_material_present(&server, "h1-roxyd").await;
+        mock_binding_delete(&server, "h1-roxyd").await;
+
+        let outcome = verbs
+            .deregister(&keyed_deregister_request("roxyd", "h1", None, sent))
+            .await
+            .unwrap_or_else(|refusal| panic!("{name}: {:?}", refusal.error()));
+        assert_eq!(outcome.kind(), DeregisterKind::IdentityRemoved, "{name}");
+        assert!(outcome.teardown().aggregate_success(), "{name}");
+        let requests = received(&server).await;
+        let delete = index_of(&requests, "DELETE", &binding_metadata_url("h1-roxyd"));
+        let last_sweep = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request.method.as_str() == "DELETE"
+                    && request.url.path() != binding_metadata_url("h1-roxyd")
+            })
+            .map(|(index, _)| index)
+            .max()
+            .expect("the material was swept");
+        assert!(last_sweep < delete, "{name}: teardown before unbind");
+        let line = assert_pair(
+            &verbs,
+            outcome.context().request_id().as_str(),
+            &Asked::new("deregister", "roxyd", "h1", None),
+        );
+        assert_eq!(
+            line["outcome"]["class"],
+            json!("identity_removed"),
+            "{name}"
+        );
+    }
+
+    // Against a stored empty key, any other key is stale.
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    mock_binding_read(&server, "h1-roxyd", &roxyd_binding("h1", Some(""))).await;
+    let outcome = verbs
+        .deregister(&keyed_deregister_request("roxyd", "h1", None, "x"))
+        .await
+        .expect("a stale deregister succeeds");
+    assert_eq!(outcome.kind(), DeregisterKind::StaleGeneration);
+    assert_binding_read_only(&received(&server).await, "h1-roxyd");
+}
+
+/// The host is checked before the key: a wrong host is refused with
+/// `HostMismatch` whether its key is stale or matching, and nothing is
+/// touched.
+#[tokio::test]
+async fn a_wrong_host_deregister_is_refused_whatever_its_key() {
+    for sent in [NEWER_KEY, IDEMPOTENCY_KEY] {
+        let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+        mock_binding_read(
+            &server,
+            "h1-roxyd",
+            &roxyd_binding("h2", Some(IDEMPOTENCY_KEY)),
+        )
+        .await;
+        let refusal = verbs
+            .deregister(&keyed_deregister_request("roxyd", "h1", None, sent))
+            .await
+            .expect_err("a wrong-host deregister is refused");
+        assert!(
+            matches!(refusal.error(), VerbError::HostMismatch { .. }),
+            "{sent}: got {:?}",
+            refusal.error()
+        );
+        assert_eq!(refusal.context().arm(), ProducingArm::Binding);
+        assert_binding_read_only(&received(&server).await, "h1-roxyd");
+    }
+}
+
+/// With no binding at all there is no generation to compare, so the
+/// absent-binding sweep runs whatever key the request carries.
+#[tokio::test]
+async fn an_absent_binding_deregister_sweeps_whatever_its_key() {
+    for sent in [IDEMPOTENCY_KEY, NEWER_KEY, ""] {
+        let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+        mock_material_present(&server, "h1-roxyd").await;
+        let outcome = verbs
+            .deregister(&keyed_deregister_request("roxyd", "h1", None, sent))
+            .await
+            .expect("an absent-binding deregister is idempotent");
+        assert_eq!(outcome.kind(), DeregisterKind::AlreadyAbsent, "{sent:?}");
+        assert!(
+            outcome
+                .teardown()
+                .attempts()
+                .iter()
+                .any(|attempt| matches!(attempt.outcome, ResourceOutcome::Removed)),
+            "{sent:?}: the planted material was swept"
+        );
+        let line = assert_pair(
+            &verbs,
+            outcome.context().request_id().as_str(),
+            &Asked::new("deregister", "roxyd", "h1", None),
+        );
+        assert_eq!(
+            line["outcome"]["class"],
+            json!("idempotent_already_absent"),
+            "{sent:?}"
+        );
+    }
+}
+
+/// A first mint's claim and its activation both carry the request's
+/// key.
+#[tokio::test]
+async fn a_first_mint_writes_the_generation_key_on_both_binding_writes() {
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    mock_first_mint(&server, "h1-roxyd").await;
+    verbs
+        .mint(&keyed_mint_request("roxyd", "h1", None, NEWER_KEY))
+        .await
+        .expect("a first mint succeeds");
+
+    let writes = binding_writes(&received(&server).await, "h1-roxyd");
+    assert_eq!(writes.len(), 2, "the claim and the activation: {writes:?}");
+    assert_eq!(writes[0]["state"], json!("creating"));
+    assert_eq!(writes[1]["state"], json!("active"));
+    for write in &writes {
+        assert_eq!(write["generation_key"], json!(NEWER_KEY), "{write}");
+    }
+}
+
+/// An active re-mint with a different key rewrites the binding with the
+/// new key — and nothing else — before it seeds or issues, and still
+/// answers an idempotent re-mint with fresh material. A keyless binding
+/// is rewritten the same way. With the stored key it writes no binding
+/// at all.
+#[tokio::test]
+async fn an_active_remint_records_a_new_key_before_seeding_and_issuance() {
+    for (name, stored) in [("stale key", Some(IDEMPOTENCY_KEY)), ("keyless", None)] {
+        let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+        let binding = roxyd_binding("h1", stored);
+        mock_binding_read(&server, "h1-roxyd", &binding).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+
+        let outcome = verbs
+            .mint(&keyed_mint_request("roxyd", "h1", None, NEWER_KEY))
+            .await
+            .unwrap_or_else(|refusal| panic!("{name}: {:?}", refusal.error()));
+        assert_eq!(outcome.kind(), MintKind::IdempotentReMint, "{name}");
+        assert!(!outcome.into_wrapped_secret_id().is_empty(), "{name}");
+
+        let requests = received(&server).await;
+        let writes = binding_writes(&requests, "h1-roxyd");
+        assert_eq!(
+            writes,
+            vec![
+                binding
+                    .with_generation_key(NEWER_KEY)
+                    .encode()
+                    .expect("encode")
+            ],
+            "{name}: exactly one rewrite, changing only the key"
+        );
+        let rewrite = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == binding_data_url("h1-roxyd")
+            })
+            .expect("the rewrite was sent");
+        let first_seed = index_of(
+            &requests,
+            "POST",
+            &service_data_url("h1-roxyd", SERVICE_EAB_KV_SUFFIX),
+        );
+        let issuance = index_of(&requests, "POST", &secret_id_issue_url("h1-roxyd"));
+        assert!(
+            rewrite < first_seed,
+            "{name}: the key is recorded before seeding"
+        );
+        assert!(first_seed < issuance, "{name}");
+    }
+
+    // The same key: exactly today's requests, with no binding write.
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    mock_binding_read(
+        &server,
+        "h1-roxyd",
+        &roxyd_binding("h1", Some(IDEMPOTENCY_KEY)),
+    )
+    .await;
+    mock_first_mint(&server, "h1-roxyd").await;
+    let outcome = verbs
+        .mint(&mint_request("roxyd", "h1", None))
+        .await
+        .expect("a same-key re-mint succeeds");
+    assert_eq!(outcome.kind(), MintKind::IdempotentReMint);
+    assert!(binding_writes(&received(&server).await, "h1-roxyd").is_empty());
+}
+
+/// A `creating` re-drive with a different key records it before
+/// convergence, so when convergence then fails the retained claim
+/// carries the new key.
+#[tokio::test]
+async fn a_creating_redrive_records_a_new_key_before_convergence() {
+    let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+    let claim = BindingRecord::creating("h1", &requested(&spec_for("roxyd")), IDEMPOTENCY_KEY);
+    mock_binding_read(&server, "h1-roxyd", &claim).await;
+    let policy_url = format!("/v1/sys/policies/acl/{}", service_policy_name("h1-roxyd"));
+    Mock::given(method("POST"))
+        .and(path(policy_url.clone()))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mock_first_mint(&server, "h1-roxyd").await;
+
+    let refusal = verbs
+        .mint(&keyed_mint_request("roxyd", "h1", None, NEWER_KEY))
+        .await
+        .expect_err("a failed convergence refuses");
+    assert_eq!(refusal.context().arm(), ProducingArm::Provisioning);
+
+    let requests = received(&server).await;
+    let writes = binding_writes(&requests, "h1-roxyd");
+    assert_eq!(
+        writes,
+        vec![
+            claim
+                .with_generation_key(NEWER_KEY)
+                .encode()
+                .expect("encode")
+        ],
+        "the retained claim is the old one with the new key, and nothing activated it"
+    );
+    let rewrite = requests
+        .iter()
+        .position(|request| {
+            request.method.as_str() == "POST" && request.url.path() == binding_data_url("h1-roxyd")
+        })
+        .expect("the rewrite was sent");
+    let convergence = requests
+        .iter()
+        .position(|request| request.url.path() == policy_url)
+        .expect("convergence was attempted");
+    assert!(
+        rewrite < convergence,
+        "the key is recorded before convergence"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method.as_str() != "DELETE"),
+        "the claim is retained"
+    );
+    assert_eq!(secret_id_requests(&requests, "h1-roxyd"), 0);
+}
+
+/// A key rewrite that fails refuses on the binding arm and runs nothing
+/// after it: no seeding, no `role_id` read, no issuance. The write was
+/// sent, so the disposition is set and a failed outcome write owes a
+/// teardown.
+#[tokio::test]
+async fn a_failed_key_rewrite_refuses_on_the_binding_arm_before_any_side_effect() {
+    async fn failing_rewrite(server: &MockServer) {
+        mock_binding_read(
+            server,
+            "h1-roxyd",
+            &roxyd_binding("h1", Some(IDEMPOTENCY_KEY)),
+        )
+        .await;
+        // On the active arm no claim is sent, so this sees only the
+        // rewrite.
+        Mock::given(method("POST"))
+            .and(path(binding_data_url("h1-roxyd")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(server)
+            .await;
+        mock_first_mint(server, "h1-roxyd").await;
+    }
+
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    failing_rewrite(&server).await;
+    let refusal = verbs
+        .mint(&keyed_mint_request("roxyd", "h1", None, NEWER_KEY))
+        .await
+        .expect_err("a failed rewrite refuses");
+    assert!(
+        matches!(refusal.error(), VerbError::Unavailable { .. }),
+        "got {:?}",
+        refusal.error()
+    );
+    assert_eq!(refusal.context().arm(), ProducingArm::Binding);
+    let requests = received(&server).await;
+    assert_eq!(binding_writes(&requests, "h1-roxyd").len(), 1);
+    assert!(
+        requests.iter().all(|request| {
+            request.url.path() == binding_data_url("h1-roxyd")
+                || request.url.path().starts_with("/v1/secret/data/bootroot/")
+        }),
+        "nothing but the binding was touched: {:?}",
+        requests
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(secret_id_requests(&requests, "h1-roxyd"), 0);
+
+    let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
+    failing_rewrite(&server).await;
+    let refusal = with_outcome_append_failure(
+        &verbs,
+        verbs.mint(&keyed_mint_request("roxyd", "h1", None, NEWER_KEY)),
+    )
+    .await
+    .expect_err("a failed rewrite refuses");
+    assert!(
+        matches!(refusal.error(), VerbError::PostMintUnrecordable { .. }),
+        "a sent rewrite may have reached OpenBao, got {:?}",
+        refusal.error()
+    );
+}
+
+/// A mint refused before the rewrite — on a host collision, a stored-spec
+/// conflict or the safe-set — writes nothing, so the stored key stays
+/// what it was.
+#[tokio::test]
+async fn a_refused_register_leaves_the_stored_key_unchanged() {
+    let outside = RegistrationSpec {
+        cert_group: Some(4242),
+        reload: ReloadSpec::new(ReloadKind::Systemd, "roxyd.service"),
+    };
+    let conflicting = BindingRecord::creating("h1", &requested(&outside), IDEMPOTENCY_KEY)
+        .activated(&requested(&outside), IDEMPOTENCY_KEY);
+    let mut outside_request = keyed_mint_request("roxyd", "h1", None, NEWER_KEY);
+    outside_request.spec = requested(&outside);
+
+    for (name, binding, request) in [
+        (
+            "host collision",
+            roxyd_binding("h2", Some(IDEMPOTENCY_KEY)),
+            keyed_mint_request("roxyd", "h1", None, NEWER_KEY),
+        ),
+        (
+            "stored-spec conflict",
+            conflicting.clone(),
+            keyed_mint_request("roxyd", "h1", None, NEWER_KEY),
+        ),
+        ("safe-set", conflicting, outside_request),
+    ] {
+        let (server, _dir, verbs) = refusal_harness(&base_fixture()).await;
+        mock_binding_read(&server, "h1-roxyd", &binding).await;
+        mock_first_mint(&server, "h1-roxyd").await;
+        let refusal = verbs.mint(&request).await.expect_err("the mint is refused");
+        match name {
+            "host collision" => assert!(matches!(
+                refusal.error(),
+                VerbError::RegistrationIdCollision { .. }
+            )),
+            "stored-spec conflict" => assert!(matches!(
+                refusal.error(),
+                VerbError::StoredSpecConflict { .. }
+            )),
+            _ => assert_eq!(refusal.context().arm(), ProducingArm::SafeSet),
+        }
+        assert_binding_read_only(&received(&server).await, "h1-roxyd");
     }
 }
 
@@ -3890,6 +4532,17 @@ impl LiveBackend {
         body["data"].clone()
     }
 
+    async fn policy_exists(&self, policy_name: &str) -> bool {
+        reqwest::Client::new()
+            .get(format!("{}/v1/sys/policies/acl/{policy_name}", self.url))
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .expect("policy read")
+            .status()
+            .is_success()
+    }
+
     async fn binding_of(&self, registration_id: &str) -> Option<serde_json::Value> {
         self.client()
             .try_read_kv(
@@ -4447,6 +5100,7 @@ async fn colliding_fixture_identities_refuse_on_the_binding_arm() {
         instance: Some(1),
         spec: requested(&expected_spec),
         wrap_ttl: Duration::minutes(5),
+        idempotency_key: IDEMPOTENCY_KEY.to_string(),
     };
     let second_request = MintRequest {
         caller: CallerIdentity::new(CALLER),
@@ -4455,6 +5109,7 @@ async fn colliding_fixture_identities_refuse_on_the_binding_arm() {
         instance: Some(1),
         spec: requested(&expected_spec),
         wrap_ttl: Duration::minutes(5),
+        idempotency_key: IDEMPOTENCY_KEY.to_string(),
     };
     let registration_id = "h1-aimer-web-001";
     for request in [&first_request, &second_request] {
@@ -4479,8 +5134,8 @@ async fn colliding_fixture_identities_refuse_on_the_binding_arm() {
         .expect("first claim succeeds");
     assert_eq!(first.kind(), MintKind::FirstMint);
 
-    let active = BindingRecord::creating("h1-aimer", &requested(&expected_spec))
-        .activated(&requested(&expected_spec));
+    let active = BindingRecord::creating("h1-aimer", &requested(&expected_spec), IDEMPOTENCY_KEY)
+        .activated(&requested(&expected_spec), IDEMPOTENCY_KEY);
     mock_binding_read(&server, registration_id, &active).await;
     let refusal = verbs
         .mint(&second_request)
@@ -5283,6 +5938,243 @@ async fn a_concurrent_mint_and_deregister_never_interleave() {
             .deregister(&deregister_request("roxyd", &host, None))
             .await
             .expect("cleanup");
+    }
+}
+
+/// Asserts that the identity `registration_id` is wholly live under
+/// generation `key`: its binding carries that key, its seeded KV
+/// material is present, and its derived role and policy exist.
+async fn assert_generation_live(backend: &LiveBackend, registration_id: &str, key: &str) {
+    let binding = backend
+        .binding_of(registration_id)
+        .await
+        .unwrap_or_else(|| panic!("{registration_id}: the binding must be present"));
+    assert_eq!(binding["generation_key"], json!(key), "{binding}");
+    for suffix in [
+        SERVICE_EAB_KV_SUFFIX,
+        SERVICE_RESPONDER_HMAC_KV_SUFFIX,
+        SERVICE_TRUST_KV_SUFFIX,
+    ] {
+        assert!(
+            backend.kv_exists(registration_id, suffix).await,
+            "{registration_id}: {suffix} must be present"
+        );
+    }
+    assert!(
+        backend
+            .read_role(&service_role_name(registration_id))
+            .await
+            .is_some(),
+        "{registration_id}: the role must be present"
+    );
+    assert!(
+        backend
+            .policy_exists(&service_policy_name(registration_id))
+            .await,
+        "{registration_id}: the policy must be present"
+    );
+}
+
+/// Asserts that nothing of the identity `registration_id` is left.
+async fn assert_identity_gone(backend: &LiveBackend, registration_id: &str) {
+    assert!(backend.binding_of(registration_id).await.is_none());
+    for suffix in REGISTRAR_TEARDOWN_KV_SUFFIXES {
+        assert!(
+            !backend.kv_exists(registration_id, suffix).await,
+            "{registration_id}: {suffix} must be swept"
+        );
+    }
+    assert!(
+        backend
+            .read_role(&service_role_name(registration_id))
+            .await
+            .is_none()
+    );
+    assert!(
+        !backend
+            .policy_exists(&service_policy_name(registration_id))
+            .await
+    );
+}
+
+/// The sequence the generation guard exists to close, against a real KV:
+/// an identity minted under `K1` is deregistered, the re-drive of that
+/// deregister is answered, a new install mints the same derived id under
+/// `K2` — and only then does the first, delayed `Deregister(K1)` arrive.
+/// It removes nothing: the `K2` binding, its material, its role and its
+/// policy all survive, and `Deregister(K2)` then removes them.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn a_late_deregister_of_an_earlier_generation_leaves_the_newer_one_intact() {
+    const K1: &str = "install-attempt-1";
+    const K2: &str = "install-attempt-2";
+
+    let backend = LiveBackend::ready().await;
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    let verbs = backend.verbs(config);
+    let registration_id = format!("{host}-piglet-003");
+
+    // 1. The first generation is minted under K1.
+    let first = verbs
+        .mint(&keyed_mint_request("piglet", &host, Some(3), K1))
+        .await
+        .expect("the first generation mints");
+    assert_eq!(first.kind(), MintKind::FirstMint);
+    assert_generation_live(&backend, &registration_id, K1).await;
+
+    // 2. and 3. `Deregister(K1)` times out in flight; its re-drive is
+    // answered and the instance number is released.
+    let late = keyed_deregister_request("piglet", &host, Some(3), K1);
+    let redriven = verbs
+        .deregister(&late)
+        .await
+        .expect("the re-drive is answered");
+    assert_eq!(redriven.kind(), DeregisterKind::IdentityRemoved);
+    assert_identity_gone(&backend, &registration_id).await;
+
+    // 4. A new install allocates the same number and mints under K2.
+    let second = verbs
+        .mint(&keyed_mint_request("piglet", &host, Some(3), K2))
+        .await
+        .expect("the second generation mints");
+    assert_eq!(second.kind(), MintKind::FirstMint);
+
+    // 5. The frame from step 2 finally arrives.
+    let stale = verbs
+        .deregister(&late)
+        .await
+        .expect("the late deregister is answered");
+    assert_eq!(stale.kind(), DeregisterKind::StaleGeneration);
+    assert!(stale.teardown().attempts().is_empty());
+    assert_generation_live(&backend, &registration_id, K2).await;
+
+    let removed = verbs
+        .deregister(&keyed_deregister_request("piglet", &host, Some(3), K2))
+        .await
+        .expect("the current generation's deregister");
+    assert_eq!(removed.kind(), DeregisterKind::IdentityRemoved);
+    assert_identity_gone(&backend, &registration_id).await;
+}
+
+/// Both orders D2-5/23 names. In order, `Register(K)` then
+/// `Deregister(K)` removes the identity. Reversed — a `Deregister`
+/// carrying the key of an earlier `Register` after a newer one re-minted
+/// the identity under its own key — removes nothing, and the newer key's
+/// `Deregister` then does.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn the_generation_guard_holds_in_normal_and_reverse_order() {
+    const K: &str = "only-generation";
+    const K1: &str = "earlier-generation";
+    const K2: &str = "newer-generation";
+
+    let backend = LiveBackend::ready().await;
+    let host = unique_label("h");
+    let (_dir, config) = load_fixture(&base_fixture());
+    let verbs = backend.verbs(config);
+    let registration_id = format!("{host}-roxyd");
+
+    verbs
+        .mint(&keyed_mint_request("roxyd", &host, None, K))
+        .await
+        .expect("mint under K");
+    let removed = verbs
+        .deregister(&keyed_deregister_request("roxyd", &host, None, K))
+        .await
+        .expect("deregister under K");
+    assert_eq!(removed.kind(), DeregisterKind::IdentityRemoved);
+    assert_identity_gone(&backend, &registration_id).await;
+
+    verbs
+        .mint(&keyed_mint_request("roxyd", &host, None, K1))
+        .await
+        .expect("mint under K1");
+    let reminted = verbs
+        .mint(&keyed_mint_request("roxyd", &host, None, K2))
+        .await
+        .expect("re-mint under K2");
+    assert_eq!(reminted.kind(), MintKind::IdempotentReMint);
+    assert_generation_live(&backend, &registration_id, K2).await;
+
+    let stale = verbs
+        .deregister(&keyed_deregister_request("roxyd", &host, None, K1))
+        .await
+        .expect("the stale deregister is answered");
+    assert_eq!(stale.kind(), DeregisterKind::StaleGeneration);
+    assert_generation_live(&backend, &registration_id, K2).await;
+
+    let removed = verbs
+        .deregister(&keyed_deregister_request("roxyd", &host, None, K2))
+        .await
+        .expect("deregister under K2");
+    assert_eq!(removed.kind(), DeregisterKind::IdentityRemoved);
+    assert_identity_gone(&backend, &registration_id).await;
+}
+
+/// A `Register(K2)` racing a stale `Deregister(K1)` on an active `K1`
+/// binding, through two separately constructed services, ends with the
+/// `K2` generation live whichever takes the per-id lock first: if the
+/// deregister wins it removes the `K1` generation and the mint then
+/// first-mints; if the mint wins it records `K2` and the deregister finds
+/// a newer generation and removes nothing. Repeated, so both orders get a
+/// chance to occur.
+#[tokio::test]
+#[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
+async fn a_register_racing_a_stale_deregister_leaves_the_newer_generation() {
+    const K1: &str = "racing-earlier-generation";
+    const K2: &str = "racing-newer-generation";
+    const ROUNDS: usize = 5;
+
+    let backend = LiveBackend::ready().await;
+    let (_dir_one, config_one) = load_fixture(&base_fixture());
+    let (_dir_two, config_two) = load_fixture(&base_fixture());
+    let minting = Arc::new(backend.verbs(config_one));
+    let deregistering = Arc::new(backend.verbs(config_two));
+
+    for round in 0..ROUNDS {
+        let host = unique_label("h");
+        let registration_id = format!("{host}-roxyd");
+        minting
+            .mint(&keyed_mint_request("roxyd", &host, None, K1))
+            .await
+            .expect("seed the K1 generation");
+
+        let for_mint = Arc::clone(&minting);
+        let for_deregister = Arc::clone(&deregistering);
+        let mint_request = keyed_mint_request("roxyd", &host, None, K2);
+        let deregister_request = keyed_deregister_request("roxyd", &host, None, K1);
+        let mint_task = tokio::spawn(async move {
+            for_mint
+                .mint(&mint_request)
+                .await
+                .map(|outcome| outcome.kind())
+                .map_err(|refusal| format!("{:?}", refusal.error()))
+        });
+        let remove_task = tokio::spawn(async move {
+            for_deregister
+                .deregister(&deregister_request)
+                .await
+                .map(|outcome| outcome.kind())
+                .map_err(|refusal| format!("{:?}", refusal.error()))
+        });
+        let minted = mint_task.await.expect("the mint task must not panic");
+        let removed = remove_task
+            .await
+            .expect("the deregister task must not panic");
+
+        match (&minted, &removed) {
+            (Ok(MintKind::FirstMint), Ok(DeregisterKind::IdentityRemoved))
+            | (Ok(MintKind::IdempotentReMint), Ok(DeregisterKind::StaleGeneration)) => {}
+            other => panic!("round {round}: not one of the two clean orderings: {other:?}"),
+        }
+        assert_generation_live(&backend, &registration_id, K2).await;
+
+        deregistering
+            .deregister(&keyed_deregister_request("roxyd", &host, None, K2))
+            .await
+            .expect("cleanup");
+        assert_identity_gone(&backend, &registration_id).await;
     }
 }
 
