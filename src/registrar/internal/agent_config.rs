@@ -405,15 +405,30 @@ pub fn upsert_internal_trust(
 /// pins a rotation may have rewritten — so `rotate responder-hmac`
 /// changes the one value it rotated.
 ///
+/// `acme` is edited in whatever form the document spells it — a
+/// `[acme]` header, dotted keys, or an inline table — since the agent
+/// loads all three alike and an edit that skipped one would leave the
+/// daemon on the old HMAC.
+///
 /// # Errors
 ///
-/// Returns an error when `contents` is not valid TOML.
+/// Returns an error when `contents` is not valid TOML, or when `acme` is
+/// present but holds something other than a table. Neither error quotes
+/// the document, which carries the HMAC.
 pub fn upsert_internal_responder_hmac(contents: &str, hmac: &HmacSecret) -> Result<String> {
-    upsert_section_keys(
-        contents,
-        ACME_SECTION,
-        &[(RESPONDER_HMAC_KEY, toml_encode_string(hmac.expose()))],
-    )
+    let mut doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    let value: Value = toml_encode_string(hmac.expose())
+        .parse()
+        .map_err(|_| anyhow::anyhow!("the responder HMAC does not encode as a TOML string"))?;
+    let Some(acme) = doc
+        .entry(ACME_SECTION)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_like_mut()
+    else {
+        anyhow::bail!("`{ACME_SECTION}` must be a table");
+    };
+    acme.insert(RESPONDER_HMAC_KEY, Item::Value(value));
+    Ok(doc.to_string())
 }
 
 /// Removes the `[eab]` table from an existing config.

@@ -493,9 +493,12 @@ operator tables and the `[trust]` pins included — publish it root-owned at
 to is decided by reading the file, before the rotation's first `OpenBao` write:
 an absent file means the host has none and the rotation does exactly what it
 does on any other host; a file that exists but cannot be read — including the
-permission error an unprivileged run gets — or does not parse as TOML refuses
-the rotation, naming the file, with nothing written anywhere, because the
-rotation must then be re-run as root. A failure after the `OpenBao` writes is
+permission error an unprivileged run gets, which the refusal answers by asking
+for a re-run as root — does not parse as TOML, or, for `rotate responder-hmac`,
+has an `acme` that is not a table refuses the rotation, naming the file, with
+nothing written anywhere. `[acme]` is rewritten in whichever form the file
+spells it — a `[acme]` header, dotted `acme.` keys or an inline table — since
+the agent loads all three alike. A failure after the `OpenBao` writes is
 reported rather than rolled back: the new value is already the source of
 truth, so re-running the rotation, or running
 `bootroot rotate registrar-internal-credential --force` to re-render the file

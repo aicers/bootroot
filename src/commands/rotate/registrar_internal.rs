@@ -122,8 +122,9 @@ pub(super) struct InternalConfigLock {
 ///
 /// # Errors
 ///
-/// Returns an error when the directory cannot be created, when the lock
-/// file cannot be opened, or when the lock cannot be taken.
+/// Returns an error naming the config the lock guards when the directory
+/// cannot be created, when the lock file cannot be opened, or when the
+/// lock cannot be taken.
 pub(super) async fn acquire_internal_config_lock(secrets_dir: &Path) -> Result<InternalConfigLock> {
     let paths = InternalPaths::new(secrets_dir);
     if !tokio::fs::try_exists(paths.dir()).await.unwrap_or(false) {
@@ -131,15 +132,23 @@ pub(super) async fn acquire_internal_config_lock(secrets_dir: &Path) -> Result<I
             .await
             .with_context(|| {
                 format!(
-                    "creating {} to take the bootroot-internal config lock in",
-                    paths.dir().display()
+                    "creating {} to take the lock on the bootroot-internal config at {} in",
+                    paths.dir().display(),
+                    paths.agent_config().display()
                 )
             })?;
     }
     let lock_path = paths.dir().join(INTERNAL_CONFIG_LOCK_FILE);
     tokio::task::spawn_blocking(move || lock_internal_config_blocking(&lock_path))
         .await
-        .context("the bootroot-internal config lock task panicked")?
+        .context("the bootroot-internal config lock task panicked")
+        .and_then(|locked| locked)
+        .with_context(|| {
+            format!(
+                "locking the bootroot-internal config at {} for update",
+                paths.agent_config().display()
+            )
+        })
 }
 
 /// The blocking half of [`acquire_internal_config_lock`].
@@ -187,7 +196,8 @@ impl InternalConfigChange<'_> {
     ///
     /// A parse failure is reported without its source: the parser's
     /// message quotes the offending line, and this file carries the
-    /// responder HMAC and the EAB HMAC.
+    /// responder HMAC and the EAB HMAC. Any other refusal — an `acme`
+    /// that is not a table — quotes nothing from the file and is kept.
     fn apply(self, contents: &str, config_path: &Path) -> Result<Option<String>> {
         let applied = match self {
             Self::SetResponderHmac(hmac) => {
@@ -195,11 +205,18 @@ impl InternalConfigChange<'_> {
             }
             Self::RemoveEab => remove_internal_eab(contents),
         };
-        applied.map_err(|_| {
-            anyhow::anyhow!(
-                "the bootroot-internal config at {} does not parse as TOML",
-                config_path.display()
-            )
+        applied.map_err(|err| {
+            if err.downcast_ref::<toml_edit::TomlError>().is_some() {
+                anyhow::anyhow!(
+                    "the bootroot-internal config at {} does not parse as TOML",
+                    config_path.display()
+                )
+            } else {
+                err.context(format!(
+                    "the bootroot-internal config at {} cannot take this change",
+                    config_path.display()
+                ))
+            }
         })
     }
 }
@@ -2104,6 +2121,96 @@ mod tests {
         assert!(
             !paths.dir().join(INTERNAL_CONFIG_LOCK_FILE).exists(),
             "the check takes no lock"
+        );
+    }
+
+    /// An `[acme]` spelled as an inline table is one the check finds
+    /// applicable and the rewrite under the lock carries the new HMAC
+    /// into; an `acme` that is not a table refuses the rotation before
+    /// its first write rather than letting it report a rewrite it did
+    /// not make.
+    #[tokio::test]
+    async fn the_check_and_the_rewrite_reach_an_inline_acme() {
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+        let set_hmac = InternalConfigChange::SetResponderHmac(&hmac);
+        let (dir, paths) = provisioned_host();
+        let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(paths.agent_config())
+            .expect("config")
+            .parse()
+            .expect("valid TOML");
+        let acme = doc
+            .remove("acme")
+            .and_then(|item| item.into_table().ok())
+            .expect("the [acme] table");
+        doc.insert(
+            "acme",
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(acme.into_inline_table())),
+        );
+        std::fs::write(paths.agent_config(), doc.to_string()).expect("config");
+
+        assert_eq!(
+            check_internal_config_change(dir.path(), set_hmac)
+                .await
+                .expect("readable"),
+            InternalConfigCheck::Applicable
+        );
+        let lock = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("the lock");
+        let rewritten = rewrite_internal_config(&paths.agent_config(), set_hmac, &lock)
+            .await
+            .expect("the rewrite")
+            .expect("the HMAC changes the file");
+        std::fs::write(paths.agent_config(), rewritten).expect("config");
+        assert_eq!(
+            bootroot::registrar::internal::load_internal_config(&paths)
+                .expect("loads")
+                .acme
+                .http_responder_hmac
+                .expose(),
+            ROTATED_HMAC
+        );
+        drop(lock);
+
+        std::fs::write(paths.agent_config(), "acme = \"old-hmac-in-a-string\"\n").expect("config");
+        let report = format!(
+            "{:#}",
+            check_internal_config_change(dir.path(), set_hmac)
+                .await
+                .expect_err("a non-table acme is refused")
+        );
+        assert!(
+            report.contains(&paths.agent_config().display().to_string())
+                && report.contains("must be a table")
+                && report.contains("nothing has been written"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("old-hmac-in-a-string") && !report.contains(ROTATED_HMAC),
+            "{report}"
+        );
+    }
+
+    /// A lock that cannot be taken fails naming the config it guards,
+    /// not only the lock file beside it.
+    #[tokio::test]
+    async fn a_lock_failure_names_the_internal_config() {
+        let (dir, paths) = provisioned_host();
+        // A directory where the lock file goes cannot be opened as one.
+        std::fs::create_dir(paths.dir().join(INTERNAL_CONFIG_LOCK_FILE)).expect("mkdir");
+        let err = acquire_internal_config_lock(dir.path())
+            .await
+            .err()
+            .expect("the lock cannot be taken");
+        let report = format!("{err:#}");
+        // The lock file's path starts with the config's, so the config
+        // is looked for as a path of its own, not as a prefix.
+        assert!(
+            report.contains(&format!(
+                "bootroot-internal config at {} for update",
+                paths.agent_config().display()
+            )) && report.contains(INTERNAL_CONFIG_LOCK_FILE),
+            "{report}"
         );
     }
 

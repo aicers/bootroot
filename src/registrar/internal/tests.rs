@@ -1047,6 +1047,84 @@ fn a_responder_hmac_upsert_changes_only_that_key() {
     );
 }
 
+/// Re-spells `[acme]` in `contents` as an inline table (`inline`) or as
+/// dotted keys, the two other forms the agent loads alike.
+fn respell_acme(contents: &str, inline: bool) -> String {
+    let mut doc: toml_edit::DocumentMut = contents.parse().expect("valid TOML");
+    let mut acme = doc
+        .remove("acme")
+        .and_then(|item| item.into_table().ok())
+        .expect("the [acme] table");
+    if inline {
+        doc.insert(
+            "acme",
+            toml_edit::Item::Value(toml_edit::Value::InlineTable(acme.into_inline_table())),
+        );
+    } else {
+        acme.set_dotted(true);
+        doc.insert("acme", toml_edit::Item::Table(acme));
+    }
+    doc.to_string()
+}
+
+/// An `[acme]` spelled as an inline table or as dotted keys takes the
+/// rotated HMAC too: the agent loads either, so an edit that skipped
+/// them would leave the daemon on the old value.
+#[test]
+fn a_responder_hmac_upsert_reaches_every_spelling_of_acme() {
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let rotated = HmacSecret::from("rotated-hmac");
+    for (inline, marker) in [(true, "acme = {"), (false, "acme.http_responder_hmac")] {
+        let before = respell_acme(&endpoint_config(&paths, true), inline);
+        assert!(before.contains(marker), "the fixture spells it: {before}");
+        assert_eq!(
+            toml_settings(&before).acme.http_responder_hmac.expose(),
+            CONFIG_RESPONDER_HMAC.expose(),
+            "the agent loads this spelling"
+        );
+
+        let after = upsert_internal_responder_hmac(&before, &rotated).expect("upsert");
+
+        assert!(after.contains(marker), "the spelling is kept: {after}");
+        let settings = toml_settings(&after);
+        assert_eq!(settings.acme.http_responder_hmac.expose(), rotated.expose());
+        let without_hmac = |contents: &str| {
+            let mut doc: toml_edit::DocumentMut = contents.parse().expect("valid TOML");
+            doc.get_mut("acme")
+                .and_then(toml_edit::Item::as_table_like_mut)
+                .expect("acme")
+                .remove("http_responder_hmac")
+                .expect("the key");
+            doc.to_string()
+        };
+        assert_eq!(
+            without_hmac(&after),
+            without_hmac(&before),
+            "nothing but the one key moved"
+        );
+    }
+}
+
+/// An `acme` that is not a table is refused rather than skipped, and the
+/// refusal quotes nothing from the file.
+#[test]
+fn a_responder_hmac_upsert_refuses_an_acme_that_is_not_a_table() {
+    for contents in [
+        "acme = \"old-hmac\"\n",
+        "[[acme]]\nhttp_responder_hmac = \"old-hmac\"\n",
+    ] {
+        let err = upsert_internal_responder_hmac(contents, &HmacSecret::from("new-hmac"))
+            .expect_err("a non-table acme is refused");
+        let report = format!("{err:#}");
+        assert!(report.contains("must be a table"), "{report}");
+        assert!(
+            !report.contains("old-hmac") && !report.contains("new-hmac"),
+            "{report}"
+        );
+    }
+}
+
 /// `rotate eab-clear` removes `[eab]` and nothing else, and on a config
 /// without one reports that there is nothing to do.
 #[test]
