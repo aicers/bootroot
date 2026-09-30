@@ -6056,6 +6056,18 @@ async fn test_rotate_responder_hmac_without_internal_config_is_unchanged() {
         ]
     );
     assert_eq!(fs::read_to_string(&pkill_log).expect("pkill log"), "");
+    let docker_log =
+        fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
+    assert!(
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC: {docker_log}"
+    );
+    assert!(
+        stdout.contains("responder config updated"),
+        "the rotation reports the responder config: {stdout}"
+    );
     assert!(
         !temp_dir
             .path()
@@ -6143,8 +6155,9 @@ async fn fail_service_record_write(server: &MockServer, registration_id: &str, s
         .await;
 }
 
-/// A fan-out write that fails after the control-node HMAC write does
-/// not end `rotate responder-hmac` there. `OpenBao` already carries the
+/// On a host with the bootroot-internal config, a fan-out write that
+/// fails after the control-node HMAC write does not end `rotate
+/// responder-hmac` there. `OpenBao` already carries the
 /// new value, so the internal config is still rewritten and the
 /// responder still handed the HMAC — both under the lock, which a
 /// repair waiting to read that value must not see released before the
@@ -6208,6 +6221,154 @@ async fn test_rotate_responder_hmac_fanout_failure_still_hands_over_the_hmac() {
     assert!(
         !stdout.contains("responder config updated"),
         "no summary claims the rotation finished: {stdout}"
+    );
+}
+
+/// Asserts that a `rotate responder-hmac` run on a host without the
+/// bootroot-internal config failed on its fan-out write and stopped
+/// there: the failure is reported, the responder's `OpenBao` Agent was
+/// not restarted, the responder was not reloaded and no internal daemon
+/// was signalled.
+fn assert_fanout_failure_ended_the_rotation(
+    root: &Path,
+    output: &std::process::Output,
+    pkill_log: &Path,
+    hmac: &str,
+) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("OpenBao KV secret write failed"),
+        "the fan-out failure is reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("registrar-internal"),
+        "no internal config is involved: {stderr}"
+    );
+    assert!(
+        !stdout.contains(hmac) && !stderr.contains(hmac),
+        "the new HMAC is never printed"
+    );
+    let docker_log = fs::read_to_string(root.join("docker.log")).expect("read docker log");
+    assert!(
+        !docker_log
+            .lines()
+            .any(|line| line.contains("restart") || line.contains("HUP")),
+        "the responder is neither restarted nor reloaded: {docker_log}"
+    );
+    assert!(
+        !root
+            .join("secrets")
+            .join("responder")
+            .join("responder.toml")
+            .exists(),
+        "no responder config is rendered for the rotation to wait on"
+    );
+    assert_eq!(fs::read_to_string(pkill_log).expect("pkill log"), "");
+    assert!(
+        !root.join("secrets").join("registrar-internal").exists(),
+        "a host without the registrar gets no internal directory"
+    );
+    assert!(
+        !stdout.contains("responder config updated"),
+        "no summary claims the rotation finished: {stdout}"
+    );
+}
+
+/// On a host without the bootroot-internal config nothing waits on the
+/// internal config lock, so a fan-out write that fails on the first
+/// service ends `rotate responder-hmac` there, before the responder is
+/// handed the new HMAC.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_without_internal_config_fanout_failure_returns_at_once() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    fail_service_record_write(&openbao, SERVICE_NAME, "http_responder_hmac").await;
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-fanout-plain").await;
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-fanout-plain",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    assert_fanout_failure_ended_the_rotation(
+        temp_dir.path(),
+        &output,
+        &pkill_log,
+        "hmac-fanout-plain",
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/responder/hmac".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"),
+        ]
+    );
+}
+
+/// A fan-out write that fails after an earlier one succeeded — here the
+/// registrar-managed identity's, which follows the `state.json` service
+/// — likewise ends `rotate responder-hmac` on a host without the
+/// internal config, keeping the writes already made and handing the
+/// responder nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_without_internal_config_later_fanout_failure_returns_at_once() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state_with_registrar(temp_dir.path(), &openbao.uri(), "remote-bootstrap")
+        .expect("prepare state");
+    fail_service_record_write(&openbao, REGISTRAR_ID, "http_responder_hmac").await;
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-fanout-registrar").await;
+    stub_registrar_identities(&openbao, &[(REGISTRAR_ID, binding_record("active"))]).await;
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-fanout-registrar",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    assert_fanout_failure_ended_the_rotation(
+        temp_dir.path(),
+        &output,
+        &pkill_log,
+        "hmac-fanout-registrar",
+    );
+    let requests = received(&openbao).await;
+    assert_eq!(
+        request_lines(&requests),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            format!("GET {SERVICES_LIST_PATH}"),
+            format!("GET {}", binding_kv_path(SERVICE_NAME)),
+            format!("GET {}", binding_kv_path(REGISTRAR_ID)),
+            "POST /v1/secret/data/bootroot/responder/hmac".to_string(),
+            format!(
+                "POST {}",
+                service_record_path(SERVICE_NAME, "http_responder_hmac")
+            ),
+            format!(
+                "POST {}",
+                service_record_path(REGISTRAR_ID, "http_responder_hmac")
+            ),
+        ]
+    );
+    assert_eq!(
+        posted_payloads(
+            &requests,
+            &service_record_path(SERVICE_NAME, "http_responder_hmac")
+        ),
+        vec![json!({ "hmac": "hmac-fanout-registrar" })],
+        "the write made before the failure is kept"
     );
 }
 

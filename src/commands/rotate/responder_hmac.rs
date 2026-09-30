@@ -72,13 +72,22 @@ pub(super) async fn rotate_responder_hmac(
 
     // From here on the control-node record carries the new value, which
     // is what a repair reads and what the responder's `OpenBao` Agent
-    // renders from, so every remaining step runs even when an earlier
-    // one fails and the failures are reported together. In particular a
-    // failed fan-out write does not return early: that would release
-    // the lock with the new value in `OpenBao` and the responder still
-    // on the old one, letting a waiting repair issue against it.
+    // renders from. On a host holding the internal config lock every
+    // remaining step therefore runs even when an earlier one fails, and
+    // the failures are reported together. In particular a failed fan-out
+    // write does not return early there: that would release the lock
+    // with the new value in `OpenBao` and the responder still on the old
+    // one, letting a waiting repair issue against it. A host without the
+    // internal config has no lock and no repair waiting on one, so a
+    // failed fan-out write returns at once, before the responder is
+    // restarted, as it did before the internal config existed.
     let fanout_outcome =
-        sync_service_responder_hmac_payloads(ctx, client, &registration_ids, &hmac, messages).await;
+        match sync_service_responder_hmac_payloads(ctx, client, &registration_ids, &hmac, messages)
+            .await
+        {
+            Err(err) if internal_lock.is_none() => return Err(err),
+            outcome => outcome,
+        };
 
     // Service agents (local host daemons and remote alike) pick up the
     // rotated HMAC from their per-service KV payload via the fast-poll
