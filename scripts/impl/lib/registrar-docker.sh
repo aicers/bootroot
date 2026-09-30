@@ -105,12 +105,12 @@ registrar_docker_prepare_deployment_tree() {
 # Both Docker-backed registrar scenarios — the per-pull-request red-team arm
 # and the extended-tier endurance arm — stand the same deployment up before
 # they diverge: a run-scoped Compose project on four freshly allocated host
-# ports, `bootroot init` under `sudo`, the registrar DNS aliases step-ca
-# resolves its challenge through, and a root-owned inherited listener under a
-# small Python supervisor. Only what each scenario then asserts, and how long
-# it waits, differs. That setup lives here once so the two arms cannot slowly
-# grow different deployments; each scenario's assertions and workload stay in
-# its own script, and nothing scenario-specific belongs here.
+# ports, `bootroot init` under `sudo`, which attaches the registrar DNS aliases
+# step-ca resolves its challenges through, and a root-owned inherited listener
+# under a small Python supervisor. Only what each scenario then asserts, and
+# how long it waits, differs. That setup lives here once so the two arms cannot
+# slowly grow different deployments; each scenario's assertions and workload
+# stay in its own script, and nothing scenario-specific belongs here.
 #
 # These functions read and write the run's own shell variables rather than
 # taking each as an argument. RUN_ROOT, WORK_DIR, INSTANCE and the paths below
@@ -352,32 +352,17 @@ registrar_docker_load_openbao_paths() {
   AGENT_EAB_PATH="$(registrar_docker_rust_string_constant "$init_constants" PATH_AGENT_EAB)"
 }
 
-# Gives the responder container both registrar hostnames, and any further
-# names passed after them, as network aliases, and proves step-ca resolves and
-# reaches each one.
+# Proves step-ca reaches every registrar hostname passed through the responder's
+# DNS aliases.
 #
-# The endpoint's HTTP-01 challenge is answered by the responder under the
-# registrar's own name, so a missing alias surfaces as an issuance that never
-# completes rather than as a name that does not resolve. The override is
-# written into the artifact directory so a failed run keeps it.
-#
-# Recreating the responder drops every alias `init` attached with `docker
-# network connect`, the bootroot-internal identity's among them. A scenario
-# that issues that identity again after this, as a full CA rotation does,
-# passes its name here so the recreated responder still answers to it.
-registrar_docker_apply_endpoint_dns_alias() {
+# The aliases are bootroot's own: `init` attaches the bootroot-internal name and
+# the endpoint's client and server names from the recorded endpoint predicate,
+# and every later alias rebuild keeps them. This leaves the responder untouched
+# and only checks that each name resolves and answers from the step-ca
+# container, so a missing alias fails here with its name rather than as an
+# issuance that never completes.
+registrar_docker_assert_endpoint_dns_aliases() {
   local alias
-  local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml"
-  local responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
-  {
-    printf 'services:\n  bootroot-http01:\n    networks:\n      default:\n        aliases:\n'
-    for alias in "$@"; do printf '          - %s\n' "$alias"; done
-  } >"$override"
-  [ -f "$responder_override" ] || fail "init did not render the responder compose override"
-  BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" \
-    -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" \
-    up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 ||
-    fail "could not apply the registrar endpoint DNS aliases"
   for alias in "$@"; do
     for _ in $(seq 1 15); do
       if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
@@ -386,7 +371,7 @@ registrar_docker_apply_endpoint_dns_alias() {
       sleep 1
     done
     docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1 ||
-      fail "step-ca cannot reach registrar hostname ${alias} through its DNS alias"
+      fail "step-ca cannot reach registrar hostname ${alias} through the alias bootroot attached"
   done
 }
 

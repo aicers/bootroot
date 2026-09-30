@@ -401,7 +401,7 @@ main() {
   registrar_docker_build_and_initialize "$SCENARIO_SLUG"
   pass "initialized an isolated live TLS OpenBao deployment"
   registrar_docker_load_openbao_paths
-  registrar_docker_apply_endpoint_dns_alias "$CLIENT_NAME" "$ENDPOINT_NAME"
+  registrar_docker_assert_endpoint_dns_aliases "$CLIENT_NAME" "$ENDPOINT_NAME"
   log_phase overrides
   patch_duration_template; set_internal_cadence
   registrar_docker_prepare_daemon

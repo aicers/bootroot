@@ -166,9 +166,10 @@ ports are the point rather than a concession: on the compose defaults a
 hard-coded step-ca or responder endpoint is indistinguishable from a derived
 one. It asserts the listener transition, the recorded `https://` URL, the
 six-file credential set — the five protected members as uid 0, gid 0 and `0600`,
-the private CA bundle beside them — the responder alias the internal SAN
-resolves through, and a real `auth/cert/login` with the credential `init` just
-published — plus that the same login without the client certificate is refused.
+the private CA bundle beside them — the responder aliases the internal SAN and
+the registrar surface's client and endpoint names resolve through, and a real
+`auth/cert/login` with the credential `init` just published — plus that the
+same login without the client certificate is refused.
 It also asserts the other side of that split: the `OpenBao` Agent sidecars'
 configuration, `AppRole` pair, templates and the directories holding them still
 belong to the owner of `secrets/`, which a root-run `init` must not take over.

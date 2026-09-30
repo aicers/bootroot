@@ -316,8 +316,9 @@ main() {
   pass "initialized an isolated live TLS OpenBao deployment"
   registrar_docker_load_openbao_paths
   # Phase 4's tail re-issues the bootroot-internal credential over HTTP-01,
-  # so the recreated responder has to keep answering to its name.
-  registrar_docker_apply_endpoint_dns_alias "$CLIENT_NAME" "$ENDPOINT_NAME" "$INTERNAL_NAME"
+  # so its name is checked beside the two surface names: `init` attached all
+  # three and nothing in this scenario recreates the responder.
+  registrar_docker_assert_endpoint_dns_aliases "$CLIENT_NAME" "$ENDPOINT_NAME" "$INTERNAL_NAME"
   registrar_docker_prepare_daemon
   set_rotation_paths
   prepare_anchor_pin

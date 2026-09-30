@@ -111,6 +111,10 @@ HTTP01_IMAGE_BUILT=0
 DOMAIN="trusted.domain"
 HOST_LABEL="bootroot-01"
 INTERNAL_SAN="001.bootroot-registrar-internal.${HOST_LABEL}.${DOMAIN}"
+# The registrar surface's two names, which `init` attaches to the responder
+# beside the internal SAN.  Spelled out for the same reason.
+CLIENT_SAN="001.bootroot-registrar.${HOST_LABEL}.${DOMAIN}"
+ENDPOINT_SAN="001.bootroot-registrar-endpoint.${HOST_LABEL}.${DOMAIN}"
 INTERNAL_ENTRY="bootroot-registrar-internal"
 
 INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-60}"
@@ -2770,17 +2774,22 @@ assert_the_deployment_runs_on_a_mounted_reserve() {
   # `remove_reserve_activation`, which the globals above are set for.
 }
 
-# The alias is why the ACME challenge above could resolve at all.
-# Asserted directly so a future change that drops it fails with the
+# The internal SAN's alias is why the ACME challenge above could resolve
+# at all, and the two surface names' are what the daemon's surface-leaf
+# issuance and `bootroot registrar issue` resolve through.  `init`
+# attaches all three itself; nothing in this scenario adds them.
+# Asserted directly so a future change that drops one fails with the
 # reason rather than as an unexplained issuance timeout.
-assert_the_responder_answers_to_the_internal_san() {
-  local aliases
+assert_the_responder_answers_to_the_registrar_names() {
+  local aliases name
   aliases="$(docker inspect "${INSTANCE}-http01" \
     --format '{{range .NetworkSettings.Networks}}{{range .Aliases}}{{println .}}{{end}}{{end}}' \
     2>>"$RUN_LOG" || true)"
-  grep -qx "$INTERNAL_SAN" <<<"$aliases" ||
-    fail "the responder does not answer to ${INTERNAL_SAN}; aliases: $(tr '\n' ' ' <<<"$aliases")"
-  pass "the responder answers to the internal SAN"
+  for name in "$INTERNAL_SAN" "$CLIENT_SAN" "$ENDPOINT_SAN"; do
+    grep -qx "$name" <<<"$aliases" ||
+      fail "the responder does not answer to ${name}; aliases: $(tr '\n' ' ' <<<"$aliases")"
+  done
+  pass "the responder answers to the internal SAN and both registrar surface names"
 }
 
 # ---------------------------------------------------------------------------
@@ -2966,7 +2975,7 @@ main() {
   assert_material_is_complete_and_restrictive
   assert_generated_config_is_the_internal_one
   assert_leaf_carries_the_fixed_san
-  assert_the_responder_answers_to_the_internal_san
+  assert_the_responder_answers_to_the_registrar_names
   assert_the_infra_agent_tree_belongs_to_its_sidecars
   assert_the_infra_agents_are_generated_for_tls
 
