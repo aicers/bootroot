@@ -240,6 +240,15 @@ BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
 "$ROOT_DIR/scripts/impl/run-registrar-redteam.sh"
 cat "$ARTIFACT_DIR/wall-clock.json"
 
+echo "[ci-local-e2e] run registrar CA rotation (issue #1027)"
+ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-registrar-ca-rotation-${RUN_ID}"
+mkdir -p "$ARTIFACT_DIR"
+ARTIFACT_DIR="$ARTIFACT_DIR" \
+BOOTROOT_PROJECT_DIR="$ROOT_DIR" \
+BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+"$ROOT_DIR/scripts/impl/run-registrar-ca-rotation-e2e.sh"
+cat "$ARTIFACT_DIR/wall-clock.json"
+
 echo "[ci-local-e2e] done"
 echo "[ci-local-e2e] artifacts:"
 echo "  - $ROOT_DIR/tmp/e2e/ci-local-no-hosts-${RUN_ID}"
@@ -256,3 +265,4 @@ echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-verbs-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-internal-init-${RUN_ID}"
 echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-redteam-${RUN_ID}"
+echo "  - $ROOT_DIR/tmp/e2e/ci-registrar-ca-rotation-${RUN_ID}"

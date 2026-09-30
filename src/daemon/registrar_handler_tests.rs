@@ -1362,6 +1362,163 @@ async fn an_unarmable_registrar_renewal_stops_the_daemon() {
     );
 }
 
+/// A reload whose surface issuance fails after a CA rotation's Phase 5
+/// removed both pairs does not stop the daemon. The refresh keeps the
+/// active configuration, and the invocation the reload begins arms
+/// renewal over the lifetimes the previous invocation observed instead
+/// of refusing the absent leaves — so the endpoint keeps answering, and
+/// a re-run of Phase 5 still has a daemon to signal.
+///
+/// Drives the reload the way `bootroot-agent` does: one invocation,
+/// stopped, then the refresh, then the next invocation over the same
+/// activated endpoint.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)]
+async fn a_reload_whose_issuance_fails_keeps_the_daemon_serving() {
+    let (logs, _guard) = crate::registrar::endpoint::test_support::capture_logs();
+    // A local server that answers the renewal pass's OpenBao login with
+    // something that is not TLS, so the pass fails fast and on this host.
+    let openbao = MockServer::start().await;
+    let deployment = Deployment::arrange();
+    write_state_file(
+        deployment.path(),
+        &state_json(&format!("https://{}", openbao.address()), "secret", None),
+    );
+    let mut settings = deployment.settings_with_endpoint(true);
+    settings.registrar.audit_store_enforcement = AuditStoreEnforcement::Directory;
+    settings.registrar.open_audit_store_as_test_user = true;
+    configure_valid_profile_certificate(&mut settings, &deployment);
+    configure_registrar_surface_material(&mut settings, &deployment);
+    let settings = Arc::new(settings);
+    let endpoint = crate::registrar::endpoint::DaemonTestEndpoint::bind()
+        .expect("bind a test endpoint through the production adoption seam");
+
+    let invoke = |shutdown: &DaemonShutdown| {
+        tokio::spawn(run_daemon(DaemonInvocation {
+            settings: Arc::clone(&settings),
+            default_eab: None,
+            eab_refresh_path: None,
+            config_path: Some(deployment.path().join("agent.toml")),
+            cli_overrides: crate::config::CliOverrides::default(),
+            shutdown: shutdown.clone(),
+            registrar_endpoint: endpoint.registrar_endpoint(),
+        }))
+    };
+    let enabled_count = || {
+        logs.events()
+            .into_iter()
+            .filter(|event| event.message.contains("daemon enabled"))
+            .count()
+    };
+    let wait_for_invocations = |count: usize| {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            while enabled_count() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let first = DaemonShutdown::new();
+    let daemon = invoke(&first);
+    wait_for_invocations(1)
+        .await
+        .expect("the first invocation starts its duties");
+    first.stop();
+    daemon
+        .await
+        .expect("the first invocation joins")
+        .expect("the first invocation stops cleanly");
+    let observed: Vec<_> = [
+        crate::registrar_certs::SurfaceLeaf::EndpointServer,
+        crate::registrar_certs::SurfaceLeaf::RegistrarClient,
+    ]
+    .into_iter()
+    .map(|leaf| {
+        let entry = endpoint
+            .renewal_state()
+            .leaf(leaf)
+            .expect("the first invocation observed both leaves");
+        (leaf, entry.not_after)
+    })
+    .collect();
+
+    // What Phase 5 leaves, and a reload whose issuance cannot replace it.
+    let endpoint_settings = &settings.registrar_endpoint;
+    for path in [
+        &endpoint_settings.server_cert_path,
+        &endpoint_settings.server_key_path,
+        &endpoint_settings.client_cert_path,
+        &endpoint_settings.client_key_path,
+    ] {
+        std::fs::remove_file(path.as_deref().expect("configured"))
+            .expect("remove surface material");
+    }
+    crate::registrar_certs::refresh_after_reload_with(
+        &settings,
+        &endpoint.registrar_endpoint(),
+        async { Err(anyhow::anyhow!("the CA is down")) },
+    )
+    .await;
+
+    let second = DaemonShutdown::new();
+    let daemon = invoke(&second);
+    wait_for_invocations(2)
+        .await
+        .expect("the invocation the reload began arms and starts its duties");
+    assert!(
+        !daemon.is_finished(),
+        "absent surface leaves on a reload must not end the invocation"
+    );
+    let state = endpoint.renewal_state();
+    for (leaf, observed) in &observed {
+        let entry = state.leaf(*leaf).expect("the absent leaf keeps its entry");
+        assert_eq!(
+            entry.not_after, *observed,
+            "the lifetime the first invocation observed is retained for {leaf:?}"
+        );
+        assert!(
+            matches!(
+                entry.attempt,
+                crate::registrar_renewal::RenewalAttempt::Failed { .. }
+            ),
+            "the absent {leaf:?} is recorded as a failed attempt: {entry:?}"
+        );
+    }
+
+    let _ = endpoint
+        .client()
+        .mint(RegisterRequest {
+            protocol_version: ProtocolVersion::current(),
+            service_name: "edge-proxy".to_string(),
+            delivery_mode: WireDeliveryMode::LocalFile,
+            host: "edge-node-01".to_string(),
+            instance: Some(1),
+            spec: WireServiceSpec {
+                component: "edge-proxy".to_string(),
+                service_name: "edge-proxy".to_string(),
+                reload: "none".to_string(),
+                cert_group: None,
+            },
+            wrap_ttl: 300,
+            idempotency_key: "caller-key".to_string(),
+            target_paths: WireTargetPaths::default(),
+        })
+        .await;
+    assert!(
+        logs.events()
+            .iter()
+            .any(|event| event.field("reason") == "handler-rejected-payload"),
+        "the endpoint still dispatches requests after the failed reload"
+    );
+    assert!(!daemon.is_finished(), "the invocation is still running");
+
+    second.stop();
+    daemon
+        .await
+        .expect("the reloaded invocation joins")
+        .expect("the reloaded invocation stops cleanly");
+}
+
 /// A production audit-store failure remains a daemon failure: directory mode
 /// reaches the real builder without consulting the mount predicate, and a
 /// regular file cannot become the record directory it needs.

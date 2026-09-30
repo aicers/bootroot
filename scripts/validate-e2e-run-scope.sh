@@ -321,12 +321,13 @@ check_truncation_keeps_the_discriminating_tail() {
   ok "a truncated identifier keeps its tail, so runs differing only there stay distinct"
 }
 
-# The two registrar scenarios, and the slug each derives its instance prefix
+# The registrar scenarios, and the slug each derives its instance prefix
 # from. Read out of the shipped scripts, so a renamed scenario cannot leave
 # this file validating a prefix nothing derives.
 REGISTRAR_SCENARIO_SCRIPTS=(
   run-registrar-redteam.sh
   run-registrar-endurance.sh
+  run-registrar-ca-rotation-e2e.sh
 )
 
 registrar_scenario_slug() {

@@ -921,6 +921,14 @@ pub(crate) struct RotateCaKeyArgs {
     /// Delete backup files on completion
     #[arg(long)]
     pub(crate) cleanup: bool,
+    /// Socket unit to read the registrar endpoint's `ListenStream=` from,
+    /// exactly as `bootroot registrar capabilities --socket-unit` does.
+    ///
+    /// Used only by a full rotation on a registrar endpoint host, which
+    /// dials the endpoint to prove it moved to the new CA. Without it the
+    /// socket path is the one `registrar capabilities` reports.
+    #[arg(long)]
+    pub(crate) registrar_socket_unit: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

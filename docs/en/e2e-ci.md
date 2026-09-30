@@ -100,6 +100,7 @@ Primary scripts:
 - `scripts/impl/run-registrar-internal-e2e.sh`
 - `scripts/impl/run-registrar-internal-init-e2e.sh`
 - `scripts/impl/run-registrar-redteam.sh`
+- `scripts/impl/run-registrar-ca-rotation-e2e.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -132,6 +133,16 @@ run it in the Docker matrix; documentation-only pull requests run the focused
 companion job, so every pull request has exactly one such gate. Ordinary wire
 and listener round trips remain in cargo tests, while certificate renewal and
 the no-AppRole renewal check remain in the scheduled endurance suite.
+
+`run-registrar-ca-rotation-e2e.sh` stands up the same kind of deployment, pins
+the deployment root in the endpoint pin file, and runs a full
+`rotate ca-key` against the live endpoint daemon: first with
+`--skip finalize`, which pauses before Phase 6 so the scenario can assert the
+widened pin file, both re-issued surface leaves and the chain a live
+connection presents, then again to resume and finish. It checks that a client
+pair copied before the rotation is accepted until Phase 6 and refused after it,
+that the re-issued pair completes a mint, and that the pin file ends holding
+only the new root.
 
 The internal-credential scenario differs in one respect: its container serves
 TLS. `auth/cert` authenticates a *client certificate*, so there has to be a

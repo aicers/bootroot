@@ -5,6 +5,7 @@ mod eab_clear;
 mod helpers;
 mod infra_cert;
 mod openbao_recovery;
+mod registrar_endpoint;
 mod registrar_internal;
 mod registrar_targets;
 mod responder_hmac;
@@ -36,6 +37,27 @@ pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 pub(super) const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
 pub(super) const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const RENDERED_FILE_TIMEOUT: Duration = Duration::from_mins(1);
+/// How long a full rotation waits for the registrar endpoint to move to
+/// the new CA generation after it signals the endpoint daemon, in Phase 5
+/// and again in Phase 6.
+///
+/// Longer than [`RENDERED_FILE_TIMEOUT`] because what Phase 5 waits for
+/// is two ACME issuances in a row — the daemon re-issues both surface
+/// leaves on the reload before it rebuilds its TLS configuration — and
+/// one issuance alone can spend a minute on directory-fetch backoff and
+/// order polling before it finishes.
+pub(super) const SURFACE_MOVE_TIMEOUT: Duration = Duration::from_mins(5);
+/// The directory a full rotation on a registrar endpoint host preserves
+/// the retired registrar client pair in, directly below the secrets
+/// directory.
+///
+/// Directly below it, rather than beside the key backups one level
+/// down, so the secrets ownership sweep can hold it back by name: it is
+/// root-owned by policy and holds a private key.
+pub(crate) const REGISTRAR_CLIENT_RETIRED_DIR: &str = "registrar-client-retired";
+/// The staging name [`REGISTRAR_CLIENT_RETIRED_DIR`] is written under
+/// before it is renamed into place.
+pub(crate) const REGISTRAR_CLIENT_RETIRED_STAGING_DIR: &str = "registrar-client-retired.staging";
 pub(super) const OPENBAO_RECOVERY_SCOPE_UNSEAL_KEYS: &str = "unseal-keys";
 pub(super) const OPENBAO_RECOVERY_SCOPE_ROOT_TOKEN: &str = "root-token";
 pub(super) const OPENBAO_ROOT_ROTATION_INCOMPLETE_ERROR: &str =
@@ -119,6 +141,14 @@ impl StatePaths {
         self.secrets_dir
             .join("secrets")
             .join("intermediate_ca_key.bak")
+    }
+
+    pub(super) fn registrar_client_retired(&self) -> PathBuf {
+        self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_DIR)
+    }
+
+    pub(super) fn registrar_client_retired_staging(&self) -> PathBuf {
+        self.secrets_dir.join(REGISTRAR_CLIENT_RETIRED_STAGING_DIR)
     }
 }
 

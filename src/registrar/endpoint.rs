@@ -42,7 +42,9 @@
 //!   [`ActivatedEndpoint::swap_active_tls`], and the accept loop loads
 //!   the active configuration immediately before each handshake — so a
 //!   renewal takes effect from the next connection with no restart, no
-//!   signal and no socket rebind.
+//!   signal and no socket rebind. A `SIGHUP` reload exchanges it too,
+//!   through [`rebuild_active_tls`], rebuilt from the files on disk once
+//!   start-time issuance has run again.
 //! - [`serve`] is the accept loop, the bounded connection fleet and the
 //!   drain-then-abort shutdown.
 //! - [`client`] is the other end of all of it: this repository's
@@ -128,6 +130,7 @@ use tracing::{info, warn};
 use self::activation::{ActivationContract, ActivationValues};
 use self::tls::EndpointCertResolver;
 use crate::config::Settings;
+use crate::registrar_renewal::RegistrarCertRenewalState;
 
 /// Largest declared request payload the endpoint will read.
 pub(crate) const MAX_FRAME_PAYLOAD_BYTES: usize = 65_536;
@@ -219,8 +222,9 @@ impl HandshakeCompleted {
 ///
 /// It carries no handler. What answers a request is built per
 /// invocation, from that invocation's settings, and reaches the accept
-/// loop as an argument to [`serve::run`] — so the three things here are
-/// exactly the three that have to outlive a reload.
+/// loop as an argument to [`serve::run`] — so what is here is exactly
+/// what has to outlive a reload: the socket, what a handshake is run
+/// against, and the last lifetimes the renewal accessor observed.
 pub(crate) struct ActivatedEndpoint {
     listener: UnixListener,
     socket_path: PathBuf,
@@ -234,6 +238,11 @@ pub(crate) struct ActivatedEndpoint {
     // that is taken and released inside a synchronous accessor.
     active: RwLock<Arc<ActiveTls>>,
     domain: String,
+    // Carried across reloads so an invocation that finds a leaf absent —
+    // a CA rotation's Phase 5 removed it and the reload's issuance could
+    // not replace it — still has the lifetime the previous invocation
+    // observed to retain, and keeps serving while renewal re-issues it.
+    renewal_state: RegistrarCertRenewalState,
 }
 
 /// The endpoint's live TLS configuration: what a handshake is run
@@ -331,6 +340,17 @@ impl ActivatedEndpoint {
     pub(crate) fn domain(&self) -> &str {
         &self.domain
     }
+
+    /// Returns the renewal accessor every daemon invocation of this
+    /// process writes.
+    ///
+    /// One accessor for the process lifetime rather than one per
+    /// invocation: each invocation's preparation re-seeds it from disk,
+    /// and a leaf found absent on a reload keeps the lifetime an earlier
+    /// invocation observed instead of stopping the daemon.
+    pub(crate) fn renewal_state(&self) -> RegistrarCertRenewalState {
+        self.renewal_state.clone()
+    }
 }
 
 impl std::fmt::Debug for ActivatedEndpoint {
@@ -394,6 +414,12 @@ impl DaemonTestEndpoint {
         crate::registrar::RegistrarEndpoint::from_activated_for_test(Arc::clone(&self.endpoint))
     }
 
+    /// Returns the renewal accessor the daemon invocations over this
+    /// endpoint write.
+    pub(crate) fn renewal_state(&self) -> RegistrarCertRenewalState {
+        self.endpoint.renewal_state()
+    }
+
     /// Returns an authenticated caller pinned to this endpoint.
     pub(crate) fn client(&self) -> client::RegistrarEndpointClient {
         let (certificate_path, key_path) = self.pki.registrar_client_files();
@@ -404,6 +430,106 @@ impl DaemonTestEndpoint {
             key_path,
             test_support::endpoint_name(),
         )
+    }
+}
+
+/// An endpoint adopted over a daemon's own settings and serving on a
+/// harness-bound socket, for a test that drives what a reload does to it.
+///
+/// The configuration is built from `settings` by the builder activation
+/// uses, so the test observes the daemon's own material rather than a
+/// fixture PKI's. Requests are answered by a handler that echoes nothing;
+/// what such a test observes is the handshake.
+#[cfg(test)]
+pub(crate) struct ServedTestEndpoint {
+    _socket_dir: tempfile::TempDir,
+    socket_path: PathBuf,
+    endpoint: Arc<ActivatedEndpoint>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+#[cfg(test)]
+impl ServedTestEndpoint {
+    /// Builds the configuration from `settings`, binds a conforming
+    /// listener, adopts it and starts the accept loop.
+    pub(crate) fn serve(settings: &Settings) -> anyhow::Result<Self> {
+        use std::os::fd::IntoRawFd as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (server_config, resolver) = tls::build_server_config(
+            settings.registrar_endpoint.server_cert_path.as_deref(),
+            settings.registrar_endpoint.server_key_path.as_deref(),
+            settings.trust.ca_bundle_path.as_deref(),
+            &settings.trust.trusted_ca_sha256,
+            &settings.domain,
+        )?;
+        let socket_dir = tempfile::tempdir()?;
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket_path = socket_dir.path().join("registrar.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)?;
+        std::fs::set_permissions(
+            &socket_path,
+            std::fs::Permissions::from_mode(REQUIRED_SOCKET_MODE),
+        )?;
+        let endpoint = adopt(
+            ActivationContract::from_test_descriptor(listener.into_raw_fd()),
+            current_effective_uid(),
+            server_config,
+            resolver,
+            settings.domain.clone(),
+        )?;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let serving = Arc::clone(&endpoint);
+        let task =
+            tokio::spawn(
+                async move { serve::run(serving, Arc::new(SilentHandler), receiver).await },
+            );
+        Ok(Self {
+            _socket_dir: socket_dir,
+            socket_path,
+            endpoint,
+            shutdown,
+            task,
+        })
+    }
+
+    /// Returns the socket the accept loop serves on.
+    pub(crate) fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
+    /// Returns the process-lifetime handle a reload is driven through.
+    pub(crate) fn registrar_endpoint(&self) -> crate::registrar::RegistrarEndpoint {
+        crate::registrar::RegistrarEndpoint::from_activated_for_test(Arc::clone(&self.endpoint))
+    }
+
+    /// Stops the accept loop and joins it.
+    pub(crate) async fn stop(self) {
+        let _ = self.shutdown.send(true);
+        self.task
+            .await
+            .expect("the accept task must join")
+            .expect("the accept task must not fail");
+    }
+}
+
+/// A handler for [`ServedTestEndpoint`] that answers every request with
+/// an empty body.
+#[cfg(test)]
+struct SilentHandler;
+
+#[cfg(test)]
+impl handler::RegistrarRequestHandler for SilentHandler {
+    fn handle<'a>(
+        &'a self,
+        _operation: frame::Operation,
+        _payload: &'a [u8],
+        _caller: crate::registrar::verbs::outcome::CallerIdentity,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<u8>, handler::HandlerRefusal>> + Send + 'a>,
+    > {
+        Box::pin(async { Ok(Vec::new()) })
     }
 }
 
@@ -492,6 +618,43 @@ pub(crate) fn activate(settings: &Settings) -> anyhow::Result<Option<Arc<Activat
     .map(Some)
 }
 
+/// Rebuilds the endpoint's whole TLS configuration from the files on disk
+/// and exchanges it for the active one.
+///
+/// What a `SIGHUP` reload runs after start-time issuance: re-issued
+/// files change nothing a client sees until the acceptor built from them
+/// is the one serving, and a narrowed `[trust]` pin set changes nothing
+/// until the client verifier built from it is. The builder is the one
+/// activation uses — the server pair, and a client verifier over the
+/// pinned subset of `[trust] ca_bundle_path` — so a reload applies
+/// exactly the rules a fresh start would.
+///
+/// A failed build leaves the active configuration in place.
+///
+/// # Errors
+///
+/// Returns an error naming the setting and path at fault when the
+/// configuration cannot be built.
+pub(crate) fn rebuild_active_tls(
+    endpoint: &ActivatedEndpoint,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    let (server_config, resolver) = tls::build_server_config(
+        settings.registrar_endpoint.server_cert_path.as_deref(),
+        settings.registrar_endpoint.server_key_path.as_deref(),
+        settings.trust.ca_bundle_path.as_deref(),
+        &settings.trust.trusted_ca_sha256,
+        &settings.domain,
+    )
+    .context("rebuilding the registrar endpoint's TLS configuration on reload")?;
+    endpoint.swap_active_tls(server_config, resolver);
+    info!(
+        socket = %endpoint.socket_path().display(),
+        "Registrar endpoint TLS configuration rebuilt from the reloaded material."
+    );
+    Ok(())
+}
+
 /// Adopts an already-validated activation contract as a serving
 /// endpoint.
 ///
@@ -561,6 +724,7 @@ pub(crate) fn adopt(
             resolver,
         })),
         domain,
+        renewal_state: RegistrarCertRenewalState::default(),
     }))
 }
 

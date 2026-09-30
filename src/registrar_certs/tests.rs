@@ -2963,6 +2963,174 @@ async fn issuance_leaves_material_the_endpoints_tls_load_accepts() {
     load().expect("the loader accepts the material issuance just published");
 }
 
+/// An invocation a reload began re-issues absent surface material, leaves
+/// usable material byte-identical, and swaps the endpoint's active TLS
+/// configuration with no restart: a handshake after the reload is
+/// presented the re-issued chain, read off the live connection.
+///
+/// Linux-only, because the endpoint is compiled nowhere else.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_reload_reissues_absent_material_and_swaps_the_active_configuration() {
+    use crate::registrar::endpoint::ServedTestEndpoint;
+    use crate::registrar::endpoint_pin::{
+        ProbeClientPair, ProbeVerdict, anchor_pin_path_for_client_certificate, probe_endpoint,
+    };
+
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    assert_eq!(
+        run_issuance(&host).await.len(),
+        2,
+        "a bare host issues both"
+    );
+    let (client_cert, client_key) = host.client_pair();
+    let pin_file = anchor_pin_path_for_client_certificate(&client_cert);
+    std::fs::write(&pin_file, format!("{}\n", host.ca.root_fingerprint())).expect("pin");
+
+    let served = ServedTestEndpoint::serve(&host.settings).expect("the endpoint serves");
+    let pair = ProbeClientPair::load(&client_cert, &client_key).expect("client pair");
+    let before = probe_endpoint(served.socket_path(), &pin_file, &Host::server_name(), &pair)
+        .await
+        .expect("the endpoint answers before the reload");
+    assert_eq!(before.verdict, ProbeVerdict::Accepted);
+
+    let (server_cert, server_key) = host.server_pair();
+    let old_server_digest = digest_of(&server_cert);
+    let client_digests = (digest_of(&client_cert), digest_of(&client_key));
+    std::fs::remove_file(&server_cert).expect("remove the server leaf");
+    std::fs::remove_file(&server_key).expect("remove the server key");
+
+    refresh_after_reload_with(&host.settings, &served.registrar_endpoint(), async {
+        run_issuance(&host).await;
+        Ok(())
+    })
+    .await;
+
+    assert_ne!(
+        digest_of(&server_cert),
+        old_server_digest,
+        "absent server material is re-issued on reload"
+    );
+    assert_eq!(
+        (digest_of(&client_cert), digest_of(&client_key)),
+        client_digests,
+        "usable client material survives the reload byte-identically"
+    );
+    let reissued = crate::tls::parse_pem_to_cert_list(
+        &std::fs::read(&server_cert).expect("read the re-issued leaf"),
+    )
+    .expect("parse the re-issued leaf");
+    let after = probe_endpoint(served.socket_path(), &pin_file, &Host::server_name(), &pair)
+        .await
+        .expect("the endpoint answers after the reload");
+    assert_eq!(after.verdict, ProbeVerdict::Accepted);
+    assert_eq!(
+        after.presented_chain.first(),
+        reissued.first(),
+        "the live handshake presents the re-issued leaf with no restart"
+    );
+    assert_ne!(
+        after.presented_chain.first(),
+        before.presented_chain.first()
+    );
+
+    served.stop().await;
+}
+
+/// With both pairs removed — what a CA rotation's Phase 5 leaves — a
+/// reload re-issues both, and a connection presenting the re-issued client
+/// leaf is accepted and presented the re-issued server chain.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_reload_reissues_both_pairs_and_accepts_the_reissued_client_leaf() {
+    use crate::registrar::endpoint::ServedTestEndpoint;
+    use crate::registrar::endpoint_pin::{
+        ProbeClientPair, ProbeVerdict, anchor_pin_path_for_client_certificate, probe_endpoint,
+    };
+
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    run_issuance(&host).await;
+    let (client_cert, client_key) = host.client_pair();
+    let (server_cert, server_key) = host.server_pair();
+    let pin_file = anchor_pin_path_for_client_certificate(&client_cert);
+    std::fs::write(&pin_file, format!("{}\n", host.ca.root_fingerprint())).expect("pin");
+    let served = ServedTestEndpoint::serve(&host.settings).expect("the endpoint serves");
+    let before = (digest_of(&server_cert), digest_of(&client_cert));
+    for path in [&server_cert, &server_key, &client_cert, &client_key] {
+        std::fs::remove_file(path).expect("remove surface material");
+    }
+
+    refresh_after_reload_with(&host.settings, &served.registrar_endpoint(), async {
+        assert_eq!(run_issuance(&host).await.len(), 2, "both pairs are pending");
+        Ok(())
+    })
+    .await;
+
+    assert_ne!((digest_of(&server_cert), digest_of(&client_cert)), before);
+    let reissued_client = ProbeClientPair::load(&client_cert, &client_key).expect("client pair");
+    let probe = probe_endpoint(
+        served.socket_path(),
+        &pin_file,
+        &Host::server_name(),
+        &reissued_client,
+    )
+    .await
+    .expect("the endpoint answers");
+    assert_eq!(probe.verdict, ProbeVerdict::Accepted);
+    let reissued_server = crate::tls::parse_pem_to_cert_list(
+        &std::fs::read(&server_cert).expect("read the re-issued leaf"),
+    )
+    .expect("parse");
+    assert_eq!(probe.presented_chain.first(), reissued_server.first());
+    served.stop().await;
+}
+
+/// A reload whose rebuilt configuration cannot be built keeps the one it
+/// has: the endpoint goes on presenting the chain it was serving.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_reload_whose_rebuild_fails_keeps_the_active_configuration() {
+    use crate::registrar::endpoint::ServedTestEndpoint;
+    use crate::registrar::endpoint_pin::{
+        ProbeClientPair, anchor_pin_path_for_client_certificate, probe_endpoint,
+    };
+
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    run_issuance(&host).await;
+    let (client_cert, client_key) = host.client_pair();
+    let pin_file = anchor_pin_path_for_client_certificate(&client_cert);
+    std::fs::write(&pin_file, format!("{}\n", host.ca.root_fingerprint())).expect("pin");
+    let served = ServedTestEndpoint::serve(&host.settings).expect("the endpoint serves");
+    let pair = ProbeClientPair::load(&client_cert, &client_key).expect("client pair");
+    let before = probe_endpoint(served.socket_path(), &pin_file, &Host::server_name(), &pair)
+        .await
+        .expect("the endpoint answers");
+
+    // An issuance that fails and leaves nothing usable behind: the
+    // rebuild has no server pair to load.
+    let (server_cert, _) = host.server_pair();
+    std::fs::remove_file(&server_cert).expect("remove the server leaf");
+    refresh_after_reload_with(&host.settings, &served.registrar_endpoint(), async {
+        anyhow::bail!("the CA is down")
+    })
+    .await;
+
+    let after = probe_endpoint(served.socket_path(), &pin_file, &Host::server_name(), &pair)
+        .await
+        .expect("the endpoint still answers");
+    assert_eq!(
+        after.presented_chain.first(),
+        before.presented_chain.first()
+    );
+    served.stop().await;
+}
+
 /// The daemon calls issuance **above** `RegistrarEndpoint::activate`, so
 /// the endpoint's TLS load sees material issuance has already ensured.
 ///

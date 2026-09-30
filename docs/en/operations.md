@@ -2018,7 +2018,10 @@ the ordinary state of a service host rather than a fault.
 A `SIGHUP` rebuilds all of it from the reloaded settings, because the
 whole daemon invocation is rebuilt; the listening socket is not, so the
 socket inode is unchanged and `[registrar_endpoint] enabled` stays fixed
-for the process lifetime.
+for the process lifetime. The reloaded invocation also runs start-time
+issuance again and rebuilds the endpoint's TLS configuration — the
+server pair and the client verifier over the pinned subset of
+`[trust] ca_bundle_path` — from what is now on disk.
 
 !!! note "`mint` is served"
     Both `mint` and `deregister` are served end to end. A mint request's
@@ -2168,14 +2171,20 @@ and turned into a complete next TLS configuration **before** any live file is
 written: its key must be the leaf's, a client replacement must carry the same
 instance, host and domain it already had, and a server replacement must carry
 the exact endpoint SAN and chain to an anchor the endpoint pin file already
-names. The pin file is never rewritten and never gains a leaf fingerprint, so a
-server replacement no pinned caller would accept is discarded rather than
-published. Only then are the merged CA bundle, the certificate and the key
-written; if any of those writes fails, every path the publication reached is
-restored from a snapshot of its bytes, mode and ownership, the endpoint keeps
-serving what it was serving, and the next pass tries again. A rollback that
-itself fails is logged as exactly that — both errors, and no claim that the
-files were put back.
+names. A renewal never rewrites the pin file and never adds a leaf fingerprint
+to it, so a server replacement no pinned caller would accept is discarded
+rather than published. Only then are the merged CA bundle, the certificate and
+the key written; if any of those writes fails, every path the publication
+reached is restored from a snapshot of its bytes, mode and ownership, the
+endpoint keeps serving what it was serving, and the next pass tries again. A
+rollback that itself fails is logged as exactly that — both errors, and no
+claim that the files were put back.
+
+The pin file's only writer after install is a full `bootroot rotate ca-key`: it
+adds the new CA generation's anchors in Phase 3 and removes the old ones in
+Phase 6, and it re-issues both surface leaves under the new CA in Phase 5 (see
+[`rotate ca-key`](cli.md#rotate-ca-key)). Neither the daemon nor its renewal
+loop can write the file.
 
 **The server side reloads with no restart.** Once every write has landed, the
 daemon exchanges the whole active TLS configuration at once: the certificate the
@@ -2311,10 +2320,12 @@ and the two need different things:**
   still usable, so start-time issuance has nothing to reissue. What repairs it is
   the *next* renewal pass succeeding, which means fixing whatever the failure
   named — OpenBao unreachable, the internal credential expired or superseded, the
-  CA refusing issuance, a trust-anchor rotation that left the pin file naming an
-  anchor the replacement cannot chain to. Fix that, and the running daemon's next
-  pass publishes the replacement and swaps the active TLS configuration with no
-  restart.
+  CA refusing issuance, a pin file naming no anchor the replacement can chain
+  to. A full `rotate ca-key` adds the new root to the pin file in Phase 3, so the
+  last one points at a rotation that stopped before Phase 3, a rotation that
+  changed the CA outside `rotate ca-key`, or a pin file edited by hand. Fix
+  that, and the running daemon's next pass publishes the replacement and swaps
+  the active TLS configuration with no restart.
 
 Do **not** re-provision the host for either. Both leaves are certificates the
 daemon issues and renews by itself, and a lapse says that maintenance stopped,
@@ -2429,7 +2440,9 @@ after Phase 4, so a leaf that falls due inside it is left alone rather than
 reissued under a root the `auth/cert` entry does not yet trust. The refusal is
 reported through the profile's ordinary post-renew failure hooks, the daemon
 keeps ticking, and the tick after the repair renews normally — there is nothing
-to restart.
+to restart. Do not restart or reload the daemon inside that gap either: a new
+start loads the credential, finds the mismatch, and exits. The rotation itself
+does not reload it until Phase 5, after the repair step has run.
 
 The same comparison guards the credential's privileged `OpenBao` login, not only
 renewal, and it re-reads the active root each time rather than trusting a value

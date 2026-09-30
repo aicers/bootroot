@@ -200,6 +200,14 @@ bootroot's own pinning helper still takes the pin-file path as an explicit
 argument, with no built-in default and no configuration lookup, and issuance
 never writes this file: the pin is over trust **anchors**, not over a leaf.
 
+The provisioning tool writes the file at install. After that, the only writer is
+a full `bootroot rotate ca-key`, which finds the file through the same rule —
+beside `[registrar_endpoint] client_cert_path` in the rendered
+`registrar-internal/agent.toml` — and adds and later removes CA anchors in it
+(§4.3). Nothing else writes it: not the daemon, not its renewal loop, and not
+start-time issuance. A rotation never creates the file; one that finds it absent
+refuses to start.
+
 ### 4.3 Format
 
 UTF-8 text, LF-separated lines.
@@ -216,7 +224,14 @@ UTF-8 text, LF-separated lines.
 - Order is irrelevant and duplicates collapse.
 - **Multiple entries must be supported.** CA rotation
   (`RotationMode::IntermediateOnly` / `Full`) means the old and the new anchor
-  have to be pinnable at the same time.
+  have to be pinnable at the same time. A full `bootroot rotate ca-key` relies
+  on it: in Phase 3 it appends the new root when the old root is pinned, and
+  the new intermediate when the old intermediate is; in Phase 6, once the
+  endpoint is proven to serve the new generation, it removes the old ones —
+  never an old entry whose new counterpart is missing. Existing lines, comments
+  included, are kept in order, new entries are appended in lowercase, and every
+  write replaces the file atomically with its owner, group and mode preserved.
+  An intermediate-only rotation keeps the root and does not touch the file.
 - At least one valid entry must be present, and **any** non-ignored line that is
   not 64 hex characters rejects the **whole file**. There is no partial
   acceptance.
@@ -233,16 +248,18 @@ Worked example:
 
 ### 4.4 Writer-side contract
 
-The **provisioning tool writes this file at install**; nothing in this
-repository writes it. bootroot only reads it.
+The **provisioning tool writes this file at install**. Within this repository
+the only writer is a full `bootroot rotate ca-key`, which adds and removes CA
+anchors as §4.3 describes; everything else in bootroot only reads it.
 
 Pin the digests of certificates the endpoint actually **presents**. The pin file
 carries digests and no certificate material, so a pinned anchor has to arrive on
 the wire for a chain to be built to it — in a bootroot deployment that is the CA
 bundle the server sends alongside its leaf, whose fingerprints are exactly what
 `tls::ca_bundle_fingerprints` returns for `trust.ca_bundle_path`. During a CA
-rotation, keep both generations in the file until the endpoint's leaf has been
-reissued under the new anchor.
+rotation both generations are in the file until the endpoint's leaf has been
+reissued under the new anchor; a full `rotate ca-key` keeps them there from
+Phase 3 until Phase 6 proves that reissue happened.
 
 That anchor arrives on the wire because bootroot puts it there. An ACME response
 commonly stops at an intermediate, so publishing a surface leaf with the response

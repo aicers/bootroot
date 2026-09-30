@@ -695,6 +695,248 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_rotate_endpoint_config_unusable(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_config_unusable,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_setting_missing(
+        &self,
+        setting: &str,
+        path: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_setting_missing,
+            &[("setting", setting), ("path", path)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_generation_mismatch(
+        &self,
+        path: &str,
+        fingerprint: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_generation_mismatch,
+            &[("path", path), ("fingerprint", fingerprint)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_pin_file_missing(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_pin_file_missing,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_pin_file_malformed(
+        &self,
+        path: &str,
+        detail: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_pin_file_malformed,
+            &[("path", path), ("detail", detail)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_pin_file_no_anchor(
+        &self,
+        path: &str,
+        fingerprints: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_pin_file_no_anchor,
+            &[("path", path), ("fingerprints", fingerprints)],
+        )
+    }
+
+    pub(crate) fn rotate_endpoint_check_key_match(&self, detail: &str) -> String {
+        format_template(
+            self.strings().rotate_endpoint_check_key_match,
+            &[("detail", detail)],
+        )
+    }
+
+    pub(crate) fn rotate_endpoint_check_validity(&self) -> &'static str {
+        self.strings().rotate_endpoint_check_validity
+    }
+
+    pub(crate) fn rotate_endpoint_check_chain(&self) -> &'static str {
+        self.strings().rotate_endpoint_check_chain
+    }
+
+    pub(crate) fn error_rotate_endpoint_client_pair_check_failed(
+        &self,
+        path: &str,
+        check: &str,
+    ) -> String {
+        format_template(
+            self.strings()
+                .error_rotate_endpoint_client_pair_check_failed,
+            &[("path", path), ("check", check)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_retired_preserved(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_retired_preserved,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn rotate_endpoint_retired_absent(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_endpoint_retired_absent,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_pin_widened(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_pin_widened,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_pin_unchanged(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_pin_unchanged,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_pin_narrowed(&self, path: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_pin_narrowed,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_pin_counterpart_missing(
+        &self,
+        path: &str,
+        fingerprint: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_pin_counterpart_missing,
+            &[("path", path), ("fingerprint", fingerprint)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_surface_already_moved(&self, setting: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_surface_already_moved,
+            &[("setting", setting)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_surface_removed(
+        &self,
+        setting: &str,
+        path: &str,
+    ) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_surface_removed,
+            &[("setting", setting), ("path", path)],
+        )
+    }
+
+    pub(crate) fn rotate_ca_key_endpoint_waiting(&self, timeout: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_endpoint_waiting,
+            &[("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_surface_not_reissued(
+        &self,
+        settings: &str,
+        timeout: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_surface_not_reissued,
+            &[("settings", settings), ("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_still_old_chain(&self, timeout: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_still_old_chain,
+            &[("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_reissued_client_refused(&self, timeout: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_reissued_client_refused,
+            &[("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_unanswered(&self, detail: &str, timeout: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_unanswered,
+            &[("detail", detail), ("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_before_dial_refused(&self) -> &'static str {
+        self.strings().error_rotate_endpoint_before_dial_refused
+    }
+
+    pub(crate) fn error_rotate_endpoint_before_dial_failed(&self, detail: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_before_dial_failed,
+            &[("detail", detail)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_retired_unusable(&self, reason: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_retired_unusable,
+            &[("reason", reason)],
+        )
+    }
+
+    pub(crate) fn warning_rotate_endpoint_refusal_unproven(&self, reason: &str) -> String {
+        format_template(
+            self.strings().warning_rotate_endpoint_refusal_unproven,
+            &[("reason", reason)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_current_not_accepted(
+        &self,
+        detail: &str,
+        timeout: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_current_not_accepted,
+            &[("detail", detail), ("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn error_rotate_endpoint_retired_still_accepted(&self, timeout: &str) -> String {
+        format_template(
+            self.strings().error_rotate_endpoint_retired_still_accepted,
+            &[("timeout", timeout)],
+        )
+    }
+
+    pub(crate) fn rotate_endpoint_pair_refused(&self) -> &'static str {
+        self.strings().rotate_endpoint_pair_refused
+    }
+
+    pub(crate) fn rotate_ca_key_paused_before_finalize(&self, phase: &str) -> String {
+        format_template(
+            self.strings().rotate_ca_key_paused_before_finalize,
+            &[("phase", phase)],
+        )
+    }
+
     pub(crate) fn info_infra_tls_renewed(&self, name: &str) -> String {
         format_template(self.strings().info_infra_tls_renewed, &[("name", name)])
     }

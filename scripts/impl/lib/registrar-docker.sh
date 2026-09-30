@@ -352,32 +352,33 @@ registrar_docker_load_openbao_paths() {
   AGENT_EAB_PATH="$(registrar_docker_rust_string_constant "$init_constants" PATH_AGENT_EAB)"
 }
 
-# Gives the responder container both registrar hostnames as network aliases,
-# and proves step-ca resolves and reaches each one.
+# Gives the responder container both registrar hostnames, and any further
+# names passed after them, as network aliases, and proves step-ca resolves and
+# reaches each one.
 #
 # The endpoint's HTTP-01 challenge is answered by the responder under the
 # registrar's own name, so a missing alias surfaces as an issuance that never
 # completes rather than as a name that does not resolve. The override is
 # written into the artifact directory so a failed run keeps it.
+#
+# Recreating the responder drops every alias `init` attached with `docker
+# network connect`, the bootroot-internal identity's among them. A scenario
+# that issues that identity again after this, as a full CA rotation does,
+# passes its name here so the recreated responder still answers to it.
 registrar_docker_apply_endpoint_dns_alias() {
-  local client_alias="$1" endpoint_alias="$2" alias
+  local alias
   local override="$ARTIFACT_DIR/docker-compose.registrar-endpoint-alias.yml"
   local responder_override="$WORK_DIR/secrets/responder/docker-compose.responder.override.yml"
-  cat >"$override" <<EOF
-services:
-  bootroot-http01:
-    networks:
-      default:
-        aliases:
-          - ${client_alias}
-          - ${endpoint_alias}
-EOF
+  {
+    printf 'services:\n  bootroot-http01:\n    networks:\n      default:\n        aliases:\n'
+    for alias in "$@"; do printf '          - %s\n' "$alias"; done
+  } >"$override"
   [ -f "$responder_override" ] || fail "init did not render the responder compose override"
   BOOTROOT_INSTANCE="$INSTANCE" docker compose -p "$INSTANCE" \
     -f "$WORK_DIR/docker-compose.deploy.yml" -f "$override" -f "$responder_override" \
     up -d --no-deps bootroot-http01 >>"$RUN_LOG" 2>&1 ||
     fail "could not apply the registrar endpoint DNS aliases"
-  for alias in "$client_alias" "$endpoint_alias"; do
+  for alias in "$@"; do
     for _ in $(seq 1 15); do
       if docker exec "${INSTANCE}-ca" bash -lc "timeout 2 bash -lc 'echo > /dev/tcp/${alias}/80'" >/dev/null 2>&1; then
         break
@@ -434,16 +435,22 @@ registrar_docker_prepare_daemon() {
 # protocol; the control FIFO then drives restart, stop and quit without the
 # socket ever being rebound. Both scenarios depend on that inode surviving a
 # restart, so there is one supervisor rather than one each.
+#
+# The supervisor ignores SIGHUP and its child does not. The reload bootroot
+# sends the endpoint daemon is `pkill -HUP -f <config path>`, and the
+# supervisor's own command line carries that path too; without this, a
+# rotation reloading the daemon would terminate the supervisor instead.
 registrar_docker_write_supervisor() {
   cat >"$RUN_ROOT/supervisor.py" <<'PY'
 import os, signal, socket, sys
 sock_path, control, pid_file, agent_bin, config = sys.argv[1:]
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); sock.bind(sock_path); sock.listen(32); os.chown(sock_path, 0, 0); os.chmod(sock_path, 0o700); os.mkfifo(control, 0o600); child = None
 def spawn():
     global child
     child = os.fork()
     if child == 0:
-        os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe(agent_bin, [agent_bin, '--config', config], env)
+        signal.signal(signal.SIGHUP, signal.SIG_DFL); os.dup2(sock.fileno(), 3); os.set_inheritable(3, True); env = os.environ.copy(); env['LISTEN_PID'] = str(os.getpid()); env['LISTEN_FDS'] = '1'; os.execvpe(agent_bin, [agent_bin, '--config', config], env)
     open(pid_file, 'w', encoding='ascii').write(str(child))
 def stop():
     global child

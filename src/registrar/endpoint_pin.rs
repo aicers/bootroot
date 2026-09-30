@@ -27,6 +27,16 @@
 //! registrar client certificate's, via
 //! [`anchor_pin_path_for_client_certificate`]. The verifier is handed an
 //! explicit path and reads no configuration.
+//!
+//! Nothing here writes the pin file either. The provisioning tool writes
+//! it at install, and a full `bootroot rotate ca-key` adds the new CA
+//! generation's anchors to it and later removes the old ones; the daemon
+//! and its renewal loop only read it.
+//!
+//! [`probe_endpoint`] is the one dial this module makes: a handshake
+//! with a given client pair that sends no request, and reports the chain
+//! the endpoint presented and whether it accepted the pair. A rotation
+//! uses it to prove the endpoint moved to a new CA generation.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,7 +45,7 @@ use std::sync::Arc;
 use rustls::ClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::{ASN1Time, FromDer};
 
@@ -348,6 +358,335 @@ pub fn build_endpoint_client_config(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth())
+}
+
+/// Why a client pair could not be loaded for a handshake probe.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeClientPairError {
+    /// The certificate or the key file could not be read.
+    #[error("could not read {}", .path.display())]
+    Unreadable {
+        /// The file that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The certificate file holds no certificate, or does not parse.
+    #[error("{} holds no parseable certificate", .path.display())]
+    NoCertificate {
+        /// The certificate file.
+        path: PathBuf,
+    },
+    /// The key file holds no private key, or does not parse.
+    #[error("{} holds no parseable private key", .path.display())]
+    NoPrivateKey {
+        /// The key file.
+        path: PathBuf,
+    },
+    /// The key file holds a key `rustls` cannot sign with.
+    #[error("{} holds a private key of an unsupported type", .path.display())]
+    UnsupportedKey {
+        /// The key file.
+        path: PathBuf,
+    },
+    /// The key is not the key of the leaf beside it.
+    #[error("the private key at {} is not the key of the leaf at {}", .key_path.display(), .certificate_path.display())]
+    KeyMismatch {
+        /// The certificate file.
+        certificate_path: PathBuf,
+        /// The key file.
+        key_path: PathBuf,
+    },
+}
+
+/// A registrar client leaf, its issuer chain and its private key, loaded
+/// for a [`probe_endpoint`] dial.
+///
+/// The key is proven to be the leaf's when the pair is loaded, so a
+/// probe never presents a torn pair and blames the endpoint for it.
+pub struct ProbeClientPair {
+    leaf: CertificateDer<'static>,
+    issuers: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+impl std::fmt::Debug for ProbeClientPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeClientPair")
+            .field("leaf", &self.leaf)
+            .field("issuers", &self.issuers)
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ProbeClientPair {
+    /// Loads a pair from a certificate file (leaf first, then its issuer
+    /// chain) and a key file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProbeClientPairError`] naming the file at fault when
+    /// either file cannot be read or parsed, when the key cannot sign,
+    /// or when the key is not the leaf's.
+    pub fn load(certificate_path: &Path, key_path: &Path) -> Result<Self, ProbeClientPairError> {
+        let read = |path: &Path| {
+            std::fs::read(path).map_err(|source| ProbeClientPairError::Unreadable {
+                path: path.to_path_buf(),
+                source,
+            })
+        };
+        let certificate_pem = read(certificate_path)?;
+        let key_pem = read(key_path)?;
+        Self::from_pem(&certificate_pem, &key_pem, certificate_path, key_path)
+    }
+
+    /// Builds a pair from PEM bytes already read, naming `certificate_path`
+    /// and `key_path` in any refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProbeClientPairError`] when either input does not parse,
+    /// when the key cannot sign, or when the key is not the leaf's.
+    pub fn from_pem(
+        certificate_pem: &[u8],
+        key_pem: &[u8],
+        certificate_path: &Path,
+        key_path: &Path,
+    ) -> Result<Self, ProbeClientPairError> {
+        tls::install_crypto_provider();
+        let mut chain = rustls_pemfile::certs(&mut std::io::BufReader::new(certificate_pem))
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .map_err(|_| ProbeClientPairError::NoCertificate {
+                path: certificate_path.to_path_buf(),
+            })?
+            .into_iter();
+        let leaf = chain
+            .next()
+            .ok_or_else(|| ProbeClientPairError::NoCertificate {
+                path: certificate_path.to_path_buf(),
+            })?;
+        // Quotes none of the key's bytes on failure: this is key material.
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))
+            .ok()
+            .flatten()
+            .ok_or_else(|| ProbeClientPairError::NoPrivateKey {
+                path: key_path.to_path_buf(),
+            })?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|_| {
+            ProbeClientPairError::UnsupportedKey {
+                path: key_path.to_path_buf(),
+            }
+        })?;
+        if !tls::cert_key_matches(&leaf, signing_key.as_ref()) {
+            return Err(ProbeClientPairError::KeyMismatch {
+                certificate_path: certificate_path.to_path_buf(),
+                key_path: key_path.to_path_buf(),
+            });
+        }
+        Ok(Self {
+            leaf,
+            issuers: chain.collect(),
+            key,
+        })
+    }
+
+    /// Returns the leaf the pair presents.
+    #[must_use]
+    pub fn leaf(&self) -> &CertificateDer<'static> {
+        &self.leaf
+    }
+
+    /// Returns the leaf followed by the issuer chain it was stored with,
+    /// which is what a handshake presents.
+    fn presented_chain(&self) -> Vec<CertificateDer<'static>> {
+        std::iter::once(self.leaf.clone())
+            .chain(self.issuers.iter().cloned())
+            .collect()
+    }
+}
+
+/// How long one [`probe_endpoint`] step — the connect, the handshake, or
+/// the read that carries the endpoint's verdict — may take.
+///
+/// Twice the five seconds the endpoint itself allows a handshake, and no
+/// probe step waits on anything but a host-local socket.
+const PROBE_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The inert name a probe dials with; the verifier applies the pinned
+/// expected name instead, exactly as the endpoint client does.
+const PROBE_DIAL_NAME: &str = "registrar-endpoint.invalid";
+
+/// What the endpoint decided about the client pair a probe presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeVerdict {
+    /// The endpoint completed the handshake with the pair and closed the
+    /// frameless connection cleanly, which is how it answers a caller it
+    /// accepted that sent no request.
+    Accepted,
+    /// The endpoint refused the pair with a TLS alert.
+    Refused,
+}
+
+/// What one handshake probe of the endpoint observed.
+#[derive(Debug, Clone)]
+pub struct EndpointProbe {
+    /// The chain the endpoint presented on this connection, leaf first,
+    /// read from the handshake and never from disk.
+    pub presented_chain: Vec<CertificateDer<'static>>,
+    /// What the endpoint decided about the probe's client pair.
+    pub verdict: ProbeVerdict,
+}
+
+/// Why a handshake probe produced no verdict.
+#[derive(Debug, thiserror::Error)]
+pub enum EndpointProbeError {
+    /// The pin file could not back a verifier.
+    #[error(transparent)]
+    Pin(#[from] EndpointPinError),
+    /// `rustls` refused to present the probe's client pair.
+    #[error("the probe's client pair could not be configured: {source}")]
+    ClientAuth {
+        /// What `rustls` refused.
+        #[source]
+        source: rustls::Error,
+    },
+    /// Nothing that passed the pinned server verification answered: the
+    /// connect failed, the handshake failed, or the server's chain did
+    /// not verify under the pin file.
+    #[error("no registrar endpoint answered at {}: {source}", .socket_path.display())]
+    Unanswered {
+        /// The socket that was dialed.
+        socket_path: PathBuf,
+        /// The failure, carrying the `rustls` error where there was one.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The endpoint answered the handshake but ended the connection in a
+    /// way that is neither a clean close nor a TLS alert.
+    #[error("the registrar endpoint at {} gave no verdict on the probe's client pair: {source}", .socket_path.display())]
+    Inconclusive {
+        /// The socket that was dialed.
+        socket_path: PathBuf,
+        /// What the read ended with.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Dials the endpoint with a client pair, completes the pinned handshake,
+/// and reports the chain the endpoint presented and whether it accepted
+/// the pair.
+///
+/// Changes nothing on the endpoint: after the handshake the probe sends
+/// `close_notify` without writing any request frame, then reads to the
+/// end of the stream. The endpoint answers a frameless connection from a
+/// caller it accepted with a clean close, and a client certificate it
+/// does not accept with a TLS alert.
+///
+/// Only TLS 1.3 is offered, and finishing the handshake is never taken as
+/// acceptance: in TLS 1.3 the client finishes before the server has
+/// validated the client certificate, so the verdict is read off the end
+/// of the stream instead.
+///
+/// The probe runs as whatever uid calls it, and the endpoint refuses any
+/// peer that is not its own uid before a handshake — which is reported
+/// here as [`EndpointProbeError::Unanswered`].
+///
+/// # Errors
+///
+/// Returns [`EndpointProbeError::Pin`] when the pin file cannot back a
+/// verifier, [`EndpointProbeError::ClientAuth`] when `rustls` refuses the
+/// pair, [`EndpointProbeError::Unanswered`] when no endpoint that passes
+/// the pinned verification answered, and
+/// [`EndpointProbeError::Inconclusive`] when the connection ended in
+/// neither a clean close nor an alert.
+///
+/// # Panics
+///
+/// Never in practice: the one `expect` is on a literal dial name that is
+/// a syntactically valid DNS name.
+pub async fn probe_endpoint(
+    socket_path: &Path,
+    pin_file: &Path,
+    expected_endpoint_name: &str,
+    client: &ProbeClientPair,
+) -> Result<EndpointProbe, EndpointProbeError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    tls::install_crypto_provider();
+    let verifier = endpoint_server_verifier(pin_file, expected_endpoint_name)?;
+    let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(client.presented_chain(), client.key.clone_key())
+        .map_err(|source| EndpointProbeError::ClientAuth { source })?;
+    let unanswered = |source: std::io::Error| EndpointProbeError::Unanswered {
+        socket_path: socket_path.to_path_buf(),
+        source,
+    };
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "the probe timed out");
+
+    let stream = tokio::time::timeout(
+        PROBE_STEP_TIMEOUT,
+        tokio::net::UnixStream::connect(socket_path),
+    )
+    .await
+    .map_err(|_| unanswered(timed_out()))?
+    .map_err(unanswered)?;
+    let server_name = ServerName::try_from(PROBE_DIAL_NAME)
+        .expect("PROBE_DIAL_NAME is a literal that is a syntactically valid DNS name");
+    let mut tls = tokio::time::timeout(
+        PROBE_STEP_TIMEOUT,
+        tokio_rustls::TlsConnector::from(Arc::new(config)).connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| unanswered(timed_out()))?
+    .map_err(unanswered)?;
+    let presented_chain: Vec<CertificateDer<'static>> = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .map(|chain| chain.iter().map(|cert| cert.clone().into_owned()).collect())
+        .unwrap_or_default();
+
+    // No request frame, only `close_notify`. A shutdown that fails has
+    // met a peer that already ended the connection, and the read below
+    // is what says how it ended.
+    let _ = tls.shutdown().await;
+    let mut ignored = Vec::new();
+    let verdict =
+        match tokio::time::timeout(PROBE_STEP_TIMEOUT, tls.read_to_end(&mut ignored)).await {
+            Ok(Ok(_)) => ProbeVerdict::Accepted,
+            Ok(Err(err)) if is_received_alert(&err) => ProbeVerdict::Refused,
+            Ok(Err(source)) => {
+                return Err(EndpointProbeError::Inconclusive {
+                    socket_path: socket_path.to_path_buf(),
+                    source,
+                });
+            }
+            Err(_) => {
+                return Err(EndpointProbeError::Inconclusive {
+                    socket_path: socket_path.to_path_buf(),
+                    source: timed_out(),
+                });
+            }
+        };
+    Ok(EndpointProbe {
+        presented_chain,
+        verdict,
+    })
+}
+
+/// Reports whether a read ended because the peer sent a TLS alert.
+fn is_received_alert(error: &std::io::Error) -> bool {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(_))
+    )
 }
 
 /// Anchor-pinning server verifier for the registrar endpoint.
@@ -1318,5 +1657,198 @@ mod tests {
         assert!(!is_endpoint_verify_rejection(&rustls::Error::from(
             rustls::CertificateError::Revoked
         )));
+    }
+
+    // -----------------------------------------------------------------
+    // The handshake probe
+    // -----------------------------------------------------------------
+
+    /// Issues a client leaf under `ca`, with the `clientAuth` usage the
+    /// endpoint's verifier requires, and returns it as PEM files beside
+    /// its key.
+    fn write_client_pair(ca: &TestCa, dir: &Path) -> (PathBuf, PathBuf) {
+        let key = KeyPair::generate().expect("generate key");
+        let mut params = CertificateParams::new(Vec::new()).expect("certificate params");
+        params.is_ca = rcgen::IsCa::NoCa;
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2099, 1, 1);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        params.subject_alt_names = vec![SanType::DnsName(
+            "001.bootroot-registrar.h1.example.internal"
+                .to_string()
+                .try_into()
+                .expect("valid DNS SAN"),
+        )];
+        let leaf = params.signed_by(&key, ca).expect("issued leaf");
+        let cert_path = dir.join("client.crt");
+        let key_path = dir.join("client.key");
+        std::fs::write(&cert_path, format!("{}{}", leaf.pem(), ca.pem())).expect("write cert");
+        std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+        (cert_path, key_path)
+    }
+
+    /// A stand-in for the endpoint's transport, answering exactly the way
+    /// it does for a frameless connection: mTLS against `client_ca`, then
+    /// a clean close once the caller closes, or an alert for a client
+    /// certificate it does not accept.
+    struct ProbeServer {
+        _dir: tempfile::TempDir,
+        socket_path: PathBuf,
+        server_leaf: CertificateDer<'static>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ProbeServer {
+        fn start(server_ca: &TestCa, client_ca: &TestCa) -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            tls::install_crypto_provider();
+            let (leaf, key) = issue_leaf_and_key(server_ca, &endpoint_name());
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca_der(client_ca)).expect("client anchor");
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .expect("client verifier");
+            let config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(vec![leaf.clone(), ca_der(server_ca)], key)
+                .expect("server config");
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+            let dir = tempdir().expect("temp dir");
+            let socket_path = dir.path().join("registrar.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind");
+            let task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut request = Vec::new();
+                        let _ = tls.read_to_end(&mut request).await;
+                        let _ = tls.shutdown().await;
+                    });
+                }
+            });
+            Self {
+                _dir: dir,
+                socket_path,
+                server_leaf: leaf,
+                task,
+            }
+        }
+    }
+
+    impl Drop for ProbeServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn pin_file_for(dir: &Path, anchor: &TestCa) -> PathBuf {
+        let path = dir.join(REGISTRAR_ENDPOINT_ANCHORS_FILE);
+        std::fs::write(
+            &path,
+            format!("# anchors\n{}\n", tls::sha256_hex(ca_der(anchor).as_ref())),
+        )
+        .expect("write pin file");
+        path
+    }
+
+    /// A pair the endpoint trusts is reported accepted, together with
+    /// the chain read off the handshake.
+    #[tokio::test]
+    async fn a_probe_with_a_trusted_pair_is_accepted_and_reports_the_presented_chain() {
+        let server_ca = valid_ca();
+        let client_ca = valid_ca();
+        let server = ProbeServer::start(&server_ca, &client_ca);
+        let dir = tempdir().expect("temp dir");
+        let pins = pin_file_for(dir.path(), &server_ca);
+        let (cert, key) = write_client_pair(&client_ca, dir.path());
+        let pair = ProbeClientPair::load(&cert, &key).expect("pair");
+
+        let probe = probe_endpoint(&server.socket_path, &pins, &endpoint_name(), &pair)
+            .await
+            .expect("the endpoint answers");
+        assert_eq!(probe.verdict, ProbeVerdict::Accepted);
+        assert_eq!(probe.presented_chain.first(), Some(&server.server_leaf));
+    }
+
+    /// A pair under a CA the endpoint does not trust is reported refused
+    /// — and the handshake finishing on the client side is not mistaken
+    /// for acceptance.
+    #[tokio::test]
+    async fn a_probe_with_an_untrusted_pair_is_refused() {
+        let server_ca = valid_ca();
+        let client_ca = valid_ca();
+        let foreign = valid_ca();
+        let server = ProbeServer::start(&server_ca, &client_ca);
+        let dir = tempdir().expect("temp dir");
+        let pins = pin_file_for(dir.path(), &server_ca);
+        let (cert, key) = write_client_pair(&foreign, dir.path());
+        let pair = ProbeClientPair::load(&cert, &key).expect("pair");
+
+        let probe = probe_endpoint(&server.socket_path, &pins, &endpoint_name(), &pair)
+            .await
+            .expect("the endpoint answers");
+        assert_eq!(probe.verdict, ProbeVerdict::Refused);
+        assert_eq!(probe.presented_chain.first(), Some(&server.server_leaf));
+    }
+
+    /// An endpoint whose chain does not verify under the pin file, and a
+    /// socket nothing listens on, are both "no endpoint answered".
+    #[tokio::test]
+    async fn a_probe_that_cannot_verify_the_server_or_connect_is_unanswered() {
+        let server_ca = valid_ca();
+        let client_ca = valid_ca();
+        let server = ProbeServer::start(&server_ca, &client_ca);
+        let dir = tempdir().expect("temp dir");
+        let wrong_pins = pin_file_for(dir.path(), &valid_ca());
+        let (cert, key) = write_client_pair(&client_ca, dir.path());
+        let pair = ProbeClientPair::load(&cert, &key).expect("pair");
+
+        let err = probe_endpoint(&server.socket_path, &wrong_pins, &endpoint_name(), &pair)
+            .await
+            .expect_err("an unpinned server is not an answer");
+        assert!(
+            matches!(err, EndpointProbeError::Unanswered { .. }),
+            "{err}"
+        );
+
+        let absent = dir.path().join("absent.sock");
+        let err = probe_endpoint(&absent, &wrong_pins, &endpoint_name(), &pair)
+            .await
+            .expect_err("nothing listens");
+        assert!(
+            matches!(err, EndpointProbeError::Unanswered { .. }),
+            "{err}"
+        );
+    }
+
+    /// A pair whose key is not the leaf's is refused at load, naming both
+    /// files, before any dial.
+    #[test]
+    fn a_probe_pair_with_a_mismatched_key_is_refused_at_load() {
+        let ca = valid_ca();
+        let dir = tempdir().expect("temp dir");
+        let (cert, _) = write_client_pair(&ca, dir.path());
+        let other = dir.path().join("other.key");
+        std::fs::write(
+            &other,
+            KeyPair::generate().expect("generate key").serialize_pem(),
+        )
+        .expect("write key");
+        let err = ProbeClientPair::load(&cert, &other).expect_err("mismatch");
+        assert!(
+            matches!(err, ProbeClientPairError::KeyMismatch { .. }),
+            "{err}"
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                ProbeClientPair::load(&cert, &dir.path().join("client.key")).expect("pair")
+            )
+            .contains("PRIVATE")
+        );
     }
 }

@@ -419,11 +419,11 @@ scheduler: before any issuance it starts, the daemon compares the stored root
 fingerprint with the deployment's active root and refuses on a mismatch with the
 typed repair-required error of §11, having made no ACME request, no login and no
 write. It is needed because the two do not move together on purpose. A full
-rotation replaces the root in Phase 2 and reloads this daemon in Phase 3, but the
-`auth/cert` entry, the leaf and the stored fingerprint are only replaced in the
-tail after Phase 4 — so inside that window a leaf that fell due would otherwise
-be reissued under a root the entry does not yet trust, and the repair would then
-have to unpick a credential it could have simply replaced.
+rotation replaces the root in Phase 2 and widens this daemon's trust in Phase 3,
+but the `auth/cert` entry, the leaf and the stored fingerprint are only replaced
+in the tail after Phase 4 — so inside that window a leaf that fell due would
+otherwise be reissued under a root the entry does not yet trust, and the repair
+would then have to unpick a credential it could have simply replaced.
 
 The refusal travels out through the same post-renew failure hooks any other
 issuance failure takes, and the daemon keeps ticking. The tick after the repair
@@ -441,8 +441,8 @@ numbers are unchanged; nothing is renumbered.
 
 | Point | What happens |
 | --- | --- |
-| **Phase 3** | The private bundle is atomically rewritten and the config's pins upserted to the same additive old-root / old-intermediate / new-root / new-intermediate set and PEM bundle the rotation publishes to `OpenBao` KV, then the internal daemon is reloaded. The entry, the leaf and the stored root fingerprint are **not** touched. |
-| **The tail after Phase 4** | An unnumbered, mandatory step that runs after step-ca restarts and **before** Phase 4 is recorded, under explicit root-token authority. It verifies the bundle and config are still on the Phase-3 additive set, replaces the `auth/cert` entry, the leaf material and the stored root fingerprint, and notifies the daemon. `--skip reissue` skips Phase 5, not this. A failure retains the pre-Phase-4 state, so a resume repeats the restart and the repair together. |
+| **Phase 3** | The private bundle is atomically rewritten and the config's pins upserted to the same additive old-root / old-intermediate / new-root / new-intermediate set and PEM bundle the rotation publishes to `OpenBao` KV. The entry, the leaf and the stored root fingerprint are **not** touched, and the internal daemon is **not** reloaded: the new root is already on disk while the stored fingerprint still names the old one, so an invocation started by a reload here would refuse the credential and end the daemon. Phase 5 reloads it, after the tail has made the two agree. |
+| **The tail after Phase 4** | An unnumbered, mandatory step that runs after step-ca restarts and **before** Phase 4 is recorded, under explicit root-token authority. It verifies the bundle and config are still on the Phase-3 additive set, replaces the `auth/cert` entry, the leaf material and the stored root fingerprint. It does **not** reload the daemon: Phase 5 removes the endpoint's surface leaves and reloads it once, which also loads the replaced credential, and a reload sent here could still be running when that removal lands — the invocation it started would then arm renewal over a leaf that is gone and end the daemon. When `--skip reissue` skips Phase 5, the skip sends the reload instead. `--skip reissue` skips Phase 5, not this. A failure retains the pre-Phase-4 state, so a resume repeats the restart and the repair together. |
 | **Phase 6** | Only when finalization is not skipped, and only after its existing migration checks pass: the private bundle and `[trust].trusted_ca_sha256` are atomically narrowed to the finalized new-root / new-intermediate pair and the daemon is reloaded, before Phase 6 is recorded. A run that skips finalization keeps the additive internal trust set, exactly as it keeps the additive KV set. |
 
 The bundle and the pins move as **one** update in both Phase 3 and Phase 6. Each
@@ -452,9 +452,9 @@ generations — a bundle the pins do not cover — with the phase unrecorded and
 nothing registered to undo it. So the rewritten config is computed before either
 file is touched, the existing pair is captured into the same
 `registrar-internal/.prior` snapshot the credential publication uses, and any
-failure puts both members back. Only the reload is outside that: a signal that
-fails leaves a pair that is already consistent, and the resume repeats the whole
-phase anyway.
+failure puts both members back. Only Phase 6's reload is outside that: a signal
+that fails leaves a pair that is already consistent, and the resume repeats the
+whole phase anyway.
 
 **Every rotation keeps the operator's `[registrar]` and `[registrar_endpoint]`
 tables.** Phases 3 and 6 rewrite the `[trust]` keys in place and leave every

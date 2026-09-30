@@ -3716,8 +3716,9 @@ async fn a_socket_mint_returns_freshly_read_anchor_material() {
 // ---------------------------------------------------------------------
 
 /// [`ActivatedEndpoint`] carries what has to outlive a `SIGHUP` and
-/// nothing else: the socket, its path, the daemon uid and the TLS
-/// material consumed once above the reload loop. A handler among them
+/// nothing else: the socket, its path, the daemon uid, the TLS
+/// material consumed once above the reload loop, and the renewal
+/// accessor a reload that finds a leaf absent retains its lifetime from. A handler among them
 /// would be a value replaced under a live accept loop, which is the
 /// coupling this endpoint deliberately does not have.
 #[test]
@@ -3747,9 +3748,10 @@ fn the_activated_endpoint_carries_no_handler() {
             "daemon_uid: u32,",
             "active: RwLock<Arc<ActiveTls>>,",
             "domain: String,",
+            "renewal_state: RegistrarCertRenewalState,",
         ],
-        "the adopted endpoint holds the socket, its path, the daemon uid and the TLS material — \
-         and no handler"
+        "the adopted endpoint holds the socket, its path, the daemon uid, the TLS material and \
+         the renewal accessor — and no handler"
     );
     assert!(
         !source.contains("fn production_handler"),
@@ -4375,6 +4377,57 @@ async fn exchanging_the_active_configuration_changes_the_presented_chain_and_the
     );
 
     drop(held);
+    running.stop().await;
+}
+
+/// The rotation's handshake probe against the real accept loop: the
+/// registrar's own pair is reported accepted with the chain the endpoint
+/// presents, a pair from a CA the endpoint never trusted is reported
+/// refused — although the client finished its half of the handshake —
+/// and neither exchange writes a request frame.
+#[tokio::test]
+async fn the_handshake_probe_reads_the_endpoints_verdict_off_the_stream() {
+    use crate::registrar::endpoint_pin::{ProbeClientPair, ProbeVerdict, probe_endpoint};
+
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
+
+    let (cert_path, key_path) = harness.pki.registrar_client_files();
+    let pair = ProbeClientPair::load(&cert_path, &key_path).expect("pair");
+    let probe = probe_endpoint(
+        &harness.socket_path,
+        &harness.pki.pin_file_path(),
+        &endpoint_name(),
+        &pair,
+    )
+    .await
+    .expect("the endpoint answers");
+    assert_eq!(probe.verdict, ProbeVerdict::Accepted);
+    let presented = probe.presented_chain.first().expect("a presented leaf");
+    assert_eq!(
+        crate::registrar::single_dns_san(presented.as_ref()).expect("one DNS SAN"),
+        endpoint_name(),
+        "the chain comes off the handshake"
+    );
+
+    let foreign = Pki::new();
+    let (foreign_cert, foreign_key) = foreign.registrar_client_files();
+    let foreign_pair = ProbeClientPair::load(&foreign_cert, &foreign_key).expect("pair");
+    let probe = probe_endpoint(
+        &harness.socket_path,
+        &harness.pki.pin_file_path(),
+        &endpoint_name(),
+        &foreign_pair,
+    )
+    .await
+    .expect("the endpoint answers");
+    assert_eq!(probe.verdict, ProbeVerdict::Refused);
+
     running.stop().await;
 }
 

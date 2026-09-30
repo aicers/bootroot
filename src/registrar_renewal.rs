@@ -55,12 +55,16 @@
 //! It never rewrites the endpoint pin file and never adds a leaf
 //! fingerprint to it: the pin file decides whether a *replacement server
 //! leaf* is safe for pinned callers, and a renewal that could edit it
-//! would be deciding that about itself. It never repairs the
-//! bootroot-internal credential and imposes no ordering on a CA
-//! rotation — a tick that reaches a leaf while that credential cannot
-//! authenticate records an ordinary failed issuance and retries. It
-//! reads no `role_id` and no `secret_id`, and never uses the per-service
-//! ACME renewal path.
+//! would be deciding that about itself. Maintaining the file across a CA
+//! generation is the rotation's job, not the renewal's: a full
+//! `bootroot rotate ca-key` adds the new generation's anchors before
+//! step-ca signs with it and removes the old ones once the endpoint is
+//! proven to serve the new chain. It never repairs the bootroot-internal
+//! credential and imposes no ordering on a CA rotation — a tick that
+//! reaches a leaf while that credential cannot authenticate records an
+//! ordinary failed issuance and retries, and the rotation moves both
+//! leaves itself by reloading the daemon. It reads no `role_id` and no
+//! `secret_id`, and never uses the per-service ACME renewal path.
 //!
 //! # The accessor
 //!
@@ -225,7 +229,8 @@ impl RegistrarCertRenewalState {
     /// a lifetime a failure retains, and a failed attempt has no
     /// lifetime to put in one. Nothing in the daemon reaches that case —
     /// preparation refuses an endpoint whose leaves it could not
-    /// observe, so both entries exist before the first pass.
+    /// observe unless an earlier invocation left an entry to retain, so
+    /// both entries exist before the first pass.
     pub(crate) fn record_failure(&self, leaf: SurfaceLeaf, reason: &str, at: OffsetDateTime) {
         self.with(|entries| {
             if let Some(entry) = entries.get_mut(&leaf) {
@@ -763,12 +768,25 @@ impl RegistrarCertRenewal {
     /// a file that changed underneath the daemon, and the caller's
     /// refusal to serve names it.
     ///
+    /// One case is not refused: a leaf that is **absent** on an
+    /// invocation a reload began, when an earlier invocation of this
+    /// process observed it. That is what a CA rotation's Phase 5 leaves
+    /// when the reload's issuance fails, and the endpoint is still
+    /// serving its previous configuration. The accessor lives on the
+    /// activated endpoint for the process lifetime, so the entry already
+    /// has a lifetime to retain: the preparation records a failed
+    /// attempt against it, and the first pass — which runs at once and
+    /// treats an absent certificate as due — re-issues the leaf.
+    /// Refusing instead would stop the daemon and leave the rotation
+    /// nothing to signal.
+    ///
     /// # Errors
     ///
     /// Returns an error when the deployment state file, the rendered
     /// internal agent config or the configured material paths cannot be
-    /// resolved, or when either leaf's certificate cannot be read or
-    /// parsed.
+    /// resolved, when either leaf's certificate cannot be read or
+    /// parsed, or when one is absent and this process has observed no
+    /// earlier lifetime for it.
     pub(crate) async fn prepare(
         settings: Arc<Settings>,
         endpoint: Arc<ActivatedEndpoint>,
@@ -790,24 +808,55 @@ impl RegistrarCertRenewal {
     /// # Errors
     ///
     /// Returns an error when a leaf's certificate cannot be read or
-    /// parsed, so that no adapter exists whose accessor is missing one
-    /// of the two entries an enabled endpoint owes.
+    /// parsed, or is absent with no earlier entry to retain, so that no
+    /// adapter exists whose accessor is missing one of the two entries
+    /// an enabled endpoint owes.
     async fn assemble(
         settings: Arc<Settings>,
         plan: SurfacePlan,
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
     ) -> Result<Self> {
-        let state = RegistrarCertRenewalState::default();
+        let state = endpoint.renewal_state();
         for pair in &plan.pairs {
-            let not_after = observed_not_after(&pair.cert_path).await.with_context(|| {
+            let context = || {
                 format!(
                     "recording the lifetime of the {} at {}",
                     pair.leaf.label(),
                     pair.cert_path.display()
                 )
-            })?;
-            state.initialize(pair.leaf, not_after);
+            };
+            match observe_leaf(&pair.cert_path).await.with_context(context)? {
+                Some(not_after) => state.initialize(pair.leaf, not_after),
+                // Only a reload reaches this: a first start's issuance is
+                // fatal, so it never gets here with a leaf absent. A CA
+                // rotation's Phase 5 removed the leaf and the reload's
+                // issuance could not replace it. The endpoint is still
+                // serving the configuration it had, the leaf's last
+                // observed lifetime is retained against a failed attempt,
+                // and this adapter's immediate first pass finds the leaf
+                // due and re-issues it. Stopping the daemon here instead
+                // would leave the rotation nothing to signal.
+                None if state.leaf(pair.leaf).is_some() => {
+                    let reason = format!(
+                        "the {} at {} is absent and issuance on reload did not replace it; the \
+                         endpoint keeps serving its previous configuration until renewal \
+                         re-issues it",
+                        pair.leaf.label(),
+                        pair.cert_path.display()
+                    );
+                    error!("{reason}");
+                    state.record_failure(pair.leaf, &reason, OffsetDateTime::now_utc());
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "{} is absent, and this process has observed no earlier lifetime for it \
+                         to retain",
+                        pair.cert_path.display()
+                    ))
+                    .with_context(context);
+                }
+            }
         }
         Ok(Self {
             settings,
@@ -1340,18 +1389,35 @@ fn fold_cleanup(publication: Result<()>, cleanup: Result<()>, leaf: SurfaceLeaf)
     }
 }
 
-/// Reads the `notAfter` of the certificate at `path`.
+/// Reads the `notAfter` of the certificate at `path`, or `None` when
+/// nothing is there.
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be read or does not parse as a
-/// PEM certificate.
-async fn observed_not_after(path: &Path) -> Result<OffsetDateTime> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("reading {} to observe its lifetime", path.display()))?;
+/// Returns an error when the file exists and cannot be read or does not
+/// parse as a PEM certificate.
+async fn observe_leaf(path: &Path) -> Result<Option<OffsetDateTime>> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "reading {} to observe its lifetime",
+                path.display()
+            )));
+        }
+    };
     daemon::parse_cert_not_after(&bytes)
+        .map(Some)
         .with_context(|| format!("parsing the certificate at {}", path.display()))
+}
+
+/// Reads the `notAfter` of a certificate a test knows is present.
+#[cfg(test)]
+async fn observed_not_after(path: &Path) -> Result<OffsetDateTime> {
+    observe_leaf(path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{} is absent", path.display()))
 }
 
 #[cfg(test)]

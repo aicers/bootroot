@@ -774,7 +774,8 @@ const OWNERSHIP_SWEEP_MOUNT: &str = "/secrets";
 
 /// Builds the list of paths, inside the sweep container, the `chown`
 /// recurses over: every immediate entry below `secrets/` except the
-/// bootroot-internal directory.
+/// bootroot-internal directory and a rotation's retired registrar client
+/// pair.
 ///
 /// The sweep exists to repair CA material a `--user root` step helper
 /// left root-owned, so that step-ca and the `OpenBao` Agent sidecars —
@@ -795,6 +796,12 @@ const OWNERSHIP_SWEEP_MOUNT: &str = "/secrets";
 /// added there later inherits the exclusion instead of silently falling
 /// out of it.
 ///
+/// The retired registrar client pair a full CA rotation preserves on a
+/// registrar endpoint host, and its staging directory, are held back for
+/// the same reason: root-owned by policy, holding the private key of the
+/// identity the endpoint trusts, and read by nothing but a root-run
+/// rotation.
+///
 /// Enumerating host-side and passing explicit operands, rather than
 /// masking the directory inside the container, is deliberate: a mistake
 /// here sweeps *less* than intended, never more.
@@ -809,7 +816,14 @@ fn ownership_sweep_targets(secrets_dir: &Path, messages: &Messages) -> Result<Ve
                 messages.error_resolve_path_failed(&secrets_dir.display().to_string())
             })?
             .file_name();
-        if name == OsStr::new(INTERNAL_DIR) {
+        if [
+            INTERNAL_DIR,
+            crate::commands::rotate::REGISTRAR_CLIENT_RETIRED_DIR,
+            crate::commands::rotate::REGISTRAR_CLIENT_RETIRED_STAGING_DIR,
+        ]
+        .iter()
+        .any(|held_back| name == OsStr::new(held_back))
+        {
             continue;
         }
         targets.push(mount.join(name));
@@ -2656,6 +2670,26 @@ mod tests {
                 .any(|t| t.to_string_lossy().contains(INTERNAL_DIR)),
             "the bootroot-internal directory is not a chown operand"
         );
+    }
+
+    /// The retired registrar client pair a full rotation preserves is
+    /// root-owned by policy, so neither it nor its staging directory is a
+    /// sweep operand: a resumed rotation sweeps before it reads the pair.
+    #[test]
+    fn ownership_sweep_targets_exclude_the_retired_registrar_client_pair() {
+        let messages = test_messages();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in [
+            "certs",
+            crate::commands::rotate::REGISTRAR_CLIENT_RETIRED_DIR,
+            crate::commands::rotate::REGISTRAR_CLIENT_RETIRED_STAGING_DIR,
+        ] {
+            std::fs::create_dir(dir.path().join(name)).expect("subdirectory");
+        }
+
+        let targets = ownership_sweep_targets(dir.path(), &messages).expect("targets");
+
+        assert_eq!(targets, [PathBuf::from("/secrets/certs")]);
     }
 
     /// No operands means no container: `chown` with none is a usage
