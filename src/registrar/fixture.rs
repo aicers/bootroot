@@ -21,7 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::registrar::config::{
-    CONFIG_FILE_NAME, Multiplicity, RegistrationSpec, ReloadKind, ReloadSpec,
+    CONFIG_FILE_NAME, MAX_COMPONENTS, Multiplicity, RegistrationSpec, ReloadKind, ReloadSpec,
     SUPPORTED_SCHEMA_VERSION,
 };
 use crate::tls::sha256_hex;
@@ -133,6 +133,30 @@ impl RegistrarConfigFixture {
             components: BTreeMap::new(),
             ..Self::default()
         }
+    }
+
+    /// Creates the widest fixture the loader accepts: the most components
+    /// it admits, each under a 63-octet key, beneath the longest domain it
+    /// admits.
+    ///
+    /// This is the file whose `observe` answer is the largest, so it is
+    /// what a test holds against the endpoint's response bound.
+    #[must_use]
+    pub fn widest() -> Self {
+        let spec = RegistrationSpec {
+            cert_group: None,
+            reload: ReloadSpec::none(),
+        };
+        (0..MAX_COMPONENTS).fold(
+            Self::empty().with_domain(&widest_domain()),
+            |fixture, index| {
+                fixture.with_component(
+                    &widest_component_key(index),
+                    Multiplicity::OnePerHost,
+                    &spec,
+                )
+            },
+        )
     }
 
     /// Overrides the deployment-wide domain.
@@ -286,4 +310,24 @@ fn default_entry(multiplicity: Multiplicity) -> ComponentFixture {
             reload: ReloadSpec::none(),
         },
     )
+}
+
+/// Returns a distinct component key of the most octets a DNS label
+/// holds, 63, for the `index`th component of [`RegistrarConfigFixture::widest`].
+#[must_use]
+pub fn widest_component_key(index: usize) -> String {
+    format!("c{index:062}")
+}
+
+/// Returns a valid domain of exactly the most octets the loader accepts,
+/// 253: three 63-octet labels and a 61-octet one.
+#[must_use]
+pub fn widest_domain() -> String {
+    [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".")
 }

@@ -18,12 +18,15 @@ use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
 use crate::registrar::audit::{ACTIVE_FILE_NAME, AuditRecordStore};
 use crate::registrar::audit_store::capacity::AuditCapacityState;
-use crate::registrar::config::{CONFIG_FILE_NAME, RegistrarConfig, ReloadKind, ReloadSpec};
+use crate::registrar::config::{
+    CONFIG_FILE_NAME, MAX_COMPONENTS, RegistrarConfig, ReloadKind, ReloadSpec,
+};
+use crate::registrar::endpoint::MAX_RESPONSE_PAYLOAD_BYTES;
 use crate::registrar::endpoint::frame::Operation;
 use crate::registrar::endpoint::handler::RegistrarRequestHandler;
 use crate::registrar::endpoint::protocol::{
-    AuditCapacityHealth, CertificateHealth, LimiterHealth, ObserveResponse, RegistrarHealth,
-    RenewalOutcome, WireServiceSpec, decode_ca_anchor, decode_mint_response,
+    AuditCapacityHealth, CERTIFICATE_LEAF_ORDER, CertificateHealth, LimiterHealth, ObserveResponse,
+    RegistrarHealth, RenewalOutcome, WireServiceSpec, decode_ca_anchor, decode_mint_response,
     decode_observe_response, encode_ca_anchor, encode_mint_response,
 };
 use crate::registrar::fixture::RegistrarConfigFixture;
@@ -353,10 +356,11 @@ fn test_limiter() -> VerbRateLimiter {
 /// nothing but which one they call.
 fn harness_dependencies(
     server: &MockServer,
+    fixture: &RegistrarConfigFixture,
     audit_store: AuditRecordStore,
 ) -> (tempfile::TempDir, RegistrarVerbs, InternalCredential) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config_path = RegistrarConfigFixture::new()
+    let config_path = fixture
         .write_to(dir.path())
         .expect("write the rendered registrar config");
     let config = RegistrarConfig::load(&config_path).expect("the fixture must load");
@@ -387,6 +391,7 @@ fn harness_dependencies(
 fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler) {
     let (dir, verbs, credential) = harness_dependencies(
         server,
+        &RegistrarConfigFixture::new(),
         AuditRecordStore::open_temporary().expect("a temporary audit store"),
     );
     (
@@ -408,7 +413,17 @@ fn health_harness(
     audit_store: AuditRecordStore,
     health: Arc<StdMutex<RegistrarHealth>>,
 ) -> (tempfile::TempDir, ProductionHandler) {
-    let (dir, verbs, credential) = harness_dependencies(server, audit_store);
+    health_harness_over(server, &RegistrarConfigFixture::new(), audit_store, health)
+}
+
+/// [`health_harness`] over the provisioning file `fixture` renders.
+fn health_harness_over(
+    server: &MockServer,
+    fixture: &RegistrarConfigFixture,
+    audit_store: AuditRecordStore,
+    health: Arc<StdMutex<RegistrarHealth>>,
+) -> (tempfile::TempDir, ProductionHandler) {
+    let (dir, verbs, credential) = harness_dependencies(server, fixture, audit_store);
     (
         dir,
         ProductionHandler::with_health(
@@ -827,6 +842,87 @@ async fn observe_reports_the_loaded_fingerprint_and_the_current_snapshot() {
             .intent_without_outcome,
         Some(2)
     );
+}
+
+/// A health snapshot at its widest encoding: every optional member
+/// present, every number at its longest rendering, every timestamp
+/// carrying nanoseconds in year 9999, and each enum at its longest
+/// spelling that still carries every member.
+fn widest_health() -> RegistrarHealth {
+    let latest = time::OffsetDateTime::new_utc(
+        time::Date::from_calendar_date(9999, time::Month::December, 31).expect("a valid date"),
+        time::Time::from_hms_nano(23, 59, 59, 999_999_999).expect("a valid time"),
+    );
+    let certificate = |leaf| CertificateHealth {
+        leaf,
+        not_after: latest,
+        remaining_seconds: i64::MIN,
+        last_renewal_outcome: RenewalOutcome::Succeeded,
+        last_renewal_at: Some(latest),
+    };
+    RegistrarHealth {
+        limiter: LimiterHealth {
+            limited_predecision_refusal: u64::MAX,
+            limited_admission: u64::MAX,
+        },
+        audit_capacity: AuditCapacityHealth {
+            state: AuditCapacityState::LowWater,
+            enforcement: AuditStoreEnforcement::Filesystem,
+            reserve_bytes: u64::MAX,
+            low_water_bytes: u64::MAX,
+            used_bytes: Some(u64::MAX),
+            headroom_bytes: Some(i64::MIN),
+            measured_at: Some(latest),
+            intent_without_outcome: Some(u64::MAX),
+            malformed_records: Some(u64::MAX),
+            retention_shortfall: Some(false),
+            records_measured_at: Some(latest),
+        },
+        certificates: CERTIFICATE_LEAF_ORDER
+            .into_iter()
+            .map(certificate)
+            .collect(),
+    }
+}
+
+/// The widest provisioning file the loader admits, observed with the
+/// widest health snapshot, is answered with a response the endpoint
+/// frames: every loadable file is observable.
+#[tokio::test]
+async fn the_widest_admitted_config_is_observable_within_the_response_bound() {
+    let server = MockServer::start().await;
+    let health = Arc::new(StdMutex::new(widest_health()));
+    let (dir, handler) = health_harness_over(
+        &server,
+        &RegistrarConfigFixture::widest(),
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        health,
+    );
+    let config =
+        RegistrarConfig::load(&dir.path().join(CONFIG_FILE_NAME)).expect("the fixture must load");
+    assert_eq!(config.component_names().count(), MAX_COMPONENTS);
+
+    let encoded = handler
+        .handle(
+            Operation::Observe,
+            OBSERVE_PAYLOAD,
+            CallerIdentity::new("registrar-client:001.bootroot-registrar.h1.example.internal"),
+        )
+        .await
+        .expect("observe is answered");
+    assert!(
+        encoded.len() <= MAX_RESPONSE_PAYLOAD_BYTES,
+        "the widest observe answer is {} bytes, past the {MAX_RESPONSE_PAYLOAD_BYTES}-byte \
+         response bound",
+        encoded.len()
+    );
+    let response = decode_observe_response(&encoded).expect("the observe response decodes");
+    assert_eq!(response.provisioning_fingerprint.domain, config.domain());
+    assert_eq!(
+        response.provisioning_fingerprint.components,
+        config.component_digests()
+    );
+    assert_eq!(response.registrar_health, widest_health());
 }
 
 /// Serving `observe` charges no limiter bucket, writes no audit record

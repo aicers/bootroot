@@ -19,11 +19,13 @@ use crate::config::{
 };
 use crate::input_validation::ValidationError;
 use crate::registrar::config::{
-    CONFIG_FILE_NAME, DEFAULT_CONFIG_PATH, Multiplicity, RegistrarConfig, RegistrationSpec,
-    ReloadKind, ReloadSpec, SUPPORTED_SCHEMA_VERSION,
+    CONFIG_FILE_NAME, DEFAULT_CONFIG_PATH, MAX_COMPONENTS, MAX_DOMAIN_OCTETS, Multiplicity,
+    RegistrarConfig, RegistrationSpec, ReloadKind, ReloadSpec, SUPPORTED_SCHEMA_VERSION,
 };
 use crate::registrar::error::{RegistrarError, SpecIdentityField};
-use crate::registrar::fixture::{ComponentFixture, FIXTURE_DOMAIN, RegistrarConfigFixture};
+use crate::registrar::fixture::{
+    ComponentFixture, FIXTURE_DOMAIN, RegistrarConfigFixture, widest_component_key, widest_domain,
+};
 use crate::registrar::identity::{
     RequestedSpec, check_instance_shape, check_spec_identity, compose_san, derive_registration_id,
     validate_request_labels,
@@ -196,6 +198,66 @@ fn an_invalid_domain_is_a_typed_failure() {
     let err = loaded.expect_err("an invalid domain must not load");
     assert!(
         matches!(err, RegistrarError::InvalidDomain { ref domain, .. } if domain == "trusted_domain"),
+        "{err:?}"
+    );
+}
+
+/// The widest file the loader admits loads: every component at the
+/// component bound, each under a 63-octet key, beneath a domain at the
+/// domain bound.
+#[test]
+fn the_widest_admitted_config_loads() {
+    assert_eq!(widest_domain().len(), MAX_DOMAIN_OCTETS);
+    let (_dir, loaded) = load_fixture(&RegistrarConfigFixture::widest());
+    let config = loaded.expect("the widest admitted config must load");
+    assert_eq!(config.component_names().count(), MAX_COMPONENTS);
+    assert!(
+        config.component_names().all(|name| name.len() == 63),
+        "every key is at the label limit"
+    );
+    assert_eq!(config.domain(), widest_domain());
+}
+
+/// One component past the bound is refused at load rather than loading
+/// into a file whose `observe` answer the endpoint could not frame.
+#[test]
+fn one_component_past_the_bound_is_refused() {
+    let fixture = RegistrarConfigFixture::widest().with_component(
+        &widest_component_key(MAX_COMPONENTS),
+        Multiplicity::OnePerHost,
+        &spec_of(None, ReloadKind::None, None),
+    );
+    let (_dir, loaded) = load_fixture(&fixture);
+    let err = loaded.expect_err("a file past the component bound must not load");
+    match err {
+        RegistrarError::ConfigMalformed { message, .. } => assert!(
+            message.contains(&format!(
+                "declares {} components, more than the {MAX_COMPONENTS}",
+                MAX_COMPONENTS + 1
+            )),
+            "{message}"
+        ),
+        other => panic!("expected ConfigMalformed, got {other:?}"),
+    }
+}
+
+/// A domain one octet past the DNS name limit is refused even though
+/// every label in it is valid.
+#[test]
+fn a_domain_past_the_name_limit_is_refused() {
+    // Lengthens the last label to 62 octets, still a valid label.
+    let domain = format!("{}d", widest_domain());
+    assert_eq!(domain.len(), MAX_DOMAIN_OCTETS + 1);
+    let (_dir, loaded) = load_fixture(&RegistrarConfigFixture::new().with_domain(&domain));
+    let err = loaded.expect_err("a domain past the name limit must not load");
+    assert!(
+        matches!(
+            err,
+            RegistrarError::InvalidDomain {
+                domain: ref found,
+                kind: ValidationError::InvalidDomainName,
+            } if *found == domain
+        ),
         "{err:?}"
     );
 }

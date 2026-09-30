@@ -615,9 +615,14 @@ enforces, not a copy re-rendered since — and from the current
 the store. `provisioning_fingerprint` is the object
 `{"components":{...},"domain":"..."}` in that member order: `components` maps
 each component key, in sorted order, to its §9.1 digest, and `domain` is the
-file's `domain`. It is served on the same authenticated connection as the two
-verbs; a daemon that refuses every request because its audit store is not
-mounted refuses `observe` with the same refusal. A daemon that predates
+file's `domain`. The answer fits the endpoint's 65,536-byte response frame for
+every provisioning file the loader admits: the loader refuses a file declaring
+more than 256 components or a `domain` longer than 253 octets, and at those
+bounds, with every key at 63 octets and every health member at its widest
+encoding, the answer stays well inside the frame. It is served on the same
+authenticated connection as the two verbs; a daemon that refuses every
+request because its audit store is not mounted refuses `observe` with the
+same refusal. A daemon that predates
 `observe` answers it with the fixed `unrecognized-operation` body, which a
 caller reads as "not offered".
 

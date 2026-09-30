@@ -97,7 +97,8 @@ pub enum RegistrarError {
     },
 
     /// The body is not UTF-8, is not TOML, or does not have the shape
-    /// this build parses.
+    /// this build parses — including one declaring more components than
+    /// this build accepts.
     #[error("registrar config at {path} is malformed: {message}")]
     ConfigMalformed {
         /// The path that was read.
@@ -149,7 +150,8 @@ pub enum RegistrarError {
         kind: ReloadKind,
     },
 
-    /// The file's `domain` is not a dot-separated DNS name.
+    /// The file's `domain` is not a dot-separated DNS name, or is longer
+    /// than a DNS name may be.
     #[error("registrar config declares invalid domain {domain:?} ({kind:?})")]
     InvalidDomain {
         /// The offending value, verbatim.

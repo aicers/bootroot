@@ -22,7 +22,9 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 
-use crate::input_validation::{validate_dns_label, validate_domain_name, validate_registration_id};
+use crate::input_validation::{
+    ValidationError, validate_dns_label, validate_domain_name, validate_registration_id,
+};
 use crate::registrar::error::RegistrarError;
 use crate::tls::sha256_hex;
 
@@ -58,6 +60,23 @@ const FINGERPRINT_HEX_LEN: usize = 64;
 const COMPONENT_DIGEST_TAG: &str = "provisioning-component-v1";
 /// Encoding of an absent optional field in a component digest's input.
 const COMPONENT_DIGEST_ABSENT: &[u8] = b"-";
+
+/// Most `[components.<key>]` entries a file may declare.
+///
+/// The endpoint's `observe` answer carries one digest per component and
+/// the domain in a single response frame, which is bounded. Without a
+/// bound here a file could load, mint normally and then be unobservable,
+/// every `observe` closing without a response — the silent failure this
+/// loader's gates exist to turn into one loud one. A product declares a
+/// handful of components, so the bound is far above any real file and
+/// far below what the frame holds; a production-handler test checks
+/// the widest loadable file's answer against the frame.
+pub(crate) const MAX_COMPONENTS: usize = 256;
+
+/// Longest `domain` a file may declare, in octets: the limit on a whole
+/// DNS name. Bounded for the same reason as [`MAX_COMPONENTS`], since the
+/// `observe` answer carries the domain verbatim.
+pub(crate) const MAX_DOMAIN_OCTETS: usize = 253;
 
 /// How many times a component may be installed, which is what selects
 /// the `registration_id` derivation arm.
@@ -374,11 +393,13 @@ impl RegistrarConfig {
     /// [`RegistrarError::FingerprintMismatch`] when the body's digest
     /// disagrees with it, [`RegistrarError::UnsupportedSchemaVersion`]
     /// when the version is not this build's,
-    /// [`RegistrarError::ConfigMalformed`] when the body is not UTF-8 or
-    /// not the documented TOML shape, and the
+    /// [`RegistrarError::ConfigMalformed`] when the body is not UTF-8, is
+    /// not the documented TOML shape, or declares more than
+    /// 256 components, and the
     /// `UnknownMultiplicity` / `UnknownReloadKind` /
     /// `InvalidReloadTarget` / `InvalidDomain` / `InvalidComponentKey`
-    /// variants when a parsed value is not one this build accepts.
+    /// variants when a parsed value is not one this build accepts —
+    /// including a `domain` longer than a DNS name may be.
     pub fn load(path: &Path) -> Result<Self, RegistrarError> {
         let bytes = std::fs::read(path).map_err(|source| RegistrarError::ConfigUnreadable {
             path: path.to_path_buf(),
@@ -489,6 +510,21 @@ impl RegistrarConfig {
             domain: raw.domain.clone(),
             kind,
         })?;
+        if raw.domain.len() > MAX_DOMAIN_OCTETS {
+            return Err(RegistrarError::InvalidDomain {
+                domain: raw.domain,
+                kind: ValidationError::InvalidDomainName,
+            });
+        }
+        if raw.components.len() > MAX_COMPONENTS {
+            return Err(RegistrarError::ConfigMalformed {
+                path: path.to_path_buf(),
+                message: format!(
+                    "declares {} components, more than the {MAX_COMPONENTS} this build accepts",
+                    raw.components.len()
+                ),
+            });
+        }
 
         let mut components = BTreeMap::new();
         for (name, entry) in raw.components {

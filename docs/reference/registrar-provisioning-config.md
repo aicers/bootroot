@@ -47,7 +47,7 @@ the digest gate exists to close.
 | --- | --- | --- | --- |
 | `fingerprint` | 64 lowercase hex characters | yes | SHA-256 of the file's body. **Must be the first line**, exactly `fingerprint = "<64 lowercase hex>"` followed by one `\n`. Not part of the digested body. |
 | `schema_version` | `u32` | yes | Compatibility gate. This build implements **1**. Never defaulted when absent. |
-| `domain` | dot-separated DNS name | yes | The deployment-wide domain, the SAN's fourth segment. Read only from this file, never from the wire. |
+| `domain` | dot-separated DNS name, at most 253 octets | yes | The deployment-wide domain, the SAN's fourth segment. Read only from this file, never from the wire. |
 | `components` | table of tables | yes in practice | One entry per component, keyed by package-id. |
 
 ### 2.1 The two integrity gates
@@ -86,6 +86,15 @@ hyphens, starting and ending alphanumeric, at most 63 octets. A key that is
 not is `RegistrarError::InvalidComponentKey` at load, rather than an entry
 that loads and then refuses every one of its enrollments at the derivation
 step.
+
+A file declares at most **256** components (`MAX_COMPONENTS`), and its
+`domain` is at most 253 octets, the limit on a whole DNS name. A file past
+either bound is refused at load — `RegistrarError::ConfigMalformed` for the
+component count, `RegistrarError::InvalidDomain` for the domain. The
+endpoint's read-only `observe` operation answers with one digest per
+component and the domain in a single, bounded response frame; the bounds make
+every file that loads one whose answer fits that frame, rather than a file
+that loads, mints normally and is then unobservable.
 
 A component **absent** from this file is refused, never defaulted — fail-open
 would let a module whose `instance` was wrongly omitted mint a
