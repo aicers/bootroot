@@ -3018,13 +3018,15 @@ fn assert_binding_read_only(requests: &[wiremock::Request], registration_id: &st
 /// all — no teardown client, no material sweep, no binding delete —
 /// answers `StaleGeneration` on the binding arm with an empty report,
 /// and leaves a pair recording the `stale_generation` class. It holds
-/// for a `creating` binding exactly as for an active one.
+/// for a `creating` binding exactly as for an active one, and for a
+/// stored empty key, which is an ordinary value rather than "no key".
 #[tokio::test]
 async fn a_stale_deregister_removes_nothing_and_records_its_own_class() {
     let spec = requested(&spec_for("roxyd"));
     for binding in [
         roxyd_binding("h1", Some(IDEMPOTENCY_KEY)),
         BindingRecord::creating("h1", &spec, IDEMPOTENCY_KEY),
+        roxyd_binding("h1", Some("")),
     ] {
         let (server, _dir, _store_root, verbs) = audit_harness(&base_fixture()).await;
         mock_binding_read(&server, "h1-roxyd", &binding).await;
