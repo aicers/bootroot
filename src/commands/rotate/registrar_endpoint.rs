@@ -810,8 +810,8 @@ async fn write_pin_file(pin_file: &Path, contents: &str, messages: &Messages) ->
     .with_context(|| messages.error_write_file_failed(&pin_file.display().to_string()))
 }
 
-/// Reports whether a run stops once Phase 5 is recorded instead of going
-/// on to Phase 7.
+/// Reports whether a run stops before Phase 6 instead of going on to
+/// Phase 7.
 ///
 /// Only on a registrar endpoint host, only while Phase 6 is still ahead,
 /// and only when finalization is skipped: there, skipping it defers
