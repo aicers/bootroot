@@ -3399,17 +3399,18 @@ async fn a_failed_key_rewrite_refuses_on_the_binding_arm_before_any_side_effect(
     );
     assert_eq!(refusal.context().arm(), ProducingArm::Binding);
     let requests = received(&server).await;
-    assert_eq!(binding_writes(&requests, "h1-roxyd").len(), 1);
-    assert!(
-        requests.iter().all(|request| {
-            request.url.path() == binding_data_url("h1-roxyd")
-                || request.url.path().starts_with("/v1/secret/data/bootroot/")
-        }),
-        "nothing but the binding was touched: {:?}",
-        requests
-            .iter()
-            .map(|request| format!("{} {}", request.method, request.url.path()))
-            .collect::<Vec<_>>()
+    // Seeding lives under the same KV prefix as the binding, so only
+    // method and exact path together tell the binding apart from a
+    // control-node read or a service-material write.
+    let seen: Vec<(&str, &str)> = requests
+        .iter()
+        .map(|request| (request.method.as_str(), request.url.path()))
+        .collect();
+    let binding = binding_data_url("h1-roxyd");
+    assert_eq!(
+        seen,
+        [("GET", binding.as_str()), ("POST", binding.as_str())],
+        "the binding read and the failed rewrite, and nothing else"
     );
     assert_eq!(secret_id_requests(&requests, "h1-roxyd"), 0);
 
