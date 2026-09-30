@@ -1274,6 +1274,7 @@ async fn phase6_fails_when_the_before_dial_is_refused() {
         finalizing.retired(),
         false,
         false,
+        &mut std::io::sink(),
         &test_messages(),
     )
     .await
@@ -1296,6 +1297,7 @@ async fn phase6_passes_when_the_narrowing_takes_effect() {
         finalizing.retired(),
         false,
         false,
+        &mut std::io::sink(),
         &test_messages(),
     )
     .await
@@ -1392,6 +1394,7 @@ async fn a_resumed_phase6_with_narrowed_trust_skips_the_before_dial() {
         finalizing.retired(),
         true,
         false,
+        &mut std::io::sink(),
         &test_messages(),
     )
     .await
@@ -1409,8 +1412,9 @@ async fn a_resumed_phase6_with_narrowed_trust_skips_the_before_dial() {
 }
 
 /// An absent retired pair on a resume fails Phase 6 without `--force`.
-/// With it, only the refusal half is waived: the current pair still has
-/// to be accepted.
+/// With it, only the refusal half is waived, and the operator is warned
+/// that the refusal was not proven: the current pair still has to be
+/// accepted.
 #[tokio::test]
 async fn an_absent_retired_pair_needs_force_and_force_still_needs_the_current_pair() {
     let finalizing = Finalizing::new().await;
@@ -1418,27 +1422,45 @@ async fn an_absent_retired_pair_needs_force_and_force_still_needs_the_current_pa
     let endpoint = FakeEndpoint::default();
     endpoint.accept_only(&[&finalizing.current.0]);
 
+    let RetiredPair::Unusable(reason) = finalizing.retired() else {
+        panic!("an absent retired pair is unusable");
+    };
+
+    let mut warnings = Vec::new();
     let err = prepare_refusal_proof(
         &endpoint,
         finalizing.retired(),
         true,
         false,
+        &mut warnings,
         &test_messages(),
     )
     .await
     .expect_err("cannot prove the refusal");
     assert!(err.to_string().contains("--force"), "{err}");
+    assert!(warnings.is_empty(), "nothing is waived without --force");
 
     let proof = prepare_refusal_proof(
         &endpoint,
         finalizing.retired(),
         true,
         true,
+        &mut warnings,
         &test_messages(),
     )
     .await
     .expect("waived");
     assert!(matches!(proof, RefusalProof::Waived));
+    assert_eq!(
+        String::from_utf8(warnings).expect("utf-8"),
+        format!(
+            "WARNING: --force given; finalizing without proof that the registrar endpoint \
+             rejects the old trust ({reason}). A dial with the current client pair is still \
+             required\n"
+        ),
+        "the operator is told the refusal was not proven"
+    );
+    assert_eq!(endpoint.dials.get(), 0, "an unusable pair is never dialed");
     wait_for_narrowing(
         &finalizing.host.endpoint,
         &endpoint,

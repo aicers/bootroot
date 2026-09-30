@@ -908,6 +908,10 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_rotate_endpoint_warning_write_failed(&self) -> &'static str {
+        self.strings().error_rotate_endpoint_warning_write_failed
+    }
+
     pub(crate) fn error_rotate_endpoint_current_not_accepted(
         &self,
         detail: &str,

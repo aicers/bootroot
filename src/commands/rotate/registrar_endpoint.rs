@@ -32,7 +32,7 @@
 //! [`super::registrar_internal::internal_rotation_applies`].
 
 use std::collections::BTreeSet;
-use std::io::Write as _;
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -810,8 +810,8 @@ async fn write_pin_file(pin_file: &Path, contents: &str, messages: &Messages) ->
     .with_context(|| messages.error_write_file_failed(&pin_file.display().to_string()))
 }
 
-/// Reports whether a run stops once Phase 5 is recorded instead of going
-/// on to Phase 7.
+/// Reports whether a run stops before Phase 6 instead of going on to
+/// Phase 7.
 ///
 /// Only on a registrar endpoint host, only while Phase 6 is still ahead,
 /// and only when finalization is skipped: there, skipping it defers
@@ -1090,18 +1090,20 @@ pub(super) enum RefusalProof {
 /// from the narrowing. A resumed Phase 6 whose trust is already narrowed
 /// relies on the local checks the pair has already passed instead. A
 /// retired pair that cannot be used fails Phase 6 unless `force` waives
-/// the refusal, with a warning that it was not proven.
+/// the refusal, with a warning to `warnings` — stderr in production —
+/// that it was not proven.
 ///
 /// # Errors
 ///
 /// Returns an error when the before-dial does not report the pair
-/// accepted, or when the retired pair cannot be used and `force` is not
-/// set.
-pub(super) async fn prepare_refusal_proof<D: EndpointDialer>(
+/// accepted, when the retired pair cannot be used and `force` is not
+/// set, or when the waiver's warning cannot be written.
+pub(super) async fn prepare_refusal_proof<D: EndpointDialer, W: Write>(
     dialer: &D,
     retired: RetiredPair,
     trust_narrowed: bool,
     force: bool,
+    warnings: &mut W,
     messages: &Messages,
 ) -> Result<RefusalProof> {
     match retired {
@@ -1121,10 +1123,12 @@ pub(super) async fn prepare_refusal_proof<D: EndpointDialer>(
             if !force {
                 anyhow::bail!(messages.error_rotate_endpoint_retired_unusable(&reason));
             }
-            eprintln!(
+            writeln!(
+                warnings,
                 "{}",
                 messages.warning_rotate_endpoint_refusal_unproven(&reason)
-            );
+            )
+            .context(messages.error_rotate_endpoint_warning_write_failed())?;
             Ok(RefusalProof::Waived)
         }
     }
