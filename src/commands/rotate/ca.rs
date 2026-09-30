@@ -599,17 +599,14 @@ pub(super) async fn rotate_ca_key(
     // needs the recorded generations and the retired client pair, and
     // Phase 7 would delete both — making the widened trust permanent and
     // turning the next `rotate ca-key` into a new rotation.
-    if registrar_endpoint::pauses_before_finalize(
+    if let Some(notice) = pause_before_finalize_notice(
         endpoint_host.is_some(),
         start_phase,
-        args.skip.contains(&RotateSkipPhase::Finalize),
+        rot_state.phase,
+        &args.skip,
+        messages,
     ) {
-        // Phase 6 is next unless `--skip reissue` also left Phase 5 unrecorded.
-        let resume_at = (rot_state.phase + 1).to_string();
-        println!(
-            "{}",
-            messages.rotate_ca_key_paused_before_finalize(&resume_at)
-        );
+        println!("{notice}");
         return Ok(());
     }
 
@@ -637,6 +634,30 @@ pub(super) async fn rotate_ca_key(
     }
 
     Ok(())
+}
+
+/// Returns the notice a run prints when it pauses before finalizing on a
+/// registrar endpoint host, or `None` when it goes on to Phase 7.
+///
+/// The notice names the phase the next run executes first, which is the
+/// one after `recorded_phase`: Phase 6 once Phase 5 is recorded, or
+/// Phase 5 when `--skip reissue` left only Phase 4 recorded.
+fn pause_before_finalize_notice(
+    endpoint_host: bool,
+    start_phase: u8,
+    recorded_phase: u8,
+    skip: &[RotateSkipPhase],
+    messages: &Messages,
+) -> Option<String> {
+    if !registrar_endpoint::pauses_before_finalize(
+        endpoint_host,
+        start_phase,
+        skip.contains(&RotateSkipPhase::Finalize),
+    ) {
+        return None;
+    }
+    let resume_at = recorded_phase.saturating_add(1).to_string();
+    Some(messages.rotate_ca_key_paused_before_finalize(&resume_at))
 }
 
 /// Phase 7: removes the retired registrar client pair, the backups when
@@ -721,9 +742,15 @@ async fn endpoint_phase6_before(
     let narrowed =
         registrar_endpoint::internal_trust_narrowed(ctx.paths.secrets_dir(), state, messages)?;
     let dialer = endpoint_dialer(host, args)?;
-    let proof =
-        registrar_endpoint::prepare_refusal_proof(&dialer, retired, narrowed, args.force, messages)
-            .await?;
+    let proof = registrar_endpoint::prepare_refusal_proof(
+        &dialer,
+        retired,
+        narrowed,
+        args.force,
+        &mut std::io::stderr(),
+        messages,
+    )
+    .await?;
     Ok((dialer, proof))
 }
 
@@ -1669,47 +1696,114 @@ mod tests {
     }
 
     /// `--skip finalize` on an endpoint host stops before Phase 7, so the
-    /// state it keeps is what the next run resumes from: Phase 5 is
-    /// recorded, and the next run starts at Phase 6 holding the pin file to
-    /// the new generation. A host without the internal credential goes on
-    /// to Phase 7, which deletes the state, as it always has.
+    /// state it keeps is what the next run resumes from. With Phase 5
+    /// recorded the next run starts at Phase 6; with `--skip reissue` too,
+    /// only Phase 4 is recorded and it starts at Phase 5. Either way it
+    /// holds the pin file to the new generation. A host without the
+    /// internal credential goes on to Phase 7, which deletes the state, as
+    /// it always has.
     #[tokio::test]
     async fn skip_finalize_on_an_endpoint_host_keeps_what_phase6_needs() {
-        let dir = tempdir().expect("tempdir");
-        let ctx = ctx_for_instance(dir.path(), "insight");
         let messages = test_messages();
-        let state = RotationState {
-            mode: RotationMode::Full,
-            started_at: String::new(),
-            old_root_fp: "a".repeat(64),
-            new_root_fp: "b".repeat(64),
-            old_intermediate_fp: "c".repeat(64),
-            new_intermediate_fp: "d".repeat(64),
-            phase: 5,
-        };
-        create_rotation_state_async(&ctx.state_dir, &state, &messages)
-            .await
-            .expect("state");
-        fs::create_dir_all(ctx.paths.registrar_client_retired()).expect("retired");
+        for (recorded, skip) in [
+            (4, vec![RotateSkipPhase::Reissue, RotateSkipPhase::Finalize]),
+            (5, vec![RotateSkipPhase::Finalize]),
+        ] {
+            let dir = tempdir().expect("tempdir");
+            let ctx = ctx_for_instance(dir.path(), "insight");
+            let state = RotationState {
+                mode: RotationMode::Full,
+                started_at: String::new(),
+                old_root_fp: "a".repeat(64),
+                new_root_fp: "b".repeat(64),
+                old_intermediate_fp: "c".repeat(64),
+                new_intermediate_fp: "d".repeat(64),
+                phase: recorded,
+            };
+            create_rotation_state_async(&ctx.state_dir, &state, &messages)
+                .await
+                .expect("state");
+            fs::create_dir_all(ctx.paths.registrar_client_retired()).expect("retired");
 
-        assert!(registrar_endpoint::pauses_before_finalize(true, 5, true));
-        let resumed = load_rotation_state(&ctx.state_dir, &messages)
-            .expect("load")
-            .expect("kept");
-        assert_eq!(resumed.phase, 5, "the next run starts at Phase 6");
-        assert_eq!(
-            registrar_endpoint::phase0_accepted_fingerprints(Some(&resumed), "", ""),
-            ["b".repeat(64), "d".repeat(64)]
-        );
-        assert!(ctx.paths.registrar_client_retired().exists());
-
-        assert!(!registrar_endpoint::pauses_before_finalize(false, 5, true));
-        phase7_cleanup(&ctx, &RotationMode::Full, false, &messages).expect("cleanup");
-        assert!(
-            load_rotation_state(&ctx.state_dir, &messages)
+            assert!(
+                pause_before_finalize_notice(true, 0, recorded, &skip, &messages).is_some(),
+                "Phase {recorded} recorded pauses"
+            );
+            let resumed = load_rotation_state(&ctx.state_dir, &messages)
                 .expect("load")
+                .expect("kept");
+            assert_eq!(resumed.phase, recorded, "the next run starts after it");
+            assert_eq!(
+                registrar_endpoint::phase0_accepted_fingerprints(Some(&resumed), "", ""),
+                ["b".repeat(64), "d".repeat(64)]
+            );
+            assert!(ctx.paths.registrar_client_retired().exists());
+
+            assert!(pause_before_finalize_notice(false, 0, recorded, &skip, &messages).is_none());
+            phase7_cleanup(&ctx, &RotationMode::Full, false, &messages).expect("cleanup");
+            assert!(
+                load_rotation_state(&ctx.state_dir, &messages)
+                    .expect("load")
+                    .is_none()
+            );
+        }
+    }
+
+    /// The pause notice names the phase the next run executes in both
+    /// places it names one, in every language: Phase 5 when `--skip
+    /// reissue` left Phase 4 recorded, Phase 6 once Phase 5 is recorded.
+    /// The whole notice is compared, so a fixed phase in either clause
+    /// cannot pass on the placeholder alone.
+    #[test]
+    fn pause_notice_names_the_phase_the_next_run_executes() {
+        let english = Messages::new("en").expect("English is supported");
+        let korean = Messages::new("ko").expect("Korean is supported");
+        let both = [RotateSkipPhase::Reissue, RotateSkipPhase::Finalize];
+        let finalize = [RotateSkipPhase::Finalize];
+
+        for (start_phase, recorded, skip, next) in [
+            (0, 4, &both[..], 5),
+            (3, 4, &both[..], 5),
+            (4, 4, &both[..], 5),
+            (0, 5, &finalize[..], 6),
+            (5, 5, &finalize[..], 6),
+        ] {
+            assert_eq!(
+                pause_before_finalize_notice(true, start_phase, recorded, skip, &english)
+                    .expect("paused"),
+                format!(
+                    "Rotation paused before Phase {next} (--skip finalize on a registrar \
+                     endpoint host). The rotation state and the retired registrar client pair \
+                     are kept; re-run `bootroot rotate ca-key --full` to resume at Phase {next}"
+                ),
+                "started at {start_phase}, recorded {recorded}"
+            );
+            assert_eq!(
+                pause_before_finalize_notice(true, start_phase, recorded, skip, &korean)
+                    .expect("paused"),
+                format!(
+                    "{next}단계 전에 교체를 일시 중지했습니다 (registrar 엔드포인트 호스트에서 \
+                     --skip finalize). 교체 상태와 이전 registrar 클라이언트 쌍을 보존합니다. \
+                     {next}단계부터 재개하려면 `bootroot rotate ca-key --full`을 다시 실행하세요"
+                ),
+                "started at {start_phase}, recorded {recorded}"
+            );
+        }
+    }
+
+    /// Only an endpoint host that skips finalization with Phase 6 still
+    /// ahead pauses; every other run goes on to Phase 7 without a notice.
+    #[test]
+    fn pause_notice_is_only_for_an_endpoint_host_skipping_finalize() {
+        let messages = test_messages();
+        let finalize = [RotateSkipPhase::Finalize];
+        assert!(pause_before_finalize_notice(false, 0, 5, &finalize, &messages).is_none());
+        assert!(
+            pause_before_finalize_notice(true, 0, 5, &[RotateSkipPhase::Reissue], &messages)
                 .is_none()
         );
+        assert!(pause_before_finalize_notice(true, 0, 6, &[], &messages).is_none());
+        assert!(pause_before_finalize_notice(true, 6, 6, &finalize, &messages).is_none());
     }
 
     /// Phase 3 must publish a bundle covering both CA generations: the

@@ -460,6 +460,7 @@ pub(crate) struct Strings {
     pub(crate) error_rotate_endpoint_before_dial_failed: &'static str,
     pub(crate) error_rotate_endpoint_retired_unusable: &'static str,
     pub(crate) warning_rotate_endpoint_refusal_unproven: &'static str,
+    pub(crate) error_rotate_endpoint_warning_write_failed: &'static str,
     pub(crate) error_rotate_endpoint_current_not_accepted: &'static str,
     pub(crate) error_rotate_endpoint_retired_still_accepted: &'static str,
     pub(crate) rotate_endpoint_pair_refused: &'static str,
