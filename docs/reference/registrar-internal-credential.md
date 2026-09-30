@@ -499,7 +499,10 @@ rotation must then be re-run as root. A failure after the `OpenBao` writes is
 reported rather than rolled back: the new value is already the source of
 truth, so re-running the rotation, or running
 `bootroot rotate registrar-internal-credential --force` to re-render the file
-from `OpenBao`, converges it.
+from `OpenBao`, converges it. `rotate responder-hmac` still hands the responder
+the new HMAC before it reports such a failure: the service agents are already
+converging on it, and the `--force` repair issues over ACME with the value it
+reads from `OpenBao`, which a responder left on the old one would refuse.
 
 **Every rotation that writes the config serializes on one lock.** Rotations can
 overlap — scheduled rotation units run on timers — and each writer is a

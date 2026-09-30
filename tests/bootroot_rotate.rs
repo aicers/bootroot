@@ -5870,8 +5870,9 @@ async fn test_rotate_responder_hmac_without_internal_config_is_unchanged() {
 
 /// A readable internal config the invoking user cannot republish — the
 /// config is root-owned in production — fails the rotation after its
-/// `OpenBao` writes, naming the file and both recoveries, and leaves the
-/// responder untouched so nothing claims the rotation finished.
+/// `OpenBao` writes, naming the file and both recoveries. The responder
+/// is still handed the new HMAC: `OpenBao` and the service agents are
+/// already on it, and the `--force` recovery issues against it.
 #[cfg(unix)]
 #[tokio::test]
 async fn test_rotate_responder_hmac_reports_an_internal_config_it_cannot_publish() {
@@ -5919,8 +5920,14 @@ async fn test_rotate_responder_hmac_reports_an_internal_config_it_cannot_publish
     let docker_log =
         fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
     assert!(
-        !docker_log.contains("restart"),
-        "the responder is not restarted past the failure: {docker_log}"
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC despite the failure: {docker_log}"
+    );
+    assert!(
+        !stdout.contains("responder config updated"),
+        "no summary claims the rotation finished: {stdout}"
     );
 }
 

@@ -77,14 +77,30 @@ pub(super) async fn rotate_responder_hmac(
     // registrar endpoint daemon is the exception: its config polls
     // nothing, so its `http_responder_hmac` is rewritten here and the
     // daemon is sent `SIGHUP`.
-    let internal_rewritten = match &internal_lock {
-        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await?,
-        None => false,
+    let internal_outcome = match &internal_lock {
+        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await,
+        None => Ok(false),
     };
 
-    let (responder_path, reloaded) =
-        hand_responder_the_hmac(ctx, &hmac, internal_lock.as_ref(), messages).await?;
+    // The responder is handed the HMAC even when the internal config
+    // could not be rewritten. `OpenBao` already carries the new value
+    // and every service agent is converging on it, and the recovery the
+    // failure names — `rotate registrar-internal-credential --force` —
+    // issues over ACME with the value it reads from `OpenBao`, so a
+    // responder left on the old one would fail that recovery too.
+    let responder_outcome =
+        hand_responder_the_hmac(ctx, &hmac, internal_lock.as_ref(), messages).await;
     drop(internal_lock);
+    let internal_rewritten = match (internal_outcome, &responder_outcome) {
+        (Ok(rewritten), _) => rewritten,
+        (Err(err), Ok(_)) => return Err(err),
+        (Err(err), Err(responder_err)) => {
+            return Err(err.context(format!(
+                "handing the responder the rotated HMAC failed as well: {responder_err:#}"
+            )));
+        }
+    };
+    let (responder_path, reloaded) = responder_outcome?;
 
     println!("{}", messages.rotate_summary_title());
     println!(
