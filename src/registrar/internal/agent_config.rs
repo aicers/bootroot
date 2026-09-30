@@ -427,22 +427,36 @@ pub fn upsert_internal_responder_hmac(contents: &str, hmac: &HmacSecret) -> Resu
     else {
         anyhow::bail!("`{ACME_SECTION}` must be a table");
     };
-    acme.insert(RESPONDER_HMAC_KEY, Item::Value(value));
+    // Replace the value in place where one is already there, carrying
+    // over its decor, so a comment trailing the old value (which
+    // `toml_edit` keeps in the value's suffix) survives the rotation.
+    match acme.get_mut(RESPONDER_HMAC_KEY) {
+        Some(Item::Value(existing)) => {
+            let decor = existing.decor().clone();
+            *existing = value;
+            *existing.decor_mut() = decor;
+        }
+        _ => {
+            acme.insert(RESPONDER_HMAC_KEY, Item::Value(value));
+        }
+    }
     Ok(doc.to_string())
 }
 
 /// Removes the `[eab]` table from an existing config.
 ///
 /// Returns `None` when the config carries no `eab` table, so the caller
-/// can leave the file untouched rather than rewrite it unchanged. Every
-/// other table and key is left as it was.
+/// can leave the file untouched rather than rewrite it unchanged. An
+/// `eab` key holding something other than a table is not an `[eab]`
+/// table either and is left alone. Every other table and key is left as
+/// it was.
 ///
 /// # Errors
 ///
 /// Returns an error when `contents` is not valid TOML.
 pub fn remove_internal_eab(contents: &str) -> Result<Option<String>> {
     let doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
-    if doc.get(EAB_SECTION).is_none() {
+    if !doc.get(EAB_SECTION).is_some_and(Item::is_table_like) {
         return Ok(None);
     }
     remove_sections(contents, &[EAB_SECTION]).map(Some)

@@ -485,7 +485,7 @@ that carries the config:
 | Rotation | What happens to the config |
 | --- | --- |
 | `rotate responder-hmac` | `[acme].http_responder_hmac` is set to the value written to `bootroot/responder/hmac`, after that write and every fan-out write and before `openbao-agent-responder` is restarted. |
-| `rotate eab-clear` | The `[eab]` table is removed, after the cleared EAB is written everywhere else. A file with no `[eab]` table is left byte for byte as it was, and not rewritten. Removing it keeps the file in agreement with `OpenBao`, from which a repair would rebuild it without `[eab]` anyway. |
+| `rotate eab-clear` | The `[eab]` table is removed, after the cleared EAB is written everywhere else. A file with no `[eab]` table — including one whose `eab` key holds something other than a table — is left byte for byte as it was, and not rewritten. Removing it keeps the file in agreement with `OpenBao`, from which a repair would rebuild it without `[eab]` anyway. |
 
 Both rewrite that one key in place and keep every other byte of the file — both
 operator tables and the `[trust]` pins included — publish it root-owned at
@@ -498,7 +498,8 @@ for a re-run as root — does not parse as TOML, or, for `rotate responder-hmac`
 has an `acme` that is not a table refuses the rotation, naming the file, with
 nothing written anywhere. `[acme]` is rewritten in whichever form the file
 spells it — a `[acme]` header, dotted `acme.` keys or an inline table — since
-the agent loads all three alike. A failure after the `OpenBao` writes is
+the agent loads all three alike, and only the value is replaced: a comment
+trailing the old HMAC stays where it was. A failure after the `OpenBao` writes is
 reported rather than rolled back: the new value is already the source of
 truth, so re-running the rotation, or running
 `bootroot rotate registrar-internal-credential --force` to re-render the file

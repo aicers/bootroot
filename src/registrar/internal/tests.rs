@@ -1125,6 +1125,38 @@ fn a_responder_hmac_upsert_refuses_an_acme_that_is_not_a_table() {
     }
 }
 
+/// The rewrite replaces the value and nothing around it: a comment
+/// trailing the old HMAC, and the spacing and quoting before it, stay
+/// where they were in every spelling of `acme`.
+#[test]
+fn a_responder_hmac_upsert_keeps_the_comment_on_the_value() {
+    let rotated = HmacSecret::from("new-hmac");
+    let encoded = crate::toml_util::toml_encode_string(rotated.expose());
+    for (before, expected) in [
+        (
+            "[acme]\nhttp_responder_hmac  =  'old-hmac'   # keep this note\nemail = \"a@b\"\n"
+                .to_string(),
+            format!(
+                "[acme]\nhttp_responder_hmac  =  {encoded}   # keep this note\nemail = \"a@b\"\n"
+            ),
+        ),
+        (
+            "acme.http_responder_hmac = 'old-hmac' # keep this note\n".to_string(),
+            format!("acme.http_responder_hmac = {encoded} # keep this note\n"),
+        ),
+        (
+            "acme = { http_responder_hmac = 'old-hmac' , email = \"a@b\" } # keep this note\n"
+                .to_string(),
+            format!(
+                "acme = {{ http_responder_hmac = {encoded} , email = \"a@b\" }} # keep this note\n"
+            ),
+        ),
+    ] {
+        let after = upsert_internal_responder_hmac(&before, &rotated).expect("upsert");
+        assert_eq!(after, expected, "only the value changed");
+    }
+}
+
 /// `rotate eab-clear` removes `[eab]` and nothing else, and on a config
 /// without one reports that there is nothing to do.
 #[test]
@@ -1165,6 +1197,31 @@ fn an_eab_removal_removes_only_the_eab_table() {
             .expect("an [eab] table"),
         after
     );
+}
+
+/// An `eab` key that is not a table is no `[eab]` table: there is
+/// nothing for `eab-clear` to remove, so the file is left as it is. An
+/// `eab` spelled as an inline table or dotted keys is still removed.
+#[test]
+fn an_eab_removal_leaves_a_non_table_eab_alone() {
+    for contents in ["eab = \"legacy\"\n", "eab = [\"kid\", \"hmac\"]\n"] {
+        assert!(
+            remove_internal_eab(contents).expect("parses").is_none(),
+            "{contents}"
+        );
+    }
+    for contents in [
+        "eab = { kid = \"kid-1\", hmac = \"hmac-1\" }\nemail = \"a@b\"\n",
+        "eab.kid = \"kid-1\"\neab.hmac = \"hmac-1\"\nemail = \"a@b\"\n",
+    ] {
+        assert_eq!(
+            remove_internal_eab(contents)
+                .expect("parses")
+                .expect("an eab table"),
+            "email = \"a@b\"\n",
+            "{contents}"
+        );
+    }
 }
 
 /// Neither edit writes anything over a file that is not TOML.
