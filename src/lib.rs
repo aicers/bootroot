@@ -39,7 +39,9 @@ pub use agent_args::Args;
 pub use daemon::{DaemonInvocation, DaemonShutdown};
 pub use daemon_messages::audit_store_reload_rejection_message;
 pub use registrar::RegistrarEndpoint;
-pub use registrar_certs::ensure_registrar_surface_certificates;
+pub use registrar_certs::{
+    ensure_registrar_surface_certificates, refresh_registrar_surface_after_reload,
+};
 
 /// Runs the agent daemon loop for all profiles.
 ///

@@ -97,6 +97,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-registrar-internal-e2e.sh`
 - `scripts/impl/run-registrar-internal-init-e2e.sh`
 - `scripts/impl/run-registrar-redteam.sh`
+- `scripts/impl/run-registrar-ca-rotation-e2e.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -128,6 +129,15 @@ request는 Docker matrix에서, 문서 전용 pull request는 집중 companion j
 실행하므로 모든 pull request가 정확히 하나의 이 게이트를 가집니다. 일반
 wire/리스너 왕복은 cargo 테스트에, 인증서 갱신과 갱신 중 AppRole 미사용 확인은
 예약된 endurance 스위트에 남습니다.
+
+`run-registrar-ca-rotation-e2e.sh`는 같은 종류의 배포를 띄우고 엔드포인트 pin
+파일에 배포 루트를 지정한 뒤, 실행 중인 엔드포인트 데몬을 상대로 전체
+`rotate ca-key`를 실행합니다. 먼저 `--skip finalize`로 실행해 Phase 6 전에
+멈추게 하고, 그 사이 확장된 pin 파일, 재발급된 두 표면 리프, 실제 연결이
+제시하는 체인을 확인합니다. 그 다음 다시 실행해 재개하고 끝냅니다. 회전 전에
+복사해 둔 클라이언트 쌍이 Phase 6 전까지는 수락되고 그 뒤에는 거부되는지,
+재발급된 쌍으로 mint가 완료되는지, pin 파일에 신규 루트만 남는지도
+확인합니다.
 
 내부 자격 증명 시나리오는 한 가지가 다릅니다. 컨테이너가 TLS를 제공합니다.
 `auth/cert`는 *클라이언트 인증서*를 인증하므로 그것을 제시할 핸드셰이크가

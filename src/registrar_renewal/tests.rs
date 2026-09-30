@@ -516,6 +516,109 @@ async fn a_leaf_that_cannot_be_observed_refuses_the_adapter() {
     );
 }
 
+/// A leaf a CA rotation's Phase 5 removed, and that the reload's issuance
+/// could not replace, does not stop the next invocation. The accessor
+/// lives on the activated endpoint, so the invocation a reload begins
+/// finds the lifetime the previous one observed, retains it against a
+/// failed attempt naming the path, and arms. The other leaf is re-seeded
+/// from disk as usual.
+#[tokio::test]
+async fn an_absent_leaf_on_a_reload_retains_the_earlier_lifetime() {
+    let harness = Harness::build();
+    let first = harness.renewal().await;
+    let pair = harness.pair(SurfaceLeaf::RegistrarClient);
+    let observed = first
+        .state()
+        .leaf(pair.leaf)
+        .expect("the first invocation observed the leaf");
+    drop(first);
+    std::fs::remove_file(&pair.cert_path).expect("remove the client leaf");
+    std::fs::remove_file(&pair.key_path).expect("remove the client key");
+
+    let reloaded = RegistrarCertRenewal::try_for_test(
+        Arc::clone(&harness.settings),
+        harness.plan.clone(),
+        Arc::clone(&harness.endpoint),
+        cadence(),
+    )
+    .await
+    .expect("an absent leaf with an earlier lifetime arms the adapter");
+
+    let state = reloaded.state();
+    assert_eq!(state.len(), 2, "both entries survive the reload");
+    let entry = state
+        .leaf(pair.leaf)
+        .expect("the absent leaf keeps its entry");
+    assert_eq!(
+        entry.not_after, observed.not_after,
+        "the lifetime the previous invocation observed is retained"
+    );
+    let RenewalAttempt::Failed { reason } = &entry.attempt else {
+        panic!("the absent leaf is recorded as a failed attempt: {entry:?}");
+    };
+    assert!(
+        reason.contains(&pair.cert_path.display().to_string()),
+        "the failure names the absent certificate: {reason}"
+    );
+    assert!(entry.attempted_at.is_some(), "a failure stamps its time");
+    assert_eq!(
+        state
+            .leaf(SurfaceLeaf::EndpointServer)
+            .expect("an entry")
+            .attempt,
+        RenewalAttempt::NeverAttempted,
+        "the present leaf is re-seeded from disk"
+    );
+    assert!(
+        crate::daemon::should_renew_certificate(
+            &pair.cert_path,
+            &harness.settings.trust,
+            cadence().renew_before,
+        )
+        .await
+        .expect("an absent certificate is decidable"),
+        "the adapter's first pass finds the absent leaf due"
+    );
+
+    // What that pass publishes lands at the absent paths and replaces
+    // the retained lifetime.
+    let material = harness.ca.material(&pair.name, -1, 60);
+    reloaded
+        .renew_leaf_with_material(&pair, material)
+        .await
+        .expect("a conforming candidate publishes into the absent paths");
+    let entry = state.leaf(pair.leaf).expect("the entry survives");
+    assert_eq!(entry.attempt, RenewalAttempt::Succeeded);
+    assert!(entry.not_after > observed.not_after);
+    assert!(pair.cert_path.exists() && pair.key_path.exists());
+}
+
+/// With no earlier invocation to retain a lifetime from, an absent leaf
+/// still refuses the adapter: a first start's issuance is fatal, so an
+/// absent leaf there is a file removed underneath the daemon.
+#[tokio::test]
+async fn an_absent_leaf_with_no_earlier_lifetime_refuses_the_adapter() {
+    let harness = Harness::build();
+    let pair = harness.pair(SurfaceLeaf::EndpointServer);
+    std::fs::remove_file(&pair.cert_path).expect("remove the server leaf");
+
+    let Err(error) = RegistrarCertRenewal::try_for_test(
+        Arc::clone(&harness.settings),
+        harness.plan.clone(),
+        Arc::clone(&harness.endpoint),
+        cadence(),
+    )
+    .await
+    else {
+        panic!("an absent leaf nothing observed must refuse the adapter");
+    };
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(&pair.cert_path.display().to_string()),
+        "the refusal names the absent certificate: {rendered}"
+    );
+}
+
 /// The accessor is empty until something initializes it, which is what a
 /// disabled endpoint leaves behind: no adapter is built, so no entry
 /// exists and nothing is ever asked of `OpenBao` or the CA.

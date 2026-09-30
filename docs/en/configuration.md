@@ -417,12 +417,21 @@ not yet valid or not CA-capable.
 
 Neither name can be minted through `bootroot service add`: both live in
 the reserved `bootroot-` namespace, which that command refuses. So the
-daemon mints them itself, once per process start, **before** it loads the
+daemon mints them itself, at every process start, **before** it loads the
 endpoint's TLS material and before it adopts the activated socket. It
 issues over the same outbound ACME path to the local step-ca that every
 other certificate goes through — never through the registrar endpoint,
 which is why a first start works with nothing yet listening — and writes
 each leaf and its key to its own configured pair of paths.
+
+The same issuance runs again at the start of every daemon invocation a
+`SIGHUP` reload begins, under the same rule: usable material is left
+alone, and absent or unusable material is re-issued. The reload then
+rebuilds the endpoint's whole TLS configuration from the files now on
+disk and swaps it in, with no restart and no socket rebind. A full
+`rotate ca-key` relies on this to move both leaves to the new CA. A
+reload whose issuance or rebuild fails is logged naming the path, and
+the endpoint keeps the configuration it was serving.
 
 Issuance runs under the **bootroot-internal privileged credential**, the
 root-owned client certificate the daemon already authenticates to OpenBao

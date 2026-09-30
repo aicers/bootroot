@@ -684,6 +684,31 @@ impl RegistrarEndpoint {
         }
     }
 
+    /// Rebuilds the active TLS configuration from the files on disk and
+    /// swaps it in, when this handle carries a listening socket.
+    ///
+    /// Does nothing on a handle without one, and on a target without the
+    /// endpoint. A failed build keeps the configuration already active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the setting and path at fault when the
+    /// replacement configuration cannot be built.
+    pub fn rebuild_active_tls(&self, settings: &crate::config::Settings) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(endpoint) = &self.inner {
+                endpoint::rebuild_active_tls(endpoint, settings)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = settings;
+            Ok(())
+        }
+    }
+
     /// Returns the adopted endpoint, for the daemon's accept task.
     #[cfg(target_os = "linux")]
     pub(crate) fn activated(&self) -> Option<std::sync::Arc<endpoint::ActivatedEndpoint>> {

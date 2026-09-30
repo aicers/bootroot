@@ -34,9 +34,14 @@
 //!
 //! # When
 //!
-//! Once per process start, before
+//! At the start of every daemon invocation, and only on a host where
+//! `registrar_endpoint.enabled` is true: once per process start, before
 //! [`crate::registrar::RegistrarEndpoint::activate`] loads the server
-//! pair, and only on a host where `registrar_endpoint.enabled` is true.
+//! pair, and again at the start of every invocation a `SIGHUP` reload
+//! begins, through [`refresh_registrar_surface_after_reload`]. A reload
+//! then rebuilds the endpoint's active TLS configuration from the files
+//! on disk, so material replaced here — or a `[trust]` pin set a CA
+//! rotation narrowed — is what the next handshake meets.
 //! A pair that is already **usable** is left exactly as it is: re-issuing
 //! it would churn a file the co-located registrar is reading and hand
 //! that process a new key on every restart. The two pairs are evaluated
@@ -534,6 +539,66 @@ pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Resul
         issue_surface_pair(settings, &pair, &plan.host, &inputs).await?;
     }
     Ok(())
+}
+
+/// Runs start-time issuance for an invocation a `SIGHUP` reload began,
+/// then rebuilds and swaps the endpoint's active TLS configuration.
+///
+/// The same issuance rule as a first start — usable material is left
+/// alone, absent or unusable material is re-issued under the publication
+/// lock — followed by the configuration exchange a reload needs and a
+/// first start does not: files re-issued on disk change nothing a client
+/// sees until an acceptor built from them is serving.
+///
+/// Never fatal. A failed issuance or a failed build is logged naming the
+/// path, and the invocation continues on the configuration it already
+/// has: taking the endpoint down over a reload would turn a recoverable
+/// fault into an outage. That includes a leaf left absent — what a CA
+/// rotation's Phase 5 leaves when this issuance fails. The renewal
+/// preparation of the invocation that follows retains the lifetime an
+/// earlier invocation observed for it rather than refusing to serve, and
+/// its first pass re-issues the leaf; a re-run of Phase 5 signals a
+/// daemon that is still there. A CA rotation does not rely on the log —
+/// it checks the live handshake itself.
+///
+/// Does nothing unless `registrar_endpoint.enabled` is true.
+pub async fn refresh_registrar_surface_after_reload(
+    settings: &Settings,
+    endpoint: &crate::registrar::RegistrarEndpoint,
+) {
+    refresh_after_reload_with(
+        settings,
+        endpoint,
+        ensure_registrar_surface_certificates(settings),
+    )
+    .await;
+}
+
+/// [`refresh_registrar_surface_after_reload`] with the issuance step
+/// injected, so a test can drive the reload against a local ACME fixture
+/// without an `OpenBao` transport.
+pub(crate) async fn refresh_after_reload_with<F>(
+    settings: &Settings,
+    endpoint: &crate::registrar::RegistrarEndpoint,
+    ensure: F,
+) where
+    F: Future<Output = Result<()>>,
+{
+    if !settings.registrar_endpoint.enabled {
+        return;
+    }
+    if let Err(err) = ensure.await {
+        tracing::error!(
+            "Registrar surface issuance on reload failed; the endpoint keeps the material it is \
+             serving: {err:#}"
+        );
+    }
+    if let Err(err) = endpoint.rebuild_active_tls(settings) {
+        tracing::error!(
+            "The registrar endpoint's TLS configuration could not be rebuilt on reload; the \
+             previous configuration stays active: {err:#}"
+        );
+    }
 }
 
 /// Renders the four configured material paths for a diagnostic, before

@@ -2198,6 +2198,70 @@ pins. An intermediate-only rotation touches none of it, and a host
 without the endpoint has none of it. See
 [the bootroot-internal registrar credential](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md).
 
+On the same host a full rotation also carries the registrar endpoint
+itself across, so the endpoint keeps answering pinned callers
+throughout:
+
+- Phase 0 reads `[registrar_endpoint] client_cert_path` from
+  `registrar-internal/agent.toml` and finds the endpoint pin file
+  `registrar-endpoint-anchors.sha256` beside it. It refuses the
+  rotation, before any backup or generation, when that key (or any of
+  the other three `[registrar_endpoint]` material paths) is unset, when
+  the pin file is absent or does not parse, or when the pin file names
+  none of the CA fingerprints the run can work from: the current root
+  or intermediate on a fresh rotation, the old ones on a rotation
+  resumed before Phase 3 is recorded, and the new ones from Phase 3 on.
+  A rotation never creates the pin file. On a fresh rotation Phase 0
+  also checks the current registrar client pair — the key matches the
+  leaf, the leaf is inside its validity window, and it verifies by
+  signature under the current intermediate and root — and preserves it
+  as `registrar-client-retired/` in the secrets directory, root-owned
+  `0700`, for Phase 6's proof. A pair that fails a check refuses the
+  rotation, naming the check.
+- Phase 3 adds the new root to the pin file when the old root is
+  pinned, and the new intermediate when the old intermediate is.
+  Existing lines, comments included, are kept in order.
+- Phase 5 removes the endpoint's server leaf and the registrar client
+  leaf — each one that does not already verify under the new CA — under
+  the publication lock, then signals the endpoint daemon once. The
+  daemon re-issues both on the reload and swaps its TLS configuration.
+  If that issuance fails, the daemon keeps serving its previous
+  configuration and its renewal loop retries the missing leaf, so a
+  re-run of `rotate ca-key --full` resumes at Phase 5 and signals it
+  again.
+  Phase 5 is recorded only once both leaves on disk and the chain a live
+  connection to the endpoint socket presents verify under the new
+  intermediate and root, and that connection, made with the re-issued
+  client pair, is accepted. Otherwise it fails within five minutes,
+  naming whether the material was not re-issued, the endpoint still
+  presents the old chain, the endpoint refuses the re-issued client
+  pair, or no endpoint answered. The rotation dials the socket
+  `registrar capabilities` reports, and must run as the endpoint
+  daemon's uid (root), because the endpoint refuses any other peer.
+- Phase 6 blocks without `--force` while either surface leaf is absent
+  or does not verify under the new intermediate and root by signature,
+  naming it by its `[registrar_endpoint]` key. Before narrowing the
+  trust it dials the endpoint with the retired client pair, which must
+  be accepted. After narrowing, it waits until the current client pair
+  is accepted and the retired pair is refused, and only then removes
+  the old root and intermediate from the pin file — never an old entry
+  whose new counterpart is missing. When the retired pair cannot be
+  used (absent on a resumed rotation, expired, or failing its checks),
+  Phase 6 fails unless `--force` is given; `--force` waives only that
+  refusal proof, with a warning, and the current-pair dial is still
+  required.
+- `--skip finalize` stops once Phase 5 is recorded instead of running
+  Phase 7: `rotation-state.json` and `registrar-client-retired/` are
+  kept and the pin file stays widened, and re-running
+  `rotate ca-key --full` resumes at Phase 6. With `--skip reissue` as
+  well, Phase 5 is never recorded: the run stops once Phase 4 is, and the
+  re-run resumes at Phase 5. A resumed run trusts only
+  the CA certificates now on disk — the new generation — for its own
+  OpenBao connection, so when the OpenBao listener's TLS certificate was
+  issued by this CA, re-issue it under the new CA with
+  `bootroot rotate infra-cert` before resuming. Phase 7 deletes
+  `registrar-client-retired/` whether or not `--cleanup` is given.
+
 Inputs:
 
 - `--full`: rotate both root and intermediate CA keys (default:
@@ -2207,6 +2271,10 @@ Inputs:
   `finalize` (Phase 6 — trust finalization)
 - `--force`: force Phase 6 even when un-migrated services remain
 - `--cleanup`: delete backup files on completion (Phase 7)
+- `--registrar-socket-unit <path>`: socket unit to read the registrar
+  endpoint's `ListenStream=` from, exactly as
+  `registrar capabilities --socket-unit` does. Used only by a full
+  rotation on a registrar endpoint host.
 
 #### `rotate openbao-recovery`
 

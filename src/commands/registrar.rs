@@ -216,6 +216,19 @@ pub(crate) fn run_registrar_capabilities(
     Ok(())
 }
 
+/// Returns the pathname the registrar endpoint is served on, exactly as
+/// `bootroot registrar capabilities` reports it: from `explicit_unit`
+/// when one is named, otherwise from the installed socket unit and its
+/// drop-ins, otherwise from the unit this build ships.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions `capabilities` does.
+pub(crate) fn endpoint_socket_path(explicit_unit: Option<&Path>) -> Result<PathBuf> {
+    let unit_dirs: Vec<PathBuf> = UNIT_DIRECTORIES.iter().map(PathBuf::from).collect();
+    resolve_socket_path(explicit_unit, &unit_dirs).map(PathBuf::from)
+}
+
 /// Builds the `capabilities` body against an explicit unit path or a
 /// unit-directory search list.
 ///

@@ -157,7 +157,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   material is in date starts having asked nothing of `OpenBao` or of the
   CA, and its certificates and keys survive the restart byte-identically.
   An already-expired leaf is repaired at start, before the endpoint's TLS
-  material loads, rather than at the first renewal tick. Both leaves are
+  material loads, rather than at the first renewal tick. The same
+  start-time issuance also runs on every `SIGHUP` reload, after which the
+  daemon rebuilds and swaps its active TLS configuration from the files
+  on disk, so re-issued material and narrowed trust take effect without a
+  restart. A leaf that reload leaves absent because its issuance failed
+  does not stop the daemon: it keeps serving its previous configuration
+  and the renewal loop re-issues the leaf. Both leaves are
   then kept valid on the daemon's own loop, under the cadence, lead time
   and retry settings of the bootroot-internal profile: a leaf is replaced
   when it falls inside lead time or stops chaining to `[trust]
@@ -169,10 +175,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   exchanges the whole active TLS configuration at once, so the next
   handshake presents the renewed leaf and accepts callers under the
   renewed trust anchors with no restart, no signal, no socket rebind and
-  no dropped connection. The endpoint pin file is never rewritten and
-  never gains a leaf fingerprint. A caller reloads per dial: it rereads
-  the pair every time and, because the two files are published by
-  separate renames, retries a momentarily mismatched pair up to five
+  no dropped connection. Renewal never rewrites the endpoint pin file; a
+  full `rotate ca-key` adds the new CA anchors to it and later removes the
+  old ones, re-issuing both surface leaves under the new CA in between,
+  and the file never gains a leaf fingerprint. A caller reloads per dial:
+  it rereads the pair every time and, because the two files are published
+  by separate renames, retries a momentarily mismatched pair up to five
   reads before failing rather than presenting it. A host that enables the
   endpoint but cannot arm that loop — no usable internal agent
   configuration, or a leaf on disk that no longer parses — now fails to

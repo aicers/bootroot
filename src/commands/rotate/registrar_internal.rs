@@ -3,18 +3,21 @@
 //! Three call sites drive this module, and each one does exactly one
 //! thing:
 //!
-//! - **Full-rotation Phase 3** publishes the additive trust set —
-//!   old root, old intermediate, new root, new intermediate — into the
-//!   dedicated private bundle and the internal config's pins, and
-//!   `SIGHUP`s the internal agent. It changes no entry, no leaf and no
-//!   stored fingerprint.
+//! - **Full-rotation Phase 3** writes the additive trust set — old
+//!   root, old intermediate, new root, new intermediate — into the
+//!   dedicated private bundle and the internal config's pins. It
+//!   changes no entry, no leaf and no stored fingerprint, and it does
+//!   not reload the internal agent: Phase 5 does, once the tail below
+//!   has made the credential it would load one the new root recognises.
 //! - **The mandatory tail after full-rotation Phase 4**, which runs
 //!   after step-ca restarts and before Phase 4 is recorded. It replaces
 //!   the `auth/cert` entry, the leaf material and the stored root
 //!   fingerprint under explicit root-token authority, while *keeping*
-//!   the Phase-3 additive trust set. `--skip reissue` cannot skip it,
-//!   and a failure retains the pre-Phase-4 state so a resume repeats
-//!   restart and repair.
+//!   the Phase-3 additive trust set. It leaves the reload to Phase 5,
+//!   which removes the endpoint's surface leaves and reloads the agent
+//!   once, or to Phase 5's skip when `--skip reissue` is given.
+//!   `--skip reissue` cannot skip the tail itself, and a failure retains
+//!   the pre-Phase-4 state so a resume repeats restart and repair.
 //! - **Full-rotation Phase 6** narrows the bundle and the pins to the
 //!   finalized new-root/new-intermediate pair — only after the existing
 //!   finalization checks pass, and before Phase 6 is recorded. Skipped
@@ -396,6 +399,24 @@ pub(super) struct InternalTrustState {
     pub(super) bundle_pem: String,
 }
 
+/// Whether a credential replacement reloads the internal daemon itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InternalReload {
+    /// Signal the daemon once the replacement is published.
+    Signal,
+    /// Leave the reload to a later step of the same run, which signals
+    /// the daemon itself.
+    ///
+    /// The tail after Phase 4 uses this when Phase 5 follows on an
+    /// endpoint host: Phase 5 removes the surface material and signals
+    /// the daemon, and a reload started here could still be running when
+    /// that removal lands. The invocation it starts would then read a
+    /// leaf that is no longer there when it arms renewal, and end the
+    /// daemon, leaving Phase 5's own signal nothing to reach. Phase 5's
+    /// one reload picks up the replaced credential as well.
+    Deferred,
+}
+
 /// Reports whether this host carries a bootroot-internal credential.
 ///
 /// A host without one — every host but a bootroot registrar host —
@@ -447,7 +468,8 @@ pub(super) async fn publish_internal_trust(
 ///
 /// Split from [`publish_internal_trust`] so the two halves are separable:
 /// the write is what a test can assert, and the signal is a `pkill` that
-/// has nothing to match in one.
+/// has nothing to match in one. Phase 3 calls it on its own, because a
+/// reload there would start an invocation that refuses to run.
 ///
 /// The bundle and the pins are **one** update. Each file publishes
 /// atomically on its own, but a Phase-3 or Phase-6 run that replaced one
@@ -465,7 +487,7 @@ pub(super) async fn publish_internal_trust(
 /// pair cannot be captured, or when either file cannot be published. In
 /// the last case the previous pair has been restored, or the failure to
 /// restore it is reported beside the failure that caused it.
-async fn write_internal_trust(
+pub(super) async fn write_internal_trust(
     secrets_dir: &Path,
     trust: &InternalTrustState,
     messages: &Messages,
@@ -572,16 +594,21 @@ pub(super) fn ensure_internal_trust_is(
 /// other non-root token is refused with a typed error rather than
 /// discovered half-way through by a 403.
 ///
+/// `reload` says whether the internal daemon is signalled once the
+/// replacement is published, or left for a later step to reload.
+///
 /// # Errors
 ///
 /// Returns an error when the token does not carry `root`, when the
 /// recorded `OpenBao` URL is plaintext, when the endpoint predicate is
-/// absent, when the ACME issuance fails, or when any file cannot be
-/// published.
+/// absent, when the ACME issuance fails, when any file cannot be
+/// published, or when a requested reload signal fails for a reason
+/// other than "no such process".
 pub(super) async fn repair_internal_credential(
     ctx: &RotateContext,
     client: &OpenBaoClient,
     trust: &InternalTrustState,
+    reload: InternalReload,
     messages: &Messages,
 ) -> Result<()> {
     require_root_authority(client).await?;
@@ -601,7 +628,7 @@ pub(super) async fn repair_internal_credential(
     // publication.
     let _lock = acquire_internal_config_lock(ctx.paths.secrets_dir()).await?;
     let context = repair_context(ctx, client, messages).await?;
-    replace_internal_credential(client, &context, &ctx.openbao_url, trust, messages).await
+    replace_internal_credential(client, &context, &ctx.openbao_url, trust, reload, messages).await
 }
 
 /// The body of a repair, past the two refusals.
@@ -621,6 +648,7 @@ async fn replace_internal_credential(
     context: &RegistrarInternalContext,
     openbao_url: &str,
     trust: &InternalTrustState,
+    reload: InternalReload,
     messages: &Messages,
 ) -> Result<()> {
     let inputs = context.inputs();
@@ -672,7 +700,10 @@ async fn replace_internal_credential(
         sweep_staging(&context.secrets_dir).await;
         return Err(err);
     }
-    signal_internal_registrar_agent(&context.secrets_dir, messages)
+    match reload {
+        InternalReload::Signal => signal_internal_registrar_agent(&context.secrets_dir, messages),
+        InternalReload::Deferred => Ok(()),
+    }
 }
 
 /// Rewrites the `auth/cert` entry to the active root, proves the staged
@@ -1149,7 +1180,7 @@ pub(super) async fn rotate_registrar_internal_credential(
     )?;
 
     let trust = trust_state_for_repair(ctx, messages).await?;
-    repair_internal_credential(ctx, client, &trust, messages).await?;
+    repair_internal_credential(ctx, client, &trust, InternalReload::Signal, messages).await?;
     println!("{}", messages.rotate_registrar_internal_complete());
     Ok(())
 }
@@ -1168,13 +1199,14 @@ mod tests {
 
     use super::{
         CERT_AUTH_MOUNT, CERT_AUTH_ROLE, INTERNAL_CONFIG_LOCK_FILE, InternalConfigChange,
-        InternalConfigCheck, InternalPaths, InternalTrustState, POLICY_BOOTROOT_REGISTRAR_INTERNAL,
-        PriorInternalAuth, RegistrarInternalContext, RotationMode, acquire_internal_config_lock,
-        apply_internal_config_change, check_internal_config_change, converge_internal_auth,
-        ensure_internal_trust_is, internal_credential_present, internal_rotation_applies,
-        publish_internal_config, repair_internal_credential, replace_internal_credential,
-        restore_cert_auth_entry, rewrite_internal_config, staging_dir, sweep_staging,
-        upsert_internal_trust, write_internal_trust, write_trust_pair,
+        InternalConfigCheck, InternalPaths, InternalReload, InternalTrustState,
+        POLICY_BOOTROOT_REGISTRAR_INTERNAL, PriorInternalAuth, RegistrarInternalContext,
+        RotationMode, acquire_internal_config_lock, apply_internal_config_change,
+        check_internal_config_change, converge_internal_auth, ensure_internal_trust_is,
+        internal_credential_present, internal_rotation_applies, publish_internal_config,
+        repair_internal_credential, replace_internal_credential, restore_cert_auth_entry,
+        rewrite_internal_config, staging_dir, sweep_staging, upsert_internal_trust,
+        write_internal_trust, write_trust_pair,
     };
     use crate::i18n::test_messages;
 
@@ -1486,6 +1518,7 @@ mod tests {
                 fingerprints: vec![ROOT_FP.to_string()],
                 bundle_pem: bundle_pem("Uk9PVA"),
             },
+            InternalReload::Signal,
             &test_messages(),
         )
         .await
@@ -1678,6 +1711,7 @@ mod tests {
                     fingerprints: vec![ROOT_FP.to_string()],
                     bundle_pem: bundle_pem("Uk9PVA"),
                 },
+                InternalReload::Signal,
                 &test_messages(),
             )
             .await
@@ -1837,6 +1871,7 @@ mod tests {
                 fingerprints: vec![ROOT_FP.to_string()],
                 bundle_pem: bundle_pem("Uk9PVA"),
             },
+            InternalReload::Signal,
             &test_messages(),
         )
         .await
@@ -2509,6 +2544,7 @@ mod tests {
                     fingerprints: vec![ROOT_FP.to_string()],
                     bundle_pem: bundle_pem("Uk9PVA"),
                 },
+                InternalReload::Signal,
                 &test_messages(),
             )
             .await

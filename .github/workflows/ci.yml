@@ -530,6 +530,10 @@ jobs:
             script: run-registrar-redteam.sh
             resolution: ""
             artifact: ci-registrar-redteam
+          - label: registrar-ca-rotation
+            script: run-registrar-ca-rotation-e2e.sh
+            resolution: ""
+            artifact: ci-registrar-ca-rotation
     steps:
       - uses: actions/checkout@v7
 
@@ -546,7 +550,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-redteam'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-redteam' && matrix.scenario.label != 'registrar-ca-rotation'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -781,6 +785,28 @@ jobs:
             [ -f "$ARTIFACT_DIR/cargo-test.log" ] && tail -n 200 "$ARTIFACT_DIR/cargo-test.log" || true
             [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+          cat "$ARTIFACT_DIR/wall-clock.json"
+
+      - name: Run E2E scenario (registrar CA rotation)
+        if: matrix.scenario.label == 'registrar-ca-rotation'
+        # A full CA rotation on a registrar endpoint host: the pin file,
+        # both surface leaves and the narrowed client trust have to move
+        # with the CA. Its own launcher contract, as registrar-redteam.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          mkdir -p "$ARTIFACT_DIR"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          BOOTROOT_PROJECT_DIR="$(pwd)" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-registrar-ca-rotation-e2e.sh || {
+            echo "registrar-ca-rotation failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && cat "$ARTIFACT_DIR/run.log" || true
+            for log in init rotate-skip-finalize rotate-infra-cert rotate-resume agent compose-logs; do
+              [ -f "$ARTIFACT_DIR/$log.log" ] && { echo "--- $log.log"; tail -n 200 "$ARTIFACT_DIR/$log.log"; } || true
+            done
             exit 1
           }
           cat "$ARTIFACT_DIR/wall-clock.json"

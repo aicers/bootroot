@@ -2104,6 +2104,63 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
 [bootroot 내부 registrar 자격증명](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md)을
 참고하세요.
 
+같은 호스트에서 전체 모드는 registrar 엔드포인트 자체도 함께 옮겨서,
+엔드포인트가 회전 내내 핀을 가진 호출자에게 계속 응답하도록 합니다.
+
+- Phase 0은 `registrar-internal/agent.toml`에서 `[registrar_endpoint]
+  client_cert_path`를 읽고 그 옆의 엔드포인트 pin 파일
+  `registrar-endpoint-anchors.sha256`을 찾습니다. 그 키(또는 나머지 세
+  `[registrar_endpoint]` 자료 경로)가 설정되지 않았거나, pin 파일이
+  없거나 해석되지 않거나, pin 파일이 이번 실행이 기준으로 삼을 수 있는
+  CA fingerprint를 하나도 담고 있지 않으면 백업이나 생성 전에 회전을
+  거부합니다. 기준 fingerprint는 새 회전에서는 현재 루트 또는 중간 CA,
+  Phase 3가 기록되기 전에 재개된 회전에서는 기존 것, Phase 3부터는 신규
+  것입니다. 회전은 pin 파일을 새로 만들지 않습니다. 새 회전에서 Phase
+  0은 현재 registrar 클라이언트 쌍도 점검하고(키가 리프와 짝이 맞는지,
+  리프가 유효 기간 안에 있는지, 현재 중간 CA와 루트 아래에서 서명
+  검증되는지) Phase 6의 증명을 위해 secrets 디렉터리의
+  `registrar-client-retired/`에 root 소유 `0700`으로 보존합니다. 점검을
+  통과하지 못한 쌍은 해당 점검을 명시하며 회전을 거부합니다.
+- Phase 3은 기존 루트가 pin 파일에 있으면 신규 루트를, 기존 중간 CA가
+  있으면 신규 중간 CA를 추가합니다. 주석을 포함한 기존 줄은 순서대로
+  유지됩니다.
+- Phase 5는 엔드포인트의 서버 리프와 registrar 클라이언트 리프 중 아직
+  새 CA 아래에서 검증되지 않는 것을 publication lock 아래에서 삭제한 뒤
+  엔드포인트 데몬에 시그널을 한 번 보냅니다. 데몬은 리로드 시 두 리프를
+  재발급하고 TLS 설정을 교체합니다. 이 발급이 실패하면 데몬은 이전 TLS
+  설정으로 계속 서비스하고 갱신 루프가 빠진 리프의 발급을 다시 시도하므로,
+  `rotate ca-key --full`을 다시 실행하면 Phase 5부터 재개하여 데몬에 다시
+  시그널을 보냅니다. Phase 5는 디스크의 두 리프와
+  엔드포인트 소켓에 대한 실제 연결이 제시하는 체인이 모두 신규 중간 CA와
+  루트 아래에서 검증되고, 재발급된 클라이언트 쌍으로 맺은 그 연결이
+  수락될 때에만 기록됩니다. 그렇지 않으면 5분 안에 실패하며, 자료가
+  재발급되지 않았는지, 엔드포인트가 아직 기존 체인을 제시하는지,
+  엔드포인트가 재발급된 클라이언트 쌍을 거부하는지, 응답한 엔드포인트가
+  없는지를 알려줍니다. 회전은 `registrar
+  capabilities`가 보고하는 소켓에 연결하며, 엔드포인트가 다른 peer를
+  거부하므로 엔드포인트 데몬과 같은 uid(root)로 실행해야 합니다.
+- Phase 6은 두 surface 리프 중 하나라도 없거나 신규 중간 CA와 루트
+  아래에서 서명 검증되지 않으면 `--force` 없이는 진행하지 않고, 해당
+  리프를 `[registrar_endpoint]` 키 이름으로 알려줍니다. trust를 축소하기
+  전에 보존된 이전 클라이언트 쌍으로 엔드포인트에 연결해 수락되는지
+  확인합니다. 축소한 뒤에는 현재 클라이언트 쌍이 수락되고 이전 쌍이
+  거부될 때까지 기다린 다음에야 pin 파일에서 기존 루트와 중간 CA를
+  제거하며, 신규 대응 항목이 없는 기존 항목은 절대 제거하지 않습니다.
+  이전 쌍을 쓸 수 없으면(재개된 회전에서 없거나, 만료되었거나, 점검을
+  통과하지 못하면) `--force` 없이는 Phase 6이 실패합니다. `--force`는
+  경고와 함께 거부 증명만 면제하며, 현재 쌍 연결 확인은 여전히
+  필요합니다.
+- `--skip finalize`는 Phase 7을 실행하지 않고 Phase 5가 기록되면
+  멈춥니다. `rotation-state.json`과 `registrar-client-retired/`는
+  보존되고 pin 파일은 확장된 상태로 남으며, `rotate ca-key --full`을
+  다시 실행하면 Phase 6부터 재개합니다. `--skip reissue`도 함께 주면
+  Phase 5는 기록되지 않으므로, Phase 4가 기록되면 멈추고 다시 실행하면
+  Phase 5부터 재개합니다. 재개된 실행은 자신의 OpenBao
+  연결에 지금 디스크에 있는 CA 인증서(신규 세대)만 신뢰하므로, OpenBao
+  리스너의 TLS 인증서를 이 CA가 발급했다면 재개하기 전에 `bootroot rotate
+  infra-cert`로 신규 CA 아래에서 다시 발급하세요. Phase 7은 `--cleanup`
+  여부와 관계없이 `registrar-client-retired/`를 삭제합니다.
+
 입력:
 
 - `--full`: 루트 + 중간 CA 키 모두 교체(기본: 중간 CA만)
@@ -2112,6 +2169,10 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
   `finalize`(Phase 6 — trust 확정)
 - `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
+- `--registrar-socket-unit <path>`: registrar 엔드포인트의
+  `ListenStream=`을 읽을 소켓 유닛. `registrar capabilities
+  --socket-unit`과 똑같이 동작하며, registrar 엔드포인트 호스트의 전체
+  모드에서만 사용합니다.
 
 #### `rotate openbao-recovery`
 

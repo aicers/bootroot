@@ -4,7 +4,7 @@ use bootroot::config::CliOverrides;
 use bootroot::{
     Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint,
     audit_store_reload_rejection_message, config, eab, ensure_registrar_surface_certificates,
-    profile, run_daemon, run_oneshot,
+    profile, refresh_registrar_surface_after_reload, run_daemon, run_oneshot,
 };
 use clap::Parser;
 #[cfg(unix)]
@@ -65,12 +65,23 @@ async fn main() -> anyhow::Result<()> {
     ensure_registrar_surface_certificates(&initial_settings).await?;
     let registrar_endpoint = RegistrarEndpoint::activate(&initial_settings)?;
     let mut pending = Some((initial_settings, initial_eab));
+    // The first invocation's issuance ran above, before activation. Every
+    // later one was begun by a reload and runs it here instead, then
+    // swaps the endpoint onto whatever is now on disk: a CA rotation
+    // removes the surface material and reloads this process to have it
+    // re-issued under the new generation, and narrows the `[trust]` pins
+    // the client verifier is built from.
+    let mut reloaded = false;
 
     loop {
         let (settings, final_eab) = match pending.take() {
             Some(value) => value,
             None => load_settings(&args).await?,
         };
+        if reloaded {
+            refresh_registrar_surface_after_reload(&settings, &registrar_endpoint).await;
+        }
+        reloaded = true;
         log_settings(&settings, final_eab.as_ref());
         let settings = Arc::new(settings);
         let shutdown = DaemonShutdown::new();

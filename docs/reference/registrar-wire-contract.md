@@ -720,7 +720,10 @@ configured path, formatted the way `material.expires_at` is. A successful
 renewal replaces it; a failed one leaves it in place, which is what makes a
 `failed` outcome beside a positive `remaining_seconds` the readable state it
 is — the leaf is still valid and the renewal that would have kept it that way
-is not working.
+is not working. A leaf found absent when a `SIGHUP` reload re-arms renewal — a
+full CA rotation removed it and the reload's issuance failed — keeps the
+`not_after` last observed in that process and reports `failed` until a renewal
+replaces it.
 
 `remaining_seconds` is **signed** and is the mathematical floor of the exact
 `not_after - now` difference over sub-second precision: `0` at the instant of

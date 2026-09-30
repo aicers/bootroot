@@ -9,11 +9,12 @@ use super::helpers::{
     confirm_action, ensure_file_exists, restart_compose_service, signal_bootroot_agent,
     try_restart_container,
 };
+use super::registrar_endpoint::{self, EndpointHost, RetiredOwner, SocketDialer, WaitBudget};
 use super::registrar_internal;
 use super::registrar_targets::{kv_fanout_targets, registrar_only_targets};
 use super::{
     INTERMEDIATE_CA_COMMON_NAME, ROOT_CA_COMMON_NAME, RotateContext, RotateOutcome,
-    STEP_CA_HELPER_IMAGE,
+    STEP_CA_HELPER_IMAGE, SURFACE_MOVE_TIMEOUT,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
 use crate::commands::compose_project::ComposeIdentity;
@@ -72,6 +73,7 @@ pub(super) async fn rotate_ca_key(
     };
 
     let mut start_phase: u8 = 0;
+    let mut resumed = false;
     let mut rot_state = if let Some(state) = load_rotation_state(&ctx.state_dir, messages)? {
         if state.mode != expected_mode {
             let mode_str = if state.mode == RotationMode::Full {
@@ -86,6 +88,7 @@ pub(super) async fn rotate_ca_key(
             messages.rotate_ca_key_resuming(&state.phase.to_string())
         );
         start_phase = state.phase;
+        resumed = true;
         state
     } else {
         if ctx.paths.intermediate_cert_bak().exists() || ctx.paths.intermediate_key_bak().exists() {
@@ -111,6 +114,21 @@ pub(super) async fn rotate_ca_key(
             new_intermediate_fp: String::new(),
             phase: 0,
         }
+    };
+
+    // Phase 0, on a registrar endpoint host: the endpoint pin file has
+    // to be one the rotation can work from, and the registrar client pair
+    // of the generation being retired has to be secured before anything
+    // can replace it — Phase 6 proves the narrowed trust took effect by
+    // showing the endpoint stops accepting exactly that pair. Both come
+    // before any backup or generation, so a refusal leaves nothing done.
+    let endpoint_host = if registrar_internal::internal_rotation_applies(
+        &rot_state.mode,
+        ctx.paths.secrets_dir(),
+    ) {
+        Some(endpoint_phase0(ctx, &rot_state, resumed, messages).await?)
+    } else {
+        None
     };
 
     // Converge secrets ownership before reading or rewriting any key
@@ -243,9 +261,18 @@ pub(super) async fn rotate_ca_key(
         // entry trusts the *root*, which an intermediate-only rotation
         // does not replace, so nothing internal changes there. The
         // bundle and the config's pins take exactly the additive set
-        // published to KV above, then the internal agent is reloaded.
+        // published to KV above.
+        //
+        // Written, not published: the internal agent is deliberately
+        // not reloaded here. Phase 2a already put the new root on disk,
+        // and the credential still records the old one until the tail
+        // after Phase 4 replaces it, so an invocation a reload starts in
+        // between refuses the credential and ends the endpoint daemon.
+        // Nothing the daemon does before that tail needs the widened
+        // set, and Phase 5 reloads it once the tail has made the
+        // credential match.
         if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
-            registrar_internal::publish_internal_trust(
+            registrar_internal::write_internal_trust(
                 ctx.paths.secrets_dir(),
                 &registrar_internal::InternalTrustState {
                     fingerprints: transitional_fps.clone(),
@@ -254,6 +281,19 @@ pub(super) async fn rotate_ca_key(
                 messages,
             )
             .await?;
+            // In the same step, before Phase 3 is recorded: every pinned
+            // old anchor gains its new counterpart, so a server leaf
+            // issued under the new root from Phase 4 on is one both the
+            // registrar client and the daemon's renewal accept. A resumed
+            // Phase 3 finds them present and changes nothing.
+            if let Some(host) = &endpoint_host {
+                registrar_endpoint::widen_pin_file(
+                    &host.pin_file,
+                    &registrar_endpoint::anchor_succession(&rot_state),
+                    messages,
+                )
+                .await?;
+            }
         }
 
         rot_state.phase = 3;
@@ -287,6 +327,12 @@ pub(super) async fn rotate_ca_key(
             // the Phase-1 backups are what carry the old one — the same
             // sources Phase 3 concatenated.
             let bundle_pem = concat_unique_ca_certs_for_repair(ctx, messages).await?;
+            // Not reloaded here. Phase 5 moves the endpoint's surface
+            // leaves, and its one reload also picks up this credential;
+            // a second one sent here could still be running when Phase 5
+            // removes the leaves, and end the daemon. Where Phase 5 is
+            // skipped, its skip branch below sends that reload instead,
+            // so a resume that skips it still reaches the daemon.
             registrar_internal::repair_internal_credential(
                 ctx,
                 client,
@@ -294,6 +340,7 @@ pub(super) async fn rotate_ca_key(
                     fingerprints: transitional_fps,
                     bundle_pem,
                 },
+                registrar_internal::InternalReload::Deferred,
                 messages,
             )
             .await?;
@@ -381,10 +428,40 @@ pub(super) async fn rotate_ca_key(
             messages,
         );
 
+        // The endpoint's two surface leaves are in no `state.json` entry,
+        // so the loop above never reaches them. They are moved here, after
+        // the listing above could still abort with nothing done, and
+        // Phase 5 is recorded only once the endpoint is proven to serve
+        // the new generation.
+        if let Some(host) = &endpoint_host {
+            let new_generation = registrar_endpoint::CaGeneration::load(
+                &ctx.paths.root_cert(),
+                &ctx.paths.intermediate_cert(),
+                messages,
+            )?;
+            let dialer = endpoint_dialer(host, args)?;
+            let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
+            registrar_endpoint::move_surface_leaves(
+                host,
+                &new_generation,
+                &dialer,
+                || super::helpers::signal_internal_registrar_agent(&secrets_dir, messages),
+                surface_wait_budget(),
+                messages,
+            )
+            .await?;
+        }
+
         rot_state.phase = 5;
         update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else if start_phase < 5 {
         println!("{}", messages.rotate_ca_key_phase_skipped("5"));
+        // The tail after Phase 4 left the reload that loads the replaced
+        // credential to Phase 5. With Phase 5 skipped, it is sent here,
+        // with no surface material removed for it to race.
+        if endpoint_host.is_some() {
+            super::helpers::signal_internal_registrar_agent(ctx.paths.secrets_dir(), messages)?;
+        }
     }
 
     // Phase 6 — Finalize trust (subtractive)
@@ -402,6 +479,20 @@ pub(super) async fn rotate_ca_key(
                 Ok(true) => {}
                 _ => unmigrated.push(entry.registration_id.clone()),
             }
+        }
+        // The two surface leaves are held to a signature check rather than
+        // the issuer-name comparison above: the new intermediate carries
+        // the old one's name, so an old leaf would pass that comparison.
+        if let Some(host) = &endpoint_host {
+            let new_generation = registrar_endpoint::CaGeneration::load(
+                &ctx.paths.root_cert(),
+                &ctx.paths.intermediate_cert(),
+                messages,
+            )?;
+            unmigrated.extend(registrar_endpoint::unmigrated_surface_leaves(
+                host,
+                &new_generation,
+            ));
         }
 
         if !unmigrated.is_empty() {
@@ -422,6 +513,15 @@ pub(super) async fn rotate_ca_key(
                 )?;
             }
         }
+
+        // Decided before any trust is narrowed, so a failure here leaves
+        // the KV trust, the internal trust and the pin file untouched.
+        let endpoint_proof = match &endpoint_host {
+            Some(host) => {
+                Some(endpoint_phase6_before(ctx, host, &rot_state, args, messages).await?)
+            }
+            None => None,
+        };
 
         let final_fps = vec![
             rot_state.new_root_fp.clone(),
@@ -470,23 +570,50 @@ pub(super) async fn rotate_ca_key(
             .await?;
         }
 
+        // `publish_internal_trust` signalled the daemon and returned
+        // without waiting. Nothing leaves the pin file until the endpoint
+        // is proven to accept the current pair and — unless `--force`
+        // waived it — to refuse the retired one; then the old anchors go,
+        // before Phase 6 is recorded.
+        if let (Some(host), Some((dialer, proof))) = (&endpoint_host, &endpoint_proof) {
+            registrar_endpoint::finish_narrowing(
+                host,
+                dialer,
+                proof,
+                &registrar_endpoint::anchor_succession(&rot_state),
+                surface_wait_budget(),
+                messages,
+            )
+            .await?;
+        }
+
         rot_state.phase = 6;
         update_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
     } else if start_phase < 6 {
         println!("{}", messages.rotate_ca_key_phase_skipped("6"));
     }
 
-    // Phase 7 — Cleanup
-    println!("{}", messages.rotate_ca_key_phase_cleanup());
-    if args.cleanup {
-        let _ = fs::remove_file(ctx.paths.intermediate_cert_bak());
-        let _ = fs::remove_file(ctx.paths.intermediate_key_bak());
-        if rot_state.mode == RotationMode::Full {
-            let _ = fs::remove_file(ctx.paths.root_cert_bak());
-            let _ = fs::remove_file(ctx.paths.root_key_bak());
-        }
+    // On a registrar endpoint host, skipping finalization defers Phase 6
+    // rather than abandoning it. Narrowing the trust and the pin file later
+    // needs the recorded generations and the retired client pair, and
+    // Phase 7 would delete both — making the widened trust permanent and
+    // turning the next `rotate ca-key` into a new rotation.
+    if registrar_endpoint::pauses_before_finalize(
+        endpoint_host.is_some(),
+        start_phase,
+        args.skip.contains(&RotateSkipPhase::Finalize),
+    ) {
+        // Phase 6 is next unless `--skip reissue` also left Phase 5 unrecorded.
+        let resume_at = (rot_state.phase + 1).to_string();
+        println!(
+            "{}",
+            messages.rotate_ca_key_paused_before_finalize(&resume_at)
+        );
+        return Ok(());
     }
-    delete_rotation_state(&ctx.state_dir, messages)?;
+
+    // Phase 7 — Cleanup
+    phase7_cleanup(ctx, &rot_state.mode, args.cleanup, messages)?;
 
     if rot_state.mode == RotationMode::Full {
         println!(
@@ -509,6 +636,110 @@ pub(super) async fn rotate_ca_key(
     }
 
     Ok(())
+}
+
+/// Phase 7: removes the retired registrar client pair, the backups when
+/// `cleanup` asks for it, and the rotation state.
+///
+/// The retired pair goes whether or not `cleanup` is given: it holds the
+/// private key of an identity that has been replaced. On every host but a
+/// registrar endpoint host it is absent and nothing is removed.
+fn phase7_cleanup(
+    ctx: &RotateContext,
+    mode: &RotationMode,
+    cleanup: bool,
+    messages: &Messages,
+) -> Result<()> {
+    println!("{}", messages.rotate_ca_key_phase_cleanup());
+    registrar_endpoint::sweep_retired_staging(&ctx.paths, messages)?;
+    registrar_endpoint::remove_retired_pair(&ctx.paths, messages)?;
+    if cleanup {
+        let _ = fs::remove_file(ctx.paths.intermediate_cert_bak());
+        let _ = fs::remove_file(ctx.paths.intermediate_key_bak());
+        if *mode == RotationMode::Full {
+            let _ = fs::remove_file(ctx.paths.root_cert_bak());
+            let _ = fs::remove_file(ctx.paths.root_key_bak());
+        }
+    }
+    delete_rotation_state(&ctx.state_dir, messages)
+}
+
+/// Phase 0 on a registrar endpoint host.
+///
+/// Reads the endpoint's paths from the internal config, holds the pin
+/// file to the fingerprints this run can work from, clears a staging
+/// directory an interrupted copy left behind, and — on a fresh rotation
+/// only — checks and preserves the current registrar client pair. A
+/// resumed rotation never re-copies it: the current pair may already be
+/// the new generation.
+async fn endpoint_phase0(
+    ctx: &RotateContext,
+    state: &RotationState,
+    resumed: bool,
+    messages: &Messages,
+) -> Result<EndpointHost> {
+    let secrets_dir = ctx.paths.secrets_dir();
+    let host = EndpointHost::resolve(secrets_dir, messages)?;
+    let accepted = registrar_endpoint::phase0_accepted_fingerprints(
+        resumed.then_some(state),
+        &state.old_root_fp,
+        &state.old_intermediate_fp,
+    );
+    registrar_endpoint::check_pin_file(&host.pin_file, &accepted, messages)?;
+    registrar_endpoint::sweep_retired_staging(&ctx.paths, messages)?;
+    if !resumed {
+        let current = registrar_endpoint::CaGeneration::load(
+            &ctx.paths.root_cert(),
+            &ctx.paths.intermediate_cert(),
+            messages,
+        )?;
+        registrar_endpoint::preserve_retired_pair(
+            &host.client,
+            &ctx.paths,
+            &current,
+            RetiredOwner::root(),
+            messages,
+        )
+        .await?;
+    }
+    Ok(host)
+}
+
+/// The part of Phase 6 that runs before any trust is narrowed on a
+/// registrar endpoint host: the retired pair's local checks and, while
+/// the internal pins still include the old generation, the dial that
+/// shows the transitional trust still accepts it.
+async fn endpoint_phase6_before(
+    ctx: &RotateContext,
+    host: &EndpointHost,
+    state: &RotationState,
+    args: &RotateCaKeyArgs,
+    messages: &Messages,
+) -> Result<(SocketDialer, registrar_endpoint::RefusalProof)> {
+    let retired = registrar_endpoint::assess_recorded_retired_pair(&ctx.paths, state, messages);
+    let narrowed =
+        registrar_endpoint::internal_trust_narrowed(ctx.paths.secrets_dir(), state, messages)?;
+    let dialer = endpoint_dialer(host, args)?;
+    let proof =
+        registrar_endpoint::prepare_refusal_proof(&dialer, retired, narrowed, args.force, messages)
+            .await?;
+    Ok((dialer, proof))
+}
+
+/// The dialer every Phase 5 and Phase 6 check reaches the endpoint with,
+/// on the socket `registrar capabilities` reports.
+fn endpoint_dialer(host: &EndpointHost, args: &RotateCaKeyArgs) -> Result<SocketDialer> {
+    let socket_path =
+        crate::commands::registrar::endpoint_socket_path(args.registrar_socket_unit.as_deref())?;
+    Ok(SocketDialer::new(host, socket_path))
+}
+
+/// The bounded wait Phase 5 and Phase 6 both use.
+fn surface_wait_budget() -> WaitBudget {
+    WaitBudget {
+        timeout: SURFACE_MOVE_TIMEOUT,
+        poll: registrar_endpoint::SURFACE_POLL_INTERVAL,
+    }
 }
 
 /// The additive PEM bundle a repair republishes mid-rotation.
@@ -1379,6 +1610,91 @@ mod tests {
                 "{locale} left a placeholder: {warning}"
             );
         }
+    }
+
+    /// Phase 7 removes the retired registrar client pair and the rotation
+    /// state whether or not `--cleanup` is given, and a leftover staging
+    /// directory with them.
+    #[test]
+    fn phase7_removes_the_retired_pair_and_the_state_without_cleanup() {
+        let dir = tempdir().expect("tempdir");
+        let ctx = ctx_for_instance(dir.path(), "insight");
+        let messages = test_messages();
+        for retired in [
+            ctx.paths.registrar_client_retired(),
+            ctx.paths.registrar_client_retired_staging(),
+        ] {
+            fs::create_dir_all(&retired).expect("retired dir");
+            fs::write(retired.join("client.key"), "key").expect("key");
+        }
+        let state = RotationState {
+            mode: RotationMode::Full,
+            started_at: String::new(),
+            old_root_fp: String::new(),
+            new_root_fp: String::new(),
+            old_intermediate_fp: String::new(),
+            new_intermediate_fp: String::new(),
+            phase: 6,
+        };
+        fs::write(
+            crate::commands::trust::rotation_state_path(&ctx.state_dir),
+            serde_json::to_string(&state).expect("json"),
+        )
+        .expect("state");
+
+        phase7_cleanup(&ctx, &RotationMode::Full, false, &messages).expect("cleanup");
+
+        assert!(!ctx.paths.registrar_client_retired().exists());
+        assert!(!ctx.paths.registrar_client_retired_staging().exists());
+        assert!(
+            load_rotation_state(&ctx.state_dir, &messages)
+                .expect("load")
+                .is_none()
+        );
+    }
+
+    /// `--skip finalize` on an endpoint host stops before Phase 7, so the
+    /// state it keeps is what the next run resumes from: Phase 5 is
+    /// recorded, and the next run starts at Phase 6 holding the pin file to
+    /// the new generation. A host without the internal credential goes on
+    /// to Phase 7, which deletes the state, as it always has.
+    #[tokio::test]
+    async fn skip_finalize_on_an_endpoint_host_keeps_what_phase6_needs() {
+        let dir = tempdir().expect("tempdir");
+        let ctx = ctx_for_instance(dir.path(), "insight");
+        let messages = test_messages();
+        let state = RotationState {
+            mode: RotationMode::Full,
+            started_at: String::new(),
+            old_root_fp: "a".repeat(64),
+            new_root_fp: "b".repeat(64),
+            old_intermediate_fp: "c".repeat(64),
+            new_intermediate_fp: "d".repeat(64),
+            phase: 5,
+        };
+        create_rotation_state_async(&ctx.state_dir, &state, &messages)
+            .await
+            .expect("state");
+        fs::create_dir_all(ctx.paths.registrar_client_retired()).expect("retired");
+
+        assert!(registrar_endpoint::pauses_before_finalize(true, 5, true));
+        let resumed = load_rotation_state(&ctx.state_dir, &messages)
+            .expect("load")
+            .expect("kept");
+        assert_eq!(resumed.phase, 5, "the next run starts at Phase 6");
+        assert_eq!(
+            registrar_endpoint::phase0_accepted_fingerprints(Some(&resumed), "", ""),
+            ["b".repeat(64), "d".repeat(64)]
+        );
+        assert!(ctx.paths.registrar_client_retired().exists());
+
+        assert!(!registrar_endpoint::pauses_before_finalize(false, 5, true));
+        phase7_cleanup(&ctx, &RotationMode::Full, false, &messages).expect("cleanup");
+        assert!(
+            load_rotation_state(&ctx.state_dir, &messages)
+                .expect("load")
+                .is_none()
+        );
     }
 
     /// Phase 3 must publish a bundle covering both CA generations: the
