@@ -684,8 +684,12 @@ binding delete — and returns `Done`, carried on bootroot's wire as
 generation it names is gone, and the identity now bound is a newer one's. A
 key equal to the stored one proceeds as above, and so does a binding with no
 stored key (one written before the guard existed). `Register` records its key
-on the binding before any convergence, seeding or issuance, and a refused
-`Register` records nothing. Keys are opaque and compared byte for byte. Every
+on the binding before any convergence, seeding or issuance. A `Register`
+refused before that write — on a host collision, a stored-spec conflict, the
+safe-set check, or exhausted claim attempts — leaves the stored key unchanged;
+one refused after it, say on a failed convergence or issuance, leaves its own
+key recorded, because the teardown a manager will drive for it already carries
+that key. Keys are opaque and compared byte for byte. Every
 write and comparison of the key happens under the per-`registration_id` mutex,
 which is a process lock: the guarantee holds while exactly one registrar
 process serves a deployment and no other code writes a binding, and the
