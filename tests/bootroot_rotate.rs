@@ -3135,6 +3135,205 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
     );
 }
 
+/// Common name every `rotate ca-key` gives the intermediate it generates.
+const ROTATED_INTERMEDIATE_CN: &str = "Bootroot Intermediate CA";
+
+/// Arranges a second rotation: the service's leaf was signed by a previous
+/// generation's intermediate, and the intermediate this rotation generates
+/// carries the same subject DN under a fresh key. Writes the service's
+/// cert and key and returns the staged new intermediate for the fake
+/// docker to install.
+fn stage_same_name_intermediate_rotation(root: &Path) -> PathBuf {
+    use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
+
+    let ca_params = || {
+        let mut params = CertificateParams::new(vec![ROTATED_INTERMEDIATE_CN.to_string()])
+            .expect("intermediate params");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, ROTATED_INTERMEDIATE_CN);
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+    };
+    let old_issuer = Issuer::new(ca_params(), KeyPair::generate().expect("old key"));
+    let new_key = KeyPair::generate().expect("new key");
+    let new_inter = ca_params()
+        .self_signed(&new_key)
+        .expect("self-signed new intermediate");
+
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let mut leaf_params =
+        CertificateParams::new(vec!["edge-proxy.trusted.domain".to_string()]).expect("leaf");
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "edge-proxy.trusted.domain");
+    let leaf = leaf_params
+        .signed_by(&leaf_key, &old_issuer)
+        .expect("sign leaf with old intermediate");
+
+    let certs_dir = root.join("certs");
+    fs::create_dir_all(&certs_dir).expect("create certs dir");
+    fs::write(certs_dir.join("edge-proxy.crt"), leaf.pem()).expect("write service cert");
+    fs::write(certs_dir.join("edge-proxy.key"), leaf_key.serialize_pem())
+        .expect("write service key");
+
+    let staged = root.join("new_intermediate_staged.crt");
+    fs::write(&staged, new_inter.pem()).expect("write staged intermediate");
+    staged
+}
+
+/// Runs `rotate ca-key` over the arrangement from
+/// [`stage_same_name_intermediate_rotation`] with the given extra
+/// `ca-key` arguments, returning its output and the fake `pkill` log.
+async fn run_same_name_intermediate_rotation(
+    root: &Path,
+    extra_args: &[&str],
+) -> (std::process::Output, PathBuf) {
+    let openbao = MockServer::start().await;
+
+    support::create_secrets_dir(root).expect("create secrets dir");
+    support::write_password_file(&root.join("secrets"), "test-password").expect("write password");
+    prepare_app_state(root, &openbao.uri(), "local-file").expect("prepare state");
+    fs::write(
+        root.join("docker-compose.yml"),
+        "version: '3'\nservices:\n  step-ca:\n    image: test\n",
+    )
+    .expect("write compose file");
+
+    let staged = stage_same_name_intermediate_rotation(root);
+    let inter_cert_path = root
+        .join("secrets")
+        .join("certs")
+        .join("intermediate_ca.crt");
+
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = root.join("docker.log");
+    write_full_rotation_fake_docker(&bin_dir, &docker_log, &staged);
+    let pkill_log = root.join("pkill.log");
+    write_fake_pkill(&bin_dir, &pkill_log).expect("write fake pkill");
+    let path_var = env::var("PATH").unwrap_or_default();
+    let combined_path = format!("{}:{path_var}", bin_dir.display());
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/ca"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/secret/data/bootroot/services/{SERVICE_NAME}/trust"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&openbao)
+        .await;
+
+    let mut args = vec![
+        "rotate",
+        "--openbao-url",
+        &openbao.uri(),
+        "--root-token",
+        support::ROOT_TOKEN,
+        "--yes",
+        "ca-key",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(&args)
+        .env("PATH", &combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
+        .env("PKILL_OUTPUT", &pkill_log)
+        .env("ROTATION_NEW_CERT_TARGET", &inter_cert_path)
+        .output()
+        .expect("run rotate ca-key");
+    (output, pkill_log)
+}
+
+/// From a deployment's second rotation on, the new intermediate carries
+/// the old one's subject DN. Phase 6 must still see a leaf the old key
+/// signed as unmigrated and refuse to narrow trust without `--force`.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_finalize_blocks_same_name_intermediate_leaf() {
+    let temp_dir = tempdir().expect("create temp dir");
+
+    let (output, _pkill_log) =
+        run_same_name_intermediate_rotation(temp_dir.path(), &["--skip", "reissue"]).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "finalization must be blocked; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Cannot finalize") && stderr.contains(SERVICE_NAME),
+        "Phase 6 must name the unmigrated service: {stderr}"
+    );
+    assert!(
+        temp_dir
+            .path()
+            .join("certs")
+            .join("edge-proxy.crt")
+            .exists(),
+        "Phase 5 was skipped, so the old leaf must still be in place"
+    );
+}
+
+/// Phase 5 over the same arrangement re-issues the service instead of
+/// reporting it as already migrated. Finalization is skipped because the
+/// fake `pkill` issues no replacement leaf for Phase 6 to find.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_ca_key_reissues_same_name_intermediate_leaf() {
+    let temp_dir = tempdir().expect("create temp dir");
+
+    let (output, pkill_log) =
+        run_same_name_intermediate_rotation(temp_dir.path(), &["--skip", "finalize"]).await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rotation with finalize skipped should succeed; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("already issued by new intermediate"),
+        "the service must not be reported as already migrated: {stdout}"
+    );
+    assert!(
+        !temp_dir
+            .path()
+            .join("certs")
+            .join("edge-proxy.crt")
+            .exists(),
+        "Phase 5 must remove the service cert"
+    );
+    assert!(
+        !temp_dir
+            .path()
+            .join("certs")
+            .join("edge-proxy.key")
+            .exists(),
+        "Phase 5 must remove the service key"
+    );
+    let pkill = fs::read_to_string(&pkill_log).expect("read pkill log");
+    assert!(
+        pkill.contains("-HUP") && pkill.contains("agent.toml"),
+        "Phase 5 must signal the service's agent: {pkill}"
+    );
+}
+
 #[tokio::test]
 async fn test_rotate_trust_sync_blocked_by_rotation_state() {
     let temp_dir = tempdir().expect("create temp dir");

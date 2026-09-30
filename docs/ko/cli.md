@@ -2077,7 +2077,13 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
   경우 버전 관리된 재발급 요청을 OpenBao KV에 기록하며, 원격 agent가
   fast-poll 주기에 이를 처리합니다(`rotate force-reissue` 참고).
   모든 registrar 관리 identity도 동일한 KV 재발급 요청을 받습니다.
-  회전은 이 요청들의 완료를 기다리지 않습니다
+  회전은 이 요청들의 완료를 기다리지 않습니다.
+  서비스 인증서가 새 중간 CA를 발급자로 명시하고 *동시에* 그 중간 CA의
+  키로 서명된 경우에만 이미 이전된 것으로 보고 건너뜁니다. 이름만으로는
+  판단하지 않습니다: 모든 회전이 중간 CA를 같은 이름으로 만들기 때문에
+  이전 세대의 인증서도 같은 이름을 발급자로 명시합니다. 새 중간 CA로
+  서명되지 않은 인증서를 가진 서비스는 여기서 재발급되며, 재발급될
+  때까지 Phase 6을 막습니다
 - Phase 6 — trust 확정: 최종 trust(신규 fingerprint만)를 OpenBao
   (`bootroot/ca`, 모든 `state.json` 서비스, 모든 registrar 관리
   identity)에 기록해 기존 fingerprint를 제거한 뒤, 인프라 OpenBao Agent
@@ -2167,7 +2173,9 @@ Phase 3과 Phase 6도 해당 자격증명의 전용 trust 번들과 핀을 각�
 - `--skip <phase,...>`: 선택 단계 건너뛰기(쉼표 구분).
   값: `reissue`(Phase 5 — 서비스 인증서 재발급),
   `finalize`(Phase 6 — trust 확정)
-- `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행
+- `--force`: 미이전 서비스가 있어도 Phase 6 강제 실행. 미이전 서비스는
+  인증서가 새 중간 CA를 발급자로 명시하지 않거나 그 중간 CA의 키로
+  서명되지 않은 서비스입니다
 - `--cleanup`: 완료 시 백업 파일 삭제(Phase 7)
 - `--registrar-socket-unit <path>`: registrar 엔드포인트의
   `ListenStream=`을 읽을 소켓 유닛. `registrar capabilities

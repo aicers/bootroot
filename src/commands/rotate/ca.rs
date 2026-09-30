@@ -480,9 +480,10 @@ pub(super) async fn rotate_ca_key(
                 _ => unmigrated.push(entry.registration_id.clone()),
             }
         }
-        // The two surface leaves are held to a signature check rather than
-        // the issuer-name comparison above: the new intermediate carries
-        // the old one's name, so an old leaf would pass that comparison.
+        // The two surface leaves are held to the endpoint's own signature
+        // check, which differs from the service check above in that it
+        // also verifies the intermediate against the new root and compares
+        // no names.
         if let Some(host) = &endpoint_host {
             let new_generation = registrar_endpoint::CaGeneration::load(
                 &ctx.paths.root_cert(),
@@ -1009,8 +1010,19 @@ fn classify_phase5_action(
     }
 }
 
-/// Checks whether a leaf certificate was issued by the new intermediate CA
-/// by comparing the leaf's Issuer DN with the intermediate's Subject DN.
+/// Checks whether a leaf certificate was issued by the new intermediate CA:
+/// the leaf's Issuer DN must equal the intermediate's Subject DN *and* the
+/// leaf's signature must verify under the intermediate's public key.
+///
+/// The DN alone cannot decide, because every rotation creates its
+/// intermediate under the same name, so a leaf from the previous
+/// generation names the new intermediate as its issuer too. Each rotation
+/// generates a fresh intermediate key, so the signature is what identifies
+/// the generation; the DN is kept because a TLS client builds no chain
+/// from a leaf whose issuer field names another certificate.
+///
+/// A read or parse failure is an `Err`; a signature that does not verify
+/// is `Ok(false)`.
 fn cert_issued_by_new_intermediate(
     cert_path: &Path,
     new_inter_cert_path: &Path,
@@ -1050,7 +1062,10 @@ fn cert_issued_by_new_intermediate(
         )
     })?;
 
-    Ok(leaf_cert.issuer() == inter_cert.subject())
+    Ok(leaf_cert.issuer() == inter_cert.subject()
+        && leaf_cert
+            .verify_signature(Some(inter_cert.public_key()))
+            .is_ok())
 }
 
 pub(super) async fn rotate_trust_sync(
@@ -2077,6 +2092,82 @@ mod tests {
         params.signed_by(&key, issuer).expect("sign leaf").pem()
     }
 
+    /// Every rotation reuses the intermediate's name, so two generations
+    /// share a subject DN and differ only in their keys: a leaf counts as
+    /// migrated only when the new intermediate's key signed it.
+    #[test]
+    fn cert_issued_by_same_name_different_key_is_decided_by_signature() {
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        let (old_issuer, _old_inter_pem) = build_issuer("Bootroot Intermediate CA");
+        let (new_issuer, new_inter_pem) = build_issuer("Bootroot Intermediate CA");
+
+        let new_inter_path = dir.path().join("new_intermediate.crt");
+        fs::write(&new_inter_path, &new_inter_pem).expect("write new intermediate");
+        let old_leaf_path = dir.path().join("old_leaf.crt");
+        fs::write(&old_leaf_path, sign_leaf_with("svc.example", &old_issuer))
+            .expect("write old leaf");
+        let new_leaf_path = dir.path().join("new_leaf.crt");
+        fs::write(&new_leaf_path, sign_leaf_with("svc.example", &new_issuer))
+            .expect("write new leaf");
+
+        assert!(
+            !cert_issued_by_new_intermediate(&old_leaf_path, &new_inter_path, &messages)
+                .expect("check old leaf"),
+            "a leaf signed by a same-named intermediate with another key is not migrated"
+        );
+        assert!(
+            cert_issued_by_new_intermediate(&new_leaf_path, &new_inter_path, &messages)
+                .expect("check new leaf"),
+            "a leaf signed by the new intermediate is migrated"
+        );
+    }
+
+    /// The signature alone does not decide either: a leaf whose issuer
+    /// field names another certificate builds no chain to the new
+    /// intermediate, even when that intermediate's key signed it.
+    #[test]
+    fn cert_issued_by_same_key_different_issuer_name_does_not_match() {
+        use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
+
+        let dir = tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        let ca_params = |cn: &str| {
+            let mut params = CertificateParams::new(vec![cn.to_string()]).expect("ca params");
+            params.distinguished_name.push(DnType::CommonName, cn);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+        };
+        let inter_cert = ca_params("New Intermediate")
+            .self_signed(&ca_key)
+            .expect("self-signed intermediate");
+        let misnamed_issuer = Issuer::new(ca_params("Other Intermediate"), &ca_key);
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params =
+            CertificateParams::new(vec!["svc.example".to_string()]).expect("leaf params");
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "svc.example");
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &misnamed_issuer)
+            .expect("signed leaf");
+
+        let inter_path = dir.path().join("intermediate.crt");
+        let leaf_path = dir.path().join("leaf.crt");
+        fs::write(&inter_path, inter_cert.pem()).expect("write intermediate");
+        fs::write(&leaf_path, leaf_cert.pem()).expect("write leaf");
+
+        assert!(
+            !cert_issued_by_new_intermediate(&leaf_path, &inter_path, &messages)
+                .expect("check issuer"),
+            "a leaf naming another issuer is not migrated even if the key signed it"
+        );
+    }
+
     /// The root-CA regeneration container must run as the secrets-directory
     /// owner, so the `--user` value is the resolved `uid:gid` and never
     /// `root` — otherwise the regenerated key would land root-owned.
@@ -2180,13 +2271,29 @@ mod tests {
         )
         .expect("write new leaf");
 
+        // Every rotation names its intermediate alike, so an old leaf can
+        // carry the new intermediate's subject as its issuer.
+        let (same_name_issuer, _same_name_pem) = build_issuer("New Intermediate");
+        let same_name_cert = dir.path().join("svc_same_name.crt");
+        fs::write(
+            &same_name_cert,
+            sign_leaf_with("svc-same-name.example", &same_name_issuer),
+        )
+        .expect("write same-name leaf");
+
         let unmigrated = make_local_file_entry("svc-old", unmigrated_cert);
         let migrated = make_local_file_entry("svc-new", migrated_cert);
+        let same_name = make_local_file_entry("svc-same-name", same_name_cert);
 
         assert_eq!(
             classify_phase5_action(&unmigrated, &new_inter_path, &messages),
             Phase5Action::LocalReissue,
             "service still on the old intermediate must be reissued"
+        );
+        assert_eq!(
+            classify_phase5_action(&same_name, &new_inter_path, &messages),
+            Phase5Action::LocalReissue,
+            "service signed by a same-named intermediate with another key must be reissued"
         );
         assert_eq!(
             classify_phase5_action(&migrated, &new_inter_path, &messages),
@@ -2239,6 +2346,13 @@ mod tests {
             sign_leaf_with("svc-old.example", &old_issuer),
         )
         .expect("write old leaf");
+        let (same_name_issuer, _same_name_pem) = build_issuer("New Intermediate");
+        let same_name_cert = dir.path().join("svc_same_name.crt");
+        fs::write(
+            &same_name_cert,
+            sign_leaf_with("svc-same-name.example", &same_name_issuer),
+        )
+        .expect("write same-name leaf");
         let missing_cert = dir.path().join("svc_missing.crt");
 
         let remote = |name: &str, cert_path: std::path::PathBuf| ServiceEntry {
@@ -2263,6 +2377,15 @@ mod tests {
             ),
             Phase5Action::RemoteReissueRequest,
             "remote service still on the old intermediate must get a request"
+        );
+        assert_eq!(
+            classify_phase5_action(
+                &remote("svc-same-name", same_name_cert),
+                &new_inter_path,
+                &messages
+            ),
+            Phase5Action::RemoteReissueRequest,
+            "remote service signed by a same-named intermediate with another key must get a request"
         );
         assert_eq!(
             classify_phase5_action(
