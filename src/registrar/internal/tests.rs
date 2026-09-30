@@ -954,7 +954,6 @@ fn a_trust_upsert_leaves_the_rest_of_the_config_alone() {
 fn endpoint_tables() -> EndpointTables {
     EndpointTables::extract(
         "[registrar]\n\
-         state_file = \"/var/lib/bootroot/state.json\"\n\
          agent_server = \"https://bootroot-ca.example.internal:9000/acme/acme/directory\"\n\
          agent_responder_url = \"http://bootroot-http01.example.internal:8080\"\n\
          rate_limit_admission_burst = 7\n\
