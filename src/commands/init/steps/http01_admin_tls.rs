@@ -7,6 +7,7 @@ use bootroot::fs_util;
 use super::super::constants::{
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
 };
+use super::openbao_tls::{TLS_OUTPUT_MOUNT, chown_tls_output_dir, reject_symlinked_tls_output_dir};
 use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, HTTP01_ADMIN_INFRA_CERT_KEY,
@@ -22,7 +23,9 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 ///
 /// Writes the certificate to `secrets_dir/bootroot-http01/tls/{server.crt,server.key}`
 /// with `0600` permissions.  `step certificate create` runs via Docker
-/// (no step CLI required on the host).
+/// (no step CLI required on the host), as the owner of `secrets/`, after
+/// a scoped root chown hands it the output directory — which a root-run
+/// `init` has already created root-owned (see `chown_tls_output_dir`).
 pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
     secrets_dir: &Path,
     sans: &[&str],
@@ -37,17 +40,33 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
     let secrets_mount = format!("{}:/home/step", mount_root.display());
 
     let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+    reject_symlinked_tls_output_dir(
+        &tls_dir,
+        |path| messages.error_http01_admin_tls_output_dir_symlink(path),
+        messages,
+    )?;
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| messages.error_write_file_failed(&tls_dir.display().to_string()))?;
     let tls_mount_root = std::fs::canonicalize(&tls_dir)
         .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string()))?;
-    let tls_mount = format!("{}:/output", tls_mount_root.display());
+    let tls_mount = format!("{}:{TLS_OUTPUT_MOUNT}", tls_mount_root.display());
 
     let meta = std::fs::metadata(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let user_arg = format!("{}:{}", meta.uid(), meta.gid());
 
+    chown_tls_output_dir(
+        &tls_mount,
+        &user_arg,
+        docker,
+        "docker http01 admin tls output chown",
+        messages.error_http01_admin_tls_provision_failed(),
+        messages,
+    )?;
+
     let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
+    let output_cert = format!("{TLS_OUTPUT_MOUNT}/server.crt");
+    let output_key = format!("{TLS_OUTPUT_MOUNT}/server.key");
     let mut args: Vec<&str> = vec![
         "run",
         "--user",
@@ -62,8 +81,8 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         "certificate",
         "create",
         "responder.internal",
-        "/output/server.crt",
-        "/output/server.key",
+        &output_cert,
+        &output_key,
         "--ca",
         &intermediate_cert,
         "--ca-key",
@@ -284,7 +303,9 @@ pub(crate) fn strip_responder_tls_config(secrets_dir: &Path, messages: &Messages
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::super::test_support::write_self_contained_fake_docker;
+    use super::super::test_support::{
+        write_self_contained_fake_docker, write_self_contained_fake_docker_exiting,
+    };
     use super::*;
     /// The responder container name a default install renders.
     const DEFAULT_RESPONDER_CONTAINER: &str = "bootroot-http01";
@@ -386,6 +407,129 @@ mod tests {
             image,
             "init http01 admin TLS issuance",
         );
+    }
+
+    /// An endpoint-enabled `init` runs as root and has already created
+    /// the output directory root-owned while writing the responder
+    /// override, while `step` runs as the owner of `secrets/`; so the
+    /// scoped root chown has to run first, over the output directory and
+    /// nothing else, or the certificate write is refused (issue #1054).
+    #[test]
+    fn issuance_chowns_the_output_dir_before_creating_the_cert() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let secrets_dir = dir.path().join("secrets");
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        let messages = crate::i18n::test_messages();
+        issue_http01_admin_tls_cert(&secrets_dir, &["localhost"], &fake, &messages)
+            .expect("issuance must succeed against the fake docker");
+
+        let log = std::fs::read_to_string(&args_log).unwrap_or_default();
+        let invocations: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            invocations.len(),
+            2,
+            "expected the chown and the certificate write, got: {log}"
+        );
+        let chown = invocations.first().expect("chown invocation");
+        let create = invocations.get(1).expect("certificate create invocation");
+        assert!(
+            chown.contains("--entrypoint chown ") && chown.contains("--no-dereference"),
+            "the first container must be the scoped chown, got: {chown}"
+        );
+        let expected_mount = format!(
+            "{}:{TLS_OUTPUT_MOUNT}",
+            std::fs::canonicalize(&tls_dir).unwrap().display()
+        );
+        assert!(
+            chown.contains(&expected_mount),
+            "the chown must mount the TLS output directory, got: {chown}"
+        );
+        assert!(
+            !chown.contains(":/home/step"),
+            "the chown must not mount the secrets directory, got: {chown}"
+        );
+        assert!(
+            create.contains("certificate create"),
+            "the second container must be the certificate write, got: {create}"
+        );
+    }
+
+    /// A failed chown aborts the issuance under the HTTP-01 admin TLS
+    /// error, before the certificate write runs into the very
+    /// `permission denied` the chown exists to prevent.
+    #[test]
+    fn issuance_aborts_when_the_chown_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker_exiting(&fake, &args_log, 1);
+
+        let secrets_dir = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+
+        let messages = crate::i18n::test_messages();
+        let error = issue_http01_admin_tls_cert(&secrets_dir, &["localhost"], &fake, &messages)
+            .expect_err("a failing chown must fail the issuance");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(messages.error_http01_admin_tls_provision_failed()),
+            "the chown failure must be reported as a failed issuance, got: {chain}"
+        );
+
+        let log = std::fs::read_to_string(&args_log).unwrap_or_default();
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "the certificate write must not run after a failed chown, got: {log}"
+        );
+        assert!(
+            !log.contains("certificate create"),
+            "the certificate write must not run after a failed chown, got: {log}"
+        );
+    }
+
+    /// A symlink at the output directory would relocate both the root
+    /// chown and the key write to its target, so it is refused before
+    /// any container runs.
+    #[test]
+    fn issuance_refuses_a_symlinked_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        let secrets_dir = dir.path().join("secrets");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
+        std::fs::create_dir_all(tls_dir.parent().expect("responder dir")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tls_dir).unwrap();
+
+        let messages = crate::i18n::test_messages();
+        let error = issue_http01_admin_tls_cert(&secrets_dir, &["localhost"], &fake, &messages)
+            .expect_err("a symlinked output directory must fail the issuance");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains(
+                &messages.error_http01_admin_tls_output_dir_symlink(&tls_dir.display().to_string())
+            ),
+            "the error must name the refused HTTP-01 admin output path, got: {chain}"
+        );
+
+        let log = std::fs::read_to_string(&args_log).unwrap_or_default();
+        assert!(
+            log.trim().is_empty(),
+            "nothing may be mounted for a symlinked output directory, got: {log}"
+        );
+        assert!(elsewhere.read_dir().unwrap().next().is_none());
     }
 
     #[test]

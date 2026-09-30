@@ -592,6 +592,7 @@ pub(super) static STRINGS: Strings = Strings {
     info_http01_admin_tls_reverted: "Responder config restored to plaintext (TLS disabled until next init)",
     info_http01_admin_tls_provisioned: "HTTP-01 admin API TLS server certificate issued: {path}",
     error_http01_admin_tls_provision_failed: "Failed to issue HTTP-01 admin API TLS server certificate",
+    error_http01_admin_tls_output_dir_symlink: "Refusing to use a symlink as the HTTP-01 admin API TLS output directory: {path}",
     info_infra_tls_renewed: "Infrastructure certificate renewed: {name}",
     info_infra_tls_reload: "Reloading service after certificate renewal: {strategy}",
     info_infra_tls_verified: "Certificate reload verified for {name}: the OpenBao listener now serves the renewed certificate",
