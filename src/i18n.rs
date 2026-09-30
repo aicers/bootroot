@@ -606,6 +606,7 @@ pub(crate) struct Strings {
     pub(crate) info_http01_admin_tls_reverted: &'static str,
     pub(crate) info_http01_admin_tls_provisioned: &'static str,
     pub(crate) error_http01_admin_tls_provision_failed: &'static str,
+    pub(crate) error_http01_admin_tls_output_dir_symlink: &'static str,
     pub(crate) info_infra_tls_renewed: &'static str,
     pub(crate) info_infra_tls_reload: &'static str,
     pub(crate) info_infra_tls_verified: &'static str,

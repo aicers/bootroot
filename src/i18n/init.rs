@@ -567,6 +567,13 @@ impl Messages {
     pub(crate) fn error_http01_admin_tls_provision_failed(&self) -> &'static str {
         self.strings().error_http01_admin_tls_provision_failed
     }
+
+    pub(crate) fn error_http01_admin_tls_output_dir_symlink(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_http01_admin_tls_output_dir_symlink,
+            &[("path", path)],
+        )
+    }
 }
 
 impl Messages {

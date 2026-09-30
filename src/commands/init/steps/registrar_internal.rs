@@ -39,6 +39,7 @@ use bootroot::registrar::internal::{
     material_status, publish_material, render_internal_agent_config,
 };
 use bootroot::registrar::registrar_internal_identity;
+use bootroot::remote_bootstrap::client_url_from_bind_addr;
 use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, config, fs_util};
 
@@ -292,6 +293,104 @@ impl RegistrarInternalContext {
 /// filesystem.
 pub(crate) fn staging_dir(paths: &InternalPaths) -> PathBuf {
     paths.dir().join(STAGING_DIR)
+}
+
+/// The step-ca ACME directory URL the internal profile enrols against.
+///
+/// The internal profile is an ordinary host daemon, not a container on
+/// the compose network, so this is the *host-side* address step-ca is
+/// published on — and a non-loopback `--stepca-bind` replaces the
+/// loopback publication rather than adding to it. With a bind recorded
+/// the URL therefore names that bind: a specific address as it is, a
+/// wildcard as loopback, and the bind's own port either way. Every one
+/// of those hosts is in the name set step-ca's serving certificate is
+/// issued for (`build_stepca_ca_dns_names`), so TLS verification holds.
+///
+/// Without a recorded bind step-ca is on loopback, on this install's
+/// `STEPCA_HOST_PORT` — the process environment, then this compose
+/// directory's `.env`, then the compose default — rather than a
+/// hard-coded `:9000`, which on a host co-located with a second
+/// instance would reach *that* instance's step-ca.
+///
+/// Follows the configured provisioner name rather than hard-coding
+/// `acme`: an install that renamed the ACME provisioner would otherwise
+/// enrol against a directory step-ca does not serve.
+pub(crate) fn internal_acme_server(
+    provisioner: &str,
+    stepca_bind_addr: Option<&str>,
+    compose_dir: &Path,
+) -> String {
+    internal_acme_server_with_env(
+        provisioner,
+        stepca_bind_addr,
+        compose_dir,
+        std::env::var(bootroot::host_port::STEPCA_HOST_PORT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`internal_acme_server`] with the `STEPCA_HOST_PORT` value supplied
+/// by the caller instead of read from the process environment, so the
+/// precedence can be exercised without a process-global environment.
+fn internal_acme_server_with_env(
+    provisioner: &str,
+    stepca_bind_addr: Option<&str>,
+    compose_dir: &Path,
+    env_value: Option<&str>,
+) -> String {
+    let base = stepca_bind_addr.map_or_else(
+        || {
+            let port =
+                bootroot::host_port::resolve_stepca_host_port_with_env(env_value, compose_dir);
+            format!("https://localhost:{port}")
+        },
+        client_url_from_bind_addr,
+    );
+    format!("{base}/acme/{provisioner}/directory")
+}
+
+/// The HTTP-01 responder admin URL the internal profile drives its
+/// challenges through.
+///
+/// The host-side address for the same reason as
+/// [`internal_acme_server`]. A recorded `--http01-admin-bind` both
+/// replaces the loopback publication and puts the admin API behind TLS,
+/// so the URL names the bind over `https://`; the admin certificate's
+/// SANs (`build_http01_admin_tls_sans`) cover every host that yields,
+/// and the internal profile's CA bundle anchors it. Without a recorded
+/// bind the admin API is plaintext on loopback, on this install's
+/// `HTTP01_ADMIN_HOST_PORT`.
+pub(crate) fn internal_responder_url(
+    http01_admin_bind_addr: Option<&str>,
+    compose_dir: &Path,
+) -> String {
+    internal_responder_url_with_env(
+        http01_admin_bind_addr,
+        compose_dir,
+        std::env::var(bootroot::host_port::HTTP01_ADMIN_HOST_PORT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`internal_responder_url`] with the `HTTP01_ADMIN_HOST_PORT` value
+/// supplied by the caller.
+fn internal_responder_url_with_env(
+    http01_admin_bind_addr: Option<&str>,
+    compose_dir: &Path,
+    env_value: Option<&str>,
+) -> String {
+    http01_admin_bind_addr.map_or_else(
+        || {
+            let port = bootroot::host_port::resolve_http01_admin_host_port_with_env(
+                env_value,
+                compose_dir,
+            );
+            format!("http://127.0.0.1:{port}")
+        },
+        client_url_from_bind_addr,
+    )
 }
 
 /// Everything provisioning needs, all of it already resolved by `init`.
@@ -2098,5 +2197,193 @@ mod publication_tests {
         std::fs::write(&path, rendered).expect("write the rendered config");
         bootroot::config::Settings::from_file(Some(path))
             .expect("the generated config must deserialize")
+    }
+}
+
+/// The two host-side endpoints the internal profile is provisioned
+/// against. `init` issues the internal leaf through both, so neither may
+/// be assumed to be on the compose default, nor on loopback when a bind
+/// intent moved it off.
+#[cfg(test)]
+mod internal_endpoint_tests {
+    use super::super::http01_admin_tls::build_http01_admin_tls_sans;
+    use super::super::stepca_setup::build_stepca_ca_dns_names;
+    use super::{internal_acme_server_with_env, internal_responder_url_with_env};
+
+    /// Every bind form `infra install` records: a specific IPv4 and IPv6
+    /// address and each wildcard spelling, all on a port that differs
+    /// from the host-port values the tests pass alongside.
+    const BINDS: [&str; 5] = [
+        "192.168.1.10:9443",
+        "[fd12::1]:9443",
+        "0.0.0.0:9443",
+        "[::]:9443",
+        "[::0]:9443",
+    ];
+
+    /// The host a URL names, with an IPv6 literal's brackets removed so
+    /// it compares against a SAN list, which stores it bare.
+    fn url_host(url: &str) -> &str {
+        let authority = url
+            .split_once("://")
+            .map_or(url, |(_, rest)| rest)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        let (host, _port) = authority.rsplit_once(':').expect("URL names a port");
+        host.strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(host)
+    }
+
+    /// An install that recorded moved ports in its `.env` is reached on
+    /// the ports it actually published. A hard-coded `:9000`/`:8080`
+    /// would fail the run here, and on a host co-located with a second
+    /// instance it would reach that instance's step-ca and responder
+    /// instead.
+    #[test]
+    fn both_endpoints_follow_the_recorded_published_ports() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".env"),
+            "STEPCA_HOST_PORT=19000\nHTTP01_ADMIN_HOST_PORT=18080\n",
+        )
+        .expect("write .env");
+        assert_eq!(
+            internal_acme_server_with_env("acme", None, dir.path(), None),
+            "https://localhost:19000/acme/acme/directory"
+        );
+        assert_eq!(
+            internal_responder_url_with_env(None, dir.path(), None),
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    /// The process environment outranks the recorded `.env`, matching
+    /// every other host-port derivation in the binary.
+    #[test]
+    fn the_environment_outranks_the_recorded_env_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".env"),
+            "STEPCA_HOST_PORT=19000\nHTTP01_ADMIN_HOST_PORT=18080\n",
+        )
+        .expect("write .env");
+        assert_eq!(
+            internal_acme_server_with_env("acme", None, dir.path(), Some("29000")),
+            "https://localhost:29000/acme/acme/directory"
+        );
+        assert_eq!(
+            internal_responder_url_with_env(None, dir.path(), Some("28080")),
+            "http://127.0.0.1:28080"
+        );
+    }
+
+    /// With nothing recorded, both fall back to the ports the compose
+    /// files interpolate.
+    #[test]
+    fn both_endpoints_fall_back_to_the_compose_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            internal_acme_server_with_env("acme", None, dir.path(), None),
+            "https://localhost:9000/acme/acme/directory"
+        );
+        assert_eq!(
+            internal_responder_url_with_env(None, dir.path(), None),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    /// The provisioner name is still followed: an install that renamed
+    /// the ACME provisioner would otherwise enrol against a directory
+    /// step-ca does not serve.
+    #[test]
+    fn the_acme_directory_follows_the_configured_provisioner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            internal_acme_server_with_env("bootroot-acme", None, dir.path(), None),
+            "https://localhost:9000/acme/bootroot-acme/directory"
+        );
+    }
+
+    /// A recorded `--stepca-bind` replaces step-ca's loopback
+    /// publication, so the ACME directory is reached on the bind — a
+    /// specific address as it is, a wildcard as loopback — and on the
+    /// bind's own port rather than `STEPCA_HOST_PORT`, which describes a
+    /// loopback publish that no longer exists.
+    #[test]
+    fn a_recorded_stepca_bind_is_where_the_acme_directory_is_reached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "STEPCA_HOST_PORT=19000\n").expect("write .env");
+        let expected = [
+            "https://192.168.1.10:9443/acme/bootroot-acme/directory",
+            "https://[fd12::1]:9443/acme/bootroot-acme/directory",
+            "https://127.0.0.1:9443/acme/bootroot-acme/directory",
+            "https://[::1]:9443/acme/bootroot-acme/directory",
+            "https://[::1]:9443/acme/bootroot-acme/directory",
+        ];
+        for (bind, expected) in BINDS.into_iter().zip(expected) {
+            assert_eq!(
+                internal_acme_server_with_env(
+                    "bootroot-acme",
+                    Some(bind),
+                    dir.path(),
+                    Some("29000")
+                ),
+                expected,
+                "bind {bind}"
+            );
+        }
+    }
+
+    /// A recorded `--http01-admin-bind` replaces the responder's
+    /// loopback publication and puts its admin API behind TLS, so the
+    /// responder is reached over `https://` on the bind, with the same
+    /// wildcard mapping and the bind's own port.
+    #[test]
+    fn a_recorded_http01_admin_bind_is_where_the_responder_is_reached() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "HTTP01_ADMIN_HOST_PORT=18080\n")
+            .expect("write .env");
+        let expected = [
+            "https://192.168.1.10:9443",
+            "https://[fd12::1]:9443",
+            "https://127.0.0.1:9443",
+            "https://[::1]:9443",
+            "https://[::1]:9443",
+        ];
+        for (bind, expected) in BINDS.into_iter().zip(expected) {
+            assert_eq!(
+                internal_responder_url_with_env(Some(bind), dir.path(), Some("28080")),
+                expected,
+                "bind {bind}"
+            );
+        }
+    }
+
+    /// The host each URL names is one the certificate behind it was
+    /// issued for, so the internal profile's TLS verification accepts
+    /// it. Built from the same bind strings on both sides: a change to
+    /// the URL mapping or to either SAN builder that pulls them apart
+    /// fails here rather than as a hostname mismatch at issuance.
+    #[test]
+    fn every_bind_derived_host_is_in_the_certificate_that_bind_serves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for bind in BINDS {
+            let acme = internal_acme_server_with_env("acme", Some(bind), dir.path(), None);
+            let stepca_names = build_stepca_ca_dns_names(Some(bind), None, "bootroot-ca");
+            assert!(
+                stepca_names.iter().any(|name| name == url_host(&acme)),
+                "bind {bind}: {acme} names a host outside step-ca's {stepca_names:?}"
+            );
+
+            let responder = internal_responder_url_with_env(Some(bind), dir.path(), None);
+            let admin_sans = build_http01_admin_tls_sans(bind, None, "bootroot-http01");
+            assert!(
+                admin_sans.iter().any(|name| name == url_host(&responder)),
+                "bind {bind}: {responder} names a host outside the admin certificate's \
+                 {admin_sans:?}"
+            );
+        }
     }
 }

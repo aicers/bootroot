@@ -592,6 +592,7 @@ pub(super) static STRINGS: Strings = Strings {
     info_http01_admin_tls_reverted: "응답기 구성이 평문으로 복원되었습니다 (다음 init까지 TLS 비활성화)",
     info_http01_admin_tls_provisioned: "HTTP-01 관리자 API TLS 서버 인증서 발급됨: {path}",
     error_http01_admin_tls_provision_failed: "HTTP-01 관리자 API TLS 서버 인증서 발급에 실패했습니다",
+    error_http01_admin_tls_output_dir_symlink: "HTTP-01 관리자 API TLS 출력 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
     info_infra_tls_renewed: "인프라 인증서 갱신됨: {name}",
     info_infra_tls_reload: "인증서 갱신 후 서비스 다시 로드 중: {strategy}",
     info_infra_tls_verified: "{name} 인증서 재로드 검증 완료: OpenBao 리스너가 이제 갱신된 인증서를 제공합니다",

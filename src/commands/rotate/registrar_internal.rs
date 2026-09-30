@@ -71,8 +71,9 @@ use super::RotateContext;
 use super::helpers::signal_internal_registrar_agent;
 use crate::commands::init::registrar_internal::{
     RegistrarInternalContext, RegistrarInternalInputs, RegistrarInternalIntent, StagedInternal,
-    converge_internal_auth, current_internal_config, discard_snapshot, issue_internal_material,
-    publish_internal_set, staging_dir, verify_internal_login,
+    converge_internal_auth, current_internal_config, discard_snapshot, internal_acme_server,
+    internal_responder_url, issue_internal_material, publish_internal_set, staging_dir,
+    verify_internal_login,
 };
 use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC,
@@ -936,10 +937,14 @@ async fn repair_context(
     };
     // Only reached when the generated config is gone: the config is the
     // record of what `init` chose, and a repair keeps it. The fallbacks
-    // below rebuild those endpoints the same way `init` derived them —
-    // from this install's own published ports — rather than from the
-    // compose defaults, which on a host that moved its ports name
-    // nothing, and on a co-located host name another instance.
+    // below rebuild those endpoints through the same derivation `init`
+    // used — the recorded step-ca and responder bind addresses when
+    // there are any, which replace the loopback publications, and
+    // otherwise this install's own published loopback ports — rather
+    // than from the compose defaults, which on a host that moved its
+    // ports name nothing, and on a co-located host name another
+    // instance. The provisioner is not recorded, so the fallback
+    // enrols against the default one.
     let compose_dir = crate::commands::compose_file::compose_file_dir(&ctx.compose_file);
 
     let responder_hmac = read_kv_string(client, &ctx.kv_mount, PATH_RESPONDER_HMAC, "value")
@@ -965,8 +970,11 @@ async fn repair_context(
         kv_mount: ctx.kv_mount.clone(),
         acme_server: existing.as_ref().map_or_else(
             || {
-                let port = bootroot::host_port::resolve_stepca_host_port(&compose_dir);
-                format!("https://localhost:{port}/acme/{DEFAULT_STEPCA_PROVISIONER}/directory")
+                internal_acme_server(
+                    DEFAULT_STEPCA_PROVISIONER,
+                    ctx.state.stepca_bind_addr.as_deref(),
+                    &compose_dir,
+                )
             },
             |settings| settings.server.clone(),
         ),
@@ -975,10 +983,7 @@ async fn repair_context(
             |settings| settings.email.clone(),
         ),
         responder_url: existing.as_ref().map_or_else(
-            || {
-                let port = bootroot::host_port::resolve_http01_admin_host_port(&compose_dir);
-                format!("http://127.0.0.1:{port}")
-            },
+            || internal_responder_url(ctx.state.http01_admin_bind_addr.as_deref(), &compose_dir),
             |settings| settings.acme.http_responder_url.clone(),
         ),
         responder_hmac,
@@ -1208,6 +1213,8 @@ mod tests {
         rewrite_internal_config, staging_dir, sweep_staging, upsert_internal_trust,
         write_internal_trust, write_trust_pair,
     };
+    use crate::commands::init::DEFAULT_STEPCA_PROVISIONER;
+    use crate::commands::init::registrar_internal::{internal_acme_server, internal_responder_url};
     use crate::i18n::test_messages;
 
     const ROOT_FP: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
@@ -1656,6 +1663,57 @@ mod tests {
             context.endpoint_tables.is_none(),
             "a config without the tables carries none"
         );
+    }
+
+    /// A repair on a host whose config is gone rebuilds the two
+    /// endpoints through the derivation `init` used, for the default
+    /// provisioner the repair enrols against. On a host that published
+    /// step-ca and the responder on routable binds, that is the binds —
+    /// not loopback addresses nothing listens on — and on a host that
+    /// recorded none it is loopback on the published ports, as before.
+    #[tokio::test]
+    async fn a_repair_without_a_config_derives_the_endpoints_init_would() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/secret/data/{}",
+                crate::commands::init::PATH_RESPONDER_HMAC
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "data": { "value": "hmac" } }
+            })))
+            .mount(&server)
+            .await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let binds = [
+            (None, None),
+            (Some("192.168.1.10:9443"), Some("192.168.1.10:8443")),
+            (Some("0.0.0.0:9443"), Some("0.0.0.0:8443")),
+        ];
+        for (stepca_bind, http01_bind) in binds {
+            let (dir, paths) = provisioned_host();
+            std::fs::remove_file(paths.agent_config()).expect("the config is gone");
+            let mut ctx = endpoint_ctx(dir.path());
+            ctx.state.stepca_bind_addr = stepca_bind.map(str::to_string);
+            ctx.state.http01_admin_bind_addr = http01_bind.map(str::to_string);
+
+            let context = super::repair_context(&ctx, &client, &test_messages())
+                .await
+                .expect("the repair context builds");
+            let compose_dir = crate::commands::compose_file::compose_file_dir(&ctx.compose_file);
+            assert_eq!(
+                context.acme_server,
+                internal_acme_server(DEFAULT_STEPCA_PROVISIONER, stepca_bind, &compose_dir),
+                "step-ca bind {stepca_bind:?}"
+            );
+            assert_eq!(
+                context.responder_url,
+                internal_responder_url(http01_bind, &compose_dir),
+                "responder bind {http01_bind:?}"
+            );
+        }
     }
 
     /// Renders a provisioned host's config broken in one particular way.

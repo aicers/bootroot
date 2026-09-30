@@ -198,6 +198,17 @@ protected five are still `0:0:600` afterwards, and the sidecar tree is still the
 sweep's to repair. `reinit` and the CA and step-ca-password rotations reach the
 same sweep.
 
+The matrix runs the script twice. `registrar-internal-init` is the loopback
+host above; `registrar-internal-init-routable` sets `BIND_MODE=routable`, which
+installs with `--stepca-bind` and `--http01-admin-bind` (plus
+`--http01-admin-tls-required`) on `BIND_HOST`, the Docker bridge gateway
+`172.17.0.1` by default, and otherwise runs the same sequence. Each bind
+*replaces* the service's loopback publication rather than adding to it, so on
+such a host `init` has to issue the internal leaf through the bind addresses —
+step-ca's ACME directory there, and the responder admin API over TLS — and the
+generated `agent.toml` has to carry them for the endpoint daemon's renewals.
+`OpenBao` stays on loopback in both arms.
+
 It is also where the shared audit store is exercised, since it is the only arm
 that seeds the endpoint predicate. Beside that predicate the seed phase writes
 the operator configuration file the run passes to `bootroot init
@@ -1097,13 +1108,14 @@ The harnesses also assume three host tools, and each check fails in its
 prerequisite block rather than mid-run:
 
 - The bind-host guard in `run-reinit-recovery.sh`, `run-stepca-san.sh`,
-  `run-openbao-tls-no-delta.sh` and `run-openbao-tls-reown.sh` lists the
+  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh` and the
+  routable mode of `run-registrar-internal-init-e2e.sh` lists the
   machine's IPv4 addresses with `ip` (iproute2), falling back to
   `ifconfig`. A host with neither is told exactly that, because no value
-  of `OPENBAO_BIND_HOST` / `STEPCA_BIND_HOST` fixes a check that cannot
-  enumerate. Both default to `172.17.0.1`, the Docker bridge gateway on
-  Linux; elsewhere (Docker Desktop has no such interface) set them to an
-  address the host actually holds.
+  of `OPENBAO_BIND_HOST` / `STEPCA_BIND_HOST` / `BIND_HOST` fixes a check
+  that cannot enumerate. All default to `172.17.0.1`, the Docker bridge
+  gateway on Linux; elsewhere (Docker Desktop has no such interface) set
+  them to an address the host actually holds.
 - `run-remote-lifecycle.sh` reads the remote agent's TOML config with
   `tomllib`, so its `python3` must be 3.11 or newer. The prerequisite
   block imports it before any container starts.
