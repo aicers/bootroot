@@ -1954,6 +1954,14 @@ Writes the new HMAC to `bootroot/responder/hmac` and to the
 registrar-managed identity (see
 [Rotation propagation to running agents](operations.md#rotation-propagation-to-running-agents)).
 
+On a host that carries the bootroot-internal registrar credential, it
+also rewrites `[acme] http_responder_hmac` in
+`secrets/registrar-internal/agent.toml` — leaving every other line of
+that file as it was — and sends the registrar endpoint daemon `SIGHUP`.
+That daemon polls nothing, so this is how it gets the new HMAC. The file
+is root-owned at `0600`, so on such a host the command must run as root;
+run unprivileged, it is refused with nothing written, naming the file.
+
 - `--hmac`: new responder HMAC (optional, auto-generated if omitted)
 
 #### `rotate approle-secret-id`
@@ -2281,6 +2289,14 @@ Behavior:
   `--eab-file` (the run command printed by `service add` /
   `bootroot-remote bootstrap` includes it). Without `--eab-file`, EAB
   KV updates and `rotate eab-clear` are silent no-ops for that agent.
+- On a host that carries the bootroot-internal registrar credential, it
+  also removes the `[eab]` table from
+  `secrets/registrar-internal/agent.toml` — leaving every other line of
+  that file as it was — and sends the registrar endpoint daemon
+  `SIGHUP`, since that daemon polls nothing. A file with no `[eab]`
+  table is left untouched. The file is root-owned at `0600`, so on such
+  a host the command must run as root; run unprivileged, it is refused
+  with nothing written, naming the file.
 
 No additional arguments. Honors the global `--yes` to skip the
 confirmation prompt.
@@ -2440,7 +2456,9 @@ Local file: `secrets/config/ca.json` (`db.dataSource`)
 #### `rotate responder-hmac`
 
 OpenBao KV: `bootroot/responder/hmac`  
-Local file: `secrets/responder/responder.toml` (`hmac_secret`)
+Local file: `secrets/responder/responder.toml` (`hmac_secret`)  
+Local file: `secrets/registrar-internal/agent.toml`
+(`[acme] http_responder_hmac`, bootroot-internal credential hosts only)
 
 When explicit values are omitted (`--new-password`, `--db-password`, `--hmac`),
 bootroot generates new random values.

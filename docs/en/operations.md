@@ -3196,6 +3196,14 @@ next login cycle. The same applies to `rotate responder-hmac`,
 fast-poll loop pulls the updated values from OpenBao KV within
 `fast_poll_interval`, with no per-service process restart or reload.
 
+The registrar endpoint daemon is the exception. It runs on
+`secrets/registrar-internal/agent.toml`, which has no `[openbao]`
+section and polls nothing, so on a host that carries it
+`rotate responder-hmac` rewrites that file's `http_responder_hmac` and
+`rotate eab-clear` removes its `[eab]` table, and each then reloads the
+daemon with `SIGHUP`. Because that file is root-owned, run both
+rotations as root on such a host.
+
 For `remote-bootstrap` services, the rotated `secret_id` is written to
 the per-service KV path (`bootroot/services/<registration_id>/secret_id`). A
 *running* remote `bootroot-agent` needs no operator action: its fast-poll

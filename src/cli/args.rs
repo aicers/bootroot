@@ -563,6 +563,10 @@ pub(crate) enum RotateCommand {
     /// signals the responder with SIGHUP via `docker compose kill -s
     /// HUP` when the compose file includes the responder service so it
     /// reloads the new value without dropping in-flight challenges.
+    /// On a host with the bootroot-internal registrar credential it
+    /// also rewrites `http_responder_hmac` in
+    /// `registrar-internal/agent.toml` and reloads the registrar
+    /// endpoint daemon, which polls nothing; run it as root there.
     ResponderHmac(RotateResponderHmacArgs),
     /// Rotates `OpenBao` recovery credentials manually.
     ///
@@ -667,10 +671,14 @@ pub(crate) enum RotateCommand {
     /// registered in `state.json` `infra_certs`.
     #[command(name = "infra-cert")]
     InfraCert(RotateInfraCertArgs),
-    /// Clears EAB credentials from every known KV path. Each
+    /// Clears EAB credentials from every known KV path. Each service
     /// bootroot-agent observes the cleared value on its next fast-poll
     /// cycle and removes its `eab.json`, so stale or invalid EAB
-    /// material stops being used without any restart or reload.
+    /// material stops being used without any restart or reload. On a
+    /// host with the bootroot-internal registrar credential it also
+    /// removes `[eab]` from `registrar-internal/agent.toml` and reloads
+    /// the registrar endpoint daemon, which polls nothing; run it as
+    /// root there.
     #[command(name = "eab-clear")]
     EabClear(RotateEabClearArgs),
 }

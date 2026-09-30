@@ -123,6 +123,10 @@ RUN_ROOT=""
 WORK_DIR=""
 SECRETS_DIR=""
 INTERNAL_DIR=""
+# The stand-in for the registrar endpoint daemon a rotation signals: the
+# PID of the `sudo` that runs it, recorded so cleanup can stop exactly
+# that process and nothing matched by pattern.
+INTERNAL_STANDIN_PID=""
 PORT_POSTGRES=0
 PORT_OPENBAO=0
 PORT_STEPCA=0
@@ -1877,6 +1881,149 @@ PY
   pass "a login with no client certificate is refused (${status})"
 }
 
+# ---------------------------------------------------------------------------
+# Rotations that rewrite the internal config
+# ---------------------------------------------------------------------------
+#
+# The internal config polls nothing, so `rotate responder-hmac` and
+# `rotate eab-clear` rewrite their one key in it themselves and reload
+# the registrar endpoint daemon.  `init` does not start that daemon, so
+# a stand-in carrying its command line takes its place: the rotation's
+# `pkill -HUP -f <config>` matches it, and `SIGHUP`'s default action
+# ends it — which is what is asserted.
+
+# `bootroot rotate` as root, against this run's deployment and root
+# token.  Root because the internal config is `root:root` `0600`: the
+# rotation refuses, with nothing written, when it cannot rewrite it.
+run_rotate_as_root() {
+  local label="$1"
+  shift
+  local log="$ARTIFACT_DIR/rotate-${label}.log"
+  if ! run_bootroot_as_root rotate \
+    --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
+    --root-token-file "$OPENBAO_ROOT_TOKEN_FILE" \
+    "$@" --yes </dev/null >"$log" 2>&1; then
+    {
+      echo "rotate ${label} failed (tail):"
+      tail -n 120 "$log" || true
+    } >>"$RUN_LOG"
+    fail "bootroot rotate ${label} failed; see $log"
+  fi
+}
+
+# Starts a root process whose command line is the endpoint daemon's.
+#
+# `exec -a` renames the `sleep` so its command line carries the config
+# path; the `sudo` that runs it carries the path too and relays the
+# signal, so either match ends the stand-in.  The PID recorded is the
+# `sudo`, which is this shell's child and so can be waited on.
+start_internal_daemon_standin() {
+  local config="$INTERNAL_DIR/agent.toml"
+  # shellcheck disable=SC2024 # the redirect is the invoking user's own log
+  sudo -n bash -c 'exec -a "bootroot-agent --config $1" sleep 600' _ "$config" \
+    >>"$RUN_LOG" 2>&1 &
+  INTERNAL_STANDIN_PID=$!
+  local attempt
+  for attempt in $(seq 1 50); do
+    pgrep -f "^bootroot-agent --config ${config}" >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  fail "the endpoint daemon stand-in did not start (attempt ${attempt})"
+}
+
+# Asserts the rotation's `SIGHUP` ended the stand-in, and reaps it.
+assert_internal_daemon_standin_was_signalled() {
+  local label="$1" attempt
+  for attempt in $(seq 1 100); do
+    if ! ps -p "$INTERNAL_STANDIN_PID" >/dev/null 2>&1; then
+      wait "$INTERNAL_STANDIN_PID" 2>/dev/null || true
+      INTERNAL_STANDIN_PID=""
+      pass "${label}: the registrar endpoint daemon was sent SIGHUP"
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "${label}: the registrar endpoint daemon stand-in was not signalled (${attempt} checks)"
+}
+
+# Stops a stand-in a failed phase left running, by its recorded PID.
+stop_internal_daemon_standin() {
+  [ -n "$INTERNAL_STANDIN_PID" ] || return 0
+  if ps -p "$INTERNAL_STANDIN_PID" >/dev/null 2>&1; then
+    sudo_to_log kill -TERM "$INTERNAL_STANDIN_PID" || true
+    wait "$INTERNAL_STANDIN_PID" 2>/dev/null || true
+  fi
+  INTERNAL_STANDIN_PID=""
+}
+
+# The digest of a file's bytes, read as root.  Only the digest leaves
+# the elevated shell, so the HMACs the file carries are never printed.
+file_digest() {
+  sudo -n sh -c 'sha256sum "$1" | cut -d" " -f1' _ "$1"
+}
+
+# The same digest over the file with every line matching `pattern`
+# removed.
+digest_without() {
+  local path="$1" pattern="$2"
+  sudo -n sh -c 'grep -v -e "$2" "$1" | sha256sum | cut -d" " -f1' _ "$path" "$pattern"
+}
+
+assert_responder_hmac_rotation_rewrites_the_internal_config() {
+  local config="$INTERNAL_DIR/agent.toml" before after verdict
+  before="$(digest_without "$config" '^http_responder_hmac = ')" ||
+    fail "could not read $config"
+
+  start_internal_daemon_standin
+  run_rotate_as_root responder-hmac responder-hmac
+
+  # Compared inside the elevated interpreter; only the verdict is
+  # printed, never either value.
+  verdict="$(sudo -n "$PYTHON_BIN" - "$config" "$SECRETS_DIR/responder/responder.toml" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    internal = tomllib.load(handle)["acme"]["http_responder_hmac"]
+with open(sys.argv[2], "rb") as handle:
+    responder = tomllib.load(handle)["hmac_secret"]
+print("match" if internal == responder else "mismatch")
+PY
+  )" || fail "could not compare the internal config's HMAC with the responder's"
+  assert_equal "the internal config carries the HMAC the responder was handed" "match" "$verdict"
+
+  after="$(digest_without "$config" '^http_responder_hmac = ')" ||
+    fail "could not read $config"
+  assert_equal "the rotation changed nothing in the internal config but its HMAC" \
+    "$before" "$after"
+  assert_equal "the rewritten internal config is still root-owned at 0600" \
+    "0:0:600" "$(file_owner_mode "$config")"
+  assert_internal_daemon_standin_was_signalled "rotate responder-hmac"
+}
+
+assert_eab_clear_rotation_rewrites_the_internal_config() {
+  local config="$INTERNAL_DIR/agent.toml" before after
+  # The deployment registered no EAB, so the table the rotation must
+  # remove is appended first — in place, keeping the owner and mode.
+  before="$(file_digest "$config")" || fail "could not read $config"
+  sudo -n sh -c \
+    'printf "\n[eab]\nkid = \"e2e-kid\"\nhmac = \"e2e-eab-hmac\"\n" >>"$1"' _ "$config" ||
+    fail "could not append an [eab] table to $config"
+  sudo -n grep -qx '\[eab\]' "$config" || fail "the appended [eab] table is not in $config"
+
+  start_internal_daemon_standin
+  run_rotate_as_root eab-clear eab-clear
+
+  if sudo -n grep -qx '\[eab\]' "$config"; then
+    fail "rotate eab-clear left the [eab] table in the internal config"
+  fi
+  pass "rotate eab-clear removed the [eab] table from the internal config"
+  after="$(file_digest "$config")" || fail "could not read $config"
+  assert_equal "the internal config is byte for byte what it was before [eab] was added" \
+    "$before" "$after"
+  assert_equal "the rewritten internal config is still root-owned at 0600" \
+    "0:0:600" "$(file_owner_mode "$config")"
+  assert_internal_daemon_standin_was_signalled "rotate eab-clear"
+}
+
 # Everything the OpenBao Agent sidecars open still belongs to the tree
 # they run in, after a root-run `init` wrote all of it.
 #
@@ -2748,6 +2895,7 @@ cleanup() {
   local status=$?
   local cleanup_status=0
   log_phase "cleanup"
+  stop_internal_daemon_standin
   capture_artifacts
   teardown_instance || {
     echo "[registrar-internal-init][cleanup] teardown failed; see ${RUN_LOG}" >&2
@@ -2836,6 +2984,12 @@ main() {
   log_phase "assert-login"
   assert_certificate_login_succeeds
   assert_login_without_the_certificate_is_refused
+
+  # Both rotations reach the endpoint daemon's config, which polls
+  # nothing: each rewrites its one key there and reloads the daemon.
+  log_phase "assert-internal-config-rotations"
+  assert_responder_hmac_rotation_rewrites_the_internal_config
+  assert_eab_clear_rotation_rewrites_the_internal_config
 
   # Last, because it re-runs the two ownership assertions against a
   # deployment a later command has passed over: the protected five must

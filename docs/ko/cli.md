@@ -1878,6 +1878,14 @@ OpenBao와 통신해 값을 갱신합니다.
 registrar 관리 identity의 `http_responder_hmac` 레코드에 기록합니다
 ([실행 중인 에이전트로의 회전 전파](operations.md#실행-중인-에이전트로의-회전-전파) 참고).
 
+bootroot 내부 registrar 자격 증명을 가진 호스트에서는
+`secrets/registrar-internal/agent.toml`의 `[acme] http_responder_hmac`도
+다시 쓰고(파일의 다른 줄은 그대로 둡니다) registrar 엔드포인트 데몬에
+`SIGHUP`을 보냅니다. 이 데몬은 아무것도 폴링하지 않으므로 이것이 새
+HMAC을 받는 경로입니다. 이 파일은 root 소유 `0600`이므로 그런 호스트에서는
+명령을 root로 실행해야 합니다. 권한 없이 실행하면 아무것도 쓰지 않고
+해당 파일을 명시하며 거부됩니다.
+
 - `--hmac`: 새 responder HMAC(선택, 미지정 시 자동 생성)
 
 #### `rotate approle-secret-id`
@@ -2179,6 +2187,13 @@ CA 번들을 기록된 회전 상태가 가리키는 신뢰 상태로 되돌립�
   (`service add` / `bootroot-remote bootstrap`이 출력하는 실행 명령에
   포함되어 있습니다). `--eab-file` 없이는 EAB KV 갱신과
   `rotate eab-clear`가 해당 에이전트에서 조용히 무시됩니다.
+- bootroot 내부 registrar 자격 증명을 가진 호스트에서는
+  `secrets/registrar-internal/agent.toml`에서 `[eab]` 테이블도
+  제거하고(파일의 다른 줄은 그대로 둡니다) registrar 엔드포인트 데몬에
+  `SIGHUP`을 보냅니다. 이 데몬은 아무것도 폴링하지 않기 때문입니다.
+  `[eab]` 테이블이 없는 파일은 건드리지 않습니다. 이 파일은 root 소유
+  `0600`이므로 그런 호스트에서는 명령을 root로 실행해야 합니다. 권한
+  없이 실행하면 아무것도 쓰지 않고 해당 파일을 명시하며 거부됩니다.
 
 추가 인자는 없습니다. 글로벌 `--yes`로 확인 프롬프트를 생략할 수
 있습니다.
@@ -2327,7 +2342,9 @@ OpenBao KV: `bootroot/stepca/db`
 #### `rotate responder-hmac`
 
 OpenBao KV: `bootroot/responder/hmac`  
-로컬 파일: `secrets/responder/responder.toml` (`hmac_secret`)
+로컬 파일: `secrets/responder/responder.toml` (`hmac_secret`)  
+로컬 파일: `secrets/registrar-internal/agent.toml`
+(`[acme] http_responder_hmac`, bootroot 내부 자격 증명 호스트에만 해당)
 
 값을 명시하지 않으면(`--new-password`, `--db-password`, `--hmac`) bootroot가
 새 랜덤 값을 생성합니다.

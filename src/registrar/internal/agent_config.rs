@@ -1,5 +1,5 @@
 //! The `bootroot-agent` config the internal profile renews under, and
-//! the trust upserts a rotation applies to it.
+//! the in-place edits a rotation applies to it.
 //!
 //! On an endpoint-enabled host this file is the registrar endpoint
 //! daemon's configuration. One process does both jobs:
@@ -36,13 +36,22 @@ use crate::config::Settings;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
 use crate::registrar::internal::{InternalCredentialError, InternalPaths};
 use crate::secret::HmacSecret;
-use crate::toml_util::{toml_encode_string, upsert_section_keys};
+use crate::toml_util::{remove_sections, toml_encode_string, upsert_section_keys};
 
 /// The instance label the internal identity is always composed at.
 pub const INTERNAL_INSTANCE_ID: &str = "001";
 
 /// The `agent.toml` section carrying the profile's trust settings.
 const TRUST_SECTION: &str = "trust";
+
+/// The `agent.toml` section carrying the ACME and HTTP-01 settings.
+const ACME_SECTION: &str = "acme";
+
+/// The `[acme]` key carrying the HTTP-01 responder HMAC.
+const RESPONDER_HMAC_KEY: &str = "http_responder_hmac";
+
+/// The `agent.toml` section carrying the EAB credentials.
+const EAB_SECTION: &str = "eab";
 
 /// The operator-owned table carrying the registrar verb-layer settings.
 pub const REGISTRAR_TABLE: &str = "registrar";
@@ -183,8 +192,11 @@ pub fn internal_registration_id(hostname: &str) -> String {
 /// `[registrar_endpoint]` tables — is appended after everything this
 /// renders, as [`EndpointTables`] holds it, and cannot override any key
 /// rendered here: the two tables are disjoint from every other table in
-/// the file. A rotation edits only the `[trust]` table, through
-/// [`build_internal_trust_updates`].
+/// the file. A rotation edits single keys in place rather than
+/// re-rendering: the `[trust]` table through
+/// [`build_internal_trust_updates`], `[acme].http_responder_hmac`
+/// through [`upsert_internal_responder_hmac`], and `[eab]` through
+/// [`remove_internal_eab`].
 #[must_use]
 pub fn render_internal_agent_config(
     paths: &InternalPaths,
@@ -383,6 +395,42 @@ pub fn upsert_internal_trust(
         TRUST_SECTION,
         &build_internal_trust_updates(paths, fingerprints),
     )
+}
+
+/// Sets `[acme].http_responder_hmac` in an existing config to `hmac`.
+///
+/// Encoded exactly as [`render_internal_agent_config`] encodes it, and
+/// every other table and key is left as it was — including the
+/// operator's `[registrar]` and `[registrar_endpoint]` and the `[trust]`
+/// pins a rotation may have rewritten — so `rotate responder-hmac`
+/// changes the one value it rotated.
+///
+/// # Errors
+///
+/// Returns an error when `contents` is not valid TOML.
+pub fn upsert_internal_responder_hmac(contents: &str, hmac: &HmacSecret) -> Result<String> {
+    upsert_section_keys(
+        contents,
+        ACME_SECTION,
+        &[(RESPONDER_HMAC_KEY, toml_encode_string(hmac.expose()))],
+    )
+}
+
+/// Removes the `[eab]` table from an existing config.
+///
+/// Returns `None` when the config carries no `eab` table, so the caller
+/// can leave the file untouched rather than rewrite it unchanged. Every
+/// other table and key is left as it was.
+///
+/// # Errors
+///
+/// Returns an error when `contents` is not valid TOML.
+pub fn remove_internal_eab(contents: &str) -> Result<Option<String>> {
+    let doc: DocumentMut = contents.parse().context("failed to parse TOML content")?;
+    if doc.get(EAB_SECTION).is_none() {
+        return Ok(None);
+    }
+    remove_sections(contents, &[EAB_SECTION]).map(Some)
 }
 
 /// Renders a fingerprint list as a TOML array literal.

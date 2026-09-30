@@ -10,17 +10,19 @@ use tempfile::TempDir;
 
 use super::agent_config::{
     INTERNAL_INSTANCE_ID, internal_agent_invocation, internal_registration_id,
-    internal_signal_pattern, load_internal_config, upsert_internal_trust,
+    internal_signal_pattern, load_internal_config, remove_internal_eab,
+    upsert_internal_responder_hmac, upsert_internal_trust,
 };
 use super::material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SET_FILES, is_protected,
     load_material, material_status, publish_material,
 };
 use super::{
-    ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_ROLE, CHAIN_FILE, INTERNAL_DIR,
-    InternalAgentConfigParams, InternalCredential, InternalCredentialError, InternalPaths,
-    KEY_FILE, ROOT_FINGERPRINT_FILE, active_root_cert_path, active_root_fingerprint,
-    build_registrar_internal_policy, render_internal_agent_config, require_https,
+    ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_ROLE, CHAIN_FILE,
+    EndpointTables, INTERNAL_DIR, InternalAgentConfigParams, InternalCredential,
+    InternalCredentialError, InternalPaths, KEY_FILE, ROOT_FINGERPRINT_FILE, active_root_cert_path,
+    active_root_fingerprint, build_registrar_internal_policy, render_internal_agent_config,
+    require_https,
 };
 use crate::fs_util::KEY_FILE_MODE;
 use crate::registrar::{
@@ -946,6 +948,154 @@ fn a_trust_upsert_leaves_the_rest_of_the_config_alone() {
         settings.acme.account_key_path.as_deref(),
         Some(paths.acme_account().as_path())
     );
+}
+
+/// The operator's two tables as an endpoint-enabled `init` copies them.
+fn endpoint_tables() -> EndpointTables {
+    EndpointTables::extract(
+        "[registrar]\n\
+         state_file = \"/var/lib/bootroot/state.json\"\n\
+         agent_server = \"https://bootroot-ca.example.internal:9000/acme/acme/directory\"\n\
+         agent_responder_url = \"http://bootroot-http01.example.internal:8080\"\n\
+         rate_limit_admission_burst = 7\n\
+         \n\
+         [registrar_endpoint]\n\
+         enabled = true\n\
+         server_cert_path = \"/etc/bootroot/registrar/server.crt\"\n\
+         server_key_path = \"/etc/bootroot/registrar/server.key\"\n\
+         client_cert_path = \"/etc/bootroot/registrar/client.crt\"\n\
+         client_key_path = \"/etc/bootroot/registrar/client.key\"\n",
+    )
+    .expect("the operator tables parse")
+}
+
+/// An endpoint-enabled host's generated config, with or without `[eab]`.
+fn endpoint_config(paths: &InternalPaths, with_eab: bool) -> String {
+    let tables = endpoint_tables();
+    let pins = [ROOT_FP.to_string()];
+    render_internal_agent_config(
+        paths,
+        &InternalAgentConfigParams {
+            endpoint_tables: Some(&tables),
+            eab_kid: with_eab.then_some("kid-1"),
+            eab_hmac: with_eab.then_some(&*CONFIG_EAB_HMAC),
+            ..config_params(&pins)
+        },
+    )
+}
+
+/// Parses `contents` and removes `path` (`table.key` or `table`), so
+/// two configs can be compared on everything except what one edit
+/// changed.
+fn document_without(contents: &str, table: &str, key: Option<&str>) -> toml_edit::DocumentMut {
+    let mut doc: toml_edit::DocumentMut = contents.parse().expect("valid TOML");
+    match key {
+        Some(key) => {
+            doc.get_mut(table)
+                .and_then(toml_edit::Item::as_table_mut)
+                .expect("the table")
+                .remove(key)
+                .expect("the key");
+        }
+        None => {
+            doc.remove(table).expect("the table");
+        }
+    }
+    doc
+}
+
+/// `rotate responder-hmac` changes `[acme].http_responder_hmac` and
+/// nothing else: the operator's tables, the pins and every other ACME
+/// key are what they were, and the result still loads as the internal
+/// config.
+#[test]
+fn a_responder_hmac_upsert_changes_only_that_key() {
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let before = endpoint_config(&paths, true);
+    let rotated = HmacSecret::from("rotated \"hmac\" with \\ escapes");
+
+    let after = upsert_internal_responder_hmac(&before, &rotated).expect("upsert");
+
+    assert_eq!(
+        document_without(&after, "acme", Some("http_responder_hmac")).to_string(),
+        document_without(&before, "acme", Some("http_responder_hmac")).to_string(),
+        "nothing but the one key moved"
+    );
+    let changed: Vec<(&str, &str)> = before
+        .lines()
+        .zip(after.lines())
+        .filter(|(old, new)| old != new)
+        .collect();
+    assert_eq!(changed.len(), 1, "one line differs: {changed:?}");
+    assert_eq!(before.lines().count(), after.lines().count());
+    assert!(
+        after.contains(&format!(
+            "http_responder_hmac = {}",
+            crate::toml_util::toml_encode_string(rotated.expose())
+        )),
+        "encoded the way the renderer encodes it"
+    );
+
+    std::fs::create_dir_all(paths.dir()).expect("the internal directory");
+    std::fs::write(paths.agent_config(), &after).expect("write");
+    let settings = load_internal_config(&paths).expect("the rewritten config loads");
+    assert_eq!(settings.acme.http_responder_hmac.expose(), rotated.expose());
+    assert_eq!(settings.trust.trusted_ca_sha256, vec![ROOT_FP.to_string()]);
+    assert!(
+        settings.eab.is_some(),
+        "the EAB is not this edit's to touch"
+    );
+}
+
+/// `rotate eab-clear` removes `[eab]` and nothing else, and on a config
+/// without one reports that there is nothing to do.
+#[test]
+fn an_eab_removal_removes_only_the_eab_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let with_eab = endpoint_config(&paths, true);
+
+    let after = remove_internal_eab(&with_eab)
+        .expect("parses")
+        .expect("there was an [eab] table to remove");
+    assert_eq!(
+        after
+            .parse::<toml_edit::DocumentMut>()
+            .expect("valid")
+            .to_string(),
+        document_without(&with_eab, "eab", None).to_string(),
+        "nothing but [eab] moved"
+    );
+    assert_eq!(
+        after,
+        endpoint_config(&paths, false),
+        "the result is byte for byte what `init` renders without an EAB"
+    );
+    assert!(toml_settings(&after).eab.is_none());
+
+    assert!(
+        remove_internal_eab(&after).expect("parses").is_none(),
+        "a config without [eab] has nothing to remove"
+    );
+
+    // An `[eab]` appended after everything else, as an operator would
+    // add one by hand, comes back out leaving the file it was added to.
+    let appended = format!("{after}\n[eab]\nkid = \"kid-2\"\nhmac = \"hmac-2\"\n");
+    assert_eq!(
+        remove_internal_eab(&appended)
+            .expect("parses")
+            .expect("an [eab] table"),
+        after
+    );
+}
+
+/// Neither edit writes anything over a file that is not TOML.
+#[test]
+fn the_config_edits_reject_invalid_toml() {
+    let broken = "[acme\nhttp_responder_hmac = \"x\"\n";
+    assert!(upsert_internal_responder_hmac(broken, &HmacSecret::from("new")).is_err());
+    assert!(remove_internal_eab(broken).is_err());
 }
 
 /// The `pkill` pattern is the fixed config path below the state-recorded

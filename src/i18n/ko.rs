@@ -329,6 +329,7 @@ pub(super) static STRINGS: Strings = Strings {
     rotate_summary_db_dsn: "- ca.json 갱신: {value}",
     rotate_summary_responder_config: "- responder 설정 갱신: {value}",
     rotate_summary_reload_responder: "- responder: SIGHUP 전송",
+    rotate_summary_internal_config: "- registrar 엔드포인트 데몬 설정 갱신 및 재로드: {value}",
     rotate_summary_approle_secret_id: "- {service_name} AppRole secret_id 회전: {value}",
     rotate_summary_approle_login_ok: "- {service_name} AppRole 로그인 확인",
     rotate_summary_infra_approle_secret_id: "- 인프라 AppRole {role_name} secret_id 회전: {value}",

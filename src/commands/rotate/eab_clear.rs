@@ -3,6 +3,10 @@ use bootroot::openbao::OpenBaoClient;
 
 use super::RotateContext;
 use super::helpers::confirm_action;
+use super::registrar_internal::{
+    InternalConfigChange, acquire_internal_config_lock, apply_internal_config_change,
+    check_internal_config_change, internal_config_path,
+};
 use super::registrar_targets::kv_fanout_targets;
 use crate::commands::init::PATH_AGENT_EAB;
 use crate::i18n::Messages;
@@ -18,13 +22,18 @@ fn service_eab_path(registration_id: &str) -> String {
 
 /// Companion to the now-removed `rotate eab`. Writes empty
 /// `{kid: "", hmac: ""}` to every known EAB KV path. Propagation to the
-/// agents is fast-poll's job: each `bootroot-agent` (local host daemon
-/// and remote alike) observes the cleared KV value on its next
-/// fast-poll cycle and removes its `eab.json`, so no per-service
-/// process restart or reload is required. Service enumeration walks the
-/// on-disk state file plus the ids that carry a registrar binding, not
-/// a blind KV listing, per issue #588 §3c: a KV subtree with neither is
-/// never cleared.
+/// service agents is fast-poll's job: each service `bootroot-agent`
+/// (local host daemon and remote alike) observes the cleared KV value on
+/// its next fast-poll cycle and removes its `eab.json`, so no
+/// per-service process restart or reload is required. Service
+/// enumeration walks the on-disk state file plus the ids that carry a
+/// registrar binding, not a blind KV listing, per issue #588 §3c: a KV
+/// subtree with neither is never cleared.
+///
+/// The registrar endpoint daemon is the exception. Its config polls
+/// nothing, so on a host that carries one the `[eab]` table is removed
+/// from it here and the daemon is reloaded, keeping the file in step
+/// with `OpenBao` so a later repair changes nothing it did not have to.
 pub(super) async fn rotate_eab_clear(
     ctx: &mut RotateContext,
     client: &OpenBaoClient,
@@ -43,6 +52,21 @@ pub(super) async fn rotate_eab_clear(
     // Resolved before the first write, so a failure to enumerate
     // registrar-managed identities clears nothing at all.
     let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
+    // Likewise before the first write: a registrar endpoint config this
+    // run cannot rewrite refuses the rotation with nothing cleared. On a
+    // host that carries one, the lock is held from here until the file
+    // is published, so a repair either read the EAB before this clears
+    // it or waits to read the cleared value.
+    let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
+    let change = InternalConfigChange::RemoveEab;
+    let internal_lock = if check_internal_config_change(&secrets_dir, change)
+        .await?
+        .found()
+    {
+        Some(acquire_internal_config_lock(&secrets_dir).await?)
+    } else {
+        None
+    };
 
     // Per issue #588 §3c: write the empty value unconditionally. KV v2
     // writes are PUTs, so creating the path is safe and idempotent, and
@@ -67,8 +91,23 @@ pub(super) async fn rotate_eab_clear(
         println!("Cleared {path}");
     }
 
-    println!(
-        "EAB clear completed; each bootroot-agent applies the cleared value via its fast-poll loop within fast_poll_interval."
-    );
+    let internal_rewritten = match &internal_lock {
+        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await?,
+        None => false,
+    };
+    drop(internal_lock);
+    if internal_rewritten {
+        println!(
+            "Removed [eab] from {}",
+            internal_config_path(&secrets_dir).display()
+        );
+        println!(
+            "EAB clear completed; service bootroot-agents apply the cleared value via their fast-poll loop within fast_poll_interval, and the registrar endpoint daemon, which polls nothing, was reloaded on its rewritten config instead."
+        );
+    } else {
+        println!(
+            "EAB clear completed; service bootroot-agents apply the cleared value via their fast-poll loop within fast_poll_interval."
+        );
+    }
     Ok(())
 }
