@@ -503,10 +503,16 @@ trailing the old HMAC stays where it was. A failure after the `OpenBao` writes i
 reported rather than rolled back: the new value is already the source of
 truth, so re-running the rotation, or running
 `bootroot rotate registrar-internal-credential --force` to re-render the file
-from `OpenBao`, converges it. `rotate responder-hmac` still hands the responder
-the new HMAC before it reports such a failure: the service agents are already
-converging on it, and the `--force` repair issues over ACME with the value it
-reads from `OpenBao`, which a responder left on the old one would refuse.
+from `OpenBao`, converges it. Once the control-node record —
+`bootroot/responder/hmac` or `bootroot/agent/eab` — carries the new value, every
+remaining step runs even when an earlier one fails, and the rotation reports all
+the failures together:
+a failed fan-out write to one service's record still leaves the config
+rewritten and, for `rotate responder-hmac`, the responder handed the new HMAC.
+`rotate responder-hmac` hands the responder the new HMAC before it reports any
+such failure: the service agents are already converging on it, and the
+`--force` repair issues over ACME with the value it reads from `OpenBao`, which
+a responder left on the old one would refuse.
 
 **Every rotation that writes the config serializes on one lock.** Rotations can
 overlap — scheduled rotation units run on timers — and each writer is a
@@ -526,11 +532,13 @@ write until they have published it:
 - `rotate responder-hmac` holds it from before its first `OpenBao` write until
   it has restarted `openbao-agent-responder`, seen the new value rendered into
   the responder config and, where the compose file runs a responder, sent the
-  responder `SIGHUP`. A repair waiting on it therefore issues only against a
+  responder `SIGHUP` — including when a fan-out write or the config rewrite
+  failed on the way. A repair waiting on it therefore issues only against a
   responder that has been handed the HMAC it read. The responder applying that
   `SIGHUP` is not awaited.
 - `rotate eab-clear` holds it from before its first `OpenBao` write until the
-  config is published and the daemon signalled.
+  config is published and the daemon signalled, including when a per-service
+  write failed on the way.
 
 Under the lock the two rotations re-read the file and apply their change to what
 they read, so a `[trust]` change published while they waited survives them. The

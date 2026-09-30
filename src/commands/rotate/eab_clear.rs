@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
 use super::RotateContext;
-use super::helpers::confirm_action;
+use super::helpers::{confirm_action, fold_failure};
 use super::registrar_internal::{
     InternalConfigChange, acquire_internal_config_lock, apply_internal_config_change,
     check_internal_config_change, internal_config_path,
@@ -78,29 +78,37 @@ pub(super) async fn rotate_eab_clear(
         .with_context(|| messages.error_openbao_kv_write_failed())?;
     println!("Cleared {PATH_AGENT_EAB}");
 
-    // Per-service EAB. Enumerate from state plus registrar bindings, not
-    // a blind KV listing: a stale KV entry with neither a state record
-    // nor a binding has no recorded owner and would be ambiguous to
-    // clear silently.
-    for registration_id in &registration_ids {
-        let path = service_eab_path(registration_id);
-        client
-            .write_kv(&kv_mount, &path, empty.clone())
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-        println!("Cleared {path}");
-    }
-
-    let internal_rewritten = match &internal_lock {
-        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await?,
-        None => false,
+    // The global record is what a repair reads the EAB from, so from
+    // here on the internal config follows it even when a per-service
+    // write fails: returning early would release the lock with the
+    // daemon's config still out of step with `OpenBao`. The failures are
+    // reported together.
+    let fanout_outcome =
+        clear_service_eab_records(client, &kv_mount, &registration_ids, &empty, messages).await;
+    let internal_outcome = match &internal_lock {
+        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await,
+        None => Ok(false),
     };
     drop(internal_lock);
+
+    let internal_rewritten = match internal_outcome {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            return Err(fold_failure(
+                fanout_outcome.err(),
+                "removing [eab] from the registrar endpoint config",
+                err,
+            ));
+        }
+    };
     if internal_rewritten {
         println!(
             "Removed [eab] from {}",
             internal_config_path(&secrets_dir).display()
         );
+    }
+    fanout_outcome?;
+    if internal_rewritten {
         println!(
             "EAB clear completed; service bootroot-agents apply the cleared value via their fast-poll loop within fast_poll_interval, and the registrar endpoint daemon, which polls nothing, was reloaded on its rewritten config instead."
         );
@@ -108,6 +116,30 @@ pub(super) async fn rotate_eab_clear(
         println!(
             "EAB clear completed; service bootroot-agents apply the cleared value via their fast-poll loop within fast_poll_interval."
         );
+    }
+    Ok(())
+}
+
+/// Writes the empty EAB to each registration's per-service record, in
+/// the order given, stopping at the first write that fails.
+///
+/// Enumerates from state plus registrar bindings, not a blind KV
+/// listing: a stale KV entry with neither a state record nor a binding
+/// has no recorded owner and would be ambiguous to clear silently.
+async fn clear_service_eab_records(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    registration_ids: &[String],
+    empty: &serde_json::Value,
+    messages: &Messages,
+) -> Result<()> {
+    for registration_id in registration_ids {
+        let path = service_eab_path(registration_id);
+        client
+            .write_kv(kv_mount, &path, empty.clone())
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+        println!("Cleared {path}");
     }
     Ok(())
 }

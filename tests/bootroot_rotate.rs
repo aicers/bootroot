@@ -5931,6 +5931,134 @@ async fn test_rotate_responder_hmac_reports_an_internal_config_it_cannot_publish
     );
 }
 
+/// Answers `registration_id`'s per-service `suffix` record write with a
+/// server error, ahead of any stub that would accept it.
+async fn fail_service_record_write(server: &MockServer, registration_id: &str, suffix: &str) {
+    Mock::given(method("POST"))
+        .and(path(service_record_path(registration_id, suffix)))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "errors": ["internal error"]
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
+/// A fan-out write that fails after the control-node HMAC write does
+/// not end `rotate responder-hmac` there. `OpenBao` already carries the
+/// new value, so the internal config is still rewritten and the
+/// responder still handed the HMAC — both under the lock, which a
+/// repair waiting to read that value must not see released before the
+/// responder has it — and both failures are reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_responder_hmac_fanout_failure_still_hands_over_the_hmac() {
+    assert_ne!(
+        bootroot::fs_util::current_process_euid(),
+        0,
+        "this test asserts what an unprivileged process cannot do, so it must not be root"
+    );
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    fail_service_record_write(&openbao, SERVICE_NAME, "http_responder_hmac").await;
+    stub_openbao_for_responder_hmac_rotation(&openbao, "hmac-fanout").await;
+    let before = valid_internal_config(false);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output = run_responder_hmac_with_env(
+        temp_dir.path(),
+        &openbao.uri(),
+        &["--root-token", support::ROOT_TOKEN],
+        "hmac-fanout",
+        &[("PKILL_OUTPUT", &pkill_log)],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("OpenBao KV secret write failed"),
+        "the fan-out failure is reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED),
+        "the internal config is still rewritten, and its failure reported too: {stderr}"
+    );
+    assert!(
+        !stdout.contains("hmac-fanout") && !stderr.contains("hmac-fanout"),
+        "the new HMAC is never printed"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/responder/hmac".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/http_responder_hmac"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    let docker_log =
+        fs::read_to_string(temp_dir.path().join("docker.log")).expect("read docker log");
+    assert!(
+        docker_log.lines().any(|line| {
+            line.contains("restart") && line.contains("bootroot-openbao-agent-responder")
+        }),
+        "the responder is handed the new HMAC despite the fan-out failure: {docker_log}"
+    );
+    assert!(
+        !stdout.contains("responder config updated"),
+        "no summary claims the rotation finished: {stdout}"
+    );
+}
+
+/// A per-service write that fails after the global EAB is cleared does
+/// not end `rotate eab-clear` there: the internal config is still
+/// brought in step with `OpenBao` under the lock, and both failures are
+/// reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rotate_eab_clear_fanout_failure_still_rewrites_the_internal_config() {
+    assert_ne!(
+        bootroot::fs_util::current_process_euid(),
+        0,
+        "this test asserts what an unprivileged process cannot do, so it must not be root"
+    );
+    let temp_dir = tempdir().expect("create temp dir");
+    let openbao = MockServer::start().await;
+    prepare_app_state(temp_dir.path(), &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    fail_service_record_write(&openbao, SERVICE_NAME, "eab").await;
+    stub_eab_clear(&openbao).await;
+    let before = valid_internal_config(true);
+    let config = write_internal_config(temp_dir.path(), &before);
+    let pkill_log = stage_fake_pkill(temp_dir.path());
+
+    let output =
+        run_rotate_root_with_pkill(temp_dir.path(), &openbao.uri(), "eab-clear", &pkill_log);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("OpenBao KV secret write failed"),
+        "the fan-out failure is reported: {stderr}"
+    );
+    assert!(
+        stderr.contains(INTERNAL_CONFIG_AS_RECORDED)
+            && stderr.contains("bootroot rotate registrar-internal-credential --force"),
+        "the internal config is still rewritten, and its failure reported too: {stderr}"
+    );
+    assert_eq!(
+        request_lines(&received(&openbao).await),
+        vec![
+            "GET /v1/sys/health".to_string(),
+            "POST /v1/secret/data/bootroot/agent/eab".to_string(),
+            format!("POST /v1/secret/data/bootroot/services/{SERVICE_NAME}/eab"),
+        ]
+    );
+    assert_eq!(fs::read_to_string(&config).expect("config"), before);
+    assert!(!stdout.contains("EAB clear completed"), "{stdout}");
+}
+
 /// `rotate eab-clear` refuses a host whose internal config does not
 /// parse before it clears anything.
 #[cfg(unix)]

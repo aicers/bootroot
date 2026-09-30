@@ -5,8 +5,8 @@ use bootroot::openbao::OpenBaoClient;
 use bootroot::secret::HmacSecret;
 
 use super::helpers::{
-    compose_has_responder, confirm_action, reload_compose_service, restart_openbao_agent,
-    wait_for_rendered_file,
+    compose_has_responder, confirm_action, fold_failure, reload_compose_service,
+    restart_openbao_agent, wait_for_rendered_file,
 };
 use super::registrar_internal::{
     InternalConfigChange, InternalConfigLock, acquire_internal_config_lock,
@@ -69,7 +69,16 @@ pub(super) async fn rotate_responder_hmac(
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
-    sync_service_responder_hmac_payloads(ctx, client, &registration_ids, &hmac, messages).await?;
+
+    // From here on the control-node record carries the new value, which
+    // is what a repair reads and what the responder's `OpenBao` Agent
+    // renders from, so every remaining step runs even when an earlier
+    // one fails and the failures are reported together. In particular a
+    // failed fan-out write does not return early: that would release
+    // the lock with the new value in `OpenBao` and the responder still
+    // on the old one, letting a waiting repair issue against it.
+    let fanout_outcome =
+        sync_service_responder_hmac_payloads(ctx, client, &registration_ids, &hmac, messages).await;
 
     // Service agents (local host daemons and remote alike) pick up the
     // rotated HMAC from their per-service KV payload via the fast-poll
@@ -91,16 +100,32 @@ pub(super) async fn rotate_responder_hmac(
     let responder_outcome =
         hand_responder_the_hmac(ctx, &hmac, internal_lock.as_ref(), messages).await;
     drop(internal_lock);
-    let internal_rewritten = match (internal_outcome, &responder_outcome) {
-        (Ok(rewritten), _) => rewritten,
-        (Err(err), Ok(_)) => return Err(err),
-        (Err(err), Err(responder_err)) => {
-            return Err(err.context(format!(
-                "handing the responder the rotated HMAC failed as well: {responder_err:#}"
-            )));
+
+    let mut failure = fanout_outcome.err();
+    let internal_rewritten = match internal_outcome {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            failure = Some(fold_failure(
+                failure,
+                "rewriting the registrar endpoint config",
+                err,
+            ));
+            false
         }
     };
-    let (responder_path, reloaded) = responder_outcome?;
+    let (responder_path, reloaded) = match responder_outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return Err(fold_failure(
+                failure,
+                "handing the responder the rotated HMAC",
+                err,
+            ));
+        }
+    };
+    if let Some(err) = failure {
+        return Err(err);
+    }
 
     println!("{}", messages.rotate_summary_title());
     println!(
