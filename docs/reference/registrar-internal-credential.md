@@ -516,7 +516,11 @@ rewritten and, for `rotate responder-hmac`, the responder handed the new HMAC.
 `rotate responder-hmac` hands the responder the new HMAC before it reports any
 such failure: the service agents are already converging on it, and the
 `--force` repair issues over ACME with the value it reads from `OpenBao`, which
-a responder left on the old one would refuse.
+a responder left on the old one would refuse. That holds only on a host that
+carries the internal config. On a host without it no lock is taken and no
+repair waits on one, so a failed fan-out write ends `rotate responder-hmac`
+before `openbao-agent-responder` is restarted: the responder is neither handed
+the new HMAC nor reloaded, and re-running the rotation converges it.
 
 **Every rotation that writes the config serializes on one lock.** Rotations can
 overlap — scheduled rotation units run on timers — and each writer is a
