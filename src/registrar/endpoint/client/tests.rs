@@ -54,6 +54,7 @@ use crate::registrar::endpoint_pin::EndpointVerifyRejection;
 /// about.
 const MINT_SUCCESS: &[u8] = include_bytes!("../fixtures/mint-success.json");
 const DEREGISTER_SUCCESS: &[u8] = include_bytes!("../fixtures/deregister-success.json");
+const OBSERVE_SUCCESS: &[u8] = include_bytes!("../fixtures/observe-success.json");
 const REFUSAL_PERMANENT: &[u8] = include_bytes!("../fixtures/refusal-permanent.json");
 
 /// Bytes that are not a TLS record, for the raw handshake-failure case.
@@ -625,6 +626,76 @@ async fn a_deregister_returns_the_success_shape_the_double_encoded() {
         protocol::DeregisterWireOutcome::AlreadyAbsent
     );
     assert_eq!(double.observed().requests.len(), 1);
+}
+
+#[tokio::test]
+async fn an_observe_returns_the_success_shape_the_double_encoded() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(OBSERVE_SUCCESS)));
+
+    let reply = deployment
+        .client()
+        .observe()
+        .await
+        .expect("the exchange completes");
+
+    let response = match reply {
+        ObserveReply::Success(response) => response,
+        ObserveReply::Refused(refusal) => panic!("expected the success arm, saw {refusal:?}"),
+    };
+    assert_eq!(
+        response,
+        protocol::decode_observe_response(OBSERVE_SUCCESS).expect("the fixture decodes")
+    );
+
+    // The one frame the client wrote is an observe frame carrying the
+    // version and nothing else.
+    double.settled(1).await;
+    let expected = frame::encode_request_frame(Operation::Observe, br#"{"protocol_version":1}"#)
+        .expect("the request frames");
+    assert_eq!(double.observed().requests, vec![expected]);
+}
+
+#[tokio::test]
+async fn an_observe_refusal_is_a_successful_exchange() {
+    let deployment = Deployment::new();
+    let double = deployment.double(answered(response_frame(REFUSAL_PERMANENT)));
+
+    let reply = deployment
+        .client()
+        .observe()
+        .await
+        .expect("a refusal is not an exchange failure");
+
+    let refusal = match reply {
+        ObserveReply::Refused(refusal) => refusal,
+        ObserveReply::Success(response) => panic!("expected the refusal arm, saw {response:?}"),
+    };
+    assert_eq!(refusal.class, protocol::RefusalClass::Permanent);
+    assert_eq!(
+        double.observed().connections,
+        1,
+        "the client retried a refusal"
+    );
+}
+
+#[tokio::test]
+async fn an_older_daemons_unrecognized_operation_answer_is_a_codec_failure() {
+    let deployment = Deployment::new();
+    let _double = deployment.double(answered(response_frame(
+        crate::registrar::endpoint::refusal::UNRECOGNIZED_OPERATION_RESPONSE,
+    )));
+
+    let err = deployment
+        .client()
+        .observe()
+        .await
+        .expect_err("the fixed marker is not a protocol payload");
+
+    assert!(
+        matches!(err, ExchangeError::Codec { .. }),
+        "expected a codec failure, saw {err:?}"
+    );
 }
 
 #[tokio::test]

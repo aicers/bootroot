@@ -18,11 +18,16 @@ use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::scan::{AUDIT_SCAN_WINDOW, scan_audit_store};
 use crate::registrar::audit::{ACTIVE_FILE_NAME, AuditRecordStore};
 use crate::registrar::audit_store::capacity::AuditCapacityState;
-use crate::registrar::config::{RegistrarConfig, ReloadKind, ReloadSpec};
+use crate::registrar::config::{
+    CONFIG_FILE_NAME, MAX_COMPONENTS, RegistrarConfig, ReloadKind, ReloadSpec,
+};
+use crate::registrar::endpoint::MAX_RESPONSE_PAYLOAD_BYTES;
+use crate::registrar::endpoint::frame::Operation;
+use crate::registrar::endpoint::handler::RegistrarRequestHandler;
 use crate::registrar::endpoint::protocol::{
-    AuditCapacityHealth, CertificateHealth, LimiterHealth, RegistrarHealth, RenewalOutcome,
-    WireServiceSpec, decode_ca_anchor, decode_mint_response, encode_ca_anchor,
-    encode_mint_response,
+    AuditCapacityHealth, CERTIFICATE_LEAF_ORDER, CertificateHealth, LimiterHealth, ObserveResponse,
+    RegistrarHealth, RenewalOutcome, WireServiceSpec, decode_ca_anchor, decode_mint_response,
+    decode_observe_response, encode_ca_anchor, encode_mint_response,
 };
 use crate::registrar::fixture::RegistrarConfigFixture;
 use crate::registrar::internal::{InternalCredential, active_root_cert_path};
@@ -351,10 +356,11 @@ fn test_limiter() -> VerbRateLimiter {
 /// nothing but which one they call.
 fn harness_dependencies(
     server: &MockServer,
+    fixture: &RegistrarConfigFixture,
     audit_store: AuditRecordStore,
 ) -> (tempfile::TempDir, RegistrarVerbs, InternalCredential) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config_path = RegistrarConfigFixture::new()
+    let config_path = fixture
         .write_to(dir.path())
         .expect("write the rendered registrar config");
     let config = RegistrarConfig::load(&config_path).expect("the fixture must load");
@@ -385,6 +391,7 @@ fn harness_dependencies(
 fn anchor_harness(server: &MockServer) -> (tempfile::TempDir, ProductionHandler) {
     let (dir, verbs, credential) = harness_dependencies(
         server,
+        &RegistrarConfigFixture::new(),
         AuditRecordStore::open_temporary().expect("a temporary audit store"),
     );
     (
@@ -406,7 +413,17 @@ fn health_harness(
     audit_store: AuditRecordStore,
     health: Arc<StdMutex<RegistrarHealth>>,
 ) -> (tempfile::TempDir, ProductionHandler) {
-    let (dir, verbs, credential) = harness_dependencies(server, audit_store);
+    health_harness_over(server, &RegistrarConfigFixture::new(), audit_store, health)
+}
+
+/// [`health_harness`] over the provisioning file `fixture` renders.
+fn health_harness_over(
+    server: &MockServer,
+    fixture: &RegistrarConfigFixture,
+    audit_store: AuditRecordStore,
+    health: Arc<StdMutex<RegistrarHealth>>,
+) -> (tempfile::TempDir, ProductionHandler) {
+    let (dir, verbs, credential) = harness_dependencies(server, fixture, audit_store);
     (
         dir,
         ProductionHandler::with_health(
@@ -743,12 +760,279 @@ async fn a_mint_response_relays_the_last_snapshot_without_scanning_the_store() {
     );
 }
 
+/// The observe payload a current caller sends.
+const OBSERVE_PAYLOAD: &[u8] = br#"{"protocol_version":1}"#;
+
+/// Drives one `observe` through the handler's own dispatch.
+async fn observe(handler: &ProductionHandler) -> ObserveResponse {
+    let encoded = handler
+        .handle(
+            Operation::Observe,
+            OBSERVE_PAYLOAD,
+            CallerIdentity::new("registrar-client:001.bootroot-registrar.h1.example.internal"),
+        )
+        .await
+        .expect("observe is answered");
+    decode_observe_response(&encoded).expect("the observe response decodes")
+}
+
+/// The audit store's active file as it stands, or nothing when no
+/// record has created it yet.
+fn active_records(audit_store: &AuditRecordStore) -> Vec<u8> {
+    match std::fs::read(audit_store.active_path()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("the active audit file is readable: {error}"),
+    }
+}
+
+/// `observe` reports the loaded config's domain and component digests,
+/// and the health snapshot as it stands — `unknown` capacity before the
+/// first maintenance tick has measured anything.
+#[tokio::test]
+async fn observe_reports_the_loaded_fingerprint_and_the_current_snapshot() {
+    let server = MockServer::start().await;
+    let health = Arc::new(StdMutex::new(RegistrarHealth::default()));
+    let (dir, handler) = health_harness(
+        &server,
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        health.clone(),
+    );
+    let config =
+        RegistrarConfig::load(&dir.path().join(CONFIG_FILE_NAME)).expect("the fixture must load");
+
+    let response = observe(&handler).await;
+    assert_eq!(response.provisioning_fingerprint.domain, config.domain());
+    assert_eq!(
+        response.provisioning_fingerprint.components,
+        config.component_digests()
+    );
+    assert_eq!(
+        response
+            .provisioning_fingerprint
+            .components
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["piglet", "review", "roxyd"]
+    );
+    assert_eq!(response.registrar_health, RegistrarHealth::default());
+    assert_eq!(
+        response.registrar_health.audit_capacity.state,
+        AuditCapacityState::Unknown,
+        "before the first tick the capacity state is relayed as unknown"
+    );
+
+    // What the tick writes is what the next observe relays.
+    let mut snapshot = relay_snapshot();
+    snapshot.audit_capacity.state = AuditCapacityState::LowWater;
+    snapshot.audit_capacity.intent_without_outcome = Some(2);
+    *health.lock().expect("the snapshot lock is not poisoned") = snapshot.clone();
+
+    let response = observe(&handler).await;
+    assert_eq!(response.registrar_health, snapshot);
+    assert_eq!(
+        response.registrar_health.audit_capacity.state,
+        AuditCapacityState::LowWater
+    );
+    assert_eq!(
+        response
+            .registrar_health
+            .audit_capacity
+            .intent_without_outcome,
+        Some(2)
+    );
+}
+
+/// A health snapshot at its widest encoding: every optional member
+/// present, every number at its longest rendering, every timestamp
+/// carrying nanoseconds in year 9999, and each enum at its longest
+/// spelling that still carries every member.
+fn widest_health() -> RegistrarHealth {
+    let latest = time::OffsetDateTime::new_utc(
+        time::Date::from_calendar_date(9999, time::Month::December, 31).expect("a valid date"),
+        time::Time::from_hms_nano(23, 59, 59, 999_999_999).expect("a valid time"),
+    );
+    let certificate = |leaf| CertificateHealth {
+        leaf,
+        not_after: latest,
+        remaining_seconds: i64::MIN,
+        last_renewal_outcome: RenewalOutcome::Succeeded,
+        last_renewal_at: Some(latest),
+    };
+    RegistrarHealth {
+        limiter: LimiterHealth {
+            limited_predecision_refusal: u64::MAX,
+            limited_admission: u64::MAX,
+        },
+        audit_capacity: AuditCapacityHealth {
+            state: AuditCapacityState::LowWater,
+            enforcement: AuditStoreEnforcement::Filesystem,
+            reserve_bytes: u64::MAX,
+            low_water_bytes: u64::MAX,
+            used_bytes: Some(u64::MAX),
+            headroom_bytes: Some(i64::MIN),
+            measured_at: Some(latest),
+            intent_without_outcome: Some(u64::MAX),
+            malformed_records: Some(u64::MAX),
+            retention_shortfall: Some(false),
+            records_measured_at: Some(latest),
+        },
+        certificates: CERTIFICATE_LEAF_ORDER
+            .into_iter()
+            .map(certificate)
+            .collect(),
+    }
+}
+
+/// The widest provisioning file the loader admits, observed with the
+/// widest health snapshot, is answered with a response the endpoint
+/// frames: every loadable file is observable.
+#[tokio::test]
+async fn the_widest_admitted_config_is_observable_within_the_response_bound() {
+    let server = MockServer::start().await;
+    let health = Arc::new(StdMutex::new(widest_health()));
+    let (dir, handler) = health_harness_over(
+        &server,
+        &RegistrarConfigFixture::widest(),
+        AuditRecordStore::open_temporary().expect("a temporary audit store"),
+        health,
+    );
+    let config =
+        RegistrarConfig::load(&dir.path().join(CONFIG_FILE_NAME)).expect("the fixture must load");
+    assert_eq!(config.component_names().count(), MAX_COMPONENTS);
+
+    let encoded = handler
+        .handle(
+            Operation::Observe,
+            OBSERVE_PAYLOAD,
+            CallerIdentity::new("registrar-client:001.bootroot-registrar.h1.example.internal"),
+        )
+        .await
+        .expect("observe is answered");
+    assert!(
+        encoded.len() <= MAX_RESPONSE_PAYLOAD_BYTES,
+        "the widest observe answer is {} bytes, past the {MAX_RESPONSE_PAYLOAD_BYTES}-byte \
+         response bound",
+        encoded.len()
+    );
+    let response = decode_observe_response(&encoded).expect("the observe response decodes");
+    assert_eq!(response.provisioning_fingerprint.domain, config.domain());
+    assert_eq!(
+        response.provisioning_fingerprint.components,
+        config.component_digests()
+    );
+    assert_eq!(response.registrar_health, widest_health());
+}
+
+/// Serving `observe` charges no limiter bucket, writes no audit record
+/// and makes no `OpenBao` request.
+#[tokio::test]
+async fn observe_charges_no_limiter_writes_no_audit_record_and_calls_no_openbao() {
+    let server = MockServer::start().await;
+    let audit_store = AuditRecordStore::open_temporary().expect("a temporary audit store");
+    let (_dir, handler) = health_harness(
+        &server,
+        audit_store.clone(),
+        Arc::new(StdMutex::new(RegistrarHealth::default())),
+    );
+    let entries = handler.verbs.limiter().entry_count();
+    let records = active_records(&audit_store);
+
+    for _ in 0..3 {
+        observe(&handler).await;
+    }
+
+    assert_eq!(
+        handler.verbs.limiter().entry_count(),
+        entries,
+        "observe charges no limiter bucket"
+    );
+    assert_eq!(
+        active_records(&audit_store),
+        records,
+        "observe writes no audit intent and no audit outcome"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "observe makes no OpenBao request"
+    );
+}
+
+/// The fingerprint is the one computed from the verbs when the handler
+/// was built: a file re-rendered underneath a running daemon is not what
+/// its mints enforce, so `observe` does not report it until a reload
+/// builds a new handler.
+#[tokio::test]
+async fn observe_reports_the_construction_time_fingerprint_not_a_rerendered_file() {
+    let server = MockServer::start().await;
+    let (dir, handler) = anchor_harness(&server);
+    let before = observe(&handler).await;
+
+    RegistrarConfigFixture::new()
+        .with_domain("other.domain")
+        .without_component("piglet")
+        .write_to(dir.path())
+        .expect("re-render the provisioning file");
+    let rerendered = RegistrarConfig::load(&dir.path().join(CONFIG_FILE_NAME))
+        .expect("the re-rendered file loads");
+    assert_ne!(rerendered.domain(), before.provisioning_fingerprint.domain);
+
+    let after = observe(&handler).await;
+    assert_eq!(
+        after.provisioning_fingerprint,
+        before.provisioning_fingerprint
+    );
+    assert_eq!(
+        after.provisioning_fingerprint.domain,
+        handler.verbs.domain()
+    );
+    assert_eq!(
+        after.provisioning_fingerprint.components,
+        handler.verbs.component_digests()
+    );
+}
+
+/// A malformed observe payload is a handler refusal, exactly as it is
+/// for the two verbs.
+#[tokio::test]
+async fn a_malformed_observe_payload_is_a_handler_refusal() {
+    let server = MockServer::start().await;
+    let (_dir, handler) = anchor_harness(&server);
+    for payload in [
+        b"{}".as_slice(),
+        br#"{"protocol_version":2}"#.as_slice(),
+        b"1".as_slice(),
+        br#""x""#.as_slice(),
+        b"null".as_slice(),
+    ] {
+        assert!(
+            handler
+                .handle(
+                    Operation::Observe,
+                    payload,
+                    CallerIdentity::new(
+                        "registrar-client:001.bootroot-registrar.h1.example.internal"
+                    ),
+                )
+                .await
+                .is_err(),
+            "{} is refused",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
 /// No arm of the request path reads the audit store or a certificate
 /// file, and every arm takes its health from the one accessor.
 ///
 /// Asserted over this module's source because it is a property of the
 /// complete request path rather than of any one response. The source
-/// inspection covers both mint and deregister, including any future
+/// inspection covers mint, deregister and observe, including any future
 /// control flow a response-level test does not exercise.
 #[test]
 fn no_request_path_arm_reads_the_audit_store() {
@@ -803,4 +1087,66 @@ fn no_request_path_arm_reads_the_audit_store() {
             "{arm} reaches the holder through the accessor and not around it: {body}"
         );
     }
+
+    // `observe` answers from the load-time fingerprint and the health
+    // accessor and from nothing else: no verb, no credential, no
+    // limiter, no audit store and no second read of the provisioning
+    // file.
+    let arm = "    fn observe(";
+    let body = source
+        .split(arm)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{arm} is declared in this file"))
+        .split("\n    }")
+        .next()
+        .unwrap_or_else(|| panic!("{arm} has a body"));
+    assert!(
+        body.contains("let health = self.health_snapshot();"),
+        "{arm} takes its health from the one accessor: {body}"
+    );
+    assert!(
+        body.contains("protocol::encode_observe_response(&self.fingerprint, &health)"),
+        "{arm} answers from the fingerprint computed at construction: {body}"
+    );
+    for forbidden in [
+        ".lock()",
+        "self.verbs",
+        "self.credential",
+        "self.kv_mount",
+        "limiter",
+        "audit",
+        "load(",
+        "component_digests",
+        "RegistrarConfig",
+        ".await",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "{arm} must not reach {forbidden}: {body}"
+        );
+    }
+    assert!(
+        source.contains("Request::Observe(_) => self.observe(&caller),"),
+        "the observe request dispatches to the observe arm"
+    );
+
+    // The fingerprint is computed once, from the verbs' own config, when
+    // the handler is built — and nowhere else.
+    assert_eq!(
+        source.matches("component_digests()").count(),
+        1,
+        "the fingerprint is computed at construction only"
+    );
+    let constructor = source
+        .split("    pub(crate) fn with_health(")
+        .nth(1)
+        .expect("with_health is declared in this file")
+        .split("\n    }")
+        .next()
+        .expect("with_health has a body");
+    assert!(
+        constructor.contains("components: verbs.component_digests(),")
+            && constructor.contains("domain: verbs.domain().to_owned(),"),
+        "with_health computes the fingerprint from the verbs it is given: {constructor}"
+    );
 }

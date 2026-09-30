@@ -9,7 +9,7 @@
 
 // This module is the codec for *both* ends of the wire, and this daemon
 // is only one of them: it decodes a request and encodes a response. The
-// caller's half — `encode_request`, the three response decoders and the
+// caller's half — `encode_request`, the four response decoders and the
 // `ca_anchor` decode behind the mint one — has no production consumer
 // in this crate, because the enrolling agent that speaks this protocol
 // is separate work. `super::client` is this repository's reference
@@ -21,6 +21,7 @@
 // reference when that agent lands.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use base64::Engine as _;
@@ -369,6 +370,16 @@ pub(crate) struct DeregisterRequest {
     pub(crate) idempotency_key: String,
 }
 
+/// The observe request payload.
+///
+/// It carries the version and nothing else: `observe` runs no verb, so
+/// there is no identity to name, no idempotency key and nothing a caller
+/// could supply that would change the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ObserveRequest {
+    pub(crate) protocol_version: ProtocolVersion,
+}
+
 /// A request decoded according to the endpoint operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 // One value exists per connection, decoded and dropped within it, so the
@@ -379,6 +390,8 @@ pub(crate) enum Request {
     Register(RegisterRequest),
     /// A deregister request.
     Deregister(DeregisterRequest),
+    /// An observe request.
+    Observe(ObserveRequest),
 }
 
 /// A payload codec failure.
@@ -407,11 +420,11 @@ pub(crate) enum CodecError {
 /// Decodes an endpoint request after its operation has been authenticated.
 ///
 /// The frame's operation, not the payload's members, selects the shape: a mint
-/// frame decodes only as a [`RegisterRequest`] and a deregistration frame only
-/// as a [`DeregisterRequest`].  Every member the selected shape does not name
-/// is an unknown member and is ignored, including one the other operation
-/// knows, so an additive extension on either shape cannot make the other
-/// shape's decoder fail.
+/// frame decodes only as a [`RegisterRequest`], a deregistration frame only as
+/// a [`DeregisterRequest`] and an observe frame only as an [`ObserveRequest`].
+/// Every member the selected shape does not name is an unknown member and is
+/// ignored, including one another operation knows, so an additive extension on
+/// any shape cannot make another shape's decoder fail.
 pub(crate) fn decode_request(operation: Operation, payload: &[u8]) -> Result<Request, CodecError> {
     match operation {
         Operation::Mint => serde_json::from_slice(payload)
@@ -419,6 +432,9 @@ pub(crate) fn decode_request(operation: Operation, payload: &[u8]) -> Result<Req
             .map_err(Into::into),
         Operation::Deregister => serde_json::from_slice(payload)
             .map(Request::Deregister)
+            .map_err(Into::into),
+        Operation::Observe => serde_json::from_slice(payload)
+            .map(Request::Observe)
             .map_err(Into::into),
     }
 }
@@ -428,6 +444,7 @@ pub(crate) fn encode_request(request: &Request) -> Result<Vec<u8>, CodecError> {
     match request {
         Request::Register(request) => serde_json::to_vec(request),
         Request::Deregister(request) => serde_json::to_vec(request),
+        Request::Observe(request) => serde_json::to_vec(request),
     }
     .map_err(Into::into)
 }
@@ -870,6 +887,32 @@ pub(crate) enum DeregisterWireOutcome {
     AlreadyAbsent,
 }
 
+/// The provisioning file the verbs enforce, as `observe` reports it.
+///
+/// Member order mirrors review-protocol's `ProvisioningFingerprint`,
+/// which `roxyd` relays this onto without interpreting it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProvisioningFingerprint {
+    /// Each component's digest, keyed by component, as
+    /// [`ComponentEntry::digest`](crate::registrar::config::ComponentEntry::digest)
+    /// defines it.
+    pub(crate) components: BTreeMap<String, String>,
+    /// The deployment domain, compared on its own rather than folded into
+    /// any component's digest.
+    pub(crate) domain: String,
+}
+
+/// A successful observe response.
+///
+/// There is no `request_id`: no verb ran, so there is no audit record
+/// for one to correlate with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ObserveResponse {
+    pub(crate) protocol_version: ProtocolVersion,
+    pub(crate) provisioning_fingerprint: ProvisioningFingerprint,
+    pub(crate) registrar_health: RegistrarHealth,
+}
+
 /// A refused invocation response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RefusalResponse {
@@ -929,6 +972,11 @@ pub(crate) fn decode_mint_response(payload: &[u8]) -> Result<MintResponse, Codec
 
 /// Decodes a deregister response from the registrar endpoint.
 pub(crate) fn decode_deregister_response(payload: &[u8]) -> Result<DeregisterResponse, CodecError> {
+    serde_json::from_slice(payload).map_err(Into::into)
+}
+
+/// Decodes an observe response from the registrar endpoint.
+pub(crate) fn decode_observe_response(payload: &[u8]) -> Result<ObserveResponse, CodecError> {
     serde_json::from_slice(payload).map_err(Into::into)
 }
 
@@ -1057,6 +1105,20 @@ pub(crate) fn encode_deregister_response(
                 DeregisterWireOutcome::AlreadyAbsent
             }
         },
+        registrar_health: health.clone(),
+    };
+    serde_json::to_vec(&response).map_err(Into::into)
+}
+
+/// Encodes an observe answer from the supplied fingerprint and health
+/// snapshot.
+pub(crate) fn encode_observe_response(
+    fingerprint: &ProvisioningFingerprint,
+    health: &RegistrarHealth,
+) -> Result<Vec<u8>, CodecError> {
+    let response = ObserveResponse {
+        protocol_version: ProtocolVersion::current(),
+        provisioning_fingerprint: fingerprint.clone(),
         registrar_health: health.clone(),
     };
     serde_json::to_vec(&response).map_err(Into::into)
@@ -4199,6 +4261,119 @@ mod tests {
         }
     }
 
+    fn observe_request() -> ObserveRequest {
+        ObserveRequest {
+            protocol_version: ProtocolVersion::current(),
+        }
+    }
+
+    /// The fingerprint the observe fixture carries: the three entries of
+    /// `docs/reference/provisioning.toml.example` and their digests.
+    fn fixture_fingerprint() -> ProvisioningFingerprint {
+        ProvisioningFingerprint {
+            components: BTreeMap::from([
+                (
+                    "piglet".to_string(),
+                    "d65707163d36d8c6f9fe68d78ac6fa916e48c295ee0da200a55eafa8e28cbaa7".to_string(),
+                ),
+                (
+                    "review".to_string(),
+                    "14b935b0edee43d86386c37e234365b170287c2d184307e84a1ddcb2cd498b31".to_string(),
+                ),
+                (
+                    "roxyd".to_string(),
+                    "7559f5080e83b113a3d65269275e719da73a64f4d8b400fecc154fc317c81f7c".to_string(),
+                ),
+            ]),
+            domain: "trusted.domain".to_string(),
+        }
+    }
+
+    #[test]
+    fn observe_request_round_trips() {
+        let request = Request::Observe(observe_request());
+        let encoded = encode_request(&request).expect("observe encodes");
+        assert_eq!(encoded, br#"{"protocol_version":1}"#);
+        assert_eq!(
+            decode_request(Operation::Observe, &encoded).expect("observe decodes"),
+            request
+        );
+    }
+
+    #[test]
+    fn observe_request_ignores_unknown_members() {
+        for payload in [
+            br#"{"protocol_version":1,"extra":true}"#.as_slice(),
+            br#"{"service_name":"api","protocol_version":1,"request_id":"r"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                decode_request(Operation::Observe, payload).expect("observe decodes"),
+                Request::Observe(observe_request())
+            );
+        }
+    }
+
+    #[test]
+    fn observe_request_rejects_a_missing_or_unsupported_version() {
+        for payload in [
+            b"{}".as_slice(),
+            br#"{"protocol_version":2}"#.as_slice(),
+            br#"{"protocol_version":0}"#.as_slice(),
+            br#"{"protocol_version":-1}"#.as_slice(),
+            br#"{"protocol_version":null}"#.as_slice(),
+            br#"{"protocol_version":"1"}"#.as_slice(),
+            b"1".as_slice(),
+            br#""x""#.as_slice(),
+            b"null".as_slice(),
+            b"".as_slice(),
+        ] {
+            assert!(
+                decode_request(Operation::Observe, payload).is_err(),
+                "{} decoded",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    }
+
+    #[test]
+    fn observe_response_encodes_in_the_stated_member_order() {
+        let health = fixture_health();
+        let encoded =
+            encode_observe_response(&fixture_fingerprint(), &health).expect("observe encodes");
+        let text = String::from_utf8(encoded.clone()).expect("the response is UTF-8");
+
+        let positions = [
+            "{\"protocol_version\":1,\"provisioning_fingerprint\":{\"components\":{",
+            "\"domain\":\"trusted.domain\"},\"registrar_health\":{",
+        ]
+        .map(|needle| text.find(needle).expect("the member sequence is present"));
+        assert!(positions.is_sorted(), "{text}");
+        assert!(!text.contains("request_id"), "{text}");
+
+        let decoded = decode_observe_response(&encoded).expect("observe decodes");
+        assert_eq!(decoded.provisioning_fingerprint, fixture_fingerprint());
+        assert_eq!(decoded.registrar_health, health);
+    }
+
+    #[test]
+    fn observe_response_carries_an_unknown_capacity_state_as_it_is() {
+        let health = RegistrarHealth::default();
+        assert_eq!(health.audit_capacity.state, AuditCapacityState::Unknown);
+        let encoded =
+            encode_observe_response(&fixture_fingerprint(), &health).expect("observe encodes");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("JSON");
+        assert_eq!(
+            value["registrar_health"]["audit_capacity"]["state"],
+            serde_json::json!("unknown")
+        );
+        assert_eq!(
+            decode_observe_response(&encoded)
+                .expect("observe decodes")
+                .registrar_health,
+            health
+        );
+    }
+
     fn fixture_context(registration_id: Option<&str>, arm: ProducingArm) -> VerbContext {
         VerbContext::new(
             RequestId::for_fixture("request-0001"),
@@ -4298,6 +4473,7 @@ mod tests {
             fixture_context(None, ProducingArm::PreDerivation),
             VerbError::unavailable("fixture", anyhow::anyhow!("unavailable")),
         );
+        let observe = Request::Observe(observe_request());
 
         vec![
             (
@@ -4343,6 +4519,15 @@ mod tests {
                 encode_refusal_response(&unclassified, &health)
                     .expect("unclassified fixture encodes"),
             ),
+            (
+                "observe-request.json",
+                encode_request(&observe).expect("observe fixture encodes"),
+            ),
+            (
+                "observe-success.json",
+                encode_observe_response(&fixture_fingerprint(), &health)
+                    .expect("observe success fixture encodes"),
+            ),
         ]
     }
 
@@ -4358,24 +4543,25 @@ mod tests {
             "refusal-permanent.json" => include_bytes!("fixtures/refusal-permanent.json"),
             "refusal-busy.json" => include_bytes!("fixtures/refusal-busy.json"),
             "refusal-unclassified.json" => include_bytes!("fixtures/refusal-unclassified.json"),
+            "observe-request.json" => include_bytes!("fixtures/observe-request.json"),
+            "observe-success.json" => include_bytes!("fixtures/observe-success.json"),
             _ => panic!("unknown fixture name: {name}"),
         }
     }
 
     fn decode_and_reencode_fixture(name: &str, fixture: &[u8]) -> Vec<u8> {
         match name {
-            "register-request.json" | "deregister-request.json" => encode_request(
-                &decode_request(
-                    if name == "register-request.json" {
-                        Operation::Mint
-                    } else {
-                        Operation::Deregister
-                    },
-                    fixture,
+            "register-request.json" | "deregister-request.json" | "observe-request.json" => {
+                let operation = match name {
+                    "register-request.json" => Operation::Mint,
+                    "deregister-request.json" => Operation::Deregister,
+                    _ => Operation::Observe,
+                };
+                encode_request(
+                    &decode_request(operation, fixture).expect("request fixture decodes"),
                 )
-                .expect("request fixture decodes"),
-            )
-            .expect("request fixture reencodes"),
+                .expect("request fixture reencodes")
+            }
             "mint-success.json" | "mint-success-local-file.json" => {
                 serde_json::to_vec(&decode_mint_response(fixture).expect("mint fixture decodes"))
                     .expect("mint fixture reencodes")
@@ -4384,6 +4570,10 @@ mod tests {
                 &decode_deregister_response(fixture).expect("deregister fixture decodes"),
             )
             .expect("deregister fixture reencodes"),
+            "observe-success.json" => serde_json::to_vec(
+                &decode_observe_response(fixture).expect("observe fixture decodes"),
+            )
+            .expect("observe fixture reencodes"),
             _ => serde_json::to_vec(
                 &decode_refusal_response(fixture).expect("refusal fixture decodes"),
             )
@@ -4420,6 +4610,16 @@ mod tests {
         }
     }
 
+    fn has_orderable_members(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(has_orderable_members),
+            serde_json::Value::Object(members) => {
+                members.len() > 1 || members.values().any(has_orderable_members)
+            }
+            _ => false,
+        }
+    }
+
     #[test]
     fn golden_fixtures_match_the_production_codec() {
         for (name, generated) in generated_fixtures() {
@@ -4440,11 +4640,15 @@ mod tests {
             let fixture_value: serde_json::Value =
                 serde_json::from_slice(&fixture).expect("fixture is JSON");
             let shuffled = shuffled_json(&fixture_value);
-            assert_ne!(
-                shuffled.as_bytes(),
-                fixture,
-                "fixture {name} did not shuffle"
-            );
+            // A fixture with no object of two or more members has no order
+            // to shuffle, so identical bytes are the correct result there.
+            if has_orderable_members(&fixture_value) {
+                assert_ne!(
+                    shuffled.as_bytes(),
+                    fixture,
+                    "fixture {name} did not shuffle"
+                );
+            }
             assert_eq!(
                 decode_and_reencode_fixture(name, shuffled.as_bytes()),
                 fixture,

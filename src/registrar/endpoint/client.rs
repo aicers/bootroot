@@ -493,6 +493,15 @@ pub(crate) enum DeregisterReply {
     Refused(protocol::RefusalResponse),
 }
 
+/// What an observe exchange produced.
+#[derive(Debug)]
+pub(crate) enum ObserveReply {
+    /// The endpoint reported its provisioning fingerprint and health.
+    Success(protocol::ObserveResponse),
+    /// The endpoint refused the invocation, and said why.
+    Refused(protocol::RefusalResponse),
+}
+
 /// A caller of the host-local registrar endpoint.
 ///
 /// Constructed from four paths and one expected endpoint name and from
@@ -590,6 +599,37 @@ impl RegistrarEndpointClient {
         } else {
             protocol::decode_deregister_response(&payload)
                 .map(DeregisterReply::Success)
+                .map_err(codec)
+        }
+    }
+
+    /// Reads the endpoint's provisioning fingerprint and registrar
+    /// health without changing anything.
+    ///
+    /// A daemon that predates `observe` answers it with the fixed
+    /// `unrecognized-operation` body, which is not a JSON object and so
+    /// arrives here as [`ExchangeError::Codec`]; a caller that has to
+    /// tell "not offered" apart reads that body off the wire itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExchangeError`] when the exchange itself failed. An
+    /// endpoint refusal is not one: it arrives as
+    /// [`ObserveReply::Refused`].
+    pub(crate) async fn observe(&self) -> Result<ObserveReply, ExchangeError> {
+        let request = protocol::ObserveRequest {
+            protocol_version: protocol::ProtocolVersion::current(),
+        };
+        let payload = self
+            .exchange(Operation::Observe, &protocol::Request::Observe(request))
+            .await?;
+        if is_refusal(&payload).map_err(codec)? {
+            protocol::decode_refusal_response(&payload)
+                .map(ObserveReply::Refused)
+                .map_err(codec)
+        } else {
+            protocol::decode_observe_response(&payload)
+                .map(ObserveReply::Success)
                 .map_err(codec)
         }
     }

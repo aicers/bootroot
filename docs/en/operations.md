@@ -1948,7 +1948,10 @@ A **bootroot-host** deployment — the host that runs the registrar's own
 control plane — can have `bootroot-agent` serve the registrar's `mint`
 and `deregister` verbs on a host-local socket. This is Linux only, it is
 `AF_UNIX` only, and it is systemd socket activation only. Every other
-deployment leaves it off, which is the default.
+deployment leaves it off, which is the default. The endpoint also answers
+a read-only `observe` operation, which reports the provisioning
+fingerprint and the registrar health, changes nothing and is not
+audited.
 
 Enabling it is supported. The daemon builds the verb layer from its
 `[registrar]` settings and registers a production request handler over
