@@ -249,13 +249,17 @@ inside its existing rollback transaction:
 2. Under the init **root token**: enable `auth/cert` if absent, write the policy,
    create the entry.
 3. The internal SAN is attached to the running HTTP-01 responder as a Docker
-   network alias. step-ca validates a challenge by fetching
+   network alias, and in the same step so are the registrar surface's two
+   names, `001.bootroot-registrar.<host>.<domain>` (client) and
+   `001.bootroot-registrar-endpoint.<host>.<domain>` (endpoint server), which
+   the daemon's surface-leaf issuance and `bootroot registrar issue` validate
+   through. step-ca validates a challenge by fetching
    `http://<identifier>/.well-known/acme-challenge/…`, and inside the compose
    network that name resolves only if the responder answers to it. Every
-   service leaf gets this from `service add`; the internal identity has no
-   `ServiceEntry`, so `init` attaches it from the recorded predicate. A
-   responder it cannot be attached to fails the run here rather than as a
-   challenge timeout in the next step.
+   service leaf gets this from `service add`; none of the three registrar
+   identities has a `ServiceEntry`, so `init` attaches them from the recorded
+   predicate. A responder they cannot be attached to fails the run here rather
+   than as a challenge timeout in the next step.
 4. Under the same root token: create or load the persistent ACME account key and
    issue the internal leaf through the ordinary outbound ACME path to step-ca —
    never with step-ca signing-key material. Everything lands in a staging
@@ -267,10 +271,10 @@ inside its existing rollback transaction:
    dedicated config — as one set, over a snapshot of whatever was there, so a
    failure mid-publication leaves the previous credential intact.
 
-The alias is part of the shared set `state.json` drives, not a one-off: `infra
-up` replays it and `service remove` reconciles it, so a responder restart or an
-unrelated deregistration cannot leave the internal identity unresolvable and
-break its next renewal.
+The three aliases are part of the shared set `state.json` drives, not a
+one-off: `infra up` replays them and `service remove` reconciles them, so a
+responder restart or an unrelated deregistration cannot leave a registrar
+identity unresolvable and break its next renewal.
 
 The step-ca ACME directory and the responder admin URL the internal profile is
 issued and configured against both follow **this install's own published

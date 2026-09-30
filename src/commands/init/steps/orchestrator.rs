@@ -134,14 +134,19 @@ fn internal_acme_server_with_env(
 }
 
 /// Attaches the bootroot-internal SAN to the running responder as a
-/// Docker network alias.
+/// Docker network alias, together with the registrar surface's client
+/// and endpoint names.
 ///
 /// step-ca validates an HTTP-01 challenge by fetching
 /// `http://<identifier>/.well-known/acme-challenge/…`, and inside the
 /// compose network that identifier resolves only if the responder
 /// answers to it. Every service leaf gets this through `service add`;
-/// the internal identity has no `ServiceEntry`, so `init` attaches it
-/// from the recorded predicate before the ACME run.
+/// the three registrar identities have no `ServiceEntry`, so `init`
+/// attaches them from the recorded predicate before the ACME run. They
+/// ride in the shared alias set for the same reason: the internal leaf
+/// is issued in the next step, and the daemon issues and renews the two
+/// surface leaves, and `bootroot registrar issue` the client leaf,
+/// through the same responder.
 ///
 /// A responder the alias could not be attached to is a hard failure
 /// here rather than the warning `service add` settles for: the very

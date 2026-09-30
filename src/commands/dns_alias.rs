@@ -1,4 +1,7 @@
 use anyhow::{Context, Result};
+use bootroot::registrar::{
+    REGISTRAR_SURFACE_INSTANCE, registrar_client_identity, registrar_endpoint_identity,
+};
 
 use crate::commands::clean::{COMPOSE_PROJECT_LABEL, COMPOSE_SERVICE_LABEL};
 use crate::commands::compose_project::ComposeIdentity;
@@ -6,7 +9,7 @@ use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::{docker_output, run_docker};
 use crate::i18n::Messages;
-use crate::state::{ServiceEntry, StateFile};
+use crate::state::{RegistrarEndpointState, ServiceEntry, StateFile};
 
 /// What an alias registration attempt did, so a caller can report it
 /// alongside its own result.
@@ -48,31 +51,62 @@ pub(crate) fn dns_alias_for_entry(entry: &ServiceEntry) -> Option<String> {
 /// compose network that name resolves only if the responder answers to
 /// it.
 pub(crate) fn registrar_internal_alias(state: &StateFile) -> Option<String> {
-    let recorded = state.registrar_endpoint.as_ref().filter(|it| it.enabled)?;
-    if recorded.host.trim().is_empty() || recorded.domain.trim().is_empty() {
-        return None;
-    }
+    let recorded = enabled_registrar_endpoint(state)?;
     Some(bootroot::registrar::registrar_internal_identity(
         &recorded.host,
         &recorded.domain,
     ))
 }
 
-/// Collects DNS aliases for all registered services, plus the
-/// bootroot-internal registrar identity on a host that serves the
-/// endpoint.
+/// Returns the recorded registrar endpoint when this host serves it:
+/// present, enabled, and with neither `host` nor `domain` blank.
 ///
-/// The internal alias belongs in the *shared* collection rather than
+/// The one predicate every registrar alias is gated by, so the internal
+/// name and the two surface names can never be attached under different
+/// conditions.
+fn enabled_registrar_endpoint(state: &StateFile) -> Option<&RegistrarEndpointState> {
+    let recorded = state.registrar_endpoint.as_ref().filter(|it| it.enabled)?;
+    if recorded.host.trim().is_empty() || recorded.domain.trim().is_empty() {
+        return None;
+    }
+    Some(recorded)
+}
+
+/// Builds the HTTP-01 DNS aliases of the registrar surface's two
+/// identities — the registrar client, then the endpoint server — when
+/// this host serves the endpoint.
+///
+/// The daemon issues and renews both surface leaves over HTTP-01, and
+/// `bootroot registrar issue` issues the client leaf the same way, so
+/// step-ca has to resolve both names through the responder exactly as
+/// it resolves a service's. Neither has a [`ServiceEntry`], so, like the
+/// internal identity, they cannot come out of the service loop.
+fn registrar_surface_aliases(state: &StateFile) -> Vec<String> {
+    let Some(recorded) = enabled_registrar_endpoint(state) else {
+        return Vec::new();
+    };
+    vec![
+        registrar_client_identity(REGISTRAR_SURFACE_INSTANCE, &recorded.host, &recorded.domain),
+        registrar_endpoint_identity(REGISTRAR_SURFACE_INSTANCE, &recorded.host, &recorded.domain),
+    ]
+}
+
+/// Collects DNS aliases for all registered services, plus the
+/// bootroot-internal registrar identity and the registrar surface's two
+/// identities on a host that serves the endpoint.
+///
+/// The registrar aliases belong in the *shared* collection rather than
 /// beside one call site: `service remove` reconciles the set and `infra
 /// up` replays it, and either rebuilding it from `state.services` alone
-/// would silently drop the internal alias off a running responder and
-/// break the next internal renewal.
+/// would silently drop them off a running responder and break the next
+/// internal or surface-leaf renewal.
 pub(crate) fn collect_dns_aliases(state: &StateFile) -> Vec<String> {
     state
         .services
         .values()
         .filter_map(dns_alias_for_entry)
         .chain(registrar_internal_alias(state))
+        .chain(registrar_surface_aliases(state))
         .collect()
 }
 
@@ -349,6 +383,14 @@ mod tests {
         }
     }
 
+    fn enabled_endpoint(host: &str, domain: &str) -> crate::state::RegistrarEndpointState {
+        crate::state::RegistrarEndpointState {
+            enabled: true,
+            domain: domain.to_string(),
+            host: host.to_string(),
+        }
+    }
+
     fn state_with(services: Vec<ServiceEntry>) -> StateFile {
         let mut map = BTreeMap::new();
         for entry in services {
@@ -363,25 +405,70 @@ mod tests {
     }
 
     /// step-ca resolves an HTTP-01 identifier through the responder's
-    /// Docker network aliases. The bootroot-internal identity has no
-    /// `ServiceEntry` to carry one, so without this it would be the one
-    /// name in the deployment that step-ca cannot reach — and `init`
-    /// would fail issuing its leaf.
+    /// Docker network aliases. The bootroot-internal identity and the
+    /// registrar surface's two identities have no `ServiceEntry` to
+    /// carry one, so without this they would be the names in the
+    /// deployment that step-ca cannot reach — and `init` would fail
+    /// issuing the internal leaf, the daemon its surface leaves, and
+    /// `registrar issue` the client leaf.
     #[test]
-    fn the_internal_identity_is_aliased_alongside_the_services() {
+    fn the_registrar_identities_are_aliased_alongside_the_services() {
         let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
-        state.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
-            enabled: true,
-            domain: "test.local".to_string(),
-            host: "bootroot-01".to_string(),
-        });
+        state.registrar_endpoint = Some(enabled_endpoint("bootroot-01", "test.local"));
         assert_eq!(
             collect_dns_aliases(&state),
             vec![
                 "001.edge-proxy.host1.test.local".to_string(),
                 "001.bootroot-registrar-internal.bootroot-01.test.local".to_string(),
+                "001.bootroot-registrar.bootroot-01.test.local".to_string(),
+                "001.bootroot-registrar-endpoint.bootroot-01.test.local".to_string(),
             ]
         );
+    }
+
+    /// The surface names follow a domain of any label count, as the
+    /// certificates the daemon issues under them do.
+    #[test]
+    fn the_surface_aliases_follow_a_multi_label_domain() {
+        let mut state = state_with(Vec::new());
+        state.registrar_endpoint = Some(enabled_endpoint("bootroot-01", "a.b.test.local"));
+        assert_eq!(
+            registrar_surface_aliases(&state),
+            vec![
+                "001.bootroot-registrar.bootroot-01.a.b.test.local".to_string(),
+                "001.bootroot-registrar-endpoint.bootroot-01.a.b.test.local".to_string(),
+            ]
+        );
+    }
+
+    /// A blank host or domain composes no registrar name at all, so the
+    /// set is exactly the services' — the same answer the predicate
+    /// gives for the internal name.
+    #[test]
+    fn a_blank_host_or_domain_contributes_no_registrar_alias() {
+        for (host, domain) in [
+            ("", "test.local"),
+            ("  ", "test.local"),
+            ("bootroot-01", ""),
+            ("bootroot-01", "  "),
+        ] {
+            let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
+            state.registrar_endpoint = Some(enabled_endpoint(host, domain));
+            assert_eq!(
+                registrar_internal_alias(&state),
+                None,
+                "{host:?}/{domain:?}"
+            );
+            assert!(
+                registrar_surface_aliases(&state).is_empty(),
+                "{host:?}/{domain:?}"
+            );
+            assert_eq!(
+                collect_dns_aliases(&state),
+                vec!["001.edge-proxy.host1.test.local".to_string()],
+                "{host:?}/{domain:?}"
+            );
+        }
     }
 
     /// A host without the endpoint gets exactly the alias set it always
@@ -390,6 +477,7 @@ mod tests {
     fn a_host_without_the_endpoint_is_unchanged() {
         let state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
         assert_eq!(registrar_internal_alias(&state), None);
+        assert!(registrar_surface_aliases(&state).is_empty());
         assert_eq!(
             collect_dns_aliases(&state),
             vec!["001.edge-proxy.host1.test.local".to_string()]
@@ -407,26 +495,29 @@ mod tests {
             host: "bootroot-01".to_string(),
         });
         assert_eq!(registrar_internal_alias(&state), None);
+        assert!(registrar_surface_aliases(&state).is_empty());
         assert!(collect_dns_aliases(&state).is_empty());
     }
 
-    /// The alias survives the two rebuilds that do not go through
+    /// The aliases survive the two rebuilds that do not go through
     /// `service add`: `service remove` reconciles the set and `infra up`
-    /// replays it, and either dropping the internal alias would leave a
-    /// running responder unable to answer the next internal renewal.
+    /// replays it, and either dropping a registrar alias would leave a
+    /// running responder unable to answer the next internal or
+    /// surface-leaf renewal.
     #[test]
-    fn the_internal_alias_survives_a_rebuild_from_state() {
+    fn the_registrar_aliases_survive_a_rebuild_from_state() {
         let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
-        state.registrar_endpoint = Some(crate::state::RegistrarEndpointState {
-            enabled: true,
-            domain: "test.local".to_string(),
-            host: "bootroot-01".to_string(),
-        });
-        let internal = "001.bootroot-registrar-internal.bootroot-01.test.local".to_string();
+        state.registrar_endpoint = Some(enabled_endpoint("bootroot-01", "test.local"));
+        let registrar = vec![
+            "001.bootroot-registrar-internal.bootroot-01.test.local".to_string(),
+            "001.bootroot-registrar.bootroot-01.test.local".to_string(),
+            "001.bootroot-registrar-endpoint.bootroot-01.test.local".to_string(),
+        ];
         // Every rebuild path derives its set from this one function.
-        assert!(collect_dns_aliases(&state).contains(&internal));
+        let with_services = collect_dns_aliases(&state);
+        assert!(registrar.iter().all(|alias| with_services.contains(alias)));
         state.services.clear();
-        assert_eq!(collect_dns_aliases(&state), vec![internal]);
+        assert_eq!(collect_dns_aliases(&state), registrar);
     }
 
     /// The lookup must filter on the compose project as well as the

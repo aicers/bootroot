@@ -153,11 +153,11 @@ load_openbao_paths() {
   pass "loaded the configured KV mount and production path constants"
 }
 
-apply_endpoint_dns_alias() {
-  registrar_docker_apply_endpoint_dns_alias \
+assert_endpoint_dns_aliases() {
+  registrar_docker_assert_endpoint_dns_aliases \
     "001.bootroot-registrar.redteam.trusted.domain" \
     "001.bootroot-registrar-endpoint.redteam.trusted.domain"
-  pass "step-ca can reach both registrar hostnames through DNS aliases"
+  pass "step-ca reaches both registrar hostnames through the aliases bootroot attached"
 }
 
 prepare_daemon() {
@@ -460,7 +460,7 @@ main() {
   sudo -n true >/dev/null 2>&1 || fail "passwordless sudo is required for the root-owned registrar socket scenario"
   [ -x "$BOOTROOT_AGENT_BIN" ] || fail "bootroot-agent matching BOOTROOT_BIN is not executable"; [ -f "$MANIFEST" ] && [ -f "$DRIVER" ] || fail "red-team support data is missing"
   assert_policy_fixture; run_policy_guard
-  log_phase deployment; prepare_workspace; registrar_docker_allocate_ports; write_configs; build_and_initialize; load_openbao_paths; apply_endpoint_dns_alias; prepare_daemon; start_daemon; assert_socket_contract; stage_bundle
+  log_phase deployment; prepare_workspace; registrar_docker_allocate_ports; write_configs; build_and_initialize; load_openbao_paths; assert_endpoint_dns_aliases; prepare_daemon; start_daemon; assert_socket_contract; stage_bundle
   log_phase containment; assert_escalation_denied
   log_phase functionality; assert_functionality_and_audit
   log_phase socket; assert_socket_refusals
