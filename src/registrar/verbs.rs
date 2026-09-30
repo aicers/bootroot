@@ -186,8 +186,9 @@
 //! That lock is in-process, and the key rewrite is a plain write, like
 //! the activation. The guard's guarantee rests on one premise: exactly
 //! one registrar process serves a deployment — the boot-time
-//! `bootroot-agent` daemon that inherits `bootroot-registrar.socket`'s
-//! listening descriptor on the bootroot host — and no other code writes
+//! `bootroot-agent` daemon that `systemd/bootroot-registrar.service`
+//! runs, which inherits `bootroot-registrar.socket`'s listening
+//! descriptor on the bootroot host — and no other code writes
 //! a binding (the CLI rotations and ca-key Phase 5 only read or list
 //! them). Two hazards remain outside it, both accepted:
 //!

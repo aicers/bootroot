@@ -15,13 +15,18 @@
 //! a feature they have no way to enable on a package they are part of).
 //! Gating it would leave exactly the callers it exists for writing their
 //! own. Nothing here panics or is reachable from a production code path.
+//!
+//! The exception is what only this library's own unit tests call: those
+//! items are crate-private, so no other compilation unit could reach
+//! them anyway, and they sit behind `cfg(test)` rather than linger as
+//! dead code in every build.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::registrar::config::{
-    CONFIG_FILE_NAME, MAX_COMPONENTS, Multiplicity, RegistrationSpec, ReloadKind, ReloadSpec,
+    CONFIG_FILE_NAME, Multiplicity, RegistrationSpec, ReloadKind, ReloadSpec,
     SUPPORTED_SCHEMA_VERSION,
 };
 use crate::tls::sha256_hex;
@@ -141,13 +146,14 @@ impl RegistrarConfigFixture {
     ///
     /// This is the file whose `observe` answer is the largest, so it is
     /// what a test holds against the endpoint's response bound.
+    #[cfg(test)]
     #[must_use]
-    pub fn widest() -> Self {
+    pub(crate) fn widest() -> Self {
         let spec = RegistrationSpec {
             cert_group: None,
             reload: ReloadSpec::none(),
         };
-        (0..MAX_COMPONENTS).fold(
+        (0..crate::registrar::config::MAX_COMPONENTS).fold(
             Self::empty().with_domain(&widest_domain()),
             |fixture, index| {
                 fixture.with_component(
@@ -314,15 +320,17 @@ fn default_entry(multiplicity: Multiplicity) -> ComponentFixture {
 
 /// Returns a distinct component key of the most octets a DNS label
 /// holds, 63, for the `index`th component of [`RegistrarConfigFixture::widest`].
+#[cfg(test)]
 #[must_use]
-pub fn widest_component_key(index: usize) -> String {
+pub(crate) fn widest_component_key(index: usize) -> String {
     format!("c{index:062}")
 }
 
 /// Returns a valid domain of exactly the most octets the loader accepts,
 /// 253: three 63-octet labels and a 61-octet one.
+#[cfg(test)]
 #[must_use]
-pub fn widest_domain() -> String {
+pub(crate) fn widest_domain() -> String {
     [
         "a".repeat(63),
         "b".repeat(63),
