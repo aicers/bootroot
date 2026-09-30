@@ -287,6 +287,13 @@ pub(crate) enum DeregisterKind {
     /// No binding existed. The material sweep still ran, and the result
     /// is the idempotent re-drive the verb pair is built around.
     AlreadyAbsent,
+    /// A binding for this host existed with a generation key other than
+    /// the request's. The generation the request names is gone — a newer
+    /// `Register` has taken the identity over — so nothing was swept or
+    /// removed and the live identity stays exactly as it was. The wire
+    /// answer is `already_absent`; the audit trail records its own class,
+    /// because the identity is not absent.
+    StaleGeneration,
 }
 
 /// A successful deregister.

@@ -248,17 +248,18 @@ impl ProductionHandler {
         request: &WireDeregisterRequest,
         caller: CallerIdentity,
     ) -> Result<Vec<u8>, HandlerRefusal> {
-        // `idempotency_key` is read by nothing here. It is decoded
-        // because the reference carries it, and it is carried no
-        // further: bootroot's idempotence comes from the durable
-        // `registration_id -> host` binding and the stored-spec
-        // comparison, and a key-keyed shortcut would let a caller replay
-        // or split an identity's history by choosing keys.
+        // `idempotency_key` is passed to the verb unchanged, where it
+        // decides one thing: a binding whose generation key differs from
+        // it belongs to a newer `Register`, and nothing is removed. It
+        // is not a response cache — bootroot's idempotence still comes
+        // from the durable `registration_id -> host` binding and the
+        // stored-spec comparison.
         let request = DeregisterRequest {
             caller: caller.clone(),
             service_name: request.service_name.clone(),
             host: request.host.clone(),
             instance: request.instance,
+            idempotency_key: request.idempotency_key.clone(),
         };
 
         let health = self.health_snapshot();
@@ -420,8 +421,11 @@ fn mint_request(
     // `wrap_ttl` is passed through as *requested*. The clamp against
     // the configured maximum is `WrapTtlPolicy`'s, inside the verb,
     // and the granted deadline is the one the outcome carries rather
-    // than anything computed here. `idempotency_key` reaches nothing
-    // here either; see `deregister`.
+    // than anything computed here. `idempotency_key` is passed through
+    // unchanged and recorded on the binding as its generation key, which
+    // a later `Deregister` is compared against. It does not make this a
+    // response cache: every mint returns fresh wrapped material, and
+    // nothing about the response is keyed on it.
     Ok(MintRequest {
         caller,
         service_name: request.service_name.clone(),
@@ -429,6 +433,7 @@ fn mint_request(
         instance: request.instance,
         spec,
         wrap_ttl,
+        idempotency_key: request.idempotency_key.clone(),
     })
 }
 

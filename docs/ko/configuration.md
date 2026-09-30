@@ -925,8 +925,10 @@ bootroot 자신의 기록은 위의 감사 기록입니다. 발급되는 모든 
   짝이 어긋난 레코드를 아예 기록하지 않으므로, 파일 안에서 둘이 어긋나는
   일은 없습니다. `class`로 태깅된 객체이며 `first_mint`,
   `idempotent_remint`, `identity_removed`, `idempotent_already_absent`,
-  `refused` 중 하나이고, 거부일 때는 `reason`이, 있을 때는 `detail`이
-  덧붙습니다.
+  `stale_generation`, `refused` 중 하나이고, 거부일 때는 `reason`이,
+  있을 때는 `detail`이 덧붙습니다. `stale_generation`은 키가 해당
+  신원의 가장 최근 등록 키와 일치하지 않은 등록 해제이며, 아무것도
+  제거하지 않았고 신원은 그대로 살아 있습니다.
 - `truncated`는 무언가 잘렸을 때만 존재합니다. 키는 필드 경로
   `caller_identity`, `requested.service_name`, `requested.host`,
   `outcome.detail`이며, 각 값은 원본 전체 바이트에 대한

@@ -142,6 +142,12 @@ fn golden_fixtures() -> Vec<(&'static str, AuditRecord, String)> {
             AuditOutcome::AlreadyAbsent,
             r#"{"class":"idempotent_already_absent"}"#,
         ),
+        (
+            "outcome stale_generation",
+            AuditVerb::Deregister,
+            AuditOutcome::StaleGeneration,
+            r#"{"class":"stale_generation"}"#,
+        ),
     ] {
         let verb_name = if matches!(verb, AuditVerb::Mint) {
             "mint"
@@ -807,6 +813,10 @@ fn the_success_classes_use_their_explicit_spellings() {
         (
             deregister_outcome(DeregisterKind::AlreadyAbsent),
             r#"{"class":"idempotent_already_absent"}"#,
+        ),
+        (
+            deregister_outcome(DeregisterKind::StaleGeneration),
+            r#"{"class":"stale_generation"}"#,
         ),
     ] {
         assert_eq!(

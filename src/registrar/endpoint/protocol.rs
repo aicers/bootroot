@@ -1050,7 +1050,12 @@ pub(crate) fn encode_deregister_response(
         registration_id,
         outcome: match outcome.kind() {
             DeregisterKind::IdentityRemoved => DeregisterWireOutcome::Removed,
-            DeregisterKind::AlreadyAbsent => DeregisterWireOutcome::AlreadyAbsent,
+            // The generation the request names is gone, and the relay
+            // decodes only these two values, so a stale generation is
+            // answered as already absent.
+            DeregisterKind::AlreadyAbsent | DeregisterKind::StaleGeneration => {
+                DeregisterWireOutcome::AlreadyAbsent
+            }
         },
         registrar_health: health.clone(),
     };
@@ -3866,6 +3871,12 @@ mod tests {
             ),
             (
                 DeregisterKind::AlreadyAbsent,
+                DeregisterWireOutcome::AlreadyAbsent,
+            ),
+            // The generation the request names is gone; the relay knows
+            // no third value.
+            (
+                DeregisterKind::StaleGeneration,
                 DeregisterWireOutcome::AlreadyAbsent,
             ),
         ] {

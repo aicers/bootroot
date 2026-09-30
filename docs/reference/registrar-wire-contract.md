@@ -43,6 +43,7 @@ obtained any other way carry their own pointer in the `Provenance` column.
 | `RX RFC-0002` | `aicers/roxyd` | RFC 0002 | §5–§6, as amended by [#171](https://github.com/aicers/roxyd/pull/171) | `1be6a4c` |
 | `BL#308` | `aicers/bootler` | `core/src/provisioning_file.rs` | module documentation, `Wire spelling` | `008bbb458b0b` (PR [#309](https://github.com/aicers/bootler/pull/309), issue [#308](https://github.com/aicers/bootler/issues/308)) |
 | `bootroot` | `aicers/bootroot` | source paths cited per row | — | this repository, working tree |
+| `D2-5/23` | `aicers/review` | `docs/rfcs/0001-d2-5-registrar-and-onboarding.md` | §6 D2-5/23 (deregister carries the generation key) | `9f595ec13d912a16ae100ff529cf5c75b1e94bb8` (read 2026-09-30) |
 
 The source document has exactly one commit in its history — `7a6c7e2`, the
 revision it was read at when `aicers/bootroot` issue #759 was written — so the
@@ -106,7 +107,7 @@ name.
 | `instance` | `Option<u32>` | review-protocol | Instance number scoped by `{service_name}.{hostname}`; `None` for a component whose multiplicity class has no instance dimension. | `RFC-C §5` |
 | `spec` | `ServiceSpec` | mirrored field name, externally owned contents (§4.4) | Applied on a first mint and compared on a re-register. | `RFC-C §5` |
 | `wrap_ttl` | `Duration` | review-protocol | *Requested* lifetime of the wrapped material; the registrar MAY clamp it. | `RFC-C §5` |
-| `idempotency_key` | `String` | review-protocol | Correlation handle, not a response cache (see §7). | `RFC-C §5` |
+| `idempotency_key` | `String` | review-protocol | Correlation handle, not a response cache (see §7); bootroot records it as the binding's generation key (§7). | `RFC-C §5`, `bootroot`, `D2-5/23` |
 
 #### 4.2.1 Bootroot-owned `Register` endpoint members
 
@@ -152,7 +153,7 @@ Four fields.
 | `service_name` | `String` | review-protocol | Same meaning and shape as on `Register`. | `RFC-C §5` |
 | `host` | `String` | review-protocol | Refused when it is not the identity's registrar-bound host. | `RFC-C §5` |
 | `instance` | `Option<u32>` | review-protocol | Same meaning as on `Register`. | `RFC-C §5` |
-| `idempotency_key` | `String` | review-protocol | Correlation handle. | `RFC-C §5` |
+| `idempotency_key` | `String` | review-protocol | Correlation handle; bootroot also compares it with the binding's generation key (§7). | `RFC-C §5`, `bootroot`, `D2-5/23` |
 
 ### 4.4 `ServiceSpec` fields
 
@@ -331,6 +332,7 @@ surfaces as a diff to this file rather than as an inference nobody re-read.
 | `Done payload` | None. `Done` carries no fields at all. | `RFC-C §5` |
 | `expires_at semantics` | The **granted absolute deadline** after any registrar clamp; the manager MUST NOT assume it equals the requested `wrap_ttl`. | `RFC-C §5` |
 | `idempotency_key semantics` | A correlation handle only. `Register` always returns **fresh** material; the key is **not** a response cache and no material is persisted. | `RFC-C §5` |
+| `Deregister generation guard` | The registrar's binding stores the `idempotency_key` of the latest `Register` that created or re-drove it (its generation key). A matching-host `Deregister` whose key differs from a stored generation key removes nothing and returns `Done`, carried on bootroot's wire as `already_absent`; an equal key, or a binding with no stored key, proceeds as a matching-host `Deregister` always has. Keys are opaque and compared byte for byte, and a wrong host is still refused first. | `bootroot`, `D2-5/23` |
 | `retryable identifiers` | Exactly one: `RegistrarBusy`. | `RFC-C §8` |
 | `teardown-owed failures` | Exactly one: `RegistrarUnavailable { reason: PostMintUnrecordable }`. | `RFC-C §5`, `RFC-C §8` |
 | `absent multiplicity entry` | Maps to `ServiceInstanceMismatch`, intentionally (§6.4). | `RFC-C §5`, `RFC-F §5.1`, `RP#218` |

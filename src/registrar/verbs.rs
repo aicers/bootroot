@@ -10,15 +10,25 @@
 //!
 //! # What a caller may and may not influence
 //!
-//! A request carries an opaque caller identity and the identity's
-//! **parts**: `service_name`, `host`, an optional numeric `instance`,
-//! and — for a mint — the requested spec and a requested `wrap_ttl`. It
-//! carries no composed name, no `registration_id`, no domain, no policy
-//! body, no role definition, no policy list and no credential. The
-//! privileged `OpenBao` client, the KV mount, the loaded config, the
-//! fixed [`SecretIdOptions`], the role-level TTLs and the bounded
-//! wrap-TTL policy are **construction** dependencies, so no request can
-//! select any of them.
+//! A request carries an opaque caller identity, the identity's
+//! **parts** — `service_name`, `host`, an optional numeric `instance` —
+//! an opaque `idempotency_key`, and — for a mint — the requested spec
+//! and a requested `wrap_ttl`. It carries no composed name, no
+//! `registration_id`, no domain, no policy body, no role definition, no
+//! policy list and no credential. The privileged `OpenBao` client, the
+//! KV mount, the loaded config, the fixed [`SecretIdOptions`], the
+//! role-level TTLs and the bounded wrap-TTL policy are **construction**
+//! dependencies, so no request can select any of them.
+//!
+//! The `idempotency_key` decides one thing: whether a deregister removes
+//! anything (see "The generation guard" below). A mint records it on the
+//! binding as the generation key and a deregister compares against it;
+//! it is used for nothing else. It does **not** make a mint a response
+//! cache — every mint returns fresh wrapped material and nothing about
+//! the response is keyed on it — and it is written to no audit record
+//! and no `tracing` event. It is not a secret and grants no authority: a
+//! caller that can reach the verbs can already mint with a key of its
+//! choosing or deregister with the stored one.
 //!
 //! The caller identity is carried into every outcome unchanged and is
 //! used for nothing else: it is never parsed, never authenticated, never
@@ -43,15 +53,20 @@
 //! 3. **Per-id work**, under the `registration_id`'s own
 //!    [`tokio::sync::Mutex`], shared by both verbs so a mint and a
 //!    deregister for one identity can never interleave. For a mint that
-//!    reaches issuance this is, in order: converge the derived role and
-//!    policy (first mint and `creating` re-drive only), seed the
+//!    reaches issuance this is, in order: record the request's key as
+//!    the generation key on an existing binding that holds another (a
+//!    first mint's claim carries it already), converge the derived role
+//!    and policy (first mint and `creating` re-drive only), seed the
 //!    identity's trust material — `eab`, `http_responder_hmac` and
 //!    `trust` under its KV subtree, read from the control-node records —
 //!    activate the binding (again only when it was `creating`), and
 //!    issue the wrap-only `secret_id`. An idempotent re-mint of an
 //!    active binding re-seeds too, before it reads the `role_id`. No
 //!    mint writes a raw `secret_id` anywhere: the target keeps the one
-//!    it unwraps.
+//!    it unwraps. For a deregister it is: read the binding, refuse a
+//!    different stored host, answer a different stored generation key
+//!    with nothing removed, and only then tear the material down and
+//!    unbind.
 //!
 //! # The limiter in front of those stages
 //!
@@ -147,6 +162,52 @@
 //! state store, and both were rejected: a second store has the same
 //! divergence problem one layer up. The hazard is documented rather than
 //! masked.
+//!
+//! # The generation guard
+//!
+//! A manager re-drives an owed deregister until it is answered, so one
+//! can arrive late — after its re-drive was answered, the instance
+//! number was released, and a new install's mint took the same derived
+//! id over. Removing whatever binding holds the id would then tear down
+//! the new identity. So a binding records the `idempotency_key` of the
+//! latest mint that created or re-drove it, and a deregister for the
+//! matching host whose key differs from that stored **generation key**
+//! removes nothing and answers already-absent: the generation it names
+//! is gone. An equal key proceeds as before, and so does a binding with
+//! no stored key, which predates the guard. The key is compared byte for
+//! byte; the empty string is an ordinary value.
+//!
+//! The mint records its key before any side effect, not after success:
+//! the teardown a manager will drive for this mint was armed with this
+//! key before the mint was sent, and has to be the one that matches.
+//! Every write and every comparison of the key happens under the per-id
+//! lock above.
+//!
+//! That lock is in-process, and the key rewrite is a plain write, like
+//! the activation. The guard's guarantee rests on one premise: exactly
+//! one registrar process serves a deployment — the boot-time
+//! `bootroot-agent` daemon that inherits `bootroot-registrar.socket`'s
+//! listening descriptor on the bootroot host — and no other code writes
+//! a binding (the CLI rotations and ca-key Phase 5 only read or list
+//! them). Two hazards remain outside it, both accepted:
+//!
+//! - A stale deregister served by a **second** registrar process that
+//!   reads the binding while it still holds the old key, after which
+//!   this process's mint records the new key and re-mints, then goes on
+//!   to sweep the material and delete the binding — removing the newer
+//!   identity, which is what the guard exists to prevent. The compare
+//!   and the delete are not atomic across processes. A compare-and-set
+//!   on the binding's version at the final delete would not close this:
+//!   the material is swept before the binding is deleted, and a check
+//!   that fails then cannot restore what the sweep removed. Closing it
+//!   needs a procedure that protects everything from the binding read
+//!   through the sweep across processes.
+//! - A second registrar process that deletes the binding between this
+//!   process's read and its key rewrite has it written back, possibly as
+//!   an active binding whose role is gone; later re-mints for that id
+//!   then refuse on issuance until a deregister clears it. The
+//!   activation write already has this property. Closing it needs a
+//!   compare-and-set on the rewrite.
 
 // Two separate things here are unreached from production code, and
 // neither is worth a per-item allow. The endpoint that drives these
@@ -196,9 +257,9 @@ use crate::registrar::identity::{RequestedSpec, check_instance_shape, derive_reg
 use crate::registrar::internal::{InternalCredential, InternalCredentialError};
 use crate::registrar::{check_spec_identity, is_reserved_service_name, validate_request_labels};
 use crate::service_material::{
-    ProvisionedServiceRole, ResourceOutcome, ServiceRoleTtls, provision_service_role,
-    read_service_trust_material, service_kv_path, service_role_name, teardown_service_material,
-    write_service_trust_material,
+    ProvisionedServiceRole, ResourceOutcome, ServiceRoleTtls, TeardownReport,
+    provision_service_role, read_service_trust_material, service_kv_path, service_role_name,
+    teardown_service_material, write_service_trust_material,
 };
 use crate::trust_bootstrap::{
     SERVICE_EAB_KV_SUFFIX, SERVICE_REISSUE_KV_SUFFIX, SERVICE_RESPONDER_HMAC_KV_SUFFIX,
@@ -464,6 +525,10 @@ pub(crate) struct MintRequest {
     /// it to its own maximum and the granted deadline is computed, never
     /// echoed.
     pub(crate) wrap_ttl: time::Duration,
+    /// The wire `idempotency_key`, opaque and unchanged. Every binding
+    /// this mint writes records it as the generation key; nothing about
+    /// the response is keyed on it.
+    pub(crate) idempotency_key: String,
 }
 
 /// A deregister request: an opaque caller plus the identity's parts.
@@ -478,6 +543,10 @@ pub(crate) struct DeregisterRequest {
     /// The instance number, present exactly for a many-per-host
     /// component.
     pub(crate) instance: Option<u32>,
+    /// The wire `idempotency_key`, opaque and unchanged: the generation
+    /// key of the identity this request tears down. A binding holding a
+    /// different one is left alone.
+    pub(crate) idempotency_key: String,
 }
 
 /// Where a verb's privileged `OpenBao` client comes from.
@@ -1142,7 +1211,7 @@ impl RegistrarVerbs {
             .validate_spec(&request.service_name, &request.spec)
             .map_err(|err| refuse(ProducingArm::SafeSet, VerbError::Registrar(err)))?;
 
-        let claim = BindingRecord::creating(&request.host, &request.spec);
+        let claim = BindingRecord::creating(&request.host, &request.spec, &request.idempotency_key);
         let claimed = self
             .claim_binding(registration_id, &claim, disposition)
             .await
@@ -1246,6 +1315,24 @@ impl RegistrarVerbs {
         self.config
             .validate_spec(&request.service_name, &request.spec)
             .map_err(|err| refuse(ProducingArm::SafeSet, VerbError::Registrar(err)))?;
+
+        // The generation guard's write side, before any convergence,
+        // seeding or issuance. A manager arms its owed teardown with this
+        // request's key before it sends the request, so once this
+        // `Register` may have touched the identity, the teardown that will
+        // be driven carries this key and has to be the one that matches.
+        // A same-key re-send writes nothing extra.
+        if !record.has_generation_key(&request.idempotency_key) {
+            let rekeyed = record.with_generation_key(&request.idempotency_key);
+            self.write_binding(
+                registration_id,
+                &rekeyed,
+                "recording the generation key",
+                disposition,
+            )
+            .await
+            .map_err(|err| refuse(ProducingArm::Binding, err))?;
+        }
 
         match record.state {
             BindingState::Active => {
@@ -1387,10 +1474,15 @@ impl RegistrarVerbs {
             .await
             .map_err(|err| refuse(ProducingArm::Provisioning, err))?;
 
-        let active = claim.activated(&request.spec);
-        self.write_binding(registration_id, &active, disposition)
-            .await
-            .map_err(|err| refuse(ProducingArm::Binding, err))?;
+        let active = claim.activated(&request.spec, &request.idempotency_key);
+        self.write_binding(
+            registration_id,
+            &active,
+            "activating the durable binding",
+            disposition,
+        )
+        .await
+        .map_err(|err| refuse(ProducingArm::Binding, err))?;
 
         self.issue(
             request,
@@ -1560,6 +1652,25 @@ impl RegistrarVerbs {
             ));
         }
 
+        // The generation guard, after the host check so a wrong host is
+        // refused whatever its key, and before anything is acquired or
+        // swept. A binding carrying another key belongs to a newer
+        // `Register`: the generation this request names is gone, so
+        // nothing is removed and the disposition stays clear. A binding
+        // with no key predates the guard and takes the host-only path.
+        if let Some(record) = &existing
+            && record
+                .generation_key
+                .as_ref()
+                .is_some_and(|stored| *stored != request.idempotency_key)
+        {
+            return Ok(DeregisterOutcome::new(
+                context(ProducingArm::Binding),
+                DeregisterKind::StaleGeneration,
+                TeardownReport::default(),
+            ));
+        }
+
         // Teardown first, unbind after. A `creating` binding takes the
         // same sequence as an `active` one: it is the durable
         // registration claim, and removing it is what "identity removed"
@@ -1718,10 +1829,18 @@ impl RegistrarVerbs {
         }
     }
 
+    /// Overwrites the binding with `record`, refusing as unavailable
+    /// with `action` on failure.
+    ///
+    /// A plain write, not a compare-and-set: see this module's header
+    /// for why that is enough under its single-registrar premise. The
+    /// disposition is set once the write was sent, whatever its result,
+    /// and stays clear when encoding or client acquisition failed first.
     async fn write_binding(
         &self,
         registration_id: &str,
         record: &BindingRecord,
+        action: &'static str,
         disposition: &MutationDisposition,
     ) -> Result<(), VerbError> {
         let path = Self::binding_path(registration_id);
@@ -1734,7 +1853,7 @@ impl RegistrarVerbs {
             Err(err) => {
                 self.client.note_failure(&err).await;
                 Err(VerbError::unavailable(
-                    "activating the durable binding",
+                    action,
                     err.context(format!("writing the registrar binding at {path}")),
                 ))
             }

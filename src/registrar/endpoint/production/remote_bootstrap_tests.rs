@@ -43,6 +43,9 @@ use crate::service_material::{service_kv_path, service_policy_name, service_role
 const KV_MOUNT: &str = "secret";
 const HOST: &str = "h1";
 const WRAP_TOKEN: &str = "hvs.remote-bootstrap-wrap-token";
+/// The `idempotency_key` every register payload here carries, and so
+/// the generation key an active binding fixture is written under.
+const IDEMPOTENCY_KEY: &str = "key";
 const OPENBAO_URL: &str = "https://openbao.advertised.test:8200";
 const AGENT_SERVER: &str = "https://stepca.example.test:9000/acme/acme/directory";
 const AGENT_RESPONDER_URL: &str = "http://responder.example.test:8080";
@@ -226,7 +229,8 @@ async fn mock_first_mint(server: &MockServer, registration_id: &str) -> String {
 /// next mint is an idempotent re-mint.
 async fn mock_active_binding(server: &MockServer, registration_id: &str, spec: &RequestedSpec) {
     let binding_path = service_kv_path(registration_id, REGISTRAR_BINDING_KV_SUFFIX);
-    let active = BindingRecord::creating(HOST, spec).activated(spec);
+    let active =
+        BindingRecord::creating(HOST, spec, IDEMPOTENCY_KEY).activated(spec, IDEMPOTENCY_KEY);
     Mock::given(method("GET"))
         .and(request_path(format!("/v1/{KV_MOUNT}/data/{binding_path}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -273,7 +277,7 @@ fn payload(
         "host": HOST,
         "spec": spec,
         "wrap_ttl": 300,
-        "idempotency_key": "key",
+        "idempotency_key": IDEMPOTENCY_KEY,
     });
     if let Some(instance) = instance {
         value["instance"] = serde_json::json!(instance);

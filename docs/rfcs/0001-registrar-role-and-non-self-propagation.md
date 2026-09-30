@@ -672,6 +672,26 @@ mutex. (An identity **already absent** for the **matching** host is still the
 idempotent `Done` re-drive of RFC-C §5; only a **wrong-host** teardown is
 refused.)
 
+**The generation guard** (amended; see §9, 2026-09-30). A matching host
+alone does not decide the removal. The durable binding also stores the
+`idempotency_key` of the latest `Register` that created or re-drove it — its
+**generation key** — and every `Deregister` carries the generation key of the
+identity it tears down. After the host check (so a wrong host is still refused
+with `ServiceHostMismatch` whatever its key), a `Deregister` whose key differs
+from the stored generation key **removes nothing** — no material sweep, no
+binding delete — and returns `Done`, carried on bootroot's wire as
+`already_absent` and recorded in the audit trail as `stale_generation`: the
+generation it names is gone, and the identity now bound is a newer one's. A
+key equal to the stored one proceeds as above, and so does a binding with no
+stored key (one written before the guard existed). `Register` records its key
+on the binding before any convergence, seeding or issuance, and a refused
+`Register` records nothing. Keys are opaque and compared byte for byte. Every
+write and comparison of the key happens under the per-`registration_id` mutex,
+which is a process lock: the guarantee holds while exactly one registrar
+process serves a deployment and no other code writes a binding, and the
+residual cross-process hazards are stated beside the implementation
+(`src/registrar/verbs.rs`, "The generation guard").
+
 ### 5.3 Registrar credential
 
 A **registrar credential** whose policy authorizes **only invoking those
@@ -1473,3 +1493,34 @@ repository by this document's header block, so §5.6's operator-facing rendering
 consequence is carried on the ruling's authority rather than as a reading of
 RFC-E §9. Nothing in either ruling depends on it. Whoever can resolve the set
 index may replace that attribution with a direct citation.
+
+### 2026-09-30 — the deregister generation guard
+
+As accepted, §5.2 said a `Deregister` for the matching host always removes the
+identity and its binding. That lets a late `Deregister` tear down a **newer**
+identity: a manager re-drives an owed `Deregister` until it is answered, so a
+frame that timed out can still be in flight after its re-drive was answered,
+the instance number was released, and a new install's `Register` first-minted
+an identity with the same derived `registration_id` — which the late frame then
+removes.
+
+**Ruling — the generation guard.** This entry transcribes REView's D2-5/23
+(`aicers/review`, `docs/rfcs/0001-d2-5-registrar-and-onboarding.md` §6, at
+`9f595ec13d912a16ae100ff529cf5c75b1e94bb8`), which makes every `Deregister`
+carry the generation key of the identity it tears down — for a module instance
+the key of the `Install` attempt that allocated the number, which is the key its
+`Register` carried; for onboarding the `Onboard` row's own key — and leaves the
+matching guard to bootroot. Its authority here is this RFC owner's approval of
+`aicers/bootroot` issue #1037. **Ruled:** the binding stores the key of the
+latest `Register` that created or re-drove it; a `Deregister` whose key differs
+from a stored key removes nothing and answers `Done` (`already_absent` on
+bootroot's wire, `stale_generation` in the audit trail); an equal key, or a
+binding with no stored key, proceeds as before. §5.2 carries the amended text.
+
+No wire change follows: the key already travels end to end
+(`NodeEnrollRequest::Deregister.idempotency_key`), the answer is an existing
+outcome value, and the binding keeps schema version 1, gaining one optional
+member while the registrar is still unreleased. What the guard does **not**
+cover — a second registrar process racing this one, since the per-id mutex is
+a process lock and the key rewrite is a plain write — is stated as an accepted
+residual hazard beside the implementation rather than closed here.

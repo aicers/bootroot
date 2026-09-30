@@ -30,6 +30,25 @@
 //! **fail-closed and without touching the data**: guessing at its meaning
 //! is what would let a second host take over an identity the newer build
 //! bound, and deleting it is worse still.
+//!
+//! # The generation key
+//!
+//! `generation_key` is the opaque `idempotency_key` of the latest
+//! `Register` that created or re-drove the binding. A `Deregister`
+//! carrying a different key removes nothing, which is what keeps a late
+//! teardown of an earlier generation from removing the identity a newer
+//! `Register` minted under the same derived id; see the verb module's
+//! "generation guard" section for the rule and its premise.
+//!
+//! The member is optional and belongs to version 1: the registrar was
+//! unreleased when it was added, so no released build has written or read
+//! a version-1 record. A stored record without it, or with an explicit
+//! `null`, decodes as `None` — a binding with no generation key, which
+//! the guard leaves to today's host-only rule — and a `None` record
+//! encodes exactly as it did before the member existed. Every binding
+//! this build writes carries it as a JSON string, because every write is
+//! made on behalf of a `Register`, which carries a key. The key is not a
+//! secret and grants no authority, so it is stored as plain text.
 
 use std::str::FromStr;
 
@@ -180,6 +199,11 @@ pub(crate) struct BindingRecord {
     /// binding goes active, and then the same value `requested_spec`
     /// carries.
     pub(crate) applied_spec: Option<BindingSpec>,
+    /// The `idempotency_key` of the latest `Register` that created or
+    /// re-drove this binding, compared byte for byte by `Deregister`.
+    /// `None` only for a record written before the member existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation_key: Option<String>,
 }
 
 /// Just the version, read before the body is parsed against this build's
@@ -229,20 +253,23 @@ pub enum BindingDecodeError {
 impl BindingRecord {
     /// Builds the record a compare-and-set claim writes: the host is
     /// bound, the requested spec is recorded so a same-host re-drive has
-    /// something to compare against, and nothing is applied yet.
-    pub(crate) fn creating(host: &str, spec: &RequestedSpec) -> Self {
+    /// something to compare against, nothing is applied yet, and the
+    /// claiming `Register`'s key is the generation key.
+    pub(crate) fn creating(host: &str, spec: &RequestedSpec, generation_key: &str) -> Self {
         Self {
             schema_version: BINDING_SCHEMA_VERSION,
             host: host.to_string(),
             state: BindingState::Creating,
             requested_spec: Some(BindingSpec::from_requested(spec)),
             applied_spec: None,
+            generation_key: Some(generation_key.to_string()),
         }
     }
 
     /// Returns this record transitioned to active, with `applied_spec`
-    /// set to the same value `requested_spec` carries.
-    pub(crate) fn activated(&self, spec: &RequestedSpec) -> Self {
+    /// set to the same value `requested_spec` carries and the activating
+    /// `Register`'s key as the generation key.
+    pub(crate) fn activated(&self, spec: &RequestedSpec, generation_key: &str) -> Self {
         let stored = BindingSpec::from_requested(spec);
         Self {
             schema_version: BINDING_SCHEMA_VERSION,
@@ -250,7 +277,27 @@ impl BindingRecord {
             state: BindingState::Active,
             requested_spec: Some(stored.clone()),
             applied_spec: Some(stored),
+            generation_key: Some(generation_key.to_string()),
         }
+    }
+
+    /// Returns this record unchanged but for its generation key, which
+    /// becomes `generation_key`: the in-place rewrite a `Register`
+    /// re-driving an existing binding makes before any side effect.
+    pub(crate) fn with_generation_key(&self, generation_key: &str) -> Self {
+        Self {
+            generation_key: Some(generation_key.to_string()),
+            ..self.clone()
+        }
+    }
+
+    /// Reports whether this record's generation key is exactly `key`.
+    ///
+    /// Byte-for-byte string equality: the key is opaque, and the empty
+    /// string is an ordinary value. A record with no generation key
+    /// matches nothing.
+    pub(crate) fn has_generation_key(&self, key: &str) -> bool {
+        self.generation_key.as_deref() == Some(key)
     }
 
     /// Decodes a stored record, gating on the schema version first.
