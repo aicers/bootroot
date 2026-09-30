@@ -192,6 +192,17 @@ root 소유 `0700` 내부 디렉터리를 읽는 작업은 실행 전체를 승�
 뒤에도 `0:0:600`이고, 사이드카 트리는 여전히 정리가 고쳐 주어야 할 대상입니다.
 `reinit`과 CA·step-ca 비밀번호 교체도 같은 정리에 도달합니다.
 
+매트릭스는 이 스크립트를 두 번 실행합니다. `registrar-internal-init`은 위의
+루프백 호스트이고, `registrar-internal-init-routable`은 `BIND_MODE=routable`로
+`BIND_HOST`(기본값은 Docker 브리지 게이트웨이 `172.17.0.1`)에
+`--stepca-bind`와 `--http01-admin-bind`(그리고
+`--http01-admin-tls-required`)를 주어 설치한 뒤 나머지는 같은 순서로
+실행합니다. 각 bind는 해당 서비스의 루프백 게시에 더해지는 것이 아니라 그것을
+*대체*하므로, 이런 호스트에서 `init`은 내부 리프를 bind 주소를 통해 발급해야
+합니다. step-ca의 ACME 디렉터리는 그 주소에서, 리스폰더 admin API는 TLS로
+도달하며, 생성된 `agent.toml`도 엔드포인트 데몬의 갱신을 위해 그 주소를 담아야
+합니다. `OpenBao`는 두 실행 모두 루프백에 둡니다.
+
 공용 감사 저장소를 확인하는 곳도 여기입니다. 엔드포인트 술어를 심는 유일한
 시나리오이기 때문입니다. 술어를 심는 단계에서 이 실행이 `bootroot init
 --agent-config`에 넘길 운영자 설정 파일도 함께 씁니다. `[registrar]
@@ -1069,12 +1080,13 @@ scripts/preflight/run-all.sh
 사전 조건 블록에서 실패합니다.
 
 - `run-reinit-recovery.sh`, `run-stepca-san.sh`,
-  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`의 bind host
+  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`, 그리고
+  `run-registrar-internal-init-e2e.sh`의 routable 모드의 bind host
   가드는 `ip`(iproute2)로, 없으면 `ifconfig`로 로컬 IPv4 주소를
   열거합니다. 둘 다 없는 호스트에는 그 사실을 그대로 알립니다.
   열거 자체가 불가능한 검사는 `OPENBAO_BIND_HOST` /
-  `STEPCA_BIND_HOST`를 어떤 값으로 바꿔도 통과하지 않기 때문입니다.
-  두 변수의 기본값 `172.17.0.1`은 Linux의 Docker 브리지 게이트웨이이며,
+  `STEPCA_BIND_HOST` / `BIND_HOST`를 어떤 값으로 바꿔도 통과하지 않기
+  때문입니다. 세 변수의 기본값 `172.17.0.1`은 Linux의 Docker 브리지 게이트웨이이며,
   그 인터페이스가 없는 환경(예: Docker Desktop)에서는 호스트가 실제로
   가진 주소로 지정합니다.
 - `run-remote-lifecycle.sh`는 원격 에이전트의 TOML 설정을 `tomllib`으로

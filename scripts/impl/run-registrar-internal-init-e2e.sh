@@ -37,6 +37,14 @@ set -euo pipefail
 # is safe on a host that already carries a default `bootroot` install,
 # and it is the arrangement that exercises the derivation.
 #
+# `BIND_MODE=routable` runs the same sequence with step-ca and the
+# responder admin API published on a routable address instead of
+# loopback (`--stepca-bind` / `--http01-admin-bind`, #1054), which is
+# how a deployment with a component off this host is installed.  Each
+# bind *replaces* the loopback publication, so the internal leaf has to
+# be issued through the bind address — and the responder admin API is
+# TLS there.  `OpenBao` stays on loopback in both modes.
+#
 # The endpoint-*disabled* half of the criterion is not re-tested here.
 # Every other lifecycle arm is an endpoint-disabled host — none of them
 # records the predicate — and each drives its whole run over the
@@ -116,6 +124,16 @@ INTERNAL_SAN="001.bootroot-registrar-internal.${HOST_LABEL}.${DOMAIN}"
 CLIENT_SAN="001.bootroot-registrar.${HOST_LABEL}.${DOMAIN}"
 ENDPOINT_SAN="001.bootroot-registrar-endpoint.${HOST_LABEL}.${DOMAIN}"
 INTERNAL_ENTRY="bootroot-registrar-internal"
+
+# `loopback` (the default) or `routable`; see the header.  The routable
+# host defaults to the Docker bridge gateway, the address
+# `run-stepca-san.sh` binds step-ca to, which every Docker host carries.
+BIND_MODE="${BIND_MODE:-loopback}"
+BIND_HOST="${BIND_HOST:-172.17.0.1}"
+# Where this host reaches step-ca and the responder admin API, which is
+# where `init` issues the internal leaf through.  Set with the ports.
+STEPCA_CLIENT_BASE=""
+RESPONDER_CLIENT_URL=""
 
 INFRA_READY_ATTEMPTS="${INFRA_READY_ATTEMPTS:-60}"
 INFRA_READY_DELAY_SECS="${INFRA_READY_DELAY_SECS:-2}"
@@ -337,9 +355,38 @@ ensure_prerequisites() {
     fail "passwordless sudo is required: endpoint-enabled 'bootroot init' publishes the \
 bootroot-internal credential as root, and this scenario runs it through 'sudo -n'"
   [ -x "$BOOTROOT_BIN" ] || fail "bootroot binary not executable: $BOOTROOT_BIN"
+  case "$BIND_MODE" in
+    loopback) ;;
+    routable) ensure_bind_host_available "$BIND_HOST" BIND_HOST ;;
+    *) fail "BIND_MODE must be 'loopback' or 'routable', not '${BIND_MODE}'" ;;
+  esac
   [ -n "$RUN_TOKEN" ] || fail "RUN_TOKEN reduced to the empty string; supply a token of [a-z0-9]"
   [ "${#INSTANCE}" -le "$MAX_INSTANCE_NAME_LEN" ] ||
     fail "derived instance name '${INSTANCE}' exceeds ${MAX_INSTANCE_NAME_LEN} characters"
+}
+
+list_local_ipv4() {
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show | awk '{print $4}' | sed 's|/.*||'
+  elif command -v ifconfig >/dev/null 2>&1; then
+    ifconfig -a | awk '/inet /{print $2}' | sed 's/^addr://'
+  else
+    return 1
+  fi
+}
+
+# The routable bind host has to be one of this machine's addresses, or
+# compose refuses to publish on it and the run fails for a reason that
+# has nothing to do with what it exercises.  The same check, and the
+# same reasoning, as `run-stepca-san.sh`.
+ensure_bind_host_available() {
+  local bind_host="$1" bind_var="$2" local_addrs
+  if ! local_addrs="$(list_local_ipv4)"; then
+    fail "cannot enumerate local IPv4 addresses: neither ip (iproute2) nor ifconfig is installed and working"
+  fi
+  if ! printf '%s\n' "$local_addrs" | grep -qFx -- "$bind_host"; then
+    fail "non-loopback bind host $bind_host is not assigned to any local interface (set $bind_var to an address that is)"
+  fi
 }
 
 run_bootroot() {
@@ -382,6 +429,19 @@ allocate_ports() {
     printf -v "$var" '%s' "$PICKED_PORT"
   done
   log "ports: postgres=${PORT_POSTGRES} openbao=${PORT_OPENBAO} stepca=${PORT_STEPCA} http01=${PORT_HTTP01}"
+  # A bind keeps the port it was allocated, so the host-port flags and
+  # the binds agree and only the address moves.
+  case "$BIND_MODE" in
+    loopback)
+      STEPCA_CLIENT_BASE="https://localhost:${PORT_STEPCA}"
+      RESPONDER_CLIENT_URL="http://127.0.0.1:${PORT_HTTP01}"
+      ;;
+    routable)
+      STEPCA_CLIENT_BASE="https://${BIND_HOST}:${PORT_STEPCA}"
+      RESPONDER_CLIENT_URL="https://${BIND_HOST}:${PORT_HTTP01}"
+      ;;
+  esac
+  log "bind mode: ${BIND_MODE} (step-ca ${STEPCA_CLIENT_BASE}, responder ${RESPONDER_CLIENT_URL})"
 }
 
 create_run_root() {
@@ -476,6 +536,14 @@ prepull_third_party_images() {
 }
 
 install_infra() {
+  local -a bind_args=()
+  if [ "$BIND_MODE" = "routable" ]; then
+    bind_args=(
+      --stepca-bind "${BIND_HOST}:${PORT_STEPCA}"
+      --http01-admin-bind "${BIND_HOST}:${PORT_HTTP01}"
+      --http01-admin-tls-required
+    )
+  fi
   log "installing instance ${INSTANCE}"
   run_bootroot infra install \
     --compose-file "$WORK_DIR/$COMPOSE_FILE_NAME" \
@@ -486,6 +554,7 @@ install_infra() {
     --http01-admin-host-port "$PORT_HTTP01" \
     --registrar-endpoint-host "$HOST_LABEL" \
     --registrar-endpoint-domain "$DOMAIN" \
+    ${bind_args[@]+"${bind_args[@]}"} \
     --no-build \
     >>"$RUN_LOG" 2>&1 || fail "infra install failed"
 }
@@ -1626,7 +1695,7 @@ assert_an_unprivileged_init_is_refused() {
     --overwrite-password \
     --overwrite-ca-json \
     --overwrite-state \
-    --responder-url "http://127.0.0.1:${PORT_HTTP01}" \
+    --responder-url "$RESPONDER_CLIENT_URL" \
     --agent-config "$AGENT_CONFIG_FILE" \
     </dev/null >"$log" 2>&1; then
     fail "an unprivileged 'bootroot init' was accepted on an endpoint-enabled host"
@@ -1656,7 +1725,7 @@ run_init() {
     --confirm-db-provision \
     --db-user "step" \
     --db-name "stepca" \
-    --responder-url "http://127.0.0.1:${PORT_HTTP01}" \
+    --responder-url "$RESPONDER_CLIENT_URL" \
     --agent-config "$AGENT_CONFIG_FILE" \
     --summary-json "$INIT_SUMMARY_JSON" \
     </dev/null >"$INIT_RAW_LOG" 2>&1; then
@@ -1793,14 +1862,15 @@ assert_generated_config_is_the_internal_one() {
     fail "the generated config does not point at the persistent ACME account key"
   grep -q "ca_bundle_path = \"${INTERNAL_DIR}/ca-bundle.pem\"" <<<"$text" ||
     fail "the generated config does not point at the private CA bundle"
-  # The endpoints follow this install's published ports.  On the compose
-  # defaults a hard-coded value looks identical, which is why the ports
-  # were moved.
-  grep -q "server = \"https://localhost:${PORT_STEPCA}/acme/acme/directory\"" <<<"$text" ||
-    fail "the generated config does not use this install's step-ca port"
-  grep -q "http_responder_url = \"http://127.0.0.1:${PORT_HTTP01}\"" <<<"$text" ||
-    fail "the generated config does not use this install's responder port"
-  pass "the generated config names the fixed identity, its private trust and this install's ports"
+  # The endpoints follow where this install publishes step-ca and the
+  # responder: its moved ports — on the compose defaults a hard-coded
+  # value looks identical, which is why the ports were moved — and, in
+  # routable mode, the bind address that replaced loopback.
+  grep -qF "server = \"${STEPCA_CLIENT_BASE}/acme/acme/directory\"" <<<"$text" ||
+    fail "the generated config does not use this install's step-ca address (${STEPCA_CLIENT_BASE})"
+  grep -qF "http_responder_url = \"${RESPONDER_CLIENT_URL}\"" <<<"$text" ||
+    fail "the generated config does not use this install's responder address (${RESPONDER_CLIENT_URL})"
+  pass "the generated config names the fixed identity, its private trust and this install's endpoints"
 
   # The endpoint daemon runs on this file, so `init` rendered the
   # operator's two tables into it, with the operator's values.

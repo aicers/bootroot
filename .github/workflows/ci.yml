@@ -526,6 +526,10 @@ jobs:
             script: run-registrar-internal-init-e2e.sh
             resolution: ""
             artifact: ci-registrar-internal-init
+          - label: registrar-internal-init-routable
+            script: run-registrar-internal-init-e2e.sh
+            resolution: ""
+            artifact: ci-registrar-internal-init-routable
           - label: registrar-redteam
             script: run-registrar-redteam.sh
             resolution: ""
@@ -550,7 +554,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-redteam' && matrix.scenario.label != 'registrar-ca-rotation'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-internal-init-routable' && matrix.scenario.label != 'registrar-redteam' && matrix.scenario.label != 'registrar-ca-rotation'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -747,18 +751,26 @@ jobs:
           }
 
       - name: Run E2E scenario (registrar internal credential, init)
-        if: matrix.scenario.label == 'registrar-internal-init'
+        if: matrix.scenario.label == 'registrar-internal-init' || matrix.scenario.label == 'registrar-internal-init-routable'
         # The other half of the internal-credential coverage: a whole
         # deployment, installed under a run-scoped instance name on four
         # freshly allocated ports, with the endpoint predicate seeded
         # into `state.json` before `init`. Moved ports are the point —
         # they are what makes a derived step-ca/responder endpoint
-        # distinguishable from a hard-coded one.
+        # distinguishable from a hard-coded one. The routable arm binds
+        # step-ca and the responder admin API to the Docker bridge
+        # gateway instead of loopback, which replaces their loopback
+        # publication, so the leaf has to be issued through the binds.
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          BIND_MODE=loopback
+          if [ "${{ matrix.scenario.label }}" = "registrar-internal-init-routable" ]; then
+            BIND_MODE=routable
+          fi
           ARTIFACT_DIR="$ARTIFACT_DIR" \
+          BIND_MODE="$BIND_MODE" \
           ./scripts/impl/run-registrar-internal-init-e2e.sh || {
-            echo "registrar-internal-init failed"
+            echo "${{ matrix.scenario.label }} failed"
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
             [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
