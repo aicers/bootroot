@@ -531,8 +531,9 @@ fn an_issued_server_leaf_is_recognized_as_the_endpoint_identity() {
 }
 
 /// The endpoint permits the issued client identity at all three
-/// operations and at no other — read off the checked-in enumeration rather than a
-/// list restated here, so a variant added later fails this test.
+/// operations and at no other — read off the checked-in enumeration
+/// rather than a list restated here, so a variant added later fails this
+/// test.
 #[test]
 #[cfg(target_os = "linux")]
 fn the_issued_client_identity_is_permitted_at_exactly_mint_deregister_and_observe() {
