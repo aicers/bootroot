@@ -7,7 +7,9 @@
 //! per-identity locks and the outcome classification. What lives here is
 //! the three steps between them: decode the payload into the dispatched
 //! operation's request type, build the verb's inputs from it, and encode
-//! the verb's result.
+//! the verb's result. `observe` is the one operation that takes no verb:
+//! it encodes the fingerprint computed at construction and the current
+//! health snapshot, and nothing else.
 //!
 //! # What it is constructed from
 //!
@@ -50,7 +52,7 @@ use tracing::{debug, warn};
 use super::frame::Operation;
 use super::handler::{HandlerRefusal, RegistrarRequestHandler};
 use super::protocol::{
-    self, ArtifactSource, DeregisterRequest as WireDeregisterRequest,
+    self, ArtifactSource, DeregisterRequest as WireDeregisterRequest, ProvisioningFingerprint,
     RegisterRequest as WireRegisterRequest, RegistrarHealth, Request, WireServiceSpec,
 };
 use crate::kv_payload::{TrustPayload, parse_trust_payload};
@@ -84,6 +86,14 @@ pub(crate) struct ProductionHandler {
     /// The deployment-level members of a remote-bootstrap artifact.
     artifact: ArtifactDeployment,
     health: Arc<StdMutex<RegistrarHealth>>,
+    /// The fingerprint `observe` reports, computed from `verbs`' config
+    /// at construction.
+    ///
+    /// That config is loaded once per daemon invocation and is what every
+    /// mint this handler serves enforces, so the value cannot drift from
+    /// the enforcer for the handler's whole life. A re-rendered file the
+    /// daemon has not reloaded is deliberately not what this reports.
+    fingerprint: ProvisioningFingerprint,
 }
 
 /// The deployment-level members of the artifact a `RemoteBootstrap` mint
@@ -142,20 +152,25 @@ impl ProductionHandler {
         artifact: ArtifactDeployment,
         health: Arc<StdMutex<RegistrarHealth>>,
     ) -> Self {
+        let fingerprint = ProvisioningFingerprint {
+            components: verbs.component_digests(),
+            domain: verbs.domain().to_owned(),
+        };
         Self {
             verbs,
             credential,
             kv_mount,
             artifact,
             health,
+            fingerprint,
         }
     }
 
     /// Returns the daemon-held health snapshot every response carries.
     ///
-    /// Mint success, deregistration success and refusal all read it
-    /// here and nowhere else, so the request path has exactly one
-    /// source for the value and that source is a clone of what the
+    /// Mint success, deregistration success, observe success and refusal
+    /// all read it here and nowhere else, so the request path has exactly
+    /// one source for the value and that source is a clone of what the
     /// maintenance tick last wrote.
     ///
     /// Nothing on this path reads the audit store, and the single
@@ -276,6 +291,23 @@ impl ProductionHandler {
         })
     }
 
+    /// Serves one observe request.
+    ///
+    /// Runs no verb: no limiter charge, no audit record, no `OpenBao`
+    /// call and no file read. The answer is the fingerprint computed at
+    /// construction and the health snapshot the maintenance tick last
+    /// wrote, relayed as it is.
+    fn observe(&self, caller: &CallerIdentity) -> Result<Vec<u8>, HandlerRefusal> {
+        let health = self.health_snapshot();
+        protocol::encode_observe_response(&self.fingerprint, &health).map_err(|error| {
+            warn!(
+                caller = caller.as_str(),
+                "Registrar endpoint could not encode an observe response: {error}"
+            );
+            HandlerRefusal
+        })
+    }
+
     /// Reads the deployment's CA anchor and returns exactly what the
     /// codec frames.
     ///
@@ -331,6 +363,7 @@ impl RegistrarRequestHandler for ProductionHandler {
             match request {
                 Request::Register(request) => self.mint(&request, caller).await,
                 Request::Deregister(request) => self.deregister(&request, caller).await,
+                Request::Observe(_) => self.observe(&caller),
             }
         })
     }

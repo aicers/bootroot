@@ -52,6 +52,12 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const FINGERPRINT_PREFIX: &str = "fingerprint = \"";
 /// Length of a SHA-256 digest rendered as lowercase hex.
 const FINGERPRINT_HEX_LEN: usize = 64;
+/// Leading field of every component digest's input, versioning its
+/// encoding: a future entry field changes this tag rather than silently
+/// changing what an existing digest means.
+const COMPONENT_DIGEST_TAG: &str = "provisioning-component-v1";
+/// Encoding of an absent optional field in a component digest's input.
+const COMPONENT_DIGEST_ABSENT: &[u8] = b"-";
 
 /// How many times a component may be installed, which is what selects
 /// the `registration_id` derivation arm.
@@ -236,6 +242,50 @@ impl ComponentEntry {
     pub fn spec(&self) -> &RegistrationSpec {
         &self.spec
     }
+
+    /// Returns the entry's component digest: the lowercase hex SHA-256
+    /// of its multiplicity, cert group and reload, in the encoding
+    /// `docs/reference/registrar-wire-contract.md` §9.1 fixes.
+    ///
+    /// The input is
+    /// `N(tag) ‖ N(multiplicity) ‖ O(cert_group) ‖ N(reload_kind) ‖
+    /// O(reload_target)`, where `N` is a netstring and `O` is `-` for an
+    /// absent value and `N` of a present one. The component key and the
+    /// deployment domain are not part of it: the key is what the digest
+    /// is filed under, and the domain is compared on its own. `roxyd`
+    /// relays this value and `REview` recomputes it over its own copy of
+    /// the file, so the encoding is a cross-repository contract.
+    #[must_use]
+    pub(crate) fn digest(&self) -> String {
+        let mut input = Vec::new();
+        push_netstring(&mut input, COMPONENT_DIGEST_TAG);
+        push_netstring(&mut input, self.multiplicity.as_str());
+        push_optional(
+            &mut input,
+            self.spec.cert_group.map(|gid| gid.to_string()).as_deref(),
+        );
+        push_netstring(&mut input, self.spec.reload.kind.as_str());
+        push_optional(&mut input, self.spec.reload.target.as_deref());
+        sha256_hex(&input)
+    }
+}
+
+/// Appends `value` as a netstring: its decimal byte length, `:`, its
+/// bytes, then `,`.
+fn push_netstring(input: &mut Vec<u8>, value: &str) {
+    input.extend_from_slice(value.len().to_string().as_bytes());
+    input.push(b':');
+    input.extend_from_slice(value.as_bytes());
+    input.push(b',');
+}
+
+/// Appends an optional field: [`COMPONENT_DIGEST_ABSENT`] when absent,
+/// otherwise the value as a netstring.
+fn push_optional(input: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => push_netstring(input, value),
+        None => input.extend_from_slice(COMPONENT_DIGEST_ABSENT),
+    }
 }
 
 /// A validated registrar config.
@@ -369,6 +419,16 @@ impl RegistrarConfig {
     /// Returns the component keys the file declares, in sorted order.
     pub fn component_names(&self) -> impl Iterator<Item = &str> {
         self.components.keys().map(String::as_str)
+    }
+
+    /// Returns every component's [`ComponentEntry::digest`], keyed by its
+    /// component key.
+    #[must_use]
+    pub(crate) fn component_digests(&self) -> BTreeMap<String, String> {
+        self.components
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.digest()))
+            .collect()
     }
 
     /// Returns the entry the wire `service_name` selects.

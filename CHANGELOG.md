@@ -128,6 +128,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   as already absent, so a late deregistration for an earlier generation
   cannot remove a newer identity registered under the same name; the
   audit trail records it under its own `stale_generation` outcome class.
+  The endpoint also answers a read-only `observe` operation returning
+  the provisioning fingerprint and the registrar health.
 - `bootroot infra install --registrar-endpoint-host <label>
   --registrar-endpoint-domain <domain>` enables the registrar endpoint on
   a bootroot host, recording in `state.json` the predicate `bootroot init`

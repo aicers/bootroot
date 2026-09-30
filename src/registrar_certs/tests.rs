@@ -530,12 +530,12 @@ fn an_issued_server_leaf_is_recognized_as_the_endpoint_identity() {
     assert_eq!(identity.domain, TEST_DOMAIN);
 }
 
-/// The endpoint permits the issued client identity at both operations
-/// and at no other — read off the checked-in enumeration rather than a
+/// The endpoint permits the issued client identity at all three
+/// operations and at no other — read off the checked-in enumeration rather than a
 /// list restated here, so a variant added later fails this test.
 #[test]
 #[cfg(target_os = "linux")]
-fn the_issued_client_identity_is_permitted_at_exactly_mint_and_deregister() {
+fn the_issued_client_identity_is_permitted_at_exactly_mint_deregister_and_observe() {
     use crate::registrar::endpoint::frame::Operation;
 
     let ca = TestCa::new("Authorization CA");
@@ -554,16 +554,19 @@ fn the_issued_client_identity_is_permitted_at_exactly_mint_and_deregister() {
     // is the registrar client identity reaches every operation the
     // checked-in enumeration carries, and no other caller reaches any.
     // So iterating that enumeration is what shows the permitted set is
-    // exactly the two — and the exhaustive match below is what a third
+    // exactly the three — and the exhaustive match below is what a fourth
     // variant would break.
-    let permitted: Vec<Operation> = ["mint", "deregister", "revoke", "rotate", "list"]
+    let permitted: Vec<Operation> = ["mint", "deregister", "observe", "revoke", "rotate", "list"]
         .into_iter()
         .filter_map(Operation::from_name)
         .collect();
-    assert_eq!(permitted, vec![Operation::Mint, Operation::Deregister]);
+    assert_eq!(
+        permitted,
+        vec![Operation::Mint, Operation::Deregister, Operation::Observe]
+    );
     for operation in permitted {
         match operation {
-            Operation::Mint | Operation::Deregister => {}
+            Operation::Mint | Operation::Deregister | Operation::Observe => {}
         }
         assert_eq!(Operation::from_name(operation.as_str()), Some(operation));
     }

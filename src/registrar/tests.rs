@@ -1308,3 +1308,210 @@ fn profile_with(instance_id: &str, service_name: &str, hostname: &str) -> Daemon
         cert_group_gid: None,
     }
 }
+
+// ---------------------------------------------------------------------
+// The component digest
+// ---------------------------------------------------------------------
+
+/// One normative vector of `docs/reference/registrar-wire-contract.md`
+/// §9.1.
+struct DigestVector {
+    multiplicity: Multiplicity,
+    cert_group: Option<u32>,
+    kind: ReloadKind,
+    target: Option<&'static str>,
+    digest: &'static str,
+}
+
+impl DigestVector {
+    fn spec(&self) -> RegistrationSpec {
+        spec_of(self.cert_group, self.kind, self.target)
+    }
+}
+
+/// The normative vectors, in the reference's row order.
+const COMPONENT_DIGEST_VECTORS: [DigestVector; 5] = [
+    DigestVector {
+        multiplicity: Multiplicity::OnePerDeployment,
+        cert_group: Some(3000),
+        kind: ReloadKind::DockerRestart,
+        target: Some("review"),
+        digest: "14b935b0edee43d86386c37e234365b170287c2d184307e84a1ddcb2cd498b31",
+    },
+    DigestVector {
+        multiplicity: Multiplicity::OnePerHost,
+        cert_group: None,
+        kind: ReloadKind::Systemd,
+        target: Some("roxyd.service"),
+        digest: "7559f5080e83b113a3d65269275e719da73a64f4d8b400fecc154fc317c81f7c",
+    },
+    DigestVector {
+        multiplicity: Multiplicity::ManyPerHost,
+        cert_group: Some(3001),
+        kind: ReloadKind::DockerRestart,
+        target: Some("piglet"),
+        digest: "d65707163d36d8c6f9fe68d78ac6fa916e48c295ee0da200a55eafa8e28cbaa7",
+    },
+    DigestVector {
+        multiplicity: Multiplicity::OnePerHost,
+        cert_group: None,
+        kind: ReloadKind::None,
+        target: None,
+        digest: "9bffbab847bd8a2d7cde4f4092bc42b57856f73ad6284e75ee0d3696fb7e4de4",
+    },
+    DigestVector {
+        multiplicity: Multiplicity::ManyPerHost,
+        cert_group: Some(0),
+        kind: ReloadKind::Sighup,
+        // Written into the file verbatim, so TOML decodes the escape to
+        // one line feed: the loaded target is `a,b:1-` followed by LF.
+        target: Some("a,b:1-\\n"),
+        digest: "7d45622a99eba7388e193fab9465991c6adf784fc9f7ce266a62eb48d0fbd35a",
+    },
+];
+
+fn spec_of(cert_group: Option<u32>, kind: ReloadKind, target: Option<&str>) -> RegistrationSpec {
+    RegistrationSpec {
+        cert_group,
+        reload: match target {
+            Some(target) => ReloadSpec::new(kind, target),
+            None => ReloadSpec::none(),
+        },
+    }
+}
+
+/// Loads a file holding one component, `component`, under `domain`, and
+/// returns that component's digest.
+fn loaded_digest(
+    component: &str,
+    domain: &str,
+    multiplicity: Multiplicity,
+    spec: &RegistrationSpec,
+) -> String {
+    let fixture = RegistrarConfigFixture::empty()
+        .with_domain(domain)
+        .with_component(component, multiplicity, spec);
+    let (_dir, loaded) = load_fixture(&fixture);
+    loaded
+        .expect("the fixture must load")
+        .component(component)
+        .expect("the component resolves")
+        .digest()
+}
+
+#[test]
+fn component_digest_vectors() {
+    let names = ["alpha", "bravo", "charlie", "delta", "echo"];
+    let fixture = names.iter().zip(COMPONENT_DIGEST_VECTORS).fold(
+        RegistrarConfigFixture::empty(),
+        |fixture, (name, vector)| fixture.with_component(name, vector.multiplicity, &vector.spec()),
+    );
+    let (_dir, loaded) = load_fixture(&fixture);
+    let config = loaded.expect("the vector file must load");
+
+    let echo = config.component("echo").expect("echo resolves");
+    assert_eq!(
+        echo.spec().reload.target.as_deref(),
+        Some("a,b:1-\n"),
+        "the fifth vector's target must load with a real line feed"
+    );
+
+    for (name, vector) in names.iter().zip(COMPONENT_DIGEST_VECTORS) {
+        assert_eq!(
+            config.component(name).expect("the entry resolves").digest(),
+            vector.digest,
+            "vector {name}"
+        );
+    }
+}
+
+#[test]
+fn component_digests_cover_every_entry() {
+    let config = RegistrarConfig::load(&repo_path(EXAMPLE_FILE))
+        .expect("the shipped example must load through the production loader");
+
+    let expected = ["review", "roxyd", "piglet"]
+        .into_iter()
+        .zip(COMPONENT_DIGEST_VECTORS)
+        .map(|(name, vector)| (name.to_string(), vector.digest.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(config.component_digests(), expected);
+}
+
+#[test]
+fn a_component_digest_changes_with_every_entry_field_and_nothing_else() {
+    let [_, _, piglet, _, _] = COMPONENT_DIGEST_VECTORS;
+    let base_spec = piglet.spec();
+    let base = loaded_digest("piglet", FIXTURE_DOMAIN, piglet.multiplicity, &base_spec);
+    assert_eq!(base, piglet.digest);
+
+    // What is not part of the input.
+    assert_eq!(
+        loaded_digest(
+            "other",
+            FIXTURE_DOMAIN,
+            Multiplicity::ManyPerHost,
+            &base_spec
+        ),
+        base,
+        "the component key is the map key, not digest input"
+    );
+    assert_eq!(
+        loaded_digest(
+            "piglet",
+            "other.domain",
+            Multiplicity::ManyPerHost,
+            &base_spec
+        ),
+        base,
+        "the domain is compared separately"
+    );
+
+    // Each field alone.
+    let variants = [
+        ("multiplicity", Multiplicity::OnePerHost, base_spec.clone()),
+        (
+            "cert_group value",
+            Multiplicity::ManyPerHost,
+            spec_of(Some(3002), ReloadKind::DockerRestart, Some("piglet")),
+        ),
+        (
+            "cert_group absent",
+            Multiplicity::ManyPerHost,
+            spec_of(None, ReloadKind::DockerRestart, Some("piglet")),
+        ),
+        (
+            "reload kind",
+            Multiplicity::ManyPerHost,
+            spec_of(Some(3001), ReloadKind::Systemd, Some("piglet")),
+        ),
+        (
+            "reload target",
+            Multiplicity::ManyPerHost,
+            spec_of(Some(3001), ReloadKind::DockerRestart, Some("piglet2")),
+        ),
+    ];
+    for (field, multiplicity, spec) in variants {
+        assert_ne!(
+            loaded_digest("piglet", FIXTURE_DOMAIN, multiplicity, &spec),
+            base,
+            "changing {field} must change the digest"
+        );
+    }
+
+    // `0` is a present cert group, never read as an absent one.
+    assert_ne!(
+        loaded_digest(
+            "piglet",
+            FIXTURE_DOMAIN,
+            Multiplicity::ManyPerHost,
+            &spec_of(Some(0), ReloadKind::DockerRestart, Some("piglet")),
+        ),
+        loaded_digest(
+            "piglet",
+            FIXTURE_DOMAIN,
+            Multiplicity::ManyPerHost,
+            &spec_of(None, ReloadKind::DockerRestart, Some("piglet")),
+        ),
+    );
+}

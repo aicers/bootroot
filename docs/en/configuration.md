@@ -326,7 +326,10 @@ Serves the registrar's `mint` and `deregister` verbs on a host-local
 `AF_UNIX` stream socket. Defaults to `false`, including when the
 `[registrar_endpoint]` table is absent — the setting exists for
 bootroot-host deployments and nothing else. The table takes exactly
-five keys; an unknown key is a configuration error.
+five keys; an unknown key is a configuration error. The endpoint also
+answers a read-only `observe` operation, which reports the provisioning
+fingerprint and the registrar health, changes nothing and is not
+audited.
 
 Enabling it is supported. The daemon registers a production request
 handler that decodes the versioned registrar payload, invokes the verbs

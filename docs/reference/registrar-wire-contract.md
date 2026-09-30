@@ -456,17 +456,19 @@ path. A `LocalFile` mint returns no artifact.
 Mirrored on the same terms as everything above, so this repository has the
 spelling on record. **Nothing in this repository ever writes this tail.** The
 bootroot daemon exposes its audit-store low-water state and its
-intent-without-outcome count on the mint/deregister endpoint; the co-located
-registrar roxyd relays them onto the tail field below, and rendering them is
-the control plane's. Only the registrar populates it.
+intent-without-outcome count on the registrar endpoint, and the read-only
+`observe` operation (§10.1) is what carries them together with the
+provisioning fingerprint without changing any identity; the co-located
+registrar roxyd relays them onto the tail fields below, and rendering them is
+the control plane's. Only the registrar populates them.
 
 | Tail field | Populated by | Relevance here | Provenance |
 | --- | --- | --- | --- |
 | `capabilities` | every agent | none | `RFC-C §7`, `RFC-C §8` |
 | `active_trust_epoch` | every agent | none | `RFC-C §7`, `RFC-C §8` |
 | `manifest_formats` | every agent | none | `RFC-C §7`, `RFC-C §8` |
-| `provisioning_fingerprint` | the registrar only | none — relayed, not written here | `RFC-C §7`, `RFC-C §8` |
-| `audit_health` | the registrar only | carries values read from the bootroot endpoint; bootroot's half of the path ends at the endpoint | `RFC-C §7`, `RFC-C §8`, `RFC-F §5.6` |
+| `provisioning_fingerprint` | the registrar only | computed here from the loaded provisioning file and returned by `observe`; relayed, not written, onto the tail by roxyd | `RFC-C §7`, `RFC-C §8` |
+| `audit_health` | the registrar only | carries values read from the bootroot endpoint, whose read-only carrier is `observe`; bootroot's half of the path ends at the endpoint | `RFC-C §7`, `RFC-C §8`, `RFC-F §5.6` |
 
 **Transcribed as found:** the source disagrees with itself on the tail's
 *order*. `RFC-C §7` appends `manifest_formats`, `audit_health`,
@@ -475,6 +477,57 @@ the control plane's. Only the registrar populates it.
 `provisioning_fingerprint`, `audit_health` — the order used in the table above.
 Nothing in this repository writes or decodes that tail, so the discrepancy is
 recorded rather than resolved; resolving it is `aicers/review-protocol`'s.
+
+### 9.1 Component digest
+
+`provisioning_fingerprint` is a per-component digest map plus a separately
+compared `domain`. `observe` computes each digest from the provisioning file
+the daemon loaded and enforces; roxyd relays the map without interpreting it,
+and REview computes the same digest over its own rendered copy. The definition
+below is normative: its encoding, its tag and its vectors are fixed, and a
+change to any of them is a change to what every peer computes.
+
+For each component entry of the loaded `RegistrarConfig`, the digest is the
+lowercase hex SHA-256 of the byte string
+
+```text
+N("provisioning-component-v1") ‖ N(multiplicity) ‖ O(cert_group) ‖ N(reload_kind) ‖ O(reload_target)
+```
+
+where:
+
+- `N(s)` is the ASCII decimal byte length of the UTF-8 string `s` (no sign, no
+  leading zeros, `0` for empty), then `:`, then the bytes of `s`, then `,` (a
+  netstring);
+- `O(None)` is the single byte `-`, and `O(Some(s))` is `N(s)`;
+- `multiplicity` is the rendered spelling: `one-per-deployment`,
+  `one-per-host` or `many-per-host` (`Multiplicity::as_str`);
+- `cert_group` is `None` when the entry has none, otherwise the `u32` in
+  canonical decimal (ASCII digits, no sign, no leading zero, `0` for zero);
+- `reload_kind` is `sighup`, `systemd`, `docker-restart` or `none`
+  (`ReloadKind::as_str`);
+- `reload_target` is the target string exactly as loaded (no trimming, no
+  normalization), or `None` when absent.
+
+The component key (the package-id) is not part of the input: it is the map
+key. `domain` is not part of it: it is compared separately. The leading tag
+versions the encoding; a future entry field changes the tag rather than
+silently changing what `v1` means.
+
+Test vectors (each line: fields → the exact input bytes → digest):
+
+| multiplicity | cert_group | kind | target | input | digest |
+| --- | --- | --- | --- | --- | --- |
+| `one-per-deployment` | `3000` | `docker-restart` | `review` | `25:provisioning-component-v1,18:one-per-deployment,4:3000,14:docker-restart,6:review,` | `14b935b0edee43d86386c37e234365b170287c2d184307e84a1ddcb2cd498b31` |
+| `one-per-host` | none | `systemd` | `roxyd.service` | `25:provisioning-component-v1,12:one-per-host,-7:systemd,13:roxyd.service,` | `7559f5080e83b113a3d65269275e719da73a64f4d8b400fecc154fc317c81f7c` |
+| `many-per-host` | `3001` | `docker-restart` | `piglet` | `25:provisioning-component-v1,13:many-per-host,4:3001,14:docker-restart,6:piglet,` | `d65707163d36d8c6f9fe68d78ac6fa916e48c295ee0da200a55eafa8e28cbaa7` |
+| `one-per-host` | none | `none` | none | `25:provisioning-component-v1,12:one-per-host,-4:none,-` | `9bffbab847bd8a2d7cde4f4092bc42b57856f73ad6284e75ee0d3696fb7e4de4` |
+| `many-per-host` | `0` | `sighup` | `a,b:1-` followed by one LF (7 bytes) | `25:provisioning-component-v1,13:many-per-host,1:0,6:sighup,7:a,b:1-` LF `,` | `7d45622a99eba7388e193fab9465991c6adf784fc9f7ce266a62eb48d0fbd35a` |
+
+The first three are the entries of `docs/reference/provisioning.toml.example`.
+The last exercises the delimiters and a control byte inside a target; the
+loader accepts it (a target only has to be non-empty), written in the TOML file
+as the escaped string `"a,b:1-\n"`.
 
 ## 10. Resolved items
 
@@ -521,6 +574,12 @@ interpret them. The idempotency key is opaque; before mint reaches the verb
 layer, the reload and certificate-group strings must match the canonical owner
 productions in §8.3.
 
+The observe request is `protocol_version` and nothing else:
+`{"protocol_version":1}`. It names no identity and carries no idempotency key,
+request id or other caller-supplied member; any other member is an unknown
+member and is ignored, and an absent or unsupported version is a codec error
+exactly as for the other two requests.
+
 The canonical response member orders are:
 
 | Shape | Member order |
@@ -528,6 +587,7 @@ The canonical response member orders are:
 | Mint success | `protocol_version`, `request_id`, `registration_id`, `outcome`, `material`, `registrar_health` |
 | Deregister success | `protocol_version`, `request_id`, `registration_id`, `outcome`, `registrar_health` |
 | Refusal | `protocol_version`, `request_id`, optional `registration_id`, `class`, optional `error`, `registrar_health` |
+| Observe success | `protocol_version`, `provisioning_fingerprint`, `registrar_health` |
 
 `request_id` and `registration_id` are JSON strings. The mint and deregister
 `outcome` values and the refusal `class` values are the bootroot-owned
@@ -542,6 +602,24 @@ response members are omitted rather than serialized as `null`. An `error` is
 omitted for an unclassified refusal; when present it is the internally tagged
 object whose `id` and payload members come from §6.1. A retry-after value is
 an unquoted non-negative whole-second integer.
+
+`observe` is the one operation that changes nothing. It runs no verb, charges
+no rate-limiter bucket, writes no audit record, makes no `OpenBao` request and
+reads no file, so its success response carries no `request_id`: there is no
+verb invocation and no audit record for one to correlate with. It answers from
+the provisioning fingerprint computed when the daemon built its handler — from
+the provisioning file the daemon loaded, which is the one every mint it serves
+enforces, not a copy re-rendered since — and from the current
+`registrar_health` snapshot, relayed as it stands, including
+`audit_capacity.state` `unknown` before the first maintenance tick has measured
+the store. `provisioning_fingerprint` is the object
+`{"components":{...},"domain":"..."}` in that member order: `components` maps
+each component key, in sorted order, to its §9.1 digest, and `domain` is the
+file's `domain`. It is served on the same authenticated connection as the two
+verbs; a daemon that refuses every request because its audit store is not
+mounted refuses `observe` with the same refusal. A daemon that predates
+`observe` answers it with the fixed `unrecognized-operation` body, which a
+caller reads as "not offered".
 
 The encoder emits those orders byte-stably, while decoders are
 order-insensitive. Serialization emits no members outside the listed shapes;
@@ -576,8 +654,8 @@ standard base64, or an explicit `null`, is a decode error.
 
 `registrar_health` is the endpoint-local, snapshot-supplied container. Its
 additive `limiter`, `audit_capacity`, and `certificates` members are present on
-mint-success, deregister-success, and refusal responses, in the response
-position shown above and in that member order:
+mint-success, deregister-success, observe-success, and refusal responses, in
+the response position shown above and in that member order:
 
 ```json
 {"limiter":{"limited_predecision_refusal":0,"limited_admission":0},"audit_capacity":{"state":"ok","enforcement":"filesystem","reserve_bytes":2147483648,"low_water_bytes":536870912,"used_bytes":786432000,"headroom_bytes":1361051648,"measured_at":"1970-01-01T00:00:00Z","intent_without_outcome":0,"malformed_records":0,"retention_shortfall":false,"records_measured_at":"1970-01-01T00:00:00Z"},"certificates":[{"leaf":"registrar_client","not_after":"1970-01-31T00:00:00Z","remaining_seconds":2592000,"last_renewal_outcome":"succeeded","last_renewal_at":"1970-01-01T00:00:00Z"},{"leaf":"endpoint_server","not_after":"1969-12-31T23:59:59Z","remaining_seconds":-1,"last_renewal_outcome":"never_attempted"}]}

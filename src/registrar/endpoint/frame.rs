@@ -36,10 +36,15 @@ pub(crate) const RESPONSE_PREFIX_BYTES: usize = 4;
 /// Longest operation name the envelope admits.
 pub(crate) const MAX_OPERATION_NAME_BYTES: usize = 32;
 
-/// The only two operations the endpoint recognizes.
+/// The only three operations the endpoint recognizes.
+///
+/// `mint` and `deregister` change identities; `observe` changes nothing.
+/// It runs no verb and reports the provisioning fingerprint the verbs
+/// enforce and the registrar health, so a caller can read those without
+/// driving an identity change.
 ///
 /// An enum rather than a string, so the dispatcher matches exhaustively
-/// and a third operation cannot be added by a caller, only by a compiler
+/// and a fourth operation cannot be added by a caller, only by a compiler
 /// error somebody has to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
@@ -47,6 +52,8 @@ pub(crate) enum Operation {
     Mint,
     /// Tear one service identity down.
     Deregister,
+    /// Read the provisioning fingerprint and the registrar health.
+    Observe,
 }
 
 impl Operation {
@@ -59,6 +66,7 @@ impl Operation {
         match name {
             "mint" => Some(Self::Mint),
             "deregister" => Some(Self::Deregister),
+            "observe" => Some(Self::Observe),
             _ => None,
         }
     }
@@ -68,6 +76,7 @@ impl Operation {
         match self {
             Self::Mint => "mint",
             Self::Deregister => "deregister",
+            Self::Observe => "observe",
         }
     }
 }

@@ -81,7 +81,7 @@ use super::{
 use crate::openbao::{OpenBaoClient, SecretIdOptions};
 use crate::registrar::audit::AuditRecordStore;
 use crate::registrar::audit_store::capacity::AuditCapacityState;
-use crate::registrar::config::RegistrarConfig;
+use crate::registrar::config::{CONFIG_FILE_NAME, RegistrarConfig};
 use crate::registrar::endpoint::production::{ArtifactDeployment, ProductionHandler};
 use crate::registrar::endpoint::protocol;
 use crate::registrar::endpoint::refusing::RefusingHandler;
@@ -597,12 +597,13 @@ fn the_caller_identity_is_the_certificate_san_and_nothing_else() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn the_only_operations_are_mint_and_deregister() {
+fn the_only_operations_are_mint_deregister_and_observe() {
     assert_eq!(Operation::from_name("mint"), Some(Operation::Mint));
     assert_eq!(
         Operation::from_name("deregister"),
         Some(Operation::Deregister)
     );
+    assert_eq!(Operation::from_name("observe"), Some(Operation::Observe));
     for name in [
         "",
         "Mint",
@@ -611,11 +612,15 @@ fn the_only_operations_are_mint_and_deregister() {
         "list",
         "mintx",
         "de_register",
+        "Observe",
+        "observe_",
+        "observer",
     ] {
         assert_eq!(Operation::from_name(name), None, "{name}");
     }
     assert_eq!(Operation::Mint.as_str(), "mint");
     assert_eq!(Operation::Deregister.as_str(), "deregister");
+    assert_eq!(Operation::Observe.as_str(), "observe");
 }
 
 #[test]
@@ -817,6 +822,9 @@ impl RegistrarRequestHandler for VerbHandler {
                         ),
                     }
                 }
+                // `observe` runs no verb, so this verb-driving double has
+                // nothing to answer it with.
+                Operation::Observe => return Err(HandlerRefusal),
             };
             Ok(rendered.into_bytes())
         })
@@ -2680,9 +2688,104 @@ async fn an_unmounted_audit_store_returns_typed_refusals_with_log_handles() {
     running.stop().await;
 }
 
+/// While the audit-store mount is absent, `observe` is refused like
+/// every other request: the audit-store-unavailable refusal, so a relay
+/// reports neither the fingerprint nor the health rather than a reading
+/// nothing vouches for. A malformed observe payload still takes the
+/// handler-refusal path.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unmounted_audit_store_refuses_observe_like_every_request() {
+    let handler = Arc::new(RefusingHandler::new(
+        PathBuf::from("/var/lib/bootroot/audit-store"),
+        "var-lib-bootroot-audit\\x2dstore.mount".to_string(),
+        crate::daemon_messages::DaemonMessages::default(),
+    ));
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(b"observe", br#"{"protocol_version":1}"#))
+        .await;
+    let body = decode_response(&observed);
+    assert_ne!(body, UNRECOGNIZED_OPERATION_RESPONSE);
+    assert_audit_store_unavailable_response(&body, "no-idempotency-key");
+
+    for payload in [
+        br#"{"protocol_version":2}"#.as_slice(),
+        b"{}".as_slice(),
+        b"not-json".as_slice(),
+    ] {
+        let malformed = harness.round_trip(&frame_of(b"observe", payload)).await;
+        assert!(
+            malformed.is_empty(),
+            "a malformed observe payload keeps the handler-refusal path"
+        );
+    }
+    running.stop().await;
+}
+
 // ---------------------------------------------------------------------
 // The production handler over the socket
 // ---------------------------------------------------------------------
+
+/// An `observe` driven over the real socket, through the real framing,
+/// the real production handler and the real codec, is recognized and
+/// answered with the codec's own observe shape; a well-formed unknown
+/// name beside it is still the fixed unrecognized-operation marker.
+#[tokio::test]
+async fn a_socket_carried_observe_returns_a_framed_codec_response() {
+    let server = MockServer::start().await;
+    let (dir, _audit, handler) = production_handler(&server);
+    let config =
+        RegistrarConfig::load(&dir.path().join(CONFIG_FILE_NAME)).expect("the fixture must load");
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(&harness.endpoint, handler);
+
+    let observed = harness
+        .round_trip(&frame_of(b"observe", br#"{"protocol_version":1}"#))
+        .await;
+    let body = decode_response(&observed);
+    assert_ne!(body, UNRECOGNIZED_OPERATION_RESPONSE);
+    let response = protocol::decode_observe_response(&body)
+        .expect("the response is the codec's own observe shape");
+    assert_eq!(response.provisioning_fingerprint.domain, config.domain());
+    assert_eq!(
+        response.provisioning_fingerprint.components,
+        config.component_digests()
+    );
+    assert_eq!(
+        response.registrar_health,
+        protocol::RegistrarHealth::default()
+    );
+
+    let unknown = harness.round_trip(&frame_of(b"rotate", b"")).await;
+    assert_eq!(decode_response(&unknown), UNRECOGNIZED_OPERATION_RESPONSE);
+
+    for payload in [
+        b"{}".as_slice(),
+        br#"{"protocol_version":2}"#.as_slice(),
+        b"1".as_slice(),
+        br#""x""#.as_slice(),
+        b"null".as_slice(),
+    ] {
+        let refused = harness.round_trip(&frame_of(b"observe", payload)).await;
+        assert!(
+            refused.is_empty(),
+            "{} is a handler refusal: a clean close with no response bytes",
+            String::from_utf8_lossy(payload)
+        );
+    }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "observe made no OpenBao request"
+    );
+
+    running.stop().await;
+}
 
 /// A deregistration driven over the real socket, through the real
 /// framing, the real production handler and the real codec, over real

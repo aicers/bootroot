@@ -632,7 +632,7 @@ where
 
 /// Hands one checked request to the handler and writes its answer.
 ///
-/// The match on [`Operation`] is exhaustive, so a third operation cannot
+/// The match on [`Operation`] is exhaustive, so a fourth operation cannot
 /// be added to the envelope without this dispatcher being made to
 /// account for it.
 async fn dispatch<S>(
@@ -645,11 +645,12 @@ async fn dispatch<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Exhaustive by design: a third operation cannot reach a handler
+    // Exhaustive by design: a fourth operation cannot reach a handler
     // without this dispatcher being made to account for it.
     let intent = match operation {
         Operation::Mint => "mint an identity",
         Operation::Deregister => "tear an identity down",
+        Operation::Observe => "observe the provisioning fingerprint and health",
     };
     debug!(
         connection = connection.as_str(),

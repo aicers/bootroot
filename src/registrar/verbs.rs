@@ -232,7 +232,7 @@ pub(crate) mod wrap_ttl;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, PoisonError, Weak};
 
@@ -688,6 +688,13 @@ impl RegistrarVerbs {
     /// in, and so the one a remote-bootstrap artifact's agent is told.
     pub(crate) fn domain(&self) -> &str {
         self.config.domain()
+    }
+
+    /// Returns the component digests of the provisioning config this
+    /// service was constructed with — the one every mint it serves
+    /// enforces — keyed by component.
+    pub(crate) fn component_digests(&self) -> BTreeMap<String, String> {
+        self.config.component_digests()
     }
 
     /// Mints — or idempotently re-mints — one service identity and

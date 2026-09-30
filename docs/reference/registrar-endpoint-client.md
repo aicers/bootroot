@@ -169,8 +169,9 @@ handshake-level failure and is not distinguishable there from an ordinary one.
 ## 6. Success or refusal
 
 The endpoint answers a mint with a mint response, a deregister with a
-deregister response, and either verb with a refusal response, and the envelope
-carries no status field to choose between them. The client fixes one rule, and
+deregister response, an observe with an observe response, and any of the three
+with a refusal response, and the envelope carries no status field to choose
+between them. The client fixes one rule, and
 it is a rule about the **membership** of the `class` key rather than about that
 key's value:
 
@@ -179,9 +180,10 @@ key's value:
 > top-level `class` member is the success shape for the operation that was
 > sent.
 
-`class` is required and non-nullable on the refusal shape and appears in
-neither success shape, while `outcome` is required on both success shapes and
-appears in no refusal. The rule rests on `class` never being added to a success
+`class` is required and non-nullable on the refusal shape and appears in no
+success shape, while `outcome` is required on the mint and deregister success
+shapes and `provisioning_fingerprint` on the observe one, and neither appears
+in a refusal. The rule rests on `class` never being added to a success
 shape, which would be a change to the wire contract in
 `docs/reference/registrar-wire-contract.md` rather than something an
 implementation may do.
@@ -205,3 +207,28 @@ The client does not retry it, reclassify it, collapse two identifiers into one,
 or promote it to an error. It implements no retry policy of any kind — not on
 connect, not on handshake, not on a transient refusal — because retry semantics
 belong with the code that owns the reasons for retrying.
+
+## 7. The three calls
+
+The client makes exactly the three calls the endpoint recognizes, each one
+dial and one exchange:
+
+| Call | Operation | Reply |
+| --- | --- | --- |
+| `mint(request)` | `mint` | `MintReply::Success(MintResponse)` or `MintReply::Refused(RefusalResponse)` |
+| `deregister(request)` | `deregister` | `DeregisterReply::Success(DeregisterResponse)` or `DeregisterReply::Refused(RefusalResponse)` |
+| `observe()` | `observe` | `ObserveReply::Success(ObserveResponse)` or `ObserveReply::Refused(RefusalResponse)` |
+
+`observe()` takes no argument: its request is `{"protocol_version":1}` and
+nothing else. It is the read-only call — the endpoint runs no verb for it,
+writes no audit record and changes nothing — and its success carries the
+provisioning fingerprint the daemon enforces and the registrar health snapshot,
+as `docs/reference/registrar-wire-contract.md` §10.1 describes. It is the call
+a relay makes on every connect to read those two values, which it must never
+read by driving a mint or a deregister.
+
+A daemon that predates `observe` answers it with the envelope's fixed
+`unrecognized-operation` body rather than a JSON object, so the client reports
+that exchange as a decode failure. A caller that needs to tell "not offered"
+apart from a malformed answer reads that fixed body off the wire itself; this
+client adds no fourth reply arm for it.
