@@ -2174,8 +2174,8 @@ Phases:
   by that intermediate's key. The name alone does not decide: every
   rotation creates its intermediate under the same name, so a
   certificate from the previous generation names it too. Services whose
-  certificate is not signed by the new intermediate are re-issued here,
-  and block Phase 6 until they are
+  certificate is not signed by the new intermediate are re-issued here;
+  the `local-file` ones among them block Phase 6 until they are
 - Phase 6 — Finalize trust: write final trust (new fingerprints only) to
   OpenBao — `bootroot/ca`, every `state.json` service and every
   registrar-managed identity — removing old fingerprints, then restart
