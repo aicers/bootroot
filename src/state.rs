@@ -876,7 +876,7 @@ mod tests {
             }
         }"#;
         let parsed: ServiceEntry = serde_json::from_str(json).expect("deserialize");
-        assert!(parsed.post_renew_hooks.is_empty());
+        assert_eq!(parsed.post_renew_hooks, [] as [PostRenewHookEntry; 0]);
     }
 
     #[test]

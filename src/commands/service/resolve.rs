@@ -863,7 +863,7 @@ mod tests {
     fn resolve_hooks_no_flags_returns_empty() {
         let args = empty_args();
         let hooks = resolve_post_renew_hooks(&args).unwrap();
-        assert!(hooks.is_empty());
+        assert_eq!(hooks, [] as [PostRenewHookEntry; 0]);
     }
 
     /// Issue #702: a `--reload-style` preset and a `--post-renew-command`
@@ -1057,7 +1057,7 @@ mod tests {
         args.reload_style = Some(ReloadStyle::None);
 
         let hooks = resolve_post_renew_hooks(&args).unwrap();
-        assert!(hooks.is_empty());
+        assert_eq!(hooks, [] as [PostRenewHookEntry; 0]);
     }
 
     #[test]
@@ -1080,7 +1080,7 @@ mod tests {
         let hooks = resolve_post_renew_hooks(&args).unwrap();
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].command, "/usr/bin/reload.sh");
-        assert!(hooks[0].args.is_empty());
+        assert_eq!(hooks[0].args, [] as [String; 0]);
         assert_eq!(hooks[0].timeout_secs, DEFAULT_HOOK_TIMEOUT_SECS);
         assert_eq!(hooks[0].on_failure, HookFailurePolicyEntry::Continue);
     }

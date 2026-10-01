@@ -426,7 +426,7 @@ mod tests {
     /// With no password supplied the instance is still pinned on its own.
     #[test]
     fn monitoring_up_pins_the_instance_without_a_grafana_password() {
-        assert!(grafana_admin_password_env(None).is_empty());
+        assert_eq!(grafana_admin_password_env(None), [] as [(&str, &str); 0]);
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
     fn detect_running_profiles_empty_when_no_grafana() {
         let queried = std::cell::RefCell::new(Vec::new());
         let profiles = detect_running_profiles_with(running_predicate(&[], &queried)).unwrap();
-        assert!(profiles.is_empty());
+        assert_eq!(profiles, [] as [MonitoringProfile; 0]);
     }
 
     #[test]

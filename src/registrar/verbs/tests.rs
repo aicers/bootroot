@@ -263,7 +263,7 @@ fn keyed_deregister_request(
 fn assert_envelope(refusal: &VerbRefusal, arm: ProducingArm) {
     let context = refusal.context();
     assert_eq!(context.caller().as_str(), CALLER);
-    assert!(!context.request_id().as_str().is_empty());
+    assert_ne!(context.request_id().as_str(), "");
     assert_eq!(context.arm(), arm);
     if matches!(arm, ProducingArm::PreDerivation | ProducingArm::Derivation) {
         assert_eq!(
@@ -3303,7 +3303,10 @@ async fn an_active_remint_records_a_new_key_before_seeding_and_issuance() {
         .await
         .expect("a same-key re-mint succeeds");
     assert_eq!(outcome.kind(), MintKind::IdempotentReMint);
-    assert!(binding_writes(&received(&server).await, "h1-roxyd").is_empty());
+    assert_eq!(
+        binding_writes(&received(&server).await, "h1-roxyd"),
+        [] as [serde_json::Value; 0]
+    );
 }
 
 /// A `creating` re-drive with a different key records it before
@@ -6047,7 +6050,7 @@ async fn a_late_deregister_of_an_earlier_generation_leaves_the_newer_one_intact(
         .await
         .expect("the late deregister is answered");
     assert_eq!(stale.kind(), DeregisterKind::StaleGeneration);
-    assert!(stale.teardown().attempts().is_empty());
+    assert_eq!(stale.teardown().attempts(), []);
     assert_generation_live(&backend, &registration_id, K2).await;
 
     let removed = verbs
@@ -6185,9 +6188,9 @@ async fn a_register_racing_a_stale_deregister_leaves_the_newer_generation() {
 #[ignore = "needs a live OpenBao; run scripts/impl/run-registrar-verbs-e2e.sh"]
 async fn the_scenario_environment_is_read_only_and_complete() {
     let backend = LiveBackend::from_env();
-    assert!(!backend.url.is_empty());
-    assert!(!backend.token.is_empty());
-    assert!(!backend.kv_mount.is_empty());
+    assert_ne!(backend.url, "");
+    assert_ne!(backend.token, "");
+    assert_ne!(backend.kv_mount, "");
     backend
         .client()
         .health_check()

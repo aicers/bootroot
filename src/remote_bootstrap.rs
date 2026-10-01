@@ -465,10 +465,9 @@ mod tests {
 
     #[test]
     fn each_reload_kind_maps_to_its_preset() {
-        assert!(
-            reload_preset_hooks(ReloadKind::None, None)
-                .expect("none")
-                .is_empty()
+        assert_eq!(
+            reload_preset_hooks(ReloadKind::None, None).expect("none"),
+            [] as [PostRenewHookEntry; 0]
         );
         for (kind, command, verb) in [
             (ReloadKind::Systemd, "systemctl", "reload"),

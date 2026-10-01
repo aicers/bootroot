@@ -1633,7 +1633,7 @@ mod auth_provisioning_tests {
             "the refusal must name what could not be read: {err:#}"
         );
         assert_eq!(rollback.registrar_internal_cert_auth_entry, None);
-        assert!(rollback.created_policies.is_empty());
+        assert_eq!(rollback.created_policies, [] as [String; 0]);
         assert!(!rollback.registrar_internal_cert_auth_mount_created);
     }
 
@@ -1678,7 +1678,7 @@ mod auth_provisioning_tests {
             format!("{err:#}").contains("policy"),
             "the refusal must name what could not be read: {err:#}"
         );
-        assert!(rollback.created_policies.is_empty());
+        assert_eq!(rollback.created_policies, [] as [String; 0]);
         assert!(!rollback.registrar_internal_cert_auth_mount_created);
     }
 
@@ -1740,7 +1740,7 @@ mod auth_provisioning_tests {
         .expect("converging what is already there must succeed");
 
         assert_eq!(rollback.registrar_internal_cert_auth_entry, None);
-        assert!(rollback.created_policies.is_empty());
+        assert_eq!(rollback.created_policies, [] as [String; 0]);
         assert!(!rollback.registrar_internal_cert_auth_mount_created);
         // What it registers instead: the bodies it is about to replace.
         assert!(rollback.registrar_internal_cert_auth_entry_backup.is_some());

@@ -1966,7 +1966,10 @@ mod tests {
     #[test]
     fn preflight_prompts_asks_nothing_when_no_condition_holds() {
         let args = default_init_args();
-        assert!(preflight_prompts(&args, &plan_with(&[])).is_empty());
+        assert_eq!(
+            preflight_prompts(&args, &plan_with(&[])),
+            [] as [PreflightPrompt; 0]
+        );
 
         // Closes #735: a flag whose condition does not hold is a silent
         // no-op, not an error and not a behaviour change.
@@ -1975,7 +1978,10 @@ mod tests {
         args.overwrite_ca_json = true;
         args.overwrite_state = true;
         args.confirm_db_provision = true;
-        assert!(preflight_prompts(&args, &plan_with(&[])).is_empty());
+        assert_eq!(
+            preflight_prompts(&args, &plan_with(&[])),
+            [] as [PreflightPrompt; 0]
+        );
     }
 
     /// Every condition holds and no flag answers it: all four prompts
@@ -2081,7 +2087,7 @@ mod tests {
         let plan = plan_with(&[]);
 
         let args = default_init_args();
-        assert!(preflight_prompts(&args, &plan).is_empty());
+        assert_eq!(preflight_prompts(&args, &plan), [] as [PreflightPrompt; 0]);
 
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
@@ -2091,7 +2097,7 @@ mod tests {
         );
 
         args.confirm_db_provision = true;
-        assert!(preflight_prompts(&args, &plan).is_empty());
+        assert_eq!(preflight_prompts(&args, &plan), [] as [PreflightPrompt; 0]);
     }
 
     /// `--reinit-mode` suppresses all four prompts on its own, so
@@ -2101,7 +2107,10 @@ mod tests {
         let mut args = default_init_args();
         args.enable.push(InitFeature::DbProvision);
         args.reinit_mode = true;
-        assert!(preflight_prompts(&args, &plan_with(ALL_ARTIFACTS)).is_empty());
+        assert_eq!(
+            preflight_prompts(&args, &plan_with(ALL_ARTIFACTS)),
+            [] as [PreflightPrompt; 0]
+        );
     }
 
     /// Each prompt renders its own message, so the loop in
@@ -2418,7 +2427,7 @@ mod tests {
                 "line {idx} must be numbered from 1: {line}"
             );
         }
-        assert!(unseal_key_echo_lines(&[], &messages).is_empty());
+        assert_eq!(unseal_key_echo_lines(&[], &messages), [] as [String; 0]);
     }
 
     /// `write_root_token_file` persists the token with mode `0600`.

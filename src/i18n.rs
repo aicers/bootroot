@@ -939,8 +939,8 @@ mod tests {
         let ko = Messages::new("ko").unwrap();
 
         for m in [&en, &ko] {
-            assert!(!m.prompt_registration_id().is_empty());
-            assert!(!m.error_registration_id_invalid().is_empty());
+            assert_ne!(m.prompt_registration_id(), "");
+            assert_ne!(m.error_registration_id_invalid(), "");
             assert_ne!(
                 m.error_registration_id_invalid(),
                 m.error_service_name_invalid(),

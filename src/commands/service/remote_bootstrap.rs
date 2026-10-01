@@ -346,8 +346,11 @@ mod tests {
         assert_eq!(fingerprints_from_bundle(&pem), expected);
         assert_eq!(expected.len(), 1);
 
-        assert!(fingerprints_from_bundle("not a certificate").is_empty());
-        assert!(fingerprints_from_bundle("").is_empty());
+        assert_eq!(
+            fingerprints_from_bundle("not a certificate"),
+            [] as [String; 0]
+        );
+        assert_eq!(fingerprints_from_bundle(""), [] as [String; 0]);
     }
     const TEST_AGENT_EMAIL: &str = "test@example.com";
     const TEST_AGENT_SERVER: &str = "https://step-ca.test:9000/acme/acme/directory";

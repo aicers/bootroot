@@ -179,7 +179,7 @@ async fn test_same_host_local_rotation_sequence_keeps_service_operational() {
     assert!(String::from_utf8_lossy(&rotate_secret.stdout).contains("AppRole login OK"));
 
     let secret_id = fs::read_to_string(files.secret_id_path).expect("read secret_id");
-    assert!(!secret_id.trim().is_empty());
+    assert_ne!(secret_id.trim(), "");
     assert_eq!(
         fs::read_to_string(files.role_id_path).expect("read role_id"),
         ROLE_ID
@@ -303,7 +303,7 @@ async fn test_same_host_secret_id_rotation_needs_no_process_signal() {
         "no sidecar reload line may be printed: {stdout}"
     );
     let secret = fs::read_to_string(&files.secret_id_path).expect("read secret_id");
-    assert!(!secret.trim().is_empty());
+    assert_ne!(secret.trim(), "");
     let role_id = fs::read_to_string(&files.role_id_path).expect("read role_id");
     assert_eq!(role_id, ROLE_ID);
 }

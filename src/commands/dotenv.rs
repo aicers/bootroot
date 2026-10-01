@@ -364,7 +364,10 @@ mod tests {
     #[test]
     fn compose_project_name_is_excluded_even_when_the_environment_is_empty() {
         let map = entries(&[(COMPOSE_PROJECT_NAME_ENV, "from-dotenv")]);
-        assert!(dotenv_pairs_to_apply(&map, &holding(&[])).is_empty());
+        assert_eq!(
+            dotenv_pairs_to_apply(&map, &holding(&[])),
+            [] as [(&str, &str); 0]
+        );
     }
 
     /// The exclusion is scoped to that one key: everything else `.env`

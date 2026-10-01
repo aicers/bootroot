@@ -3003,12 +3003,7 @@ exit 0
         serde_json::from_str(&state_contents).expect("parse rotation-state.json");
     assert_eq!(state["mode"], "intermediate-only");
     assert_eq!(state["phase"], 1);
-    assert!(
-        !state["old_intermediate_fp"]
-            .as_str()
-            .unwrap_or("")
-            .is_empty()
-    );
+    assert_ne!(state["old_intermediate_fp"].as_str().unwrap_or(""), "");
 }
 
 #[cfg(unix)]
@@ -3045,7 +3040,18 @@ async fn test_rotate_ca_key_resumes_from_phase() {
     )
     .expect("write rotation-state.json");
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3110,7 +3116,18 @@ async fn test_rotate_ca_key_finalize_blocks_unmigrated() {
     .expect("write rotation-state.json");
 
     // Service certs don't exist — Phase 6 should see them as un-migrated and block.
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3698,7 +3715,18 @@ async fn test_rotate_ca_key_cleanup_deletes_backups() {
     )
     .expect("write rotation-state.json");
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3791,7 +3819,18 @@ async fn test_rotate_ca_key_skip_reissue_skips_phase_5() {
     fs::create_dir_all(service_cert.parent().unwrap()).ok();
     fs::write(&service_cert, "dummy-cert-data").ok();
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -3872,7 +3911,18 @@ async fn test_rotate_ca_key_force_finalize_with_unmigrated() {
 
     // Service certs don't match new intermediate → normally blocks finalization
     // --force should override
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4239,7 +4289,18 @@ async fn test_rotate_ca_key_full_force_finalize_enhanced_warning() {
 
     // Service certs don't match new intermediate → blocks finalization
     // --force should override with enhanced full-mode warning
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4485,7 +4546,18 @@ async fn test_rotate_ca_key_full_mode_cleanup_deletes_root_backups() {
     )
     .expect("write rotation-state.json");
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -4625,7 +4697,18 @@ async fn test_rotate_ca_key_full_mode_resumes_from_phase() {
     )
     .expect("write rotation-state.json");
 
+    let bin_dir = temp_dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    let docker_log = temp_dir.path().join("docker.log");
+    write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+    let combined_path = env::join_paths(
+        std::iter::once(bin_dir).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .expect("join PATH");
+
     let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .env("PATH", combined_path)
+        .env("DOCKER_OUTPUT", &docker_log)
         .current_dir(temp_dir.path())
         .args([
             "rotate",
@@ -5551,12 +5634,12 @@ async fn test_rotate_responder_hmac_without_registrar_entry_does_not_list() {
         .len(),
         1
     );
-    assert!(
+    assert_eq!(
         posted_payloads(
             &requests,
             &service_record_path(REGISTRAR_ID, "http_responder_hmac")
-        )
-        .is_empty()
+        ),
+        [] as [serde_json::Value; 0]
     );
 }
 
@@ -5772,7 +5855,10 @@ async fn test_rotate_trust_sync_fans_out_to_registrar_identities() {
             "summary names {id}: {stdout}"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")),
+        [] as [serde_json::Value; 0]
+    );
     assert!(!stdout.contains(STRAY_ID), "{stdout}");
     let listing = listing_positions(&requests);
     let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/ca")
@@ -5879,7 +5965,10 @@ async fn test_rotate_eab_clear_fans_out_to_registrar_identities() {
             "{stdout}"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "eab")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "eab")),
+        [] as [serde_json::Value; 0]
+    );
     let listing = listing_positions(&requests);
     let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/agent/eab")
         .expect("global EAB cleared");
@@ -6577,7 +6666,10 @@ async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
             "{id} receives both the transitional and the final trust"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")),
+        [] as [serde_json::Value; 0]
+    );
     let listing = listing_positions(&requests);
     assert_eq!(listing.len(), 3, "Phases 3, 5 and 6 each enumerate");
 
@@ -6588,7 +6680,10 @@ async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
         assert_eq!(payloads.len(), 1, "{id}: one reissue request");
         assert_reissue_payload(&payloads[0]);
     }
-    assert!(posted_payloads(&requests, &reissue_kv_path(STRAY_ID)).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &reissue_kv_path(STRAY_ID)),
+        [] as [serde_json::Value; 0]
+    );
     assert!(
         stdout.contains(&format!("{REGISTRAR_ID}: reissue requested at")),
         "phase 5 should report the registrar identity's request: {stdout}"
