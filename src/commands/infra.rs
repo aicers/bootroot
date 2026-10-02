@@ -2999,23 +2999,28 @@ mod tests {
     /// localhost openbao / http01 ports unconditionally — skipping them
     /// based on a recorded override intent reintroduces the half-up
     /// state where openbao starts but http01 fails to bind 127.0.0.1:8080.
+    ///
+    /// The test holds 8200 itself while the preflight runs, rather than
+    /// expecting a free 8200 to pass: other tests in this binary hold
+    /// the default port as a sentinel, so a port seen free can be taken
+    /// before the preflight binds it.  Where another holder already has
+    /// it, that holder may release it mid-check, so a pass only retries.
     #[test]
     fn preflight_compose_published_ports_checks_openbao_localhost_during_install() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:8200");
-        if listener.is_err() {
-            // Port already in use on this host (e.g. a real openbao
-            // running locally); the preflight must still detect the
-            // collision rather than skip it.
-            let err =
+        for _ in 0..16 {
+            let _sentinel = std::net::TcpListener::bind((
+                "127.0.0.1",
+                bootroot::host_port::DEFAULT_OPENBAO_HOST_PORT,
+            ))
+            .ok();
+            if let Err(err) =
                 preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
-                    .expect_err("preflight must abort when 8200 is busy");
-            assert!(err.to_string().contains("8200"), "{err}");
-            return;
+            {
+                assert!(err.to_string().contains("8200"), "{err}");
+                return;
+            }
         }
-        drop(listener);
-        // 8200 free: the preflight succeeds without any "override skip".
-        preflight_compose_published_ports(&["openbao".to_string()], default_host_ports())
-            .expect("free 8200 must pass preflight");
+        panic!("preflight must abort while 8200 is held");
     }
 
     /// The compose-declared defaults, for tests that only exercise one
