@@ -90,6 +90,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_secret_id_path_role_id_collision: "--secret-id-path must not end in `role_id`: the sibling `role_id` file is derived as <dir>/role_id and would collide with secret_id at {value}",
     error_service_secret_id_path_eab_collision: "--secret-id-path must not end in `eab.json`: the sibling `eab.json` file is derived as <dir>/eab.json and would collide with secret_id at {value}",
     error_service_secret_id_path_inside_secrets_dir: "--secret-id-path must resolve outside the root-owned secrets tree {secrets_dir}: a path inside it ({value}) cannot be traversed by the non-root agent",
+    error_service_secret_id_path_exists: "Refusing to overwrite an existing --secret-id-path credential file at {value}: bootroot did not create it for this registration (remove it, or choose another --secret-id-path)",
+    error_service_secret_id_path_claimed: "--secret-id-path credential file {path} is also claimed by registration {service}; refusing to remove it to resume this add",
     error_service_secret_id_path_parent_missing: "--secret-id-path parent directory does not exist: {value} (provision it, owned by the agent account, before running `service add`)",
     error_service_policy_mismatch: "To change the secret_id policy for an existing service, use `bootroot service update`",
     error_service_not_found: "Service not found: {value}",

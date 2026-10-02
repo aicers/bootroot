@@ -1828,6 +1828,7 @@ async fn write_state_file_to(
 ) -> Result<()> {
     let (
         existing_services,
+        existing_pending_service_adds,
         existing_openbao_bind_addr,
         existing_openbao_advertise_addr,
         existing_http01_admin_bind_addr,
@@ -1841,6 +1842,7 @@ async fn write_state_file_to(
         let state = StateFile::load(state_path)?;
         (
             state.services,
+            state.pending_service_adds,
             state.openbao_bind_addr,
             state.openbao_advertise_addr,
             state.http01_admin_bind_addr,
@@ -1853,6 +1855,7 @@ async fn write_state_file_to(
         )
     } else {
         (
+            BTreeMap::new(),
             BTreeMap::new(),
             None,
             None,
@@ -1884,6 +1887,7 @@ async fn write_state_file_to(
         policies: policy_map,
         approles,
         services: existing_services,
+        pending_service_adds: existing_pending_service_adds,
         openbao_bind_addr: existing_openbao_bind_addr,
         openbao_advertise_addr: existing_openbao_advertise_addr,
         http01_admin_bind_addr: existing_http01_admin_bind_addr,
@@ -2593,6 +2597,48 @@ mod tests {
             reloaded.openbao_bind_addr.as_deref(),
             Some("192.168.1.10:8200"),
             "openbao_bind_addr must survive a state rewrite during init"
+        );
+    }
+
+    /// `write_state_file_to` carries an interrupted `service add`'s
+    /// pending record through, like the committed services beside it:
+    /// dropping it would leave an id with issued credentials and no
+    /// trace in `state.json`.
+    #[tokio::test]
+    async fn write_state_file_preserves_pending_service_adds() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        let pending = crate::state::PendingServiceAdd {
+            secret_id_path_override: Some(std::path::PathBuf::from(
+                "/srv/agent/edge-proxy/secret_id",
+            )),
+        };
+        existing
+            .pending_service_adds
+            .insert("edge-proxy".to_string(), pending.clone());
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .await
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert_eq!(
+            reloaded.pending_service_adds.get("edge-proxy"),
+            Some(&pending)
         );
     }
 

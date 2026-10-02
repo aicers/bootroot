@@ -1334,7 +1334,12 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
     co-located non-root `bootroot-agent` can read `role_id`/`eab.json`
     and rewrite `secret_id`. The parent directory must already exist,
     be agent-owned, and resolve outside `<secrets_dir>`; a path inside
-    `<secrets_dir>` is rejected.
+    `<secrets_dir>` is rejected. `secret_id` and `role_id` are never
+    overwritten: if either already exists there, the add is refused
+    before anything is provisioned or issued. The one exception is a
+    rerun that completes an interrupted add of the same registration
+    to the same path (see [Interrupted adds](#interrupted-adds)), which
+    replaces the two files that run left.
   - `remote-bootstrap`: where the **target host** keeps them. The path
     is written into the bootstrap artifact as `secret_id_path`, with
     `role_id_path` and `eab_file_path` beside it, just as
@@ -1557,12 +1562,30 @@ bootroot reads back to resume, do take that flush.
   `--eab-file` is required for EAB rotation to apply) — printed in both
   default and preview modes
 
+### Interrupted adds
+
+Once OpenBao authentication succeeds, and before anything is provisioned
+or issued, `service add` records the registration in `state.json` under
+`pending_service_adds.<registration_id>`. The save that writes
+`services.<registration_id>` removes that record, so a registration is
+never in both. If the add fails or is interrupted in between — after a
+`secret_id` was minted, or credentials, KV, `agent.toml` or the bootstrap
+artifact were written — the record stays, and rerunning `service add`
+with the same arguments completes the registration with no manual
+cleanup. With a local-file `--secret-id-path`, the rerun removes the
+`secret_id` and `role_id` the interrupted run left there, unless another
+registration also claims either file, in which case it refuses and
+removes nothing. A pending record is not a registration: `service info`,
+`status`, rotation, DNS aliases and `service remove` ignore it.
+
 ### Failure conditions
 
 The command is considered failed when:
 
 - Missing `state.json`
 - Duplicate `service-name`
+- A local-file `--secret-id-path` whose `secret_id` or `role_id` already
+  exists (other than one left by an interrupted add being completed)
 - Missing `instance-id`
 - OpenBao AppRole creation failure
 

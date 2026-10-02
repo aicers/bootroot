@@ -79,6 +79,21 @@ pub(crate) struct StateFile {
     /// Registered services, keyed by [`ServiceEntry::registration_id`].
     #[serde(default)]
     pub(crate) services: BTreeMap<String, ServiceEntry>,
+    /// `service add` runs that started and may have issued credentials
+    /// but have not committed their [`StateFile::services`] entry, keyed
+    /// by `registration_id`.
+    ///
+    /// The record is saved after `OpenBao` authentication and before any
+    /// provisioning or minting, and the save that inserts the
+    /// `services` entry removes it, so the two maps never hold the same
+    /// id. An id in neither map therefore had nothing issued for it by
+    /// an uncommitted add; an id here is completed by rerunning
+    /// `service add` with the same arguments. Only `service add` reads
+    /// this map — every other reader of `services` must keep ignoring
+    /// it, since a pending id has no committed registration to rotate,
+    /// alias or remove.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) pending_service_adds: BTreeMap<String, PendingServiceAdd>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) openbao_bind_addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +144,20 @@ pub(crate) struct StateFile {
     /// material, config or private bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) registrar_endpoint: Option<RegistrarEndpointState>,
+}
+
+/// An in-progress `service add`, recorded in
+/// [`StateFile::pending_service_adds`] before anything is issued.
+///
+/// It holds no credential, `role_id` or token — only what a rerun needs
+/// to recognise the files its own interrupted attempt may have left.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PendingServiceAdd {
+    /// The local-file `--secret-id-path` the attempt writes its
+    /// no-clobber `secret_id` (and sibling `role_id`) to, with its
+    /// parent canonicalized; `None` when the attempt writes to the
+    /// default secrets-tree location, which it overwrites anyway.
+    pub(crate) secret_id_path_override: Option<PathBuf>,
 }
 
 /// The recorded registrar-endpoint predicate, and the two identity
@@ -383,6 +412,51 @@ mod tests {
             openbao_url: url.to_string(),
             ..StateFile::default()
         }
+    }
+
+    /// A `state.json` written before `pending_service_adds` existed
+    /// parses, and a state holding no pending record serializes back to
+    /// exactly the bytes it was read from: the field is absent rather
+    /// than an empty map.
+    #[test]
+    fn state_without_pending_service_adds_round_trips_byte_identically() {
+        let state = StateFile {
+            openbao_url: "https://openbao.example:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: Some(PathBuf::from("secrets")),
+            ..StateFile::default()
+        };
+        let original = state.serialize().expect("serialize");
+        assert!(!original.contains("pending_service_adds"));
+        let parsed: StateFile = serde_json::from_str(&original).expect("parse");
+        assert!(parsed.pending_service_adds.is_empty());
+        assert_eq!(parsed.serialize().expect("serialize"), original);
+    }
+
+    /// A pending record carries `secret_id_path_override` and nothing
+    /// else — no credential, `role_id` or token — and round-trips.
+    #[test]
+    fn pending_service_add_serializes_to_its_override_only() {
+        let mut state = state_with_url("https://openbao.example:8200");
+        state.pending_service_adds.insert(
+            "edge-proxy".to_string(),
+            PendingServiceAdd {
+                secret_id_path_override: Some(PathBuf::from("/srv/agent/edge-proxy/secret_id")),
+            },
+        );
+        state
+            .pending_service_adds
+            .insert("plain".to_string(), PendingServiceAdd::default());
+        let value = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(
+            value["pending_service_adds"],
+            serde_json::json!({
+                "edge-proxy": { "secret_id_path_override": "/srv/agent/edge-proxy/secret_id" },
+                "plain": { "secret_id_path_override": null },
+            })
+        );
+        let parsed: StateFile = serde_json::from_value(value).expect("parse");
+        assert_eq!(parsed.pending_service_adds, state.pending_service_adds);
     }
 
     /// `openbao_advertise_addr` is the fourth member the daemon's

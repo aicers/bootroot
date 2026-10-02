@@ -138,6 +138,8 @@ async fn test_app_add_writes_state_and_secret() {
     );
 
     assert_state_contains_default_delivery_mode(temp_dir.path());
+    // The commit's save dropped the pending record, field and all.
+    assert_no_pending_record(temp_dir.path());
 
     let agent_contents = fs::read_to_string(&agent_config).expect("read agent config");
     assert!(agent_contents.contains("# BEGIN bootroot managed profile: edge-proxy"));
@@ -877,6 +879,7 @@ async fn test_app_add_secret_id_path_rejected_inside_secrets_dir() {
         stderr.contains("must resolve outside the root-owned secrets tree"),
         "stderr must explain the secrets-tree restriction: {stderr}"
     );
+    assert_no_pending_record(temp_dir.path());
 }
 
 /// Issue #702 — `service add` may arm a `--reload-style` preset and a
@@ -1452,6 +1455,7 @@ async fn test_app_add_print_only_shows_snippets_without_writes() {
         fs::read_to_string(temp_dir.path().join("state.json")).expect("read state.json");
     let state: serde_json::Value = serde_json::from_str(&state_contents).expect("parse state");
     assert!(state["services"]["edge-proxy"].is_null());
+    assert_no_pending_record(temp_dir.path());
     assert!(
         !temp_dir
             .path()
@@ -2296,6 +2300,7 @@ async fn test_app_add_remote_bootstrap_rerun_is_idempotent() {
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(second.status.success());
     assert!(stdout.contains("existing remote-bootstrap service matched input"));
+    assert_no_pending_record(temp_dir.path());
 
     let second_artifact: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&artifact_path).expect("read artifact second"))
@@ -2559,6 +2564,7 @@ async fn test_app_add_rejects_duplicate() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(stderr.contains("bootroot service add failed"));
+    assert_no_pending_record(temp_dir.path());
 }
 
 /// A second *distinct* local-file service must not reuse another
@@ -2648,6 +2654,7 @@ async fn test_app_add_rejects_agent_config_shared_across_services() {
         stderr.contains("is already used by service edge-proxy"),
         "expected the agent-config conflict rejection, got: {stderr}"
     );
+    assert_no_pending_record(temp_dir.path());
 }
 
 /// The shared-config rejection must survive path re-spelling: the
@@ -2949,6 +2956,7 @@ async fn test_app_add_rejects_agent_config_with_stale_removed_service_profile() 
         !config_after_reject.contains("billing-api"),
         "the rejected add must not have written anything: {config_after_reject}"
     );
+    assert!(read_state(temp_dir.path())["pending_service_adds"]["billing-api"].is_null());
 }
 
 #[cfg(unix)]
@@ -5573,4 +5581,543 @@ async fn test_singleton_and_one_per_host_registration_shapes() {
             assert!(rendered.contains("service_name = \"roxyd\""));
         }
     }
+}
+
+/// Runs a local-file `service add` for `edge-proxy` in `root` with the
+/// root token, `extra` appended, and returns the process output.
+fn run_local_file_add(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let agent_config = root.join("agent.toml");
+    let cert_path = root.join("certs").join("edge-proxy.crt");
+    let key_path = root.join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert parent")).expect("create cert dir");
+    let agent_config = agent_config.to_string_lossy();
+    let cert_path = cert_path.to_string_lossy();
+    let key_path = key_path.to_string_lossy();
+    let mut args = vec![
+        "service",
+        "add",
+        "--registration-id",
+        "edge-proxy",
+        "--service-name",
+        "edge-proxy",
+        "--hostname",
+        "edge-node-01",
+        "--domain",
+        "trusted.domain",
+        "--agent-config",
+        agent_config.as_ref(),
+        "--cert-path",
+        cert_path.as_ref(),
+        "--key-path",
+        key_path.as_ref(),
+        "--instance-id",
+        "001",
+    ];
+    if !extra.contains(&"--auth-mode") {
+        args.extend_from_slice(&["--root-token", support::ROOT_TOKEN]);
+    }
+    args.extend_from_slice(extra);
+    std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(&args)
+        .output()
+        .expect("run service add")
+}
+
+fn output_text(output: &std::process::Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Asserts `state.json` holds a pending record for `edge-proxy` and no
+/// committed entry — what an add interrupted after its record leaves.
+fn assert_pending_only(root: &std::path::Path) {
+    let state = read_state(root);
+    assert!(
+        state["pending_service_adds"]["edge-proxy"].is_object(),
+        "the add must have recorded itself before issuing: {state}"
+    );
+    assert!(
+        state["services"]["edge-proxy"].is_null(),
+        "nothing may be committed: {state}"
+    );
+}
+
+/// Asserts `state.json` carries no pending record at all, the field
+/// absent rather than empty.
+fn assert_no_pending_record(root: &std::path::Path) {
+    let contents = fs::read_to_string(root.join("state.json")).expect("read state.json");
+    assert!(
+        !contents.contains("pending_service_adds"),
+        "no pending record may be written: {contents}"
+    );
+}
+
+/// Asserts `edge-proxy` is committed and its pending record is gone.
+fn assert_committed(root: &std::path::Path) {
+    assert_no_pending_record(root);
+    assert!(read_state(root)["services"]["edge-proxy"].is_object());
+}
+
+/// Rewrites `state.json` as an add interrupted just before its commit
+/// would have left it: `edge-proxy`'s committed entry moved back into a
+/// pending record naming `recorded_override`.
+fn uncommit_edge_proxy(root: &std::path::Path, recorded_override: Option<&std::path::Path>) {
+    let mut state = read_state(root);
+    state["services"]
+        .as_object_mut()
+        .expect("services map")
+        .remove("edge-proxy")
+        .expect("edge-proxy was committed");
+    set_pending_record(&mut state, "edge-proxy", recorded_override);
+    write_state_value(root, &state);
+}
+
+/// Inserts a pending record for `id` naming `recorded_override`, stored
+/// as `service add` stores it: with its parent canonicalized.
+fn set_pending_record(
+    state: &mut serde_json::Value,
+    id: &str,
+    recorded_override: Option<&std::path::Path>,
+) {
+    let recorded = recorded_override.map(|path| {
+        let parent = path
+            .parent()
+            .expect("override parent")
+            .canonicalize()
+            .expect("canonicalize override parent");
+        parent.join(path.file_name().expect("override file name"))
+    });
+    state["pending_service_adds"][id] = json!({ "secret_id_path_override": recorded });
+}
+
+fn write_state_value(root: &std::path::Path, state: &serde_json::Value) {
+    fs::write(
+        root.join("state.json"),
+        serde_json::to_string_pretty(state).expect("serialize state"),
+    )
+    .expect("write state.json");
+}
+
+/// Stubs everything a local-file add for `edge-proxy` requests.
+async fn stub_full_local_file_add(server: &MockServer) {
+    stub_app_add_openbao(server, "edge-proxy").await;
+    stub_app_add_trust_missing(server).await;
+    stub_app_add_service_sync_material(server, "edge-proxy").await;
+}
+
+/// An operator-provisioned override directory `agent/edge-proxy` under
+/// `root`, and the `secret_id` path in it.
+fn override_secret_id_path(root: &std::path::Path) -> std::path::PathBuf {
+    let agent_dir = root.join("agent").join("edge-proxy");
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+    agent_dir.join("secret_id")
+}
+
+/// The record is durable before the first provisioning request: a
+/// failing policy write, a failing `secret_id` mint and a failing KV
+/// sync each leave a pending record and no committed entry.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_failure_after_record_leaves_pending_record() {
+    // The policy write is the first provisioning request.
+    let policy_fails = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(policy_fails.path(), &server.uri()).expect("write state.json");
+    stub_app_add_policy_write_forbidden_with_token(&server, "edge-proxy", support::ROOT_TOKEN)
+        .await;
+    let output = run_local_file_add(policy_fails.path(), &[]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_pending_only(policy_fails.path());
+
+    // Provisioning succeeds and the mint fails: wiremock answers the
+    // unstubbed `secret-id` request with a 404.
+    let mint_fails = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(mint_fails.path(), &server.uri()).expect("write state.json");
+    stub_app_add_openbao_common(&server, "edge-proxy", support::ROOT_TOKEN).await;
+    let output = run_local_file_add(mint_fails.path(), &[]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("secret_id create failed"),
+        "{}",
+        output_text(&output)
+    );
+    assert_pending_only(mint_fails.path());
+
+    // The credential is minted and written, and the KV sync fails. With
+    // an override, the rollback guard removes the two no-clobber files
+    // and the record stays, so a rerun has nothing to clear.
+    let kv_fails = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(kv_fails.path(), &server.uri()).expect("write state.json");
+    Mock::given(method("POST"))
+        .and(path("/v1/secret/data/bootroot/services/edge-proxy/eab"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    stub_full_local_file_add(&server).await;
+    let secret_id_path = override_secret_id_path(kv_fails.path());
+    let secret_id_arg = secret_id_path.to_string_lossy().to_string();
+    let output = run_local_file_add(kv_fails.path(), &["--secret-id-path", &secret_id_arg]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_pending_only(kv_fails.path());
+    assert!(!secret_id_path.exists());
+    assert_eq!(
+        read_state(kv_fails.path())["pending_service_adds"]["edge-proxy"]["secret_id_path_override"],
+        json!(
+            secret_id_path
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("secret_id")
+        )
+    );
+}
+
+/// A remote-bootstrap rerun that differs from the committed entry only
+/// in its `secret_id` policy is refused before anything is recorded.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_policy_mismatch_writes_no_record() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    write_state_file(root, &server.uri()).expect("write state.json");
+    fs::write(root.join("agent.toml"), "# config").expect("write agent config");
+    fs::create_dir_all(root.join("certs")).expect("create cert dir");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+    let first = run_remote_bootstrap_add(root, &[]);
+    assert!(first.status.success(), "{}", output_text(&first));
+    assert_committed(root);
+
+    let output = run_remote_bootstrap_add(root, &["--secret-id-ttl", "2h"]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("bootroot service update"),
+        "{}",
+        output_text(&output)
+    );
+    assert_committed(root);
+}
+
+/// A failed authentication records nothing: the record follows it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_failed_authentication_writes_no_record() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    // No login stub: the AppRole login is answered with a 404.
+    let output = run_local_file_add(
+        temp_dir.path(),
+        &[
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "runtime-role-id",
+            "--approle-secret-id",
+            "runtime-secret-id",
+        ],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_no_pending_record(temp_dir.path());
+    assert!(read_state(temp_dir.path())["services"]["edge-proxy"].is_null());
+}
+
+/// Rerunning a local-file add without an override after it was
+/// interrupted just before its commit — record saved, credentials, KV,
+/// `eab.json` and `agent.toml` all written — commits it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rerun_completes_interrupted_local_file_add() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    stub_full_local_file_add(&server).await;
+
+    let first = run_local_file_add(temp_dir.path(), &[]);
+    assert!(first.status.success(), "{}", output_text(&first));
+    assert_committed(temp_dir.path());
+    uncommit_edge_proxy(temp_dir.path(), None);
+    assert_pending_only(temp_dir.path());
+
+    let rerun = run_local_file_add(temp_dir.path(), &[]);
+    assert!(rerun.status.success(), "{}", output_text(&rerun));
+    assert_committed(temp_dir.path());
+    assert_state_contains_default_delivery_mode(temp_dir.path());
+    let agent_contents =
+        fs::read_to_string(temp_dir.path().join("agent.toml")).expect("read agent config");
+    assert_eq!(
+        agent_contents
+            .matches("# BEGIN bootroot managed profile: edge-proxy")
+            .count(),
+        1,
+        "the rerun must replace its own managed profile, not add a second: {agent_contents}"
+    );
+}
+
+/// Rerunning a remote-bootstrap add interrupted just before its commit —
+/// credentials, KV and the artifact already written — commits it.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rerun_completes_interrupted_remote_bootstrap_add() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    write_state_file(root, &server.uri()).expect("write state.json");
+    fs::write(root.join("agent.toml"), "# config").expect("write agent config");
+    fs::create_dir_all(root.join("certs")).expect("create cert dir");
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_remote_sync_material(&server, "edge-proxy").await;
+
+    let first = run_remote_bootstrap_add(root, &[]);
+    assert!(first.status.success(), "{}", output_text(&first));
+    uncommit_edge_proxy(root, None);
+    assert_pending_only(root);
+
+    let rerun = run_remote_bootstrap_add(root, &[]);
+    assert!(rerun.status.success(), "{}", output_text(&rerun));
+    assert_committed(root);
+    assert_eq!(
+        read_state(root)["services"]["edge-proxy"]["delivery_mode"],
+        "remote-bootstrap"
+    );
+    assert_eq!(
+        read_edge_proxy_artifact(root)["wrap_token"].as_str(),
+        Some("wrap-token-edge-proxy")
+    );
+}
+
+/// Rerunning a local-file `--secret-id-path` add interrupted after it
+/// wrote both no-clobber override files removes them, writes the new
+/// values at `0600` under the parent's owner, and commits.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rerun_completes_interrupted_override_add() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    write_state_file(root, &server.uri()).expect("write state.json");
+    stub_full_local_file_add(&server).await;
+    let secret_id_path = override_secret_id_path(root);
+    let role_id_path = secret_id_path.with_file_name("role_id");
+    let secret_id_arg = secret_id_path.to_string_lossy().to_string();
+
+    let mut state = read_state(root);
+    set_pending_record(&mut state, "edge-proxy", Some(&secret_id_path));
+    write_state_value(root, &state);
+    fs::write(&secret_id_path, "old-secret-id").expect("write old secret_id");
+    fs::write(&role_id_path, "old-role-id").expect("write old role_id");
+
+    let rerun = run_local_file_add(root, &["--secret-id-path", &secret_id_arg]);
+    assert!(rerun.status.success(), "{}", output_text(&rerun));
+    assert_committed(root);
+    let parent_meta = fs::metadata(secret_id_path.parent().unwrap()).expect("parent metadata");
+    for (path, expected) in [
+        (&secret_id_path, "secret-edge-proxy"),
+        (&role_id_path, "role-edge-proxy"),
+    ] {
+        assert_eq!(fs::read_to_string(path).expect("read credential"), expected);
+        let meta = fs::metadata(path).expect("credential metadata");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (parent_meta.uid(), parent_meta.gid())
+        );
+    }
+    assert_eq!(
+        read_state(root)["services"]["edge-proxy"]["approle"]["secret_id_path"],
+        secret_id_arg
+    );
+}
+
+/// A fresh add whose override `secret_id`, or separately `role_id`,
+/// already exists refuses before writing a record and before any
+/// `OpenBao` request: the root token authenticates without one, so the
+/// mock server sees nothing at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_fresh_override_refuses_existing_credential_before_issuing() {
+    for stale in ["secret_id", "role_id"] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+        let server = MockServer::start().await;
+        write_state_file(root, &server.uri()).expect("write state.json");
+        stub_full_local_file_add(&server).await;
+        let secret_id_path = override_secret_id_path(root);
+        let stale_path = secret_id_path.with_file_name(stale);
+        fs::write(&stale_path, "stale").expect("write stale credential");
+        let secret_id_arg = secret_id_path.to_string_lossy().to_string();
+
+        let output = run_local_file_add(root, &["--secret-id-path", &secret_id_arg]);
+        assert!(
+            !output.status.success(),
+            "{stale}: {}",
+            output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Refusing to overwrite"),
+            "{stale}: {}",
+            output_text(&output)
+        );
+        assert_no_pending_record(root);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording")
+                .len(),
+            0,
+            "{stale}: no OpenBao request may follow authentication"
+        );
+        assert_eq!(fs::read_to_string(&stale_path).unwrap(), "stale");
+    }
+}
+
+/// A record naming path A does not license touching path B: a rerun
+/// with B refuses a file at B and leaves A's files alone, and commits
+/// once B is empty.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rerun_with_a_different_override_path() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let server = MockServer::start().await;
+    write_state_file(root, &server.uri()).expect("write state.json");
+    stub_full_local_file_add(&server).await;
+    let path_a = override_secret_id_path(root);
+    fs::write(&path_a, "a-secret-id").expect("write A secret_id");
+    fs::write(path_a.with_file_name("role_id"), "a-role-id").expect("write A role_id");
+    let dir_b = root.join("agent").join("edge-proxy-b");
+    fs::create_dir_all(&dir_b).expect("create B dir");
+    let path_b = dir_b.join("secret_id");
+    let path_b_arg = path_b.to_string_lossy().to_string();
+    let mut state = read_state(root);
+    set_pending_record(&mut state, "edge-proxy", Some(&path_a));
+    write_state_value(root, &state);
+
+    fs::write(&path_b, "b-stale").expect("write B secret_id");
+    let refused = run_local_file_add(root, &["--secret-id-path", &path_b_arg]);
+    assert!(!refused.status.success(), "{}", output_text(&refused));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Refusing to overwrite"),
+        "{}",
+        output_text(&refused)
+    );
+    assert_eq!(fs::read_to_string(&path_b).unwrap(), "b-stale");
+    assert_eq!(fs::read_to_string(&path_a).unwrap(), "a-secret-id");
+    assert_eq!(
+        fs::read_to_string(path_a.with_file_name("role_id")).unwrap(),
+        "a-role-id"
+    );
+
+    fs::remove_file(&path_b).expect("clear B");
+    let committed = run_local_file_add(root, &["--secret-id-path", &path_b_arg]);
+    assert!(committed.status.success(), "{}", output_text(&committed));
+    assert_committed(root);
+    assert_eq!(fs::read_to_string(&path_b).unwrap(), "secret-edge-proxy");
+    assert_eq!(fs::read_to_string(&path_a).unwrap(), "a-secret-id");
+}
+
+/// Writes a committed local-file `other-proxy` entry whose `secret_id`
+/// lives at `secret_id_path`, with its own `agent.toml`.
+fn add_committed_other_proxy(state: &mut serde_json::Value, secret_id_path: &std::path::Path) {
+    state["services"]["other-proxy"] = json!({
+        "registration_id": "other-proxy",
+        "service_name": "other-proxy",
+        "hostname": "edge-node-01",
+        "domain": "trusted.domain",
+        "agent_config_path": "other-agent.toml",
+        "cert_path": "certs/other-proxy.crt",
+        "key_path": "certs/other-proxy.key",
+        "instance_id": "001",
+        "approle": {
+            "role_name": "bootroot-service-other-proxy",
+            "role_id": "role-other-proxy",
+            "secret_id_path": secret_id_path,
+            "policy_name": "bootroot-service-other-proxy"
+        }
+    });
+}
+
+/// A recorded path a committed registration also claims — its very
+/// `secret_id`, or (shared directory) the `role_id` beside another
+/// `secret_id` — is refused, and no file is removed.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_rerun_refuses_a_recorded_path_a_committed_entry_claims() {
+    for shared_directory in [false, true] {
+        let temp_dir = tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+        let server = MockServer::start().await;
+        write_state_file(root, &server.uri()).expect("write state.json");
+        stub_full_local_file_add(&server).await;
+        let secret_id_path = override_secret_id_path(root);
+        let role_id_path = secret_id_path.with_file_name("role_id");
+        let claimed = if shared_directory {
+            secret_id_path.with_file_name("other_secret_id")
+        } else {
+            secret_id_path.clone()
+        };
+        fs::write(&secret_id_path, "secret-id").expect("write secret_id");
+        fs::write(&claimed, "claimed").expect("write claimed secret_id");
+        fs::write(&role_id_path, "role-id").expect("write role_id");
+        let mut state = read_state(root);
+        add_committed_other_proxy(&mut state, &claimed);
+        set_pending_record(&mut state, "edge-proxy", Some(&secret_id_path));
+        write_state_value(root, &state);
+        let secret_id_arg = secret_id_path.to_string_lossy().to_string();
+
+        let output = run_local_file_add(root, &["--secret-id-path", &secret_id_arg]);
+        assert!(!output.status.success(), "{}", output_text(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("also claimed by registration other-proxy"),
+            "{}",
+            output_text(&output)
+        );
+        assert!(secret_id_path.exists() && claimed.exists());
+        assert_eq!(fs::read_to_string(&role_id_path).unwrap(), "role-id");
+        assert_pending_only(root);
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("request recording")
+                .len(),
+            0
+        );
+    }
+}
+
+/// A pending-only id is not a registration `service info` can find.
+#[cfg(unix)]
+#[test]
+fn test_service_info_does_not_find_a_pending_only_id() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://localhost:8200").expect("write state.json");
+    let mut state = read_state(temp_dir.path());
+    set_pending_record(&mut state, "edge-proxy", None);
+    write_state_value(temp_dir.path(), &state);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args(["service", "info", "--registration-id", "edge-proxy"])
+        .output()
+        .expect("run service info");
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Service not found: edge-proxy"),
+        "{}",
+        output_text(&output)
+    );
 }

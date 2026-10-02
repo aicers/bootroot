@@ -426,6 +426,21 @@ mod tests {
         );
     }
 
+    /// An id with only a pending `service add` record has no committed
+    /// registration, so it opens no HTTP-01 route.
+    #[test]
+    fn a_pending_service_add_contributes_no_alias() {
+        let mut state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
+        state.pending_service_adds.insert(
+            "pending-proxy".to_string(),
+            crate::state::PendingServiceAdd::default(),
+        );
+        assert_eq!(
+            collect_dns_aliases(&state),
+            vec!["001.edge-proxy.host1.test.local".to_string()]
+        );
+    }
+
     /// The surface names follow a domain of any label count, as the
     /// certificates the daemon issues under them do.
     #[test]

@@ -1294,7 +1294,11 @@ post-renew 훅이 컨테이너를 리로드합니다
     `role_id`/`eab.json`을 읽고 `secret_id`를 다시 쓸 수 있도록 합니다.
     상위 디렉터리는 미리 존재하고 에이전트 소유여야 하며
     `<secrets_dir>` 밖으로 해석되어야 합니다. `<secrets_dir>` 내부로
-    해석되는 경로는 거부됩니다.
+    해석되는 경로는 거부됩니다. `secret_id`와 `role_id`는 덮어쓰지
+    않습니다. 둘 중 하나라도 이미 있으면 아무것도 프로비저닝하거나
+    발급하기 전에 추가를 거부합니다. 단, 같은 등록을 같은 경로로
+    진행하다 중단된 추가를 완료하는 재실행([중단된 추가](#중단된-추가)
+    참고)은 그 실행이 남긴 두 파일을 교체합니다.
   - `remote-bootstrap`: **대상 호스트**가 자격 증명을 두는 위치입니다.
     이 경로는 부트스트랩 아티팩트에 `secret_id_path`로 기록되고,
     `role_id_path`와 `eab_file_path`는 그 옆 경로가 됩니다.
@@ -1504,12 +1508,29 @@ rename을 잃는 크래시는 이전 인증서/키/번들을 그대로 남기고
   EAB 회전이 적용되려면 `--eab-file`이 필수) — 기본 모드와 preview 모드
   모두 출력
 
+### 중단된 추가
+
+`service add`는 OpenBao 인증에 성공한 뒤, 아무것도 프로비저닝하거나
+발급하기 전에 `state.json`의 `pending_service_adds.<registration_id>`에
+등록을 기록합니다. `services.<registration_id>`를 기록하는 저장이 이
+기록을 제거하므로, 하나의 등록이 두 곳에 동시에 있지 않습니다. 그 사이에
+추가가 실패하거나 중단되면 — `secret_id`가 발급되었거나 자격 증명, KV,
+`agent.toml` 또는 부트스트랩 아티팩트가 기록된 뒤라도 — 기록이 남으며,
+같은 인자로 `service add`를 다시 실행하면 수동 정리 없이 등록이
+완료됩니다. local-file `--secret-id-path`를 쓴 경우 재실행은 중단된 실행이
+그 경로에 남긴 `secret_id`와 `role_id`를 제거합니다. 다만 다른 등록도 둘 중
+하나를 사용하고 있으면 아무것도 제거하지 않고 거부합니다. 대기 중인
+기록은 등록이 아닙니다. `service info`, `status`, 회전, DNS 별칭,
+`service remove`는 이를 무시합니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
 
 - `state.json` 누락
 - 중복된 `service-name`
+- local-file `--secret-id-path`의 `secret_id` 또는 `role_id`가 이미 존재
+  (완료 중인 중단된 추가가 남긴 파일은 제외)
 - `instance-id` 누락
 - OpenBao AppRole 생성 실패
 

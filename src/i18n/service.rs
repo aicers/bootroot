@@ -67,6 +67,20 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_service_secret_id_path_exists(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_path_exists,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_service_secret_id_path_claimed(&self, path: &str, service: &str) -> String {
+        format_template(
+            self.strings().error_service_secret_id_path_claimed,
+            &[("path", path), ("service", service)],
+        )
+    }
+
     pub(crate) fn error_service_policy_mismatch(&self) -> &'static str {
         self.strings().error_service_policy_mismatch
     }
