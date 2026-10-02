@@ -1723,6 +1723,30 @@ mod tests {
             .expect("an empty service registry must be a no-op success");
     }
 
+    /// A pending `service add` record is not a registration: with no
+    /// committed entry, `--all` mints and writes nothing for its id.
+    #[tokio::test]
+    async fn rotate_all_services_ignores_a_pending_service_add() {
+        let dir = tempdir().expect("tempdir");
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
+        let pending_secret_id = dir.path().join("agent").join("secret_id");
+        ctx.state.pending_service_adds.insert(
+            "pending-proxy".to_string(),
+            crate::state::PendingServiceAdd {
+                secret_id_path_override: Some(pending_secret_id.clone()),
+            },
+        );
+        // An unroutable URL makes any accidental mint fail loudly.
+        let mut client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+        client.set_token("scoped-token".to_string());
+        let messages = test_messages();
+        rotate_all_service_approle_secret_ids(&ctx, &client, None, true, &messages)
+            .await
+            .expect("a pending-only id must leave --all a no-op success");
+        assert!(!pending_secret_id.exists());
+        assert!(!dir.path().join("secrets").join("services").exists());
+    }
+
     #[tokio::test]
     async fn rotate_all_services_rotates_local_and_remote_targets() {
         let dir = tempdir().expect("tempdir");

@@ -367,6 +367,20 @@ byte for byte.
   recorded with the service, so a re-run of `service add` must repeat it
   to be treated as idempotent; a different or missing one is refused as a
   duplicate. Without the flag the artifact is unchanged.
+- `bootroot service add` now records the registration in `state.json`,
+  under `pending_service_adds`, before it provisions or issues anything,
+  and the save that commits the service entry removes that record. An add
+  interrupted part-way — after a `secret_id` was minted, or files, KV or
+  the bootstrap artifact were written, but before the entry was saved —
+  used to leave no trace in `state.json`; it now leaves the pending
+  record, and rerunning `service add` with the same arguments completes
+  it with no manual cleanup, including the `--secret-id-path` credential
+  files the interrupted run had already created. No other command treats
+  a pending record as a registration. Otherwise, a local-file
+  `--secret-id-path` whose `secret_id` or sibling `role_id` file already
+  exists is now refused before anything is provisioned or minted; the
+  refusal used to come only when the file was written, after a
+  `secret_id` had already been issued.
 
 ### Removed
 

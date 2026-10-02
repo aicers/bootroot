@@ -22,7 +22,7 @@ use crate::commands::dns_alias::{DnsAliasOutcome, register_dns_alias};
 use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry, StateFile};
+use crate::state::{DeliveryMode, PendingServiceAdd, ServiceEntry, ServiceRoleEntry, StateFile};
 
 pub(super) const SERVICE_SECRET_DIR: &str = "services";
 pub(super) const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
@@ -155,19 +155,131 @@ impl Drop for OverrideCredentialRollback<'_> {
         if self.armed {
             // Best-effort synchronous cleanup on the error path; `Drop`
             // cannot be async, and a single unlink is negligible.
-            let _ = std::fs::remove_file(self.secret_id_path);
-            let _ = std::fs::remove_file(self.role_id_path);
+            let _ = remove_override_credentials(self.role_id_path, self.secret_id_path);
         }
     }
 }
 
-/// Reports whether two local agent-config paths name the same file.
+/// Unlinks an override `secret_id` and its sibling `role_id`, treating
+/// an absent file as already removed. Both unlinks are attempted; the
+/// first other failure is returned, naming its path.
+fn remove_override_credentials(role_id_path: &Path, secret_id_path: &Path) -> std::io::Result<()> {
+    let unlink = |path: &Path| match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(std::io::Error::new(
+            err.kind(),
+            format!("{}: {err}", path.display()),
+        )),
+        _ => Ok(()),
+    };
+    let secret_id = unlink(secret_id_path);
+    let role_id = unlink(role_id_path);
+    secret_id.and(role_id)
+}
+
+/// Clears the way for this run's no-clobber `--secret-id-path`
+/// credentials before anything is recorded or issued, and returns the
+/// override as the pending record stores it (parent canonicalized), or
+/// `None` without an override.
+///
+/// A pending record for this id naming the same path means an earlier,
+/// interrupted run of this add may have left the two files, which the
+/// no-clobber writer would refuse; they are removed unless a committed
+/// registration or another pending add also claims the `secret_id` or
+/// the shared `role_id`. Any other run refuses either file existing —
+/// the writer's own no-clobber refusal, moved ahead of the record and
+/// of every `OpenBao` request — so a recorded path never holds a file
+/// bootroot did not create.
+fn prepare_override_credentials(
+    state: &StateFile,
+    resolved: &ResolvedServiceAdd,
+    messages: &Messages,
+) -> Result<Option<std::path::PathBuf>> {
+    let Some(secret_id_path) = resolved.secret_id_path_override.as_deref() else {
+        return Ok(None);
+    };
+    let (Some(parent), Some(file_name)) = (secret_id_path.parent(), secret_id_path.file_name())
+    else {
+        anyhow::bail!(
+            messages
+                .error_service_secret_id_path_parent_missing(&secret_id_path.display().to_string())
+        );
+    };
+    let recorded = parent
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "failed to canonicalize override parent {}",
+                parent.display()
+            )
+        })?
+        .join(file_name);
+    let role_id_path = role_id_sibling_path(secret_id_path);
+
+    let resumes_own_attempt = state
+        .pending_service_adds
+        .get(&resolved.registration_id)
+        .and_then(|pending| pending.secret_id_path_override.as_deref())
+        == Some(recorded.as_path());
+    if !resumes_own_attempt {
+        for path in [secret_id_path, role_id_path.as_path()] {
+            // Only a definite absence lets the add proceed: an unreadable
+            // path would otherwise reach the no-clobber writer, and its
+            // refusal, after a `secret_id` was already minted.
+            match std::fs::symlink_metadata(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to inspect override credential {}", path.display())
+                    });
+                }
+                Ok(_) => anyhow::bail!(
+                    messages.error_service_secret_id_path_exists(&path.display().to_string())
+                ),
+            }
+        }
+        return Ok(Some(recorded));
+    }
+
+    let committed = state.services.values().map(|entry| {
+        (
+            &entry.registration_id,
+            entry.approle.secret_id_path.as_path(),
+        )
+    });
+    let pending = state
+        .pending_service_adds
+        .iter()
+        .filter(|(id, _)| **id != resolved.registration_id)
+        .filter_map(|(id, pending)| Some((id, pending.secret_id_path_override.as_deref()?)));
+    let claim = committed.chain(pending).find_map(|(claimant, claimed)| {
+        if same_local_file(claimed, secret_id_path) {
+            Some((claimant, secret_id_path))
+        } else if same_local_file(&role_id_sibling_path(claimed), &role_id_path) {
+            Some((claimant, role_id_path.as_path()))
+        } else {
+            None
+        }
+    });
+    if let Some((claimant, claimed_path)) = claim {
+        anyhow::bail!(
+            messages.error_service_secret_id_path_claimed(
+                &claimed_path.display().to_string(),
+                claimant,
+            )
+        );
+    }
+    remove_override_credentials(&role_id_path, secret_id_path)
+        .context("failed to remove credentials left by an interrupted service add")?;
+    Ok(Some(recorded))
+}
+
+/// Reports whether two local paths name the same file.
 /// Paths resolved by this binary are stored absolute and lexically
 /// normalized, so a literal comparison covers equivalent spellings;
 /// the canonicalizing fallback additionally resolves symlinks for
-/// files that exist, so a symlinked spelling of a registered config
-/// cannot bypass the one-config-per-service guard.
-fn same_agent_config_file(registered: &Path, candidate: &Path) -> bool {
+/// files that exist, so a symlinked spelling of a registered file
+/// cannot bypass a one-file-per-service guard.
+fn same_local_file(registered: &Path, candidate: &Path) -> bool {
     if registered == candidate {
         return true;
     }
@@ -300,7 +412,7 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         if let Some(conflict) = state.services.values().find(|entry| {
             matches!(entry.delivery_mode, DeliveryMode::LocalFile)
-                && same_agent_config_file(&entry.agent_config_path, &resolved.agent_config)
+                && same_local_file(&entry.agent_config_path, &resolved.agent_config)
         }) {
             anyhow::bail!(messages.error_service_agent_config_conflict(
                 &resolved.agent_config.display().to_string(),
@@ -435,9 +547,11 @@ async fn run_service_add_preview(
     );
 }
 
-// One line over the limit since the state persist gained its `.await`:
-// the body is a linear apply sequence whose steps depend on each other,
-// so splitting it would only move the ordering somewhere less visible.
+// Over the limit since the pending record and the state persist joined
+// it: the body is a linear apply sequence whose steps depend on each
+// other — the record has to be durable before the first issuance and
+// dropped in the commit's save — so splitting it would only move the
+// ordering somewhere less visible.
 #[allow(clippy::too_many_lines)]
 async fn run_service_add_apply(
     state: &mut StateFile,
@@ -453,6 +567,22 @@ async fn run_service_add_apply(
     let mut client = OpenBaoClient::with_local_trust(&state.openbao_url, state.secrets_dir())
         .with_context(|| messages.error_openbao_client_create_failed())?;
     authenticate_openbao_client(&mut client, auth, messages).await?;
+
+    // Record the add before anything is provisioned, minted or written,
+    // so an interruption from here on leaves a trace in `state.json`
+    // that a same-argument rerun completes. The record is replaced
+    // wholesale: a rerun with different arguments supersedes it.
+    let secret_id_path_override = prepare_override_credentials(state, resolved, messages)?;
+    state.pending_service_adds.insert(
+        resolved.registration_id.clone(),
+        PendingServiceAdd {
+            secret_id_path_override,
+        },
+    );
+    state
+        .save_async(state_path)
+        .await
+        .with_context(|| messages.error_serialize_state_failed())?;
 
     let secret_id_options = build_secret_id_options(resolved);
     let wrap_ttl = resolve::effective_wrap_ttl(resolved.secret_id_wrap_ttl.as_deref());
@@ -539,9 +669,12 @@ async fn run_service_add_apply(
 
     let entry = build_service_entry(resolved, approle_result, &secret_id_path);
 
+    // One save commits the entry and drops the pending record, so no
+    // published `state.json` holds the id in both maps.
     state
         .services
         .insert(resolved.registration_id.clone(), entry.clone());
+    state.pending_service_adds.remove(&resolved.registration_id);
     state
         .save_async(state_path)
         .await
@@ -1287,10 +1420,13 @@ mod tests {
         OverrideCredentialRollback, ServiceAppRoleMaterialized, build_secret_id_options,
         build_service_entry, build_service_entry_from_role, display_policy_value, display_wrap_ttl,
         is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
-        policy_fields_match, rerender_local_managed_profile, write_origin_credential_files,
+        policy_fields_match, prepare_override_credentials, rerender_local_managed_profile,
+        write_origin_credential_files,
     };
     use crate::i18n::{Messages, test_messages};
-    use crate::state::{DeliveryMode, ServiceEntry, ServiceRoleEntry};
+    use crate::state::{
+        DeliveryMode, PendingServiceAdd, ServiceEntry, ServiceRoleEntry, StateFile,
+    };
 
     /// An override `service add` writes `role_id` then `secret_id`, both
     /// no-clobber. A stale pre-existing `secret_id` must fail the add
@@ -1543,6 +1679,215 @@ mod tests {
         assert_common_fields(&entry, &resolved);
         assert!(entry.instance_id.is_none());
         assert!(entry.notes.is_none());
+    }
+
+    /// A temp directory holding an operator-provisioned override
+    /// directory `agent/`, and a resolved add whose `--secret-id-path`
+    /// names `agent/secret_id` in it.
+    fn override_fixture() -> (tempfile::TempDir, PathBuf, ResolvedServiceAdd) {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let secret_id_path = agent_dir.join("secret_id");
+        let mut resolved = sample_resolved();
+        resolved.secret_id_path_override = Some(secret_id_path.clone());
+        (dir, secret_id_path, resolved)
+    }
+
+    fn record_pending(state: &mut StateFile, id: &str, path: Option<&std::path::Path>) {
+        state.pending_service_adds.insert(
+            id.to_string(),
+            PendingServiceAdd {
+                secret_id_path_override: path.map(|p| {
+                    let parent = p.parent().unwrap().canonicalize().unwrap();
+                    parent.join(p.file_name().unwrap())
+                }),
+            },
+        );
+    }
+
+    fn write_override_files(secret_id_path: &std::path::Path) -> PathBuf {
+        let role_id_path = super::role_id_sibling_path(secret_id_path);
+        std::fs::write(secret_id_path, "old-sid").unwrap();
+        std::fs::write(&role_id_path, "old-rid").unwrap();
+        role_id_path
+    }
+
+    /// Without an override there is nothing to clear and nothing to
+    /// record beyond the id.
+    #[test]
+    fn prepare_override_credentials_without_override_records_none() {
+        let state = StateFile::default();
+        let recorded =
+            prepare_override_credentials(&state, &sample_resolved(), &test_messages()).unwrap();
+        assert!(recorded.is_none());
+    }
+
+    /// A fresh add records the override with its parent canonicalized,
+    /// so a symlinked spelling of the directory resumes the same record.
+    #[test]
+    fn prepare_override_credentials_records_canonical_parent() {
+        let (dir, secret_id_path, mut resolved) = override_fixture();
+        let link = dir.path().join("agent-link");
+        std::os::unix::fs::symlink(secret_id_path.parent().unwrap(), &link).unwrap();
+        resolved.secret_id_path_override = Some(link.join("secret_id"));
+        let recorded =
+            prepare_override_credentials(&StateFile::default(), &resolved, &test_messages())
+                .unwrap()
+                .expect("an override is recorded");
+        assert_eq!(
+            recorded,
+            secret_id_path
+                .parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join("secret_id")
+        );
+
+        // The symlinked spelling resumes a record written for the
+        // canonical one, and clears the earlier attempt's files.
+        let mut state = StateFile::default();
+        record_pending(&mut state, &resolved.registration_id, Some(&recorded));
+        let role_id_path = write_override_files(&secret_id_path);
+        prepare_override_credentials(&state, &resolved, &test_messages()).unwrap();
+        assert!(!secret_id_path.exists() && !role_id_path.exists());
+    }
+
+    /// A fresh add refuses an existing `secret_id` or `role_id`, and
+    /// removes neither.
+    #[test]
+    fn prepare_override_credentials_fresh_add_refuses_existing_files() {
+        for stale in ["secret_id", "role_id"] {
+            let (_dir, secret_id_path, resolved) = override_fixture();
+            let stale_path = secret_id_path.parent().unwrap().join(stale);
+            std::fs::write(&stale_path, "stale").unwrap();
+            let err =
+                prepare_override_credentials(&StateFile::default(), &resolved, &test_messages())
+                    .unwrap_err();
+            assert!(
+                err.to_string().contains("Refusing to overwrite"),
+                "{stale}: {err:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&stale_path).unwrap(), "stale");
+        }
+    }
+
+    /// A planted symlink counts as an existing file, dangling or not.
+    #[test]
+    fn prepare_override_credentials_fresh_add_refuses_a_dangling_symlink() {
+        let (dir, secret_id_path, resolved) = override_fixture();
+        std::os::unix::fs::symlink(dir.path().join("missing"), &secret_id_path).unwrap();
+        prepare_override_credentials(&StateFile::default(), &resolved, &test_messages())
+            .unwrap_err();
+        assert!(std::fs::symlink_metadata(&secret_id_path).is_ok());
+    }
+
+    /// A path whose existence cannot be determined refuses rather than
+    /// being read as absent; an over-long file name is one such path.
+    #[test]
+    fn prepare_override_credentials_fresh_add_refuses_an_uninspectable_path() {
+        let (_dir, secret_id_path, mut resolved) = override_fixture();
+        let long_name = "s".repeat(300);
+        resolved.secret_id_path_override = Some(secret_id_path.with_file_name(&long_name));
+        let err = prepare_override_credentials(&StateFile::default(), &resolved, &test_messages())
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to inspect override credential"),
+            "{err:#}"
+        );
+    }
+
+    /// A record for this id naming another path, or naming none, is not
+    /// this attempt's: the files are refused, not removed.
+    #[test]
+    fn prepare_override_credentials_other_recorded_path_refuses() {
+        let (dir, secret_id_path, resolved) = override_fixture();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let role_id_path = write_override_files(&secret_id_path);
+        for recorded in [Some(elsewhere.join("secret_id")), None] {
+            let mut state = StateFile::default();
+            state.pending_service_adds.insert(
+                resolved.registration_id.clone(),
+                PendingServiceAdd {
+                    secret_id_path_override: recorded,
+                },
+            );
+            prepare_override_credentials(&state, &resolved, &test_messages()).unwrap_err();
+            assert!(secret_id_path.exists() && role_id_path.exists());
+        }
+    }
+
+    /// Resuming this id's own record removes both files, and tolerates
+    /// either being absent already.
+    #[test]
+    fn prepare_override_credentials_resume_removes_own_files() {
+        let (_dir, secret_id_path, resolved) = override_fixture();
+        let mut state = StateFile::default();
+        record_pending(&mut state, &resolved.registration_id, Some(&secret_id_path));
+        let role_id_path = super::role_id_sibling_path(&secret_id_path);
+        std::fs::write(&role_id_path, "old-rid").unwrap();
+        let recorded = prepare_override_credentials(&state, &resolved, &test_messages())
+            .unwrap()
+            .expect("an override is recorded");
+        assert_eq!(
+            state
+                .pending_service_adds
+                .get(&resolved.registration_id)
+                .and_then(|pending| pending.secret_id_path_override.as_deref()),
+            Some(recorded.as_path())
+        );
+        assert!(!secret_id_path.exists() && !role_id_path.exists());
+    }
+
+    /// A recorded path another pending add also claims — its
+    /// `secret_id`, or the `role_id` a shared directory gives both — is
+    /// refused, and nothing is removed.
+    #[test]
+    fn prepare_override_credentials_resume_refuses_a_path_another_pending_add_claims() {
+        let (_dir, secret_id_path, resolved) = override_fixture();
+        let sibling = secret_id_path.parent().unwrap().join("other_secret_id");
+        let role_id_path = super::role_id_sibling_path(&secret_id_path);
+        // The refusal names the file actually claimed.
+        for (claimed, named) in [
+            (&secret_id_path, &secret_id_path),
+            (&sibling, &role_id_path),
+        ] {
+            let mut state = StateFile::default();
+            record_pending(&mut state, &resolved.registration_id, Some(&secret_id_path));
+            write_override_files(&secret_id_path);
+            std::fs::write(&sibling, "other").unwrap();
+            record_pending(&mut state, "other-id", Some(claimed));
+            let err =
+                prepare_override_credentials(&state, &resolved, &test_messages()).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("other-id"), "{err:#}");
+            assert!(message.contains(&named.display().to_string()), "{err:#}");
+            assert!(secret_id_path.exists() && role_id_path.exists());
+        }
+    }
+
+    /// The same refusal holds against a committed entry, here reached
+    /// through a symlinked spelling of the shared directory.
+    #[test]
+    fn prepare_override_credentials_resume_refuses_a_path_a_committed_entry_claims() {
+        let (dir, secret_id_path, resolved) = override_fixture();
+        let link = dir.path().join("agent-link");
+        std::os::unix::fs::symlink(secret_id_path.parent().unwrap(), &link).unwrap();
+        let mut state = StateFile::default();
+        record_pending(&mut state, &resolved.registration_id, Some(&secret_id_path));
+        let role_id_path = write_override_files(&secret_id_path);
+        let mut committed = sample_entry_from_resolved(&sample_resolved());
+        committed.registration_id = "committed-id".to_string();
+        committed.approle.secret_id_path = link.join("committed_secret_id");
+        state
+            .services
+            .insert(committed.registration_id.clone(), committed);
+        let err = prepare_override_credentials(&state, &resolved, &test_messages()).unwrap_err();
+        assert!(err.to_string().contains("committed-id"), "{err:#}");
+        assert!(secret_id_path.exists() && role_id_path.exists());
     }
 
     fn sample_entry_from_resolved(resolved: &ResolvedServiceAdd) -> ServiceEntry {

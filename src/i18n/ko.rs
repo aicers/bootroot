@@ -90,6 +90,8 @@ pub(super) static STRINGS: Strings = Strings {
     error_service_secret_id_path_role_id_collision: "--secret-id-path는 `role_id`로 끝날 수 없습니다. 형제 `role_id` 파일이 <dir>/role_id로 파생되어 {value}에서 secret_id와 충돌합니다",
     error_service_secret_id_path_eab_collision: "--secret-id-path는 `eab.json`으로 끝날 수 없습니다. 형제 `eab.json` 파일이 <dir>/eab.json으로 파생되어 {value}에서 secret_id와 충돌합니다",
     error_service_secret_id_path_inside_secrets_dir: "--secret-id-path는 root 소유 secrets 트리 {secrets_dir} 밖으로 해석되어야 합니다. 트리 내부 경로({value})는 비-root 에이전트가 통과할 수 없습니다",
+    error_service_secret_id_path_exists: "기존 --secret-id-path 자격 증명 파일을 덮어쓰지 않습니다: {value} (이 등록을 위해 bootroot가 만든 파일이 아닙니다. 파일을 제거하거나 다른 --secret-id-path를 지정하세요)",
+    error_service_secret_id_path_claimed: "--secret-id-path 자격 증명 파일 {path}을(를) 등록 {service}도 사용하고 있어, 이 추가 작업을 재개하기 위해 제거하지 않습니다",
     error_service_secret_id_path_parent_missing: "--secret-id-path의 상위 디렉터리가 없습니다: {value} (`service add` 실행 전에 에이전트 계정 소유로 생성하세요)",
     error_service_policy_mismatch: "기존 서비스의 secret_id 정책을 변경하려면 `bootroot service update`를 사용하세요",
     error_service_not_found: "서비스를 찾을 수 없습니다: {value}",

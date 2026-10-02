@@ -114,6 +114,8 @@ pub(crate) struct Strings {
     pub(crate) error_service_secret_id_path_eab_collision: &'static str,
     pub(crate) error_service_secret_id_path_inside_secrets_dir: &'static str,
     pub(crate) error_service_secret_id_path_parent_missing: &'static str,
+    pub(crate) error_service_secret_id_path_exists: &'static str,
+    pub(crate) error_service_secret_id_path_claimed: &'static str,
     pub(crate) error_service_policy_mismatch: &'static str,
     pub(crate) error_service_not_found: &'static str,
     pub(crate) error_service_instance_id_required: &'static str,
