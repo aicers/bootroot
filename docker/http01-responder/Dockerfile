@@ -1,7 +1,7 @@
 # Build Stage
 # Pinned to an explicit patch release so the shipped binary is reproducible and
 # Dependabot can propose toolchain bumps.
-FROM rust:1.97.1-slim-bookworm AS builder
+FROM rust:1.98.1-slim-bookworm AS builder
 
 WORKDIR /usr/src/bootroot
 
