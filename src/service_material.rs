@@ -1149,7 +1149,7 @@ mod tests {
         let ids = list_registrar_managed_ids(&client(&server), "secret")
             .await
             .expect("a not-found listing is empty");
-        assert!(ids.is_empty());
+        assert_eq!(ids, Vec::<String>::new());
     }
 
     #[tokio::test]

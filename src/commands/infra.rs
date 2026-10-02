@@ -2700,10 +2700,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join(INTERNAL_DIR)).expect("subdirectory");
 
-        assert!(
-            ownership_sweep_targets(dir.path(), &messages)
-                .expect("targets")
-                .is_empty()
+        assert_eq!(
+            ownership_sweep_targets(dir.path(), &messages).expect("targets"),
+            Vec::<PathBuf>::new()
         );
     }
 

@@ -396,7 +396,7 @@ mod tests {
                 .all(|body| body.get("options") == Some(&serde_json::json!({ "cas": 0 }))),
             "every write is a create-if-absent: {writes:?}"
         );
-        assert!(rollback.written_kv_paths.is_empty());
+        assert_eq!(rollback.written_kv_paths, Vec::<String>::new());
     }
 
     /// A disabled or absent predicate writes nothing new, and neither
@@ -430,7 +430,7 @@ mod tests {
         }
 
         assert!(writes.lock().expect("capture").is_empty());
-        assert!(rollback.written_kv_paths.is_empty());
+        assert_eq!(rollback.written_kv_paths, Vec::<String>::new());
         assert!(
             server
                 .received_requests()
@@ -452,7 +452,7 @@ mod tests {
     fn test_resolve_secret_auto_generates() {
         let messages = test_messages();
         let value = resolve_secret("HTTP-01 HMAC", None, true, &messages).unwrap();
-        assert!(!value.is_empty());
+        assert_ne!(value, "");
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
             resolved.stepca_password, "should-be-ignored",
             "outside reinit_mode, auto-generate must run"
         );
-        assert!(!resolved.stepca_password.is_empty());
+        assert_ne!(resolved.stepca_password, "");
     }
 
     /// Regression: in reinit mode the previous HTTP-01 HMAC was wiped

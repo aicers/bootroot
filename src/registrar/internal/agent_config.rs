@@ -330,20 +330,20 @@ pub fn load_internal_config(paths: &InternalPaths) -> Result<Settings, InternalC
             profile.instance_id
         )));
     }
-    expect_path("profiles.paths.cert", &profile.paths.cert, &paths.chain()).map_err(&invalid)?;
-    expect_path("profiles.paths.key", &profile.paths.key, &paths.key()).map_err(&invalid)?;
+    expect_path("profiles.paths.cert", &profile.paths.cert, &paths.chain()).map_err(invalid)?;
+    expect_path("profiles.paths.key", &profile.paths.key, &paths.key()).map_err(invalid)?;
     let account_key = settings
         .acme
         .account_key_path
         .as_deref()
         .ok_or_else(|| invalid("acme.account_key_path is unset".to_string()))?;
-    expect_path("acme.account_key_path", account_key, &paths.acme_account()).map_err(&invalid)?;
+    expect_path("acme.account_key_path", account_key, &paths.acme_account()).map_err(invalid)?;
     let bundle = settings
         .trust
         .ca_bundle_path
         .as_deref()
         .ok_or_else(|| invalid("trust.ca_bundle_path is unset".to_string()))?;
-    expect_path("trust.ca_bundle_path", bundle, &paths.ca_bundle()).map_err(&invalid)?;
+    expect_path("trust.ca_bundle_path", bundle, &paths.ca_bundle()).map_err(invalid)?;
     if settings.trust.trusted_ca_sha256.is_empty() {
         return Err(invalid("trust.trusted_ca_sha256 is empty".to_string()));
     }

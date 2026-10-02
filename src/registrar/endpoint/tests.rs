@@ -1278,7 +1278,7 @@ async fn a_partial_prefix_is_a_partial_frame() {
         response: Vec::new(),
     };
     let observed = drive(&handler, &[0u8, 0, 0]).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "partial-frame");
@@ -1297,7 +1297,7 @@ async fn a_partial_operation_name_is_a_partial_frame_logging_the_bytes_that_arri
     };
     // Declares a four-byte name and supplies two of them.
     let observed = drive(&handler, &[0u8, 0, 0, 0, 4, b'm', b'i']).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "partial-frame");
@@ -1315,7 +1315,7 @@ async fn an_operation_name_with_no_byte_read_logs_the_unread_marker() {
     };
     // Declares a four-byte name and supplies none of them.
     let observed = drive(&handler, &[0u8, 0, 0, 0, 4]).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "partial-frame");
@@ -1332,7 +1332,7 @@ async fn a_partial_operation_name_is_escaped_in_the_log() {
         response: Vec::new(),
     };
     let observed = drive(&handler, &[0u8, 0, 0, 0, 4, b'm', 0x00]).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
     assert_eq!(logs.refusal().field("received_name"), "m\\x00");
 }
 
@@ -1343,7 +1343,7 @@ async fn a_partial_payload_is_a_partial_frame_naming_its_operation() {
         response: Vec::new(),
     };
     let observed = drive(&handler, &frame_declaring(16, b"mint", b"short")).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "partial-frame");
@@ -1361,7 +1361,7 @@ async fn an_over_long_declared_payload_is_refused_before_the_name_is_read() {
     };
     let declared = u32::try_from(MAX_FRAME_PAYLOAD_BYTES + 1).expect("the limit fits u32");
     let observed = drive(&handler, &frame_declaring(declared, b"mint", b"")).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "over-long-frame");
@@ -1409,7 +1409,7 @@ async fn a_non_name_byte_is_a_malformed_header_logging_the_escaped_bytes() {
         response: Vec::new(),
     };
     let observed = drive(&handler, &frame_of(b"Mi\nt", b"")).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "malformed-header");
@@ -1500,7 +1500,7 @@ async fn the_refusal_helper_writes_nothing_and_closes() {
         .read_to_end(&mut observed)
         .await
         .expect("read to EOF");
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 }
 
 /// Every silent transport reason takes the same path.
@@ -1631,7 +1631,7 @@ async fn the_header_deadline_expires_with_no_header_when_no_byte_arrives() {
         response: Vec::new(),
     };
     let observed = drive_with(&handler, b"", false).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "no-header");
@@ -1646,7 +1646,7 @@ async fn the_header_deadline_expires_as_a_partial_frame_after_one_byte() {
         response: Vec::new(),
     };
     let observed = drive_with(&handler, &[0u8], false).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
     assert_eq!(logs.refusal().field("reason"), "partial-frame");
 }
 
@@ -1659,7 +1659,7 @@ async fn the_body_deadline_expires_as_a_partial_frame() {
         response: Vec::new(),
     };
     let observed = drive_with(&handler, &frame_declaring(8, b"mint", b""), false).await;
-    assert!(observed.is_empty());
+    assert_eq!(observed, Vec::<u8>::new());
 
     let event = logs.refusal();
     assert_eq!(event.field("reason"), "partial-frame");
@@ -2471,7 +2471,7 @@ async fn shutdown_stops_accepting_and_joins_every_task() {
         }),
     );
     let observed = harness.round_trip(&frame_of(b"mint", b"")).await;
-    assert!(!observed.is_empty());
+    assert_ne!(observed, Vec::<u8>::new());
     running.stop().await;
 
     // The listener is still open — it belongs to the handle, not to the
@@ -2608,7 +2608,7 @@ fn assert_audit_store_unavailable_response(body: &[u8], idempotency_key: &str) -
         response.registrar_health,
         protocol::RegistrarHealth::default()
     );
-    assert!(!response.request_id.is_empty());
+    assert_ne!(response.request_id, "");
     assert_ne!(response.request_id, idempotency_key);
     response.request_id
 }
@@ -2676,8 +2676,8 @@ async fn an_unmounted_audit_store_returns_typed_refusals_with_log_handles() {
             audit_store.display().to_string()
         );
         assert_eq!(event.field("mount_unit"), mount_unit);
-        assert!(!event.field("caller").is_empty());
-        assert!(!event.field("operation").is_empty());
+        assert_ne!(event.field("caller"), "");
+        assert_ne!(event.field("operation"), "");
     }
 
     let malformed = harness.round_trip(&frame_of(b"mint", b"not-json")).await;
@@ -3392,7 +3392,7 @@ async fn a_register_key_reaches_only_the_binding() {
     }
     assert_eq!(binding_writes, 2, "the claim and the activation");
     let trail = audit_trail(&audit);
-    assert!(!trail.is_empty());
+    assert_ne!(trail, Vec::<serde_json::Value>::new());
     for line in &trail {
         assert!(
             !line.to_string().contains(REGISTER_KEY),

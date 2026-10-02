@@ -305,9 +305,9 @@ fn a_limited_record_bounds_only_its_caller_identity() {
             .is_some(),
         "a capped limited caller carries its truncation proof"
     );
-    assert!(record.request_id.is_empty());
-    assert!(record.requested.service_name.is_empty());
-    assert!(record.requested.host.is_empty());
+    assert_eq!(record.request_id, "");
+    assert_eq!(record.requested.service_name, "");
+    assert_eq!(record.requested.host, "");
     assert!(record.registration_id.is_none());
     assert!(record.outcome.is_none());
 }

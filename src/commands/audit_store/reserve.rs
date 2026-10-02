@@ -3408,7 +3408,7 @@ mod tests {
         );
         let facts = evaluate(&inputs, &correct, &messages).expect("phase 1");
         assert_eq!(facts.image, ImageEvaluation::Correct);
-        assert!(image_commands(&inputs, &facts).is_empty());
+        assert_eq!(image_commands(&inputs, &facts), Vec::<String>::new());
 
         // Exact size but sparse: an in-place allocation and nothing
         // else — no `install`, no `mkfs`.
@@ -5177,7 +5177,7 @@ mod tests {
             description: description.to_string(),
             stacked: false,
         };
-        assert!(facts.deferred.is_empty());
+        assert_eq!(facts.deferred, Vec::<String>::new());
         assert_ne!(facts.underlying, UnderlyingState::NotEmpty);
 
         let (findings, steps) = migration_report_of(&fixture, &facts, &artifacts, &host);

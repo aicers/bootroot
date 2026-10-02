@@ -1417,7 +1417,7 @@ async fn a_generation_larger_than_the_whole_budget_is_dropped_whole() {
         assert!(!outcome.retained_unmet);
     })
     .await;
-    assert!(generation_names(dir.path()).is_empty());
+    assert_eq!(generation_names(dir.path()), Vec::<String>::new());
     assert!(logs.contains(&seeded_len.to_string()), "the size is logged");
     assert!(logs.contains(&budget.to_string()), "the budget is logged");
 
@@ -3070,7 +3070,7 @@ async fn the_fallback_reverifies_before_truncating_and_truncates_what_it_copied(
     })
     .await;
     assert!(logs.contains("shorter than the"), "{logs}");
-    assert!(generation_names(dir.path()).is_empty());
+    assert_eq!(generation_names(dir.path()), Vec::<String>::new());
     assert_eq!(
         len_of(&active),
         16,
@@ -3390,7 +3390,7 @@ async fn a_pending_restore_clears_when_the_rename_back_succeeds() {
         live_bytes,
         "the live inode is back at the configured path"
     );
-    assert!(generation_names(dir.path()).is_empty());
+    assert_eq!(generation_names(dir.path()), Vec::<String>::new());
     assert!(
         !rotation.marker_path().exists(),
         "a cleared restore removes its marker"
@@ -3435,7 +3435,7 @@ async fn a_pending_restore_clears_when_a_new_active_log_appears() {
         StubDocker::without_containers(),
     );
     assert!(!tightened.run_pass(at(120)).await.retained_unmet);
-    assert!(generation_names(dir.path()).is_empty());
+    assert_eq!(generation_names(dir.path()), Vec::<String>::new());
 }
 
 /// A retry whose re-stat matches the pending file's own identity is the
@@ -3720,7 +3720,7 @@ async fn a_rename_that_fails_removes_its_own_marker() {
     let outcome = rotation.run_pass(at(0)).await;
     assert!(outcome.rotated());
     assert_eq!(outcome.form, RotationForm::Fallback);
-    assert!(docker.signalled().is_empty());
+    assert_eq!(docker.signalled(), Vec::<String>::new());
     assert!(
         !rotation.marker_path().exists(),
         "a rename that never happened leaves no marker behind"
@@ -4590,7 +4590,7 @@ async fn a_replacement_between_the_marker_and_the_rename_is_never_signalled() {
         logs.contains("no longer carries the identity it recorded"),
         "{logs}"
     );
-    assert!(docker.signalled().is_empty());
+    assert_eq!(docker.signalled(), Vec::<String>::new());
     assert!(!active.exists());
 }
 
