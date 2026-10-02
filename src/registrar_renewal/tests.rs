@@ -899,7 +899,7 @@ fn an_uninitialized_accessor_reports_no_certificates() {
         &RegistrarCertRenewalState::default(),
         OffsetDateTime::now_utc(),
     );
-    assert!(certificates_of(&health).is_empty());
+    assert_eq!(certificates_of(&health), Vec::<CertificateHealth>::new());
 }
 
 /// The reporting path reads the accessor and nothing else.

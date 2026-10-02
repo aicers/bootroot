@@ -2098,7 +2098,7 @@ mod tests {
             CliCommand::Rotate(args) => match args.command {
                 RotateCommand::AppRoleSecretId(approle) => {
                     assert!(approle.clear_rotate_bound_cidrs);
-                    assert!(approle.rotate_bound_cidrs.is_empty());
+                    assert_eq!(approle.rotate_bound_cidrs, Vec::<String>::new());
                 }
                 _ => panic!("expected AppRoleSecretId subcommand"),
             },
@@ -2166,7 +2166,7 @@ mod tests {
     fn test_cli_init_rotate_bound_cidrs_empty_by_default() {
         let cli = Cli::parse_from(["bootroot", "init"]);
         match cli.command {
-            CliCommand::Init(args) => assert!(args.rotate_bound_cidrs.is_empty()),
+            CliCommand::Init(args) => assert_eq!(args.rotate_bound_cidrs, Vec::<String>::new()),
             _ => panic!("expected Init command"),
         }
     }
@@ -3307,7 +3307,7 @@ mod tests {
         let cli = Cli::parse_from(["bootroot", "service", "add"]);
         match cli.command {
             CliCommand::Service(ServiceCommand::Add(args)) => {
-                assert!(args.rn_cidrs.is_empty());
+                assert_eq!(args.rn_cidrs, Vec::<String>::new());
             }
             _ => panic!("expected service add"),
         }
@@ -3552,7 +3552,7 @@ mod tests {
                 assert!(!args.yes);
                 assert!(args.root_token_output.is_none());
                 assert!(!args.no_eab);
-                assert!(args.enable.is_empty());
+                assert_eq!(args.enable, Vec::<InitFeature>::new());
             }
             _ => panic!("expected reinit"),
         }

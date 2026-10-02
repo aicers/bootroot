@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn test_render_hooks_toml_empty() {
         let toml = render_hooks_toml(&[]);
-        assert!(toml.is_empty());
+        assert_eq!(toml, "");
     }
 
     #[test]

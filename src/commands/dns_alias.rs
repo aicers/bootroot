@@ -477,7 +477,7 @@ mod tests {
     fn a_host_without_the_endpoint_is_unchanged() {
         let state = state_with(vec![sample_entry("edge-proxy", Some("001"))]);
         assert_eq!(registrar_internal_alias(&state), None);
-        assert!(registrar_surface_aliases(&state).is_empty());
+        assert_eq!(registrar_surface_aliases(&state), Vec::<String>::new());
         assert_eq!(
             collect_dns_aliases(&state),
             vec!["001.edge-proxy.host1.test.local".to_string()]
@@ -495,8 +495,8 @@ mod tests {
             host: "bootroot-01".to_string(),
         });
         assert_eq!(registrar_internal_alias(&state), None);
-        assert!(registrar_surface_aliases(&state).is_empty());
-        assert!(collect_dns_aliases(&state).is_empty());
+        assert_eq!(registrar_surface_aliases(&state), Vec::<String>::new());
+        assert_eq!(collect_dns_aliases(&state), Vec::<String>::new());
     }
 
     /// The aliases survive the two rebuilds that do not go through

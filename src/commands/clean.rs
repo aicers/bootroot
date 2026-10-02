@@ -319,7 +319,7 @@ mod tests {
             &Messages::new("en").unwrap(),
         )
         .expect("resolve_compose_project_for_dir must succeed for `.`");
-        assert!(!project.is_empty());
+        assert_ne!(project, "");
     }
 
     /// Companion to the test above: an exported `COMPOSE_PROJECT_NAME`

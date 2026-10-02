@@ -1285,7 +1285,7 @@ mod tests {
         assert_eq!(settings.retry.backoff_secs, vec![5, 10, 30, 60]);
         assert_eq!(settings.scheduler.max_concurrent_issuances, 3);
         assert!(settings.trust.ca_bundle_path.is_none());
-        assert!(settings.trust.trusted_ca_sha256.is_empty());
+        assert_eq!(settings.trust.trusted_ca_sha256, Vec::<String>::new());
 
         let profile = &settings.profiles[0];
         assert_eq!(profile.daemon.check_interval, Duration::from_hours(1));

@@ -656,7 +656,7 @@ mod tests {
             "Key Authorization should have 2 parts separated by ."
         );
         let thumbprint = parts[1];
-        assert!(!thumbprint.is_empty());
+        assert_ne!(thumbprint, "");
         assert!(!thumbprint.contains('='));
         assert!(!thumbprint.contains('+'));
         assert!(!thumbprint.contains('/'));
@@ -939,7 +939,7 @@ mod tests {
         let err = client.fetch_directory().await.unwrap_err();
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert!(!err.to_string().is_empty());
+        assert_ne!(err.to_string(), "");
     }
 
     #[tokio::test]

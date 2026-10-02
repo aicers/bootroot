@@ -1941,7 +1941,7 @@ mod list_kv_tests {
             .list_kv("secret", "bootroot/services/")
             .await
             .expect("a not-found listing is empty, not an error");
-        assert!(keys.is_empty());
+        assert_eq!(keys, Vec::<String>::new());
     }
 
     #[tokio::test]

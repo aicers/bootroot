@@ -3003,12 +3003,7 @@ exit 0
         serde_json::from_str(&state_contents).expect("parse rotation-state.json");
     assert_eq!(state["mode"], "intermediate-only");
     assert_eq!(state["phase"], 1);
-    assert!(
-        !state["old_intermediate_fp"]
-            .as_str()
-            .unwrap_or("")
-            .is_empty()
-    );
+    assert_ne!(state["old_intermediate_fp"].as_str().unwrap_or(""), "");
 }
 
 #[cfg(unix)]
@@ -5551,12 +5546,12 @@ async fn test_rotate_responder_hmac_without_registrar_entry_does_not_list() {
         .len(),
         1
     );
-    assert!(
+    assert_eq!(
         posted_payloads(
             &requests,
             &service_record_path(REGISTRAR_ID, "http_responder_hmac")
-        )
-        .is_empty()
+        ),
+        Vec::<serde_json::Value>::new()
     );
 }
 
@@ -5772,7 +5767,10 @@ async fn test_rotate_trust_sync_fans_out_to_registrar_identities() {
             "summary names {id}: {stdout}"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")),
+        Vec::<serde_json::Value>::new()
+    );
     assert!(!stdout.contains(STRAY_ID), "{stdout}");
     let listing = listing_positions(&requests);
     let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/ca")
@@ -5879,7 +5877,10 @@ async fn test_rotate_eab_clear_fans_out_to_registrar_identities() {
             "{stdout}"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "eab")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "eab")),
+        Vec::<serde_json::Value>::new()
+    );
     let listing = listing_positions(&requests);
     let control_write = position_of(&requests, "POST", "/v1/secret/data/bootroot/agent/eab")
         .expect("global EAB cleared");
@@ -6577,7 +6578,10 @@ async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
             "{id} receives both the transitional and the final trust"
         );
     }
-    assert!(posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &service_record_path(STRAY_ID, "trust")),
+        Vec::<serde_json::Value>::new()
+    );
     let listing = listing_positions(&requests);
     assert_eq!(listing.len(), 3, "Phases 3, 5 and 6 each enumerate");
 
@@ -6588,7 +6592,10 @@ async fn test_rotate_ca_key_fans_out_trust_to_registrar_identities() {
         assert_eq!(payloads.len(), 1, "{id}: one reissue request");
         assert_reissue_payload(&payloads[0]);
     }
-    assert!(posted_payloads(&requests, &reissue_kv_path(STRAY_ID)).is_empty());
+    assert_eq!(
+        posted_payloads(&requests, &reissue_kv_path(STRAY_ID)),
+        Vec::<serde_json::Value>::new()
+    );
     assert!(
         stdout.contains(&format!("{REGISTRAR_ID}: reissue requested at")),
         "phase 5 should report the registrar identity's request: {stdout}"

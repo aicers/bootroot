@@ -119,7 +119,10 @@ fn the_scan_reads_a_service_name_in_every_spelling() {
         vec!["agent-selftest".to_string()]
     );
     // A value the shell expands names nothing here.
-    assert!(service_names("--service-name \"$SERVICE_NAME\"\n").is_empty());
+    assert_eq!(
+        service_names("--service-name \"$SERVICE_NAME\"\n"),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
