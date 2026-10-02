@@ -187,8 +187,10 @@ fn remove_override_credentials(role_id_path: &Path, secret_id_path: &Path) -> st
 /// registration or another pending add also claims the `secret_id` or
 /// the shared `role_id`. Any other run refuses either file existing —
 /// the writer's own no-clobber refusal, moved ahead of the record and
-/// of every `OpenBao` request — so a recorded path never holds a file
-/// bootroot did not create.
+/// of provisioning and issuance (it runs after `OpenBao`
+/// authentication, which in `AppRole` mode has already sent a login
+/// request) — so a recorded path never holds a file bootroot did not
+/// create.
 fn prepare_override_credentials(
     state: &StateFile,
     resolved: &ResolvedServiceAdd,
