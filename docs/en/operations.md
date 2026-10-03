@@ -131,8 +131,10 @@ brings up or recreates OpenBao — `infra install`, `infra up`, `init` and
 device that container's mounts need: `path = "file"` with
 `file_path = "/openbao/audit/audit.log"` exactly when that bring-up
 applies the audit override, and `path = "stdout"` with
-`file_path = "stdout"` otherwise. Two different operations write that
-file, and the guarantees below belong to only one of them.
+`file_path = "stdout"` otherwise. More than one operation writes that
+file — destination sync, HCL rendering and the snapshot restoration in
+`init`'s rollback among them — and the guarantees below belong to
+destination sync alone.
 
 - **Destination sync** is what sets the device. It rewrites only those
   two values, and leaves the file unwritten when it already declares the
@@ -169,6 +171,32 @@ file, and the guarantees below belong to only one of them.
   `--services` lists: the `--services` gating above belongs to the sync
   and does not hold this rendering back. A hand edit to `openbao.hcl`
   does not survive either rendering.
+- **Snapshot restoration** belongs to `init`'s rollback. When `init`
+  enables TLS on OpenBao's API listener, it first saves `openbao.hcl` as
+  it stands, or records that the file does not exist, before issuing the
+  certificate and rendering the TLS configuration. If the run then fails,
+  the rollback writes those saved pre-TLS contents back, or removes the
+  file when there was none. A restoration that succeeds discards
+  everything written after the snapshot — the TLS rendering, the sync
+  on its result and any hand edit alike. The restoration is neither a
+  rendering nor a sync: it puts back the saved bytes rather than
+  bootroot's template, and none of the sync's guarantees apply to it —
+  it checks no device, skips no write and refuses nothing. A run that
+  failed before taking the snapshot has nothing to restore, and a
+  restore that fails is reported while the rest of the rollback goes on.
+  Only after the restoration, and only when `init` had reached its
+  recreate of OpenBao, does the rollback run destination sync on
+  whatever the restoration left, selecting `stdout`: the rollback
+  recreates OpenBao from the base Compose file alone, without the audit
+  override. `init` marks that recreate as reached before it resolves
+  the Compose project and dispatches the recreate, so the rollback runs
+  this sync even when either of those then fails and the container was
+  never actually recreated. That sync keeps its own guarantees, and when
+  it refuses that file or fails to read or rewrite it the rollback
+  reports it and does not recreate OpenBao. When `init` failed before
+  reaching that recreate — when no unseal key source was available, for
+  example — the rollback runs no destination sync and leaves the running
+  container alone.
 
 `monitoring up` never recreates OpenBao at all: it
 brings up the monitoring services with `--no-deps`. If you run
