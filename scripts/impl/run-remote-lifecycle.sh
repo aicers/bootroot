@@ -92,6 +92,9 @@ RUNTIME_SERVICE_ADD_ROLE_ID=""
 RUNTIME_SERVICE_ADD_SECRET_ID=""
 RUNTIME_ROTATE_ROLE_ID=""
 RUNTIME_ROTATE_SECRET_ID=""
+# The client token `drive_openbao_audit_traffic` minted, which the audit
+# assertion requires to appear in the container log only as its HMAC.
+OPENBAO_AUDIT_DRIVEN_TOKEN=""
 CURRENT_PHASE="init"
 # PID of the background bootroot-agent daemon started for the genuine
 # KV force-reissue round-trip. Empty when no daemon is running; the
@@ -1048,6 +1051,30 @@ run_rotation_responder_hmac() {
     responder-hmac >>"$RUN_LOG" 2>&1
 }
 
+# Drives one AppRole login and one KV read against the running OpenBao,
+# so its container log carries both of the entries
+# `assert_openbao_audit_docker_logs` looks for.
+#
+# The `secret_id` and the token it mints reach `curl` over a pipe rather
+# than in `argv`: `ps` shows a process's arguments to every user on the
+# host, so a credential spelled on the command line is published for as
+# long as the request runs.
+drive_openbao_audit_traffic() {
+  local url="${OPENBAO_URL%/}" token
+
+  token="$(
+    printf '{"role_id":"%s","secret_id":"%s"}' \
+      "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID" |
+      curl -sS -X POST -H 'Content-Type: application/json' \
+        --data @- "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
+  )"
+  [ -n "$token" ] || fail "the audit-traffic AppRole login returned no token"
+  OPENBAO_AUDIT_DRIVEN_TOKEN="$token"
+  openbao_audit_curl_header_config "X-Vault-Token: ${token}" |
+    curl -sS -o /dev/null --config - "${url}/v1/secret/data/bootroot" ||
+    fail "the audit-traffic KV read could not be driven"
+}
+
 main() {
   mkdir -p "$ARTIFACT_DIR" "$CONTROL_DIR" "$REMOTE_DIR" "$REMOTE_CERTS_DIR" "$CERT_META_DIR"
   : >"$PHASE_LOG"
@@ -1122,8 +1149,14 @@ main() {
   run_force_reissue_wait_roundtrip \
     "$SERVICE_NAME" "$REMOTE_AGENT_CONFIG_PATH" "$HOSTNAME" "$INSTANCE_ID"
 
+  # This deployment is endpoint-disabled, so OpenBao audits through the
+  # `stdout` device into its container log. That log starts empty at
+  # every recreate of the container, so the entries the assertion looks
+  # for are driven here, after the last one.
   log_phase "assert-openbao-audit-log"
-  assert_openbao_audit_log "${RUN_INSTANCE}-openbao"
+  assert_openbao_stdout_audit_container "${RUN_INSTANCE}-openbao"
+  drive_openbao_audit_traffic
+  assert_openbao_audit_docker_logs "${RUN_INSTANCE}-openbao" "$OPENBAO_AUDIT_DRIVEN_TOKEN"
 }
 
 main "$@"

@@ -834,7 +834,7 @@ fn resolve_responder_container_path(container_path: &str, secrets_dir: &Path) ->
 
 /// Strips a trailing HCL comment (`#` or `//`) from a line, preserving
 /// comment markers that appear inside double-quoted strings.
-fn strip_hcl_line_comment(line: &str) -> &str {
+pub(crate) fn strip_hcl_line_comment(line: &str) -> &str {
     let mut in_quote = false;
     let bytes = line.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {

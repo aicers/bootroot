@@ -222,11 +222,30 @@ and `openbao/` beneath it, that the store and `records/` are `0:0:700` while
 `openbao/` has passed to the container's user, that the rendered override binds
 `<audit_store_dir>/openbao` and re-declares OpenBao's other two mounts, and that
 the running container's `/openbao/audit` is a bind mount of the store on the
-host. The closing unprivileged `infra up` repeats those assertions — the proof
-that the select path works against a store it cannot descend into — and then
-runs `assert_openbao_audit_log`, the shared file-audit assertion every other
-lifecycle harness runs, unchanged: it reads the *container* path through `docker
-exec`, so a correct bind mount is transparent to it.
+host. It also asserts that the running container's `openbao.hcl` declares the
+store-backed device — `path = "file"` with `file_path =
+"/openbao/audit/audit.log"` — and that `sys/audit` lists exactly one device,
+`file/`. The closing unprivileged `infra up` repeats those assertions — the
+proof that the select path works against a store it cannot descend into — and
+then runs `assert_openbao_audit_log`, the shared assertion in its file form, as
+`run-registrar-redteam.sh` runs it too: it reads the *container* path through
+`docker exec`, so a correct bind mount is transparent to it.
+
+This arm is also where the **reopen probe** runs, on every pull request. That
+`OpenBao` reopens its file audit device on `SIGHUP` is what `bootroot-agent`'s
+lossless rotation rests on, and it is a property of the image, so it is
+established against the running one rather than assumed. The probe, its two
+refutation self-tests (a stand-in of the same image that ignores `SIGHUP`, and
+one that reopens only after the probe's budget) and the self-test of the
+command bound every one of its waits runs under used to run in the local
+lifecycle; that arm has no file device any more, so they run here instead,
+against the store-backed device, in an `assert-audit-reopen-probe` phase
+immediately before `assert-audit-rotation`. The listener answers only over TLS
+here, so the probe verifies it against a readable copy of the credential's CA
+bundle, and its AppRole credential carries only the `default` policy, so its
+KV read answers `403`, which it accepts. The probe makes a new file the active
+one, so fresh AppRole and KV traffic is driven before the shared assertion runs
+again.
 
 It is also the only arm that exercises the store's **reserve**, and it does so
 in three parts. The first needs nothing of the host: against a store path of its
@@ -330,8 +349,15 @@ The endpoint-*disabled* case is not a scenario of its own. Every other arm is an
 endpoint-disabled host and drives its whole run over the plaintext `http://` URL
 `init` recorded, so a listener that transitioned when it should not have fails
 them outright. Those arms provision no store either: with no recorded predicate
-no override is rendered, and their OpenBao audit log stays on the
-`openbao-audit` named volume.
+no override is rendered, and OpenBao audits through the `stdout` device into its
+container log. The local and remote lifecycles hold that device to the shared
+assertion in its `docker logs` form, `assert_openbao_audit_docker_logs`: an
+`auth/approle/login` response and a `secret/data/...` read response in
+`docker logs <instance>-openbao`, the login's client token present only as its
+`hmac-sha256:` value, and the container on the bounded `local` logging driver
+with nothing mounted at `/openbao/audit`. A container's log starts empty at
+every recreate, so each lifecycle drives a fresh AppRole login and KV read
+after the last recreate of OpenBao, immediately before the assertion.
 
 ### Two lifecycle runs can share a host
 

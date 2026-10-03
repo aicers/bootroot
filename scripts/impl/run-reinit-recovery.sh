@@ -701,9 +701,7 @@ scenario_c_rsync_clone_stale_state() {
   # sets one, otherwise fall back to the same fixed default bootroot
   # uses.  The work-dir basename is deliberately NOT consulted.
   local project="${COMPOSE_PROJECT_NAME:-bootroot}"
-  for vol in "${project}_openbao-data" "${project}_openbao-audit"; do
-    docker volume rm "$vol" >/dev/null 2>&1 || true
-  done
+  docker volume rm "${project}_openbao-data" >/dev/null 2>&1 || true
   run_reinit "scenario-c"
   assert_post_reinit_contracts "scenario-c"
 }

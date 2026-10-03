@@ -178,9 +178,11 @@ RESERVE_UNIT_NAME=""
 # deployment has been touched.  A non-default `--openbao-url` is left
 # alone by the port resolution, which is what makes this reliable.
 RESERVE_DEAD_OPENBAO_URL="http://127.0.0.1:1"
-# The container path `openbao/openbao.hcl` writes its file audit device
-# to.  Unchanged by the override this run renders — only what backs it
-# moves.
+# The container directory the store-backed `file` audit device writes
+# its log under, and the target the override this run renders binds the
+# store at.  Without that override nothing is mounted there and
+# `openbao.hcl` declares the `stdout` device instead, which audits into
+# the container log.
 OPENBAO_AUDIT_CONTAINER_DIR="/openbao/audit"
 OPENBAO_AUDIT_CONTAINER_LOG="${OPENBAO_AUDIT_CONTAINER_DIR}/audit.log"
 # `init`'s machine-readable summary, and the root token read out of it.
@@ -921,7 +923,7 @@ assert_the_audit_bind_guard_boundaries() {
   sudo -n rm -rf "$store/openbao" ||
     fail "could not remove the pre-existing audit bind source fixture"
   instance_compose up -d openbao >>"$RUN_LOG" 2>&1 ||
-    fail "could not restore OpenBao's ordinary audit volume after the bind-guard test"
+    fail "could not restore OpenBao on the base compose file, without the audit override, after the bind-guard test"
   wait_for_openbao_listening
 }
 
@@ -1561,9 +1563,9 @@ assert_the_rendered_steps_migrate_an_existing_store() {
 
   # The window closes here, and only here.  The OpenBao writer went down
   # before the store moved aside and stayed down across every pass; it
-  # comes back on its ordinary audit volume, which is what the base
-  # compose file declares now that the override naming this section's
-  # store -- and the store itself -- are gone.
+  # comes back on the base compose file alone, auditing through the
+  # `stdout` device into its container log, now that the override naming
+  # this section's store -- and the store itself -- are gone.
   instance_compose up -d openbao >>"$RUN_LOG" 2>&1 ||
     fail "could not restart the OpenBao writer after the migration window"
   wait_for_openbao_listening
@@ -2297,20 +2299,20 @@ assert_the_container_audit_dir_is_backed_by_the_store() {
 #
 # That is the point of running it here: the helper reads the *container*
 # path through `docker exec`, so a correct bind mount is transparent to
-# it and it has to pass exactly as it does on a host still using the
-# `openbao-audit` named volume.  A regression that moved the device
-# somewhere the container does not see would fail here even though the
-# host-side reads above still found a file.
+# it and it has to pass whatever backs that path.  A regression that
+# moved the device somewhere the container does not see would fail here
+# even though the host-side reads above still found a file.
 #
 # The entries it looks for — an `auth/approle/login` response and a
 # `secret/data/...` read — are the two infra OpenBao Agent sidecars'.
 # `init` starts them *after* the TLS recreate that moves the device
 # (`apply_openbao_agent_compose_override`, phase 2 of the agent
 # bring-up), so their traffic lands in the store rather than in the
-# volume the device wrote to beforehand.  That holds for the first call
-# alone: once a rotation or a move of the store has made another file
-# the active one, the sidecars' entries are in the file left behind and
-# the arm drives its own through `drive_fresh_audit_traffic` first.
+# container log the `stdout` device wrote to beforehand.  That holds for
+# the first call alone: once a rotation, a move of the store or the
+# reopen probe has made another file the active one, the sidecars'
+# entries are in the file left behind and the arm drives its own through
+# `drive_fresh_audit_traffic` first.
 assert_the_shared_audit_log_assertion_still_passes() {
   assert_openbao_audit_log "${INSTANCE}-openbao" "$OPENBAO_AUDIT_CONTAINER_LOG"
   pass "the shared OpenBao file-audit assertion passes over the store-backed device"
@@ -2326,9 +2328,9 @@ assert_the_shared_audit_log_assertion_still_passes() {
 # `[registrar_endpoint] enabled = true`: only an endpoint-enabled host
 # has `<audit_store_dir>/openbao` bind-mounted under the container's
 # `/openbao/audit`, and this is the only scenario that provisions one.
-# Everywhere else the device is still on the `openbao-audit` named
-# volume, nothing on the host is there to rotate, and the rotation
-# changes nothing.
+# Everywhere else OpenBao audits through the `stdout` device into its
+# container log, whose retention Docker's logging driver owns, nothing
+# on the host is there to rotate, and the rotation changes nothing.
 #
 # The rotation itself runs through the library's own code — an ignored
 # unit test, driven the way `run-registrar-verbs-e2e.sh` drives its own
@@ -2497,6 +2499,31 @@ it was written to"
 post-rotation entry is in the new active log, and neither is duplicated"
 }
 
+# The credential `mint_audit_approle` last minted.  Globals rather than
+# output, since a function can hand back only one value; the `secret_id`
+# never reaches an argument list from here.
+AUDIT_APPROLE_ROLE_ID=""
+AUDIT_APPROLE_SECRET_ID=""
+
+# Mints an AppRole credential of this run's own, carrying only the
+# `default` policy, and leaves it in the two globals above.
+#
+# `slug` names the role, so two callers in one run do not share one;
+# `purpose` completes the failure message.
+mint_audit_approle() {
+  local slug="$1" purpose="$2"
+  local role="audit-${slug}-${RUN_TOKEN}"
+  openbao_api POST "auth/approle/role/${role}" \
+    '{"token_policies":"default","token_ttl":"60s"}' >/dev/null ||
+    fail "could not create the AppRole ${purpose}"
+  AUDIT_APPROLE_ROLE_ID="$(openbao_api GET "auth/approle/role/${role}/role-id" |
+    jq -r '.data.role_id // empty')"
+  AUDIT_APPROLE_SECRET_ID="$(openbao_api POST "auth/approle/role/${role}/secret-id" '{}' |
+    jq -r '.data.secret_id // empty')"
+  [ -n "$AUDIT_APPROLE_ROLE_ID" ] && [ -n "$AUDIT_APPROLE_SECRET_ID" ] ||
+    fail "could not mint an AppRole credential ${purpose}"
+}
+
 # A fresh AppRole login and a fresh KV read, driven against whatever
 # file the device is writing to now.
 #
@@ -2514,19 +2541,11 @@ post-rotation entry is in the new active log, and neither is duplicated"
 # arms driving traffic in one run do not share either; `occasion` is the
 # phrase the two reported assertions end with.
 drive_fresh_audit_traffic() {
-  local slug="$1" occasion="$2"
-  local role="audit-${slug}-${RUN_TOKEN}" role_id secret_id status
-  openbao_api POST "auth/approle/role/${role}" \
-    '{"token_policies":"default","token_ttl":"60s"}' >/dev/null ||
-    fail "could not create the AppRole for the traffic driven ${occasion}"
-  role_id="$(openbao_api GET "auth/approle/role/${role}/role-id" |
-    jq -r '.data.role_id // empty')"
-  secret_id="$(openbao_api POST "auth/approle/role/${role}/secret-id" '{}' |
-    jq -r '.data.secret_id // empty')"
-  [ -n "$role_id" ] && [ -n "$secret_id" ] ||
-    fail "could not mint an AppRole credential for the traffic driven ${occasion}"
+  local slug="$1" occasion="$2" status
+  mint_audit_approle "$slug" "for the traffic driven ${occasion}"
 
-  status="$(printf '{"role_id":"%s","secret_id":"%s"}' "$role_id" "$secret_id" |
+  status="$(printf '{"role_id":"%s","secret_id":"%s"}' \
+    "$AUDIT_APPROLE_ROLE_ID" "$AUDIT_APPROLE_SECRET_ID" |
     openbao_api_unauthed POST "auth/approle/login" |
     jq -r 'if .auth.client_token then "ok" else "no-token" end')"
   assert_equal "an AppRole login succeeds ${occasion}" "ok" "$status"
@@ -2538,6 +2557,66 @@ drive_fresh_audit_traffic() {
   openbao_api GET "secret/data/bootroot-audit-${slug}" >/dev/null ||
     fail "the KV read driven ${occasion} raised"
   pass "a fresh AppRole login and KV read were driven ${occasion}"
+}
+
+# The deployment's audit device, as the running container loads it and
+# as OpenBao registers it: the store-backed `file` device `init` set in
+# `openbao.hcl` because its recreate carried the audit override, and no
+# other.  A `stdout` device left beside it, or one the switch failed to
+# remove, would be a second destination the rotation and the store's
+# reserve know nothing about.
+assert_the_store_backed_device_is_the_only_one() {
+  local hcl devices
+  hcl="$(docker exec "${INSTANCE}-openbao" cat /openbao/config/openbao.hcl 2>>"$RUN_LOG")" ||
+    fail "could not read the running container's openbao.hcl"
+  printf '%s\n' "$hcl" | grep -qx '  path = "file"' ||
+    fail "the running container's openbao.hcl does not declare the device at path \"file\""
+  printf '%s\n' "$hcl" | grep -qxF "    file_path = \"${OPENBAO_AUDIT_CONTAINER_LOG}\"" ||
+    fail "the running container's openbao.hcl does not write ${OPENBAO_AUDIT_CONTAINER_LOG}"
+  devices="$(openbao_api GET "sys/audit" | jq -r '.data | keys | join(",")')"
+  assert_equal "sys/audit lists exactly the store-backed file/ device" "file/" "$devices"
+}
+
+# The reopen-on-signal probe, its two refutation self-tests and the
+# bound self-test every one of its waits rests on, run against the
+# store-backed device this deployment writes into.
+#
+# `bootroot-agent` rotates this device by renaming the active log aside
+# and signalling the container; that is lossless only where the image
+# honours `SIGHUP`, and this arm is the one place on every pull request
+# where a file device exists to establish it against.  So an
+# `OPENBAO_IMAGE` bump that breaks the reopen turns this arm red rather
+# than degrading every rotation to the lossy fallback.
+#
+# The listener answers only over TLS, trusting the bundle in a root-only
+# directory.  That bundle is public material, so a copy the invoking
+# user can read is handed to the probe as its CA bundle.  Its AppRole
+# credential carries only the `default` policy, as
+# `drive_fresh_audit_traffic`'s does: the probe's KV read is allowed to
+# answer `403`, since the audit entry is what it asserts.
+#
+# The probe makes a new file the active one, so fresh traffic is driven
+# before the shared assertion, and before anything later reads the log.
+assert_the_image_reopens_the_store_device_on_sighup() {
+  local container="${INSTANCE}-openbao" url="https://localhost:${PORT_OPENBAO}"
+  local ca="$RUN_ROOT/openbao-probe-ca-bundle.pem"
+
+  # shellcheck disable=SC2024 # the redirect is the invoking user's own:
+  # the copy exists so the unelevated probe can read it.
+  sudo -n cat "$INTERNAL_DIR/ca-bundle.pem" >"$ca" ||
+    fail "could not copy the listener's CA bundle for the reopen probe"
+  mint_audit_approle reopen-probe "for the reopen probe"
+
+  assert_openbao_audit_bound_stops_a_command_that_will_not_stop
+  assert_openbao_audit_reopen "$container" "$url" \
+    "$AUDIT_APPROLE_ROLE_ID" "$AUDIT_APPROLE_SECRET_ID" "$OPENBAO_AUDIT_CONTAINER_LOG" "$ca"
+  pass "the image reopens the store-backed audit device on SIGHUP"
+  assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target "$container" "$url" "$ca"
+  assert_openbao_audit_reopen_probe_refutes_a_late_reopen "$container" "$url" "$ca"
+  pass "the reopen probe refutes a target that never reopens and one that reopens too late"
+
+  drive_fresh_audit_traffic reopen-probe "after the reopen probe"
+  assert_the_shared_audit_log_assertion_still_passes
 }
 
 # The active log OpenBao created after the reopen is a fresh file it
@@ -3054,6 +3133,7 @@ main() {
   assert_the_directory_mode_outcome_is_a_success
   assert_the_audit_override_binds_the_store
   assert_the_container_audit_dir_is_backed_by_the_store
+  assert_the_store_backed_device_is_the_only_one
 
   log_phase "assert-listener"
   assert_state_url_moved_to_https
@@ -3091,6 +3171,11 @@ main() {
   # stack and both sidecars re-authenticated against the store-backed
   # device.
   assert_the_shared_audit_log_assertion_still_passes
+
+  # The image's reopen-on-signal property, established against the
+  # store-backed device before bootroot's own rotation relies on it.
+  log_phase "assert-audit-reopen-probe"
+  assert_the_image_reopens_the_store_device_on_sighup
 
   # The device this run has been filling is then rotated in place.
   # Deliberately after the assertion above, so that one still runs

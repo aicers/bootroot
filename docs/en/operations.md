@@ -94,39 +94,135 @@ bootroot monitoring status
 
 ### Audit logging
 
-A file-based audit backend is declared in `openbao/openbao.hcl` and
-enabled automatically when the OpenBao container starts. The audit log
-captures every OpenBao API request (authentication, secret reads/writes,
-policy changes) and is essential for post-incident investigation.
+OpenBao's audit device is declared in `openbao/openbao.hcl` and enabled
+automatically when the OpenBao container starts. The audit log captures
+every OpenBao API request (authentication, secret reads/writes, policy
+changes) and is essential for post-incident investigation. Most request
+and response strings in it — tokens, secret values, request bodies — are
+written as HMAC-SHA256 hashes (`hmac-sha256:…`) rather than in the clear.
 
-`bootroot init` verifies that the audit backend is active. If no file
-audit device is found (e.g. the audit stanza was removed from
-`openbao.hcl`, or the `openbao-audit` volume is not mounted), init
-fails. Restore the audit configuration and re-run init.
+Where the records go depends on how the running container was created:
 
-- **Log location (inside container):** `/openbao/audit/audit.log`
-- **Host access:** on an ordinary host the log is persisted on the
-  `openbao-audit` Docker volume. Inspect it with
-  `docker compose exec openbao cat /openbao/audit/audit.log`.
-- **Host access on a provisioned registrar endpoint host:** the device
-  writes into the shared audit store instead, at
-  `<audit_store_dir>/openbao/audit.log` on the host — a bind mount of the
-  same container path, so the `docker compose exec` recipe above is
-  unchanged. This requires `state.json`'s `registrar_endpoint.enabled`
+- **Ordinary host** — any host without the registrar endpoint, and an
+  endpoint host before `bootroot init` provisions its audit store.
+  OpenBao audits through a file device mounted at `stdout/` whose
+  `file_path` is `stdout`, so the records go to the container's standard
+  output and Docker keeps them. Read them with
+  `docker compose logs openbao`, or `docker logs <instance>-openbao`
+  (`docker logs bootroot-openbao` on a default install). Nothing is
+  mounted at `/openbao/audit`, and no Docker volume holds audit records.
+- **Provisioned registrar endpoint host** — the device is mounted at
+  `file/` and writes into the shared audit store, at
+  `<audit_store_dir>/openbao/audit.log` on the host. That directory is
+  bind-mounted at `/openbao/audit` in the container, so
+  `docker compose exec openbao cat /openbao/audit/audit.log` reads the
+  same file. This requires `state.json`'s `registrar_endpoint.enabled`
   and the daemon configuration's `[registrar_endpoint] enabled` to
   **agree**: when they disagree `bootroot init` refuses to proceed and
-  the audit log stays exactly where it was. Records written before the
-  store was provisioned remain on the `openbao-audit` volume and are
-  read as before; nothing migrates them. See
+  the audit device stays exactly where it was. Records written before the
+  store was provisioned — including those from `init`'s own OpenBao calls
+  before it recreated the container — went to the container log of the
+  container that wrote them, and nothing moves them into the store. See
   [The shared audit store](#the-shared-audit-store) below.
-- **Rotation:** the deployment rotates the device itself, on a host
-  whose registrar endpoint is enabled. Do **not** point `logrotate`, a
-  tailing sidecar or a signal at the device's directory: a second
-  rotator would race this one over the same active log and collide in
-  the same `audit-*.log` namespace. See
+
+**The device follows the audit override.** Every bootroot command that
+brings up or recreates OpenBao — `infra install`, `infra up`, `init` and
+`init`'s rollback — first sets the audit stanza of `openbao/openbao.hcl`
+to the device that container's mounts need: `path = "file"` with
+`file_path = "/openbao/audit/audit.log"` exactly when that command applies
+the audit override, and `path = "stdout"` with `file_path = "stdout"`
+otherwise. It rewrites only those two values and leaves the file
+untouched when it already declares the right device. It refuses, before
+any container is started or recreated, an `openbao.hcl` that does not
+hold exactly one audit stanza declaring one of the two — after a hand
+edit, for example — and never overwrites one; a stanza or attribute
+inside a `#`, `//` or `/* ... */` comment does not count. With
+`--services`, it does this when OpenBao is listed or a listed service
+depends on it, directly or through another service. Unless `openbao`
+is listed, the dependencies are read from the project as
+`docker compose config` resolves it, so every form Compose honours
+counts: `depends_on` however it is written, `links`, `volumes_from`, and
+a `network_mode`, `ipc` or `pid` of `service:openbao`. That project is
+read without interpolation, so a bring-up whose way runs through a
+dependency named by a variable — `network_mode: service:${NAME}`, for
+example — is refused, also before any container is started; name the
+service literally, or list `openbao` in `--services`.
+`monitoring up` never recreates OpenBao at all: it
+brings up the monitoring services with `--no-deps`. If you run
+`docker compose up` for OpenBao yourself, include the audit override
+exactly when `openbao.hcl` declares the `file` device; a `file` device
+started without its directory cannot open its log, and when OpenBao has
+to add that device at the unseal it stays sealed.
+
+The two are separate audit devices, so a switch between them — `init`
+provisioning the store, or an endpoint host being switched off — disables
+one and enables the other at the next unseal. Returning to `stdout/`
+logs one sanity-check error for `file/`, whose directory is no longer
+mounted, before disabling it. Nothing needs to be done about it.
+**Each audit device has its own HMAC salt**, so the `hmac-sha256:`
+values `stdout/` wrote cannot be compared with the ones `file/` writes:
+correlating a token or a value across a switch is not possible from the
+hashes.
+
+`bootroot init` verifies that a file audit device is active. If none is
+found (e.g. the audit stanza was removed from `openbao.hcl`), init fails.
+Restore the audit configuration and re-run init.
+
+**Retention on an ordinary host.** Both compose files run OpenBao under
+Docker's [`local` logging driver](https://docs.docker.com/engine/logging/drivers/local/)
+with `max-size: 20m`, `max-file: 10` and `compress: true`: at most 10
+segments of at most 20 MiB of log content each, so 200 MiB is the hard
+ceiling, and rotated segments are gzip-compressed, so the usual footprint
+on disk is well below it. OpenBao's own server output shares that budget;
+on a provisioned endpoint host only that output goes there, and the audit
+records stay in the store. Delivery is Docker's default `blocking` mode,
+because `non-blocking` drops lines from a ring buffer whenever the driver
+falls behind.
+
+The two bounds can be changed in the `.env` beside the compose file,
+which Docker Compose reads and `infra install` preserves:
+
+| `.env` key | Default |
+| --- | --- |
+| `OPENBAO_LOG_MAX_SIZE` | `20m` |
+| `OPENBAO_LOG_MAX_FILES` | `10` |
+
+A new value applies when the OpenBao container is next created. bootroot
+neither writes nor validates these keys: Docker rejects an invalid value
+when it creates the container.
+
+**What an ordinary host does not guarantee.** The container log is a
+bounded record, not a fail-closed one:
+
+- Once `max-file` segments are full, Docker drops the oldest one
+  silently.
+- Removing the container discards its log. That covers every recreate —
+  including one an image or compose-definition change causes —
+  `docker compose down`, `bootroot clean`, `bootroot clean --openbao-only`
+  and `bootroot reinit`. Export the history first if you need it, for
+  example with `docker logs bootroot-openbao > openbao-audit.log`.
+- If the driver cannot persist a line — because the disk is full, for
+  example — `dockerd` logs an error and drops the line while OpenBao
+  keeps serving.
+
+Hosts that need fail-closed, retention-bounded audit storage use the
+registrar endpoint's audit store.
+
+An `openbao-audit` Docker volume left by an earlier version is no longer
+mounted, and no bootroot command removes it. Keep or delete it by hand
+(`docker volume rm <project>_openbao-audit`) once its records are no
+longer needed.
+
+- **Rotation:** on an ordinary host the logging driver above rotates the
+  container log. On a provisioned registrar endpoint host the deployment
+  rotates the device itself. Do **not** point `logrotate`, a tailing
+  sidecar or a signal at the device's directory there: a second rotator
+  would race this one over the same active log and collide in the same
+  `audit-*.log` namespace. See
   [Rotating the audit device](#rotating-the-audit-device) below.
-- **Verification:** confirm the audit device is active with
-  `docker compose exec openbao bao audit list`.
+- **Verification:** `docker compose exec openbao bao audit list` shows
+  exactly one device of type `file`: `stdout/` on an ordinary host,
+  `file/` on a provisioned registrar endpoint host.
 
 #### Rotating the audit device
 
@@ -290,7 +386,9 @@ cannot chown is a device that cannot write.
 device on `SIGHUP` is a claim about the *image*, so it is not taken on
 trust. It was established against **`openbao/openbao:2.5.5`**, the
 pinned tag (overridable through `OPENBAO_IMAGE`), and the Docker E2E
-lifecycle re-establishes it on **every CI pass**: the check renames the
+registrar-internal-init scenario re-establishes it on **every pull
+request**, against the store-backed device it provisions: the check
+renames the
 active log aside, signals the container, waits up to 30 seconds for the
 path to reappear, asserts the new file is a *different inode*, drives
 one authenticated read whose audited path carries a fresh random nonce,
@@ -308,7 +406,7 @@ sleeps would run for the budget plus every `docker exec` in between —
 comfortably long enough to see a file that arrived a minute after the
 signal and call the reopen established, on an image whose rotations
 would all degrade to the lossy form. And it is the check itself that is
-kept honest: the lifecycle also runs the probe against two stand-ins of
+kept honest: the scenario also runs the probe against two stand-ins of
 the same image, one whose main process ignores `SIGHUP` and one that
 honours it but recreates the log only after the budget has passed, and
 fails the build if either is reported as a reopen.
@@ -322,7 +420,7 @@ and the whole group is signalled, so a `docker exec` that spawned
 something does not leave it holding the pipe; and the signal is followed
 by an unconditional kill five seconds later, so a command that ignores
 it stops anyway. That bound is itself proved before the probe runs: the
-lifecycle asserts it reports a timeout for a command that traps the
+scenario asserts it reports a timeout for a command that traps the
 signal and exits 0, and that it both reports a timeout for and leaves
 nothing behind of one that ignores the signal outright.
 
@@ -613,10 +711,12 @@ worse failure than reading a duplicate.
 
 **Deployments without the registrar endpoint.** Where
 `[registrar_endpoint] enabled` is not `true`, none of this applies. No
-rotation task runs, the three configuration keys have no effect, and
-`/openbao/audit` is still backed by the `openbao-audit` named volume —
-so there is nothing bind-mounted for a host tool to reach either, and no
-external rotation is recommended in its place.
+rotation task runs and the three configuration keys have no effect.
+Nothing is mounted at `/openbao/audit`: OpenBao audits through the
+`stdout` device into its container log, which Docker's `local` logging
+driver bounds and rotates (see [Audit logging](#audit-logging)). There is
+no file for a host tool to reach, and no external rotation is
+recommended in its place.
 
 #### Registrar verb rate limiting
 
@@ -1719,9 +1819,11 @@ both agree `bootroot init` refuses:
 2. Set `registrar_endpoint.enabled` to `false` in `state.json`.
 
 A bring-up stops applying the audit override as soon as the recorded
-predicate is `false`, so OpenBao returns to the `openbao-audit` volume on
-its next recreate; the rendered override stays on disk, inert, until an
-`init` sees the two sources agree on `false` and deletes it. That final
+predicate is `false`, so the next one — `bootroot infra up`, say — sets
+`openbao.hcl` back to the `stdout` device before it recreates OpenBao,
+which then audits into its container log again; the rendered override
+stays on disk, inert, until an `init` sees the two sources agree on
+`false` and deletes it. That final
 run still needs `--agent-config`, since a rendered override keeps the
 flag mandatory. **The store's directories and their contents are never
 touched** by any of this — switching a host off changes what is mounted,

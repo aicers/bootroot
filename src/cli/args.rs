@@ -28,7 +28,7 @@ Without flags, `bootroot clean`:
     when `--yes` is given).
 
 Pass `--openbao-only` to wipe just the `bootroot-openbao` container and
-its named volumes (recovery from a partial-init OpenBao state); every
+its `openbao-data` volume (recovery from a partial-init OpenBao state); every
 other compose service, `secrets/`, `state.json`, and `.env` stay
 intact.";
 

@@ -2788,7 +2788,7 @@ bootroot clean --openbao-only --yes
   OpenBao 바인드/광고, HTTP-01 admin 바인드/광고, `infra_certs` 개수)를
   모두 출력하여 운영자가 확인 전에 복구 대상을 검증할 수 있도록 합니다.
   `--yes`가 없으면 확인을 요청합니다.
-- `bootroot-openbao` 컨테이너와 `openbao-data` / `openbao-audit`
+- `bootroot-openbao` 컨테이너(그 컨테이너 로그 포함)와 `openbao-data`
   볼륨만 제거합니다 (`postgres-data` 등 다른 named volume은 보존).
 - OpenBao 런타임/부트스트랩 산출물만 제거합니다:
   `secrets/openbao/unseal-keys.txt`, 생성된 인프라 OpenBao Agent 설정

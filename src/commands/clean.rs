@@ -27,11 +27,14 @@ pub(crate) const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 /// `bootroot-openbao`.
 pub(crate) const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 
-/// Named volumes the `openbao` compose service mounts. Removing only
-/// these is the contract `--openbao-only` advertises (#588 §5b);
-/// using `docker compose down -v` instead would also wipe
-/// `postgres-data`, `prometheus-data`, and `grafana-data`.
-pub(crate) const OPENBAO_NAMED_VOLUMES: &[&str] = &["openbao-data", "openbao-audit"];
+/// Named volumes the `openbao` compose service mounts: only its storage.
+/// Its audit records have no volume of their own — they go to the
+/// container log, or, on a registrar endpoint host, to the audit store
+/// the audit override bind-mounts, which no clean removes. Removing only
+/// these is the contract `--openbao-only` advertises (#588 §5b); using
+/// `docker compose down -v` instead would also wipe `postgres-data`,
+/// `prometheus-data`, and `grafana-data`.
+pub(crate) const OPENBAO_NAMED_VOLUMES: &[&str] = &["openbao-data"];
 
 pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     if args.openbao_only {
@@ -217,6 +220,32 @@ mod tests {
     // "basename normalises to empty" error case is deliberately gone
     // rather than lost: the shared resolver never derives a name from the
     // filesystem, so no input can reach it.
+
+    /// The removal list is exactly the `openbao-*` named volumes the
+    /// shipped compose files declare, so `--openbao-only` and `reinit`
+    /// neither leave `OpenBao` state behind nor name a volume that no
+    /// longer exists.
+    #[test]
+    fn openbao_named_volumes_match_the_shipped_compose_files() {
+        assert_eq!(OPENBAO_NAMED_VOLUMES, &["openbao-data"]);
+        for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+            let content =
+                std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(compose))
+                    .unwrap();
+            let top_level = content
+                .split("\nvolumes:\n")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{compose} declares no top-level volumes"));
+            let declared: Vec<&str> = top_level
+                .lines()
+                .take_while(|line| line.is_empty() || line.starts_with(' '))
+                .filter_map(|line| line.trim().strip_suffix(':'))
+                .filter(|name| name.starts_with("openbao"))
+                .collect();
+            assert_eq!(declared, OPENBAO_NAMED_VOLUMES, "{compose}");
+            assert!(!content.contains("openbao-audit:"), "{compose}");
+        }
+    }
 
     /// Regression test: when the compose file lives in a subdirectory,
     /// `remove_clean_artifacts` must delete `state.json` at the

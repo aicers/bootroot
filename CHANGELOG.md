@@ -208,9 +208,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   five consecutive checks that leave an obligation unmet is logged at
   `error` with the active log's size and the retained set's total. A
   rotation failure never fails an `OpenBao` request, stops the daemon or
-  takes the endpoint down. Hosts without the registrar endpoint are
-  unchanged: no rotation runs, the three keys have no effect, and the
-  device stays on the `openbao-audit` volume.
+  takes the endpoint down. Hosts without the registrar endpoint run no
+  rotation and the three keys have no effect there: those hosts audit
+  through a device that writes to the container's standard output.
 - `bootroot status --agent-config` now scans the registrar audit store and
   reports unpaired intents, malformed records, and retention shortfalls. It
   distinguishes a store that is not configured from a provisioned empty store
@@ -253,6 +253,27 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- On hosts without the registrar endpoint, OpenBao's audit records now go
+  to the container log instead of a file on the `openbao-audit` volume,
+  which grew without bound until a full disk stopped OpenBao serving.
+  Both compose files run OpenBao under Docker's `local` logging driver,
+  keeping at most 10 segments of at most 20 MiB each, gzip-compressed
+  once rotated; set `OPENBAO_LOG_MAX_SIZE` and `OPENBAO_LOG_MAX_FILES` in
+  the `.env` beside the compose file to change those bounds. Read the
+  records with `docker compose logs openbao`, and expect
+  `bao audit list` to show the device at `stdout/` rather than `file/`;
+  its HMAC values are not comparable with those of the old device. The
+  `openbao-audit` volume is no longer created, mounted, or removed by
+  `clean --openbao-only` and `reinit`; one left by an earlier install
+  stays until removed by hand. That retention is bounded but not
+  fail-closed: Docker drops the oldest segment silently once the limit
+  is reached, removing or recreating the container discards its log
+  (`docker compose down`, `bootroot clean`, `clean --openbao-only`,
+  `reinit`, and an image or compose change all do), and a line the
+  driver cannot persist — on a full disk, for example — is dropped while
+  OpenBao keeps serving. Export the log first if you need the history;
+  hosts that need fail-closed audit storage use the registrar endpoint's
+  audit store, where OpenBao still writes `audit.log` as before.
 - On endpoint-enabled deployments, `bootroot infra up` now requires the
   daemon's `--agent-config` and refuses to start the Compose stack until a
   `filesystem` audit-store reserve is enforced. The generated OpenBao audit

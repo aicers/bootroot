@@ -32,8 +32,7 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let profile_str = args.profile.to_string();
     let svc_refs: Vec<&str> = services.iter().map(String::as_str).collect();
-    let mut up_tail: Vec<&str> = vec!["up", "-d"];
-    up_tail.extend(&svc_refs);
+    let up_tail = monitoring_up_tail(&svc_refs);
     let up = identity.compose(&[&compose_str], Some(&profile_str), &up_tail);
     let grafana_env = grafana_admin_password_env(args.grafana_admin_password.as_deref());
     run_compose_with_env(&up, &grafana_env, "docker compose up", messages)?;
@@ -50,6 +49,21 @@ pub(crate) fn run_monitoring_up(args: &MonitoringUpArgs, messages: &Messages) ->
 
     println!("{}", messages.monitoring_up_completed());
     Ok(())
+}
+
+/// Builds the `up` arguments for the monitoring services.
+///
+/// `--no-deps` because `prometheus` declares `depends_on: openbao`: an
+/// `up` on the base compose file alone would otherwise converge `openbao`
+/// too, and recreate a container an `infra up` or `init` created with
+/// the audit override — dropping the audit store's bind mount, coming
+/// back sealed, and leaving the store-backed audit device with no
+/// directory to write to. The monitoring services need nothing more than
+/// the stack that is already running.
+fn monitoring_up_tail<'a>(services: &[&'a str]) -> Vec<&'a str> {
+    let mut tail: Vec<&str> = vec!["up", "-d", "--no-deps"];
+    tail.extend(services);
+    tail
 }
 
 pub(crate) fn run_monitoring_status(
@@ -421,6 +435,21 @@ mod tests {
             GRAFANA_ADMIN_PASSWORD_ENV.to_string(),
             Some("s3cret".to_string())
         )));
+    }
+
+    /// `monitoring up` must never converge `openbao` through
+    /// `prometheus`'s `depends_on`, or it recreates the container without
+    /// the audit override.
+    #[test]
+    fn monitoring_up_does_not_bring_up_dependencies() {
+        for profile in [MonitoringProfile::Lan, MonitoringProfile::Public] {
+            let services = monitoring_services(profile);
+            let refs: Vec<&str> = services.iter().map(String::as_str).collect();
+            let tail = monitoring_up_tail(&refs);
+            assert_eq!(tail.get(..3), Some(&["up", "-d", "--no-deps"][..]));
+            assert_eq!(tail.get(3..), Some(refs.as_slice()));
+            assert!(!tail.contains(&"openbao"), "{tail:?}");
+        }
     }
 
     /// With no password supplied the instance is still pinned on its own.

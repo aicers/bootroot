@@ -33,12 +33,29 @@ services:
       - "9101"
     volumes:
       - openbao-data:/openbao/file
-      - openbao-audit:/openbao/audit
       - ./openbao:/openbao/config:ro
     # The standard entrypoint chowns /openbao/config and /openbao/file but
-    # does not know about /openbao/audit.  Fix ownership before delegating
-    # to the original entrypoint so the openbao user can write audit logs.
-    entrypoint: ["sh", "-c", "chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit && exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
+    # does not know about /openbao/audit.  That directory exists only when
+    # the audit override (secrets/openbao/docker-compose.openbao-audit.yml)
+    # bind-mounts the registrar endpoint's audit store there and the
+    # device writes /openbao/audit/audit.log; without it OpenBao audits to
+    # stdout.  When it exists, fix its ownership before delegating to the
+    # original entrypoint so the openbao user can write the audit log, and
+    # refuse to start if that fails.
+    entrypoint: ["sh", "-c", "if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
+    # Audit records of the stdout device, and the server's own output, go
+    # to the container log.  The `local` driver bounds them at max-file
+    # segments of max-size each and compresses rotated segments.  `mode`
+    # is left at Docker's default `blocking`: `non-blocking` drops lines
+    # when the driver falls behind.  Override the bounds through
+    # OPENBAO_LOG_MAX_SIZE / OPENBAO_LOG_MAX_FILES in the `.env` beside
+    # this file.
+    logging:
+      driver: local
+      options:
+        max-size: "${OPENBAO_LOG_MAX_SIZE:-20m}"
+        max-file: "${OPENBAO_LOG_MAX_FILES:-10}"
+        compress: "true"
 
   # PostgreSQL for step-ca. The port is exposed to the host so that
   # `bootroot rotate db` (which runs on the host) can connect directly.
@@ -156,7 +173,6 @@ services:
 
 volumes:
   openbao-data:
-  openbao-audit:
   postgres-data:
   prometheus-data:
   grafana-data:
