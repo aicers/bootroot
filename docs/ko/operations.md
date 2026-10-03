@@ -116,24 +116,45 @@ OpenBao의 감사 장치는 `openbao/openbao.hcl`에 선언되어 있으며 Open
 
 **장치는 audit 오버라이드를 따릅니다.** OpenBao를 띄우거나 재생성하는
 모든 bootroot 명령 — `infra install`, `infra up`, `init`, 그리고 `init`의
-롤백 — 은 먼저 `openbao/openbao.hcl`의 감사 스탠자를 그 컨테이너의
-마운트에 맞는 장치로 설정합니다. 그 명령이 audit 오버라이드를 적용할 때에만
+롤백 — 은 `openbao/openbao.hcl`의 감사 스탠자를 그 컨테이너의 마운트에
+맞는 장치로 설정합니다. 그 기동이 audit 오버라이드를 적용할 때에만
 `path = "file"`과 `file_path = "/openbao/audit/audit.log"`를, 그 밖에는
-`path = "stdout"`과 `file_path = "stdout"`을 씁니다. 이 두 값만 다시 쓰며,
-이미 맞는 장치가 선언되어 있으면 파일을 건드리지 않습니다. 둘 중 하나를
-선언하는 감사 스탠자가 정확히 하나 있지 않은 `openbao.hcl`은 — 예를 들어
-손으로 편집한 뒤 — 어떤 컨테이너도 시작하거나 재생성하기 전에 거부하며,
-결코 덮어쓰지 않습니다. `#`, `//`, `/* ... */` 주석 안의 스탠자나 속성은
-세지 않습니다. `--services`가 주어지면, OpenBao가 목록에 있거나 목록의
-서비스가 직접 또는 다른 서비스를 거쳐 OpenBao에 의존할 때 이 일을 합니다.
-`openbao`가 목록에 없으면 의존성은 `docker compose config`가 해석한
-프로젝트에서 읽으므로, Compose가 따르는 모든 형식이 의존성으로 셉니다.
-어떻게 쓰였든 `depends_on`, `links`, `volumes_from`, 그리고
-`service:openbao`인 `network_mode`, `ipc`, `pid`가 모두 해당합니다. 그
-프로젝트는 보간 없이 읽으므로, 변수로 지정된 의존성 — 예를 들어
-`network_mode: service:${NAME}` — 을 거쳐 가는 기동은 역시 어떤 컨테이너도
-시작하기 전에 거부합니다. 서비스 이름을 변수 없이 쓰거나 `--services`에
-`openbao`를 넣으세요. `monitoring up`은 OpenBao를 아예 재생성하지 않습니다. 모니터링
+`path = "stdout"`과 `file_path = "stdout"`을 씁니다. 이 파일을 쓰는 동작은
+두 가지이며, 아래의 보장은 그중 하나에만 해당합니다.
+
+- **대상 동기화**(destination sync)가 장치를 설정합니다. 이 두 값만 다시
+  쓰며, 이미 맞는 장치가 선언되어 있으면 파일을 쓰지 않습니다. 둘 중 하나를
+  선언하는 감사 스탠자가 정확히 하나 있지 않은 `openbao.hcl`은 — 예를 들어
+  손으로 편집한 뒤 — 거부하며, 거부한 파일을 결코 덮어쓰지 않습니다. `#`,
+  `//`, `/* ... */` 주석 안의 스탠자나 속성은 세지 않습니다. 이 거부는
+  동기화가 준비하는 기동이나 재생성보다 먼저 일어나지만, 동기화가 검사하는
+  파일만 보호합니다. 같은 명령에서 그보다 먼저 실행된 아래의 렌더링을
+  되돌리지는 못합니다. `--services`가 주어지면 `infra install`과 `infra up`은
+  OpenBao가 목록에 있거나 목록의 서비스가 직접 또는 다른 서비스를 거쳐
+  OpenBao에 의존할 때에만 동기화를 실행합니다. `openbao`가 목록에 없으면
+  의존성은 `docker compose config`가 해석한 프로젝트에서 읽으므로 — 이 읽기는
+  아무것도 시작하지 않습니다 — Compose가 따르는 모든 형식이 의존성으로
+  셉니다. 어떻게 쓰였든 `depends_on`, `links`, `volumes_from`, 그리고
+  `service:openbao`인 `network_mode`, `ipc`, `pid`가 모두 해당합니다. 그
+  프로젝트는 보간 없이 읽으므로, 변수로 지정된 의존성 — 예를 들어
+  `network_mode: service:${NAME}` — 을 거쳐 가는 기동은 역시 그 기동이
+  아무것도 시작하기 전에 거부합니다. 서비스 이름을 변수 없이 쓰거나
+  `--services`에 `openbao`를 넣으세요.
+- **HCL 렌더링**은 `stdout` 장치를 선언하는 bootroot 자체 템플릿으로 파일
+  전체를 다시 만들어, 손으로 편집한 내용까지 포함해 기존 내용을 대체합니다.
+  동기화의 쓰지 않는 동작도, 거부도 렌더링에는 적용되지 않습니다. 이미 맞는
+  장치를 선언한 파일도 다시 쓰고, 인식되지 않는 감사 스탠자도 거부하지 않고
+  대체합니다. `init`은 OpenBao의 API 리스너에 TLS를 켤 때 — 기록된 비루프백
+  바인드가 있거나 레지스트라 엔드포인트 호스트일 때 — TLS 설정 전체를 먼저
+  렌더링하고, 그다음에야 그 결과에 대해 대상 동기화를 실행합니다.
+  `infra install`은 `--openbao-bind` 의도를 기록할 때, 그리고
+  `--openbao-bind` 없이 실행되어 이전에 기록된 의도를 지울 때 평문 설정을
+  복원합니다. 이 복원은 자체 대상 동기화보다 먼저, `--services`에 무엇이
+  있든 실행됩니다. 위의 `--services` 조건은 동기화에 속하며 이 렌더링을
+  막지 않습니다. 손으로 편집한 `openbao.hcl`은 두 렌더링 중 어느 것에서도
+  살아남지 않습니다.
+
+`monitoring up`은 OpenBao를 아예 재생성하지 않습니다. 모니터링
 서비스를 `--no-deps`로 띄우기 때문입니다. OpenBao에 대해 `docker compose up`을
 직접 실행한다면, `openbao.hcl`이 `file` 장치를 선언할 때에만 audit
 오버라이드를 포함하세요. 디렉터리 없이 시작한 `file` 장치는 로그를 열 수

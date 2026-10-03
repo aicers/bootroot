@@ -127,26 +127,49 @@ Where the records go depends on how the running container was created:
 
 **The device follows the audit override.** Every bootroot command that
 brings up or recreates OpenBao — `infra install`, `infra up`, `init` and
-`init`'s rollback — first sets the audit stanza of `openbao/openbao.hcl`
-to the device that container's mounts need: `path = "file"` with
-`file_path = "/openbao/audit/audit.log"` exactly when that command applies
-the audit override, and `path = "stdout"` with `file_path = "stdout"`
-otherwise. It rewrites only those two values and leaves the file
-untouched when it already declares the right device. It refuses, before
-any container is started or recreated, an `openbao.hcl` that does not
-hold exactly one audit stanza declaring one of the two — after a hand
-edit, for example — and never overwrites one; a stanza or attribute
-inside a `#`, `//` or `/* ... */` comment does not count. With
-`--services`, it does this when OpenBao is listed or a listed service
-depends on it, directly or through another service. Unless `openbao`
-is listed, the dependencies are read from the project as
-`docker compose config` resolves it, so every form Compose honours
-counts: `depends_on` however it is written, `links`, `volumes_from`, and
-a `network_mode`, `ipc` or `pid` of `service:openbao`. That project is
-read without interpolation, so a bring-up whose way runs through a
-dependency named by a variable — `network_mode: service:${NAME}`, for
-example — is refused, also before any container is started; name the
-service literally, or list `openbao` in `--services`.
+`init`'s rollback — sets the audit stanza of `openbao/openbao.hcl` to the
+device that container's mounts need: `path = "file"` with
+`file_path = "/openbao/audit/audit.log"` exactly when that bring-up
+applies the audit override, and `path = "stdout"` with
+`file_path = "stdout"` otherwise. Two different operations write that
+file, and the guarantees below belong to only one of them.
+
+- **Destination sync** is what sets the device. It rewrites only those
+  two values, and leaves the file unwritten when it already declares the
+  right device. It refuses an `openbao.hcl` that does not hold exactly
+  one audit stanza declaring one of the two — after a hand edit, for
+  example — and never overwrites the file it refused; a stanza or
+  attribute inside a `#`, `//` or `/* ... */` comment does not count.
+  The refusal comes before the bring-up or recreate the sync prepares,
+  but it protects only the file the sync examines: it cannot undo a
+  rendering, below, that ran earlier in the same command. With
+  `--services`, `infra install` and `infra up` run the sync only when
+  OpenBao is listed or a listed service depends on it, directly or
+  through another service. Unless `openbao` is listed, the dependencies
+  are read from the project as `docker compose config` resolves it — a
+  read that starts nothing — so every form Compose honours counts:
+  `depends_on` however it is written, `links`, `volumes_from`, and a
+  `network_mode`, `ipc` or `pid` of `service:openbao`. That project is
+  read without interpolation, so a bring-up whose way runs through a
+  dependency named by a variable — `network_mode: service:${NAME}`, for
+  example — is refused, also before that bring-up starts anything; name
+  the service literally, or list `openbao` in `--services`.
+- **HCL rendering** regenerates the whole file from bootroot's own
+  template, which declares the `stdout` device, and replaces what was
+  there, hand edits included. Neither the sync's no-write behaviour nor
+  its refusal applies to it: a file that already declared the right
+  device is still rewritten, and an unrecognised audit stanza is
+  replaced rather than refused. `init`, when it enables TLS on OpenBao's
+  API listener — for a recorded non-loopback bind, or on a registrar
+  endpoint host — renders the whole TLS configuration first and only
+  then runs destination sync on the result. `infra install` restores the
+  plaintext configuration when it records an `--openbao-bind` intent,
+  and when a run without `--openbao-bind` clears one recorded earlier.
+  It does so before its own destination sync, regardless of what
+  `--services` lists: the `--services` gating above belongs to the sync
+  and does not hold this rendering back. A hand edit to `openbao.hcl`
+  does not survive either rendering.
+
 `monitoring up` never recreates OpenBao at all: it
 brings up the monitoring services with `--no-deps`. If you run
 `docker compose up` for OpenBao yourself, include the audit override
