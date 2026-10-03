@@ -47,8 +47,10 @@ use crate::state::StateFile;
 pub(crate) mod migration;
 pub(crate) mod reserve;
 
-/// The container path `openbao/openbao.hcl` writes its file audit
-/// device to. Unchanged by this override — only what backs it moves.
+/// The container directory the store-backed `file` audit device writes
+/// `audit.log` under, and the target this override binds the store at.
+/// It exists only when this override is applied: without it nothing is
+/// mounted there and `openbao.hcl` declares the `stdout` device instead.
 const OPENBAO_AUDIT_CONTAINER_PATH: &str = OPENBAO_CONTAINER_AUDIT_DIR;
 
 /// The `openbao` service's other two mounts, re-declared verbatim
@@ -1279,6 +1281,48 @@ fn reserve_inputs<'a>(
         expected_uid: inputs.expected_uid,
         rerun_command: RESERVE_RERUN_COMMAND,
     }
+}
+
+/// Runs [`prepare_audit_store_for_infra_up`] and then sets `openbao.hcl`'s
+/// audit device to match its verdict, both before any Docker invocation.
+///
+/// The store-backed `file` device exactly when an override is returned,
+/// which `infra up` then passes to Compose, and the `stdout` device
+/// otherwise — including when a rendered override is still on disk but
+/// the recorded predicate is `false`. `openbao.hcl` is left alone when
+/// `services` neither names `openbao` nor a service that depends on it,
+/// as `read_config` resolves the project (see
+/// [`crate::commands::infra::sync_openbao_audit_device_for_up`]).
+///
+/// # Errors
+///
+/// Returns every error [`prepare_audit_store_for_infra_up`] returns, and
+/// an error when `openbao.hcl` holds no recognised audit stanza or cannot
+/// be written.
+pub(crate) fn prepare_openbao_audit_for_infra_up(
+    state_path: &Path,
+    compose_file: &Path,
+    agent_config: Option<&Path>,
+    expected_uid: u32,
+    services: &[String],
+    read_config: &crate::commands::infra::ReadComposeConfig<'_>,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    let audit_override = prepare_audit_store_for_infra_up(
+        state_path,
+        compose_file,
+        agent_config,
+        expected_uid,
+        messages,
+    )?;
+    crate::commands::infra::sync_openbao_audit_device_for_up(
+        compose_file,
+        services,
+        audit_override.as_deref(),
+        read_config,
+        messages,
+    )?;
+    Ok(audit_override)
 }
 
 /// Runs the audit-store portion of `bootroot infra up` before any Docker
@@ -3142,6 +3186,102 @@ mod tests {
         );
     }
 
+    /// The audit stanza lines of the two devices.
+    const STDOUT_DEVICE_LINES: [&str; 2] =
+        ["  path = \"stdout\"\n", "    file_path = \"stdout\"\n"];
+    const STORE_DEVICE_LINES: [&str; 2] = [
+        "  path = \"file\"\n",
+        "    file_path = \"/openbao/audit/audit.log\"\n",
+    ];
+
+    /// Writes `openbao.hcl` into `compose_dir` declaring the store-backed
+    /// device when `store` is set and the `stdout` device otherwise.
+    fn write_openbao_hcl(compose_dir: &Path, store: bool) -> PathBuf {
+        let mut content = repo_file("openbao/openbao.hcl");
+        if store {
+            for (from, to) in STDOUT_DEVICE_LINES.iter().zip(STORE_DEVICE_LINES) {
+                content = content.replace(from, to);
+            }
+        }
+        fs::create_dir_all(compose_dir.join("openbao")).expect("openbao dir");
+        let hcl = compose_dir.join("openbao").join("openbao.hcl");
+        fs::write(&hcl, content).expect("write hcl");
+        hcl
+    }
+
+    fn declares(hcl: &Path, lines: [&str; 2]) -> bool {
+        let content = fs::read_to_string(hcl).expect("read hcl");
+        lines.iter().all(|line| content.contains(line))
+    }
+
+    fn openbao_only() -> Vec<String> {
+        vec!["openbao".to_string()]
+    }
+
+    #[test]
+    fn infra_up_sets_the_store_device_when_it_applies_the_override() {
+        let (fixture, state, compose_dir, compose_file) = provisioned_fixture();
+        let hcl = write_openbao_hcl(&compose_dir, false);
+        let applied = prepare_openbao_audit_for_infra_up(
+            &state,
+            &compose_file,
+            Some(&fixture.agent_config(true)),
+            current_process_euid(),
+            &openbao_only(),
+            &|_: &Path| -> Result<String> { panic!("openbao is listed") },
+            &test_messages(),
+        )
+        .expect("bring-up");
+        assert_eq!(
+            applied.as_deref(),
+            Some(audit_override_path(&compose_dir).as_path())
+        );
+        assert!(declares(&hcl, STORE_DEVICE_LINES));
+    }
+
+    /// The endpoint switched off: the rendered override is still on
+    /// disk, but the recorded predicate is `false`, so it is not applied
+    /// and `OpenBao` returns to the `stdout` device.
+    #[test]
+    fn infra_up_sets_the_stdout_device_when_the_predicate_is_false() {
+        let (fixture, _state, compose_dir, compose_file) = provisioned_fixture();
+        assert!(audit_override_path(&compose_dir).exists());
+        let disabled_state = fixture.state(Some(false));
+        let hcl = write_openbao_hcl(&compose_dir, true);
+        let applied = prepare_openbao_audit_for_infra_up(
+            &disabled_state,
+            &compose_file,
+            Some(&fixture.agent_config(false)),
+            current_process_euid(),
+            &openbao_only(),
+            &|_: &Path| -> Result<String> { panic!("openbao is listed") },
+            &test_messages(),
+        )
+        .expect("bring-up");
+        assert!(applied.is_none());
+        assert!(declares(&hcl, STDOUT_DEVICE_LINES));
+    }
+
+    #[test]
+    fn infra_up_leaves_the_hcl_alone_when_it_does_not_bring_up_openbao() {
+        let (fixture, state, compose_dir, compose_file) = provisioned_fixture();
+        fs::write(&compose_file, repo_file("docker-compose.yml")).expect("compose file");
+        let hcl = write_openbao_hcl(&compose_dir, false);
+        let before = fs::read_to_string(&hcl).expect("read hcl");
+        let applied = prepare_openbao_audit_for_infra_up(
+            &state,
+            &compose_file,
+            Some(&fixture.agent_config(true)),
+            current_process_euid(),
+            &["postgres".to_string(), "step-ca".to_string()],
+            &|_: &Path| Ok(crate::commands::init::SHIPPED_COMPOSE_CONFIG.to_string()),
+            &test_messages(),
+        )
+        .expect("bring-up");
+        assert!(applied.is_some());
+        assert_eq!(fs::read_to_string(&hcl).expect("read hcl"), before);
+    }
+
     #[test]
     fn a_bring_up_selects_the_override_over_a_conforming_store() {
         let (fixture, state, compose_dir, _compose_file) = provisioned_fixture();
@@ -3527,29 +3667,71 @@ mod tests {
         assert!(audit.contains("create_host_path: false"), "{audit}");
     }
 
+    /// The `openbao` service's block of a compose file, up to the next
+    /// service.
+    fn openbao_service_block(content: &str) -> &str {
+        let start = content.find("\n  openbao:\n").expect("openbao service") + 1;
+        let rest = &content[start..];
+        let end = rest
+            .match_indices('\n')
+            .map(|(index, _)| index + 1)
+            .find(|&index| {
+                let line = &rest[index..];
+                line.starts_with("  ") && !line.starts_with("   ") && !line.starts_with("  #")
+                    || (!line.is_empty() && !line.starts_with(' ') && !line.starts_with('#'))
+            })
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Without the audit override, nothing backs `/openbao/audit`: the
+    /// device audits to the container log, which the `local` driver
+    /// bounds. The entrypoint still prepares the directory the override
+    /// binds, and only that one.
     #[test]
-    fn the_named_volume_and_the_audit_device_stanza_are_left_alone() {
+    fn the_base_compose_files_audit_to_a_bounded_container_log() {
+        const LOGGING: &str = "    logging:
+      driver: local
+      options:
+        max-size: \"${OPENBAO_LOG_MAX_SIZE:-20m}\"
+        max-file: \"${OPENBAO_LOG_MAX_FILES:-10}\"
+        compress: \"true\"
+";
+        const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl\"]\n";
         for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
             let content = repo_file(compose);
-            // The override stops the volume being mounted where it
-            // applies; it does not stop the volume existing, and an
-            // existing deployment's audit history is in it.
+            let service = openbao_service_block(&content);
+            assert!(service.contains(LOGGING), "{compose}: {service}");
             assert!(
-                content.contains("\n  openbao-audit:\n"),
-                "{compose} no longer declares the openbao-audit volume"
+                !service.contains("mode:"),
+                "{compose}: delivery mode must stay blocking"
             );
+            assert!(service.contains(ENTRYPOINT), "{compose}: {service}");
+            let entries = collect_openbao_volume_entries(&content);
+            assert_eq!(
+                entries,
+                vec![
+                    OPENBAO_DATA_MOUNT.to_string(),
+                    OPENBAO_CONFIG_MOUNT.to_string()
+                ],
+                "{compose}"
+            );
+            // Neither a volume key nor a `openbao-audit:<target>` mount;
+            // the comment may still name the override file.
             assert!(
-                content.contains("openbao-audit:/openbao/audit"),
-                "{compose} no longer mounts the openbao-audit volume by default"
+                !content.contains("openbao-audit:"),
+                "{compose} still names the openbao-audit volume"
             );
         }
-        // The container path is unchanged, so the device's `file_path`
-        // needs no edit and `verify_audit_file` keeps passing.
+        // The store-backed device is a different device at its own
+        // path; the canonical stanza is the `stdout` one.
         let hcl = repo_file("openbao/openbao.hcl");
         assert!(
-            hcl.contains("file_path = \"/openbao/audit/audit.log\""),
-            "the audit device's file_path moved"
+            hcl.contains("  type = \"file\"\n  path = \"stdout\"\n"),
+            "{hcl}"
         );
+        assert!(hcl.contains("    file_path = \"stdout\"\n"), "{hcl}");
+        assert!(!hcl.contains("/openbao/audit"), "{hcl}");
     }
 
     #[test]

@@ -21,6 +21,19 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// chown that precedes it re-owns exactly this path.
 pub(super) const TLS_OUTPUT_MOUNT: &str = "/output";
 
+/// The value `OpenBao`'s file audit device takes for both `path` and
+/// `file_path` to write to standard output.
+const OPENBAO_AUDIT_STDOUT: &str = "stdout";
+
+/// Mount path of the store-backed file audit device. Unchanged from the
+/// device every endpoint host has carried, so its audit table entry
+/// survives.
+const OPENBAO_AUDIT_STORE_MOUNT_PATH: &str = "file";
+
+/// The file the store-backed device writes: `audit.log` under the
+/// directory the audit override binds the store at.
+const OPENBAO_AUDIT_STORE_FILE_PATH: &str = "/openbao/audit/audit.log";
+
 /// Issues an `OpenBao` TLS server certificate signed by the local
 /// step-ca intermediate CA.
 ///
@@ -298,16 +311,16 @@ fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Resul
 /// Replaces `tls_disable = 1` on the `:8200` listener with
 /// `tls_cert_file` and `tls_key_file` pointing to the container
 /// mount paths.  The telemetry listener on `:9101` keeps plaintext.
-pub(in crate::commands::init) fn write_openbao_hcl_with_tls(
-    compose_dir: &Path,
-    messages: &Messages,
-) -> Result<()> {
+fn write_openbao_hcl_with_tls(compose_dir: &Path, messages: &Messages) -> Result<()> {
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
     // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
-    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
-    // the server configuration rather than enabled via the API, and `init`
-    // verifies that a file audit backend is present (see
-    // `OpenBaoClient::verify_audit_file`).
+    // with the repo: the `stdout` device, which audits to the container log.
+    // OpenBao >= 2.5 requires audit devices to be declared in the server
+    // configuration rather than enabled via the API, and `init` verifies
+    // that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`). Where the audit override applies,
+    // `sync_openbao_audit_device` switches the stanza to the store-backed
+    // `file` device afterwards.
     let content = format!(
         r#"storage "file" {{
   path = "/openbao/file"
@@ -338,9 +351,9 @@ telemetry {{
 
 audit {{
   type = "file"
-  path = "file"
+  path = "stdout"
   options {{
-    file_path = "/openbao/audit/audit.log"
+    file_path = "stdout"
   }}
 }}
 
@@ -353,6 +366,26 @@ ui = true
 
     println!("{}", messages.info_openbao_hcl_tls_written());
     Ok(())
+}
+
+/// Rewrites `openbao.hcl` for the TLS recreate `init` runs, with the
+/// audit device that recreate's mounts need.
+///
+/// [`write_openbao_hcl_with_tls`] renders the canonical `stdout` device;
+/// when the recreate carries the audit override, passed as
+/// `audit_override`, [`sync_openbao_audit_device`] then switches it to
+/// the store-backed `file` device.
+pub(in crate::commands::init) fn write_openbao_hcl_for_tls_recreate(
+    compose_dir: &Path,
+    audit_override: Option<&Path>,
+    messages: &Messages,
+) -> Result<()> {
+    write_openbao_hcl_with_tls(compose_dir, messages)?;
+    sync_openbao_audit_device(
+        compose_dir,
+        OpenBaoAuditDevice::for_audit_override(audit_override.is_some()),
+        messages,
+    )
 }
 
 /// Builds the SANs list for the `OpenBao` TLS certificate.
@@ -456,10 +489,13 @@ pub(crate) fn write_openbao_hcl_plaintext(compose_dir: &Path, messages: &Message
         return Ok(());
     }
     // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
-    // with the repo. OpenBao >= 2.5 requires audit devices to be declared in
-    // the server configuration rather than enabled via the API, and `init`
-    // verifies that a file audit backend is present (see
-    // `OpenBaoClient::verify_audit_file`).
+    // with the repo: the `stdout` device, which audits to the container log.
+    // OpenBao >= 2.5 requires audit devices to be declared in the server
+    // configuration rather than enabled via the API, and `init` verifies
+    // that a file audit backend is present (see
+    // `OpenBaoClient::verify_audit_file`). Where the audit override applies,
+    // `sync_openbao_audit_device` switches the stanza to the store-backed
+    // `file` device afterwards.
     let content = r#"storage "file" {
   path = "/openbao/file"
 }
@@ -488,9 +524,9 @@ telemetry {
 
 audit {
   type = "file"
-  path = "file"
+  path = "stdout"
   options {
-    file_path = "/openbao/audit/audit.log"
+    file_path = "stdout"
   }
 }
 
@@ -501,6 +537,302 @@ ui = true
     publish_openbao_hcl(&hcl_path, content, messages)?;
 
     println!("{}", messages.info_openbao_hcl_tls_reverted());
+    Ok(())
+}
+
+/// An audit device the `audit` stanza of `openbao.hcl` can declare.
+///
+/// `OpenBao` keeps each declared device's options in its audit table and
+/// refuses to unseal when the configuration changes an existing device's
+/// options, so the two destinations are two devices at two paths rather
+/// than one device whose `file_path` moves. A switch disables one and
+/// enables the other at the next unseal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenBaoAuditDevice {
+    /// `path = "stdout"`, `file_path = "stdout"`: audits to the
+    /// container's standard output, retained by the Docker logging
+    /// driver. Used whenever `OpenBao` runs without the audit override.
+    Stdout,
+    /// `path = "file"`, `file_path = "/openbao/audit/audit.log"`: audits
+    /// to the registrar endpoint's audit store, which the audit override
+    /// bind-mounts at `/openbao/audit`. Used exactly when the Compose
+    /// invocation that creates the container includes that override.
+    StoreFile,
+}
+
+impl OpenBaoAuditDevice {
+    /// Returns the device a Compose invocation needs: the store-backed
+    /// file device when it includes the audit override, the `stdout`
+    /// device otherwise.
+    #[must_use]
+    pub(crate) fn for_audit_override(override_applied: bool) -> Self {
+        if override_applied {
+            Self::StoreFile
+        } else {
+            Self::Stdout
+        }
+    }
+
+    /// The device's mount path, its `path` attribute.
+    fn mount_path(self) -> &'static str {
+        match self {
+            Self::Stdout => OPENBAO_AUDIT_STDOUT,
+            Self::StoreFile => OPENBAO_AUDIT_STORE_MOUNT_PATH,
+        }
+    }
+
+    /// The device's `file_path` option.
+    fn file_path(self) -> &'static str {
+        match self {
+            Self::Stdout => OPENBAO_AUDIT_STDOUT,
+            Self::StoreFile => OPENBAO_AUDIT_STORE_FILE_PATH,
+        }
+    }
+
+    /// Returns the device a `path` / `file_path` pair declares, if it is
+    /// one of the two.
+    fn from_pair(mount_path: &str, file_path: &str) -> Option<Self> {
+        [Self::Stdout, Self::StoreFile]
+            .into_iter()
+            .find(|device| device.mount_path() == mount_path && device.file_path() == file_path)
+    }
+}
+
+/// Where the attributes [`sync_openbao_audit_device`] rewrites sit in
+/// `openbao.hcl`.
+struct AuditStanzaLines {
+    path_line: usize,
+    file_path_line: usize,
+    device: OpenBaoAuditDevice,
+}
+
+/// Splits `key = "value"` into its key and unquoted value.
+///
+/// Returns `None` for a line that is not a single attribute with a
+/// plain quoted string value.
+fn hcl_string_attribute(active: &str) -> Option<(&str, &str)> {
+    let (key, value) = active.split_once('=')?;
+    let inner = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+    if inner.contains('"') {
+        return None;
+    }
+    Some((key.trim(), inner))
+}
+
+/// The active text of one HCL line, with its comments removed.
+struct ActiveHclLine {
+    text: String,
+    /// Whether any part of the line sat inside a `/* ... */` comment.
+    touches_block_comment: bool,
+}
+
+/// Removes the comments from `line`, continuing a `/* ... */` comment
+/// that an earlier line opened when `in_block_comment` is set.
+///
+/// HCL treats a block comment as whitespace, so each one becomes a
+/// single space; `#` and `//` end the line's active text. Comment
+/// markers inside a quoted string are part of the string.
+fn strip_hcl_comments(line: &str, in_block_comment: &mut bool) -> ActiveHclLine {
+    let mut text = String::with_capacity(line.len());
+    let mut touches_block_comment = *in_block_comment;
+    let mut in_quote = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if *in_block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *in_block_comment = false;
+                text.push(' ');
+            }
+            continue;
+        }
+        if in_quote {
+            text.push(c);
+            match c {
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        text.push(escaped);
+                    }
+                }
+                '"' => in_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quote = true;
+                text.push(c);
+            }
+            '#' => break,
+            '/' if chars.peek() == Some(&'/') => break,
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                *in_block_comment = true;
+                touches_block_comment = true;
+            }
+            _ => text.push(c),
+        }
+    }
+    ActiveHclLine {
+        text,
+        touches_block_comment,
+    }
+}
+
+/// Locates the single `audit` stanza of `lines` and its `path` and
+/// `file_path` lines.
+///
+/// Returns `None` unless the content holds exactly one top-level
+/// `audit` stanza with exactly one `path` attribute directly inside it
+/// and exactly one `file_path` attribute anywhere inside it, each on a
+/// line of its own with no `/* ... */` comment on it, and the two
+/// values form one of the two devices. Commented-out text, line or
+/// block, is not part of the stanza.
+fn locate_audit_stanza(lines: &[&str]) -> Option<AuditStanzaLines> {
+    let mut depth: usize = 0;
+    let mut stanzas = 0usize;
+    let mut in_audit = false;
+    let mut in_block_comment = false;
+    let mut path_lines: Vec<(usize, String)> = Vec::new();
+    let mut file_path_lines: Vec<(usize, String)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let stripped = strip_hcl_comments(line, &mut in_block_comment);
+        let active = stripped.text.trim();
+        // A rewritten line's value is located on the raw line, which a
+        // block comment on it would confuse; such a line declares no
+        // value the sync can rewrite.
+        let value_of = |attribute: Option<(&str, &str)>| {
+            if stripped.touches_block_comment {
+                String::new()
+            } else {
+                attribute.map_or_else(String::new, |(_, value)| value.to_string())
+            }
+        };
+        if depth == 0 {
+            let rest = active.strip_prefix("audit");
+            if rest.is_some_and(|rest| {
+                let rest = rest.trim_start();
+                rest.starts_with('{') || rest.starts_with('"')
+            }) {
+                stanzas += 1;
+                in_audit = true;
+            }
+        } else if in_audit {
+            let attribute = hcl_string_attribute(active);
+            let key = active.split_once('=').map(|(key, _)| key.trim());
+            if key == Some("path") {
+                // Directly inside the stanza only; a nested block's own
+                // `path` would not be the device's mount path.
+                if depth == 1 {
+                    path_lines.push((index, value_of(attribute)));
+                }
+            } else if key == Some("file_path") {
+                file_path_lines.push((index, value_of(attribute)));
+            }
+        }
+        for byte in active.bytes() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => depth = depth.checked_sub(1)?,
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            in_audit = false;
+        }
+    }
+    if stanzas != 1 || depth != 0 || in_block_comment {
+        return None;
+    }
+    let [(path_line, mount_path)] = path_lines.as_slice() else {
+        return None;
+    };
+    let [(file_path_line, file_path)] = file_path_lines.as_slice() else {
+        return None;
+    };
+    Some(AuditStanzaLines {
+        path_line: *path_line,
+        file_path_line: *file_path_line,
+        device: OpenBaoAuditDevice::from_pair(mount_path, file_path)?,
+    })
+}
+
+/// Replaces the quoted value of the attribute on `line`, keeping its
+/// indentation, spacing and any trailing comment.
+fn replace_attribute_value(line: &str, value: &str) -> Option<String> {
+    let equals = line.find('=')?;
+    let open = equals + 1 + line.get(equals + 1..)?.find('"')?;
+    let close = open + 1 + line.get(open + 1..)?.find('"')?;
+    Some(format!(
+        "{}\"{value}\"{}",
+        line.get(..open)?,
+        line.get(close + 1..)?
+    ))
+}
+
+/// Sets the audit stanza of `<compose_dir>/openbao/openbao.hcl` to
+/// `device`.
+///
+/// Every bootroot path that brings up or recreates the `openbao` service
+/// calls this first, so the device always matches the mounts that
+/// invocation creates the container with: the store-backed file device
+/// would otherwise start with no `/openbao/audit`, fail post-unseal
+/// setup and leave `OpenBao` sealed.
+///
+/// Only the values of the stanza's `path` line and its `file_path` line
+/// are rewritten. A stanza that already declares `device` is left
+/// unwritten, so the file's inode and mtime do not change. An absent
+/// `openbao.hcl` is not an error, the same as
+/// [`write_openbao_hcl_plaintext`].
+///
+/// # Errors
+///
+/// Returns an error, before writing anything, when the file does not
+/// hold exactly one audit stanza whose `path` and `file_path` lines
+/// declare one of the two devices — for example after a hand edit — or
+/// when reading or publishing the file fails.
+pub(crate) fn sync_openbao_audit_device(
+    compose_dir: &Path,
+    device: OpenBaoAuditDevice,
+    messages: &Messages,
+) -> Result<()> {
+    let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
+    if !hcl_path.exists() {
+        return Ok(());
+    }
+    let display = hcl_path.display().to_string();
+    let content = std::fs::read_to_string(&hcl_path)
+        .with_context(|| messages.error_read_file_failed(&display))?;
+    let unrecognized =
+        || anyhow::anyhow!(messages.error_openbao_hcl_audit_stanza_unrecognized(&display));
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let stanza = locate_audit_stanza(&lines).ok_or_else(unrecognized)?;
+    if stanza.device == device {
+        return Ok(());
+    }
+    let mut rewritten = String::with_capacity(content.len());
+    for (index, line) in lines.iter().enumerate() {
+        let value = if index == stanza.path_line {
+            Some(device.mount_path())
+        } else if index == stanza.file_path_line {
+            Some(device.file_path())
+        } else {
+            None
+        };
+        match value {
+            Some(value) => {
+                let replaced = replace_attribute_value(line, value).ok_or_else(unrecognized)?;
+                rewritten.push_str(&replaced);
+            }
+            None => rewritten.push_str(line),
+        }
+    }
+    publish_openbao_hcl(&hcl_path, &rewritten, messages)?;
+    println!(
+        "{}",
+        messages.info_openbao_audit_device_set(device.mount_path(), &display)
+    );
     Ok(())
 }
 
@@ -752,7 +1084,8 @@ mod tests {
         // File audit backend must be declared so init's
         // `verify_audit_file` succeeds after the TLS rewrite.
         assert!(content.contains("audit {"));
-        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
+        assert!(content.contains("type = \"file\""));
+        assert!(content.contains("file_path = \"stdout\""));
     }
 
     /// The bootroot-internal registrar credential authenticates at
@@ -802,7 +1135,8 @@ mod tests {
         // Plaintext rewrite must preserve the file audit backend so init
         // can run after a subsequent `--openbao-bind` reinstall cycle.
         assert!(content.contains("audit {"));
-        assert!(content.contains("file_path = \"/openbao/audit/audit.log\""));
+        assert!(content.contains("type = \"file\""));
+        assert!(content.contains("file_path = \"stdout\""));
     }
 
     /// The chown container must mount ONLY the `openbao/tls` directory and
@@ -1073,6 +1407,366 @@ mod tests {
         );
         // The symlink target is untouched.
         assert!(elsewhere.read_dir().unwrap().next().is_none());
+    }
+
+    /// The audit stanza every renderer emits, and the canonical file
+    /// ships: the `stdout` device, with no option beyond `file_path` —
+    /// in particular nothing that weakens the default HMAC.
+    const STDOUT_AUDIT_STANZA: &str = "audit {
+  type = \"file\"
+  path = \"stdout\"
+  options {
+    file_path = \"stdout\"
+  }
+}
+";
+
+    /// Returns the text of the single top-level `audit` stanza.
+    fn audit_stanza(content: &str) -> String {
+        let start = content.find("\naudit {").expect("audit stanza") + 1;
+        let rest = &content[start..];
+        let end = rest.find("\n}\n").expect("stanza end") + 3;
+        rest[..end].to_string()
+    }
+
+    fn canonical_hcl() -> String {
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("openbao/openbao.hcl"))
+            .expect("read canonical openbao.hcl")
+    }
+
+    /// A compose directory holding `openbao/openbao.hcl` with `content`.
+    fn compose_dir_with_hcl(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let hcl = dir.path().join(OPENBAO_HCL_PATH);
+        fs::write(&hcl, content).unwrap();
+        (dir, hcl)
+    }
+
+    fn store_file_hcl() -> String {
+        canonical_hcl()
+            .replace("\n  path = \"stdout\"", "\n  path = \"file\"")
+            .replace(
+                "file_path = \"stdout\"",
+                "file_path = \"/openbao/audit/audit.log\"",
+            )
+    }
+
+    #[test]
+    fn canonical_and_rendered_hcl_declare_the_stdout_device() {
+        let messages = crate::i18n::test_messages();
+        let tls = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tls.path().join("openbao")).unwrap();
+        write_openbao_hcl_with_tls(tls.path(), &messages).unwrap();
+        let (plaintext, hcl) = compose_dir_with_hcl("placeholder");
+        write_openbao_hcl_plaintext(plaintext.path(), &messages).unwrap();
+
+        for (name, content) in [
+            ("canonical", canonical_hcl()),
+            (
+                "tls",
+                fs::read_to_string(tls.path().join(OPENBAO_HCL_PATH)).unwrap(),
+            ),
+            ("plaintext", fs::read_to_string(&hcl).unwrap()),
+        ] {
+            assert_eq!(audit_stanza(&content), STDOUT_AUDIT_STANZA, "{name}");
+            assert_eq!(content.matches("audit {").count(), 1, "{name}");
+            for weakening in ["log_raw", "hmac_accessor", "elide_list_responses"] {
+                assert!(!content.contains(weakening), "{name} sets {weakening}");
+            }
+            let lines: Vec<&str> = content.split_inclusive('\n').collect();
+            assert_eq!(
+                locate_audit_stanza(&lines).map(|stanza| stanza.device),
+                Some(OpenBaoAuditDevice::Stdout),
+                "{name}"
+            );
+        }
+    }
+
+    /// The store-backed device's `file_path` is the active file the
+    /// daemon's rotator renames, under the directory the audit override
+    /// binds the store at.
+    #[test]
+    fn the_store_file_path_is_the_rotated_file_under_the_bind_target() {
+        assert_eq!(
+            OPENBAO_AUDIT_STORE_FILE_PATH,
+            format!(
+                "{}/{}",
+                bootroot::registrar::audit_store::OPENBAO_CONTAINER_AUDIT_DIR,
+                bootroot::registrar::openbao_audit::ACTIVE_FILE_NAME
+            )
+        );
+    }
+
+    #[test]
+    fn sync_switches_between_the_two_devices_in_both_directions() {
+        let messages = crate::i18n::test_messages();
+        let canonical = canonical_hcl();
+        let (dir, hcl) = compose_dir_with_hcl(&canonical);
+
+        sync_openbao_audit_device(dir.path(), OpenBaoAuditDevice::StoreFile, &messages).unwrap();
+        let store = fs::read_to_string(&hcl).unwrap();
+        assert_eq!(store, store_file_hcl());
+        assert!(store.contains("  type = \"file\"\n  path = \"file\"\n"));
+        assert!(store.contains("    file_path = \"/openbao/audit/audit.log\"\n"));
+
+        sync_openbao_audit_device(dir.path(), OpenBaoAuditDevice::Stdout, &messages).unwrap();
+        assert_eq!(fs::read_to_string(&hcl).unwrap(), canonical);
+    }
+
+    /// Only the two values change: the TLS listener, a trailing comment
+    /// and the line layout around them survive the rewrite.
+    #[test]
+    fn sync_rewrites_only_the_two_values() {
+        let messages = crate::i18n::test_messages();
+        let tls = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tls.path().join("openbao")).unwrap();
+        write_openbao_hcl_with_tls(tls.path(), &messages).unwrap();
+        let hcl = tls.path().join(OPENBAO_HCL_PATH);
+        let original = fs::read_to_string(&hcl)
+            .unwrap()
+            .replace("\n  path = \"stdout\"", "\n  path   =   \"stdout\" # mount");
+        fs::write(&hcl, &original).unwrap();
+
+        sync_openbao_audit_device(tls.path(), OpenBaoAuditDevice::StoreFile, &messages).unwrap();
+        let rewritten = fs::read_to_string(&hcl).unwrap();
+        assert_eq!(
+            rewritten,
+            original
+                .replace(
+                    "path   =   \"stdout\" # mount",
+                    "path   =   \"file\" # mount"
+                )
+                .replace(
+                    "file_path = \"stdout\"",
+                    "file_path = \"/openbao/audit/audit.log\""
+                )
+        );
+        assert!(rewritten.contains("tls_cert_file"));
+    }
+
+    #[test]
+    fn sync_does_not_write_when_the_device_already_matches() {
+        let messages = crate::i18n::test_messages();
+        for (content, device) in [
+            (canonical_hcl(), OpenBaoAuditDevice::Stdout),
+            (store_file_hcl(), OpenBaoAuditDevice::StoreFile),
+        ] {
+            let (dir, hcl) = compose_dir_with_hcl(&content);
+            let past =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+            fs::File::options()
+                .write(true)
+                .open(&hcl)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+            let before = fs::metadata(&hcl).unwrap();
+
+            sync_openbao_audit_device(dir.path(), device, &messages).unwrap();
+
+            let after = fs::metadata(&hcl).unwrap();
+            assert_eq!(
+                after.ino(),
+                before.ino(),
+                "{device:?}: the file was replaced"
+            );
+            assert_eq!(
+                after.modified().unwrap(),
+                past,
+                "{device:?}: the file was written"
+            );
+            assert_eq!(fs::read_to_string(&hcl).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn sync_is_ok_without_an_hcl() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        for device in [OpenBaoAuditDevice::Stdout, OpenBaoAuditDevice::StoreFile] {
+            sync_openbao_audit_device(dir.path(), device, &messages).unwrap();
+        }
+        assert!(!dir.path().join(OPENBAO_HCL_PATH).exists());
+        assert!(!dir.path().join("openbao").exists());
+    }
+
+    #[test]
+    fn sync_refuses_an_unrecognised_audit_stanza_in_both_locales() {
+        let canonical = canonical_hcl();
+        let stanza = audit_stanza(&canonical);
+        let refused = [
+            ("no audit stanza", canonical.replace(&stanza, "")),
+            (
+                "two audit stanzas",
+                canonical.replace(&stanza, &format!("{stanza}\n{stanza}")),
+            ),
+            (
+                "no file_path line",
+                canonical.replace("    file_path = \"stdout\"\n", ""),
+            ),
+            (
+                "two file_path lines",
+                canonical.replace(
+                    "    file_path = \"stdout\"\n",
+                    "    file_path = \"stdout\"\n    file_path = \"stdout\"\n",
+                ),
+            ),
+            ("no path line", canonical.replace("  path = \"stdout\"\n", "")),
+            (
+                "stdout path with the store file",
+                canonical.replace(
+                    "file_path = \"stdout\"",
+                    "file_path = \"/openbao/audit/audit.log\"",
+                ),
+            ),
+            (
+                "file path writing to stdout",
+                canonical.replace("\n  path = \"stdout\"", "\n  path = \"file\""),
+            ),
+            (
+                "another file",
+                canonical.replace("file_path = \"stdout\"", "file_path = \"/var/log/x.log\""),
+            ),
+            (
+                "single-line stanza",
+                canonical.replace(
+                    &stanza,
+                    "audit { type = \"file\" path = \"stdout\" options { file_path = \"stdout\" } }\n",
+                ),
+            ),
+            // HCL reads a block comment as whitespace, so each of these
+            // has no active stanza or attribute where the text shows one.
+            (
+                "block-commented stanza",
+                canonical.replace(&stanza, &format!("/*\n{stanza}*/\n")),
+            ),
+            (
+                "stanza commented from a line of its own",
+                canonical.replace(&stanza, &format!("/* disabled\n{stanza}   */\n")),
+            ),
+            (
+                "block-commented file_path line",
+                canonical.replace(
+                    "    file_path = \"stdout\"\n",
+                    "    /* file_path = \"stdout\" */\n",
+                ),
+            ),
+            (
+                "file_path inside a multi-line block comment",
+                canonical.replace(
+                    "    file_path = \"stdout\"\n",
+                    "    /*\n    file_path = \"stdout\"\n    */\n",
+                ),
+            ),
+            (
+                "block-commented path line",
+                canonical.replace("  path = \"stdout\"\n", "  /* path = \"stdout\" */\n"),
+            ),
+            (
+                "path inside a multi-line block comment",
+                canonical.replace(
+                    "  path = \"stdout\"\n",
+                    "  /*\n  path = \"stdout\"\n  */\n",
+                ),
+            ),
+            (
+                "block comment on a rewritten line",
+                canonical.replace("  path = \"stdout\"\n", "  path = /* mount */ \"stdout\"\n"),
+            ),
+            (
+                "unterminated block comment",
+                format!("{canonical}/*\n"),
+            ),
+        ];
+        for (case, content) in refused {
+            for (locale, marker) in [
+                ("en", "refusing to rewrite"),
+                ("ko", "다시 쓰기를 거부합니다"),
+            ] {
+                let messages = crate::i18n::Messages::new(locale).unwrap();
+                let (dir, hcl) = compose_dir_with_hcl(&content);
+                for device in [OpenBaoAuditDevice::Stdout, OpenBaoAuditDevice::StoreFile] {
+                    let err = sync_openbao_audit_device(dir.path(), device, &messages)
+                        .expect_err(case)
+                        .to_string();
+                    assert!(
+                        err.contains(&hcl.display().to_string()),
+                        "{case} {locale}: {err}"
+                    );
+                    assert!(err.contains(marker), "{case} {locale}: {err}");
+                    assert_eq!(fs::read_to_string(&hcl).unwrap(), content, "{case}");
+                }
+            }
+        }
+    }
+
+    /// Comments around the stanza, line or block, and comment markers
+    /// inside a quoted string, leave the one active stanza recognised —
+    /// and only the active lines are rewritten.
+    #[test]
+    fn sync_reads_past_comments_to_the_active_stanza() {
+        let messages = crate::i18n::test_messages();
+        let canonical = canonical_hcl();
+        let stanza = audit_stanza(&canonical);
+        let store_stanza = audit_stanza(&store_file_hcl());
+        let commented = canonical.replace(
+            &stanza,
+            &format!(
+                "/* an older device:\n{store_stanza}*/\n\
+                 # audit {{ path = \"file\" }}\n\
+                 // audit {{\n\
+                 api_addr = \"http://x/*y*/\" /* note */\n\
+                 {stanza}"
+            ),
+        );
+        let (dir, hcl) = compose_dir_with_hcl(&commented);
+        sync_openbao_audit_device(dir.path(), OpenBaoAuditDevice::StoreFile, &messages).unwrap();
+        let content = fs::read_to_string(&hcl).unwrap();
+        assert_eq!(
+            content,
+            commented.replacen(&stanza, &store_stanza, 1),
+            "only the active stanza is rewritten"
+        );
+        let lines: Vec<&str> = content.split_inclusive('\n').collect();
+        assert_eq!(
+            locate_audit_stanza(&lines).map(|stanza| stanza.device),
+            Some(OpenBaoAuditDevice::StoreFile)
+        );
+    }
+
+    /// `init`'s TLS rewrite lands on the device its recreate's mounts
+    /// need: the store-backed file device with the audit override, the
+    /// `stdout` device without it.
+    #[test]
+    fn init_tls_rewrite_follows_the_audit_override() {
+        let messages = crate::i18n::test_messages();
+        let override_path = Path::new("secrets/openbao/docker-compose.openbao-audit.yml");
+        for (audit_override, start, expected) in [
+            (
+                Some(override_path),
+                canonical_hcl(),
+                OpenBaoAuditDevice::StoreFile,
+            ),
+            (
+                Some(override_path),
+                store_file_hcl(),
+                OpenBaoAuditDevice::StoreFile,
+            ),
+            (None, store_file_hcl(), OpenBaoAuditDevice::Stdout),
+            (None, canonical_hcl(), OpenBaoAuditDevice::Stdout),
+        ] {
+            let (dir, hcl) = compose_dir_with_hcl(&start);
+            write_openbao_hcl_for_tls_recreate(dir.path(), audit_override, &messages).unwrap();
+            let content = fs::read_to_string(&hcl).unwrap();
+            assert!(content.contains("tls_cert_file"));
+            let lines: Vec<&str> = content.split_inclusive('\n').collect();
+            assert_eq!(
+                locate_audit_stanza(&lines).map(|stanza| stanza.device),
+                Some(expected),
+                "{audit_override:?}"
+            );
+        }
     }
 
     #[test]

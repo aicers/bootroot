@@ -86,39 +86,126 @@ bootroot monitoring status
 
 ### 감사 로깅
 
-파일 기반 감사 백엔드는 `openbao/openbao.hcl`에 선언되어 있으며
-OpenBao 컨테이너 시작 시 자동으로 활성화됩니다. 감사 로그는 모든
-OpenBao API 요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하며,
-사후 조사에 필수적입니다.
+OpenBao의 감사 장치는 `openbao/openbao.hcl`에 선언되어 있으며 OpenBao
+컨테이너 시작 시 자동으로 활성화됩니다. 감사 로그는 모든 OpenBao API
+요청(인증, 시크릿 읽기/쓰기, 정책 변경)을 기록하며, 사후 조사에
+필수적입니다. 그 안의 요청·응답 문자열 대부분, 즉 토큰, 시크릿 값, 요청
+본문은 평문이 아니라 HMAC-SHA256 해시(`hmac-sha256:…`)로 기록됩니다.
 
-`bootroot init`은 감사 백엔드가 활성 상태인지 확인합니다. 파일 감사
-장치가 없는 경우(예: `openbao.hcl`에서 감사 스탠자가 제거되었거나
-`openbao-audit` 볼륨이 마운트되지 않은 경우) init은 실패합니다.
-감사 설정을 복원한 후 init을 다시 실행하세요.
+기록이 어디로 가는지는 실행 중인 컨테이너가 어떻게 생성되었는지에 따라
+달라집니다.
 
-- **로그 위치 (컨테이너 내부):** `/openbao/audit/audit.log`
-- **호스트 접근:** 일반 호스트에서 로그는 `openbao-audit` Docker 볼륨에
-  저장됩니다. `docker compose exec openbao cat /openbao/audit/audit.log`으로
-  확인할 수 있습니다.
-- **프로비저닝된 레지스트라 엔드포인트 호스트에서의 호스트 접근:** 감사
-  장치는 대신 공용 감사 저장소에 기록하며, 호스트 경로는
-  `<audit_store_dir>/openbao/audit.log`입니다. 컨테이너 경로는 동일한
-  경로의 bind mount이므로 위의 `docker compose exec` 방법은 그대로
-  동작합니다. 이는 `state.json`의 `registrar_endpoint.enabled`와 데몬
-  설정의 `[registrar_endpoint] enabled`가 **일치**할 때만 적용됩니다.
-  두 값이 다르면 `bootroot init`이 진행을 거부하고 감사 로그는 있던
-  자리에 그대로 남습니다. 저장소가 프로비저닝되기 전에 기록된 항목은
-  `openbao-audit` 볼륨에 그대로 남아 이전과 같이 읽을 수 있으며, 무엇도
-  이를 옮기지 않습니다. 아래 [공용 감사 저장소](#공용-감사-저장소)를
-  참고하세요.
-- **로테이션:** 레지스트라 엔드포인트가 활성화된 호스트에서는 배포
-  자체가 장치를 로테이션합니다. 장치 디렉터리에 `logrotate`, tail
-  사이드카, 시그널을 **직접 사용하지 마세요.** 두 번째 로테이터는
-  동일한 활성 로그를 두고 경합하며 같은 `audit-*.log` 이름 공간에서
-  충돌합니다. 아래 [감사 장치 로테이션](#rotating-the-audit-device)을
-  참고하세요.
-- **확인:** `docker compose exec openbao bao audit list`로 감사 장치가
-  활성 상태인지 확인합니다.
+- **일반 호스트** — 레지스트라 엔드포인트가 없는 모든 호스트, 그리고
+  `bootroot init`이 감사 저장소를 프로비저닝하기 전의 엔드포인트 호스트.
+  OpenBao는 `file_path`가 `stdout`인 파일 장치를 `stdout/`에 마운트해
+  감사하므로, 기록은 컨테이너의 표준 출력으로 나가고 Docker가 보관합니다.
+  `docker compose logs openbao` 또는 `docker logs <instance>-openbao`(기본
+  설치에서는 `docker logs bootroot-openbao`)로 읽습니다. `/openbao/audit`에는
+  아무것도 마운트되지 않으며, 감사 기록을 담는 Docker 볼륨도 없습니다.
+- **프로비저닝된 레지스트라 엔드포인트 호스트** — 장치는 `file/`에
+  마운트되어 공용 감사 저장소, 즉 호스트의 `<audit_store_dir>/openbao/audit.log`에
+  기록합니다. 그 디렉터리는 컨테이너의 `/openbao/audit`에 bind mount되므로
+  `docker compose exec openbao cat /openbao/audit/audit.log`도 같은 파일을
+  읽습니다. 이는 `state.json`의 `registrar_endpoint.enabled`와 데몬 설정의
+  `[registrar_endpoint] enabled`가 **일치**할 때만 적용됩니다. 두 값이
+  다르면 `bootroot init`이 진행을 거부하고 감사 장치는 있던 자리에 그대로
+  남습니다. 저장소가 프로비저닝되기 전에 기록된 항목은 — `init`이 컨테이너를
+  재생성하기 전에 스스로 호출한 OpenBao 요청을 포함해 — 그것을 기록한
+  컨테이너의 컨테이너 로그로 갔으며, 무엇도 이를 저장소로 옮기지 않습니다.
+  아래 [공용 감사 저장소](#공용-감사-저장소)를 참고하세요.
+
+**장치는 audit 오버라이드를 따릅니다.** OpenBao를 띄우거나 재생성하는
+모든 bootroot 명령 — `infra install`, `infra up`, `init`, 그리고 `init`의
+롤백 — 은 먼저 `openbao/openbao.hcl`의 감사 스탠자를 그 컨테이너의
+마운트에 맞는 장치로 설정합니다. 그 명령이 audit 오버라이드를 적용할 때에만
+`path = "file"`과 `file_path = "/openbao/audit/audit.log"`를, 그 밖에는
+`path = "stdout"`과 `file_path = "stdout"`을 씁니다. 이 두 값만 다시 쓰며,
+이미 맞는 장치가 선언되어 있으면 파일을 건드리지 않습니다. 둘 중 하나를
+선언하는 감사 스탠자가 정확히 하나 있지 않은 `openbao.hcl`은 — 예를 들어
+손으로 편집한 뒤 — 어떤 컨테이너도 시작하거나 재생성하기 전에 거부하며,
+결코 덮어쓰지 않습니다. `#`, `//`, `/* ... */` 주석 안의 스탠자나 속성은
+세지 않습니다. `--services`가 주어지면, OpenBao가 목록에 있거나 목록의
+서비스가 직접 또는 다른 서비스를 거쳐 OpenBao에 의존할 때 이 일을 합니다.
+`openbao`가 목록에 없으면 의존성은 `docker compose config`가 해석한
+프로젝트에서 읽으므로, Compose가 따르는 모든 형식이 의존성으로 셉니다.
+어떻게 쓰였든 `depends_on`, `links`, `volumes_from`, 그리고
+`service:openbao`인 `network_mode`, `ipc`, `pid`가 모두 해당합니다. 그
+프로젝트는 보간 없이 읽으므로, 변수로 지정된 의존성 — 예를 들어
+`network_mode: service:${NAME}` — 을 거쳐 가는 기동은 역시 어떤 컨테이너도
+시작하기 전에 거부합니다. 서비스 이름을 변수 없이 쓰거나 `--services`에
+`openbao`를 넣으세요. `monitoring up`은 OpenBao를 아예 재생성하지 않습니다. 모니터링
+서비스를 `--no-deps`로 띄우기 때문입니다. OpenBao에 대해 `docker compose up`을
+직접 실행한다면, `openbao.hcl`이 `file` 장치를 선언할 때에만 audit
+오버라이드를 포함하세요. 디렉터리 없이 시작한 `file` 장치는 로그를 열 수
+없으며, OpenBao가 unseal 시점에 그 장치를 새로 추가해야 하면 OpenBao는 봉인된
+상태로 남습니다.
+
+두 장치는 서로 다른 감사 장치이므로, 둘 사이의 전환 — `init`이 저장소를
+프로비저닝하거나 엔드포인트 호스트를 끄는 경우 — 은 다음 unseal에서 한
+장치를 비활성화하고 다른 장치를 활성화합니다. `stdout/`으로 돌아갈 때는
+디렉터리가 더 이상 마운트되지 않은 `file/`에 대해 sanity check 오류를 한 번
+기록한 뒤 그 장치를 비활성화합니다. 따로 할 일은 없습니다. **감사 장치마다
+HMAC salt가 따로 있으므로**, `stdout/`이 기록한 `hmac-sha256:` 값은 `file/`이
+기록하는 값과 비교할 수 없습니다. 해시로는 전환을 사이에 둔 토큰이나 값을
+대조할 수 없습니다.
+
+`bootroot init`은 파일 감사 장치가 활성 상태인지 확인합니다. 찾지 못하면
+(예: `openbao.hcl`에서 감사 스탠자가 제거된 경우) init은 실패합니다. 감사
+설정을 복원한 후 init을 다시 실행하세요.
+
+**일반 호스트의 보존.** 두 compose 파일 모두 OpenBao를 Docker의
+[`local` 로깅 드라이버](https://docs.docker.com/engine/logging/drivers/local/)로
+`max-size: 20m`, `max-file: 10`, `compress: true`와 함께 실행합니다. 로그
+내용 기준 최대 20 MiB인 세그먼트를 최대 10개까지 보존하므로 200 MiB가
+절대 상한이며, 로테이션된 세그먼트는 gzip으로 압축되므로 보통 디스크
+사용량은 그보다 훨씬 작습니다. OpenBao 서버 자체의 출력도 같은 예산을
+나눠 씁니다. 프로비저닝된 엔드포인트 호스트에서는 그 출력만 이곳으로 가고
+감사 기록은 저장소에 남습니다. 전달 방식은 Docker의 기본값인 `blocking`
+모드입니다. `non-blocking`은 드라이버가 뒤처질 때마다 링 버퍼에서 줄을
+버리기 때문입니다.
+
+두 상한은 compose 파일 옆의 `.env`에서 바꿀 수 있습니다. Docker Compose가
+이 파일을 읽으며, `infra install`은 그 키를 보존합니다.
+
+| `.env` 키 | 기본값 |
+| --- | --- |
+| `OPENBAO_LOG_MAX_SIZE` | `20m` |
+| `OPENBAO_LOG_MAX_FILES` | `10` |
+
+새 값은 OpenBao 컨테이너가 다음에 생성될 때 적용됩니다. bootroot는 이
+키를 쓰지도 검증하지도 않습니다. 잘못된 값은 Docker가 컨테이너를 생성할
+때 거부합니다.
+
+**일반 호스트가 보장하지 않는 것.** 컨테이너 로그는 상한이 있는
+기록이지, fail-closed 기록이 아닙니다.
+
+- `max-file`개의 세그먼트가 가득 차면 Docker는 가장 오래된 세그먼트를
+  조용히 버립니다.
+- 컨테이너를 제거하면 그 로그도 사라집니다. 이미지나 compose 정의의
+  변경으로 인한 것을 포함한 모든 재생성, `docker compose down`,
+  `bootroot clean`, `bootroot clean --openbao-only`, `bootroot reinit`이
+  모두 해당합니다. 이력이 필요하다면 먼저 내보내세요. 예:
+  `docker logs bootroot-openbao > openbao-audit.log`.
+- 드라이버가 한 줄을 저장하지 못하면 — 예를 들어 디스크가 가득 찬 경우 —
+  `dockerd`가 오류를 기록하고 그 줄을 버리며, OpenBao는 계속 요청을
+  처리합니다.
+
+fail-closed이면서 보존 상한이 있는 감사 저장이 필요한 호스트는 레지스트라
+엔드포인트의 감사 저장소를 사용합니다.
+
+이전 버전이 남긴 `openbao-audit` Docker 볼륨은 더 이상 마운트되지 않으며,
+어떤 bootroot 명령도 이를 제거하지 않습니다. 그 기록이 더 필요 없어지면
+직접 보관하거나 삭제하세요(`docker volume rm <project>_openbao-audit`).
+
+- **로테이션:** 일반 호스트에서는 위의 로깅 드라이버가 컨테이너 로그를
+  로테이션합니다. 프로비저닝된 레지스트라 엔드포인트 호스트에서는 배포
+  자체가 장치를 로테이션합니다. 그곳의 장치 디렉터리에 `logrotate`, tail
+  사이드카, 시그널을 **직접 사용하지 마세요.** 두 번째 로테이터는 동일한
+  활성 로그를 두고 경합하며 같은 `audit-*.log` 이름 공간에서 충돌합니다.
+  아래 [감사 장치 로테이션](#rotating-the-audit-device)을 참고하세요.
+- **확인:** `docker compose exec openbao bao audit list`는 `file` 유형의
+  장치를 정확히 하나 보여 줍니다. 일반 호스트에서는 `stdout/`, 프로비저닝된
+  레지스트라 엔드포인트 호스트에서는 `file/`입니다.
 
 #### 감사 장치 로테이션 {#rotating-the-audit-device}
 
@@ -271,8 +358,9 @@ truncate하지 않으므로 **단 한 바이트도 잃지 않습니다.** OpenBa
 **어떻게 확립하고, 어떻게 다시 확립하는가.** OpenBao가 `SIGHUP`에
 이 장치를 reopen한다는 것은 *이미지*에 대한 주장이므로 믿고 넘어가지
 않습니다. 고정된 태그인 **`openbao/openbao:2.5.5`**(`OPENBAO_IMAGE`로
-재정의 가능)에 대해 확립했으며, Docker E2E 라이프사이클이 **매 CI
-패스마다** 이를 다시 확립합니다. 그 검사는 활성 로그를 옆으로 rename하고,
+재정의 가능)에 대해 확립했으며, Docker E2E registrar-internal-init
+시나리오가 자신이 프로비저닝한 저장소 기반 장치에 대해 **모든 풀
+리퀘스트마다** 이를 다시 확립합니다. 그 검사는 활성 로그를 옆으로 rename하고,
 컨테이너에 시그널을 보내고, 경로가 다시 나타나기를 최대 30초 기다리고,
 새 파일이 *다른 아이노드*임을 확인하고, 감사 경로에 새 난수 nonce가
 담기는 인증된 읽기 하나를 발생시킨 뒤, 그 nonce가 새 활성 로그에 있고
@@ -287,7 +375,7 @@ rename된 세대에는 **없으며** 그 세대의 크기가 그대로임을 확
 사이의 모든 `docker exec` 시간만큼 더 기다리게 되고, 시그널 후 1분이
 지나서야 나타난 파일을 보고도 reopen이 확립되었다고 보고하기에 충분한
 시간입니다. 그런 이미지에서는 모든 로테이션이 손실 있는 형태로
-떨어집니다. 그리고 검사 자체도 정직하게 유지됩니다. 라이프사이클은 같은
+떨어집니다. 그리고 검사 자체도 정직하게 유지됩니다. 그 시나리오는 같은
 이미지의 대역 컨테이너 둘, 즉 주 프로세스가 `SIGHUP`을 무시하는 것과
 시그널을 받아들이되 예산이 지난 뒤에야 로그를 다시 만드는 것에 대해
 프로브를 실행하고, 둘 중 하나라도 reopen으로 보고되면 빌드를
@@ -300,7 +388,7 @@ rename된 세대에는 **없으며** 그 세대의 크기가 그대로임을 확
 그룹에서 시작되고 그룹 전체에 시그널이 전달되므로, 무언가를 띄운
 `docker exec`가 그 자식에게 파이프를 붙잡힌 채 남겨두지 않습니다. 그리고
 시그널 5초 뒤에는 조건 없는 kill이 뒤따르므로, 시그널을 무시하는 명령도
-결국 멈춥니다. 이 한정 자체도 프로브에 앞서 증명됩니다. 라이프사이클은
+결국 멈춥니다. 이 한정 자체도 프로브에 앞서 증명됩니다. 그 시나리오는
 시그널을 트랩하고 0으로 종료하는 명령에 대해 타임아웃이 보고되는지,
 그리고 시그널을 아예 무시하는 명령에 대해 타임아웃이 보고되면서 아무것도
 남지 않는지를 함께 확인합니다.
@@ -571,10 +659,12 @@ cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
 
 **레지스트라 엔드포인트가 없는 배포.** `[registrar_endpoint] enabled`가
 `true`가 아닌 곳에서는 위의 어느 것도 적용되지 않습니다. 로테이션
-작업은 시작되지 않고, 세 개의 설정 키는 아무 효과가 없으며,
-`/openbao/audit`는 여전히 `openbao-audit` 명명 볼륨이 뒷받침합니다.
-따라서 호스트 도구가 접근할 bind mount도 없고, 그 대신 사용할 외부
-로테이션을 권장하지도 않습니다.
+작업은 시작되지 않고, 세 개의 설정 키는 아무 효과가 없습니다.
+`/openbao/audit`에는 아무것도 마운트되지 않습니다. OpenBao는 `stdout`
+장치로 컨테이너 로그에 감사하며, Docker의 `local` 로깅 드라이버가 그
+로그의 상한을 두고 로테이션합니다([감사 로깅](#감사-로깅) 참고). 호스트
+도구가 접근할 파일은 없으며, 그 대신 사용할 외부 로테이션을 권장하지도
+않습니다.
 
 #### 레지스트라 동사 속도 제한 {#registrar-verb-rate-limiting}
 
@@ -1625,7 +1715,9 @@ rm <audit_store_dir>.img
 2. `state.json`의 `registrar_endpoint.enabled`를 `false`로 설정합니다.
 
 기록된 술어가 `false`가 되는 즉시 bring-up은 audit 오버라이드를 적용하지
-않으므로, OpenBao는 다음 재생성 때 `openbao-audit` 볼륨으로 돌아갑니다.
+않으므로, 다음 bring-up — 예를 들어 `bootroot infra up` — 은 OpenBao를
+재생성하기 전에 `openbao.hcl`을 `stdout` 장치로 되돌리고, OpenBao는 다시
+컨테이너 로그에 감사합니다.
 렌더링된 오버라이드는 두 출처가 `false`로 일치하는 것을 확인한 `init`이
 삭제할 때까지 디스크에 비활성 상태로 남습니다. 그 마지막 실행에도
 `--agent-config`가 필요합니다. 렌더링된 오버라이드가 있는 한 플래그는

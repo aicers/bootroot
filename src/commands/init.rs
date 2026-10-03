@@ -25,13 +25,19 @@ pub(crate) use constants::{
     RESPONDER_TEMPLATE_DIR, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
     STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
+#[cfg(test)]
+pub(crate) use paths::SHIPPED_COMPOSE_CONFIG;
 pub(crate) use paths::{
-    compose_has_openbao, compose_has_responder, compose_has_stepca, to_container_path,
+    ComposeServices, compose_has_openbao, compose_has_responder, compose_has_stepca,
+    compose_up_reaches_service, to_container_path,
 };
 pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,
 };
-pub(crate) use steps::openbao_tls::{reissue_openbao_tls_cert, write_openbao_hcl_plaintext};
+pub(crate) use steps::openbao_tls::{
+    OpenBaoAuditDevice, reissue_openbao_tls_cert, sync_openbao_audit_device,
+    write_openbao_hcl_plaintext,
+};
 pub(crate) use steps::registrar_internal;
 pub(crate) use steps::stepca_setup::set_acme_cert_duration;
 pub(crate) use steps::{

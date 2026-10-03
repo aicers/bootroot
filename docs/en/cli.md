@@ -2938,10 +2938,10 @@ operator-managed runbook for those.
   bind/advertise, `infra_certs` count) so the operator can verify the
   recovery target before confirming. Without `--yes`, prompts for
   confirmation.
-- Stops and removes the `bootroot-openbao` container and the
-  `openbao-data` / `openbao-audit` volumes (the project's other named
-  volumes — `postgres-data`, `prometheus-data`, `grafana-data` — are
-  not touched).
+- Stops and removes the `bootroot-openbao` container, together with
+  its container log, and the `openbao-data` volume (the project's other
+  named volumes — `postgres-data`, `prometheus-data`, `grafana-data` —
+  are not touched).
 - Removes only OpenBao runtime/bootstrap artifacts:
   `secrets/openbao/unseal-keys.txt`, the generated infra OpenBao Agent
   config trees under `secrets/openbao/{stepca,responder}`,

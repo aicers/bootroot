@@ -26,9 +26,9 @@ telemetry {
 
 audit {
   type = "file"
-  path = "file"
+  path = "stdout"
   options {
-    file_path = "/openbao/audit/audit.log"
+    file_path = "stdout"
   }
 }
 

@@ -214,10 +214,11 @@ pub(super) struct OpenBaoTlsTransition<'a> {
     /// transitions the same listener to TLS without publishing a port.
     override_path: Option<&'a Path>,
     /// The rendered audit override, when this host provisioned the
-    /// shared audit store. It rebinds `/openbao/audit` onto
-    /// `<audit_store_dir>/openbao`, so the recreated container comes up
-    /// writing its file audit device into the store rather than into
-    /// the `openbao-audit` named volume.
+    /// shared audit store. It bind-mounts `<audit_store_dir>/openbao` at
+    /// `/openbao/audit`, so the recreated container comes up writing its
+    /// store-backed `file` audit device into the store. Without it
+    /// nothing is mounted there, and `openbao.hcl` declares the `stdout`
+    /// device, which audits to the container log.
     audit_override_path: Option<&'a Path>,
     /// The URL that is about to be written to `state.openbao_url`, i.e.
     /// `client_url_from_bind_addr(&bind_addr)` — never the advertise

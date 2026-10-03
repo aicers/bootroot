@@ -2336,6 +2336,27 @@ mod tests {
         );
     }
 
+    /// Both locales name the one `OpenBao` volume `reinit` removes, and
+    /// neither names the audit volume no compose file declares any more.
+    #[test]
+    fn write_reinit_plan_names_only_the_openbao_data_volume_in_every_locale() {
+        for locale in ["en", "ko"] {
+            let messages = crate::i18n::Messages::new(locale).expect("locale");
+            let mut buf = Vec::new();
+            write_reinit_plan(
+                &mut buf,
+                &DeploymentIntent::default(),
+                Path::new("secrets"),
+                DEFAULT_OPENBAO_CONTAINER,
+                &messages,
+            )
+            .expect("write plan");
+            let rendered = String::from_utf8(buf).expect("utf-8 plan");
+            assert!(rendered.contains("openbao-data"), "{locale}:\n{rendered}");
+            assert!(!rendered.contains("openbao-audit"), "{locale}:\n{rendered}");
+        }
+    }
+
     /// The dry-run plan must surface both destructive actions and
     /// preserved artifacts so the operator can see, before confirming,
     /// what will be wiped versus what will survive.  Asserts both
@@ -2361,8 +2382,12 @@ mod tests {
             "missing destructive heading; got:\n{rendered}"
         );
         assert!(
-            rendered.contains("openbao-data") && rendered.contains("openbao-audit"),
+            rendered.contains("openbao-data"),
             "missing volume-wipe bullet; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("openbao-audit"),
+            "the plan names a volume that is no longer created; got:\n{rendered}"
         );
 
         // Preserved section + sentinel preserved artifacts.

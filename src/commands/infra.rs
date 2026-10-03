@@ -37,10 +37,11 @@ use crate::commands::guardrails::{
     write_stepca_exposed_override,
 };
 use crate::commands::init::{
-    DEFAULT_KV_MOUNT, HTTP01_ADMIN_INFRA_CERT_KEY, HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_INFRA_CERT_KEY, RESPONDER_COMPOSE_OVERRIDE_NAME,
+    ComposeServices, DEFAULT_KV_MOUNT, HTTP01_ADMIN_INFRA_CERT_KEY,
+    HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
+    OPENBAO_INFRA_CERT_KEY, OpenBaoAuditDevice, RESPONDER_COMPOSE_OVERRIDE_NAME,
     RESPONDER_CONFIG_DIR, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME, compose_has_responder,
-    compose_has_stepca,
+    compose_has_stepca, compose_up_reaches_service, sync_openbao_audit_device,
 };
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::commands::openbao_url::effective_openbao_url;
@@ -48,6 +49,8 @@ use crate::i18n::Messages;
 use crate::state::{RegistrarEndpointState, StateFile};
 
 const DEFAULT_GRAFANA_ADMIN_PASSWORD: &str = "admin";
+/// The compose service whose audit device follows the audit override.
+const OPENBAO_SERVICE: &str = "openbao";
 // Keep in sync with docker-compose.yml POSTGRES_USER / POSTGRES_DB.
 const DEFAULT_POSTGRES_USER: &str = "step";
 const DEFAULT_POSTGRES_DB: &str = "stepca";
@@ -142,6 +145,84 @@ fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
     files
 }
 
+/// Returns the project a compose file defines, as `docker compose config
+/// --format json` prints it; see [`read_compose_config`].
+pub(crate) type ReadComposeConfig<'a> = dyn Fn(&Path) -> Result<String> + 'a;
+
+/// Sets `openbao.hcl`'s audit device for a `docker compose up` of
+/// `services` against `compose_file`, before that invocation runs.
+///
+/// The store-backed `file` device when the invocation includes the audit
+/// override, passed as `audit_override`, and the `stdout` device
+/// otherwise. Does nothing when the invocation does not bring up
+/// `openbao`, neither by name nor as a dependency of a listed service:
+/// that `up` leaves the running container, and the configuration it
+/// loaded, alone.
+///
+/// Unless `services` names `openbao`, whether the invocation reaches it
+/// is read from the project as Compose itself resolves it, which
+/// `read_config` returns: [`read_compose_config`] in production, a
+/// fixture in tests.
+///
+/// # Errors
+///
+/// Returns an error when `read_config` fails or returns no readable
+/// project, when a service on the way depends on a name that leaves
+/// unknown whether the invocation reaches `openbao`, or when
+/// [`sync_openbao_audit_device`] refuses or fails to write `openbao.hcl`.
+pub(crate) fn sync_openbao_audit_device_for_up(
+    compose_file: &Path,
+    services: &[String],
+    audit_override: Option<&Path>,
+    read_config: &ReadComposeConfig<'_>,
+    messages: &Messages,
+) -> Result<()> {
+    let reaches_openbao = services.iter().any(|service| service == OPENBAO_SERVICE) || {
+        let compose_path = compose_file.display().to_string();
+        let config = ComposeServices::from_config_json(&read_config(compose_file)?)
+            .with_context(|| messages.error_compose_config_unreadable(&compose_path))?;
+        compose_up_reaches_service(&config, services, OPENBAO_SERVICE).map_err(|unresolved| {
+            anyhow::anyhow!(
+                messages.error_compose_dependencies_unresolved(&compose_path, &unresolved.service)
+            )
+        })?
+    };
+    if !reaches_openbao {
+        return Ok(());
+    }
+    sync_openbao_audit_device(
+        &crate::commands::compose_file::compose_file_dir(compose_file),
+        OpenBaoAuditDevice::for_audit_override(audit_override.is_some()),
+        messages,
+    )
+}
+
+/// Returns `docker compose config --no-interpolate --format json` of
+/// `compose_file`: its services with every dependency Compose derives,
+/// implicit ones included, normalized into `depends_on`.
+///
+/// The command reads the compose file and starts nothing. It runs
+/// without interpolation, so the variables the `up` itself is handed —
+/// `GRAFANA_ADMIN_PASSWORD` and the like — need not be supplied here,
+/// and the dependency graph it prints does not depend on the identity it
+/// is scoped to.
+///
+/// # Errors
+///
+/// Returns an error when the compose identity cannot be resolved or
+/// `docker compose config` cannot be run or exits unsuccessfully, for
+/// example on an invalid compose file.
+pub(crate) fn read_compose_config(compose_file: &Path, messages: &Messages) -> Result<String> {
+    let identity = ComposeIdentity::resolve(compose_file, None, messages)?;
+    docker_compose_output(
+        compose_file,
+        &identity,
+        None,
+        &["config", "--no-interpolate", "--format", "json"],
+        messages,
+    )
+}
+
 /// Determines whether `infra install` runs the preliminary `docker compose
 /// pull --ignore-pull-failures` before `up`.
 ///
@@ -170,11 +251,15 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     // This runs before even a Compose pull. Filesystem mode renders and
     // verifies the reserve phases here and refuses every result short of
     // enforced, so Docker cannot start OpenBao against an unmounted store.
-    let audit_override = crate::commands::audit_store::prepare_audit_store_for_infra_up(
+    // The audit device in `openbao.hcl` is set to match whether the
+    // override below is applied, before any Docker call too.
+    let audit_override = crate::commands::audit_store::prepare_openbao_audit_for_infra_up(
         &state_path,
         &args.compose_file.compose_file,
         args.agent_config.as_deref(),
         crate::commands::audit_store::production_uid(),
+        &args.services,
+        &|compose_file| read_compose_config(compose_file, messages),
         messages,
     )?;
     // Skip responder overrides when the compose file does not declare
@@ -649,6 +734,19 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     // localhost ports regardless of whether an override intent was
     // recorded.
     preflight_compose_published_ports(&args.services, host_ports)?;
+
+    // The base-only `up` below never carries the audit override, so
+    // OpenBao audits through the `stdout` device. On an initialised
+    // registrar endpoint host this drops the store bind, and the
+    // store-backed `file` device would start with no directory and leave
+    // OpenBao sealed.
+    sync_openbao_audit_device_for_up(
+        &args.compose_file.compose_file,
+        &args.services,
+        None,
+        &|compose_file| read_compose_config(compose_file, messages),
+        messages,
+    )?;
 
     // Load local images or pull + build.
     let loaded_archives = if let Some(dir) = args.image_archive_dir.as_deref() {
@@ -3063,6 +3161,241 @@ mod tests {
             registrar_endpoint_domain: None,
             no_build: false,
         }
+    }
+
+    /// The audit stanza lines of the two devices, as the canonical
+    /// `openbao.hcl` and the sync spell them.
+    const STDOUT_DEVICE_LINES: [&str; 2] =
+        ["  path = \"stdout\"\n", "    file_path = \"stdout\"\n"];
+    const STORE_DEVICE_LINES: [&str; 2] = [
+        "  path = \"file\"\n",
+        "    file_path = \"/openbao/audit/audit.log\"\n",
+    ];
+
+    /// A compose directory holding the shipped compose file and an
+    /// `openbao.hcl` that declares the store-backed device.
+    fn audit_device_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let compose_file = dir.path().join("docker-compose.yml");
+        std::fs::copy(repo.join("docker-compose.yml"), &compose_file).unwrap();
+        std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let hcl = dir.path().join("openbao/openbao.hcl");
+        let canonical = std::fs::read_to_string(repo.join("openbao/openbao.hcl")).unwrap();
+        std::fs::write(
+            &hcl,
+            canonical
+                .replace(STDOUT_DEVICE_LINES[0], STORE_DEVICE_LINES[0])
+                .replace(STDOUT_DEVICE_LINES[1], STORE_DEVICE_LINES[1]),
+        )
+        .unwrap();
+        (dir, compose_file, hcl)
+    }
+
+    fn declares(hcl: &Path, lines: [&str; 2]) -> bool {
+        let content = std::fs::read_to_string(hcl).unwrap();
+        lines.iter().all(|line| content.contains(line))
+    }
+
+    /// Stands in for `docker compose config` of the shipped compose file.
+    fn shipped_config() -> impl Fn(&Path) -> Result<String> {
+        |_| Ok(crate::commands::init::SHIPPED_COMPOSE_CONFIG.to_string())
+    }
+
+    /// A bring-up that names `openbao` needs no project to know it is
+    /// reached, so it must not run `docker compose config` at all.
+    fn no_config(compose_file: &Path) -> Result<String> {
+        panic!("read the project of {}", compose_file.display())
+    }
+
+    /// `infra install` passes no audit override, so its base-only `up`
+    /// lands on the `stdout` device even over an `openbao.hcl` an
+    /// endpoint host's `init` left on the store-backed one.
+    #[test]
+    fn install_bring_up_sets_the_stdout_device() {
+        let messages = test_messages();
+        for services in [default_infra_services(), vec!["openbao".to_string()]] {
+            let (_dir, compose_file, hcl) = audit_device_fixture();
+            sync_openbao_audit_device_for_up(
+                &compose_file,
+                &services,
+                None,
+                &shipped_config(),
+                &messages,
+            )
+            .unwrap();
+            assert!(declares(&hcl, STDOUT_DEVICE_LINES), "{services:?}");
+        }
+    }
+
+    #[test]
+    fn a_bring_up_with_the_audit_override_sets_the_store_device() {
+        let messages = test_messages();
+        let (dir, compose_file, hcl) = audit_device_fixture();
+        let override_path = dir
+            .path()
+            .join("secrets/openbao/docker-compose.openbao-audit.yml");
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &["openbao".to_string()],
+            None,
+            &no_config,
+            &messages,
+        )
+        .unwrap();
+        assert!(declares(&hcl, STDOUT_DEVICE_LINES));
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &["openbao".to_string()],
+            Some(&override_path),
+            &no_config,
+            &messages,
+        )
+        .unwrap();
+        assert!(declares(&hcl, STORE_DEVICE_LINES));
+    }
+
+    /// A service that depends on `openbao` brings it up too, so the
+    /// device follows that invocation as well.
+    #[test]
+    fn a_bring_up_reaching_openbao_through_a_dependency_sets_the_device() {
+        let messages = test_messages();
+        let (_dir, compose_file, hcl) = audit_device_fixture();
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &["prometheus".to_string()],
+            None,
+            &shipped_config(),
+            &messages,
+        )
+        .unwrap();
+        assert!(declares(&hcl, STDOUT_DEVICE_LINES));
+    }
+
+    /// The project Compose resolves decides, not the compose file's
+    /// spelling: a dependency only `network_mode: service:openbao`
+    /// declares, under a quoted `"services":` key, still syncs. A
+    /// dependency left as a variable reference, a project that cannot be
+    /// read and a failing `docker compose config` all refuse the
+    /// bring-up in both locales before `openbao.hcl` is touched — on an
+    /// endpoint host switched off, a miss would recreate `OpenBao`
+    /// without the bind while the file device stays.
+    #[test]
+    fn a_bring_up_follows_the_project_compose_resolves_or_refuses() {
+        let implicit = |_: &Path| -> Result<String> {
+            Ok(r#"{"services": {
+                "openbao": {},
+                "app": {"depends_on": {"openbao": {"condition": "service_started"}}, "network_mode": "service:openbao"}
+            }}"#
+            .to_string())
+        };
+        let (_dir, compose_file, hcl) = audit_device_fixture();
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &["app".to_string()],
+            None,
+            &implicit,
+            &test_messages(),
+        )
+        .unwrap();
+        assert!(declares(&hcl, STDOUT_DEVICE_LINES));
+
+        let uninterpolated = |_: &Path| -> Result<String> {
+            Ok(r#"{"services": {
+                "openbao": {},
+                "app": {"depends_on": {"${TARGET}": {"condition": "service_started"}}}
+            }}"#
+            .to_string())
+        };
+        let unreadable = |_: &Path| -> Result<String> { Ok("{}".to_string()) };
+        let failing = |_: &Path| -> Result<String> { anyhow::bail!("docker compose failed: boom") };
+        let readers: [(&str, &ReadComposeConfig<'_>, [&str; 2]); 3] = [
+            (
+                "uninterpolated",
+                &uninterpolated,
+                ["refusing to bring it up", "기동을 거부합니다"],
+            ),
+            (
+                "unreadable",
+                &unreadable,
+                ["did not return a project", "프로젝트를 반환하지 않았습니다"],
+            ),
+            ("failing", &failing, ["boom", "boom"]),
+        ];
+        let (_dir, compose_file, hcl) = audit_device_fixture();
+        let before = std::fs::read_to_string(&hcl).unwrap();
+        for (case, reader, markers) in readers {
+            for (locale, marker) in ["en", "ko"].into_iter().zip(markers) {
+                let messages = crate::i18n::Messages::new(locale).unwrap();
+                let err = sync_openbao_audit_device_for_up(
+                    &compose_file,
+                    &["app".to_string()],
+                    None,
+                    reader,
+                    &messages,
+                )
+                .expect_err(case);
+                let err = format!("{err:#}");
+                assert!(err.contains(marker), "{case} {locale}: {err}");
+                if case != "failing" {
+                    assert!(
+                        err.contains(&compose_file.display().to_string()),
+                        "{case} {locale}: {err}"
+                    );
+                }
+                if case == "uninterpolated" {
+                    assert!(err.contains("app"), "{case} {locale}: {err}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&hcl).unwrap(),
+                    before,
+                    "{case} {locale}"
+                );
+            }
+        }
+    }
+
+    /// An `up` that does not bring up `openbao` leaves `openbao.hcl`
+    /// alone — even when it is not what an `up` of `openbao` would
+    /// write, and even when it is not a recognised stanza at all.
+    #[test]
+    fn a_bring_up_without_openbao_leaves_the_hcl_untouched() {
+        let messages = test_messages();
+        let services: Vec<String> = ["postgres", "step-ca", "bootroot-http01"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (_dir, compose_file, hcl) = audit_device_fixture();
+        let before = std::fs::read_to_string(&hcl).unwrap();
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &services,
+            None,
+            &shipped_config(),
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&hcl).unwrap(), before);
+
+        std::fs::write(&hcl, "hand edited\n").unwrap();
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &services,
+            None,
+            &shipped_config(),
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&hcl).unwrap(), "hand edited\n");
+        sync_openbao_audit_device_for_up(
+            &compose_file,
+            &["openbao".to_string()],
+            None,
+            &no_config,
+            &messages,
+        )
+        .expect_err("a bring-up of openbao refuses the hand edit");
+        assert_eq!(std::fs::read_to_string(&hcl).unwrap(), "hand edited\n");
     }
 
     /// An invalid identity must be rejected before any side effect, so

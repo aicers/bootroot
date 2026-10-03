@@ -553,6 +553,20 @@ impl Messages {
         self.strings().error_openbao_hcl_write_failed
     }
 
+    pub(crate) fn error_openbao_hcl_audit_stanza_unrecognized(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_hcl_audit_stanza_unrecognized,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn info_openbao_audit_device_set(&self, device: &str, path: &str) -> String {
+        format_template(
+            self.strings().info_openbao_audit_device_set,
+            &[("device", device), ("path", path)],
+        )
+    }
+
     pub(crate) fn info_http01_admin_tls_reverted(&self) -> &'static str {
         self.strings().info_http01_admin_tls_reverted
     }

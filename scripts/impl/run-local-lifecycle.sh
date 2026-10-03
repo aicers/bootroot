@@ -104,6 +104,9 @@ RUNTIME_ROTATE_SECRET_ID=""
 INFRA_ROTATE_ROLE_ID=""
 INFRA_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
+# The client token `drive_openbao_audit_traffic` minted, which the audit
+# assertion requires to appear in the container log only as its HMAC.
+OPENBAO_AUDIT_DRIVEN_TOKEN=""
 OPENBAO_RECOVERY_OUTPUT_FILE="$ARTIFACT_DIR/openbao-recovery.json"
 # Each host-daemon bootroot-agent's fast-poll loop (default
 # fast_poll_interval = 30s) is the only propagation route for rotated
@@ -1364,46 +1367,32 @@ write_manifest() {
 EOF
 }
 
-# Establishes the reopen against the running image, proves the check
-# that establishes it can go red, and then holds the device to the
-# unmodified audit-log assertion.
+# Holds this endpoint-disabled deployment's audit device — the `stdout`
+# one, since nothing here renders the audit override — to the shared
+# assertion in its `docker logs` form, after checking the container
+# carries the bounded `local` logging driver and nothing at
+# `/openbao/audit`.
 #
-# The order is the point. `bootroot-agent` rotates this device by
-# renaming the active log aside and signalling the container, and that
-# is lossless only where the image honours `SIGHUP`; where it does not,
-# every rotation silently degrades to a copy-and-truncate that destroys
-# the records written while the copy runs. Re-establishing it on every
-# lifecycle pass is what turns an `OPENBAO_IMAGE` bump that breaks the
-# reopen into a red build rather than a quiet loss of audit records.
+# The container log is scoped to the container, so a recreate leaves
+# nothing of what came before it; the rotations above recreate OpenBao.
+# A fresh AppRole login and KV read are therefore driven first, after
+# the last of them.
 #
-# The audit-log assertion then runs *after* a signal-form rotation has
-# occurred, against the active log OpenBao created — with a fresh
-# AppRole login and KV read driven into it first, since the entries it
-# looks for went into the renamed generation.
+# The reopen-on-signal probe no longer runs here: there is no file
+# device on this host to rotate. It runs in the registrar-internal-init
+# arm, against the store-backed device `bootroot-agent` rotates.
 assert_openbao_audit_device() {
   local container="${RUN_INSTANCE}-openbao"
 
-  log_phase "assert-openbao-audit-reopen"
-  # Before the probe itself, the bound every one of its waits runs
-  # under: a bound a command can decline is a probe that hangs, and one
-  # that answers with the command's own status for a wait its budget
-  # already closed.
-  assert_openbao_audit_bound_stops_a_command_that_will_not_stop
-  assert_openbao_audit_reopen "$container" "$OPENBAO_URL" \
-    "$RUNTIME_ROTATE_ROLE_ID" "$RUNTIME_ROTATE_SECRET_ID"
-  assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target \
-    "$container" "$OPENBAO_URL"
-  assert_openbao_audit_reopen_probe_refutes_a_late_reopen \
-    "$container" "$OPENBAO_URL"
-
   log_phase "assert-openbao-audit-log"
+  assert_openbao_stdout_audit_container "$container"
   drive_openbao_audit_traffic
-  assert_openbao_audit_log "$container"
+  assert_openbao_audit_docker_logs "$container" "$OPENBAO_AUDIT_DRIVEN_TOKEN"
 }
 
-# Drives one AppRole login and one KV read, so the active log OpenBao
-# created after the reopen carries both of the entries
-# `assert_openbao_audit_log` looks for.
+# Drives one AppRole login and one KV read after the last recreate of
+# OpenBao, so the container log of the container now running carries
+# both of the entries `assert_openbao_audit_docker_logs` looks for.
 #
 # The `secret_id` and the token it mints reach `curl` over a pipe rather
 # than in `argv`, the same way the reopen probe hands them over: `ps`
@@ -1420,6 +1409,8 @@ drive_openbao_audit_traffic() {
         --data @- "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
   )"
   [ -n "$token" ] || fail "the post-rotation AppRole login returned no token"
+  # Kept for the assertion, which checks the log never carries it raw.
+  OPENBAO_AUDIT_DRIVEN_TOKEN="$token"
   openbao_audit_curl_header_config "X-Vault-Token: ${token}" |
     curl -sS -o /dev/null --config - "${url}/v1/secret/data/bootroot" ||
     fail "the post-rotation KV read could not be driven"

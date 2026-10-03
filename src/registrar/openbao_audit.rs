@@ -140,8 +140,9 @@ use crate::registrar::audit_store::OPENBAO_CONTAINER_AUDIT_DIR;
 #[cfg(test)]
 mod tests;
 
-/// The name `openbao/openbao.hcl`'s `file_path` gives the device's
-/// active log. Fixed: this module does not edit that stanza.
+/// The name the store-backed `file` audit device's `file_path` gives its
+/// active log, under [`OPENBAO_CONTAINER_AUDIT_DIR`]. Fixed: this module
+/// does not edit that stanza.
 pub const ACTIVE_FILE_NAME: &str = "audit.log";
 
 /// The prefix every rotated generation's name starts with.

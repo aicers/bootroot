@@ -3,10 +3,21 @@
 #
 # Sourced by lifecycle harnesses to verify, against the real OpenBao
 # container, that the declarative `audit { type = "file" ... }` stanza
-# in `openbao/openbao.hcl` actually produces an audit log at runtime
-# and that the log captures representative AppRole login + KV read
-# events. Callers must define a `fail` function that aborts the
-# harness with a message; this helper invokes it on any failed check.
+# in `openbao/openbao.hcl` actually produces audit records at runtime
+# and that they capture representative AppRole login + KV read events.
+# Callers must define a `fail` function that aborts the harness with a
+# message; this helper invokes it on any failed check.
+#
+# That stanza declares one of two devices. Without the audit override —
+# on every host that does not carry the registrar endpoint, and on an
+# endpoint host before `init` — it is the `stdout` device, whose records
+# go to the container log and are read back through `docker logs`
+# (`assert_openbao_audit_docker_logs`). Exactly when the audit override
+# bind-mounts the registrar endpoint's audit store at `/openbao/audit`,
+# it is the store-backed `file` device writing
+# `/openbao/audit/audit.log`, read back through `docker exec`
+# (`assert_openbao_audit_log`) and rotated by `bootroot-agent`, whose
+# reopen-on-signal the probe below establishes.
 
 OPENBAO_AUDIT_CONTAINER_DEFAULT="bootroot-openbao"
 OPENBAO_AUDIT_LOG_PATH_DEFAULT="/openbao/audit/audit.log"
@@ -37,6 +48,94 @@ assert_openbao_audit_log() {
   fi
 }
 
+# The `docker logs` form of the assertion above, for the `stdout`
+# device: the same three checks, read from the container log rather
+# than from a file inside the container — at least one audit record,
+# at least one `"type":"response"` entry for `auth/approle/login`, and
+# one for an `"operation":"read"` on a `secret/data/...` path.
+#
+# The log is container-scoped: a recreate starts it empty, so the caller
+# drives the login and the read after the last recreate of OpenBao.
+#
+# Checks are added, because nothing else on such a host reads the
+# records back: the login response's client token is the HMAC OpenBao
+# writes by default (`hmac-sha256:...`), and — when the caller passes the
+# token it minted as the optional second argument — that token itself
+# appears nowhere in the log. The token reaches `grep` as a pattern file
+# on a pipe, never in `argv`, where `ps` would publish it.
+#
+# The log is captured to a file once and every check greps that file.
+# Grepping `docker logs` through a pipe would let a `grep` that stops at
+# its first match close the pipe under `docker logs`, which a harness
+# running with `pipefail` reports as a failed check.
+assert_openbao_audit_docker_logs() {
+  local container="${1:-$OPENBAO_AUDIT_CONTAINER_DEFAULT}" secret="${2:-}"
+  local logs status=0
+
+  logs="$(mktemp "${TMPDIR:-/tmp}/bootroot-openbao-audit-logs.XXXXXX")" ||
+    fail "could not create a file to capture ${container}'s log in"
+  docker logs "$container" >"$logs" 2>&1 || status=$?
+  if [ "$status" -ne 0 ]; then
+    rm -f "$logs"
+    fail "could not read the container log of ${container}"
+  fi
+
+  if ! grep -E '"type":"(request|response)"' "$logs" >/dev/null; then
+    rm -f "$logs"
+    fail "openbao container log carries no audit record: docker logs ${container}"
+  fi
+
+  if ! grep -F '"type":"response"' "$logs" |
+      grep -F '"path":"auth/approle/login"' >/dev/null; then
+    rm -f "$logs"
+    fail "openbao container log missing AppRole login response entry: docker logs ${container}"
+  fi
+
+  if ! grep -F '"type":"response"' "$logs" | grep -F '"operation":"read"' |
+      grep -E '"path":"secret/data/' >/dev/null; then
+    rm -f "$logs"
+    fail "openbao container log missing KV read response entry (operation=read on secret/data/...): docker logs ${container}"
+  fi
+
+  if ! grep -F '"type":"response"' "$logs" | grep -F '"path":"auth/approle/login"' |
+      grep -E '"client_token":"hmac-sha256:' >/dev/null; then
+    rm -f "$logs"
+    fail "openbao container log carries no HMAC'd client token in an AppRole login response: docker logs ${container}"
+  fi
+
+  if [ -n "$secret" ] && printf '%s\n' "$secret" | grep -F -f - "$logs" >/dev/null; then
+    rm -f "$logs"
+    fail "openbao container log carries a client token in the clear: docker logs ${container}"
+  fi
+  rm -f "$logs"
+}
+
+# Asserts that a container runs the `stdout` device's storage layout:
+# Docker's `local` logging driver with the bounded, compressed rotation
+# both compose files declare and the default (blocking) delivery mode,
+# and nothing mounted at `/openbao/audit`.
+#
+# Usage:
+#   assert_openbao_stdout_audit_container <container> [max-size] [max-file]
+assert_openbao_stdout_audit_container() {
+  local container="$1" max_size="${2:-20m}" max_file="${3:-10}" config mounts
+
+  config="$(docker inspect -f \
+    '{{.HostConfig.LogConfig.Type}} max-size={{index .HostConfig.LogConfig.Config "max-size"}} max-file={{index .HostConfig.LogConfig.Config "max-file"}} compress={{index .HostConfig.LogConfig.Config "compress"}} mode={{index .HostConfig.LogConfig.Config "mode"}}' \
+    "$container")" || fail "could not inspect the logging driver of ${container}"
+  case "$config" in
+    "local max-size=${max_size} max-file=${max_file} compress=true mode=") ;;
+    "local max-size=${max_size} max-file=${max_file} compress=true mode=<no value>") ;;
+    *) fail "${container} does not log through the bounded local driver: ${config}" ;;
+  esac
+
+  mounts="$(docker inspect -f \
+    '{{range .Mounts}}{{if eq .Destination "/openbao/audit"}}{{.Type}} {{.Source}}{{end}}{{end}}' \
+    "$container")" || fail "could not inspect the mounts of ${container}"
+  [ -z "$mounts" ] ||
+    fail "${container} has a mount at /openbao/audit without the audit override: ${mounts}"
+}
+
 # ---------------------------------------------------------------------
 # The reopen-on-signal probe
 # ---------------------------------------------------------------------
@@ -50,7 +149,9 @@ assert_openbao_audit_log() {
 # signal.
 #
 # So the claim is established here, against whatever image is actually
-# running, on every lifecycle pass — rather than once, in a document
+# running, on every pull request — in the registrar-internal-init arm,
+# against the store-backed `file` device, which is the only device
+# `bootroot-agent` rotates — rather than once, in a document
 # that goes stale at the next image bump while every rotation silently
 # degrades to the lossy copy-and-truncate fallback. The wiring is the
 # point: a bump that breaks the reopen fails the build.
@@ -207,9 +308,15 @@ openbao_audit_container_state() {
 }
 
 # Reports the seal state as `sealed=<bool> initialized=<bool>`.
+#
+# The optional second argument is a CA bundle the listener's certificate
+# is verified against, for an OpenBao that answers only over TLS.
 openbao_audit_seal_state() {
-  local url="${1%/}"
-  curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" "${url}/v1/sys/seal-status" |
+  local url="${1%/}" ca="${2:-}"
+  local -a tls=()
+  [ -z "$ca" ] || tls=(--cacert "$ca")
+  curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" ${tls[@]+"${tls[@]}"} \
+    "${url}/v1/sys/seal-status" |
     jq -r '"sealed=\(.sealed) initialized=\(.initialized)"'
 }
 
@@ -249,7 +356,12 @@ openbao_audit_free_generation() {
 # Runs the reopen protocol and answers 0 when it holds.
 #
 # Usage:
-#   openbao_audit_reopen_probe <container> <openbao-url> <role-id> <secret-id> [log-path]
+#   openbao_audit_reopen_probe <container> <openbao-url> <role-id> <secret-id> [log-path] [ca-bundle]
+#
+# `ca-bundle`, when given, is passed as `--cacert` to every `curl` call
+# the probe makes — the seal status, the AppRole login and the KV read —
+# for an OpenBao that answers only over TLS. Omitted, or empty, the calls
+# are made exactly as before. An empty `log-path` selects the default.
 #
 # Prints the reason on stderr and returns non-zero when it does not.
 # Restores the renamed generation whenever it stops with the configured
@@ -257,13 +369,15 @@ openbao_audit_free_generation() {
 # an audit log.
 openbao_audit_reopen_probe() {
   local container="$1" url="${2%/}" role_id="$3" secret_id="$4"
-  local path="${5:-$OPENBAO_AUDIT_LOG_PATH_DEFAULT}"
+  local path="${5:-$OPENBAO_AUDIT_LOG_PATH_DEFAULT}" ca="${6:-}"
+  local -a tls=()
   local dir generation old_id new_id moved_id
   local state_before state_after seal_before seal_after
   local gen_size gen_size_after nonce token status attempt moved
   local deadline now reappeared arrived
 
   dir="$(dirname "$path")"
+  [ -z "$ca" ] || tls=(--cacert "$ca")
 
   # "No container restart" is measured, not observed: the three fields
   # and the seal state are captured before and compared after.
@@ -271,7 +385,7 @@ openbao_audit_reopen_probe() {
     echo "probe: could not inspect ${container}" >&2
     return 1
   }
-  seal_before="$(openbao_audit_seal_state "$url")" || true
+  seal_before="$(openbao_audit_seal_state "$url" "$ca")" || true
   if [ "$seal_before" != "sealed=false initialized=true" ]; then
     echo "probe: OpenBao is not unsealed before the probe: ${seal_before}" >&2
     return 1
@@ -396,7 +510,7 @@ device on the signal" >&2
   # a header without spelling it on the command line.
   token="$(
     printf '{"role_id":"%s","secret_id":"%s"}' "$role_id" "$secret_id" |
-      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" ${tls[@]+"${tls[@]}"} \
         -X POST -H 'Content-Type: application/json' \
         --data @- "${url}/v1/auth/approle/login" | jq -r '.auth.client_token // empty'
   )"
@@ -406,7 +520,7 @@ device on the signal" >&2
   fi
   status="$(
     openbao_audit_curl_header_config "X-Vault-Token: ${token}" |
-      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" \
+      curl -sS --max-time "$OPENBAO_AUDIT_PROBE_STEP_SECONDS" ${tls[@]+"${tls[@]}"} \
         -o /dev/null -w '%{http_code}' --config - \
         "${url}/v1/secret/data/bootroot-audit-reopen-probe/${nonce}"
   )"
@@ -458,7 +572,7 @@ after the reopen" >&2
     echo "probe: the container was restarted: '${state_before}' became '${state_after}'" >&2
     return 1
   fi
-  seal_after="$(openbao_audit_seal_state "$url")" || true
+  seal_after="$(openbao_audit_seal_state "$url" "$ca")" || true
   if [ "$seal_after" != "sealed=false initialized=true" ]; then
     echo "probe: OpenBao is not unsealed after the probe: ${seal_after}" >&2
     return 1
@@ -513,8 +627,11 @@ OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS=40
 # The probe's status and combined output are left in
 # `OPENBAO_AUDIT_STANDIN_STATUS` and `OPENBAO_AUDIT_STANDIN_OUTPUT`,
 # since a function can return only one of the two.
+#
+# The optional fifth argument is the CA bundle the probe verifies the
+# reference deployment's TLS listener against.
 openbao_audit_run_against_standin() {
-  local reference="$1" url="$2" suffix="$3" script="$4"
+  local reference="$1" url="$2" suffix="$3" script="$4" ca="${5:-}"
   local image project standin
   local -a labels=()
 
@@ -536,7 +653,7 @@ openbao_audit_run_against_standin() {
   # The run stops at the reappearance budget, before it reaches the
   # credentials, so those are placeholders.
   OPENBAO_AUDIT_STANDIN_OUTPUT="$(
-    openbao_audit_reopen_probe "$standin" "$url" "role" "secret" 2>&1
+    openbao_audit_reopen_probe "$standin" "$url" "role" "secret" "" "$ca" 2>&1
   )" || OPENBAO_AUDIT_STANDIN_STATUS=$?
   docker rm -f "$standin" >/dev/null 2>&1 || true
 }
@@ -554,10 +671,11 @@ openbao_audit_run_against_standin() {
 # probe could not talk to.
 #
 # Usage:
-#   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target <reference-container> <url>
+#   assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target <reference-container> <url> [ca-bundle]
 assert_openbao_audit_reopen_probe_refutes_a_non_reopening_target() {
   openbao_audit_run_against_standin "$1" "$2" "reopen-probe-standin" \
-    'trap "" HUP; mkdir -p /openbao/audit; : > /openbao/audit/audit.log; while true; do sleep 1; done'
+    'trap "" HUP; mkdir -p /openbao/audit; : > /openbao/audit/audit.log; while true; do sleep 1; done' \
+    "${3:-}"
   if [ "$OPENBAO_AUDIT_STANDIN_STATUS" -eq 0 ]; then
     fail "the openbao audit reopen probe passed a target that does not reopen; the check that \
 guards the rotation mechanism cannot itself be trusted"
@@ -584,12 +702,12 @@ ${OPENBAO_AUDIT_STANDIN_OUTPUT}"
 # reporting an established reopen the budget it names refutes.
 #
 # Usage:
-#   assert_openbao_audit_reopen_probe_refutes_a_late_reopen <reference-container> <url>
+#   assert_openbao_audit_reopen_probe_refutes_a_late_reopen <reference-container> <url> [ca-bundle]
 assert_openbao_audit_reopen_probe_refutes_a_late_reopen() {
   openbao_audit_run_against_standin "$1" "$2" "late-reopen-probe-standin" \
     "mkdir -p /openbao/audit; : > /openbao/audit/audit.log; \
 trap 'sleep ${OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS}; : > /openbao/audit/audit.log' HUP; \
-while true; do sleep 1; done"
+while true; do sleep 1; done" "${3:-}"
   if [ "$OPENBAO_AUDIT_STANDIN_STATUS" -eq 0 ]; then
     fail "the openbao audit reopen probe established a reopen that arrived \
 ${OPENBAO_AUDIT_LATE_REOPEN_DELAY_SECONDS}s after the signal, past its \

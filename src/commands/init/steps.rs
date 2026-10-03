@@ -198,17 +198,38 @@ impl InitRollback {
             // forward path can fail before that (no unseal key source is
             // available), and tearing down a container this run never
             // touched would knock a healthy deployment offline.
-            let invocation = rollback_openbao_invocation(
-                &rollback_identity(compose_file, messages),
-                compose_file,
-            );
-            if let Err(err) = crate::commands::infra::run_compose_with_exec(
-                &invocation,
-                "docker compose up -d openbao (rollback)",
-                docker,
+            //
+            // The recreate is on the base compose file alone, without the
+            // audit override, so the restored HCL is set to the `stdout`
+            // device first: a store-backed `file` device would start with
+            // no `/openbao/audit` and leave OpenBao sealed. Only here —
+            // when the forward path failed before the recreate, the
+            // running container still matches the restored HCL, and a
+            // later restart must load the device its mounts carry.
+            match crate::commands::init::sync_openbao_audit_device(
+                &crate::commands::compose_file::compose_file_dir(compose_file),
+                crate::commands::init::OpenBaoAuditDevice::Stdout,
                 messages,
             ) {
-                eprintln!("Rollback: failed to recreate OpenBao: {err}");
+                Ok(()) => {
+                    let invocation = rollback_openbao_invocation(
+                        &rollback_identity(compose_file, messages),
+                        compose_file,
+                    );
+                    if let Err(err) = crate::commands::infra::run_compose_with_exec(
+                        &invocation,
+                        "docker compose up -d openbao (rollback)",
+                        docker,
+                        messages,
+                    ) {
+                        eprintln!("Rollback: failed to recreate OpenBao: {err}");
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Rollback: failed to set the OpenBao audit device; not recreating OpenBao: {err:#}"
+                    );
+                }
             }
         }
 
@@ -1116,6 +1137,100 @@ mod rollback_tests {
             !args_log.exists(),
             "rollback must not run docker against a container this run never recreated"
         );
+    }
+
+    /// The canonical `openbao.hcl` switched to the store-backed device,
+    /// as `init` leaves it on a registrar endpoint host.
+    fn store_device_hcl() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openbao/openbao.hcl"),
+        )
+        .unwrap()
+        .replace("  path = \"stdout\"\n", "  path = \"file\"\n")
+        .replace(
+            "    file_path = \"stdout\"\n",
+            "    file_path = \"/openbao/audit/audit.log\"\n",
+        )
+    }
+
+    /// Runs a rollback over a compose directory whose `openbao.hcl`
+    /// backup holds `original`, and returns the restored HCL and the
+    /// fake docker's argv log, if anything ran.
+    fn run_rollback_over_hcl(original: &str, openbao_recreated: bool) -> (String, Option<String>) {
+        use std::fs;
+
+        use super::test_support::write_self_contained_fake_docker;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+        fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let hcl_path = dir.path().join("openbao/openbao.hcl");
+        fs::write(&hcl_path, "tls_cert_file = ...\n").unwrap();
+
+        let rollback = InitRollback {
+            docker: Some(fake),
+            hcl_backup: Some(RollbackFile {
+                path: hcl_path.clone(),
+                original: Some(original.to_string()),
+            }),
+            compose_file: Some(dir.path().join("docker-compose.yml")),
+            openbao_recreated,
+            ..Default::default()
+        };
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(rollback.rollback(&client, "secret", &crate::i18n::test_messages()));
+        (
+            fs::read_to_string(&hcl_path).unwrap(),
+            fs::read_to_string(&args_log).ok(),
+        )
+    }
+
+    /// The rollback recreate runs on the base compose file, without the
+    /// audit override, so the restored HCL moves to the `stdout` device
+    /// before it.
+    #[test]
+    fn rollback_sets_the_stdout_device_before_recreating_openbao() {
+        let original = store_device_hcl();
+        let (restored, log) = run_rollback_over_hcl(&original, true);
+        assert!(restored.contains("  path = \"stdout\"\n"), "{restored}");
+        assert!(
+            restored.contains("    file_path = \"stdout\"\n"),
+            "{restored}"
+        );
+        assert_eq!(
+            restored,
+            original
+                .replace("  path = \"file\"\n", "  path = \"stdout\"\n")
+                .replace(
+                    "    file_path = \"/openbao/audit/audit.log\"\n",
+                    "    file_path = \"stdout\"\n"
+                )
+        );
+        let log = log.expect("the recreate ran");
+        assert!(log.contains("up -d openbao"), "{log}");
+    }
+
+    /// A forward path that failed before the recreate leaves the running
+    /// container on the restored HCL's device, so the HCL stays exactly
+    /// as restored.
+    #[test]
+    fn rollback_keeps_the_restored_device_when_this_run_did_not_recreate() {
+        let original = store_device_hcl();
+        let (restored, log) = run_rollback_over_hcl(&original, false);
+        assert_eq!(restored, original);
+        assert!(log.is_none(), "{log:?}");
+    }
+
+    /// An HCL whose audit stanza is not recognised is refused before the
+    /// recreate runs: it is neither rewritten nor recreated onto.
+    #[test]
+    fn rollback_does_not_recreate_onto_an_unrecognised_audit_stanza() {
+        let (restored, log) = run_rollback_over_hcl("hand edited\n", true);
+        assert_eq!(restored, "hand edited\n");
+        assert!(log.is_none(), "{log:?}");
     }
 
     /// Regression: rollback must restore the pre-TLS `state.json` so it

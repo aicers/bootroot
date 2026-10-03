@@ -40,6 +40,24 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_compose_dependencies_unresolved(
+        &self,
+        path: &str,
+        service: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_compose_dependencies_unresolved,
+            &[("path", path), ("service", service)],
+        )
+    }
+
+    pub(crate) fn error_compose_config_unreadable(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_compose_config_unreadable,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn infra_up_completed(&self) -> &'static str {
         self.strings().infra_up_completed
     }

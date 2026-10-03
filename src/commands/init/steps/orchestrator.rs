@@ -26,7 +26,7 @@ use super::openbao_setup::{
 };
 use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
-    write_openbao_hcl_with_tls,
+    write_openbao_hcl_for_tls_recreate,
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
 use super::prompts::{confirm_overwrite, should_confirm};
@@ -694,7 +694,8 @@ async fn run_init_inner(
     registrar_endpoint: Option<&EnabledEndpoint>,
     // The rendered audit override, when this host provisioned one.
     // Carried onto the `OpenBao` recreate below so the container comes
-    // up on the bind mount rather than the named volume.
+    // up on the store's bind mount, with the store-backed `file` audit
+    // device rather than the `stdout` one.
     audit_override: Option<&Path>,
 ) -> Result<InitSummary> {
     let bootstrap = bootstrap_openbao(client, args, messages).await?;
@@ -1250,7 +1251,9 @@ async fn run_init_inner(
             .tls_artifacts
             .push(compose_dir.join(OPENBAO_TLS_KEY_PATH));
 
-        write_openbao_hcl_with_tls(compose_dir, messages)?;
+        // The recreate below carries the audit override exactly when
+        // `audit_override` is set, so the audit device follows it.
+        write_openbao_hcl_for_tls_recreate(compose_dir, audit_override, messages)?;
 
         // Record the infra cert entry in state so the rotation
         // pipeline can renew it.

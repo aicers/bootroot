@@ -1,6 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 
 use super::constants::{
     OPENBAO_CONTAINER_PORT, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
@@ -114,6 +116,120 @@ fn compose_has_top_level_service(yaml: &str, service_name: &str) -> bool {
     }
     false
 }
+
+/// A project's services and the dependencies Compose resolved for each.
+///
+/// Read from `docker compose config --format json`, which normalizes
+/// every way Compose lets a service depend on another — `depends_on` in
+/// any YAML spelling, `links`, `volumes_from`, and a `network_mode`,
+/// `ipc` or `pid` of `service:<name>` — into one `depends_on` mapping,
+/// after resolving anchors, merge keys, `extends` and `include`. Reading
+/// that output rather than the compose file leaves no form for the
+/// answer to miss.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ComposeServices {
+    services: BTreeMap<String, NormalizedService>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NormalizedService {
+    depends_on: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+impl ComposeServices {
+    /// Parses the output of `docker compose config --format json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `json` is not a project with a `services`
+    /// mapping.
+    pub(crate) fn from_config_json(json: &str) -> serde_json::Result<Self> {
+        serde_json::from_str(json)
+    }
+}
+
+/// A `docker compose up` whose reach the normalized project cannot
+/// settle.
+///
+/// A service the invocation would converge depends on a name Compose
+/// left uninterpolated (`network_mode: service:${NAME}`, read with
+/// `--no-interpolate`), so whether `openbao` is among its dependencies
+/// is unknown. Callers refuse the invocation rather than guess: guessing
+/// wrong in either direction leaves `openbao.hcl` on a device that does
+/// not match the container's mounts.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct UnresolvedComposeDependencies {
+    /// The service whose dependencies are unresolved.
+    pub(crate) service: String,
+}
+
+/// Returns whether `docker compose up` of `services` against the
+/// project `config` brings up, and may therefore recreate, `target`.
+///
+/// An empty `services` list brings up every service the project
+/// declares. Otherwise `target` is reached when it is listed or when a
+/// listed service depends on it, directly or through another service:
+/// without `--no-deps`, Compose converges a service's dependencies too.
+///
+/// # Errors
+///
+/// Returns [`UnresolvedComposeDependencies`] when a service on the way
+/// depends on a name that still holds a `$` variable reference.
+pub(crate) fn compose_up_reaches_service(
+    config: &ComposeServices,
+    services: &[String],
+    target: &str,
+) -> std::result::Result<bool, UnresolvedComposeDependencies> {
+    if services.is_empty() {
+        return Ok(config.services.contains_key(target));
+    }
+    if services.iter().any(|service| service == target) {
+        return Ok(true);
+    }
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut pending: Vec<&str> = services.iter().map(String::as_str).collect();
+    while let Some(service) = pending.pop() {
+        if service == target {
+            return Ok(true);
+        }
+        if !visited.insert(service) {
+            continue;
+        }
+        // Undeclared: Compose itself refuses the invocation.
+        let Some(normalized) = config.services.get(service) else {
+            continue;
+        };
+        for dependency in normalized.depends_on.iter().flat_map(BTreeMap::keys) {
+            if dependency.contains('$') {
+                return Err(UnresolvedComposeDependencies {
+                    service: service.to_string(),
+                });
+            }
+            pending.push(dependency);
+        }
+    }
+    Ok(false)
+}
+
+/// The dependencies `docker compose config --no-interpolate --format
+/// json` reports for the shipped `docker-compose.yml` and
+/// `docker-compose.deploy.yml`, trimmed to what the check reads.
+#[cfg(test)]
+pub(crate) const SHIPPED_COMPOSE_CONFIG: &str = r#"{
+  "name": "bootroot",
+  "services": {
+    "bootroot-http01": {"image": "bootroot-http01"},
+    "grafana": {"depends_on": {"prometheus": {"condition": "service_started", "required": true}}},
+    "grafana-public": {"depends_on": {"prometheus": {"condition": "service_started", "required": true}}},
+    "openbao": {"image": "openbao/openbao:latest"},
+    "postgres": {"image": "postgres:16"},
+    "prometheus": {"depends_on": {
+      "openbao": {"condition": "service_started", "required": true},
+      "step-ca": {"condition": "service_started", "required": true}
+    }},
+    "step-ca": {"depends_on": {"postgres": {"condition": "service_healthy", "required": true}}}
+  }
+}"#;
 
 /// Resolves the responder admin URL, selecting `https://` when TLS is
 /// configured in the responder's `responder.toml`.
@@ -332,6 +448,139 @@ volumes:
     driver: local
 ";
         assert!(!compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    fn names(services: &[&str]) -> Vec<String> {
+        services
+            .iter()
+            .map(|service| (*service).to_string())
+            .collect()
+    }
+
+    fn config(json: &str) -> ComposeServices {
+        ComposeServices::from_config_json(json).expect("normalized compose config")
+    }
+
+    #[test]
+    fn compose_up_reaches_openbao_through_the_shipped_dependencies() {
+        let shipped = config(SHIPPED_COMPOSE_CONFIG);
+        for services in [
+            vec![],
+            vec!["openbao"],
+            vec!["postgres", "openbao"],
+            vec!["prometheus"],
+            // grafana -> prometheus -> openbao
+            vec!["grafana"],
+            vec!["grafana-public"],
+        ] {
+            assert_eq!(
+                compose_up_reaches_service(&shipped, &names(&services), "openbao"),
+                Ok(true),
+                "{services:?} must reach openbao"
+            );
+        }
+        for services in [
+            vec!["postgres"],
+            vec!["step-ca"],
+            vec!["bootroot-http01"],
+            vec!["postgres", "step-ca", "bootroot-http01"],
+            vec!["undeclared"],
+        ] {
+            assert_eq!(
+                compose_up_reaches_service(&shipped, &names(&services), "openbao"),
+                Ok(false),
+                "{services:?} must not reach openbao"
+            );
+        }
+    }
+
+    /// Compose folds every implicit dependency — `network_mode`, `ipc`
+    /// and `pid` of `service:<name>`, `links` and `volumes_from` — into
+    /// the normalized `depends_on`, so each reaches `openbao` here
+    /// although none spells `depends_on` in the compose file. This is the
+    /// output Compose produces for those forms under a quoted
+    /// `"services":` root key.
+    #[test]
+    fn compose_up_reaches_openbao_through_implicit_dependencies() {
+        let normalized = config(
+            r#"{
+  "services": {
+    "openbao": {"image": "openbao/openbao:latest"},
+    "net": {"depends_on": {"openbao": {"condition": "service_started", "required": true, "restart": true}}, "network_mode": "service:openbao"},
+    "ipc": {"depends_on": {"openbao": {"condition": "service_started", "required": true, "restart": true}}, "ipc": "service:openbao"},
+    "pid": {"depends_on": {"openbao": {"condition": "service_started", "required": true, "restart": true}}, "pid": "service:openbao"},
+    "linked": {"depends_on": {"openbao": {"condition": "service_started", "required": true, "restart": true}}, "links": ["openbao"]},
+    "volumes": {"depends_on": {"openbao": {"condition": "service_started", "required": true, "restart": false}}, "volumes_from": ["openbao"]},
+    "through": {"depends_on": {"net": {"condition": "service_started", "required": true}}},
+    "unrelated": {"depends_on": null}
+  }
+}"#,
+        );
+        for service in ["net", "ipc", "pid", "linked", "volumes", "through"] {
+            assert_eq!(
+                compose_up_reaches_service(&normalized, &names(&[service]), "openbao"),
+                Ok(true),
+                "{service}"
+            );
+        }
+        assert_eq!(
+            compose_up_reaches_service(&normalized, &names(&["unrelated"]), "openbao"),
+            Ok(false)
+        );
+    }
+
+    /// A dependency `--no-interpolate` leaves as a variable reference
+    /// refuses the question rather than answering `false`, and names the
+    /// service that declared it — but only on the invocation's way.
+    #[test]
+    fn compose_up_refuses_an_uninterpolated_dependency_on_the_way() {
+        let normalized = config(
+            r#"{
+  "services": {
+    "openbao": {},
+    "postgres": {},
+    "app": {"depends_on": {"${TARGET:-openbao}": {"condition": "service_started"}}, "network_mode": "service:${TARGET:-openbao}"},
+    "front": {"depends_on": {"app": {"condition": "service_started"}}}
+  }
+}"#,
+        );
+        for service in ["app", "front"] {
+            assert_eq!(
+                compose_up_reaches_service(&normalized, &names(&[service]), "openbao"),
+                Err(UnresolvedComposeDependencies {
+                    service: "app".to_string(),
+                }),
+                "{service}"
+            );
+        }
+        assert_eq!(
+            compose_up_reaches_service(&normalized, &names(&["postgres"]), "openbao"),
+            Ok(false)
+        );
+        assert_eq!(
+            compose_up_reaches_service(&normalized, &names(&["openbao", "app"]), "openbao"),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn compose_up_reaches_service_needs_the_target_declared_for_an_empty_list() {
+        let normalized = config(r#"{"services": {"postgres": {"image": "postgres"}}}"#);
+        assert_eq!(
+            compose_up_reaches_service(&normalized, &[], "openbao"),
+            Ok(false)
+        );
+        assert_eq!(
+            compose_up_reaches_service(&normalized, &[], "postgres"),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn compose_services_refuses_output_without_a_services_mapping() {
+        for json in ["", "{}", r#"{"services": []}"#, "not json"] {
+            assert!(ComposeServices::from_config_json(json).is_err(), "{json:?}");
+        }
     }
 
     #[test]

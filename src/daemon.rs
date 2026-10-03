@@ -1151,9 +1151,11 @@ fn spawn_registrar_cert_renewal(
 ///
 /// The predicate is exactly `[registrar_endpoint] enabled = true` and
 /// nothing else — not the socket, not the unit pair, not whether the
-/// store directory exists. Where it does not hold, `/openbao/audit` is
-/// still backed by the `openbao-audit` named volume, nothing on the
-/// host is there to rotate, and no task is spawned at all.
+/// store directory exists. Where it does not hold, nothing backs
+/// `/openbao/audit`: `OpenBao` audits through its `stdout` device into
+/// the container log, whose retention the Docker logging driver owns,
+/// nothing on the host is there to rotate, and no task is spawned at
+/// all.
 ///
 /// The device's directory is derived through
 /// [`crate::registrar::audit_store::openbao_dir`] rather than by
