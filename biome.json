@@ -11,7 +11,8 @@
       "**/*.json",
       "**/*.jsonc",
       "!!**/state.json",
-      "!!src/registrar/endpoint/fixtures/*.json"
+      "!!src/registrar/endpoint/fixtures/*.json",
+      "!!tests/fixtures/formats/**/*.json"
     ]
   },
   "formatter": {

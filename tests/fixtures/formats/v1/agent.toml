@@ -1,0 +1,44 @@
+email = "admin@example.com"
+server = "https://localhost:9000/acme/acme/directory"
+domain = "example.internal"
+
+[acme]
+directory_fetch_attempts = 10
+directory_fetch_base_delay_secs = 1
+directory_fetch_max_delay_secs = 10
+poll_attempts = 15
+poll_interval_secs = 2
+http_responder_url = "http://127.0.0.1:8080"
+http_responder_hmac = "hmac-val"
+http_responder_timeout_secs = 5
+http_responder_token_ttl_secs = 300
+
+# BEGIN bootroot managed profile: edge-node-01-edge-proxy
+[[profiles]]
+registration_id = "edge-node-01-edge-proxy"
+service_name = "edge-proxy"
+instance_id = "001"
+hostname = "edge-node-01"
+
+[profiles.paths]
+cert = "/etc/bootroot/edge-proxy/certs/edge-proxy.crt"
+key = "/etc/bootroot/edge-proxy/certs/edge-proxy.key"
+
+[[profiles.hooks.post_renew.success]]
+command = "systemctl"
+args = ["reload", "edge-proxy.service"]
+timeout_secs = 30
+on_failure = "continue"
+
+[trust]
+ca_bundle_path = "/etc/bootroot/edge-proxy/certs/ca-bundle.pem"
+trusted_ca_sha256 = ["cf1c7c37a9c4ad9b8ea01332310a4013fa20bdf8d3fed57f20ca0607b9d0b72f"]
+
+[openbao]
+url = "https://openbao.example.internal:8200"
+kv_mount = "secret"
+role_id_path = "/var/lib/bootroot/secrets/services/edge-node-01-edge-proxy/role_id"
+secret_id_path = "/var/lib/bootroot/secrets/services/edge-node-01-edge-proxy/secret_id"
+ca_bundle_path = "/etc/bootroot/edge-proxy/certs/ca-bundle.pem"
+state_path = "/etc/bootroot/edge-proxy/bootroot-agent-state-edge-node-01-edge-proxy.json"
+# END bootroot managed profile: edge-node-01-edge-proxy

@@ -1,0 +1,38 @@
+{
+  "schema_version": 5,
+  "openbao_url": "https://openbao.example.internal:8200",
+  "kv_mount": "secret",
+  "registration_id": "edge-node-02-api",
+  "service_name": "api",
+  "role_id_path": "/etc/bootroot/api/secrets/role_id",
+  "secret_id_path": "/etc/bootroot/api/secrets/secret_id",
+  "eab_file_path": "/etc/bootroot/api/secrets/eab.json",
+  "agent_config_path": "/etc/bootroot/api/agent.toml",
+  "ca_bundle_path": "/etc/bootroot/api/certs/ca-bundle.pem",
+  "ca_bundle_pem": "-----BEGIN CERTIFICATE-----\nMIIBiTCCATCgAwIBAgIUJV3zgCzgdFjzLqE/ZwEg/Q1j+ckwCgYIKoZIzj0EAwIw\nKjEoMCYGA1UEAwwfQm9vdHJvb3QgRm9ybWF0IEZpeHR1cmUgUm9vdCBDQTAgFw03\nNTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowKjEoMCYGA1UEAwwfQm9vdHJv\nb3QgRm9ybWF0IEZpeHR1cmUgUm9vdCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEH\nA0IABAVaTSKkNgZGvD7gRpnSs05M5AN+lQiiJUGbkt0f3b+OqVmBSCKIVLUkCLmU\n2oBLF0RVbfjIPyZkEedgMzKIl9ujMjAwMB0GA1UdDgQWBBSr7JTCB7S90ZwEZy+f\nTh2k0ZwLvjAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIHuL651b\nZVnaLrTf0GJZjqKiNEtapQ0P9+ihKP9o2VuqAiA0IrtYT8QCe4w2pG9KEA02qJpo\nrYNJwhQYhhNgpRrX4Q==\n-----END CERTIFICATE-----\n",
+  "trusted_ca_sha256": [
+    "cf1c7c37a9c4ad9b8ea01332310a4013fa20bdf8d3fed57f20ca0607b9d0b72f"
+  ],
+  "agent_email": "admin@example.com",
+  "agent_server": "https://bootroot-ca.example.internal:9000/acme/acme/directory",
+  "agent_domain": "example.internal",
+  "agent_responder_url": "http://bootroot-http01.example.internal:8080",
+  "profile_hostname": "edge-node-02",
+  "profile_instance_id": "001",
+  "profile_cert_path": "/etc/bootroot/api/certs/api.crt",
+  "profile_key_path": "/etc/bootroot/api/certs/api.key",
+  "post_renew_hooks": [
+    {
+      "command": "systemctl",
+      "args": [
+        "reload",
+        "api.service"
+      ],
+      "timeout_secs": 30,
+      "on_failure": "continue"
+    }
+  ],
+  "wrap_token": "wrap-token-api",
+  "wrap_expires_at": "2026-01-01T00:00:00Z",
+  "cert_group_gid": 2000
+}

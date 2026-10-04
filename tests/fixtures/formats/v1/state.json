@@ -1,0 +1,150 @@
+{
+  "openbao_url": "https://openbao.example.internal:8200",
+  "kv_mount": "secret",
+  "secrets_dir": "/var/lib/bootroot/secrets",
+  "policies": {
+    "bootroot_agent": "bootroot-agent",
+    "infra_rotate": "bootroot-infra-rotate",
+    "responder": "bootroot-responder",
+    "runtime_rotate": "bootroot-runtime-rotate",
+    "runtime_service_add": "bootroot-runtime-service-add",
+    "stepca": "bootroot-stepca"
+  },
+  "approles": {
+    "bootroot_agent": "bootroot-agent-role",
+    "infra_rotate": "bootroot-infra-rotate-role",
+    "responder": "bootroot-responder-role",
+    "runtime_rotate": "bootroot-runtime-rotate-role",
+    "runtime_service_add": "bootroot-runtime-service-add-role",
+    "stepca": "bootroot-stepca-role"
+  },
+  "services": {
+    "edge-node-01-edge-proxy": {
+      "registration_id": "edge-node-01-edge-proxy",
+      "service_name": "edge-proxy",
+      "delivery_mode": "local-file",
+      "hostname": "edge-node-01",
+      "domain": "example.internal",
+      "agent_config_path": "/etc/bootroot/edge-proxy/agent.toml",
+      "cert_path": "/etc/bootroot/edge-proxy/certs/edge-proxy.crt",
+      "key_path": "/etc/bootroot/edge-proxy/certs/edge-proxy.key",
+      "instance_id": "001",
+      "notes": "format fixture",
+      "post_renew_hooks": [
+        {
+          "command": "systemctl",
+          "args": [
+            "reload",
+            "edge-proxy.service"
+          ],
+          "timeout_secs": 30,
+          "on_failure": "continue"
+        }
+      ],
+      "approle": {
+        "role_name": "bootroot-service-edge-node-01-edge-proxy",
+        "role_id": "role-id-edge-proxy",
+        "secret_id_path": "/var/lib/bootroot/secrets/services/edge-node-01-edge-proxy/secret_id",
+        "policy_name": "bootroot-service-edge-node-01-edge-proxy",
+        "secret_id_ttl": "24h",
+        "secret_id_wrap_ttl": "30m",
+        "token_bound_cidrs": [
+          "10.0.0.0/24"
+        ]
+      },
+      "cert_group_gid": 2000
+    },
+    "edge-node-02-api": {
+      "registration_id": "edge-node-02-api",
+      "service_name": "api",
+      "delivery_mode": "remote-bootstrap",
+      "hostname": "edge-node-02",
+      "domain": "example.internal",
+      "agent_config_path": "/etc/bootroot/api/agent.toml",
+      "cert_path": "/etc/bootroot/api/certs/api.crt",
+      "key_path": "/etc/bootroot/api/certs/api.key",
+      "instance_id": "001",
+      "notes": null,
+      "post_renew_hooks": [
+        {
+          "command": "systemctl",
+          "args": [
+            "reload",
+            "api.service"
+          ],
+          "timeout_secs": 30,
+          "on_failure": "continue"
+        }
+      ],
+      "approle": {
+        "role_name": "bootroot-service-edge-node-02-api",
+        "role_id": "role-id-api",
+        "secret_id_path": "/var/lib/bootroot/secrets/services/edge-node-02-api/secret_id",
+        "policy_name": "bootroot-service-edge-node-02-api",
+        "secret_id_ttl": null,
+        "secret_id_wrap_ttl": null,
+        "token_bound_cidrs": null
+      },
+      "agent_email": "admin@example.com",
+      "agent_server": "https://bootroot-ca.example.internal:9000/acme/acme/directory",
+      "agent_responder_url": "http://bootroot-http01.example.internal:8080",
+      "cert_group_gid": 2000,
+      "remote_secret_id_path": "/etc/bootroot/api/secrets/secret_id"
+    }
+  },
+  "pending_service_adds": {
+    "edge-node-03-worker": {
+      "secret_id_path_override": "/srv/agent/edge-node-03-worker/secret_id"
+    }
+  },
+  "openbao_bind_addr": "0.0.0.0:8200",
+  "openbao_advertise_addr": "openbao.example.internal:8200",
+  "http01_admin_bind_addr": "0.0.0.0:8080",
+  "http01_admin_advertise_addr": "bootroot-http01.example.internal:8080",
+  "stepca_bind_addr": "0.0.0.0:9000",
+  "stepca_advertise_addr": "bootroot-ca.example.internal:9000",
+  "infra_certs": {
+    "bootroot-http01": {
+      "cert_path": "/var/lib/bootroot/secrets/bootroot-http01/tls/server.crt",
+      "key_path": "/var/lib/bootroot/secrets/bootroot-http01/tls/server.key",
+      "sans": [
+        "bootroot-http01.example.internal"
+      ],
+      "renew_before": "720h",
+      "reload_strategy": {
+        "type": "container_restart",
+        "container_name": "bootroot-http01"
+      }
+    },
+    "openbao": {
+      "cert_path": "/var/lib/bootroot/secrets/openbao/tls/server.crt",
+      "key_path": "/var/lib/bootroot/secrets/openbao/tls/server.key",
+      "sans": [
+        "openbao.example.internal"
+      ],
+      "renew_before": "720h",
+      "reload_strategy": {
+        "type": "container_signal",
+        "container_name": "bootroot-openbao",
+        "signal": "SIGHUP"
+      },
+      "issued_at": "2026-01-01T00:00:00Z",
+      "expires_at": "2027-01-01T00:00:00Z"
+    }
+  },
+  "rotate_bound_cidrs": {
+    "infra_rotate": [
+      "10.0.0.0/24"
+    ],
+    "runtime_rotate": [
+      "10.0.0.0/24"
+    ]
+  },
+  "rotate_secret_id_ttl": "24h",
+  "last_secret_id_rotation": "2026-01-01T00:00:00Z",
+  "registrar_endpoint": {
+    "enabled": true,
+    "domain": "example.internal",
+    "host": "bootroot-01"
+  }
+}
