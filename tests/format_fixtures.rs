@@ -7,8 +7,8 @@
 //! never edited: an additive change keeps every one passing, and a
 //! change that stops one loading has to modify or delete it to pass,
 //! which is what the release maker's
-//! `git diff --diff-filter=MD -- tests/fixtures/formats/` finds. See
-//! `ARCHITECTURE.md` §11.
+//! `git diff --no-renames --diff-filter=MD -- tests/fixtures/formats/`
+//! finds. See `ARCHITECTURE.md` §11.
 //!
 //! `state.json` and `responder.toml` are loaded beside their loaders,
 //! in the `bootroot` and `bootroot-http01-responder` binaries; the
