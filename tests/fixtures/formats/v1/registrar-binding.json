@@ -1,0 +1,20 @@
+{
+  "applied_spec": {
+    "cert_group": 2000,
+    "reload": {
+      "kind": "systemd",
+      "target": "edge-proxy.service"
+    }
+  },
+  "generation_key": "install-key-1",
+  "host": "edge-node-01",
+  "requested_spec": {
+    "cert_group": 2000,
+    "reload": {
+      "kind": "systemd",
+      "target": "edge-proxy.service"
+    }
+  },
+  "schema_version": 1,
+  "state": "active"
+}

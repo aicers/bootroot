@@ -11,4 +11,6 @@ site/
 site-pdf-*/
 tmp/
 state.json
+# The on-disk format samples carry a `state.json` that is source.
+!tests/fixtures/formats/*/state.json
 .env

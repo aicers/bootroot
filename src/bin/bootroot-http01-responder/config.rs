@@ -187,6 +187,39 @@ fn validate_socket_addr(value: &str, field_name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The on-disk format samples, one directory per version that added
+    /// a shape worth covering. See `ARCHITECTURE.md` §11.
+    const FORMAT_FIXTURES_DIR: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/formats");
+
+    /// Every `responder.toml` an earlier release wrote still loads.
+    ///
+    /// `load_settings` treats an absent file as one holding only the
+    /// defaults, so each sample's existence is asserted first: a moved
+    /// or renamed sample must fail here rather than load as nothing.
+    #[test]
+    fn every_responder_format_sample_loads() {
+        let first = Path::new(FORMAT_FIXTURES_DIR)
+            .join("v1")
+            .join(DEFAULT_CONFIG_PATH);
+        assert!(first.is_file(), "missing sample {}", first.display());
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(FORMAT_FIXTURES_DIR)
+            .expect("read the formats directory")
+            .map(|entry| {
+                entry
+                    .expect("a formats entry")
+                    .path()
+                    .join(DEFAULT_CONFIG_PATH)
+            })
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort_unstable();
+        for path in paths {
+            load_settings(Some(&path))
+                .unwrap_or_else(|err| panic!("{} does not load: {err:#}", path.display()));
+        }
+    }
+
     fn test_settings() -> ResponderSettings {
         ResponderSettings {
             listen_addr: DEFAULT_LISTEN_ADDR.to_string(),

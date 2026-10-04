@@ -932,6 +932,92 @@ mod tests {
         );
     }
 
+    /// The on-disk format samples, one directory per version that added
+    /// a shape worth covering. See `ARCHITECTURE.md` §11.
+    const FORMAT_FIXTURES_DIR: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/formats");
+
+    /// The `v1` sample, which every later version directory adds to.
+    fn first_state_format_sample() -> PathBuf {
+        Path::new(FORMAT_FIXTURES_DIR)
+            .join("v1")
+            .join(DEFAULT_STATE_FILE)
+    }
+
+    /// Returns `formats/*/state.json` for every version directory
+    /// holding one, after asserting `v1` does.
+    fn state_format_samples() -> Vec<PathBuf> {
+        let first = first_state_format_sample();
+        assert!(first.is_file(), "missing sample {}", first.display());
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(FORMAT_FIXTURES_DIR)
+            .expect("read the formats directory")
+            .map(|entry| {
+                entry
+                    .expect("a formats entry")
+                    .path()
+                    .join(DEFAULT_STATE_FILE)
+            })
+            .filter(|path| path.is_file())
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Every `state.json` an earlier release wrote still loads. A
+    /// change that breaks this has to modify or delete a sample to
+    /// pass, and that is what makes it visible as breaking.
+    #[test]
+    fn every_state_format_sample_loads() {
+        for path in state_format_samples() {
+            StateFile::load(&path)
+                .unwrap_or_else(|err| panic!("{} does not load: {err:#}", path.display()));
+        }
+    }
+
+    /// The `v1` sample covers the parts of the file an installed
+    /// registrar host holds: a service entry and an enabled endpoint.
+    #[test]
+    fn the_first_state_format_sample_covers_a_registrar_host() {
+        let state = StateFile::load(&first_state_format_sample()).expect("the sample loads");
+        assert!(!state.services.is_empty(), "a service entry");
+        assert!(
+            state
+                .registrar_endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.enabled),
+            "an enabled registrar endpoint"
+        );
+    }
+
+    /// The sample test can fail: the `v1` sample with `registration_id`
+    /// removed from one service entry — what every file written before
+    /// that field existed looks like — does not load.
+    #[test]
+    fn the_state_sample_without_a_registration_id_does_not_load() {
+        let text = std::fs::read_to_string(first_state_format_sample()).expect("read the sample");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("the sample is JSON");
+        let entry = value
+            .get_mut("services")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|services| services.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the sample carries a service entry");
+        assert!(entry.remove("registration_id").is_some());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mutated = dir.path().join(DEFAULT_STATE_FILE);
+        std::fs::write(
+            &mutated,
+            serde_json::to_string_pretty(&value).expect("serialize"),
+        )
+        .expect("write the mutated sample");
+        let err = StateFile::load(&mutated).expect_err("must not load");
+        assert!(
+            format!("{err:#}").contains("registration_id"),
+            "error must name the missing field, got: {err:#}"
+        );
+    }
+
     #[test]
     fn service_entry_without_hooks_deserializes_empty_vec() {
         let json = r#"{
