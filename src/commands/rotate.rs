@@ -23,6 +23,7 @@ use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
 use crate::state::StateFile;
+use crate::state_lock::StateLock;
 
 pub(super) const ROLE_ID_FILENAME: &str = "role_id";
 /// Image the `step` helper containers run in the `rotate` flows. The
@@ -192,6 +193,18 @@ async fn run_rotate_with_exec(
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
+    // Only the two subcommands that save `state.json` serialize on it.
+    // The rest read it once, and some of them wait on remote agents for
+    // minutes: they must neither hold up a writer nor need write access
+    // beside the state file. Taken after the missing-state check, so a
+    // run in the wrong directory leaves no lock file there, and before
+    // the load, so what is saved was read under the lock.
+    let state_lock = match &args.command {
+        RotateCommand::AppRoleSecretId(_) | RotateCommand::InfraCert(_) => {
+            Some(StateLock::acquire(&state_path, messages).await?)
+        }
+        _ => None,
+    };
     let state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
@@ -228,7 +241,8 @@ async fn run_rotate_with_exec(
     // InfraCert operates on local files and Docker only — it must not
     // require an OpenBao connection so it can fix a broken/expired cert.
     if let RotateCommand::InfraCert(_) = &args.command {
-        infra_cert::rotate_infra_certs(&mut ctx, args.yes, messages).await?;
+        let state_lock = held_state_lock(state_lock.as_ref())?;
+        infra_cert::rotate_infra_certs(&mut ctx, state_lock, args.yes, messages).await?;
         return Ok(RotateOutcome::Completed);
     }
 
@@ -288,6 +302,7 @@ async fn run_rotate_with_exec(
             };
             approle::rotate_approle_secret_id(
                 &mut ctx,
+                held_state_lock(state_lock.as_ref())?,
                 &client,
                 step_args,
                 args.yes,
@@ -317,6 +332,16 @@ async fn run_rotate_with_exec(
     }
 
     Ok(RotateOutcome::Completed)
+}
+
+/// The state lock a saving subcommand runs under.
+///
+/// `run_rotate_with_exec` takes it for exactly the subcommands that
+/// reach this, so `None` here is a subcommand that started saving
+/// `state.json` without being added to that match: refused rather than
+/// run unlocked.
+fn held_state_lock(state_lock: Option<&StateLock>) -> Result<&StateLock> {
+    state_lock.context("this rotate subcommand saves state.json but took no state lock")
 }
 
 /// Test harness for the `rotate` commands that shell out to `docker`.

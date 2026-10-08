@@ -422,6 +422,25 @@ byte for byte.
 
 ### Fixed
 
+- Two `bootroot` commands that change `state.json` at the same time no
+  longer lose one of the two updates. Each command loads the whole file,
+  works, and writes the whole file back, and nothing serialized that
+  interval: a `service add` that finished while a scheduled
+  `rotate approle-secret-id --infra` was restarting its agent was
+  overwritten when the rotation saved, so the new service vanished from
+  the registry without an error from either command — and with it from
+  `rotate approle-secret-id --all-services`, leaving its `secret_id` to
+  expire at its TTL. `rotate approle-secret-id`, `rotate infra-cert`,
+  `service add`, `service update`, `service remove`, `infra install`,
+  `init` and `reinit` now hold an exclusive lock on `state.json.lock`,
+  beside the state file, from before they read it until after they last
+  write it. A command started while another holds the lock waits for it
+  and prints one line to stderr saying so. The lock file is created with
+  mode `0600` and is never removed, so state-changing commands for one
+  state file must run as the user that owns it or as root; a command that
+  cannot open it fails, naming it, before changing anything. Read-only
+  commands, `service add --dry-run`/`--print-only` and the other `rotate`
+  subcommands take no lock.
 - `bootroot rotate ca-key` now treats a service certificate as already on
   the new CA only when the new intermediate's key signed it, not merely
   when it names an intermediate with the same name. Every rotation creates

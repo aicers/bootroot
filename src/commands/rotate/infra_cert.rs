@@ -19,6 +19,7 @@ use crate::commands::init::{
 };
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy};
+use crate::state_lock::StateLock;
 
 /// Signal that reloads the `OpenBao` listener certificate in place.
 ///
@@ -46,6 +47,7 @@ const OPENBAO_PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`dispatch_reissue`] — the loop body does not need to change.
 pub(super) async fn rotate_infra_certs(
     ctx: &mut RotateContext,
+    _state_lock: &StateLock,
     auto_confirm: bool,
     messages: &Messages,
 ) -> Result<()> {

@@ -106,6 +106,7 @@ pub(crate) struct Strings {
     pub(crate) error_responder_rejected: &'static str,
     pub(crate) error_responder_ready_timeout_invalid: &'static str,
     pub(crate) error_state_missing: &'static str,
+    pub(crate) info_state_lock_waiting: &'static str,
     pub(crate) error_service_duplicate: &'static str,
     pub(crate) error_service_agent_config_conflict: &'static str,
     pub(crate) error_service_agent_config_stale_profile: &'static str,

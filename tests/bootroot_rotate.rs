@@ -8177,3 +8177,304 @@ async fn test_rotate_ca_key_reissue_without_registrar_endpoint_enumerates_nothin
         "rotation-state.json should be deleted after completion"
     );
 }
+
+/// The fake `docker` for the lost-update regression: `restart` announces
+/// itself on one FIFO and then blocks on another until the test lets it
+/// go, which is what holds a rotation inside its load-to-save interval
+/// for as long as the test needs — with no sleep on either side.
+fn write_blocking_fake_docker(bin_dir: &Path) -> anyhow::Result<()> {
+    let script = r#"#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "restart" ]; then
+  printf 'reached\n' > "$RESTART_REACHED_FIFO"
+  cat "$RESTART_RELEASE_FIFO" > /dev/null
+fi
+
+exit 0
+"#;
+    let path = bin_dir.join("docker");
+    fs::write(&path, script).context("write blocking fake docker")?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .context("set blocking fake docker permissions")?;
+    Ok(())
+}
+
+fn make_fifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {} failed", path.display());
+}
+
+/// Lets the blocked fake `docker` go, exactly once: explicitly on the
+/// path the test takes, and on drop when an assertion fails first, so a
+/// failing test does not leave a rotation waiting on the FIFO forever.
+struct RestartRelease {
+    fifo: PathBuf,
+    released: bool,
+}
+
+impl RestartRelease {
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            // Opening for writing waits for the fake's `cat`, which is
+            // the very next thing it does after announcing itself.
+            let _ = fs::write(&self.fifo, "go\n");
+        }
+    }
+}
+
+impl Drop for RestartRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Mounts what one `rotate approle-secret-id --infra stepca` run asks
+/// of `OpenBao` when it authenticates with the infra-rotate `AppRole`.
+async fn stub_openbao_for_infra_stepca_rotation(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    for (role_id, secret_id, token) in [
+        ("ir-role-id", "old-infra-rotate-secret", "rotate-token"),
+        ("ir-role-id", "self-minted-infra", "rotate-token"),
+        ("stepca-role-id", "stepca-new", "client-token"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .and(body_json(json!({
+                "role_id": role_id,
+                "secret_id": secret_id
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": token }
+            })))
+            .mount(server)
+            .await;
+    }
+    for (role, minted) in [
+        ("bootroot-stepca-role", "stepca-new"),
+        ("bootroot-infra-rotate-role", "self-minted-infra"),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+            .and(header("X-Vault-Token", "rotate-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "secret_id": minted }
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Whether some other descriptor holds the state lock beside
+/// `state.json` in `root`.
+///
+/// `flock(2)` belongs to the open file description, so this probe is
+/// refused by a lock another process holds exactly as that process's
+/// own second attempt would be. A lock file that is not there is a lock
+/// nobody holds.
+fn state_lock_is_held(root: &Path) -> bool {
+    let Ok(file) = fs::File::open(root.join("state.json.lock")) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+}
+
+/// The lost update this lock exists for: a writer that commits while an
+/// infra rotation is restarting its agent must not be overwritten when
+/// the rotation saves the state it loaded before the restart.
+///
+/// The rotation is held inside `docker restart`. While it is there the
+/// state lock is held — the assertion that fails without the lock — and
+/// a `service update` started then waits, says so, and commits only
+/// after the rotation's save. The final `state.json` carries both.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one choreography: two writers and the FIFOs between them
+async fn test_rotate_infra_approle_serializes_with_a_concurrent_service_update() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let root = temp_dir.path();
+    let openbao = MockServer::start().await;
+    prepare_app_state(root, &openbao.uri(), "remote-bootstrap").expect("prepare state");
+    stub_openbao_for_infra_stepca_rotation(&openbao).await;
+
+    let cred_dir = root.join("rotate-cred");
+    fs::create_dir_all(&cred_dir).expect("create cred dir");
+    let cred_path = cred_dir.join("secret_id");
+    fs::write(&cred_path, "old-infra-rotate-secret").expect("seed rotate credential");
+    let agent_dir = root.join("secrets").join("openbao").join("stepca");
+    fs::create_dir_all(&agent_dir).expect("create agent dir");
+    fs::write(agent_dir.join("role_id"), "stepca-role-id").expect("write role_id");
+
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_blocking_fake_docker(&bin_dir).expect("write fake docker");
+    let reached_fifo = root.join("restart-reached.fifo");
+    let release_fifo = root.join("restart-release.fifo");
+    make_fifo(&reached_fifo);
+    make_fifo(&release_fifo);
+    // Opened for reading *and* writing, so neither this open nor the
+    // fake's waits for the other side, and so the thread below can
+    // always report the rotation's exit here: a rotation that died
+    // before reaching `docker restart` fails the test instead of
+    // hanging it.
+    let reached = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&reached_fifo)
+        .expect("open the reached FIFO");
+    let mut reached_reporter = reached.try_clone().expect("clone the reached FIFO");
+
+    let combined_path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let rotation = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            "ir-role-id",
+            "--approle-secret-id-file",
+            cred_path.to_string_lossy().as_ref(),
+            "--yes",
+            "approle-secret-id",
+            "--infra",
+            "stepca",
+        ])
+        .env("PATH", &combined_path)
+        .env("RESTART_REACHED_FIFO", &reached_fifo)
+        .env("RESTART_RELEASE_FIFO", &release_fifo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rotate approle-secret-id --infra");
+    let mut release = RestartRelease {
+        fifo: release_fifo,
+        released: false,
+    };
+    let rotation = std::thread::spawn(move || {
+        let output = rotation.wait_with_output().expect("wait for the rotation");
+        // Unread on the path the test takes; the pipe buffers it.
+        let _ = reached_reporter.write_all(b"exited\n");
+        output
+    });
+
+    let mut signal = String::new();
+    BufReader::new(reached)
+        .read_line(&mut signal)
+        .expect("read the restart signal");
+    if signal.trim() != "reached" {
+        let output = rotation.join().expect("join the rotation");
+        panic!(
+            "the rotation ended before `docker restart`: stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The rotation loaded `state.json` before the restart and saves it
+    // after: this is the interval the lock has to cover.
+    assert!(
+        state_lock_is_held(root),
+        "a rotation between its load and its save must hold the state lock"
+    );
+
+    let mut update = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args([
+            "service",
+            "update",
+            "--registration-id",
+            SERVICE_NAME,
+            "--secret-id-ttl",
+            "12h",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn service update");
+    let mut update_stderr = BufReader::new(update.stderr.take().expect("piped stderr"));
+    let mut seen = String::new();
+    let waiting_line = loop {
+        let mut line = String::new();
+        let read = update_stderr.read_line(&mut line).expect("read stderr");
+        if read == 0 {
+            break None;
+        }
+        if line.contains("state.json.lock") {
+            break Some(line);
+        }
+        seen.push_str(&line);
+    };
+    let Some(waiting_line) = waiting_line else {
+        panic!("service update ended without waiting for the state lock; stderr:\n{seen}");
+    };
+    assert!(
+        waiting_line.contains("Waiting for another bootroot command"),
+        "the waiting line says what it waits for: {waiting_line}"
+    );
+    assert!(
+        update.try_wait().expect("poll service update").is_none(),
+        "service update must still be waiting while the rotation holds the lock"
+    );
+    let before_release: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("state.json")).expect("read state"))
+            .expect("parse state");
+    assert!(
+        before_release["services"][SERVICE_NAME]["approle"]["secret_id_ttl"].is_null(),
+        "the waiting writer has written nothing yet"
+    );
+
+    release.release();
+
+    let rotation = rotation.join().expect("join the rotation");
+    assert!(
+        rotation.status.success(),
+        "rotation: stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&rotation.stdout),
+        String::from_utf8_lossy(&rotation.stderr)
+    );
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut update_stderr, &mut rest).expect("drain stderr");
+    let update_status = update.wait().expect("wait for service update");
+    assert!(update_status.success(), "service update: stderr:\n{rest}");
+    assert!(
+        !rest.contains("state.json.lock"),
+        "the waiting line is printed once; rest of stderr:\n{rest}"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("state.json")).expect("read state"))
+            .expect("parse state");
+    assert_eq!(
+        state["services"][SERVICE_NAME]["approle"]["secret_id_ttl"], "12h",
+        "the second writer's change must survive the rotation's save; state:\n{state:#}"
+    );
+    assert!(
+        state["last_secret_id_rotation"].is_string(),
+        "the rotation's stamp must survive the second writer's save; state:\n{state:#}"
+    );
+
+    let lock_path = root.join("state.json.lock");
+    let lock_meta = fs::metadata(&lock_path).expect("the lock file stays behind");
+    assert_eq!(lock_meta.permissions().mode() & 0o777, 0o600);
+    assert_eq!(lock_meta.len(), 0, "nothing is written to the lock file");
+    assert!(!state_lock_is_held(root), "both writers released the lock");
+}

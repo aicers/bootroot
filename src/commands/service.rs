@@ -23,6 +23,7 @@ use crate::commands::init::validate_secret_id_ttl;
 use crate::commands::openbao_auth::authenticate_openbao_client;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, PendingServiceAdd, ServiceEntry, ServiceRoleEntry, StateFile};
+use crate::state_lock::StateLock;
 
 pub(super) const SERVICE_SECRET_DIR: &str = "services";
 pub(super) const SERVICE_ROLE_ID_FILENAME: &str = "role_id";
@@ -355,10 +356,18 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
+    let preview = args.dry_run || args.print_only;
+    // A preview writes nothing, so it neither waits for a writer nor
+    // leaves a lock file. An apply holds the lock from before the load
+    // to after the commit's save.
+    let state_lock = if preview {
+        None
+    } else {
+        Some(StateLock::acquire(&state_path, messages).await?)
+    };
     let mut state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 
-    let preview = args.dry_run || args.print_only;
     let resolved = resolve::resolve_service_add_args(args, messages, preview)?;
 
     resolve::validate_service_add(&resolved, messages)?;
@@ -445,12 +454,12 @@ pub(crate) async fn run_service_add(args: &ServiceAddArgs, messages: &Messages) 
         }
     }
 
-    if preview {
+    let Some(state_lock) = state_lock.as_ref() else {
         run_service_add_preview(&state, &resolved, messages).await;
         return Ok(());
-    }
+    };
 
-    run_service_add_apply(&mut state, &state_path, &resolved, messages).await
+    run_service_add_apply(&mut state, &state_path, state_lock, &resolved, messages).await
 }
 
 async fn run_service_add_preview(
@@ -558,6 +567,7 @@ async fn run_service_add_preview(
 async fn run_service_add_apply(
     state: &mut StateFile,
     state_path: &Path,
+    _state_lock: &StateLock,
     resolved: &ResolvedServiceAdd,
     messages: &Messages,
 ) -> Result<()> {
@@ -925,6 +935,8 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
+    // Held to the end of the function: the save is its last step.
+    let _state_lock = StateLock::acquire_blocking(&state_path, messages)?;
     let mut state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
 

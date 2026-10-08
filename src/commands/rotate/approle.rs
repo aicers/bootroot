@@ -26,6 +26,7 @@ use crate::commands::openbao_auth::RuntimeAuthResolved;
 use crate::commands::service::resolve::effective_wrap_ttl;
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry};
+use crate::state_lock::StateLock;
 
 /// How the invocation authenticated, as far as the self-mint step needs
 /// to know: root-token runs perform no self-mint (a root run has no
@@ -52,8 +53,12 @@ enum CidrBindingAction<'a> {
     Clear,
 }
 
+// One argument past clippy's limit: the state lock is passed on its own
+// so that every function that saves `state.json` names it.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn rotate_approle_secret_id(
     ctx: &mut RotateContext,
+    state_lock: &StateLock,
     client: &OpenBaoClient,
     args: &RotateAppRoleSecretIdArgs,
     auto_confirm: bool,
@@ -88,6 +93,7 @@ pub(super) async fn rotate_approle_secret_id(
         });
         rotate_infra_approle_secret_id(
             ctx,
+            state_lock,
             client,
             target,
             auto_confirm,
@@ -145,7 +151,7 @@ pub(super) async fn rotate_approle_secret_id(
     // invocation — batch, single-service, and infra alike — and only
     // after the self-mint above, so a failed self-mint cannot suppress
     // the stale-rotation warning in `bootroot status`.
-    record_rotation_success(ctx, messages).await?;
+    record_rotation_success(ctx, state_lock, messages).await?;
     Ok(())
 }
 
@@ -157,7 +163,11 @@ pub(super) async fn rotate_approle_secret_id(
 /// Async because the state write is: publishing `state.json` costs
 /// three disk round trips, which `StateFile::save_async` keeps off the
 /// runtime thread this rotation runs on.
-async fn record_rotation_success(ctx: &mut RotateContext, messages: &Messages) -> Result<()> {
+async fn record_rotation_success(
+    ctx: &mut RotateContext,
+    _state_lock: &StateLock,
+    messages: &Messages,
+) -> Result<()> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("Failed to format the rotation-success timestamp")?;
@@ -681,8 +691,12 @@ fn infra_agent_container_kind(target: InfraRoleTarget) -> BootrootContainer {
 /// Rotates one infra role's `secret_id`. `root_provision` is `Some`
 /// exactly when the run is root-authenticated: the provisioning step
 /// below runs with the given CIDR-binding action.
+// One argument past clippy's limit, for the same reason as
+// `rotate_approle_secret_id`.
+#[allow(clippy::too_many_arguments)]
 async fn rotate_infra_approle_secret_id(
     ctx: &mut RotateContext,
+    state_lock: &StateLock,
     client: &OpenBaoClient,
     target: InfraRoleTarget,
     auto_confirm: bool,
@@ -705,7 +719,8 @@ async fn rotate_infra_approle_secret_id(
     // (single-auth model: the resolved credential is the only one the
     // command ever uses).
     if let Some(binding) = root_provision {
-        provision_infra_rotate_role(ctx, client, binding, show_secrets, messages).await?;
+        provision_infra_rotate_role(ctx, state_lock, client, binding, show_secrets, messages)
+            .await?;
     }
 
     let agent_dir = infra_agent_dir(ctx, target);
@@ -820,6 +835,7 @@ async fn ensure_infra_role_id_file(
 /// operator credential carries the effective binding.
 async fn provision_infra_rotate_role(
     ctx: &mut RotateContext,
+    _state_lock: &StateLock,
     client: &OpenBaoClient,
     binding: CidrBindingAction<'_>,
     show_secrets: bool,
@@ -1243,8 +1259,10 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_infra_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             InfraRoleTarget::Stepca,
             true,
@@ -1301,8 +1319,10 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_infra_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             InfraRoleTarget::Responder,
             true,
@@ -1361,8 +1381,10 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("runtime-rotate-token".to_string());
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         let err = rotate_infra_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             InfraRoleTarget::Stepca,
             true,
@@ -1402,9 +1424,17 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
-            .await
-            .expect("provisioning should succeed");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        provision_infra_rotate_role(
+            &mut ctx,
+            &state_lock,
+            &client,
+            CidrBindingAction::Keep,
+            false,
+            &messages,
+        )
+        .await
+        .expect("provisioning should succeed");
 
         assert_eq!(
             ctx.state.approles.get("infra_rotate").map(String::as_str),
@@ -1474,9 +1504,17 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
-            .await
-            .expect("re-provisioning must succeed on a current deployment");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        provision_infra_rotate_role(
+            &mut ctx,
+            &state_lock,
+            &client,
+            CidrBindingAction::Keep,
+            false,
+            &messages,
+        )
+        .await
+        .expect("re-provisioning must succeed on a current deployment");
 
         assert!(
             !ctx.state_file.exists(),
@@ -1960,8 +1998,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2022,8 +2062,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2067,8 +2109,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file: None,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2120,8 +2164,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2191,8 +2237,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         let err = rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2278,8 +2326,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(Some("alpha"), false, None),
             true,
@@ -2348,8 +2398,10 @@ mod tests {
             runtime_auth: &runtime_auth,
             secret_id_file,
         };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         rotate_approle_secret_id(
             &mut ctx,
+            &state_lock,
             &client,
             &approle_args(None, false, Some(InfraRoleTarget::Stepca)),
             true,
@@ -2384,9 +2436,19 @@ mod tests {
         };
         let mut args = approle_args(None, false, Some(InfraRoleTarget::Stepca));
         args.rotate_bound_cidrs = vec!["10.0.0.5/32".to_string()];
-        let err = rotate_approle_secret_id(&mut ctx, &client, &args, true, &auth, false, &messages)
-            .await
-            .expect_err("--rotate-bound-cidrs without root auth must be rejected");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        let err = rotate_approle_secret_id(
+            &mut ctx,
+            &state_lock,
+            &client,
+            &args,
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect_err("--rotate-bound-cidrs without root auth must be rejected");
         assert!(
             format!("{err:#}").contains("--rotate-bound-cidrs"),
             "error must name the flag: {err:#}"
@@ -2442,8 +2504,10 @@ mod tests {
         client.set_token("root-token".to_string());
         let messages = test_messages();
         let cidrs = vec!["10.0.0.5/32".to_string()];
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         provision_infra_rotate_role(
             &mut ctx,
+            &state_lock,
             &client,
             CidrBindingAction::Set(&cidrs),
             false,
@@ -2521,9 +2585,17 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
-            .await
-            .expect("recovery provisioning without the flag should succeed");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        provision_infra_rotate_role(
+            &mut ctx,
+            &state_lock,
+            &client,
+            CidrBindingAction::Keep,
+            false,
+            &messages,
+        )
+        .await
+        .expect("recovery provisioning without the flag should succeed");
         assert!(
             !ctx.state_file.exists(),
             "state.json must not be rewritten when nothing changed"
@@ -2588,8 +2660,10 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
         provision_infra_rotate_role(
             &mut ctx,
+            &state_lock,
             &client,
             CidrBindingAction::Clear,
             false,
@@ -2658,9 +2732,17 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
-        provision_infra_rotate_role(&mut ctx, &client, CidrBindingAction::Keep, false, &messages)
-            .await
-            .expect("provisioning must keep the recorded secret_id TTL");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        provision_infra_rotate_role(
+            &mut ctx,
+            &state_lock,
+            &client,
+            CidrBindingAction::Keep,
+            false,
+            &messages,
+        )
+        .await
+        .expect("provisioning must keep the recorded secret_id TTL");
     }
 
     #[tokio::test]
@@ -2679,9 +2761,19 @@ mod tests {
         };
         let mut args = approle_args(None, false, Some(InfraRoleTarget::Stepca));
         args.clear_rotate_bound_cidrs = true;
-        let err = rotate_approle_secret_id(&mut ctx, &client, &args, true, &auth, false, &messages)
-            .await
-            .expect_err("--clear-rotate-bound-cidrs without root auth must be rejected");
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        let err = rotate_approle_secret_id(
+            &mut ctx,
+            &state_lock,
+            &client,
+            &args,
+            true,
+            &auth,
+            false,
+            &messages,
+        )
+        .await
+        .expect_err("--clear-rotate-bound-cidrs without root auth must be rejected");
         assert!(
             format!("{err:#}").contains("--clear-rotate-bound-cidrs"),
             "error must name the flag: {err:#}"

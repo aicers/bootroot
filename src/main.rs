@@ -8,6 +8,7 @@ mod i18n;
 #[cfg(test)]
 mod runtime_image_declaration;
 mod state;
+mod state_lock;
 #[cfg(test)]
 mod test_support;
 
