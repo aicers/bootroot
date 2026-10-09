@@ -215,6 +215,98 @@ async fn test_http01_responder_reloads_hmac_secret_on_sighup() {
     );
 }
 
+// The bundled config ships `hmac_secret = "CHANGE-ME"`. A responder
+// holding it must serve challenges and refuse every registration, and
+// must follow a reload in either direction without a restart.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_refuses_registrations_on_placeholder_secret() {
+    const PLACEHOLDER: &str = "CHANGE-ME";
+    const REAL_SECRET: &str = "real-secret";
+
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_path = temp_dir.path().join("responder.toml");
+    let (mut responder, listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, PLACEHOLDER);
+        })
+        .await;
+    let challenge_base_url = format!("http://{listen_addr}");
+    let admin_base_url = format!("http://{admin_addr}");
+
+    let refused = register_token(
+        &admin_base_url,
+        PLACEHOLDER,
+        "token-placeholder",
+        "token-placeholder.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = refused.text().await.expect("read refusal body");
+    assert!(
+        body.starts_with("HMAC secret is not configured"),
+        "unexpected refusal body: {body}"
+    );
+    let challenge = fetch_challenge(&challenge_base_url, "token-placeholder").await;
+    assert_eq!(challenge.status(), StatusCode::NOT_FOUND);
+
+    // What runs ahead of the refusal keeps its own answer: the readiness
+    // probes rely on the `405`, and an unsigned request is still a `401`.
+    let admin_url = format!("{admin_base_url}{ADMIN_PATH}");
+    let client = reqwest::Client::new();
+    let probe = client
+        .get(&admin_url)
+        .send()
+        .await
+        .expect("probe admin port");
+    assert_eq!(probe.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let unsigned = client
+        .post(&admin_url)
+        .json(&json!({
+            "token": "token-unsigned",
+            "key_authorization": "token-unsigned.key",
+            "ttl_secs": TEST_TTL_SECS,
+        }))
+        .send()
+        .await
+        .expect("send unsigned registration");
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+    write_responder_config(&config_path, &listen_addr, &admin_addr, REAL_SECRET);
+    send_sighup(responder.pid());
+    let accepted_token =
+        wait_for_reload(&mut responder, &admin_base_url, PLACEHOLDER, REAL_SECRET).await;
+    let challenge = fetch_challenge(&challenge_base_url, &accepted_token).await;
+    assert_eq!(challenge.status(), StatusCode::OK);
+    // The guard reads the loaded secret, not the request: with a real
+    // secret loaded the placeholder is just a wrong signature.
+    let wrong = register_token(
+        &admin_base_url,
+        PLACEHOLDER,
+        "token-wrong-secret",
+        "token-wrong-secret.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    write_responder_config(&config_path, &listen_addr, &admin_addr, PLACEHOLDER);
+    send_sighup(responder.pid());
+    wait_for_refusal(&mut responder, &admin_base_url, REAL_SECRET).await;
+    let refused = register_token(
+        &admin_base_url,
+        PLACEHOLDER,
+        "token-placeholder-again",
+        "token-placeholder-again.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let challenge = fetch_challenge(&challenge_base_url, "token-placeholder-again").await;
+    assert_eq!(challenge.status(), StatusCode::NOT_FOUND);
+}
+
 // step-ca reaches the responder as an HTTP proxy (`HTTP_PROXY` on the
 // `step-ca` compose service), so the three tests below put on the wire
 // what a proxy client sends: a request line in absolute form, and
@@ -670,6 +762,35 @@ async fn wait_for_reload(
     }
 
     panic!("responder did not reload the updated HMAC secret");
+}
+
+/// Waits until a reload onto the placeholder secret has taken effect,
+/// which is when a registration signed with `secret` is answered `503`.
+#[cfg(unix)]
+async fn wait_for_refusal(responder: &mut ResponderProcess, admin_base_url: &str, secret: &str) {
+    for attempt in 0..STARTUP_RETRIES {
+        if let Some(status) = responder.try_wait() {
+            let stderr = responder.take_stderr();
+            panic!("responder exited during reload with {status}: {stderr}");
+        }
+
+        let token = format!("refused-{attempt}");
+        let response = register_token(
+            admin_base_url,
+            secret,
+            &token,
+            &format!("{token}.key"),
+            TEST_TTL_SECS,
+        )
+        .await;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            return;
+        }
+
+        sleep(STARTUP_DELAY).await;
+    }
+
+    panic!("responder did not start refusing registrations after reloading the placeholder");
 }
 
 #[cfg(unix)]

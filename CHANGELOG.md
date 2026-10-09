@@ -507,6 +507,15 @@ byte for byte.
   already in that state is repaired by running `bootroot infra up` once
   with this version; nothing else needs to be done, and agents succeed
   on their next attempt.
+- The HTTP-01 responder no longer accepts registrations while its
+  `hmac_secret` is the bundled placeholder `CHANGE-ME` (or `change-me`).
+  It still starts and serves challenges, but answers every registration
+  with `503 Service Unavailable` and logs why. A responder that was
+  started or recreated without its rendered configuration — by any
+  route, not only the `infra up` one described above — therefore fails
+  closed instead of accepting a publicly known secret. A manually
+  deployed responder that was actually using the placeholder as its
+  secret must be given a real one, and its agents the same value.
 
 ## [0.3.0] - 2026-08-17
 

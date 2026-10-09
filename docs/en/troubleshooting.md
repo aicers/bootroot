@@ -131,7 +131,9 @@ different things:
   than waiting out the per-request timeout.
 - *"answered `<status>`"* — the responder is reachable and refused the
   request, so waiting longer cannot help. Check `--responder-url` and the
-  HMAC secret; a `401` is a signature mismatch.
+  HMAC secret; a `401` is a signature mismatch. A `503` with
+  `HMAC secret is not configured` means the responder at that URL is still
+  on the placeholder secret.
 - *"Failed to build the HTTP-01 registration request"* — the request was
   never sent, so nothing was waited on. The endpoint in the message is what
   `--responder-url` produced; a missing `http://` prefix is the usual cause.
@@ -264,6 +266,31 @@ Run `bootroot infra up` once with a version that includes the fix. It
 recreates the responder with the rendered config mounted; nothing else
 needs repair, and agents succeed on their next attempt
 (`bootroot rotate force-reissue` forces one).
+
+### Every issuance fails with `503` and `HMAC secret is not configured`
+
+`Responder returned 503 Service Unavailable: HMAC secret is not configured`
+means the responder is running on the placeholder `hmac_secret`.
+`docker logs <instance>-http01` shows the matching error line, beginning
+`hmac_secret is the bundled placeholder`.
+
+This is the same container state the preceding subsection describes —
+`docker inspect <instance>-http01` shows the command
+`--config=/app/responder.toml` — which a responder of this version answers
+with `503`, where an older one answered `401 Unauthorized: Invalid signature`
+and accepted the placeholder. No registration is accepted in that state,
+with any secret, and tokens registered before the container was recreated
+are gone with it.
+
+- On an initialised deployment, run `bootroot infra up` from the directory
+  that holds `state.json`.
+- Run `bootroot init` instead if the deployment was never initialised, if
+  `infra install` was re-run to record a changed bind, or if
+  `secrets/responder/docker-compose.responder.override.yml` is missing.
+- A manually deployed responder needs a real `hmac_secret` in its
+  `responder.toml`.
+
+Agents succeed on their next attempt.
 
 ### `Finalize failed: badCSR`
 

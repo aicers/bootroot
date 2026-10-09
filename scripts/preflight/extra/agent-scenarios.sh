@@ -18,6 +18,9 @@ COMPOSE_ARGS=(
   -f docker-compose.yml
   -f docker-compose.test.yml
 )
+# The responder secret every scenario runs with; see
+# write_dev_responder_override for where it comes from.
+DEV_RESPONDER_HMAC="dev-hmac"
 AGENT_BIN="${BOOTROOT_AGENT_BIN:-$ROOT_DIR/target/debug/bootroot-agent}"
 AGENT_BUILT=0
 
@@ -79,16 +82,49 @@ detect_compose() {
 }
 
 current_responder_hmac() {
-  if [ -f "$ROOT_DIR/responder.toml.compose" ]; then
-    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/responder.toml.compose"
-    return
-  fi
-  if [ -f "$ROOT_DIR/secrets/responder/responder.toml" ]; then
-    awk -F'"' '/^hmac_secret = / {print $2; exit}' \
-      "$ROOT_DIR/secrets/responder/responder.toml"
-    return
-  fi
-  printf '%s\n' "dev-hmac"
+  printf '%s\n' "$DEV_RESPONDER_HMAC"
+}
+
+# Gives the stack's responder a working development secret.
+#
+# The base compose file mounts responder.toml.compose, whose hmac_secret is
+# the public placeholder, and a responder holding the placeholder refuses
+# every registration. So render a copy of that config carrying the
+# development secret and mount it over the same container path, from a
+# compose override appended to COMPOSE_ARGS so that every invocation below
+# carries it. Compose merges volumes by container path, which replaces the
+# base mount and leaves the base `command` valid.
+#
+# Both files live under tmp/ only. The base compose definition is what a
+# broken deployment falls back to, so the development secret must never be
+# written there.
+write_dev_responder_override() {
+  local src="$ROOT_DIR/responder.toml.compose"
+  [ -f "$src" ] || fail "Missing responder.toml.compose"
+
+  mkdir -p "$TMP_DIR"
+  # Absolute, because TMP_DIR can be overridden and a relative path in an
+  # override resolves against the project directory, not against TMP_DIR.
+  local tmp_abs
+  tmp_abs="$(cd "$TMP_DIR" && pwd)"
+  local responder_cfg="$tmp_abs/responder.toml.dev"
+  local compose_override="$tmp_abs/docker-compose.dev-hmac.yml"
+
+  sed -e "s|^hmac_secret = .*$|hmac_secret = \"$DEV_RESPONDER_HMAC\"|" \
+    "$src" > "$responder_cfg"
+  grep -Fxq "hmac_secret = \"$DEV_RESPONDER_HMAC\"" "$responder_cfg" \
+    || fail "responder.toml.compose has no hmac_secret line to replace"
+  # The container reads this as a different user, whatever the caller's umask.
+  chmod 0644 "$responder_cfg"
+
+  cat <<YAML > "$compose_override"
+services:
+  bootroot-http01:
+    volumes:
+      - "$responder_cfg:/app/responder.toml:ro"
+YAML
+
+  COMPOSE_ARGS+=(-f "$compose_override")
 }
 
 ensure_agent_binary() {
@@ -956,6 +992,7 @@ YAML
   log "eab-required failure ok"
 }
 
+write_dev_responder_override
 check_prereqs
 
 case "$SCENARIO" in

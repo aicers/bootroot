@@ -21,6 +21,9 @@ pub(super) const DEFAULT_MAX_SKEW_SECS: u64 = 60;
 pub(super) const DEFAULT_ADMIN_RATE_LIMIT_REQUESTS: u64 = 300;
 pub(super) const DEFAULT_ADMIN_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub(super) const DEFAULT_ADMIN_BODY_LIMIT_BYTES: u64 = 8 * 1024;
+/// The `hmac_secret` the bundled and example configs ship with. It is
+/// public, so a responder holding it has no secret at all.
+const PLACEHOLDER_HMAC_SECRET: &str = "CHANGE-ME";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Bootroot HTTP-01 responder")]
@@ -136,6 +139,17 @@ impl ResponderSettings {
         Ok(())
     }
 
+    /// Reports whether `hmac_secret` is still the shipped placeholder.
+    ///
+    /// The comparison is on the loaded value whatever its source, and is
+    /// a plain one: the placeholder is published, so there is no timing
+    /// to protect.
+    pub(super) fn has_placeholder_hmac_secret(&self) -> bool {
+        self.hmac_secret
+            .trim_ascii()
+            .eq_ignore_ascii_case(PLACEHOLDER_HMAC_SECRET)
+    }
+
     pub(super) fn tls_enabled(&self) -> bool {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
@@ -185,6 +199,8 @@ fn validate_socket_addr(value: &str, field_name: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use config::FileFormat;
+
     use super::*;
 
     /// The on-disk format samples, one directory per version that added
@@ -246,6 +262,68 @@ mod tests {
             .validate()
             .expect_err("empty HMAC secret must be rejected");
         assert!(err.to_string().contains("hmac_secret"));
+    }
+
+    #[test]
+    fn test_placeholder_hmac_secret_is_recognised() {
+        // The failure messages name a case by position, never by value:
+        // an `hmac_secret` does not belong in test output either.
+        let placeholders = ["CHANGE-ME", "change-me", "  Change-Me  "];
+        for (case, value) in placeholders.into_iter().enumerate() {
+            let mut settings = test_settings();
+            settings.hmac_secret = value.to_string();
+            assert!(
+                settings.has_placeholder_hmac_secret(),
+                "placeholder case {case} must be treated as the placeholder"
+            );
+        }
+        let real = [
+            "CHANGE-ME-2",
+            "dev-hmac",
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+        ];
+        for (case, value) in real.into_iter().enumerate() {
+            let mut settings = test_settings();
+            settings.hmac_secret = value.to_string();
+            assert!(
+                !settings.has_placeholder_hmac_secret(),
+                "real case {case} must not be treated as the placeholder"
+            );
+        }
+    }
+
+    /// The responder has to start on the bundle config, so the
+    /// placeholder is refused per registration and not at load.
+    #[test]
+    fn test_validate_accepts_placeholder_hmac_secret() {
+        let mut settings = test_settings();
+        settings.hmac_secret = PLACEHOLDER_HMAC_SECRET.to_string();
+        settings
+            .validate()
+            .expect("a placeholder HMAC secret must not fail validation");
+    }
+
+    /// Ties the guard to the files that are shipped: a placeholder
+    /// changed there to a string the guard does not know fails here.
+    #[test]
+    fn test_shipped_configs_carry_a_recognised_placeholder() {
+        for name in ["responder.toml.compose", "responder.toml.example"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let hmac_secret = Config::builder()
+                .add_source(File::from_str(&contents, FileFormat::Toml))
+                .build()
+                .unwrap_or_else(|err| panic!("parse {}: {err}", path.display()))
+                .get_string("hmac_secret")
+                .unwrap_or_else(|err| panic!("hmac_secret in {}: {err}", path.display()));
+            let mut settings = test_settings();
+            settings.hmac_secret = hmac_secret;
+            assert!(
+                settings.has_placeholder_hmac_secret(),
+                "{name} ships an hmac_secret the responder would accept"
+            );
+        }
     }
 
     #[test]

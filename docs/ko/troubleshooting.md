@@ -132,6 +132,8 @@
 - *"... `<상태 코드>`을(를) 반환했습니다"* — responder에는 연결되었지만
   요청이 거부된 경우이므로 더 기다려도 해결되지 않습니다. `--responder-url`
   과 HMAC 비밀값을 확인하세요. `401`은 서명 불일치입니다.
+  `HMAC secret is not configured`가 붙은 `503`은 해당 URL의 responder가
+  아직 플레이스홀더 시크릿으로 동작하고 있다는 뜻입니다.
 - *"Failed to build the HTTP-01 registration request"* — 요청 자체가 만들어
   지지 않아 전송되지 않은 경우이므로 대기도 일어나지 않습니다. 메시지에
   표시된 엔드포인트가 `--responder-url`로부터 만들어진 값이며, 보통
@@ -261,6 +263,32 @@ bootroot service add \
 렌더링된 설정이 마운트된 상태로 리스폰더가 다시 생성되며, 그 밖에
 복구할 것은 없습니다. 에이전트는 다음 시도에서 성공합니다
 (`bootroot rotate force-reissue`로 즉시 시도하게 할 수 있습니다).
+
+### 모든 발급이 `503`과 `HMAC secret is not configured`로 실패
+
+`Responder returned 503 Service Unavailable: HMAC secret is not configured`
+는 리스폰더가 플레이스홀더 `hmac_secret`으로 동작하고 있다는 뜻입니다.
+`docker logs <instance>-http01`에는 이에 대응하는,
+`hmac_secret is the bundled placeholder`로 시작하는 오류 줄이 나타납니다.
+
+이는 바로 앞 절에서 설명한 것과 같은 컨테이너 상태입니다
+(`docker inspect <instance>-http01`의 명령이
+`--config=/app/responder.toml`로 나타남). 이 버전의 리스폰더는 이
+상태에서 `503`으로 응답하며, 이전 버전은
+`401 Unauthorized: Invalid signature`로 응답하면서 플레이스홀더를
+수락했습니다. 이 상태에서는 어떤 시크릿으로도 등록이 수락되지 않으며,
+컨테이너가 다시 생성되기 전에 등록된 토큰은 컨테이너와 함께 사라집니다.
+
+- 초기화된 배포에서는 `state.json`이 있는 디렉터리에서
+  `bootroot infra up`을 실행하세요.
+- 배포가 한 번도 초기화되지 않았거나, 변경된 바인딩을 기록하려고
+  `infra install`을 다시 실행했거나,
+  `secrets/responder/docker-compose.responder.override.yml`이 없다면
+  대신 `bootroot init`을 실행하세요.
+- 수동으로 배포한 리스폰더는 `responder.toml`에 실제 `hmac_secret`이
+  있어야 합니다.
+
+에이전트는 다음 시도에서 성공합니다.
 
 ### `Finalize failed: badCSR`
 

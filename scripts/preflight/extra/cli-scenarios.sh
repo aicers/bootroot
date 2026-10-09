@@ -43,18 +43,6 @@ wait_for_postgres_admin() {
   fail "PostgreSQL admin endpoint did not become reachable before init"
 }
 
-current_responder_hmac() {
-  if [ -f "$ROOT_DIR/responder.toml.compose" ]; then
-    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/responder.toml.compose"
-    return
-  fi
-  if [ -f "$ROOT_DIR/secrets/responder/responder.toml" ]; then
-    awk -F'"' '/^hmac_secret = / {print $2; exit}' "$ROOT_DIR/secrets/responder/responder.toml"
-    return
-  fi
-  printf '%s\n' "dev-hmac"
-}
-
 run_cli_tests() {
   log "Running CLI unit tests"
   cargo test --bin bootroot
@@ -77,9 +65,6 @@ run_init_scenario() {
   rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json" "$ROOT_DIR/.env"
   mkdir -p "$ROOT_DIR/tmp"
 
-  local responder_hmac
-  responder_hmac="$(current_responder_hmac)"
-
   log "Installing infrastructure"
   cargo run --bin bootroot -- infra install
 
@@ -95,7 +80,7 @@ run_init_scenario() {
   BOOTROOT_LANG=en cargo run --bin bootroot -- init \
     --enable auto-generate,show-secrets,db-provision \
     --summary-json "$INIT_SUMMARY_JSON" \
-    --http-hmac "$responder_hmac" \
+    --http-hmac "dev-hmac" \
     --no-eab \
     --no-save-unseal-keys \
     --overwrite-password \
@@ -189,8 +174,6 @@ wait_for_stepca_directory() {
 
 write_agent_config() {
   local output_path="$1"
-  local responder_hmac
-  responder_hmac="$(current_responder_hmac)"
   cat >"$output_path" <<EOF
 email = "admin@example.com"
 server = "https://localhost:9000/acme/acme/directory"
@@ -203,7 +186,7 @@ directory_fetch_max_delay_secs = 10
 poll_attempts = 15
 poll_interval_secs = 2
 http_responder_url = "http://localhost:8080"
-http_responder_hmac = "$responder_hmac"
+http_responder_hmac = "dev-hmac"
 http_responder_timeout_secs = 5
 http_responder_token_ttl_secs = 300
 EOF
