@@ -1847,7 +1847,22 @@ mod tests {
     async fn update_ca_json_writes_the_policy_and_is_idempotent() {
         let temp_dir = tempdir().unwrap();
         let secrets_dir = temp_dir.path().join("secrets");
-        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        // `dnsNames` and `metricsAddress` are already settled, so the
+        // policy alone has to carry the restart: an install upgraded from
+        // a release without it changes nothing else.
+        write_ca_json(
+            &secrets_dir,
+            r#"{
+                "root": "/home/step/certs/root_ca.crt",
+                "dnsNames": ["localhost", "bootroot-ca", "stepca.internal"],
+                "metricsAddress": ":9102",
+                "db": {"type": "badger", "dataSource": "/home/step/db"},
+                "authority": {"provisioners": [
+                    {"type": "JWK", "name": "admin"},
+                    {"type": "ACME", "name": "acme", "claims": {"defaultTLSCertDuration": "24h"}}
+                ]}
+            }"#,
+        );
         let messages = test_messages();
         let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
         let deny = default_deny_dns();
@@ -1863,8 +1878,19 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            !first.dns_names_changed,
+            "the fixture already carries the derived name set"
+        );
+        assert!(
+            !first.metrics_address_changed,
+            "the fixture already carries the metrics address"
+        );
         assert!(first.policy_changed);
-        assert!(first.stepca_reload_required());
+        assert!(
+            first.stepca_reload_required(),
+            "a policy-only change must restart step-ca"
+        );
         let after_first = read_ca_json(&secrets_dir);
         assert_eq!(
             after_first["authority"]["policy"]["x509"]["deny"]["dns"],
