@@ -2827,6 +2827,23 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+Commands that change `state.json` — `rotate approle-secret-id`,
+`rotate infra-cert`, `service add`, `service update`, `service remove`,
+`infra install`, `init` and `reinit` — serialize on a lock file,
+`state.json.lock`, beside the state file, so a scheduled rotation and
+another command that overlap cannot overwrite each other's update. A
+command started while another holds the lock waits for it, with no
+timeout, and prints one line to stderr saying so. This includes a
+timer-fired rotation started while an operator's command is waiting at
+a confirmation prompt: its journal shows that line until the prompt is
+answered. The lock file is created with mode `0600` by the first
+command that needs it and is never removed, so state-changing commands
+for one state file must all run as the user that owns it, or as root.
+Do not delete the lock file while a command is running: the next
+command would create a new one and run unserialized against the one
+still in progress. Read-only commands (`status`, `verify`,
+`service info`, and the other `rotate` subcommands) take no lock.
+
 ### Scheduling AppRole secret_id rotation
 
 Every AppRole `secret_id` bootroot mints carries a short TTL (default

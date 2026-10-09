@@ -2668,6 +2668,22 @@ Persistent=true
 WantedBy=timers.target
 ```
 
+`state.json`을 변경하는 명령(`rotate approle-secret-id`,
+`rotate infra-cert`, `service add`, `service update`, `service remove`,
+`infra install`, `init`, `reinit`)은 상태 파일 옆의 잠금 파일
+`state.json.lock`으로 직렬화되므로, 예약된 회전과 겹쳐 실행된 다른
+명령이 서로의 변경을 덮어쓰지 않습니다. 다른 명령이 잠금을 잡고 있는
+동안 시작된 명령은 제한 시간 없이 기다리며, 기다린다는 내용을 stderr에
+한 줄 출력합니다. 운영자의 명령이 확인 프롬프트에서 대기하는 동안
+타이머로 시작된 회전도 마찬가지이며, 프롬프트에 응답할 때까지 해당
+저널에 그 한 줄이 남습니다. 잠금 파일은 처음 필요로 하는 명령이 `0600`
+모드로 생성하고 이후 삭제되지 않으므로, 하나의 상태 파일을 변경하는
+명령은 모두 그 파일을 소유한 사용자 또는 root로 실행해야 합니다.
+명령이 실행 중일 때 잠금 파일을 삭제하지 마세요. 다음 명령이 새 잠금
+파일을 만들어, 아직 진행 중인 명령과 직렬화되지 않은 채 실행됩니다.
+읽기 전용 명령(`status`, `verify`, `service info`, 그 밖의 `rotate` 하위
+명령)은 잠금을 잡지 않습니다.
+
 ### AppRole secret_id 회전 스케줄링
 
 bootroot가 발급하는 모든 AppRole `secret_id`는 짧은 TTL(기본 `24h`)을

@@ -311,6 +311,10 @@ impl Messages {
         self.strings().error_state_missing
     }
 
+    pub(crate) fn info_state_lock_waiting(&self, path: &str) -> String {
+        format_template(self.strings().info_state_lock_waiting, &[("path", path)])
+    }
+
     pub(crate) fn error_openbao_bind_wildcard_required(&self) -> &'static str {
         self.strings().error_openbao_bind_wildcard_required
     }

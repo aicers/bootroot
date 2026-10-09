@@ -66,6 +66,7 @@ use crate::commands::openbao_unseal::unseal_keys_path;
 use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
 use crate::state::StateFile;
+use crate::state_lock::StateLock;
 
 /// Assembles the inputs the bootroot-internal provisioning runs under.
 ///
@@ -251,6 +252,24 @@ fn args_with_effective_openbao_url_with_env<'a>(
 }
 
 pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()> {
+    // `init` writes `state.json` in several steps and reads it between
+    // them, so the lock spans the whole run. On a first `init` the state
+    // file does not exist yet and the lock file is created beside where
+    // it will be.
+    let state_lock = StateLock::acquire(&StateFile::default_path(), messages).await?;
+    run_init_locked(args, &state_lock, messages).await
+}
+
+/// [`run_init`] under the state lock its caller holds.
+///
+/// The entry point for `reinit`, which takes the lock once for its own
+/// state writes and this run together: taking it again here would wait
+/// forever on the descriptor `reinit` already holds.
+pub(crate) async fn run_init_locked(
+    args: &InitArgs,
+    state_lock: &StateLock,
+    messages: &Messages,
+) -> Result<()> {
     // Point the whole init flow at the OpenBao host port the compose
     // stack actually publishes.  The first client below is built before
     // any `state.json` value is consulted, so without this a second
@@ -331,6 +350,7 @@ pub(crate) async fn run_init(args: &InitArgs, messages: &Messages) -> Result<()>
     let mut rollback = InitRollback::default();
     let result = run_init_inner(
         &mut client,
+        state_lock,
         args,
         messages,
         &mut rollback,
@@ -683,10 +703,13 @@ fn preflight_prompts(args: &InitArgs, plan: &InitPlan) -> Vec<PreflightPrompt> {
     .collect()
 }
 
-#[allow(clippy::too_many_lines)]
 // Keep init flow in one place to preserve ordering across subsystems.
+// One argument past clippy's limit: the state lock is passed on its own
+// so that the function that saves `state.json` names it.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_init_inner(
     client: &mut OpenBaoClient,
+    _state_lock: &StateLock,
     args: &InitArgs,
     messages: &Messages,
     rollback: &mut InitRollback,
@@ -2498,7 +2521,8 @@ mod tests {
         // runs earlier and emits its own diagnostic.
         args.compose.compose_file = dir.path().join("does-not-exist.yml");
 
-        let err = run_init(&args, &test_messages())
+        let state_lock = crate::state_lock::hold_for_test(&dir.path().join("state.json"));
+        let err = run_init_locked(&args, &state_lock, &test_messages())
             .await
             .expect_err("bad --summary-json must be rejected at preflight");
         let msg = err.to_string();
@@ -2521,7 +2545,8 @@ mod tests {
         args.root_token_output = Some(bad_path.clone());
         args.compose.compose_file = dir.path().join("does-not-exist.yml");
 
-        let err = run_init(&args, &test_messages())
+        let state_lock = crate::state_lock::hold_for_test(&dir.path().join("state.json"));
+        let err = run_init_locked(&args, &state_lock, &test_messages())
             .await
             .expect_err("bad --root-token-output must be rejected at preflight");
         let msg = err.to_string();

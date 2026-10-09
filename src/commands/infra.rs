@@ -47,6 +47,7 @@ use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unsea
 use crate::commands::openbao_url::effective_openbao_url;
 use crate::i18n::Messages;
 use crate::state::{RegistrarEndpointState, StateFile};
+use crate::state_lock::StateLock;
 
 const DEFAULT_GRAFANA_ADMIN_PASSWORD: &str = "admin";
 /// The compose service whose audit device follows the audit override.
@@ -449,8 +450,23 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) -> Result<()> {
+    // Taken before the first read of `state.json` — the registrar
+    // endpoint check below judges a request against what is recorded —
+    // and held past the last of the intent writes. On a fresh directory
+    // the state file does not exist yet and the lock file is created
+    // beside where it will be.
+    let state_lock = StateLock::acquire_blocking(&StateFile::default_path(), messages)?;
+    run_infra_install_locked(args, &state_lock, messages)
+}
+
+/// [`run_infra_install`] under the state lock its caller holds.
+#[allow(clippy::too_many_lines)]
+fn run_infra_install_locked(
+    args: &InfraInstallArgs,
+    state_lock: &StateLock,
+    messages: &Messages,
+) -> Result<()> {
     // Validate the declared identity before anything is written: a
     // rejected name must leave no `.env` behind.
     if let Some(ref instance_name) = args.instance_name {
@@ -632,6 +648,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
     if let Some(ref bind_addr) = openbao_bind {
         write_openbao_exposed_override(compose_dir, bind_addr, messages)?;
         save_openbao_bind_intent(
+            state_lock,
             compose_dir,
             bind_addr,
             args.openbao_advertise_addr.as_deref(),
@@ -640,12 +657,13 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         )?;
         println!("{}", messages.info_openbao_bind_intent_recorded(bind_addr));
     } else {
-        clear_openbao_bind_intent(compose_dir, &openbao_url, messages)?;
+        clear_openbao_bind_intent(state_lock, compose_dir, &openbao_url, messages)?;
     }
 
     if let Some(ref bind_addr) = http01_admin_bind {
         write_http01_exposed_override(compose_dir, bind_addr, messages)?;
         save_http01_admin_bind_intent(
+            state_lock,
             compose_dir,
             bind_addr,
             args.http01_admin_advertise_addr.as_deref(),
@@ -657,12 +675,13 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
             messages.info_http01_admin_bind_intent_recorded(bind_addr)
         );
     } else {
-        clear_http01_admin_bind_intent(compose_dir, messages)?;
+        clear_http01_admin_bind_intent(state_lock, compose_dir, messages)?;
     }
 
     if let Some(ref bind_addr) = stepca_bind {
         write_stepca_exposed_override(compose_dir, bind_addr, messages)?;
         save_stepca_bind_intent(
+            state_lock,
             bind_addr,
             args.stepca_advertise_addr.as_deref(),
             &openbao_url,
@@ -670,7 +689,7 @@ pub(crate) fn run_infra_install(args: &InfraInstallArgs, messages: &Messages) ->
         )?;
         println!("{}", messages.info_stepca_bind_intent_recorded(bind_addr));
     } else {
-        clear_stepca_bind_intent(compose_dir, messages)?;
+        clear_stepca_bind_intent(state_lock, compose_dir, messages)?;
     }
 
     // Recorded, never cleared: without the flags the predicate `init`
@@ -1803,6 +1822,7 @@ pub(crate) fn has_openbao_bind_intent(state_path: &Path) -> Result<bool> {
 /// parsed.  A corrupted state file must not be silently replaced,
 /// because stored intent is the authoritative TLS safety gate.
 fn save_openbao_bind_intent(
+    _state_lock: &StateLock,
     compose_dir: &Path,
     bind_addr: &str,
     advertise_addr: Option<&str>,
@@ -1878,6 +1898,7 @@ fn save_openbao_bind_intent_to(
 /// ensuring the latest install always reflects the operator's current
 /// intent.
 fn clear_openbao_bind_intent(
+    _state_lock: &StateLock,
     compose_dir: &Path,
     openbao_url: &str,
     messages: &Messages,
@@ -1937,6 +1958,7 @@ fn clear_openbao_bind_intent_to(
 
 /// Persists the HTTP-01 admin non-loopback bind address to `StateFile`.
 fn save_http01_admin_bind_intent(
+    _state_lock: &StateLock,
     compose_dir: &Path,
     bind_addr: &str,
     advertise_addr: Option<&str>,
@@ -2011,7 +2033,11 @@ fn save_http01_admin_bind_intent_to(
 }
 
 /// Clears a previously stored HTTP-01 admin non-loopback bind intent.
-fn clear_http01_admin_bind_intent(compose_dir: &Path, messages: &Messages) -> Result<()> {
+fn clear_http01_admin_bind_intent(
+    _state_lock: &StateLock,
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
     clear_http01_admin_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
 }
 
@@ -2058,6 +2084,7 @@ pub(crate) fn has_http01_admin_bind_intent(state_path: &Path) -> Result<bool> {
 
 /// Persists the step-ca non-loopback bind address to `StateFile`.
 fn save_stepca_bind_intent(
+    _state_lock: &StateLock,
     bind_addr: &str,
     advertise_addr: Option<&str>,
     openbao_url: &str,
@@ -2147,7 +2174,11 @@ fn sync_state_openbao_url_to(
 /// Clears a previously stored step-ca non-loopback bind intent and
 /// removes the compose override file so that a subsequent `infra up`
 /// reverts step-ca's ACME directory to the default loopback publish.
-fn clear_stepca_bind_intent(compose_dir: &Path, messages: &Messages) -> Result<()> {
+fn clear_stepca_bind_intent(
+    _state_lock: &StateLock,
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
     clear_stepca_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
 }
 
@@ -3411,7 +3442,13 @@ mod tests {
         for invalid in ["Insight", "in sight", "-insight", "", &"a".repeat(40)] {
             let mut args = install_args(compose_path.clone());
             args.instance_name = Some(invalid.to_string());
-            let err = run_infra_install(&args, &messages).unwrap_err().to_string();
+            let err = run_infra_install_locked(
+                &args,
+                &crate::state_lock::hold_for_test(&dir.path().join("state.json")),
+                &messages,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 err.contains("39"),
                 "{invalid:?} error must name the limit: {err}"
@@ -6081,7 +6118,12 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             registrar_endpoint_domain: None,
             no_build: false,
         };
-        let err = run_infra_install(&args, &messages).unwrap_err();
+        let err = run_infra_install_locked(
+            &args,
+            &crate::state_lock::hold_for_test(&dir.path().join("state.json")),
+            &messages,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("bootroot-http01"),
@@ -6399,7 +6441,13 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             let mut args = install_args(compose_path.clone());
             args.registrar_endpoint_host = Some(host.to_string());
             args.registrar_endpoint_domain = Some(domain.to_string());
-            let err = run_infra_install(&args, &messages).unwrap_err().to_string();
+            let err = run_infra_install_locked(
+                &args,
+                &crate::state_lock::hold_for_test(&dir.path().join("state.json")),
+                &messages,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 err.contains("--registrar-endpoint-"),
                 "({host:?}, {domain:?}) must be refused by the predicate check: {err}"

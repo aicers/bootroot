@@ -200,10 +200,16 @@ impl StateFile {
     /// invocation, or the next run after a crash — sees either the whole
     /// previous version or the whole new one, and two concurrent writers
     /// see one version or the other rather than each other's bytes.
-    /// `bootler` staggers its two rotation units ten minutes apart
-    /// because this write used to race; that stagger is no longer
-    /// load-bearing for this file (removing it is `bootler`'s own
-    /// follow-up).
+    ///
+    /// That makes one write atomic and nothing more. A command loads
+    /// the whole file, works, and writes the whole struct back, and the
+    /// rename does not serialize that interval: of two commands that
+    /// overlap, the one that saves last writes back what it loaded
+    /// before the other saved, and the other's update is gone without
+    /// an error from either. What serializes a load-to-save interval is
+    /// the state lock, [`crate::state_lock::StateLock`], which every
+    /// command that calls this holds from before its load until after
+    /// its last save.
     ///
     /// The containing directory is flushed after the rename, inside
     /// [`fs_util::atomic_write_blocking`]. This file is read back to

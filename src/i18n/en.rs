@@ -83,6 +83,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_responder_rejected: "The HTTP-01 responder at {endpoint} answered {status}: {body}. The responder is reachable, so check the responder URL and the HMAC secret rather than waiting longer.",
     error_responder_ready_timeout_invalid: "--responder-ready-timeout-secs must be greater than 0",
     error_state_missing: "state.json not found (run `bootroot init` first)",
+    info_state_lock_waiting: "Waiting for another bootroot command to release the state lock {path}",
     error_service_duplicate: "Service already exists: {value}",
     error_service_agent_config_conflict: "Agent config {path} is already used by service {service}. Each distinct local-file service needs its own agent.toml: the [openbao] section holds a single AppRole identity, so two services sharing one config would overwrite each other's credentials",
     error_service_agent_config_stale_profile: "Agent config {path} still contains a bootroot-managed profile for service {service} (likely left by `service remove` without --strip-config/--delete-artifacts). The agent fast-polls every profile in a config under its single [openbao] AppRole identity, so the stale service would run under this service's credentials. Delete the `# BEGIN/END bootroot managed profile: {service}` block (or use a separate agent.toml) and retry",

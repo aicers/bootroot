@@ -83,6 +83,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_responder_rejected: "{endpoint}의 HTTP-01 responder가 {status}을(를) 반환했습니다: {body}. responder에는 연결되었으므로 더 기다리지 말고 responder URL과 HMAC 비밀값을 확인하세요.",
     error_responder_ready_timeout_invalid: "--responder-ready-timeout-secs는 0보다 커야 합니다",
     error_state_missing: "state.json을 찾을 수 없습니다 (`bootroot init`을 먼저 실행하세요)",
+    info_state_lock_waiting: "다른 bootroot 명령이 상태 잠금 {path}을(를) 해제하기를 기다리는 중입니다",
     error_service_duplicate: "서비스가 이미 존재합니다: {value}",
     error_service_agent_config_conflict: "에이전트 설정 {path}은(는) 이미 {service} 서비스가 사용 중입니다. [openbao] 섹션은 하나의 AppRole 자격 증명만 담으므로, 서로 다른 local-file 서비스는 각각 별도의 agent.toml을 사용해야 합니다. 하나의 설정을 공유하면 서로의 자격 증명을 덮어쓰게 됩니다",
     error_service_agent_config_stale_profile: "에이전트 설정 {path}에 {service} 서비스의 bootroot 관리 프로필이 남아 있습니다(--strip-config/--delete-artifacts 없이 `service remove`를 실행하면 남습니다). 에이전트는 설정 안의 모든 프로필을 하나의 [openbao] AppRole 자격 증명으로 fast-poll하므로, 남은 서비스가 이 서비스의 자격 증명으로 실행됩니다. `# BEGIN/END bootroot managed profile: {service}` 블록을 삭제하거나 별도의 agent.toml을 사용한 뒤 다시 시도하세요",

@@ -22,6 +22,7 @@ use crate::commands::dns_alias::reconcile_dns_aliases;
 use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, StateFile};
+use crate::state_lock::StateLock;
 
 /// On-disk artifacts eligible for deletion under `--delete-artifacts`.
 struct ArtifactPlan {
@@ -94,7 +95,10 @@ pub(crate) async fn run_service_remove(
     messages: &Messages,
 ) -> Result<()> {
     let state_path = StateFile::default_path();
-    let mut state = load_state_or_missing(&state_path, messages)?;
+    ensure_state_exists(&state_path, messages)?;
+    let state_lock = StateLock::acquire(&state_path, messages).await?;
+    let mut state =
+        StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
     let entry = require_service_entry(&state, &args.registration_id, messages)?;
 
     let kv_suffixes = service_kv_suffixes(&entry);
@@ -208,6 +212,7 @@ pub(crate) async fn run_service_remove(
     finalize_removal(
         &mut state,
         &state_path,
+        &state_lock,
         &args.registration_id,
         // `service remove` reports the alias refresh nowhere, so the
         // outcome is dropped here rather than widening this command's
@@ -221,13 +226,16 @@ pub(crate) async fn run_service_remove(
     Ok(())
 }
 
-/// Loads `state.json`, bailing with `error_state_missing` when the file
-/// is absent (mirrors `run_service_update`).
-fn load_state_or_missing(state_path: &Path, messages: &Messages) -> Result<StateFile> {
+/// Bails with `error_state_missing` when `state.json` is absent
+/// (mirrors `run_service_update`).
+///
+/// Its own step, ahead of the state lock: a command run in the wrong
+/// directory must not leave a lock file there.
+fn ensure_state_exists(state_path: &Path, messages: &Messages) -> Result<()> {
     if !state_path.exists() {
         anyhow::bail!(messages.error_state_missing());
     }
-    StateFile::load(state_path).with_context(|| messages.error_parse_state_failed())
+    Ok(())
 }
 
 /// Returns a clone of the registered entry with this `registration_id`,
@@ -260,6 +268,7 @@ fn require_service_entry(
 async fn finalize_removal(
     state: &mut StateFile,
     state_path: &Path,
+    _state_lock: &StateLock,
     registration_id: &str,
     reconcile: impl FnOnce(&StateFile) -> Result<()>,
     messages: &Messages,
@@ -523,11 +532,11 @@ mod tests {
     }
 
     #[test]
-    fn load_state_or_missing_bails_when_absent() {
+    fn ensure_state_exists_bails_when_absent() {
         let dir = tempdir().expect("tempdir");
         let messages = test_messages();
         let state_path = dir.path().join("state.json");
-        let err = load_state_or_missing(&state_path, &messages).expect_err("must bail");
+        let err = ensure_state_exists(&state_path, &messages).expect_err("must bail");
         assert_eq!(err.to_string(), messages.error_state_missing());
     }
 
@@ -566,10 +575,12 @@ mod tests {
             sample_entry("keep", DeliveryMode::LocalFile),
         );
         state.save(&state_path).expect("save");
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
 
         finalize_removal(
             &mut state,
             &state_path,
+            &state_lock,
             "svc",
             |post_removal| {
                 assert!(
@@ -606,10 +617,12 @@ mod tests {
             sample_entry("svc", DeliveryMode::LocalFile),
         );
         state.save(&state_path).expect("save");
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
 
         let err = finalize_removal(
             &mut state,
             &state_path,
+            &state_lock,
             "svc",
             |_| anyhow::bail!("responder detached"),
             &messages,

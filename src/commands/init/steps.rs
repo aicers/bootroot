@@ -22,7 +22,7 @@ pub(crate) use ca_certs::{
 pub(crate) use openbao_setup::{
     infra_rotate_policy, parse_ttl_to_secs, validate_rotate_bound_cidrs, validate_secret_id_ttl,
 };
-pub(crate) use orchestrator::run_init;
+pub(crate) use orchestrator::{run_init, run_init_locked};
 pub(crate) use prompts::prompt_yes_no;
 
 use super::types::EabCredentials;

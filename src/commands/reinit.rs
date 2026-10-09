@@ -24,12 +24,13 @@ use crate::commands::infra::run_infra_up;
 use crate::commands::init::registrar_internal::{
     preflight_endpoint_tables, registrar_endpoint_intent,
 };
-use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init};
+use crate::commands::init::{compose_has_openbao, prompt_yes_no, run_init_locked};
 use crate::commands::openbao_url::{
     OPENBAO_HOST_PORT_ENV, effective_openbao_url, effective_openbao_url_with_env,
 };
 use crate::i18n::Messages;
 use crate::state::StateFile;
+use crate::state_lock::StateLock;
 
 /// Compose service name owned by bootroot's local `OpenBao` deployment.
 /// Used by the scope check that distinguishes a compose-managed local
@@ -109,6 +110,14 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     let compose_file = &args.compose.compose_file;
     let compose_dir = compose_file_dir(compose_file);
     let state_path = StateFile::default_path();
+
+    // Taken once for the whole recovery — the snapshot of the old
+    // state, the two intermediate rewrites and the init pass that
+    // follows — and handed to that pass rather than taken again there:
+    // a second acquisition in this process would wait forever on the
+    // first. `infra up` in between only reads the state and takes
+    // nothing.
+    let state_lock = StateLock::acquire(&state_path, messages).await?;
 
     // 1. Refuse any operator-supplied `--openbao-url` that differs from
     //    the CLI default.  This is purely args-derived so it runs before
@@ -241,6 +250,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //     present so infra up restores its required port override.
     write_minimal_state_for_infra(
         &state_path,
+        &state_lock,
         &snapshot,
         &openbao,
         &effective_secrets_dir,
@@ -278,6 +288,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //     direct init.
     write_minimal_state(
         &state_path,
+        &state_lock,
         &snapshot,
         &openbao,
         &effective_secrets_dir,
@@ -299,7 +310,7 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
         &effective_secrets_dir,
         std::env::var(OPENBAO_HOST_PORT_ENV).ok().as_deref(),
     );
-    run_init(&init_args, messages).await?;
+    run_init_locked(&init_args, &state_lock, messages).await?;
 
     println!("{}", messages.reinit_completed());
     println!("{}", messages.reinit_service_registry_post_summary());
@@ -550,6 +561,7 @@ pub(crate) fn snapshot_deployment_intent(state_path: &Path) -> Result<Deployment
 /// runtime thread `run_reinit` runs on.
 pub(crate) async fn write_minimal_state(
     state_path: &Path,
+    state_lock: &StateLock,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
     effective_secrets_dir: &Path,
@@ -557,6 +569,7 @@ pub(crate) async fn write_minimal_state(
 ) -> Result<()> {
     write_minimal_state_with_registrar_endpoint(
         state_path,
+        state_lock,
         snapshot,
         openbao,
         effective_secrets_dir,
@@ -575,6 +588,7 @@ pub(crate) async fn write_minimal_state(
 /// restores the predicate with [`write_minimal_state`] before invoking init.
 async fn write_minimal_state_for_infra(
     state_path: &Path,
+    state_lock: &StateLock,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
     effective_secrets_dir: &Path,
@@ -582,6 +596,7 @@ async fn write_minimal_state_for_infra(
 ) -> Result<()> {
     write_minimal_state_with_registrar_endpoint(
         state_path,
+        state_lock,
         snapshot,
         openbao,
         effective_secrets_dir,
@@ -594,6 +609,7 @@ async fn write_minimal_state_for_infra(
 /// Serializes a reinit state carrying the selected registrar predicate.
 async fn write_minimal_state_with_registrar_endpoint(
     state_path: &Path,
+    _state_lock: &StateLock,
     snapshot: &DeploymentIntent,
     openbao: &OpenBaoArgs,
     effective_secrets_dir: &Path,
@@ -1385,9 +1401,17 @@ mod tests {
         let effective = PathBuf::from("secrets");
         let messages = test_messages();
 
-        write_minimal_state(&state_path, &snapshot, &openbao, &effective, &messages)
-            .await
-            .unwrap();
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
+        write_minimal_state(
+            &state_path,
+            &state_lock,
+            &snapshot,
+            &openbao,
+            &effective,
+            &messages,
+        )
+        .await
+        .unwrap();
 
         let rewritten = StateFile::load(&state_path).unwrap();
         assert!(
@@ -3410,8 +3434,10 @@ mod tests {
             kv_mount: "secret".to_string(),
         };
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
         write_minimal_state(
             &state_path,
+            &state_lock,
             &snapshot,
             &openbao,
             Path::new("secrets-custom"),
@@ -3458,8 +3484,10 @@ mod tests {
             kv_mount: "secret".to_string(),
         };
         let messages = test_messages();
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
         write_minimal_state(
             &state_path,
+            &state_lock,
             &snapshot,
             &openbao,
             Path::new("secrets"),
@@ -3493,8 +3521,10 @@ mod tests {
         };
         let messages = test_messages();
 
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
         write_minimal_state_for_infra(
             &state_path,
+            &state_lock,
             &snapshot,
             &openbao,
             Path::new("secrets"),
@@ -3512,6 +3542,7 @@ mod tests {
 
         write_minimal_state(
             &state_path,
+            &state_lock,
             &snapshot,
             &openbao,
             Path::new("secrets"),
@@ -3541,8 +3572,10 @@ mod tests {
             openbao_url: "http://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
         };
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
         write_minimal_state(
             &state_path,
+            &state_lock,
             &snapshot,
             &openbao,
             Path::new("secrets"),

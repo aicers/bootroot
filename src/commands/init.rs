@@ -42,8 +42,8 @@ pub(crate) use steps::registrar_internal;
 pub(crate) use steps::stepca_setup::set_acme_cert_duration;
 pub(crate) use steps::{
     compute_ca_bundle_pem, compute_ca_fingerprints, infra_rotate_policy, parse_ttl_to_secs,
-    prompt_yes_no, read_ca_cert_fingerprint, run_init, validate_rotate_bound_cidrs,
-    validate_secret_id_ttl,
+    prompt_yes_no, read_ca_cert_fingerprint, run_init, run_init_locked,
+    validate_rotate_bound_cidrs, validate_secret_id_ttl,
 };
 pub(crate) use types::{
     AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, ResponderCheck, StepCaInitResult,
