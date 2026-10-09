@@ -375,6 +375,17 @@ mod tests {
         assert_eq!(err, RegisterError::InvalidTtl);
     }
 
+    /// Agents and `init` surface this text verbatim, and the
+    /// troubleshooting guide quotes it.
+    #[test]
+    fn test_not_configured_display_text() {
+        assert_eq!(
+            RegisterError::NotConfigured.to_string(),
+            "HMAC secret is not configured: the responder is running on the placeholder \
+             hmac_secret and refuses registrations until it is given its real configuration"
+        );
+    }
+
     #[tokio::test]
     async fn test_register_request_refuses_on_placeholder_secret() {
         let state = ResponderState::shared(ResponderSettings {

@@ -251,6 +251,28 @@ async fn test_http01_responder_refuses_registrations_on_placeholder_secret() {
     let challenge = fetch_challenge(&challenge_base_url, "token-placeholder").await;
     assert_eq!(challenge.status(), StatusCode::NOT_FOUND);
 
+    // What runs ahead of the refusal keeps its own answer: the readiness
+    // probes rely on the `405`, and an unsigned request is still a `401`.
+    let admin_url = format!("{admin_base_url}{ADMIN_PATH}");
+    let client = reqwest::Client::new();
+    let probe = client
+        .get(&admin_url)
+        .send()
+        .await
+        .expect("probe admin port");
+    assert_eq!(probe.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let unsigned = client
+        .post(&admin_url)
+        .json(&json!({
+            "token": "token-unsigned",
+            "key_authorization": "token-unsigned.key",
+            "ttl_secs": TEST_TTL_SECS,
+        }))
+        .send()
+        .await
+        .expect("send unsigned registration");
+    assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
     write_responder_config(&config_path, &listen_addr, &admin_addr, REAL_SECRET);
     send_sighup(responder.pid());
     let accepted_token =
