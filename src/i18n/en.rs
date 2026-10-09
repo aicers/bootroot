@@ -602,6 +602,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_http01_admin_tls_output_dir_symlink: "Refusing to use a symlink as the HTTP-01 admin API TLS output directory: {path}",
     error_registrar_internal_provision_failed: "Failed to sign the bootroot-internal registrar certificate",
     error_registrar_internal_staging_symlink: "Refusing to use a symlink as the bootroot-internal registrar staging directory: {path}",
+    warning_registrar_internal_acme_file_replaced: "Warning: the ACME account key at {path} is not one bootroot can read back; replacing it with a new one",
     info_infra_tls_renewed: "Infrastructure certificate renewed: {name}",
     info_infra_tls_reload: "Reloading service after certificate renewal: {strategy}",
     info_infra_tls_verified: "Certificate reload verified for {name}: the OpenBao listener now serves the renewed certificate",

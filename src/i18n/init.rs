@@ -603,6 +603,13 @@ impl Messages {
             &[("path", path)],
         )
     }
+
+    pub(crate) fn warning_registrar_internal_acme_file_replaced(&self, path: &str) -> String {
+        format_template(
+            self.strings().warning_registrar_internal_acme_file_replaced,
+            &[("path", path)],
+        )
+    }
 }
 
 impl Messages {

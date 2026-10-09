@@ -14,7 +14,7 @@ use std::time::Duration;
 // registrar handler build below, the two fallible compositions in this
 // module.
 use anyhow::Context as _;
-use tokio::sync::{Mutex as TokioMutex, Semaphore, watch};
+use tokio::sync::{Mutex as TokioMutex, Semaphore, oneshot, watch};
 use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
@@ -175,10 +175,25 @@ pub struct DaemonInvocation {
 ///
 /// # Errors
 /// Returns an error if issuance or shutdown handling fails.
+pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
+    run_daemon_reporting(invocation, None).await
+}
+
+/// Runs [`run_daemon`], sending the label of every profile the periodic
+/// loop was spawned for through `scheduled` once that loop has run.
+///
+/// The report only observes: it is built from the profiles the spawn
+/// loop itself iterates, so it says what was scheduled rather than what
+/// the filter would allow, and sending it changes nothing about which
+/// tasks run or when. A test awaits it as evidence that the daemon got
+/// past scheduling, where stopping at once would prove nothing.
 // The daemon composes lifecycle-owned services in one place; extracting the
 // registrar maintenance wiring would make shutdown ownership less visible.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<()> {
+async fn run_daemon_reporting(
+    invocation: DaemonInvocation,
+    scheduled: Option<oneshot::Sender<Vec<String>>>,
+) -> anyhow::Result<()> {
     let DaemonInvocation {
         settings,
         default_eab,
@@ -269,7 +284,11 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     #[cfg(not(target_os = "linux"))]
     let registrar_maintenance = None;
     spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx, registrar_maintenance);
+    let mut scheduled_labels = Vec::new();
     for profile in issuable_profiles(&settings) {
+        if scheduled.is_some() {
+            scheduled_labels.push(config::profile_domain(&settings, &profile));
+        }
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let profile_locks = Arc::clone(&profile_locks);
@@ -289,6 +308,10 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
             )
             .await
         }));
+    }
+    if let Some(scheduled) = scheduled {
+        // A receiver that has gone away no longer wants the report.
+        let _ = scheduled.send(scheduled_labels);
     }
 
     if settings.openbao.is_some() {
@@ -1364,8 +1387,9 @@ fn skips_internal_profile(
         return false;
     }
     info!(
-        "Profile '{}' is the bootroot-internal credential; it is replaced by `bootroot init` \
-         and `bootroot rotate registrar-internal-credential`, and no issuance is started for it.",
+        "Profile '{}' is the bootroot-internal credential; it is replaced by `bootroot init`, \
+         `bootroot rotate registrar-internal-credential`, and `bootroot rotate ca-key --full`, \
+         and no issuance is started for it.",
         config::profile_domain(settings, profile)
     );
     true
@@ -2199,6 +2223,11 @@ mod tests {
         (acme, url)
     }
 
+    /// How long the periodic arm below waits for the daemon's report and
+    /// then for its stop. It bounds only a run that has already failed;
+    /// a passing run is released by the report and the stop themselves.
+    const DAEMON_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn nothing_connected(acme: &std::net::TcpListener) -> bool {
         matches!(
             acme.accept().map_err(|err| err.kind()),
@@ -2257,21 +2286,47 @@ mod tests {
         .expect("a force-reissue of the internal profile is a no-op");
         assert!(nothing_connected(&acme), "the force-reissue reached ACME");
 
-        // The periodic loop: with no profile to run it spawns none, so
-        // the daemon is idle until it is stopped.
+        // The periodic loop: the daemon reports which profiles it
+        // scheduled once its spawn loop has run, and only then is it
+        // stopped, so a loop that spawned the internal profile is caught
+        // by the report rather than raced by the stop.
         let shutdown = DaemonShutdown::new();
-        let daemon = tokio::spawn(run_daemon(DaemonInvocation {
-            settings: Arc::clone(&settings),
-            default_eab: None,
-            eab_refresh_path: None,
-            config_path: Some(paths.agent_config()),
-            cli_overrides: config::CliOverrides::default(),
-            shutdown: shutdown.clone(),
-            registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
-        }));
+        let (scheduled_tx, scheduled_rx) = oneshot::channel();
+        let mut daemon = tokio::spawn(run_daemon_reporting(
+            DaemonInvocation {
+                settings: Arc::clone(&settings),
+                default_eab: None,
+                eab_refresh_path: None,
+                config_path: Some(paths.agent_config()),
+                cli_overrides: config::CliOverrides::default(),
+                shutdown: shutdown.clone(),
+                registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+            },
+            Some(scheduled_tx),
+        ));
+        let scheduled = tokio::time::timeout(DAEMON_PROGRESS_TIMEOUT, scheduled_rx).await;
         shutdown.stop();
-        daemon
+        // A wrongly scheduled task that reached issuance is blocked on the
+        // silent directory and never sees the stop; the bound turns that
+        // into an abort rather than a hang.
+        let joined = tokio::time::timeout(DAEMON_PROGRESS_TIMEOUT, &mut daemon)
             .await
+            .ok();
+        if joined.is_none() {
+            daemon.abort();
+            let _ = daemon.await;
+        }
+        let scheduled = scheduled
+            .expect("the daemon reports its periodic scheduling in time")
+            .unwrap_or_else(|_| {
+                panic!("the daemon stopped before reporting its scheduling: {joined:?}")
+            });
+        assert!(
+            scheduled.is_empty(),
+            "the periodic loop scheduled {scheduled:?} for the internal profile"
+        );
+        joined
+            .expect("the daemon stops when asked with nothing scheduled")
             .unwrap()
             .expect("the daemon stops cleanly with nothing to issue");
         assert!(nothing_connected(&acme), "the periodic loop reached ACME");

@@ -123,11 +123,14 @@ pub(super) struct InitRollback {
     pub(super) registrar_internal_cert_auth_entry: Option<String>,
     /// The `auth/cert` entry this run found already there, captured
     /// verbatim before it was rewritten.  A re-run over an established
-    /// credential converges the entry onto the recorded predicate's SAN
-    /// and the active root *before* the leaf that matches it is issued,
-    /// so a failure after that point would otherwise leave the host
-    /// trusting a certificate it does not have.  Written back on
-    /// rollback, byte for byte.
+    /// credential signs the new leaf into staging first and only then
+    /// pins the entry to it, so between that write and publication the
+    /// host trusts a leaf that is still only staged; a failure there
+    /// would otherwise leave it trusting a certificate it does not have.
+    /// Written back on rollback, byte for byte, as long as the new files
+    /// are unpublished.  Once a replacement is published the backup is
+    /// cleared, so a later failure keeps the new entry and the new files
+    /// as the pair they are.
     pub(super) registrar_internal_cert_auth_entry_backup: Option<serde_json::Value>,
     /// The `bootroot-registrar-internal` policy this run found already
     /// there, captured before it was rewritten.  Restored on rollback

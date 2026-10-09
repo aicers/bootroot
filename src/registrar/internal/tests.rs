@@ -938,6 +938,39 @@ fn the_generated_config_names_the_fixed_identity_and_private_trust() {
     );
 }
 
+/// The header the operator reads names every path that replaces the
+/// internal credential — `init`, the standalone rotation and the repair
+/// that ends a full CA rotation — and keeps apart using that credential
+/// from renewing the endpoint's own certificates.
+#[test]
+fn the_generated_header_names_every_replacement_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let rendered = render_internal_agent_config(&paths, &config_params(&[]));
+    let header = rendered
+        .lines()
+        .map_while(|line| line.strip_prefix('#'))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        header.contains(
+            "only `bootroot init`, `bootroot rotate registrar-internal-credential` and the \
+             final repair of `bootroot rotate ca-key --full` replace it."
+        ),
+        "{header}"
+    );
+    assert!(
+        header.contains("It uses the internal credential but does not renew it"),
+        "{header}"
+    );
+    assert!(
+        header.contains("renews the endpoint's own two certificates"),
+        "{header}"
+    );
+}
+
 /// The generated config carries two bearer secrets — the HTTP-01
 /// responder HMAC and, where the deployment registered one, the EAB HMAC
 /// — so the `Settings` it deserializes into must not print them.
