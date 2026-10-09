@@ -1050,7 +1050,7 @@ mod tests {
 
         let messages = test_messages();
         let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &messages)
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &[], &messages)
                 .await
                 .unwrap();
         let responder_paths =
@@ -1126,7 +1126,7 @@ mod tests {
 
         let messages = test_messages();
         let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &messages)
+            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &[], &messages)
                 .await
                 .unwrap();
         let responder_paths =

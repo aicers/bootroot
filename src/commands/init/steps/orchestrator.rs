@@ -37,9 +37,9 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, record_cleared_agent_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    ensure_step_ca_initialized, reconcile_ca_json_managed_keys, resolve_stepca_ca_dns_names,
-    restart_stepca_openbao_agent, snapshot_stepca_ca_json_template, update_ca_json_with_backup,
-    write_password_file_with_backup, write_stepca_templates,
+    build_stepca_policy_deny_dns_names, ensure_step_ca_initialized, reconcile_ca_json_managed_keys,
+    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
+    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -860,6 +860,16 @@ async fn run_init_inner(
         &StateFile::default_path(),
         &identity.container(BootrootContainer::StepCa),
     )?;
+    // step-ca refuses to issue for any IP address and for every DNS
+    // name a control-node server certificate carries: a service host
+    // holding the responder HMAC could otherwise be issued a certificate
+    // that impersonates `OpenBao`, step-ca or the responder admin API to
+    // every client verifying against this CA.
+    let stepca_policy_deny_dns = build_stepca_policy_deny_dns_names(
+        &identity.container(BootrootContainer::StepCa),
+        &identity.container(BootrootContainer::OpenBao),
+        &identity.container(BootrootContainer::Http01),
+    );
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, &stepca_dns_names, messages)?;
     if step_ca_result == super::super::types::StepCaInitResult::Initialized {
         // Fix ownership: step-ca init may create files with different
@@ -868,22 +878,25 @@ async fn run_init_inner(
     }
 
     // Reconciles the `db` section, the ACME provisioner's cert duration,
-    // the top-level `dnsNames` and the top-level `metricsAddress`.  Runs
-    // before `write_stepca_templates` so the generated `ca.json.ctmpl`
-    // is built from the patched document (notably `db.type`).
+    // the top-level `dnsNames`, the top-level `metricsAddress` and
+    // `authority.policy`.  Runs before `write_stepca_templates` so the
+    // generated `ca.json.ctmpl` is built from the patched document
+    // (notably `db.type`).
     let ca_json_update = update_ca_json_with_backup(
         &secrets_dir,
         &secrets.db_dsn,
         &args.cert_duration,
         &args.stepca_provisioner,
         &stepca_dns_names,
+        &stepca_policy_deny_dns,
         messages,
     )
     .await?;
-    // Covers both boot-time keys, not `dnsNames` alone: an installation
-    // predating the metrics setting has an unchanged name set, and
-    // gating on that alone would leave the new template unrendered, the
-    // sidecar on the old one and step-ca without the listener.
+    // Covers every boot-time key, not `dnsNames` alone: an installation
+    // predating the metrics setting or the issuance policy has an
+    // unchanged name set, and gating on that alone would leave the new
+    // template unrendered, the sidecar on the old one and step-ca without
+    // the listener or the policy.
     let stepca_reload_required = ca_json_update.stepca_reload_required();
     rollback.ca_json_backup = Some(ca_json_update.rollback);
 
@@ -907,6 +920,7 @@ async fn run_init_inner(
         &args.cert_duration,
         &args.stepca_provisioner,
         &stepca_dns_names,
+        &stepca_policy_deny_dns,
         messages,
     )
     .await?;
@@ -926,7 +940,13 @@ async fn run_init_inner(
             &identity.container(BootrootContainer::OpenBaoAgentStepCa),
             rollback.docker(),
         );
-        reconcile_ca_json_managed_keys(&secrets_dir, &stepca_dns_names, messages).await?;
+        reconcile_ca_json_managed_keys(
+            &secrets_dir,
+            &stepca_dns_names,
+            &stepca_policy_deny_dns,
+            messages,
+        )
+        .await?;
     }
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized
@@ -936,15 +956,16 @@ async fn run_init_inner(
         // loads the fully configured file on first boot.
         //
         // The second arm covers the already-initialized CA: step-ca
-        // reads both `dnsNames` and `metricsAddress` at boot and keeps
-        // the results in memory — the serving leaf in the one case, the
-        // metrics listener's existence in the other — so a restart, not
-        // a re-run of `step ca init` (which would replace the root and
-        // intermediate keys), is what makes `infra install
+        // reads `dnsNames`, `metricsAddress` and `authority.policy` at
+        // boot and keeps the results in memory — the serving leaf, the
+        // metrics listener's existence and the issuance policy — so a
+        // restart, not a re-run of `step ca init` (which would replace
+        // the root and intermediate keys), is what makes `infra install
         // --stepca-bind` followed by `init` repair an installed system,
         // and what gives an installation predating the metrics setting
-        // its listener.  Gating on the change keeps a repeat `init` on a
-        // settled document restart-free.
+        // or the policy its listener and its policy.  Gating on the
+        // change keeps a repeat `init` on a settled document
+        // restart-free.
         let compose_str = args.compose.compose_file.to_string_lossy();
         let restart = identity.compose(&[&compose_str], None, &["restart", "step-ca"]);
         let _ = run_compose(&restart, "docker compose restart step-ca", messages);

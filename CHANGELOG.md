@@ -486,6 +486,15 @@ byte for byte.
 
 ### Security
 
+- The bundled step-ca now refuses to issue certificates for any IP address
+  and for the control node's own names (`localhost`, `stepca.internal`,
+  `openbao.internal`, `responder.internal` and the instance's step-ca,
+  OpenBao and responder container names), so a service host holding the
+  responder HMAC can no longer obtain a certificate that impersonates
+  OpenBao, step-ca or the responder admin API. `bootroot init` writes this
+  as `authority.policy` in `ca.json`, replacing any hand-written policy,
+  and restarts step-ca; an existing installation receives it on its next
+  `bootroot init` re-run.
 - Updated `rustls` to 0.23.45 so TLS 1.3 handshakes reject messages that
   cross encryption-level boundaries within the same record.
 - Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258

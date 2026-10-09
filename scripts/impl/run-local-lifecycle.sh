@@ -946,6 +946,42 @@ issue_unaliased_name() {
   [ "$san" = "$expected_san" ] ||
     fail "the certificate issued for ${name} has subjectAltName '${san}', expected '${expected_san}'"
   printf '[lifecycle] issued certificate for the unaliased name has subjectAltName %s\n' "$san" >>"$RUN_LOG"
+
+  # The issuance above is the allowed side of step-ca's issuance policy:
+  # a four-label service name is still issued with it in place.  The
+  # denied side follows — the policy is in the live ca.json, and step-ca
+  # refuses an order for a control-node name and for an IP address.
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  jq -e '.authority.policy.x509.deny.ip == ["0.0.0.0/0", "::/0"]' "$ca_json" >/dev/null 2>>"$RUN_LOG" ||
+    fail "${ca_json} does not deny every IP address: $(jq -c '.authority.policy' "$ca_json" 2>&1)"
+  jq -e --arg openbao "${RUN_INSTANCE}-openbao" \
+    '.authority.policy.x509.deny.dns as $dns | ($dns | index("stepca.internal")) != null and ($dns | index($openbao)) != null' \
+    "$ca_json" >/dev/null 2>>"$RUN_LOG" ||
+    fail "${ca_json} does not deny stepca.internal and ${RUN_INSTANCE}-openbao: $(jq -c '.authority.policy' "$ca_json" 2>&1)"
+  printf '[lifecycle] %s carries authority.policy %s\n' "$ca_json" "$(jq -c '.authority.policy' "$ca_json")" >>"$RUN_LOG"
+
+  # `bootroot-agent` composes four-part names only, so the `step` client
+  # in the step-ca container places the orders.  Both a non-zero exit and
+  # the refusal message are required: a CA that is down also exits
+  # non-zero.  The CA URL is step-ca's listener inside its own container,
+  # which `docker exec` reaches without the published port this run
+  # chose; it is the same for every run.
+  local stepca_container_port=9000
+  local identifier output status n=0
+  for identifier in stepca.internal 10.1.2.3; do
+    n=$((n + 1))
+    status=0
+    output="$(docker exec "$ca_container" step ca certificate "$identifier" \
+      "/tmp/denied-${n}.crt" "/tmp/denied-${n}.key" \
+      --provisioner acme --ca-url "https://localhost:${stepca_container_port}" \
+      --root /home/step/certs/root_ca.crt --standalone 2>&1)" || status=$?
+    printf '[lifecycle] ACME order for denied identifier %s exited %d:\n%s\n' \
+      "$identifier" "$status" "$output" >>"$RUN_LOG"
+    [ "$status" -ne 0 ] ||
+      fail "step-ca issued a certificate for the denied identifier ${identifier}"
+    grep -Fq "The server will not issue certificates for the identifier" <<<"$output" ||
+      fail "the ACME order for ${identifier} failed without step-ca's policy refusal; see $RUN_LOG"
+  done
 }
 
 # `infra up` over the initialised deployment must leave the responder on
