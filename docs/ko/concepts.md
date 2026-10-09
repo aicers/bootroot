@@ -247,9 +247,10 @@ Bootroot는 서비스 추가를 두 가지 방식으로 지원합니다. 인증�
   `bootroot-remote bootstrap`이 1회 실행으로 반영합니다.
   이 흐름에서는 step-ca 설치 머신의 `bootroot` CLI가 서비스의 목표 상태를
   기록하고, 서비스 머신의 `bootroot-remote bootstrap`이 이를 읽어 한 번에
-  반영합니다. `bootroot-remote apply-secret-id`는 `secret_id_ttl`이
-  지나도록 오프라인이어서 자격 증명이 이미 만료된 에이전트를 복구하는
-  경로일 뿐입니다.
+  반영합니다. `bootroot-remote apply-secret-id`는 호스트의 `secret_id`가
+  아직 유효할 때만 동작합니다. 이미 만료되었다면
+  [`secret_id`가 만료된 원격 호스트
+  복구](operations.md#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 두 delivery mode 모두 의도하는 모델은 같습니다. 먼저 trust를 준비한 뒤,
 검증이 켜진 상태로 `bootroot-agent`를 호스트 데몬(예: systemd)으로

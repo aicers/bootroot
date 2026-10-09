@@ -3421,6 +3421,99 @@ fn assert_alias_line_position(stdout: &str) {
     );
 }
 
+/// Runs a local-file `service add` for `edge-proxy` against a
+/// `state.json` carrying `rotate_secret_id_ttl` (or not) and returns the
+/// `secret_id_ttl` its role write sent to `OpenBao`.
+async fn service_add_role_secret_id_ttl(recorded: Option<&str>) -> serde_json::Value {
+    let temp_dir = tempdir().expect("create temp dir");
+    let server = MockServer::start().await;
+    let agent_config = temp_dir.path().join("agent.toml");
+    let cert_path = temp_dir.path().join("certs").join("edge-proxy.crt");
+    let key_path = temp_dir.path().join("certs").join("edge-proxy.key");
+    fs::create_dir_all(cert_path.parent().expect("cert path has a parent"))
+        .expect("create cert dir");
+
+    write_state_file(temp_dir.path(), &server.uri()).expect("write state.json");
+    if let Some(ttl) = recorded {
+        let state_path = temp_dir.path().join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read state.json"))
+                .expect("parse state.json");
+        state["rotate_secret_id_ttl"] = json!(ttl);
+        fs::write(
+            &state_path,
+            serde_json::to_string_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state.json");
+    }
+    stub_app_add_openbao(&server, "edge-proxy").await;
+    stub_app_add_trust_missing(&server).await;
+    stub_app_add_service_sync_material(&server, "edge-proxy").await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(temp_dir.path())
+        .args([
+            "service",
+            "add",
+            "--registration-id",
+            "edge-proxy",
+            "--service-name",
+            "edge-proxy",
+            "--hostname",
+            "edge-node-01",
+            "--domain",
+            "trusted.domain",
+            "--agent-config",
+            agent_config.to_string_lossy().as_ref(),
+            "--cert-path",
+            cert_path.to_string_lossy().as_ref(),
+            "--key-path",
+            key_path.to_string_lossy().as_ref(),
+            "--instance-id",
+            "001",
+            "--root-token",
+            support::ROOT_TOKEN,
+        ])
+        .output()
+        .expect("run service add");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server records requests");
+    let role_writes: Vec<_> = requests
+        .iter()
+        .filter(|req| {
+            req.method.as_str() == "POST"
+                && req.url.path() == "/v1/auth/approle/role/bootroot-service-edge-proxy"
+        })
+        .collect();
+    assert_eq!(role_writes.len(), 1, "service add writes the role once");
+    let body: serde_json::Value =
+        serde_json::from_slice(&role_writes[0].body).expect("parse role write body");
+    body["secret_id_ttl"].clone()
+}
+
+/// The service role takes the role-level `secret_id` TTL `init` recorded.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_role_uses_recorded_secret_id_ttl() {
+    assert_eq!(service_add_role_secret_id_ttl(Some("168h")).await, "168h");
+}
+
+/// A `state.json` that predates the recorded TTL keeps the 24h role.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_app_add_role_defaults_secret_id_ttl_without_record() {
+    assert_eq!(service_add_role_secret_id_ttl(None).await, "24h");
+}
+
 fn write_state_file(root: &std::path::Path, openbao_url: &str) -> anyhow::Result<()> {
     let state = json!({
         "openbao_url": openbao_url,

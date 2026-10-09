@@ -594,9 +594,10 @@ Treat it as a short-lived credential:
     node, a *running* remote `bootroot-agent` needs no operator action —
     its fast-poll loop reads the rotated `secret_id` from OpenBao and
     refreshes its own on-disk credential within roughly one poll interval.
-    `bootroot-remote apply-secret-id` is only a recovery path for an agent
-    that was offline past its `secret_id_ttl` and whose credential already
-    expired. See [Operations](operations.md) for the rotation workflow.
+    `bootroot-remote apply-secret-id` works only while the host's
+    `secret_id` is still valid; for one that has expired, see
+    [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired).
+    See [Operations](operations.md) for the rotation workflow.
 - **No `secret_id` in KV**: when the service's KV subtree holds no
     `secret_id` — which is always the case for an identity minted through
     the registrar, whose mint never writes one — `bootroot-remote

@@ -351,9 +351,10 @@ bootroot service add \
 
 After secret_id rotation on the control node, a *running* remote
 `bootroot-agent` picks up the new secret_id itself through its fast-poll loop —
-no manual delivery is needed. The command below is the **recovery** path only,
-for an agent that was offline past its `secret_id_ttl` and whose credential
-already expired:
+no manual delivery is needed. The command below pulls it by hand, for
+example while the agent is not running; it works only while the host's
+`secret_id` is still valid (for one that has expired, see
+[Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)):
 
 ```bash
 bootroot-remote apply-secret-id \

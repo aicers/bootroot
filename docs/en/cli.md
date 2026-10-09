@@ -13,8 +13,9 @@ Roles:
 - `bootroot`: automates infra/init/service/rotate/monitoring on the
   machine hosting step-ca
 - `bootroot-remote`: performs one-shot bootstrap on machines hosting remote
-  services (its `apply-secret-id` subcommand is a recovery path for an agent
-  that was offline past its `secret_id_ttl`)
+  services (its `apply-secret-id` subcommand works only while the host's
+  `secret_id` is still valid; see
+  [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired))
 
 Primary commands:
 
@@ -89,9 +90,9 @@ action, so no second daemon (per-service OpenBao Agent) runs on any
 service host. When an added service runs on a different machine from the
 step-ca host, run `bootroot-remote bootstrap` once on that service machine
 to apply the initial configuration bundle and start `bootroot-agent`.
-`bootroot-remote apply-secret-id` and re-running
-`bootroot-remote bootstrap` are recovery paths only — needed when an agent
-was offline past its `secret_id_ttl` and its credential already expired.
+`bootroot-remote apply-secret-id` works only while the host's `secret_id`
+is still valid; for one that has expired, see
+[Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired).
 
 ## Name resolution responsibilities
 
@@ -844,7 +845,10 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   `bootroot ca update --cert-duration <value>` followed by
   `bootroot ca restart`.
 - `--secret-id-ttl`: role-level `secret_id` TTL for AppRole roles
-  created during init (default `24h`). Set this to at least 2× your
+  created during init (default `24h`). The value is recorded in
+  `state.json` and also governs the service AppRoles that
+  `bootroot service add` creates later (registrar-minted roles use
+  `[registrar] role_secret_id_ttl` instead). Set this to at least 2× your
   planned rotation interval so that a missed run does not expire
   credentials. `24h` is the security-conservative default; use `48h` or
   longer when operational slack is more important than minimising
@@ -1228,8 +1232,9 @@ You still need to perform:
 In both modes, no per-service OpenBao Agent runs on the service host:
 the agent self-authenticates and pulls trust, `secret_id`,
 responder-HMAC, and EAB rotations via fast-poll, so rotations propagate
-without a manual re-bootstrap or `apply-secret-id` (those are recovery
-paths only, for an agent offline past its `secret_id_ttl`).
+without a manual re-bootstrap or `apply-secret-id` (`apply-secret-id`
+works only while the host's `secret_id` is still valid; see
+[Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)).
 
 **`--eab-file` is required for EAB rotation to apply.** The documented
 run command passes the provisioned `eab.json` path via `--eab-file`.
@@ -3325,8 +3330,9 @@ bootstrap of service state (`secret_id`/`eab`/`responder_hmac`/`trust`) stored
 in OpenBao on the step-ca machine to files on remote service machines, and
 updates local files such as `agent.toml`. After the initial bootstrap, the
 running `bootroot-agent` keeps trust and `secret_id` current via its
-fast-poll loop; `bootroot-remote apply-secret-id` is a recovery path for an
-agent that was offline past its `secret_id_ttl`.
+fast-poll loop; `bootroot-remote apply-secret-id` works only while the
+host's `secret_id` is still valid (see
+[Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)).
 `bootroot-remote` also supports the global `--lang` option
 (environment variable: `BOOTROOT_LANG`).
 
@@ -3444,10 +3450,11 @@ topology to bootroot-agent's compiled-in defaults.
 ### `bootroot-remote apply-secret-id`
 
 Applies a rotated secret_id to the remote service machine. This is a
-**recovery** path, not the steady state: a running `bootroot-agent` already
-pulls rotated secret_ids from OpenBao via its fast-poll loop. Use this
-command only to recover an agent that was offline past its `secret_id_ttl`
-(its credential already expired, so it can no longer self-refresh).
+manual pull of what a running `bootroot-agent`'s fast-poll loop already
+does on its own, useful when the agent is not running. It logs in with the
+`secret_id` currently on the host, so it works only while that `secret_id`
+is still valid; it cannot recover a host whose `secret_id` has expired —
+see [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired).
 
 Key inputs:
 

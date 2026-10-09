@@ -118,8 +118,10 @@ pub(crate) struct StateFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) rotate_bound_cidrs: BTreeMap<String, Vec<String>>,
     /// Role-level `secret_id` TTL applied to the rotate `AppRole`s at
-    /// init (`--secret-id-ttl`). `bootroot status` derives the dead-man
-    /// warning threshold (half this TTL) from it.
+    /// init (`--secret-id-ttl`), and to every service `AppRole` that
+    /// `bootroot service add` creates afterwards (a zero or unreadable
+    /// value gives those the 24h default instead). `bootroot status`
+    /// derives the dead-man warning threshold (half this TTL) from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rotate_secret_id_ttl: Option<String>,
     /// RFC 3339 timestamp of the last successful `bootroot rotate

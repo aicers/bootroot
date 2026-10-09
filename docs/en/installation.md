@@ -670,9 +670,10 @@ install `bootroot-remote` on that service machine.
 - Build/install: `cargo build --release --bin bootroot-remote`
 - Runtime: `bootroot-remote bootstrap ...` (one-shot initial trust/bootstrap
   apply before the first agent run). The running `bootroot-agent` then pulls
-  trust and secret_id rotations via its fast-poll loop, so
-  `bootroot-remote apply-secret-id ...` is only a recovery path for an agent
-  that was offline past its `secret_id_ttl`
+  trust and secret_id rotations via its fast-poll loop.
+  `bootroot-remote apply-secret-id ...` works only while the host's
+  `secret_id` is still valid; for one that has expired, see
+  [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)
 
 For detailed arguments/examples in `remote-bootstrap` mode, see
 `bootroot-remote bootstrap`/`apply-secret-id` in [CLI](cli.md) and the

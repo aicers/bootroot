@@ -108,6 +108,10 @@ RUNTIME_ROTATE_SECRET_ID=""
 INFRA_ROTATE_ROLE_ID=""
 INFRA_ROTATE_SECRET_ID=""
 INIT_ROOT_TOKEN=""
+# A role-level secret_id TTL above the 24h default, so the service roles
+# `service add` creates are seen to follow the value `init` recorded.
+INIT_SECRET_ID_TTL="168h"
+INIT_SECRET_ID_TTL_SECS="604800"
 # The client token `drive_openbao_audit_traffic` minted, which the audit
 # assertion requires to appear in the container log only as its HMAC.
 OPENBAO_AUDIT_DRIVEN_TOKEN=""
@@ -600,6 +604,7 @@ run_bootstrap_chain() {
     --stepca-provisioner "acme" \
     --stepca-password "password" \
     --http-hmac "dev-hmac" \
+    --secret-id-ttl "$INIT_SECRET_ID_TTL" \
     --no-eab \
     --save-unseal-keys \
     --overwrite-password \
@@ -698,6 +703,50 @@ run_bootstrap_chain() {
     --auth-mode approle \
     --approle-role-id "$RUNTIME_SERVICE_ADD_ROLE_ID" \
     --approle-secret-id "$RUNTIME_SERVICE_ADD_SECRET_ID" >>"$RUN_LOG" 2>&1
+
+  assert_service_role_secret_id_ttl "$WEB_SERVICE"
+}
+
+# Reads back, with the init root token, the role-level `secret_id_ttl`
+# of the service role `service add` created and the TTL of the
+# `secret_id` it issued, and requires both to be the lifetime `init` was
+# given.  Neither credential reaches `argv`: the token goes to `curl` as
+# a config read from a pipe and the `secret_id` as a request body built
+# from its file, and only the TTL fields are extracted from the replies.
+assert_service_role_secret_id_ttl() {
+  local service="$1"
+  local url="${OPENBAO_URL%/}"
+  local role="bootroot-service-${service}"
+  local secret_id_file="$SECRETS_DIR/services/${service}/secret_id"
+  local role_ttl lookup sid_ttl sid_expiration
+
+  log_phase "service-role-secret-id-ttl"
+  [ -s "$secret_id_file" ] || fail "no secret_id file for ${service}"
+
+  role_ttl="$(
+    curl -fsS --config <(openbao_audit_curl_header_config "X-Vault-Token: ${INIT_ROOT_TOKEN}") \
+      "${url}/v1/auth/approle/role/${role}" | jq -r '.data.secret_id_ttl // empty'
+  )" || fail "could not read role ${role}"
+  [ "$role_ttl" = "$INIT_SECRET_ID_TTL_SECS" ] ||
+    fail "role ${role} secret_id_ttl is '${role_ttl}', expected ${INIT_SECRET_ID_TTL_SECS}"
+
+  lookup="$(
+    jq -n --rawfile sid "$secret_id_file" '{secret_id: ($sid | rtrimstr("\n"))}' |
+      curl -fsS -X POST -H 'Content-Type: application/json' \
+        --config <(openbao_audit_curl_header_config "X-Vault-Token: ${INIT_ROOT_TOKEN}") \
+        --data @- "${url}/v1/auth/approle/role/${role}/secret-id/lookup" |
+      jq -c '{secret_id_ttl: .data.secret_id_ttl, expiration_time: .data.expiration_time}'
+  )" || fail "could not look up the secret_id of ${service}"
+  sid_ttl="$(jq -r '.secret_id_ttl // empty' <<<"$lookup")"
+  sid_expiration="$(jq -r '.expiration_time // empty' <<<"$lookup")"
+  [ "$sid_ttl" = "$INIT_SECRET_ID_TTL_SECS" ] ||
+    fail "secret_id of ${service} has secret_id_ttl '${sid_ttl}', expected ${INIT_SECRET_ID_TTL_SECS}"
+  case "$sid_expiration" in
+    "" | 0001-01-01T00:00:00Z)
+      fail "secret_id of ${service} has no expiration ('${sid_expiration}')"
+      ;;
+  esac
+  echo "service role ${role}: secret_id_ttl=${role_ttl}, secret_id ttl=${sid_ttl}, expires ${sid_expiration}" >>"$RUN_LOG"
 }
 
 wait_for_openbao_api() {

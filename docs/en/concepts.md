@@ -254,8 +254,9 @@ In `bootroot service add`, `--delivery-mode` is the selector option.
   In this flow, the `bootroot` CLI on the step-ca machine writes desired
   service state, and `bootroot-remote bootstrap` on the service machine reads
   and applies it in a single run.
-  `bootroot-remote apply-secret-id` is only a recovery path for an agent that
-  was offline past its `secret_id_ttl` and whose credential already expired.
+  `bootroot-remote apply-secret-id` works only while the host's `secret_id`
+  is still valid; for one that has expired, see
+  [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired).
 
 In both delivery modes, the intended model is the same: prepare trust first,
 then start `bootroot-agent` with verification enabled, running as a host
