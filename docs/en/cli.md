@@ -278,6 +278,13 @@ When a non-loopback OpenBao bind intent is stored in `state.json` (set by
 are in place and automatically applies the compose override so OpenBao
 listens on the stored address.
 
+Once `bootroot init` has run, `infra up` also applies the responder config
+override `init` generated under `secrets/responder/`, whatever the HTTP-01
+admin bind is. That override is what mounts the rendered responder config,
+so a responder that `infra up` recreates keeps the config carrying the
+deployment's HMAC. Before `init` has run there is no override, and the
+responder runs on the bundle's `responder.toml.compose`.
+
 ### Failure conditions
 
 The command is considered failed when:

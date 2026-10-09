@@ -2533,6 +2533,34 @@ assert_stepca_fetches_through_the_responder() {
   pass "${container} carries ${expected} after 'infra up'"
 }
 
+# That `infra up` must leave the responder on the config `init` rendered.
+#
+# The base compose file starts the responder on the bundle's
+# `responder.toml.compose`, whose `hmac_secret` is a placeholder; the
+# override `init` wrote under the secrets directory is the only thing
+# that mounts the rendered one. `infra up` has to pass it on a loopback
+# bind as much as on a routable one, or the container it recreates
+# rejects every agent's signature.
+#
+# Container metadata only — the rendered file is never read here.
+assert_infra_up_kept_the_rendered_responder_config() {
+  local container="${INSTANCE}-http01"
+  local expected_arg="--config=/app/responder/responder.toml"
+  local expected_mount="/app/responder"
+  local command mounts
+  command="$(docker inspect --format '{{json .Config.Cmd}}' "$container" 2>>"$RUN_LOG")" ||
+    fail "could not inspect the command of ${container} after infra up"
+  mounts="$(docker inspect \
+    --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
+    "$container" 2>>"$RUN_LOG")" ||
+    fail "could not inspect the mounts of ${container} after infra up"
+  if ! printf '%s\n' "$command" | grep -qF -- "\"${expected_arg}\"" ||
+    ! printf '%s\n' "$mounts" | grep -qxF -- "$expected_mount"; then
+    fail "infra up left ${container} off the rendered responder config: command ${command} (expected ${expected_arg}), mount destinations [$(printf '%s' "$mounts" | tr '\n' ' ')] (expected ${expected_mount})"
+  fi
+  pass "'infra up' left the responder on its rendered config (${expected_arg}, ${expected_mount} mounted)"
+}
+
 # The shared audit store, and the OpenBao file audit device now bound
 # into it.
 #
@@ -3504,6 +3532,7 @@ main() {
   log_phase "assert-sweep"
   run_infra_up_over_the_initialised_deployment
   assert_stepca_fetches_through_the_responder
+  assert_infra_up_kept_the_rendered_responder_config
   assert_material_is_complete_and_restrictive
   assert_the_infra_agent_tree_belongs_to_its_sidecars
   # The unprivileged bring-up selected the audit override and checked

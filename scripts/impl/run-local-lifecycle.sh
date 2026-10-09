@@ -948,6 +948,54 @@ issue_unaliased_name() {
   printf '[lifecycle] issued certificate for the unaliased name has subjectAltName %s\n' "$san" >>"$RUN_LOG"
 }
 
+# `infra up` over the initialised deployment must leave the responder on
+# the config `init` rendered. The base compose file starts it on the
+# bundle's `responder.toml.compose`, whose `hmac_secret` is a placeholder;
+# the override `init` wrote under the secrets directory is the only thing
+# that mounts the rendered one, so an `infra up` that recreates the
+# responder without it puts every agent's signature out of step with it.
+#
+# Compose does recreate the responder here whether or not `infra up`
+# passes that override: the container was last created with this
+# harness's alias override, which `infra up` never passes. So the
+# container ID proves nothing, and what is asserted is what the new
+# container was created with.
+#
+# The assertion reads container metadata only, never the rendered file.
+assert_responder_runs_on_rendered_config() {
+  local container="${RUN_INSTANCE}-http01"
+  local expected_arg="--config=/app/responder/responder.toml"
+  local expected_mount="/app/responder"
+  local command mounts
+  command="$(docker inspect --format '{{json .Config.Cmd}}' "$container" 2>>"$RUN_LOG")" ||
+    fail "could not inspect the command of ${container} after infra up"
+  mounts="$(docker inspect \
+    --format '{{range .Mounts}}{{println .Destination}}{{end}}' \
+    "$container" 2>>"$RUN_LOG")" ||
+    fail "could not inspect the mounts of ${container} after infra up"
+  if ! printf '%s\n' "$command" | grep -qF -- "\"${expected_arg}\"" ||
+    ! printf '%s\n' "$mounts" | grep -qxF -- "$expected_mount"; then
+    fail "infra up left ${container} off the rendered responder config: command ${command} (expected ${expected_arg}), mount destinations [$(printf '%s' "$mounts" | tr '\n' ' ')] (expected ${expected_mount})"
+  fi
+}
+
+run_infra_up_after_init() {
+  log_phase "infra-up-after-init"
+  run_bootroot infra up \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "$OPENBAO_URL" >>"$RUN_LOG" 2>&1 ||
+    fail "infra up failed over the initialised deployment"
+  # Before any other Compose invocation: `apply_dns_aliases` passes the
+  # responder override itself, and would recreate the container onto the
+  # rendered config whatever `infra up` had done to it.
+  assert_responder_runs_on_rendered_config
+  # `infra up` replays the DNS aliases from state.json itself, so the
+  # harness's own alias override is not applied again. Issuing for every
+  # registered service through the responder is the proof that it still
+  # accepts the deployment's HMAC.
+  run_verify_pair "after-infra-up"
+}
+
 # Daemon-deploy local-file path: drives `bootroot rotate force-reissue
 # --wait` end-to-end so the in-binary signal+wait code path runs in CI.
 force_reissue_for_service() {
@@ -1566,6 +1614,7 @@ main() {
 
   run_verify_pair "initial"
   issue_unaliased_name
+  run_infra_up_after_init
   start_local_bootroot_agent_daemons
   run_rotations_with_verification
   stop_local_bootroot_agent_daemons

@@ -56,6 +56,8 @@ mod unix_integration {
         assert!(phase_contents.contains("\"phase\":\"service-add\""));
         assert!(phase_contents.contains("\"phase\":\"verify-initial\""));
         assert!(phase_contents.contains("\"phase\":\"issue-unaliased-name\""));
+        assert!(phase_contents.contains("\"phase\":\"infra-up-after-init\""));
+        assert!(phase_contents.contains("\"phase\":\"verify-after-infra-up\""));
         assert!(phase_contents.contains("\"phase\":\"rotate-infra-secret-id\""));
         assert!(
             phase_contents
