@@ -2442,9 +2442,13 @@ mod tests {
         let (dir, _paths) = pinned_host(&pki, &leaf);
         let args = crate::cli::args::RotateRegistrarInternalArgs { force: false };
 
-        for (response, stops) in [
-            (entry_with(&leaf.cert_pem), true),
-            (ResponseTemplate::new(500).set_body_string("boom"), false),
+        for (case, response, stops) in [
+            ("a pinned entry", entry_with(&leaf.cert_pem), true),
+            (
+                "an unreadable entry",
+                ResponseTemplate::new(500).set_body_string("boom"),
+                false,
+            ),
         ] {
             let server = entry_read_server(response).await;
             Mock::given(method("GET"))
@@ -2464,7 +2468,7 @@ mod tests {
                 &test_messages(),
             )
             .await;
-            assert_eq!(outcome.is_ok(), stops, "{outcome:?}");
+            assert_eq!(outcome.is_ok(), stops, "{case}");
             let requests = server.received_requests().await.expect("recording");
             assert!(
                 requests
