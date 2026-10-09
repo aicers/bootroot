@@ -231,10 +231,11 @@ pub fn render_internal_agent_config(
          #   bootroot-agent --config {config}\n\
          #\n\
          # `bootroot-registrar.service` runs that process; `bootroot init`\n\
-         # does not start it. It does not renew the internal credential:\n\
-         # the `[[profiles]]` entry below names that credential and its\n\
-         # two paths, and only `bootroot init` and\n\
-         # `bootroot rotate registrar-internal-credential` replace it.\n\
+         # does not start it. It uses the internal credential but does\n\
+         # not renew it: the `[[profiles]]` entry below names that\n\
+         # credential and its two paths, and only `bootroot init`,\n\
+         # `bootroot rotate registrar-internal-credential` and the\n\
+         # final repair of `bootroot rotate ca-key --full` replace it.\n\
          # The `[registrar]` and `[registrar_endpoint]` tables are copied\n\
          # from the `--agent-config` file `bootroot init` ran with and\n\
          # carried over unchanged by every rotation.\n\

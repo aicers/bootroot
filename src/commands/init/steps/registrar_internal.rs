@@ -922,9 +922,10 @@ async fn stage_account_key(
         Ok(existing) if bootroot::acme::is_account_key(&existing) => existing,
         Ok(_) => {
             eprintln!(
-                "Warning: the ACME account key at {} is not one bootroot can read back; \
-                 replacing it with a new one",
-                published.display()
+                "{}",
+                messages.warning_registrar_internal_account_key_replaced(
+                    &published.display().to_string()
+                )
             );
             new_account_key()?
         }
@@ -3110,6 +3111,50 @@ mod offline_signing_tests {
         assert!(bootroot::acme::is_account_key(
             staged.material.acme_account.expose()
         ));
+    }
+
+    /// The warning for a replaced account key names the file it replaces
+    /// in both locales, and only the file: it is handed the path alone,
+    /// so neither the broken contents nor the new key can reach it.
+    #[test]
+    fn the_account_key_replacement_warning_names_the_path_in_each_locale() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let published = dir.path().join(ACME_ACCOUNT_FILE);
+        let path = published.display().to_string();
+        let broken = "not an account key";
+        std::fs::write(&published, broken).expect("a broken key");
+        let fresh = bootroot::acme::create_account_key().expect("an account key");
+
+        for (lang, expected) in [
+            (
+                "en",
+                format!(
+                    "Warning: the ACME account key at {path} is not one bootroot can read \
+                     back; replacing it with a new one"
+                ),
+            ),
+            (
+                "ko",
+                format!(
+                    "경고: {path}의 ACME 계정 키는 bootroot가 다시 읽을 수 있는 키가 \
+                     아니므로 새 키로 교체합니다"
+                ),
+            ),
+        ] {
+            let warning = crate::i18n::Messages::new(lang)
+                .expect("a supported locale")
+                .warning_registrar_internal_account_key_replaced(&path);
+            assert_eq!(warning, expected, "{lang}");
+            assert!(
+                !warning.contains(broken),
+                "{lang} leaks the account contents"
+            );
+            assert!(
+                !warning.contains("PRIVATE KEY"),
+                "{lang} leaks key material"
+            );
+            assert!(!warning.contains(fresh.trim()), "{lang} leaks the new key");
+        }
     }
 
     /// What an interrupted run left in staging is removed before the
