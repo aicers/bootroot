@@ -286,9 +286,9 @@ registrar_docker_prepull_third_party_images() {
 # and the endpoint host label `infra install` records the state predicate with.
 #
 # `init` has already recreated the responder with its rendered HMAC and
-# started the OpenBao agents by the time this returns. Replaying `infra up`
-# afterwards races that rendered configuration with the base image and leaves
-# the registrar's pre-issued HMAC unable to authenticate to the responder.
+# started the OpenBao agents by the time this returns. An `infra up` after
+# it would keep that rendered configuration mounted, and is simply not needed
+# here.
 #
 # Leaves set: HTTP01_IMAGE and the exported BOOTROOT_HTTP01_IMAGE,
 # HTTP01_IMAGE_BUILT once the build succeeds — the flag the caller's cleanup

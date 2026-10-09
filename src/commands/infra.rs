@@ -128,8 +128,9 @@ struct UpComposeOverrides<'a> {
 /// without interacting, and the merged service keeps both the intended
 /// host port publication and the audit bind mount.
 ///
-/// The responder's TLS config is mounted before its exposed-port
-/// override so the container starts with TLS active.
+/// The responder's rendered config is mounted before its exposed-port
+/// override, so a recreated container starts on the deployment's HMAC
+/// and, when HTTP-01 admin TLS is on, with TLS active.
 fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
     let mut files: Vec<&str> = vec![overrides.compose_file];
     files.extend(
@@ -1734,14 +1735,17 @@ pub(crate) fn resolve_stepca_exposed_override(
     Ok(Some(override_path))
 }
 
-/// Resolves the responder compose config override path when HTTP-01
-/// admin TLS is active.
+/// Resolves the responder compose config override `bootroot init` wrote.
 ///
-/// Returns `None` when no HTTP-01 admin bind intent is stored or the
-/// override file does not exist (e.g. before `bootroot init` runs).
-/// Returns the path when the override is present so that `infra up`
-/// mounts the TLS-enabled responder config and cert directory into the
-/// container.
+/// Returns the path whenever the override is present under the recorded
+/// secrets directory, whatever the HTTP-01 admin bind is, so that an
+/// `infra up` that recreates the responder keeps the rendered config —
+/// the one carrying the deployment's HMAC — mounted, along with the
+/// certificate directory when HTTP-01 admin TLS is on. Without it the
+/// container falls back to the bundle's placeholder config.
+///
+/// Returns `None` when there is no state file or the override file does
+/// not exist, which is the case before `bootroot init` has run.
 fn resolve_responder_compose_override(
     state_path: &Path,
     compose_dir: &Path,
@@ -1750,9 +1754,6 @@ fn resolve_responder_compose_override(
         return Ok(None);
     }
     let state = StateFile::load(state_path)?;
-    if state.http01_admin_bind_addr.is_none() {
-        return Ok(None);
-    }
     // Derive the override path from the persisted secrets_dir so that
     // non-default --secrets-dir installs are resolved correctly.
     let secrets_dir = state.secrets_dir();
@@ -5939,7 +5940,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
     }
 
     #[test]
-    fn resolve_responder_config_override_returns_none_without_bind_intent() {
+    fn resolve_responder_config_override_returns_none_on_loopback_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
         let state = StateFile {
@@ -5961,6 +5962,43 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         state.save(&state_path).unwrap();
         let result = resolve_responder_compose_override(&state_path, dir.path());
         assert!(result.unwrap().is_none());
+    }
+
+    /// Regression: on a loopback HTTP-01 admin bind — no bind intent is
+    /// recorded — `infra up` must still pass the override `init` wrote.
+    /// It is the only thing that mounts the rendered responder config,
+    /// so without it a recreated responder runs on the bundle's
+    /// placeholder `hmac_secret`.
+    #[test]
+    fn resolve_responder_config_override_returns_path_on_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let state = StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            secrets_dir: None,
+            http01_admin_bind_addr: None,
+            ..Default::default()
+        };
+        state.save(&state_path).unwrap();
+
+        // Simulate init having written the override file.
+        let override_dir = dir.path().join("secrets").join(RESPONDER_CONFIG_DIR);
+        std::fs::create_dir_all(&override_dir).unwrap();
+        std::fs::write(
+            override_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME),
+            "services: {}",
+        )
+        .unwrap();
+
+        let path = resolve_responder_compose_override(&state_path, dir.path())
+            .unwrap()
+            .expect("must return the override path without a recorded bind intent");
+        assert!(
+            path.ends_with("secrets/responder/docker-compose.responder.override.yml"),
+            "unexpected override path: {}",
+            path.display()
+        );
     }
 
     #[test]

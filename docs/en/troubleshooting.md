@@ -240,6 +240,31 @@ fields independently.
   map service FQDN to responder IP
 - service hosts (remote mode) must also map step-ca/responder names correctly
 
+### Every issuance fails with `Invalid signature` after `infra up` (older builds)
+
+If every issuance and renewal on a single-machine deployment fails with
+`Responder returned 401 Unauthorized: Invalid signature` from the moment
+`bootroot infra up` was run, the responder was recreated without its
+rendered config. bootroot `0.3.0` and earlier did this on any deployment
+whose HTTP-01 admin bind is loopback, which is the default: the first
+`infra up` after `init` put the responder back on the bundle's
+`responder.toml.compose` and its placeholder `hmac_secret`, while every
+agent kept signing with the deployment's real one.
+
+To confirm, run `docker inspect <instance>-http01`: a responder in this
+state shows the command `--config=/app/responder.toml`, where a healthy
+one shows `--config=/app/responder/responder.toml` and a mount at
+`/app/responder`.
+
+While in this state the responder also accepted registrations signed with
+the bundle's placeholder secret, from anything that could reach its admin
+port.
+
+Run `bootroot infra up` once with a version that includes the fix. It
+recreates the responder with the rendered config mounted; nothing else
+needs repair, and agents succeed on their next attempt
+(`bootroot rotate force-reissue` forces one).
+
 ### `Finalize failed: badCSR`
 
 - Requested SANs do not match step-ca provisioner policy

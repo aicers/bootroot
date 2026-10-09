@@ -683,15 +683,20 @@ Execution steps:
    and does not resolve from the step-ca container, proving that step-ca
    validates HTTP-01 through the responder (`HTTP_PROXY`) and not by name
    resolution
-6. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
+6. `infra-up-after-init`: run `bootroot infra up` over the initialised
+   deployment and assert the responder it recreates still has the
+   rendered config mounted and selected
+7. `verify-after-infra-up`: issue/verify certs again, proving the
+   responder still accepts the deployment's HMAC after `infra up`
+8. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
    secret_ids with the dedicated `infra_rotate` credential, then assert
    the `runtime_rotate` credential is denied on the infra role paths
-7. `rotate-openbao-recovery`: manually rotate OpenBao root token
-8. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
+9. `rotate-openbao-recovery`: manually rotate OpenBao root token
+10. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
    AppRole-based access continuity
-9. `rotate-responder-hmac`: run rotation and force reissue
-10. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
-11. `cleanup`: capture logs/artifacts and tear down Compose
+11. `rotate-responder-hmac`: run rotation and force reissue
+12. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
+13. `cleanup`: capture logs/artifacts and tear down Compose
 
 Actual commands (script excerpt):
 
@@ -730,7 +735,7 @@ bootroot service add --registration-id edge-proxy --service-name edge-proxy \
 bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
-# 4) verify-initial / 10) verify-after-responder-hmac
+# 4) verify-initial / 7) verify-after-infra-up / 12) verify-after-responder-hmac
 bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
 bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
@@ -746,7 +751,7 @@ bootroot-agent --config "$UNALIASED_AGENT_CONFIG" \
   --eab-file "$SECRETS_DIR/services/edge-proxy/eab.json" --oneshot
 openssl x509 -in "$UNALIASED_CERT" -noout -ext subjectAltName
 
-# 6) rotate-infra-secret-id
+# 8) rotate-infra-secret-id
 # from init summary
 #   infra_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
@@ -758,7 +763,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 # negative check: the same command with the runtime_rotate credential
 # must fail with permission denied
 
-# 7) rotate-openbao-recovery (manual, explicit operator action)
+# 9) rotate-openbao-recovery (manual, explicit operator action)
 bootroot rotate --compose-file "$COMPOSE_FILE" \
   --openbao-url "http://127.0.0.1:8200" \
   --root-token "$INIT_ROOT_TOKEN" \
@@ -767,7 +772,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --rotate-root-token \
   --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
 
-# 9) rotate-responder-hmac
+# 11) rotate-responder-hmac
 # from init summary
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id

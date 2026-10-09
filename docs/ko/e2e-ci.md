@@ -660,15 +660,20 @@ Compose 프로젝트 레이블이 붙어 있습니다. 확인이 레이블이 �
 5. `issue-unaliased-name`: 별칭이 없고 step-ca 컨테이너에서 해석되지 않는
    이름으로 인증서를 발급받아, step-ca가 이름 해석이 아니라
    리스폰더(`HTTP_PROXY`)를 통해 HTTP-01을 검증함을 증명
-6. `rotate-infra-secret-id`: 전용 `infra_rotate` 자격증명으로
+6. `infra-up-after-init`: 초기화된 배포 위에서 `bootroot infra up`을
+   실행하고, 다시 생성된 리스폰더에 렌더링된 설정이 여전히 마운트되어
+   선택되어 있는지 검증
+7. `verify-after-infra-up`: 인증서를 다시 발급/검증하여 `infra up` 이후에도
+   리스폰더가 배포의 HMAC을 수락함을 증명
+8. `rotate-infra-secret-id`: 전용 `infra_rotate` 자격증명으로
    stepca/responder 인프라 AppRole secret_id를 회전한 뒤,
    `runtime_rotate` 자격증명이 인프라 역할 경로에서 거부되는지 검증
-7. `rotate-openbao-recovery`: OpenBao 루트 토큰 수동 회전
-8. `bootstrap-after-openbao-recovery`: remote bootstrap 재실행으로
+9. `rotate-openbao-recovery`: OpenBao 루트 토큰 수동 회전
+10. `bootstrap-after-openbao-recovery`: remote bootstrap 재실행으로
    AppRole 기반 접근 연속성 검증
-9. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
-10. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
-11. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
+11. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
+12. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
+13. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
 
 실제 실행 명령(스크립트 발췌):
 
@@ -707,7 +712,7 @@ bootroot service add --registration-id edge-proxy --service-name edge-proxy \
 bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
-# 4) verify-initial / 10) verify-after-responder-hmac
+# 4) verify-initial / 7) verify-after-infra-up / 12) verify-after-responder-hmac
 bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
 bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
@@ -724,7 +729,7 @@ bootroot-agent --config "$UNALIASED_AGENT_CONFIG" \
   --eab-file "$SECRETS_DIR/services/edge-proxy/eab.json" --oneshot
 openssl x509 -in "$UNALIASED_CERT" -noout -ext subjectAltName
 
-# 6) rotate-infra-secret-id
+# 8) rotate-infra-secret-id
 # init summary에서
 #   infra_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
@@ -736,7 +741,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 # 부정 검증: 같은 명령을 runtime_rotate 자격증명으로 실행하면
 # permission denied로 실패해야 합니다
 
-# 7) rotate-openbao-recovery (명시적 수동 실행)
+# 9) rotate-openbao-recovery (명시적 수동 실행)
 bootroot rotate --compose-file "$COMPOSE_FILE" \
   --openbao-url "http://127.0.0.1:8200" \
   --root-token "$INIT_ROOT_TOKEN" \
@@ -745,7 +750,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --rotate-root-token \
   --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
 
-# 9) rotate-responder-hmac
+# 11) rotate-responder-hmac
 # init summary에서
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id

@@ -238,6 +238,30 @@ bootroot service add \
   IP로 찾을 수 있어야 합니다.
 - 서비스 머신(원격 추가 시)도 step-ca/responder 이름을 올바른 IP로 찾을 수 있어야 합니다.
 
+### `infra up` 이후 모든 발급이 `Invalid signature`로 실패(이전 빌드)
+
+단일 머신 배포에서 `bootroot infra up`을 실행한 시점부터 모든 발급과
+갱신이 `Responder returned 401 Unauthorized: Invalid signature`로
+실패한다면, 리스폰더가 렌더링된 설정 없이 다시 생성된 것입니다. bootroot
+`0.3.0` 이하 버전은 HTTP-01 admin 바인딩이 루프백(기본값)인 모든
+배포에서 이렇게 동작했습니다. `init` 이후 첫 `infra up`이 리스폰더를
+번들의 `responder.toml.compose`와 그 플레이스홀더 `hmac_secret`으로
+되돌렸고, 에이전트는 계속 배포의 실제 HMAC으로 서명했습니다.
+
+확인하려면 `docker inspect <instance>-http01`을 실행하세요. 이 상태의
+리스폰더는 명령이 `--config=/app/responder.toml`로 나타나며, 정상
+리스폰더는 `--config=/app/responder/responder.toml`과 `/app/responder`
+마운트를 보여 줍니다.
+
+이 상태에 있는 동안 리스폰더는 admin 포트에 접근할 수 있는 모든
+대상으로부터 번들의 플레이스홀더 시크릿으로 서명된 등록도
+수락했습니다.
+
+수정이 포함된 버전으로 `bootroot infra up`을 한 번 실행하세요.
+렌더링된 설정이 마운트된 상태로 리스폰더가 다시 생성되며, 그 밖에
+복구할 것은 없습니다. 에이전트는 다음 시도에서 성공합니다
+(`bootroot rotate force-reissue`로 즉시 시도하게 할 수 있습니다).
+
 ### `Finalize failed: badCSR`
 
 - 요청 SAN이 step-ca 프로비저너 정책과 맞지 않을 때 발생합니다.

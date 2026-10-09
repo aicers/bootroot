@@ -491,6 +491,22 @@ byte for byte.
 - Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258
   (unbounded buffering of empty HTTP/2 DATA frames, which lets a peer
   drive a connection's memory use without bound).
+- `bootroot infra up` no longer recreates the HTTP-01 responder without
+  its rendered configuration on a deployment whose HTTP-01 admin bind is
+  loopback — the default, and every single-machine install. `init`
+  switches the responder from the bundle's `responder.toml.compose` to
+  the rendered config through a compose override, and `infra up` applied
+  that override only when a non-loopback admin bind was recorded. On
+  every other deployment the first `infra up` after `init` therefore put
+  the responder back on the bundle's placeholder `hmac_secret`: every
+  issuance and renewal failed with `401 Unauthorized: Invalid signature`,
+  and the responder accepted registrations signed with the placeholder
+  from anything that could reach its admin port — local processes on the
+  control node and containers on the compose network. `infra up` now
+  applies the override whenever `init` has written it. A deployment
+  already in that state is repaired by running `bootroot infra up` once
+  with this version; nothing else needs to be done, and agents succeed
+  on their next attempt.
 
 ## [0.3.0] - 2026-08-17
 
