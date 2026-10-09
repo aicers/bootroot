@@ -1415,6 +1415,11 @@ run_rotation_secret_id_if_due() {
   log_phase "rotate-secret-id-if-due"
   local cred_file="$ARTIFACT_DIR/rotate-creds/infra/secret_id"
   local out cred_before cred_after agent_before agent_after
+  # The self-mint phase's runs all started no later than this second.
+  # `last_success` is recorded in whole seconds, so `--if-due 1s` is
+  # due only once the clock has moved past it.
+  local self_mint_done
+  self_mint_done="$(date -u +%s)"
 
   cred_before="$(cat "$cred_file")"
   agent_before="$(cat "$SECRETS_DIR/openbao/stepca/secret_id")"
@@ -1428,6 +1433,9 @@ run_rotation_secret_id_if_due() {
 
   cred_before="$cred_after"
   agent_before="$(cat "$SECRETS_DIR/openbao/responder/secret_id")"
+  while [ "$(date -u +%s)" -le "$self_mint_done" ]; do
+    sleep 0.2
+  done
   out="$(run_infra_rotation_if_due "$cred_file" responder 1s)"
   printf '%s\n' "$out" | grep -q '^if-due: rotated target=infra_responder$' ||
     fail "--infra responder --if-due 1s did not rotate: ${out}"
