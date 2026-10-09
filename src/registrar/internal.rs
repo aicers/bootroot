@@ -117,8 +117,9 @@ pub const KEY_FILE: &str = "key.pem";
 /// certificate data.
 pub const CHAIN_FILE: &str = "chain.pem";
 /// The persistent ACME account signing key the endpoint's two surface
-/// certificates and `bootroot registrar issue` are ordered under. The
-/// internal leaf is signed offline and never ordered with it.
+/// certificates are ordered under. `bootroot registrar issue` does not
+/// use it: it creates a fresh account key for each issuance. The
+/// internal leaf is signed offline, with no ACME account at all.
 /// Root-owned, `0600`.
 pub const ACME_ACCOUNT_FILE: &str = "acme-account.json";
 /// The fingerprint of the deployment root the internal leaf was signed
