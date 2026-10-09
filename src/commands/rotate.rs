@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bootroot::openbao::OpenBaoClient;
 
+pub(crate) use self::helpers::signal_internal_registrar_agent;
 use crate::cli::args::{RotateArgs, RotateCommand};
 use crate::commands::compose_project::DOCKER_BIN;
 use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
@@ -33,7 +34,7 @@ pub(super) const ROLE_ID_FILENAME: &str = "role_id";
 ///
 /// It is the `step-ca` entry of `deploy/runtime-images.json`; a test
 /// holds it to the declaration.
-pub(super) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca:0.30.2";
+pub(crate) const STEP_CA_HELPER_IMAGE: &str = "smallstep/step-ca:0.30.2";
 pub(super) const ROOT_CA_COMMON_NAME: &str = "Bootroot Root CA";
 pub(super) const INTERMEDIATE_CA_COMMON_NAME: &str = "Bootroot Intermediate CA";
 pub(super) const RENDERED_FILE_POLL_INTERVAL: Duration = Duration::from_secs(1);

@@ -200,9 +200,9 @@ Controls HTTP-01 responder settings and retry behavior for ACME operations.
   keeps the historical behaviour: a fresh account key is generated per issuance
   and the account is re-registered under it. Set it, and the key is loaded from
   that path or created there once at `0600`, so the profile keeps one stable
-  ACME account across renewals. `bootroot init` sets it for the
-  bootroot-internal registrar credential's generated config; nothing else sets
-  it for you.
+  ACME account across renewals. `bootroot init` sets it in the generated
+  configuration of the registrar endpoint daemon, where it is the account the
+  endpoint's two certificates are ordered under; nothing else sets it for you.
 
 ### Trust
 
@@ -437,7 +437,10 @@ Issuance runs under the **bootroot-internal privileged credential**, the
 root-owned client certificate the daemon already authenticates to OpenBao
 with. No `role_id` and no `secret_id` is read anywhere on this path: the
 whole point of the certificate form is that the registrar surface keeps
-no expiring secret alive.
+no expiring secret alive. That credential is not itself an ACME
+certificate: `bootroot init` signs it offline from the intermediate key,
+and the daemon uses it without ever issuing or renewing it — see
+[The bootroot-internal credential](operations.md#the-bootroot-internal-credential).
 
 Nothing is issued on a host where `registrar_endpoint.enabled` is
 `false`. No material path is created, and nothing is asked of the CA or
@@ -530,9 +533,10 @@ endpoint-enabled start, and they are ordered:
    write.
 2. **Issuance itself failed.** An unreachable CA, a failed OpenBao read,
    a refused certificate login, an unreadable state file or internal
-   config, a credential superseded by a trust rotation, or a write that
-   could not land. The diagnostic names the material paths and the
-   failure. Which paths depends on how far the start got: a failure
+   config, a credential that has expired or been superseded by a trust
+   rotation, or a write that could not land. The diagnostic names the
+   material paths and the failure. Which paths depends on how far the
+   start got: a failure
    inside one issuance names that pair, the OpenBao reads and the
    credential load are shared by both pairs and so name every pair that
    still needed issuing, and a state file or internal config that cannot

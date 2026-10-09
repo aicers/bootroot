@@ -2160,7 +2160,7 @@ answer, which would turn every caller into a hang:
   path, a digest mismatch included.
 - **The internal credential**, from the fixed layout below the secrets
   directory. A failure says the bootroot-internal credential is absent,
-  invalid, or issued under a root the deployment has superseded.
+  invalid, expired, or issued under a root the deployment has superseded.
 - **The audit record store**, from `[registrar] audit_record_dir`. A
   failure names the store and its directory.
 
@@ -2306,12 +2306,13 @@ that changed, and the running daemon is left as it is. Only the
 Both leaves expire, and the daemon renews both itself. Where the endpoint is
 enabled it runs one renewal pass immediately at start and then one per interval,
 under the cadence, lead time and issuance-retry settings of the rendered
-internal agent configuration's single profile — the same values that govern the
-bootroot-internal credential's own renewal. A leaf is renewed when it falls
-inside lead time, or when it no longer chains to `trust.ca_bundle_path`, which
-is what a trust-anchor rotation under a running daemon leaves behind. Where the
-endpoint is disabled nothing of this exists: no pass runs and nothing is asked
-of OpenBao or the CA.
+internal agent configuration's single profile. That profile names the
+bootroot-internal credential, which the daemon uses and never renews; these two
+leaves are the only certificates renewed under its settings. A leaf is renewed
+when it falls inside lead time, or when it no longer chains to
+`trust.ca_bundle_path`, which is what a trust-anchor rotation under a running
+daemon leaves behind. Where the endpoint is disabled nothing of this exists: no
+pass runs and nothing is asked of OpenBao or the CA.
 
 Arming that loop is part of starting. An enabled endpoint whose renewal cannot
 be prepared — a rendered internal agent configuration that is missing or no
@@ -2561,68 +2562,201 @@ client-certificate option is introduced in either case — the listener already
 requests client certificates, and requiring them there would break the
 certificate-less `AppRole` agents and every token-authenticated command.
 
-`bootroot init` provisions it, and writes `registrar-internal/agent.toml` and
-its private CA bundle below the state-recorded secrets directory. That
-configuration carries the internal profile and the `[registrar]` and
-`[registrar_endpoint]` tables from `--agent-config`, and the process that runs
-on it is the registrar endpoint daemon, run by `bootroot-registrar.service`
+`bootroot init` provisions it. It signs the leaf **offline from the
+intermediate key** — `step certificate create` in the step-ca helper image,
+exactly as the `OpenBao` and HTTP-01 admin TLS certificates are signed — so it
+needs Docker, the intermediate certificate and key, and `password.txt` under
+the secrets directory, as `rotate infra-cert` does. No ACME order is ever
+placed for the internal name.
+
+The `auth/cert` entry `init` writes, `auth/cert/certs/bootroot-registrar-internal`,
+trusts **that one certificate**: its `certificate` is the leaf alone — not the
+chain, and not the root CA. No other certificate of the deployment's CA can log
+in, including one step-ca issues for the same name, so the login succeeds only
+for the holder of the private key in
+`<secrets-dir>/registrar-internal/key.pem`. Holding the responder HMAC and the
+EAB, or any other means of obtaining a certificate from the deployment's CA, is
+not enough.
+
+`init` also writes `registrar-internal/agent.toml` and its private CA bundle
+below the state-recorded secrets directory. That configuration carries the
+internal profile and the `[registrar]` and `[registrar_endpoint]` tables from
+`--agent-config`, and the process that runs on it is the registrar endpoint
+daemon, run by `bootroot-registrar.service`
 ([Installing the units](#installing-the-units)):
 
 ```sh
 bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 ```
 
-That one process renews the internal credential and serves the endpoint; there
-is no second `bootroot-agent` process for the credential. As with every other
-agent, `init` does not start it. Ordinary renewal begins once the service
-starts, on that config's own `daemon` and `retry` settings and through the same
-predicate every other profile uses. Until it is started there is nothing to
-renew and nothing to signal — a rotation that `HUP`s it and finds no process
-treats that as success.
+That one process serves the endpoint and renews the endpoint's two
+certificates. It **uses** the internal credential and does not renew it: the
+configuration's one `[[profiles]]` entry names the identity and its two paths,
+and nothing is issued through it. There is no second `bootroot-agent` process
+for the credential. As with every other agent, `init` does not start it. Until
+it is started there is nothing to signal — a rotation that `HUP`s it and finds
+no process treats that as success.
 
 On a deployment initialized with `--no-eab`, `init` records the cleared agent
 EAB payload at `bootroot/agent/eab` when that path does not exist yet, so the
 daemon's first surface issuance, which refuses an absent entry, can start. An
 existing entry is left as it is.
 
-Renewal has one precondition: before it issues, the daemon checks that the root
-recorded beside the credential is still the deployment's active root, and
-refuses without making an ACME request, a login or a write when it is not. A
-full CA rotation opens exactly that gap between its Phase 3 and the repair step
-after Phase 4, so a leaf that falls due inside it is left alone rather than
-reissued under a root the `auth/cert` entry does not yet trust. The refusal is
-reported through the profile's ordinary post-renew failure hooks, the daemon
-keeps ticking, and the tick after the repair renews normally — there is nothing
-to restart. Do not restart or reload the daemon inside that gap either: a new
-start loads the credential, finds the mismatch, and exits. The rotation itself
-does not reload it until Phase 5, after the repair step has run.
+**Lifetime and replacement.** The leaf is valid for **ten years** (`87600h`),
+the lifetime of the root and intermediate CA certificates. Nothing renews it
+unattended, and no timer can. It is replaced, together with the entry, only by:
 
-The same comparison guards the credential's privileged `OpenBao` login, not only
-renewal, and it re-reads the active root each time rather than trusting a value
-read at start-up. A registrar verb reached after the root changed therefore
-refuses with the same repair-required error instead of logging in — or continuing
-to write under a token it acquired before the change.
+- `bootroot init`, on its first run and on every re-run;
+- `bootroot rotate registrar-internal-credential`, which acts by itself when
+  the entry does not match the published leaf, when the root changed, or
+  within 30 days of the leaf's expiry;
+- the mandatory tail of `bootroot rotate ca-key --full`.
+
+Every replacement needs the `OpenBao` **root token**. Replacing a pinned leaf
+means rewriting the `auth/cert` entry, and writing that path lets the writer
+choose the entry's `token_policies` — that is, mint a token carrying policies
+of its choosing — so only the root token may hold that ability. A one-year leaf
+would need either a yearly root-token ceremony, with a registrar outage when
+one is missed, or a timer holding a credential that can mint tokens. Ten years
+is the CA certificates' own lifetime: a leaf never expires before the root it
+chains to, and the root's expiry forces a full CA rotation whose tail replaces
+the leaf.
+
+The long validity has a cost. A copy of `key.pem` taken off the control node
+stays usable until the leaf is replaced, not until a near expiry. The control
+is replacement, by one operator command, and it takes effect at once: the
+previous leaf is refused the moment the entry is rewritten. What this does not
+close is that the responder HMAC and the EAB remain deployment-wide, so a
+holder of them can still obtain certificates for other names.
+
+**Re-running `init`.** A re-run over a host that already carried a credential
+signs a new leaf, replaces the entry and, after publishing, reloads the
+endpoint daemon — `SIGHUP`, through the same `pkill -HUP` the rotations use,
+where "no process matched" is success — because the entry stops accepting the
+leaf the daemon has loaded the moment it is rewritten. A first provisioning
+sends no signal. A failure before the publication restores the entry and the
+policy that were found and leaves the prior files untouched; a failure after
+it keeps the new entry and the new files, which are a working pair.
+
+**A changed root.** Every use of the credential has one precondition: the root
+recorded beside it must still be the deployment's active root. The comparison
+re-reads the active root each time rather than trusting a value read at
+start-up, and a mismatch is refused with a repair-required error before any
+login or write. A full CA rotation opens exactly that gap between replacing the
+root and the repair step after Phase 4, so a registrar verb reached inside it
+refuses instead of logging in — or continuing to write under a token it
+acquired before the change. Do not restart or reload the daemon inside that gap
+either: a new start loads the credential, finds the mismatch, and exits. The
+rotation itself does not reload it until Phase 5, after the repair step has
+run.
+
+**An expired credential.** bootroot refuses an expired leaf before it makes any
+request, with an error that names the command (one line, wrapped here):
+
+```text
+the bootroot-internal credential's certificate expired at <RFC 3339 time>;
+run `bootroot rotate registrar-internal-credential`
+```
+
+A running daemon answers every `mint` and `deregister` with it and can no
+longer renew the endpoint's two certificates, whose ACME inputs are read
+through this credential; a restarted daemon does not start. Services that are
+already enrolled keep working meanwhile: their agents authenticate with their
+own `AppRole`s and renew through ACME without the registrar. `OpenBao` enforces
+the expiry itself as well.
 
 **Rotation.** An intermediate-only CA rotation leaves the credential, its entry,
-its config and its private bundle untouched: the entry trusts the root, which
-that rotation does not replace. A full rotation publishes the additive trust set
-into the private bundle and the config's pins in Phase 3, replaces the entry, the
-leaf and the stored root fingerprint in a mandatory step after Phase 4 (which
-`--skip reissue` does not skip), and narrows the bundle and pins to the finalized
-generation in Phase 6 — only when finalization is not skipped.
+its config and its private bundle untouched: the entry is pinned to the leaf
+itself, which does not depend on its issuer remaining valid, and that rotation
+does not replace the root. A full rotation publishes the additive trust set
+into the private bundle and the config's pins in Phase 3; in a mandatory step
+after Phase 4 (which `--skip reissue` does not skip) it signs a new leaf with
+the new intermediate, pins the entry to it and replaces the stored root
+fingerprint; and it narrows the bundle and pins to the finalized generation in
+Phase 6 — only when finalization is not skipped.
 
-**Repair.** If the credential expires, a rotation is interrupted, or the material
-is lost or partially written, the daemon fails closed with a repair-required
-error rather than attempting an ACME request, a login or a write. Repair it with
+**Replacement and repair.** When the leaf is expired or within 30 days of
+expiry, a rotation was interrupted, the material is lost or partially written,
+or the entry is not pinned to the published leaf, run
 
 ```sh
 bootroot rotate registrar-internal-credential
 ```
 
-which needs an `OpenBao` token carrying the `root` policy — an `AppRole` token is
-refused — and which never re-runs install and never changes a service
-credential. It restores the trust state the recorded rotation says is current,
-replaces the material and the stored fingerprint, and reloads the internal agent.
+which needs an `OpenBao` token carrying the `root` policy — checked first, and
+an `AppRole` token is refused — and which never re-runs install and never
+changes a service credential. It signs offline, so like `rotate infra-cert` it
+needs Docker, the intermediate key and `password.txt`. It restores the trust
+state the recorded rotation says is current, replaces the leaf, the entry and
+the stored fingerprint, and reloads the endpoint daemon.
+
+Without `--force` it reports "up to date" and changes nothing only when all of
+the following hold; otherwise it acts exactly as with `--force`:
+
+1. the material is present and the stored root fingerprint matches the active
+   root;
+2. the `auth/cert` entry exists and its `certificate` is exactly the published
+   leaf — one certificate, the same DER as the first certificate in
+   `registrar-internal/chain.pem`;
+3. the published leaf's `notAfter` is more than 30 days away.
+
+A failed read of the entry is an error, not "up to date". `--force` replaces
+the credential anyway.
+
+**Upgrading.** An installation initialised before the entry was pinned has an
+ACME-issued internal leaf, valid 24 hours by default, and an entry that trusts
+the root CA. The registrar endpoint is in no release, so this affects only
+development and test stacks built from `main`.
+
+- **What migrates it.** Either `bootroot rotate registrar-internal-credential`
+  or a re-run of `bootroot init`, both with the root token, on the control
+  node. Each signs a new leaf offline into staging; captures the existing entry
+  and policy; rewrites the policy and **replaces** the entry at the same path,
+  so its `certificate` is the new leaf; proves a real login with the staged
+  credential; publishes the six files; and signals the daemon. It is one entry
+  under one name, overwritten, so from that write on the old leaf and every
+  other certificate of the CA are refused. A failure between the entry write
+  and the publication restores the entry and the policy that were found, which
+  leaves the host as it was, old shape included. A failure after the
+  publication — possible in `init` only — keeps the new entry and the new
+  files, a working pair.
+- **What does not migrate it.** `bootroot infra up`, `service add`,
+  `rotate infra-cert`, a restart of the daemon, and any update path that runs
+  only those. None of them holds the root token. `bootroot rotate ca-key
+  --full` migrates as a side effect of its tail, but it is not the way to
+  migrate.
+- **Between upgrading the binaries and migrating.** Nothing on the host can
+  close the path without the root token, so an upgrade alone leaves the old
+  entry accepting a forged certificate until the migration is run. The
+  upgraded daemon no longer renews the internal leaf: the ACME-issued leaf on
+  disk works until its `notAfter`, at most one certificate lifetime — 24 hours
+  by default — away. From then on the daemon refuses with the
+  expired-credential error above: a running daemon refuses every `mint` and
+  `deregister` and can no longer renew the endpoint's two certificates, and a
+  restarted daemon does not start. Services that are already enrolled are
+  unaffected. **Run the migration immediately after the upgrade.**
+- **Idempotence.** A second `bootroot rotate registrar-internal-credential`
+  without `--force` changes nothing. A re-run of `init` always signs a new
+  leaf and replaces the entry.
+- **What migrating does not undo.** A token obtained through the old entry
+  stays valid for up to one hour, and anything created with one —
+  `bootroot-service-*` roles, policies, secret IDs, KV records — stays. A
+  deployment with reason to think the path was used should review those and
+  rotate the responder HMAC and the EAB.
+
+To verify the migration, read the entry with the root token and inspect the
+published leaf:
+
+```sh
+bao read auth/cert/certs/bootroot-registrar-internal
+openssl x509 -in <secrets-dir>/registrar-internal/chain.pem \
+  -noout -enddate -issuer
+```
+
+The entry's `certificate` must hold one certificate, byte-identical to the
+first certificate in `<secrets-dir>/registrar-internal/chain.pem`. The
+`openssl` output must show the intermediate as the issuer and an expiry about
+ten years out.
 
 The whole contract, including the exact `OpenBao` policy the credential carries,
 is in

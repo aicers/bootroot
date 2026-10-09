@@ -142,18 +142,34 @@ widened pin file, both re-issued surface leaves and the chain a live
 connection presents, then again to resume and finish. It checks that a client
 pair copied before the rotation is accepted until Phase 6 and refused after it,
 that the re-issued pair completes a mint, and that the pin file ends holding
-only the new root.
+only the new root. After the resumed rotation it also asserts that the
+bootroot-internal `auth/cert` entry's `certificate` equals the published
+internal leaf, and that this leaf is issued by the new intermediate.
 
 The internal-credential scenario differs in one respect: its container serves
 TLS. `auth/cert` authenticates a *client certificate*, so there has to be a
 handshake to present one in. The container generates its own server
-certificate into a mounted directory (`-dev-tls`), which keeps the two trust
-anchors as separate as they are in a deployment — that certificate's CA
-verifies the server, and a CA each test mints is what the `auth/cert` entry
-trusts for clients. Those tests assert what a mock cannot: that the SAN
-allowlist really refuses the deployment's other registrar names, that
-`token_no_default_policy` really keeps `default` off the minted token, and
-that the policy body means to the real ACL engine what it looks like it means.
+certificate into a mounted directory (`-dev-tls`), which keeps server trust and
+client trust as separate as they are in a deployment — that certificate's CA
+verifies the server, while the client leaves each test presents are signed by a
+CA that test mints. The `auth/cert` entry trusts none of those CAs: it is
+pinned to one leaf, as a deployment's is. Whether a pinned non-CA certificate is
+accepted is `OpenBao`'s decision, so it is proved here against the real server
+and nowhere by a mock. The tests assert that:
+
+- the pinned leaf logs in, and its token carries exactly
+  `bootroot-registrar-internal`;
+- a second leaf from the same intermediate with the same SAN and CN is refused;
+- a certificate that copies the pinned leaf's serial number, SAN and authority
+  key identifier but has another key is refused;
+- after the entry is rewritten with a new leaf, the new one logs in and the
+  previous one is refused;
+- an expired pinned leaf is refused by `OpenBao`.
+
+They also keep asserting what a mock cannot about the rest of the entry: that
+the SAN allowlist really refuses the deployment's other registrar names, that
+`token_no_default_policy` really keeps `default` off the minted token, and that
+the policy body means to the real ACL engine what it looks like it means.
 
 `run-registrar-internal-init-e2e.sh` is the provisioning half, and needs a whole
 deployment rather than one container: `bootroot init` on an endpoint-enabled
@@ -170,6 +186,31 @@ the private CA bundle beside them — the responder aliases the internal SAN and
 the registrar surface's client and endpoint names resolve through, and a real
 `auth/cert/login` with the credential `init` just published — plus that the
 same login without the client certificate is refused.
+
+Three phases follow that login (`assert-login`) and run before
+`assert-internal-config-rotations`. They are what holds the credential to its
+pinned shape end to end:
+
+- **`assert-internal-pin`** — the entry's `certificate` is one certificate
+  whose DER equals the first certificate of `registrar-internal/chain.pem`; the
+  leaf's issuer is the deployment intermediate, its `notAfter` is more than nine
+  years away, and its SAN is exactly the internal name.
+- **`assert-acme-forgery-refused`** — a certificate for the internal SAN is
+  obtained through step-ca's ACME endpoint with the deployment's HMAC and EAB,
+  by running `bootroot-agent --oneshot` on a config derived from the internal
+  one. That issuance succeeding is the positive control; `auth/cert/login` with
+  the resulting certificate is refused, and the legitimate credential still
+  logs in.
+- **`assert-old-shape-migration`** — the entry is overwritten in the old
+  root-CA shape, after which the forged certificate logs in. `bootroot rotate
+  registrar-internal-credential` without `--force` then replaces the entry and
+  the leaf: the published credential logs in, the forged certificate and the
+  previous legitimate leaf are refused, the daemon stand-in was signalled, and
+  a second run reports up to date and changes nothing.
+
+The legitimate login is asserted once more after
+`assert-internal-config-rotations`.
+
 It also asserts the other side of that split: the `OpenBao` Agent sidecars'
 configuration, `AppRole` pair, templates and the directories holding them still
 belong to the owner of `secrets/`, which a root-run `init` must not take over.
@@ -204,10 +245,11 @@ installs with `--stepca-bind` and `--http01-admin-bind` (plus
 `--http01-admin-tls-required`) on `BIND_HOST`, the Docker bridge gateway
 `172.17.0.1` by default, and otherwise runs the same sequence. Each bind
 *replaces* the service's loopback publication rather than adding to it, so on
-such a host `init` has to issue the internal leaf through the bind addresses —
-step-ca's ACME directory there, and the responder admin API over TLS — and the
-generated `agent.toml` has to carry them for the endpoint daemon's renewals.
-`OpenBao` stays on loopback in both arms.
+such a host the generated `agent.toml` has to carry the bind addresses —
+step-ca's ACME directory there, and the responder admin API over TLS — for the
+endpoint daemon to order and renew its two certificates through. The internal
+leaf itself is signed offline and uses neither; the forged-certificate phase
+above does order through them. `OpenBao` stays on loopback in both arms.
 
 It is also where the shared audit store is exercised, since it is the only arm
 that seeds the endpoint predicate. Beside that predicate the seed phase writes

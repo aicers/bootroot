@@ -113,7 +113,7 @@ pub(super) struct InitRollback {
     /// failed re-run of `init` does not delete a working one; the
     /// staging directory below is removed either way.
     pub(super) registrar_internal_dir: Option<PathBuf>,
-    /// The staging directory the internal leaf is issued into before it
+    /// The staging directory the internal leaf is signed into before it
     /// is proved and published.  Removed on rollback whether or not the
     /// layout directory around it is, because it is this run's alone and
     /// holds a private key that was never published.

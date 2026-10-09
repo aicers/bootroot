@@ -39,17 +39,20 @@ pub(crate) fn dns_alias_for_entry(entry: &ServiceEntry) -> Option<String> {
     ))
 }
 
-/// Builds the HTTP-01 DNS alias the bootroot-internal registrar
-/// credential is issued under, when this host serves the registrar
+/// Builds the HTTP-01 DNS alias carrying the bootroot-internal
+/// registrar credential's name, when this host serves the registrar
 /// endpoint.
 ///
 /// The internal identity deliberately has no [`ServiceEntry`] — it is
 /// not a registered service — so it cannot come out of the loop above.
-/// It still needs the alias for exactly the same reason every service
-/// does: step-ca validates an HTTP-01 challenge by fetching
-/// `http://<identifier>/.well-known/acme-challenge/…`, and inside the
-/// compose network that name resolves only if the responder answers to
-/// it.
+///
+/// No bootroot issuance uses this alias. The internal leaf is signed
+/// offline against the intermediate key, never ordered through ACME, so
+/// nothing bootroot does needs step-ca to resolve the name. The alias
+/// is kept in the set all the same: removing aliases is a separate
+/// cleanup, and a certificate ordered for the name is worth nothing —
+/// the `auth/cert` entry, the only thing that authenticates a peer by
+/// it, is pinned to the one leaf `init` signed.
 pub(crate) fn registrar_internal_alias(state: &StateFile) -> Option<String> {
     let recorded = enabled_registrar_endpoint(state)?;
     Some(bootroot::registrar::registrar_internal_identity(
@@ -99,7 +102,7 @@ fn registrar_surface_aliases(state: &StateFile) -> Vec<String> {
 /// beside one call site: `service remove` reconciles the set and `infra
 /// up` replays it, and either rebuilding it from `state.services` alone
 /// would silently drop them off a running responder and break the next
-/// internal or surface-leaf renewal.
+/// surface-leaf renewal.
 pub(crate) fn collect_dns_aliases(state: &StateFile) -> Vec<String> {
     state
         .services

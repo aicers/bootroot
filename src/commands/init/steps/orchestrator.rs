@@ -77,12 +77,13 @@ use crate::state_lock::StateLock;
 /// step-ca and the responder: the recorded `--stepca-bind` /
 /// `--http01-admin-bind` address when there is one, which replaces the
 /// loopback publication, and otherwise loopback on this install's own
-/// published ports rather than the compose defaults. `init` itself
-/// issues the internal leaf through them, so an address nothing listens
-/// on would not merely write a config pointing at the wrong place: it
-/// would fail the run, and on a host co-located with a second instance
-/// a hard-coded `:9000` or `:8080` would reach *that* instance's
-/// step-ca and responder.
+/// published ports rather than the compose defaults. The endpoint
+/// daemon orders its two certificates through them as it starts, so an
+/// address nothing listens on would leave it unable to start, and on a
+/// host co-located with a second instance a hard-coded `:9000` or
+/// `:8080` would reach *that* instance's step-ca and responder. `init`
+/// itself dials neither for this credential: the internal leaf is
+/// signed offline, through `docker`.
 ///
 /// The operator's `[registrar]` and `[registrar_endpoint]` tables ride
 /// along from `--agent-config`, already held to every requirement an
@@ -94,10 +95,12 @@ fn registrar_internal_context(
     compose_dir: &Path,
     state: &StateFile,
     secrets: &InitSecrets,
+    docker: &Path,
 ) -> registrar_internal::RegistrarInternalContext {
     registrar_internal::RegistrarInternalContext {
         intent: endpoint.intent.clone(),
         secrets_dir: args.secrets_dir.secrets_dir.clone(),
+        docker: docker.to_path_buf(),
         kv_mount: args.openbao.kv_mount.clone(),
         acme_server: registrar_internal::internal_acme_server(
             &args.stepca_provisioner,
@@ -124,17 +127,17 @@ fn registrar_internal_context(
 /// compose network that identifier resolves only if the responder
 /// answers to it. Every service leaf gets this through `service add`;
 /// the three registrar identities have no `ServiceEntry`, so `init`
-/// attaches them from the recorded predicate before the ACME run. They
-/// ride in the shared alias set for the same reason: the internal leaf
-/// is issued in the next step, and the daemon issues and renews the two
-/// surface leaves, and `bootroot registrar issue` the client leaf,
-/// through the same responder.
+/// attaches them from the recorded predicate. The daemon issues and
+/// renews the two surface leaves, and `bootroot registrar issue` the
+/// client leaf, through this responder. No bootroot issuance uses the
+/// internal name's alias: the internal leaf is signed offline in the
+/// next step. It stays in the set because the set is attached as one.
 ///
-/// A responder the alias could not be attached to is a hard failure
-/// here rather than the warning `service add` settles for: the very
-/// next step issues the internal leaf through it, and the ACME error
-/// that would follow names a challenge timeout rather than the missing
-/// alias that caused it.
+/// A responder the aliases could not be attached to is a hard failure
+/// here rather than the warning `service add` settles for: the endpoint
+/// daemon orders its two certificates through it as it starts, and the
+/// ACME error that would follow names a challenge timeout rather than
+/// the missing alias that caused it.
 ///
 /// # Errors
 ///
@@ -152,8 +155,9 @@ fn register_internal_dns_alias(identity: &ComposeIdentity, messages: &Messages) 
         crate::commands::dns_alias::DnsAliasOutcome::Registered { .. } => Ok(()),
         crate::commands::dns_alias::DnsAliasOutcome::NothingToRegister
         | crate::commands::dns_alias::DnsAliasOutcome::Skipped => anyhow::bail!(
-            "the HTTP-01 responder could not be given the `{alias}` alias, so step-ca cannot \
-             resolve the bootroot-internal identity and its certificate cannot be issued"
+            "the HTTP-01 responder could not be given the registrar aliases (`{alias}` among \
+             them), so step-ca cannot resolve the registrar endpoint's names and its \
+             certificates cannot be issued"
         ),
     }
 }
@@ -1134,15 +1138,16 @@ async fn run_init_inner(
     )
     .await?;
 
-    // The bootroot-internal registrar credential, stages 2 and 3. Both
-    // run under the init root token, after `OpenBao` bootstrap, step-ca
-    // initialization and EAB acquisition, and both are inside the
-    // rollback envelope: the `auth/cert` mount, the policy, the entry
-    // and the whole staged directory are registered before they are
-    // created. Nothing is published here — the credential is proved over
-    // the TLS listener first, below. The state is read for the step-ca
-    // and responder bind intents `infra install` recorded, which decide
-    // the addresses the leaf is issued through.
+    // The bootroot-internal registrar credential, stages 2 and 3: the
+    // leaf is signed offline into staging, and then the `auth/cert`
+    // entry is pinned to it under the init root token. Both run after
+    // `OpenBao` bootstrap, step-ca initialization and EAB acquisition,
+    // and both are inside the rollback envelope: the staged directory,
+    // the `auth/cert` mount, the policy and the entry are registered
+    // before they are created. Nothing is published here — the
+    // credential is proved over the TLS listener first, below. The state
+    // is read for the step-ca and responder bind intents `infra install`
+    // recorded, which decide the addresses the published config names.
     let internal_context = registrar_endpoint
         .map(|endpoint| -> Result<_> {
             let state = StateFile::load(&StateFile::default_path())?;
@@ -1152,6 +1157,7 @@ async fn run_init_inner(
                 compose_dir,
                 &state,
                 &secrets,
+                rollback.docker(),
             ))
         })
         .transpose()?;
@@ -1159,17 +1165,23 @@ async fn run_init_inner(
         Some(context) => {
             let inputs = context.inputs();
             println!("{}", messages.init_registrar_internal_provisioning());
-            // The internal leaf is issued through the ordinary HTTP-01
-            // path, so step-ca has to be able to resolve its SAN to the
-            // responder before the ACME run — the same Docker network
-            // alias every service leaf needs. The internal identity has
-            // no `ServiceEntry` to carry it, so it is attached here,
-            // from the recorded predicate.
+            // The registrar's names have no `ServiceEntry` to carry
+            // their Docker network aliases, so they are attached here,
+            // from the recorded predicate. The endpoint's two surface
+            // leaves are ordered through the responder under them. The
+            // internal name rides in the same set, though no bootroot
+            // issuance uses it: its leaf is signed offline just below.
             register_internal_dns_alias(&identity, messages)?;
-            registrar_internal::provision_internal_auth(client, &inputs, rollback, messages)
-                .await?;
-            registrar_internal::register_internal_rollback(rollback, &args.secrets_dir.secrets_dir);
-            Some(registrar_internal::issue_internal_material(&inputs, messages).await?)
+            // Staged before the entry is written, because the entry is
+            // pinned to the leaf and so needs it to exist — and so that
+            // a host that cannot sign fails with `OpenBao` untouched.
+            let provisioning = registrar_internal::register_internal_rollback(
+                rollback,
+                &args.secrets_dir.secrets_dir,
+            );
+            let staged = registrar_internal::issue_internal_material(&inputs, messages).await?;
+            registrar_internal::provision_internal_auth(client, &inputs, &staged, rollback).await?;
+            Some((staged, provisioning))
         }
         None => None,
     };
@@ -1369,7 +1381,8 @@ async fn run_init_inner(
         // Reconnect through the URL that was just recorded and prove a
         // real `auth/cert/login` succeeds before a single byte of the
         // credential, its config or its private bundle is published.
-        if let (Some(staged), Some(context)) = (staged_internal.as_ref(), internal_context.as_ref())
+        if let (Some((staged, provisioning)), Some(context)) =
+            (staged_internal.as_ref(), internal_context.as_ref())
         {
             registrar_internal::verify_and_publish_internal(
                 staged,
@@ -1378,6 +1391,18 @@ async fn run_init_inner(
                 messages,
             )
             .await?;
+            // A replaced credential is the host's settled state from
+            // here on, and the daemon still holding the previous leaf —
+            // which the pinned entry has refused since it was rewritten
+            // — is reloaded onto it.
+            registrar_internal::settle_internal_publication(
+                rollback,
+                *provisioning,
+                &args.secrets_dir.secrets_dir,
+                |secrets_dir| {
+                    crate::commands::rotate::signal_internal_registrar_agent(secrets_dir, messages)
+                },
+            )?;
             println!(
                 "{}",
                 messages.init_registrar_internal_ready(

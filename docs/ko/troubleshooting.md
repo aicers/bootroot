@@ -283,6 +283,43 @@ OpenBao TLS output directory`로 중단될 수 있습니다. 이는
 옮깁니다) 다시 실행하십시오. `openbao/tls`보다 *상위* 경로의 심볼릭
 링크는 문제가 없으며 기존과 동일하게 해석됩니다.
 
+### bootroot 내부 자격 증명의 인증서 만료
+
+registrar 엔드포인트를 제공하는 호스트에서 엔드포인트 데몬이, 또는 데몬이
+응답하는 `mint`나 `deregister`가 다음 오류로 실패합니다(실제로는 한 줄이며
+여기서는 줄을 나눴습니다).
+
+```text
+the bootroot-internal credential's certificate expired at <RFC 3339 time>;
+run `bootroot rotate registrar-internal-credential`
+```
+
+데몬이 OpenBao에 인증할 때 쓰는 클라이언트 인증서가 `notAfter`를 지난
+것입니다. 이 인증서를 무인으로 갱신하는 주체는 없으므로, bootroot는 어떤
+요청도 보내기 전에 이를 거부합니다.
+
+- 실행 중인 데몬은 모든 `mint`와 `deregister`에 이 오류로 응답하고,
+  엔드포인트의 인증서 두 개도 더 이상 갱신하지 못합니다.
+- 재시작한 데몬은 기동하지 못합니다.
+- 이미 등록된 서비스는 계속 동작합니다. 서비스의 에이전트는 자신의
+  AppRole로 인증하고 registrar 없이 ACME로 갱신하기 때문입니다.
+
+컨트롤 노드에서 root로, OpenBao 루트 토큰을 사용해 자격 증명을 교체하십시오.
+
+```bash
+bootroot rotate registrar-internal-credential
+```
+
+이 명령은 유효 기간 10년의 새 리프를 오프라인으로 서명하고
+(`rotate infra-cert`와 마찬가지로 Docker, 중간 CA 키, `password.txt`가
+필요합니다) OpenBao의 `auth/cert` 항목을 그 리프에 고정한 뒤 데몬을
+재로드합니다.
+데몬이 멈춰 있었다면 다시 시작하십시오. 이 자격 증명을 ACME로 발급하던
+빌드에서 업그레이드한 스택에서는 디스크의 리프가 업그레이드 후 인증서 수명
+한 번(기본 24시간) 안에 만료되며, 같은 명령으로 마이그레이션합니다.
+[bootroot 내부 자격 증명](operations.md#bootroot-내부-자격-증명)을
+참고하십시오.
+
 ### 발급 직후 호환성 자동 강화 실패
 
 ## 회전 후 FD 비동기 문제 (이슈 #614)

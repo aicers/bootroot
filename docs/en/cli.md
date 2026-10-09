@@ -2220,12 +2220,16 @@ endpoint](operations.md#the-bootroot-internal-credential), a **full**
 rotation additionally runs one unnumbered, mandatory step between Phase 4
 and the point Phase 4 is recorded: it replaces the bootroot-internal
 credential's `auth/cert` entry, leaf material and stored root
-fingerprint. `--skip reissue` skips Phase 5, not this step, and the step
+fingerprint. The step signs the new leaf offline with the new
+intermediate key — it needs Docker, the intermediate key and
+`password.txt`, like `rotate infra-cert` — and pins the entry to that one
+certificate. `--skip reissue` skips Phase 5, not this step, and the step
 requires an OpenBao token carrying the `root` policy — so a full rotation
 on such a host cannot be driven with `--auth-mode approle`. Phases 3 and
 6 also publish and then narrow that credential's private trust bundle and
-pins. An intermediate-only rotation touches none of it, and a host
-without the endpoint has none of it. See
+pins. An intermediate-only rotation touches none of it — the entry is
+pinned to the leaf itself, which does not depend on its issuer remaining
+valid — and a host without the endpoint has none of it. See
 [the bootroot-internal registrar credential](https://github.com/aicers/bootroot/blob/main/docs/reference/registrar-internal-credential.md).
 
 On the same host a full rotation also carries the registrar endpoint
@@ -2338,32 +2342,60 @@ Important behavior:
 
 #### `rotate registrar-internal-credential`
 
-Repairs the bootroot-internal registrar credential — the credential
-bootroot's own daemon authenticates to OpenBao with, at `auth/cert`, in
-order to run the registrar's `mint` and `deregister` verbs. Only a host
-that serves the registrar endpoint has one.
+Replaces the bootroot-internal registrar credential — the client
+certificate bootroot's own daemon authenticates to OpenBao with, at
+`auth/cert`, in order to run the registrar's `mint` and `deregister`
+verbs. Only a host that serves the registrar endpoint has one. Nothing
+renews this credential unattended: this command, `bootroot init` and the
+tail of a full `rotate ca-key` are the only things that replace it.
 
-Replaces the trusted `auth/cert` entry, the leaf and its private key, the
-persistent ACME account key and the stored root fingerprint, and brings
-the dedicated `registrar-internal/agent.toml` trust pins and private CA
-bundle back onto the trust state the recorded rotation says is current —
-the additive set while a full CA rotation is unfinished, the finalized
-set otherwise. Then signals the internal agent to reload.
+Signs a new leaf and private key offline from the intermediate key,
+replaces the `auth/cert` entry so that its `certificate` is that one
+leaf, replaces the stored root fingerprint, and brings the dedicated
+`registrar-internal/agent.toml` trust pins and private CA bundle back
+onto the trust state the recorded rotation says is current — the additive
+set while a full CA rotation is unfinished, the finalized set otherwise.
+The persistent ACME account key, which the endpoint's two certificates
+are ordered under, is carried over. Then signals the endpoint daemon to
+reload. The previous leaf is refused from the moment the entry is
+rewritten.
 
-- `--force`: repair even when the material is complete and the stored
-  root fingerprint already matches the active root. Without it, such a
-  host is reported as up to date and nothing is changed, which is what
-  makes the command safe to run from a script on every host.
+Without `--force`, the host is reported as up to date and nothing is
+changed only when **all** of the following hold:
+
+1. the material is present and the stored root fingerprint matches the
+   active root;
+2. the `auth/cert` entry exists and its `certificate` is exactly the
+   published leaf — one certificate, the same DER as the first
+   certificate in `registrar-internal/chain.pem`;
+3. the published leaf's `notAfter` is more than 30 days away.
+
+Otherwise the command acts exactly as it does with `--force`. So by
+itself it migrates an installation whose entry still trusts the root CA,
+repairs the credential after a root change, and replaces a leaf within
+30 days of its expiry. A failed read of the entry is an error, not "up
+to date". That is what makes the command safe to run from a script on
+every host.
+
+- `--force`: replace the credential even when all three conditions
+  hold.
 
 Requires an OpenBao token carrying the `root` policy, confirmed by token
 self-lookup **before** anything is mutated; an AppRole token is refused
-with a typed error. It never re-runs install and never changes a service
-credential.
+with a typed error. It signs offline — `step certificate create` in the
+step-ca helper image — so, like `rotate infra-cert`, it needs Docker and
+the intermediate certificate, the intermediate key and `password.txt`
+under the secrets directory. No ACME order is placed. It never re-runs
+install and never changes a service credential.
 
-Use it after an interrupted CA rotation, an expired internal leaf, or a
-credential that was lost or partially written. A daemon whose stored root
-fingerprint disagrees with the active root fails closed — it makes no
-ACME request, no login and no write — and names this command.
+Use it after an interrupted CA rotation, for an expired or soon-expiring
+internal leaf, for a credential that was lost or partially written, and
+to migrate an installation initialised before the entry was pinned to
+the leaf (see
+[The bootroot-internal credential](operations.md#the-bootroot-internal-credential)).
+A daemon whose internal leaf has expired, or whose stored root
+fingerprint disagrees with the active root, fails closed — it makes no
+login and no write — and names this command.
 
 #### `rotate eab-clear`
 

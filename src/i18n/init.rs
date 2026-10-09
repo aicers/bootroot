@@ -592,6 +592,17 @@ impl Messages {
             &[("path", path)],
         )
     }
+
+    pub(crate) fn error_registrar_internal_provision_failed(&self) -> &'static str {
+        self.strings().error_registrar_internal_provision_failed
+    }
+
+    pub(crate) fn error_registrar_internal_staging_symlink(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_registrar_internal_staging_symlink,
+            &[("path", path)],
+        )
+    }
 }
 
 impl Messages {

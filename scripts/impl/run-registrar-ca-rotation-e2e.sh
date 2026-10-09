@@ -268,6 +268,34 @@ write_mint() {
   jq -n '{protocol_version:1,service_name:"review",delivery_mode:"RemoteBootstrap",host:"carotation",spec:{component:"review",service_name:"review",reload:"{ kind = \"docker-restart\", target = \"review\" }",cert_group:"3000"},wrap_ttl:60,idempotency_key:"carotation-post-rotation-mint",agent_config_path:"/etc/review/agent.toml",role_id_path:"/var/lib/review/secrets/role_id",secret_id_path:"/var/lib/review/secrets/secret_id",eab_file_path:"/var/lib/review/secrets/eab.json",profile_cert_path:"/var/lib/review/certs/cert.pem",profile_key_path:"/var/lib/review/certs/key.pem",ca_bundle_path:"/var/lib/review/certs/ca-bundle.pem"}' >"$RUN_ROOT/mint.json"
 }
 
+# The tail after Phase 4 replaced the bootroot-internal credential: it signed
+# a new leaf with the new intermediate and pinned the `auth/cert` entry to it.
+# Read after the resumed run, with the root token, over a bundle of the CA
+# certificates now on disk — the listener's certificate was re-issued under
+# them, so the bundle built at `init` no longer verifies it.
+assert_internal_entry_pins_the_new_leaf() {
+  local chain="$SECRETS/registrar-internal/chain.pem" bundle="$RUN_ROOT/openbao-ca-after.pem"
+  local certificate entry_digest
+  sudo -n sh -c 'cat "$1" "$2" >"$3"; chmod 644 "$3"' _ \
+    "$SECRETS/certs/root_ca.crt" "$SECRETS/certs/intermediate_ca.crt" "$bundle" ||
+    fail "could not assemble the post-rotation OpenBao trust bundle"
+  certificate="$(sudo -n curl -fsS --cacert "$bundle" --header @"$TOKEN_CURL" \
+    "$OPENBAO_URL/v1/auth/cert/certs/bootroot-registrar-internal" | jq -r '.data.certificate // empty')" ||
+    fail "could not read the bootroot-internal cert-auth entry after the rotation"
+  [ "$(grep -c 'BEGIN CERTIFICATE' <<<"$certificate")" = 1 ] ||
+    fail "after the rotation the bootroot-internal entry must hold exactly one certificate"
+  if command -v sha256sum >/dev/null; then
+    entry_digest="$(openssl x509 -outform DER <<<"$certificate" | sha256sum | awk '{print $1}')"
+  else
+    entry_digest="$(openssl x509 -outform DER <<<"$certificate" | shasum -a 256 | awk '{print $1}')"
+  fi
+  # `openssl x509 -in` reads the first certificate of the chain: the leaf.
+  [ "$entry_digest" = "$(root_certificate_der_digest "$chain")" ] ||
+    fail "after the rotation the bootroot-internal entry is not pinned to the published leaf"
+  assert_leaf_under_new_generation "$chain" "the bootroot-internal leaf"
+  pass "the bootroot-internal entry is pinned to the published leaf, issued by the new intermediate"
+}
+
 assert_after_rotation() {
   local digests
   sudo -n test -e "$ROTATION_STATE" && fail "rotation-state.json survived Phase 7"
@@ -279,6 +307,8 @@ assert_after_rotation() {
   sudo -n grep -qxF "$PIN_COMMENT" "$PIN_FILE" || fail "the pin file lost its comment"
   [ "$(sudo -n stat -c '%u:%g:%a' "$PIN_FILE")" = "0:0:600" ] || fail "the pin file's owner or mode changed"
   pass "the pin file holds only the new root, keeps its comment, owner and mode"
+
+  assert_internal_entry_pins_the_new_leaf
 
   write_mint
   # shellcheck disable=SC2024 # the invoking user owns the artifact files.
@@ -315,9 +345,11 @@ main() {
   registrar_docker_build_and_initialize "$SCENARIO_SLUG"
   pass "initialized an isolated live TLS OpenBao deployment"
   registrar_docker_load_openbao_paths
-  # Phase 4's tail re-issues the bootroot-internal credential over HTTP-01,
-  # so its name is checked beside the two surface names: `init` attached all
-  # three and nothing in this scenario recreates the responder.
+  # `init` attached all three names and nothing in this scenario recreates
+  # the responder. The two surface names are what Phase 5 re-issues over
+  # HTTP-01; the bootroot-internal name is checked beside them because the
+  # set is attached as one, though Phase 4's tail signs that credential
+  # offline and orders nothing for it.
   registrar_docker_assert_endpoint_dns_aliases "$CLIENT_NAME" "$ENDPOINT_NAME" "$INTERNAL_NAME"
   registrar_docker_prepare_daemon
   set_rotation_paths

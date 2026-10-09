@@ -49,8 +49,8 @@
 //!
 //! This is not a scheduler. There is no registration point, no lead-time
 //! constant and no retry policy, and nothing here changes how the
-//! per-service loop or the internal profile's own renewal is scheduled,
-//! credentialed or triggered.
+//! per-service loop is scheduled, credentialed or triggered, or how the
+//! bootroot-internal credential — which nothing renews — is replaced.
 //!
 //! # Why this is not a module of [`crate::registrar`]
 //!

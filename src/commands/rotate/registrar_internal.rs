@@ -23,15 +23,21 @@
 //!   finalization checks pass, and before Phase 6 is recorded. Skipped
 //!   finalization keeps the additive set.
 //!
-//! An intermediate-only rotation reaches none of them: the internal
-//! entry trusts the *root*, which an intermediate-only rotation does not
-//! replace, so the entry, the material, the config and the bundle are
-//! all still correct and are left untouched.
+//! An intermediate-only rotation reaches none of them. The entry is
+//! pinned to the internal leaf itself, and `OpenBao` accepts a pinned
+//! leaf whether or not its issuer is still the active intermediate; the
+//! root, which the config's pins and the bundle are anchored on, is not
+//! replaced either. So the entry, the material, the config and the
+//! bundle are all still correct and are left untouched.
 //!
 //! `bootroot rotate registrar-internal-credential` reuses the tail as
-//! its whole body. It repairs expired, interrupted or unusable material
-//! and stale config trust, never re-runs install, and never touches a
-//! service credential.
+//! its whole body. It replaces the leaf — signing a new one offline
+//! against the intermediate key — together with the entry pinned to it.
+//! Without `--force` it acts when the material is incomplete, when the
+//! root changed, when the entry is not pinned to the published leaf (an
+//! installation from before the entry was pinned, above all), or when
+//! the leaf is within [`RENEWAL_WINDOW`] of expiry. It never re-runs
+//! install and never touches a service credential.
 //!
 //! `rotate responder-hmac` and `rotate eab-clear` reach the internal
 //! config too, through [`check_internal_config_change`] and
@@ -61,8 +67,9 @@ use bootroot::eab::EabCredentials;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths,
-    MaterialStatus, capture_members, load_material, material_status, remove_internal_eab,
-    require_https, require_root_authority, upsert_internal_responder_hmac, upsert_internal_trust,
+    MaterialStatus, capture_members, first_certificate_der, leaf_not_after, load_material,
+    material_status, remove_internal_eab, require_https, require_root_authority,
+    upsert_internal_responder_hmac, upsert_internal_trust,
 };
 use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, fs_util};
@@ -94,6 +101,15 @@ const INTERNAL_CONFIG_LOCK_FILE: &str = "agent.toml.lock";
 /// The mode the lock file is created at. Nothing reads it; the
 /// descriptor is the lock.
 const INTERNAL_CONFIG_LOCK_MODE: u32 = 0o600;
+
+/// How close to its `notAfter` the internal leaf may come before
+/// `bootroot rotate registrar-internal-credential` replaces it without
+/// `--force`.
+///
+/// Nothing renews the leaf unattended, so this is not a renewal lead
+/// time a timer acts on: it is what makes the one operator command
+/// sufficient for a leaf nearing the end of its ten years.
+const RENEWAL_WINDOW: time::Duration = time::Duration::days(30);
 
 /// The recovery a failed internal-config update after the `OpenBao`
 /// writes names: the new value is already the source of truth, so either
@@ -437,10 +453,11 @@ pub(super) fn internal_credential_present(secrets_dir: &Path) -> bool {
 /// The gate every internal rotation call site is written behind, so the
 /// two halves of the condition are stated once. An intermediate-only
 /// rotation is excluded whatever the host carries: the `auth/cert` entry
-/// trusts the *root*, which that rotation does not replace, so the
-/// entry, the leaf, the config and the bundle are all still correct and
-/// rewriting them would be a change to artifacts the rotation is
-/// specified to leave alone.
+/// is pinned to the leaf itself and goes on accepting it under a new
+/// intermediate, and the root is not replaced, so the entry, the leaf,
+/// the config and the bundle are all still correct and rewriting them
+/// would be a change to artifacts the rotation is specified to leave
+/// alone.
 pub(super) fn internal_rotation_applies(mode: &RotationMode, secrets_dir: &Path) -> bool {
     *mode == RotationMode::Full && internal_credential_present(secrets_dir)
 }
@@ -602,9 +619,9 @@ pub(super) fn ensure_internal_trust_is(
 ///
 /// Returns an error when the token does not carry `root`, when the
 /// recorded `OpenBao` URL is plaintext, when the endpoint predicate is
-/// absent, when the ACME issuance fails, when any file cannot be
-/// published, or when a requested reload signal fails for a reason
-/// other than "no such process".
+/// absent, when the replacement leaf cannot be signed, when any file
+/// cannot be published, or when a requested reload signal fails for a
+/// reason other than "no such process".
 pub(super) async fn repair_internal_credential(
     ctx: &RotateContext,
     client: &OpenBaoClient,
@@ -623,7 +640,7 @@ pub(super) async fn repair_internal_credential(
 
     // Held from before the responder HMAC and the EAB are read out of
     // `OpenBao` until the set carrying them is published — across the
-    // ACME issuance in between, which is the point: the values this
+    // signing in between, which is the point: the values this
     // republishes are the ones it read, so a responder-HMAC or EAB
     // rotation either finishes before the read or waits for the
     // publication.
@@ -641,9 +658,9 @@ pub(super) async fn repair_internal_credential(
 ///
 /// # Errors
 ///
-/// Returns an error when the ACME issuance fails, when the `auth/cert`
-/// entry cannot be converged, when the replacement cannot log in, or
-/// when any file cannot be published.
+/// Returns an error when the replacement leaf cannot be signed, when the
+/// `auth/cert` entry cannot be converged, when the replacement cannot
+/// log in, or when any file cannot be published.
 async fn replace_internal_credential(
     client: &OpenBaoClient,
     context: &RegistrarInternalContext,
@@ -655,16 +672,14 @@ async fn replace_internal_credential(
     let inputs = context.inputs();
 
     // The replacement is staged **before** anything in `OpenBao`
-    // changes. The convergence below rewrites the entry to trust the
-    // active root, and during a full rotation that is the *new* root:
-    // an entry replaced ahead of a leaf that is then never issued
-    // rejects the on-disk credential the internal daemon is still using,
-    // turning a retryable ACME failure into a host that cannot
-    // authenticate. Issuance needs no `auth/cert` entry — it runs over
-    // ACME against step-ca — so it costs nothing to prove it first.
+    // changes. The convergence below pins the entry to the staged leaf,
+    // so it could not run first in any case — and a host that cannot
+    // sign (no Docker, no intermediate key, no `password.txt`) fails
+    // here with the entry, and so the credential the internal daemon is
+    // still using, exactly as they were.
     //
     // The publication carries `trust`, not the active generation the
-    // issuance staged: the Phase-4 tail replaces the credential while
+    // signing staged: the Phase-4 tail replaces the credential while
     // the fleet is still on the additive set, and a repair mid-rotation
     // has to restore that same set.
     //
@@ -707,8 +722,8 @@ async fn replace_internal_credential(
     }
 }
 
-/// Rewrites the `auth/cert` entry to the active root, proves the staged
-/// leaf logs in against it, and publishes the set.
+/// Pins the `auth/cert` entry to the staged leaf, proves that leaf logs
+/// in against it, and publishes the set.
 ///
 /// One unit, because its caller undoes it as one: the login is what
 /// makes the new entry and the new leaf provably a pair, and the
@@ -730,7 +745,7 @@ async fn converge_and_publish(
     // left enabled, which is the state a working credential needs and
     // the state the next repair converges on regardless.
     let mut mounted_now = false;
-    converge_internal_auth(client, inputs, messages, &mut mounted_now).await?;
+    converge_internal_auth(client, inputs, staged.leaf_pem()?, &mut mounted_now).await?;
     verify_internal_login(staged, openbao_url).await?;
     publish_internal_set(staged, inputs, messages).await
 }
@@ -797,8 +812,8 @@ impl PriorInternalAuth {
 ///
 /// Best effort and never fatal: the repair has already failed, and an
 /// error raised here would displace the one that matters. What it must
-/// not do is stay silent — an entry left trusting a root no on-disk leaf
-/// chains to is exactly the state that stops the internal daemon
+/// not do is stay silent — an entry left pinned to a leaf that is not
+/// the one on disk is exactly the state that stops the internal daemon
 /// authenticating, so a restore that does not land is reported with the
 /// command that repairs it.
 async fn restore_cert_auth_entry(client: &OpenBaoClient, prior: Option<&serde_json::Value>) {
@@ -892,8 +907,8 @@ async fn sweep_staging(secrets_dir: &Path) {
 }
 
 /// Builds the repair's context from the recorded state, the existing
-/// generated config and — for the EAB the internal ACME account needs —
-/// the root-token client.
+/// generated config and — for the responder HMAC and the EAB the
+/// republished config carries — the root-token client.
 ///
 /// The existing config is the record of the values `init` chose (the
 /// ACME directory, the contact email, the responder URL), so a repair
@@ -905,7 +920,7 @@ async fn sweep_staging(secrets_dir: &Path) {
 /// and `[registrar_endpoint]` tables, which only `init` takes from the
 /// operator. It is read strictly, whole, and first: a config that
 /// exists but cannot be read or does not parse as the daemon's settings
-/// refuses the repair before anything is issued, converged or
+/// refuses the repair before anything is signed, converged or
 /// published, rather than letting the republication drop the
 /// endpoint's configuration. The fallbacks are for an absent config
 /// only, never for one that is present and unreadable.
@@ -967,6 +982,7 @@ async fn repair_context(
     Ok(RegistrarInternalContext {
         intent,
         secrets_dir,
+        docker: ctx.docker.clone(),
         kv_mount: ctx.kv_mount.clone(),
         acme_server: existing.as_ref().map_or_else(
             || {
@@ -1139,6 +1155,83 @@ pub(super) async fn trust_state_for_repair(
     .await
 }
 
+/// Reports whether the credential needs nothing done to it, which is
+/// when a run without `--force` stops.
+///
+/// All of these hold, and each one failing alone makes the run proceed
+/// exactly as with `--force`:
+///
+/// - the material is present and its stored root fingerprint is the
+///   active root's;
+/// - the `auth/cert` entry exists and its `certificate` is exactly the
+///   published leaf — one certificate, the same DER. An entry that does
+///   not parse, that names a CA (the shape every installation had before
+///   the entry was pinned) or that names any other certificate is a
+///   mismatch, and replacing it is how such an installation migrates;
+/// - the published leaf's `notAfter` is more than [`RENEWAL_WINDOW`]
+///   after `now`.
+///
+/// The two local conditions are read first, so the entry is only read
+/// when the answer depends on it.
+///
+/// # Errors
+///
+/// Returns an error when the entry cannot be read. A lookup that did not
+/// answer is not "up to date": reporting it as such would leave an
+/// unmigrated entry in place behind a message saying nothing needs
+/// doing.
+async fn internal_credential_up_to_date(
+    secrets_dir: &Path,
+    client: &OpenBaoClient,
+    now: time::OffsetDateTime,
+    messages: &Messages,
+) -> Result<bool> {
+    let paths = InternalPaths::new(secrets_dir);
+    if !matches!(material_status(&paths), MaterialStatus::Present)
+        || !stored_root_matches_active(secrets_dir, messages)
+            .await
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    // Loaded a moment ago by the root comparison; a set that stopped
+    // loading in between is one to replace.
+    let Ok(material) = load_material(&paths) else {
+        return Ok(false);
+    };
+    let chain_path = paths.chain();
+    let Ok(leaf_der) = first_certificate_der(&chain_path, &material.chain) else {
+        return Ok(false);
+    };
+    match leaf_not_after(&chain_path, &material.chain) {
+        Ok(not_after) if not_after - RENEWAL_WINDOW > now => {}
+        _ => return Ok(false),
+    }
+
+    let entry = client
+        .read_cert_auth_entry(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+        .await
+        .context("reading the bootroot-registrar-internal cert auth entry")?;
+    Ok(entry
+        .as_ref()
+        .and_then(|entry| entry.get("certificate"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|pinned| entry_is_pinned_to(pinned, &leaf_der)))
+}
+
+/// Reports whether an entry's `certificate` is the one leaf whose DER is
+/// `leaf_der`, and nothing else.
+///
+/// One certificate exactly: an entry that carries the leaf followed by
+/// anything else is not the shape this crate writes.
+fn entry_is_pinned_to(pinned: &str, leaf_der: &[u8]) -> bool {
+    let mut certificates = x509_parser::pem::Pem::iter_from_buffer(pinned.as_bytes());
+    let Some(Ok(first)) = certificates.next() else {
+        return false;
+    };
+    first.label == "CERTIFICATE" && first.contents == leaf_der && certificates.next().is_none()
+}
+
 /// Repairs the bootroot-internal credential on operator demand.
 ///
 /// The command form of the Phase-4 tail: the same root-authority check,
@@ -1166,13 +1259,13 @@ pub(super) async fn rotate_registrar_internal_credential(
 
     let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     if !args.force
-        && matches!(
-            material_status(&InternalPaths::new(&secrets_dir)),
-            MaterialStatus::Present
+        && internal_credential_up_to_date(
+            &secrets_dir,
+            client,
+            time::OffsetDateTime::now_utc(),
+            messages,
         )
-        && stored_root_matches_active(&secrets_dir, messages)
-            .await
-            .unwrap_or(false)
+        .await?
     {
         println!("{}", messages.rotate_registrar_internal_up_to_date());
         return Ok(());
@@ -1208,12 +1301,15 @@ mod tests {
         POLICY_BOOTROOT_REGISTRAR_INTERNAL, PriorInternalAuth, RegistrarInternalContext,
         RotationMode, acquire_internal_config_lock, apply_internal_config_change,
         check_internal_config_change, converge_internal_auth, ensure_internal_trust_is,
-        internal_credential_present, internal_rotation_applies, publish_internal_config,
-        repair_internal_credential, replace_internal_credential, restore_cert_auth_entry,
-        rewrite_internal_config, staging_dir, sweep_staging, upsert_internal_trust,
-        write_internal_trust, write_trust_pair,
+        internal_credential_present, internal_credential_up_to_date, internal_rotation_applies,
+        publish_internal_config, repair_internal_credential, replace_internal_credential,
+        restore_cert_auth_entry, rewrite_internal_config, rotate_registrar_internal_credential,
+        staging_dir, sweep_staging, upsert_internal_trust, write_internal_trust, write_trust_pair,
     };
     use crate::commands::init::DEFAULT_STEPCA_PROVISIONER;
+    use crate::commands::init::registrar_internal::test_fixtures::{
+        TestLeaf, TestPki, write_signing_fake_docker,
+    };
     use crate::commands::init::registrar_internal::{internal_acme_server, internal_responder_url};
     use crate::i18n::test_messages;
 
@@ -1273,9 +1369,9 @@ mod tests {
     /// The repair inputs every test below drives, pointed at a
     /// provisioned host's secrets directory.
     ///
-    /// The ACME and responder endpoints are unreachable on purpose: no
-    /// test here gets as far as issuing, and one that did would be
-    /// reaching the network rather than asserting anything.
+    /// The ACME and responder endpoints are unreachable on purpose: the
+    /// replacement leaf is signed offline, so nothing here dials either,
+    /// and a repair that did would fail rather than pass.
     fn repair_inputs(secrets_dir: &std::path::Path) -> RegistrarInternalContext {
         RegistrarInternalContext {
             intent: super::RegistrarInternalIntent {
@@ -1283,6 +1379,10 @@ mod tests {
                 host: "bootroot-01".to_string(),
             },
             secrets_dir: secrets_dir.to_path_buf(),
+            // Never a real `docker`: a test that reaches the signing
+            // supplies a fake, and one that does not must not start a
+            // container by accident.
+            docker: std::path::PathBuf::from("/nonexistent/docker"),
             kv_mount: "secret".to_string(),
             acme_server: "https://127.0.0.1:1/acme/acme/directory".to_string(),
             email: "ops@example.internal".to_string(),
@@ -1397,10 +1497,10 @@ mod tests {
     /// An intermediate-only rotation leaves every internal artifact
     /// alone, on a provisioned host as much as on a bare one.
     ///
-    /// The `auth/cert` entry trusts the *root*, and an intermediate-only
-    /// rotation does not replace it — so the entry, the leaf, the stored
-    /// fingerprint, the config's pins and the private bundle are all
-    /// still correct. Phase 3, the Phase-4 tail and Phase 6 are each
+    /// The `auth/cert` entry is pinned to the leaf itself, which it goes
+    /// on accepting under a new intermediate, and the root is not
+    /// replaced — so the entry, the leaf, the stored fingerprint, the
+    /// config's pins and the private bundle are all still correct. Phase 3, the Phase-4 tail and Phase 6 are each
     /// written behind this predicate, so a host that carries a working
     /// credential must still select no internal work in that mode.
     #[tokio::test]
@@ -1898,28 +1998,29 @@ mod tests {
         );
     }
 
-    /// A repair proves its replacement before it touches the entry the
-    /// running credential authenticates against.
+    /// A repair has its replacement in hand before it touches the entry
+    /// the running credential authenticates against.
     ///
-    /// The convergence rewrites the `auth/cert` entry to trust the
-    /// *active* root, which during a full rotation is the new one. Doing
-    /// that ahead of a leaf that is then never issued would leave the
-    /// on-disk credential chained to a root the entry no longer trusts —
-    /// a retryable ACME failure turned into a host that cannot log in.
-    /// So an issuance failure must reach no `auth/` write at all.
+    /// The convergence pins the `auth/cert` entry to the staged leaf, so
+    /// a leaf that could not be signed — no Docker, no intermediate key,
+    /// no `password.txt` — must leave the entry, and with it the
+    /// credential the daemon is still using, exactly as it was. A
+    /// signing failure reaches no `OpenBao` request at all.
     #[tokio::test]
-    async fn an_issuance_failure_reaches_no_cert_auth_write() {
+    async fn a_signing_failure_reaches_no_cert_auth_write() {
         use wiremock::MockServer;
 
         let server = MockServer::start().await;
         let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
 
-        // No CA material below the secrets directory, so the issuance
-        // fails at its first step — before ACME, and long before any
-        // `OpenBao` write.
+        // The CA is in place, so what fails is the signing helper.
         let (dir, paths) = provisioned_host();
-        let context = repair_inputs(dir.path());
+        TestPki::new().write_ca(dir.path());
+        let failing = dir.path().join("failing-docker");
+        crate::test_support::write_executable(&failing, b"#!/bin/sh\nexit 1\n");
+        let mut context = repair_inputs(dir.path());
+        context.docker = failing;
 
         replace_internal_credential(
             &client,
@@ -1933,16 +2034,15 @@ mod tests {
             &test_messages(),
         )
         .await
-        .expect_err("issuance must fail without CA material");
+        .expect_err("the repair fails when the leaf cannot be signed");
 
         let seen = server
             .received_requests()
             .await
             .expect("the mock records every request");
         assert!(
-            seen.iter()
-                .all(|request| !request.url.path().contains("/auth/")),
-            "no auth surface may be touched before the replacement exists: {:?}",
+            seen.is_empty(),
+            "nothing in OpenBao may be touched before the replacement exists: {:?}",
             seen.iter()
                 .map(|request| request.url.path().to_string())
                 .collect::<Vec<_>>()
@@ -1957,8 +2057,8 @@ mod tests {
     ///
     /// The entry and the material move as one: either the host ends on
     /// the new pair, or on the pair it started with. An entry left
-    /// trusting a root no on-disk leaf chains to is the one state that
-    /// stops the internal daemon authenticating, so the captured body
+    /// pinned to a leaf that is not the one on disk is the one state
+    /// that stops the internal daemon authenticating, so the captured body
     /// goes back verbatim — and a host whose entry did not exist before
     /// gets it removed again.
     #[tokio::test]
@@ -2039,12 +2139,6 @@ mod tests {
         client.set_token("root-token".to_string());
 
         let (dir, _paths) = provisioned_host();
-        std::fs::create_dir_all(dir.path().join("certs")).expect("ca dir");
-        std::fs::write(
-            dir.path().join("certs").join("root_ca.crt"),
-            bundle_pem("Uk9PVA"),
-        )
-        .expect("root CA");
         let context = repair_inputs(dir.path());
 
         // What a repair does around a login or a publication that
@@ -2053,15 +2147,18 @@ mod tests {
             .await
             .expect("both artifacts are readable");
         let mut mounted_now = false;
-        converge_internal_auth(
-            &client,
-            &context.inputs(),
-            &test_messages(),
-            &mut mounted_now,
-        )
-        .await
-        .expect("the convergence writes both artifacts");
+        let leaf = bundle_pem("TkVXTEVBRg");
+        converge_internal_auth(&client, &context.inputs(), &leaf, &mut mounted_now)
+            .await
+            .expect("the convergence writes both artifacts");
         prior.restore(&client).await;
+
+        let entries = writes.entries.lock().expect("capture").clone();
+        assert_eq!(
+            entries.first().and_then(|entry| entry.get("certificate")),
+            Some(&serde_json::Value::String(leaf)),
+            "the convergence pins the entry to the leaf it was handed"
+        );
 
         let policies = writes.policies.lock().expect("capture").clone();
         assert_eq!(
@@ -2084,6 +2181,298 @@ mod tests {
             Some(&prior_entry()),
             "the entry is still restored alongside it"
         );
+    }
+
+    /// The whole repair, over a host that already carries a credential:
+    /// the replacement is signed offline, the entry is pinned to the
+    /// staged leaf and only the leaf, and — the login proof failing, as
+    /// it does over this plain-HTTP mock — the entry and the policy the
+    /// repair found go back verbatim, the published files are untouched
+    /// and no staging directory is left.
+    #[tokio::test]
+    async fn a_failure_after_the_entry_write_restores_what_the_repair_found() {
+        let (server, writes) = converge_mock_server().await;
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+
+        let (dir, paths) = provisioned_host();
+        let pki = TestPki::new();
+        pki.write_ca(dir.path());
+        let leaf = pki.fresh_leaf();
+        let args_log = dir.path().join("docker_args.log");
+        let mut context = repair_inputs(dir.path());
+        context.docker = write_signing_fake_docker(dir.path(), &args_log, &leaf);
+        let before: Vec<Vec<u8>> = paths
+            .all()
+            .iter()
+            .map(|member| std::fs::read(member).expect("member"))
+            .collect();
+
+        let err = replace_internal_credential(
+            &client,
+            &context,
+            &server.uri(),
+            &InternalTrustState {
+                fingerprints: vec![ROOT_FP.to_string()],
+                bundle_pem: bundle_pem("Uk9PVA"),
+            },
+            InternalReload::Signal,
+            &test_messages(),
+        )
+        .await
+        .expect_err("the login proof cannot succeed over plaintext");
+        assert!(
+            format!("{err:#}").contains("certificate login requires TLS"),
+            "the repair got as far as the login proof: {err:#}"
+        );
+
+        let log = std::fs::read_to_string(&args_log).expect("the helper ran");
+        assert!(
+            log.contains("certificate create") && log.contains("--not-after 87600h"),
+            "the replacement was signed offline: {log}"
+        );
+
+        let entries = writes.entries.lock().expect("capture").clone();
+        assert_eq!(entries.len(), 2, "the convergence, then the restore");
+        assert_eq!(
+            entries[0]["certificate"], leaf.cert_pem,
+            "the entry is pinned to the staged leaf alone, not its chain"
+        );
+        assert_eq!(entries[1], prior_entry(), "the entry goes back verbatim");
+        let policies = writes.policies.lock().expect("capture").clone();
+        assert_eq!(policies.len(), 2);
+        assert_eq!(policies[1], PRIOR_POLICY, "the policy goes back verbatim");
+
+        let after: Vec<Vec<u8>> = paths
+            .all()
+            .iter()
+            .map(|member| std::fs::read(member).expect("member"))
+            .collect();
+        assert_eq!(after, before, "the published set was never touched");
+        assert!(
+            !staging_dir(&paths).exists(),
+            "the unpublished key must not survive a failed repair"
+        );
+    }
+
+    /// A host the up-to-date predicate can be driven over: a real CA,
+    /// and a published set whose leaf is `leaf` under that CA.
+    fn pinned_host(pki: &TestPki, leaf: &TestLeaf) -> (TempDir, InternalPaths) {
+        let (dir, paths) = provisioned_host();
+        pki.write_ca(dir.path());
+        std::fs::write(
+            paths.chain(),
+            format!("{}{}", leaf.cert_pem, pki.intermediate_pem),
+        )
+        .expect("chain");
+        std::fs::write(
+            paths.root_fingerprint(),
+            format!(
+                "{}\n",
+                bootroot::registrar::internal::active_root_fingerprint(dir.path())
+                    .expect("the active root")
+            ),
+        )
+        .expect("fingerprint");
+        (dir, paths)
+    }
+
+    /// An `OpenBao` whose entry read answers `response`, counting the
+    /// reads.
+    async fn entry_read_server(response: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v1/auth/{CERT_AUTH_MOUNT}/certs/{CERT_AUTH_ROLE}"
+            )))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn entry_with(certificate: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "certificate": certificate, "display_name": CERT_AUTH_ROLE }
+        }))
+    }
+
+    async fn up_to_date(dir: &TempDir, server: &MockServer) -> anyhow::Result<bool> {
+        let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("root-token".to_string());
+        internal_credential_up_to_date(
+            dir.path(),
+            &client,
+            time::OffsetDateTime::now_utc(),
+            &test_messages(),
+        )
+        .await
+    }
+
+    /// All three conditions holding is the one case a run without
+    /// `--force` stops at: the material is present under the active
+    /// root, the entry is pinned to exactly the published leaf, and the
+    /// leaf is more than thirty days from expiry.
+    #[tokio::test]
+    async fn a_pinned_current_credential_is_up_to_date() {
+        let pki = TestPki::new();
+        let leaf = pki.fresh_leaf();
+        let (dir, _paths) = pinned_host(&pki, &leaf);
+        let server = entry_read_server(entry_with(&leaf.cert_pem)).await;
+        assert!(up_to_date(&dir, &server).await.expect("the entry is read"));
+
+        // `OpenBao` hands the PEM back as it likes; what is compared is
+        // the certificate, not its spelling.
+        let respelt = format!("\n{}\n\n", leaf.cert_pem.trim_end());
+        let server = entry_read_server(entry_with(&respelt)).await;
+        assert!(up_to_date(&dir, &server).await.expect("the entry is read"));
+    }
+
+    /// The material failing alone: a set that is incomplete, or one
+    /// whose stored root is not the active root, is replaced — and the
+    /// entry is not even read to decide it.
+    #[tokio::test]
+    async fn incomplete_or_superseded_material_is_not_up_to_date() {
+        let pki = TestPki::new();
+        let leaf = pki.fresh_leaf();
+
+        let (dir, paths) = pinned_host(&pki, &leaf);
+        std::fs::remove_file(paths.key()).expect("remove the key");
+        let server = entry_read_server(entry_with(&leaf.cert_pem)).await;
+        assert!(!up_to_date(&dir, &server).await.expect("no read is needed"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty()
+        );
+
+        let (dir, paths) = pinned_host(&pki, &leaf);
+        std::fs::write(paths.root_fingerprint(), format!("{OLD_ROOT_FP}\n")).expect("stale");
+        let server = entry_read_server(entry_with(&leaf.cert_pem)).await;
+        assert!(!up_to_date(&dir, &server).await.expect("no read is needed"));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty()
+        );
+    }
+
+    /// The entry failing alone. An installation from before the entry
+    /// was pinned holds the root CA there, and replacing it is how that
+    /// installation migrates; an absent entry, another leaf of the same
+    /// CA, the leaf followed by its intermediate and an entry that does
+    /// not parse are all mismatches too.
+    #[tokio::test]
+    async fn an_entry_that_is_not_the_published_leaf_is_not_up_to_date() {
+        let pki = TestPki::new();
+        let leaf = pki.fresh_leaf();
+        let (dir, _paths) = pinned_host(&pki, &leaf);
+        let other = pki.fresh_leaf();
+        let with_intermediate = format!("{}{}", leaf.cert_pem, pki.intermediate_pem);
+        let cases: [(&str, ResponseTemplate); 7] = [
+            ("the root CA (the old shape)", entry_with(&pki.root_pem)),
+            ("the intermediate CA", entry_with(&pki.intermediate_pem)),
+            ("another leaf of the same CA", entry_with(&other.cert_pem)),
+            (
+                "the leaf and its intermediate",
+                entry_with(&with_intermediate),
+            ),
+            ("not a certificate", entry_with("not a certificate")),
+            (
+                "no certificate field",
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": {} })),
+            ),
+            ("no entry", ResponseTemplate::new(404)),
+        ];
+        for (case, response) in cases {
+            let server = entry_read_server(response).await;
+            assert!(
+                !up_to_date(&dir, &server).await.expect("the entry is read"),
+                "{case}"
+            );
+        }
+    }
+
+    /// The expiry failing alone: a leaf within thirty days of its
+    /// `notAfter` — or past it — is replaced, though the entry is pinned
+    /// to it and the root is current. One just outside the window is
+    /// left alone.
+    #[tokio::test]
+    async fn a_leaf_within_thirty_days_of_expiry_is_not_up_to_date() {
+        let pki = TestPki::new();
+        let now = time::OffsetDateTime::now_utc();
+        for (days, expected) in [(-1, false), (29, false), (31, true)] {
+            let leaf = pki.leaf(now + time::Duration::days(days));
+            let (dir, _paths) = pinned_host(&pki, &leaf);
+            let server = entry_read_server(entry_with(&leaf.cert_pem)).await;
+            assert_eq!(
+                up_to_date(&dir, &server).await.expect("the entry is read"),
+                expected,
+                "a leaf {days} days from expiry"
+            );
+        }
+    }
+
+    /// An entry read that did not answer is an error. Reporting it as
+    /// "up to date" would leave an unmigrated entry in place behind a
+    /// message saying nothing needs doing.
+    #[tokio::test]
+    async fn an_entry_read_failure_is_an_error_and_not_up_to_date() {
+        let pki = TestPki::new();
+        let leaf = pki.fresh_leaf();
+        let (dir, _paths) = pinned_host(&pki, &leaf);
+        let server = entry_read_server(ResponseTemplate::new(500).set_body_string("boom")).await;
+        let err = up_to_date(&dir, &server)
+            .await
+            .expect_err("a failed read is not an answer");
+        assert!(format!("{err:#}").contains("cert auth entry"), "{err:#}");
+    }
+
+    /// The command itself: without `--force` it stops on a host whose
+    /// three conditions hold, having written nothing, and fails rather
+    /// than stopping when the entry cannot be read.
+    #[tokio::test]
+    async fn the_command_stops_only_on_an_up_to_date_host() {
+        let pki = TestPki::new();
+        let leaf = pki.fresh_leaf();
+        let (dir, _paths) = pinned_host(&pki, &leaf);
+        let args = crate::cli::args::RotateRegistrarInternalArgs { force: false };
+
+        for (response, stops) in [
+            (entry_with(&leaf.cert_pem), true),
+            (ResponseTemplate::new(500).set_body_string("boom"), false),
+        ] {
+            let server = entry_read_server(response).await;
+            Mock::given(method("GET"))
+                .and(path("/v1/auth/token/lookup-self"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": { "policies": ["root"] }
+                })))
+                .mount(&server)
+                .await;
+            let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
+            client.set_token("root-token".to_string());
+            let outcome = rotate_registrar_internal_credential(
+                &endpoint_ctx(dir.path()),
+                &client,
+                &args,
+                true,
+                &test_messages(),
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), stops, "{outcome:?}");
+            let requests = server.received_requests().await.expect("recording");
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method == wiremock::http::Method::GET),
+                "nothing is written either way"
+            );
+        }
     }
 
     /// The Phase-4 tail refuses to replace anything on a host whose
