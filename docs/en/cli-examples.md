@@ -393,16 +393,19 @@ bootroot rotate approle-secret-id --registration-id edge-proxy
 
 ## 4) DNS resolution for HTTP-01 validation
 
-`bootroot service add` automatically registers each service's validation FQDN
-(`<instance_id>.<service_name>.<hostname>.<domain>`) as a Docker network alias
-on the `bootroot-http01` container. This lets step-ca resolve the FQDN to the
-responder without any manual configuration.
+In the compose stack, step-ca does not have to resolve a service's validation
+FQDN (`<instance_id>.<service_name>.<hostname>.<domain>`): it fetches every
+HTTP-01 validation through the responder. See
+[Validation through the responder](installation.md#validation-through-the-responder).
 
-If `bootroot-http01` is restarted (e.g. `docker compose down` / `up`),
-`bootroot infra up` replays all aliases from `state.json` automatically.
+`bootroot service add` still registers the FQDN as a Docker network alias on
+the `bootroot-http01` container. If `bootroot-http01` is restarted (e.g.
+`docker compose down` / `up`), `bootroot infra up` replays all aliases from
+`state.json` automatically.
 
-For non-Compose environments or when manual resolution is needed, add
-`/etc/hosts` entries inside the step-ca container:
+For a step-ca that does not run from the shipped compose files and has to
+resolve the name itself, add `/etc/hosts` entries where step-ca runs. For a
+step-ca container, for example:
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \

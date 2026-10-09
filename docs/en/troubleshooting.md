@@ -216,6 +216,15 @@ fields independently.
 
 ### HTTP-01 failures
 
+- `urn:ietf:params:acme:error:connection` ("The server could not connect to
+  validation target") now means that step-ca could not reach the
+  responder, or that the step-ca container predates the proxy variable
+  described in
+  [Validation through the responder](installation.md#validation-through-the-responder).
+  Check `docker exec <instance>-ca env` for any variable containing
+  `proxy` in either case (expect exactly
+  `HTTP_PROXY=http://bootroot-http01:80`), check that the responder is
+  running, and run `bootroot infra up`.
 - `bootroot service add` registers the service FQDN as a Docker network
   alias on `bootroot-http01` automatically. If the alias was lost (e.g.
   after a container restart without running `bootroot infra up`), re-run
@@ -226,7 +235,9 @@ fields independently.
   above)` means none were registered — consult the warning above it for
   the specific cause. The add still succeeded, so `bootroot infra up` is
   what registers them once that cause is addressed.
-- step-ca must map service FQDN to responder IP
+- a step-ca that does not run from the shipped compose files (a compose
+  file of your own without the bundled responder, or a host install) must
+  map service FQDN to responder IP
 - service hosts (remote mode) must also map step-ca/responder names correctly
 
 ### `Finalize failed: badCSR`

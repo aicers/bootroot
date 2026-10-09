@@ -386,16 +386,20 @@ bootroot rotate approle-secret-id --registration-id edge-proxy
 
 ## 4) HTTP-01 검증을 위한 DNS 해석
 
-`bootroot service add`는 서비스의 검증 FQDN
-(`<instance_id>.<service_name>.<hostname>.<domain>`)을 `bootroot-http01`
-컨테이너에 Docker 네트워크 별칭으로 자동 등록합니다. 따라서 step-ca가 별도
-설정 없이 해당 FQDN을 리스폰더로 해석할 수 있습니다.
+compose 스택에서는 step-ca가 서비스의 검증 FQDN
+(`<instance_id>.<service_name>.<hostname>.<domain>`)을 해석할 필요가
+없습니다. step-ca가 모든 HTTP-01 검증을 리스폰더를 통해 가져오기
+때문입니다. [리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)을
+참고하세요.
 
-`bootroot-http01`이 재시작된 경우(예: `docker compose down` / `up`),
-`bootroot infra up`이 `state.json`에서 별칭을 자동으로 재적용합니다.
+`bootroot service add`는 여전히 이 FQDN을 `bootroot-http01` 컨테이너에
+Docker 네트워크 별칭으로 등록합니다. `bootroot-http01`이 재시작된 경우(예:
+`docker compose down` / `up`), `bootroot infra up`이 `state.json`에서 별칭을
+자동으로 재적용합니다.
 
-Compose 이외의 환경이나 수동 해석이 필요한 경우 step-ca 컨테이너의
-`/etc/hosts`에 항목을 추가하세요:
+제공되는 compose 파일로 실행하지 않아 step-ca가 이름을 직접 해석해야 하는
+경우에는 step-ca가 동작하는 환경의 `/etc/hosts`에 항목을 추가하세요. 예를
+들어 step-ca 컨테이너라면:
 
 ```bash
 RESPONDER_IP="$(docker inspect -f \

@@ -88,6 +88,17 @@ services:
     user: "${BOOTROOT_STEPCA_USER:-1000:1000}"
     depends_on:
       - postgres
+    # step-ca fetches every HTTP-01 validation through the responder, used
+    # as an HTTP proxy, so a challenge validates for any name whose token
+    # is registered there, whether or not the name resolves from this
+    # container. `bootroot-http01` is this file's responder service name
+    # and must stay in step with `RESPONDER_SERVICE_NAME`. Do not add
+    # `HTTPS_PROXY`, `NO_PROXY` or the lower-case variants: the responder
+    # tunnels nothing, and only plain-HTTP fetches belong on it. An ACME
+    # client that answers on its own port 80 cannot be validated by this
+    # step-ca, which never connects to it.
+    environment:
+      - HTTP_PROXY=http://bootroot-http01:80
     ports:
       - "127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000"
     expose:

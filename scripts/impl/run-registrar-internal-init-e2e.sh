@@ -2519,6 +2519,20 @@ run_infra_up_over_the_initialised_deployment() {
   pass "'infra up' completed over the initialised deployment"
 }
 
+# Both shipped compose files point step-ca at the responder as its HTTP
+# proxy, which is what lets an HTTP-01 challenge validate for a name
+# that has no network alias — every identity the registrar mints.  This
+# is the deploy file's arm of that, and bootroot's own `infra up`: the
+# container the bring-up above left running has to carry the variable.
+assert_stepca_fetches_through_the_responder() {
+  local expected="HTTP_PROXY=http://bootroot-http01:80" container="${INSTANCE}-ca" container_env
+  container_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>>"$RUN_LOG")" ||
+    fail "could not read the environment of ${container}"
+  grep -Fxq "$expected" <<<"$container_env" ||
+    fail "${container} does not carry ${expected} after 'infra up'"
+  pass "${container} carries ${expected} after 'infra up'"
+}
+
 # The shared audit store, and the OpenBao file audit device now bound
 # into it.
 #
@@ -3489,6 +3503,7 @@ main() {
   # sweep narrowed too far would fail the second.
   log_phase "assert-sweep"
   run_infra_up_over_the_initialised_deployment
+  assert_stepca_fetches_through_the_responder
   assert_material_is_complete_and_restrictive
   assert_the_infra_agent_tree_belongs_to_its_sidecars
   # The unprivileged bring-up selected the audit override and checked

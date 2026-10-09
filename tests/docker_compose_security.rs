@@ -351,6 +351,154 @@ fn deploy_stepca_metrics_port_is_exposed_but_never_published() {
     assert_metrics_port_exposed_never_published(&compose, "docker-compose.deploy.yml");
 }
 
+const RESPONDER_SERVICE: &str = "bootroot-http01";
+const STEPCA_PROXY_ENTRY: &str = "HTTP_PROXY=http://bootroot-http01:80";
+
+/// step-ca fetches every HTTP-01 validation through the responder, used
+/// as an HTTP proxy, which is what lets a challenge validate for a name
+/// that resolves nowhere — an identity the registrar minted never gets
+/// the network alias `service add` attaches. The variable is the whole
+/// mechanism, so it is pinned exactly:
+///
+/// - on `step-ca`, as the only `environment:` entry, with the responder
+///   service it names declared in the same file;
+/// - upper-case `HTTP_PROXY` alone. `HTTPS_PROXY` would send step-ca's
+///   TLS traffic to a host that cannot tunnel it, and `NO_PROXY` would
+///   put the names it matches back on resolution;
+/// - on no other service.
+///
+/// The last two are one check: outside comments, the entry is the only
+/// line of the file that mentions a proxy in either case.
+fn assert_stepca_validates_through_the_responder(compose: &str, file_name: &str) {
+    let environment = service_key_value(compose, "step-ca", "environment")
+        .unwrap_or_else(|| panic!("{file_name} must declare environment: on step-ca"));
+    let SectionValue::Block(entries) = &environment else {
+        panic!("{file_name} must write step-ca's environment: as a block list: {environment:?}");
+    };
+    let entries: Vec<&str> = entries.iter().copied().map(entry_text).collect();
+    assert_eq!(
+        entries,
+        [STEPCA_PROXY_ENTRY],
+        "{file_name} must set exactly {STEPCA_PROXY_ENTRY} on step-ca"
+    );
+
+    assert!(
+        compose
+            .lines()
+            .any(|line| line_indent(line) == 2 && line.trim() == format!("{RESPONDER_SERVICE}:")),
+        "{file_name} points step-ca at {RESPONDER_SERVICE} and must declare that service"
+    );
+
+    let proxy_lines: Vec<&str> = compose
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && line.to_ascii_lowercase().contains("proxy"))
+        .collect();
+    assert_eq!(
+        proxy_lines,
+        [format!("- {STEPCA_PROXY_ENTRY}")],
+        "{file_name} must mention a proxy on exactly one line outside comments"
+    );
+}
+
+#[test]
+fn stepca_validates_http01_through_the_responder() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.yml");
+    assert_stepca_validates_through_the_responder(&compose, "docker-compose.yml");
+}
+
+#[test]
+fn deploy_stepca_validates_http01_through_the_responder() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.deploy.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.deploy.yml");
+    assert_stepca_validates_through_the_responder(&compose, "docker-compose.deploy.yml");
+}
+
+/// The guard has to fail for each way the variable can go wrong, not
+/// only for its absence.
+const PROXY_FIXTURE: &str = concat!(
+    "services:\n",
+    "  postgres:\n",
+    "    environment:\n",
+    "      - POSTGRES_USER=step\n",
+    "  step-ca:\n",
+    "    depends_on:\n",
+    "      - postgres\n",
+    "    # HTTP_PROXY in a comment is not a second proxy line\n",
+    "    environment:\n",
+    "      - HTTP_PROXY=http://bootroot-http01:80\n",
+    "    ports:\n",
+    "      - \"127.0.0.1:${STEPCA_HOST_PORT:-9000}:9000\"\n",
+    "  bootroot-http01:\n",
+    "    restart: always\n",
+);
+const PROXY_FIXTURE_ENTRY: &str = "      - HTTP_PROXY=http://bootroot-http01:80\n";
+
+#[test]
+fn proxy_guard_accepts_the_shipped_form() {
+    assert_stepca_validates_through_the_responder(PROXY_FIXTURE, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must declare environment: on step-ca")]
+fn proxy_guard_rejects_a_removed_variable() {
+    let removed = PROXY_FIXTURE.replace(
+        &format!("    environment:\n{PROXY_FIXTURE_ENTRY}    ports:"),
+        "    ports:",
+    );
+    assert_stepca_validates_through_the_responder(&removed, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must set exactly HTTP_PROXY=http://bootroot-http01:80 on step-ca")]
+fn proxy_guard_rejects_a_renamed_variable() {
+    let renamed = PROXY_FIXTURE.replace("- HTTP_PROXY=", "- http_proxy=");
+    assert_stepca_validates_through_the_responder(&renamed, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must declare environment: on step-ca")]
+fn proxy_guard_rejects_the_variable_on_another_service() {
+    let moved = PROXY_FIXTURE
+        .replace(
+            &format!("    environment:\n{PROXY_FIXTURE_ENTRY}    ports:"),
+            "    ports:",
+        )
+        .replace(
+            "      - POSTGRES_USER=step\n",
+            &format!("      - POSTGRES_USER=step\n{PROXY_FIXTURE_ENTRY}"),
+        );
+    assert_stepca_validates_through_the_responder(&moved, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must mention a proxy on exactly one line outside comments")]
+fn proxy_guard_rejects_a_second_service_carrying_the_variable() {
+    let copied = PROXY_FIXTURE.replace(
+        "      - POSTGRES_USER=step\n",
+        &format!("      - POSTGRES_USER=step\n{PROXY_FIXTURE_ENTRY}"),
+    );
+    assert_stepca_validates_through_the_responder(&copied, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must set exactly HTTP_PROXY=http://bootroot-http01:80 on step-ca")]
+fn proxy_guard_rejects_an_added_https_or_no_proxy() {
+    let widened = PROXY_FIXTURE.replace(
+        PROXY_FIXTURE_ENTRY,
+        &format!("{PROXY_FIXTURE_ENTRY}      - NO_PROXY=.trusted.domain\n"),
+    );
+    assert_stepca_validates_through_the_responder(&widened, "fixture");
+}
+
+#[test]
+#[should_panic(expected = "must declare that service")]
+fn proxy_guard_rejects_a_file_without_the_responder() {
+    let orphaned = PROXY_FIXTURE.replace("  bootroot-http01:\n    restart: always\n", "");
+    assert_stepca_validates_through_the_responder(&orphaned, "fixture");
+}
+
 #[test]
 fn postgres_volume_uses_postgresql_root_for_postgres_18() {
     let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");

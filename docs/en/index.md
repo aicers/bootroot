@@ -250,12 +250,17 @@ For certificate issuance/renewal to work reliably, name-to-IP mapping
 in practice many deployments configure `/etc/hosts` mappings directly.
 
 1. step-ca -> service FQDN (HTTP-01 target) -> responder IP
-   step-ca must resolve each service validation FQDN
-   (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder IP.
-   In Docker Compose environments, `bootroot service add` registers this
-   mapping automatically as a network alias on `bootroot-http01`.
-   For host installs, configure mappings in the environment where step-ca
-   runs (container/host `/etc/hosts`) or in DNS.
+   In Docker Compose environments no mapping from a service validation FQDN
+   (`<instance_id>.<service_name>.<hostname>.<domain>`) to the responder is
+   needed, because step-ca fetches every HTTP-01 validation through the
+   responder; see
+   [Validation through the responder](installation.md#validation-through-the-responder).
+   `bootroot service add` still registers the FQDN as a network alias on
+   `bootroot-http01`, but validation does not depend on it.
+   For host installs of step-ca, step-ca must resolve each validation FQDN
+   to the responder IP: configure mappings in the environment where step-ca
+   runs (container/host `/etc/hosts`) or in DNS, or set `HTTP_PROXY` for
+   step-ca yourself.
 
 2. Remote service machine -> step-ca/responder name -> IP  
    If a service runs on a different machine from step-ca/OpenBao and that

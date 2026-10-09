@@ -696,20 +696,71 @@ docker compose up --build -d bootroot-http01
 `/.well-known/acme-challenge/` 요청에 응답합니다. bootroot-agent는
 포트 8080의 관리자 API로 토큰을 등록하며, 동일한 HMAC 시크릿을 사용합니다.
 
+#### 리스폰더를 통한 검증
+
+bootroot가 제공하는 두 compose 파일(`docker-compose.yml`,
+`docker-compose.deploy.yml`)은 모두 `step-ca` 서비스에
+`HTTP_PROXY=http://bootroot-http01:80`을 설정합니다. 따라서 step-ca는
+챌린지 대상 이름이 무엇이든 모든 HTTP-01 요청을 리스폰더로 보내고,
+리스폰더는 경로만 보고 응답합니다. 토큰이 리스폰더에 등록된 이름이라면,
+그 이름이 step-ca 컨테이너에서 해석되는지와 무관하게 챌린지가 검증됩니다.
+
+- **트레이드오프.** 토큰을 bootroot 리스폰더에 등록하지 않고 자신의 포트
+  80에서 HTTP-01에 직접 응답하는 ACME 클라이언트는 번들된 step-ca로 검증할
+  수 없습니다. step-ca가 그 클라이언트에 접속하지 않기 때문입니다.
+- **누가 무엇을 발급받을 수 있는가.** ACME 디렉터리에 접근할 수 있고,
+  EAB가 필요한 경우 이를 충족하며, 리스폰더 HMAC 시크릿을 가진
+  클라이언트라면 step-ca는 어떤 DNS 이름이나 루프백이 아닌 IP 주소에
+  대해서도 검증을 통과시킵니다. 발급 범위를 제한하는 것은 이름 해석이
+  아니라 이 자격증명들입니다. 리스폰더 HMAC과 EAB 자격증명은 배포 전체가
+  공유하며, 등록된 모든 서비스 호스트가 이를 가지고 있습니다. 그러므로
+  이러한 호스트 각각이 다른 서비스의 이름과 제어 노드 자체의 이름을 포함한
+  어떤 이름으로든 이 CA에서 인증서를 발급받을 수 있다고 간주하고, 그런
+  호스트를 폐기하거나 그 호스트가 침해되었을 때는 HMAC을
+  회전하세요(`bootroot rotate responder-hmac`).
+- **step-ca의 다른 외부 요청은 영향을 받지 않습니다.** PostgreSQL은 HTTP가
+  아니며, 이 변수는 step-ca가 `https://`로 가져오는 것에는 적용되지
+  않습니다. `ca.json`을 직접 수정해 step-ca가 평문 `http://`로 가져오는
+  항목(예: 웹훅 URL)을 추가하면 리스폰더가 `404`로 응답하므로, 그런
+  항목에는 `https://`를 사용하세요.
+- **기존 설치.** 이 변수는 갱신된 compose 파일로 step-ca 컨테이너가 다시
+  생성될 때 적용되며, `bootroot infra up`이 이를 수행합니다. 컨테이너
+  재시작만으로는 적용되지 않으며, 컨테이너가 다시 생성되기 전까지는 검증이
+  아래에서 설명하는 별칭에 계속 의존합니다.
+- **확인 방법.** `docker exec <instance>-ca env`의 출력에
+  `HTTP_PROXY=http://bootroot-http01:80`이 있어야 합니다.
+- **Docker 클라이언트에 프록시 값이 설정된 호스트.**
+  `~/.docker/config.json`에 `proxies` 섹션이 있으면 Compose는 그 값을 모든
+  서비스 컨테이너에 `HTTP_PROXY`, `http_proxy`, `HTTPS_PROXY`,
+  `https_proxy`, `NO_PROXY`, `no_proxy`로 복사합니다. compose 파일의
+  `HTTP_PROXY`가 주입된 대문자 변수를 대체하고 step-ca는 소문자 변수보다
+  이를 우선하므로, 검증은 여전히 리스폰더로 갑니다. 그러나 주입된
+  `NO_PROXY`가 인증서 이름과 일치하면(예: 배포의 도메인 접미사 또는 `*`)
+  사정이 다릅니다. step-ca가 그 이름에 직접 접속하므로 그 이름의 검증은
+  다시 별칭에 의존하게 됩니다. 그런 호스트에서는 클라이언트 프록시
+  설정에서 bootroot 스택을 제외하세요.
+- **직접 작성한 compose 파일.** 번들된 리스폰더 없이 `step-ca`를 정의하는
+  운영자 자신의 compose 파일은 bootroot가 변경하지 않습니다. 그 경우
+  step-ca는 이전과 같이 검증 대상에 직접 접속하며, 이름 해석은 계속
+  운영자의 책임입니다.
+
 #### DNS 별칭(자동)
 
-HTTP-01 검증 시 step-ca 컨테이너가 각 서비스의 챌린지 호스트명을 리스폰더로
-해석해야 합니다. `bootroot service add`가 이를 자동으로 처리합니다: 검증 FQDN
+`bootroot service add`는 여전히 검증 FQDN
 (`<instance_id>.<service_name>.<hostname>.<domain>`)을 `bootroot-http01`
-컨테이너에 Docker 네트워크 별칭으로 등록합니다. 수동으로
-`docker-compose.override.yml`을 작성할 필요가 없습니다.
+컨테이너에 Docker 네트워크 별칭으로 등록하지만, 검증은 더 이상 이 별칭에
+의존하지 않습니다. step-ca는 이름을 해석하는 대신
+[리스폰더를 통한 검증](#리스폰더를-통한-검증)에서 설명한 프록시 변수로
+리스폰더에 도달합니다. 수동으로 `docker-compose.override.yml`을 작성할
+필요가 없습니다.
 
 등록은 best-effort이며 실패해도 서비스 추가 자체는 성공하므로, 요약의
 `- 등록된 HTTP-01 DNS 별칭:` 줄이 그 결과를 보고합니다. 개수는 실제로 등록된
 별칭 수이고, `0개 (등록을 건너뛰었습니다; 위 경고를 확인하세요)`는 등록된
-별칭이 없다는 뜻이며 구체적인 원인은 그 위에 출력된 경고에 나옵니다. 등록을
-건너뛰면 별칭이 재적용될 때까지 챌린지 호스트명을 해석할 수 없으므로 이 줄을
-반드시 확인하세요.
+별칭이 없다는 뜻이며 구체적인 원인은 그 위에 출력된 경고에 나옵니다.
+step-ca가 프록시 변수와 함께 실행 중이라면 등록을 건너뛰어도 더 이상 발급이
+막히지 않습니다. 이 변수가 추가되기 전에 만들어져 아직 다시 생성되지 않은
+step-ca 컨테이너에서만 문제가 됩니다.
 
 리스폰더 컨테이너가 재시작된 경우(예: `docker compose down` / `up`),
 `bootroot infra up`을 실행하면 `state.json`에 저장된 모든 별칭이 자동으로
@@ -719,6 +770,12 @@ HTTP-01 검증 시 step-ca 컨테이너가 각 서비스의 챌린지 호스트�
 
 부득이하게 Docker 밖에서 실행해야 한다면 바이너리를 사용하고
 systemd로 관리하세요.
+
+!!! note
+    제공되는 compose 파일은 step-ca가 compose 서비스 `bootroot-http01`을
+    바라보도록 설정합니다. compose의 step-ca 옆에서 리스폰더를 호스트
+    바이너리로 실행하는 구성은 제공되는 파일로는 지원되지 않습니다.
+    step-ca가 도달할 프록시가 없기 때문입니다.
 
 #### 1단계. 리스폰더 바이너리 빌드
 

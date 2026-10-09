@@ -83,6 +83,10 @@ EDGE_AGENT_CONFIG="$WORKSPACE_DIR/agent-${EDGE_SERVICE}.toml"
 WEB_AGENT_CONFIG="$WORKSPACE_DIR/agent-${WEB_SERVICE}.toml"
 DOMAIN="trusted.domain"
 INSTANCE_ID="001"
+# The value both shipped compose files set on step-ca, and the hostname
+# of a name that is deliberately given no alias anywhere.
+STEPCA_HTTP_PROXY_ENV="HTTP_PROXY=http://bootroot-http01:80"
+UNALIASED_HOSTNAME="unaliased-01"
 REMOTE_SERVICE="api-gw"
 REMOTE_HOSTNAME="api-01"
 REMOTE_INSTANCE_ID="002"
@@ -850,6 +854,100 @@ run_verify_pair() {
   snapshot_cert_meta "$REMOTE_SERVICE" "$label" "$REMOTE_CERTS_DIR"
 }
 
+# Orders a certificate for a name step-ca cannot resolve.
+#
+# step-ca fetches every HTTP-01 validation through the responder, used
+# as an HTTP proxy, so a challenge validates for any name whose token is
+# registered there.  That is what lets an identity minted by the
+# registrar issue at all: it never passes through `service add` and so
+# never gets the network alias every other name in this script has.
+#
+# The name below is given nothing.  No `service add` is run for it, and
+# it is in no alias list, no `/etc/hosts` and no overlay; the phase first
+# proves it does not resolve from the step-ca container, which is what
+# makes the issuance after it evidence of the proxy path and not of an
+# alias.  The order itself is the edge service's own, under a copy of
+# its config with another hostname: the same ACME order, the same token
+# registration and the same step-ca fetch a minted identity's first
+# order makes.
+issue_unaliased_name() {
+  log_phase "issue-unaliased-name"
+  local ca_container="${RUN_INSTANCE}-ca"
+  local name="${INSTANCE_ID}.${EDGE_SERVICE}.${UNALIASED_HOSTNAME}.${DOMAIN}"
+  local out_dir="$ARTIFACT_DIR/unaliased-name"
+  local config="$out_dir/agent-${EDGE_SERVICE}.toml"
+  local cert="$out_dir/${EDGE_SERVICE}.crt"
+  local key="$out_dir/${EDGE_SERVICE}.key"
+  local container_env san expected_san
+  mkdir -p "$out_dir"
+
+  container_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$ca_container" 2>>"$RUN_LOG")" ||
+    fail "could not read the environment of ${ca_container}"
+  grep -Fxq "$STEPCA_HTTP_PROXY_ENV" <<<"$container_env" ||
+    fail "${ca_container} does not carry ${STEPCA_HTTP_PROXY_ENV}; its proxy variables are: $(grep -i proxy <<<"$container_env" | tr '\n' ' ')"
+
+  # The positive control comes first: without it a step-ca image that
+  # lost `getent`, or a container that is not running, would read as
+  # "does not resolve".
+  docker exec "$ca_container" getent hosts bootroot-http01 >>"$RUN_LOG" 2>&1 ||
+    fail "${ca_container} cannot resolve bootroot-http01 with getent, so getent cannot show that ${name} does not resolve"
+  if docker exec "$ca_container" getent hosts "$name" >>"$RUN_LOG" 2>&1; then
+    fail "${name} resolves from ${ca_container}; the issuance below would not prove the proxy path"
+  fi
+  printf '[lifecycle] %s does not resolve from %s (getent hosts exited non-zero; bootroot-http01 resolves)\n' \
+    "$name" "$ca_container" >>"$RUN_LOG"
+
+  # A copy, so neither the edge service's config nor its certificate is
+  # touched.  Each of the three rewrites reports itself, because a line
+  # the copy failed to rewrite would leave the order pointed at the edge
+  # service's own name or files and the phase would pass for the wrong
+  # reason.
+  [ -f "$EDGE_AGENT_CONFIG" ] || fail "agent config missing at $EDGE_AGENT_CONFIG"
+  awk -v hostname="$UNALIASED_HOSTNAME" -v cert="$cert" -v key="$key" '
+    /^[[:space:]]*\[/ {
+      section = $0
+      gsub(/[[:space:]]/, "", section)
+    }
+    section == "[[profiles]]" && /^[[:space:]]*hostname[[:space:]]*=/ {
+      printf "hostname = \"%s\"\n", hostname; rewritten["hostname"]++; next
+    }
+    section == "[profiles.paths]" && /^[[:space:]]*cert[[:space:]]*=/ {
+      printf "cert = \"%s\"\n", cert; rewritten["cert"]++; next
+    }
+    section == "[profiles.paths]" && /^[[:space:]]*key[[:space:]]*=/ {
+      printf "key = \"%s\"\n", key; rewritten["key"]++; next
+    }
+    { print }
+    END {
+      if (rewritten["hostname"] != 1 || rewritten["cert"] != 1 || rewritten["key"] != 1) {
+        printf "expected one hostname, cert and key line; rewrote %d, %d and %d\n",
+          rewritten["hostname"], rewritten["cert"], rewritten["key"] >"/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$EDGE_AGENT_CONFIG" >"$config" 2>>"$RUN_LOG" ||
+    fail "could not derive an agent config for ${name} from $EDGE_AGENT_CONFIG"
+
+  printf '[lifecycle] ordering a certificate for %s: --config %s\n' "$name" "$config" >>"$RUN_LOG"
+  RUST_LOG="${RUST_LOG:-info}" \
+    "$BOOTROOT_AGENT_BIN" --config "$config" \
+    --eab-file "$SECRETS_DIR/services/${EDGE_SERVICE}/eab.json" \
+    --oneshot >>"$RUN_LOG" 2>&1 ||
+    fail "bootroot-agent --oneshot did not obtain a certificate for ${name}"
+
+  [ -f "$cert" ] || fail "bootroot-agent --oneshot exited 0 without writing $cert"
+  # `-ext` prints the extension's name on one line and its value on the
+  # next; the value is the whole of what is compared, so a certificate
+  # carrying the name beside another does not pass.
+  san="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>>"$RUN_LOG" |
+    sed -e '1d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" ||
+    fail "could not read the subjectAltName of $cert"
+  expected_san="DNS:${name}"
+  [ "$san" = "$expected_san" ] ||
+    fail "the certificate issued for ${name} has subjectAltName '${san}', expected '${expected_san}'"
+  printf '[lifecycle] issued certificate for the unaliased name has subjectAltName %s\n' "$san" >>"$RUN_LOG"
+}
+
 # Daemon-deploy local-file path: drives `bootroot rotate force-reissue
 # --wait` end-to-end so the in-binary signal+wait code path runs in CI.
 force_reissue_for_service() {
@@ -1467,6 +1565,7 @@ main() {
   run_remote_bootstrap
 
   run_verify_pair "initial"
+  issue_unaliased_name
   start_local_bootroot_agent_daemons
   run_rotations_with_verification
   stop_local_bootroot_agent_daemons
