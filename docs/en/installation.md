@@ -642,7 +642,10 @@ done
 ```
 
 Put those two fingerprints in `agent.toml.compose` under
-`trust.trusted_ca_sha256`, then run:
+`trust.trusted_ca_sha256`, and set `http_responder_hmac` there to the
+deployment's HMAC — the `hmac_secret` in `secrets/responder/responder.toml`.
+The `CHANGE-ME` the file ships with is a placeholder, and a registration
+signed with it is refused. Then run:
 
 ```bash
 cargo build --bin bootroot-agent
@@ -692,6 +695,16 @@ the HTTP-01 responder.
 The responder reads `responder.toml.compose` and listens on port 80 for
 `/.well-known/acme-challenge/` requests. bootroot-agent registers tokens via
 an admin API on port 8080 using the shared HMAC secret.
+
+`responder.toml.compose` is a placeholder config: its `hmac_secret` is the
+published value `CHANGE-ME`, which the responder treats as no secret at all.
+On it the responder starts and serves challenges, but answers every
+registration with `503 Service Unavailable`. `bootroot init` renders the
+real config under `secrets/responder/` and remounts the container onto it.
+Recreating the container from the base compose file alone on an initialised
+deployment — the `docker compose up` above, for example — returns it to the
+refusing state until `bootroot infra up` is run from the deployment's
+directory.
 
 #### Validation through the responder
 

@@ -1222,7 +1222,11 @@ admin_body_limit_bytes = 8192
   저장합니다. (기본값 `0.0.0.0:8080`, 환경 변수:
   `BOOTROOT_RESPONDER__ADMIN_ADDR`)
 - `hmac_secret`: 공유 비밀키(`acme.http_responder_hmac`와 동일해야 함).
-  **기본값 없음(필수)**, 빈 값은 거부됩니다. (환경 변수:
+  **기본값 없음(필수)**, 빈 값은 거부됩니다. 예시 값인 `change-me` /
+  `CHANGE-ME`(대소문자 무관, 파일에서 왔든
+  `BOOTROOT_RESPONDER__HMAC_SECRET`에서 왔든)는 설정되지 않은 것으로
+  취급합니다. 리스폰더는 기동하지만 값을 바꿀 때까지 모든 등록 요청에
+  `503`으로 응답합니다. (환경 변수:
   `BOOTROOT_RESPONDER__HMAC_SECRET`)
 - `token_ttl_secs`: 토큰 유효 시간(초, 기본값 `300`, 환경 변수:
   `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, 0은 허용되지 않음)

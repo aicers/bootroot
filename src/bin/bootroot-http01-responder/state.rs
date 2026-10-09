@@ -28,6 +28,7 @@ struct TokenEntry {
 pub(super) enum RegisterError {
     InvalidSignature,
     InvalidTtl,
+    NotConfigured,
     RateLimited,
 }
 
@@ -36,6 +37,10 @@ impl Display for RegisterError {
         match self {
             Self::InvalidSignature => f.write_str("Invalid signature"),
             Self::InvalidTtl => f.write_str("Invalid ttl_secs"),
+            Self::NotConfigured => f.write_str(
+                "HMAC secret is not configured: the responder is running on the placeholder \
+                 hmac_secret and refuses registrations until it is given its real configuration",
+            ),
             Self::RateLimited => f.write_str("Rate limit exceeded"),
         }
     }
@@ -120,6 +125,11 @@ impl ResponderState {
             admin_rate_limit_window_secs,
         ) = {
             let settings = self.settings.read().await;
+            // First, ahead of every other check: the placeholder is
+            // public, so a signature made with it authenticates nobody.
+            if settings.has_placeholder_hmac_secret() {
+                return Err(RegisterError::NotConfigured);
+            }
             (
                 settings.token_ttl_secs,
                 settings.max_token_ttl_secs,
@@ -363,6 +373,44 @@ mod tests {
             .await
             .expect_err("zero ttl must be rejected");
         assert_eq!(err, RegisterError::InvalidTtl);
+    }
+
+    #[tokio::test]
+    async fn test_register_request_refuses_on_placeholder_secret() {
+        let state = ResponderState::shared(ResponderSettings {
+            hmac_secret: "CHANGE-ME".to_string(),
+            ..test_settings()
+        });
+        let signer = Http01HmacSigner::new("CHANGE-ME");
+
+        // A zero TTL would be `InvalidTtl` on a configured responder;
+        // the refusal has to come before that check too.
+        for (token, ttl_secs) in [("token-placeholder", 60), ("token-placeholder-zero", 0)] {
+            let request = RegisterRequest {
+                token: token.to_string(),
+                key_authorization: format!("{token}.key"),
+                ttl_secs: Some(ttl_secs),
+            };
+            let signature =
+                signer.sign_request(123, &request.token, &request.key_authorization, ttl_secs);
+
+            let err = state
+                .register_request(123, &signature, request)
+                .await
+                .expect_err("a placeholder secret must refuse every registration");
+            assert_eq!(err, RegisterError::NotConfigured);
+        }
+
+        assert!(state.tokens.read().await.is_empty());
+        assert!(
+            state
+                .admin_rate_limiter
+                .lock()
+                .await
+                .registrations
+                .is_empty(),
+            "a refused registration must not consume the rate-limit budget"
+        );
     }
 
     #[tokio::test]

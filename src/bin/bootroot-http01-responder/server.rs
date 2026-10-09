@@ -20,11 +20,21 @@ use super::tls::{ReloadableCertResolver, TlsListener, build_tls_config, load_cer
 
 type ServerTask = JoinHandle<std::io::Result<()>>;
 
+/// Logged at `error` because the binary's default filter shows nothing
+/// lower, and once per load, never per refused request.
+const PLACEHOLDER_HMAC_SECRET_MESSAGE: &str = "hmac_secret is the bundled placeholder; refusing \
+    all HTTP-01 registrations. Give the responder a real hmac_secret: on a bootroot deployment \
+    run \"bootroot init\" if it is not initialised yet, or \"bootroot infra up\" from the \
+    deployment directory if it is";
+
 pub(super) async fn run(args: Args) -> Result<()> {
     let config_path = args.config;
     let settings = load_settings(config_path.as_deref())?;
     let listen_addr = parse_socket_addr(&settings.listen_addr, "listen_addr")?;
     let admin_addr = parse_socket_addr(&settings.admin_addr, "admin_addr")?;
+    if settings.has_placeholder_hmac_secret() {
+        error!("{PLACEHOLDER_HMAC_SECRET_MESSAGE}");
+    }
 
     let tls = if settings.tls_enabled() {
         let cert = settings
@@ -119,7 +129,12 @@ async fn wait_for_shutdown(
             }
             () = reload_signal.recv() => {
                 match reload_settings(state, config_path).await {
-                    Ok(()) => info!("Reloaded responder configuration"),
+                    Ok(()) => {
+                        info!("Reloaded responder configuration");
+                        if state.settings().await.has_placeholder_hmac_secret() {
+                            error!("{PLACEHOLDER_HMAC_SECRET_MESSAGE}");
+                        }
+                    }
                     Err(err) => error!("Reload failed: {err}"),
                 }
                 if let Some(resolver) = cert_resolver {

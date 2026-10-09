@@ -645,8 +645,11 @@ for cert in secrets/certs/root_ca.crt secrets/certs/intermediate_ca.crt; do
 done
 ```
 
-출력된 두 지문을 `agent.toml.compose`의 `trust.trusted_ca_sha256`에 넣은 뒤
-실행합니다:
+출력된 두 지문을 `agent.toml.compose`의 `trust.trusted_ca_sha256`에 넣고,
+같은 파일의 `http_responder_hmac`을 배포의 HMAC, 즉
+`secrets/responder/responder.toml`의 `hmac_secret` 값으로 설정합니다.
+파일에 들어 있는 `CHANGE-ME`는 플레이스홀더이며, 이 값으로 서명한 등록은
+거부됩니다. 그런 다음 실행합니다:
 
 ```bash
 cargo build --bin bootroot-agent
@@ -695,6 +698,16 @@ docker compose up --build -d bootroot-http01
 리스폰더는 `responder.toml.compose`를 읽고 포트 80에서
 `/.well-known/acme-challenge/` 요청에 응답합니다. bootroot-agent는
 포트 8080의 관리자 API로 토큰을 등록하며, 동일한 HMAC 시크릿을 사용합니다.
+
+`responder.toml.compose`는 플레이스홀더 설정입니다. 이 파일의
+`hmac_secret`은 공개된 값 `CHANGE-ME`이며, 리스폰더는 이를 시크릿이
+설정되지 않은 것으로 취급합니다. 이 설정에서 리스폰더는 기동하여
+챌린지에는 응답하지만 모든 등록 요청에 `503 Service Unavailable`로
+응답합니다. `bootroot init`이 실제 설정을 `secrets/responder/` 아래에
+렌더링하고 컨테이너를 그 설정으로 다시 마운트합니다. 초기화된 배포에서
+기본 compose 파일만으로 컨테이너를 다시 생성하면(예: 위의
+`docker compose up`) 배포 디렉터리에서 `bootroot infra up`을 실행할
+때까지 리스폰더는 다시 등록을 거부하는 상태가 됩니다.
 
 #### 리스폰더를 통한 검증
 

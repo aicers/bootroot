@@ -1303,7 +1303,11 @@ admin_body_limit_bytes = 8192
   responder can answer on `listen_addr`. (default `0.0.0.0:8080`,
   environment variable: `BOOTROOT_RESPONDER__ADMIN_ADDR`)
 - `hmac_secret`: shared secret (must match `acme.http_responder_hmac`).
-  **No default (required)**. Empty values are rejected. (environment variable:
+  **No default (required)**. Empty values are rejected. The example value
+  `change-me` / `CHANGE-ME` (in any case, whether it comes from the file or
+  from `BOOTROOT_RESPONDER__HMAC_SECRET`) is treated as not configured: the
+  responder starts, but answers every registration with `503` until the
+  value is replaced. (environment variable:
   `BOOTROOT_RESPONDER__HMAC_SECRET`)
 - `token_ttl_secs`: how long tokens stay valid (default `300`, environment
   variable: `BOOTROOT_RESPONDER__TOKEN_TTL_SECS`, value must be > 0)

@@ -83,6 +83,10 @@ pub(super) async fn register_token(
             StatusCode::BAD_REQUEST,
             RegisterError::InvalidTtl.to_string(),
         ),
+        Err(RegisterError::NotConfigured) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            RegisterError::NotConfigured.to_string(),
+        ),
         Err(RegisterError::RateLimited) => (
             StatusCode::TOO_MANY_REQUESTS,
             RegisterError::RateLimited.to_string(),
