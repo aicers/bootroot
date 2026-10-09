@@ -21,6 +21,10 @@ const FINGERPRINT_HEX_LEN: usize = 64;
 /// The opening of every PEM block header.
 const PEM_OPENING: &str = "-----BEGIN ";
 
+/// The first and last lines of a certificate's PEM block.
+const CERTIFICATE_PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+const CERTIFICATE_PEM_END: &str = "-----END CERTIFICATE-----";
+
 /// A private key held in memory, in PEM.
 ///
 /// Named here because the internal leaf's key was the first of them,
@@ -101,7 +105,7 @@ pub struct InternalMaterial {
     pub chain: String,
     /// The persistent ACME account signing key.
     pub acme_account: AcmeAccountKey,
-    /// Hex SHA-256 of the root the `auth/cert` entry trusts.
+    /// Hex SHA-256 of the deployment root the leaf was signed under.
     pub root_fingerprint: String,
 }
 
@@ -130,11 +134,12 @@ pub(super) const SET_FILES: [&str; 6] = [
 
 /// The five members of the set that are published `root:root`.
 ///
-/// Four of them authenticate this host to `OpenBao` — the leaf's key,
-/// its chain, the ACME account key that renews it and the fingerprint
-/// of the root the `auth/cert` entry trusts — and the fifth configures
-/// the agent that performs that renewal, including the trust pins it
-/// checks the CA against. Every one of them is a file the invoking user
+/// Four of them are the credential this host authenticates to
+/// `OpenBao` with and what stands beside it — the leaf's key, its
+/// chain, the fingerprint of the root it was signed under, and the ACME
+/// account key the endpoint's own certificates are ordered under — and
+/// the fifth configures the daemon that uses them, including the trust
+/// pins it checks the CA against. Every one of them is a file the invoking user
 /// must not be able to read or rewrite, so the owner is asserted on
 /// each publish exactly as [`KEY_FILE_MODE`] is.
 ///
@@ -254,6 +259,70 @@ pub fn load_material(paths: &InternalPaths) -> Result<InternalMaterial, Internal
         acme_account: AcmeAccountKey::new(acme_account),
         root_fingerprint,
     })
+}
+
+/// Returns the first certificate's PEM block in `chain`, through its
+/// closing line.
+///
+/// `chain.pem` is the internal leaf followed by its issuer, and the
+/// `auth/cert` entry is pinned to the leaf alone, so this is the one
+/// place the two are told apart. `None` when `chain` holds no complete
+/// certificate block.
+#[must_use]
+pub fn first_certificate_pem(chain: &str) -> Option<&str> {
+    let start = chain.find(CERTIFICATE_PEM_BEGIN)?;
+    let rest = chain.get(start..)?;
+    let end = rest.find(CERTIFICATE_PEM_END)? + CERTIFICATE_PEM_END.len();
+    // The line ending belongs to the block, so the slice is a
+    // well-formed PEM file by itself.
+    let end = match rest.get(end..) {
+        Some(tail) if tail.starts_with("\r\n") => end + 2,
+        Some(tail) if tail.starts_with('\n') => end + 1,
+        _ => end,
+    };
+    rest.get(..end)
+}
+
+/// Decodes the first certificate in `pem` to DER.
+///
+/// `path` names where the PEM came from, for the error.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Invalid`] when `pem` holds no
+/// certificate block or the block is not an X.509 certificate.
+pub fn first_certificate_der(path: &Path, pem: &str) -> Result<Vec<u8>, InternalCredentialError> {
+    let invalid = |reason: &str| InternalCredentialError::Invalid {
+        path: path.to_path_buf(),
+        reason: reason.to_string(),
+    };
+    let block = first_certificate_pem(pem).ok_or_else(|| invalid("no certificate was found"))?;
+    let (_, parsed) = x509_parser::pem::parse_x509_pem(block.as_bytes())
+        .map_err(|_| invalid("the first certificate is not valid PEM"))?;
+    x509_parser::parse_x509_certificate(&parsed.contents)
+        .map_err(|_| invalid("the first certificate is not an X.509 certificate"))?;
+    Ok(parsed.contents)
+}
+
+/// Reads the `notAfter` of the first certificate in `chain`: the
+/// internal leaf's.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Invalid`] when `chain` does not
+/// open with a parseable certificate.
+pub fn leaf_not_after(
+    path: &Path,
+    chain: &str,
+) -> Result<time::OffsetDateTime, InternalCredentialError> {
+    let der = first_certificate_der(path, chain)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|_| {
+        InternalCredentialError::Invalid {
+            path: path.to_path_buf(),
+            reason: "the first certificate is not an X.509 certificate".to_string(),
+        }
+    })?;
+    Ok(cert.validity().not_after.to_datetime())
 }
 
 /// Publishes the four credential files atomically.

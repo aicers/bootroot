@@ -501,9 +501,13 @@ A **bootroot-host** deployment that serves the
 [registrar endpoint](operations.md#registrar-endpoint-linux-only) runs the
 endpoint daemon as its own `bootroot-agent` process, alongside any service agent
 on that host. That one process does two jobs: it serves the endpoint, and it
-renews one certificate — the bootroot-internal credential it authenticates to
-`OpenBao` with in order to run the registrar's `mint` and `deregister` verbs.
-There is no second process for the credential.
+renews the endpoint's two certificates. To run the registrar's `mint` and
+`deregister` verbs it authenticates to `OpenBao` with the bootroot-internal
+credential, a client certificate it **uses and does not renew**: `bootroot
+init` signs that leaf offline from the intermediate key, valid for ten years,
+and only `init`, `bootroot rotate registrar-internal-credential` and a full CA
+rotation replace it, each under the `OpenBao` root token. There is no second
+process for the credential.
 
 **Run `bootroot init` as root on this host.** The five files that make up the
 credential — `registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
@@ -547,14 +551,15 @@ signal the process by.
 
 **Run this process as root as well.** Unlike a service agent, it reads the config
 above, the leaf key and the ACME account key — all `0600` and owned by `root` in
-a `0700` root-owned directory — and republishes the leaf back into it on every
-renewal. Started under the unprivileged user your service agents run as, it
-cannot even open its own config.
+a `0700` root-owned directory. Started under the unprivileged user your service
+agents run as, it cannot even open its own config.
 
-**Ordinary renewal begins only once you start it.** Until then the credential
-stays whatever `init` issued, and a rotation that signals the process finds
-nothing to signal — which it treats as success, so a missing process is silent
-rather than an error.
+**Nothing about the credential waits on this process.** It is whatever `init`
+signed whether or not the daemon is running, and a rotation that signals the
+process finds nothing to signal until you start it — which it treats as
+success, so a missing process is silent rather than an error. What does begin
+only once you start it is the endpoint itself and the renewal of its two
+certificates.
 
 Two things about this config that differ from a service agent's:
 
@@ -562,9 +567,12 @@ Two things about this config that differ from a service agent's:
   the shared `secrets/certs/ca-bundle.pem`, so a CA rotation can narrow this
   identity's trust without touching what a service reads;
 - its `[acme].account_key_path` points at `registrar-internal/acme-account.json`,
-  so it keeps one stable ACME account across renewals. Configurations that do
-  not set that key keep the existing behaviour of a fresh account key per
-  issuance.
+  the ACME account the endpoint's two certificates — and
+  `bootroot registrar issue` — are ordered under, so they keep one stable
+  account across renewals. The file is present after a first `init` and is
+  preserved when the credential is replaced. The internal credential itself is
+  never ordered through ACME. Configurations that do not set that key keep the
+  existing behaviour of a fresh account key per issuance.
 
 A host without the registrar endpoint has none of these files and needs none of
 this.

@@ -46,24 +46,32 @@
 //! bundle — so a rotation can narrow it without touching anything a
 //! service reads.
 //!
-//! # Renewal
+//! # Issuance and replacement
 //!
-//! There is no registrar-specific scheduler here, and there must not be
-//! one. The internal profile is renewed by an ordinary `bootroot-agent`
-//! process reading [`InternalPaths::agent_config`], on that config's own
-//! `daemon` and `retry` settings, through the same renewal predicate
-//! every other profile uses. On an endpoint-enabled host that process
-//! is the registrar endpoint daemon, run by `bootroot-registrar.service`;
-//! `init` does not start it.
+//! The leaf is not an ACME certificate. `bootroot init` signs it offline
+//! against the intermediate key, and the `auth/cert` entry's
+//! `certificate` is that one leaf — not the deployment root — so no
+//! other certificate of the deployment's CA can log in, including one
+//! step-ca issues for the same name.
 //!
-//! That loop has one precondition, and it is not a scheduler:
-//! [`check_renewal_allowed`] compares the stored root fingerprint with
-//! the deployment's active root before any issuance the daemon starts,
-//! and refuses with [`InternalCredentialError::RepairRequired`] on a
-//! mismatch. Between a full rotation's Phase 3 and the tail after Phase
-//! 4 the stored fingerprint deliberately still names the old root, and a
-//! leaf reissued in that window would be chained to a root the
-//! `auth/cert` entry does not yet trust.
+//! Nothing renews it. Replacing a pinned leaf means rewriting the entry,
+//! and the ability to write that path is the ability to mint a token
+//! carrying policies of the writer's choosing, so only the root token
+//! holds it. The leaf is therefore valid for as long as the CA
+//! certificates are and is replaced, together with the entry, by the
+//! three operations that already run under the root token: `bootroot
+//! init`, `bootroot rotate registrar-internal-credential` and the tail
+//! of a full CA rotation. There is no registrar-specific scheduler here
+//! and there must not be one.
+//!
+//! The `bootroot-agent` process reading [`InternalPaths::agent_config`]
+//! *uses* the credential. On an endpoint-enabled host that process is
+//! the registrar endpoint daemon, run by `bootroot-registrar.service`;
+//! `init` does not start it. The config's one `[[profiles]]` entry names
+//! the identity and its two paths, and the daemon starts no issuance for
+//! it ([`internal_profile_paths`] is how it recognises the profile). An
+//! expired leaf is refused by name, with
+//! [`InternalCredentialError::Expired`], before any request is made.
 
 pub mod agent_config;
 pub mod client;
@@ -87,11 +95,12 @@ pub use client::{
 };
 pub use material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SetSnapshot, capture_members,
-    capture_set, load_material, material_status, publish_material,
+    capture_set, first_certificate_der, first_certificate_pem, leaf_not_after, load_material,
+    material_status, publish_material,
 };
 pub use renewal::{
     active_root_cert_path, active_root_fingerprint, active_root_fingerprint_async,
-    check_renewal_allowed, internal_profile_paths,
+    internal_profile_paths,
 };
 
 /// The fixed subdirectory, below the state-recorded secrets directory,
@@ -110,7 +119,10 @@ pub const CHAIN_FILE: &str = "chain.pem";
 /// The ACME account signing key the internal profile registers with.
 /// Root-owned, `0600`.
 pub const ACME_ACCOUNT_FILE: &str = "acme-account.json";
-/// The fingerprint of the root the `auth/cert` entry trusts.
+/// The fingerprint of the deployment root the internal leaf was signed
+/// under. The `auth/cert` entry names the leaf and not this root; the
+/// fingerprint is what tells a credential a full CA rotation has left
+/// behind from one that is current.
 pub const ROOT_FINGERPRINT_FILE: &str = "root-fingerprint";
 /// The dedicated `bootroot-agent` config for the internal profile.
 /// Root-owned, `0600`.
@@ -173,7 +185,7 @@ impl InternalPaths {
         self.dir.join(ACME_ACCOUNT_FILE)
     }
 
-    /// The fingerprint of the root the `auth/cert` entry trusts.
+    /// The fingerprint of the root the internal leaf was signed under.
     #[must_use]
     pub fn root_fingerprint(&self) -> PathBuf {
         self.dir.join(ROOT_FINGERPRINT_FILE)
@@ -261,6 +273,17 @@ pub enum InternalCredentialError {
         /// The fingerprint of the deployment's active root.
         active: String,
     },
+    /// The leaf's validity has ended. Nothing renews it unattended, so
+    /// it is refused by name rather than passed to `OpenBao` to refuse.
+    #[error(
+        "the bootroot-internal credential's certificate expired at {}; run \
+         `bootroot rotate registrar-internal-credential`",
+        format_not_after(*not_after)
+    )]
+    Expired {
+        /// The leaf's `notAfter`.
+        not_after: time::OffsetDateTime,
+    },
     /// A mutation was attempted without explicit root-token authority.
     #[error(
         "repairing the bootroot-internal credential requires an OpenBao token carrying \
@@ -292,6 +315,13 @@ pub enum InternalCredentialError {
         #[source]
         source: anyhow::Error,
     },
+}
+
+/// Renders a `notAfter` for [`InternalCredentialError::Expired`].
+fn format_not_after(not_after: time::OffsetDateTime) -> String {
+    not_after
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| not_after.to_string())
 }
 
 /// Builds the ACL policy body the internal credential's token carries.

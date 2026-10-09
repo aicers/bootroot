@@ -228,12 +228,17 @@ const PKILL_NO_PROCESS_MATCHED: i32 = 1;
 /// reload — not a failed rotation. Any other non-zero status
 /// is a real failure and aborts the phase that sent the signal.
 ///
+/// `bootroot init` sends it too, when it replaces a credential the host
+/// already carried: the entry is pinned to the new leaf from the moment
+/// it is rewritten, and the daemon loads its credential only at start
+/// and on `SIGHUP`.
+///
 /// # Errors
 ///
 /// Returns an error when `pkill` cannot be run, or when it exits with a
 /// status other than success or [`PKILL_NO_PROCESS_MATCHED`].
 #[cfg(unix)]
-pub(super) fn signal_internal_registrar_agent(
+pub(crate) fn signal_internal_registrar_agent(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
@@ -267,7 +272,7 @@ fn classify_internal_signal_status(
 }
 
 #[cfg(not(unix))]
-pub(super) fn signal_internal_registrar_agent(
+pub(crate) fn signal_internal_registrar_agent(
     _secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {

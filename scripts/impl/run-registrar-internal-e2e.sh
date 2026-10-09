@@ -27,9 +27,18 @@ set -euo pipefail
 # separate from the verbs one: `auth/cert` authenticates a *client
 # certificate*, so there has to be a handshake to present it in.  The
 # container's `-dev-tls` mode generates the server certificate and writes
-# it to a mounted directory, which keeps the two trust anchors as
+# it to a mounted directory, which keeps server trust and client trust as
 # separate as they are in a deployment: the scenario's CA verifies the
-# server, and a CA each test mints is what the entry trusts for clients.
+# server, while the client leaves each test presents are signed by a CA
+# that test mints.  The entry trusts none of those CAs.  It is pinned to
+# one leaf, as the deployment's is, and the tests assert against this
+# real server that the pinned leaf logs in while a second leaf of the
+# same CA with the same name, a look-alike copying the pinned leaf's
+# serial number and authority key identifier, a leaf the entry used to
+# name and an expired pinned leaf are all refused.  Whether a pinned
+# non-CA certificate is accepted is OpenBao's decision and depends on
+# its version, so it is proved here, at the image tag the compose files
+# pin, and nowhere by a mock.
 #
 # The connection details travel as environment variables on the child
 # process only.  The tests read them and never write them: mutating the

@@ -269,7 +269,7 @@ pub(crate) async fn run_daemon(invocation: DaemonInvocation) -> anyhow::Result<(
     #[cfg(not(target_os = "linux"))]
     let registrar_maintenance = None;
     spawn_openbao_audit_rotation(&mut handles, &settings, &shutdown_rx, registrar_maintenance);
-    for profile in settings.profiles.clone() {
+    for profile in issuable_profiles(&settings) {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let profile_locks = Arc::clone(&profile_locks);
@@ -1293,7 +1293,7 @@ pub(crate) async fn run_oneshot(
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
     let mut handles = Vec::new();
 
-    for profile in settings.profiles.clone() {
+    for profile in issuable_profiles(&settings) {
         let settings = Arc::clone(&settings);
         let semaphore = Arc::clone(&semaphore);
         let default_eab = default_eab.clone();
@@ -1333,35 +1333,42 @@ async fn collect_task_results(
     first_error.map_or(Ok(()), Err)
 }
 
-/// The bootroot-internal profile's fail-closed precondition, checked
-/// before every issuance the daemon starts.
+/// The profiles the daemon issues for: every configured profile but the
+/// bootroot-internal one, which it uses and never issues for.
 ///
-/// A no-op for every other profile. For the internal one it compares the
-/// stored root fingerprint with the deployment's active root and refuses
-/// on a mismatch, so a leaf that falls due between a full rotation's
-/// Phase 3 and its post-Phase-4 repair is not reissued under a root the
-/// `auth/cert` entry no longer trusts. Nothing about it is a second
-/// scheduler: the refusal is reported through the same post-renew
-/// failure hooks an issuance failure takes, and the caller decides
-/// whether that ends the run or only this tick.
-async fn refuse_stale_internal_root(
+/// The internal leaf is signed offline by `bootroot init` and the
+/// `auth/cert` entry is pinned to that one certificate, so a leaf this
+/// process obtained through ACME for the same name would replace the
+/// only certificate `OpenBao` accepts with one it refuses. The periodic
+/// loop and the one-shot pass both spawn from this list, and the
+/// fast-poll force-reissue asks the same question of the one profile it
+/// is handed. The profile is recognised by the fixed layout as well as
+/// the identity, so the same identity at other paths is an ordinary
+/// profile and is issued for like one.
+fn issuable_profiles(settings: &config::Settings) -> Vec<config::DaemonProfileSettings> {
+    settings
+        .profiles
+        .iter()
+        .filter(|profile| !skips_internal_profile(settings, profile))
+        .cloned()
+        .collect()
+}
+
+/// Reports whether `profile` is the bootroot-internal profile, logging
+/// the skip when it is. See [`issuable_profiles`].
+fn skips_internal_profile(
     settings: &config::Settings,
     profile: &config::DaemonProfileSettings,
-    profile_label: &str,
-) -> Option<anyhow::Error> {
-    let err = crate::registrar::internal::check_renewal_allowed(profile).err()?;
-    error!(
-        "Profile '{}' issuance refused before any ACME request: {err}",
-        profile_label
-    );
-    let result = Err(anyhow::Error::new(err));
-    if let Err(hook_err) = handle_issuance_result(&result, settings, profile, profile_label).await {
-        error!(
-            "Post-renew failure hooks failed for '{}': {hook_err}",
-            profile_label
-        );
+) -> bool {
+    if crate::registrar::internal::internal_profile_paths(profile).is_none() {
+        return false;
     }
-    result.err()
+    info!(
+        "Profile '{}' is the bootroot-internal credential; it is replaced by `bootroot init` \
+         and `bootroot rotate registrar-internal-credential`, and no issuance is started for it.",
+        config::profile_domain(settings, profile)
+    );
+    true
 }
 
 async fn run_profile_oneshot(
@@ -1371,9 +1378,6 @@ async fn run_profile_oneshot(
     semaphore: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let profile_label = config::profile_domain(&settings, &profile);
-    if let Some(err) = refuse_stale_internal_root(&settings, &profile, &profile_label).await {
-        return Err(err);
-    }
 
     let _permit = semaphore.acquire().await?;
     let profile_eab = profile::resolve_profile_eab(&profile, default_eab);
@@ -1708,12 +1712,12 @@ async fn force_renew_profile(
     profile_locks: &ProfileLocks,
     runtime: &IssuanceRuntime,
 ) -> anyhow::Result<()> {
+    if skips_internal_profile(settings, profile) {
+        return Ok(());
+    }
     let profile_label = config::profile_domain(settings, profile);
     let lock = profile_locks.for_profile(&profile_label);
     let _profile_guard = lock.lock().await;
-    if let Some(err) = refuse_stale_internal_root(settings, profile, &profile_label).await {
-        return Err(err);
-    }
     info!(
         "Profile '{}' force-reissue requested. Starting ACME issuance...",
         profile_label
@@ -1761,18 +1765,6 @@ async fn check_and_renew_profile(
 
     if !needs_renewal {
         tracing::debug!("Profile '{}' certificate still valid.", profile_label);
-        return Ok(());
-    }
-
-    if refuse_stale_internal_root(settings, profile, &profile_label)
-        .await
-        .is_some()
-    {
-        // The credential is repairable and the repair is another
-        // process's job, so the loop keeps ticking rather than ending:
-        // the tick after `bootroot rotate registrar-internal-credential`
-        // — or after a full rotation's post-Phase-4 tail — renews
-        // normally.
         return Ok(());
     }
 
@@ -1974,15 +1966,13 @@ mod tests {
         format!("{}{}", ca.root_cert.pem(), ca.intermediate_cert.pem())
     }
 
-    /// The bootroot-internal profile is renewed by the **ordinary**
-    /// loop. A second, test-only profile in the same generated config
-    /// proves it: both are enumerated, both resolve the same configured
-    /// tick, lead time and jitter, both select the same retry backoff
-    /// through `select_retry_backoff`, and both carry the same
-    /// failure-hook set. Nothing here is registrar-specific, and that is
-    /// the assertion.
+    /// The daemon issues for every profile in the generated internal
+    /// config but the internal one. A second, test-only profile in the
+    /// same config is the control: it is enumerated, on the config's own
+    /// tick, lead time, jitter, retry backoff and failure hooks, while
+    /// the profile at the fixed internal layout is not.
     #[test]
-    fn the_generated_internal_config_gives_both_profiles_one_loop() {
+    fn the_generated_internal_config_issues_for_the_companion_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent.toml");
         fs::write(&path, internal_config_with_second_profile(dir.path())).unwrap();
@@ -1990,32 +1980,48 @@ mod tests {
 
         assert_eq!(settings.profiles.len(), 2);
         let internal = &settings.profiles[0];
-        let companion = &settings.profiles[1];
         assert_eq!(internal.service_name, "bootroot-registrar-internal");
-        assert_ne!(internal.registration_id, companion.registration_id);
+        assert!(crate::registrar::internal::internal_profile_paths(internal).is_some());
 
-        for profile in &settings.profiles {
-            assert_eq!(profile.daemon.check_interval, Duration::from_hours(2));
-            assert_eq!(profile.daemon.renew_before, Duration::from_hours(24));
-            assert_eq!(profile.daemon.check_jitter, Duration::from_secs(30));
-            // The generated `[retry]` is the deployment's; neither
-            // profile overrides it, so both resolve the same backoff
-            // through the one selector the daemon uses.
-            assert_eq!(profile.retry.as_ref().map(|r| r.backoff_secs.clone()), None);
-            assert_eq!(
-                select_retry_backoff(&settings, profile),
-                settings.retry.backoff_secs.as_slice()
-            );
-            let failure = &profile.hooks.post_renew.failure;
-            assert_eq!(failure.len(), 1);
-            assert_eq!(failure[0].command, "/bin/true");
-        }
+        let issued = issuable_profiles(&settings);
+        assert_eq!(issued.len(), 1, "only the companion is issued for");
+        let companion = &issued[0];
+        assert_eq!(companion.service_name, "companion");
+        assert_ne!(internal.registration_id, companion.registration_id);
+        assert_eq!(companion.daemon.check_interval, Duration::from_hours(2));
+        assert_eq!(companion.daemon.renew_before, Duration::from_hours(24));
+        assert_eq!(companion.daemon.check_jitter, Duration::from_secs(30));
+        assert_eq!(
+            select_retry_backoff(&settings, companion),
+            settings.retry.backoff_secs.as_slice()
+        );
+        let failure = &companion.hooks.post_renew.failure;
+        assert_eq!(failure.len(), 1);
+        assert_eq!(failure[0].command, "/bin/true");
     }
 
-    /// The internal profile renews on expiry **and** on private-bundle
-    /// drift, because the generated config always sets
-    /// `[trust].ca_bundle_path`. The second profile in the same config
-    /// reaches the same answer through the same predicate.
+    /// The internal profile is recognised by its fixed layout and not by
+    /// its identity alone: the same label and instance at other paths is
+    /// an ordinary profile, and the daemon issues for it.
+    #[test]
+    fn the_internal_identity_at_other_paths_is_issued_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        fs::write(&path, internal_config_with_second_profile(dir.path())).unwrap();
+        let mut settings = config::Settings::from_file(Some(path)).unwrap();
+        let moved = &mut settings.profiles[0];
+        moved.paths.cert = dir.path().join("elsewhere").join("chain.pem");
+        moved.paths.key = dir.path().join("elsewhere").join("key.pem");
+
+        let issued = issuable_profiles(&settings);
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued[0].service_name, "bootroot-registrar-internal");
+    }
+
+    /// A profile under the generated internal config renews on expiry
+    /// **and** on private-bundle drift, because that config always sets
+    /// `[trust].ca_bundle_path` — which is what the endpoint's two
+    /// surface leaves and any companion profile are renewed under.
     #[tokio::test]
     async fn both_profiles_renew_on_expiry_and_on_private_bundle_drift() {
         let dir = tempfile::tempdir().unwrap();
@@ -2091,20 +2097,21 @@ mod tests {
         assert!(should_renew(&profile, &trust, lead).await.unwrap());
     }
 
-    /// Writes a host caught in a full rotation's Phase-3 window: the
-    /// deployment root is already the new one, the private bundle
-    /// carries the additive set so the leaf still chains to it, and the
-    /// stored fingerprint deliberately still names the old root, as it
-    /// does until the tail after Phase 4. The leaf is a day from expiry,
-    /// so the ordinary predicate says renew.
+    /// Writes a host whose internal leaf every ordinary renewal rule
+    /// would reissue: it is a day from expiry, and the host is caught in
+    /// a full rotation's Phase-3 window besides — the deployment root is
+    /// already the new one, the private bundle carries the additive set,
+    /// and the stored fingerprint still names the old root, as it does
+    /// until the tail after Phase 4.
     ///
-    /// Returns the stale fingerprint and the file the profile's
-    /// post-renew failure hook records its reason in.
-    fn write_mid_rotation_internal_host(
+    /// Returns the file the profile's post-renew failure hook records
+    /// its reason in. An issuance that was started and failed writes it;
+    /// one that was never started does not.
+    fn write_due_internal_host(
         secrets: &std::path::Path,
         paths: &crate::registrar::internal::InternalPaths,
         acme_url: &str,
-    ) -> (String, PathBuf) {
+    ) -> PathBuf {
         let old = build_test_ca("old");
         let new = build_test_ca("new");
         let certs = secrets.join("certs");
@@ -2130,7 +2137,7 @@ mod tests {
 
         // A real account key: a placeholder is rejected before the first
         // request is made, which would let the "no ACME request"
-        // assertion pass even with the guard gone.
+        // assertion pass even if an issuance were started.
         let account_pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
             &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
             &ring::rand::SystemRandom::new(),
@@ -2154,9 +2161,6 @@ mod tests {
         )
         .unwrap();
 
-        // The profile's ordinary post-renew failure hook is the only
-        // reporting path a refusal takes, and what it is handed is what
-        // separates "refused before ACME" from "tried ACME and failed".
         let reason_path = secrets.join("failure-reason");
         let hook = format!(
             "\n[[profiles.hooks.post_renew.failure]]\ncommand = \"/bin/sh\"\n\
@@ -2179,79 +2183,153 @@ mod tests {
             },
         );
         fs::write(paths.agent_config(), format!("{config}{hook}")).unwrap();
-        (stale_fp, reason_path)
+        reason_path
     }
 
-    /// The fail-closed guard, end to end through the ordinary loop.
-    ///
-    /// The tick is due — `should_renew` says so — and must still make no
-    /// ACME request and leave the chain and the key exactly as it found
-    /// them, because a leaf reissued inside the Phase-3 window would be
-    /// chained to a root the `auth/cert` entry does not yet trust.
+    /// A stand-in for step-ca that never answers. The assertions below
+    /// are about whether anything ever *connects* to it, and a
+    /// non-blocking accept says so without waiting. The URL is
+    /// `https://` because the ACME client refuses a plaintext directory
+    /// before it dials, which would make "no connection" pass for the
+    /// wrong reason.
+    fn silent_acme_directory() -> (std::net::TcpListener, String) {
+        let acme = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        acme.set_nonblocking(true).unwrap();
+        let url = format!("https://{}/acme/acme/directory", acme.local_addr().unwrap());
+        (acme, url)
+    }
+
+    fn nothing_connected(acme: &std::net::TcpListener) -> bool {
+        matches!(
+            acme.accept().map_err(|err| err.kind()),
+            Err(std::io::ErrorKind::WouldBlock)
+        )
+    }
+
+    /// The internal leaf is signed offline and pinned in the `auth/cert`
+    /// entry, so none of the daemon's three issuance paths may start an
+    /// ACME run for it — not even for a leaf the ordinary predicate says
+    /// is due. Each path returns success, reaches no ACME directory,
+    /// runs no failure hook and leaves the chain and the key as it found
+    /// them.
     #[tokio::test]
-    async fn a_stale_stored_root_stops_the_internal_tick_before_any_acme_request() {
+    async fn no_daemon_path_issues_for_the_internal_profile() {
         let dir = tempfile::tempdir().unwrap();
         let secrets = dir.path();
         let paths = crate::registrar::internal::InternalPaths::new(secrets);
+        let (acme, acme_url) = silent_acme_directory();
+        let reason_path = write_due_internal_host(secrets, &paths, &acme_url);
 
-        // A stand-in for step-ca that never answers: the assertion is
-        // that nothing ever *connects* to it, and a non-blocking accept
-        // says so without waiting. The URL is `https://` because the
-        // ACME client refuses a plaintext directory before it dials,
-        // which would make the assertion pass for the wrong reason.
-        let acme = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        acme.set_nonblocking(true).unwrap();
-        let acme_url = format!("https://{}/acme/acme/directory", acme.local_addr().unwrap());
-
-        let (stale_fp, reason_path) = write_mid_rotation_internal_host(secrets, &paths, &acme_url);
-
-        let settings = config::Settings::from_file(Some(paths.agent_config())).unwrap();
+        let settings = Arc::new(config::Settings::from_file(Some(paths.agent_config())).unwrap());
         let profile = settings.profiles.first().unwrap();
-        let lead = Duration::from_secs(THIRTY_DAYS_SECS);
         assert!(
-            should_renew(profile, &settings.trust, lead).await.unwrap(),
-            "the fixture must actually be due for renewal"
+            should_renew(
+                profile,
+                &settings.trust,
+                Duration::from_secs(THIRTY_DAYS_SECS)
+            )
+            .await
+            .unwrap(),
+            "the fixture must be due by the ordinary predicate, or this proves nothing"
         );
-
         let chain_before = fs::read(paths.chain()).unwrap();
         let key_before = fs::read(paths.key()).unwrap();
 
-        check_and_renew_profile(
+        // The one-shot pass.
+        run_oneshot(Arc::clone(&settings), None)
+            .await
+            .expect("a one-shot pass over the internal profile alone has nothing to do");
+        assert!(nothing_connected(&acme), "the one-shot pass reached ACME");
+
+        // The fast-poll force-reissue.
+        force_renew_profile(
             &settings,
             profile,
             None,
             Arc::new(Semaphore::new(1)),
             &ProfileLocks::new(),
-            lead,
             &IssuanceRuntime {
                 config_path: paths.agent_config(),
                 cli_overrides: config::CliOverrides::default(),
             },
         )
         .await
-        .expect("a refused tick is not a daemon failure; the loop keeps ticking");
+        .expect("a force-reissue of the internal profile is a no-op");
+        assert!(nothing_connected(&acme), "the force-reissue reached ACME");
 
-        assert!(
-            matches!(
-                acme.accept().map_err(|err| err.kind()),
-                Err(std::io::ErrorKind::WouldBlock)
-            ),
-            "the tick must not have reached the ACME directory"
-        );
+        // The periodic loop: with no profile to run it spawns none, so
+        // the daemon is idle until it is stopped.
+        let shutdown = DaemonShutdown::new();
+        let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+            settings: Arc::clone(&settings),
+            default_eab: None,
+            eab_refresh_path: None,
+            config_path: Some(paths.agent_config()),
+            cli_overrides: config::CliOverrides::default(),
+            shutdown: shutdown.clone(),
+            registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+        }));
+        shutdown.stop();
+        daemon
+            .await
+            .unwrap()
+            .expect("the daemon stops cleanly with nothing to issue");
+        assert!(nothing_connected(&acme), "the periodic loop reached ACME");
+
         assert_eq!(fs::read(paths.chain()).unwrap(), chain_before);
         assert_eq!(fs::read(paths.key()).unwrap(), key_before);
-
-        let reason = fs::read_to_string(&reason_path)
-            .expect("the ordinary failure hook must have reported the refusal");
         assert!(
-            reason.contains(&stale_fp)
-                && reason.contains("bootroot rotate registrar-internal-credential"),
-            "the refusal must be the typed repair-required one, got: {reason}"
+            !reason_path.exists(),
+            "no issuance was started, so no failure hook may have run"
         );
     }
 
+    /// The control for the test above: the same identity at other paths
+    /// is an ordinary profile, and both the one-shot pass and the
+    /// periodic loop dial the ACME directory for it.
+    #[tokio::test]
+    async fn the_internal_identity_at_other_paths_reaches_acme() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path();
+        let paths = crate::registrar::internal::InternalPaths::new(secrets);
+        let acme = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let acme_url = format!("https://{}/acme/acme/directory", acme.local_addr().unwrap());
+        write_due_internal_host(secrets, &paths, &acme_url);
+
+        let mut settings = config::Settings::from_file(Some(paths.agent_config())).unwrap();
+        let elsewhere = secrets.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let moved = settings.profiles.first_mut().unwrap();
+        moved.paths.cert = elsewhere.join("chain.pem");
+        moved.paths.key = elsewhere.join("key.pem");
+        let settings = Arc::new(settings);
+
+        let oneshot = tokio::spawn(run_oneshot(Arc::clone(&settings), None));
+        acme.accept()
+            .await
+            .expect("the one-shot pass dials the ACME directory");
+        oneshot.abort();
+        let _ = oneshot.await;
+
+        let shutdown = DaemonShutdown::new();
+        let daemon = tokio::spawn(run_daemon(DaemonInvocation {
+            settings: Arc::clone(&settings),
+            default_eab: None,
+            eab_refresh_path: None,
+            config_path: Some(paths.agent_config()),
+            cli_overrides: config::CliOverrides::default(),
+            shutdown: shutdown.clone(),
+            registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+        }));
+        acme.accept()
+            .await
+            .expect("the periodic loop dials the ACME directory");
+        daemon.abort();
+        let _ = daemon.await;
+    }
+
     /// The generated internal config with a second, test-only profile
-    /// appended — the fixture the two tests above share.
+    /// appended.
     fn internal_config_with_second_profile(dir: &std::path::Path) -> String {
         let paths = crate::registrar::internal::InternalPaths::new(dir);
         let base = crate::registrar::internal::render_internal_agent_config(

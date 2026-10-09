@@ -231,6 +231,8 @@ struct CertAuth {
     client_token: ClientToken,
     #[serde(default)]
     lease_duration: u64,
+    #[serde(default)]
+    policies: Vec<String>,
 }
 
 /// The `auth/token/lookup-self` response envelope, narrowed to the one
@@ -259,6 +261,8 @@ pub struct CertLogin {
     pub client_token: ClientToken,
     /// The token's lease duration in seconds, as reported by `OpenBao`.
     pub lease_duration_secs: u64,
+    /// The policies the issued token carries, as reported by `OpenBao`.
+    pub policies: Vec<String>,
 }
 
 /// Checks whether a response status and body indicate a missing resource.
@@ -1350,13 +1354,18 @@ impl OpenBaoClient {
         self.delete_action(&format!("sys/auth/{mount}")).await
     }
 
-    /// Creates or converges the one trusted `auth/cert` entry.
+    /// Creates or converges the one `auth/cert` entry.
     ///
-    /// `ca_pem` is the deployment root the entry trusts, `allowed_dns`
-    /// and its matching common name constrain the one internal leaf it
-    /// accepts, and `policies` the exact token
-    /// policy set. `token_no_default_policy` is set, so the issued token
-    /// carries the allowlist and nothing else.
+    /// `leaf_pem` is the one certificate the entry accepts: the internal
+    /// leaf itself, alone, and not a CA. An entry whose `certificate` is
+    /// a CA accepts every leaf that CA signs for the allowed name; one
+    /// whose `certificate` is a non-CA certificate accepts exactly that
+    /// certificate, and stops accepting it the moment the entry is
+    /// rewritten with another. `allowed_dns` and its matching common
+    /// name constrain it further to the one internal name, and
+    /// `policies` is the exact token policy set.
+    /// `token_no_default_policy` is set, so the issued token carries the
+    /// allowlist and nothing else.
     ///
     /// # Errors
     /// Returns an error if the entry cannot be written.
@@ -1364,7 +1373,7 @@ impl OpenBaoClient {
         &self,
         mount: &str,
         name: &str,
-        ca_pem: &str,
+        leaf_pem: &str,
         allowed_dns: &str,
         policies: &[&str],
         token_ttl: &str,
@@ -1383,7 +1392,7 @@ impl OpenBaoClient {
         self.post_action(
             &format!("auth/{mount}/certs/{name}"),
             &CertEntryRequest {
-                certificate: ca_pem,
+                certificate: leaf_pem,
                 allowed_dns_sans: allowed_dns,
                 allowed_common_names: allowed_dns,
                 token_policies: policies,
@@ -1484,6 +1493,7 @@ impl OpenBaoClient {
         Ok(CertLogin {
             client_token: parsed.auth.client_token,
             lease_duration_secs: parsed.auth.lease_duration,
+            policies: parsed.auth.policies,
         })
     }
 
@@ -2649,7 +2659,7 @@ mod cert_auth_tests {
 
     const MOUNT: &str = "cert";
     const ENTRY: &str = "bootroot-registrar-internal";
-    const ROOT_PEM: &str = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
+    const LEAF_PEM: &str = "-----BEGIN CERTIFICATE-----\nQUJD\n-----END CERTIFICATE-----\n";
     const SAN: &str = "001.bootroot-registrar-internal.h1.example.internal";
 
     fn root_client(server: &MockServer) -> OpenBaoClient {
@@ -2658,12 +2668,14 @@ mod cert_auth_tests {
         client
     }
 
-    /// The entry binds the deployment root, the one fixed SAN and the
-    /// one exact-allowlist policy — and nothing else. `token_no_default_policy`
-    /// is what keeps the issued token off `default`, so the allowlist
-    /// really is the whole grant.
+    /// The entry binds the one leaf, the one fixed SAN and the one
+    /// exact-allowlist policy — and nothing else. `certificate` is the
+    /// leaf it was handed, verbatim: a CA there would accept every leaf
+    /// of that CA carrying the SAN. `token_no_default_policy` is what
+    /// keeps the issued token off `default`, so the allowlist really is
+    /// the whole grant.
     #[tokio::test]
-    async fn the_entry_binds_the_root_the_san_and_one_policy() {
+    async fn the_entry_binds_the_leaf_the_san_and_one_policy() {
         let server = MockServer::start().await;
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&captured);
@@ -2678,12 +2690,34 @@ mod cert_auth_tests {
             .await;
 
         root_client(&server)
-            .write_cert_auth_entry(MOUNT, ENTRY, ROOT_PEM, SAN, &[ENTRY], "1h")
+            .write_cert_auth_entry(MOUNT, ENTRY, LEAF_PEM, SAN, &[ENTRY], "1h")
             .await
             .expect("the entry must be written");
 
         let body = captured.lock().expect("capture").clone().expect("a body");
-        assert_eq!(body["certificate"], ROOT_PEM);
+        assert_eq!(body["certificate"], LEAF_PEM);
+        // Every field the entry carries, and no other: pinning the leaf
+        // adds none and removes none.
+        let mut fields: Vec<&str> = body
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "allowed_common_names",
+                "allowed_dns_sans",
+                "certificate",
+                "display_name",
+                "token_max_ttl",
+                "token_no_default_policy",
+                "token_policies",
+                "token_ttl",
+            ]
+        );
         assert_eq!(body["allowed_dns_sans"], SAN);
         assert_eq!(body["allowed_common_names"], SAN);
         assert_eq!(body["token_policies"], json!([ENTRY]));
@@ -2696,6 +2730,7 @@ mod cert_auth_tests {
             "allowed_uri_sans",
             "allowed_email_sans",
             "required_extensions",
+            "token_bound_cidrs",
         ] {
             assert!(body.get(widened).is_none(), "{widened}");
         }

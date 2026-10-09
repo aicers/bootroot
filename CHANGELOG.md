@@ -114,8 +114,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   around those paths and the one wrapped `secret_id` the mint issued.
   On the bootroot host the endpoint daemon is the one `bootroot-agent`
   process that runs on `<secrets-dir>/registrar-internal/agent.toml`,
-  renewing the bootroot-internal credential and serving the endpoint:
-  the operator writes `[registrar]` and `[registrar_endpoint]` in the
+  serving the endpoint and renewing its two certificates. It
+  authenticates to `OpenBao` with the bootroot-internal credential, a
+  client certificate `bootroot init` signs offline from the intermediate
+  key, valid for ten years. The `auth/cert` entry is pinned to that one
+  certificate, so no other certificate of the deployment's CA can log
+  in. The daemon uses the credential and does not renew it; `bootroot
+  init`, `bootroot rotate registrar-internal-credential` and a full CA
+  rotation replace it, each under the `OpenBao` root token, and an
+  expired one is refused with an error naming that command. The
+  operator writes `[registrar]` and `[registrar_endpoint]` in the
   file passed to `bootroot init --agent-config`, and `init` validates
   both tables — refusing a missing or invalid required key by name
   before it creates anything — and renders them into that configuration,

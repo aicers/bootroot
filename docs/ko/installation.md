@@ -511,9 +511,13 @@ bootroot verify --registration-id edge-proxy \
 [registrar 엔드포인트](operations.md#registrar-endpoint-linux-only)를 제공하는 **bootroot
 호스트** 배포에서는 해당 호스트의 서비스 에이전트와 별개로 엔드포인트 데몬을 자체
 `bootroot-agent` 프로세스로 운영합니다. 이 하나의 프로세스가 두 가지 일을 합니다.
-엔드포인트를 제공하고, 인증서 하나를 갱신합니다. 그 인증서는 registrar의
-`mint`/`deregister` 동사를 실행하기 위해 `OpenBao`에 인증할 때 사용하는 bootroot
-내부 자격 증명입니다. 자격 증명을 위한 두 번째 프로세스는 없습니다.
+엔드포인트를 제공하고, 엔드포인트의 인증서 두 개를 갱신합니다. registrar의
+`mint`/`deregister` 동사를 실행할 때는 bootroot 내부 자격 증명이라는 클라이언트
+인증서로 `OpenBao`에 인증하는데, 이 인증서는 **사용할 뿐 갱신하지 않습니다**.
+그 리프는 `bootroot init`이 중간 CA 키로 오프라인 서명하며 유효 기간은
+10년입니다. `init`, `bootroot rotate registrar-internal-credential`, 전체 CA
+회전만이 `OpenBao` 루트 토큰으로 이를 교체합니다. 자격 증명을 위한 두 번째
+프로세스는 없습니다.
 
 **이 호스트에서는 `bootroot init`을 root로 실행하세요.** 자격 증명을 구성하는
 다섯 개 파일(`registrar-internal/key.pem`, `chain.pem`, `acme-account.json`,
@@ -554,21 +558,26 @@ bootroot-agent --config <secrets-directory>/registrar-internal/agent.toml
 
 **이 프로세스도 root로 실행하세요.** 서비스 에이전트와 달리 위 설정 파일, 리프
 키, ACME 계정 키를 읽습니다. 셋 모두 `0700` root 소유 디렉터리 안에 `0600`
-root 소유로 있으며, 갱신할 때마다 리프를 그 디렉터리에 다시 게시합니다. 서비스
-에이전트를 실행하는 일반 사용자로 시작하면 자기 설정 파일조차 열 수 없습니다.
+root 소유로 있습니다. 서비스 에이전트를 실행하는 일반 사용자로 시작하면 자기
+설정 파일조차 열 수 없습니다.
 
-**일상적인 갱신은 이 프로세스를 시작한 뒤에야 시작됩니다.** 그전까지 자격 증명은
-`init`이 발급한 상태 그대로이며, 회전이 신호를 보내도 대상 프로세스가 없습니다.
-이 경우는 성공으로 처리하므로, 프로세스가 없는 것은 오류가 아니라 조용한 결과입니다.
+**자격 증명은 이 프로세스의 실행 여부와 무관합니다.** 데몬이 실행 중이든 아니든
+자격 증명은 `init`이 서명한 상태 그대로이며, 프로세스를 시작하기 전에는 회전이
+신호를 보내도 대상 프로세스가 없습니다. 이 경우는 성공으로 처리하므로, 프로세스가
+없는 것은 오류가 아니라 조용한 결과입니다. 프로세스를 시작한 뒤에야 시작되는 것은
+엔드포인트 자체와 엔드포인트 인증서 두 개의 갱신입니다.
 
 서비스 에이전트 설정과 다른 점이 두 가지 있습니다.
 
 - `[trust]`가 공유 `secrets/certs/ca-bundle.pem`이 아니라 **전용**
   `registrar-internal/ca-bundle.pem`을 가리킵니다. 덕분에 CA 회전이 서비스가 읽는
   파일을 건드리지 않고 이 신원의 신뢰 범위만 좁힐 수 있습니다.
-- `[acme].account_key_path`가 `registrar-internal/acme-account.json`을 가리켜,
-  갱신을 거듭해도 하나의 ACME 계정을 유지합니다. 이 키를 설정하지 않은 기존
-  설정은 발급마다 새 계정 키를 만드는 기존 동작을 그대로 유지합니다.
+- `[acme].account_key_path`가 `registrar-internal/acme-account.json`을
+  가리킵니다. 엔드포인트의 인증서 두 개와 `bootroot registrar issue`가 주문에
+  사용하는 ACME 계정이며, 갱신을 거듭해도 하나의 계정을 유지합니다. 이 파일은 첫
+  `init` 이후 존재하고 자격 증명을 교체해도 보존됩니다. 내부 자격 증명 자체는
+  ACME로 주문하지 않습니다. 이 키를 설정하지 않은 기존 설정은 발급마다 새 계정
+  키를 만드는 기존 동작을 그대로 유지합니다.
 
 registrar 엔드포인트를 사용하지 않는 호스트에는 이 파일들이 없으며, 이 절도
 필요하지 않습니다.

@@ -285,6 +285,43 @@ target. Replace the link with a real directory (moving its contents if
 the target holds the live `server.{crt,key}`) and rerun. Symlinks
 anywhere *above* `openbao/tls` are fine and resolve as before.
 
+### The bootroot-internal credential's certificate expired
+
+On a host that serves the registrar endpoint, the endpoint daemon — or a
+`mint` or `deregister` it answers — fails with (one line, wrapped here):
+
+```text
+the bootroot-internal credential's certificate expired at <RFC 3339 time>;
+run `bootroot rotate registrar-internal-credential`
+```
+
+The client certificate the daemon authenticates to OpenBao with has
+passed its `notAfter`. Nothing renews that certificate unattended, so
+bootroot refuses it before making any request:
+
+- a running daemon answers every `mint` and `deregister` with this error
+  and can no longer renew the endpoint's two certificates;
+- a restarted daemon does not start;
+- services that are already enrolled keep working, because their agents
+  authenticate with their own AppRoles and renew through ACME without
+  the registrar.
+
+Replace the credential on the control node, as root, with the OpenBao
+root token:
+
+```bash
+bootroot rotate registrar-internal-credential
+```
+
+The command signs a new ten-year leaf offline — it needs Docker, the
+intermediate key and `password.txt`, like `rotate infra-cert` — pins the
+OpenBao `auth/cert` entry to it and reloads the daemon; start the daemon
+again if it had stopped. On a stack upgraded from a build that issued
+this credential through ACME, the leaf on disk expires within one
+certificate lifetime (24 hours by default) of the upgrade and the same
+command migrates it. See
+[The bootroot-internal credential](operations.md#the-bootroot-internal-credential).
+
 ## Silent rotation FD desync (issue #614)
 
 After `bootroot rotate ca-key` or `bootroot rotate force-reissue`,

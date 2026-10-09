@@ -584,19 +584,24 @@ pub(crate) enum RotateCommand {
     ///
     /// The credential bootroot's own daemon authenticates to `OpenBao`
     /// with at `auth/cert` in order to run the registrar's mint and
-    /// deregister verbs. Replaces the trusted `auth/cert` entry, the
-    /// leaf and its private key, the persistent ACME account key and
-    /// the stored root fingerprint, and brings the dedicated config's
-    /// trust pins and private CA bundle back onto the trust state the
-    /// recorded rotation says is current — the additive set while a
-    /// full rotation is unfinished, the finalized set otherwise. Then
-    /// signals the internal agent to reload.
+    /// deregister verbs. Signs a new leaf offline against the
+    /// intermediate key and pins the `auth/cert` entry to it, so no
+    /// other certificate of the deployment's CA can log in; replaces
+    /// the leaf's private key and the stored root fingerprint with it,
+    /// keeps the persistent ACME account key, and brings the dedicated
+    /// config's trust pins and private CA bundle back onto the trust
+    /// state the recorded rotation says is current — the additive set
+    /// while a full rotation is unfinished, the finalized set
+    /// otherwise. Then signals the internal agent to reload.
     ///
     /// Requires an `OpenBao` token carrying the `root` policy; an
-    /// `AppRole` token is refused. Never re-runs install and never
-    /// touches a service credential. Use it after an interrupted
-    /// rotation, an expired internal leaf, or a credential that was
-    /// lost or partially written.
+    /// `AppRole` token is refused. Needs Docker, the intermediate key
+    /// and `password.txt`, like `rotate infra-cert`. Never re-runs
+    /// install and never touches a service credential. Nothing renews
+    /// this credential unattended: use it to migrate an installation
+    /// whose entry still trusts the root CA, when the leaf is within 30
+    /// days of expiry or has expired, after an interrupted rotation, or
+    /// for a credential that was lost or partially written.
     #[command(name = "registrar-internal-credential")]
     RegistrarInternalCredential(RotateRegistrarInternalArgs),
     /// Rotates the `OpenBao` `AppRole` `secret_id` for one registered
@@ -718,12 +723,15 @@ pub(crate) struct RotateResponderHmacArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub(crate) struct RotateRegistrarInternalArgs {
-    /// Repairs even when the stored root fingerprint already matches the
-    /// active root.
+    /// Replaces the credential even when nothing about it needs
+    /// repair.
     ///
-    /// Without it, a credential whose material loads and whose root
-    /// still matches is left alone and the command reports so, which is
-    /// what makes the command safe to run from a script on every host.
+    /// Without it, the command leaves the credential alone and reports
+    /// so when all of these hold: the material is complete and was
+    /// issued under the active root, the `auth/cert` entry is pinned to
+    /// exactly the published leaf, and that leaf is more than 30 days
+    /// from expiry. That is what makes the command safe to run from a
+    /// script on every host.
     #[arg(long)]
     pub(crate) force: bool,
 }

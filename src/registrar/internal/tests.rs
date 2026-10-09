@@ -344,10 +344,10 @@ async fn invalid_members_fail_with_a_typed_error() {
 /// shared loader holds it to every invariant the generator gives it.
 ///
 /// A host whose config no longer describes this identity is a host whose
-/// renewal daemon cannot start. Reporting it as provisioned would let
-/// the privileged verbs run over a certificate nothing renews, so each
-/// drift below is a typed refusal naming the config rather than a silent
-/// pass.
+/// endpoint daemon cannot start. Reporting it as provisioned would let
+/// the privileged verbs run on a host whose endpoint certificates
+/// nothing renews, so each drift below is a typed refusal naming the
+/// config rather than a silent pass.
 #[tokio::test]
 async fn a_config_that_drifted_from_the_generator_fails_the_shared_loader() {
     // Not TOML at all.
@@ -629,6 +629,121 @@ async fn an_unreadable_active_root_refuses_the_login() {
     assert!(matches!(err, InternalCredentialError::Io { .. }), "{err:?}");
 }
 
+/// A provisioned host whose published leaf's `notAfter` is `not_after`,
+/// with the active root the credential was signed under in place.
+///
+/// Written directly rather than through `publish_material`, as an
+/// ordinary user can: the loader reads these bytes whoever owns them.
+fn host_with_leaf_expiring(not_after: time::OffsetDateTime) -> (TempDir, String) {
+    let dir = TempDir::new().expect("tempdir");
+    let paths = InternalPaths::new(dir.path());
+    let (bundle, material) = real_credential_expiring(not_after);
+    let active = write_active_root(dir.path(), &bundle);
+    std::fs::create_dir_all(paths.dir()).expect("create the internal directory");
+    std::fs::write(paths.key(), material.key.expose()).expect("key");
+    std::fs::write(paths.chain(), &material.chain).expect("chain");
+    std::fs::write(paths.acme_account(), account_json()).expect("account key");
+    std::fs::write(paths.root_fingerprint(), format!("{active}\n")).expect("fingerprint");
+    std::fs::write(paths.ca_bundle(), &bundle).expect("bundle");
+    std::fs::write(paths.agent_config(), generated_config(&paths)).expect("config");
+    (dir, active)
+}
+
+/// Nothing renews the leaf unattended, so one whose `notAfter` has
+/// passed is refused at load, by name: the error carries that `notAfter`
+/// and ends with the command that replaces the leaf. No request is made
+/// — the URL names nothing that listens — and the daemon, which loads
+/// the credential as it starts, does not start on it.
+#[test]
+fn loading_an_expired_leaf_names_the_repair_command() {
+    let expired_at = (time::OffsetDateTime::now_utc() - time::Duration::hours(1))
+        .replace_nanosecond(0)
+        .expect("a whole second");
+    let (dir, active) = host_with_leaf_expiring(expired_at);
+    let err = InternalCredential::load(dir.path(), "https://127.0.0.1:1", &active)
+        .expect_err("an expired leaf must be refused");
+    match &err {
+        InternalCredentialError::Expired { not_after } => assert_eq!(*not_after, expired_at),
+        other => panic!("{other:?}"),
+    }
+    let message = err.to_string();
+    assert!(
+        message.ends_with("run `bootroot rotate registrar-internal-credential`"),
+        "{message}"
+    );
+    assert!(message.contains("expired at"), "{message}");
+}
+
+/// A leaf that is still valid loads, however close to its `notAfter`:
+/// the refusal is for a leaf that has expired, not one that soon will.
+#[test]
+fn loading_a_valid_leaf_is_unaffected() {
+    for remaining in [time::Duration::hours(1), time::Duration::days(3650)] {
+        let (dir, active) = host_with_leaf_expiring(time::OffsetDateTime::now_utc() + remaining);
+        InternalCredential::load(dir.path(), "https://127.0.0.1:1", &active)
+            .expect("a valid leaf loads");
+    }
+}
+
+/// A superseded root is reported ahead of an expired leaf: both name
+/// the same command, and the root is the more fundamental of the two.
+#[test]
+fn a_root_mismatch_is_reported_ahead_of_expiry() {
+    let (dir, _active) =
+        host_with_leaf_expiring(time::OffsetDateTime::now_utc() - time::Duration::hours(1));
+    let err = InternalCredential::load(dir.path(), "https://127.0.0.1:1", OTHER_FP)
+        .expect_err("a mismatched root must be refused");
+    assert!(
+        matches!(err, InternalCredentialError::RepairRequired { .. }),
+        "{err:?}"
+    );
+}
+
+/// The two helpers the pin and the expiry are read through: the leaf is
+/// the first certificate of the chain, alone, whatever follows it.
+#[test]
+fn the_leaf_is_the_first_certificate_of_the_chain() {
+    use super::{first_certificate_der, first_certificate_pem, leaf_not_after};
+
+    let not_after = (time::OffsetDateTime::now_utc() + time::Duration::days(10))
+        .replace_nanosecond(0)
+        .expect("a whole second");
+    let (bundle, material) = real_credential_expiring(not_after);
+    let path = Path::new("chain.pem");
+
+    let leaf = first_certificate_pem(&material.chain).expect("a leaf");
+    assert_eq!(format!("{leaf}{bundle}"), material.chain);
+    assert_eq!(
+        first_certificate_der(path, &material.chain).expect("der"),
+        first_certificate_der(path, leaf).expect("der"),
+    );
+    assert_ne!(
+        first_certificate_der(path, &material.chain).expect("der"),
+        first_certificate_der(path, &bundle).expect("der"),
+    );
+    assert_eq!(
+        leaf_not_after(path, &material.chain).expect("notAfter"),
+        not_after
+    );
+
+    // Leading text and a missing final newline are both tolerated; a
+    // block that is not a certificate, or is cut short, is not.
+    let unterminated = leaf.trim_end();
+    assert_eq!(
+        first_certificate_pem(&format!("# leaf\n{unterminated}")),
+        Some(unterminated)
+    );
+    assert_eq!(first_certificate_pem(&key_pem()), None);
+    assert_eq!(
+        first_certificate_pem("-----BEGIN CERTIFICATE-----\nQUJD\n"),
+        None
+    );
+    assert!(matches!(
+        first_certificate_der(path, &chain_pem()),
+        Err(InternalCredentialError::Invalid { .. })
+    ));
+}
+
 /// `InternalMaterial` is deliberately not `Clone` — the key inside it
 /// is not a value to copy around casually — so the tests that need a
 /// second copy under a different root fingerprint say so here.
@@ -670,6 +785,11 @@ fn an_unparseable_key_fails_the_transport() {
 /// Issues a self-signed CA and a leaf under it, returning the CA bundle
 /// PEM and the internal material that chains to it.
 fn real_credential() -> (String, InternalMaterial) {
+    real_credential_expiring(time::OffsetDateTime::now_utc() + time::Duration::days(3650))
+}
+
+/// [`real_credential`] whose leaf's `notAfter` is `not_after`.
+fn real_credential_expiring(not_after: time::OffsetDateTime) -> (String, InternalMaterial) {
     let ca_key = rcgen::KeyPair::generate().expect("ca key");
     let mut ca_params =
         rcgen::CertificateParams::new(vec!["bootroot-ca".to_string()]).expect("ca params");
@@ -677,9 +797,11 @@ fn real_credential() -> (String, InternalMaterial) {
     let ca = ca_params.self_signed(&ca_key).expect("self-signed ca");
 
     let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
-    let leaf_params =
+    let mut leaf_params =
         rcgen::CertificateParams::new(vec![registrar_internal_identity(HOST, DOMAIN)])
             .expect("leaf params");
+    leaf_params.not_before = not_after - time::Duration::days(3650);
+    leaf_params.not_after = not_after;
     let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
 
@@ -1625,6 +1747,65 @@ mod login {
         // above made no second login.
     }
 
+    /// A credential built while its leaf was valid is refused once the
+    /// leaf's `notAfter` has passed — with a login still cached and well
+    /// inside its lease, and without a request. `OpenBao` would answer a
+    /// fresh login with an opaque verification failure; this names the
+    /// command instead, on every verb.
+    ///
+    /// The mock expects exactly one login: the one made while the leaf
+    /// was valid.
+    #[tokio::test]
+    async fn a_leaf_that_expires_after_construction_stops_the_login_and_the_cache() {
+        let server = MockServer::start().await;
+        mock_login(&server, 3600, 1).await;
+        let (_dir, credential) = credential_over(&server);
+        credential
+            .authenticated()
+            .await
+            .expect("the login while the leaf is valid must succeed");
+
+        // The same credential, cache and all, a moment after its
+        // `notAfter`.
+        let expired_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let credential = credential.with_leaf_not_after(expired_at);
+        for attempt in 0..2 {
+            let err = credential
+                .authenticated()
+                .await
+                .expect_err("an expired leaf must refuse");
+            match &err {
+                InternalCredentialError::Expired { not_after } => {
+                    assert_eq!(*not_after, expired_at, "attempt {attempt}");
+                }
+                other => panic!("attempt {attempt}: {other:?}"),
+            }
+            assert!(
+                err.to_string()
+                    .ends_with("run `bootroot rotate registrar-internal-credential`"),
+                "{err}"
+            );
+        }
+        // `expect(1)` is asserted when the server drops.
+    }
+
+    /// The boundary itself: valid strictly before `notAfter`, expired at
+    /// it and after.
+    #[test]
+    fn the_leaf_is_valid_strictly_before_its_not_after() {
+        use crate::registrar::internal::client::refuse_expired;
+
+        let not_after = time::OffsetDateTime::now_utc();
+        refuse_expired(not_after, not_after - time::Duration::seconds(1))
+            .expect("a second before notAfter is valid");
+        for now in [not_after, not_after + time::Duration::seconds(1)] {
+            assert!(matches!(
+                refuse_expired(not_after, now),
+                Err(InternalCredentialError::Expired { .. })
+            ));
+        }
+    }
+
     #[test]
     fn only_a_403_reads_as_an_expired_token() {
         assert!(is_expired_token_error(&anyhow::anyhow!(
@@ -1712,10 +1893,18 @@ mod authority {
 /// `scripts/impl/run-registrar-internal-e2e.sh` and are read, never
 /// written.
 ///
-/// Server trust and client trust are separate anchors here, exactly as
-/// they are in a deployment: the scenario's `OpenBao` serves its own dev
-/// TLS certificate, while the leaves these tests present are signed by a
-/// CA the test mints and registers in the entry.
+/// It is also where the pin is proved. Which certificates an entry
+/// accepts is `OpenBao`'s decision, not this crate's, so the refusals
+/// that close the forgery path — another leaf of the same CA, a
+/// look-alike that copies the pinned leaf's serial number and authority
+/// key identifier, a leaf the entry used to name — are asserted against
+/// the real server at the pinned image tag, beside the pinned leaf
+/// logging in. An image bump that lost any of them fails here.
+///
+/// Server trust and client trust are separate here, exactly as they are
+/// in a deployment: the scenario's `OpenBao` serves its own dev TLS
+/// certificate, while the leaves these tests present are signed by a CA
+/// each test mints. The entry names one of those leaves, never the CA.
 mod live {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1725,7 +1914,8 @@ mod live {
     use crate::openbao::OpenBaoClient;
     use crate::registrar::internal::{
         AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredential, InternalMaterial,
-        PrivateKeyPem, build_registrar_internal_policy,
+        PrivateKeyPem, build_registrar_internal_policy, first_certificate_der,
+        first_certificate_pem,
     };
     use crate::registrar::{registrar_endpoint_identity, registrar_internal_identity};
 
@@ -1734,7 +1924,7 @@ mod live {
     /// Environment variable carrying that `OpenBao`'s privileged token.
     const ENV_TOKEN: &str = "BOOTROOT_INTERNAL_TEST_OPENBAO_TOKEN";
     /// Environment variable naming the PEM that verifies its **server**
-    /// certificate. Unrelated to the CA the entry trusts.
+    /// certificate. Unrelated to the CA the presented leaves chain to.
     const ENV_SERVER_CA: &str = "BOOTROOT_INTERNAL_TEST_SERVER_CA";
     /// Environment variable naming the KV v2 mount the policy is scoped
     /// to.
@@ -1791,32 +1981,49 @@ mod live {
             OpenBaoClient::with_client(&self.url, http)
         }
 
-        /// Mounts `auth/cert` if needed and writes one entry trusting
-        /// `ca`, bound to the fixed internal SAN, carrying one freshly
-        /// written copy of the real policy body.
-        ///
-        /// Returns the policy's name, for a caller that needs to name
-        /// it again.
-        async fn provision_entry(&self, ca: &TestCa, entry: &str) -> String {
+        /// Mounts `auth/cert` if needed and writes one entry pinned to
+        /// `leaf_pem`, bound to the fixed internal SAN, carrying one
+        /// freshly written copy of the real policy body under `policy`.
+        async fn provision_entry(&self, leaf_pem: &str, entry: &str, policy: &str) {
             let root = self.root_client();
             root.ensure_cert_auth(CERT_AUTH_MOUNT)
                 .await
                 .expect("the cert backend must mount");
-            let policy = unique("bootroot-internal-policy");
-            root.write_policy(&policy, &build_registrar_internal_policy(&self.kv_mount))
+            root.write_policy(policy, &build_registrar_internal_policy(&self.kv_mount))
                 .await
                 .expect("the policy must be written");
-            root.write_cert_auth_entry(
-                CERT_AUTH_MOUNT,
-                entry,
-                &ca.pem,
-                &registrar_internal_identity(HOST, DOMAIN),
-                &[policy.as_str()],
-                "1h",
-            )
-            .await
-            .expect("the entry must be written");
-            policy
+            self.pin_entry(leaf_pem, entry, policy).await;
+        }
+
+        /// Writes — or rewrites — `entry` so that it is pinned to
+        /// `leaf_pem`, through the production writer.
+        async fn pin_entry(&self, leaf_pem: &str, entry: &str, policy: &str) {
+            self.root_client()
+                .write_cert_auth_entry(
+                    CERT_AUTH_MOUNT,
+                    entry,
+                    leaf_pem,
+                    &registrar_internal_identity(HOST, DOMAIN),
+                    &[policy],
+                    "1h",
+                )
+                .await
+                .expect("the entry must be written");
+        }
+
+        /// Asserts `material` is refused at `entry`, by `OpenBao` and
+        /// not by a transport that never got there.
+        async fn assert_refused(&self, material: &InternalMaterial, entry: &str, what: &str) {
+            let err = self
+                .cert_client(material)
+                .login_cert(CERT_AUTH_MOUNT, entry)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{what} must be refused"));
+            assert!(
+                format!("{err:#}").contains("OpenBao API error"),
+                "{what}: {err:#}"
+            );
         }
     }
 
@@ -1828,69 +2035,188 @@ mod live {
         format!("{prefix}-{}-{n}", std::process::id())
     }
 
-    /// One CA, and the leaves signed under it.
+    /// The pinned leaf's PEM block alone, as the entry carries it.
+    fn leaf_pem(material: &InternalMaterial) -> &str {
+        first_certificate_pem(&material.chain).expect("the chain opens with the leaf")
+    }
+
+    /// The subject key identifier every test intermediate carries.
+    ///
+    /// Fixed rather than derived from the key, so a look-alike issuer
+    /// can be given the same one and the leaves it signs carry the same
+    /// authority key identifier as a real one's.
+    const INTERMEDIATE_KEY_ID: [u8; 20] = [0xb0; 20];
+
+    /// One deployment CA — a root and an intermediate under it — and the
+    /// leaves signed by that intermediate.
     struct TestCa {
-        pem: String,
-        params: rcgen::CertificateParams,
-        key: rcgen::KeyPair,
+        root_pem: String,
+        intermediate_pem: String,
+        intermediate_params: rcgen::CertificateParams,
+        intermediate_key: rcgen::KeyPair,
+    }
+
+    /// How a test leaf differs from the one production signs.
+    #[derive(Clone, Default)]
+    struct LeafShape {
+        /// The serial number, when a test needs to copy one.
+        serial: Option<Vec<u8>>,
+        /// The `notAfter`, when a test needs an expired leaf.
+        not_after: Option<time::OffsetDateTime>,
     }
 
     impl TestCa {
         fn new() -> Self {
-            let key = rcgen::KeyPair::generate().expect("ca key");
-            let mut params = rcgen::CertificateParams::new(vec!["bootroot-test-ca".to_string()])
-                .expect("params");
-            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-            let cert = params.self_signed(&key).expect("self-signed ca");
+            let root_key = rcgen::KeyPair::generate().expect("root key");
+            let root_params = Self::ca_params("bootroot-test-root");
+            let root = root_params
+                .self_signed(&root_key)
+                .expect("self-signed root");
+            let root_issuer = rcgen::Issuer::from_params(&root_params, &root_key);
+
+            let intermediate_key = rcgen::KeyPair::generate().expect("intermediate key");
+            let intermediate_params = Self::intermediate_params();
+            let intermediate = intermediate_params
+                .signed_by(&intermediate_key, &root_issuer)
+                .expect("intermediate");
             Self {
-                pem: cert.pem(),
-                params,
-                key,
+                root_pem: root.pem(),
+                intermediate_pem: intermediate.pem(),
+                intermediate_params,
+                intermediate_key,
             }
+        }
+
+        fn ca_params(common_name: &str) -> rcgen::CertificateParams {
+            let mut params =
+                rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, common_name);
+            params
+        }
+
+        fn intermediate_params() -> rcgen::CertificateParams {
+            let mut params = Self::ca_params("bootroot-test-intermediate");
+            params.key_identifier_method =
+                rcgen::KeyIdMethod::PreSpecified(INTERMEDIATE_KEY_ID.to_vec());
+            params
+        }
+
+        /// An issuer that looks like this CA's intermediate — the same
+        /// name and the same key identifier — and is not it: the key is
+        /// its own, and nothing chains it to the root.
+        fn look_alike_intermediate() -> (rcgen::CertificateParams, rcgen::KeyPair) {
+            (
+                Self::intermediate_params(),
+                rcgen::KeyPair::generate().expect("look-alike key"),
+            )
         }
 
         /// Material carrying a leaf whose only DNS SAN is `san`.
         fn leaf(&self, san: &str) -> InternalMaterial {
+            self.leaf_shaped(san, &LeafShape::default())
+        }
+
+        fn leaf_shaped(&self, san: &str, shape: &LeafShape) -> InternalMaterial {
+            let issuer =
+                rcgen::Issuer::from_params(&self.intermediate_params, &self.intermediate_key);
+            Self::sign_leaf(san, shape, &issuer, &self.intermediate_pem)
+        }
+
+        /// Signs a leaf for `san` under `issuer`, with the subject and
+        /// SAN production gives the internal leaf, and returns it as
+        /// material whose chain is the leaf followed by `issuer_pem`.
+        fn sign_leaf(
+            san: &str,
+            shape: &LeafShape,
+            issuer: &rcgen::Issuer<'_, &rcgen::KeyPair>,
+            issuer_pem: &str,
+        ) -> InternalMaterial {
             let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
             let mut leaf_params =
                 rcgen::CertificateParams::new(vec![san.to_string()]).expect("leaf params");
-            // Production issuance sets the CN to the reserved DNS identity
+            // Production signing sets the CN to the reserved DNS identity
             // as well as placing it in the leaf's sole DNS SAN. Model both
             // entry constraints here: the live backend rejects rcgen's
             // default CN before it can exercise the SAN allowlist.
             leaf_params
                 .distinguished_name
                 .push(rcgen::DnType::CommonName, san);
-            let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
-            let leaf = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf");
+            leaf_params.use_authority_key_identifier_extension = true;
+            leaf_params.serial_number = shape.serial.clone().map(rcgen::SerialNumber::from);
+            if let Some(not_after) = shape.not_after {
+                leaf_params.not_before = not_after - time::Duration::days(30);
+                leaf_params.not_after = not_after;
+            }
+            let leaf = leaf_params.signed_by(&leaf_key, issuer).expect("leaf");
             InternalMaterial {
                 key: PrivateKeyPem::new(leaf_key.serialize_pem()),
-                chain: format!("{}{}", leaf.pem(), self.pem),
+                chain: format!("{}{issuer_pem}", leaf.pem()),
                 acme_account: AcmeAccountKey::new(account_json()),
                 root_fingerprint: ROOT_FP.to_string(),
             }
         }
     }
 
+    /// The serial number, the authority key identifier and the public
+    /// key of the leaf in `material`.
+    fn leaf_identity(material: &InternalMaterial) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let der = first_certificate_der(std::path::Path::new("chain.pem"), &material.chain)
+            .expect("the chain opens with a certificate");
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).expect("a certificate");
+        let authority_key_id = cert
+            .extensions()
+            .iter()
+            .find_map(|extension| match extension.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::AuthorityKeyIdentifier(aki) => {
+                    aki.key_identifier.as_ref().map(|id| id.0.to_vec())
+                }
+                _ => None,
+            })
+            .expect("the leaf carries an authority key identifier");
+        (
+            cert.raw_serial().to_vec(),
+            authority_key_id,
+            cert.public_key().raw.to_vec(),
+        )
+    }
+
     /// The credential type itself authenticates at the **fixed** entry
     /// name, over TLS, with no `role_id` and no `secret_id` anywhere —
-    /// the acceptance criterion, end to end against a real backend.
+    /// the acceptance criterion, end to end against a real backend. The
+    /// entry is pinned to the credential's own leaf, and the token it
+    /// yields carries exactly the one fixed policy.
     ///
-    /// The one test that uses [`CERT_AUTH_ROLE`]; the rest name their
-    /// own entries so they can run beside it.
+    /// The one test that uses [`CERT_AUTH_ROLE`], as the entry and as
+    /// the policy; the rest name their own so they can run beside it.
     #[tokio::test]
     #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
-    async fn the_credential_logs_in_at_the_fixed_entry() {
+    async fn the_pinned_leaf_logs_in_at_the_fixed_entry() {
         let backend = LiveBackend::from_env();
         let ca = TestCa::new();
-        backend.provision_entry(&ca, CERT_AUTH_ROLE).await;
-
-        // The CA the entry trusts is also this scenario's deployment
-        // root, written where the credential re-reads it from before
-        // every login.
         let dir = TempDir::new().expect("tempdir");
         let mut material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
-        material.root_fingerprint = write_active_root(dir.path(), &ca.pem);
+        backend
+            .provision_entry(leaf_pem(&material), CERT_AUTH_ROLE, CERT_AUTH_ROLE)
+            .await;
+
+        let login = backend
+            .cert_client(&material)
+            .login_cert(CERT_AUTH_MOUNT, CERT_AUTH_ROLE)
+            .await
+            .expect("the pinned leaf must authenticate");
+        assert_eq!(
+            login.policies,
+            [CERT_AUTH_ROLE],
+            "the token carries exactly the internal policy"
+        );
+
+        // The root the leaf was signed under is also this scenario's
+        // deployment root, written where the credential re-reads it from
+        // before every login.
+        material.root_fingerprint = write_active_root(dir.path(), &ca.root_pem);
         let credential = InternalCredential::from_parts(
             dir.path(),
             &backend.url,
@@ -1917,22 +2243,197 @@ mod live {
             .expect("the cached login must still serve");
     }
 
-    /// The entry accepts the one fixed SAN and nothing else.
+    /// The path this pin closes. A second leaf from the same
+    /// intermediate, carrying the same SAN and the same CN — what a
+    /// holder of the deployment's responder HMAC can obtain from step-ca
+    /// — is refused, while the pinned leaf logs in beside it.
     ///
-    /// The refused leaves carry the deployment's *other* registrar name
-    /// and an ordinary service name, and both are signed by the very CA
-    /// the entry trusts — so what is proved is that the SAN allowlist is
-    /// doing the work, not the chain check.
+    /// The pinned leaf is also accepted when it is presented alone,
+    /// without the intermediate: the entry names the certificate, and
+    /// does not need its issuer to recognise it.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn a_second_leaf_of_the_same_ca_is_refused() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let san = registrar_internal_identity(HOST, DOMAIN);
+        let pinned = ca.leaf(&san);
+        let entry = unique("internal-pin");
+        backend
+            .provision_entry(
+                leaf_pem(&pinned),
+                &entry,
+                &unique("bootroot-internal-policy"),
+            )
+            .await;
+
+        backend
+            .cert_client(&pinned)
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the pinned leaf must authenticate");
+        let alone = InternalMaterial {
+            chain: leaf_pem(&pinned).to_string(),
+            ..super::clone_material(&pinned)
+        };
+        backend
+            .cert_client(&alone)
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the pinned leaf authenticates without its intermediate");
+
+        backend
+            .assert_refused(&ca.leaf(&san), &entry, "a second leaf of the same CA")
+            .await;
+    }
+
+    /// The pin is on the certificate, not on anything a forger can copy
+    /// into another one. A certificate with the pinned leaf's serial
+    /// number, SAN, CN and authority key identifier but its own key —
+    /// signed by an issuer that carries the intermediate's name and key
+    /// identifier — is refused.
+    ///
+    /// This is the property that depends on the `OpenBao` version: it
+    /// holds because the server compares the public key of a pinned
+    /// non-CA certificate. An image bump that lost it fails here.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn a_look_alike_of_the_pinned_leaf_is_refused() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let san = registrar_internal_identity(HOST, DOMAIN);
+        let shape = LeafShape {
+            serial: Some(vec![0x42; 16]),
+            not_after: None,
+        };
+        let pinned = ca.leaf_shaped(&san, &shape);
+        let entry = unique("internal-lookalike");
+        backend
+            .provision_entry(
+                leaf_pem(&pinned),
+                &entry,
+                &unique("bootroot-internal-policy"),
+            )
+            .await;
+
+        let (issuer_params, issuer_key) = TestCa::look_alike_intermediate();
+        let issuer_pem = issuer_params
+            .self_signed(&issuer_key)
+            .expect("the look-alike issuer")
+            .pem();
+        let forged = TestCa::sign_leaf(
+            &san,
+            &shape,
+            &rcgen::Issuer::from_params(&issuer_params, &issuer_key),
+            &issuer_pem,
+        );
+
+        // The forgery really is a look-alike, or its refusal proves
+        // nothing about the pin.
+        let (pinned_serial, pinned_aki, pinned_key) = leaf_identity(&pinned);
+        let (forged_serial, forged_aki, forged_key) = leaf_identity(&forged);
+        assert_eq!(forged_serial, pinned_serial);
+        assert_eq!(forged_aki, pinned_aki);
+        assert_eq!(forged_aki, INTERMEDIATE_KEY_ID);
+        assert_ne!(forged_key, pinned_key);
+
+        backend
+            .cert_client(&pinned)
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the pinned leaf must authenticate");
+        backend
+            .assert_refused(&forged, &entry, "a look-alike of the pinned leaf")
+            .await;
+    }
+
+    /// Replacing the credential takes effect at once: the moment the
+    /// entry is rewritten with a new leaf, that leaf logs in and the
+    /// previous one — legitimate until a moment ago — is refused. This
+    /// is what makes replacement the control for a key that has left
+    /// the control node.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn a_replaced_leaf_is_refused_and_its_replacement_logs_in() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let san = registrar_internal_identity(HOST, DOMAIN);
+        let previous = ca.leaf(&san);
+        let entry = unique("internal-replace");
+        let policy = unique("bootroot-internal-policy");
+        backend
+            .provision_entry(leaf_pem(&previous), &entry, &policy)
+            .await;
+        backend
+            .cert_client(&previous)
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the first leaf authenticates while the entry names it");
+
+        let replacement = ca.leaf(&san);
+        backend
+            .pin_entry(leaf_pem(&replacement), &entry, &policy)
+            .await;
+
+        backend
+            .cert_client(&replacement)
+            .login_cert(CERT_AUTH_MOUNT, &entry)
+            .await
+            .expect("the replacement authenticates once the entry names it");
+        backend
+            .assert_refused(&previous, &entry, "the leaf the entry used to name")
+            .await;
+    }
+
+    /// `OpenBao` enforces the pinned leaf's expiry itself: a leaf whose
+    /// `notAfter` has passed is refused even though the entry names it.
+    /// bootroot's own `Expired` refusal is a diagnostic in front of this
+    /// one, never a substitute for it.
+    #[tokio::test]
+    #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
+    async fn an_expired_pinned_leaf_is_refused() {
+        let backend = LiveBackend::from_env();
+        let ca = TestCa::new();
+        let expired = ca.leaf_shaped(
+            &registrar_internal_identity(HOST, DOMAIN),
+            &LeafShape {
+                serial: None,
+                not_after: Some(time::OffsetDateTime::now_utc() - time::Duration::hours(1)),
+            },
+        );
+        let entry = unique("internal-expired");
+        backend
+            .provision_entry(
+                leaf_pem(&expired),
+                &entry,
+                &unique("bootroot-internal-policy"),
+            )
+            .await;
+        backend
+            .assert_refused(&expired, &entry, "an expired pinned leaf")
+            .await;
+    }
+
+    /// The entry's SAN allowlist still does its own work under the pin.
+    ///
+    /// Each refused leaf is itself the one the entry is pinned to, so
+    /// the pin cannot be what refuses it: it carries the deployment's
+    /// *other* registrar name, or an ordinary service name, and the
+    /// entry allows only the internal one.
     #[tokio::test]
     #[ignore = "needs a live TLS OpenBao; run scripts/impl/run-registrar-internal-e2e.sh"]
     async fn the_entry_accepts_only_the_fixed_internal_san() {
         let backend = LiveBackend::from_env();
         let ca = TestCa::new();
-        let entry = unique("internal-san");
-        backend.provision_entry(&ca, &entry).await;
+        let policy = unique("bootroot-internal-policy");
 
+        let internal = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        let entry = unique("internal-san");
         backend
-            .cert_client(&ca.leaf(&registrar_internal_identity(HOST, DOMAIN)))
+            .provision_entry(leaf_pem(&internal), &entry, &policy)
+            .await;
+        backend
+            .cert_client(&internal)
             .login_cert(CERT_AUTH_MOUNT, &entry)
             .await
             .expect("the fixed internal SAN must authenticate");
@@ -1941,15 +2442,12 @@ mod live {
             registrar_endpoint_identity("001", HOST, DOMAIN),
             format!("001.piglet.{HOST}.{DOMAIN}"),
         ] {
-            let err = backend
-                .cert_client(&ca.leaf(&refused))
-                .login_cert(CERT_AUTH_MOUNT, &entry)
-                .await
-                .expect_err("only the fixed internal SAN may authenticate");
-            assert!(
-                format!("{err:#}").contains("OpenBao API error"),
-                "{refused}: {err:#}"
-            );
+            let other = ca.leaf(&refused);
+            let entry = unique("internal-san");
+            backend.pin_entry(leaf_pem(&other), &entry, &policy).await;
+            backend
+                .assert_refused(&other, &entry, &format!("a pinned leaf named {refused}"))
+                .await;
         }
     }
 
@@ -1970,9 +2468,15 @@ mod live {
         let backend = LiveBackend::from_env();
         let ca = TestCa::new();
         let entry = unique("internal-policies");
-        backend.provision_entry(&ca, &entry).await;
-
         let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        backend
+            .provision_entry(
+                leaf_pem(&material),
+                &entry,
+                &unique("bootroot-internal-policy"),
+            )
+            .await;
+
         let mut client = backend.cert_client(&material);
         let login = client
             .login_cert(CERT_AUTH_MOUNT, &entry)
@@ -2004,9 +2508,15 @@ mod live {
         let backend = LiveBackend::from_env();
         let ca = TestCa::new();
         let entry = unique("internal-acl");
-        backend.provision_entry(&ca, &entry).await;
-
         let material = ca.leaf(&registrar_internal_identity(HOST, DOMAIN));
+        backend
+            .provision_entry(
+                leaf_pem(&material),
+                &entry,
+                &unique("bootroot-internal-policy"),
+            )
+            .await;
+
         let mut client = backend.cert_client(&material);
         let login = client
             .login_cert(CERT_AUTH_MOUNT, &entry)
@@ -2074,57 +2584,20 @@ mod live {
     }
 }
 
-/// The fail-closed guard the ordinary renewal loop runs before it
-/// issues. The window it exists for is between a full rotation's Phase
-/// 3, which publishes the additive trust set and reloads this daemon,
-/// and the tail after Phase 4, which is the only place the entry, the
-/// leaf and the stored fingerprint move.
-mod renewal_guard {
+/// How the daemon tells the bootroot-internal profile, which it uses
+/// and never issues for, from every other profile.
+mod internal_profile {
     use tempfile::TempDir;
 
-    use super::{account_json, chain_pem, generated_config, key_pem};
+    use super::generated_config;
     use crate::config::{DaemonProfileSettings, Settings};
-    use crate::registrar::internal::{
-        InternalCredentialError, InternalPaths, check_renewal_allowed, internal_profile_paths,
-    };
-
-    /// A self-signed root and its hex SHA-256, as the deployment's
-    /// `certs/root_ca.crt` and as the fingerprint recorded beside the
-    /// credential.
-    fn root_ca(label: &str) -> (String, String) {
-        let key = rcgen::KeyPair::generate().expect("generate a root key");
-        let mut params =
-            rcgen::CertificateParams::new(Vec::<String>::new()).expect("root parameters");
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, label);
-        let cert = params.self_signed(&key).expect("self-sign the root");
-        let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
-        (cert.pem(), fingerprint)
-    }
-
-    /// A provisioned host whose active root is `active_pem` and whose
-    /// credential records `stored_fp`.
-    fn host(active_pem: &str, stored_fp: &str) -> (TempDir, InternalPaths) {
-        let dir = TempDir::new().expect("tempdir");
-        let paths = InternalPaths::new(dir.path());
-        std::fs::create_dir_all(dir.path().join("certs")).expect("create the CA directory");
-        std::fs::write(dir.path().join("certs").join("root_ca.crt"), active_pem)
-            .expect("write the active root");
-        std::fs::create_dir_all(paths.dir()).expect("create the internal directory");
-        std::fs::write(paths.key(), key_pem()).expect("key");
-        std::fs::write(paths.chain(), chain_pem()).expect("chain");
-        std::fs::write(paths.acme_account(), account_json()).expect("account key");
-        std::fs::write(paths.root_fingerprint(), format!("{stored_fp}\n")).expect("fingerprint");
-        std::fs::write(paths.ca_bundle(), chain_pem()).expect("bundle");
-        std::fs::write(paths.agent_config(), generated_config(&paths)).expect("config");
-        (dir, paths)
-    }
+    use crate::registrar::internal::{InternalPaths, internal_profile_paths};
 
     /// The one profile the generated config carries, read the way
     /// `bootroot-agent` reads it.
     fn internal_profile(paths: &InternalPaths) -> DaemonProfileSettings {
+        std::fs::create_dir_all(paths.dir()).expect("create the internal directory");
+        std::fs::write(paths.agent_config(), generated_config(paths)).expect("config");
         let settings =
             Settings::from_file(Some(paths.agent_config())).expect("the generated config parses");
         settings
@@ -2134,84 +2607,53 @@ mod renewal_guard {
             .expect("the generated config carries one profile")
     }
 
-    /// The ordinary case: the stored root is the active one, so the
-    /// guard is invisible and the loop renews as it always did.
+    /// The profile `init` renders is recognised, and the layout it is
+    /// recognised by is the one below the secrets directory its
+    /// certificate sits under.
     #[test]
-    fn a_current_root_lets_the_ordinary_loop_renew() {
-        let (root_pem, root_fp) = root_ca("current");
-        let (_dir, paths) = host(&root_pem, &root_fp);
-        check_renewal_allowed(&internal_profile(&paths)).expect("a matching root renews normally");
-    }
-
-    /// The window itself: the root moved and the fingerprint has not
-    /// caught up, so the refusal is the typed repair-required one and
-    /// it names the command that fixes it.
-    #[test]
-    fn a_stale_stored_root_refuses_with_repair_required() {
-        let (_old_pem, old_fp) = root_ca("old");
-        let (new_pem, new_fp) = root_ca("new");
-        let (_dir, paths) = host(&new_pem, &old_fp);
-
-        let err = check_renewal_allowed(&internal_profile(&paths))
-            .expect_err("a superseded root must refuse renewal");
-        match &err {
-            InternalCredentialError::RepairRequired { stored, active } => {
-                assert_eq!(stored, &old_fp);
-                assert_eq!(active, &new_fp);
-            }
-            other => panic!("expected repair-required, got {other:?}"),
-        }
-        assert!(
-            err.to_string()
-                .contains("bootroot rotate registrar-internal-credential")
+    fn the_generated_profile_is_recognised_at_the_fixed_layout() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        assert_eq!(
+            internal_profile_paths(&internal_profile(&paths)),
+            Some(paths)
         );
     }
 
-    /// An ordinary service profile is not guarded at all. It is not
-    /// bound to an `auth/cert` entry, and renewing it across a rotation
-    /// is exactly what the rotation wants — so the guard must not even
-    /// look for a credential beside it.
+    /// An ordinary service profile is not the internal one, even at the
+    /// internal paths: the label and the instance are part of what is
+    /// recognised.
     #[test]
-    fn an_ordinary_service_profile_is_not_guarded() {
-        let (new_pem, _new_fp) = root_ca("new");
-        let (_old_pem, old_fp) = root_ca("old");
-        let (_dir, paths) = host(&new_pem, &old_fp);
+    fn another_identity_at_the_fixed_layout_is_not_recognised() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
         let mut profile = internal_profile(&paths);
         profile.service_name = "edge-proxy".to_string();
-        check_renewal_allowed(&profile).expect("a service profile is never guarded");
         assert!(internal_profile_paths(&profile).is_none());
-    }
 
-    /// The staging profile a provisioning or a repair issues through
-    /// carries the internal identity but writes into
-    /// `registrar-internal/staging`. It must not be matched: a repair
-    /// issues its replacement leaf precisely when the stored root no
-    /// longer matches, so a guard that caught it there could never be
-    /// satisfied.
-    #[test]
-    fn the_staging_profile_a_repair_issues_through_is_not_guarded() {
-        let (new_pem, _new_fp) = root_ca("new");
-        let (_old_pem, old_fp) = root_ca("old");
-        let (_dir, paths) = host(&new_pem, &old_fp);
         let mut profile = internal_profile(&paths);
-        let staging = paths.dir().join("staging");
-        profile.paths.cert = staging.join("leaf.pem");
-        profile.paths.key = staging.join("key.pem");
+        profile.instance_id = "002".to_string();
         assert!(internal_profile_paths(&profile).is_none());
-        check_renewal_allowed(&profile).expect("the staging issuance is not the guarded one");
     }
 
-    /// Fail closed rather than open: a host whose active root cannot be
-    /// read refuses too, because "cannot tell" and "does not match" have
-    /// the same consequence for a leaf about to be reissued.
+    /// The same identity at other paths is an ordinary profile. What the
+    /// daemon must not replace is the leaf the `auth/cert` entry is
+    /// pinned to, and that leaf is at the fixed paths and nowhere else —
+    /// so a profile that writes elsewhere is issued for like any other.
     #[test]
-    fn an_unreadable_active_root_refuses_as_well() {
-        let (root_pem, root_fp) = root_ca("current");
-        let (dir, paths) = host(&root_pem, &root_fp);
-        std::fs::remove_file(dir.path().join("certs").join("root_ca.crt"))
-            .expect("remove the active root");
-        let err = check_renewal_allowed(&internal_profile(&paths))
-            .expect_err("an unreadable active root must refuse renewal");
-        assert!(matches!(err, InternalCredentialError::Io { .. }), "{err:?}");
+    fn the_internal_identity_at_other_paths_is_not_recognised() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+
+        let mut moved = internal_profile(&paths);
+        let elsewhere = dir.path().join("elsewhere");
+        moved.paths.cert = elsewhere.join("chain.pem");
+        moved.paths.key = elsewhere.join("key.pem");
+        assert!(internal_profile_paths(&moved).is_none());
+
+        // One path at the fixed layout is not both.
+        let mut half = internal_profile(&paths);
+        half.paths.key = elsewhere.join("key.pem");
+        assert!(internal_profile_paths(&half).is_none());
     }
 }

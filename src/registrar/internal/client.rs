@@ -1,6 +1,13 @@
 //! The bootroot-internal `OpenBao` client: certificate login, refresh
 //! before expiry, and the root-authority check every repair runs first.
 //!
+//! The `auth/cert` entry is pinned to the one leaf this credential
+//! holds, so the login succeeds for the holder of its private key and
+//! for nobody else: another leaf of the same CA carrying the same name
+//! is refused by `OpenBao`. Nothing renews that leaf unattended, so one
+//! whose validity has ended is refused here, by name and before any
+//! request, rather than left to surface as `OpenBao`'s refusal.
+//!
 //! Nothing here reads a `role_id` or a `secret_id`. The credential is
 //! the TLS client certificate, and the only login it performs is
 //! `auth/cert/login` over TLS. A plaintext `OpenBao` URL is refused
@@ -17,7 +24,7 @@ use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
 use crate::openbao::OpenBaoClient;
-use crate::registrar::internal::material::{InternalMaterial, load_material};
+use crate::registrar::internal::material::{InternalMaterial, leaf_not_after, load_material};
 use crate::registrar::internal::renewal::active_root_fingerprint_async;
 use crate::registrar::internal::{
     CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalCredentialError, InternalPaths,
@@ -37,6 +44,11 @@ const REFRESH_LEAD: time::Duration = time::Duration::seconds(60);
 /// immediate expiry would re-authenticate on every call, so it is read
 /// as "no scheduled refresh" instead.
 const NO_EXPIRY: u64 = 0;
+
+/// How long a credential built by [`InternalCredential::for_test`] is
+/// taken to be valid for.
+#[cfg(test)]
+const TEST_LEAF_VALIDITY: time::Duration = time::Duration::days(365);
 
 /// A cached login: the token and, when the backend gave it one, the
 /// moment it stops being usable.
@@ -93,9 +105,12 @@ pub struct RootAuthority(());
 /// built before that window is still in hand after the root has changed
 /// beneath it. Comparing the roots once, at construction, would leave
 /// that object logging in — or worse, writing under a still-valid
-/// cached token — against an `auth/cert` entry that no longer trusts its
-/// leaf. So the comparison is a precondition of *use*, not of
+/// cached token — with a leaf of a CA generation the deployment has
+/// left. So the comparison is a precondition of *use*, not of
 /// construction.
+///
+/// The leaf's own expiry is held to the same rule and for the same
+/// reason: the object outlives the moment it was built in.
 #[derive(Clone)]
 pub struct InternalCredential {
     base_url: String,
@@ -103,6 +118,9 @@ pub struct InternalCredential {
     login: Arc<Mutex<Option<CachedLogin>>>,
     root_fingerprint: String,
     secrets_dir: PathBuf,
+    /// The leaf's `notAfter`, kept so every use can refuse an expired
+    /// credential without re-reading the chain.
+    leaf_not_after: OffsetDateTime,
 }
 
 impl fmt::Debug for InternalCredential {
@@ -111,6 +129,7 @@ impl fmt::Debug for InternalCredential {
             .field("base_url", &self.base_url)
             .field("root_fingerprint", &self.root_fingerprint)
             .field("secrets_dir", &self.secrets_dir)
+            .field("leaf_not_after", &self.leaf_not_after)
             .finish_non_exhaustive()
     }
 }
@@ -120,10 +139,11 @@ impl InternalCredential {
     /// `secrets_dir` and builds the client-authenticated transport for
     /// it.
     ///
-    /// The three refusals happen in cost order, and each one is reached
-    /// before the work the next would do: a plaintext URL before the
-    /// credential is read, an absent or partial set before the root is
-    /// compared, and a superseded root before a transport is built.
+    /// The refusals happen in cost order, and each one is reached before
+    /// the work the next would do: a plaintext URL before the credential
+    /// is read, an absent or partial set before the root is compared,
+    /// and a superseded root or an expired leaf before a transport is
+    /// built.
     /// Performs no network request at all — the login happens on first
     /// use — so none of them costs a request either.
     ///
@@ -136,6 +156,8 @@ impl InternalCredential {
     /// fingerprint is not `active_root_fingerprint`. That comparison is
     /// a fail-fast, not the enduring one: every acquisition of the login
     /// re-reads the active root from `secrets_dir` and compares again.
+    /// Returns [`InternalCredentialError::Expired`] when the leaf's
+    /// `notAfter` has passed, which every acquisition checks again too.
     pub fn load(
         secrets_dir: &Path,
         openbao_url: &str,
@@ -145,6 +167,10 @@ impl InternalCredential {
         let paths = InternalPaths::new(secrets_dir);
         let material = load_material(&paths)?;
         compare_root(&material.root_fingerprint, active_root_fingerprint)?;
+        refuse_expired(
+            leaf_not_after(&paths.chain(), &material.chain)?,
+            OffsetDateTime::now_utc(),
+        )?;
         let bundle = std::fs::read_to_string(paths.ca_bundle()).map_err(|source| {
             InternalCredentialError::Io {
                 operation: "reading",
@@ -168,8 +194,10 @@ impl InternalCredential {
     /// # Errors
     ///
     /// Returns [`InternalCredentialError::PlaintextOpenBaoUrl`] for a
-    /// non-HTTPS URL, and [`InternalCredentialError::OpenBao`] when the
-    /// transport cannot be built from the supplied PEMs.
+    /// non-HTTPS URL, [`InternalCredentialError::Invalid`] when the
+    /// chain does not open with a certificate, and
+    /// [`InternalCredentialError::OpenBao`] when the transport cannot be
+    /// built from the supplied PEMs.
     pub fn from_parts(
         secrets_dir: &Path,
         openbao_url: &str,
@@ -186,12 +214,15 @@ impl InternalCredential {
             operation: "building the client-authenticated OpenBao transport",
             source,
         })?;
+        let leaf_not_after =
+            leaf_not_after(&InternalPaths::new(secrets_dir).chain(), &material.chain)?;
         Ok(Self {
             base_url: openbao_url.to_string(),
             client: OpenBaoClient::with_client(openbao_url, http),
             login: Arc::new(Mutex::new(None)),
             root_fingerprint: material.root_fingerprint.clone(),
             secrets_dir: secrets_dir.to_path_buf(),
+            leaf_not_after,
         })
     }
 
@@ -200,7 +231,10 @@ impl InternalCredential {
     /// The one construction that skips [`require_https`], so the login
     /// cache and the re-authentication rules can be driven against a
     /// plain-HTTP mock. Production has no path to it: the two public
-    /// constructors both go through the TLS refusal.
+    /// constructors both go through the TLS refusal. It holds no
+    /// certificate, so its leaf is taken to be valid for
+    /// [`TEST_LEAF_VALIDITY`] from now; [`Self::with_leaf_not_after`]
+    /// moves that.
     #[cfg(test)]
     pub(crate) fn for_test(
         openbao_url: &str,
@@ -213,7 +247,19 @@ impl InternalCredential {
             login: Arc::new(Mutex::new(None)),
             root_fingerprint: root_fingerprint.to_string(),
             secrets_dir: secrets_dir.to_path_buf(),
+            leaf_not_after: OffsetDateTime::now_utc() + TEST_LEAF_VALIDITY,
         })
+    }
+
+    /// Moves a test credential's `notAfter`, keeping its login cache.
+    ///
+    /// How a test reaches "built while the leaf was valid, used after it
+    /// expired" without waiting for a certificate to expire.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_leaf_not_after(mut self, not_after: OffsetDateTime) -> Self {
+        self.leaf_not_after = not_after;
+        self
     }
 
     /// The fingerprint of the root this credential was issued under.
@@ -223,15 +269,16 @@ impl InternalCredential {
     }
 
     /// Refuses to proceed when the root on disk is no longer the one
-    /// the `auth/cert` entry trusts.
+    /// this credential's leaf was signed under.
     ///
     /// Re-reads the deployment root from the fixed path below the
     /// state-recorded secrets directory rather than trusting a value
     /// captured earlier, because "earlier" is exactly when it was still
     /// right. Called *before* any login or write: a mismatched root
-    /// means the entry no longer trusts this leaf, so every one of those
-    /// would fail anyway, and attempting them would turn a clean
-    /// repair-required into a partial change.
+    /// means a full CA rotation is under way and this credential is the
+    /// previous generation's, which the rotation's tail is about to
+    /// replace together with its entry. Using it meanwhile would turn a
+    /// clean repair-required into a partial change.
     ///
     /// # Errors
     ///
@@ -251,16 +298,21 @@ impl InternalCredential {
     /// mismatch must stop a *cached* token being handed out just as
     /// firmly as it stops a fresh login, or the window between a root
     /// change and a lease expiry would be one in which verb writes
-    /// continue unchecked.
+    /// continue unchecked. The leaf's expiry is checked beside it and
+    /// ahead of the cache for the same reason: `OpenBao` enforces expiry
+    /// itself, and would answer a login with an opaque verification
+    /// failure where this names the command that replaces the leaf.
     ///
     /// # Errors
     ///
     /// Returns [`InternalCredentialError::RepairRequired`] when the
     /// active root is no longer the one this credential was issued
-    /// under, and [`InternalCredentialError::OpenBao`] when the
-    /// certificate login fails.
+    /// under, [`InternalCredentialError::Expired`] once the leaf's
+    /// `notAfter` has passed, and [`InternalCredentialError::OpenBao`]
+    /// when the certificate login fails.
     pub async fn authenticated(&self) -> Result<OpenBaoClient, InternalCredentialError> {
         self.check_active_root().await?;
+        refuse_expired(self.leaf_not_after, OffsetDateTime::now_utc())?;
         let mut guard = self.login.lock().await;
         let now = OffsetDateTime::now_utc();
         let fresh = match guard.as_ref() {
@@ -356,6 +408,20 @@ pub(crate) fn compare_root(stored: &str, active: &str) -> Result<(), InternalCre
         stored: stored.to_string(),
         active: active.to_ascii_lowercase(),
     })
+}
+
+/// Refuses a leaf whose `notAfter` is not after `now`.
+///
+/// A diagnostic and not a trust decision: `OpenBao` goes on enforcing
+/// expiry itself, and nothing is accepted here that it would refuse.
+pub(crate) fn refuse_expired(
+    not_after: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), InternalCredentialError> {
+    if now < not_after {
+        return Ok(());
+    }
+    Err(InternalCredentialError::Expired { not_after })
 }
 
 /// Refuses a non-HTTPS `OpenBao` URL.

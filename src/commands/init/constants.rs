@@ -80,6 +80,21 @@ pub(crate) const OPENBAO_TLS_CONTAINER_KEY_PATH: &str = "/openbao/config/tls/ser
 pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
 pub(crate) const OPENBAO_INFRA_CERT_KEY: &str = "openbao";
 pub(crate) const OPENBAO_TLS_DEFAULT_NOT_AFTER: &str = "8760h";
+/// The validity of the bootroot-internal registrar leaf: ten years, the
+/// lifetime of the root and intermediate certificates themselves.
+///
+/// Long, where the other offline-signed control-node certificates live
+/// one year, because nothing can renew this one unattended. The
+/// `auth/cert` entry is pinned to the leaf, so replacing the leaf means
+/// rewriting the entry, and whoever can write that path chooses the
+/// policies its tokens carry: only the `OpenBao` root token may. A
+/// shorter validity would need either a recurring root-token ceremony,
+/// with a stopped registrar as the price of missing one, or a timer
+/// holding a credential that can mint tokens. A leaf is always signed
+/// at or after the creation of the root it chains to, so at this
+/// validity it never expires before that root does — and the full CA
+/// rotation the root's expiry forces replaces the leaf in its tail.
+pub(crate) const REGISTRAR_INTERNAL_NOT_AFTER: &str = "87600h";
 pub(crate) const OPENBAO_TLS_DEFAULT_RENEW_BEFORE: &str = "720h";
 
 pub(crate) const HTTP01_ADMIN_INFRA_CERT_KEY: &str = "bootroot-http01";

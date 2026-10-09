@@ -4,6 +4,7 @@ pub mod http01_protocol;
 pub mod responder_client;
 pub(crate) mod types;
 
+pub use client::{create_account_key, is_account_key};
 // The selectable outbound path and its options belong to the registrar
 // surface issuance, which is inside this crate; only the ordinary
 // `issue_certificate` is reached from the binary crates. That issuance

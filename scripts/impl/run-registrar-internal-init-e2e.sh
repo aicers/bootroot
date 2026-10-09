@@ -10,19 +10,30 @@ set -euo pipefail
 # scenario covers the other half — the acceptance criterion that an
 # endpoint-enabled *loopback* host completes `init` with a
 # TLS-terminated `:8200`, an `https://` state URL, and a certificate
-# login that works — and it needs a whole deployment to do it: step-ca
-# has to sign the internal leaf through the ordinary outbound ACME path,
-# and the HTTP-01 responder has to answer the challenge for it.
+# login that works — and it needs a whole deployment to do it: `init`
+# signs the internal leaf offline with the intermediate key step-ca's
+# initialization created, pins the `auth/cert` entry to that one leaf,
+# and proves the login over the listener it has just moved to TLS.
+#
+# It is also where the pin is shown to close what it is for.  step-ca
+# and the HTTP-01 responder are both up, and both will still issue a
+# certificate for the internal name to anyone holding the deployment's
+# responder HMAC and EAB.  The scenario orders exactly such a
+# certificate and asserts that OpenBao refuses it — and that the same
+# certificate *is* accepted once the entry is put back in the shape it
+# had before it was pinned, which is what the migration then ends.
 #
 # Three things here are only observable end to end, and each one is a
 # way this could be wrong while every unit test passed:
 #
 #   - step-ca resolves an HTTP-01 identifier through the responder's
-#     Docker network aliases.  The internal identity has no
-#     `ServiceEntry`, so it is not in the set `service add` maintains,
-#     and without an alias of its own the challenge cannot resolve at
-#     all.
-#   - `init` issues the internal leaf through this install's *own*
+#     Docker network aliases.  The registrar's identities have no
+#     `ServiceEntry`, so they are not in the set `service add`
+#     maintains, and without aliases of their own a challenge for one
+#     cannot resolve at all.  No bootroot issuance orders the internal
+#     name any more; the forgery phase does, which is how its alias is
+#     still exercised.
+#   - the published internal config names this install's *own*
 #     published step-ca and responder ports.  On the compose defaults a
 #     hard-coded `:9000`/`:8080` is indistinguishable from a derived
 #     one; on moved ports it reaches nothing, and on a host that already
@@ -131,7 +142,7 @@ INTERNAL_ENTRY="bootroot-registrar-internal"
 BIND_MODE="${BIND_MODE:-loopback}"
 BIND_HOST="${BIND_HOST:-172.17.0.1}"
 # Where this host reaches step-ca and the responder admin API, which is
-# where `init` issues the internal leaf through.  Set with the ports.
+# what the published internal config names.  Set with the ports.
 STEPCA_CLIENT_BASE=""
 RESPONDER_CLIENT_URL=""
 
@@ -1906,30 +1917,55 @@ PY
   assert_equal "the issued leaf carries exactly the fixed internal SAN" "$INTERNAL_SAN" "$san"
 }
 
-# The criterion this scenario exists for: the credential `init` just
-# published authenticates at `auth/cert` over the URL `init` just
-# recorded.  Presented as a PEM client certificate through python3's
-# `ssl`, which every platform this runs on supports.
-assert_certificate_login_succeeds() {
-  local out
-  out="$(sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR" "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
+# Presents the certificate at `cert`, with the key at `key`, to
+# `auth/cert/login` and prints one line of JSON saying what came back:
+# the HTTP status, whether a token was returned, and its policies.
+#
+# Through python3's `ssl`, which takes a PEM pair directly on every
+# platform this runs on, and elevated because the legitimate pair and
+# the bundle that verifies the listener are root's.  A certificate the
+# listener turned away during the handshake is reported as status 0
+# rather than raised: it was refused just as surely as one the login
+# endpoint answered, and the caller asserts on the outcome either way.
+certificate_login() {
+  local cert="$1" key="$2"
+  sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR/ca-bundle.pem" "$cert" "$key" \
+    "localhost" "$PORT_OPENBAO" "$INTERNAL_ENTRY" <<'PY'
 import http.client, json, ssl, sys
-cred, host, port, entry = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-context = ssl.create_default_context(cafile=f"{cred}/ca-bundle.pem")
-context.load_cert_chain(certfile=f"{cred}/chain.pem", keyfile=f"{cred}/key.pem")
-conn = http.client.HTTPSConnection(host, port, context=context, timeout=15)
-conn.request("POST", "/v1/auth/cert/login", json.dumps({"name": entry}),
-             {"Content-Type": "application/json"})
-response = conn.getresponse()
-body = json.loads(response.read())
+bundle, cert, key, host, port, entry = sys.argv[1:7]
+context = ssl.create_default_context(cafile=bundle)
+context.load_cert_chain(certfile=cert, keyfile=key)
+conn = http.client.HTTPSConnection(host, int(port), context=context, timeout=15)
+try:
+    conn.request("POST", "/v1/auth/cert/login", json.dumps({"name": entry}),
+                 {"Content-Type": "application/json"})
+    response = conn.getresponse()
+    status, raw = response.status, response.read()
+except (ssl.SSLError, OSError) as err:
+    print(json.dumps({"status": 0, "has_token": False, "policies": [],
+                      "errors": [f"transport: {err}"]}))
+    sys.exit(0)
+try:
+    body = json.loads(raw)
+except ValueError:
+    body = {}
 auth = body.get("auth") or {}
 print(json.dumps({
-    "status": response.status,
+    "status": status,
     "has_token": bool(auth.get("client_token")),
     "policies": sorted(auth.get("token_policies") or auth.get("policies") or []),
+    "errors": body.get("errors") or [],
 }))
 PY
-  )" || fail "the certificate login raised; see the traceback above"
+}
+
+# The criterion this scenario exists for: the credential `init` just
+# published authenticates at `auth/cert` over the URL `init` just
+# recorded.
+assert_certificate_login_succeeds() {
+  local out
+  out="$(certificate_login "$INTERNAL_DIR/chain.pem" "$INTERNAL_DIR/key.pem")" ||
+    fail "the certificate login raised; see the traceback above"
   assert_equal "the certificate login is accepted" "200" "$(jq -r .status <<<"$out")"
   assert_equal "the login returns a token" "true" "$(jq -r .has_token <<<"$out")"
   # `token_no_default_policy` is what makes the allowlist the whole
@@ -2098,6 +2134,285 @@ assert_eab_clear_rotation_rewrites_the_internal_config() {
   assert_equal "the rewritten internal config is still root-owned at 0600" \
     "0:0:600" "$(file_owner_mode "$config")"
   assert_internal_daemon_standin_was_signalled "rotate eab-clear"
+}
+
+# ---------------------------------------------------------------------------
+# The pinned entry, and what it refuses
+# ---------------------------------------------------------------------------
+#
+# The `auth/cert` entry names one certificate: the leaf `init` signed
+# offline.  Every service host holds the deployment's responder HMAC
+# (and EAB, where there is one), and with those anyone who can reach
+# step-ca can have a certificate issued for the internal name.  Under an
+# entry that trusted the root CA that certificate logged in as the
+# registrar's internal identity.  The three phases below show the entry
+# is pinned, that such a certificate is refused, and that an entry still
+# in the earlier shape is migrated by the one operator command.
+
+# One line of JSON describing the entry's `certificate` against the
+# published leaf: how many certificates the entry holds, whether the
+# first is the leaf byte for byte in DER, who issued the leaf, how long
+# it has left and what it is named.
+#
+# `issuer_pem` is the CA certificate the leaf is expected to have been
+# issued by.  Elevated because `chain.pem` is root's.
+internal_pin_report() {
+  local entry_certificate="$1" issuer_pem="$2"
+  sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR/chain.pem" "$issuer_pem" "$entry_certificate" <<'PY'
+import hashlib, json, re, ssl, sys, tempfile, time
+chain_path, issuer_path, entry_pem = sys.argv[1:4]
+BLOCK = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+def decode(pem):
+    with tempfile.NamedTemporaryFile("w", suffix=".pem") as handle:
+        handle.write(pem + "\n")
+        handle.flush()
+        return ssl._ssl._test_decode_cert(handle.name)
+
+chain = BLOCK.findall(open(chain_path).read())
+entry = BLOCK.findall(entry_pem)
+leaf_der = ssl.PEM_cert_to_DER_cert(chain[0])
+leaf = decode(chain[0])
+issuer = decode(BLOCK.findall(open(issuer_path).read())[0])
+names = leaf.get("subjectAltName", ())
+print(json.dumps({
+    "entry_certificates": len(entry),
+    "entry_is_leaf": bool(entry) and ssl.PEM_cert_to_DER_cert(entry[0]) == leaf_der,
+    "issued_by": leaf["issuer"] == issuer["subject"],
+    "days_left": int((ssl.cert_time_to_seconds(leaf["notAfter"]) - time.time()) // 86400),
+    "sans": ",".join(f"{kind}:{value}" for kind, value in names),
+    "leaf_sha256": hashlib.sha256(leaf_der).hexdigest(),
+}))
+PY
+}
+
+# The entry's `certificate`, read with the root token.
+internal_entry_certificate() {
+  openbao_api GET "auth/cert/certs/${INTERNAL_ENTRY}" | jq -r '.data.certificate // empty'
+}
+
+# Asserts the entry is pinned to the published leaf and to nothing else.
+assert_entry_is_pinned_to_the_published_leaf() {
+  local label="$1" certificate report
+  certificate="$(internal_entry_certificate)"
+  [ -n "$certificate" ] || fail "${label}: the auth/cert entry carries no certificate"
+  report="$(internal_pin_report "$certificate" "$SECRETS_DIR/certs/intermediate_ca.crt")" ||
+    fail "${label}: could not compare the entry with the published leaf"
+  assert_equal "${label}: the entry's certificate is one certificate" \
+    "1" "$(jq -r .entry_certificates <<<"$report")"
+  assert_equal "${label}: the entry's certificate is the published leaf, byte for byte in DER" \
+    "true" "$(jq -r .entry_is_leaf <<<"$report")"
+}
+
+assert_the_entry_is_pinned_to_the_offline_leaf() {
+  local certificate report
+  assert_entry_is_pinned_to_the_published_leaf "after init"
+
+  certificate="$(internal_entry_certificate)"
+  report="$(internal_pin_report "$certificate" "$SECRETS_DIR/certs/intermediate_ca.crt")" ||
+    fail "could not read the published leaf"
+  assert_equal "the leaf's issuer is the deployment intermediate" \
+    "true" "$(jq -r .issued_by <<<"$report")"
+  # Ten years, the lifetime of the CA certificates: nothing renews this
+  # leaf unattended, so a 24-hour ACME lifetime here would mean it was
+  # not signed offline at all.
+  assert_at_least "the leaf's notAfter is more than nine years away, in days" \
+    "$((9 * 365 + 1))" "$(jq -r .days_left <<<"$report")"
+  assert_equal "the leaf's only subject alternative name is the internal name" \
+    "DNS:${INTERNAL_SAN}" "$(jq -r .sans <<<"$report")"
+}
+
+# Asserts a login with `cert`/`key` is refused, with no token returned.
+assert_certificate_login_is_refused() {
+  local what="$1" cert="$2" key="$3" out
+  out="$(certificate_login "$cert" "$key")" || fail "${what}: the login attempt raised"
+  [ "$(jq -r .has_token <<<"$out")" = "false" ] ||
+    fail "${what}: the login returned a token"
+  [ "$(jq -r .status <<<"$out")" != "200" ] ||
+    fail "${what}: the login was accepted"
+  pass "${what} is refused with no token ($(jq -c '{status, errors}' <<<"$out"))"
+}
+
+# Where the forged material lives: a directory of this run's own under
+# `WORK_DIR`, never under `ARTIFACT_DIR`.  CI uploads the artifact
+# directory, and the config derived below carries the responder HMAC.
+FORGE_DIR=""
+
+# Obtains a certificate for the internal SAN through step-ca's ACME
+# endpoint, the way a holder of the responder HMAC and the EAB would.
+#
+# The config is derived from the internal one, which holds exactly what
+# such a holder has: the ACME directory, the responder URL and HMAC, the
+# EAB if there is one, and the trust pins.  The `[registrar]` and
+# `[registrar_endpoint]` tables are dropped, and the certificate, key,
+# account key and CA bundle paths are moved into this run's own
+# directory.  The moved paths are what make this an ordinary profile to
+# `bootroot-agent`, so it issues: at the internal layout it would start
+# no issuance at all.  It runs as the invoking user, with no privilege
+# on this host — which is the point.
+forge_internal_certificate() {
+  local agent_bin log="$ARTIFACT_DIR/acme-forgery.log" san
+  agent_bin="$(dirname "$BOOTROOT_BIN")/bootroot-agent"
+  [ -x "$agent_bin" ] ||
+    fail "bootroot-agent is not built beside ${BOOTROOT_BIN}; build it with \
+'cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent'"
+
+  FORGE_DIR="$WORK_DIR/acme-forgery"
+  (umask 077 && mkdir -p "$FORGE_DIR") || fail "could not create $FORGE_DIR"
+  # The published bundle sits in a root-only directory, and the agent
+  # rewrites the one it is pointed at, so it gets a copy.
+  # shellcheck disable=SC2024 # the redirect is the invoking user's own file
+  (umask 077 && sudo -n cat "$INTERNAL_DIR/ca-bundle.pem" >"$FORGE_DIR/ca-bundle.pem") ||
+    fail "could not copy the private CA bundle"
+  # shellcheck disable=SC2024 # the redirect is the invoking user's own file
+  (umask 077 && sudo -n "$PYTHON_BIN" - "$INTERNAL_DIR/agent.toml" "$FORGE_DIR" \
+    >"$FORGE_DIR/agent.toml" <<'PY'
+import json, re, sys
+source, forge = sys.argv[1:3]
+moved = {
+    ("profiles.paths", "cert"): f"{forge}/cert.pem",
+    ("profiles.paths", "key"): f"{forge}/key.pem",
+    ("acme", "account_key_path"): f"{forge}/acme-account.json",
+    ("trust", "ca_bundle_path"): f"{forge}/ca-bundle.pem",
+}
+dropped = ("registrar", "registrar_endpoint")
+section, seen, out = "", set(), []
+for line in open(source).read().splitlines():
+    header = re.fullmatch(r"\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*", line)
+    if header:
+        section = header.group(1)
+    if section in dropped or section.startswith(tuple(f"{name}." for name in dropped)):
+        continue
+    key = re.match(r"\s*([A-Za-z0-9_]+)\s*=", line)
+    if key and (section, key.group(1)) in moved:
+        seen.add((section, key.group(1)))
+        out.append(f"{key.group(1)} = {json.dumps(moved[(section, key.group(1))])}")
+        continue
+    out.append(line)
+missing = sorted(set(moved) - seen)
+if missing:
+    sys.exit(f"the internal config has no {missing}")
+print("\n".join(out))
+PY
+  ) || fail "could not derive the forgery config from $INTERNAL_DIR/agent.toml"
+
+  if ! (cd "$FORGE_DIR" && "$agent_bin" --config "$FORGE_DIR/agent.toml" --oneshot) \
+    >"$log" 2>&1; then
+    {
+      echo "the ACME issuance for the internal SAN failed (tail):"
+      tail -n 120 "$log" || true
+    } >>"$RUN_LOG"
+    fail "bootroot-agent --oneshot could not obtain a certificate for the internal SAN; \
+see $log"
+  fi
+  [ -s "$FORGE_DIR/cert.pem" ] && [ -s "$FORGE_DIR/key.pem" ] ||
+    fail "bootroot-agent --oneshot exited 0 without writing a certificate and key"
+  pass "step-ca issued a certificate through ACME to a holder of the responder HMAC"
+
+  san="$("$PYTHON_BIN" - "$FORGE_DIR/cert.pem" <<'PY'
+import ssl, sys
+names = ssl._ssl._test_decode_cert(sys.argv[1]).get("subjectAltName", ())
+print(",".join(f"{kind}:{value}" for kind, value in names))
+PY
+  )" || fail "could not read the ACME-issued certificate"
+  # The positive control: the forgery itself still works, so what
+  # follows is OpenBao refusing a certificate that really was issued.
+  assert_equal "the ACME-issued certificate is for the internal name" \
+    "DNS:${INTERNAL_SAN}" "$san"
+
+  # The agent writes an ordinary leaf alone.  A client presents its
+  # issuer with it, as the legitimate credential does, so that an entry
+  # trusting the root can build the chain.
+  (umask 077 && {
+    cat "$FORGE_DIR/cert.pem"
+    sudo -n cat "$SECRETS_DIR/certs/intermediate_ca.crt"
+  } >"$FORGE_DIR/chain.pem") || fail "could not assemble the forged chain"
+}
+
+assert_an_acme_issued_certificate_is_refused() {
+  forge_internal_certificate
+  assert_certificate_login_is_refused \
+    "a certificate step-ca issued for the internal name" \
+    "$FORGE_DIR/chain.pem" "$FORGE_DIR/key.pem"
+  # Refusing everything would pass the line above too.
+  assert_certificate_login_succeeds
+}
+
+# Puts the entry back in the shape it had before it was pinned: the
+# deployment root CA as `certificate`, every other field as read back.
+write_the_entry_in_the_old_shape() {
+  local entry root_pem body response
+  entry="$(openbao_api GET "auth/cert/certs/${INTERNAL_ENTRY}")" ||
+    fail "could not read the auth/cert entry"
+  root_pem="$(sudo -n cat "$SECRETS_DIR/certs/root_ca.crt")" ||
+    fail "could not read the deployment root CA"
+  body="$(jq -c --arg certificate "$root_pem" '.data | .certificate = $certificate' <<<"$entry")" ||
+    fail "the auth/cert entry did not read back as an object"
+  response="$(openbao_api POST "auth/cert/certs/${INTERNAL_ENTRY}" "$body")" ||
+    fail "could not overwrite the auth/cert entry"
+  if [ -n "$response" ] && jq -e '(.errors // []) | length > 0' <<<"$response" >/dev/null; then
+    fail "OpenBao refused the old-shape entry: $(jq -c .errors <<<"$response")"
+  fi
+  assert_equal "the entry now trusts the root CA, as it did before it was pinned" \
+    "$(printf '%s' "$root_pem" | tr -d '[:space:]')" \
+    "$(internal_entry_certificate | tr -d '[:space:]')"
+}
+
+# An installation initialised before the entry was pinned trusts the
+# root CA.  The one operator command migrates it, without `--force`:
+# it finds the entry is not the published leaf and replaces both.
+assert_the_old_shape_is_migrated_by_the_rotation() {
+  local kept="$WORK_DIR/previous-internal" before after out log
+
+  # The legitimate pair as it is now, kept to show it stops working.
+  sudo -n install -d -m 0700 "$kept" || fail "could not create $kept"
+  sudo -n cp "$INTERNAL_DIR/chain.pem" "$INTERNAL_DIR/key.pem" "$kept/" ||
+    fail "could not keep a copy of the current credential"
+  before="$(file_digest "$INTERNAL_DIR/chain.pem")" || fail "could not read the chain"
+
+  write_the_entry_in_the_old_shape
+
+  # The behaviour before the change, reproduced: under an entry that
+  # trusts the root, the ACME-issued certificate logs in as the
+  # registrar's internal identity.
+  out="$(certificate_login "$FORGE_DIR/chain.pem" "$FORGE_DIR/key.pem")" ||
+    fail "the forged login raised"
+  assert_equal "under the old-shape entry the ACME-issued certificate is accepted" \
+    "200 true" "$(jq -r '"\(.status) \(.has_token)"' <<<"$out")"
+  assert_equal "and receives the internal policy" \
+    "[\"${INTERNAL_ENTRY}\"]" "$(jq -c .policies <<<"$out")"
+
+  start_internal_daemon_standin
+  run_rotate_as_root registrar-internal-credential registrar-internal-credential
+  log="$ARTIFACT_DIR/rotate-registrar-internal-credential.log"
+  if grep -q "nothing to repair" "$log"; then
+    fail "the rotation reported an old-shape entry as up to date"
+  fi
+  pass "rotate registrar-internal-credential acted without --force on the old-shape entry"
+
+  assert_entry_is_pinned_to_the_published_leaf "after the migration"
+  after="$(file_digest "$INTERNAL_DIR/chain.pem")" || fail "could not read the chain"
+  [ "$before" != "$after" ] || fail "the migration did not replace the published leaf"
+  pass "the migration published a new leaf"
+  assert_certificate_login_succeeds
+  assert_certificate_login_is_refused \
+    "after the migration, the ACME-issued certificate" \
+    "$FORGE_DIR/chain.pem" "$FORGE_DIR/key.pem"
+  assert_certificate_login_is_refused \
+    "after the migration, the previous legitimate leaf" \
+    "$kept/chain.pem" "$kept/key.pem"
+  assert_internal_daemon_standin_was_signalled "rotate registrar-internal-credential"
+  assert_material_is_complete_and_restrictive
+
+  # Idempotent: a second run finds nothing to do and changes nothing.
+  log="$ARTIFACT_DIR/rotate-registrar-internal-credential-again.log"
+  run_rotate_as_root registrar-internal-credential-again registrar-internal-credential
+  grep -q "nothing to repair" "$log" ||
+    fail "a second rotation did not report the credential up to date; see $log"
+  pass "a second rotation reports the credential up to date"
+  assert_equal "a second rotation leaves the published leaf as it was" \
+    "$after" "$(file_digest "$INTERNAL_DIR/chain.pem")"
+  assert_entry_is_pinned_to_the_published_leaf "after the second rotation"
 }
 
 # Everything the OpenBao Agent sidecars open still belongs to the tree
@@ -3144,11 +3459,28 @@ main() {
   assert_certificate_login_succeeds
   assert_login_without_the_certificate_is_refused
 
+  # The entry names the one leaf `init` signed offline.
+  log_phase "assert-internal-pin"
+  assert_the_entry_is_pinned_to_the_offline_leaf
+
+  # A certificate for the same name, really issued by step-ca to a
+  # holder of the responder HMAC, is refused.
+  log_phase "assert-acme-forgery-refused"
+  assert_an_acme_issued_certificate_is_refused
+
+  # An entry in the shape it had before it was pinned accepts that
+  # certificate, and the one operator command ends that.
+  log_phase "assert-old-shape-migration"
+  assert_the_old_shape_is_migrated_by_the_rotation
+
   # Both rotations reach the endpoint daemon's config, which polls
   # nothing: each rewrites its one key there and reloads the daemon.
   log_phase "assert-internal-config-rotations"
   assert_responder_hmac_rotation_rewrites_the_internal_config
   assert_eab_clear_rotation_rewrites_the_internal_config
+  # Both rewrote the internal config in place; the credential beside it
+  # still logs in.
+  assert_certificate_login_succeeds
 
   # Last, because it re-runs the two ownership assertions against a
   # deployment a later command has passed over: the protected five must

@@ -32,6 +32,65 @@ const EC_P256_COORD_LEN: usize = 32;
 /// JSON field the persisted ACME account key is stored under.
 const ACCOUNT_KEY_FIELD: &str = "account_key_pkcs8";
 
+/// Decodes the PKCS#8 key out of a persisted ACME account key's
+/// contents.
+///
+/// `None` for anything that is not the JSON object this module writes,
+/// with the key under [`ACCOUNT_KEY_FIELD`] in standard base64. Never
+/// quotes the contents.
+fn decode_account_key(contents: &str) -> Option<Vec<u8>> {
+    let parsed: serde_json::Value = serde_json::from_str(contents).ok()?;
+    let encoded = parsed.get(ACCOUNT_KEY_FIELD)?.as_str()?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+}
+
+/// Reports whether `contents` is a persisted ACME account key in the
+/// form this module writes and reads back.
+///
+/// The check a caller carrying an existing account key into a new set
+/// makes before it does: a file that would be refused at the next order
+/// is one to replace, not to keep.
+#[must_use]
+pub fn is_account_key(contents: &str) -> bool {
+    decode_account_key(contents).is_some()
+}
+
+/// Generates a fresh ACME account key and returns it in its persisted
+/// form.
+///
+/// Returns the file contents with the key's PKCS#8 bytes, so the one
+/// routine that knows the format serves both the client that creates its
+/// own key on first use and a provisioning step that stages one ahead
+/// of it. Nothing is registered with the CA here: an account is
+/// registered by the first order placed under the key.
+///
+/// # Errors
+///
+/// Returns an error if the key cannot be generated or serialized.
+fn generate_account_key(rng: &SystemRandom) -> Result<(String, Vec<u8>)> {
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng)
+        .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
+    let payload = serde_json::to_string_pretty(&serde_json::json!({
+        ACCOUNT_KEY_FIELD: base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref()),
+    }))
+    .context("serializing the ACME account key")?;
+    Ok((payload, pkcs8.as_ref().to_vec()))
+}
+
+/// Creates a new persistent ACME account key, in the form
+/// `account_key_path` holds.
+///
+/// The contents are a secret: write them at `0600` and nowhere else.
+///
+/// # Errors
+///
+/// Returns an error if the key cannot be generated or serialized.
+pub fn create_account_key() -> Result<String> {
+    generate_account_key(&SystemRandom::new()).map(|(contents, _)| contents)
+}
+
 /// Loads the persistent ACME account key at `path`, creating it once if
 /// it is not there yet.
 ///
@@ -65,12 +124,7 @@ fn load_or_create_account_key(path: &std::path::Path, rng: &SystemRandom) -> Res
             .with_context(|| format!("decoding the ACME account key at {}", path.display()));
     }
 
-    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng)
-        .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?;
-    let payload = serde_json::to_vec_pretty(&serde_json::json!({
-        ACCOUNT_KEY_FIELD: base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref()),
-    }))
-    .context("serializing the ACME account key")?;
+    let (payload, pkcs8) = generate_account_key(rng)?;
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -79,11 +133,11 @@ fn load_or_create_account_key(path: &std::path::Path, rng: &SystemRandom) -> Res
     }
     crate::fs_util::atomic_write_blocking(
         crate::fs_util::Destination::bootroot_owned(path),
-        &payload,
+        payload.as_bytes(),
         crate::fs_util::StagedMode::Policy(crate::fs_util::KEY_FILE_MODE),
     )
     .with_context(|| format!("writing the ACME account key at {}", path.display()))?;
-    Ok(pkcs8.as_ref().to_vec())
+    Ok(pkcs8)
 }
 
 #[derive(Debug, Deserialize, Clone)]

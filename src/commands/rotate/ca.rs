@@ -257,11 +257,12 @@ pub(super) async fn rotate_ca_key(
         restart_infra_openbao_agents(ctx, messages);
 
         // The bootroot-internal credential's private trust moves with
-        // the fleet's, and only in a full rotation: the `auth/cert`
-        // entry trusts the *root*, which an intermediate-only rotation
-        // does not replace, so nothing internal changes there. The
-        // bundle and the config's pins take exactly the additive set
-        // published to KV above.
+        // the fleet's, and only in a full rotation. The `auth/cert`
+        // entry is pinned to the internal leaf itself, which it goes on
+        // accepting under a new intermediate, and an intermediate-only
+        // rotation does not replace the root either, so nothing
+        // internal changes there. The bundle and the config's pins take
+        // exactly the additive set published to KV above.
         //
         // Written, not published: the internal agent is deliberately
         // not reloaded here. Phase 2a already put the new root on disk,
