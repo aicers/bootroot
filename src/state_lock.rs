@@ -15,11 +15,12 @@
 //!
 //! An exclusive `flock(2)` on `<resolved state file>.lock`, the design
 //! of [`bootroot::publication_lock`]: the file is a name to lock and
-//! never a record, it is created `0600`, nothing is written to it, it
-//! is never removed, and the kernel releases the lock as the descriptor
-//! closes — on drop, on every error path, and when the holder is
-//! killed. A lock file left behind by a dead process therefore blocks
-//! nobody.
+//! never a record, it is created `0600`, nothing is written to it, and
+//! it is never removed. The guard unlocks on drop — on every error path
+//! too — so that a copy of the descriptor in a child another thread has
+//! forked and not yet `exec`ed cannot keep the lock held, and the kernel
+//! still releases it when the holder is killed without running `drop`.
+//! A lock file left behind by a dead process therefore blocks nobody.
 //!
 //! # Who takes it
 //!
@@ -60,15 +61,26 @@ const LOCK_FILE_SUFFIX: &str = ".lock";
 const LOCK_FILE_MODE: u32 = 0o600;
 
 /// Exclusive access to one state file's load-to-save interval, released
-/// when it is dropped.
+/// when it is dropped: the guard unlocks the file before closing it.
 #[derive(Debug)]
 pub(crate) struct StateLock {
-    /// The open lock file. `flock(2)` is released as the descriptor
-    /// closes, so holding this open is holding the lock; nothing ever
-    /// reads or writes it. The descriptor is close-on-exec, the
-    /// standard library's default, so a child such as `docker` never
-    /// inherits the lock.
-    _file: File,
+    /// The open lock file, holding the `flock(2)`; nothing ever reads or
+    /// writes it. Unlocked on drop, and released by the kernel if the
+    /// holder dies first. The descriptor is close-on-exec, the standard
+    /// library's default, so a child such as `docker` never inherits the
+    /// lock.
+    file: File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // `flock` belongs to the open file description, which a child
+        // forked by another thread shares until its `exec`; closing our
+        // descriptor alone would leave the lock held through that copy.
+        // An error is discarded: the descriptor closes next, and the
+        // kernel releases the lock once no copy remains.
+        let _ = self.file.unlock();
+    }
 }
 
 impl StateLock {
@@ -188,7 +200,7 @@ fn acquire_with(state_path: &Path, on_wait: impl FnOnce(&Path)) -> Result<StateL
     let lock_path = lock_path_for(state_path)?;
     let file = open_lock_file(&lock_path)?;
     match file.try_lock() {
-        Ok(()) => return Ok(StateLock { _file: file }),
+        Ok(()) => return Ok(StateLock { file }),
         Err(TryLockError::WouldBlock) => {}
         Err(TryLockError::Error(err)) => {
             return Err(anyhow::Error::new(err)
@@ -198,7 +210,7 @@ fn acquire_with(state_path: &Path, on_wait: impl FnOnce(&Path)) -> Result<StateL
     on_wait(&lock_path);
     file.lock()
         .with_context(|| format!("waiting for the state lock {}", lock_path.display()))?;
-    Ok(StateLock { _file: file })
+    Ok(StateLock { file })
 }
 
 /// Answers whether another descriptor holds the state lock for
@@ -215,7 +227,25 @@ pub(crate) fn is_held(state_path: &Path) -> bool {
     let Ok(file) = OpenOptions::new().read(true).open(&lock_path) else {
         return false;
     };
-    matches!(file.try_lock(), Err(TryLockError::WouldBlock))
+    probe_is_held(&file)
+}
+
+/// Answers whether another descriptor holds a `flock` on `file`, giving
+/// back with `unlock` a lock the probe itself took.
+///
+/// Unlocked rather than left to the descriptor closing, so that a child
+/// another test thread forks in between cannot carry the probe's lock
+/// into the next step of the test.
+#[cfg(test)]
+fn probe_is_held(file: &File) -> bool {
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
 }
 
 /// Takes the state lock for `state_path` in a test.
@@ -506,9 +536,28 @@ mod tests {
         hold_for_test(&theirs);
     }
 
+    /// A copy of the guard's descriptor — what a child forked by another
+    /// thread holds until its `exec` — does not keep the lock held once
+    /// the guard is dropped.
+    #[test]
+    fn a_descriptor_copy_does_not_keep_a_dropped_lock_held() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join(STATE_FILE);
+        let held = hold_for_test(&state_path);
+        let copy = held.file.try_clone().unwrap();
+
+        drop(held);
+
+        assert!(
+            !is_held(&state_path),
+            "dropping the guard releases the lock despite the copy"
+        );
+        drop(copy);
+    }
+
     /// Whether some descriptor holds a `flock` on exactly `path`.
     fn is_held_at(path: &Path) -> bool {
         let file = OpenOptions::new().read(true).open(path).unwrap();
-        matches!(file.try_lock(), Err(TryLockError::WouldBlock))
+        probe_is_held(&file)
     }
 }
