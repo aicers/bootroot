@@ -370,6 +370,11 @@ pub(crate) struct Strings {
     pub(crate) error_self_mint_verify_failed: &'static str,
     pub(crate) error_rotate_bound_cidrs_requires_provisioning: &'static str,
     pub(crate) error_clear_rotate_bound_cidrs_requires_provisioning: &'static str,
+    pub(crate) error_if_due_invalid_duration: &'static str,
+    pub(crate) error_if_due_out_of_range: &'static str,
+    pub(crate) error_if_due_requires_file_auth: &'static str,
+    pub(crate) error_if_due_backing_off: &'static str,
+    pub(crate) error_if_due_budget_spent: &'static str,
     pub(crate) error_rotate_bound_cidrs_invalid: &'static str,
     pub(crate) rotate_summary_openbao_recovery_targets: &'static str,
     pub(crate) rotate_summary_openbao_recovery_output: &'static str,
@@ -842,6 +847,43 @@ mod tests {
                     !text.contains("bootroot-openbao") && !text.contains("bootroot-http01"),
                     "{locale}: message still hard-codes a default container name: {text}"
                 );
+                assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
+            }
+        }
+    }
+
+    /// The `--if-due` refusals name the target, the counts and the
+    /// instant they are about, and the budget refusal states both ways
+    /// back, in both locales.
+    #[test]
+    fn if_due_refusals_render_their_values_in_both_locales() {
+        for locale in ["en", "ko"] {
+            let m = Messages::new(locale).unwrap();
+            let backing_off =
+                m.error_if_due_backing_off("infra_stepca", 1, 2, "2026-10-10T05:45:00Z");
+            let spent = m.error_if_due_budget_spent("all_services", 4, 4);
+            let invalid = m.error_if_due_invalid_duration("soon");
+            let range = m.error_if_due_out_of_range("13h", "12h");
+            for value in ["infra_stepca", "1", "2", "2026-10-10T05:45:00Z"] {
+                assert!(backing_off.contains(value), "{locale}: {backing_off}");
+            }
+            assert!(
+                spent.contains("all_services") && spent.contains('4'),
+                "{locale}: {spent}"
+            );
+            assert!(spent.contains("--if-due"), "{locale}: {spent}");
+            assert!(invalid.contains("soon"), "{locale}: {invalid}");
+            assert!(
+                range.contains("13h") && range.contains("12h"),
+                "{locale}: {range}"
+            );
+            for text in [
+                backing_off.as_str(),
+                spent.as_str(),
+                invalid.as_str(),
+                range.as_str(),
+                m.error_if_due_requires_file_auth(),
+            ] {
                 assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
             }
         }

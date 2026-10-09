@@ -186,6 +186,37 @@ pub enum KvCreateIfAbsent {
     AlreadyExists,
 }
 
+/// A failed `AppRole` login
+/// ([`OpenBaoClient::login_approle_with_status`]), with the HTTP status
+/// of `OpenBao`'s answer when one arrived.
+///
+/// The error is exactly the one [`OpenBaoClient::login_approle`]
+/// returns for the same failure; the status is carried beside it as a
+/// value so a caller can tell a login that never reached the server
+/// from one the server answered without parsing a message.
+#[derive(Debug)]
+pub struct AppRoleLoginError {
+    status: Option<u16>,
+    error: anyhow::Error,
+}
+
+impl AppRoleLoginError {
+    /// Returns the HTTP status of the login response, or `None` when the
+    /// request produced no response at all (connection refused, name
+    /// resolution, TLS, timeout).
+    #[must_use]
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// Returns the error [`OpenBaoClient::login_approle`] reports for
+    /// this failure.
+    #[must_use]
+    pub fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
 /// Versioned KV v2 read result.
 #[derive(Debug, Clone)]
 pub struct KvReadWithVersion {
@@ -902,6 +933,25 @@ impl OpenBaoClient {
     /// # Errors
     /// Returns an error if the login request fails.
     pub async fn login_approle(&self, role_id: &str, secret_id: &str) -> Result<String> {
+        self.login_approle_with_status(role_id, secret_id)
+            .await
+            .map_err(AppRoleLoginError::into_error)
+    }
+
+    /// Logs in using an `AppRole` `role_id/secret_id` pair, reporting
+    /// the HTTP status of a failed login's response.
+    ///
+    /// Sends the same single request as [`Self::login_approle`] and
+    /// fails with the same error, carried in an [`AppRoleLoginError`]
+    /// together with the response status when a response arrived.
+    ///
+    /// # Errors
+    /// Returns an error if the login request fails.
+    pub async fn login_approle_with_status(
+        &self,
+        role_id: &str,
+        secret_id: &str,
+    ) -> std::result::Result<String, AppRoleLoginError> {
         let url = self.endpoint("auth/approle/login");
         let response = self
             .client
@@ -912,10 +962,19 @@ impl OpenBaoClient {
             }))
             .send()
             .await
-            .with_context(|| "OpenBao request failed: auth/approle/login")?;
+            .with_context(|| "OpenBao request failed: auth/approle/login")
+            .map_err(|error| AppRoleLoginError {
+                status: None,
+                error,
+            })?;
+        let status = response.status().as_u16();
         let parsed: AppRoleLoginResponse = Self::parse_response(response)
             .await
-            .context("OpenBao response parse failed: auth/approle/login")?;
+            .context("OpenBao response parse failed: auth/approle/login")
+            .map_err(|error| AppRoleLoginError {
+                status: Some(status),
+                error,
+            })?;
         Ok(parsed.auth.client_token)
     }
 
@@ -2903,5 +2962,111 @@ mod cert_auth_tests {
         let rendered = format!("{:?}", Holder { login });
         assert!(!rendered.contains("s.secret-cert-token"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+}
+
+/// The status a failed `AppRole` login reports beside its unchanged
+/// error.
+#[cfg(test)]
+mod approle_login_status_tests {
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::OpenBaoClient;
+
+    async fn server_answering(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn a_refused_login_reports_its_status_and_keeps_the_error_text() {
+        let body = r#"{"errors":["invalid role or secret ID"]}"#;
+        let server = server_answering(400, body).await;
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+
+        let failure = client
+            .login_approle_with_status("role", "secret")
+            .await
+            .expect_err("a 400 must fail the login");
+        assert_eq!(failure.status(), Some(400));
+        let plain = client
+            .login_approle("role", "secret")
+            .await
+            .expect_err("a 400 must fail the login");
+        let reported = failure.into_error();
+        assert_eq!(format!("{reported:#}"), format!("{plain:#}"));
+        assert_eq!(
+            reported.chain().last().map(ToString::to_string).as_deref(),
+            Some(format!("OpenBao API error (400 Bad Request): {body}").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_answer_reports_503() {
+        let server = server_answering(503, r#"{"errors":["Vault is sealed"]}"#).await;
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+
+        let failure = client
+            .login_approle_with_status("role", "secret")
+            .await
+            .expect_err("a 503 must fail the login");
+        assert_eq!(failure.status(), Some(503));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_success_reports_its_2xx_status() {
+        let server = server_answering(200, "not json").await;
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+
+        let failure = client
+            .login_approle_with_status("role", "secret")
+            .await
+            .expect_err("an unparseable body must fail the login");
+        assert_eq!(failure.status(), Some(200));
+    }
+
+    #[tokio::test]
+    async fn a_login_with_no_response_reports_no_status() {
+        // Bound and released, so nothing is listening on the port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let client = OpenBaoClient::new(&format!("http://{addr}")).expect("client");
+
+        let failure = client
+            .login_approle_with_status("role", "secret")
+            .await
+            .expect_err("a refused connection must fail the login");
+        assert_eq!(failure.status(), None);
+        assert_eq!(
+            failure.into_error().to_string(),
+            "OpenBao request failed: auth/approle/login"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_login_returns_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": "s.token" }
+            })))
+            .mount(&server)
+            .await;
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+
+        let token = client
+            .login_approle_with_status("role", "secret")
+            .await
+            .expect("login");
+        assert_eq!(token, "s.token");
     }
 }

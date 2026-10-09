@@ -3,6 +3,7 @@ mod ca;
 mod db;
 mod eab_clear;
 mod helpers;
+mod if_due;
 mod infra_cert;
 mod openbao_recovery;
 mod registrar_endpoint;
@@ -21,7 +22,9 @@ pub(crate) use self::helpers::signal_internal_registrar_agent;
 use crate::cli::args::{RotateArgs, RotateCommand};
 use crate::commands::compose_project::DOCKER_BIN;
 use crate::commands::init::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};
-use crate::commands::openbao_auth::{authenticate_openbao_client, resolve_runtime_auth};
+use crate::commands::openbao_auth::{
+    RuntimeAuthResolved, authenticate_openbao_client, resolve_runtime_auth,
+};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 use crate::state_lock::StateLock;
@@ -208,6 +211,9 @@ async fn run_rotate_with_exec(
     };
     let state =
         StateFile::load(&state_path).with_context(|| messages.error_parse_state_failed())?;
+    // The run's start instant for the `approle-secret-id` record: read
+    // once, under the lock and before any `OpenBao` request.
+    let started_at = if_due::start_instant();
 
     let openbao_url = args
         .openbao
@@ -247,10 +253,56 @@ async fn run_rotate_with_exec(
         return Ok(RotateOutcome::Completed);
     }
 
-    let runtime_auth = resolve_runtime_auth(&args.runtime_auth, true, messages)?;
+    let if_due_value = match &args.command {
+        RotateCommand::AppRoleSecretId(step_args) => step_args.if_due.as_deref(),
+        _ => None,
+    };
+    // `--if-due` refuses every credential but a file-based AppRole one,
+    // so it never prompts for a root token only to refuse it.
+    let runtime_auth = resolve_runtime_auth(&args.runtime_auth, if_due_value.is_none(), messages)?;
+    // The self-mint step replaces the on-disk credential file, so it
+    // must know whether the secret_id actually came from a file:
+    // inline/env values take precedence over the *_FILE flag in
+    // resolve_runtime_auth, in which case there is no file to replace.
+    let secret_id_file = if args.runtime_auth.approle_secret_id.is_none() {
+        args.runtime_auth.approle_secret_id_file.as_deref()
+    } else {
+        None
+    };
+    let if_due_plan = match (&args.command, if_due_value) {
+        (RotateCommand::AppRoleSecretId(step_args), Some(value)) => {
+            match if_due::admit(
+                step_args,
+                value,
+                &runtime_auth,
+                secret_id_file,
+                &ctx,
+                started_at,
+                messages,
+            )? {
+                if_due::Admission::Skip => return Ok(RotateOutcome::Completed),
+                if_due::Admission::Attempt(plan) => Some(plan),
+            }
+        }
+        _ => None,
+    };
     let mut client = OpenBaoClient::with_local_trust(&ctx.openbao_url, ctx.paths.secrets_dir())
         .with_context(|| messages.error_openbao_client_create_failed())?;
-    authenticate_openbao_client(&mut client, &runtime_auth, messages).await?;
+    match (&if_due_plan, &runtime_auth) {
+        (Some(plan), RuntimeAuthResolved::AppRole { role_id, secret_id }) => {
+            if_due::log_in(
+                &mut ctx,
+                held_state_lock(state_lock.as_ref())?,
+                &mut client,
+                plan,
+                role_id,
+                secret_id,
+                messages,
+            )
+            .await?;
+        }
+        _ => authenticate_openbao_client(&mut client, &runtime_auth, messages).await?,
+    }
     client
         .health_check()
         .await
@@ -287,16 +339,6 @@ async fn run_rotate_with_exec(
             .await?;
         }
         RotateCommand::AppRoleSecretId(step_args) => {
-            // The self-mint step replaces the on-disk credential file, so
-            // it must know whether the secret_id actually came from a
-            // file: inline/env values take precedence over the *_FILE
-            // flag in resolve_runtime_auth, in which case there is no
-            // file to replace.
-            let secret_id_file = if args.runtime_auth.approle_secret_id.is_none() {
-                args.runtime_auth.approle_secret_id_file.as_deref()
-            } else {
-                None
-            };
             let auth = approle::RotateAuthContext {
                 runtime_auth: &runtime_auth,
                 secret_id_file,
@@ -308,10 +350,14 @@ async fn run_rotate_with_exec(
                 step_args,
                 args.yes,
                 &auth,
+                started_at,
                 args.show_secrets,
                 messages,
             )
             .await?;
+            if let Some(plan) = &if_due_plan {
+                println!("{}", if_due::rotated_line(plan.target));
+            }
         }
         RotateCommand::TrustSync(_) => {
             ca::rotate_trust_sync(&mut ctx, &client, args.yes, messages).await?;

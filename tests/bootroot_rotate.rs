@@ -8507,3 +8507,828 @@ async fn test_rotate_infra_approle_serializes_with_a_concurrent_service_update()
     assert_eq!(lock_meta.len(), 0, "nothing is written to the lock file");
     assert!(!state_lock_is_held(root), "both writers released the lock");
 }
+
+// `rotate approle-secret-id --if-due`: the gate, the login count and the
+// record, driven through the binary against a mock `OpenBao`. Record
+// instants are computed from the test's own clock reading; nothing
+// sleeps.
+
+const IF_DUE_ROTATE_ROLE_ID: &str = "rr-role-id";
+const IF_DUE_ROTATE_SECRET: &str = "old-rotate-secret";
+const IF_DUE_SELF_MINTED: &str = "self-minted-rotate-secret";
+
+/// One `--if-due` scenario's working tree: a `state.json` with one local
+/// service, the rotate credential file, the infra agents' `role_id`
+/// files, and a fake `docker` on `PATH` that logs its argv.
+struct IfDueFixture {
+    temp_dir: tempfile::TempDir,
+    cred_path: PathBuf,
+    docker_log: PathBuf,
+    path_env: String,
+}
+
+impl IfDueFixture {
+    fn new(openbao_url: &str) -> Self {
+        let temp_dir = tempdir().expect("create temp dir");
+        let secret_path =
+            prepare_app_state(temp_dir.path(), openbao_url, "local-file").expect("prepare state");
+        fs::write(&secret_path, "old-service-secret").expect("seed service secret_id");
+        for (dir, role_id) in [
+            ("stepca", "stepca-role-id"),
+            ("responder", "responder-role-id"),
+        ] {
+            let agent_dir = temp_dir.path().join("secrets").join("openbao").join(dir);
+            fs::create_dir_all(&agent_dir).expect("create agent dir");
+            fs::write(agent_dir.join("role_id"), role_id).expect("write role_id");
+            fs::write(agent_dir.join("secret_id"), format!("{dir}-old")).expect("write secret_id");
+        }
+        let cred_dir = temp_dir.path().join("rotate-cred");
+        fs::create_dir_all(&cred_dir).expect("create cred dir");
+        let cred_path = cred_dir.join("secret_id");
+        fs::write(&cred_path, IF_DUE_ROTATE_SECRET).expect("seed rotate credential");
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let docker_log = temp_dir.path().join("docker.log");
+        write_fake_docker(&bin_dir, &docker_log).expect("write fake docker");
+        let path_env = format!(
+            "{}:{}",
+            bin_dir.display(),
+            env::var("PATH").unwrap_or_default()
+        );
+        Self {
+            temp_dir,
+            cred_path,
+            docker_log,
+            path_env,
+        }
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.temp_dir.path().join("state.json")
+    }
+
+    /// Writes `record` as `state.json`'s `approle_rotation`, and dates
+    /// the credential file an hour before `now`, so the file is older
+    /// than any login the record prepares and does not void its count.
+    fn set_record(&self, record: &serde_json::Value, now: time::OffsetDateTime) {
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(self.state_path()).expect("read state"))
+                .expect("parse state");
+        state["approle_rotation"] = record.clone();
+        fs::write(
+            self.state_path(),
+            serde_json::to_string_pretty(&state).expect("serialize state"),
+        )
+        .expect("write state");
+        self.set_cred_mtime(now - time::Duration::hours(1));
+    }
+
+    fn set_cred_mtime(&self, instant: time::OffsetDateTime) {
+        fs::File::options()
+            .write(true)
+            .open(&self.cred_path)
+            .expect("open rotate credential")
+            .set_modified(instant.into())
+            .expect("set rotate credential mtime");
+    }
+
+    fn record(&self) -> serde_json::Value {
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(self.state_path()).expect("read state"))
+                .expect("parse state");
+        state["approle_rotation"].clone()
+    }
+
+    /// Runs `bootroot rotate` with the given global arguments, which
+    /// carry the authentication, and `approle-secret-id` arguments.
+    fn run_with_auth(
+        &self,
+        openbao_url: &str,
+        auth: &[&str],
+        subcommand: &[&str],
+    ) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(self.temp_dir.path())
+            .args(["rotate", "--openbao-url", openbao_url])
+            .args(auth)
+            .args(["--yes", "approle-secret-id"])
+            .args(subcommand)
+            .env("PATH", &self.path_env)
+            .env("DOCKER_OUTPUT", &self.docker_log)
+            .env_remove("OPENBAO_ROOT_TOKEN")
+            .env_remove("OPENBAO_APPROLE_SECRET_ID")
+            .env_remove("OPENBAO_APPROLE_SECRET_ID_FILE")
+            .output()
+            .expect("run rotate approle-secret-id")
+    }
+
+    /// Runs with file-based `AppRole` authentication, the only kind
+    /// `--if-due` accepts.
+    fn run(&self, openbao_url: &str, subcommand: &[&str]) -> std::process::Output {
+        let cred = self.cred_path.to_string_lossy().into_owned();
+        self.run_with_auth(
+            openbao_url,
+            &[
+                "--auth-mode",
+                "approle",
+                "--approle-role-id",
+                IF_DUE_ROTATE_ROLE_ID,
+                "--approle-secret-id-file",
+                &cred,
+            ],
+            subcommand,
+        )
+    }
+}
+
+fn whole_seconds_now() -> time::OffsetDateTime {
+    let now = time::OffsetDateTime::now_utc();
+    now.replace_nanosecond(0).expect("zero nanoseconds")
+}
+
+fn rfc3339(instant: time::OffsetDateTime) -> String {
+    instant
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format instant")
+}
+
+fn if_due_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("if-due:"))
+        .collect()
+}
+
+/// Asserts that `value` is a recorded instant between `before` and
+/// `after`, the test's clock readings around the run.
+fn assert_instant_within(
+    value: &serde_json::Value,
+    before: time::OffsetDateTime,
+    after: time::OffsetDateTime,
+) {
+    let text = value.as_str().expect("an instant is recorded");
+    let instant = time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+        .expect("the instant is RFC 3339");
+    assert_eq!(instant.nanosecond(), 0, "whole seconds: {text}");
+    assert!(
+        before <= instant && instant <= after,
+        "{text} is not within the run"
+    );
+}
+
+async fn assert_no_request(openbao: &MockServer) {
+    let received = openbao.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "requests reached OpenBao: {received:?}"
+    );
+}
+
+/// The login with the scheduler's current rotate credential.
+fn if_due_rotate_login(status: u16) -> Mock {
+    let response = if status == 200 {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        }))
+    } else {
+        ResponseTemplate::new(status).set_body_string(r#"{"errors":["permission denied"]}"#)
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": IF_DUE_ROTATE_ROLE_ID,
+            "secret_id": IF_DUE_ROTATE_SECRET
+        })))
+        .respond_with(response)
+}
+
+/// Everything a successful `--all-services` run asks of `OpenBao` after
+/// its login: the health check, the one service's rotation and the
+/// runtime-rotate credential's self-mint with its verification.
+async fn mount_all_services_after_login(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": "service-new" }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/role-id")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "role_id": ROLE_ID }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(
+            json!({ "role_id": ROLE_ID, "secret_id": "service-new" }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "client-token" }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/auth/approle/role/bootroot-runtime-rotate-role/secret-id",
+        ))
+        .and(header("X-Vault-Token", "rotate-token"))
+        .and(body_json(json!({ "num_uses": 6 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": IF_DUE_SELF_MINTED }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": IF_DUE_ROTATE_ROLE_ID,
+            "secret_id": IF_DUE_SELF_MINTED
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "verified-token" }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn test_rotate_approle_secret_id_help_lists_if_due() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .args(["rotate", "approle-secret-id", "--help"])
+        .output()
+        .expect("run --help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("--if-due <DURATION>"), "{stdout}");
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_skips_a_target_rotated_recently() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    let last_success = now - time::Duration::minutes(10);
+    fixture.set_record(
+        &json!({ "all_services": { "last_success": rfc3339(last_success) } }),
+        now,
+    );
+    let state_before = fs::read(fixture.state_path()).expect("read state");
+    let cred_before = fs::read(&fixture.cred_path).expect("read credential");
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![format!(
+            "if-due: skipped target=all_services last-success={} due-at={}",
+            rfc3339(last_success),
+            rfc3339(last_success + time::Duration::hours(1))
+        )]
+    );
+    assert_no_request(&openbao).await;
+    assert_eq!(
+        fs::read(fixture.state_path()).expect("read state"),
+        state_before
+    );
+    assert_eq!(
+        fs::read(&fixture.cred_path).expect("read credential"),
+        cred_before
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.docker_log).expect("docker log"),
+        ""
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_rotates_a_due_target_and_records_it() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    if_due_rotate_login(200).expect(1).mount(&openbao).await;
+    mount_all_services_after_login(&openbao).await;
+
+    let before = whole_seconds_now();
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+    let after = whole_seconds_now();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().last(),
+        Some("if-due: rotated target=all_services"),
+        "{stdout}"
+    );
+    assert_eq!(if_due_lines(&stdout).len(), 1, "{stdout}");
+    assert_eq!(
+        fs::read_to_string(&fixture.cred_path).expect("read credential"),
+        IF_DUE_SELF_MINTED
+    );
+    let record = fixture.record();
+    assert_instant_within(&record["all_services"]["last_success"], before, after);
+    assert_eq!(
+        record["all_services"]
+            .as_object()
+            .map(|entry| entry.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["last_success".to_string()]),
+        "a fresh credential leaves no count: {record}"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_counts_a_login_followed_by_a_failure() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    if_due_rotate_login(200).expect(1).mount(&openbao).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/auth/approle/role/{ROLE_NAME}/secret-id")))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .mount(&openbao)
+        .await;
+    let cred_before = fs::read(&fixture.cred_path).expect("read credential");
+
+    let before = whole_seconds_now();
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+    let after = whole_seconds_now();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(if_due_lines(&stdout).is_empty(), "{stdout}");
+    let record = fixture.record();
+    assert_eq!(
+        record["all_services"]["logins_since_renewal"], 1,
+        "{record}"
+    );
+    assert_instant_within(&record["all_services"]["last_login"], before, after);
+    assert!(record["all_services"]["last_success"].is_null(), "{record}");
+    assert_eq!(
+        fs::read(&fixture.cred_path).expect("read credential"),
+        cred_before
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_a_sealed_openbao_costs_nothing() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    if_due_rotate_login(503).expect(1).mount(&openbao).await;
+    let state_before = fs::read(fixture.state_path()).expect("read state");
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read(fixture.state_path()).expect("read state"),
+        state_before
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_an_unreachable_openbao_costs_nothing() {
+    // Bound and released, so nothing listens on the port.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let unreachable = format!("http://{}", listener.local_addr().expect("addr"));
+    drop(listener);
+    let fixture = IfDueFixture::new(&unreachable);
+    let state_before = fs::read(fixture.state_path()).expect("read state");
+
+    let output = fixture.run(&unreachable, &["--all-services", "--if-due", "1h"]);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read(fixture.state_path()).expect("read state"),
+        state_before
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_counts_a_refused_login_and_keeps_its_error() {
+    let plain_openbao = MockServer::start().await;
+    let plain = IfDueFixture::new(&plain_openbao.uri());
+    if_due_rotate_login(400)
+        .expect(1)
+        .mount(&plain_openbao)
+        .await;
+    let plain_output = plain.run(&plain_openbao.uri(), &["--all-services"]);
+    assert!(!plain_output.status.success());
+
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    if_due_rotate_login(400).expect(1).mount(&openbao).await;
+    let before = whole_seconds_now();
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+    let after = whole_seconds_now();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, String::from_utf8_lossy(&plain_output.stderr));
+    assert!(
+        stderr.contains("OpenBao API error (400 Bad Request)"),
+        "{stderr}"
+    );
+    let record = fixture.record();
+    assert_eq!(
+        record["all_services"]["logins_since_renewal"], 1,
+        "{record}"
+    );
+    assert_instant_within(&record["all_services"]["last_login"], before, after);
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_backs_off_between_counted_logins() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    let last_login = now - time::Duration::minutes(10);
+    fixture.set_record(
+        &json!({ "all_services": {
+            "logins_since_renewal": 1,
+            "last_login": rfc3339(last_login)
+        } }),
+        now,
+    );
+    let state_before = fs::read(fixture.state_path()).expect("read state");
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert_eq!(
+        if_due_lines(&stdout),
+        vec![format!(
+            "if-due: backing_off target=all_services logins=1/4 retry-at={}",
+            rfc3339(last_login + time::Duration::minutes(15))
+        )]
+    );
+    assert_no_request(&openbao).await;
+    assert_eq!(
+        fs::read(fixture.state_path()).expect("read state"),
+        state_before
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_refuses_once_the_budget_is_spent() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    fixture.set_record(
+        &json!({ "all_services": {
+            "logins_since_renewal": 4,
+            "last_login": rfc3339(now - time::Duration::minutes(30))
+        } }),
+        now,
+    );
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}");
+    assert_eq!(
+        if_due_lines(&stdout),
+        vec!["if-due: budget_spent target=all_services logins=4/4"]
+    );
+    assert!(stderr.contains("without --if-due"), "{stderr}");
+    assert_no_request(&openbao).await;
+}
+
+#[tokio::test]
+async fn test_rotate_without_if_due_recovers_a_spent_budget() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    fixture.set_record(
+        &json!({ "all_services": {
+            "logins_since_renewal": 4,
+            "last_login": rfc3339(now - time::Duration::minutes(30))
+        } }),
+        now,
+    );
+    if_due_rotate_login(200).expect(1).mount(&openbao).await;
+    mount_all_services_after_login(&openbao).await;
+
+    let output = fixture.run(&openbao.uri(), &["--all-services"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(if_due_lines(&stdout).is_empty(), "{stdout}");
+    let record = fixture.record();
+    assert!(
+        record["all_services"]["logins_since_renewal"].is_null(),
+        "{record}"
+    );
+    assert!(record["all_services"]["last_login"].is_null(), "{record}");
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_attempts_after_a_break_glass_credential() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    let last_login = now - time::Duration::hours(1);
+    fixture.set_record(
+        &json!({ "all_services": {
+            "logins_since_renewal": 4,
+            "last_login": rfc3339(last_login)
+        } }),
+        now,
+    );
+    // The operator wrote a re-minted credential after the last login.
+    fixture.set_cred_mtime(last_login + time::Duration::minutes(30));
+    if_due_rotate_login(200).expect(1).mount(&openbao).await;
+    mount_all_services_after_login(&openbao).await;
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.lines().last(),
+        Some("if-due: rotated target=all_services")
+    );
+    let record = fixture.record();
+    assert!(
+        record["all_services"]["logins_since_renewal"].is_null(),
+        "{record}"
+    );
+    assert!(record["all_services"]["last_login"].is_null(), "{record}");
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_restarts_a_fresh_count_on_a_newer_credential() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let now = whole_seconds_now();
+    let last_login = now - time::Duration::hours(1);
+    fixture.set_record(
+        &json!({ "all_services": {
+            "logins_since_renewal": 4,
+            "last_login": rfc3339(last_login)
+        } }),
+        now,
+    );
+    fixture.set_cred_mtime(last_login + time::Duration::minutes(30));
+    if_due_rotate_login(200).expect(1).mount(&openbao).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&openbao)
+        .await;
+
+    let output = fixture.run(&openbao.uri(), &["--all-services", "--if-due", "1h"]);
+
+    assert!(!output.status.success());
+    let record = fixture.record();
+    assert_eq!(
+        record["all_services"]["logins_since_renewal"], 1,
+        "the newer credential's count starts over: {record}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // sequential mock choreography for four CLI runs
+async fn test_rotate_if_due_infra_targets_are_recorded_separately() {
+    const INFRA_ROTATE_ROLE: &str = "bootroot-infra-rotate-role";
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+
+    Mock::given(method("GET"))
+        .and(path("/v1/sys/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&openbao)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": IF_DUE_ROTATE_ROLE_ID,
+            "secret_id": IF_DUE_ROTATE_SECRET
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        })))
+        .expect(1)
+        .mount(&openbao)
+        .await;
+    for (role, role_id, minted) in [
+        ("bootroot-stepca-role", "stepca-role-id", "stepca-new"),
+        (
+            "bootroot-responder-role",
+            "responder-role-id",
+            "responder-new",
+        ),
+    ] {
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/auth/approle/role/{role}/secret-id")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "secret_id": minted }
+            })))
+            .expect(1)
+            .mount(&openbao)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/auth/approle/login"))
+            .and(body_json(
+                json!({ "role_id": role_id, "secret_id": minted }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "auth": { "client_token": "client-token" }
+            })))
+            .expect(1)
+            .mount(&openbao)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1/auth/approle/role/{INFRA_ROTATE_ROLE}/secret-id"
+        )))
+        .and(body_json(json!({ "num_uses": 6 })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "secret_id": IF_DUE_SELF_MINTED }
+        })))
+        .expect(2)
+        .mount(&openbao)
+        .await;
+    // The stepca run's verification login and the responder run's own
+    // login, both with the self-minted credential.
+    Mock::given(method("POST"))
+        .and(path("/v1/auth/approle/login"))
+        .and(body_json(json!({
+            "role_id": IF_DUE_ROTATE_ROLE_ID,
+            "secret_id": IF_DUE_SELF_MINTED
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "auth": { "client_token": "rotate-token" }
+        })))
+        .expect(3)
+        .mount(&openbao)
+        .await;
+
+    for target in ["stepca", "responder"] {
+        let output = fixture.run(&openbao.uri(), &["--infra", target, "--if-due", "1h"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{target}: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            stdout.lines().last().map(str::to_string),
+            Some(format!("if-due: rotated target=infra_{target}"))
+        );
+    }
+    let state_after_rotation = fs::read(fixture.state_path()).expect("read state");
+    for target in ["stepca", "responder"] {
+        let output = fixture.run(&openbao.uri(), &["--infra", target, "--if-due", "1h"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{target}: {stdout}");
+        let lines = if_due_lines(&stdout);
+        assert_eq!(lines.len(), 1, "{stdout}");
+        assert!(
+            lines[0].starts_with(&format!("if-due: skipped target=infra_{target} ")),
+            "{stdout}"
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.state_path()).expect("read state"),
+        state_after_rotation
+    );
+    let docker_log = fs::read_to_string(&fixture.docker_log).expect("docker log");
+    let restarts: Vec<&str> = docker_log
+        .lines()
+        .filter(|line| line.starts_with("restart "))
+        .collect();
+    assert_eq!(
+        restarts,
+        vec![
+            "restart bootroot-openbao-agent-stepca",
+            "restart bootroot-openbao-agent-responder"
+        ],
+        "{docker_log}"
+    );
+    let record = fixture.record();
+    assert!(
+        record["infra_stepca"]["last_success"].is_string(),
+        "{record}"
+    );
+    assert!(
+        record["infra_responder"]["last_success"].is_string(),
+        "{record}"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_if_due_refuses_before_any_request() {
+    let openbao = MockServer::start().await;
+    let fixture = IfDueFixture::new(&openbao.uri());
+    let cred = fixture.cred_path.to_string_lossy().into_owned();
+    let approle_file = [
+        "--auth-mode",
+        "approle",
+        "--approle-role-id",
+        IF_DUE_ROTATE_ROLE_ID,
+        "--approle-secret-id-file",
+        cred.as_str(),
+    ];
+    let approle_inline = [
+        "--auth-mode",
+        "approle",
+        "--approle-role-id",
+        IF_DUE_ROTATE_ROLE_ID,
+        "--approle-secret-id",
+        IF_DUE_ROTATE_SECRET,
+    ];
+    let root = ["--root-token", support::ROOT_TOKEN];
+    let cases: [(&[&str], &str); 4] = [
+        (&approle_inline, "1h"),
+        (&root, "1h"),
+        (&approle_file, "0s"),
+        (&approle_file, "13h"),
+    ];
+    for (auth, value) in cases {
+        let output =
+            fixture.run_with_auth(&openbao.uri(), auth, &["--all-services", "--if-due", value]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{auth:?} {value}: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(if_due_lines(&stdout).is_empty(), "{stdout}");
+        assert!(stderr.contains("--if-due"), "{auth:?} {value}: {stderr}");
+    }
+    // The secret_id from the environment is not a file either.
+    let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(fixture.temp_dir.path())
+        .args([
+            "rotate",
+            "--openbao-url",
+            &openbao.uri(),
+            "--auth-mode",
+            "approle",
+            "--approle-role-id",
+            IF_DUE_ROTATE_ROLE_ID,
+            "--approle-secret-id-file",
+            &cred,
+            "--yes",
+            "approle-secret-id",
+            "--all-services",
+            "--if-due",
+            "1h",
+        ])
+        .env("OPENBAO_APPROLE_SECRET_ID", IF_DUE_ROTATE_SECRET)
+        .env_remove("OPENBAO_ROOT_TOKEN")
+        .output()
+        .expect("run rotate approle-secret-id");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--approle-secret-id-file"), "{stderr}");
+    assert_no_request(&openbao).await;
+
+    let output = fixture.run(
+        &openbao.uri(),
+        &["--registration-id", SERVICE_NAME, "--if-due", "1h"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "clap rejects the combination"
+    );
+    assert_no_request(&openbao).await;
+}

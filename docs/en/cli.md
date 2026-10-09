@@ -2056,6 +2056,26 @@ is required:
   This is the recovery path for a recorded CIDR that locks the
   rotation job out — subsequent self-mints are unbound until a
   provisioning run records a new binding.
+- `--if-due <duration>`: rotates only when due, so a scheduler can run
+  the command often (for example hourly). Accepted with
+  `--all-services` and `--infra`; conflicts with `--registration-id`
+  (and with the two provisioning flags above). While the target's last
+  fully successful rotation, recorded in `state.json`, is younger than
+  `<duration>` (e.g. `11h30m`), the run exits 0 without logging in,
+  writing a file or restarting a sidecar. It prints exactly one line:
+  `if-due: skipped target=<target> last-success=<instant>
+  due-at=<instant>` (exit 0), `if-due: rotated target=<target>` (exit
+  0, after the summary), `if-due: backing_off target=<target>
+  logins=<n>/<budget> retry-at=<instant>` (exit 1, no login) or
+  `if-due: budget_spent target=<target> logins=<n>/<budget>` (exit 1,
+  no login); a due run that attempts and fails prints none and exits 1.
+  Targets are `all_services`, `infra_stepca` and `infra_responder`, and
+  the budget is 4 for `all_services` and 2 for each infra target. The
+  flag refuses, exit 1 and before any OpenBao request, unless the run
+  authenticates as an AppRole whose `secret_id` comes from
+  `--approle-secret-id-file`, and unless `<duration>` is above zero and
+  at most half the rotate roles' `secret_id` TTL. See
+  [Operations > Scheduling AppRole secret_id rotation](operations.md#scheduling-approle-secret_id-rotation).
 
 The two credentials are deliberately asymmetric: the runtime-rotate
 credential can touch service AppRoles but not the infra roles (the

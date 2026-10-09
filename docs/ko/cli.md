@@ -1975,6 +1975,25 @@ AppRole `secret_id`를 회전합니다 — 등록된 서비스 하나, 등록된
   `--rotate-bound-cidrs`와 함께 쓸 수 없습니다. 기록된 CIDR이 회전
   작업을 잠근 경우의 복구 경로입니다 — 프로비저닝 실행이 새 바인딩을
   기록하기 전까지 이후 자체 재발급은 바인딩 없이 발급됩니다.
+- `--if-due <duration>`: 회전 시점이 되었을 때만 회전하므로 스케줄러가
+  명령을 자주(예: 매시간) 실행할 수 있습니다. `--all-services`와
+  `--infra`와 함께 쓸 수 있으며 `--registration-id`(및 위의 두
+  프로비저닝 플래그)와는 함께 쓸 수 없습니다. `state.json`에 기록된
+  대상의 마지막 완전 성공 회전이 `<duration>`(예: `11h30m`)보다 최근이면
+  로그인, 파일 쓰기, 사이드카 재시작 없이 0으로 종료합니다. 출력은 정확히
+  한 줄입니다: `if-due: skipped target=<target> last-success=<instant>
+  due-at=<instant>`(종료 코드 0), `if-due: rotated target=<target>`(종료
+  코드 0, 요약 다음), `if-due: backing_off target=<target>
+  logins=<n>/<budget> retry-at=<instant>`(종료 코드 1, 로그인 없음),
+  `if-due: budget_spent target=<target> logins=<n>/<budget>`(종료 코드
+  1, 로그인 없음). 회전을 시도했다가 실패한 실행은 이 줄을 출력하지 않고
+  1로 종료합니다. 대상은 `all_services`, `infra_stepca`,
+  `infra_responder`이며, 예산은 `all_services`가 4, 각 인프라 대상이
+  2입니다. 실행이 `--approle-secret-id-file`에서 `secret_id`를 읽는
+  AppRole로 인증하지 않거나, `<duration>`이 0이거나 rotate 역할
+  `secret_id` TTL의 절반보다 크면 OpenBao 요청 없이 1로 종료합니다.
+  [운영 > AppRole secret_id 회전 스케줄링](operations.md#approle-secret_id-회전-스케줄링)을
+  참고하세요.
 
 두 자격증명은 의도적으로 비대칭입니다: runtime-rotate 자격증명은 서비스
 AppRole만 다룰 수 있고 인프라 역할은 다룰 수 없으며(인프라 역할은 CA

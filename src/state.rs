@@ -129,6 +129,12 @@ pub(crate) struct StateFile {
     /// `bootroot status` warns when this timestamp goes stale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_secret_id_rotation: Option<String>,
+    /// Per-target record `bootroot rotate approle-secret-id --if-due`
+    /// decides from: when each scheduled target last rotated and renewed
+    /// its rotate credential file, and how many logins its `--if-due`
+    /// runs have spent on that file since. Omitted while empty.
+    #[serde(default, skip_serializing_if = "AppRoleRotationRecord::is_empty")]
+    pub(crate) approle_rotation: AppRoleRotationRecord,
     /// The registrar endpoint's enablement, as recorded on this host.
     ///
     /// **`bootroot infra install` is the one command that sets it**,
@@ -144,6 +150,104 @@ pub(crate) struct StateFile {
     /// material, config or private bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) registrar_endpoint: Option<RegistrarEndpointState>,
+}
+
+/// A target `bootroot rotate approle-secret-id --if-due` schedules: the
+/// `--all-services` batch, or one `--infra` role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppRoleRotationTarget {
+    AllServices,
+    InfraStepca,
+    InfraResponder,
+}
+
+impl AppRoleRotationTarget {
+    /// The targets that share the infra-rotate credential.
+    pub(crate) const INFRA: [Self; 2] = [Self::InfraStepca, Self::InfraResponder];
+
+    /// Returns the target's key in [`AppRoleRotationRecord`], which is
+    /// also the name the `if-due:` lines print.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AllServices => "all_services",
+            Self::InfraStepca => "infra_stepca",
+            Self::InfraResponder => "infra_responder",
+        }
+    }
+}
+
+impl fmt::Display for AppRoleRotationTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// [`StateFile::approle_rotation`]: one entry per
+/// [`AppRoleRotationTarget`], each omitted while empty.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AppRoleRotationRecord {
+    #[serde(default, skip_serializing_if = "AppRoleRotationEntry::is_empty")]
+    all_services: AppRoleRotationEntry,
+    #[serde(default, skip_serializing_if = "AppRoleRotationEntry::is_empty")]
+    infra_stepca: AppRoleRotationEntry,
+    #[serde(default, skip_serializing_if = "AppRoleRotationEntry::is_empty")]
+    infra_responder: AppRoleRotationEntry,
+}
+
+impl AppRoleRotationRecord {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.all_services.is_empty()
+            && self.infra_stepca.is_empty()
+            && self.infra_responder.is_empty()
+    }
+
+    pub(crate) fn entry(&self, target: AppRoleRotationTarget) -> &AppRoleRotationEntry {
+        match target {
+            AppRoleRotationTarget::AllServices => &self.all_services,
+            AppRoleRotationTarget::InfraStepca => &self.infra_stepca,
+            AppRoleRotationTarget::InfraResponder => &self.infra_responder,
+        }
+    }
+
+    pub(crate) fn entry_mut(&mut self, target: AppRoleRotationTarget) -> &mut AppRoleRotationEntry {
+        match target {
+            AppRoleRotationTarget::AllServices => &mut self.all_services,
+            AppRoleRotationTarget::InfraStepca => &mut self.infra_stepca,
+            AppRoleRotationTarget::InfraResponder => &mut self.infra_responder,
+        }
+    }
+}
+
+/// One target's entry in [`AppRoleRotationRecord`].
+///
+/// Instants are UTC RFC 3339 at whole seconds, kept as the text that was
+/// written so a value that no longer parses survives a save unchanged;
+/// the reader treats it as absent.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AppRoleRotationEntry {
+    /// Start instant of the last run that rotated this target and
+    /// replaced its rotate credential file by self-mint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_success: Option<String>,
+    /// `--if-due` runs for this target that made a counted login with
+    /// the credential file as it now is.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) logins_since_renewal: u32,
+    /// Start instant of the latest of those runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_login: Option<String>,
+}
+
+impl AppRoleRotationEntry {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.last_success.is_none() && self.logins_since_renewal == 0 && self.last_login.is_none()
+    }
+}
+
+// `skip_serializing_if` hands the predicate a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// An in-progress `service add`, recorded in
@@ -418,6 +522,72 @@ mod tests {
             openbao_url: url.to_string(),
             ..StateFile::default()
         }
+    }
+
+    /// A `state.json` without the `--if-due` record loads and saves back
+    /// byte for byte: the empty record is omitted rather than written.
+    #[test]
+    fn state_without_approle_rotation_round_trips_byte_identically() {
+        let state = StateFile {
+            openbao_url: "https://openbao.example:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            last_secret_id_rotation: Some("2026-10-10T00:00:00Z".to_string()),
+            ..StateFile::default()
+        };
+        let original = state.serialize().expect("serialize");
+        assert!(!original.contains("approle_rotation"));
+        let parsed: StateFile = serde_json::from_str(&original).expect("parse");
+        assert!(parsed.approle_rotation.is_empty());
+        assert_eq!(parsed.serialize().expect("serialize"), original);
+    }
+
+    /// An entry holding only a last success writes neither a zero count
+    /// nor an absent last login, and the other targets not at all.
+    #[test]
+    fn an_entry_with_only_a_last_success_omits_the_count_and_last_login() {
+        let mut state = state_with_url("https://openbao.example:8200");
+        state
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::InfraStepca)
+            .last_success = Some("2026-10-10T00:00:02Z".to_string());
+        let value: serde_json::Value =
+            serde_json::from_str(&state.serialize().expect("serialize")).expect("parse");
+        assert_eq!(
+            value["approle_rotation"],
+            serde_json::json!({
+                "infra_stepca": { "last_success": "2026-10-10T00:00:02Z" }
+            })
+        );
+    }
+
+    #[test]
+    fn every_approle_rotation_target_round_trips() {
+        let mut state = state_with_url("https://openbao.example:8200");
+        for (index, target) in [
+            AppRoleRotationTarget::AllServices,
+            AppRoleRotationTarget::InfraStepca,
+            AppRoleRotationTarget::InfraResponder,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let count = u32::try_from(index).expect("small") + 1;
+            *state.approle_rotation.entry_mut(target) = AppRoleRotationEntry {
+                last_success: Some("2026-10-09T00:00:00Z".to_string()),
+                logins_since_renewal: count,
+                last_login: Some(format!("2026-10-10T0{count}:00:00Z")),
+            };
+        }
+        let text = state.serialize().expect("serialize");
+        for key in ["all_services", "infra_stepca", "infra_responder"] {
+            assert!(
+                text.contains(&format!("\"{key}\"")),
+                "{key} missing:\n{text}"
+            );
+        }
+        let parsed: StateFile = serde_json::from_str(&text).expect("parse");
+        assert_eq!(parsed.approle_rotation, state.approle_rotation);
+        assert_eq!(parsed.serialize().expect("serialize"), text);
     }
 
     /// A `state.json` written before `pending_service_adds` existed
