@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bootroot::acme::http01_protocol::Http01HmacSigner;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 
 use super::config::ResponderSettings;
 
@@ -75,9 +75,28 @@ impl AdminRateLimiter {
     }
 }
 
+/// The loaded settings and the signer built from their `hmac_secret`.
+///
+/// They are one value behind one lock so that a reload replaces both at
+/// once: a registration must never be judged by the secret of one
+/// configuration and verified with the signer of another.
+struct LoadedConfig {
+    settings: ResponderSettings,
+    hmac_signer: Http01HmacSigner,
+}
+
+impl LoadedConfig {
+    fn new(settings: ResponderSettings) -> Self {
+        let hmac_signer = settings.build_hmac_signer();
+        Self {
+            settings,
+            hmac_signer,
+        }
+    }
+}
+
 pub(super) struct ResponderState {
-    settings: RwLock<ResponderSettings>,
-    hmac_signer: RwLock<Http01HmacSigner>,
+    config: RwLock<LoadedConfig>,
     tokens: RwLock<HashMap<String, TokenEntry>>,
     admin_rate_limiter: Mutex<AdminRateLimiter>,
 }
@@ -88,17 +107,15 @@ impl ResponderState {
     }
 
     fn new(settings: ResponderSettings) -> Self {
-        let hmac_signer = settings.build_hmac_signer();
         Self {
-            settings: RwLock::new(settings),
-            hmac_signer: RwLock::new(hmac_signer),
+            config: RwLock::new(LoadedConfig::new(settings)),
             tokens: RwLock::new(HashMap::new()),
             admin_rate_limiter: Mutex::new(AdminRateLimiter::default()),
         }
     }
 
-    pub(super) async fn settings(&self) -> tokio::sync::RwLockReadGuard<'_, ResponderSettings> {
-        self.settings.read().await
+    pub(super) async fn settings(&self) -> RwLockReadGuard<'_, ResponderSettings> {
+        RwLockReadGuard::map(self.config.read().await, |config| &config.settings)
     }
 
     pub(super) async fn fetch_key_authorization(&self, token: &str) -> Option<String> {
@@ -119,45 +136,49 @@ impl ResponderState {
         request: RegisterRequest,
     ) -> Result<(), RegisterError> {
         let (
-            default_ttl_secs,
+            requested_ttl_secs,
             max_token_ttl_secs,
             admin_rate_limit_requests,
-            admin_rate_limit_window_secs,
+            admin_rate_limit_window,
         ) = {
-            let settings = self.settings.read().await;
+            // One read guard covers the placeholder check and the
+            // signature check, so a concurrent reload cannot hand this
+            // request the settings of one configuration and the signer
+            // of another.
+            let config = self.config.read().await;
+            let settings = &config.settings;
             // First, ahead of every other check: the placeholder is
             // public, so a signature made with it authenticates nobody.
             if settings.has_placeholder_hmac_secret() {
                 return Err(RegisterError::NotConfigured);
             }
+            let requested_ttl_secs = request.ttl_secs.unwrap_or(settings.token_ttl_secs);
+            if requested_ttl_secs == 0 {
+                return Err(RegisterError::InvalidTtl);
+            }
+            if !config.hmac_signer.verify_request(
+                signature,
+                timestamp,
+                &request.token,
+                &request.key_authorization,
+                requested_ttl_secs,
+            ) {
+                return Err(RegisterError::InvalidSignature);
+            }
             (
-                settings.token_ttl_secs,
+                requested_ttl_secs,
                 settings.max_token_ttl_secs,
                 usize::try_from(settings.admin_rate_limit_requests)
                     .expect("validated admin_rate_limit_requests must fit into usize"),
                 Duration::from_secs(settings.admin_rate_limit_window_secs),
             )
         };
-        let requested_ttl_secs = request.ttl_secs.unwrap_or(default_ttl_secs);
-        if requested_ttl_secs == 0 {
-            return Err(RegisterError::InvalidTtl);
-        }
-        let signer = { self.hmac_signer.read().await.clone() };
-        if !signer.verify_request(
-            signature,
-            timestamp,
-            &request.token,
-            &request.key_authorization,
-            requested_ttl_secs,
-        ) {
-            return Err(RegisterError::InvalidSignature);
-        }
 
         let now = tokio::time::Instant::now();
         if !self.admin_rate_limiter.lock().await.allow_registration_at(
             now,
             admin_rate_limit_requests,
-            admin_rate_limit_window_secs,
+            admin_rate_limit_window,
         ) {
             return Err(RegisterError::RateLimited);
         }
@@ -176,28 +197,21 @@ impl ResponderState {
     }
 
     pub(super) async fn max_skew_secs(&self) -> u64 {
-        self.settings.read().await.max_skew_secs
+        self.settings().await.max_skew_secs
     }
 
     pub(super) async fn admin_body_limit_bytes(&self) -> usize {
-        usize::try_from(self.settings.read().await.admin_body_limit_bytes)
+        usize::try_from(self.settings().await.admin_body_limit_bytes)
             .expect("validated admin_body_limit_bytes must fit into usize")
     }
 
     pub(super) async fn cleanup_interval(&self) -> Duration {
-        Duration::from_secs(self.settings.read().await.cleanup_interval_secs)
+        Duration::from_secs(self.settings().await.cleanup_interval_secs)
     }
 
     pub(super) async fn update_settings(&self, settings: ResponderSettings) {
-        let hmac_signer = settings.build_hmac_signer();
-        {
-            let mut settings_lock = self.settings.write().await;
-            *settings_lock = settings;
-        }
-        {
-            let mut signer_lock = self.hmac_signer.write().await;
-            *signer_lock = hmac_signer;
-        }
+        let config = LoadedConfig::new(settings);
+        *self.config.write().await = config;
     }
 
     pub(super) async fn purge_expired_tokens(&self) -> usize {
@@ -422,6 +436,66 @@ mod tests {
                 .is_empty(),
             "a refused registration must not consume the rate-limit budget"
         );
+    }
+
+    /// A reload replaces the secret the guard looks at and the signer
+    /// that verifies with it. A registration that saw one from before
+    /// the reload and the other from after it would be checked against
+    /// the placeholder while the guard believed a real secret was
+    /// loaded, and a signature anyone can make would be accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_register_request_never_accepts_placeholder_across_reloads() {
+        const RELOADS: usize = 4_000;
+        const REGISTRARS: usize = 3;
+
+        let real = test_settings();
+        let placeholder = ResponderSettings {
+            hmac_secret: "CHANGE-ME".to_string(),
+            ..test_settings()
+        };
+        let state = ResponderState::shared(real.clone());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut registrars = tokio::task::JoinSet::new();
+        for registrar in 0..REGISTRARS {
+            let state = Arc::clone(&state);
+            let done = Arc::clone(&done);
+            registrars.spawn(async move {
+                let signer = Http01HmacSigner::new("CHANGE-ME");
+                let token = format!("token-race-{registrar}");
+                let key_authorization = format!("{token}.key");
+                let signature = signer.sign_request(123, &token, &key_authorization, 60);
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let request = RegisterRequest {
+                        token: token.clone(),
+                        key_authorization: key_authorization.clone(),
+                        ttl_secs: Some(60),
+                    };
+                    let result = state.register_request(123, &signature, request).await;
+                    assert!(
+                        matches!(
+                            result,
+                            Err(RegisterError::NotConfigured | RegisterError::InvalidSignature)
+                        ),
+                        "a placeholder-signed registration got past the guard: {result:?}"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+
+        for _ in 0..RELOADS {
+            state.update_settings(placeholder.clone()).await;
+            tokio::task::yield_now().await;
+            state.update_settings(real.clone()).await;
+            tokio::task::yield_now().await;
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        while let Some(joined) = registrars.join_next().await {
+            joined.expect("registrar task must not panic");
+        }
+        assert!(state.tokens.read().await.is_empty());
     }
 
     #[tokio::test]
