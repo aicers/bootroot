@@ -723,14 +723,28 @@ bootroot가 제공하는 두 compose 파일(`docker-compose.yml`,
   수 없습니다. step-ca가 그 클라이언트에 접속하지 않기 때문입니다.
 - **누가 무엇을 발급받을 수 있는가.** ACME 디렉터리에 접근할 수 있고,
   EAB가 필요한 경우 이를 충족하며, 리스폰더 HMAC 시크릿을 가진
-  클라이언트라면 step-ca는 어떤 DNS 이름이나 루프백이 아닌 IP 주소에
-  대해서도 검증을 통과시킵니다. 발급 범위를 제한하는 것은 이름 해석이
-  아니라 이 자격증명들입니다. 리스폰더 HMAC과 EAB 자격증명은 배포 전체가
-  공유하며, 등록된 모든 서비스 호스트가 이를 가지고 있습니다. 그러므로
-  이러한 호스트 각각이 다른 서비스의 이름과 제어 노드 자체의 이름을 포함한
-  어떤 이름으로든 이 CA에서 인증서를 발급받을 수 있다고 간주하고, 그런
+  클라이언트라면 step-ca는 제어 노드 자체의 이름을 제외한 어떤 DNS
+  이름에 대해서도 검증을 통과시키며, IP 주소는 어떤 것도 검증하지
+  않습니다. 발급 범위를 제한하는 것은 이름 해석이 아니라 이
+  자격증명들입니다. 리스폰더 HMAC과 EAB 자격증명은 배포 전체가 공유하며,
+  등록된 모든 서비스 호스트가 이를 가지고 있습니다. 그러므로 이러한 호스트
+  각각이 다른 서비스의 이름을 포함해 제어 노드 자체의 이름이 아닌 어떤
+  이름으로든 이 CA에서 인증서를 발급받을 수 있다고 간주하고, 그런
   호스트를 폐기하거나 그 호스트가 침해되었을 때는 HMAC을
   회전하세요(`bootroot rotate responder-hmac`).
+
+  번들된 step-ca는 어떤 IP 주소에 대해서도, 그리고 제어 노드 자체의
+  이름인 `localhost`, `stepca.internal`, `openbao.internal`,
+  `responder.internal`, `<instance>-ca`, `<instance>-openbao`,
+  `<instance>-http01`(기본 인스턴스에서는 `bootroot-ca`,
+  `bootroot-openbao`, `bootroot-http01`)에 대해서도 인증서를 발급하지
+  않습니다. 이 이름과 주소는 step-ca, OpenBao, 리스폰더 관리자 API의 서버
+  인증서가 담고 있는 것이므로, 어떤 서비스 호스트도 이 엔드포인트를
+  사칭하는 인증서를 발급받을 수 없습니다. 이 거부는 `ca.json`의
+  `authority.policy.x509.deny`입니다. 이 키는 bootroot가 관리하며 매
+  `bootroot init`마다 다시 쓰므로, 직접 작성한 정책은 교체됩니다. 기존
+  설치에는 다음 `bootroot init` 재실행 시 적용되고 이때 step-ca가
+  재시작됩니다. `bootroot infra up`은 이를 적용하지 않습니다.
 - **step-ca의 다른 외부 요청은 영향을 받지 않습니다.** PostgreSQL은 HTTP가
   아니며, 이 변수는 step-ca가 `https://`로 가져오는 것에는 적용되지
   않습니다. `ca.json`을 직접 수정해 step-ca가 평문 `http://`로 가져오는

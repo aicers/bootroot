@@ -719,16 +719,30 @@ container.
 - **Trade-off.** An ACME client that answers HTTP-01 on its own port 80,
   instead of registering its token with the bootroot responder, cannot be
   validated by the bundled step-ca: step-ca never connects to that client.
-- **Who may be issued what.** step-ca will validate any DNS name or
-  non-loopback IP address for a client that can reach the ACME directory,
-  satisfies EAB where it is required, and holds the responder HMAC secret.
-  Those credentials, not name resolution, are what bound issuance. The
-  responder HMAC and the EAB credential are deployment-wide, and every
-  registered service host holds them. Treat each of those hosts as able to
-  obtain a certificate from this CA for any name, including the names of
-  other services and of the control node itself, and rotate the HMAC
-  (`bootroot rotate responder-hmac`) when such a host is decommissioned or
-  compromised.
+- **Who may be issued what.** step-ca will validate any DNS name other
+  than the control node's own, and no IP address, for a client that can
+  reach the ACME directory, satisfies EAB where it is required, and holds
+  the responder HMAC secret. Those credentials, not name resolution, are
+  what bound issuance. The responder HMAC and the EAB credential are
+  deployment-wide, and every registered service host holds them. Treat each
+  of those hosts as able to obtain a certificate from this CA for any name
+  outside the control node's own, including the names of other services,
+  and rotate the HMAC (`bootroot rotate responder-hmac`) when such a host
+  is decommissioned or compromised.
+
+  The bundled step-ca refuses to issue for any IP address and for the
+  control node's own names: `localhost`, `stepca.internal`,
+  `openbao.internal`, `responder.internal`, `<instance>-ca`,
+  `<instance>-openbao` and `<instance>-http01` (`bootroot-ca`,
+  `bootroot-openbao` and `bootroot-http01` on the default instance). These
+  are the names and addresses the step-ca, OpenBao and responder admin API
+  server certificates carry, so no service host can obtain a certificate
+  that impersonates those endpoints. The refusal is
+  `authority.policy.x509.deny` in `ca.json`. bootroot owns that key and
+  rewrites it on every `bootroot init`, so a policy written there by hand
+  is replaced. An existing installation receives it on its next
+  `bootroot init` re-run, which restarts step-ca; `bootroot infra up` does
+  not apply it.
 - **Other outbound requests are unaffected.** PostgreSQL is not HTTP, and
   the variable does not apply to anything step-ca fetches over `https://`.
   If you hand-edit `ca.json` to add something step-ca fetches over plain
