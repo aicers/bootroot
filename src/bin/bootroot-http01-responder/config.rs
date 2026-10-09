@@ -266,24 +266,28 @@ mod tests {
 
     #[test]
     fn test_placeholder_hmac_secret_is_recognised() {
-        for secret in ["CHANGE-ME", "change-me", "  Change-Me  "] {
+        // The failure messages name a case by position, never by value:
+        // an `hmac_secret` does not belong in test output either.
+        let placeholders = ["CHANGE-ME", "change-me", "  Change-Me  "];
+        for (case, value) in placeholders.into_iter().enumerate() {
             let mut settings = test_settings();
-            settings.hmac_secret = secret.to_string();
+            settings.hmac_secret = value.to_string();
             assert!(
                 settings.has_placeholder_hmac_secret(),
-                "{secret:?} must be treated as the placeholder"
+                "placeholder case {case} must be treated as the placeholder"
             );
         }
-        for secret in [
+        let real = [
             "CHANGE-ME-2",
             "dev-hmac",
             "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
-        ] {
+        ];
+        for (case, value) in real.into_iter().enumerate() {
             let mut settings = test_settings();
-            settings.hmac_secret = secret.to_string();
+            settings.hmac_secret = value.to_string();
             assert!(
                 !settings.has_placeholder_hmac_secret(),
-                "{secret:?} must not be treated as the placeholder"
+                "real case {case} must not be treated as the placeholder"
             );
         }
     }
