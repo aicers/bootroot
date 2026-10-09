@@ -693,22 +693,75 @@ The responder reads `responder.toml.compose` and listens on port 80 for
 `/.well-known/acme-challenge/` requests. bootroot-agent registers tokens via
 an admin API on port 8080 using the shared HMAC secret.
 
+#### Validation through the responder
+
+Both compose files bootroot ships, `docker-compose.yml` and
+`docker-compose.deploy.yml`, set `HTTP_PROXY=http://bootroot-http01:80` on
+the `step-ca` service. step-ca therefore sends every HTTP-01 fetch to the
+responder, whatever name the challenge is for, and the responder answers by
+path alone. A challenge validates for any name whose token is registered
+with the responder, whether or not that name resolves from the step-ca
+container.
+
+- **Trade-off.** An ACME client that answers HTTP-01 on its own port 80,
+  instead of registering its token with the bootroot responder, cannot be
+  validated by the bundled step-ca: step-ca never connects to that client.
+- **Who may be issued what.** step-ca will validate any DNS name or
+  non-loopback IP address for a client that can reach the ACME directory,
+  satisfies EAB where it is required, and holds the responder HMAC secret.
+  Those credentials, not name resolution, are what bound issuance. The
+  responder HMAC and the EAB credential are deployment-wide, and every
+  registered service host holds them. Treat each of those hosts as able to
+  obtain a certificate from this CA for any name, including the names of
+  other services and of the control node itself, and rotate the HMAC
+  (`bootroot rotate responder-hmac`) when such a host is decommissioned or
+  compromised.
+- **Other outbound requests are unaffected.** PostgreSQL is not HTTP, and
+  the variable does not apply to anything step-ca fetches over `https://`.
+  If you hand-edit `ca.json` to add something step-ca fetches over plain
+  `http://` (a webhook URL, for example), the responder answers it `404`;
+  use `https://` for it.
+- **Existing installations.** The variable takes effect when the step-ca
+  container is recreated from the updated compose file, which
+  `bootroot infra up` does. A container restart alone does not, and until
+  the container is recreated validation still depends on the aliases
+  described below.
+- **Checking.** `docker exec <instance>-ca env` lists
+  `HTTP_PROXY=http://bootroot-http01:80`.
+- **Hosts whose Docker client sets proxy values.** When
+  `~/.docker/config.json` carries a `proxies` section, Compose copies its
+  values into every service container as `HTTP_PROXY`, `http_proxy`,
+  `HTTPS_PROXY`, `https_proxy`, `NO_PROXY` and `no_proxy`. The compose
+  file's `HTTP_PROXY` replaces the injected upper-case one and step-ca
+  prefers it over the lower-case one, so validation still goes to the
+  responder. An injected `NO_PROXY` that matches a certificate name (the
+  deployment's domain suffix, for example, or `*`) is different: step-ca
+  then connects to that name directly, and validation of that name depends
+  on the alias again. Exclude the bootroot stack from the client proxy
+  configuration on such a host.
+- **Your own compose file.** bootroot does not change a compose file of
+  your own that defines `step-ca` without the bundled responder. There,
+  step-ca connects to the validation target directly as before, and name
+  resolution remains your responsibility.
+
 #### DNS alias (automatic)
 
-For HTTP-01 validation, the step-ca container must resolve each service's
-challenge hostname to the responder.  `bootroot service add` handles this
-automatically: it registers the validation FQDN
+`bootroot service add` still registers the validation FQDN
 (`<instance_id>.<service_name>.<hostname>.<domain>`) as a Docker network
-alias on the `bootroot-http01` container.  No manual
-`docker-compose.override.yml` is required.
+alias on the `bootroot-http01` container, but validation no longer depends
+on it: step-ca reaches the responder through the proxy variable described
+in [Validation through the responder](#validation-through-the-responder),
+not by resolving the name.  No manual `docker-compose.override.yml` is
+required.
 
 Registration is best-effort and never fails the add, so the summary
 reports what it did on its `- HTTP-01 DNS aliases registered:` line.
 A count is how many aliases were attached; a zero followed by
 `(registration skipped; see the warning above)` means no aliases were
 registered — consult the warning printed above it for the specific
-cause.  Read that line before moving on: a skipped registration leaves
-the challenge hostname unresolvable until the aliases are replayed.
+cause.  A skipped registration no longer blocks issuance once step-ca
+runs with the proxy variable; it matters only for a step-ca container
+that predates the variable and has not been recreated.
 
 If the responder container is restarted (e.g. `docker compose down` / `up`),
 run `bootroot infra up` to replay all aliases from `state.json`.
@@ -716,6 +769,12 @@ run `bootroot infra up` to replay all aliases from `state.json`.
 ### Binary (optional)
 
 If you must run it outside Docker, use the binary and manage it with systemd.
+
+!!! note
+    The shipped compose files point step-ca at the compose service
+    `bootroot-http01`. Running the responder as a host binary alongside the
+    compose step-ca is not supported with the shipped files: step-ca would
+    have no proxy to reach.
 
 #### Step 1. Build the responder binary
 

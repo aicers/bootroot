@@ -712,53 +712,6 @@ YAML
   log "hmac-mismatch failure ok"
 }
 
-scenario_fail_dns_unresolvable() {
-  log "Scenario: fail-dns-unresolvable"
-  compose_up
-  mkdir -p "$TMP_DIR"
-
-  local cfg="$TMP_DIR/agent.toml.bad-dns"
-  cat <<'TOML' > "$cfg"
-email = "admin@example.com"
-server = "https://bootroot-ca:9000/acme/acme/directory"
-domain = "unresolvable.domain"
-
-[scheduler]
-max_concurrent_issuances = 1
-
-[acme]
-poll_attempts = 3
-poll_interval_secs = 1
-http_responder_url = "http://bootroot-http01:8080"
-http_responder_hmac = "dev-hmac"
-http_responder_timeout_secs = 5
-http_responder_token_ttl_secs = 300
-
-[retry]
-backoff_secs = [1, 2, 3]
-
-[[profiles]]
-registration_id = "bootroot-agent"
-service_name = "agent-selftest"
-instance_id = "001"
-hostname = "bootroot-agent"
-
-[profiles.paths]
-cert = "certs/fail-dns.crt"
-key = "certs/fail-dns.key"
-TOML
-
-  local output
-  output="$(run_agent_oneshot "$cfg" 2>&1 || true)"
-  if ! printf "%s" "$output" | grep -Fq "validation target"; then
-    if ! printf "%s" "$output" | grep -Fq "could not connect"; then
-      printf "%s\n" "$output"
-      fail "Expected DNS resolution failure not found"
-    fi
-  fi
-  log "dns-unresolvable failure ok"
-}
-
 scenario_fail_directory_unreachable() {
   log "Scenario: fail-directory-unreachable"
   compose_up
@@ -1014,7 +967,6 @@ case "$SCENARIO" in
     scenario_topology_b
     scenario_fail_responder_down
     scenario_fail_hmac_mismatch
-    scenario_fail_dns_unresolvable
     scenario_fail_directory_unreachable
     scenario_fail_domain_empty
     scenario_fail_step_ca_down
@@ -1032,7 +984,6 @@ case "$SCENARIO" in
   failures)
     scenario_fail_responder_down
     scenario_fail_hmac_mismatch
-    scenario_fail_dns_unresolvable
     scenario_fail_directory_unreachable
     scenario_fail_domain_empty
     scenario_fail_step_ca_down

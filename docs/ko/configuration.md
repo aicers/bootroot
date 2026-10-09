@@ -1090,10 +1090,13 @@ check_jitter = "0s"
 ```
 
 DNS SAN은 `<instance-id>.<service-name>.<hostname>.<domain>` 형식으로
-자동 생성됩니다. 이 이름은 HTTP-01 검증 대상이므로, step-ca에서
-HTTP-01 리스폰더 IP로 해석되어야 합니다. Compose 환경에서는 `bootroot service add`가
-`bootroot-http01` 컨테이너에 별칭을 자동 등록합니다. 베어메탈 환경에서는
-`/etc/hosts` 또는 DNS를 수동으로 설정하세요.
+자동 생성됩니다. 이 이름은 HTTP-01 검증 대상이기도 합니다. compose
+스택에서는 이 이름이 step-ca에서 해석될 필요가 없습니다. step-ca가 모든
+검증을 리스폰더를 통해 가져오기 때문입니다. `bootroot service add`는 여전히
+`bootroot-http01` 컨테이너에 별칭을 등록합니다.
+[리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)을 참고하세요.
+step-ca를 호스트에 설치한 환경에서는 이 이름이 HTTP-01 리스폰더 IP로
+해석되도록 `/etc/hosts` 또는 DNS를 수동으로 설정하세요.
 
 `service_name`과 `hostname`은 각각 단일 DNS label입니다. 영문자, 숫자,
 하이픈만 쓸 수 있고 최대 63 옥텟입니다. 둘 중 하나라도 규칙을 어기면

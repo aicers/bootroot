@@ -657,15 +657,18 @@ Compose 프로젝트 레이블이 붙어 있습니다. 확인이 레이블이 �
    자격증명 파싱
 3. `service-add`: 두 서비스를 `local-file` 모드로 추가
 4. `verify-initial`: 초기 인증서 발급/검증 후 fingerprint 스냅샷 저장
-5. `rotate-infra-secret-id`: 전용 `infra_rotate` 자격증명으로
+5. `issue-unaliased-name`: 별칭이 없고 step-ca 컨테이너에서 해석되지 않는
+   이름으로 인증서를 발급받아, step-ca가 이름 해석이 아니라
+   리스폰더(`HTTP_PROXY`)를 통해 HTTP-01을 검증함을 증명
+6. `rotate-infra-secret-id`: 전용 `infra_rotate` 자격증명으로
    stepca/responder 인프라 AppRole secret_id를 회전한 뒤,
    `runtime_rotate` 자격증명이 인프라 역할 경로에서 거부되는지 검증
-6. `rotate-openbao-recovery`: OpenBao 루트 토큰 수동 회전
-7. `bootstrap-after-openbao-recovery`: remote bootstrap 재실행으로
+7. `rotate-openbao-recovery`: OpenBao 루트 토큰 수동 회전
+8. `bootstrap-after-openbao-recovery`: remote bootstrap 재실행으로
    AppRole 기반 접근 연속성 검증
-8. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
-9. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
-10. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
+9. `rotate-responder-hmac`: 회전 실행 후 재발급 강제
+10. `verify-after-responder-hmac`: 재검증 및 fingerprint 변경 확인
+11. `cleanup`: 로그/아티팩트 수집 후 Compose 정리
 
 실제 실행 명령(스크립트 발췌):
 
@@ -704,11 +707,24 @@ bootroot service add --registration-id edge-proxy --service-name edge-proxy \
 bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
-# 4) verify-initial / 9) verify-after-responder-hmac
+# 4) verify-initial / 10) verify-after-responder-hmac
 bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
 bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
-# 5) rotate-infra-secret-id
+# 5) issue-unaliased-name
+# 이 이름은 어떤 별칭 목록에도 없습니다. step-ca에서 해석되지 않아야 하고,
+# 리스폰더의 서비스 이름은 해석되어야 합니다(getent가 없어서 통과하는 일을
+# 막기 위한 양성 대조)
+docker exec "${RUN_INSTANCE}-ca" getent hosts bootroot-http01
+! docker exec "${RUN_INSTANCE}-ca" getent hosts \
+  001.edge-proxy.unaliased-01.trusted.domain
+# hostname = "unaliased-01"과 별도의 cert/key 경로를 가진 edge 에이전트
+# 설정 사본
+bootroot-agent --config "$UNALIASED_AGENT_CONFIG" \
+  --eab-file "$SECRETS_DIR/services/edge-proxy/eab.json" --oneshot
+openssl x509 -in "$UNALIASED_CERT" -noout -ext subjectAltName
+
+# 6) rotate-infra-secret-id
 # init summary에서
 #   infra_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
@@ -720,7 +736,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 # 부정 검증: 같은 명령을 runtime_rotate 자격증명으로 실행하면
 # permission denied로 실패해야 합니다
 
-# 6) rotate-openbao-recovery (명시적 수동 실행)
+# 7) rotate-openbao-recovery (명시적 수동 실행)
 bootroot rotate --compose-file "$COMPOSE_FILE" \
   --openbao-url "http://127.0.0.1:8200" \
   --root-token "$INIT_ROOT_TOKEN" \
@@ -729,7 +745,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --rotate-root-token \
   --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
 
-# 8) rotate-responder-hmac
+# 9) rotate-responder-hmac
 # init summary에서
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id
@@ -762,7 +778,9 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 
 1. 머신 전체 `hosts` 잠금을 잡은 뒤 `stepca.internal`, `responder.internal`
    host entry 추가
-2. `no-hosts`와 동일한 전체 흐름 phase 실행
+2. `issue-unaliased-name`을 포함해 `no-hosts`와 동일한 전체 흐름 phase
+   실행. 이 phase가 발급받는 이름은 `/etc/hosts`에도 추가되지 않으므로, 이
+   모드에서도 리스폰더를 통한 검증을 증명
 3. cleanup에서 임시 host entry 제거
 
 실제 실행 명령(스크립트 발췌):

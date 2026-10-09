@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -9,7 +9,9 @@ use bootroot::acme::http01_protocol::{HEADER_SIGNATURE, HEADER_TIMESTAMP, Http01
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::tempdir;
-use tokio::time::sleep;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{sleep, timeout};
 
 const ADMIN_PATH: &str = "/admin/http01";
 const CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge";
@@ -21,6 +23,14 @@ const TEST_TTL_SECS: u64 = 60;
 /// `reserve_socket_addr` dropping its listener and the responder child
 /// re-binding the same address.
 const RESPONDER_BIND_ATTEMPTS: u32 = 4;
+/// Bound on one raw exchange with the challenge listener. The responder
+/// closes the connection after the response only when asked to, so a
+/// request that forgot `Connection: close` runs into this instead of
+/// hanging the test.
+const RAW_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A name nothing resolves: the responder must answer for it without
+/// trying to.
+const UNALIASED_NAME: &str = "001.unaliased.host.invalid";
 
 #[derive(Default)]
 struct ResponderConfigOverrides {
@@ -205,6 +215,97 @@ async fn test_http01_responder_reloads_hmac_secret_on_sighup() {
     );
 }
 
+// step-ca reaches the responder as an HTTP proxy (`HTTP_PROXY` on the
+// `step-ca` compose service), so the three tests below put on the wire
+// what a proxy client sends: a request line in absolute form, and
+// `CONNECT`. They pin what that design rests on — the responder answers
+// a challenge by path alone whatever name the URI carries, and it has no
+// outbound path, so it is not an open proxy. A change that gives the
+// responder an HTTP client must keep them passing.
+
+#[tokio::test]
+async fn test_http01_responder_serves_absolute_form_challenge_request() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_path = temp_dir.path().join("responder.toml");
+    let (_responder, listen_addr, admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, "initial-secret");
+        })
+        .await;
+    let admin_base_url = format!("http://{admin_addr}");
+
+    let response = register_token(
+        &admin_base_url,
+        "initial-secret",
+        "token-proxied",
+        "token-proxied.key",
+        TEST_TTL_SECS,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (status, body) = raw_exchange(
+        &listen_addr,
+        &raw_request(
+            "GET",
+            &format!("http://{UNALIASED_NAME}{CHALLENGE_PATH_PREFIX}/token-proxied"),
+            UNALIASED_NAME,
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, "token-proxied.key");
+}
+
+#[tokio::test]
+async fn test_http01_responder_forwards_no_absolute_form_request() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_path = temp_dir.path().join("responder.toml");
+    let (_responder, listen_addr, _admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, "initial-secret");
+        })
+        .await;
+    let decoy = Decoy::bind();
+    let authority = decoy.authority();
+
+    // The two bodies differ in case (the router's not-found and the
+    // handler's), so the status is what is asserted.
+    for path in [
+        "/secret".to_string(),
+        format!("{CHALLENGE_PATH_PREFIX}/token-never-registered"),
+    ] {
+        let (status, _body) = raw_exchange(
+            &listen_addr,
+            &raw_request("GET", &format!("http://{authority}{path}"), &authority),
+        )
+        .await;
+        assert_eq!(status, 404, "absolute-form GET of {path}");
+    }
+    decoy.assert_no_pending_connection();
+}
+
+#[tokio::test]
+async fn test_http01_responder_refuses_connect() {
+    let temp_dir = tempdir().expect("create temp dir");
+    let config_path = temp_dir.path().join("responder.toml");
+    let (_responder, listen_addr, _admin_addr) =
+        spawn_responder_retrying(&config_path, |path, listen, admin| {
+            write_responder_config(path, listen, admin, "initial-secret");
+        })
+        .await;
+    let decoy = Decoy::bind();
+    let authority = decoy.authority();
+
+    let (status, _body) = raw_exchange(
+        &listen_addr,
+        &raw_request("CONNECT", &authority, &authority),
+    )
+    .await;
+    assert_eq!(status, 404);
+    decoy.assert_no_pending_connection();
+}
+
 struct ResponderProcess {
     child: Child,
 }
@@ -253,6 +354,89 @@ fn reserve_socket_addr() -> String {
         .local_addr()
         .expect("read listener address")
         .to_string()
+}
+
+/// Builds a bodiless HTTP/1.1 request with the request target written
+/// exactly as given. `Connection: close` is not optional: without it the
+/// responder keeps the connection open after the response and
+/// [`raw_exchange`] never sees the end of the stream.
+fn raw_request(method: &str, target: &str, host: &str) -> String {
+    format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+}
+
+/// Writes `request` to the challenge listener as it stands and returns
+/// the response's status code and body. `reqwest` cannot stand in here:
+/// it always sends origin form to a server it is not told is a proxy,
+/// and the request line is what these tests are about.
+async fn raw_exchange(listen_addr: &str, request: &str) -> (u16, String) {
+    let exchange = async {
+        let mut stream = TcpStream::connect(listen_addr)
+            .await
+            .expect("connect to challenge listener");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write raw request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read raw response");
+        response
+    };
+    let response = timeout(RAW_EXCHANGE_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the responder held the connection open for {RAW_EXCHANGE_TIMEOUT:?} after: \
+                 {request:?}"
+            )
+        });
+    let response = String::from_utf8(response).expect("response is UTF-8");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("response has no header terminator: {response:?}"));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("response has no status code: {head:?}"));
+    (status, body.to_string())
+}
+
+/// A loopback listener standing in for whatever a proxied request names.
+/// Nothing is expected to connect to it: a connection is the responder
+/// forwarding.
+struct Decoy {
+    listener: TcpListener,
+}
+
+impl Decoy {
+    fn bind() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind decoy listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set decoy listener non-blocking");
+        Self { listener }
+    }
+
+    fn authority(&self) -> String {
+        self.listener
+            .local_addr()
+            .expect("read decoy address")
+            .to_string()
+    }
+
+    fn assert_no_pending_connection(&self) {
+        match self.listener.accept() {
+            Ok((_stream, peer)) => panic!("the responder forwarded a connection from {peer}"),
+            Err(err) => assert_eq!(
+                err.kind(),
+                ErrorKind::WouldBlock,
+                "decoy accept failed for a reason other than having nothing pending: {err}"
+            ),
+        }
+    }
 }
 
 fn write_responder_config(config_path: &Path, listen_addr: &str, admin_addr: &str, secret: &str) {

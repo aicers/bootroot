@@ -97,9 +97,11 @@ was offline past its `secret_id_ttl` and its credential already expired.
 
 Key points:
 
-- For HTTP-01 validation, step-ca must resolve each service validation FQDN to
-  the responder IP. In Docker Compose environments, `bootroot service add`
-  registers this alias automatically on `bootroot-http01`.
+- In the compose stack, step-ca does not have to resolve a service
+  validation FQDN for HTTP-01 validation: it fetches every validation
+  through the responder. `bootroot service add` still registers the FQDN as
+  an alias on `bootroot-http01`. See
+  [Validation through the responder](installation.md#validation-through-the-responder).
 - If step-ca/responder are accessed by hostname (not direct IP), keep DNS/hosts
   mappings consistent across participating hosts.
 

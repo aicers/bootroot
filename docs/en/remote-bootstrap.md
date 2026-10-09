@@ -41,16 +41,19 @@ filesystem with the control node.
     managed `infra install` bind flags (`--openbao-bind`,
     `--stepca-bind`, `--http01-admin-bind`) that expose them.
 
-3. **DNS / name resolution.** The SAN (Subject Alternative Name) for the
-    service certificate must resolve from whatever DNS, `/etc/hosts`, or
-    cloud-internal DNS the environment uses.
+3. **DNS / name resolution.** With the bundled stack, the SAN (Subject
+    Alternative Name) of the service certificate does not have to resolve
+    for HTTP-01 validation. What the remote host needs is to reach the ACME
+    directory and the responder admin URL it was given; if those are names
+    rather than IP literals, they must resolve on the remote host.
 
     !!! note
-        The in-compose DNS alias automation tracked by
-        [#472](https://github.com/aicers/bootroot/issues/472) only covers
-        traffic between bundled containers on the Docker bridge network.
-        Remote hosts need real DNS or equivalent entries configured by the
-        operator.
+        step-ca fetches every HTTP-01 validation through the responder on
+        the control node, so no DNS record or `/etc/hosts` entry for the
+        SAN is involved; see
+        [Validation through the responder](installation.md#validation-through-the-responder).
+        A step-ca that does not run from the shipped compose files still
+        has to resolve the SAN to the responder.
 
 4. **Filesystem layout.** Directories for secrets, certs, and agent config
     must exist (or be creatable) on the remote host. The paths are defined
@@ -692,11 +695,14 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
     `service add` (e.g. `https://192.168.1.10:9000/acme/acme/directory`).
 
 !!! warning
-    The automatic HTTP-01 DNS alias registration (added in the current
-    unreleased version) only covers traffic between bundled containers on
-    the Docker bridge network. For remote hosts, configure real DNS records
-    or `/etc/hosts` entries so that the service's SAN resolves correctly
-    from both the responder and the CA's perspective.
+    With the bundled stack, a remote service's SAN does not have to resolve
+    for HTTP-01 validation: step-ca fetches the challenge through the
+    responder (see
+    [Validation through the responder](installation.md#validation-through-the-responder)).
+    What the remote host needs is to reach the ACME directory and the
+    responder admin URL it was given. A step-ca container created before
+    the proxy variable shipped keeps resolving the SAN until
+    `bootroot infra up` recreates it.
 
 ## `RemoteBootstrapArtifact` schema reference
 

@@ -234,13 +234,17 @@ step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-r
 ### 1) step-ca -> 서비스 FQDN(HTTP-01 검증 대상) -> 리스폰더 IP
 
 - 접속 주체: step-ca
-- 필수 조건: step-ca가 각 서비스의 검증 FQDN
-  (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더 IP로
-  찾을 수 있어야 합니다.
-- Docker Compose 환경: `bootroot service add`가 `bootroot-http01`
-  컨테이너에 네트워크 별칭을 자동 등록하므로 수동 설정이 필요 없습니다.
-- 베어메탈 환경: step-ca가 동작하는 환경(컨테이너/호스트)의
-  `/etc/hosts` 또는 DNS를 수동으로 설정하세요.
+- Docker Compose 환경: 서비스의 검증 FQDN
+  (`<instance_id>.<service_name>.<hostname>.<domain>`)을 리스폰더로 매핑할
+  필요가 없습니다. step-ca가 모든 HTTP-01 검증을 리스폰더를 통해 가져오기
+  때문입니다.
+  [리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)을
+  참고하세요. `bootroot service add`는 여전히 `bootroot-http01` 컨테이너에
+  네트워크 별칭을 등록하지만, 검증은 이 별칭에 의존하지 않습니다.
+- 베어메탈 환경(step-ca를 호스트에 설치): step-ca가 각 검증 FQDN을
+  리스폰더 IP로 찾을 수 있어야 합니다. step-ca가 동작하는
+  환경(컨테이너/호스트)의 `/etc/hosts` 또는 DNS를 수동으로 설정하거나,
+  step-ca에 `HTTP_PROXY`를 직접 설정하세요.
 
 ### 2) 원격 서비스 머신 -> step-ca/responder 이름 -> IP
 

@@ -1176,10 +1176,13 @@ check_jitter = "0s"
 The DNS SAN is auto-generated as
 `<instance-id>.<service-name>.<hostname>.<domain>` — `registration_id`
 never appears in it. This
-name is also the target for HTTP-01 validation, so it must resolve from step-ca
-to the HTTP-01 responder IP. In Compose environments, `bootroot service add`
-registers the alias on the `bootroot-http01` container automatically; for host
-installs, update `/etc/hosts` or DNS.
+name is also the target for HTTP-01 validation. In the compose stack it does
+not have to resolve from step-ca, which fetches every validation through the
+responder; `bootroot service add` still registers it as an alias on the
+`bootroot-http01` container. See
+[Validation through the responder](installation.md#validation-through-the-responder).
+For host installs of step-ca, update `/etc/hosts` or DNS so the name resolves
+to the HTTP-01 responder IP.
 
 `service_name` and `hostname` are each a single DNS label — letters,
 digits and hyphens, at most 63 octets. Config load rejects a profile that

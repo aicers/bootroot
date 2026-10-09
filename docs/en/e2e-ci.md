@@ -679,15 +679,19 @@ Execution steps:
    credentials from JSON
 3. `service-add`: add both services in `local-file` mode
 4. `verify-initial`: issue/verify initial certs and snapshot fingerprints
-5. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
+5. `issue-unaliased-name`: order a certificate for a name that has no alias
+   and does not resolve from the step-ca container, proving that step-ca
+   validates HTTP-01 through the responder (`HTTP_PROXY`) and not by name
+   resolution
+6. `rotate-infra-secret-id`: rotate the stepca/responder infra AppRole
    secret_ids with the dedicated `infra_rotate` credential, then assert
    the `runtime_rotate` credential is denied on the infra role paths
-6. `rotate-openbao-recovery`: manually rotate OpenBao root token
-7. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
+7. `rotate-openbao-recovery`: manually rotate OpenBao root token
+8. `bootstrap-after-openbao-recovery`: re-run remote bootstrap and verify
    AppRole-based access continuity
-8. `rotate-responder-hmac`: run rotation and force reissue
-9. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
-10. `cleanup`: capture logs/artifacts and tear down Compose
+9. `rotate-responder-hmac`: run rotation and force reissue
+10. `verify-after-responder-hmac`: verify certs again and confirm fingerprint changes
+11. `cleanup`: capture logs/artifacts and tear down Compose
 
 Actual commands (script excerpt):
 
@@ -726,11 +730,23 @@ bootroot service add --registration-id edge-proxy --service-name edge-proxy \
 bootroot service add --registration-id web-app --service-name web-app \
   --delivery-mode local-file --agent-config "$WEB_AGENT_CONFIG"
 
-# 4) verify-initial / 9) verify-after-responder-hmac
+# 4) verify-initial / 10) verify-after-responder-hmac
 bootroot verify --registration-id edge-proxy --agent-config "$EDGE_AGENT_CONFIG"
 bootroot verify --registration-id web-app --agent-config "$WEB_AGENT_CONFIG"
 
-# 5) rotate-infra-secret-id
+# 5) issue-unaliased-name
+# the name is in no alias list; it must not resolve from step-ca, while
+# the responder's service name must (so a missing getent cannot pass)
+docker exec "${RUN_INSTANCE}-ca" getent hosts bootroot-http01
+! docker exec "${RUN_INSTANCE}-ca" getent hosts \
+  001.edge-proxy.unaliased-01.trusted.domain
+# a copy of the edge agent config with hostname = "unaliased-01" and its
+# own cert/key paths
+bootroot-agent --config "$UNALIASED_AGENT_CONFIG" \
+  --eab-file "$SECRETS_DIR/services/edge-proxy/eab.json" --oneshot
+openssl x509 -in "$UNALIASED_CERT" -noout -ext subjectAltName
+
+# 6) rotate-infra-secret-id
 # from init summary
 #   infra_rotate: role_id/secret_id
 bootroot rotate --compose-file "$COMPOSE_FILE" \
@@ -742,7 +758,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
 # negative check: the same command with the runtime_rotate credential
 # must fail with permission denied
 
-# 6) rotate-openbao-recovery (manual, explicit operator action)
+# 7) rotate-openbao-recovery (manual, explicit operator action)
 bootroot rotate --compose-file "$COMPOSE_FILE" \
   --openbao-url "http://127.0.0.1:8200" \
   --root-token "$INIT_ROOT_TOKEN" \
@@ -751,7 +767,7 @@ bootroot rotate --compose-file "$COMPOSE_FILE" \
   --rotate-root-token \
   --output "$OPENBAO_RECOVERY_OUTPUT_FILE"
 
-# 8) rotate-responder-hmac
+# 9) rotate-responder-hmac
 # from init summary
 #   runtime_service_add: role_id/secret_id
 #   runtime_rotate: role_id/secret_id
@@ -784,7 +800,9 @@ Execution steps:
 
 1. Take the machine-wide `hosts` lock, then add host entries for
    `stepca.internal` and `responder.internal`
-2. Run the same end-to-end flow phases as `no-hosts`
+2. Run the same end-to-end flow phases as `no-hosts`, including
+   `issue-unaliased-name`: the name it orders is added to no `/etc/hosts`
+   either, so it proves validation through the responder in this mode too
 3. Remove temporary host entries during cleanup
 
 Actual commands (script excerpt):

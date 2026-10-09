@@ -215,6 +215,15 @@ bootroot service add \
 
 ### HTTP-01 실패
 
+- `urn:ietf:params:acme:error:connection`("The server could not connect to
+  validation target")은 이제 step-ca가 리스폰더에 도달하지 못했거나,
+  step-ca 컨테이너가
+  [리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)에서 설명한
+  프록시 변수보다 먼저 만들어졌다는 뜻입니다.
+  `docker exec <instance>-ca env`에서 대소문자와 무관하게 `proxy`가
+  들어간 변수를 확인하고(정확히 `HTTP_PROXY=http://bootroot-http01:80`
+  하나만 있어야 합니다), 리스폰더가 실행 중인지 확인한 뒤
+  `bootroot infra up`을 실행하세요.
 - `bootroot service add`는 서비스 FQDN을 `bootroot-http01` 컨테이너에
   Docker 네트워크 별칭으로 자동 등록합니다. 컨테이너 재시작 후 별칭이
   사라진 경우 `bootroot infra up`을 실행하면 `state.json`에서 별칭을
@@ -224,7 +233,9 @@ bootroot service add \
   확인하세요)`는 등록된 별칭이 없다는 뜻이며, 구체적인 원인은 그 위에 출력된
   경고에 나옵니다. 추가 자체는 성공했으므로 원인을 해결한 뒤
   `bootroot infra up`으로 별칭을 등록하면 됩니다.
-- step-ca가 서비스 FQDN을 responder IP로 찾을 수 있어야 합니다.
+- 제공되는 compose 파일로 실행하지 않는 step-ca(번들된 리스폰더가 없는
+  운영자 자신의 compose 파일, 또는 호스트 설치)는 서비스 FQDN을 responder
+  IP로 찾을 수 있어야 합니다.
 - 서비스 머신(원격 추가 시)도 step-ca/responder 이름을 올바른 IP로 찾을 수 있어야 합니다.
 
 ### `Finalize failed: badCSR`

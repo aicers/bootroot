@@ -92,9 +92,12 @@ EAB 회전을 가져와 `agent.toml`을 재렌더하므로 어느 서비스 호�
 
 핵심 원칙:
 
-- HTTP-01 검증이 동작하려면 step-ca가 서비스 검증 FQDN을 responder IP로
-  찾을 수 있어야 합니다. Docker Compose 환경에서는 `bootroot service add`가
-  `bootroot-http01` 컨테이너에 별칭을 자동 등록합니다.
+- compose 스택에서는 HTTP-01 검증을 위해 step-ca가 서비스 검증 FQDN을
+  해석할 필요가 없습니다. step-ca가 모든 검증을 리스폰더를 통해 가져오기
+  때문입니다. `bootroot service add`는 여전히 `bootroot-http01` 컨테이너에
+  별칭을 등록합니다.
+  [리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)을
+  참고하세요.
 - step-ca/responder를 IP가 아닌 이름으로 접근하면, 관련 호스트들에서
   DNS/hosts 매핑을 일관되게 맞춰야 합니다.
 

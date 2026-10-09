@@ -410,6 +410,17 @@ byte for byte.
   exists is now refused before anything is provisioned or minted; the
   refusal used to come only when the file was written, after a
   `secret_id` had already been issued.
+- step-ca now fetches every HTTP-01 validation through the bundled
+  responder: both compose files set `HTTP_PROXY=http://bootroot-http01:80`
+  on `step-ca`. A challenge therefore validates for any name whose token
+  is registered with the responder, whether or not the name resolves from
+  the step-ca container. The aliases `service add` registers are still
+  attached, but issuance no longer depends on them. An ACME client that
+  answers HTTP-01 on its own port 80, instead of registering its token
+  with the responder, can no longer be validated by the bundled step-ca.
+  An existing installation picks the change up when step-ca is recreated
+  from the new compose file with `bootroot infra up`; a restart is not
+  enough.
 
 ### Removed
 

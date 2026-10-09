@@ -41,15 +41,19 @@
     (`--openbao-bind`, `--stepca-bind`, `--http01-admin-bind`)는 아래
     네트워크 요구사항 섹션을 참고하세요.
 
-3. **DNS / 이름 해석.** 서비스 인증서의 SAN(Subject Alternative Name)은
-    해당 환경에서 사용하는 DNS, `/etc/hosts`, 또는 클라우드 내부 DNS에서
-    해석 가능해야 합니다.
+3. **DNS / 이름 해석.** 번들된 스택에서는 서비스 인증서의 SAN(Subject
+    Alternative Name)이 HTTP-01 검증을 위해 해석될 필요가 없습니다. 원격
+    호스트에 필요한 것은 전달받은 ACME 디렉터리와 리스폰더 관리자 URL에
+    도달하는 것입니다. 이들이 IP literal이 아니라 이름이라면 원격
+    호스트에서 해석되어야 합니다.
 
     !!! note
-        [#472](https://github.com/aicers/bootroot/issues/472)에서 추적 중인
-        compose 내부 DNS 별칭 자동화는 Docker 브리지 네트워크의 번들 컨테이너
-        간 트래픽에만 적용됩니다. 원격 호스트는 운영자가 직접 실제 DNS 또는
-        동등한 항목을 구성해야 합니다.
+        step-ca는 모든 HTTP-01 검증을 제어 노드의 리스폰더를 통해
+        가져오므로, SAN에 대한 DNS 레코드나 `/etc/hosts` 항목은 관여하지
+        않습니다.
+        [리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증)을
+        참고하세요. 제공되는 compose 파일로 실행하지 않는 step-ca는
+        여전히 SAN을 리스폰더로 해석할 수 있어야 합니다.
 
 4. **파일시스템 레이아웃.** 시크릿, 인증서, 에이전트 설정을 위한 디렉터리가
     원격 호스트에 존재하거나 생성 가능해야 합니다. 경로는 부트스트랩
@@ -666,10 +670,14 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
     (예: `https://192.168.1.10:9000/acme/acme/directory`).
 
 !!! warning
-    자동 HTTP-01 DNS 별칭 등록(현재 미출시 버전에 추가됨)은 Docker 브리지
-    네트워크의 번들 컨테이너 간 트래픽에만 적용됩니다. 원격 호스트의 경우
-    리스폰더와 CA 관점 모두에서 서비스의 SAN이 올바르게 해석되도록 실제 DNS
-    레코드 또는 `/etc/hosts` 항목을 구성해야 합니다.
+    번들된 스택에서는 원격 서비스의 SAN이 HTTP-01 검증을 위해 해석될
+    필요가 없습니다. step-ca가 챌린지를 리스폰더를 통해 가져오기
+    때문입니다
+    ([리스폰더를 통한 검증](installation.md#리스폰더를-통한-검증) 참고).
+    원격 호스트에 필요한 것은 전달받은 ACME 디렉터리와 리스폰더 관리자
+    URL에 도달하는 것입니다. 프록시 변수가 추가되기 전에 만들어진 step-ca
+    컨테이너는 `bootroot infra up`이 다시 생성하기 전까지 계속 SAN을
+    해석합니다.
 
 ## `RemoteBootstrapArtifact` 스키마 참조
 
