@@ -92,7 +92,17 @@ fn lock_is_held(root: &Path) -> bool {
     let Ok(file) = fs::File::open(root.join(LOCK_FILE)) else {
         return false;
     };
-    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
+    match file.try_lock() {
+        Ok(()) => {
+            // Given back rather than left to the descriptor closing: a
+            // child another test thread forks in between would carry
+            // the probe's lock into the next step of the test.
+            let _ = file.unlock();
+            false
+        }
+        Err(fs::TryLockError::WouldBlock) => true,
+        Err(fs::TryLockError::Error(_)) => false,
+    }
 }
 
 #[test]

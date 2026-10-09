@@ -121,11 +121,25 @@ const INTERNAL_CONFIG_RECOVERY: &str = "the new value is already in OpenBao; re-
 
 /// Exclusive hold on the internal config's lock, released when dropped.
 ///
-/// The kernel releases the lock as the descriptor closes, so a rotation
-/// that fails — or is killed — mid-update strands nothing.
+/// The guard unlocks on drop, so a rotation that fails mid-update
+/// strands nothing and a copy of the descriptor in a child another
+/// thread has forked and not yet `exec`ed cannot keep the lock held;
+/// the kernel still releases the lock of a rotation that is killed
+/// without running `drop`.
 pub(super) struct InternalConfigLock {
-    /// The open lock file; holding it open is holding the lock.
-    _file: File,
+    /// The open lock file, holding the lock; unlocked on drop.
+    file: File,
+}
+
+impl Drop for InternalConfigLock {
+    fn drop(&mut self) {
+        // `flock` belongs to the open file description, which a child
+        // forked by another thread shares until its `exec`; closing our
+        // descriptor alone would leave the lock held through that copy.
+        // An error is discarded: the descriptor closes next, and the
+        // kernel releases the lock once no copy remains.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Takes the internal config's lock, waiting for whichever rotation
@@ -192,7 +206,7 @@ fn lock_internal_config_blocking(lock_path: &Path) -> Result<InternalConfigLock>
             lock_path.display()
         )
     })?;
-    Ok(InternalConfigLock { _file: file })
+    Ok(InternalConfigLock { file })
 }
 
 /// One change a rotation makes to the internal config, applied to the
@@ -2520,8 +2534,10 @@ mod tests {
     ///
     /// `flock` belongs to the open file description, so a hold on
     /// another descriptor in this process refuses this one exactly as
-    /// another process's would. Test-only: the answer is stale the
-    /// moment it is returned.
+    /// another process's would. A lock the probe takes is given back
+    /// with `unlock` before it returns, so that a child another test
+    /// thread forks cannot carry it into the next step. Test-only: the
+    /// answer is stale the moment it is returned.
     fn lock_is_free(paths: &InternalPaths) -> bool {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -2530,7 +2546,32 @@ mod tests {
             .truncate(false)
             .open(paths.dir().join(INTERNAL_CONFIG_LOCK_FILE))
             .expect("open the lock file");
-        file.try_lock().is_ok()
+        let free = file.try_lock().is_ok();
+        if free {
+            let _ = file.unlock();
+        }
+        free
+    }
+
+    /// A copy of the guard's descriptor — what a child forked by another
+    /// thread holds until its `exec` — does not keep the lock held once
+    /// the guard is dropped.
+    #[tokio::test]
+    async fn a_descriptor_copy_does_not_keep_a_dropped_lock_held() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        let held = acquire_internal_config_lock(dir.path())
+            .await
+            .expect("take the lock");
+        let copy = held.file.try_clone().expect("duplicate the descriptor");
+
+        drop(held);
+
+        assert!(
+            lock_is_free(&paths),
+            "dropping the guard releases the lock despite the copy"
+        );
+        drop(copy);
     }
 
     /// The four answers the pre-write check gives, one per kind of

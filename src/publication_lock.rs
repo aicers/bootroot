@@ -42,8 +42,11 @@
 //! The lock file is a name to lock, never a record: it is empty, it is
 //! created `0600`, and it is not removed afterwards, because unlinking
 //! it would hand the next two runs a different inode each and serialise
-//! neither. `flock` is released by the kernel when the descriptor
-//! closes, so a run that is killed mid-publication strands nothing.
+//! neither. The guard unlocks every lock file on drop, so that a copy
+//! of a descriptor in a child another thread has forked and not yet
+//! `exec`ed cannot keep a lock held, and the kernel still releases the
+//! locks of a holder that dies without running `drop`, so a run that is
+//! killed mid-publication strands nothing.
 //!
 //! # What it does not cover
 //!
@@ -72,12 +75,26 @@ pub const LOCK_FILE_NAME: &str = ".bootroot-registrar-publish.lock";
 const LOCK_FILE_MODE: u32 = 0o600;
 
 /// Exclusive access to every directory one publication writes into,
-/// released when it is dropped.
+/// released when it is dropped: the guard unlocks each lock file before
+/// closing it.
 pub struct PublicationLock {
-    /// The open lock files. `flock(2)` is released as the descriptor
-    /// closes, so holding these open is holding the lock and dropping
-    /// them is releasing it; nothing ever reads or writes them.
-    _files: Vec<File>,
+    /// The open lock files, each holding its `flock(2)`; unlocked on
+    /// drop, and released by the kernel if the holder dies first.
+    /// Nothing ever reads or writes them.
+    files: Vec<File>,
+}
+
+impl Drop for PublicationLock {
+    fn drop(&mut self) {
+        // `flock` belongs to the open file description, which a child
+        // forked by another thread shares until its `exec`; closing our
+        // descriptors alone would leave the locks held through that
+        // copy. Errors are discarded: the descriptors close next, and
+        // the kernel releases each lock once no copy remains.
+        for file in &self.files {
+            let _ = file.unlock();
+        }
+    }
 }
 
 /// Takes the publication lock covering `destinations`, waiting for
@@ -139,7 +156,7 @@ fn hold_blocking(dirs: &[PathBuf]) -> Result<PublicationLock> {
     for dir in &ordered {
         files.push(lock(&dir.join(LOCK_FILE_NAME))?);
     }
-    Ok(PublicationLock { _files: files })
+    Ok(PublicationLock { files })
 }
 
 /// Opens one lock file and takes its exclusive `flock`.
@@ -189,10 +206,17 @@ pub(crate) fn is_free(dir: &Path) -> bool {
         return false;
     };
     // SAFETY: `file` owns an open descriptor that outlives the call and
-    // `flock` dereferences nothing. The lock, if taken, is released as
-    // `file` is dropped at the end of this function.
+    // `flock` dereferences nothing. The lock, if taken, is given back
+    // with `unlock` before this function returns.
     let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    outcome == 0
+    let free = outcome == 0;
+    if free {
+        // Not left to the descriptor closing: a child another test
+        // thread forks in between would carry the probe's lock into the
+        // next step of the test.
+        let _ = file.unlock();
+    }
+    free
 }
 
 /// The directories a set of destinations is published into that no
@@ -255,6 +279,36 @@ mod tests {
             is_free(&live) && is_free(&keys),
             "both directories are released with the publication"
         );
+    }
+
+    /// A copy of each of the guard's descriptors — what a child forked
+    /// by another thread holds until its `exec` — does not keep a lock
+    /// held once the guard is dropped.
+    #[tokio::test]
+    async fn a_descriptor_copy_does_not_keep_a_dropped_lock_held() {
+        let root = TempDir::new().expect("tempdir");
+        let certs = root.path().join("certs");
+        let keys = root.path().join("keys");
+        let held = hold(&[
+            &certs.join("registrar.pem"),
+            &keys.join("registrar-key.pem"),
+        ])
+        .await
+        .expect("the acquisition");
+        assert_eq!(held.files.len(), 2, "one lock file per directory");
+        let copies: Vec<File> = held
+            .files
+            .iter()
+            .map(|file| file.try_clone().expect("duplicate the descriptor"))
+            .collect();
+
+        drop(held);
+
+        assert!(
+            is_free(&certs) && is_free(&keys),
+            "dropping the guard releases both locks despite the copies"
+        );
+        drop(copies);
     }
 
     /// A writer that shares no directory with another waits for

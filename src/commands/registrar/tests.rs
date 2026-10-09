@@ -1485,10 +1485,17 @@ fn publication_lock_is_free(dir: &Path) -> bool {
         return false;
     };
     // SAFETY: `file` owns an open descriptor that outlives the call, and
-    // `flock` dereferences nothing. The lock, if taken, is released as
-    // `file` is dropped at the end of this function.
+    // `flock` dereferences nothing. The lock, if taken, is given back
+    // with `unlock` before this function returns.
     let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    outcome == 0
+    let free = outcome == 0;
+    if free {
+        // Not left to the descriptor closing: a child another test
+        // thread forks in between would carry the probe's lock into the
+        // next step of the test.
+        let _ = file.unlock();
+    }
+    free
 }
 
 /// A publication step that refuses unless the publication is holding
