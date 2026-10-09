@@ -604,10 +604,9 @@ impl Messages {
         )
     }
 
-    pub(crate) fn warning_registrar_internal_account_key_replaced(&self, path: &str) -> String {
+    pub(crate) fn warning_registrar_internal_acme_file_replaced(&self, path: &str) -> String {
         format_template(
-            self.strings()
-                .warning_registrar_internal_account_key_replaced,
+            self.strings().warning_registrar_internal_acme_file_replaced,
             &[("path", path)],
         )
     }

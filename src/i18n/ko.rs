@@ -602,7 +602,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_http01_admin_tls_output_dir_symlink: "HTTP-01 관리자 API TLS 출력 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
     error_registrar_internal_provision_failed: "bootroot 내부 registrar 인증서 서명에 실패했습니다",
     error_registrar_internal_staging_symlink: "bootroot 내부 registrar 스테이징 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
-    warning_registrar_internal_account_key_replaced: "경고: {path}의 ACME 계정 키는 bootroot가 다시 읽을 수 있는 키가 아니므로 새 키로 교체합니다",
+    warning_registrar_internal_acme_file_replaced: "경고: {path}의 ACME 계정 키는 bootroot가 다시 읽을 수 있는 키가 아니므로 새 키로 교체합니다",
     info_infra_tls_renewed: "인프라 인증서 갱신됨: {name}",
     info_infra_tls_reload: "인증서 갱신 후 서비스 다시 로드 중: {strategy}",
     info_infra_tls_verified: "{name} 인증서 재로드 검증 완료: OpenBao 리스너가 이제 갱신된 인증서를 제공합니다",

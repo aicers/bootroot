@@ -923,7 +923,7 @@ async fn stage_account_key(
         Ok(_) => {
             eprintln!(
                 "{}",
-                messages.warning_registrar_internal_account_key_replaced(
+                messages.warning_registrar_internal_acme_file_replaced(
                     &published.display().to_string()
                 )
             );
@@ -3143,7 +3143,7 @@ mod offline_signing_tests {
         ] {
             let warning = crate::i18n::Messages::new(lang)
                 .expect("a supported locale")
-                .warning_registrar_internal_account_key_replaced(&path);
+                .warning_registrar_internal_acme_file_replaced(&path);
             assert_eq!(warning, expected, "{lang}");
             assert!(
                 !warning.contains(broken),
