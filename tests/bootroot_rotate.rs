@@ -8182,13 +8182,19 @@ async fn test_rotate_ca_key_reissue_without_registrar_endpoint_enumerates_nothin
 /// itself on one FIFO and then blocks on another until the test lets it
 /// go, which is what holds a rotation inside its load-to-save interval
 /// for as long as the test needs — with no sleep on either side.
+///
+/// It opens the release FIFO *before* announcing itself. Once the test
+/// has read the announcement the read end is therefore open, so the
+/// line the test writes stays in the pipe even if the test closes its
+/// own end straight afterwards.
 fn write_blocking_fake_docker(bin_dir: &Path) -> anyhow::Result<()> {
     let script = r#"#!/bin/sh
 set -eu
 
 if [ "${1:-}" = "restart" ]; then
+  exec 3< "$RESTART_RELEASE_FIFO"
   printf 'reached\n' > "$RESTART_REACHED_FIFO"
-  cat "$RESTART_RELEASE_FIFO" > /dev/null
+  read -r _ <&3
 fi
 
 exit 0
@@ -8211,18 +8217,34 @@ fn make_fifo(path: &Path) {
 /// Lets the blocked fake `docker` go, exactly once: explicitly on the
 /// path the test takes, and on drop when an assertion fails first, so a
 /// failing test does not leave a rotation waiting on the FIFO forever.
+///
+/// Releasing never waits for the fake. The FIFO is held open for
+/// reading *and* writing, so the write lands in the pipe whether or not
+/// anything is there to read it: a rotation that ended before reaching
+/// `docker restart` leaves no reader, and unwinding out of that failure
+/// must report it, not hang on it.
 struct RestartRelease {
-    fifo: PathBuf,
+    fifo: fs::File,
     released: bool,
 }
 
 impl RestartRelease {
+    fn open(path: &Path) -> Self {
+        let fifo = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open the release FIFO");
+        Self {
+            fifo,
+            released: false,
+        }
+    }
+
     fn release(&mut self) {
         if !self.released {
             self.released = true;
-            // Opening for writing waits for the fake's `cat`, which is
-            // the very next thing it does after announcing itself.
-            let _ = fs::write(&self.fifo, "go\n");
+            let _ = std::io::Write::write_all(&mut self.fifo, b"go\n");
         }
     }
 }
@@ -8333,6 +8355,7 @@ async fn test_rotate_infra_approle_serializes_with_a_concurrent_service_update()
         .open(&reached_fifo)
         .expect("open the reached FIFO");
     let mut reached_reporter = reached.try_clone().expect("clone the reached FIFO");
+    let mut release = RestartRelease::open(&release_fifo);
 
     let combined_path = format!(
         "{}:{}",
@@ -8364,10 +8387,6 @@ async fn test_rotate_infra_approle_serializes_with_a_concurrent_service_update()
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rotate approle-secret-id --infra");
-    let mut release = RestartRelease {
-        fifo: release_fifo,
-        released: false,
-    };
     let rotation = std::thread::spawn(move || {
         let output = rotation.wait_with_output().expect("wait for the rotation");
         // Unread on the path the test takes; the pipe buffers it.
