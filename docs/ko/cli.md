@@ -11,8 +11,9 @@ CLI는 infra 기동/초기화/상태 점검과 서비스 온보딩, 발급 검�
 
 - `bootroot`: step-ca가 동작하는 머신에서 infra/init/service/rotate/monitoring 자동화
 - `bootroot-remote`: 원격 서비스가 동작하는 머신에서 일회성 bootstrap 수행
-  (`apply-secret-id` 하위 명령은 `secret_id_ttl`을 넘겨 오프라인 상태였던
-  에이전트를 복구하는 경로입니다)
+  (`apply-secret-id` 하위 명령은 호스트의 `secret_id`가 아직 유효할 때만
+  동작합니다. [`secret_id`가 만료된 원격 호스트
+  복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참고)
 
 주요 명령:
 
@@ -83,10 +84,10 @@ EAB 회전을 가져와 `agent.toml`을 재렌더하므로 어느 서비스 호�
 번째 데몬(서비스별 OpenBao Agent)이 필요 없습니다. 추가 서비스가 step-ca
 운영 머신이 아닌 다른 머신에서 동작하는 경우, 해당 서비스 머신에서
 `bootroot-remote bootstrap`을 1회 실행해 초기 설정 번들을 반영하고
-`bootroot-agent`를 기동합니다. `bootroot-remote apply-secret-id`와
-`bootroot-remote bootstrap` 재실행은 복구 경로일 뿐입니다 — 에이전트가
-`secret_id_ttl`을 넘겨 오프라인 상태였고 자격 증명이 이미 만료된 경우에만
-필요합니다.
+`bootroot-agent`를 기동합니다. `bootroot-remote apply-secret-id`는
+호스트의 `secret_id`가 아직 유효할 때만 동작합니다. 이미 만료되었다면
+[`secret_id`가 만료된 원격 호스트
+복구](operations.md#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 ## 이름 해석(DNS/hosts) 운영 책임
 
@@ -820,6 +821,9 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   보안 보수적 기본값이며, 운영 여유가 노출 최소화보다 중요할 때 `48h`
   이상을 사용하세요. `48h` 초과 시 경고를 출력하고, `168h` 초과 시
   거부합니다. 회전 주기 안내가 항상 stderr에 출력됩니다.
+  이 값은 `state.json`에 기록되며, 이후 `bootroot service add`가 생성하는
+  서비스 AppRole에도 적용됩니다(registrar로 발급된 역할은 대신
+  `[registrar] role_secret_id_ttl`을 사용합니다).
   서비스별 오버라이드는 이후
   `bootroot service add --secret-id-ttl` 또는
   `bootroot service update --secret-id-ttl`로 설정할 수 있습니다.
@@ -1192,8 +1196,9 @@ bootroot status
 두 모드 모두 서비스 호스트에는 서비스별 OpenBao Agent가 실행되지
 않습니다: 에이전트가 스스로 인증하고 trust, `secret_id`, 리스폰더 HMAC,
 EAB 회전을 fast-poll로 가져오므로 수동 재부트스트랩이나 `apply-secret-id`
-없이 회전이 전파됩니다(이들은 `secret_id_ttl`을 넘겨 오프라인 상태였던
-에이전트를 위한 복구 경로일 뿐입니다).
+없이 회전이 전파됩니다(`apply-secret-id`는 호스트의 `secret_id`가 아직
+유효할 때만 동작합니다. [`secret_id`가 만료된 원격 호스트
+복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참고).
 
 **EAB 회전이 적용되려면 `--eab-file`이 필수입니다.** 문서화된 실행 명령은
 프로비저닝된 `eab.json` 경로를 `--eab-file`로 전달합니다. 없으면 KV의
@@ -3150,8 +3155,9 @@ OpenBao에 저장된 서비스 목표 상태(`secret_id`/`eab`/`responder_hmac`/
 원격 서비스 머신에서 1회 bootstrap으로 반영해 `agent.toml` 같은 로컬
 파일을 갱신합니다. 초기 bootstrap 이후에는 실행 중인 `bootroot-agent`가
 fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
-`bootroot-remote apply-secret-id`는 `secret_id_ttl`을 넘겨 오프라인
-상태였던 에이전트를 위한 복구 경로입니다.
+`bootroot-remote apply-secret-id`는 호스트의 `secret_id`가 아직 유효할
+때만 동작합니다([`secret_id`가 만료된 원격 호스트
+복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참고).
 `bootroot-remote`도 공통 옵션 `--lang`(환경 변수 `BOOTROOT_LANG`)을 지원합니다.
 
 전송 옵션(SSH, Ansible, cloud-init, systemd-credentials), `secret_id` 위생,
@@ -3258,11 +3264,13 @@ fast-poll 루프로 trust와 `secret_id`를 최신 상태로 유지하며,
 
 ### `bootroot-remote apply-secret-id`
 
-회전된 secret_id를 원격 서비스 머신에 반영합니다. 이는 정상 운영 흐름이
-아니라 **복구** 경로입니다. 실행 중인 `bootroot-agent`는 이미 fast-poll
-루프로 회전된 secret_id를 OpenBao에서 가져옵니다. 이 명령은 에이전트가
-`secret_id_ttl`을 넘겨 오프라인 상태였던(자격 증명이 이미 만료되어 스스로
-갱신할 수 없는) 경우에만 사용하세요.
+회전된 secret_id를 원격 서비스 머신에 반영합니다. 실행 중인
+`bootroot-agent`의 fast-poll 루프가 이미 스스로 하는 일을 수동으로 가져오는
+명령이며, 에이전트가 실행 중이 아닐 때 유용합니다. 호스트에 있는 현재
+`secret_id`로 로그인하므로 그 `secret_id`가 아직 유효할 때만 동작하고,
+`secret_id`가 만료된 호스트는 복구할 수 없습니다 —
+[`secret_id`가 만료된 원격 호스트
+복구](operations.md#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 주요 입력:
 

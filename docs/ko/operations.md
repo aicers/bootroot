@@ -1889,8 +1889,9 @@ fail-closed 통제이므로 차오를수록 호출이 거부됩니다. 성공에
   이후 *실행 중인* 에이전트는 스스로 최신 상태를 유지합니다: fast-poll
   루프가 자신의 `secret_id`를 갱신하고 OpenBao KV에서 trust를 다시
   렌더링하므로 수동 작업이 필요 없습니다. `bootroot-remote apply-secret-id`는
-  `secret_id_ttl`을 넘겨 오프라인 상태였던(자격증명이 이미 만료되어 스스로
-  갱신할 수 없는) 에이전트를 복구할 때만 필요합니다.
+  호스트의 `secret_id`가 아직 유효할 때만 동작합니다. 이미 만료되었다면
+  [`secret_id`가 만료된 원격 호스트
+  복구](#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 - **한 호스트에서 서로 다른 서비스 여러 개**: 서비스마다 `bootroot-agent`
   하나와 agent 구성 하나를 사용하며, 각각 자체 `[openbao]` 자격증명과
   고유한 `state_path`를 가집니다. 서로 다른 서비스는 하나의 구성을 공유할
@@ -3259,6 +3260,19 @@ registrar 관리 identity에도 같은 규칙이 적용되며, 기준은
 `service add` 시 `--secret-id-ttl`을 생략하면 `bootroot init` 시
 설정된 역할 수준 TTL을 상속합니다.
 
+`service add`는 서비스의 AppRole(`bootroot-service-<registration_id>`)을
+`bootroot init --secret-id-ttl`이 `state.json`에 기록한 역할 수준 TTL로
+생성합니다. `state.json`에 기록된 값이 없는 배포(그 기록보다 오래된
+bootroot로 초기화된 배포)는 `24h`를 받으며, OpenBao가 "만료 없음"으로
+해석하는 0이 기록된 경우도 `24h`를 받습니다. 역할은 생성될 때의 TTL을
+유지합니다: 이후 다른 값으로 `init`을 다시 실행하거나 업그레이드해도 이미
+존재하는 서비스 역할은 바뀌지 않습니다. registrar로 발급된 identity는
+대신 `[registrar] role_secret_id_ttl`에서 역할 수준 TTL을 가져옵니다.
+
+서비스별 `--secret-id-ttl`은 역할 수준 TTL을 넘을 수 없습니다: OpenBao는
+더 긴 TTL의 `secret_id` 발급을 거부하므로, `service add` 또는 해당 서비스의
+다음 회전이 실패합니다.
+
 서비스별 재정의가 있는 경우, 회전 스케줄은 모든 대상 중 **가장 작은**
 TTL에 대해 2배 이상 불변식을 만족해야 합니다 — 서비스 하나가 `12h`로
 재정의되면 전체 작업을 최소 6시간마다 실행해야 합니다.
@@ -3301,10 +3315,10 @@ bootstrap이며, 이후 실행 중인 에이전트는 스스로 자립합니다:
    에서 자신의 `secret_id`를 갱신하고(`secret_id_ttl`을 넘겨서도 유지), control
    node에서 `bootroot rotate approle-secret-id`나 CA/trust 회전이 일어나면
    `bootroot/services/<registration_id>/trust`에서 `agent.toml`의 `[trust]` 핀과
-   `ca-bundle.pem`을 다시 렌더링합니다. `bootroot-remote apply-secret-id`와
-   `bootroot-remote bootstrap` 재실행은 복구 경로일 뿐입니다 — 에이전트가
-   `secret_id_ttl`을 넘겨 오프라인 상태였고 자격증명이 이미 만료되어 더 이상
-   스스로 갱신할 수 없을 때 필요합니다.
+   `ca-bundle.pem`을 다시 렌더링합니다. `bootroot-remote apply-secret-id`는
+   호스트의 `secret_id`가 아직 유효할 때만 동작합니다. 이미 만료되었다면
+   [`secret_id`가 만료된 원격 호스트
+   복구](#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 최소 환경/설정 체크리스트:
 
@@ -3402,6 +3416,9 @@ identity는 자격증명을 받은 적이 없으므로 건너뜀으로 보고되
 `secret_id` TTL 한 번이 지나면 인증에 실패합니다. 이미 `secret_id`가
 만료된 identity는 push로 복구할 수 없습니다 — 그 호스트는 더 이상
 로그인해 값을 읽을 수 없습니다.
+그러한 identity는 같은 호스트가 같은 spec으로 register 요청을 다시 보내면
+새 래핑된 `secret_id`를 받습니다. registrar 데몬은 자신의 인증서로
+로그인하며, 이 로그인은 `secret_id` TTL과 함께 만료되지 않습니다.
 
 이 나열에는 `<kv>/metadata/bootroot/services/`에 대한 `list` 권한이
 필요하며, `bootroot init`이 이를 `bootroot-runtime-rotate` 정책에
@@ -3419,9 +3436,12 @@ Phase 5에서는 로컬 인증서를 삭제하기보다도) 먼저 실행되므�
 `rotate eab-clear`(멱등), responder HMAC은 `rotate responder-hmac`을 다시
 실행합니다.
 
-`bootroot-remote apply-secret-id`는 정상 상태가 아니라 **복구** 경로입니다:
-`secret_id_ttl`을 넘겨 오프라인 상태였던(자격증명이 이미 만료되어 스스로
-갱신할 수 없는) 에이전트에 새 `secret_id`를 전달합니다:
+`bootroot-remote apply-secret-id`는 에이전트의 fast-poll 루프가 스스로 하는
+일을 수동으로 가져오는 명령이며, 에이전트가 실행 중이 아닐 때 유용합니다.
+호스트에 있는 현재 `secret_id`로 로그인하므로 그 `secret_id`가 아직 유효할
+때만 동작합니다. 이미 만료되었다면
+[`secret_id`가 만료된 원격 호스트
+복구](#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요:
 
 ```bash
 bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
@@ -3457,6 +3477,79 @@ OpenBao가 사설 CA로 HTTPS를 통해 제공될 때 — 즉 non-loopback
 언래핑 호출이 토큰이 **이미 언래핑됨**(비인가 당사자가 소비)으로 실패하면,
 `bootroot-remote`가 잠재적 보안 사고로 표시합니다. 이 경우 `secret_id`를
 즉시 회전하고 비인가 접근을 조사하세요.
+
+### `secret_id`가 만료된 원격 호스트 복구 {#recovering-a-remote-host-whose-secret_id-expired}
+
+원격 에이전트는 호스트의 `secret_id`가 아직 유효한 동안에만 그 값을 최신
+상태로 유지합니다. fast-poll 루프, `bootroot-remote apply-secret-id`, 그리고
+`wrap_token`이 없는 아티팩트로 실행한 `bootroot-remote bootstrap`은 모두
+OpenBao에서 무엇이든 읽기 전에 호스트에 이미 있는 `secret_id`로
+로그인합니다. 따라서 그 `secret_id`가 만료되면 어느 것도 로그인할 수 없고,
+KV에 새 값을 기록하는 회전도 호스트에 닿지 않습니다. `apply-secret-id`는
+fast-poll 루프가 스스로 하는 일을 수동으로 가져오는 명령으로, 에이전트가
+실행 중이 아니고 `secret_id`가 아직 유효할 때 유용하며 만료된
+`secret_id`의 복구 수단이 아닙니다. 호스트가 이미 사용한 아티팩트로
+`bootroot-remote bootstrap`을 다시 실행하는 것도 복구가 아닙니다: 그
+아티팩트의 `wrap_token`은 이미 소비되었거나 처음부터 없었습니다.
+
+아래 절차는 모두 `bootroot-remote bootstrap`으로 끝납니다. 이 명령은 새로
+전달된 `secret_id`로 로그인한 뒤, KV에 저장된 서비스의 `secret_id`를 가져와
+호스트의 파일을 덮어씁니다. 예약된 회전이 호스트의 `secret_id`가 만료될
+만큼 오래 멈춰 있었다면 KV의 값도 대개 함께 만료되어 있으며, 그 경우
+bootstrap은 성공을 보고하면서도 에이전트에 만료된 자격증명을 남깁니다.
+따라서 먼저 control node에서 새 `secret_id`를 KV에 게시하세요:
+
+```bash
+bootroot rotate approle-secret-id --registration-id <id> --yes
+```
+
+registrar로 발급된 identity라면 예약된 회전과 마찬가지로
+`--agent-config <경로>`를 추가합니다. 이 명령은
+`bootroot-runtime-rotate-role` 자격증명으로 인증하는데, 이 자격증명은 예약된
+회전이 실행되는 동안에만 스스로 갱신됩니다. 이것도 만료되었다면 root
+토큰(`bootroot rotate --auth-mode root --root-token-file <경로>
+approle-secret-id ...`)을 사용하거나,
+[데드맨 모니터링과 비상 복구](#데드맨-모니터링과-비상-복구)에 따라 먼저
+복구하세요. 이 단계는 호스트의 `bootroot-remote bootstrap`보다 먼저
+실행해야 합니다: bootstrap이 만료된 `secret_id`로 호스트의 파일을 덮어쓴
+뒤에는 이후의 회전도 호스트에 닿지 않습니다.
+
+래핑(기본값)으로 등록된 `remote-bootstrap` 서비스의 경우:
+
+1. control node에서 위와 같이 새 `secret_id`를 KV에 게시합니다.
+2. control node에서 원래 등록과 같은 인자로 `bootroot service add`를 다시
+   실행합니다. [멱등 재실행](#멱등-service-add-재실행)이 새 래핑된
+   `secret_id`를 발급하고 `bootstrap.json`을 다시 생성합니다.
+3. 다시 생성된 `bootstrap.json`을 원격 호스트로 전송합니다.
+4. `wrap_token`이 만료되기 전에 원격 호스트에서
+   `bootroot-remote bootstrap --artifact <경로>`를 실행합니다.
+
+재실행은 control node에서 OpenBao에 인증하므로 그곳에서 유효한 OpenBao
+로그인이 필요합니다. day-2 `service add`가 사용하는 `runtime_service_add`
+AppRole 자격증명은 `bootroot init --secret-id-ttl`에 준 TTL에 만료되며 어떤
+회전도 이를 갱신하지 않으므로, 그 TTL보다 오래된 배포에서는 실제로 root
+토큰(`--auth-mode root`)으로 로그인하게 됩니다.
+
+**`--no-wrap`으로 등록한 경우.** 재실행만으로는 자격증명이 발급되지
+않습니다: 래핑하지 않은 등록의 `bootstrap.json`에는 자격증명이 없고,
+`bootroot-remote bootstrap`은 호스트에 있는 만료된 `secret_id`로
+로그인합니다. 복구하는 동안 등록을 래핑 전달로 전환하세요:
+
+1. control node에서 위와 같이 새 `secret_id`를 KV에 게시합니다.
+2. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
+   inherit` (`state.json`만 변경).
+3. 원래 인자에서 `--no-wrap`만 빼고 `bootroot service add`를 다시
+   실행합니다. 이제 기록과 일치하므로 래핑된 `secret_id`를 발급합니다.
+4. `bootstrap.json`을 전송하고 원격 호스트에서
+   `bootroot-remote bootstrap --artifact <경로>`를 실행합니다.
+5. 이후 `bootroot service update --registration-id <id> --no-wrap`으로
+   등록을 래핑하지 않는 전달로 되돌립니다.
+
+**registrar로 발급된 identity.** 그러한 identity는 같은 호스트가 같은
+spec으로 register 요청을 다시 보내면 새 래핑된 `secret_id`를 받습니다.
+registrar 데몬은 자신의 인증서로 로그인하며, 이 로그인은 `secret_id`
+TTL과 함께 만료되지 않습니다. 호스트가 새 아티팩트로 bootstrap하기 전에
+위와 같이 새 `secret_id`를 KV에 게시하세요.
 
 ## 인프라 AppRole secret_id 회전 (stepca, responder)
 
@@ -3583,9 +3676,9 @@ bootroot rotate trust-sync --yes
 중인 `bootroot-agent`의 fast-poll 루프가 갱신된
 `bootroot/services/<name>/trust` payload를 읽어 `agent.toml` `[trust]` 핀을
 다시 렌더링하고 `ca-bundle.pem`을 약 1 fast-poll 주기 내에 다시 기록합니다.
-`remote-bootstrap` 서비스의 경우 `bootroot-remote bootstrap` 재실행은
-에이전트가 `secret_id_ttl`을 넘겨 오프라인 상태였고 더 이상 스스로 갱신할 수
-없는 경우의 복구 경로일 뿐입니다.
+에이전트가 오프라인인 동안 `secret_id`가 만료된 `remote-bootstrap` 호스트는
+[`secret_id`가 만료된 원격 호스트
+복구](#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 ## 강제 재발급
 

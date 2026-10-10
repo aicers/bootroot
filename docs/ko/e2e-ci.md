@@ -643,6 +643,9 @@ Compose 프로젝트 레이블이 붙어 있습니다. 확인이 레이블이 �
 - 서비스는 `--delivery-mode local-file`로 추가
 - 이 시나리오의 서비스 구성(총 2개): `edge-proxy`, `web-app`
 - 해석 모드는 `no-hosts` (`/etc/hosts` 수정 없음)
+- `bootroot init`은 `--secret-id-ttl 168h`로 실행되며, `service add` 이후
+  `service-role-secret-id-ttl` 단계가 `web-app` 서비스 역할과 그
+  `secret_id`의 실효 TTL을 OpenBao에서 다시 읽어 확인합니다(각각 `604800`초)
 
 목적:
 
@@ -954,10 +957,10 @@ sudo -n cp "$tmp_file" /etc/hosts
 > 테스트 기간 동안 유효하고, `bootstrap`과 `apply-secret-id` 모두 동일한
 > 방식으로 인증하기 때문에 동작합니다. 운영 환경에서는 실행 중인
 > `bootroot-agent`가 fast-poll 루프를 통해 운영자 개입 없이 `secret_id`와
-> trust를 자가 치유하며, `apply-secret-id`(및 재-bootstrap)는 `secret_id_ttl`을
-> 넘겨 오프라인 상태였던(따라서 스스로 갱신할 수 없는) 에이전트를 위한 복구
-> 경로입니다(운영 가이드 참조). 위의 원격 전달 라이프사이클 시나리오가 이
-> 자가 치유 경로를 직접 검증합니다.
+> trust를 자가 치유하며, `apply-secret-id`는 호스트의 `secret_id`가 아직
+> 유효할 때만 동작합니다([`secret_id`가 만료된 원격 호스트
+> 복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참조).
+> 위의 원격 전달 라이프사이클 시나리오가 이 자가 치유 경로를 직접 검증합니다.
 
 실행 단계(항목별 반복):
 
@@ -1251,7 +1254,9 @@ E2E에서 OpenBao 언실/런타임 인증 사용 방식:
   `skipped`(EAB만) 중 하나여야 함
 - 회전 후 재반영이 정상 완료되어야 함 (회전/복구 매트릭스에서는 `bootstrap`
   사용, 운영 환경에서는 실행 중인 에이전트가 fast-poll로 `secret_id`/trust를
-  자가 치유하고 `apply-secret-id` / 재-bootstrap은 오프라인 복구 경로)
+  자가 치유하며, `apply-secret-id`는 호스트의 `secret_id`가 아직 유효할 때만
+  동작함 — [`secret_id`가 만료된 원격 호스트
+  복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참조)
 - 하나라도 `failed`이면 해당 단계를 실패로 처리함
 
 ## E2E `phases.log` 형식

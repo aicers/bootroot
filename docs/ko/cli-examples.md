@@ -346,8 +346,10 @@ bootroot service add \
 
 control node에서 secret_id 회전 후에는 *실행 중인* 원격 `bootroot-agent`가
 fast-poll 루프로 새 secret_id를 직접 받아오므로 수동 전달이 필요하지 않습니다.
-아래 명령은 `secret_id_ttl`이 지나도록 오프라인이어서 자격 증명이 이미 만료된
-에이전트를 위한 **복구** 경로일 뿐입니다:
+아래 명령은 예를 들어 에이전트가 실행 중이 아닐 때 이를 수동으로 가져오며,
+호스트의 `secret_id`가 아직 유효할 때만 동작합니다(이미 만료되었다면
+[`secret_id`가 만료된 원격 호스트
+복구](operations.md#recovering-a-remote-host-whose-secret_id-expired) 참고):
 
 ```bash
 bootroot-remote apply-secret-id \

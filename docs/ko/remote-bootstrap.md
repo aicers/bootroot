@@ -572,9 +572,10 @@ bootstrap`을 한 번씩 실행하세요. 각 구성에 고유한 `state_path`�
     *실행 중인* 원격 `bootroot-agent`에는 운영 조치가 필요하지 않습니다.
     fast-poll 루프가 OpenBao에서 회전된 `secret_id`를 읽어 대략 한 번의 poll
     간격 안에 디스크의 자격 증명을 갱신합니다. `bootroot-remote apply-secret-id`는
-    `secret_id_ttl`이 지나도록 오프라인이어서 자격 증명이 이미 만료된 에이전트를
-    복구하는 경로일 뿐입니다. 회전 워크플로우는 [운영](operations.md)을
-    참고하세요.
+    호스트의 `secret_id`가 아직 유효할 때만 동작합니다. 이미 만료되었다면
+    [`secret_id`가 만료된 원격 호스트
+    복구](operations.md#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
+    회전 워크플로우는 [운영](operations.md)을 참고하세요.
 - **KV에 `secret_id`가 없는 경우**: 서비스의 KV 하위 트리에 `secret_id`가
     없으면 — registrar를 통해 발급된 정체성은 발급 시 `secret_id`를 기록하지
     않으므로 항상 이 경우입니다 — `bootroot-remote bootstrap`은 방금 인증에

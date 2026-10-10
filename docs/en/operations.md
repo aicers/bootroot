@@ -2004,9 +2004,9 @@ A host runs one `bootroot-agent` process plus one agent config per
 - Run `bootroot-remote bootstrap` once per service at initial setup. A
   *running* agent then keeps itself current: its fast-poll loop refreshes
   its own `secret_id` and re-renders trust from OpenBao KV with no manual
-  step. `bootroot-remote apply-secret-id` is only needed to recover an agent
-  that was offline past its `secret_id_ttl` (its credential already expired,
-  so it cannot self-refresh).
+  step. `bootroot-remote apply-secret-id` works only while the host's
+  `secret_id` is still valid; for one that has expired, see
+  [Recovering a remote host whose `secret_id` expired](#recovering-a-remote-host-whose-secret_id-expired).
 - **Multiple distinct services on one host**: use one `bootroot-agent`
   plus one agent config per service, each with its own `[openbao]`
   credential and its own unique `state_path`. Distinct services cannot
@@ -3456,6 +3456,21 @@ this cadence across all services and the infra roles.
 When `--secret-id-ttl` is omitted during `service add`, the service
 inherits the role-level TTL configured during `bootroot init`.
 
+`service add` creates the service's AppRole
+(`bootroot-service-<registration_id>`) with the role-level TTL that
+`bootroot init --secret-id-ttl` recorded in `state.json`. A deployment
+whose `state.json` has no recorded value — one initialised by a bootroot
+that predates the record — gets `24h`, and so does a recorded value of
+zero, which OpenBao would read as "never expires". A role keeps the TTL
+it was created with: a later re-`init` with a different value, or an
+upgrade, does not change service roles that already exist. Identities
+minted through the registrar take their role-level TTL from
+`[registrar] role_secret_id_ttl` instead.
+
+A per-service `--secret-id-ttl` must not exceed the role-level TTL:
+OpenBao refuses to issue a `secret_id` with a longer TTL, and `service
+add` or the next rotation of that service then fails.
+
 When per-service overrides are in play, the rotation schedule must
 satisfy the ≥2× invariant for the **smallest** TTL among all targets —
 a single service overridden down to `12h` forces the whole job to run
@@ -3502,10 +3517,9 @@ model is one-shot bootstrap; a running agent is then self-sufficient:
    `[trust]` pins + `ca-bundle.pem` from
    `bootroot/services/<registration_id>/trust` after a `bootroot rotate
    approle-secret-id` or a CA/trust rotation on the control node.
-   `bootroot-remote apply-secret-id` and a re-run of `bootroot-remote
-   bootstrap` are recovery paths only — needed when an agent was offline
-   past its `secret_id_ttl` and its credential already expired, so it can no
-   longer self-refresh.
+   `bootroot-remote apply-secret-id` works only while the host's
+   `secret_id` is still valid; for one that has expired, see
+   [Recovering a remote host whose `secret_id` expired](#recovering-a-remote-host-whose-secret_id-expired).
 
 Minimum environment/config checklist:
 
@@ -3610,6 +3624,10 @@ when a target is installed, so without the scheduled batch every
 registrar-minted host stops authenticating one `secret_id` TTL after
 bootstrap. A push cannot recover an identity whose `secret_id` has
 already lapsed — its host can no longer log in to read it.
+Such an identity gets a fresh wrapped `secret_id` when the same host
+sends its register request again with the same spec; the registrar
+daemon logs in with its own certificate, which does not expire with the
+`secret_id` TTL.
 
 The listing needs `list` on `<kv>/metadata/bootroot/services/`, which
 `bootroot init` writes into the `bootroot-runtime-rotate` policy. A
@@ -3627,10 +3645,11 @@ processes. Re-run the rotation to converge — `rotate trust-sync` for
 trust, `rotate eab-clear` (idempotent) for EAB, and `rotate
 responder-hmac` again for the responder HMAC.
 
-`bootroot-remote apply-secret-id` is the **recovery** path, not the steady
-state: it delivers a fresh `secret_id` to an agent that was offline past
-its `secret_id_ttl` (whose credential already expired, so it cannot
-self-refresh):
+`bootroot-remote apply-secret-id` is a manual pull of what the agent's
+fast-poll loop does on its own, useful when the agent is not running. It
+logs in with the `secret_id` currently on the host, so it works only
+while that `secret_id` is still valid; for one that has expired, see
+[Recovering a remote host whose `secret_id` expired](#recovering-a-remote-host-whose-secret_id-expired):
 
 ```bash
 bootroot-remote apply-secret-id --openbao-url https://<ip>:8200 \
@@ -3669,6 +3688,87 @@ If the unwrap call fails because the token was **already unwrapped**
 (consumed by an unauthorized party), `bootroot-remote` flags the event
 as a potential security incident. In this case, rotate the `secret_id`
 immediately and investigate the unauthorized access.
+
+### Recovering a remote host whose `secret_id` expired
+
+A remote agent keeps its `secret_id` current only while the one on its
+host is still valid. Its fast-poll loop, `bootroot-remote
+apply-secret-id`, and `bootroot-remote bootstrap` on an artifact without
+a `wrap_token` all log in with the `secret_id` already on the host
+before they read anything from OpenBao, so once that `secret_id` has
+expired none of them can, and a rotation that writes a new one to KV
+does not reach the host. `apply-secret-id` is a manual
+pull of what the fast-poll loop does on its own, useful when the agent
+is not running and its `secret_id` is still valid; it is not a recovery
+for an expired one. Neither is re-running `bootroot-remote bootstrap`
+with the artifact the host already used: its `wrap_token` has been
+consumed, or it never carried one.
+
+Every procedure below ends in a `bootroot-remote bootstrap` that logs in
+with a freshly delivered `secret_id` and then pulls the `secret_id`
+stored in KV for the service and writes it over the host's file. If
+scheduled rotation stopped long enough for the host's `secret_id` to
+expire, the one in KV has usually expired too, and that bootstrap
+reports success while leaving the agent with an expired credential. So
+first publish a fresh `secret_id` to KV on the control node:
+
+```bash
+bootroot rotate approle-secret-id --registration-id <id> --yes
+```
+
+For a registrar-minted identity, add `--agent-config <path>`, as its
+scheduled rotation does. The command authenticates with the
+`bootroot-runtime-rotate-role` credential, which renews itself only
+while scheduled rotations run; when it has expired as well, use the
+root token (`bootroot rotate --auth-mode root --root-token-file <path>
+approle-secret-id ...`) or recover it first, as described in
+[Dead-man monitoring and break-glass recovery](#dead-man-monitoring-and-break-glass-recovery).
+Run this before the host's `bootroot-remote bootstrap`: once bootstrap
+has written an expired `secret_id` over the host's file, a later
+rotation cannot reach the host either.
+
+For a `remote-bootstrap` service registered with wrapping (the
+default):
+
+1. On the control node, publish a fresh `secret_id` to KV as above.
+2. On the control node, re-run `bootroot service add` with the same
+   arguments as the original registration. The
+   [idempotent rerun](#idempotent-service-add-rerun) issues a fresh
+   wrapped `secret_id` and regenerates `bootstrap.json`.
+3. Ship the regenerated `bootstrap.json` to the remote host.
+4. Run `bootroot-remote bootstrap --artifact <path>` on the remote host
+   before its `wrap_token` expires.
+
+The rerun authenticates to OpenBao on the control node and needs a
+valid OpenBao login there. The `runtime_service_add` AppRole credential
+that day-2 `service add` runs use expires at the TTL given to
+`bootroot init --secret-id-ttl`, and no rotation renews it, so on a
+deployment older than that TTL the login is in practice the root token
+(`--auth-mode root`).
+
+**Registrations made with `--no-wrap`.** The rerun alone issues no
+credential: an unwrapped registration's `bootstrap.json` carries none,
+and `bootroot-remote bootstrap` then logs in with the expired
+`secret_id` already on the host. Switch the registration to wrapped
+delivery for the recovery:
+
+1. On the control node, publish a fresh `secret_id` to KV as above.
+2. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
+   inherit` (changes `state.json` only).
+3. Re-run `bootroot service add` with the original arguments but without
+   `--no-wrap`. It now matches the record and issues a wrapped
+   `secret_id`.
+4. Ship `bootstrap.json` and run `bootroot-remote bootstrap --artifact
+   <path>` on the remote host.
+5. `bootroot service update --registration-id <id> --no-wrap` afterwards
+   returns the registration to unwrapped delivery.
+
+**Registrar-minted identities.** Such an identity gets a fresh wrapped
+`secret_id` when the same host sends its register request again with
+the same spec; the registrar daemon logs in with its own certificate,
+which does not expire with the `secret_id` TTL. Publish a fresh
+`secret_id` to KV as above before the host bootstraps from the new
+artifact.
 
 ## Infra AppRole secret_id rotation (stepca, responder)
 
@@ -3799,9 +3899,9 @@ After `trust-sync`, no per-host action is needed for either delivery mode. A
 running `bootroot-agent`'s fast-poll loop reads the updated
 `bootroot/services/<name>/trust` payload, re-renders the `agent.toml`
 `[trust]` pins, and rewrites `ca-bundle.pem` within roughly one fast-poll
-interval. For `remote-bootstrap` services, re-running `bootroot-remote
-bootstrap` is only a recovery path for an agent that was offline past its
-`secret_id_ttl` and can no longer self-refresh.
+interval. For a `remote-bootstrap` host whose `secret_id` expired while
+its agent was offline, see
+[Recovering a remote host whose `secret_id` expired](#recovering-a-remote-host-whose-secret_id-expired).
 
 ## Force reissue
 

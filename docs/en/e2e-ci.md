@@ -665,6 +665,10 @@ Configuration:
 - Services are added with `--delivery-mode local-file`
 - Service set in this scenario (2 services): `edge-proxy`, `web-app`
 - Resolution mode is `no-hosts` (no `/etc/hosts` mutation)
+- `bootroot init` runs with `--secret-id-ttl 168h`; after `service add`,
+  the `service-role-secret-id-ttl` phase reads the `web-app` service
+  role's and its `secret_id`'s effective TTL back from OpenBao
+  (`604800` seconds each)
 
 Purpose:
 
@@ -983,10 +987,10 @@ Purpose:
 > and both `bootstrap` and `apply-secret-id` authenticate the same way. In
 > production a running `bootroot-agent` self-heals `secret_id` and trust
 > through its fast-poll loop with no operator action; `apply-secret-id`
-> (and re-bootstrap) is the recovery path for an agent that was offline
-> past its `secret_id_ttl` and can no longer self-refresh (see the
-> operations guide). The remote-delivery lifecycle scenario above exercises
-> that self-heal path directly.
+> works only while the host's `secret_id` is still valid (see
+> [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)).
+> The remote-delivery lifecycle scenario above exercises that self-heal
+> path directly.
 
 Execution steps (per rotation item):
 
@@ -1281,8 +1285,9 @@ Pass/fail rules:
   `skipped` (EAB only) in the summary output
 - after rotation, re-apply must complete successfully (`bootstrap` in the
   rotation/recovery matrix; in production the running agent self-heals
-  `secret_id`/trust via fast-poll, with `apply-secret-id` / re-bootstrap as
-  the offline-recovery path)
+  `secret_id`/trust via fast-poll, and `apply-secret-id` works only while
+  the host's `secret_id` is still valid — see
+  [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired))
 - if any item shows `failed`, the phase fails
 
 ## E2E `phases.log` format

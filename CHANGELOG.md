@@ -498,6 +498,16 @@ byte for byte.
   path named one file for both and the EAB write overwrote the
   credential — or, when no EAB was provisioned, the stale-file cleanup
   removed it.
+- `bootroot service add` now creates the service AppRole with the
+  role-level `secret_id` TTL given to `bootroot init --secret-id-ttl`,
+  as the manual stated, instead of always `24h`. A deployment initialised
+  with a longer lifetime no longer has its service credentials expire
+  after 24 hours while its rotate and infra credentials survive the
+  outage. Deployments initialised without the flag, and service roles
+  that already exist, are unchanged. The manual also no longer presents
+  `bootroot-remote apply-secret-id` as a recovery for an already expired
+  `secret_id` — it logs in with that `secret_id` — and describes the
+  `bootroot service add` rerun and `bootroot-remote bootstrap` that are.
 
 ### Security
 

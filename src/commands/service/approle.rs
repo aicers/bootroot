@@ -9,7 +9,7 @@ use bootroot::service_material::{
 };
 
 use super::ServiceAppRoleMaterialized;
-use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL};
+use crate::commands::init::{SECRET_ID_TTL, TOKEN_TTL, parse_ttl_to_secs};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -24,6 +24,23 @@ fn provision_message(err: &ServiceProvisionError, messages: &Messages) -> &'stat
     }
 }
 
+/// Returns the role-level `secret_id_ttl` a service role is created with:
+/// the value `init --secret-id-ttl` recorded, when it parses to a positive
+/// duration, and [`SECRET_ID_TTL`] otherwise.
+///
+/// A zero is replaced rather than passed on because `OpenBao` reads a role
+/// `secret_id_ttl` of 0 as "never expires", and `init` accepts and records
+/// one. An absent value is a `state.json` written before `init` recorded
+/// it, and an unparseable one was edited by hand; both keep the constant
+/// service roles have always had.
+fn service_role_secret_id_ttl(state: &StateFile) -> &str {
+    state
+        .rotate_secret_id_ttl
+        .as_deref()
+        .filter(|ttl| parse_ttl_to_secs(ttl).is_some_and(|secs| secs > 0))
+        .unwrap_or(SECRET_ID_TTL)
+}
+
 pub(super) async fn ensure_service_approle(
     client: &OpenBaoClient,
     state: &StateFile,
@@ -32,15 +49,17 @@ pub(super) async fn ensure_service_approle(
     wrap_ttl: Option<&str>,
     messages: &Messages,
 ) -> Result<ServiceAppRoleMaterialized> {
-    // The CLI keeps its own role-level TTLs: the shared helper declares
-    // none, so `init`'s constants stay this caller's decision.
+    // The role's `secret_id_ttl` follows the one `init` recorded, so a
+    // deployment initialised for a longer outage window gives its service
+    // credentials the same lifetime as its rotate and infra ones. The
+    // shared helper declares no TTLs; choosing them stays this caller's.
     let provisioned = provision_service_role(
         client,
         &state.kv_mount,
         registration_id,
         ServiceRoleTtls {
             token_ttl: TOKEN_TTL,
-            secret_id_ttl: SECRET_ID_TTL,
+            secret_id_ttl: service_role_secret_id_ttl(state),
         },
     )
     .await
@@ -167,6 +186,42 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn state_with_ttl(ttl: Option<&str>) -> StateFile {
+        let mut value = serde_json::json!({
+            "openbao_url": "http://localhost:8200",
+            "kv_mount": "secret",
+            "secrets_dir": "secrets",
+            "policies": {},
+            "approles": {},
+            "services": {}
+        });
+        if let Some(ttl) = ttl {
+            value["rotate_secret_id_ttl"] = serde_json::json!(ttl);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The recorded TTL reaches the service role only when it parses to a
+    /// positive duration; absent, zero, empty and unreadable values all
+    /// fall back to the constant.
+    #[test]
+    fn service_role_secret_id_ttl_follows_positive_recorded_value() {
+        assert_eq!(service_role_secret_id_ttl(&state_with_ttl(None)), "24h");
+        for recorded in ["168h", "12h"] {
+            assert_eq!(
+                service_role_secret_id_ttl(&state_with_ttl(Some(recorded))),
+                recorded
+            );
+        }
+        for recorded in ["0", "0h", "", "abc"] {
+            assert_eq!(
+                service_role_secret_id_ttl(&state_with_ttl(Some(recorded))),
+                SECRET_ID_TTL,
+                "recorded {recorded:?} must fall back to the constant"
+            );
+        }
+    }
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777

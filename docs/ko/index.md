@@ -215,9 +215,10 @@ bootroot-remote 배치 규칙:
 - 초기 설정 시 서비스별로 `bootroot-remote bootstrap`을 1회 실행합니다. 이후
   실행 중인 `bootroot-agent`는 자립적으로 동작합니다. fast-poll 루프가 자신의
   `secret_id`를 갱신하고 trust를 다시 렌더링하므로 `secret_id` 회전에 호스트별
-  조치가 필요하지 않습니다. `bootroot-remote apply-secret-id`는
-  `secret_id_ttl`이 지나도록 오프라인이었던 에이전트를 복구하는 경로일
-  뿐입니다.
+  조치가 필요하지 않습니다. `bootroot-remote apply-secret-id`는 호스트의
+  `secret_id`가 아직 유효할 때만 동작합니다. 이미 만료되었다면
+  [`secret_id`가 만료된 원격 호스트
+  복구](operations.md#recovering-a-remote-host-whose-secret_id-expired)를 참고하세요.
 
 참고:
 step-ca가 설치된 머신에 서비스가 추가되는 경우에는 bootroot-remote가

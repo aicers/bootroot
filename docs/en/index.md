@@ -234,8 +234,9 @@ bootroot-remote placement rules:
 - Each service should have `bootroot-remote bootstrap` run once during initial
   setup. The running `bootroot-agent` is then self-sufficient: its fast-poll
   loop refreshes its own `secret_id` and re-renders trust, so `secret_id`
-  rotation needs no per-host action. `bootroot-remote apply-secret-id` is only
-  a recovery path for an agent that was offline past its `secret_id_ttl`.
+  rotation needs no per-host action. `bootroot-remote apply-secret-id` works
+  only while the host's `secret_id` is still valid; for one that has
+  expired, see [Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired).
 
 Note:
 If a service is added on the machine where step-ca is installed,

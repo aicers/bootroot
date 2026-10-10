@@ -103,10 +103,10 @@ path "{kv_mount}/metadata/{base}/*" {{
 /// The role-level `AppRole` lifetimes a caller provisions with.
 ///
 /// These are *role* settings, not per-issuance ones, and they are the
-/// caller's to choose: the CLI passes the values its `init` constants
-/// fix, and the registrar passes the ones fixed at its construction. The
-/// library declares neither, so neither caller can silently inherit the
-/// other's.
+/// caller's to choose: the CLI passes its `init` token TTL and the
+/// `secret_id` TTL `init` recorded in `state.json`, and the registrar
+/// passes the ones fixed at its construction. The library declares
+/// neither, so neither caller can silently inherit the other's.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceRoleTtls<'a> {
     /// `token_ttl`, which is also used as `token_max_ttl`.

@@ -174,9 +174,9 @@ the full teardown semantics and the `--delete-artifacts` flag.
 - Ensure `bootroot-remote bootstrap` completed successfully on the service host
 - A running `bootroot-agent` self-heals trust and secret_id rotations via its
   fast-poll loop, so no per-rotation operator action is normally required
-- Recovery only: if the agent was offline past its `secret_id_ttl` (its
-  credential already expired), re-run `bootroot-remote bootstrap` — or
-  `bootroot-remote apply-secret-id` for secret_id alone — on the service host
+- `bootroot-remote apply-secret-id` works only while the host's `secret_id`
+  is still valid; for one that has expired, see
+  [Operations → Recovering a remote host whose `secret_id` expired](operations.md#recovering-a-remote-host-whose-secret_id-expired)
 - Verify the bootstrap summary JSON shows all items as `applied`
 
 ### Wrap token expired
