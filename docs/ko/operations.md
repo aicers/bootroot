@@ -3492,13 +3492,36 @@ fast-poll 루프가 스스로 하는 일을 수동으로 가져오는 명령으�
 `bootroot-remote bootstrap`을 다시 실행하는 것도 복구가 아닙니다: 그
 아티팩트의 `wrap_token`은 이미 소비되었거나 처음부터 없었습니다.
 
+아래 절차는 모두 `bootroot-remote bootstrap`으로 끝납니다. 이 명령은 새로
+전달된 `secret_id`로 로그인한 뒤, KV에 저장된 서비스의 `secret_id`를 가져와
+호스트의 파일을 덮어씁니다. 예약된 회전이 호스트의 `secret_id`가 만료될
+만큼 오래 멈춰 있었다면 KV의 값도 대개 함께 만료되어 있으며, 그 경우
+bootstrap은 성공을 보고하면서도 에이전트에 만료된 자격증명을 남깁니다.
+따라서 먼저 control node에서 새 `secret_id`를 KV에 게시하세요:
+
+```bash
+bootroot rotate approle-secret-id --registration-id <id> --yes
+```
+
+registrar로 발급된 identity라면 예약된 회전과 마찬가지로
+`--agent-config <경로>`를 추가합니다. 이 명령은
+`bootroot-runtime-rotate-role` 자격증명으로 인증하는데, 이 자격증명은 예약된
+회전이 실행되는 동안에만 스스로 갱신됩니다. 이것도 만료되었다면 root
+토큰(`bootroot rotate --auth-mode root --root-token-file <경로>
+approle-secret-id ...`)을 사용하거나,
+[데드맨 모니터링과 비상 복구](#데드맨-모니터링과-비상-복구)에 따라 먼저
+복구하세요. 이 단계는 호스트의 `bootroot-remote bootstrap`보다 먼저
+실행해야 합니다: bootstrap이 만료된 `secret_id`로 호스트의 파일을 덮어쓴
+뒤에는 이후의 회전도 호스트에 닿지 않습니다.
+
 래핑(기본값)으로 등록된 `remote-bootstrap` 서비스의 경우:
 
-1. control node에서 원래 등록과 같은 인자로 `bootroot service add`를 다시
+1. control node에서 위와 같이 새 `secret_id`를 KV에 게시합니다.
+2. control node에서 원래 등록과 같은 인자로 `bootroot service add`를 다시
    실행합니다. [멱등 재실행](#멱등-service-add-재실행)이 새 래핑된
    `secret_id`를 발급하고 `bootstrap.json`을 다시 생성합니다.
-2. 다시 생성된 `bootstrap.json`을 원격 호스트로 전송합니다.
-3. `wrap_token`이 만료되기 전에 원격 호스트에서
+3. 다시 생성된 `bootstrap.json`을 원격 호스트로 전송합니다.
+4. `wrap_token`이 만료되기 전에 원격 호스트에서
    `bootroot-remote bootstrap --artifact <경로>`를 실행합니다.
 
 재실행은 control node에서 OpenBao에 인증하므로 그곳에서 유효한 OpenBao
@@ -3512,19 +3535,21 @@ AppRole 자격증명은 `bootroot init --secret-id-ttl`에 준 TTL에 만료되�
 `bootroot-remote bootstrap`은 호스트에 있는 만료된 `secret_id`로
 로그인합니다. 복구하는 동안 등록을 래핑 전달로 전환하세요:
 
-1. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
+1. control node에서 위와 같이 새 `secret_id`를 KV에 게시합니다.
+2. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
    inherit` (`state.json`만 변경).
-2. 원래 인자에서 `--no-wrap`만 빼고 `bootroot service add`를 다시
+3. 원래 인자에서 `--no-wrap`만 빼고 `bootroot service add`를 다시
    실행합니다. 이제 기록과 일치하므로 래핑된 `secret_id`를 발급합니다.
-3. `bootstrap.json`을 전송하고 원격 호스트에서
+4. `bootstrap.json`을 전송하고 원격 호스트에서
    `bootroot-remote bootstrap --artifact <경로>`를 실행합니다.
-4. 이후 `bootroot service update --registration-id <id> --no-wrap`으로
+5. 이후 `bootroot service update --registration-id <id> --no-wrap`으로
    등록을 래핑하지 않는 전달로 되돌립니다.
 
 **registrar로 발급된 identity.** 그러한 identity는 같은 호스트가 같은
 spec으로 register 요청을 다시 보내면 새 래핑된 `secret_id`를 받습니다.
 registrar 데몬은 자신의 인증서로 로그인하며, 이 로그인은 `secret_id`
-TTL과 함께 만료되지 않습니다.
+TTL과 함께 만료되지 않습니다. 호스트가 새 아티팩트로 bootstrap하기 전에
+위와 같이 새 `secret_id`를 KV에 게시하세요.
 
 ## 인프라 AppRole secret_id 회전 (stepca, responder)
 

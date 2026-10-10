@@ -3704,15 +3704,39 @@ for an expired one. Neither is re-running `bootroot-remote bootstrap`
 with the artifact the host already used: its `wrap_token` has been
 consumed, or it never carried one.
 
+Every procedure below ends in a `bootroot-remote bootstrap` that logs in
+with a freshly delivered `secret_id` and then pulls the `secret_id`
+stored in KV for the service and writes it over the host's file. If
+scheduled rotation stopped long enough for the host's `secret_id` to
+expire, the one in KV has usually expired too, and that bootstrap
+reports success while leaving the agent with an expired credential. So
+first publish a fresh `secret_id` to KV on the control node:
+
+```bash
+bootroot rotate approle-secret-id --registration-id <id> --yes
+```
+
+For a registrar-minted identity, add `--agent-config <path>`, as its
+scheduled rotation does. The command authenticates with the
+`bootroot-runtime-rotate-role` credential, which renews itself only
+while scheduled rotations run; when it has expired as well, use the
+root token (`bootroot rotate --auth-mode root --root-token-file <path>
+approle-secret-id ...`) or recover it first, as described in
+[Dead-man monitoring and break-glass recovery](#dead-man-monitoring-and-break-glass-recovery).
+Run this before the host's `bootroot-remote bootstrap`: once bootstrap
+has written an expired `secret_id` over the host's file, a later
+rotation cannot reach the host either.
+
 For a `remote-bootstrap` service registered with wrapping (the
 default):
 
-1. On the control node, re-run `bootroot service add` with the same
+1. On the control node, publish a fresh `secret_id` to KV as above.
+2. On the control node, re-run `bootroot service add` with the same
    arguments as the original registration. The
    [idempotent rerun](#idempotent-service-add-rerun) issues a fresh
    wrapped `secret_id` and regenerates `bootstrap.json`.
-2. Ship the regenerated `bootstrap.json` to the remote host.
-3. Run `bootroot-remote bootstrap --artifact <path>` on the remote host
+3. Ship the regenerated `bootstrap.json` to the remote host.
+4. Run `bootroot-remote bootstrap --artifact <path>` on the remote host
    before its `wrap_token` expires.
 
 The rerun authenticates to OpenBao on the control node and needs a
@@ -3728,20 +3752,23 @@ and `bootroot-remote bootstrap` then logs in with the expired
 `secret_id` already on the host. Switch the registration to wrapped
 delivery for the recovery:
 
-1. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
+1. On the control node, publish a fresh `secret_id` to KV as above.
+2. `bootroot service update --registration-id <id> --secret-id-wrap-ttl
    inherit` (changes `state.json` only).
-2. Re-run `bootroot service add` with the original arguments but without
+3. Re-run `bootroot service add` with the original arguments but without
    `--no-wrap`. It now matches the record and issues a wrapped
    `secret_id`.
-3. Ship `bootstrap.json` and run `bootroot-remote bootstrap --artifact
+4. Ship `bootstrap.json` and run `bootroot-remote bootstrap --artifact
    <path>` on the remote host.
-4. `bootroot service update --registration-id <id> --no-wrap` afterwards
+5. `bootroot service update --registration-id <id> --no-wrap` afterwards
    returns the registration to unwrapped delivery.
 
 **Registrar-minted identities.** Such an identity gets a fresh wrapped
 `secret_id` when the same host sends its register request again with
 the same spec; the registrar daemon logs in with its own certificate,
-which does not expire with the `secret_id` TTL.
+which does not expire with the `secret_id` TTL. Publish a fresh
+`secret_id` to KV as above before the host bootstraps from the new
+artifact.
 
 ## Infra AppRole secret_id rotation (stepca, responder)
 
