@@ -1909,6 +1909,7 @@ async fn write_state_file_to(
         existing_stepca_advertise_addr,
         existing_infra_certs,
         existing_last_secret_id_rotation,
+        existing_approle_rotation,
         existing_registrar_endpoint,
     ) = if state_path.exists() {
         let state = StateFile::load(state_path)?;
@@ -1923,6 +1924,7 @@ async fn write_state_file_to(
             state.stepca_advertise_addr,
             state.infra_certs,
             state.last_secret_id_rotation,
+            state.approle_rotation,
             state.registrar_endpoint,
         )
     } else {
@@ -1937,6 +1939,7 @@ async fn write_state_file_to(
             None,
             BTreeMap::new(),
             None,
+            AppRoleRotationRecord::default(),
             None,
         )
     };
@@ -1970,11 +1973,13 @@ async fn write_state_file_to(
         rotate_bound_cidrs: rotate_bound_cidrs_map,
         rotate_secret_id_ttl: Some(rotate_secret_id_ttl.to_string()),
         last_secret_id_rotation: existing_last_secret_id_rotation,
-        // Not carried over: this run minted fresh rotate credentials,
-        // so the `--if-due` counts describe credentials that are gone,
-        // and an empty record makes the next scheduled run due — the
-        // safe direction.
-        approle_rotation: AppRoleRotationRecord::default(),
+        // Preserved verbatim: this run minted additional rotate
+        // SecretIDs, but it neither wrote the scheduler's rotate
+        // credential file nor revoked the SecretID in it, so the
+        // `--if-due` accounting still describes the credential the
+        // scheduler logs in with. Installing a new credential into that
+        // file is recognised by the gate's modification-time rule.
+        approle_rotation: existing_approle_rotation,
         // Preserved verbatim: `infra install` is what sets this
         // predicate, and `init` only reads it.
         registrar_endpoint: existing_registrar_endpoint,
@@ -2019,6 +2024,7 @@ fn validate_http01_exposed_override_for_init(
 mod tests {
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+    use crate::state::AppRoleRotationTarget;
 
     /// Every pre-flight condition an `InitPlan` can carry, so
     /// `plan_with(ALL_ARTIFACTS)` reads as "all three files exist".
@@ -2725,7 +2731,8 @@ mod tests {
     /// (#672): the operator-supplied CIDR binding for both rotate
     /// labels, the rotate roles' `secret_id` TTL (the dead-man
     /// threshold source), and preserves a previously recorded
-    /// rotation-success timestamp across an init re-run.
+    /// rotation-success timestamp and the `--if-due` record across an
+    /// init re-run.
     #[tokio::test]
     async fn write_state_file_records_rotate_fields_and_preserves_timestamp() {
         let messages = crate::i18n::test_messages();
@@ -2737,11 +2744,23 @@ mod tests {
             last_secret_id_rotation: Some("2026-07-01T00:00:00Z".to_string()),
             ..Default::default()
         };
-        let entry = existing
+        let services = existing
             .approle_rotation
-            .entry_mut(crate::state::AppRoleRotationTarget::AllServices);
-        entry.last_success = Some("2026-07-01T00:00:00Z".to_string());
-        entry.logins_since_renewal = 2;
+            .entry_mut(AppRoleRotationTarget::AllServices);
+        services.last_success = Some("2026-07-01T00:00:00Z".to_string());
+        services.logins_since_renewal = 4;
+        services.last_login = Some("2026-07-03T00:00:00Z".to_string());
+        let stepca = existing
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::InfraStepca);
+        stepca.last_success = Some("2026-06-20T12:00:00Z".to_string());
+        stepca.logins_since_renewal = 2;
+        stepca.last_login = Some("2026-07-02T06:00:00Z".to_string());
+        existing
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::InfraResponder)
+            .last_success = Some("2026-06-25T18:30:00Z".to_string());
+        let seeded = existing.approle_rotation.clone();
         existing.save(&state_path).unwrap();
         write_state_file_to(
             &state_path,
@@ -2769,9 +2788,10 @@ mod tests {
             Some("2026-07-01T00:00:00Z"),
             "the dead-man timestamp must survive an init re-run"
         );
-        assert!(
-            reloaded.approle_rotation.is_empty(),
-            "the --if-due record describes the rotate credentials init replaced"
+        assert_eq!(
+            reloaded.approle_rotation, seeded,
+            "init neither writes nor revokes the scheduler's rotate credential, \
+             so its --if-due record must survive an init re-run"
         );
 
         // Opt-in semantics: an init run without the flag records no
@@ -2792,6 +2812,186 @@ mod tests {
         assert!(
             reloaded.rotate_bound_cidrs.is_empty(),
             "omitting --rotate-bound-cidrs must clear the recorded binding"
+        );
+    }
+
+    /// `write_state_file_to` carries rotation timestamps it cannot
+    /// interpret through as text: reading them is the `--if-due` gate's
+    /// job, not init's.
+    #[tokio::test]
+    async fn write_state_file_preserves_uninterpretable_rotation_timestamps() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        let services = existing
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::AllServices);
+        services.last_success = Some("not-a-time".to_string());
+        services.logins_since_renewal = 3;
+        services.last_login = Some("2999-01-01T00:00:00Z".to_string());
+        let responder = existing
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::InfraResponder);
+        responder.last_success = Some("2999-01-01T00:00:00Z".to_string());
+        responder.logins_since_renewal = 1;
+        responder.last_login = Some("not-a-time".to_string());
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .await
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        let services = reloaded
+            .approle_rotation
+            .entry(AppRoleRotationTarget::AllServices);
+        assert_eq!(services.last_success.as_deref(), Some("not-a-time"));
+        assert_eq!(services.logins_since_renewal, 3);
+        assert_eq!(services.last_login.as_deref(), Some("2999-01-01T00:00:00Z"));
+        let responder = reloaded
+            .approle_rotation
+            .entry(AppRoleRotationTarget::InfraResponder);
+        assert_eq!(
+            responder.last_success.as_deref(),
+            Some("2999-01-01T00:00:00Z")
+        );
+        assert_eq!(responder.logins_since_renewal, 1);
+        assert_eq!(responder.last_login.as_deref(), Some("not-a-time"));
+        assert!(
+            reloaded
+                .approle_rotation
+                .entry(AppRoleRotationTarget::InfraStepca)
+                .is_empty()
+        );
+    }
+
+    /// Reads `state_path` as raw JSON, for asserting what serialization
+    /// omitted.
+    fn raw_state_json(state_path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(state_path).unwrap()).unwrap()
+    }
+
+    /// A fresh init writes no `--if-due` record, so every scheduled
+    /// target is due on its first run.
+    #[tokio::test]
+    async fn write_state_file_fresh_init_omits_approle_rotation() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .await
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert!(reloaded.approle_rotation.is_empty());
+        assert!(
+            raw_state_json(&state_path)
+                .get("approle_rotation")
+                .is_none()
+        );
+    }
+
+    /// An init over a state file that predates the `--if-due` record
+    /// does not invent one.
+    #[tokio::test]
+    async fn write_state_file_without_approle_rotation_keeps_it_omitted() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            last_secret_id_rotation: Some("2026-07-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        existing.save(&state_path).unwrap();
+        assert!(
+            raw_state_json(&state_path)
+                .get("approle_rotation")
+                .is_none()
+        );
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .await
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert!(reloaded.approle_rotation.is_empty());
+        assert!(
+            raw_state_json(&state_path)
+                .get("approle_rotation")
+                .is_none()
+        );
+    }
+
+    /// A partially populated `--if-due` record comes back with only the
+    /// targets it had: init creates no empty entry for the others.
+    #[tokio::test]
+    async fn write_state_file_preserves_a_partial_approle_rotation() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let mut existing = crate::state::StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        let responder = existing
+            .approle_rotation
+            .entry_mut(AppRoleRotationTarget::InfraResponder);
+        responder.logins_since_renewal = 1;
+        responder.last_login = Some("2026-07-02T06:00:00Z".to_string());
+        let seeded = existing.approle_rotation.clone();
+        existing.save(&state_path).unwrap();
+        write_state_file_to(
+            &state_path,
+            "http://localhost:8200",
+            "secret",
+            BTreeMap::new(),
+            Path::new("secrets"),
+            &[],
+            "24h",
+            &messages,
+        )
+        .await
+        .unwrap();
+        let reloaded = crate::state::StateFile::load(&state_path).unwrap();
+        assert_eq!(reloaded.approle_rotation, seeded);
+        let raw = raw_state_json(&state_path);
+        let record = raw
+            .get("approle_rotation")
+            .and_then(serde_json::Value::as_object)
+            .expect("a populated record must be serialized");
+        assert_eq!(
+            record.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["infra_responder"]
         );
     }
 
