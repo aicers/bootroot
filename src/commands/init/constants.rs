@@ -193,6 +193,22 @@ pub(crate) mod openbao_constants {
     /// the legitimate cycle.
     pub(crate) const ROTATE_SELF_MINT_NUM_USES: u32 = 3 * ROTATE_SELF_MINT_LOGINS_PER_CYCLE;
 
+    /// Logins of one self-minted rotate credential that scheduled
+    /// `rotate approle-secret-id --if-due` runs may spend before the
+    /// credential is renewed.
+    ///
+    /// Of the [`ROTATE_SELF_MINT_NUM_USES`], one is spent by the
+    /// self-mint's own verification login and one is reserved for an
+    /// operator's manual run; the rest are the scheduled budget. The
+    /// `--all-services` target has all of it; the `--infra` targets
+    /// share one credential and split it evenly, so one failing target
+    /// cannot spend the logins its sibling needs for its own rotation.
+    pub(crate) const ROTATE_IF_DUE_SCHEDULED_LOGINS: u32 = ROTATE_SELF_MINT_NUM_USES - 2;
+
+    /// The `--infra` targets that share the infra-rotate credential, and
+    /// so split [`ROTATE_IF_DUE_SCHEDULED_LOGINS`] between them.
+    pub(crate) const ROTATE_IF_DUE_INFRA_TARGETS: u32 = 2;
+
     pub(crate) const APPROLE_BOOTROOT_AGENT: &str = "bootroot-agent-role";
     pub(crate) const APPROLE_BOOTROOT_RESPONDER: &str = "bootroot-responder-role";
     pub(crate) const APPROLE_BOOTROOT_STEPCA: &str = "bootroot-stepca-role";

@@ -65,7 +65,7 @@ use crate::commands::init::{
 use crate::commands::openbao_unseal::unseal_keys_path;
 use crate::commands::openbao_url::{OPENBAO_HOST_PORT_ENV, effective_openbao_url_with_env};
 use crate::i18n::Messages;
-use crate::state::StateFile;
+use crate::state::{AppRoleRotationRecord, StateFile};
 use crate::state_lock::StateLock;
 
 /// Assembles the inputs the bootroot-internal provisioning runs under.
@@ -1970,6 +1970,11 @@ async fn write_state_file_to(
         rotate_bound_cidrs: rotate_bound_cidrs_map,
         rotate_secret_id_ttl: Some(rotate_secret_id_ttl.to_string()),
         last_secret_id_rotation: existing_last_secret_id_rotation,
+        // Not carried over: this run minted fresh rotate credentials,
+        // so the `--if-due` counts describe credentials that are gone,
+        // and an empty record makes the next scheduled run due — the
+        // safe direction.
+        approle_rotation: AppRoleRotationRecord::default(),
         // Preserved verbatim: `infra install` is what sets this
         // predicate, and `init` only reads it.
         registrar_endpoint: existing_registrar_endpoint,
@@ -2726,12 +2731,17 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        let existing = crate::state::StateFile {
+        let mut existing = crate::state::StateFile {
             openbao_url: "http://localhost:8200".to_string(),
             kv_mount: "secret".to_string(),
             last_secret_id_rotation: Some("2026-07-01T00:00:00Z".to_string()),
             ..Default::default()
         };
+        let entry = existing
+            .approle_rotation
+            .entry_mut(crate::state::AppRoleRotationTarget::AllServices);
+        entry.last_success = Some("2026-07-01T00:00:00Z".to_string());
+        entry.logins_since_renewal = 2;
         existing.save(&state_path).unwrap();
         write_state_file_to(
             &state_path,
@@ -2758,6 +2768,10 @@ mod tests {
             reloaded.last_secret_id_rotation.as_deref(),
             Some("2026-07-01T00:00:00Z"),
             "the dead-man timestamp must survive an init re-run"
+        );
+        assert!(
+            reloaded.approle_rotation.is_empty(),
+            "the --if-due record describes the rotate credentials init replaced"
         );
 
         // Opt-in semantics: an init run without the flag records no

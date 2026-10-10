@@ -1384,6 +1384,76 @@ run_rotation_secret_id_self_mint() {
   done
 }
 
+# Runs one `--infra <target> --if-due <duration>` invocation with the
+# infra credential file the self-mint phase left behind, appending its
+# output to the run log and printing its stdout for the caller to check.
+run_infra_rotation_if_due() {
+  local cred_file="$1" target="$2" threshold="$3" stdout_file
+  stdout_file="$ARTIFACT_DIR/rotate-if-due-${target}.out"
+  if ! run_bootroot rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "$OPENBAO_URL" \
+    --auth-mode approle \
+    --approle-role-id "$INFRA_ROTATE_ROLE_ID" \
+    --approle-secret-id-file "$cred_file" \
+    --yes \
+    approle-secret-id \
+    --infra "$target" \
+    --if-due "$threshold" >"$stdout_file" 2>>"$RUN_LOG"; then
+    cat "$stdout_file" >>"$RUN_LOG"
+    fail "--infra ${target} --if-due ${threshold} failed"
+  fi
+  cat "$stdout_file" >>"$RUN_LOG"
+  cat "$stdout_file"
+}
+
+# `rotate approle-secret-id --if-due` against a real OpenBao: the
+# self-mint phase just rotated both infra targets with the infra
+# credential file, so a long threshold skips — touching neither the
+# credential file nor the agent's secret_id — and a short one rotates.
+run_rotation_secret_id_if_due() {
+  log_phase "rotate-secret-id-if-due"
+  local cred_file="$ARTIFACT_DIR/rotate-creds/infra/secret_id"
+  local out cred_before cred_after agent_before agent_after
+  # The self-mint phase's runs all started no later than this second.
+  # `last_success` is recorded in whole seconds, so `--if-due 1s` is
+  # due only once the clock has moved past it.
+  local self_mint_done
+  self_mint_done="$(date -u +%s)"
+
+  cred_before="$(cat "$cred_file")"
+  agent_before="$(cat "$SECRETS_DIR/openbao/stepca/secret_id")"
+  out="$(run_infra_rotation_if_due "$cred_file" stepca 1h)"
+  printf '%s\n' "$out" | grep -q '^if-due: skipped target=infra_stepca ' ||
+    fail "--infra stepca --if-due 1h did not skip: ${out}"
+  cred_after="$(cat "$cred_file")"
+  agent_after="$(cat "$SECRETS_DIR/openbao/stepca/secret_id")"
+  [ "$cred_before" = "$cred_after" ] || fail "a skipped --if-due run replaced the infra credential file"
+  [ "$agent_before" = "$agent_after" ] || fail "a skipped --if-due run rotated the stepca secret_id"
+
+  cred_before="$cred_after"
+  agent_before="$(cat "$SECRETS_DIR/openbao/responder/secret_id")"
+  while [ "$(date -u +%s)" -le "$self_mint_done" ]; do
+    sleep 0.2
+  done
+  out="$(run_infra_rotation_if_due "$cred_file" responder 1s)"
+  printf '%s\n' "$out" | grep -q '^if-due: rotated target=infra_responder$' ||
+    fail "--infra responder --if-due 1s did not rotate: ${out}"
+  cred_after="$(cat "$cred_file")"
+  agent_after="$(cat "$SECRETS_DIR/openbao/responder/secret_id")"
+  [ "$cred_before" != "$cred_after" ] || fail "a rotating --if-due run did not self-mint the infra credential file"
+  [ "$agent_before" != "$agent_after" ] || fail "a rotating --if-due run did not rotate the responder secret_id"
+
+  cred_before="$cred_after"
+  agent_before="$agent_after"
+  out="$(run_infra_rotation_if_due "$cred_file" responder 1h)"
+  printf '%s\n' "$out" | grep -q '^if-due: skipped target=infra_responder ' ||
+    fail "--infra responder --if-due 1h did not skip after rotating: ${out}"
+  [ "$cred_before" = "$(cat "$cred_file")" ] || fail "a skipped --if-due run replaced the infra credential file"
+  [ "$agent_before" = "$(cat "$SECRETS_DIR/openbao/responder/secret_id")" ] ||
+    fail "a skipped --if-due run rotated the responder secret_id"
+}
+
 run_rotations_with_verification() {
   # Rotate the infra secret_ids first: the stepca-password and
   # responder-hmac phases below drive the restarted infra OpenBao
@@ -1391,6 +1461,7 @@ run_rotations_with_verification() {
   # verifying they re-authenticated with the rotated credentials.
   run_rotation_infra_secret_id
   run_rotation_secret_id_self_mint
+  run_rotation_secret_id_if_due
 
   log_phase "rotate-openbao-recovery"
   run_bootroot rotate \

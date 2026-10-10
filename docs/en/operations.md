@@ -3090,6 +3090,38 @@ lines and marks the unit failed. Rotation is idempotent (old
 a single missed run, but alert on unit failures so consecutive misses
 cannot ride past the TTL.
 
+**Frequent checks with `--if-due`.** Instead of matching the timer to
+the cadence, the job can fire often and let each invocation decide: add
+`--if-due <duration>` to the `--all-services` and `--infra` invocations
+and run the timer hourly. An invocation whose target was last rotated
+less than `<duration>` ago prints `if-due: skipped …` and exits 0
+without logging in, writing a file or restarting a sidecar; once due it
+rotates and prints `if-due: rotated …`. Pick a value half a timer period
+below the cadence you want (`11h30m` on an hourly timer rotates every
+twelve hours) and no more than half the `secret_id` TTL. A due run whose
+login gets no answer or a 5xx answer (OpenBao unreachable or sealed)
+spends none of the rotate credential's six logins and is retried on the
+next tick. A due run that logged in and then failed, or whose login
+OpenBao refused, may have spent one, so further attempts are spaced
+`<duration>`/4 apart and capped at four for `--all-services`, and spaced
+`<duration>`/2 apart and capped at two for each `--infra` target, which
+share one credential. Ticks in between exit non-zero with `if-due:
+backing_off …`; once the cap is reached they exit non-zero with `if-due:
+budget_spent …` without logging in, which leaves one login for you: fix
+the cause, then run the same invocation, with the same credential file,
+once without `--if-due`. A failed manual run spends a login the count
+does not see, so do not repeat it blindly. If the credential has already
+expired, follow [break-glass
+recovery](#dead-man-monitoring-and-break-glass-recovery): once the
+re-minted `secret_id` is written into the credential file, the next
+scheduled run starts a new count and attempts by itself. Because a due
+target that is waiting exits non-zero on every tick, give each
+invocation its own unit, or use the wrapper script below, so that one
+target's failure does not hold the others back. The decision is read
+from `approle_rotation` in `state.json`; a target counts as rotated
+there only after a fully successful run that renewed its own credential
+file, so the flag requires `--approle-secret-id-file`.
+
 Cron equivalent. A crontab entry must be a single physical line (cron
 does not join `\` continuations), so put the three invocations in a
 small wrapper script — e.g. `/usr/local/sbin/bootroot-rotate-secret-ids`,

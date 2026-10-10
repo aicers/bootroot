@@ -157,6 +157,58 @@ impl Messages {
             .error_rotate_bound_cidrs_requires_provisioning
     }
 
+    pub(crate) fn error_if_due_invalid_duration(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_if_due_invalid_duration,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_if_due_out_of_range(&self, value: &str, max: &str) -> String {
+        format_template(
+            self.strings().error_if_due_out_of_range,
+            &[("value", value), ("max", max)],
+        )
+    }
+
+    pub(crate) fn error_if_due_requires_file_auth(&self) -> &'static str {
+        self.strings().error_if_due_requires_file_auth
+    }
+
+    pub(crate) fn error_if_due_backing_off(
+        &self,
+        target: &str,
+        logins: u32,
+        budget: u32,
+        retry_at: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_if_due_backing_off,
+            &[
+                ("target", target),
+                ("logins", &logins.to_string()),
+                ("budget", &budget.to_string()),
+                ("retry_at", retry_at),
+            ],
+        )
+    }
+
+    pub(crate) fn error_if_due_budget_spent(
+        &self,
+        target: &str,
+        logins: u32,
+        budget: u32,
+    ) -> String {
+        format_template(
+            self.strings().error_if_due_budget_spent,
+            &[
+                ("target", target),
+                ("logins", &logins.to_string()),
+                ("budget", &budget.to_string()),
+            ],
+        )
+    }
+
     pub(crate) fn error_clear_rotate_bound_cidrs_requires_provisioning(&self) -> &'static str {
         self.strings()
             .error_clear_rotate_bound_cidrs_requires_provisioning

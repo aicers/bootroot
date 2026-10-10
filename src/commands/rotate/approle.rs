@@ -9,7 +9,7 @@ use bootroot::service_material::service_role_name;
 
 use super::helpers::{confirm_action, restart_container, write_secret_id_atomic};
 use super::registrar_targets::{read_registrar_binding_state, registrar_only_targets};
-use super::{ROLE_ID_FILENAME, RotateContext};
+use super::{ROLE_ID_FILENAME, RotateContext, if_due};
 use crate::cli::args::{InfraRoleTarget, RotateAppRoleSecretIdArgs};
 use crate::cli::output::display_secret;
 use crate::commands::audit_store::{AgentConfigReadError, load_registrar_settings};
@@ -53,8 +53,9 @@ enum CidrBindingAction<'a> {
     Clear,
 }
 
-// One argument past clippy's limit: the state lock is passed on its own
-// so that every function that saves `state.json` names it.
+// Two arguments past clippy's limit: the state lock is passed on its own
+// so that every function that saves `state.json` names it, and the
+// run's start instant is read by the caller before it logs in.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rotate_approle_secret_id(
     ctx: &mut RotateContext,
@@ -63,6 +64,7 @@ pub(super) async fn rotate_approle_secret_id(
     args: &RotateAppRoleSecretIdArgs,
     auto_confirm: bool,
     auth: &RotateAuthContext<'_>,
+    started_at: time::OffsetDateTime,
     show_secrets: bool,
     messages: &Messages,
 ) -> Result<()> {
@@ -135,7 +137,7 @@ pub(super) async fn rotate_approle_secret_id(
     // succeeded, and only for runs authenticated as the rotate AppRole
     // itself. Re-minting the rotate credentials under root auth is the
     // break-glass recovery procedure, not this step.
-    if let RuntimeAuthResolved::AppRole { role_id, .. } = auth.runtime_auth {
+    let renewed = if let RuntimeAuthResolved::AppRole { role_id, .. } = auth.runtime_auth {
         self_mint_own_secret_id(
             ctx,
             client,
@@ -144,15 +146,32 @@ pub(super) async fn rotate_approle_secret_id(
             auth.secret_id_file,
             messages,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        false
+    };
 
     // Dead-man record point (#672): written on every successful
     // invocation — batch, single-service, and infra alike — and only
     // after the self-mint above, so a failed self-mint cannot suppress
     // the stale-rotation warning in `bootroot status`.
-    record_rotation_success(ctx, state_lock, messages).await?;
+    let renewal = renewed.then(|| CredentialRenewal {
+        label: own_label,
+        target: if_due::target_of(args),
+        started_at,
+    });
+    record_rotation_success(ctx, state_lock, renewal, messages).await?;
     Ok(())
+}
+
+/// A successful run's self-mint replaced its rotate credential file.
+struct CredentialRenewal {
+    /// The rotate role whose credential was renewed.
+    label: AppRoleLabel,
+    /// The scheduled target the run rotated; `None` for
+    /// `--registration-id`.
+    target: Option<crate::state::AppRoleRotationTarget>,
+    started_at: time::OffsetDateTime,
 }
 
 /// Records the RFC 3339 timestamp of a fully successful
@@ -160,18 +179,32 @@ pub(super) async fn rotate_approle_secret_id(
 /// silently stops firing produces no failure log of its own, so this
 /// timestamp is the only signal `bootroot status` can watch.
 ///
+/// When the run renewed its rotate credential file, the same save
+/// records that in the `--if-due` record. A run that did not leaves
+/// that record untouched: its credential was not renewed, and the next
+/// scheduled run must still happen on time.
+///
 /// Async because the state write is: publishing `state.json` costs
 /// three disk round trips, which `StateFile::save_async` keeps off the
 /// runtime thread this rotation runs on.
 async fn record_rotation_success(
     ctx: &mut RotateContext,
     _state_lock: &StateLock,
+    renewal: Option<CredentialRenewal>,
     messages: &Messages,
 ) -> Result<()> {
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .context("Failed to format the rotation-success timestamp")?;
     ctx.state.last_secret_id_rotation = Some(now);
+    if let Some(renewal) = renewal {
+        if_due::record_renewal(
+            &mut ctx.state.approle_rotation,
+            renewal.label,
+            renewal.target,
+            renewal.started_at,
+        )?;
+    }
     ctx.state
         .save_async(&ctx.state_file)
         .await
@@ -190,6 +223,9 @@ async fn record_rotation_success(
 /// failure — mint, verification, or a crash before the file write —
 /// self-heals: the next run logs in with the old, still-valid
 /// credential and retries, and the orphaned mint expires by TTL.
+///
+/// Returns whether the credential file was replaced: `false` when the
+/// `secret_id` was not read from a file, so there was none to replace.
 async fn self_mint_own_secret_id(
     ctx: &RotateContext,
     client: &OpenBaoClient,
@@ -197,7 +233,7 @@ async fn self_mint_own_secret_id(
     role_id: &str,
     secret_id_file: Option<&Path>,
     messages: &Messages,
-) -> Result<()> {
+) -> Result<bool> {
     let role_name = label.role_name();
     let Some(secret_id_path) = secret_id_file else {
         // Inline/env-supplied credentials leave no file to replace. A
@@ -205,7 +241,7 @@ async fn self_mint_own_secret_id(
         // aware that the credential they authenticated with still
         // expires at its TTL.
         eprintln!("{}", messages.warning_self_mint_skipped_non_file(role_name));
-        return Ok(());
+        return Ok(false);
     };
     let token_bound_cidrs = ctx
         .state
@@ -242,7 +278,7 @@ async fn self_mint_own_secret_id(
         )
     );
     println!("{}", messages.rotate_summary_self_mint_login_ok(role_name));
-    Ok(())
+    Ok(true)
 }
 
 /// Per-service facts the caller needs to print an accurate summary:
@@ -1113,9 +1149,53 @@ mod tests {
     };
     use super::*;
     use crate::commands::compose_project::DOCKER_BIN;
-    use crate::state::{ServiceRoleEntry, StateFile};
+    use crate::state::{
+        AppRoleRotationEntry, AppRoleRotationRecord, AppRoleRotationTarget, ServiceRoleEntry,
+        StateFile,
+    };
 
     const RUNTIME_ROTATE_ROLE: &str = "bootroot-runtime-rotate-role";
+    /// The start instant every run below is handed, and its record form.
+    const STARTED_AT_TEXT: &str = "2026-10-10T00:00:02Z";
+
+    /// A record in which every target has counted logins standing, as
+    /// failed `--if-due` runs leave it.
+    fn counted_record() -> AppRoleRotationRecord {
+        let mut record = AppRoleRotationRecord::default();
+        for target in [
+            AppRoleRotationTarget::AllServices,
+            AppRoleRotationTarget::InfraStepca,
+            AppRoleRotationTarget::InfraResponder,
+        ] {
+            *record.entry_mut(target) = counted_entry();
+        }
+        record
+    }
+
+    fn counted_entry() -> AppRoleRotationEntry {
+        AppRoleRotationEntry {
+            last_success: Some("2026-10-09T00:00:00Z".to_string()),
+            logins_since_renewal: 2,
+            last_login: Some("2026-10-09T12:00:00Z".to_string()),
+        }
+    }
+
+    /// [`counted_entry`] after its credential was renewed.
+    fn renewed_entry(last_success: &str) -> AppRoleRotationEntry {
+        AppRoleRotationEntry {
+            last_success: Some(last_success.to_string()),
+            logins_since_renewal: 0,
+            last_login: None,
+        }
+    }
+
+    fn started_at() -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(
+            STARTED_AT_TEXT,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("STARTED_AT_TEXT is RFC 3339")
+    }
 
     /// Builds a rotate context whose compose directory records a
     /// non-default identity, so every by-name docker call these tests
@@ -1910,6 +1990,7 @@ mod tests {
             rotate_bound_cidrs: Vec::new(),
             clear_rotate_bound_cidrs: false,
             agent_config: None,
+            if_due: None,
         }
     }
 
@@ -1985,6 +2066,7 @@ mod tests {
 
         let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.approle_rotation = counted_record();
         let credential_path = dir.path().join("rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
         fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
@@ -2006,11 +2088,24 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
         .await
         .expect("rotation with self-mint should succeed");
+
+        // The runtime credential was renewed, so the batch's count is
+        // gone; a single-service run is no scheduled target, so the
+        // batch's last success stays where it was.
+        let record = &ctx.state.approle_rotation;
+        assert_eq!(
+            record.entry(AppRoleRotationTarget::AllServices),
+            &renewed_entry("2026-10-09T00:00:00Z")
+        );
+        for target in AppRoleRotationTarget::INFRA {
+            assert_eq!(record.entry(target), &counted_entry(), "{target}");
+        }
 
         let replaced = fs::read_to_string(&credential_path).expect("read credential file");
         assert_eq!(
@@ -2030,6 +2125,70 @@ mod tests {
             saved.contains("last_secret_id_rotation"),
             "state.json must persist the dead-man timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn all_services_self_mint_records_the_batch_success() {
+        let dir = tempdir().expect("tempdir");
+        let server = MockServer::start().await;
+        mount_secret_id_mock(&service_role_name("alpha"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("alpha-role-id", "fresh-secret-id", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_self_mint_mock(RUNTIME_ROTATE_ROLE, "self-minted-secret")
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_login_mock_for("rr-role-id", "self-minted-secret", 200)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
+        insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.approle_rotation = counted_record();
+        let credential_path = dir.path().join("rotate-cred").join("secret_id");
+        fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
+        fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
+
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("runtime-rotate-token".to_string());
+        let messages = test_messages();
+        let (runtime_auth, secret_id_file) =
+            approle_auth("rr-role-id", "old-rotate-secret", Some(&credential_path));
+        let auth = RotateAuthContext {
+            runtime_auth: &runtime_auth,
+            secret_id_file,
+        };
+        let state_lock = crate::state_lock::hold_for_test(&ctx.state_file);
+        rotate_approle_secret_id(
+            &mut ctx,
+            &state_lock,
+            &client,
+            &approle_args(None, true, None),
+            true,
+            &auth,
+            started_at(),
+            false,
+            &messages,
+        )
+        .await
+        .expect("the batch with self-mint should succeed");
+
+        let record = &ctx.state.approle_rotation;
+        assert_eq!(
+            record.entry(AppRoleRotationTarget::AllServices),
+            &renewed_entry(STARTED_AT_TEXT)
+        );
+        for target in AppRoleRotationTarget::INFRA {
+            assert_eq!(record.entry(target), &counted_entry(), "{target}");
+        }
+        let saved = StateFile::load(&ctx.state_file).expect("state.json saved");
+        assert_eq!(&saved.approle_rotation, record);
     }
 
     #[tokio::test]
@@ -2054,6 +2213,7 @@ mod tests {
 
         let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.approle_rotation = counted_record();
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("runtime-rotate-token".to_string());
         let messages = test_messages();
@@ -2070,6 +2230,7 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2078,6 +2239,11 @@ mod tests {
         assert!(
             ctx.state.last_secret_id_rotation.is_some(),
             "the dead-man timestamp is still recorded"
+        );
+        assert_eq!(
+            ctx.state.approle_rotation,
+            counted_record(),
+            "no credential file was renewed, so the --if-due record stands"
         );
     }
 
@@ -2101,6 +2267,7 @@ mod tests {
 
         let mut ctx = make_ctx(dir.path(), &fake_docker);
         insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.approle_rotation = counted_record();
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         let messages = test_messages();
@@ -2117,6 +2284,7 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2125,6 +2293,11 @@ mod tests {
         assert!(
             ctx.state.last_secret_id_rotation.is_some(),
             "the dead-man timestamp is recorded for root-auth runs too"
+        );
+        assert_eq!(
+            ctx.state.approle_rotation,
+            counted_record(),
+            "a root-token run renews no rotate credential"
         );
     }
 
@@ -2151,6 +2324,7 @@ mod tests {
 
         let mut ctx = make_ctx(dir.path(), Path::new(DOCKER_BIN));
         insert_local_service(&mut ctx, dir.path(), "alpha");
+        ctx.state.approle_rotation = counted_record();
         let credential_path = dir.path().join("rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
         fs::write(&credential_path, "old-rotate-secret").expect("seed credential file");
@@ -2172,6 +2346,7 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2187,6 +2362,7 @@ mod tests {
             ctx.state.last_secret_id_rotation.is_none(),
             "the dead-man timestamp must not be recorded on failure"
         );
+        assert_eq!(ctx.state.approle_rotation, counted_record());
         assert!(
             !ctx.state_file.exists(),
             "state.json must not be written on failure"
@@ -2245,6 +2421,7 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2334,6 +2511,7 @@ mod tests {
             &approle_args(Some("alpha"), false, None),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2382,6 +2560,7 @@ mod tests {
             "stepca-role-id",
         )
         .expect("write role_id");
+        ctx.state.approle_rotation = counted_record();
         let credential_path = dir.path().join("infra-rotate-cred").join("secret_id");
         fs::create_dir_all(credential_path.parent().expect("parent")).expect("create cred dir");
         fs::write(&credential_path, "old-infra-rotate-secret").expect("seed credential file");
@@ -2406,11 +2585,29 @@ mod tests {
             &approle_args(None, false, Some(InfraRoleTarget::Stepca)),
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
         .await
         .expect("infra rotation with self-mint should succeed");
+
+        // The shared infra credential was renewed: both infra targets
+        // have their logins again, and only the rotated one moved its
+        // last success.
+        let record = &ctx.state.approle_rotation;
+        assert_eq!(
+            record.entry(AppRoleRotationTarget::InfraStepca),
+            &renewed_entry(STARTED_AT_TEXT)
+        );
+        assert_eq!(
+            record.entry(AppRoleRotationTarget::InfraResponder),
+            &renewed_entry("2026-10-09T00:00:00Z")
+        );
+        assert_eq!(
+            record.entry(AppRoleRotationTarget::AllServices),
+            &counted_entry()
+        );
 
         // The next `--infra responder` invocation reads this file at
         // startup and authenticates with the fresh credential.
@@ -2444,6 +2641,7 @@ mod tests {
             &args,
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )
@@ -2769,6 +2967,7 @@ mod tests {
             &args,
             true,
             &auth,
+            started_at(),
             false,
             &messages,
         )

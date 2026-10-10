@@ -866,6 +866,30 @@ pub(crate) struct RotateAppRoleSecretIdArgs {
     /// before issuing any `secret_id` without it.
     #[arg(long, conflicts_with = "infra")]
     pub(crate) agent_config: Option<PathBuf>,
+
+    /// Rotates only when due: skips (exit 0, no `OpenBao` login, no file
+    /// written, no sidecar restarted) while the target's last fully
+    /// successful rotation is younger than DURATION (e.g. `11h30m`).
+    ///
+    /// For a scheduler that runs `--all-services` or `--infra` often,
+    /// such as hourly. Due runs whose login gets no answer or a 5xx
+    /// answer are retried freely; due runs that logged in, or whose
+    /// login was refused, are spaced DURATION divided by the target's
+    /// login budget apart and capped (4 for `--all-services`, 2 for each
+    /// `--infra` target), so one login of the rotate credential stays
+    /// for an operator. Prints one `if-due:` line: `skipped` or
+    /// `rotated` (exit 0), `backing_off` or `budget_spent` (exit 1, no
+    /// login). Requires `--approle-secret-id-file`; DURATION must be
+    /// above zero and at most half the rotate roles' `secret_id` TTL.
+    ///
+    /// The provisioning flags are excluded because they need the root
+    /// token, which this flag refuses.
+    #[arg(
+        long,
+        value_name = "DURATION",
+        conflicts_with_all = ["registration_id", "rotate_bound_cidrs", "clear_rotate_bound_cidrs"]
+    )]
+    pub(crate) if_due: Option<String>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -2147,6 +2171,51 @@ mod tests {
             .is_err(),
             "--clear-rotate-bound-cidrs must require --infra"
         );
+    }
+
+    #[test]
+    fn test_cli_parses_rotate_approle_secret_id_if_due() {
+        for selector in [&["--all-services"][..], &["--infra", "responder"][..]] {
+            let mut command_line = vec!["bootroot", "rotate", "approle-secret-id"];
+            command_line.extend_from_slice(selector);
+            command_line.extend_from_slice(&["--if-due", "11h30m"]);
+            let cli = Cli::parse_from(command_line);
+            match cli.command {
+                CliCommand::Rotate(args) => match args.command {
+                    RotateCommand::AppRoleSecretId(approle) => {
+                        assert_eq!(approle.if_due.as_deref(), Some("11h30m"));
+                    }
+                    _ => panic!("expected AppRoleSecretId subcommand"),
+                },
+                _ => panic!("expected Rotate command"),
+            }
+        }
+        let cli = Cli::parse_from(["bootroot", "rotate", "approle-secret-id", "--all-services"]);
+        match cli.command {
+            CliCommand::Rotate(args) => match args.command {
+                RotateCommand::AppRoleSecretId(approle) => assert!(approle.if_due.is_none()),
+                _ => panic!("expected AppRoleSecretId subcommand"),
+            },
+            _ => panic!("expected Rotate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_if_due_rejects_registration_id_and_provisioning_flags() {
+        let rejected: [&[&str]; 3] = [
+            &["--registration-id", "api"],
+            &["--infra", "stepca", "--rotate-bound-cidrs", "10.0.0.5/32"],
+            &["--infra", "stepca", "--clear-rotate-bound-cidrs"],
+        ];
+        for extra in rejected {
+            let mut argv = vec!["bootroot", "rotate", "approle-secret-id"];
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--if-due", "1h"]);
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "--if-due must be a usage error with {extra:?}"
+            );
+        }
     }
 
     #[test]

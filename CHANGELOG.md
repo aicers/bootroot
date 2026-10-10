@@ -258,6 +258,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   stable ACME account across renewals instead of registering a fresh one
   per issuance. Leaving it unset — which every existing configuration
   does — keeps the ephemeral-key behaviour unchanged.
+- `bootroot rotate approle-secret-id` gained `--if-due <duration>` for
+  `--all-services` and `--infra`, so a scheduler can run the command often
+  and have it rotate only when due. A run does nothing and exits 0 (no
+  OpenBao login, no file write, no sidecar restart) while the target's
+  last fully successful rotation is younger than `<duration>`. Once due, a
+  run whose login never reaches OpenBao's AppRole backend (OpenBao
+  unreachable or sealed) spends none of the rotate credential's six logins
+  and can be retried at every tick; runs that logged in, or whose login
+  was refused, are spaced out and capped (four for `--all-services`, two
+  for each `--infra` target) so that one login is left for an operator,
+  after which the command refuses without logging in and names the
+  recovery. Each run under the flag prints one `if-due:` line saying
+  whether it skipped, rotated, is backing off or has spent its budget. The
+  state is kept in a new `approle_rotation` record in `state.json`.
+  Without the flag the command behaves as before.
 
 ### Changed
 
