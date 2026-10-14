@@ -705,6 +705,123 @@ async fn a_trust_update_waiting_on_a_renewal_republishes_the_renewed_pair() {
     assert_eq!(fixture.configured(), pair("B"));
 }
 
+/// A trust update that lands while a profile's very first issuance holds
+/// the generation lock carries that issuance's pair forward beside the
+/// new bundle.
+///
+/// The issuance read the old bundle under the lock and is stopped before
+/// `current` exists. Had the update decided there was nothing to
+/// republish before taking the lock, the issuance would go on to publish
+/// the old bundle and nothing would replace it until the next renewal —
+/// the state of every host on its first issuance after an upgrade.
+#[tokio::test]
+async fn a_trust_update_during_a_first_issuance_republishes_its_pair() {
+    let fixture = Arc::new(Fixture::new());
+    fixture.write_bundle("bundle one\n");
+
+    let (staged_tx, staged_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = Mutex::new(resume_rx);
+    let issuance_probe = Probe::new(move |point| {
+        if point == PublicationPoint::Staged {
+            staged_tx.send(()).expect("the test is listening");
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test lets the issuance go on");
+        }
+        Ok(())
+    });
+    let issuance = tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { fixture.publish(&material("A"), &issuance_probe).await }
+    });
+    tokio::task::spawn_blocking(move || staged_rx.recv())
+        .await
+        .expect("join")
+        .expect("the issuance staged its generation");
+    assert_eq!(
+        fixture.current(),
+        None,
+        "the first issuance has not swapped"
+    );
+
+    fixture.write_bundle("bundle two\n");
+    let (requested_tx, requested_rx) = mpsc::channel();
+    let trust_probe = Probe::new(move |point| {
+        if point == PublicationPoint::LockRequested {
+            requested_tx.send(()).expect("the test is listening");
+        }
+        Ok(())
+    });
+    let trust = tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { republish_for_trust(&fixture.settings, &trust_probe).await }
+    });
+    tokio::task::spawn_blocking(move || requested_rx.recv())
+        .await
+        .expect("join")
+        .expect("the trust update waits on the lock rather than skipping the profile");
+    assert_eq!(fixture.current(), None, "still no current while it waits");
+
+    resume_tx.send(()).expect("the issuance is waiting");
+    issuance
+        .await
+        .expect("join")
+        .expect("the issuance publishes");
+    trust
+        .await
+        .expect("join")
+        .expect("the trust update publishes");
+
+    assert_eq!(fixture.current(), Some(PathBuf::from("gen-2")));
+    assert_eq!(
+        read_snapshot(&fixture.root),
+        Some(snapshot("A", Some("bundle two\n"))),
+        "the first issuance's pair, beside the bundle now on disk"
+    );
+    assert_eq!(
+        read(&fixture.root.join("gen-1").join(BUNDLE_NAME)),
+        Some("bundle one\n".to_string()),
+        "the issuance itself published the bundle it read"
+    );
+}
+
+/// A failure to flush the swap of `current` comes after the commit
+/// point, so the publication goes on: `current` keeps the new
+/// generation, and the configured pair is written as on success.
+#[tokio::test]
+async fn a_failed_flush_after_the_swap_still_publishes() {
+    let fixture = Fixture::new();
+    fixture
+        .publish(&material("A"), &Probe::default())
+        .await
+        .expect("publish A");
+
+    fixture
+        .publish(&material("B"), &failing_at(PublicationPoint::Swapped))
+        .await
+        .expect("a failure after the swap does not fail the publication");
+
+    assert_eq!(fixture.current(), Some(PathBuf::from("gen-2")));
+    assert_eq!(read_snapshot(&fixture.root), Some(snapshot("B", None)));
+    assert_eq!(
+        fixture.configured(),
+        pair("B"),
+        "the configured pair is not left behind a live generation"
+    );
+    assert_eq!(
+        fixture.entries(),
+        names(&[
+            "gen-1",
+            "gen-2",
+            CURRENT_LINK_NAME,
+            crate::publication_lock::LOCK_FILE_NAME,
+        ])
+    );
+}
+
 /// A trust update on a profile with no `current` creates nothing — not
 /// a generation, not a lock file, not the tree.
 #[tokio::test]

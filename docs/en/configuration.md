@@ -1290,7 +1290,10 @@ published and `current` is swapped, then `paths.cert` and `paths.key` are
 written, and the post-renew hooks run last. If the generation cannot be
 published the renewal fails before the configured certificate and key are
 touched, the failure hooks run, and the renewal is retried. `current` keeps
-naming the last complete generation throughout.
+naming the last complete generation throughout. The swap of `current` is the
+commit point: once it has happened the renewal goes on, and a failure after
+it — flushing the swap to disk, or removing older generations — is logged as
+a warning instead of failing the renewal.
 
 **A CA-trust update publishes a generation too.** When the fast-poll loop
 replaces the CA bundle, each profile that already has a `current` gets a new

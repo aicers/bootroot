@@ -47,7 +47,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -114,7 +114,9 @@ pub(crate) enum PublicationPoint {
     /// `current.tmp` names `gen-<n>`; `current` still names the previous
     /// generation.
     LinkStaged,
-    /// `current` names `gen-<n>`; the configured pair is unwritten.
+    /// `current` names `gen-<n>`, the root has not been flushed, and the
+    /// configured pair is unwritten. A failure injected here stands in
+    /// for that flush failing, which does not fail the publication.
     Swapped,
     /// The configured certificate is written and the configured key is
     /// not.
@@ -276,7 +278,7 @@ pub(crate) enum GenerationOutcome {
         generation: u64,
     },
     /// [`PairSource::Current`] found no `current` to copy a pair from,
-    /// and nothing was created. The profile's next issuance publishes
+    /// and no generation was created. The profile's next issuance publishes
     /// its first generation.
     NoCurrent,
     /// [`PairSource::Current`] found a `current` whose generation does
@@ -305,12 +307,15 @@ pub(crate) enum GenerationOutcome {
 /// 6. Remove every generation but `gen-<n>` and the one `current` named
 ///    before step 5.
 ///
-/// A failure in steps 0 to 5 leaves `current` naming the generation it
-/// named before, or absent, and whatever was staged is removed by the
-/// next publication's step 2 or step 6. Step 6 itself only warns: by
-/// then `current` has been swapped and the publication has happened, so
-/// reporting a failure would announce as lost a snapshot consumers are
-/// already reading.
+/// The rename of `current` in step 5 is the commit point. A failure
+/// before it leaves `current` naming the generation it named before, or
+/// absent, and whatever was staged is removed by the next publication's
+/// step 2 or step 6. Nothing after it fails the publication — neither
+/// the flush that makes the swap durable nor step 6 — and each only
+/// warns: `current` already names the new generation and a consumer may
+/// have acted on it, so reporting a failure would announce as lost a
+/// snapshot consumers are already reading, and would leave the
+/// configured pair unwritten behind it.
 ///
 /// # Errors
 ///
@@ -324,20 +329,26 @@ pub(crate) async fn publish_generation(
     probe: &Probe,
 ) -> Result<GenerationOutcome> {
     let republish = matches!(source, PairSource::Current);
-    // Answered before anything is created: a profile with no tree is
-    // not given an empty one by a trust update.
-    if republish && !is_symlink(&target.current()) {
-        return Ok(GenerationOutcome::NoCurrent);
-    }
     if !republish {
         // A first issuance reaches here before the configured pair's
         // writer has created the key directory this tree lives in.
         cert_group::ensure_key_parent_dir(&target.key_dir, target.policy).await?;
     }
     let tree = target.clone();
-    tokio::task::spawn_blocking(move || ensure_tree(&tree))
+    let exists = tokio::task::spawn_blocking(move || ensure_tree(&tree, !republish))
         .await
         .context("the generation tree task panicked")??;
+    // A trust update does not give a profile with no tree an empty one.
+    // That needs no lock: an issuance creates the tree before it takes
+    // the lock and reads the bundle only once it holds it, so one that
+    // has not created the tree yet reads the bundle this update already
+    // wrote. A tree that does exist may have its first issuance under
+    // way, holding the lock with an older bundle read, so whether there
+    // is a `current` to carry forward is answered under the lock, in
+    // `commit`, once that issuance has swapped it.
+    if !exists {
+        return Ok(GenerationOutcome::NoCurrent);
+    }
 
     probe.reach(PublicationPoint::LockRequested)?;
     let lock = crate::publication_lock::hold(&[&target.current()]).await?;
@@ -418,23 +429,25 @@ pub(crate) async fn republish_for_trust(settings: &Settings, probe: &Probe) -> R
     first_failure.map_or(Ok(()), Err)
 }
 
-/// Step 0: the two directories above every generation.
-fn ensure_tree(target: &GenerationTarget) -> Result<()> {
+/// Step 0: the two directories above every generation. Returns whether
+/// the tree exists, which is always so when `create` is set.
+fn ensure_tree(target: &GenerationTarget, create: bool) -> Result<bool> {
     let generations = target
         .root
         .parent()
         .expect("a generation root is always <key_dir>/.bootroot-generations/<id>");
-    ensure_tree_dir(generations, target.policy)?;
-    ensure_tree_dir(&target.root, target.policy)
+    Ok(ensure_tree_dir(generations, target.policy, create)?
+        && ensure_tree_dir(&target.root, target.policy, create)?)
 }
 
 /// Creates `path` under the key directory's policy, or re-asserts the
-/// policy on the directory already there.
+/// policy on the directory already there. Returns whether the directory
+/// exists: without `create`, an absent one is left absent.
 ///
 /// Anything else already there — a symlink, a regular file — is refused
 /// and not followed: the tree holds a copy of the private key, and a
 /// link here would have it written wherever the link points.
-fn ensure_tree_dir(path: &Path, policy: CertGroupPolicy) -> Result<()> {
+fn ensure_tree_dir(path: &Path, policy: CertGroupPolicy, create: bool) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_dir() => {}
         Ok(_) => anyhow::bail!(
@@ -443,6 +456,7 @@ fn ensure_tree_dir(path: &Path, policy: CertGroupPolicy) -> Result<()> {
              renewal recreates the generation tree",
             path.display()
         ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create => return Ok(false),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             match DirBuilder::new().mode(STAGED_DIR_MODE).create(path) {
                 Ok(()) => {}
@@ -457,7 +471,8 @@ fn ensure_tree_dir(path: &Path, policy: CertGroupPolicy) -> Result<()> {
         }
         Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
     }
-    apply_dir_policy(path, policy)
+    apply_dir_policy(path, policy)?;
+    Ok(true)
 }
 
 /// Gives a directory of the tree the key directory's policy: `0700`, or
@@ -518,6 +533,9 @@ fn commit(
                 return Ok(GenerationOutcome::NoCurrent);
             };
             let from = root.join(generation_name(previous));
+            if !is_generation_dir(&from)? {
+                return Ok(GenerationOutcome::StalePair);
+            }
             let Some(cert_pem) = read_member(&from.join(&target.cert_name))? else {
                 return Ok(GenerationOutcome::StalePair);
             };
@@ -584,8 +602,22 @@ fn commit(
     probe.reach(PublicationPoint::LinkStaged)?;
     std::fs::rename(&staged_link, &current)
         .with_context(|| format!("swapping {} onto {name}", current.display()))?;
-    sync_dir(root)?;
-    probe.reach(PublicationPoint::Swapped)?;
+    // The commit point: `current` names the new generation, and a
+    // consumer watching it may already be reading it. A failure from
+    // here on is not reported as a failed publication. The flush only
+    // makes the swap durable; without it a crash can bring back the
+    // previous generation, which is complete and is replaced by the
+    // profile's next publication.
+    if let Err(err) = probe
+        .reach(PublicationPoint::Swapped)
+        .and_then(|()| sync_dir(root))
+    {
+        tracing::warn!(
+            "Swapped {} onto {name} but could not flush the swap to disk, so a crash may \
+             bring back the previous generation until the next publication: {err:#}",
+            current.display()
+        );
+    }
 
     if let Err(err) = prune(root, generation, previous) {
         tracing::warn!(
@@ -699,9 +731,29 @@ fn is_staged_generation(name: &OsStr) -> bool {
         .is_some_and(|name| name.starts_with(GENERATION_PREFIX) && name.ends_with(STAGING_SUFFIX))
 }
 
-/// Whether `path` is a symlink, without following it.
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+/// Whether the generation `current` names is there to copy a pair from.
+///
+/// A symlink or anything but a directory in its place is refused and not
+/// followed: `current` is the only link in the tree ever followed, and
+/// following another would carry whatever it points at into a snapshot.
+fn is_generation_dir(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(true),
+        Ok(_) => Err(refusal(path, "a directory")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+/// The error for an entry of a generation that is not what a
+/// publication writes there.
+fn refusal(path: &Path, expected: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} must be {expected} in the generation tree, but a symlink or another kind of file \
+         is in its place; it was not followed and nothing was republished from it. Remove it, \
+         and the profile's next renewal publishes a generation that does not use it",
+        path.display()
+    )
 }
 
 /// Removes whatever is at `path`, a directory with its contents, and
@@ -721,12 +773,34 @@ fn remove_entry(path: &Path) -> Result<()> {
 
 /// Reads one file of a generation, or `None` when the generation does
 /// not hold it.
+///
+/// A symlink in its place is refused rather than followed, as
+/// [`is_generation_dir`] refuses one in place of the generation, and so
+/// is anything but a regular file. `O_NONBLOCK` keeps a FIFO planted
+/// there from stalling the open; it changes nothing for a regular file.
 fn read_member(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(refusal(path, "a regular file"));
+        }
+        Err(err) => return Err(err).with_context(|| format!("opening {}", path.display())),
+    };
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(refusal(path, "a regular file"));
     }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(Some(contents))
 }
 
 /// Writes one file of a staged generation at its final owner and mode,
