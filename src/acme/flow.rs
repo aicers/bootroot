@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use tracing::{info, warn};
@@ -12,6 +12,7 @@ use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
 use crate::cert_group::CertGroupPolicy;
 use crate::fs_util;
+use crate::fs_util::generation::{self, GenerationPlan, GenerationTarget, PairSource, Probe};
 use crate::registrar::internal::PrivateKeyPem;
 
 fn contact_from_email(email: &str) -> String {
@@ -69,17 +70,36 @@ pub(crate) enum LeafPublication {
     LeafWithChain,
 }
 
+/// Whether an issuance also publishes a generation: one consistent
+/// snapshot of the certificate, key and CA bundle, swapped into place
+/// atomically beside the profile's key.
+///
+/// See [`crate::fs_util::generation`] for the tree and its reader
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GenerationPublication {
+    /// Publish a generation, after the CA bundle and before the
+    /// configured pair. What every `[[profiles]]` issuance does.
+    #[default]
+    Snapshot,
+    /// Publish no generation. The registrar surface's leaves take this:
+    /// they have a publication lock and a rollback of their own, and
+    /// their pairs are not moved into generations.
+    None,
+}
+
 /// How one issuance differs from the ordinary service issuance.
 ///
-/// Both members default to today's behaviour, so
-/// [`issue_certificate`] is this struct's default and every existing
-/// caller is unaffected.
+/// Every member defaults to the ordinary service issuance, so
+/// [`issue_certificate`] is this struct's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct IssuanceOptions {
     /// Which CSR shape to ask the CA for.
     pub(crate) csr_shape: CsrShape,
     /// What to write at `profile.paths.cert`.
     pub(crate) leaf_publication: LeafPublication,
+    /// Whether a generation is published beside the configured pair.
+    pub(crate) generation: GenerationPublication,
 }
 
 fn build_csr_params(
@@ -555,8 +575,13 @@ pub(crate) async fn issue_certificate_material(
     run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await
 }
 
-/// Issues a registrar-surface certificate with optional pin-only bootstrap
+/// Issues a certificate under `options` with optional pin-only bootstrap
 /// TLS while the configured output bundle is being repaired.
+///
+/// Under [`GenerationPublication::Snapshot`] the publication is the CA
+/// bundle, then the generation through its `current` swap, then the
+/// configured pair, and this returns only after all three. Under
+/// [`GenerationPublication::None`] it is [`publish_issued_material`].
 pub(crate) async fn issue_certificate_with_bootstrap(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
@@ -569,17 +594,21 @@ pub(crate) async fn issue_certificate_with_bootstrap(
     else {
         return Ok(());
     };
-    publish_issued_material(settings, profile, &material).await
+    match options.generation {
+        GenerationPublication::Snapshot => {
+            publish_snapshot(settings, profile, &material, &Probe::default()).await
+        }
+        GenerationPublication::None => publish_issued_material(settings, profile, &material).await,
+    }
 }
 
-/// Publishes what an issuance produced at the configured paths.
+/// Publishes what an issuance produced at the configured paths, with no
+/// generation.
 ///
-/// The chain first, the leaf after. An unpinned fingerprint or a CA
-/// bundle that cannot be read fails here, before anything is published,
-/// so no consumer is left holding a leaf whose issuer this host does not
-/// trust. With `ca_bundle_path` unconfigured there is nothing to verify
-/// or merge, and with an empty chain the bundle is left alone with a
-/// warning; neither is a refusal.
+/// The chain first, the leaf after: [`publish_bundle`], then
+/// [`publish_pair`]. An unpinned fingerprint or a CA bundle that cannot
+/// be read fails before anything is published, so no consumer is left
+/// holding a leaf whose issuer this host does not trust.
 ///
 /// Reachable on its own so the registrar surface's issuance can take
 /// [`crate::publication_lock`] around exactly this half and no more:
@@ -601,37 +630,140 @@ pub(crate) async fn publish_issued_material(
     profile: &crate::config::DaemonProfileSettings,
     material: &IssuedMaterial,
 ) -> Result<()> {
-    let policy = crate::cert_group::CertGroupPolicy {
-        gid: profile.cert_group_gid,
-    };
-    if let Some(bundle_path) = &settings.trust.ca_bundle_path {
-        if material.chain.is_empty() {
-            warn!("Certificate chain not present; CA bundle not updated.");
-        } else {
-            verify_chain_fingerprints(&material.chain, &settings.trust.trusted_ca_sha256)?;
-            write_merged_ca_bundle(
-                bundle_path,
-                &material.chain,
-                &settings.trust.trusted_ca_sha256,
-                policy,
-            )
-            .await?;
-            info!("CA bundle saved to: {:?}", bundle_path);
+    publish_bundle(settings, profile, material).await?;
+    publish_pair(profile, material, &Probe::default()).await
+}
+
+/// Publishes what an issuance produced as a generation and at the
+/// configured paths: [`publish_bundle`], then the generation, then
+/// [`publish_pair`].
+///
+/// The generation comes before the configured pair so that a failure to
+/// publish it fails the issuance while `paths.cert` and `paths.key` are
+/// still untouched — what a pin or bundle failure has always done. A
+/// consumer that reloads on the post-renew hook is therefore never left
+/// with a new pair on disk that no success hook announced.
+///
+/// # Errors
+///
+/// Returns an error under the conditions [`publish_issued_material`]
+/// does, and when the generation cannot be published.
+pub(crate) async fn publish_snapshot(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    material: &IssuedMaterial,
+    probe: &Probe,
+) -> Result<()> {
+    publish_bundle(settings, profile, material).await?;
+    publish_profile_generation(settings, profile, material, probe).await?;
+    publish_pair(profile, material, probe).await
+}
+
+/// Publishes the issued certificate and key, beside the CA bundle now
+/// on disk, as the profile's next generation, and swaps `current` onto
+/// it.
+///
+/// A profile whose configuration the tree cannot represent — see
+/// [`GenerationTarget::plan`] — gets no generation and a warning, and
+/// this succeeds: its issuance goes on to the configured paths exactly
+/// as it did before the tree existed.
+///
+/// # Errors
+///
+/// Returns an error when the generation cannot be published. `current`
+/// then still names the generation it named before.
+pub(crate) async fn publish_profile_generation(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    material: &IssuedMaterial,
+    probe: &Probe,
+) -> Result<()> {
+    let label = crate::config::profile_domain(settings, profile);
+    match GenerationTarget::plan(settings, profile) {
+        GenerationPlan::Publish(target) => {
+            let source = PairSource::Issued {
+                cert_pem: material.cert_pem.clone(),
+                key_pem: PrivateKeyPem::new(material.key_pem.expose().to_owned()),
+            };
+            generation::publish_generation(&target, source, probe)
+                .await
+                .with_context(|| format!("publishing a generation for profile '{label}'"))?;
+        }
+        GenerationPlan::Skip(reason) => {
+            warn!(
+                "No generation is published for profile '{label}': {reason}. Its certificate \
+                 and key are written at their configured paths as before."
+            );
         }
     }
+    Ok(())
+}
 
-    // Each file is staged and `rename(2)`d, so neither destination
-    // ever holds a truncated PEM. The *pair* is not atomic: the two
-    // renames are separate, so a reader landing between them sees the
-    // new leaf with the old key, or the old leaf with the new key.
-    // Closing that window is the reader's side of the contract — a
-    // bounded retry on a mismatched pair — and is not done here.
-    fs_util::write_cert_and_key(
+/// Verifies the issuer chain against the pinned fingerprints and merges
+/// it into `[trust].ca_bundle_path`.
+///
+/// With `ca_bundle_path` unconfigured there is nothing to verify or
+/// merge, and with an empty chain the bundle is left alone with a
+/// warning; neither is a refusal.
+///
+/// # Errors
+///
+/// Returns an error when the returned chain carries a fingerprint that
+/// is not pinned, or when the CA bundle cannot be read or merged.
+pub(crate) async fn publish_bundle(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+    material: &IssuedMaterial,
+) -> Result<()> {
+    let Some(bundle_path) = &settings.trust.ca_bundle_path else {
+        return Ok(());
+    };
+    if material.chain.is_empty() {
+        warn!("Certificate chain not present; CA bundle not updated.");
+        return Ok(());
+    }
+    verify_chain_fingerprints(&material.chain, &settings.trust.trusted_ca_sha256)?;
+    write_merged_ca_bundle(
+        bundle_path,
+        &material.chain,
+        &settings.trust.trusted_ca_sha256,
+        crate::cert_group::CertGroupPolicy {
+            gid: profile.cert_group_gid,
+        },
+    )
+    .await?;
+    info!("CA bundle saved to: {:?}", bundle_path);
+    Ok(())
+}
+
+/// Writes the certificate and the key at the profile's configured paths.
+///
+/// # Errors
+///
+/// Returns an error when the leaf or the key cannot be written.
+pub(crate) async fn publish_pair(
+    profile: &crate::config::DaemonProfileSettings,
+    material: &IssuedMaterial,
+    probe: &Probe,
+) -> Result<()> {
+    // Each file is staged and `rename(2)`d, so neither destination ever
+    // holds a truncated PEM. The *pair* is still not atomic: the two
+    // renames are separate, and the key's whole staged write and fsync
+    // sits between them, so a reader of these two paths can see the new
+    // leaf beside the old key. A consumer that reloads on the post-renew
+    // hook never does, because the hook runs after both. One that reads
+    // on a file event reads the profile's generation instead — see
+    // `crate::fs_util::generation` — which a `[[profiles]]` issuance has
+    // already swapped into place by the time this runs.
+    fs_util::write_cert_and_key_probed(
         &profile.paths.cert,
         &profile.paths.key,
         &material.cert_pem,
         material.key_pem.expose(),
-        policy,
+        crate::cert_group::CertGroupPolicy {
+            gid: profile.cert_group_gid,
+        },
+        probe,
     )
     .await?;
     info!("Certificate saved to: {:?}", profile.paths.cert);
@@ -789,6 +921,9 @@ fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod generation_tests;
 
 #[cfg(test)]
 mod tests {

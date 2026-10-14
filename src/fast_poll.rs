@@ -1209,7 +1209,10 @@ pub(crate) struct LiveFastPollHooks<F> {
 /// cert-group gid policy) so it stays world-readable and cert-group
 /// consistent like the renewal-time bundle, under
 /// [`crate::ca_bundle_lock`] so it cannot land inside another in-process
-/// writer's read-merge-write span; the `agent.toml` rewrite goes
+/// writer's read-merge-write span. Every profile that already has a
+/// generation tree then gets a new generation holding its current pair
+/// beside the new bundle ([`fs_util::generation::republish_for_trust`]).
+/// The `agent.toml` rewrite goes
 /// through [`fs_util::atomic_write`] at `0o600` (the #613-safe writer) so a
 /// crash cannot leave the daemon's hot-read config half-written. The
 /// `upsert_section_keys` round-trip preserves operator-tuned sections.
@@ -1240,6 +1243,13 @@ async fn apply_trust_to_disk(
                 format!("Failed to write CA bundle to {}", ca_bundle_path.display())
             })?;
     }
+    // No post-renew hook announces a trust update, so the swap of each
+    // profile's `current` is the only signal a consumer of the
+    // generation tree gets that the bundle changed. After the bundle
+    // lock is released, because the generation lock is always taken
+    // first.
+    fs_util::generation::republish_for_trust(settings, &fs_util::generation::Probe::default())
+        .await?;
 
     let current = fs::read_to_string(config_path)
         .await
@@ -3644,6 +3654,212 @@ mod tests {
                 .unwrap()
                 .contains("BEGIN CERTIFICATE"),
             "the trust apply lands once the bundle is free"
+        );
+    }
+
+    /// The pieces the generation tests below share: a profile whose
+    /// configured paths live in `dir`, the bundle beside them, and an
+    /// `agent.toml` for the trust apply to rewrite.
+    struct GenerationHost {
+        settings: config::Settings,
+        config_path: PathBuf,
+        bundle_path: PathBuf,
+        root: PathBuf,
+    }
+
+    impl GenerationHost {
+        fn new(dir: &Path) -> Self {
+            let config_path = dir.join("agent.toml");
+            std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
+            let bundle_path = dir.join("trust").join("ca-bundle.pem");
+            let mut settings = test_settings("edge-proxy");
+            settings.trust.ca_bundle_path = Some(bundle_path.clone());
+            settings.profiles[0].paths.cert = dir.join("certs").join("cert.pem");
+            settings.profiles[0].paths.key = dir.join("keys").join("key.pem");
+            let root =
+                fs_util::generation::generation_root(&settings.profiles[0].paths.key, "edge-proxy");
+            Self {
+                settings,
+                config_path,
+                bundle_path,
+                root,
+            }
+        }
+
+        /// What a reader that resolves `current` once sees: the
+        /// generation's name, then its certificate, key and bundle.
+        fn current(&self) -> (String, String, String, String) {
+            let name = std::fs::read_link(self.root.join("current")).expect("current resolves");
+            let generation = self.root.join(&name);
+            let read = |file: &str| std::fs::read_to_string(generation.join(file)).unwrap();
+            (
+                name.to_string_lossy().into_owned(),
+                read("cert.pem"),
+                read("key.pem"),
+                read("ca-bundle.pem"),
+            )
+        }
+    }
+
+    fn generation_material(label: &str, chain: Vec<Vec<u8>>) -> crate::acme::IssuedMaterial {
+        crate::acme::IssuedMaterial {
+            cert_pem: format!("certificate {label}\n"),
+            key_pem: crate::registrar::internal::PrivateKeyPem::new(format!("key {label}\n")),
+            chain,
+        }
+    }
+
+    fn trust_payload(bundle: &str) -> TrustPayload {
+        TrustPayload {
+            trusted_ca_sha256: vec!["a".repeat(64)],
+            ca_bundle_pem: bundle.to_string(),
+        }
+    }
+
+    /// A trust update republishes the pair `current` names beside the
+    /// new bundle as the next generation, and gives a profile that has
+    /// no tree nothing at all.
+    #[tokio::test]
+    async fn apply_trust_to_disk_republishes_the_current_generation_with_the_new_bundle() {
+        use crate::acme::flow::publish_snapshot;
+        use crate::fs_util::generation::Probe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = GenerationHost::new(dir.path());
+        // A second profile, sharing the key directory, never issued.
+        let mut unissued = host.settings.profiles[0].clone();
+        unissued.registration_id = "edge-cache".to_string();
+        unissued.paths.cert = dir.path().join("certs").join("cache-cert.pem");
+        unissued.paths.key = dir.path().join("keys").join("cache-key.pem");
+        host.settings.profiles.push(unissued);
+
+        std::fs::create_dir_all(host.bundle_path.parent().unwrap()).unwrap();
+        std::fs::write(&host.bundle_path, "bundle one\n").unwrap();
+        publish_snapshot(
+            &host.settings,
+            &host.settings.profiles[0],
+            &generation_material("A", Vec::new()),
+            &Probe::default(),
+        )
+        .await
+        .expect("the renewal publishes generation 1");
+        assert_eq!(host.current().0, "gen-1");
+
+        apply_trust_to_disk(
+            &host.settings,
+            &host.config_path,
+            "edge-proxy",
+            &trust_payload("bundle two\n"),
+        )
+        .await
+        .expect("apply trust");
+
+        assert_eq!(
+            host.current(),
+            (
+                "gen-2".to_string(),
+                "certificate A\n".to_string(),
+                "key A\n".to_string(),
+                "bundle two\n".to_string(),
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(host.root.join("gen-1").join("ca-bundle.pem")).unwrap(),
+            "bundle one\n",
+            "the previous generation is kept, with the bundle it was published with"
+        );
+        let trees: Vec<_> = std::fs::read_dir(host.root.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            trees,
+            vec![std::ffi::OsString::from("edge-proxy")],
+            "a profile with no current gets no tree from a trust update"
+        );
+    }
+
+    /// A trust update that lands between a renewal's bundle merge and
+    /// its generation is not lost: the renewal reads the bundle only
+    /// once it holds the generation lock, so the final `current` holds
+    /// the renewal's pair beside the bundle the update wrote.
+    #[tokio::test]
+    async fn a_trust_update_between_a_renewals_bundle_and_generation_is_in_the_snapshot() {
+        use crate::acme::flow::{
+            publish_bundle, publish_pair, publish_profile_generation, publish_snapshot,
+        };
+        use crate::fs_util::generation::Probe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = GenerationHost::new(dir.path());
+        let issuer = b"issuer certificate".to_vec();
+        host.settings.trust.trusted_ca_sha256 = vec![crate::tls::sha256_hex(&issuer)];
+        let profile = host.settings.profiles[0].clone();
+
+        publish_snapshot(
+            &host.settings,
+            &profile,
+            &generation_material("A", vec![issuer.clone()]),
+            &Probe::default(),
+        )
+        .await
+        .expect("the first renewal publishes generation 1");
+        let merged = std::fs::read_to_string(&host.bundle_path).unwrap();
+        assert_eq!(host.current().3, merged);
+
+        // The second renewal merges its chain into the bundle...
+        let renewed = generation_material("B", vec![issuer]);
+        publish_bundle(&host.settings, &profile, &renewed)
+            .await
+            .expect("the renewal's bundle merge");
+        assert_eq!(std::fs::read_to_string(&host.bundle_path).unwrap(), merged);
+
+        // ...a trust update replaces it, and republishes the pair that
+        // is current at that moment...
+        apply_trust_to_disk(
+            &host.settings,
+            &host.config_path,
+            "edge-proxy",
+            &trust_payload("bundle two\n"),
+        )
+        .await
+        .expect("apply trust");
+        assert_eq!(
+            host.current(),
+            (
+                "gen-2".to_string(),
+                "certificate A\n".to_string(),
+                "key A\n".to_string(),
+                "bundle two\n".to_string(),
+            )
+        );
+
+        // ...and only then does the renewal publish its generation and
+        // its configured pair.
+        publish_profile_generation(&host.settings, &profile, &renewed, &Probe::default())
+            .await
+            .expect("the renewal's generation");
+        publish_pair(&profile, &renewed, &Probe::default())
+            .await
+            .expect("the renewal's configured pair");
+
+        assert_eq!(
+            host.current(),
+            (
+                "gen-3".to_string(),
+                "certificate B\n".to_string(),
+                "key B\n".to_string(),
+                "bundle two\n".to_string(),
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&host.bundle_path).unwrap(),
+            "bundle two\n",
+            "the snapshot's bundle is the one at [trust].ca_bundle_path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&profile.paths.key).unwrap(),
+            "key B\n"
         );
     }
 

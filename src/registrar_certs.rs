@@ -89,7 +89,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 use x509_parser::prelude::ASN1Time;
 
-use crate::acme::{CsrShape, IssuanceOptions, LeafPublication};
+use crate::acme::{CsrShape, GenerationPublication, IssuanceOptions, LeafPublication};
 use crate::config::{
     DaemonProfileSettings, HookSettings, Paths, RegistrarEndpointSettings, Settings,
 };
@@ -192,6 +192,9 @@ impl SurfaceLeaf {
         IssuanceOptions {
             csr_shape: self.csr_shape(),
             leaf_publication: SURFACE_LEAF_PUBLICATION,
+            // The surface publishes under its own lock and rollback,
+            // and its pairs are not moved into generation trees.
+            generation: GenerationPublication::None,
         }
     }
 

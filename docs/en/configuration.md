@@ -1250,6 +1250,82 @@ How reloads work (important for daemon owners):
 - The daemon must **support reload** (signal handling or config reload logic).
   If it does not, use a restart (`systemctl restart ...`) instead.
 
+#### Consistent snapshots
+
+`paths.cert` and `paths.key` are published one after the other. Each file is
+replaced atomically, so neither is ever half-written, but the *pair* is not:
+between the two, a reader sees the new certificate beside the old key. The
+gap is the key's whole staged write and flush to disk — tens of
+milliseconds — not a single `rename(2)`.
+
+A daemon reloaded by a [post-renew hook](#hooks) never reads inside that gap,
+because hooks run after both files are written. A consumer that reacts to a
+file event can. For those, every issuance and renewal of a profile also
+publishes a **generation**: a directory holding the certificate, the key and
+the CA bundle together, with a `current` symlink swapped onto it atomically.
+
+```text
+<directory of paths.key>/.bootroot-generations/<registration_id>/
+├── .bootroot-registrar-publish.lock
+├── current -> gen-<n>
+├── gen-<n-1>/
+└── gen-<n>/
+    ├── <file name of paths.cert>
+    ├── <file name of paths.key>
+    └── <file name of [trust].ca_bundle_path>
+```
+
+- The files keep the file names of the configured paths and hold the same
+  bytes that are written there, with the same modes and ownership. Every
+  directory in the tree has the key directory's mode and group. The bundle
+  file is omitted when `[trust].ca_bundle_path` is unset or the bundle does
+  not exist yet.
+- Generations are numbered from 1. `current` is a relative link, so the tree
+  also resolves inside a container that bind-mounts the key directory.
+- The lock file serializes publications into the tree. It is empty and is
+  never removed.
+
+**Order of a renewal.** The CA bundle is merged first, then the generation is
+published and `current` is swapped, then `paths.cert` and `paths.key` are
+written, and the post-renew hooks run last. If the generation cannot be
+published the renewal fails before the configured certificate and key are
+touched, the failure hooks run, and the renewal is retried. `current` keeps
+naming the last complete generation throughout.
+
+**A CA-trust update publishes a generation too.** When the fast-poll loop
+replaces the CA bundle, each profile that already has a `current` gets a new
+generation holding the same certificate and key beside the new bundle. No
+hook runs for a trust update, so this swap is the only signal of it.
+
+**Retention.** The tree holds the current generation and the one before it.
+Older ones are removed by each publication.
+
+**Reading a snapshot.** A consumer of the tree must follow these rules:
+
+- Resolve `current` **once** — `readlink` it, or open it as a directory and
+  `openat` the files — and read all three files from that one generation.
+  Reading `current/<certificate>` and `current/<key>` as two separate path
+  lookups can straddle a swap and yield a mismatched pair.
+- A reader that resolved `gen-<n>` can finish reading it: it is kept until
+  the publication after next.
+- To be told when a complete snapshot exists, watch `current`. For example,
+  the systemd path unit directive
+  `PathChanged=<keydir>/.bootroot-generations/<id>/current` fires once per
+  complete publication, in every delivery mode and without a hook.
+- `bootroot service remove --delete-artifacts` removes the profile's tree
+  along with its certificate and key.
+
+The configured `paths.cert` and `paths.key` are written exactly as before and
+remain a non-atomic pair. They are the right thing to read for a consumer that
+reloads on the post-renew hook, and nothing about them changes.
+
+No generation is published, and a warning is logged, for a profile whose tree
+could not hold its files: one where two of the certificate, key and CA bundle
+paths share a file name, or one that shares both its `registration_id` and
+its key directory with another profile. Such a profile is issued and renewed
+at its configured paths as before. The registrar surface's own certificates
+are not published as generations either.
+
 ### CLI Overrides
 
 ```bash

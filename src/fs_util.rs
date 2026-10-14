@@ -8,6 +8,8 @@ use tokio::fs;
 
 use crate::cert_group::{self, CertGroupPolicy};
 
+pub mod generation;
+
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
 
@@ -1604,6 +1606,33 @@ pub async fn write_cert_and_key(
     key_pem: &str,
     policy: CertGroupPolicy,
 ) -> Result<()> {
+    write_cert_and_key_probed(
+        cert_path,
+        key_path,
+        cert_pem,
+        key_pem,
+        policy,
+        &generation::Probe::default(),
+    )
+    .await
+}
+
+/// [`write_cert_and_key`], reporting
+/// [`generation::PublicationPoint::CertificateWritten`] to `probe`
+/// between the two renames.
+///
+/// That point is the window the pair has always had: the certificate is
+/// the new one and the key is still the old one. A test stops there to
+/// show what a reader of the configured paths can see, and what a reader
+/// of the generation tree cannot.
+pub(crate) async fn write_cert_and_key_probed(
+    cert_path: &Path,
+    key_path: &Path,
+    cert_pem: &str,
+    key_pem: &str,
+    policy: CertGroupPolicy,
+    probe: &generation::Probe,
+) -> Result<()> {
     let cert_dir = cert_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cert path has no parent directory"))?;
@@ -1615,6 +1644,7 @@ pub async fn write_cert_and_key(
     cert_group::ensure_cert_parent_dir(cert_dir, key_dir, policy).await?;
 
     cert_group::write_cert_file(cert_path, cert_pem, policy).await?;
+    probe.reach(generation::PublicationPoint::CertificateWritten)?;
     cert_group::write_key_file(key_path, key_pem, policy).await?;
 
     Ok(())

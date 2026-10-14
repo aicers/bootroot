@@ -8,6 +8,25 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `bootroot-agent` publishes every `[[profiles]]` issuance and renewal as a
+  consistent snapshot as well as at the configured paths. Beside the profile's
+  key, `.bootroot-generations/<registration_id>/gen-<n>/` holds the
+  certificate, the key and the CA bundle under their configured file names,
+  and a `current` symlink is swapped onto the new generation atomically. A
+  consumer that reads the pair on a file event rather than on the post-renew
+  hook can now read one that always matches: resolve `current` once, read all
+  three files from that one generation, and watch `current` — for example
+  with systemd `PathChanged=` — to be told when a complete snapshot exists.
+  The previous generation is kept, so a read in progress across a swap
+  finishes. The generation is published after the CA bundle and before
+  `paths.cert` and `paths.key`, which are written exactly as before and
+  followed by the post-renew hooks; if it cannot be published the renewal
+  fails and is retried with the configured pair untouched. A CA-trust update
+  from the fast-poll loop publishes a new generation too, carrying the
+  current pair beside the new bundle. `bootroot service remove
+  --delete-artifacts` removes the profile's tree. A profile whose
+  certificate, key and CA bundle paths do not have three distinct file names
+  gets no generation and a warning, and is issued as before.
 - `bootroot registrar` provisions the registrar surface a deployment tool
   drives before the host-local endpoint can be used.
   `bootroot registrar capabilities --json` reports the wire version, the
