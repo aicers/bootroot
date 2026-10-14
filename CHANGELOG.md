@@ -539,8 +539,14 @@ byte for byte.
   as `authority.policy` in `ca.json`, replacing any hand-written policy,
   and restarts step-ca; an existing installation receives it on its next
   `bootroot init` re-run.
-- Updated `rustls` to 0.23.45 so TLS 1.3 handshakes reject messages that
-  cross encryption-level boundaries within the same record.
+- Updated `rustls` to 0.23.46 so TLS 1.3 handshakes reject messages that
+  cross encryption-level boundaries within the same record, and to address
+  RUSTSEC-2026-0346 (`Debug` output of client session values exposing TLS
+  secrets), RUSTSEC-2026-0347 (buffered application data sent to the outer
+  server after an ECH rejection), RUSTSEC-2026-0348 (Brotli certificate
+  decompression allocating up to 1 GiB before authentication) and
+  RUSTSEC-2026-0349 (an unauthenticated ServerHello downgrading later
+  connections to classical key exchange).
 - Bumped `h2` from 0.4.15 to 0.4.16 to address RUSTSEC-2026-0258
   (unbounded buffering of empty HTTP/2 DATA frames, which lets a peer
   drive a connection's memory use without bound).
