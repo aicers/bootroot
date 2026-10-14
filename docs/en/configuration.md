@@ -1284,6 +1284,10 @@ the CA bundle together, with a `current` symlink swapped onto it atomically.
   also resolves inside a container that bind-mounts the key directory.
 - The lock file serializes publications into the tree. It is empty and is
   never removed.
+- `current` is the only symlink in the tree that bootroot follows. A symlink,
+  or another kind of file, where one of the tree's directories, its lock file
+  or a generation's files belong fails the publication with an error naming
+  that path; remove it and the next publication succeeds.
 
 **Order of a renewal.** The CA bundle is merged first, then the generation is
 published and `current` is swapped, then `paths.cert` and `paths.key` are

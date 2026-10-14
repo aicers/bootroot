@@ -1038,6 +1038,68 @@ async fn a_file_in_place_of_the_tree_is_refused() {
     );
 }
 
+/// A symlink planted at the tree's lock file is refused, not followed:
+/// a publication neither locks, writes nor creates what it points at,
+/// publishes no generation, and leaves the configured pair unwritten.
+/// A renewal and a trust update are refused alike.
+#[tokio::test]
+async fn a_symlinked_lock_file_is_refused_and_not_followed() {
+    let fixture = Fixture::new();
+    fixture.write_bundle("bundle one\n");
+    let outside = fixture
+        .cert
+        .parent()
+        .expect("cert dir")
+        .parent()
+        .expect("tempdir")
+        .join("outside");
+    std::fs::create_dir(&outside).expect("the link's directory");
+    let existing = outside.join("existing");
+    std::fs::write(&existing, b"someone else's file").expect("the link's target");
+    let dangling = outside.join("dangling");
+    let lock = fixture.root.join(crate::publication_lock::LOCK_FILE_NAME);
+    std::fs::create_dir_all(&fixture.root).expect("the tree");
+
+    for target in [&existing, &dangling] {
+        std::os::unix::fs::symlink(target, &lock).expect("plant the link");
+
+        let err = fixture
+            .publish(&material("A"), &Probe::default())
+            .await
+            .expect_err("a symlinked lock file is refused");
+        let message = format!("{err:#}");
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert!(message.contains("Remove it"), "{message}");
+
+        republish_for_trust(&fixture.settings, &Probe::default())
+            .await
+            .expect_err("a trust update refuses it too");
+
+        assert_eq!(fixture.configured(), (None, None));
+        assert_eq!(
+            fixture.entries(),
+            names(&[crate::publication_lock::LOCK_FILE_NAME]),
+            "no generation was published"
+        );
+        assert!(
+            std::fs::symlink_metadata(&lock)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::remove_file(&lock).expect("remove the link");
+    }
+
+    assert_eq!(
+        std::fs::read(&existing).expect("the target is untouched"),
+        b"someone else's file"
+    );
+    assert!(
+        std::fs::symlink_metadata(&dangling).is_err(),
+        "nothing was created where the dangling link pointed"
+    );
+}
+
 /// An agent upgraded in place has a configured pair and no tree. Its
 /// first issuance creates `gen-1` from what it issued; nothing is seeded
 /// from the files already there.

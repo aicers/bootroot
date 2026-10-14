@@ -44,6 +44,8 @@
 //! tree's root from before the generation number is chosen until the
 //! tree is pruned, and both read every input only once it is held. The
 //! bundle is read under `crate::ca_bundle_lock`, always taken second.
+//! The lock file is opened without following a link, so `current`
+//! stays the only symlink in the tree anything follows.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -351,7 +353,7 @@ pub(crate) async fn publish_generation(
     }
 
     probe.reach(PublicationPoint::LockRequested)?;
-    let lock = crate::publication_lock::hold(&[&target.current()]).await?;
+    let lock = crate::publication_lock::hold_refusing_links(&[&target.current()]).await?;
     // Read with the generation lock held, so a trust update that landed
     // after this renewal merged the bundle is in the snapshot; and under
     // the bundle's own lock, so it is never read out of the middle of
