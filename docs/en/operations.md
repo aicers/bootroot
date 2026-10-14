@@ -2362,19 +2362,23 @@ deployed registrar is expected to match, is:
   or process restart to pick up a renewal — the dial after the publication
   presents the new pair.
 - **Check that the key is the leaf's** before presenting anything.
-- **On a mismatch, re-read.** Five reads in total, with waits of 1 ms, 2 ms,
-  4 ms and 8 ms after the first four mismatches. A pair that matches on any of
-  the five is used.
-- **After the fifth mismatch, fail with a typed error** naming both paths and
+- **On a mismatch, re-read.** Six reads in total, with waits of 50 ms, 100 ms,
+  200 ms, 400 ms and 800 ms after the first five mismatches — 1.55 s in all. A
+  pair that matches on any of the six is used.
+- **After the sixth mismatch, fail with a typed error** naming both paths and
   the number of reads. That is a misconfiguration — two files that are not each
   other's — rather than a race, and it is reported instead of being retried
   further or presented anyway.
 
-This is a fixed local policy of the reader's and is deliberately not the
-daemon's issuance-retry backoff: it is measured against one pair of renames on
-the same host, not against a CA that is down. Any other failure — an absent
-file, an unreadable one, a certificate PEM the parser refuses — is returned at
-once and is not re-read.
+The budget is sized against what actually separates the two renames. Each file
+is written to a temporary, given its owner and mode and flushed to disk before
+it is renamed, so the gap between the certificate's rename and the key's is the
+key's whole staged write and flush, not a single `rename(2)`: 93 ms was measured
+on an ext4 virtual machine. This is a fixed local policy of the reader's and is
+deliberately not the daemon's issuance-retry backoff: it is measured against one
+staged write on the same host, not against a CA that is down. Any other failure
+— an absent file, an unreadable one, a certificate PEM the parser refuses — is
+returned at once and is not re-read.
 
 The reference implementation is this repository's in-repo registrar endpoint
 client (`src/registrar/endpoint/client.rs`). It has no production consumer here;

@@ -123,25 +123,32 @@ const REFUSAL_DISCRIMINATOR: &str = "class";
 /// finding a matching one.
 ///
 /// The writer publishes the pair with two separate renames, so a reader
-/// that lands between them sees the new certificate beside the old key,
-/// or the old certificate beside the new key. That window is the
-/// writer's whole publication step and is over in microseconds, so what
-/// closes it is a short bounded retry rather than a lock: the reader
-/// re-reads both files and keeps whichever read finds a matching pair.
-const CLIENT_MATERIAL_READS: usize = 5;
+/// that lands between them sees the new certificate beside the old key.
+/// That window is not one `rename(2)`. Each file is staged, chowned,
+/// chmoded and `fsync`ed before it is renamed, so what separates the
+/// certificate's rename from the key's is the key's whole staged write
+/// and flush: 93 ms was measured between the two on an ext4 virtual
+/// machine. What closes it is a bounded retry rather than a lock: the
+/// reader re-reads both files and keeps whichever read finds a matching
+/// pair.
+const CLIENT_MATERIAL_READS: usize = 6;
 
-/// The waits between those reads — one after each of the first four
-/// mismatches, and none after the fifth, which is the read the typed
+/// The waits between those reads — one after each of the first five
+/// mismatches, and none after the sixth, which is the read the typed
 /// mismatch is reported from.
 ///
-/// This is a fixed local policy of the reader's, and deliberately not
-/// the daemon's issuance-retry backoff: it is measured against one
-/// `rename(2)` pair on the same host, not against a CA that is down.
+/// 1.55 s in all, which leaves an order of magnitude over the measured
+/// window for a slower disk while the first re-read still lands within
+/// it on a fast one. This is a fixed local policy of the reader's, and
+/// deliberately not the daemon's issuance-retry backoff: it is measured
+/// against one staged write and flush on the same host, not against a CA
+/// that is down.
 const CLIENT_MATERIAL_BACKOFF: [Duration; CLIENT_MATERIAL_READS - 1] = [
-    Duration::from_millis(1),
-    Duration::from_millis(2),
-    Duration::from_millis(4),
-    Duration::from_millis(8),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
 ];
 
 /// Which half of the exchange an I/O failure interrupted.
@@ -881,7 +888,8 @@ fn load_dial_config(
 ) -> Result<ClientConfig, ExchangeError> {
     // `std::thread::sleep` because this whole function is already on
     // Tokio's blocking pool, where blocking the thread is what the pool
-    // is for. The waits are microseconds against one `rename(2)` pair.
+    // is for. The waits total 1.55 s at most, against the writer's
+    // staged write and flush of the second file.
     let (chain, key) =
         load_matching_client_material(certificate_path, key_path, std::thread::sleep)
             .map_err(|source| ExchangeError::Material { source })?;
@@ -946,7 +954,10 @@ pub(crate) fn build_client_config(
 /// stages the certificate and the key and `rename(2)`s them one after
 /// the other, so the pair is not published atomically even though
 /// neither file is ever truncated: a dial landing between the two
-/// renames sees a certificate and a key that are not each other's.
+/// renames sees a certificate and a key that are not each other's. The
+/// gap is the second file's whole staged write and `fsync` — tens of
+/// milliseconds, 93 ms measured on an ext4 virtual machine — and the
+/// retry budget is sized against that, not against a single rename.
 /// Presenting that pair would fail the handshake with a signature error
 /// that says nothing about what really happened, so it is never
 /// presented — the reader re-reads instead, up to
@@ -1002,7 +1013,7 @@ fn load_matching_client_material(
 /// connection rather than two.
 ///
 /// A key `rustls` cannot sign with at all is *not* reported as a
-/// mismatch: re-reading it would find the same key five times and then
+/// mismatch: re-reading it would find the same key six times and then
 /// blame a race that never happened, so it is passed through for
 /// `with_client_auth_cert` to refuse with
 /// [`ClientMaterialError::Unusable`], which names the real fault.

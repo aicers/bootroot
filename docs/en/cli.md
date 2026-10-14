@@ -1739,7 +1739,9 @@ regenerates the `secret_id` delivery material regardless, the fresh
 - `--dry-run`: print the teardown plan without mutating `state.json` or
   `OpenBao`.
 - `--delete-artifacts`: also delete bootroot-owned on-disk artifacts —
-  the cert/key files, the per-service secret directory, and the
+  the cert/key files, the profile's
+  [generation tree](configuration.md#consistent-snapshots) beside the key
+  (which holds copies of it), the per-service secret directory, and the
   remote-bootstrap artifact directory — and strip bootroot's
   managed profile block from `agent.toml`. **Off by default:**
   `service add` only records cert/key paths (the files are produced later

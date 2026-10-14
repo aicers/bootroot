@@ -901,6 +901,53 @@ run_verify_pair() {
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
   snapshot_cert_meta "$WEB_SERVICE" "$label"
   snapshot_cert_meta "$REMOTE_SERVICE" "$label" "$REMOTE_CERTS_DIR"
+  assert_generation_snapshot "$EDGE_SERVICE"
+  assert_generation_snapshot "$WEB_SERVICE"
+  assert_generation_snapshot "$REMOTE_SERVICE" "$REMOTE_CERTS_DIR"
+}
+
+# Asserts the consistent snapshot the agent publishes beside a profile's
+# key: `current` is a relative link to one `gen-<n>`, and the key that
+# generation holds is the key of the certificate beside it.
+#
+# Read the way the reader contract says to: `current` is resolved once
+# and both files come from the generation it named.  Nothing here reads
+# the configured paths, so the check holds while the daemons are running
+# and may be publishing.
+assert_generation_snapshot() {
+  local service="$1"
+  local certs_dir="${2:-$CERTS_DIR}"
+  local root="$certs_dir/.bootroot-generations/$service"
+  local target generation cert_pub key_pub
+  [ -L "$root/current" ] || fail "No current generation link for $service: $root/current"
+  target="$(readlink "$root/current")"
+  case "$target" in
+    gen-[1-9]*) ;;
+    *) fail "current of $service names '$target', not a relative gen-<n>" ;;
+  esac
+  generation="$root/$target"
+  [ -f "$generation/${service}.crt" ] || fail "Generation $generation holds no ${service}.crt"
+  [ -f "$generation/${service}.key" ] || fail "Generation $generation holds no ${service}.key"
+  cert_pub="$(openssl x509 -in "$generation/${service}.crt" -noout -pubkey)"
+  key_pub="$(openssl pkey -in "$generation/${service}.key" -pubout)"
+  [ "$cert_pub" = "$key_pub" ] \
+    || fail "Generation $generation of $service holds a key that is not its certificate's"
+}
+
+# Asserts the current generation mirrors the configured files byte for
+# byte.  Only called while no daemon is running: a renewal writes the
+# generation before the configured pair, so the two differ for as long
+# as one is in flight.
+assert_generation_mirrors_configured() {
+  local service="$1"
+  local certs_dir="${2:-$CERTS_DIR}"
+  local bundle_name="${3:-}"
+  local generation name
+  generation="$certs_dir/.bootroot-generations/$service/$(readlink "$certs_dir/.bootroot-generations/$service/current")"
+  for name in "${service}.crt" "${service}.key" ${bundle_name:+"$bundle_name"}; do
+    cmp -s "$generation/$name" "$certs_dir/$name" \
+      || fail "Generation file $generation/$name differs from $certs_dir/$name"
+  done
 }
 
 # Orders a certificate for a name step-ca cannot resolve.
@@ -1769,6 +1816,9 @@ main() {
   run_remote_bootstrap
 
   run_verify_pair "initial"
+  assert_generation_mirrors_configured "$EDGE_SERVICE"
+  assert_generation_mirrors_configured "$WEB_SERVICE"
+  assert_generation_mirrors_configured "$REMOTE_SERVICE" "$REMOTE_CERTS_DIR" "ca-bundle.pem"
   issue_unaliased_name
   run_infra_up_after_init
   start_local_bootroot_agent_daemons

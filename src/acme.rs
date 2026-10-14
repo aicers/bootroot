@@ -11,8 +11,8 @@ pub use client::{create_account_key, is_account_key};
 // reaches the exchange and the publication separately, so it can hold
 // `crate::publication_lock` across the second and not the first.
 pub(crate) use flow::{
-    CsrShape, IssuanceOptions, IssuedMaterial, LeafPublication, issue_certificate_material,
-    publish_issued_material,
+    CsrShape, GenerationPublication, IssuanceOptions, IssuedMaterial, LeafPublication,
+    issue_certificate_material, publish_issued_material,
 };
 pub use flow::{build_registrar_client_csr_params, issue_certificate};
 // The two publication helpers a renewal stages its merged CA bundle
@@ -54,10 +54,38 @@ pub async fn issue_registrar_client_certificate(
         settings,
         profile,
         eab_creds,
-        IssuanceOptions {
-            csr_shape: CsrShape::RegistrarClient,
-            leaf_publication: LeafPublication::LeafWithChain,
-        },
+        registrar_client_issuance_options(),
     )
     .await
+}
+
+/// The options [`issue_registrar_client_certificate`] issues under.
+///
+/// No generation: the registrar surface publishes its pairs under its
+/// own lock and rollback, and they are not moved into generation trees.
+fn registrar_client_issuance_options() -> IssuanceOptions {
+    IssuanceOptions {
+        csr_shape: CsrShape::RegistrarClient,
+        leaf_publication: LeafPublication::LeafWithChain,
+        generation: GenerationPublication::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The registrar client leaf is issued in its own shape, published
+    /// with its chain, and asks for no generation tree.
+    #[test]
+    fn the_registrar_client_issuance_publishes_no_generation() {
+        assert_eq!(
+            registrar_client_issuance_options(),
+            IssuanceOptions {
+                csr_shape: CsrShape::RegistrarClient,
+                leaf_publication: LeafPublication::LeafWithChain,
+                generation: GenerationPublication::None,
+            }
+        );
+    }
 }

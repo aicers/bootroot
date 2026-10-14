@@ -27,6 +27,8 @@ use crate::state_lock::StateLock;
 /// On-disk artifacts eligible for deletion under `--delete-artifacts`.
 struct ArtifactPlan {
     dirs: Vec<PathBuf>,
+    /// Directories removed only if deleting `dirs` left them empty.
+    dirs_if_empty: Vec<PathBuf>,
     files: Vec<PathBuf>,
     agent_config: PathBuf,
 }
@@ -166,14 +168,7 @@ pub(crate) async fn run_service_remove(
     // On-disk artifacts (opt-in). These are local, but a failure here
     // also keeps the entry so a re-run can retry.
     if let Some(plan) = artifacts.as_ref() {
-        for dir in &plan.dirs {
-            let result = delete_dir_if_present(dir);
-            report.record(&format!("directory {}", dir.display()), result, messages);
-        }
-        for file in &plan.files {
-            let result = delete_file_if_present(file);
-            report.record(&format!("file {}", file.display()), result, messages);
-        }
+        delete_artifacts(plan, &mut report, messages);
     }
 
     // Strip the managed profile block whenever the operator asked for it,
@@ -311,7 +306,16 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
         secrets_dir
             .join(REMOTE_BOOTSTRAP_DIR)
             .join(&entry.registration_id),
+        // Every generation the agent published for this profile holds a
+        // copy of the private key, so deleting the key without them
+        // would leave it on disk.
+        bootroot::fs_util::generation::generation_root(&entry.key_path, &entry.registration_id),
     ];
+    // Shared with every other profile whose key lives in the same
+    // directory, so it goes only once the last of their trees has.
+    let dirs_if_empty = vec![bootroot::fs_util::generation::generations_dir(
+        &entry.key_path,
+    )];
     let mut files = vec![entry.cert_path.clone(), entry.key_path.clone()];
     // A `--secret-id-path` override relocates `secret_id`, its sibling
     // `role_id`, and `eab.json` outside the default `<secrets_dir>/
@@ -332,6 +336,7 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
     }
     ArtifactPlan {
         dirs,
+        dirs_if_empty,
         files,
         agent_config: entry.agent_config_path.clone(),
     }
@@ -401,6 +406,34 @@ fn confirm_removal(registration_id: &str, messages: &Messages) -> Result<bool> {
     ))
 }
 
+/// Deletes every on-disk artifact in `plan`, recording each outcome.
+///
+/// Every resource is attempted; a failure keeps the entry so a re-run
+/// can retry.
+fn delete_artifacts(plan: &ArtifactPlan, report: &mut TeardownReport, messages: &Messages) {
+    for dir in &plan.dirs {
+        let result = delete_dir_if_present(dir);
+        report.record(&format!("directory {}", dir.display()), result, messages);
+    }
+    for dir in &plan.dirs_if_empty {
+        match delete_dir_if_empty(dir) {
+            Ok(Some(true)) => {
+                report.record(&format!("directory {}", dir.display()), Ok(true), messages);
+            }
+            // Absent, or still holding another profile's tree: neither
+            // is this service's to report, and neither is a failure.
+            Ok(Some(false) | None) => {}
+            Err(err) => {
+                report.record(&format!("directory {}", dir.display()), Err(err), messages);
+            }
+        }
+    }
+    for file in &plan.files {
+        let result = delete_file_if_present(file);
+        report.record(&format!("file {}", file.display()), result, messages);
+    }
+}
+
 fn delete_dir_if_present(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {
@@ -410,6 +443,22 @@ fn delete_dir_if_present(path: &Path) -> Result<bool> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("Failed to inspect {}", path.display())),
+    }
+}
+
+/// Removes `path` if it is an empty directory.
+///
+/// `Ok(Some(true))` means it was removed, `Ok(Some(false))` that it was
+/// already absent, and `Ok(None)` that it still holds something and was
+/// left in place.
+fn delete_dir_if_empty(path: &Path) -> Result<Option<bool>> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(Some(true)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+        Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to remove directory {}", path.display()))
+        }
     }
 }
 
@@ -658,6 +707,64 @@ mod tests {
         assert_eq!(
             plan.files,
             vec![entry.cert_path.clone(), entry.key_path.clone()]
+        );
+    }
+
+    /// The agent's generation tree for the profile holds copies of the
+    /// private key, so `--delete-artifacts` removes it with the key; the
+    /// directory above it is shared and goes only when left empty.
+    #[test]
+    fn build_artifact_plan_removes_the_profiles_generation_tree() {
+        let state = sample_state();
+        let mut entry = sample_entry("svc", DeliveryMode::LocalFile);
+        entry.key_path = PathBuf::from("/etc/agent/svc/key.pem");
+        let plan = build_artifact_plan(&state, &entry);
+
+        let generations = PathBuf::from("/etc/agent/svc/.bootroot-generations");
+        assert!(
+            plan.dirs.contains(&generations.join("svc")),
+            "{:?}",
+            plan.dirs
+        );
+        assert!(
+            !plan.dirs.contains(&generations),
+            "the shared directory is never removed with its contents"
+        );
+        assert_eq!(plan.dirs_if_empty, vec![generations]);
+    }
+
+    /// With the profile's tree deleted, the shared directory goes when
+    /// nothing else is in it and stays when another profile's tree is.
+    #[test]
+    fn the_shared_generations_directory_goes_only_when_left_empty() {
+        let dir = tempdir().expect("tempdir");
+        let state = sample_state();
+        let mut entry = sample_entry("svc", DeliveryMode::LocalFile);
+        entry.key_path = dir.path().join("key.pem");
+        let plan = build_artifact_plan(&state, &entry);
+        let generations = dir.path().join(".bootroot-generations");
+        let mine = generations.join("svc");
+        let theirs = generations.join("other");
+        std::fs::create_dir_all(mine.join("gen-1")).expect("create this profile's tree");
+        std::fs::write(mine.join("gen-1").join("key.pem"), b"key").expect("write a key copy");
+        std::fs::create_dir_all(&theirs).expect("create another profile's tree");
+
+        assert!(delete_dir_if_present(&mine).expect("remove this profile's tree"));
+        assert_eq!(
+            delete_dir_if_empty(&plan.dirs_if_empty[0]).expect("not a failure"),
+            None,
+            "another profile's tree keeps the shared directory"
+        );
+        assert!(theirs.is_dir());
+
+        std::fs::remove_dir(&theirs).expect("remove the other tree");
+        assert_eq!(
+            delete_dir_if_empty(&plan.dirs_if_empty[0]).expect("removed"),
+            Some(true)
+        );
+        assert_eq!(
+            delete_dir_if_empty(&plan.dirs_if_empty[0]).expect("idempotent"),
+            Some(false)
         );
     }
 

@@ -123,9 +123,46 @@ fn parent_of(path: &Path) -> PathBuf {
     }
 }
 
+/// Takes the publication lock covering `destinations` as [`hold`] does,
+/// but refuses a lock file that is a symlink or anything but a regular
+/// file rather than opening it.
+///
+/// What the generation tree takes. Its root is a directory bootroot
+/// creates and owns, and `current` is the only link in it a reader or
+/// writer ever follows; a lock file followed out of the tree would let
+/// whoever placed the link serialise publications on an inode they
+/// control, and a dangling one would have the open create a file
+/// wherever it points. The registrar surface keeps [`hold`] unchanged.
+///
+/// # Errors
+///
+/// Returns an error as [`hold`] does, and when a lock file is a symlink
+/// or is not a regular file.
+pub(crate) async fn hold_refusing_links(destinations: &[&Path]) -> Result<PublicationLock> {
+    let dirs: Vec<PathBuf> = destinations.iter().map(|path| parent_of(path)).collect();
+    tokio::task::spawn_blocking(move || hold_blocking_with(&dirs, LockEntry::RefuseLinks))
+        .await
+        .context("the publication lock task panicked")?
+}
+
+/// How a lock file already in place is treated when it is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockEntry {
+    /// Opened wherever it resolves to, as the registrar surface always
+    /// has.
+    Follow,
+    /// Refused unless it is a regular file at that very name.
+    RefuseLinks,
+}
+
 /// The blocking half of [`hold`]: `flock` waits, so it waits on a
 /// blocking thread.
 fn hold_blocking(dirs: &[PathBuf]) -> Result<PublicationLock> {
+    hold_blocking_with(dirs, LockEntry::Follow)
+}
+
+/// The blocking half of [`hold`] and [`hold_refusing_links`].
+fn hold_blocking_with(dirs: &[PathBuf], entry: LockEntry) -> Result<PublicationLock> {
     let mut ordered: Vec<PathBuf> = Vec::with_capacity(dirs.len());
     for dir in dirs {
         // The publication creates these directories itself a moment
@@ -154,20 +191,52 @@ fn hold_blocking(dirs: &[PathBuf]) -> Result<PublicationLock> {
 
     let mut files = Vec::with_capacity(ordered.len());
     for dir in &ordered {
-        files.push(lock(&dir.join(LOCK_FILE_NAME))?);
+        files.push(lock(&dir.join(LOCK_FILE_NAME), entry)?);
     }
     Ok(PublicationLock { files })
 }
 
 /// Opens one lock file and takes its exclusive `flock`.
-fn lock(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
+///
+/// Under [`LockEntry::RefuseLinks`] the open carries `O_NOFOLLOW`, so a
+/// symlink at the lock's name — dangling or not — fails it rather than
+/// being opened or created through, and `O_NONBLOCK`, so a FIFO planted
+/// there cannot stall it before the descriptor's own type is checked.
+/// Neither flag changes how `flock` waits.
+fn lock(path: &Path, entry: LockEntry) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
         .read(true)
         .write(true)
         .create(true)
-        .mode(LOCK_FILE_MODE)
-        .open(path)
-        .with_context(|| format!("opening the registrar publication lock {}", path.display()))?;
+        .truncate(false)
+        .mode(LOCK_FILE_MODE);
+    if entry == LockEntry::RefuseLinks {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if entry == LockEntry::RefuseLinks && err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(link_refusal(path));
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "opening the registrar publication lock {}",
+                path.display()
+            )));
+        }
+    };
+    if entry == LockEntry::RefuseLinks {
+        let meta = file.metadata().with_context(|| {
+            format!(
+                "inspecting the registrar publication lock {}",
+                path.display()
+            )
+        })?;
+        if !meta.file_type().is_file() {
+            return Err(link_refusal(path));
+        }
+    }
     // SAFETY: `file` owns an open descriptor that outlives the call, and
     // `flock` dereferences nothing — it takes that descriptor and an
     // operation constant and reports a status.
@@ -181,6 +250,16 @@ fn lock(path: &Path) -> Result<File> {
         );
     }
     Ok(file)
+}
+
+/// The error for a lock file [`LockEntry::RefuseLinks`] will not open.
+fn link_refusal(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the publication lock {} must be a regular file, but a symlink or another kind of file \
+         is in its place; it was not followed and nothing was published. Remove it, and the \
+         next publication recreates it",
+        path.display()
+    )
 }
 
 /// Attempts the publication lock in `dir` without waiting, and answers
@@ -309,6 +388,87 @@ mod tests {
             "dropping the guard releases both locks despite the copies"
         );
         drop(copies);
+    }
+
+    /// The generation tree's lock refuses a symlink at the lock's name,
+    /// whether it points at an existing file or at nothing, and neither
+    /// opens, locks nor creates what it points at.
+    #[tokio::test]
+    async fn a_symlinked_lock_file_is_refused_and_not_followed() {
+        let root = TempDir::new().expect("tempdir");
+        let tree = root.path().join("tree");
+        std::fs::create_dir(&tree).expect("the tree");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("the link's directory");
+        let existing = outside.join("existing");
+        std::fs::write(&existing, b"someone else's file").expect("the link's target");
+        let dangling = outside.join("dangling");
+        let lock_path = tree.join(LOCK_FILE_NAME);
+
+        for target in [&existing, &dangling] {
+            std::os::unix::fs::symlink(target, &lock_path).expect("plant the link");
+
+            let Err(err) = hold_refusing_links(&[&tree.join("current")]).await else {
+                panic!("a symlinked lock file must be refused");
+            };
+
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&lock_path.display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("Remove it"), "{message}");
+            assert!(
+                std::fs::symlink_metadata(&lock_path)
+                    .expect("the link is still there")
+                    .file_type()
+                    .is_symlink()
+            );
+            std::fs::remove_file(&lock_path).expect("remove the link");
+        }
+
+        assert_eq!(
+            std::fs::read(&existing).expect("the target is untouched"),
+            b"someone else's file"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_err(),
+            "nothing was created where the dangling link pointed"
+        );
+    }
+
+    /// Anything but a regular file at the lock's name is refused too.
+    #[tokio::test]
+    async fn a_directory_in_place_of_the_lock_file_is_refused() {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir(root.path().join(LOCK_FILE_NAME)).expect("plant the directory");
+
+        assert!(
+            hold_refusing_links(&[&root.path().join("current")])
+                .await
+                .is_err(),
+            "a directory is not a lock file"
+        );
+    }
+
+    /// A regular lock file, or none yet, is taken as [`hold`] takes it.
+    #[tokio::test]
+    async fn a_regular_lock_file_is_taken_without_following() {
+        let root = TempDir::new().expect("tempdir");
+        let current = root.path().join("current");
+
+        let held = hold_refusing_links(&[&current])
+            .await
+            .expect("the first acquisition creates the lock file");
+        assert!(!is_free(root.path()), "the lock is held");
+        drop(held);
+
+        let held = hold_refusing_links(&[&current])
+            .await
+            .expect("the lock file left behind is taken again");
+        assert!(!is_free(root.path()), "the lock is held again");
+        drop(held);
+        assert!(is_free(root.path()));
     }
 
     /// A writer that shares no directory with another waits for

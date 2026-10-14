@@ -1676,8 +1676,10 @@ bootroot service update --registration-id aimer-web \
   진행을 거부합니다.
 - `--dry-run`: `state.json`이나 `OpenBao`를 변경하지 않고 제거 계획만
   출력합니다.
-- `--delete-artifacts`: bootroot 소유의 디스크 아티팩트(인증서/키 파일,
-  서비스별 시크릿 디렉터리, 원격 부트스트랩 아티팩트 디렉터리)도
+- `--delete-artifacts`: bootroot 소유의 디스크 아티팩트(인증서/키 파일, 키
+  옆에 있으며 키의 사본을 담고 있는 프로필의
+  [세대 트리](configuration.md#consistent-snapshots), 서비스별 시크릿
+  디렉터리, 원격 부트스트랩 아티팩트 디렉터리)도
   삭제하고 `agent.toml`에서 bootroot 관리 프로필 블록을 제거합니다. **기본은
   비활성:** `service add`는 인증서/키 경로만 기록하며(파일은 이후 회전/에이전트가
   생성) 이 플래그가 없으면 디스크 자료는 보존됩니다. 이 플래그가 있어도

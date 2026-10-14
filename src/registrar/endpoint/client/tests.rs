@@ -1130,7 +1130,7 @@ fn a_reader_between_the_two_renames_retries_until_the_pair_matches() {
 
     assert_eq!(
         waits.into_inner().expect("not poisoned"),
-        vec![Duration::from_millis(1)],
+        vec![Duration::from_millis(50)],
         "one mismatch costs one wait, and the next read finds the pair"
     );
     assert!(
@@ -1155,11 +1155,11 @@ fn a_reader_between_the_two_renames_retries_until_the_pair_matches() {
     );
 }
 
-/// A pair that never matches costs exactly five reads and the four
+/// A pair that never matches costs exactly six reads and the five
 /// documented waits, and then returns the typed mismatch rather than
 /// presenting anything.
 #[test]
-fn a_permanent_mismatch_reads_five_times_and_returns_the_typed_error() {
+fn a_permanent_mismatch_reads_six_times_and_returns_the_typed_error() {
     let deployment = Deployment::new();
     // A key from a different leaf, and nothing repairs it.
     let (_certificate, key) =
@@ -1175,22 +1175,67 @@ fn a_permanent_mismatch_reads_five_times_and_returns_the_typed_error() {
     .expect_err("a pair that never matches is never presented");
 
     assert!(
-        matches!(
-            err,
-            ClientMaterialError::KeyMismatch { reads, .. } if reads == super::CLIENT_MATERIAL_READS
-        ),
+        matches!(err, ClientMaterialError::KeyMismatch { reads: 6, .. }),
         "{err:?}"
     );
     assert_eq!(
         waits.into_inner().expect("not poisoned"),
         vec![
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-            Duration::from_millis(4),
-            Duration::from_millis(8),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
         ],
-        "four waits after the first four of five reads, and none after the fifth"
+        "five waits after the first five of six reads, and none after the sixth"
     );
+}
+
+/// The budget outlasts a slow writer: a key whose staged write and
+/// flush is still under way through the first three waits, and lands
+/// inside the fourth, is picked up by the read that follows it.
+///
+/// The old schedule had given up after 15 ms, long before a key that
+/// takes tens of milliseconds to flush is renamed into place.
+#[test]
+fn a_key_published_inside_the_fourth_wait_is_picked_up() {
+    let deployment = Deployment::new();
+    let renewed_cert = deployment.pki.path("renewed.crt");
+    let renewed_key = deployment.pki.path("renewed.key");
+    write_leaf_material(
+        &deployment.pki.ca,
+        vec![dns_san(&registrar_client_name())],
+        &renewed_cert,
+        &renewed_key,
+        true,
+    );
+    std::fs::copy(&renewed_cert, &deployment.certificate_path).expect("the first rename");
+
+    let waits = StdMutex::new(Vec::new());
+    let (chain, key) = super::load_matching_client_material(
+        &deployment.certificate_path,
+        &deployment.key_path,
+        |delay| {
+            let mut waits = waits.lock().expect("not poisoned");
+            waits.push(delay);
+            if waits.len() == 4 {
+                std::fs::copy(&renewed_key, &deployment.key_path).expect("the second rename");
+            }
+        },
+    )
+    .expect("the fifth read finds the matching pair");
+
+    assert_eq!(
+        waits.into_inner().expect("not poisoned"),
+        vec![
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        ],
+        "four mismatches cost four waits, and the read after the fourth finds the pair"
+    );
+    assert!(super::client_pair_matches(&chain, &key));
 }
 
 /// The mismatch never reaches the socket: a dial whose pair is

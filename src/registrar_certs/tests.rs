@@ -1405,6 +1405,44 @@ async fn the_client_pair_is_issued_with_every_name_invariant_and_the_client_auth
     );
 }
 
+/// Neither surface leaf asks for a generation, and a start-time
+/// issuance of both pairs leaves no generation tree beside either key:
+/// the surface keeps its own publication, lock and rollback.
+#[tokio::test]
+async fn a_start_time_surface_issuance_publishes_no_generation_tree() {
+    for leaf in [SurfaceLeaf::EndpointServer, SurfaceLeaf::RegistrarClient] {
+        assert_eq!(
+            leaf.issuance_options().generation,
+            GenerationPublication::None
+        );
+    }
+
+    let mut host = Host::new();
+    let acme = start_acme(Arc::clone(&host.ca)).await;
+    aim_at(&mut host.settings, &acme);
+    let pairs = surface_pairs(host.endpoint(), TEST_HOST, TEST_DOMAIN).expect("pairs resolve");
+    for pair in &pairs {
+        issue_surface_pair(&host.settings, pair, TEST_HOST, &openbao_inputs())
+            .await
+            .expect("the pair is issued");
+    }
+
+    for (cert_path, key_path) in [host.server_pair(), host.client_pair()] {
+        assert!(key_path.is_file(), "{} was published", key_path.display());
+        for published in [&cert_path, &key_path] {
+            let tree = published
+                .parent()
+                .expect("a published file has a directory")
+                .join(crate::fs_util::generation::GENERATIONS_DIR_NAME);
+            assert!(
+                std::fs::symlink_metadata(&tree).is_err(),
+                "{} must not exist",
+                tree.display()
+            );
+        }
+    }
+}
+
 /// The server leaf takes the ordinary shape — no extended key usage
 /// requested — and is still the endpoint identity the loader's own name
 /// rule accepts, with a key that matches it.
