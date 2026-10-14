@@ -120,7 +120,7 @@ services:
       ]
 
   bootroot-http01:
-    image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:0.3.0}
+    image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:0.4.0}
     container_name: ${BOOTROOT_INSTANCE:-bootroot}-http01
     restart: always
     ports:
