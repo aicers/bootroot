@@ -788,6 +788,174 @@ async fn a_trust_update_during_a_first_issuance_republishes_its_pair() {
     );
 }
 
+/// A trust update that reaches the lock while `current` is unusable,
+/// with a renewal holding the lock, judges `current` as that renewal
+/// leaves it — not as it was when the update started waiting.
+///
+/// `current` names a generation whose key is gone. Had the update
+/// inspected it before taking the lock it would have failed; once the
+/// renewal has swapped in a whole generation, the update carries that
+/// one forward.
+#[tokio::test]
+async fn a_trust_update_waiting_on_a_renewal_judges_the_renewed_current() {
+    let fixture = Arc::new(Fixture::new());
+    fixture.write_bundle("bundle one\n");
+    fixture
+        .publish(&material("A"), &Probe::default())
+        .await
+        .expect("publish A");
+    std::fs::remove_file(fixture.root.join("gen-1").join(KEY_NAME)).expect("spoil gen-1");
+
+    let (staged_tx, staged_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let resume_rx = Mutex::new(resume_rx);
+    let renewal_probe = Probe::new(move |point| {
+        if point == PublicationPoint::Staged {
+            staged_tx.send(()).expect("the test is listening");
+            resume_rx
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("the test lets the renewal go on");
+        }
+        Ok(())
+    });
+    let renewal = tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { fixture.publish(&material("B"), &renewal_probe).await }
+    });
+    tokio::task::spawn_blocking(move || staged_rx.recv())
+        .await
+        .expect("join")
+        .expect("the renewal staged its generation");
+
+    fixture.write_bundle("bundle two\n");
+    let (requested_tx, requested_rx) = mpsc::channel();
+    let trust_probe = Probe::new(move |point| {
+        if point == PublicationPoint::LockRequested {
+            requested_tx.send(()).expect("the test is listening");
+        }
+        Ok(())
+    });
+    let trust = tokio::spawn({
+        let fixture = Arc::clone(&fixture);
+        async move { republish_for_trust(&fixture.settings, &trust_probe).await }
+    });
+    tokio::task::spawn_blocking(move || requested_rx.recv())
+        .await
+        .expect("join")
+        .expect("the trust update reached the lock");
+    assert_eq!(
+        fixture.current(),
+        Some(PathBuf::from("gen-1")),
+        "current is still the unusable generation while the update waits"
+    );
+
+    resume_tx.send(()).expect("the renewal is waiting");
+    renewal.await.expect("join").expect("the renewal publishes");
+    trust
+        .await
+        .expect("join")
+        .expect("the renewed current is usable");
+
+    assert_eq!(fixture.current(), Some(PathBuf::from("gen-3")));
+    assert_eq!(
+        read_snapshot(&fixture.root),
+        Some(snapshot("B", Some("bundle two\n")))
+    );
+}
+
+/// A failed profile does not stop a trust update: every eligible
+/// profile is attempted, the first failure is the one returned, each is
+/// logged, and a usable profile after them still gets the new bundle
+/// beside its own pair.
+#[test]
+fn a_trust_update_attempts_every_profile_and_returns_the_first_failure() {
+    let dir = TempDir::new().expect("tempdir");
+    let bundle = dir.path().join("trust").join(BUNDLE_NAME);
+    let mut settings = settings();
+    settings.trust.ca_bundle_path = Some(bundle.clone());
+    for (index, id) in ["first", "second", "usable"].into_iter().enumerate() {
+        let mut profile = profile(
+            id,
+            &dir.path().join("certs").join(format!("{id}-{CERT_NAME}")),
+            &dir.path().join("keys").join(format!("{id}-{KEY_NAME}")),
+        );
+        profile.instance_id = format!("00{}", index + 1);
+        settings.profiles.push(profile);
+    }
+    let root = |id: &str| dir.path().join("keys").join(GENERATIONS_DIR_NAME).join(id);
+
+    let (result, logs) = logs_from(|| async {
+        std::fs::create_dir_all(bundle.parent().expect("bundle parent")).expect("mkdir");
+        std::fs::write(&bundle, "bundle one\n").expect("write the bundle");
+        for (profile, label) in settings.profiles.iter().zip(["F", "S", "U"]) {
+            publish_snapshot(&settings, profile, &material(label), &Probe::default())
+                .await
+                .expect("the first issuance");
+        }
+        // The first profile's generation is gone; the second's has lost
+        // its certificate.
+        std::fs::remove_dir_all(root("first").join("gen-1")).expect("spoil first");
+        std::fs::remove_file(
+            root("second")
+                .join("gen-1")
+                .join(format!("second-{CERT_NAME}")),
+        )
+        .expect("spoil second");
+        std::fs::write(&bundle, "bundle two\n").expect("the trust update's bundle");
+        republish_for_trust(&settings, &Probe::default()).await
+    });
+
+    let first = crate::config::profile_domain(&settings, &settings.profiles[0]);
+    let second = crate::config::profile_domain(&settings, &settings.profiles[1]);
+    let message = format!("{:#}", result.expect_err("the failures are returned"));
+    assert!(message.contains(&first), "{message}");
+    assert!(
+        message.contains(&root("first").join("gen-1").display().to_string()),
+        "{message}"
+    );
+    assert!(!message.contains(&second), "{message}");
+    assert!(logs.contains(&first), "{logs}");
+    assert!(logs.contains(&second), "{logs}");
+    assert!(
+        logs.contains(
+            &root("second")
+                .join("gen-1")
+                .join(format!("second-{CERT_NAME}"))
+                .display()
+                .to_string()
+        ),
+        "{logs}"
+    );
+
+    for id in ["first", "second"] {
+        assert_eq!(
+            std::fs::read_link(root(id).join(CURRENT_LINK_NAME)).ok(),
+            Some(PathBuf::from("gen-1")),
+            "{id}"
+        );
+        assert!(!root(id).join("gen-2").exists(), "{id}");
+    }
+    let usable = root("usable").join("gen-2");
+    assert_eq!(
+        std::fs::read_link(root("usable").join(CURRENT_LINK_NAME)).ok(),
+        Some(PathBuf::from("gen-2"))
+    );
+    assert_eq!(
+        read(&usable.join(format!("usable-{CERT_NAME}"))),
+        Some("certificate U\n".to_string())
+    );
+    assert_eq!(
+        read(&usable.join(format!("usable-{KEY_NAME}"))),
+        Some("key U\n".to_string())
+    );
+    assert_eq!(
+        read(&usable.join(BUNDLE_NAME)),
+        Some("bundle two\n".to_string())
+    );
+}
+
 /// A failure to flush the swap of `current` comes after the commit
 /// point, so the publication goes on: `current` keeps the new
 /// generation, and the configured pair is written as on success.

@@ -268,6 +268,13 @@ pub(crate) enum PairSource {
     /// A trust update: the pair of the generation `current` names,
     /// resolved only once the generation lock is held. Never the
     /// configured paths, which a renewal may be halfway through.
+    ///
+    /// A tree with no `current` has no snapshot to carry forward and is
+    /// [`GenerationOutcome::NoCurrent`]. A `current` that exists but
+    /// cannot be carried forward — it names something that is not a
+    /// generation, a generation that is gone, or one without the
+    /// certificate or key under their configured names — is an error,
+    /// and is left exactly as it was found.
     Current,
 }
 
@@ -279,15 +286,11 @@ pub(crate) enum GenerationOutcome {
         /// The number of the generation `current` now names.
         generation: u64,
     },
-    /// [`PairSource::Current`] found no `current` to copy a pair from,
-    /// and no generation was created. The profile's next issuance publishes
-    /// its first generation.
+    /// [`PairSource::Current`] found no tree, or a tree with no
+    /// `current`, and no generation was created. The profile has no
+    /// snapshot to carry forward; its next issuance publishes its first
+    /// generation.
     NoCurrent,
-    /// [`PairSource::Current`] found a `current` whose generation does
-    /// not hold the profile's certificate and key under their configured
-    /// names, and nothing was published. The profile's next issuance
-    /// publishes one that does.
-    StalePair,
 }
 
 /// Publishes one generation into `target`'s tree and swaps `current`
@@ -324,7 +327,12 @@ pub(crate) enum GenerationOutcome {
 /// Returns an error when the tree cannot be created or is not made of
 /// directories, when the lock cannot be taken, when an input cannot be
 /// read, or when a file, directory or the `current` link cannot be
-/// written, renamed or flushed.
+/// written, renamed or flushed. For [`PairSource::Current`], also when
+/// `current` exists but names something that is not a canonical
+/// generation, a generation directory that does not exist, or a
+/// generation without the certificate or key under their configured
+/// names; nothing is published, and `current` and every generation are
+/// left as they were.
 pub(crate) async fn publish_generation(
     target: &GenerationTarget,
     source: PairSource,
@@ -397,14 +405,23 @@ pub(crate) async fn publish_generation(
 /// The caller must have released [`crate::ca_bundle_lock`] first: the
 /// generation lock is always taken before it.
 ///
-/// A profile with no `current` is left without a tree, and one whose
+/// A profile with no tree, or a tree with no `current`, has no snapshot
+/// to carry forward and is skipped without being given one; one whose
 /// configuration [`GenerationTarget::plan`] cannot represent is left
-/// alone as its renewals leave it. Every profile is attempted; the first
-/// failure is the one returned.
+/// alone as its renewals leave it. A profile whose `current` exists but
+/// cannot be carried forward fails, and is left as it was found: its
+/// consumers would otherwise never be told of the new bundle, and the
+/// caller must not record the update as applied.
+///
+/// Every eligible profile is attempted, and each failure is logged; the
+/// first one is returned once all have been. A failure therefore leaves
+/// the update partly applied — the bundle already written and the other
+/// profiles' generations already published — and nothing is undone.
 ///
 /// # Errors
 ///
-/// Returns an error when a profile's generation cannot be published.
+/// Returns an error when a profile's generation cannot be published,
+/// including when its existing `current` cannot be carried forward.
 pub(crate) async fn republish_for_trust(settings: &Settings, probe: &Probe) -> Result<()> {
     let mut first_failure = None;
     for profile in &settings.profiles {
@@ -414,11 +431,6 @@ pub(crate) async fn republish_for_trust(settings: &Settings, probe: &Probe) -> R
         };
         match publish_generation(&target, PairSource::Current, probe).await {
             Ok(GenerationOutcome::Published { .. } | GenerationOutcome::NoCurrent) => {}
-            Ok(GenerationOutcome::StalePair) => tracing::warn!(
-                "The current generation of profile '{label}' does not hold its certificate \
-                 and key under their configured names, so the new CA bundle was not \
-                 republished beside them; the profile's next renewal publishes all three."
-            ),
             Err(err) => {
                 let err = err.context(format!(
                     "republishing the generation of profile '{label}' with the new CA bundle"
@@ -522,30 +534,20 @@ fn commit(
 ) -> Result<GenerationOutcome> {
     let root = &target.root;
     let current = target.current();
-    let previous = current_generation(&current)?;
+    // Inspected here, under the lock, and not by the caller before it: a
+    // renewal or a first issuance that held the lock while this waited
+    // has swapped `current` since, and the pair to carry forward is the
+    // one it published.
+    let link = current_link(&current)?;
 
-    let (cert_pem, key_pem) = match source {
-        PairSource::Issued { cert_pem, key_pem } => (cert_pem, key_pem),
-        PairSource::Current => {
-            // Resolved here, under the lock, and not by the caller
-            // before it: a renewal that held the lock while this waited
-            // has swapped `current` since, and the pair to carry forward
-            // is the one it published.
-            let Some(previous) = previous else {
-                return Ok(GenerationOutcome::NoCurrent);
-            };
-            let from = root.join(generation_name(previous));
-            if !is_generation_dir(&from)? {
-                return Ok(GenerationOutcome::StalePair);
-            }
-            let Some(cert_pem) = read_member(&from.join(&target.cert_name))? else {
-                return Ok(GenerationOutcome::StalePair);
-            };
-            let Some(key_pem) = read_member(&from.join(&target.key_name))? else {
-                return Ok(GenerationOutcome::StalePair);
-            };
-            (cert_pem, PrivateKeyPem::new(key_pem))
+    let (previous, cert_pem, key_pem) = match source {
+        PairSource::Issued { cert_pem, key_pem } => {
+            (issued_previous(&current, link), cert_pem, key_pem)
         }
+        PairSource::Current => match current_pair(target, &current, link)? {
+            Some((previous, cert_pem, key_pem)) => (Some(previous), cert_pem, key_pem),
+            None => return Ok(GenerationOutcome::NoCurrent),
+        },
     };
 
     let generation = next_generation(root)?;
@@ -630,13 +632,82 @@ fn commit(
     Ok(GenerationOutcome::Published { generation })
 }
 
-/// The generation `current` names, or `None` when there is no `current`
-/// or it does not name one.
+/// The generation an issuance replaces, which step 6 keeps: the one
+/// `current` names, if any. A `current` naming anything else is not
+/// trusted and is simply replaced.
+fn issued_previous(current: &Path, link: CurrentLink) -> Option<u64> {
+    match link {
+        CurrentLink::Absent => None,
+        CurrentLink::Generation(generation) => Some(generation),
+        CurrentLink::Other(named) => {
+            tracing::warn!(
+                "{} names {}, which is not a generation; it is replaced by this publication",
+                current.display(),
+                named.display()
+            );
+            None
+        }
+    }
+}
+
+/// The generation a trust update carries forward and the pair it holds,
+/// or `None` when there is no `current` and so no snapshot to carry.
+///
+/// A `current` that exists but cannot be carried forward is an error,
+/// never a skip: its consumers would otherwise be left on the old bundle
+/// with no signal that anything went wrong. Nothing is changed on the
+/// way — the pair comes only from the generation `current` names, under
+/// the configured names, and is never guessed at or taken from the
+/// configured paths.
+fn current_pair(
+    target: &GenerationTarget,
+    current: &Path,
+    link: CurrentLink,
+) -> Result<Option<(u64, String, PrivateKeyPem)>> {
+    let generation = match link {
+        CurrentLink::Absent => return Ok(None),
+        CurrentLink::Generation(generation) => generation,
+        CurrentLink::Other(named) => anyhow::bail!(
+            "{} names {}, which is not a generation of this tree, so there is no snapshot to \
+             republish beside the new CA bundle; it was left in place, and the profile's next \
+             renewal replaces it",
+            current.display(),
+            named.display()
+        ),
+    };
+    let from = target.root.join(generation_name(generation));
+    if !is_generation_dir(&from)? {
+        anyhow::bail!(
+            "{} names {}, which does not exist, so there is no snapshot to republish beside \
+             the new CA bundle; {} was left in place, and the profile's next renewal replaces \
+             it",
+            current.display(),
+            from.display(),
+            current.display()
+        );
+    }
+    let cert_pem = read_current_member(current, &from, &target.cert_name, "certificate")?;
+    let key_pem = read_current_member(current, &from, &target.key_name, "key")?;
+    Ok(Some((generation, cert_pem, PrivateKeyPem::new(key_pem))))
+}
+
+/// What `current` is when a publication inspects it.
+enum CurrentLink {
+    /// There is no `current`.
+    Absent,
+    /// `current` names this canonically numbered generation.
+    Generation(u64),
+    /// `current` is a symlink naming this, which is not a canonical
+    /// generation name: `gen-01`, an absolute path, anything else.
+    Other(PathBuf),
+}
+
+/// Reads what `current` names, without following it.
 ///
 /// A `current` that is not a symlink is an error: step 5 renames a link
 /// over it, and replacing a directory or a file someone put there is
 /// not this publication's to decide.
-fn current_generation(current: &Path) -> Result<Option<u64>> {
+fn current_link(current: &Path) -> Result<CurrentLink> {
     match std::fs::symlink_metadata(current) {
         Ok(meta) if meta.file_type().is_symlink() => {}
         Ok(_) => anyhow::bail!(
@@ -644,22 +715,19 @@ fn current_generation(current: &Path) -> Result<Option<u64>> {
              remove it, and the next renewal recreates it",
             current.display()
         ),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CurrentLink::Absent);
+        }
         Err(err) => {
             return Err(err).with_context(|| format!("inspecting {}", current.display()));
         }
     }
     let named = std::fs::read_link(current)
         .with_context(|| format!("reading the link {}", current.display()))?;
-    let generation = parse_generation(named.as_os_str());
-    if generation.is_none() {
-        tracing::warn!(
-            "{} names {}, which is not a generation; it is replaced by this publication",
-            current.display(),
-            named.display()
-        );
-    }
-    Ok(generation)
+    Ok(match parse_generation(named.as_os_str()) {
+        Some(generation) => CurrentLink::Generation(generation),
+        None => CurrentLink::Other(named),
+    })
 }
 
 /// One past the largest generation number present in `root`.
@@ -803,6 +871,33 @@ fn read_member(path: &Path) -> Result<Option<String>> {
     file.read_to_string(&mut contents)
         .with_context(|| format!("reading {}", path.display()))?;
     Ok(Some(contents))
+}
+
+/// Reads the certificate or the key — `what` — a trust update carries
+/// forward from `generation`, the one `current` names, under its
+/// configured `name`.
+///
+/// A generation without it is an error rather than a skip: it was
+/// published under other names, which a trust update does not guess at,
+/// and its consumers would otherwise never see the new bundle.
+fn read_current_member(
+    current: &Path,
+    generation: &Path,
+    name: &OsStr,
+    what: &str,
+) -> Result<String> {
+    let path = generation.join(name);
+    read_member(&path)?.with_context(|| {
+        format!(
+            "{} names {}, which holds no {what} under its configured name, {}, so there is \
+             no snapshot to republish beside the new CA bundle; {} was left in place, and the \
+             profile's next renewal replaces it",
+            current.display(),
+            generation.display(),
+            path.display(),
+            current.display()
+        )
+    })
 }
 
 /// Writes one file of a staged generation at its final owner and mode,

@@ -1300,9 +1300,37 @@ it — flushing the swap to disk, or removing older generations — is logged as
 a warning instead of failing the renewal.
 
 **A CA-trust update publishes a generation too.** When the fast-poll loop
-replaces the CA bundle, each profile that already has a `current` gets a new
-generation holding the same certificate and key beside the new bundle. No
-hook runs for a trust update, so this swap is the only signal of it.
+replaces the CA bundle, it writes `[trust].ca_bundle_path` first and then
+republishes each profile's snapshot. No hook runs for a trust update, so the
+swap of `current` is the only signal of it. What happens to a profile depends
+on its tree:
+
+- **A usable snapshot is republished.** When `current` names a generation
+  that holds the certificate and key under the file names of the configured
+  `paths.cert` and `paths.key`, the profile gets a new generation holding
+  those same bytes beside the new bundle, and `current` is swapped onto it.
+- **A profile without a snapshot is skipped.** One with no tree, or a tree
+  with no `current`, has nothing to carry forward. It gets no tree and no
+  generation, nothing is copied from its configured files, and its next
+  issuance publishes its first generation with the bundle then on disk.
+- **An unusable snapshot fails the update.** When `current` names something
+  that is not a generation of the tree (such as `gen-01` or an absolute
+  path), names a generation that no longer exists, or names one without the
+  certificate or the key under the configured file names — for instance
+  after `paths.cert` or `paths.key` was renamed — the update fails with an
+  error naming the profile and that link, directory or file. The tree is left
+  exactly as it was: `current` is not swapped or repaired, and nothing is
+  taken from the configured paths instead.
+
+Every profile is attempted even after one fails, so a failure leaves the
+update partly applied: the new bundle is already written and the other
+profiles have already been republished. The trusted fingerprints are not
+written to `agent.toml`, the update is not recorded as applied, and the next
+poll applies it again. Each retry republishes the other profiles once more,
+so their `current` is swapped on every poll until the failing profile is
+usable. The profile's next renewal publishes a usable generation, after which
+that retry succeeds; so does correcting the tree by hand, for example by
+restoring the missing file.
 
 **Retention.** The tree holds the current generation and the one before it.
 Older ones are removed by each publication.

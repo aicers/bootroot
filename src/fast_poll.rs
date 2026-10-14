@@ -1210,12 +1210,18 @@ pub(crate) struct LiveFastPollHooks<F> {
 /// consistent like the renewal-time bundle, under
 /// [`crate::ca_bundle_lock`] so it cannot land inside another in-process
 /// writer's read-merge-write span. Every profile that already has a
-/// generation tree then gets a new generation holding its current pair
-/// beside the new bundle ([`fs_util::generation::republish_for_trust`]).
-/// The `agent.toml` rewrite goes
+/// `current` then gets a new generation holding its current pair beside
+/// the new bundle ([`fs_util::generation::republish_for_trust`]); one with
+/// no tree or no `current` is skipped. The `agent.toml` rewrite goes
 /// through [`fs_util::atomic_write`] at `0o600` (the #613-safe writer) so a
 /// crash cannot leave the daemon's hot-read config half-written. The
 /// `upsert_section_keys` round-trip preserves operator-tuned sections.
+///
+/// A profile whose existing `current` cannot be carried forward fails the
+/// republication, and with it this call, before `agent.toml` is touched.
+/// Nothing is undone: the bundle stays written and the other profiles'
+/// generations stay published, and because the pin is not persisted the
+/// caller does not record the update and applies it again next time.
 async fn apply_trust_to_disk(
     settings: &config::Settings,
     config_path: &Path,
@@ -1247,7 +1253,8 @@ async fn apply_trust_to_disk(
     // profile's `current` is the only signal a consumer of the
     // generation tree gets that the bundle changed. After the bundle
     // lock is released, because the generation lock is always taken
-    // first.
+    // first. A profile that could not be signalled fails the update
+    // before the pin is persisted, so the next poll applies it again.
     fs_util::generation::republish_for_trust(settings, &fs_util::generation::Probe::default())
         .await?;
 
@@ -3861,6 +3868,120 @@ mod tests {
             std::fs::read_to_string(&profile.paths.key).unwrap(),
             "key B\n"
         );
+    }
+
+    /// A trust update that cannot carry one profile's `current` forward
+    /// fails, but only after writing the bundle and republishing every
+    /// other profile; the pin in `agent.toml` is not rewritten, so the
+    /// update is applied again on the next poll, and once the snapshot
+    /// is usable that retry completes it.
+    #[tokio::test]
+    async fn apply_trust_to_disk_fails_on_an_unusable_snapshot_and_succeeds_once_it_is_fixed() {
+        use crate::acme::flow::publish_snapshot;
+        use crate::fs_util::generation::Probe;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = GenerationHost::new(dir.path());
+        let mut later = host.settings.profiles[0].clone();
+        later.registration_id = "edge-cache".to_string();
+        later.instance_id = "002".to_string();
+        later.paths.cert = dir.path().join("certs").join("cache-cert.pem");
+        later.paths.key = dir.path().join("keys").join("cache-key.pem");
+        host.settings.profiles.push(later);
+        let later_root = host.root.with_file_name("edge-cache");
+
+        std::fs::create_dir_all(host.bundle_path.parent().unwrap()).unwrap();
+        std::fs::write(&host.bundle_path, "bundle one\n").unwrap();
+        for (profile, label) in host.settings.profiles.iter().zip(["A", "C"]) {
+            publish_snapshot(
+                &host.settings,
+                profile,
+                &generation_material(label, Vec::new()),
+                &Probe::default(),
+            )
+            .await
+            .expect("the first issuance");
+        }
+        let missing = host.root.join("gen-1").join("key.pem");
+        std::fs::remove_file(&missing).unwrap();
+        let config_before = std::fs::read(&host.config_path).unwrap();
+        let configured_key = host.settings.profiles[0].paths.key.clone();
+
+        let err = apply_trust_to_disk(
+            &host.settings,
+            &host.config_path,
+            "edge-proxy",
+            &trust_payload("bundle two\n"),
+        )
+        .await
+        .expect_err("an unusable snapshot fails the trust update");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&missing.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&host.bundle_path).unwrap(),
+            "bundle two\n",
+            "the bundle written before republication stays"
+        );
+        assert_eq!(
+            std::fs::read_link(host.root.join("current")).unwrap(),
+            Path::new("gen-1")
+        );
+        assert!(!host.root.join("gen-2").exists());
+        assert_eq!(
+            std::fs::read_to_string(host.root.join("gen-1").join("cert.pem")).unwrap(),
+            "certificate A\n"
+        );
+        assert_eq!(std::fs::read_to_string(&configured_key).unwrap(), "key A\n");
+        let later_generation = later_root.join("gen-2");
+        assert_eq!(
+            std::fs::read_link(later_root.join("current")).unwrap(),
+            Path::new("gen-2"),
+            "the later profile is republished despite the earlier failure"
+        );
+        assert_eq!(
+            std::fs::read_to_string(later_generation.join("cache-key.pem")).unwrap(),
+            "key C\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(later_generation.join("ca-bundle.pem")).unwrap(),
+            "bundle two\n"
+        );
+        assert_eq!(
+            std::fs::read(&host.config_path).unwrap(),
+            config_before,
+            "the persisted pin is not rewritten"
+        );
+
+        std::fs::write(&missing, "key A\n").unwrap();
+        apply_trust_to_disk(
+            &host.settings,
+            &host.config_path,
+            "edge-proxy",
+            &trust_payload("bundle two\n"),
+        )
+        .await
+        .expect("the retry succeeds once the snapshot is usable");
+
+        assert_eq!(
+            host.current(),
+            (
+                "gen-2".to_string(),
+                "certificate A\n".to_string(),
+                "key A\n".to_string(),
+                "bundle two\n".to_string(),
+            )
+        );
+        assert_eq!(
+            std::fs::read_link(later_root.join("current")).unwrap(),
+            Path::new("gen-3")
+        );
+        let updated = std::fs::read_to_string(&host.config_path).unwrap();
+        assert!(updated.contains("[trust]"), "{updated}");
+        assert!(updated.contains(&"a".repeat(64)), "{updated}");
     }
 
     #[tokio::test]
