@@ -221,7 +221,9 @@ fn settings() -> crate::config::Settings {
 ///
 /// The subscriber is the thread's default, and a current-thread runtime
 /// polls the future on this thread, so the events of the async half are
-/// the ones captured.
+/// the ones captured. The capture relies on the global subscriber from
+/// [`crate::test_tracing`] so that a parallel test reaching the same log
+/// line first cannot disable it.
 fn logs_from<F: Future>(publish: impl FnOnce() -> F) -> (F::Output, String) {
     #[derive(Clone)]
     struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -237,6 +239,7 @@ fn logs_from<F: Future>(publish: impl FnOnce() -> F) -> (F::Output, String) {
         }
     }
 
+    crate::test_tracing::install_undecided_global_subscriber();
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer = Captured(Arc::clone(&buffer));
     let subscriber = tracing_subscriber::fmt()

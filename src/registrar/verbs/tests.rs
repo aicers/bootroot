@@ -4230,6 +4230,7 @@ async fn a_limited_invocation_emits_no_daemon_log_line() {
         .deregister(&deregister_request("roxyd", "h1", None))
         .await;
 
+    crate::test_tracing::install_undecided_global_subscriber();
     let (counter, events) = EventCounter::new();
     let _guard = tracing::subscriber::set_default(counter);
     for _ in 0..FLOOD {

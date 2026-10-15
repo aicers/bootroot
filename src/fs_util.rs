@@ -2401,6 +2401,7 @@ mod tests {
             }
         }
 
+        crate::test_tracing::install_undecided_global_subscriber();
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let writer = Captured(Arc::clone(&buffer));
         let subscriber = tracing_subscriber::fmt()

@@ -124,19 +124,19 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
 /// Every test that uses it runs on a current-thread runtime, so the
 /// whole future stays on the thread the guard was taken on.
 ///
-/// The interest cache is rebuilt afterwards, and that is load-bearing
-/// rather than defensive. `tracing` caches each callsite's interest
-/// globally, and a callsite first reached on a *parallel* test thread —
-/// where the default subscriber is the no-op one — is cached as
-/// `Interest::never()` and stays disabled for every thread, including
-/// this one. Rebuilding recomputes it over the live subscribers, this
-/// one now among them, so a capture cannot come back empty because some
-/// other test happened to reach the same log line first.
+/// The capture depends on the global subscriber from
+/// [`crate::test_tracing`]. `tracing` caches each callsite's interest
+/// for the whole process, and a parallel test thread with no subscriber
+/// that first reaches a log line while this capture is live caches it
+/// as `Interest::never()` for every thread. Rebuilding the interest
+/// cache after installing the capture cannot prevent that, because the
+/// callsite is registered after the rebuild; the global subscriber
+/// keeps every callsite from being cached `never` at all.
 pub(crate) fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    crate::test_tracing::install_undecided_global_subscriber();
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     let guard = tracing::subscriber::set_default(subscriber);
-    tracing::callsite::rebuild_interest_cache();
     (logs, guard)
 }
 // ---------------------------------------------------------------------
