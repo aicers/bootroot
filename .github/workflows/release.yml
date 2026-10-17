@@ -54,7 +54,7 @@ jobs:
               run: |
                   echo "${{ steps.release_notes.outputs.release_notes_b64 }}" | base64 -d > release_notes.txt
                   gh release create "${{ steps.version.outputs.version }}" \
-                    --title "${{ steps.version.outputs.version }}" \
+                    --title "${{ github.event.repository.name }} ${{ steps.version.outputs.version }}" \
                     --notes-file release_notes.txt \
                     --repo "${{ github.repository }}"
               env:
