@@ -17,7 +17,7 @@ mod support;
 // End-to-end fixture exercises a full service add → state.json round
 // trip; the assertion block grew when the consumer-reload hint
 // (issue #614) was added and pushed it past the default 100-line
-// threshold. The project CLAUDE.md treats `clippy::too_many_lines`
+// threshold. The project AGENTS.md treats `clippy::too_many_lines`
 // loosely, so allow it here rather than fragmenting the test.
 #[allow(clippy::too_many_lines)]
 #[cfg(unix)]
@@ -316,7 +316,7 @@ async fn test_app_add_summary_reports_a_recovered_connect_as_skipped() {
 /// secrets-tree location.
 // The single end-to-end fixture asserts across every relocated seam
 // (files, state, config, summary), which pushes it past the default
-// 100-line threshold; CLAUDE.md treats `too_many_lines` loosely, so keep
+// 100-line threshold; AGENTS.md treats `too_many_lines` loosely, so keep
 // it whole rather than fragmenting the flow.
 #[allow(clippy::too_many_lines)]
 #[cfg(unix)]
