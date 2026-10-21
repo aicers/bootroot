@@ -4,6 +4,15 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Bumped `rustls-webpki` from 0.103.15 to 0.103.16 and `webpki-root-certs`
+  from 1.0.9 to 1.0.10 to address RUSTSEC-2026-0382 (certificate
+  verification accepting distrusted intermediates) and RUSTSEC-2026-0383
+  (bundled root certificates trusting distrusted emSign intermediates).
+
 ## [0.4.0] - 2026-10-15
 
 ### Added
@@ -2936,6 +2945,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.4.0...HEAD
 [0.4.0]: https://github.com/aicers/bootroot/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/aicers/bootroot/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/aicers/bootroot/compare/0.1.0...0.2.0
