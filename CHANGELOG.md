@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- The `bootroot-registrar.service` systemd unit, which runs the registrar
+  endpoint daemon, now keeps retrying every five seconds when its start needs
+  OpenBao and OpenBao is not reachable yet — for example while it is still
+  sealed after a reboot and the registrar surface certificates have expired.
+  Before, the daemon failed five times in under a second, and the service and
+  its socket then stayed failed until someone restarted them by hand, even
+  after OpenBao came back. Reinstall the unit file to pick up the fix.
+
 ### Security
 
 - Bumped `rustls-webpki` from 0.103.15 to 0.103.16 and `webpki-root-certs`

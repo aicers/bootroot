@@ -5,6 +5,11 @@
 # socket unit is a Requires/After dependency purely so the listening
 # descriptor exists before this starts and is inherited as fd 3.
 #
+# A start that has to issue registrar surface material needs OpenBao, so
+# after a boot race, a seal or an OpenBao restart the daemon must come
+# back by itself once OpenBao answers: there is no start limit, and the
+# five-second restart interval keeps a down OpenBao from being hammered.
+#
 # This daemon is the one bootroot-agent process on an endpoint-enabled
 # host. It runs on the configuration `bootroot init` renders at
 # <secrets-dir>/registrar-internal/agent.toml, which renews the
@@ -37,6 +42,7 @@ Requires=bootroot-registrar.socket
 After=bootroot-registrar.socket
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 # Root, because mint and deregister need the privileged internal
@@ -46,6 +52,7 @@ User=root
 Group=root
 ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target

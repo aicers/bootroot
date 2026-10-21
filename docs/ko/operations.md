@@ -2336,7 +2336,7 @@ rename됩니다. 따라서 인증서의 rename과 키의 rename 사이의 간격
 - **리프가 이미 만료됐고 데몬이 멈춰 있는 경우.** 데몬을 시작하세요. 기동 시점
   발급은 엔드포인트가 자재를 로드하기 전에 돌면서 쓸 수 없는 쌍을 재발급하므로,
   리프는 엔드포인트가 서비스를 시작하기 *전에* 복구됩니다. `systemctl start
-  bootroot-agent` 한 번이면 표면이 유효한 인증서와 함께 돌아옵니다.
+  bootroot-registrar.service` 한 번이면 표면이 유효한 인증서와 함께 돌아옵니다.
 - **리프는 아직 유효한데 마지막 갱신이 실패한 경우.** 무엇을 시작해도 달라지지
   않습니다. 데몬은 이미 떠 있고 디스크의 인증서는 아직 쓸 수 있으므로, 기동
   시점 발급이 재발급할 것이 없습니다. 이를 고치는 것은 *다음* 갱신 패스가
@@ -2390,13 +2390,28 @@ systemctl enable --now bootroot-registrar.service
 함께 없애지 않습니다.
 
 서비스 유닛은 `Requires=bootroot-registrar.socket`,
-`After=bootroot-registrar.socket`, `User=root`, `Group=root`,
-`Restart=on-failure`, `WantedBy=multi-user.target`과 다음 자리표시자
-`ExecStart`를 사용하며, 위의 drop-in이 이를 대체합니다.
+`After=bootroot-registrar.socket`, `StartLimitIntervalSec=0`, `User=root`,
+`Group=root`, `Restart=on-failure`, `RestartSec=5s`,
+`WantedBy=multi-user.target`과 다음 자리표시자 `ExecStart`를 사용하며, 위의
+drop-in이 이를 대체합니다.
 
 ```ini
 ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 ```
+
+따라서 데몬은 기동이 성공할 때까지 횟수 제한 없이 5초마다 재시도합니다. 예를
+들어 기동 시 발급할 레지스트라 표면 자재가 있는데 `OpenBao`가 listen하지 않거나
+봉인되어 있거나 재시작 중이라면, `OpenBao`가 응답하는 시점에 기동이 성공합니다.
+잘못된 설정이나 폐기된 내부 자격 증명처럼 누군가 고칠 때까지 계속되는
+기동 거부도 마찬가지로 5초마다 재시도되고 로그에 기록됩니다.
+`OpenBao`가 로그인을 거부하면 그때마다 감사 기록도 남는데, 엔드포인트
+호스트에서 `OpenBao` 감사 장치를 회전하는 것이 바로 이 데몬이고 데몬이 기동하지
+못하는 동안에는 아무것도 그것을 회전하지 않으므로, 이런 루프는 그대로 두지 말고
+고쳐야 합니다.
+이 루프에 빠진 유닛은 `failed`가 아니라 `activating (auto-restart)`로 표시되므로
+`systemctl --failed`에는 나오지 않지만,
+`systemctl status bootroot-registrar.service`, 유닛의 `NRestarts` 횟수
+(`systemctl show -p NRestarts bootroot-registrar.service`), 저널에는 나타납니다.
 
 이 서비스는 연결이 들어올 때 지연 기동되는 것이 아니라 **부팅 시
 시작**됩니다. 레지스트라가 접속하든 하지 않든 갱신 루프와 fast-poll
