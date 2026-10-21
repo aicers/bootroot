@@ -2471,8 +2471,8 @@ and the two need different things:**
 - **The leaf has already expired and the daemon is stopped.** Start the daemon.
   Start-time issuance runs before the endpoint loads its material and reissues
   an unusable pair, so the leaf is repaired *before* the endpoint begins serving
-  — one `systemctl start bootroot-agent` and the surface comes back with valid
-  certificates.
+  — one `systemctl start bootroot-registrar.service` and the surface comes back
+  with valid certificates.
 - **The leaf is still valid and its last renewal failed.** Starting anything
   changes nothing: the daemon is already running and the certificate on disk is
   still usable, so start-time issuance has nothing to reissue. What repairs it is
@@ -2528,14 +2528,32 @@ The socket unit uses `ListenStream=/run/bootroot/registrar.sock`,
 taking the runtime directory with it.
 
 The service unit uses `Requires=bootroot-registrar.socket`,
-`After=bootroot-registrar.socket`, `User=root`, `Group=root`,
-`Restart=on-failure`, `WantedBy=multi-user.target` and a placeholder
+`After=bootroot-registrar.socket`, `StartLimitIntervalSec=0`, `User=root`,
+`Group=root`, `Restart=on-failure`, `RestartSec=5s`,
+`WantedBy=multi-user.target` and a placeholder
 
 ```ini
 ExecStart=/usr/local/bin/bootroot-agent --config /etc/bootroot/agent.toml
 ```
 
 which the drop-in above replaces.
+
+The daemon therefore retries every five seconds, without a limit, until its
+start succeeds — for example once `OpenBao` answers, when the start has
+registrar surface material to issue and `OpenBao` is not listening, sealed or
+restarting.
+A start refusal that persists until someone fixes it, such as a bad
+configuration or a revoked internal credential, is retried and logged every
+five seconds as well.
+When `OpenBao` refuses the login, it also writes an audit record each time, and
+on an endpoint host this daemon is what rotates the `OpenBao` audit device:
+nothing rotates it while the daemon cannot start, so a loop like this has to be
+fixed, not left running.
+A unit in this loop shows `activating (auto-restart)`, not `failed`, so
+`systemctl --failed` does not list it, while
+`systemctl status bootroot-registrar.service`, its `NRestarts` count
+(`systemctl show -p NRestarts bootroot-registrar.service`) and the journal do
+show it.
 
 It is **enabled at boot** rather than started lazily by a connection.
 The renewal and fast-poll loops have to run whether or not a registrar

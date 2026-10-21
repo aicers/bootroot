@@ -150,7 +150,9 @@ fn the_socket_unit_is_installed_into_sockets_target() {
 
 /// The service depends on the socket for ordering and for the
 /// descriptor, and runs as root because the verbs need the privileged
-/// internal credential.
+/// internal credential. It restarts every five seconds with no start
+/// limit, so a start that needs `OpenBao` comes back once `OpenBao` answers
+/// instead of staying failed.
 #[test]
 fn the_service_unit_orders_after_the_socket_and_runs_as_root() {
     let unit = parse_unit(SERVICE_UNIT);
@@ -158,7 +160,9 @@ fn the_service_unit_orders_after_the_socket_and_runs_as_root() {
     assert_has_value(&unit, "Unit", "After", "bootroot-registrar.socket");
     assert_directive(&unit, "Service", "User", "root");
     assert_directive(&unit, "Service", "Group", "root");
+    assert_directive(&unit, "Unit", "StartLimitIntervalSec", "0");
     assert_directive(&unit, "Service", "Restart", "on-failure");
+    assert_directive(&unit, "Service", "RestartSec", "5s");
 }
 
 /// It starts at boot rather than being started lazily by a connection:
