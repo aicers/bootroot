@@ -319,6 +319,18 @@ registrar_docker_build_and_initialize() {
   done
   curl -fsS "http://localhost:${PORT_OPENBAO}/v1/sys/seal-status" >/dev/null 2>&1 ||
     fail "OpenBao did not become reachable"
+  # `init` provisions the database over TCP straight after OpenBao, and a
+  # fresh PostgreSQL container is not that server yet: its first-boot
+  # initdb runs a temporary server on the Unix socket alone, then stops it
+  # and starts the final one. Probe over TCP inside the container, so only
+  # the final server answers.
+  for _ in $(seq 1 60); do
+    docker exec "${INSTANCE}-postgres" pg_isready -h 127.0.0.1 -U step -d postgres \
+      >/dev/null 2>&1 && break
+    sleep 1
+  done
+  docker exec "${INSTANCE}-postgres" pg_isready -h 127.0.0.1 -U step -d postgres \
+    >/dev/null 2>&1 || fail "PostgreSQL did not become reachable over TCP"
   # `infra install` recorded the endpoint predicate `init` must preserve
   # while it writes the complete state record after provisioning.
   [ "$(jq -r '.registrar_endpoint.enabled' "$WORK_DIR/state.json" 2>/dev/null)" = "true" ] ||
