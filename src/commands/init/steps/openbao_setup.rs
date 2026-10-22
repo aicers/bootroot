@@ -22,8 +22,8 @@ use super::super::constants::{
     OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
 };
 use super::super::paths::{
-    OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, resolve_openbao_agent_addr,
-    to_container_path,
+    OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, compose_logs_to_journald,
+    resolve_openbao_agent_addr, to_container_path,
 };
 use super::super::types::{AppRoleLabel, AppRoleOutput, EabCredentials, OpenBaoConfigResult};
 use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
@@ -876,6 +876,14 @@ async fn write_openbao_agent_compose_override(
     } else {
         ""
     };
+    // The sidecars join the compose file's project, so they log where
+    // its services do: the host journal under the deploy compose,
+    // Docker's default driver under one that also runs on Docker Desktop.
+    let logging = if compose_logs_to_journald(compose_file, messages)? {
+        "    logging:\n      driver: journald\n"
+    } else {
+        ""
+    };
     let meta = std::fs::metadata(&mount_root)
         .with_context(|| messages.error_resolve_path_failed(&mount_root.display().to_string()))?;
     let user = {
@@ -890,7 +898,7 @@ services:
     container_name: {stepca_container}
     user: "{user}"
     restart: always
-    command: ["agent", "-config=/openbao/secrets/openbao/stepca/agent.hcl"]
+{logging}    command: ["agent", "-config=/openbao/secrets/openbao/stepca/agent.hcl"]
 {depends_on}    environment:
       - VAULT_ADDR={openbao_addr}
     volumes:
@@ -900,7 +908,7 @@ services:
     container_name: {responder_container}
     user: "{user}"
     restart: always
-    command: ["agent", "-config=/openbao/secrets/openbao/responder/agent.hcl"]
+{logging}    command: ["agent", "-config=/openbao/secrets/openbao/responder/agent.hcl"]
 {depends_on}    environment:
       - VAULT_ADDR={openbao_addr}
     volumes:
@@ -912,6 +920,7 @@ services:
         responder_container = identity.container(BootrootContainer::OpenBaoAgentResponder),
         agent_image = OPENBAO_AGENT_IMAGE,
         depends_on = depends_on,
+        logging = logging,
         openbao_addr = openbao_addr,
         secrets_path = mount_root.display(),
         user = user
@@ -1240,6 +1249,75 @@ services:
         // Loopback / no-TLS path keeps http and adds no CA env.
         assert!(contents.contains("VAULT_ADDR=http://openbao:8200"));
         assert!(!contents.contains("VAULT_CACERT"));
+    }
+
+    /// Writes the agent override for a compose file holding `compose`
+    /// and returns the override's contents.
+    async fn agent_override_for(compose: &str) -> String {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).unwrap();
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, compose).unwrap();
+        let override_path = write_openbao_agent_compose_override(
+            &compose_file,
+            &secrets_dir,
+            "http://openbao:8200",
+            &ComposeIdentity::for_instance("bootroot"),
+            &test_messages(),
+        )
+        .await
+        .unwrap()
+        .expect("override path");
+        fs::read_to_string(&override_path).unwrap()
+    }
+
+    /// The `logging:` block of each sidecar, in the override's order.
+    fn sidecar_logging_blocks(contents: &str) -> Vec<Vec<&str>> {
+        let mut blocks = Vec::new();
+        let mut lines = contents.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line == "    logging:" {
+                let mut block = Vec::new();
+                while let Some(entry) = lines.next_if(|entry| entry.starts_with("      ")) {
+                    block.push(entry.trim());
+                }
+                blocks.push(block);
+            }
+        }
+        blocks
+    }
+
+    #[tokio::test]
+    async fn test_write_openbao_agent_compose_override_follows_a_journald_compose() {
+        let contents = agent_override_for(
+            "services:\n  openbao:\n    image: openbao/openbao\n    logging:\n      driver: journald\n",
+        )
+        .await;
+        assert_eq!(
+            sidecar_logging_blocks(&contents),
+            vec![vec!["driver: journald"], vec!["driver: journald"]],
+            "both sidecars must log through journald: {contents}"
+        );
+        assert_eq!(
+            contents
+                .matches("    restart: always\n    logging:\n      driver: journald\n    command:")
+                .count(),
+            2,
+            "the block sits right after restart: {contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_openbao_agent_compose_override_keeps_the_default_driver_elsewhere() {
+        let compose =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml"))
+                .unwrap();
+        let contents = agent_override_for(&compose).await;
+        assert!(
+            !contents.contains("logging:"),
+            "the sidecars stay on Docker's default driver: {contents}"
+        );
     }
 
     /// The `OpenBao` Agent sidecars run the `OpenBao` image the runtime

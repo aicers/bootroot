@@ -50,7 +50,23 @@ for service in bootroot-openbao bootroot-postgres bootroot-ca bootroot-http01; d
   fi
 done
 
-echo "[validate-deploy-compose] OK: no build: contexts; default services present"
+# The production services log through Docker's journald driver, so their
+# output reaches the host journal. The monitoring services behind the
+# `lan`/`public` profiles are outside the production stack and not held to
+# it.
+rendered_json="$(
+  env -u BOOTROOT_INSTANCE \
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --format json
+)"
+for service in openbao postgres step-ca bootroot-http01; do
+  driver="$(jq -r --arg service "$service" '.services[$service].logging.driver // empty' <<<"$rendered_json")"
+  if [ "$driver" != "journald" ]; then
+    echo "[validate-deploy-compose] FAIL: $service renders logging driver '${driver:-<none>}', expected journald" >&2
+    exit 1
+  fi
+done
+
+echo "[validate-deploy-compose] OK: no build: contexts; default services present and logging to journald"
 
 # Staging smoke: prove the deploy compose resolves from a directory that
 # holds ONLY the files a prebuilt payload stages — the compose file plus

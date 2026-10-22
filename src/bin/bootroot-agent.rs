@@ -1,21 +1,68 @@
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use bootroot::config::CliOverrides;
+use bootroot::logging::{self, LogDestination};
 use bootroot::{
     Args, DaemonInvocation, DaemonShutdown, RegistrarEndpoint,
     audit_store_reload_rejection_message, config, eab, ensure_registrar_surface_certificates,
     profile, refresh_registrar_surface_after_reload, run_daemon, run_oneshot,
 };
 use clap::Parser;
+use clap::error::ErrorKind;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+/// clap's exit status for a refused command line.
+const USAGE_ERROR_EXIT: u8 = 2;
 
-    let args = Args::parse();
+#[tokio::main]
+async fn main() -> ExitCode {
+    // Before anything that can fail, so that under the journal every
+    // start-up error is an entry at its own priority rather than plain
+    // text the journal would store at priority 6.
+    let destination = logging::init(std::env::var_os(logging::JOURNAL_STREAM_VAR).as_deref());
+
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(err) => return refuse_args(&err, destination),
+    };
+    match run(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            match destination {
+                LogDestination::Journal => error!("{err:#}"),
+                // What the standard library prints for an error `main`
+                // returns.
+                LogDestination::Other => eprintln!("Error: {err:?}"),
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reports a command line clap refused, or the help or version it was
+/// asked for, and returns the status to exit with.
+fn refuse_args(err: &clap::Error, destination: LogDestination) -> ExitCode {
+    match destination {
+        LogDestination::Journal => match err.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                // Output the operator asked for, printed as clap prints
+                // it; clap's own `exit` ignores a failure to print too.
+                let _ = err.print();
+                ExitCode::SUCCESS
+            }
+            _ => {
+                error!("{}", err.render().to_string().trim_end());
+                ExitCode::from(USAGE_ERROR_EXIT)
+            }
+        },
+        LogDestination::Other => err.exit(),
+    }
+}
+
+async fn run(args: Args) -> anyhow::Result<()> {
     info!("Starting Bootroot Agent (Rust)");
 
     if args.oneshot {

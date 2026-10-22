@@ -197,21 +197,23 @@ HMAC salt가 따로 있으므로**, `stdout/`이 기록한 `hmac-sha256:` 값은
 (예: `openbao.hcl`에서 감사 스탠자가 제거된 경우) init은 실패합니다. 감사
 설정을 복원한 후 init을 다시 실행하세요.
 
-**일반 호스트의 보존.** 두 compose 파일 모두 OpenBao를 Docker의
+**일반 호스트의 보존.** 컨테이너 로그가 어디에 보존되는지는 스택을
+실행하는 compose 파일에 따라 다릅니다. OpenBao 서버 자체의 출력도 감사
+기록과 함께 그곳으로 갑니다. 프로비저닝된 엔드포인트 호스트에서는 그
+출력만 이곳으로 가고 감사 기록은 저장소에 남습니다. 어느 파일이든 전달
+방식은 Docker의 기본값인 `blocking` 모드입니다. `non-blocking`은
+드라이버가 뒤처질 때마다 링 버퍼에서 줄을 버리기 때문입니다.
+
+`docker-compose.yml`은 OpenBao를 Docker의
 [`local` 로깅 드라이버](https://docs.docker.com/engine/logging/drivers/local/)로
 `max-size: 20m`, `max-file: 10`, `compress: true`와 함께 실행합니다. 로그
 내용 기준 최대 20 MiB인 세그먼트를 최대 10개까지 보존하므로 200 MiB가
 절대 상한이며, 로테이션된 세그먼트는 gzip으로 압축되므로 보통 디스크
-사용량은 그보다 훨씬 작습니다. OpenBao 서버 자체의 출력도 같은 예산을
-나눠 씁니다. 프로비저닝된 엔드포인트 호스트에서는 그 출력만 이곳으로 가고
-감사 기록은 저장소에 남습니다. 전달 방식은 Docker의 기본값인 `blocking`
-모드입니다. `non-blocking`은 드라이버가 뒤처질 때마다 링 버퍼에서 줄을
-버리기 때문입니다.
+사용량은 그보다 훨씬 작습니다. 두 상한은 `docker-compose.yml` 옆의
+`.env`에서 바꿀 수 있습니다. Docker Compose가 이 파일을 읽으며,
+`infra install`은 그 키를 보존합니다.
 
-두 상한은 compose 파일 옆의 `.env`에서 바꿀 수 있습니다. Docker Compose가
-이 파일을 읽으며, `infra install`은 그 키를 보존합니다.
-
-| `.env` 키 | 기본값 |
+| `.env` 키 (`docker-compose.yml`) | 기본값 |
 | --- | --- |
 | `OPENBAO_LOG_MAX_SIZE` | `20m` |
 | `OPENBAO_LOG_MAX_FILES` | `10` |
@@ -220,8 +222,23 @@ HMAC salt가 따로 있으므로**, `stdout/`이 기록한 `hmac-sha256:` 값은
 키를 쓰지도 검증하지도 않습니다. 잘못된 값은 Docker가 컨테이너를 생성할
 때 거부합니다.
 
+`docker-compose.deploy.yml`은 모든 운영 서비스 — OpenBao, PostgreSQL,
+step-ca, HTTP-01 응답기 — 와 `bootroot init`이 그 스택에 추가하는 두
+OpenBao Agent 사이드카를 Docker의
+[`journald` 로깅 드라이버](https://docs.docker.com/engine/logging/drivers/journald/)로
+실행하므로, systemd-journald가 실행 중인 호스트가 필요합니다. 기록은
+호스트 저널로 가며, 한 줄이 한 항목이 되고 `CONTAINER_NAME`에 컨테이너
+이름이 담깁니다. `journalctl CONTAINER_NAME=<instance>-openbao`로 읽으며,
+`docker logs <instance>-openbao`도 그대로 동작합니다. 보존 기간은 호스트
+저널의 것을 따릅니다. Ubuntu에서는 기본적으로 영구 저장이며, 파일
+시스템의 최대 10 %, 최대 4 GiB입니다. 그곳에서는 `OPENBAO_LOG_MAX_SIZE`와
+`OPENBAO_LOG_MAX_FILES`가 아무 효과가 없습니다. 새 파일로 스택을 올리면
+네 컨테이너가 모두 다시 생성되므로, OpenBao는 봉인된 상태로 재시작하며
+재부팅 후와 같이 봉인을 해제해야 합니다.
+
 **일반 호스트가 보장하지 않는 것.** 컨테이너 로그는 상한이 있는
-기록이지, fail-closed 기록이 아닙니다.
+기록이지, fail-closed 기록이 아닙니다. `docker-compose.yml`에서는 다음과
+같습니다.
 
 - `max-file`개의 세그먼트가 가득 차면 Docker는 가장 오래된 세그먼트를
   조용히 버립니다.
@@ -234,6 +251,20 @@ HMAC salt가 따로 있으므로**, `stdout/`이 기록한 `hmac-sha256:` 값은
   `dockerd`가 오류를 기록하고 그 줄을 버리며, OpenBao는 계속 요청을
   처리합니다.
 
+`docker-compose.deploy.yml`에서는 다음과 같습니다.
+
+- 크기 상한에 도달하면 journald는 가장 오래된 항목을 조용히 제거합니다.
+- journald는 서비스별 속도 제한(기본값 30초당 10,000줄)을 넘는 줄을
+  버리며, 모든 컨테이너의 줄은 `docker.service`의 한도에 합산됩니다.
+- 컨테이너를 제거하거나 다시 생성해도 이미 저널에 도달한 기록은 삭제되지
+  않지만, `docker logs`는 현재 컨테이너의 줄만 보여 줍니다.
+- journald가 한 줄을 저장하지 못하면 — 예를 들어 디스크가 가득 찬 경우 —
+  그 줄은 사라지며, OpenBao는 계속 요청을 처리합니다.
+- 호스트 저널을 읽을 수 있는 사람은 누구나 이 기록을 읽을 수 있습니다.
+  Ubuntu에서는 root와 `adm`, `systemd-journal` 그룹의 구성원이며, `local`
+  드라이버에서는 root만 읽을 수 있었습니다. 이 그룹들로부터 감사 기록을
+  지켜야 하는 호스트는 레지스트라 엔드포인트의 감사 저장소를 사용합니다.
+
 fail-closed이면서 보존 상한이 있는 감사 저장이 필요한 호스트는 레지스트라
 엔드포인트의 감사 저장소를 사용합니다.
 
@@ -241,8 +272,9 @@ fail-closed이면서 보존 상한이 있는 감사 저장이 필요한 호스�
 어떤 bootroot 명령도 이를 제거하지 않습니다. 그 기록이 더 필요 없어지면
 직접 보관하거나 삭제하세요(`docker volume rm <project>_openbao-audit`).
 
-- **로테이션:** 일반 호스트에서는 위의 로깅 드라이버가 컨테이너 로그를
-  로테이션합니다. 프로비저닝된 레지스트라 엔드포인트 호스트에서는 배포
+- **로테이션:** 일반 호스트에서는 `docker-compose.yml`이면 `local` 로깅
+  드라이버가, `docker-compose.deploy.yml`이면 호스트 저널이 컨테이너
+  로그를 로테이션합니다. 프로비저닝된 레지스트라 엔드포인트 호스트에서는 배포
   자체가 장치를 로테이션합니다. 그곳의 장치 디렉터리에 `logrotate`, tail
   사이드카, 시그널을 **직접 사용하지 마세요.** 두 번째 로테이터는 동일한
   활성 로그를 두고 경합하며 같은 `audit-*.log` 이름 공간에서 충돌합니다.
@@ -705,8 +737,10 @@ cat <audit_store_dir>/openbao/audit-*.log <audit_store_dir>/openbao/audit.log
 `true`가 아닌 곳에서는 위의 어느 것도 적용되지 않습니다. 로테이션
 작업은 시작되지 않고, 세 개의 설정 키는 아무 효과가 없습니다.
 `/openbao/audit`에는 아무것도 마운트되지 않습니다. OpenBao는 `stdout`
-장치로 컨테이너 로그에 감사하며, Docker의 `local` 로깅 드라이버가 그
-로그의 상한을 두고 로테이션합니다([감사 로깅](#감사-로깅) 참고). 호스트
+장치로 컨테이너 로그에 감사하며, `docker-compose.yml`에서는 Docker의
+`local` 로깅 드라이버가 그 로그의 상한을 두고 로테이션하고,
+`docker-compose.deploy.yml`에서는 호스트 저널이 그 로그를 보존합니다
+([감사 로깅](#감사-로깅) 참고). 호스트
 도구가 접근할 파일은 없으며, 그 대신 사용할 외부 로테이션을 권장하지도
 않습니다.
 
@@ -1909,6 +1943,12 @@ fail-closed 통제이므로 차오를수록 호출이 거부됩니다. 성공에
 - 점검 순서:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --registration-id <service>`.
+- **에이전트 로그:** 에이전트는 `RUST_LOG`가 따로 지정하지 않으면 INFO
+  수준으로 기록합니다. systemd 아래에서는 각 로그 이벤트가 타임스탬프나
+  색상 코드 없이 자신의 우선순위를 가진 저널 항목 하나가 되며
+  (`journalctl -u <unit> -p warning`은 경고와 오류만 보여 줍니다), 패닉은
+  오류 항목 하나로 기록됩니다. 에이전트가 해석할 수 없는 `RUST_LOG`
+  지시어는 무시되며 오류 항목 하나로 보고됩니다.
 
 ### 하드닝된 systemd 유닛 예시
 

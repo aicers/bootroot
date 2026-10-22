@@ -117,6 +117,76 @@ fn compose_has_top_level_service(yaml: &str, service_name: &str) -> bool {
     false
 }
 
+/// Returns true when a service of the compose file logs through Docker's
+/// journald driver.
+///
+/// `init`'s `OpenBao` Agent sidecars join the same Compose project, so
+/// they follow the driver of the file they join: a compose file whose
+/// services log to the host journal gets sidecars that do too, and one
+/// that also runs on Docker Desktop, which has no journald, leaves them
+/// on Docker's default driver.
+pub(crate) fn compose_logs_to_journald(compose_file: &Path, messages: &Messages) -> Result<bool> {
+    let compose_contents = std::fs::read_to_string(compose_file)
+        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
+    Ok(compose_has_journald_service(&compose_contents))
+}
+
+/// Returns true when a service under the top-level `services:` has a
+/// `logging:` key whose `driver:` is `journald`.
+///
+/// The same structural scan as [`compose_has_top_level_service`]: a
+/// `driver: journald` anywhere else — under a top-level `volumes:` or
+/// `networks:` entry, in a comment — is not a service's logging driver.
+fn compose_has_journald_service(yaml: &str) -> bool {
+    let mut in_services = false;
+    let mut service_indent: Option<usize> = None;
+    let mut key_indent: Option<usize> = None;
+    let mut in_logging = false;
+    let mut logging_indent: Option<usize> = None;
+    for raw_line in yaml.lines() {
+        // Strip end-of-line comments, as the service scan does: the keys
+        // and the driver name read here are bare identifiers.
+        let line = raw_line.split('#').next().unwrap_or("");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim();
+        if indent == 0 {
+            in_services = trimmed.starts_with("services:");
+            service_indent = None;
+            key_indent = None;
+            in_logging = false;
+            continue;
+        }
+        if !in_services {
+            continue;
+        }
+        if indent <= *service_indent.get_or_insert(indent) {
+            key_indent = None;
+            in_logging = false;
+            continue;
+        }
+        let service_key = *key_indent.get_or_insert(indent);
+        if indent <= service_key {
+            in_logging = trimmed
+                .strip_prefix("logging:")
+                .is_some_and(|rest| rest.trim().is_empty());
+            logging_indent = None;
+            continue;
+        }
+        if !in_logging || indent != *logging_indent.get_or_insert(indent) {
+            continue;
+        }
+        if let Some(driver) = trimmed.strip_prefix("driver:")
+            && driver.trim().trim_matches(['"', '\'']) == "journald"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// A project's services and the dependencies Compose resolved for each.
 ///
 /// Read from `docker compose config --format json`, which normalizes
@@ -448,6 +518,78 @@ volumes:
     driver: local
 ";
         assert!(!compose_has_top_level_service(yaml, "openbao"));
+    }
+
+    #[test]
+    fn compose_has_journald_service_detects_a_service_driver() {
+        let yaml = "\
+services:
+  openbao:
+    image: openbao/openbao:latest
+    logging:
+      driver: journald
+  postgres:
+    image: postgres:18
+";
+        assert!(compose_has_journald_service(yaml));
+        let quoted = yaml.replace("driver: journald", "driver: \"journald\"");
+        assert!(compose_has_journald_service(&quoted));
+    }
+
+    #[test]
+    fn compose_has_journald_service_skips_a_volumes_entry_driver() {
+        let yaml = "\
+services:
+  openbao:
+    image: openbao/openbao:latest
+volumes:
+  openbao-data:
+    logging:
+      driver: journald
+  other:
+    driver: journald
+";
+        assert!(!compose_has_journald_service(yaml));
+    }
+
+    #[test]
+    fn compose_has_journald_service_rejects_the_local_driver() {
+        let yaml = "\
+services:
+  openbao:
+    image: openbao/openbao:latest
+    # logging: driver: journald
+    logging:
+      driver: local
+      options:
+        max-size: \"20m\"
+";
+        assert!(!compose_has_journald_service(yaml));
+    }
+
+    #[test]
+    fn compose_has_journald_service_rejects_a_service_without_logging() {
+        let yaml = "\
+services:
+  openbao:
+    image: openbao/openbao:latest
+    driver: journald
+    labels:
+      driver: journald
+";
+        assert!(!compose_has_journald_service(yaml));
+    }
+
+    #[test]
+    fn compose_has_journald_service_reads_the_repository_compose_files() {
+        let read = |name: &str| {
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(name))
+                .unwrap_or_else(|err| panic!("reading {name}: {err}"))
+        };
+        assert!(compose_has_journald_service(&read(
+            "docker-compose.deploy.yml"
+        )));
+        assert!(!compose_has_journald_service(&read("docker-compose.yml")));
     }
 
     fn names(services: &[&str]) -> Vec<String> {

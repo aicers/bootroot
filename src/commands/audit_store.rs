@@ -3685,23 +3685,52 @@ mod tests {
     }
 
     /// Without the audit override, nothing backs `/openbao/audit`: the
-    /// device audits to the container log, which the `local` driver
-    /// bounds. The entrypoint still prepares the directory the override
-    /// binds, and only that one.
+    /// device audits to the container log, which `docker-compose.yml`
+    /// bounds with the `local` driver and `docker-compose.deploy.yml`
+    /// hands to the host journal. The entrypoint still prepares the
+    /// directory the override binds, and only that one.
     #[test]
-    fn the_base_compose_files_audit_to_a_bounded_container_log() {
-        const LOGGING: &str = "    logging:
+    fn the_base_compose_files_audit_to_the_container_log() {
+        const LOCAL_LOGGING: &str = "    logging:
       driver: local
       options:
         max-size: \"${OPENBAO_LOG_MAX_SIZE:-20m}\"
         max-file: \"${OPENBAO_LOG_MAX_FILES:-10}\"
         compress: \"true\"
 ";
+        const JOURNALD_LOGGING: &str = "    logging:
+      driver: journald
+";
         const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl\"]\n";
         for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
             let content = repo_file(compose);
             let service = openbao_service_block(&content);
-            assert!(service.contains(LOGGING), "{compose}: {service}");
+            if compose == "docker-compose.yml" {
+                assert!(service.contains(LOCAL_LOGGING), "{compose}: {service}");
+            } else {
+                // Exactly the two lines: everything nested under
+                // `logging:` is the driver and nothing else.
+                let logging: Vec<&str> = service
+                    .lines()
+                    .skip_while(|line| *line != "    logging:")
+                    .enumerate()
+                    .take_while(|(index, line)| *index == 0 || line.starts_with("     "))
+                    .map(|(_, line)| line)
+                    .collect();
+                assert_eq!(
+                    logging,
+                    JOURNALD_LOGGING.lines().collect::<Vec<_>>(),
+                    "{compose}: {service}"
+                );
+                assert!(
+                    !service.contains("options:"),
+                    "{compose}: the journald driver keeps Docker's defaults: {service}"
+                );
+                assert!(
+                    !service.contains("OPENBAO_LOG_MAX_"),
+                    "{compose}: the local driver's bounds no longer apply: {service}"
+                );
+            }
             assert!(
                 !service.contains("mode:"),
                 "{compose}: delivery mode must stay blocking"

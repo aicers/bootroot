@@ -6,6 +6,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- `docker-compose.deploy.yml` runs OpenBao, PostgreSQL, step-ca and the
+  HTTP-01 responder under Docker's journald logging driver, and `bootroot
+  init` gives the two OpenBao Agent containers it adds to that stack the same
+  driver, so their output, OpenBao's audit records on hosts without the
+  registrar endpoint included, goes to the host journal and is kept by its
+  retention; read it with `journalctl CONTAINER_NAME=<container>` or
+  `docker logs`. OpenBao there no longer uses the `local` driver, and
+  `OPENBAO_LOG_MAX_SIZE` and `OPENBAO_LOG_MAX_FILES` no longer apply to that
+  file. The deploy compose now needs a host running systemd-journald.
+  `docker-compose.yml` is unchanged. Bringing the stack up with the new file
+  recreates all four containers, so OpenBao restarts sealed and must be
+  unsealed, as after a reboot.
+- `bootroot-agent` logs at INFO by default instead of errors only, so
+  `bootroot verify`, which runs it once, now shows its INFO lines too;
+  `RUST_LOG` still overrides. When its standard output or standard error is
+  connected to the systemd journal, it writes each log event as one line that
+  starts with the event's syslog priority, without a timestamp or colour codes
+  and with line breaks inside an event written as `\n`, and a panic is logged
+  as one error entry. Elsewhere the output is unchanged, except that colour
+  codes are written only to a terminal.
+
 ### Fixed
 
 - The `bootroot-registrar.service` systemd unit, which runs the registrar

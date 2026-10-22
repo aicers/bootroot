@@ -19,6 +19,9 @@
 # holds these defaults to the declaration. The monitoring services below sit
 # behind the `lan`/`public` profiles, outside the declared production stack.
 #
+# The production services log through Docker's journald driver, so this file
+# needs a host running systemd-journald.
+#
 # The only source-tree config the default install services still need is
 # `openbao/openbao.hcl` and `responder.toml.compose`; `infra install` itself
 # generates `.env` and creates the `secrets/` and `certs/` directories.
@@ -44,18 +47,12 @@ services:
     # refuse to start if that fails.
     entrypoint: ["sh", "-c", "if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
     # Audit records of the stdout device, and the server's own output, go
-    # to the container log.  The `local` driver bounds them at max-file
-    # segments of max-size each and compresses rotated segments.  `mode`
-    # is left at Docker's default `blocking`: `non-blocking` drops lines
-    # when the driver falls behind.  Override the bounds through
-    # OPENBAO_LOG_MAX_SIZE / OPENBAO_LOG_MAX_FILES in the `.env` beside
-    # this file.
+    # to the container log, which the journald driver hands to the host
+    # journal; their retention is the host journal's.  `mode` is left at
+    # Docker's default `blocking`: `non-blocking` drops lines when the
+    # driver falls behind.
     logging:
-      driver: local
-      options:
-        max-size: "${OPENBAO_LOG_MAX_SIZE:-20m}"
-        max-file: "${OPENBAO_LOG_MAX_FILES:-10}"
-        compress: "true"
+      driver: journald
 
   # PostgreSQL for step-ca. The port is exposed to the host so that
   # `bootroot rotate db` (which runs on the host) can connect directly.
@@ -75,6 +72,8 @@ services:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
+    logging:
+      driver: journald
 
   step-ca:
     image: ${BOOTROOT_STEP_CA_IMAGE:-smallstep/step-ca:0.30.2}
@@ -118,6 +117,8 @@ services:
         "--password-file",
         "/home/step/password.txt",
       ]
+    logging:
+      driver: journald
 
   bootroot-http01:
     image: ${BOOTROOT_HTTP01_IMAGE:-bootroot-http01-responder:0.4.0}
@@ -131,6 +132,8 @@ services:
       - --config=/app/responder.toml
     networks:
       default:
+    logging:
+      driver: journald
 
   prometheus:
     image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.13.1}

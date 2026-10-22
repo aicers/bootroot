@@ -219,21 +219,24 @@ hashes.
 found (e.g. the audit stanza was removed from `openbao.hcl`), init fails.
 Restore the audit configuration and re-run init.
 
-**Retention on an ordinary host.** Both compose files run OpenBao under
-Docker's [`local` logging driver](https://docs.docker.com/engine/logging/drivers/local/)
+**Retention on an ordinary host.** Where the container log is kept
+depends on the compose file the stack runs from. OpenBao's own server
+output shares it with the audit records; on a provisioned endpoint host
+only that output goes there, and the audit records stay in the store.
+Under either file delivery is Docker's default `blocking` mode, because
+`non-blocking` drops lines from a ring buffer whenever the driver falls
+behind.
+
+`docker-compose.yml` runs OpenBao under Docker's
+[`local` logging driver](https://docs.docker.com/engine/logging/drivers/local/)
 with `max-size: 20m`, `max-file: 10` and `compress: true`: at most 10
 segments of at most 20 MiB of log content each, so 200 MiB is the hard
 ceiling, and rotated segments are gzip-compressed, so the usual footprint
-on disk is well below it. OpenBao's own server output shares that budget;
-on a provisioned endpoint host only that output goes there, and the audit
-records stay in the store. Delivery is Docker's default `blocking` mode,
-because `non-blocking` drops lines from a ring buffer whenever the driver
-falls behind.
+on disk is well below it. The two bounds can be changed in the `.env`
+beside `docker-compose.yml`, which Docker Compose reads and
+`infra install` preserves:
 
-The two bounds can be changed in the `.env` beside the compose file,
-which Docker Compose reads and `infra install` preserves:
-
-| `.env` key | Default |
+| `.env` key (`docker-compose.yml`) | Default |
 | --- | --- |
 | `OPENBAO_LOG_MAX_SIZE` | `20m` |
 | `OPENBAO_LOG_MAX_FILES` | `10` |
@@ -242,8 +245,23 @@ A new value applies when the OpenBao container is next created. bootroot
 neither writes nor validates these keys: Docker rejects an invalid value
 when it creates the container.
 
+`docker-compose.deploy.yml` runs every production service — OpenBao,
+PostgreSQL, step-ca and the HTTP-01 responder — and the two OpenBao
+Agent sidecars `bootroot init` adds to that stack under Docker's
+[`journald` logging driver](https://docs.docker.com/engine/logging/drivers/journald/),
+so it needs a host running systemd-journald. The records go to the host
+journal, one entry per line with the container's name in
+`CONTAINER_NAME`: read them with
+`journalctl CONTAINER_NAME=<instance>-openbao`, and
+`docker logs <instance>-openbao` still works. Their retention is the
+host journal's — on Ubuntu, by default, persistent, and at most 10 % of
+the file system and 4 GiB. `OPENBAO_LOG_MAX_SIZE` and
+`OPENBAO_LOG_MAX_FILES` have no effect there. Bringing the stack up with
+the new file recreates all four containers, so OpenBao restarts sealed
+and must be unsealed, as after a reboot.
+
 **What an ordinary host does not guarantee.** The container log is a
-bounded record, not a fail-closed one:
+bounded record, not a fail-closed one. With `docker-compose.yml`:
 
 - Once `max-file` segments are full, Docker drops the oldest one
   silently.
@@ -256,6 +274,24 @@ bounded record, not a fail-closed one:
   example — `dockerd` logs an error and drops the line while OpenBao
   keeps serving.
 
+With `docker-compose.deploy.yml`:
+
+- Once its size limit is reached, journald removes the oldest entries
+  silently.
+- journald drops lines beyond its per-service rate limit (by default
+  10,000 per 30 s), and every container's lines count against
+  `docker.service`.
+- Removing or recreating the container does not delete what already
+  reached the journal, but `docker logs` shows only the current
+  container's lines.
+- If journald cannot store a line — because the disk is full, for
+  example — the line is lost while OpenBao keeps serving.
+- Anyone who can read the host journal can read the records. On Ubuntu
+  that is root and the members of the `adm` and `systemd-journal`
+  groups; under the `local` driver it was root alone. Hosts that must
+  keep audit records from those groups use the registrar endpoint's
+  audit store.
+
 Hosts that need fail-closed, retention-bounded audit storage use the
 registrar endpoint's audit store.
 
@@ -264,12 +300,13 @@ mounted, and no bootroot command removes it. Keep or delete it by hand
 (`docker volume rm <project>_openbao-audit`) once its records are no
 longer needed.
 
-- **Rotation:** on an ordinary host the logging driver above rotates the
-  container log. On a provisioned registrar endpoint host the deployment
-  rotates the device itself. Do **not** point `logrotate`, a tailing
-  sidecar or a signal at the device's directory there: a second rotator
-  would race this one over the same active log and collide in the same
-  `audit-*.log` namespace. See
+- **Rotation:** on an ordinary host the container log is rotated by the
+  `local` logging driver with `docker-compose.yml`, and by the host
+  journal with `docker-compose.deploy.yml`. On a provisioned registrar
+  endpoint host the deployment rotates the device itself. Do **not**
+  point `logrotate`, a tailing sidecar or a signal at the device's
+  directory there: a second rotator would race this one over the same
+  active log and collide in the same `audit-*.log` namespace. See
   [Rotating the audit device](#rotating-the-audit-device) below.
 - **Verification:** `docker compose exec openbao bao audit list` shows
   exactly one device of type `file`: `stdout/` on an ordinary host,
@@ -765,7 +802,9 @@ worse failure than reading a duplicate.
 rotation task runs and the three configuration keys have no effect.
 Nothing is mounted at `/openbao/audit`: OpenBao audits through the
 `stdout` device into its container log, which Docker's `local` logging
-driver bounds and rotates (see [Audit logging](#audit-logging)). There is
+driver bounds and rotates with `docker-compose.yml`, and the host journal
+keeps with `docker-compose.deploy.yml` (see
+[Audit logging](#audit-logging)). There is
 no file for a host tool to reach, and no external rotation is
 recommended in its place.
 
@@ -2024,6 +2063,12 @@ A host runs one `bootroot-agent` process plus one agent config per
 - Triage flow:
   `systemctl status <unit>` -> `journalctl -u <unit> -n 200`
   -> `bootroot verify --registration-id <service>`.
+- **Agent log:** the agent logs at INFO unless `RUST_LOG` says
+  otherwise. Under systemd each log event is one journal entry at its
+  own priority (`journalctl -u <unit> -p warning` shows warnings and
+  errors only), without a timestamp or colour codes, and a panic is one
+  error entry. A `RUST_LOG` directive the agent cannot parse is ignored
+  and reported as one error entry.
 
 ### Hardened systemd unit example
 
