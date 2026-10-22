@@ -351,6 +351,31 @@ fn deploy_stepca_metrics_port_is_exposed_but_never_published() {
     assert_metrics_port_exposed_never_published(&compose, "docker-compose.deploy.yml");
 }
 
+/// The production stack of `docker-compose.deploy.yml`: the services
+/// whose output the host journal collects.
+const DEPLOY_PRODUCTION_SERVICES: [&str; 4] = ["openbao", "postgres", "step-ca", "bootroot-http01"];
+
+/// Every production service of the deploy compose logs through Docker's
+/// journald driver with Docker's defaults, so `mode` stays `blocking` and
+/// the driver sets `CONTAINER_NAME` itself. The `local` driver's bounds
+/// belong to `docker-compose.yml` and are named nowhere here.
+#[test]
+fn deploy_production_services_log_through_journald() {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.deploy.yml");
+    let compose = fs::read_to_string(compose_path).expect("read docker-compose.deploy.yml");
+    for service in DEPLOY_PRODUCTION_SERVICES {
+        assert_eq!(
+            service_key_value(&compose, service, "logging"),
+            Some(SectionValue::Block(vec!["driver: journald"])),
+            "docker-compose.deploy.yml must log {service} through journald and nothing else"
+        );
+    }
+    assert!(
+        !compose.contains("OPENBAO_LOG_MAX_"),
+        "docker-compose.deploy.yml must not name the local driver's bounds"
+    );
+}
+
 const RESPONDER_SERVICE: &str = "bootroot-http01";
 const STEPCA_PROXY_ENTRY: &str = "HTTP_PROXY=http://bootroot-http01:80";
 

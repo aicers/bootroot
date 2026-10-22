@@ -112,8 +112,10 @@ assert_openbao_audit_docker_logs() {
 
 # Asserts that a container runs the `stdout` device's storage layout:
 # Docker's `local` logging driver with the bounded, compressed rotation
-# both compose files declare and the default (blocking) delivery mode,
-# and nothing mounted at `/openbao/audit`.
+# `docker-compose.yml` declares and the default (blocking) delivery mode,
+# and nothing mounted at `/openbao/audit`. `docker-compose.deploy.yml`
+# hands the container log to the host journal instead, so this assertion
+# holds for stacks brought up from `docker-compose.yml` only.
 #
 # Usage:
 #   assert_openbao_stdout_audit_container <container> [max-size] [max-file]
