@@ -45,6 +45,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   from 1.0.9 to 1.0.10 to address RUSTSEC-2026-0382 (certificate
   verification accepting distrusted intermediates) and RUSTSEC-2026-0383
   (bundled root certificates trusting distrusted emSign intermediates).
+- Bumped `ctutils` from 0.4.2 to 0.4.6 to address RUSTSEC-2026-0385
+  (non-constant-time mask generation and `u128` comparisons).
 
 ## [0.4.0] - 2026-10-15
 
