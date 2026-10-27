@@ -4355,7 +4355,7 @@ mod pin_rotation_tests {
     }
 
     async fn start_tls_server(cert_der: Vec<u8>, key_der: Vec<u8>) -> u16 {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cert = CertificateDer::from(cert_der);
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
         let config = rustls::ServerConfig::builder()

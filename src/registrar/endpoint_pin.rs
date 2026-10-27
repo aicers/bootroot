@@ -474,11 +474,12 @@ impl ProbeClientPair {
             .ok_or_else(|| ProbeClientPairError::NoPrivateKey {
                 path: key_path.to_path_buf(),
             })?;
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|_| {
-            ProbeClientPairError::UnsupportedKey {
-                path: key_path.to_path_buf(),
-            }
-        })?;
+        let signing_key =
+            rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).map_err(|_| {
+                ProbeClientPairError::UnsupportedKey {
+                    path: key_path.to_path_buf(),
+                }
+            })?;
         if !tls::cert_key_matches(&leaf, signing_key.as_ref()) {
             return Err(ProbeClientPairError::KeyMismatch {
                 certificate_path: certificate_path.to_path_buf(),
@@ -746,7 +747,7 @@ impl RegistrarEndpointVerifier {
             pins,
             expected_name,
             expected_server_name,
-            supported_algs: rustls::crypto::ring::default_provider()
+            supported_algs: rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms,
         })
     }

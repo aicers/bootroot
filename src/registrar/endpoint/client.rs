@@ -1021,7 +1021,7 @@ fn client_pair_matches(chain: &[CertificateDer<'static>], key: &PrivateKeyDer<'s
     let Some(leaf) = chain.first() else {
         return false;
     };
-    let Ok(signing_key) = rustls::crypto::ring::sign::any_supported_type(key) else {
+    let Ok(signing_key) = rustls::crypto::aws_lc_rs::sign::any_supported_type(key) else {
         return true;
     };
     crate::tls::cert_key_matches(leaf, signing_key.as_ref())

@@ -723,7 +723,7 @@ mod tests {
         let ca_der = ca_cert.der().to_vec();
 
         let fingerprint = {
-            let digest = ring::digest::digest(&ring::digest::SHA256, &ca_der);
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &ca_der);
             let mut hex = String::with_capacity(64);
             for byte in digest.as_ref() {
                 use std::fmt::Write;
@@ -775,7 +775,7 @@ mod tests {
         use tokio::net::TcpListener;
         use tokio_rustls::TlsAcceptor;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let chain = cert_chain.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key_der));
 
@@ -917,7 +917,7 @@ mod tests {
         let ca_der = ca_cert.der().to_vec();
 
         let fingerprint = {
-            let digest = ring::digest::digest(&ring::digest::SHA256, &ca_der);
+            let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &ca_der);
             let mut hex = String::with_capacity(64);
             for byte in digest.as_ref() {
                 use std::fmt::Write;

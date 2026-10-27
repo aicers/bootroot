@@ -841,7 +841,7 @@ fn generate_ca_signed_cert_pair(san: &str) -> CertPair {
 }
 
 fn build_tls_client(root_pem: &str) -> reqwest::Client {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let root_store = {
         let mut store = rustls::RootCertStore::empty();
         let certs: Vec<_> =

@@ -1,7 +1,7 @@
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bootroot::openbao::{KvMountStatus, OpenBaoClient, WrapInfo};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

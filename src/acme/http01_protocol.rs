@@ -5,9 +5,9 @@
 //! names and payload format.  Keeping them in one place prevents silent
 //! protocol divergence.
 
+use aws_lc_rs::hmac;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use ring::hmac;
 
 pub const HEADER_TIMESTAMP: &str = "x-bootroot-timestamp";
 pub const HEADER_SIGNATURE: &str = "x-bootroot-signature";
@@ -109,5 +109,16 @@ mod tests {
         let signature = signer.sign_request(123, "token", "key-auth", 60);
         assert!(signer.verify_request(&signature, 123, "token", "key-auth", 60));
         assert!(!signer.verify_request(&signature, 124, "token", "key-auth", 60));
+    }
+
+    #[test]
+    fn request_signature_matches_known_answer() {
+        // HMAC-SHA256 as ring 0.17 and `openssl dgst -sha256 -hmac`
+        // both compute it, so agents and responders of either release
+        // keep authenticating each other.
+        let signer = Http01HmacSigner::new("bootroot-test-secret");
+        let signature = signer.sign_request(1_700_000_000, "tok", "auth", 60);
+        assert_eq!(signature, "IjOX8jQAZCssVKmfDeysjY7ywEMYbeup46no6G7hWSQ=");
+        assert!(signer.verify_request(&signature, 1_700_000_000, "tok", "auth", 60));
     }
 }

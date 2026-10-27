@@ -200,7 +200,7 @@ fn encode_cert_pem(der: &[u8]) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
     let mut output = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
         use std::fmt::Write;

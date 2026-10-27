@@ -1066,7 +1066,7 @@ async fn start_openbao_tls_mock(server_cert: TlsServerCert) -> u16 {
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cert = CertificateDer::from(server_cert.cert_der);
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_cert.key_der));
 

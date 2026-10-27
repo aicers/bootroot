@@ -502,7 +502,7 @@ fn ca_params(common_name: &str) -> CertificateParams {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
     let mut out = String::with_capacity(64);
     for byte in digest.as_ref() {
         let _ = write!(out, "{byte:02x}");
@@ -522,7 +522,7 @@ struct TlsAcmeProxy {
 
 impl TlsAcmeProxy {
     async fn start(ca: &TestCa, upstream: &str) -> Self {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (leaf_pem, key_pem) = ca.server_leaf("localhost");
         let leaf = rustls::pki_types::CertificateDer::from(pem_to_der(&leaf_pem));
         let intermediate =

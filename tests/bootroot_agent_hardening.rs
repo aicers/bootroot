@@ -42,7 +42,7 @@ impl AcmeTlsFixture {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
     let mut output = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
         use std::fmt::Write;
@@ -154,7 +154,7 @@ fn bootroot_agent_rejects_removed_verify_flag() {
 }
 
 async fn start_acme_tls_fixture() -> Result<AcmeTlsFixture> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let rcgen::CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["localhost".to_string()])
             .context("generate ACME fixture cert")?;

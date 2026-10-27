@@ -19,6 +19,7 @@ const USAGE_ERROR_EXIT: u8 = 2;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    bootroot::tls::install_crypto_provider();
     // Before anything that can fail, so that under the journal every
     // start-up error is an entry at its own priority rather than plain
     // text the journal would store at priority 6.

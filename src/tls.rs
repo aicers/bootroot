@@ -245,8 +245,12 @@ fn parse_pem_private_key(key_pem: &str) -> Result<rustls::pki_types::PrivateKeyD
         .ok_or_else(|| anyhow::anyhow!("the client private key PEM contained no private key"))
 }
 
-pub(crate) fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+/// Installs aws-lc-rs as the process-default rustls `CryptoProvider`.
+///
+/// A provider that is already installed is kept: the call is idempotent,
+/// so every entry point that builds a TLS configuration may make it.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Builds a [`rustls::RootCertStore`] containing every Mozilla webpki
@@ -395,7 +399,7 @@ impl PinnedCertVerifier {
         Self {
             inner,
             allowed,
-            supported_algs: rustls::crypto::ring::default_provider()
+            supported_algs: rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms,
         }
     }
@@ -480,7 +484,7 @@ impl BootstrapPinnedCertVerifier {
     fn new(allowed: HashSet<String>) -> Self {
         Self {
             allowed,
-            supported_algs: rustls::crypto::ring::default_provider()
+            supported_algs: rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms,
         }
     }
@@ -587,7 +591,7 @@ pub fn ca_bundle_fingerprints(pem_content: &str) -> Result<Vec<String>> {
 /// this yields the fingerprint used for `trusted_ca_sha256` pins and the
 /// KV trust-payload consistency check (issue #695).
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
     let mut output = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
         use std::fmt::Write;
@@ -627,11 +631,15 @@ pub(crate) fn cert_key_matches(
     let Some(signer) = signing_key.choose_scheme(&KEY_MATCH_SCHEMES) else {
         return false;
     };
-    let algorithm: &dyn ring::signature::VerificationAlgorithm = match signer.scheme() {
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
-        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
-        rustls::SignatureScheme::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
-        rustls::SignatureScheme::ED25519 => &ring::signature::ED25519,
+    let algorithm: &dyn aws_lc_rs::signature::VerificationAlgorithm = match signer.scheme() {
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => {
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1
+        }
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => {
+            &aws_lc_rs::signature::ECDSA_P384_SHA384_ASN1
+        }
+        rustls::SignatureScheme::RSA_PSS_SHA256 => &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
+        rustls::SignatureScheme::ED25519 => &aws_lc_rs::signature::ED25519,
         _ => return false,
     };
     let Ok(signature) = signer.sign(KEY_MATCH_TEST_MESSAGE) else {
@@ -641,7 +649,7 @@ pub(crate) fn cert_key_matches(
         return false;
     };
     let public_key: &[u8] = certificate.public_key().subject_public_key.as_ref();
-    ring::signature::UnparsedPublicKey::new(algorithm, public_key)
+    aws_lc_rs::signature::UnparsedPublicKey::new(algorithm, public_key)
         .verify(KEY_MATCH_TEST_MESSAGE, &signature)
         .is_ok()
 }
