@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use aws_lc_rs::digest;
 use bootroot::db::{check_auth_sync, check_tcp_sync, for_host_runtime, parse_db_dsn};
-use ring::digest;
 use x509_parser::pem::Pem;
 
 use crate::cli::args::VerifyArgs;

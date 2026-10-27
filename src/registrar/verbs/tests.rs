@@ -4398,9 +4398,9 @@ impl LiveBackend {
     async fn control_node(&self) -> &'static LiveControlNode {
         LIVE_CONTROL_NODE
             .get_or_init(|| async {
+                use aws_lc_rs::rand::SecureRandom as _;
                 use base64::Engine as _;
                 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
-                use ring::rand::SecureRandom as _;
 
                 let key = KeyPair::generate().expect("generate the CA key");
                 let mut params = CertificateParams::new(Vec::new()).expect("CA params");
@@ -4413,7 +4413,7 @@ impl LiveBackend {
                 let fingerprint = crate::tls::sha256_hex(cert.der().as_ref());
 
                 let mut bytes = [0_u8; 32];
-                ring::rand::SystemRandom::new()
+                aws_lc_rs::rand::SystemRandom::new()
                     .fill(&mut bytes)
                     .expect("draw the responder HMAC");
                 let responder_hmac = base64::engine::general_purpose::STANDARD.encode(bytes);

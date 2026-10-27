@@ -154,7 +154,7 @@ pub(crate) fn test_trust_material() -> &'static (String, String) {
         let pem = state.ca_pem.clone();
         let (_, parsed) =
             x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("parse generated ca pem");
-        let digest = ring::digest::digest(&ring::digest::SHA256, &parsed.contents);
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &parsed.contents);
         let mut hex = String::with_capacity(64);
         for byte in digest.as_ref() {
             use std::fmt::Write as _;

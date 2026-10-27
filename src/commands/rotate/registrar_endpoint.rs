@@ -241,7 +241,7 @@ impl CaGeneration {
 /// CA fingerprint in a rotation is recorded in.
 fn der_sha256_hex(der: &[u8]) -> String {
     use std::fmt::Write as _;
-    ring::digest::digest(&ring::digest::SHA256, der)
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der)
         .as_ref()
         .iter()
         .fold(String::with_capacity(64), |mut hex, byte| {

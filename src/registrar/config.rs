@@ -591,8 +591,7 @@ fn verify_fingerprint(path: &Path, declared: &str, body: &[u8]) -> Result<(), Re
     // check over a local file rather than a MAC over a secret: it is
     // computed from bytes the comparing process just read, and anyone
     // able to write the file can compute the matching digest, so there
-    // is nothing a timing side channel could reveal. `ring`'s
-    // constant-time helper is deprecated besides.
+    // is nothing a timing side channel could reveal.
     if declared != computed {
         return Err(RegistrarError::FingerprintMismatch {
             path: path.to_path_buf(),

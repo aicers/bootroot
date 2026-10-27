@@ -87,7 +87,7 @@ pub(super) fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Ce
         .with_context(|| format!("parse PEM key from {}", key_path.display()))?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
 
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|e| anyhow::anyhow!("unsupported private key type: {e}"))?;
 
     verify_cert_key_match(certs.first().expect("non-empty certs"), &*signing_key)?;
@@ -122,14 +122,18 @@ fn verify_cert_key_match(
         .map_err(|e| anyhow::anyhow!("parse leaf certificate for key match: {e}"))?;
     let public_key_bytes: &[u8] = cert.public_key().subject_public_key.as_ref();
 
-    let ring_alg: &dyn ring::signature::VerificationAlgorithm = match scheme {
-        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => &ring::signature::ECDSA_P256_SHA256_ASN1,
-        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => &ring::signature::ECDSA_P384_SHA384_ASN1,
-        rustls::SignatureScheme::RSA_PSS_SHA256 => &ring::signature::RSA_PSS_2048_8192_SHA256,
-        rustls::SignatureScheme::ED25519 => &ring::signature::ED25519,
+    let algorithm: &dyn aws_lc_rs::signature::VerificationAlgorithm = match scheme {
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => {
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1
+        }
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => {
+            &aws_lc_rs::signature::ECDSA_P384_SHA384_ASN1
+        }
+        rustls::SignatureScheme::RSA_PSS_SHA256 => &aws_lc_rs::signature::RSA_PSS_2048_8192_SHA256,
+        rustls::SignatureScheme::ED25519 => &aws_lc_rs::signature::ED25519,
         other => anyhow::bail!("unsupported scheme for cert/key match: {other:?}"),
     };
-    let verifier = ring::signature::UnparsedPublicKey::new(ring_alg, public_key_bytes);
+    let verifier = aws_lc_rs::signature::UnparsedPublicKey::new(algorithm, public_key_bytes);
     verifier
         .verify(test_message, &signature)
         .map_err(|_| anyhow::anyhow!("private key does not match the leaf certificate"))?;
@@ -142,7 +146,7 @@ pub(super) fn build_tls_config(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Arc<ReloadableCertResolver>, Arc<ServerConfig>)> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    bootroot::tls::install_crypto_provider();
     let certified_key = load_certified_key(cert_path, key_path)?;
     let resolver = Arc::new(ReloadableCertResolver::new(certified_key));
 

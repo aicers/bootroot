@@ -15,6 +15,7 @@ use self::config::Args;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    bootroot::tls::install_crypto_provider();
     tracing_subscriber::fmt::init();
     server::run(Args::parse()).await
 }

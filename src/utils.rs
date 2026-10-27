@@ -2,9 +2,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ring::rand::{SecureRandom, SystemRandom};
 
 pub const MIN_JITTER_DELAY_NANOS: i128 = 1_000_000_000;
 

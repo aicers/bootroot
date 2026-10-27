@@ -592,7 +592,7 @@ pub(crate) fn load_certified_key(
             setting: SERVER_KEY_SETTING,
             path: key_path.to_path_buf(),
         })?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|_| {
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).map_err(|_| {
         EndpointTlsError::UnsupportedKey {
             setting: SERVER_KEY_SETTING,
             path: key_path.to_path_buf(),

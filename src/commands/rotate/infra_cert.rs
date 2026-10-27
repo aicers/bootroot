@@ -292,7 +292,7 @@ async fn wait_for_served_leaf(
     deadline: Duration,
     interval: Duration,
 ) -> ProbeOutcome {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    bootroot::tls::install_crypto_provider();
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))
@@ -374,7 +374,7 @@ async fn probe_served_leaf(
 fn leaf_fingerprint_from_pem(
     cert_path: &Path,
     messages: &Messages,
-) -> Result<ring::digest::Digest> {
+) -> Result<aws_lc_rs::digest::Digest> {
     let pem = std::fs::read(cert_path)
         .with_context(|| messages.error_read_file_failed(&cert_path.display().to_string()))?;
     let mut reader = BufReader::new(pem.as_slice());
@@ -386,8 +386,8 @@ fn leaf_fingerprint_from_pem(
 }
 
 /// Computes the SHA-256 fingerprint of a DER-encoded certificate.
-fn fingerprint(der: &[u8]) -> ring::digest::Digest {
-    ring::digest::digest(&ring::digest::SHA256, der)
+fn fingerprint(der: &[u8]) -> aws_lc_rs::digest::Digest {
+    aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der)
 }
 
 /// TLS verifier that accepts any certificate.
@@ -431,7 +431,7 @@ impl ServerCertVerifier for AcceptAnyServerCert {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -514,7 +514,7 @@ mod tests {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         use tokio_rustls::TlsAcceptor;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cert = CertificateDer::from(cert_der);
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der));
         let config = rustls::ServerConfig::builder()

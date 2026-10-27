@@ -293,6 +293,7 @@ enum OutputFormat {
 
 #[tokio::main]
 async fn main() {
+    bootroot::tls::install_crypto_provider();
     let args = Args::parse();
     let lang = match Locale::parse(&args.lang) {
         Ok(lang) => lang,

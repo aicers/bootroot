@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ring::digest;
+use aws_lc_rs::digest;
 use x509_parser::pem::parse_x509_pem;
 
 use super::super::constants::{CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME};

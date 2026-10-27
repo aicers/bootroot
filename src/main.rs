@@ -28,6 +28,7 @@ use crate::i18n::Messages;
 const EXIT_CODE_WAIT_TIMEOUT: u8 = 124;
 
 fn main() -> ExitCode {
+    bootroot::tls::install_crypto_provider();
     let cli = Cli::parse();
     let messages = match Messages::new(&cli.lang) {
         Ok(messages) => messages,

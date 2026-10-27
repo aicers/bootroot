@@ -2162,9 +2162,9 @@ mod tests {
         // A real account key: a placeholder is rejected before the first
         // request is made, which would let the "no ACME request"
         // assertion pass even if an issuance were started.
-        let account_pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-            &ring::rand::SystemRandom::new(),
+        let account_pkcs8 = aws_lc_rs::signature::EcdsaKeyPair::generate_pkcs8(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &aws_lc_rs::rand::SystemRandom::new(),
         )
         .unwrap();
         fs::write(

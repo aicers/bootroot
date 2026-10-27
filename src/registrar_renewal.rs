@@ -371,7 +371,7 @@ pub(crate) fn validate_candidate(
         .ok()
         .flatten()
         .ok_or(CandidateRejection::Malformed)?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
         .map_err(|_| CandidateRejection::Malformed)?;
     if !tls::cert_key_matches(candidate, signing_key.as_ref()) {
         return Err(CandidateRejection::KeyMismatched);

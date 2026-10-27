@@ -4,6 +4,24 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- bootroot's binaries now do all their TLS and other cryptography with
+  aws-lc-rs, and *ring* is no longer built in. Their TLS connections to
+  servers that prefer the hybrid post-quantum key exchange X25519MLKEM768, the
+  bundled OpenBao among them, now always negotiate it, which can cost one
+  extra round trip in the handshake; bootroot's own TLS listeners, the
+  registrar endpoint and the HTTP-01 responder, accept it from clients that
+  propose it first. They also now accept peer certificates and handshake
+  signatures that use ECDSA P-521, ECDSA with SHA-512 or ML-DSA, and load RSA
+  private keys for their own TLS certificates at any size from 2048 to 8192
+  bits, where only 2048-, 3072- and 4096-bit keys loaded before; RSA
+  certificates from peers still verify at 2048 to 8192 bits, as before.
+  Existing ACME account keys, certificates, private keys and HTTP-01 responder
+  secrets keep working unchanged.
+
 ## [0.5.0] - 2026-10-26
 
 ### Changed
@@ -2980,6 +2998,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.5.0...HEAD
 [0.5.0]: https://github.com/aicers/bootroot/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/aicers/bootroot/compare/0.3.0...0.4.0
 [0.3.0]: https://github.com/aicers/bootroot/compare/0.2.0...0.3.0

@@ -411,7 +411,7 @@ fn parse_pair(cert_bytes: &[u8], key_bytes: &[u8]) -> Option<ParsedPair> {
         (validity.not_before, validity.not_after)
     };
     let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_bytes)).ok()??;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).ok()?;
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).ok()?;
     Some(ParsedPair {
         leaf,
         signing_key,
