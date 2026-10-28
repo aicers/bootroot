@@ -1152,4 +1152,23 @@ mod tests {
         let pem = generate_ca_pem();
         assert!(build_http_client_with_local_and_webpki_roots(&pem).is_ok());
     }
+
+    /// The process-default provider every bootroot TLS client is built
+    /// from, and a configuration built from it, offer the hybrid
+    /// post-quantum key exchange first.
+    #[test]
+    fn client_configurations_offer_x25519mlkem768_first() {
+        install_crypto_provider();
+        let provider =
+            rustls::crypto::CryptoProvider::get_default().expect("an installed default provider");
+        assert_eq!(
+            provider.kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+        let config = build_client_config_from_pem(&generate_ca_pem(), &[]).expect("client config");
+        assert_eq!(
+            config.crypto_provider().kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+    }
 }
