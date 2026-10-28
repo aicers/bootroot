@@ -2398,9 +2398,10 @@ mod agent_config_tests {
 /// verifies against the artifact-embedded CA and rejects unknown CAs.
 #[cfg(test)]
 mod tls_integration_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use rustls::NamedGroup;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -2501,6 +2502,14 @@ mod tls_integration_tests {
     /// Starts a minimal HTTPS server that returns `200 OK` for every
     /// request. Returns the port on `127.0.0.1`.
     async fn start_tls_server(server: ServerCert) -> u16 {
+        start_recording_tls_server(server).await.0
+    }
+
+    /// [`start_tls_server`], also returning the key exchange group each
+    /// completed handshake negotiated, in order.
+    async fn start_recording_tls_server(
+        server: ServerCert,
+    ) -> (u16, Arc<Mutex<Vec<Option<NamedGroup>>>>) {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cert = CertificateDer::from(server.cert_der);
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server.key_der));
@@ -2513,14 +2522,23 @@ mod tls_integration_tests {
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
+        let groups = Arc::new(Mutex::new(Vec::new()));
 
+        let recorded = Arc::clone(&groups);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
+                let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(stream).await else {
                         return;
                     };
+                    recorded.lock().expect("group log").push(
+                        tls.get_ref()
+                            .1
+                            .negotiated_key_exchange_group()
+                            .map(rustls::crypto::SupportedKxGroup::name),
+                    );
                     let mut buf = vec![0u8; 4096];
                     let _ = tls.read(&mut buf).await;
                     let _ = tls
@@ -2535,14 +2553,14 @@ mod tls_integration_tests {
             }
         });
 
-        port
+        (port, groups)
     }
 
     #[tokio::test]
     async fn with_pem_trust_validates_against_artifact_ca() {
         let ca = TestCa::generate();
         let server_cert = ca.sign_server_cert();
-        let port = start_tls_server(server_cert).await;
+        let (port, groups) = start_recording_tls_server(server_cert).await;
 
         let client =
             OpenBaoClient::with_pem_trust(&format!("https://localhost:{port}"), &ca.pem(), &[])
@@ -2552,6 +2570,12 @@ mod tls_integration_tests {
             .health_check()
             .await
             .expect("health check should pass with artifact CA");
+
+        // The handshake negotiated the hybrid post-quantum key exchange.
+        assert_eq!(
+            *groups.lock().expect("group log"),
+            [Some(NamedGroup::X25519MLKEM768)]
+        );
     }
 
     #[tokio::test]

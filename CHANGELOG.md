@@ -9,18 +9,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - bootroot's binaries now do all their TLS and other cryptography with
-  aws-lc-rs, and *ring* is no longer built in. Their TLS connections to
-  servers that prefer the hybrid post-quantum key exchange X25519MLKEM768, the
-  bundled OpenBao among them, now always negotiate it, which can cost one
-  extra round trip in the handshake; bootroot's own TLS listeners, the
-  registrar endpoint and the HTTP-01 responder, accept it from clients that
-  propose it first. They also now accept peer certificates and handshake
-  signatures that use ECDSA P-521, ECDSA with SHA-512 or ML-DSA, and load RSA
-  private keys for their own TLS certificates at any size from 2048 to 8192
-  bits, where only 2048-, 3072- and 4096-bit keys loaded before; RSA
-  certificates from peers still verify at 2048 to 8192 bits, as before.
-  Existing ACME account keys, certificates, private keys and HTTP-01 responder
-  secrets keep working unchanged.
+  aws-lc-rs, and *ring* is no longer built in. Their TLS connections now offer
+  the hybrid post-quantum key exchange X25519MLKEM768 first, so a server that
+  supports it, such as the bundled OpenBao and step-ca, now negotiates it
+  without an extra round trip, where most connections negotiated X25519
+  before; a server that does not support it still negotiates the group it
+  negotiated before. bootroot's own TLS listeners, the registrar endpoint and
+  the HTTP-01 responder, now support it as well, so bootroot's connections to
+  them negotiate it, as does any other client that offers it first. The
+  binaries also now accept peer certificates and handshake signatures that use
+  ECDSA P-521, ECDSA with SHA-512 or ML-DSA, and load RSA private keys for
+  their own TLS certificates at any size from 2048 to 8192 bits, where only
+  2048-, 3072- and 4096-bit keys loaded before; RSA certificates from peers
+  still verify at 2048 to 8192 bits, as before. Existing ACME account keys,
+  certificates, private keys and HTTP-01 responder secrets keep working
+  unchanged.
 
 ## [0.5.0] - 2026-10-26
 

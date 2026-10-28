@@ -19,7 +19,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 libc = "0.2"
 aws-lc-rs = "1"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# `prefer-post-quantum` puts X25519MLKEM768 first among the aws-lc-rs
+# provider's key exchange groups, for every connection bootroot makes. 0.23.46
+# is the first release that records the server's choice of group only after
+# the server is authenticated (RUSTSEC-2026-0349).
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
