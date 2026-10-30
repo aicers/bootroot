@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::net::TcpListener;
 use std::path::Path;
@@ -404,9 +404,16 @@ struct ResponderProcess {
 
 impl ResponderProcess {
     fn spawn(config_path: &Path) -> Self {
+        Self::spawn_with_stdout(config_path, Stdio::null())
+    }
+
+    /// Spawns the responder with its log, which `tracing` writes to stdout,
+    /// going to `stdout` and with `RUST_LOG` removed from its environment.
+    fn spawn_with_stdout(config_path: &Path, stdout: Stdio) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_bootroot-http01-responder"))
             .args(["--config", config_path.to_string_lossy().as_ref()])
-            .stdout(Stdio::null())
+            .env_remove("RUST_LOG")
+            .stdout(stdout)
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn bootroot-http01-responder");
@@ -842,6 +849,30 @@ fn generate_ca_signed_cert_pair(san: &str) -> CertPair {
 
 fn build_tls_client(root_pem: &str) -> reqwest::Client {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    build_tls_client_on(
+        root_pem,
+        rustls::crypto::aws_lc_rs::default_provider(),
+        rustls::ALL_VERSIONS,
+    )
+}
+
+/// Builds a client that offers only the classical X25519 group.
+fn build_classical_tls_client(root_pem: &str) -> reqwest::Client {
+    build_tls_client_on(
+        root_pem,
+        rustls::crypto::CryptoProvider {
+            kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        },
+        &[&rustls::version::TLS13],
+    )
+}
+
+fn build_tls_client_on(
+    root_pem: &str,
+    provider: rustls::crypto::CryptoProvider,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> reqwest::Client {
     let root_store = {
         let mut store = rustls::RootCertStore::empty();
         let certs: Vec<_> =
@@ -853,7 +884,9 @@ fn build_tls_client(root_pem: &str) -> reqwest::Client {
         }
         store
     };
-    let tls_config = rustls::ClientConfig::builder()
+    let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+        .with_protocol_versions(versions)
+        .expect("the provider supports these versions")
         .with_root_certificates(root_store)
         .with_no_client_auth();
     reqwest::Client::builder()
@@ -902,12 +935,29 @@ async fn spawn_responder_tls_retrying<F>(
 where
     F: Fn(&Path, &str, &str),
 {
+    spawn_responder_tls_retrying_with(config_path, client, config_writer, None).await
+}
+
+/// As [`spawn_responder_tls_retrying`], with the responder's log written to
+/// `log_path`, whose previous contents a bind retry replaces.
+async fn spawn_responder_tls_retrying_with<F>(
+    config_path: &Path,
+    client: &reqwest::Client,
+    config_writer: F,
+    log_path: Option<&Path>,
+) -> (ResponderProcess, String, String, String)
+where
+    F: Fn(&Path, &str, &str),
+{
     let mut last_failure = String::new();
     for attempt in 0..RESPONDER_BIND_ATTEMPTS {
         let listen_addr = reserve_socket_addr();
         let admin_addr = reserve_socket_addr();
         config_writer(config_path, &listen_addr, &admin_addr);
-        let mut responder = ResponderProcess::spawn(config_path);
+        let stdout = log_path.map_or_else(Stdio::null, |path| {
+            Stdio::from(File::create(path).expect("create responder log"))
+        });
+        let mut responder = ResponderProcess::spawn_with_stdout(config_path, stdout);
         let admin_port = admin_addr
             .split(':')
             .next_back()
@@ -999,6 +1049,172 @@ async fn test_http01_responder_serves_admin_api_over_tls() {
     assert_eq!(
         challenge.text().await.expect("read challenge response"),
         "tls-token.key"
+    );
+}
+
+/// A responder on TLS with its log in a file the test reads.
+struct TlsResponderWithLog {
+    responder: ResponderProcess,
+    admin_base_url: String,
+    log_path: std::path::PathBuf,
+    root_pem: String,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    _temp_dir: tempfile::TempDir,
+}
+
+impl TlsResponderWithLog {
+    async fn spawn() -> Self {
+        let temp_dir = tempdir().expect("create temp dir");
+        let pair = generate_ca_signed_cert_pair("localhost");
+        let cert_path = temp_dir.path().join("cert.pem");
+        let key_path = temp_dir.path().join("key.pem");
+        fs::write(&cert_path, &pair.cert).expect("write cert");
+        fs::write(&key_path, &pair.key).expect("write key");
+        let config_path = temp_dir.path().join("responder.toml");
+        let log_path = temp_dir.path().join("responder.log");
+        let overrides = ResponderConfigOverrides {
+            tls_cert_path: Some(cert_path.to_string_lossy().into_owned()),
+            tls_key_path: Some(key_path.to_string_lossy().into_owned()),
+            ..ResponderConfigOverrides::default()
+        };
+        let client = build_tls_client(&pair.root);
+        let (responder, _listen_addr, _admin_addr, admin_base_url) =
+            spawn_responder_tls_retrying_with(
+                &config_path,
+                &client,
+                |path, listen, admin| {
+                    write_responder_config_with_overrides(
+                        path,
+                        listen,
+                        admin,
+                        "tls-secret",
+                        &overrides,
+                    );
+                },
+                Some(&log_path),
+            )
+            .await;
+        Self {
+            responder,
+            admin_base_url,
+            log_path,
+            root_pem: pair.root,
+            cert_path,
+            key_path,
+            _temp_dir: temp_dir,
+        }
+    }
+
+    /// Sends one request, which a refused client fails at the handshake.
+    async fn request(&self, client: &reqwest::Client) -> Result<reqwest::Response, reqwest::Error> {
+        client
+            .get(format!("{}{ADMIN_PATH}", self.admin_base_url))
+            .send()
+            .await
+    }
+
+    /// Returns the log's refused-handshake lines, once `expected` of them
+    /// are there or the retries run out. The client sees the alert before
+    /// the responder has logged it.
+    async fn refused_handshake_lines(&self, expected: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for _ in 0..STARTUP_RETRIES {
+            lines = fs::read_to_string(&self.log_path)
+                .expect("read responder log")
+                .lines()
+                .filter(|line| line.contains("refused a TLS handshake"))
+                .map(str::to_owned)
+                .collect();
+            if lines.len() >= expected {
+                break;
+            }
+            sleep(STARTUP_DELAY).await;
+        }
+        lines
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_refuses_a_classical_client_and_logs_it() {
+    let mut server = TlsResponderWithLog::spawn().await;
+
+    server
+        .request(&build_classical_tls_client(&server.root_pem))
+        .await
+        .expect_err("a client offering only X25519 must be refused");
+
+    let lines = server.refused_handshake_lines(1).await;
+    // Stopping the process first settles the count: a second line for the
+    // same connection would have been written by now.
+    server.responder.child.kill().expect("stop the responder");
+    server.responder.child.wait().expect("reap the responder");
+    assert_eq!(server.refused_handshake_lines(1).await, lines);
+    let [line] = lines.as_slice() else {
+        panic!("expected exactly one refused-handshake line: {lines:?}");
+    };
+    println!("captured refused-handshake line: {line}");
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("127.0.0.1"), "{line}");
+    assert!(line.contains("NoKxGroupsInCommon"), "{line}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_refuses_a_tls12_only_client() {
+    let server = TlsResponderWithLog::spawn().await;
+
+    let client = build_tls_client_on(
+        &server.root_pem,
+        rustls::crypto::aws_lc_rs::default_provider(),
+        &[&rustls::version::TLS12],
+    );
+    server
+        .request(&client)
+        .await
+        .expect_err("a TLS 1.2-only client must be refused");
+
+    let lines = server.refused_handshake_lines(1).await;
+    assert_eq!(lines.len(), 1, "{lines:?}");
+}
+
+/// The provider lives in the `ServerConfig`, which a reload leaves in place.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_http01_responder_stays_hybrid_only_after_a_cert_reload() {
+    let server = TlsResponderWithLog::spawn().await;
+
+    let pair = generate_ca_signed_cert_pair("localhost");
+    fs::write(&server.cert_path, &pair.cert).expect("write new cert");
+    fs::write(&server.key_path, &pair.key).expect("write new key");
+    send_sighup(server.responder.pid());
+
+    // The default client trusts only the new CA, so it fails until the
+    // resolver has swapped.
+    let client = build_tls_client(&pair.root);
+    let mut swapped = false;
+    for _ in 0..STARTUP_RETRIES {
+        if server.request(&client).await.is_ok() {
+            swapped = true;
+            break;
+        }
+        sleep(STARTUP_DELAY).await;
+    }
+    assert!(swapped, "the default client must reach the new certificate");
+    let refused_before = server.refused_handshake_lines(0).await.len();
+
+    // This client trusts the new CA too, so what refuses it is the group.
+    server
+        .request(&build_classical_tls_client(&pair.root))
+        .await
+        .expect_err("a reload must not admit a client offering only X25519");
+    let lines = server.refused_handshake_lines(refused_before + 1).await;
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.contains("NoKxGroupsInCommon")),
+        "{lines:?}"
     );
 }
 

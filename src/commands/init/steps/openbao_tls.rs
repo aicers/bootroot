@@ -21,6 +21,14 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// chown that precedes it re-owns exactly this path.
 pub(super) const TLS_OUTPUT_MOUNT: &str = "/output";
 
+/// The address `OpenBao`'s metrics listener takes by default, which is
+/// what lets the monitoring profiles scrape `openbao:9101`.
+const OPENBAO_METRICS_ADDRESS: &str = "0.0.0.0:9101";
+
+/// The address that listener takes when `OpenBao` is bound off loopback:
+/// it is unauthenticated, so it answers inside its own container alone.
+const OPENBAO_METRICS_LOOPBACK_ADDRESS: &str = "127.0.0.1:9101";
+
 /// The value `OpenBao`'s file audit device takes for both `path` and
 /// `file_path` to write to standard output.
 const OPENBAO_AUDIT_STDOUT: &str = "stdout";
@@ -310,9 +318,21 @@ fn publish_openbao_hcl(path: &Path, content: &str, messages: &Messages) -> Resul
 ///
 /// Replaces `tls_disable = 1` on the `:8200` listener with
 /// `tls_cert_file` and `tls_key_file` pointing to the container
-/// mount paths.  The telemetry listener on `:9101` keeps plaintext.
-fn write_openbao_hcl_with_tls(compose_dir: &Path, messages: &Messages) -> Result<()> {
+/// mount paths, and holds that listener to TLS 1.3 with the hybrid
+/// post-quantum key exchange alone.  The telemetry listener on `:9101`
+/// keeps plaintext; it is unauthenticated, so `metrics_on_loopback`, set
+/// when `OpenBao` is bound off loopback, confines it to the container.
+fn write_openbao_hcl_with_tls(
+    compose_dir: &Path,
+    metrics_on_loopback: bool,
+    messages: &Messages,
+) -> Result<()> {
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
+    let metrics_address = if metrics_on_loopback {
+        OPENBAO_METRICS_LOOPBACK_ADDRESS
+    } else {
+        OPENBAO_METRICS_ADDRESS
+    };
     // The `audit` stanza must match the canonical openbao/openbao.hcl shipped
     // with the repo: the `stdout` device, which audits to the container log.
     // OpenBao >= 2.5 requires audit devices to be declared in the server
@@ -335,13 +355,15 @@ listener "tcp" {{
   cluster_address = "127.0.0.1:8201"
   tls_cert_file = "{OPENBAO_TLS_CONTAINER_CERT_PATH}"
   tls_key_file  = "{OPENBAO_TLS_CONTAINER_KEY_PATH}"
+  tls_min_version              = "tls13"
+  tls_key_exchange_preferences = ["X25519MLKEM768"]
   telemetry {{
     disallow_metrics = true
   }}
 }}
 
 listener "tcp" {{
-  address = "0.0.0.0:9101"
+  address = "{metrics_address}"
   cluster_address = "127.0.0.1:9102"
   tls_disable = 1
   telemetry {{
@@ -379,13 +401,15 @@ ui = true
 /// [`write_openbao_hcl_with_tls`] renders the canonical `stdout` device;
 /// when the recreate carries the audit override, passed as
 /// `audit_override`, [`sync_openbao_audit_device`] then switches it to
-/// the store-backed `file` device.
+/// the store-backed `file` device.  `metrics_on_loopback` is the recorded
+/// bind intent; see [`write_openbao_hcl_with_tls`].
 pub(in crate::commands::init) fn write_openbao_hcl_for_tls_recreate(
     compose_dir: &Path,
+    metrics_on_loopback: bool,
     audit_override: Option<&Path>,
     messages: &Messages,
 ) -> Result<()> {
-    write_openbao_hcl_with_tls(compose_dir, messages)?;
+    write_openbao_hcl_with_tls(compose_dir, metrics_on_loopback, messages)?;
     sync_openbao_audit_device(
         compose_dir,
         OpenBaoAuditDevice::for_audit_override(audit_override.is_some()),
@@ -1080,7 +1104,7 @@ mod tests {
         let openbao_dir = dir.path().join("openbao");
         std::fs::create_dir_all(&openbao_dir).unwrap();
         let messages = crate::i18n::test_messages();
-        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(dir.path(), false, &messages).unwrap();
         let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
         assert!(content.contains("tls_cert_file"));
         assert!(content.contains("tls_key_file"));
@@ -1099,6 +1123,83 @@ mod tests {
         assert_raft_config(&content, "https://127.0.0.1:8200");
     }
 
+    /// The listener block of `content` whose `address` is `address`.
+    fn listener_block<'a>(content: &'a str, address: &str) -> &'a str {
+        content
+            .split("listener \"tcp\"")
+            .find(|block| block.contains(&format!("address = \"{address}\"\n")))
+            .unwrap_or_else(|| panic!("no listener on {address}: {content}"))
+    }
+
+    const TLS_MIN_VERSION_LINE: &str = "tls_min_version              = \"tls13\"";
+    const TLS_KX_PREFERENCES_LINE: &str = "tls_key_exchange_preferences = [\"X25519MLKEM768\"]";
+
+    /// The API listener alone is held to TLS 1.3 with the hybrid group, and
+    /// the metrics listener's address follows the bind. Its `cluster_address`
+    /// does not move.
+    #[test]
+    fn write_openbao_hcl_with_tls_restricts_the_api_listener_only() {
+        for (bind, metrics_address) in [(false, "0.0.0.0:9101"), (true, "127.0.0.1:9101")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+            let messages = crate::i18n::test_messages();
+            write_openbao_hcl_with_tls(dir.path(), bind, &messages).unwrap();
+            let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
+
+            let api = listener_block(&content, "0.0.0.0:8200");
+            assert!(api.contains(TLS_MIN_VERSION_LINE), "{content}");
+            assert!(api.contains(TLS_KX_PREFERENCES_LINE), "{content}");
+            assert_eq!(content.matches("tls_min_version").count(), 1, "{content}");
+            assert_eq!(
+                content.matches("tls_key_exchange_preferences").count(),
+                1,
+                "{content}"
+            );
+
+            let metrics = listener_block(&content, metrics_address);
+            assert!(
+                metrics.contains("cluster_address = \"127.0.0.1:9102\"\n"),
+                "{content}"
+            );
+            assert!(metrics.contains("metrics_only = true"), "{content}");
+        }
+    }
+
+    /// `metrics_on_loopback` reaches the writer through the recreate path.
+    #[test]
+    fn write_openbao_hcl_for_tls_recreate_carries_the_metrics_address() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let messages = crate::i18n::test_messages();
+        write_openbao_hcl_for_tls_recreate(dir.path(), true, None, &messages).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
+        listener_block(&content, "127.0.0.1:9101");
+        assert!(!content.contains("0.0.0.0:9101"), "{content}");
+    }
+
+    /// The plaintext writer and the shipped config have no TLS to restrict,
+    /// and keep their metrics listener on every interface.
+    #[test]
+    fn plaintext_configs_carry_no_tls_restriction() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        std::fs::write(dir.path().join(OPENBAO_HCL_PATH), "").unwrap();
+        let messages = crate::i18n::test_messages();
+        write_openbao_hcl_plaintext(dir.path(), &messages).unwrap();
+        let written = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
+        for content in [
+            written.as_str(),
+            include_str!("../../../../openbao/openbao.hcl"),
+        ] {
+            assert!(!content.contains("tls_min_version"), "{content}");
+            assert!(
+                !content.contains("tls_key_exchange_preferences"),
+                "{content}"
+            );
+            listener_block(content, "0.0.0.0:9101");
+        }
+    }
+
     /// The bootroot-internal registrar credential authenticates at
     /// `auth/cert`, which validates the presented chain against its own
     /// trusted entry. The *listener* therefore stays as it is: a TLS
@@ -1111,7 +1212,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
         let messages = crate::i18n::test_messages();
-        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(dir.path(), false, &messages).unwrap();
         let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
         for option in [
             "tls_client_ca_file",
@@ -1129,7 +1230,7 @@ mod tests {
         std::fs::create_dir_all(&openbao_dir).unwrap();
         let messages = crate::i18n::test_messages();
         // Start with TLS-enabled HCL.
-        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(dir.path(), false, &messages).unwrap();
         // Restore plaintext.
         write_openbao_hcl_plaintext(dir.path(), &messages).unwrap();
         let content = std::fs::read_to_string(dir.path().join(OPENBAO_HCL_PATH)).unwrap();
@@ -1162,7 +1263,7 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let hcl_path = dir.path().join(OPENBAO_HCL_PATH);
 
-        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(dir.path(), false, &messages).unwrap();
         let tls = std::fs::read_to_string(&hcl_path).unwrap();
         write_openbao_hcl_plaintext(dir.path(), &messages).unwrap();
         let plaintext = std::fs::read_to_string(&hcl_path).unwrap();
@@ -1528,7 +1629,7 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let tls = tempfile::tempdir().unwrap();
         fs::create_dir_all(tls.path().join("openbao")).unwrap();
-        write_openbao_hcl_with_tls(tls.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(tls.path(), false, &messages).unwrap();
         let (plaintext, hcl) = compose_dir_with_hcl("placeholder");
         write_openbao_hcl_plaintext(plaintext.path(), &messages).unwrap();
 
@@ -1592,7 +1693,7 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let tls = tempfile::tempdir().unwrap();
         fs::create_dir_all(tls.path().join("openbao")).unwrap();
-        write_openbao_hcl_with_tls(tls.path(), &messages).unwrap();
+        write_openbao_hcl_with_tls(tls.path(), false, &messages).unwrap();
         let hcl = tls.path().join(OPENBAO_HCL_PATH);
         let original = fs::read_to_string(&hcl)
             .unwrap()
@@ -1828,7 +1929,8 @@ mod tests {
             (None, canonical_hcl(), OpenBaoAuditDevice::Stdout),
         ] {
             let (dir, hcl) = compose_dir_with_hcl(&start);
-            write_openbao_hcl_for_tls_recreate(dir.path(), audit_override, &messages).unwrap();
+            write_openbao_hcl_for_tls_recreate(dir.path(), false, audit_override, &messages)
+                .unwrap();
             let content = fs::read_to_string(&hcl).unwrap();
             assert!(content.contains("tls_cert_file"));
             let lines: Vec<&str> = content.split_inclusive('\n').collect();

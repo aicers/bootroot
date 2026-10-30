@@ -36,6 +36,11 @@ set -euo pipefail
 #     can read them through its `:ro` mount
 #   - a second rotation on the unchanged deployment still succeeds, so
 #     the chown is a no-op when ownership is already correct
+#
+# And, after `init` under the bind:
+#   - the OpenBao listener accepts TLS 1.3 with X25519MLKEM768 alone
+#   - `ca.json`'s `metricsAddress` is `127.0.0.1:9102`, and OpenBao's and
+#     step-ca's metrics answer nowhere but inside their own containers
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -563,6 +568,58 @@ assert_post_init_baseline() {
   } >>"$RUN_LOG"
 }
 
+# `init` restricts the API listener to TLS 1.3 with X25519MLKEM768, and
+# the refused cases are only meaningful beside the accepted one: it is
+# what shows the listener is up and the host's `openssl` offers the group.
+assert_listener_accepts_only_hybrid_tls13() {
+  log_phase "assert-listener-hybrid-tls13"
+  openssl s_client -connect "$OPENBAO_BIND_ADDR" -tls1_3 \
+    -groups X25519MLKEM768 </dev/null >"$ARTIFACT_DIR/s-client-hybrid.log" 2>&1 \
+    || fail "OpenBao listener at ${OPENBAO_BIND_ADDR} refused TLS 1.3 with X25519MLKEM768 (see $ARTIFACT_DIR/s-client-hybrid.log)"
+  if openssl s_client -connect "$OPENBAO_BIND_ADDR" -tls1_3 \
+    -groups X25519 </dev/null >"$ARTIFACT_DIR/s-client-classical.log" 2>&1; then
+    fail "OpenBao listener at ${OPENBAO_BIND_ADDR} accepted a client offering only X25519"
+  fi
+  if openssl s_client -connect "$OPENBAO_BIND_ADDR" -tls1_2 \
+    </dev/null >"$ARTIFACT_DIR/s-client-tls12.log" 2>&1; then
+    fail "OpenBao listener at ${OPENBAO_BIND_ADDR} accepted TLS 1.2"
+  fi
+}
+
+# Under the bind both unauthenticated metrics listeners answer only
+# inside their own containers.  The probes run from the OpenBao
+# container, whose image carries busybox `wget`.
+assert_metrics_confined_to_their_containers() {
+  log_phase "assert-metrics-confined"
+  local ca_json="$SECRETS_DIR/config/ca.json"
+  local metrics_address="" attempt
+  # Retried because `ca.json` is co-owned with the OpenBao Agent sidecar,
+  # whose render can land between `init` returning and this read.
+  for attempt in $(seq 1 "$TLS_ASSERT_ATTEMPTS"); do
+    metrics_address="$(jq -r .metricsAddress "$ca_json" 2>/dev/null || true)"
+    [ "$metrics_address" = "127.0.0.1:9102" ] && break
+    sleep "$TLS_ASSERT_DELAY_SECS"
+  done
+  [ "$metrics_address" = "127.0.0.1:9102" ] \
+    || fail "ca.json metricsAddress is '${metrics_address}', expected '127.0.0.1:9102'"
+
+  local metrics_path='/v1/sys/metrics?format=prometheus' served=0
+  for attempt in $(seq 1 "$TLS_ASSERT_ATTEMPTS"); do
+    if compose exec -T openbao wget -qO- "http://127.0.0.1:9101${metrics_path}" >/dev/null 2>&1; then
+      served=1
+      break
+    fi
+    sleep "$TLS_ASSERT_DELAY_SECS"
+  done
+  [ "$served" = "1" ] || fail "OpenBao metrics did not answer on 127.0.0.1:9101 inside its container"
+  if compose exec -T openbao wget -qO- "http://openbao:9101${metrics_path}" >/dev/null 2>&1; then
+    fail "OpenBao metrics answered on openbao:9101 from the compose network"
+  fi
+  if compose exec -T openbao wget -qO- "http://step-ca:9102/metrics" >/dev/null 2>&1; then
+    fail "step-ca metrics answered on step-ca:9102 from the compose network"
+  fi
+}
+
 assert_tls_files_mode_0644() {
   local label="$1"
   local path mode
@@ -682,6 +739,8 @@ main() {
   apply_exposed_override
   run_init
   assert_post_init_baseline
+  assert_listener_accepts_only_hybrid_tls13
+  assert_metrics_confined_to_their_containers
 
   reown_secrets_tree
 

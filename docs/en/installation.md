@@ -508,7 +508,10 @@ bootroot init
 
 `bootroot clean` discards every key, token and certificate, the CA included.
 After `bootroot init`, add every service again with `bootroot service add` and
-give every consumer the new CA bundle.
+give every consumer the new CA bundle. Where OpenBao or the HTTP-01 admin API
+serves TLS, they refuse `bootroot-agent` and `bootroot-remote` of an earlier
+release, which do not offer X25519MLKEM768, so every host runs this release's
+binaries before its services are added again.
 
 ## bootroot-agent
 

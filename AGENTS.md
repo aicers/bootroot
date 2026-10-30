@@ -553,6 +553,13 @@ Where the crate handles key material or secrets:
   that did not run, and why. This is not licence to weaken, skip,
   `continue-on-error`, or delete a check to make a local run pass — and
   a change exempt under the bullet above still needs no matrix at all.
+- **The host's TLS tools**: the Docker E2E harnesses reach OpenBao's TLS
+  listener and the responder admin API with the host's `curl` and
+  `openssl`, which must offer X25519MLKEM768 (OpenSSL 3.5 or later, as
+  on Ubuntu 26.04). On a host whose OpenSSL is older, or whose `openssl`
+  is LibreSSL, run the matrix as far as it goes and let CI's `Docker E2E`
+  jobs gate the rest, as the bullet above on a matrix that cannot run
+  already says.
 - The extended E2E suite is scheduled CI coverage in
   `e2e-extended.yml`, not a per-pull-request requirement. Run
   `scripts/preflight/ci/e2e-extended.sh` only for investigation or when

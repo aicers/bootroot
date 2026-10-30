@@ -389,7 +389,10 @@ async fn handshake(
     // configuration it started with.
     let acceptor = endpoint.tls_acceptor();
     match timeout_at(deadline, acceptor.accept(stream)).await {
-        Ok(Ok(tls)) => Some(tls),
+        Ok(Ok(tls)) => {
+            warn_on_classical_key_exchange(&tls, connection);
+            Some(tls)
+        }
         Ok(Err(err)) => {
             warn!(
                 connection = connection.as_str(),
@@ -408,6 +411,32 @@ async fn handshake(
             None
         }
     }
+}
+
+/// Logs a connection that completed its handshake on anything but the
+/// hybrid post-quantum group, and leaves it to be served.
+///
+/// The socket is local, so there is no peer address to name; the connection
+/// id is the correlation handle.
+fn warn_on_classical_key_exchange(
+    tls: &tokio_rustls::server::TlsStream<UnixStream>,
+    connection: &ConnectionId,
+) {
+    let group = tls
+        .get_ref()
+        .1
+        .negotiated_key_exchange_group()
+        .map(rustls::crypto::SupportedKxGroup::name);
+    if group == Some(rustls::NamedGroup::X25519MLKEM768) {
+        return;
+    }
+    let group_name = group.map_or_else(|| "none".to_string(), |name| format!("{name:?}"));
+    warn!(
+        connection = connection.as_str(),
+        group = %group_name,
+        "Registrar endpoint negotiated a classical key exchange; the client does not offer \
+         X25519MLKEM768"
+    );
 }
 
 /// The label a handshake that never completed is logged under.

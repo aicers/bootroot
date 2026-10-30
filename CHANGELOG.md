@@ -12,13 +12,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   aws-lc-rs, and *ring* is no longer built in. Their TLS connections now offer
   the hybrid post-quantum key exchange X25519MLKEM768 first, so a server that
   supports it, such as the bundled OpenBao and step-ca, now negotiates it
-  without an extra round trip, where most connections negotiated X25519
-  before; a server that does not support it still negotiates the group it
-  negotiated before. bootroot's own TLS listeners, the registrar endpoint and
-  the HTTP-01 responder, now support it as well, so bootroot's connections to
-  them negotiate it, as does any other client that offers it first. The
-  binaries also now accept peer certificates and handshake signatures that use
-  ECDSA P-521, ECDSA with SHA-512 or ML-DSA, and load RSA private keys for
+  without an extra round trip, where most connections negotiated X25519 before;
+  a server that does not support it still negotiates the group it negotiated
+  before. The registrar endpoint now supports it as well, so bootroot's
+  connections to it negotiate it, as does any other client that offers it first.
+  The binaries also now accept peer certificates and handshake signatures that
+  use ECDSA P-521, ECDSA with SHA-512 or ML-DSA, and load RSA private keys for
   their own TLS certificates at any size from 2048 to 8192 bits, where only
   2048-, 3072- and 4096-bit keys loaded before; RSA certificates from peers
   still verify at 2048 to 8192 bits, as before. Existing ACME account keys,
@@ -47,6 +46,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   installation guide). The `openbao` container now starts as root, hands its
   storage and audit directories to the `openbao` user, and runs the server as
   that user.
+- The HTTP-01 responder's admin API, when it serves TLS, and OpenBao's API
+  listener, when `bootroot init` configures it for TLS, now accept only TLS 1.3
+  with the hybrid post-quantum key exchange X25519MLKEM768, so a client that
+  does not offer that group, or offers only TLS 1.2, is refused at the
+  handshake. bootroot's binaries of this release offer it, as do OpenSSL 3.5 and
+  later and Go 1.24 and later; `bootroot-agent` and `bootroot-remote` of an
+  earlier release do not, so every host must run this release's binaries, and
+  `curl` or `openssl` linked against an older OpenSSL can no longer reach them.
+  The responder logs each refused handshake at WARN with the client's address
+  and the TLS error, and now logs at WARN by default instead of errors only;
+  `RUST_LOG` still overrides.
+- The registrar endpoint now accepts only TLS 1.3, where it accepted TLS 1.2 as
+  well, and logs a WARN line naming the key exchange group for each connection
+  that did not negotiate X25519MLKEM768.
+- When OpenBao is bound off loopback with `bootroot infra install
+  --openbao-bind`, `bootroot init` now binds OpenBao's metrics listener to
+  `127.0.0.1:9101` inside its container and step-ca's to `127.0.0.1:9102`, so
+  neither is reachable on the compose network and the `lan` and `public`
+  monitoring profiles cannot scrape that installation; read the metrics with
+  `docker compose exec`. Without `--openbao-bind` nothing changes.
 
 ## [0.5.0] - 2026-10-26
 

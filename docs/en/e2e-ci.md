@@ -1222,7 +1222,9 @@ prerequisite block rather than mid-run:
   binary it found; the fix is to put a directory holding a capable
   `openssl` first on `PATH`. All six scripts that check for `openssl`
   check this, not only the one that calls `-ext`, because the matrix
-  runs every step against one host.
+  runs every step against one host. The host's `openssl` and `curl` must
+  also offer X25519MLKEM768 (OpenSSL 3.5 or later), because the harnesses
+  reach OpenBao's TLS listener and the responder admin API with them.
 
 ## Init automation input/output rules
 

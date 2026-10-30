@@ -2133,6 +2133,150 @@ async fn one_connection_serves_exactly_one_request() {
     running.stop().await;
 }
 
+/// The registrar's client configuration, on a provider and protocol
+/// versions the test chooses, so the endpoint can be offered what a
+/// production client never offers.
+fn registrar_client_config_on(
+    pki: &Pki,
+    provider: rustls::crypto::CryptoProvider,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> ClientConfig {
+    let verifier = crate::registrar::endpoint_pin::endpoint_server_verifier(
+        &pki.pin_file_path(),
+        &endpoint_name(),
+    )
+    .expect("a pinned server verifier");
+    let (chain, key) = pki.registrar_client_material();
+    ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(versions)
+        .expect("the provider supports these versions")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(chain, key)
+        .expect("a client configuration")
+}
+
+/// The events carrying the classical key exchange line.
+fn classical_key_exchange_warnings(logs: &CapturedLogs) -> Vec<CapturedEvent> {
+    logs.events()
+        .into_iter()
+        .filter(|event| {
+            event
+                .message
+                .contains("negotiated a classical key exchange")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_tls12_only_client_is_refused_at_the_handshake() {
+    let (logs, _guard) = capture_logs();
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
+
+    let config = registrar_client_config_on(
+        &harness.pki,
+        rustls::crypto::aws_lc_rs::default_provider(),
+        &[&rustls::version::TLS12],
+    );
+    tls_connect(&harness.socket_path, config)
+        .await
+        .expect_err("the endpoint speaks TLS 1.3 only");
+
+    running.stop().await;
+    assert!(
+        logs.events().iter().any(|event| event
+            .message
+            .starts_with("Registrar endpoint could not complete a TLS handshake")),
+        "{:?}",
+        logs.events()
+    );
+    assert!(classical_key_exchange_warnings(&logs).is_empty());
+}
+
+/// The socket is local, so a classical TLS 1.3 client is still served; it
+/// leaves one line naming the group.
+#[tokio::test]
+async fn a_classical_tls13_client_is_served_and_logged_once() {
+    let (logs, _guard) = capture_logs();
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
+
+    let config = registrar_client_config_on(
+        &harness.pki,
+        rustls::crypto::CryptoProvider {
+            kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        },
+        &[&rustls::version::TLS13],
+    );
+    let mut stream = tls_connect(&harness.socket_path, config)
+        .await
+        .expect("the endpoint accepts a classical TLS 1.3 client");
+    stream
+        .write_all(&frame_of(b"mint", b""))
+        .await
+        .expect("write the request");
+    let served = read_response_frame(&mut stream).await;
+    assert!(
+        String::from_utf8_lossy(&served).starts_with("mint|"),
+        "{served:?}"
+    );
+
+    running.stop().await;
+    let warnings = classical_key_exchange_warnings(&logs);
+    let [warning] = warnings.as_slice() else {
+        panic!("expected exactly one line: {warnings:?}");
+    };
+    assert_eq!(warning.level, "WARN");
+    assert_eq!(warning.field("group"), "X25519");
+    assert_ne!(warning.field("connection"), "");
+}
+
+/// A client on the default group list negotiates the hybrid group and
+/// leaves no such line.
+#[tokio::test]
+async fn a_default_client_negotiates_the_hybrid_group_without_a_warning() {
+    let (logs, _guard) = capture_logs();
+    let harness = Harness::bind().expect("harness");
+    let running = RunningEndpoint::start(
+        &harness.endpoint,
+        Arc::new(EchoHandler {
+            response: b"served".to_vec(),
+        }),
+    );
+
+    let mut stream = tls_connect(&harness.socket_path, harness.pki.registrar_client_config())
+        .await
+        .expect("handshake");
+    assert_eq!(
+        stream
+            .get_ref()
+            .1
+            .negotiated_key_exchange_group()
+            .map(rustls::crypto::SupportedKxGroup::name),
+        Some(rustls::NamedGroup::X25519MLKEM768)
+    );
+    stream
+        .write_all(&frame_of(b"mint", b""))
+        .await
+        .expect("write the request");
+    read_response_frame(&mut stream).await;
+
+    running.stop().await;
+    assert!(classical_key_exchange_warnings(&logs).is_empty());
+}
+
 /// The listener is held across a reload, so the next invocation resumes
 /// accepting on the very same socket inode.
 #[tokio::test]

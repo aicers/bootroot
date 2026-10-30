@@ -384,6 +384,37 @@ bootroot rotate registrar-internal-credential
 
 ### 발급 직후 호환성 자동 강화 실패
 
+## OpenBao 또는 HTTP-01 관리자 API가 클라이언트를 거부하는 경우
+
+OpenBao의 TLS 리스너와, TLS를 제공할 때의 HTTP-01 리스폰더 관리자 API는 하이브리드
+포스트 양자 키 교환 X25519MLKEM768을 사용하는 TLS 1.3만 받습니다. 이 그룹을
+제시하지 않거나 TLS 1.2만 제시하는 클라이언트는 핸드셰이크에서 거부됩니다.
+
+리스폰더는 거부할 때마다 컨테이너 로그에 WARN으로 남기며, 클라이언트 주소는
+`peer`에 있습니다.
+
+<!-- markdownlint-disable MD013 -->
+```text
+HTTP-01 admin API refused a TLS handshake: peer is incompatible: NoKxGroupsInCommon peer=<client address>
+```
+<!-- markdownlint-enable MD013 -->
+
+OpenBao는 자체 컨테이너 로그에 INFO로 남기며, bootroot의 문구가 아니라 Go의
+다음 줄로 나타납니다.
+
+```text
+http: TLS handshake error from <client address>: ...
+```
+
+해결 방법은 이 그룹을 제시하는 클라이언트를 쓰는 것입니다. 이번 릴리스의
+bootroot 바이너리, OpenSSL 3.5 이상이나 Go 1.24 이상으로 만든 도구가 해당합니다.
+호스트의 OpenSSL이 어느 쪽 리스너에든 접속할 수 있는지 확인하려면 다음을
+실행하세요.
+
+```bash
+openssl s_client -connect <host>:<port> -tls1_3 -groups X25519MLKEM768
+```
+
 ## 회전 후 FD 비동기 문제 (이슈 #614)
 
 `bootroot rotate ca-key` 또는 `bootroot rotate force-reissue` 이후,

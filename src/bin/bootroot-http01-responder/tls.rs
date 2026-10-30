@@ -20,12 +20,13 @@ use http::uri::Scheme;
 use poem::Addr;
 use poem::listener::{Acceptor, Listener};
 use poem::web::{LocalAddr, RemoteAddr};
-use rustls::ServerConfig;
+use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use rustls::{ServerConfig, SupportedCipherSuite};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Cert resolver that allows atomic swap of the `CertifiedKey` on SIGHUP.
 pub(super) struct ReloadableCertResolver {
@@ -141,6 +142,28 @@ fn verify_cert_key_match(
     Ok(())
 }
 
+/// Returns the crypto provider every TLS server of this binary is built from.
+///
+/// It holds the hybrid post-quantum group alone, and TLS 1.3 suites alone,
+/// so a peer that would settle for a classical key exchange is refused at
+/// the handshake rather than silently served. The provider lives in the
+/// `ServerConfig`, which a `SIGHUP` reload leaves in place, so a reload
+/// cannot widen it.
+fn server_crypto_provider() -> CryptoProvider {
+    let base = rustls::crypto::aws_lc_rs::default_provider();
+    let cipher_suites = base
+        .cipher_suites
+        .iter()
+        .copied()
+        .filter(|suite| matches!(suite, SupportedCipherSuite::Tls13(_)))
+        .collect();
+    CryptoProvider {
+        kx_groups: vec![rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768],
+        cipher_suites,
+        ..base
+    }
+}
+
 /// Builds a `ReloadableCertResolver` and the corresponding `ServerConfig`.
 pub(super) fn build_tls_config(
     cert_path: &Path,
@@ -150,7 +173,9 @@ pub(super) fn build_tls_config(
     let certified_key = load_certified_key(cert_path, key_path)?;
     let resolver = Arc::new(ReloadableCertResolver::new(certified_key));
 
-    let mut config = ServerConfig::builder()
+    let mut config = ServerConfig::builder_with_provider(Arc::new(server_crypto_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("restrict the HTTP-01 admin API to TLS 1.3")?
         .with_no_client_auth()
         .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -211,7 +236,10 @@ impl Acceptor for TlsAcceptorWrapper {
     async fn accept(&mut self) -> IoResult<(Self::Io, LocalAddr, RemoteAddr, Scheme)> {
         let (tcp_stream, remote_addr) = self.tcp.accept().await?;
         Ok((
-            LazyTlsStream::Handshaking(self.tls.accept(tcp_stream)),
+            LazyTlsStream::Handshaking {
+                accept: self.tls.accept(tcp_stream),
+                peer: remote_addr,
+            },
             LocalAddr(Addr::SocketAddr(self.local_addr)),
             RemoteAddr(Addr::SocketAddr(remote_addr)),
             Scheme::HTTPS,
@@ -230,7 +258,11 @@ impl Acceptor for TlsAcceptorWrapper {
 /// remote peer stalls the TLS handshake.
 pub(super) enum LazyTlsStream {
     /// TLS handshake in progress; driven on each I/O poll.
-    Handshaking(tokio_rustls::server::Accept<tokio::net::TcpStream>),
+    Handshaking {
+        accept: tokio_rustls::server::Accept<tokio::net::TcpStream>,
+        /// The address a failed handshake is logged against.
+        peer: SocketAddr,
+    },
     /// TLS handshake completed; connection is ready.
     Established(tokio_rustls::server::TlsStream<tokio::net::TcpStream>),
     /// Sentinel used during enum variant swap.
@@ -239,9 +271,13 @@ pub(super) enum LazyTlsStream {
 
 impl LazyTlsStream {
     /// Drives the TLS handshake until it completes or yields `Pending`.
+    ///
+    /// A failure is logged here because poem discards the error this
+    /// returns. The stream stays in `Transitioning`, so a later poll of the
+    /// same connection gets the "invalid state" error and logs nothing more.
     fn poll_handshake(&mut self, cx: &mut TaskContext<'_>) -> Poll<IoResult<()>> {
-        let mut accept = match std::mem::replace(self, Self::Transitioning) {
-            Self::Handshaking(a) => a,
+        let (mut accept, peer) = match std::mem::replace(self, Self::Transitioning) {
+            Self::Handshaking { accept, peer } => (accept, peer),
             other => {
                 *self = other;
                 return Poll::Ready(Ok(()));
@@ -252,9 +288,12 @@ impl LazyTlsStream {
                 *self = Self::Established(stream);
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Err(error)) => {
+                warn!(peer = %peer, "HTTP-01 admin API refused a TLS handshake: {error}");
+                Poll::Ready(Err(error))
+            }
             Poll::Pending => {
-                *self = Self::Handshaking(accept);
+                *self = Self::Handshaking { accept, peer };
                 Poll::Pending
             }
         }
@@ -271,7 +310,7 @@ impl AsyncRead for LazyTlsStream {
         loop {
             match this {
                 Self::Established(stream) => return Pin::new(stream).poll_read(cx, buf),
-                Self::Handshaking(_) => match this.poll_handshake(cx) {
+                Self::Handshaking { .. } => match this.poll_handshake(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -294,7 +333,7 @@ impl AsyncWrite for LazyTlsStream {
         loop {
             match this {
                 Self::Established(stream) => return Pin::new(stream).poll_write(cx, buf),
-                Self::Handshaking(_) => match this.poll_handshake(cx) {
+                Self::Handshaking { .. } => match this.poll_handshake(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -311,7 +350,7 @@ impl AsyncWrite for LazyTlsStream {
         loop {
             match this {
                 Self::Established(stream) => return Pin::new(stream).poll_flush(cx),
-                Self::Handshaking(_) => match this.poll_handshake(cx) {
+                Self::Handshaking { .. } => match this.poll_handshake(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -328,7 +367,7 @@ impl AsyncWrite for LazyTlsStream {
         loop {
             match this {
                 Self::Established(stream) => return Pin::new(stream).poll_shutdown(cx),
-                Self::Handshaking(_) => match this.poll_handshake(cx) {
+                Self::Handshaking { .. } => match this.poll_handshake(cx) {
                     Poll::Ready(Ok(())) => {}
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -338,5 +377,37 @@ impl AsyncWrite for LazyTlsStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_crypto_provider_holds_only_the_hybrid_group_and_tls13_suites() {
+        let provider = server_crypto_provider();
+
+        let groups: Vec<_> = provider
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+        assert_eq!(groups, [rustls::NamedGroup::X25519MLKEM768]);
+
+        let base_tls13_suites = rustls::crypto::aws_lc_rs::default_provider()
+            .cipher_suites
+            .iter()
+            .filter(|suite| matches!(suite, SupportedCipherSuite::Tls13(_)))
+            .count();
+        assert_eq!(provider.cipher_suites.len(), base_tls13_suites);
+        assert!(
+            provider
+                .cipher_suites
+                .iter()
+                .all(|suite| matches!(suite, SupportedCipherSuite::Tls13(_))),
+            "every cipher suite must be TLS 1.3: {:?}",
+            provider.cipher_suites
+        );
     }
 }

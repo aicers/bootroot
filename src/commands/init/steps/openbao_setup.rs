@@ -1022,7 +1022,7 @@ mod tests {
     use super::super::super::paths::resolve_openbao_agent_addr;
     use super::super::super::types::{AppRoleLabel, AppRoleOutput};
     use super::super::responder_setup::write_responder_files;
-    use super::super::stepca_setup::write_stepca_templates;
+    use super::super::stepca_setup::{StepCaManagedKeys, write_stepca_templates};
     use super::super::test_support::{test_cert_pem, test_messages};
     use super::*;
 
@@ -1058,10 +1058,20 @@ mod tests {
         .unwrap();
 
         let messages = test_messages();
-        let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &[], &messages)
-                .await
-                .unwrap();
+        let stepca_templates = write_stepca_templates(
+            &secrets_dir,
+            "secret",
+            "24h",
+            "acme",
+            &StepCaManagedKeys {
+                dns_names: &[],
+                metrics_address: ":9102",
+                policy_deny_dns: &[],
+            },
+            &messages,
+        )
+        .await
+        .unwrap();
         let responder_paths =
             write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
                 .await
@@ -1134,10 +1144,20 @@ mod tests {
         .unwrap();
 
         let messages = test_messages();
-        let stepca_templates =
-            write_stepca_templates(&secrets_dir, "secret", "24h", "acme", &[], &[], &messages)
-                .await
-                .unwrap();
+        let stepca_templates = write_stepca_templates(
+            &secrets_dir,
+            "secret",
+            "24h",
+            "acme",
+            &StepCaManagedKeys {
+                dns_names: &[],
+                metrics_address: ":9102",
+                policy_deny_dns: &[],
+            },
+            &messages,
+        )
+        .await
+        .unwrap();
         let responder_paths =
             write_responder_files(&secrets_dir, "secret", "hmac-123", false, &messages)
                 .await
