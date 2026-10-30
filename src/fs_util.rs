@@ -3224,16 +3224,6 @@ mod tests {
         );
     }
 
-    /// A process that cannot establish the required owner publishes
-    /// nothing: the chown is on the staged inode, before the rename, so
-    /// its failure leaves the destination exactly as it was.
-    ///
-    /// This is the ordering guarantee stated as a test. An unprivileged
-    /// process asking for `root:root` gets `EPERM` from the kernel — no
-    /// check in this crate decides it — and what matters is where in the
-    /// sequence that answer arrives: an old credential still readable
-    /// and a new one not published, rather than a protected file left
-    /// owned by whoever ran the command.
     /// The `--cert-owner` arm fails like the fixed-owner one when the
     /// process cannot give the staged inode away: the destination keeps
     /// its inode, bytes, owner and mode, no temporary is left behind, and
@@ -3289,6 +3279,16 @@ mod tests {
         );
     }
 
+    /// A process that cannot establish the required owner publishes
+    /// nothing: the chown is on the staged inode, before the rename, so
+    /// its failure leaves the destination exactly as it was.
+    ///
+    /// This is the ordering guarantee stated as a test. An unprivileged
+    /// process asking for `root:root` gets `EPERM` from the kernel — no
+    /// check in this crate decides it — and what matters is where in the
+    /// sequence that answer arrives: an old credential still readable
+    /// and a new one not published, rather than a protected file left
+    /// owned by whoever ran the command.
     #[tokio::test]
     async fn a_fixed_owner_publish_that_cannot_own_the_file_publishes_nothing() {
         use std::os::unix::fs::MetadataExt;

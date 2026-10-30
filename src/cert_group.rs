@@ -693,8 +693,9 @@ pub async fn write_cert_file(path: &Path, cert_pem: &str, policy: CertGroupPolic
 ///
 /// The bundle mode ([`CA_BUNDLE_FILE_MODE`], `0644`) is unchanged
 /// regardless of policy; only the group ownership is adjusted under a
-/// group policy, and an owner policy leaves it to the writer. Because the mode is applied to the staged file
-/// on every write, a bundle an earlier writer left stricter (the
+/// group policy, and an owner policy leaves it to the writer. Because
+/// the mode is applied to the staged file on every write, a bundle an
+/// earlier writer left stricter (the
 /// `bootroot-remote` bootstrap path creates it at `0600`) is still
 /// republished world-readable.
 ///
