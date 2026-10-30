@@ -224,12 +224,12 @@ async fn cert_owner_only_the_owner_reads_the_key() {
         .expect("write the bundle as root");
 
     for path in [&key, &cert, &bundle] {
-        assert!(readable_as(uid, path), "uid {uid} reads {}", path.display());
+        assert!(readable_as(uid, path), "the owner reads {}", path.display());
     }
     assert!(
         readable_as(other, &cert),
-        "uid {other} reads the certificate"
+        "another uid reads the certificate"
     );
-    assert!(readable_as(other, &bundle), "uid {other} reads the bundle");
-    assert!(!readable_as(other, &key), "uid {other} is refused the key");
+    assert!(readable_as(other, &bundle), "another uid reads the bundle");
+    assert!(!readable_as(other, &key), "another uid is refused the key");
 }
