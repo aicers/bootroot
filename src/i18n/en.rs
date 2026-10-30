@@ -512,7 +512,7 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_responder_ambiguous: "{count} HTTP-01 responder containers match compose project `{project}`; refusing to pick one arbitrarily. Remove the stale container, or reinstall the other instance with a distinct `--instance-name`.",
     error_instance_name_invalid: "Invalid --instance-name `{name}`: use lowercase ASCII letters, digits and `-`, starting with a letter or digit, at most {max} characters",
     error_service_update_failed: "bootroot service update failed",
-    error_service_update_no_flags: "No update flags specified; pass --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, or --post-renew-command",
+    error_service_update_no_flags: "No update flags specified; pass --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --cert-owner, --reload-style, or --post-renew-command",
     service_update_summary: "bootroot service update: summary",
     service_update_field_changed: "- {field}: {old} -> {new}",
     service_update_rotate_hint: "Run `bootroot rotate approle-secret-id` for the new policy to take effect.",

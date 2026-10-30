@@ -1466,10 +1466,93 @@ bootstrap`으로도 전달되며, 그곳에서 모든 훅이 순서대로
     넓어지므로 무관한 파일을 같은 디렉터리에 두는 것은 지원되지
     않습니다.
 
-지속성: `cert_group_gid`는 `ServiceEntry`에 저장되고, 관리되는
-`agent.toml` 프로필 블록에 렌더링되며, remote-bootstrap 아티팩트로
-전달되고, `DaemonProfileSettings`에 노출됩니다 — 회전 시마다
-동일한 정책이 다시 적용됩니다.
+인증서/키 소유자 정책:
+
+- `--cert-owner <uid>`: 발급되는 개인 키를 소유할 숫자 uid. 고정
+  uid로 실행되며 bind-mount된 디렉터리에서 인증서와 키를 읽는
+  컨테이너 안의 서버를 위한 것입니다. 이런 컨테이너의 gid는 보통
+  호스트 자체 그룹 데이터베이스의 그룹이기도 하므로(예: gid 999나
+  1000), 그룹-읽기 키는 그 호스트 그룹의 모든 멤버도 읽을 수 있게
+  됩니다. 이 정책에서는 그 uid(와 root)만 키를 읽을 수 있습니다.
+  - 값은 앞뒤 공백을 제거한 뒤 ASCII 숫자로만 이루어진 10진 uid이며,
+    1부터 4294967294까지입니다. 두 전달 모드에서 동일하며 어떤 사용자
+    데이터베이스로도 해석되지 않습니다: 이 uid는 보통 컨테이너 안의
+    사용자를 가리키며, control host나 원격 agent host에는 그 사용자가
+    없어도 됩니다. 다음 값은 아무것도 기록되기 전에 거부됩니다:
+    - 빈 값: `--cert-owner must not be empty`;
+    - 숫자로만 이루어지지 않은 값(사용자 이름, 부호, 중간의 공백):
+      `--cert-owner must be a numeric uid (got "<value>"); user names
+      are not resolved`;
+    - 32비트 uid 범위를 벗어난 값: `--cert-owner "<value>" is not a
+      valid numeric uid`;
+    - `0`: `--cert-owner 0 (root) is not permitted; without the flag
+      the key is owned by the account bootroot-agent runs as`;
+    - `4294967295`: `--cert-owner 4294967295 is not permitted; chown
+      reads it as "leave the owner unchanged"`.
+  - 설정 시: 매 발급/회전마다 agent는 다음과 같이 기록합니다:
+
+    | | `--cert-owner U` |
+    | --- | --- |
+    | 키 파일 | 소유자 `U`, 그룹 `0`, `0600` |
+    | 인증서 파일 | 기록한 계정, `0644` |
+    | CA 번들 | 기록한 계정, `0644` |
+    | 키 상위 디렉터리 | `0755`, 소유자와 그룹은 변경하지 않음 |
+    | 인증서 상위 디렉터리 | `0755`, 소유자와 그룹은 변경하지 않음 |
+    | generation 트리 디렉터리 | `0755` |
+    | generation 멤버 | 키 `U:0` `0600`, 나머지는 기록한 계정 `0644` |
+
+    키는 스테이징된 파일에서, 그 파일의 열린 디스크립터를 통해, 모드가
+    설정되고 제자리로 rename되기 전에 매 기록마다 `U:0`으로
+    넘겨집니다. 따라서 갱신은 그 사이에 누군가 소유자나 모드를 바꿨더라도
+    다시 적용하며, 컨슈머는 항상 제자리에서 다시 쓰인 파일이 아닌 새
+    파일을 받습니다.
+  - 디렉터리: uid는 키가 있는 디렉터리를 통과(traverse)할 수 있어야
+    하는데, 그 디렉터리의 소유자도 아니고 그룹에도 속하지 않으므로
+    키 디렉터리와 인증서 디렉터리 모두 `0755`가 됩니다. 목록 조회로는
+    파일 이름만 드러나며, 키를 제외한 모든 파일은 공개 신뢰
+    자료입니다. 키 자체의 `0600`과 소유자가 다른 모든 non-root 계정의
+    접근을 막습니다. 이 정책에서 두 디렉터리는 bootroot가 소유하는
+    출력 디렉터리입니다: `0755`로 인해 traversal이 넓어지므로 무관한
+    파일을 같은 디렉터리에 두는 것은 지원되지 않습니다. 디렉터리의
+    소유자는 변경되지 않습니다. 두 디렉터리를 root 소유로 두세요:
+    어느 한쪽 디렉터리에 쓸 수 있는 계정은 그 안의 파일을 바꿔치기할
+    수 있으며, 어떤 정책도 이를 바꾸지 못합니다. root agent가 만든
+    디렉터리는 root 소유이므로 uid는 키를 읽을 수 있지만 디렉터리 안의
+    어떤 것도 rename, 교체, 삭제할 수 없습니다. `--cert-owner` 서비스마다
+    디렉터리를 하나씩 쓰세요: 다른 프로필과 공유하는 디렉터리는 마지막에
+    기록한 프로필의 모드를 따릅니다(각 키는 자신의 소유자와 모드를
+    유지합니다).
+  - 컨테이너에는 개별 파일이 아닌 **디렉터리**를 마운트하세요: 모든
+    파일은 rename으로 교체되며, 파일 bind mount는 이전 파일을 계속
+    보여줍니다. 컨테이너가 키의 모드도 바꾸지 못하도록 읽기 전용으로
+    마운트하세요. 다음 기록이 새 `0600` 키를 게시합니다.
+  - uid가 호스트의 계정도 가리킨다면(예: uid 999나 100), 컨테이너와
+    마찬가지로 그 한 계정이 키를 읽을 수 있습니다. 어떤 그룹도 읽을 수
+    없습니다.
+  - `--cert-group`과 함께 쓸 수 없습니다: `service add`는 두 플래그를
+    함께 거부하고, `bootroot-agent`와 `bootroot-remote bootstrap`은
+    `cert_group_gid`와 `cert_owner_uid`를 함께 담은 프로필이나
+    아티팩트를 거부합니다.
+  - 이를 적용하려면 `bootroot-agent`가 root(유효 uid 0)로 실행되어야
+    합니다: 파일을 다른 uid에 넘기려면 `CAP_CHOWN`이 필요하며, 검사는
+    유효 uid에 대해 이루어지므로 `CAP_CHOWN`을 가진 non-root agent도
+    거부됩니다. non-root agent는 ACME 요청 전에, 그리고 번들,
+    generation, 인증서/키 쌍을 건드리기 전에
+    `profile '<label>' sets cert_owner_uid = <uid>, which needs
+    bootroot-agent to run as root (it runs as uid <euid>); nothing was
+    written`과 함께 발급에 실패합니다. `service add`는 자신을 실행한
+    계정의 uid를 검사하지 않습니다: 키는 agent가 기록하며, agent는 다른
+    계정으로 실행될 수 있습니다. `bootroot verify`는 agent를 자신의
+    실행 계정으로 한 번 실행하므로, 이런 서비스에 대해서는 root로
+    실행해야 합니다.
+  - 원격 agent host는 `cert_owner_uid`를 아는 `bootroot-remote`
+    릴리스를 실행해야 합니다: 이전 릴리스는 이 멤버를 무시하고
+    agent가 실행되는 계정 소유의 키를 기록합니다.
+
+지속성: `cert_group_gid`와 `cert_owner_uid`는 `ServiceEntry`에
+저장되고, 관리되는 `agent.toml` 프로필 블록에 렌더링되며,
+remote-bootstrap 아티팩트로 전달되고, `DaemonProfileSettings`에
+노출됩니다 — 회전 시마다 동일한 정책이 다시 적용됩니다.
 
 원자성: 키 파일, 인증서, CA 번들 모두 stage-then-rename 방식으로
 기록됩니다 — `state.json`과 `init` 출력 파일을 기록하는 것과 동일한
@@ -1553,7 +1636,8 @@ rename을 잃는 크래시는 이전 인증서/키/번들을 그대로 남기고
 ## bootroot service update
 
 `service add`를 다시 실행하지 않고 서비스별 `secret_id` 정책 필드,
-cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니다.
+cert-group 및 cert-owner 정책, 그리고 갱신 후(post-renew) 훅 구성을
+변경합니다.
 업데이트 플래그 중 하나 이상이 필요합니다.
 
 ### 입력
@@ -1586,6 +1670,24 @@ cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니�
   이전 재렌더링이 실패한 경우 단순히 동일 명령을 다시 실행하면
   복구되며, `state.json`이 디스크의 관리 프로필보다 앞서나가는
   상황은 발생하지 않습니다.
+- `--cert-owner <uid-or-clear>`: 이미 등록된 서비스의 인증서/키
+  소유자 정책을 변경합니다. `service add`와 같은 숫자 uid를 같은
+  거부 규칙으로 받으며, 추가로 문자열 `clear`(대소문자 무관)를 사용해
+  기존 소유자를 제거하고 기본값으로 되돌릴 수 있습니다. 동작은
+  `--cert-group`과 정확히 같습니다: 변경은
+  `cert_owner_uid: <old> -> <new>`로 보고되며(없으면 `unset`),
+  `local-file` 서비스는 state에 이미 같은 값이 있더라도 매 실행마다
+  `state.json` 저장 전에 관리되는 `agent.toml` 프로필 블록을 다시
+  렌더링하고, `remote-bootstrap` 서비스는 `cert_owner_uid`를 언급하는
+  재발행 경고를 출력합니다. 새 모드는 agent의 다음 기록부터
+  적용됩니다. 두 플래그는 결과를 검사하기 전에 모두 적용되며, 서비스는
+  gid와 소유자를 함께 가질 수 없습니다: 그룹이 있는 서비스에
+  `--cert-owner 999`만 지정하면 아무것도 바꾸지 않고
+  `--cert-owner and --cert-group are exclusive; service
+  <registration-id> would have cert_group_gid <gid> and cert_owner_uid
+  <uid>; clear one with "--cert-group clear" or "--cert-owner clear"`로
+  거부됩니다. 한 번의 호출로 그룹에서 소유자로 전환하려면
+  `--cert-group clear --cert-owner <uid>`를 지정하세요.
 - `--reload-style`: 갱신 후 훅의 리로드 스타일 프리셋
   (`sighup`, `systemd`, `docker-restart`, `none`). `service add`와
   동일한 의미를 가집니다. 이전에 구성된 훅을 제거하려면 `none`을
@@ -1633,6 +1735,8 @@ cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니�
 - `state.json` 누락
 - 서비스 미등록
 - 업데이트 플래그 미지정
+- `--cert-group`과 `--cert-owner`의 결과로 서비스가 gid와 소유자를 함께
+  갖게 되는 경우
 
 ### 예시
 
@@ -1640,6 +1744,10 @@ cert-group 정책, 그리고 갱신 후(post-renew) 훅 구성을 변경합니�
 bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
 bootroot service update --registration-id edge-proxy --no-wrap
 bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
+
+# 그룹-읽기 서비스를 컨테이너 uid가 소유하는 키로 전환합니다.
+bootroot service update --registration-id edge-proxy \
+  --cert-group clear --cert-owner 999
 
 # 기존 서비스에 갱신 후 훅을 재구성 (이슈 #614).
 bootroot service update --registration-id review \

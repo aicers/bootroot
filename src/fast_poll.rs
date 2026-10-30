@@ -3442,6 +3442,7 @@ mod tests {
             hooks: config::HookSettings::default(),
             eab: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
         }
     }
 

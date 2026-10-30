@@ -1007,6 +1007,23 @@ pub enum StagedOwner {
     /// group-readable by the policy, so no consumer loses access to a
     /// file it could read before.
     PolicyGroup(Option<u32>),
+    /// Give the new inode to this uid and group 0, whatever the
+    /// destination carried and whatever the writing process is.
+    ///
+    /// For the private key of a service under `--cert-owner`, whose
+    /// owner is dictated by that policy and re-asserted on every write.
+    /// Like [`StagedOwner::Fixed`] the chown is unconditional and its
+    /// error is returned, so a process that cannot give the file away —
+    /// one not running as root — publishes nothing rather than a key it
+    /// owns itself. Unlike it, the chown goes through the staged file's
+    /// open descriptor (`fchown`), not its path: a root process giving a
+    /// file away must not follow a name another account could have
+    /// replaced with a symlink in a directory that account can write.
+    ///
+    /// Not a [`FixedOwner`]: that type's single `root()` constructor is
+    /// the stated guarantee for the protected registrar-internal files,
+    /// and an operator-chosen uid must not become a way to build one.
+    PolicyOwner(u32),
     /// Establish exactly this uid and gid on the new inode, whatever the
     /// destination carried and whatever the writing process is.
     ///
@@ -1236,6 +1253,18 @@ fn chown_fixed_context(owner: FixedOwner, path: &Path) -> String {
     )
 }
 
+/// The failure context of a [`StagedOwner::PolicyOwner`] publish, and of
+/// a generation member written under the same owner: names the uid and
+/// what giving a file to it takes.
+pub(crate) fn chown_policy_owner_context(uid: u32, path: &Path) -> String {
+    format!(
+        "{} must be owned by uid {uid} gid {} (cert_owner_uid): the file could not be given \
+         that owner, which needs bootroot-agent to run as root, so nothing was published",
+        path.display(),
+        cert_group::KEY_FILE_GROUP_OWNER
+    )
+}
+
 /// Publishes `contents` at `path` by staging a temporary in the same
 /// directory, applying `mode` and `owner` to it there, and `rename`ing
 /// it over the destination.
@@ -1389,6 +1418,17 @@ pub fn publish_staged_blocking(
                 )?;
             }
         }
+        StagedOwner::PolicyOwner(uid) => {
+            // Unconditional, as the `Fixed` arm below, and through the
+            // descriptor: the path could name a link someone else put
+            // there by now, and root would follow it.
+            std::os::unix::fs::fchown(
+                tmp.as_file(),
+                Some(uid),
+                Some(cert_group::KEY_FILE_GROUP_OWNER),
+            )
+            .with_context(|| chown_policy_owner_context(uid, path))?;
+        }
         StagedOwner::Fixed(fixed) => {
             // Unconditional, unlike the `Destination` arm's
             // change-nothing skip: this owner is a policy re-asserted on
@@ -1400,7 +1440,11 @@ pub fn publish_staged_blocking(
         }
     }
     if let Some(final_mode) = final_mode {
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(final_mode))
+        // Through the descriptor rather than the path, for the reason
+        // the `PolicyOwner` arm gives; for a file nobody tampered with
+        // it is the same `chmod`.
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(final_mode))
             .with_context(|| {
                 format!(
                     "Failed to set mode {final_mode:o} on temp file for {}",
@@ -3177,6 +3221,61 @@ mod tests {
             entries,
             vec![std::ffi::OsString::from("key.pem")],
             "the staged temporary must not survive the publish"
+        );
+    }
+
+    /// The `--cert-owner` arm fails like the fixed-owner one when the
+    /// process cannot give the staged inode away: the destination keeps
+    /// its inode, bytes, owner and mode, no temporary is left behind, and
+    /// the error names the uid and the root requirement. Skipped as root,
+    /// where the chown succeeds.
+    #[test]
+    fn a_policy_owner_publish_that_cannot_own_the_file_publishes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+
+        if current_process_euid() == 0 {
+            return;
+        }
+        let uid = if current_process_euid() == 4_000_000_000 {
+            4_000_000_001
+        } else {
+            4_000_000_000
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("key.pem");
+        std::fs::write(&path, "PRIOR").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        let err = publish_staged_blocking(
+            &path,
+            b"NEXT",
+            StagedMode::Policy(cert_group::KEY_FILE_MODE_OWNER),
+            StagedOwner::PolicyOwner(uid),
+            StagedDurability::RenameOnly,
+        )
+        .unwrap_err();
+        let report = format!("{err:#}");
+        assert!(
+            report.contains(&format!("uid {uid} gid 0"))
+                && report.contains("bootroot-agent to run as root")
+                && report.contains(&path.display().to_string()),
+            "the refusal must name the uid, the root requirement and the file: {report}"
+        );
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "PRIOR");
+        assert_eq!(after.ino(), before.ino(), "the rename must not have run");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o640);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("key.pem")],
+            "the staged temporary is removed with the failed publish"
         );
     }
 

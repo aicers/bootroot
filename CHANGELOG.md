@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `bootroot service add` and `bootroot service update` take
+  `--cert-owner <uid>`: `bootroot-agent` then writes the service's private key
+  owned by that numeric uid, with group 0 and mode `0600`, on every issuance and
+  renewal, and makes the key's directory `0755` so that user can reach it, while
+  the certificate and the CA bundle stay readable by everyone. It is meant for a
+  server in a container that runs as a fixed uid and reads its key from a
+  bind-mounted directory, without making the key readable by a host group. The
+  uid need not exist on the host; `0` and user names are refused, the flag
+  cannot be combined with `--cert-group`, and `bootroot-agent` must run as root
+  to apply it. `service update --cert-owner clear` removes it.
+
 ### Changed
 
 - bootroot's binaries now do all their TLS and other cryptography with

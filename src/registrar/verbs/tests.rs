@@ -4917,6 +4917,7 @@ async fn a_minted_identity_completes_remote_bootstrap() {
             expires_at: &expires_at,
         }),
         cert_group_gid: None,
+        cert_owner_uid: None,
     });
     let artifact_path = target.path().join("bootstrap.json");
     std::fs::write(

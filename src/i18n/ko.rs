@@ -512,7 +512,7 @@ pub(super) static STRINGS: Strings = Strings {
     dns_alias_responder_ambiguous: "compose 프로젝트 `{project}`에 일치하는 HTTP-01 응답기 컨테이너가 {count}개입니다. 임의로 선택하지 않습니다. 오래된 컨테이너를 제거하거나, 다른 인스턴스를 별도의 `--instance-name`으로 다시 설치하세요.",
     error_instance_name_invalid: "잘못된 --instance-name `{name}`: 소문자 ASCII 문자, 숫자, `-`만 사용할 수 있으며 문자 또는 숫자로 시작하고 최대 {max}자여야 합니다",
     error_service_update_failed: "bootroot service update 실패",
-    error_service_update_no_flags: "업데이트 플래그가 지정되지 않았습니다; --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --reload-style, 또는 --post-renew-command를 전달하세요",
+    error_service_update_no_flags: "업데이트 플래그가 지정되지 않았습니다; --secret-id-ttl, --secret-id-wrap-ttl, --no-wrap, --rn-cidrs, --cert-group, --cert-owner, --reload-style, 또는 --post-renew-command를 전달하세요",
     service_update_summary: "bootroot service update: 요약",
     service_update_field_changed: "- {field}: {old} -> {new}",
     service_update_rotate_hint: "새로운 정책을 적용하려면 `bootroot rotate approle-secret-id`를 실행하세요.",

@@ -742,6 +742,7 @@ one. Re-run `bootroot service add` to re-emit the artifact.
 | `wrap_token` | `string?` | Response-wrapped `secret_id` token (omitted when wrapping is disabled via `--no-wrap`). Sensitive — treat as a credential. | `bootroot-remote` unwrap path |
 | `wrap_expires_at` | `string?` | RFC 3339 timestamp when `wrap_token` expires (omitted when wrapping is disabled). | `bootroot-remote` unwrap error classification |
 | `cert_group_gid` | `u32?` | Numeric gid owning the issued cert/key files (omitted when `--cert-group` is unset). | `--profile-cert-group-gid` |
+| `cert_owner_uid` | `u32?` | Numeric uid owning the issued private key, with group 0 and mode `0600` (omitted when `--cert-owner` is unset). Refused when `0`, `4294967295`, or carried beside `cert_group_gid`. | artifact only |
 
 ### Version history
 

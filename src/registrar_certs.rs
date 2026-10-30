@@ -1096,6 +1096,7 @@ fn issuance_settings(
         // the co-located registrar reads the *client certificate*, which
         // is public, from a path root also owns.
         cert_group_gid: None,
+        cert_owner_uid: None,
     }];
     issuance
 }

@@ -589,6 +589,7 @@ pub(crate) async fn issue_certificate_with_bootstrap(
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
 ) -> Result<()> {
+    ensure_can_write_owner(settings, profile)?;
     let Some(material) =
         run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await?
     else {
@@ -622,16 +623,52 @@ pub(crate) async fn issue_certificate_with_bootstrap(
 ///
 /// # Errors
 ///
-/// Returns an error when the returned chain carries a fingerprint that
-/// is not pinned, when the CA bundle cannot be read or merged, or when
-/// the leaf and key cannot be written.
+/// Returns an error when the profile sets `cert_owner_uid` and this
+/// process is not root (before anything is written), when the returned
+/// chain carries a fingerprint that is not pinned, when the CA bundle
+/// cannot be read or merged, or when the leaf and key cannot be written.
 pub(crate) async fn publish_issued_material(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     material: &IssuedMaterial,
 ) -> Result<()> {
+    ensure_can_write_owner(settings, profile)?;
     publish_bundle(settings, profile, material).await?;
     publish_pair(profile, material, &Probe::default()).await
+}
+
+/// Refuses a profile whose `cert_owner_uid` this process cannot apply,
+/// before anything is requested or written.
+///
+/// Giving the key to another uid needs `CAP_CHOWN`, and the key is the
+/// last file a publication writes: without this check the bundle, the
+/// generation and the certificate would already be in place when the
+/// key's chown failed, leaving a new certificate beside the old key —
+/// and an issuance would place an ACME order on every retry only to
+/// discard the certificate. The check is on the effective uid rather
+/// than on capabilities, so a non-root agent holding `CAP_CHOWN` is
+/// refused too: the documented requirement is root.
+///
+/// # Errors
+///
+/// Returns an error when the profile sets `cert_owner_uid` and the
+/// process's effective uid is not 0.
+fn ensure_can_write_owner(
+    settings: &crate::config::Settings,
+    profile: &crate::config::DaemonProfileSettings,
+) -> Result<()> {
+    let Some(uid) = profile.cert_owner_uid else {
+        return Ok(());
+    };
+    let euid = fs_util::current_process_euid();
+    if euid != 0 {
+        let label = crate::config::profile_domain(settings, profile);
+        anyhow::bail!(
+            "profile '{label}' sets cert_owner_uid = {uid}, which needs bootroot-agent to run \
+             as root (it runs as uid {euid}); nothing was written"
+        );
+    }
+    Ok(())
 }
 
 /// Publishes what an issuance produced as a generation and at the
@@ -654,6 +691,7 @@ pub(crate) async fn publish_snapshot(
     material: &IssuedMaterial,
     probe: &Probe,
 ) -> Result<()> {
+    ensure_can_write_owner(settings, profile)?;
     publish_bundle(settings, profile, material).await?;
     publish_profile_generation(settings, profile, material, probe).await?;
     publish_pair(profile, material, probe).await
@@ -727,9 +765,7 @@ pub(crate) async fn publish_bundle(
         bundle_path,
         &material.chain,
         &settings.trust.trusted_ca_sha256,
-        crate::cert_group::CertGroupPolicy {
-            gid: profile.cert_group_gid,
-        },
+        crate::cert_group::CertGroupPolicy::for_profile(profile),
     )
     .await?;
     info!("CA bundle saved to: {:?}", bundle_path);
@@ -760,9 +796,7 @@ pub(crate) async fn publish_pair(
         &profile.paths.key,
         &material.cert_pem,
         material.key_pem.expose(),
-        crate::cert_group::CertGroupPolicy {
-            gid: profile.cert_group_gid,
-        },
+        crate::cert_group::CertGroupPolicy::for_profile(profile),
         probe,
     )
     .await?;
@@ -994,6 +1028,7 @@ mod tests {
             hooks: crate::config::HookSettings::default(),
             eab: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
         }
     }
 
@@ -1023,9 +1058,7 @@ mod tests {
     ) -> Result<()> {
         let (leaf_pem, chain) = split_leaf_and_chain(cert_pem)?;
         let key_pem = rcgen::KeyPair::generate()?.serialize_pem();
-        let policy = crate::cert_group::CertGroupPolicy {
-            gid: profile.cert_group_gid,
-        };
+        let policy = crate::cert_group::CertGroupPolicy::for_profile(profile);
         // Mirrors the production sequence, publication order included:
         // the chain is verified and the bundle merged first, and the
         // leaf and key are written only once both have succeeded.
@@ -1536,7 +1569,7 @@ mod tests {
             &bundle_path,
             std::slice::from_ref(&intermediate_der),
             &trusted,
-            CertGroupPolicy { gid: None },
+            CertGroupPolicy::none(),
         )
         .await
         .expect_err("must refuse to overwrite an unreadable bundle");

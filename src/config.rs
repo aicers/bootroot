@@ -921,6 +921,13 @@ pub struct DaemonProfileSettings {
     /// and operator-only ownership. See issue #593.
     #[serde(default)]
     pub cert_group_gid: Option<u32>,
+    /// Numeric uid that owns the issued private key (group 0, mode
+    /// `0600`) under the `--cert-owner` policy, whose key and cert
+    /// parent directories become `0755`. Exclusive with
+    /// `cert_group_gid`. `None` (the default) preserves the host-local
+    /// default. Applying it needs `bootroot-agent` to run as root.
+    #[serde(default)]
+    pub cert_owner_uid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -2120,6 +2127,82 @@ mod tests {
             msg.contains("cert_group_gid") && msg.contains("4000000000"),
             "expected unknown-gid error, got: {msg}",
         );
+    }
+
+    /// A profile config with `policy_lines` in the profile's policy slot.
+    fn profile_config_with(policy_lines: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        writeln!(
+            file,
+            r#"
+            domain = "trusted.domain"
+            [acme]
+            http_responder_url = "http://localhost:8080"
+            http_responder_hmac = "dev-hmac"
+
+            [[profiles]]
+            registration_id = "edge-proxy"
+            service_name = "edge-proxy"
+            instance_id = "001"
+            hostname = "edge-node-01"
+            {policy_lines}
+
+            [profiles.paths]
+            cert = "certs/edge-proxy.pem"
+            key = "certs/edge-proxy.key"
+        "#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    /// `cert_owner_uid = N` parses onto the profile and validates without
+    /// the uid having to exist on this host; absent, it is `None`.
+    #[test]
+    fn settings_parses_profile_cert_owner_uid() {
+        let file = profile_config_with("cert_owner_uid = 999");
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        assert_eq!(settings.profiles[0].cert_owner_uid, Some(999));
+        assert_eq!(settings.profiles[0].cert_group_gid, None);
+        settings.validate().expect("an owner uid validates");
+
+        let file = profile_config_with("cert_owner_uid = 4000000000");
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        settings
+            .validate()
+            .expect("a uid the host does not have still validates");
+
+        let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+        write_minimal_profile_config(&mut file);
+        let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+        assert!(settings.profiles[0].cert_owner_uid.is_none());
+    }
+
+    /// `0`, `4294967295`, and an owner beside a gid fail validation, each
+    /// naming `profiles.cert_owner_uid`.
+    #[test]
+    fn validate_rejects_invalid_cert_owner_uid() {
+        let egid = crate::cert_group::current_process_egid();
+        for (lines, expected) in [
+            ("cert_owner_uid = 0".to_string(), "must not be 0 (root)"),
+            (
+                "cert_owner_uid = 4294967295".to_string(),
+                "must not be 4294967295",
+            ),
+            (
+                format!("cert_owner_uid = 999\n            cert_group_gid = {egid}"),
+                "are exclusive",
+            ),
+        ] {
+            let file = profile_config_with(&lines);
+            let settings = Settings::new(Some(file.path().to_path_buf())).unwrap();
+            let msg = settings.validate().unwrap_err().to_string();
+            assert!(
+                msg.contains("profiles.cert_owner_uid") && msg.contains(expected),
+                "{lines}: {msg}"
+            );
+        }
     }
 
     /// Accepts the common case where `[openbao]` carries an absolute

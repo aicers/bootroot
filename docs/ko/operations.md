@@ -1965,6 +1965,12 @@ fail-closed 통제이므로 차오를수록 호출이 거부됩니다. 성공에
 할당되므로 미리 프로비저닝된 영속 파일을 재시작 간에 소유할 수 없고,
 디렉터리 그룹 권한만으로는 `0600` 파일을 읽을 수 없습니다.
 
+`--cert-owner`로 추가한 서비스에는 root로 실행되는 agent가 필요합니다:
+발급된 키를 다른 uid에 넘기려면 `CAP_CHOWN`이 필요하며, agent는 유효
+uid가 0이 아니면 `CAP_CHOWN`이 있더라도 그런 프로필을 거부합니다.
+따라서 이 비루트 유닛은 그런 서비스에는 적용되지 않으며, 그 서비스의
+agent는 root로 실행하세요.
+
 `service add` 후 1회 준비 작업(경로는 아래 예시 유닛과 일치):
 
 ```sh
@@ -3782,8 +3788,20 @@ bootroot service add --registration-id web-app --service-name web-app \
 ```
 
 컨테이너 프로세스가 bind-mount된 키를 읽어야 하는 비루트 사용자로
-동작한다면 `--cert-group`을 사용하세요
-([CLI > bootroot service add](cli.md) 참고).
+동작한다면([CLI > bootroot service add](cli.md) 참고):
+
+- 서버가 자신의 키를 직접 읽고, 컨테이너의 gid가 호스트 자체 그룹
+  데이터베이스의 그룹이기도 하다면(Ubuntu에서 gid 999는 흔히
+  `systemd-journal`, gid 1000은 첫 로그인 사용자의 그룹입니다)
+  `--cert-owner <컨테이너의 uid>`를 사용하세요. agent는 키를 그 uid,
+  그룹 0, 모드 `0600`으로 기록하므로 어떤 호스트 그룹도 키를 읽을 수
+  없으며, 키 디렉터리를 `0755`로 만듭니다. uid는 호스트에 없어도
+  됩니다. 일부 서버는 자신이 소유하지 않은 그룹-읽기 키를 거부하기도
+  합니다. 이 방식은 agent가 root로 실행되어야 합니다. 개별 파일이 아닌
+  **디렉터리**를 읽기 전용으로 bind-mount하세요: 모든 파일은 rename으로
+  교체되며, 파일 bind mount는 이전 파일을 계속 보여줍니다.
+- 그 외의 경우에는 `--cert-group`을 사용하세요: 키를 읽어야 하는 여러
+  계정이 한 그룹을 공유하거나, agent가 root로 실행되지 않는 경우입니다.
 
 ### `docker-restart` 훅과 하드닝 유닛의 관계
 

@@ -127,9 +127,12 @@ pub(super) async fn apply_local_service_configs(
     next = bootroot::toml_util::upsert_section_keys(&next, "openbao", &openbao_updates)?;
     // The CA bundle is public trust material: write it 0644 and pick up
     // the `--cert-group` gid when a policy is set, so cert-group members
-    // and non-root consumers in separate containers can read it.
+    // and non-root consumers in separate containers can read it. A
+    // `--cert-owner` service needs nothing here: the bundle is not
+    // re-owned under that policy.
     let cert_group_policy = CertGroupPolicy {
         gid: resolved.cert_group_gid,
+        owner_uid: None,
     };
     write_local_ca_bundle(
         &ca_bundle_path,
@@ -404,6 +407,7 @@ fn render_managed_profile_block(args: &ResolvedServiceAdd) -> String {
         &args.cert_path,
         &args.key_path,
         args.cert_group_gid,
+        args.cert_owner_uid,
     );
     inject_hooks_into_profile_block(&base, &args.post_renew_hooks)
 }
@@ -488,6 +492,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
             secret_id_path_override: None,
             remote_secret_id_path: None,
         }
@@ -529,6 +534,7 @@ mod tests {
             &args.cert_path,
             &args.key_path,
             args.cert_group_gid,
+            None,
         );
         let existing = format!("email = \"admin@example.com\"\n\n{remote_block}\n");
 

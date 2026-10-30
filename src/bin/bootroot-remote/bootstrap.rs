@@ -489,7 +489,60 @@ fn validate_bootstrap_args(args: &ResolvedBootstrapArgs, lang: Locale) -> Result
             )
         );
     }
+    validate_artifact_cert_owner_uid(args.cert_owner_uid, args.cert_group_gid, lang)?;
     validate_artifact_cert_group_gid(args.cert_group_gid, lang)?;
+    Ok(())
+}
+
+/// Validates the `cert_owner_uid` carried in the bootstrap artifact.
+///
+/// Refuses `0`, `4294967295` (which `chown` reads as "leave the owner
+/// unchanged") and an artifact that also carries a `cert_group_gid`:
+/// the two policies are exclusive. The uid is not looked up in this
+/// host's user database — it usually names a user inside a container
+/// that this host need not have.
+fn validate_artifact_cert_owner_uid(
+    uid: Option<u32>,
+    gid: Option<u32>,
+    lang: Locale,
+) -> Result<()> {
+    let Some(uid) = uid else {
+        return Ok(());
+    };
+    if let Some(gid) = gid {
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!(
+                    "Bootstrap artifact carries both cert_owner_uid={uid} and \
+                     cert_group_gid={gid}, which are exclusive. Clear one with `bootroot \
+                     service update --cert-group clear` or `--cert-owner clear`, re-emit the \
+                     artifact with `bootroot service add`, and re-run bootstrap.",
+                ),
+                &format!(
+                    "부트스트랩 아티팩트에 cert_owner_uid={uid}와 cert_group_gid={gid}가 함께 \
+                     들어 있지만 두 값은 함께 쓸 수 없습니다. `bootroot service update \
+                     --cert-group clear` 또는 `--cert-owner clear`로 하나를 지우고, \
+                     `bootroot service add`로 아티팩트를 다시 만든 뒤 bootstrap을 다시 \
+                     실행하세요.",
+                ),
+            )
+        );
+    }
+    if let Err(err) = bootroot::cert_group::validate_cert_owner_uid(uid) {
+        anyhow::bail!(
+            "{}",
+            localized(
+                lang,
+                &format!(
+                    "Bootstrap artifact requested cert_owner_uid={uid}, which is not \
+                     permitted: {err}.",
+                ),
+                &format!("부트스트랩 아티팩트의 cert_owner_uid={uid}는 허용되지 않습니다: {err}."),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -563,6 +616,7 @@ mod tests {
             wrap_token: None,
             wrap_expires_at: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
         }
     }
 
@@ -778,6 +832,50 @@ mod tests {
             msg.contains("cert_group_gid") && msg.contains("4000000000"),
             "expected unknown-gid error, got: {msg}",
         );
+    }
+
+    /// Bootstrap refuses an artifact `cert_owner_uid` of `0` or
+    /// `4294967295`, and one carried beside a `cert_group_gid`.
+    #[test]
+    fn validate_bootstrap_args_rejects_invalid_cert_owner_uid() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let role_id_path = dir.path().join("role_id");
+        std::fs::write(&role_id_path, "rid").expect("write role_id");
+        let secret_id_path = dir.path().join("secret_id");
+        std::fs::write(&secret_id_path, "sid").expect("write secret_id");
+
+        let mut args = dummy_args();
+        args.registration_id = "svc".to_string();
+        args.service_name = "svc".to_string();
+        args.profile_hostname = "host".to_string();
+        args.agent_domain = "example.com".to_string();
+        args.profile_instance_id = Some("1".to_string());
+        args.role_id_path = role_id_path;
+        args.secret_id_path = secret_id_path;
+        args.eab_file_path = dir.path().join("eab.json");
+
+        args.cert_owner_uid = Some(999);
+        validate_bootstrap_args(&args, Locale::En).expect("uid 999 is accepted");
+
+        for (uid, gid, expected) in [
+            (0, None, "cert_owner_uid=0"),
+            (u32::MAX, None, "cert_owner_uid=4294967295"),
+            (999, Some(5001), "cert_group_gid=5001"),
+        ] {
+            args.cert_owner_uid = Some(uid);
+            args.cert_group_gid = gid;
+            let msg = format!(
+                "{}",
+                validate_bootstrap_args(&args, Locale::En).expect_err("must be refused")
+            );
+            assert!(msg.contains(expected), "{msg}");
+            let ko = format!(
+                "{}",
+                validate_bootstrap_args(&args, Locale::Ko).expect_err("must be refused")
+            );
+            assert!(ko.contains(expected), "{ko}");
+        }
     }
 
     #[test]

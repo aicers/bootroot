@@ -273,6 +273,24 @@ jobs:
             setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
             -- "$CARGO_BIN" test
 
+      - name: Run Root-Only Cert Owner Tests
+        # `--cert-owner` gives the issued key to another uid, which only
+        # root can do, so the tests that show what a root agent writes run
+        # here as root while the build stays the runner's: cargo builds as
+        # the runner and starts each test binary through `sudo`, which keeps
+        # `target/` owned by the runner for every later step.
+        # BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 turns the tests' non-root skip
+        # into a failure, so a runner that silently stopped being root
+        # cannot pass this step by skipping; `sudo` strips it by default,
+        # hence --preserve-env. `as_root_only` selects the one library test
+        # of the same kind (the generation tree under an owner).
+        env:
+          BOOTROOT_E2E_REQUIRE_CERT_OWNER: "1"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo --preserve-env=BOOTROOT_E2E_REQUIRE_CERT_OWNER
+        run: |
+          cargo test --test e2e_cert_owner_chown
+          cargo test --lib as_root_only
+
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory
         run: echo "BOOTROOT_SECRETS_DIR=$GITHUB_WORKSPACE/secrets" >> "$GITHUB_ENV"

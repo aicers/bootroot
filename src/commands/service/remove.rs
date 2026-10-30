@@ -576,6 +576,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
             remote_secret_id_path: None,
         }
     }
@@ -861,6 +862,7 @@ mod tests {
             Path::new("/certs/cert.pem"),
             Path::new("/certs/key.pem"),
             None,
+            None,
         );
         let contents = bootroot::trust_bootstrap::upsert_managed_profile_block(
             "email = \"a@b.c\"\n",
@@ -898,6 +900,7 @@ mod tests {
             Path::new("/certs/cert.pem"),
             Path::new("/certs/key.pem"),
             None,
+            None,
         );
         let contents = format!("email = \"a@b.c\"\n\n{block}\n");
         std::fs::write(&path, &contents).expect("write");
@@ -928,6 +931,7 @@ mod tests {
             "host1",
             Path::new("/certs/cert.pem"),
             Path::new("/certs/key.pem"),
+            None,
             None,
         );
         // Build the file the way the real pipeline does: profile first,
@@ -1027,6 +1031,7 @@ mod tests {
                 "host1",
                 Path::new("/certs/cert.pem"),
                 Path::new("/certs/key.pem"),
+                None,
                 None,
             )
         };

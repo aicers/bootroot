@@ -197,7 +197,9 @@ pub const ALL_MANAGED_PROFILE_MARKERS: [ManagedProfileMarkers; 2] =
 /// `cert_group_gid = N` line so that the agent applies the
 /// `--cert-group` policy on every issuance and rotation. `None`
 /// preserves the host-local default (operator-only mode/owner) and
-/// emits no line.
+/// emits no line. `cert_owner_uid` is rendered the same way, as a
+/// `cert_owner_uid = N` line for the `--cert-owner` policy; the two are
+/// exclusive, and the caller never passes both.
 /// The marker lines name the `registration_id`, not the `service_name`:
 /// two registrations of one component on one host share a
 /// `service_name`, and markers keyed on it would address one block from
@@ -214,9 +216,14 @@ pub fn render_managed_profile_block(
     cert_path: &Path,
     key_path: &Path,
     cert_group_gid: Option<u32>,
+    cert_owner_uid: Option<u32>,
 ) -> String {
     let group_line = match cert_group_gid {
         Some(gid) => format!("cert_group_gid = {gid}\n"),
+        None => String::new(),
+    };
+    let owner_line = match cert_owner_uid {
+        Some(uid) => format!("cert_owner_uid = {uid}\n"),
         None => String::new(),
     };
     format!(
@@ -226,7 +233,7 @@ registration_id = \"{registration_id}\"\n\
 service_name = \"{service_name}\"\n\
 instance_id = \"{instance_id}\"\n\
 hostname = \"{hostname}\"\n\
-{group_line}\n\
+{group_line}{owner_line}\n\
 [profiles.paths]\n\
 cert = \"{cert}\"\n\
 key = \"{key}\"\n\
@@ -541,6 +548,7 @@ mod tests {
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
             None,
+            None,
         );
         let once = upsert_managed_profile_block("", BEGIN_PREFIX, END_PREFIX, "edge-proxy", &block);
         let twice =
@@ -558,6 +566,7 @@ mod tests {
             "node-01",
             Path::new(&format!("certs/{service}.crt")),
             Path::new(&format!("certs/{service}.key")),
+            None,
             None,
         )
     }
@@ -666,6 +675,7 @@ mod tests {
             "edge-node-01",
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
+            None,
             None,
         );
         let original = "email = \"admin@example.com\"\n";
@@ -832,6 +842,7 @@ instance_id = \"001\"\n\n\
                 Path::new(&format!("certs/{name}.crt")),
                 Path::new(&format!("certs/{name}.key")),
                 None,
+                None,
             )
         };
         let contents = format!("{}\n{}", make_block("api-v2"), make_block("apifoobar"));
@@ -867,6 +878,7 @@ instance_id = \"001\"\n\n\
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
             None,
+            None,
         );
         let removed = remove_managed_profile_block(&block, BEGIN_PREFIX, END_PREFIX, "edge-proxy");
         assert!(removed.is_empty(), "file with only the block becomes empty");
@@ -887,6 +899,7 @@ instance_id = \"001\"\n\n\
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
             Some(5001),
+            None,
         );
         let has_policy_line = block.contains("cert_group_gid = 5001");
         assert!(
@@ -907,12 +920,53 @@ instance_id = \"001\"\n\n\
             Path::new("certs/edge-proxy.crt"),
             Path::new("certs/edge-proxy.key"),
             None,
+            None,
         );
         let has_policy_line = block.contains("cert_group_gid");
         assert!(
             !has_policy_line,
             "rendered profile must omit the policy line when unset"
         );
+    }
+
+    /// `--cert-owner` renders a `cert_owner_uid` line in the same place,
+    /// and no gid line beside it.
+    #[test]
+    fn render_managed_profile_block_includes_cert_owner_uid() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            None,
+            Some(999),
+        );
+        assert!(
+            block.contains("hostname = \"edge-node-01\"\ncert_owner_uid = 999\n\n[profiles.paths]"),
+            "rendered profile must carry the owner line in the policy slot: {block}"
+        );
+        assert!(!block.contains("cert_group_gid"));
+    }
+
+    #[test]
+    fn render_managed_profile_block_omits_cert_owner_uid_when_none() {
+        let block = render_managed_profile_block(
+            BEGIN_PREFIX,
+            END_PREFIX,
+            "edge-proxy",
+            "edge-proxy",
+            "001",
+            "edge-node-01",
+            Path::new("certs/edge-proxy.crt"),
+            Path::new("certs/edge-proxy.key"),
+            Some(5001),
+            None,
+        );
+        assert!(!block.contains("cert_owner_uid"));
     }
 
     #[test]

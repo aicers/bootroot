@@ -462,6 +462,13 @@ pub(crate) struct ServiceEntry {
     /// workarounds — see issue #593.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cert_group_gid: Option<u32>,
+    /// Numeric uid that owns the issued private key (group 0, mode
+    /// `0600`) under the `--cert-owner` policy. Exclusive with
+    /// [`ServiceEntry::cert_group_gid`]. `None` means the operator did
+    /// not opt into the policy. Persisted for the same reason the gid
+    /// is: so rotation always re-applies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cert_owner_uid: Option<u32>,
     /// Target-host `secret_id` path a `remote-bootstrap` registration
     /// named with `--secret-id-path`. It goes into the bootstrap
     /// artifact only, with `role_id` and `eab.json` as its siblings;
@@ -981,6 +988,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
             remote_secret_id_path: None,
         };
         let json = serde_json::to_string_pretty(&entry).expect("serialize");

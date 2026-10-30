@@ -716,6 +716,7 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 | `wrap_token` | `string?` | 응답 래핑된 `secret_id` 토큰 (`--no-wrap` 사용 시 생략). 민감 정보 — 자격 증명으로 취급하세요. | `bootroot-remote` 언래핑 경로 |
 | `wrap_expires_at` | `string?` | `wrap_token` 만료 시각 (RFC 3339 형식, 래핑 비활성화 시 생략). | `bootroot-remote` 언래핑 오류 분류 |
 | `cert_group_gid` | `u32?` | 발급된 인증서/키 파일을 소유하는 숫자 gid (`--cert-group` 미설정 시 생략). | `--profile-cert-group-gid` |
+| `cert_owner_uid` | `u32?` | 발급된 개인 키를 그룹 0, 모드 `0600`으로 소유하는 숫자 uid (`--cert-owner` 미설정 시 생략). `0`, `4294967295`, 또는 `cert_group_gid`와 함께 담긴 경우 거부됩니다. | 아티팩트 전용 |
 
 ### 버전 이력
 

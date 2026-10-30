@@ -1345,6 +1345,7 @@ fn issuance_settings(
         // daemon's own issuance of this pair writes it: the key is
         // `0600` and the certificate beside it is public.
         cert_group_gid: None,
+        cert_owner_uid: None,
     }];
     settings
 }

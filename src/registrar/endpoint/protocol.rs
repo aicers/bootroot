@@ -1076,6 +1076,9 @@ fn encode_bootstrap_artifact(
             expires_at: &wrap_expires_at,
         }),
         cert_group_gid: source.cert_group_gid,
+        // A registrar registration has no owner policy, and the wire
+        // contract carries none.
+        cert_owner_uid: None,
     });
     Ok(BootstrapArtifact(
         serialize_artifact(&artifact)?.into_bytes(),

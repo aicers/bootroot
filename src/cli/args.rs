@@ -1718,8 +1718,21 @@ pub(crate) struct ServiceAddArgs {
     /// `local-file` deployments accept a name or numeric gid;
     /// `remote-bootstrap` deployments accept numeric form only — see
     /// issue #593 for the cross-host NSS rationale.
-    #[arg(long, value_name = "GID-OR-NAME")]
+    #[arg(long, value_name = "GID-OR-NAME", conflicts_with = "cert_owner")]
     pub(crate) cert_group: Option<String>,
+
+    /// Numeric uid that should own the issued private key.
+    ///
+    /// When set, the agent writes the key owned by this uid with group
+    /// 0 and mode `0600` on every issuance and rotation, and makes the
+    /// key and cert directories `0755` so that uid can reach it; the
+    /// certificate and the CA bundle stay `0644`. Meant for a server in
+    /// a container that runs as a fixed uid. The uid is never resolved
+    /// against a user database and need not exist on the host; `0` and
+    /// user names are refused. `bootroot-agent` must run as root to
+    /// apply it. Exclusive with `--cert-group`.
+    #[arg(long, value_name = "UID")]
+    pub(crate) cert_owner: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1767,6 +1780,17 @@ pub(crate) struct ServiceUpdateArgs {
     /// deployments accept numeric form only — see issue #593.
     #[arg(long, value_name = "GID-OR-NAME-OR-CLEAR")]
     pub(crate) cert_group: Option<String>,
+
+    /// Numeric uid that owns the issued private key.
+    ///
+    /// Use a numeric uid to have the agent write the key owned by it,
+    /// group 0, mode `0600`, with `0755` key and cert directories, from
+    /// its next issuance or rotation. Use the literal string `clear` to
+    /// remove an existing owner and revert to the default. The service
+    /// may not end up with both a group and an owner: switch from one to
+    /// the other in one call with `--cert-group clear --cert-owner <uid>`.
+    #[arg(long, value_name = "UID-OR-CLEAR")]
+    pub(crate) cert_owner: Option<String>,
 
     /// Reload style preset for post-renew hook.
     ///
@@ -3148,6 +3172,81 @@ mod tests {
         match cli.command {
             CliCommand::Service(ServiceCommand::Update(args)) => {
                 assert_eq!(args.cert_group.as_deref(), Some("clear"));
+            }
+            _ => panic!("expected service update"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parses_service_add_cert_owner() {
+        let cli = Cli::parse_from(["bootroot", "service", "add", "--cert-owner", "999"]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Add(args)) => {
+                assert_eq!(args.cert_owner.as_deref(), Some("999"));
+                assert!(args.cert_group.is_none());
+            }
+            _ => panic!("expected service add"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rejects_service_add_cert_group_with_cert_owner() {
+        let err = Cli::try_parse_from([
+            "bootroot",
+            "service",
+            "add",
+            "--cert-group",
+            "5001",
+            "--cert-owner",
+            "999",
+        ])
+        .expect_err("the two policies conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = err.to_string();
+        assert!(
+            message.contains("--cert-group") && message.contains("--cert-owner"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_service_update_cert_owner_clear() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--registration-id",
+            "edge-proxy",
+            "--cert-owner",
+            "clear",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.cert_owner.as_deref(), Some("clear"));
+            }
+            _ => panic!("expected service update"),
+        }
+    }
+
+    /// `service update` applies both flags in one call, which is how a
+    /// service switches from a group to an owner.
+    #[test]
+    fn test_cli_parses_service_update_cert_group_clear_with_cert_owner() {
+        let cli = Cli::parse_from([
+            "bootroot",
+            "service",
+            "update",
+            "--registration-id",
+            "edge-proxy",
+            "--cert-group",
+            "clear",
+            "--cert-owner",
+            "999",
+        ]);
+        match cli.command {
+            CliCommand::Service(ServiceCommand::Update(args)) => {
+                assert_eq!(args.cert_group.as_deref(), Some("clear"));
+                assert_eq!(args.cert_owner.as_deref(), Some("999"));
             }
             _ => panic!("expected service update"),
         }

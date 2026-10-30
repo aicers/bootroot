@@ -62,6 +62,16 @@ echo "[test-core]   BOOTROOT_E2E_CERT_GROUP_GID=<gid of a group this user is"
 echo "[test-core]   in as a non-primary supplementary group>, then runs cargo"
 echo "[test-core]   test under 'setpriv --init-groups'.  A green run below"
 echo "[test-core]   does not mean that regression was verified."
+# The `--cert-owner` root tests are the same story: CI re-runs
+# `tests/e2e_cert_owner_chown.rs` and the library's `as_root_only` test
+# as root with BOOTROOT_E2E_REQUIRE_CERT_OWNER=1, and this script does
+# not, so here they skip as a non-root run and report as a pass.
+echo "[test-core] NOTICE: the cert-owner tests in"
+echo "[test-core]   tests/e2e_cert_owner_chown.rs and the library's"
+echo "[test-core]   as_root_only test run as root only in CI, which exports"
+echo "[test-core]   BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 and starts the test"
+echo "[test-core]   binaries through sudo.  Run as non-root below, they skip;"
+echo "[test-core]   a green run does not mean they were verified."
 echo "[test-core] running unit tests"
 cargo test
 

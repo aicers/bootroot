@@ -2163,6 +2163,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
             remote_secret_id_path: None,
         }
     }
