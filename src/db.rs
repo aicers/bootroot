@@ -1,9 +1,11 @@
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use postgres::NoTls;
+use postgres::config::SslMode;
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Hostname that step-ca uses to reach `PostgreSQL` from inside the compose
 /// network.
@@ -22,6 +24,10 @@ pub const DB_HOST_RUNTIME_HOST: &str = "127.0.0.1";
 pub const DEFAULT_POSTGRES_HOST_PORT: u16 = 5433;
 /// Environment variable that controls the host-side published port.
 pub const POSTGRES_HOST_PORT_ENV: &str = "POSTGRES_HOST_PORT";
+/// The `sslmode` value under which bootroot connects without TLS.
+const SSLMODE_DISABLE: &str = "disable";
+/// The DSN host bootroot dials as the IPv4 loopback address over TLS.
+const LOCALHOST: &str = "localhost";
 
 #[derive(Debug, Clone)]
 pub struct DbDsn {
@@ -31,6 +37,7 @@ pub struct DbDsn {
     pub port: u16,
     pub database: String,
     pub sslmode: Option<String>,
+    pub sslrootcert: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -72,22 +79,28 @@ pub fn parse_db_dsn(input: &str) -> Result<DbDsn> {
     {
         anyhow::bail!("DSN contains empty fields");
     }
-    let sslmode = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "sslmode")
-        .map(|(_, value)| value.to_string());
+    let query_param = |name: &str| {
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    };
     Ok(DbDsn {
         user: user.to_string(),
         password: password.to_string(),
         host: host.to_string(),
         port,
         database: database.to_string(),
-        sslmode,
+        sslmode: query_param("sslmode"),
+        sslrootcert: query_param("sslrootcert"),
     })
 }
 
 /// Builds a `PostgreSQL` DSN from structured components.
+///
+/// `sslmode` defaults to `disable`. `sslrootcert`, when given, follows it
+/// as written: it is a path and is not percent-encoded.
 #[must_use]
 pub fn build_db_dsn(
     user: &str,
@@ -96,9 +109,16 @@ pub fn build_db_dsn(
     port: u16,
     database: &str,
     sslmode: Option<&str>,
+    sslrootcert: Option<&str>,
 ) -> String {
-    let sslmode = sslmode.unwrap_or("disable");
-    format!("postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}")
+    let sslmode = sslmode.unwrap_or(SSLMODE_DISABLE);
+    let mut dsn =
+        format!("postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}");
+    if let Some(sslrootcert) = sslrootcert {
+        dsn.push_str("&sslrootcert=");
+        dsn.push_str(sslrootcert);
+    }
+    dsn
 }
 
 /// Translates a DSN into its compose-internal form.
@@ -107,9 +127,9 @@ pub fn build_db_dsn(
 /// [`DB_COMPOSE_PORT`] so step-ca (running inside the compose network) can
 /// reach `PostgreSQL` regardless of the host-side published port.
 ///
-/// Preserves user, password, database, and the `sslmode` query parameter.
-/// Other query parameters are dropped — see [`parse_db_dsn`] /
-/// [`build_db_dsn`].
+/// Preserves user, password, database, and the `sslmode` and `sslrootcert`
+/// query parameters. Other query parameters are dropped — see
+/// [`parse_db_dsn`] / [`build_db_dsn`].
 ///
 /// # Errors
 ///
@@ -123,6 +143,7 @@ pub fn for_compose_runtime(dsn: &str) -> Result<String> {
         DB_COMPOSE_PORT,
         &parsed.database,
         parsed.sslmode.as_deref(),
+        parsed.sslrootcert.as_deref(),
     ))
 }
 
@@ -133,9 +154,9 @@ pub fn for_compose_runtime(dsn: &str) -> Result<String> {
 /// `POSTGRES_HOST_PORT`, else `compose_dir/.env`, else
 /// [`DEFAULT_POSTGRES_HOST_PORT`]).
 ///
-/// Preserves user, password, database, and the `sslmode` query parameter.
-/// Other query parameters are dropped — see [`parse_db_dsn`] /
-/// [`build_db_dsn`].
+/// Preserves user, password, database, and the `sslmode` and `sslrootcert`
+/// query parameters. Other query parameters are dropped — see
+/// [`parse_db_dsn`] / [`build_db_dsn`].
 ///
 /// # Errors
 ///
@@ -160,6 +181,7 @@ pub fn for_host_runtime_with_port(dsn: &str, port: u16) -> Result<String> {
         port,
         &parsed.database,
         parsed.sslmode.as_deref(),
+        parsed.sslrootcert.as_deref(),
     ))
 }
 
@@ -230,6 +252,7 @@ pub fn effective_admin_dsn_for_kv(
         admin.port,
         &admin.database,
         admin.sslmode.as_deref(),
+        admin.sslrootcert.as_deref(),
     ))
 }
 
@@ -262,23 +285,124 @@ pub fn validate_db_identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// How [`connect_db`] reaches the server a DSN names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbTransport {
+    /// `sslmode=disable`: plaintext, to the DSN's host as written.
+    Plain,
+    /// Every other `sslmode`, or none: TLS, verified against the CA root
+    /// for the name [`DB_COMPOSE_HOST`].
+    VerifiedTls,
+}
+
+/// Builds the `postgres::Config` [`connect_db`] dials with, and the
+/// transport it must use, from a DSN.
+///
+/// Only the user, password, host, port and database reach the config;
+/// every query parameter is consumed here or ignored, so tokio-postgres
+/// never parses a value it rejects (such as `verify-full` or
+/// `sslrootcert`). The raw parts are re-formed into a `postgresql://` URL
+/// so the percent-decoding `postgres::Config` applies is kept.
+///
+/// For TLS the config dials the DSN's host as a numeric `hostaddr` and
+/// names [`DB_COMPOSE_HOST`] as `host`, which tokio-postgres hands to the
+/// TLS connector as the name to verify: the server's certificate names
+/// the service, not the loopback address it is reached by.
+///
+/// No error carries the DSN or its password.
+fn db_connect_config(dsn: &str) -> Result<(postgres::Config, DbTransport)> {
+    let parsed = parse_db_dsn(dsn).context("Failed to parse PostgreSQL DSN")?;
+    let DbDsn {
+        user,
+        password,
+        host,
+        port,
+        database,
+        sslmode,
+        ..
+    } = &parsed;
+    if sslmode.as_deref() == Some(SSLMODE_DISABLE) {
+        let mut config = format!("postgresql://{user}:{password}@{host}:{port}/{database}")
+            .parse::<postgres::Config>()
+            .context("Failed to parse PostgreSQL DSN")?;
+        config.ssl_mode(SslMode::Disable);
+        return Ok((config, DbTransport::Plain));
+    }
+    let hostaddr = tls_dial_address(host)?;
+    let mut config = format!(
+        "postgresql://{user}:{password}@{DB_COMPOSE_HOST}:{port}/{database}?hostaddr={hostaddr}"
+    )
+    .parse::<postgres::Config>()
+    .context("Failed to parse PostgreSQL DSN")?;
+    config.ssl_mode(SslMode::Require);
+    Ok((config, DbTransport::VerifiedTls))
+}
+
+/// Maps a DSN host to the numeric address a TLS connection dials: an IP
+/// address is kept and `localhost` (ASCII case-insensitively) becomes
+/// `127.0.0.1`.
+///
+/// Any other name is refused rather than resolved, because the name
+/// verified is always [`DB_COMPOSE_HOST`] and the host only says where
+/// to dial.
+fn tls_dial_address(host: &str) -> Result<IpAddr> {
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        return Ok(addr);
+    }
+    if host.eq_ignore_ascii_case(LOCALHOST) {
+        return Ok(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+    anyhow::bail!(
+        "PostgreSQL host `{host}` is not an IP address or `{LOCALHOST}`: bootroot's TLS \
+         connections to PostgreSQL dial an IP address and verify the name `{DB_COMPOSE_HOST}`"
+    )
+}
+
+/// Opens a connection to the `PostgreSQL` server a DSN names.
+///
+/// `sslmode=disable` connects without TLS. Every other `sslmode`, or
+/// none, connects over TLS and verifies the server for the name
+/// [`DB_COMPOSE_HOST`], with the certificates in `root_ca` as the only
+/// trust anchors; nothing falls back to plaintext. `root_ca` is read only
+/// for a TLS connection, so a plaintext one works before `step ca init`
+/// has written it.
+fn connect_db(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<postgres::Client> {
+    let (mut config, transport) = db_connect_config(dsn)?;
+    config.connect_timeout(timeout);
+    match transport {
+        DbTransport::Plain => Ok(config.connect(NoTls)?),
+        DbTransport::VerifiedTls => {
+            let pem = std::fs::read_to_string(root_ca).with_context(|| {
+                format!("Failed to read PostgreSQL CA root {}", root_ca.display())
+            })?;
+            let tls_config =
+                crate::tls::build_client_config_from_pem(&pem, &[]).with_context(|| {
+                    format!("Failed to load PostgreSQL CA root {}", root_ca.display())
+                })?;
+            Ok(config.connect(MakeRustlsConnect::new(tls_config))?)
+        }
+    }
+}
+
 /// Checks DB auth by connecting and running a lightweight query.
+///
+/// The connection is made as [`provision_db_sync`] describes, with
+/// `root_ca` the CA root file a TLS connection verifies against.
 ///
 /// # Errors
 ///
-/// Returns an error when the DSN is invalid, authentication fails, or the
-/// query cannot be executed.
-pub fn check_auth_sync(dsn: &str, timeout: Duration) -> Result<()> {
+/// Returns an error when the DSN is invalid, its host cannot be dialled
+/// over TLS (a name other than `localhost`), `root_ca` cannot be read for
+/// a TLS connection, the TLS handshake or the server's verification
+/// fails, authentication fails, the query cannot be executed, or the
+/// check exceeds `timeout`.
+pub fn check_auth_sync(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<()> {
     let dsn = dsn.to_string();
+    let root_ca = root_ca.to_path_buf();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = (|| {
-            let mut config = dsn
-                .parse::<postgres::Config>()
-                .context("Failed to parse PostgreSQL DSN")?;
-            config.connect_timeout(timeout);
-            let mut client = config
-                .connect(NoTls)
+            let mut client = connect_db(&dsn, &root_ca, timeout)
                 .context("Failed to authenticate to PostgreSQL")?;
             client
                 .simple_query("SELECT 1")
@@ -300,23 +424,29 @@ pub fn check_auth_sync(dsn: &str, timeout: Duration) -> Result<()> {
 
 /// Provisions a DB role and database using the provided admin DSN.
 ///
+/// With `sslmode=disable` the admin DSN connects without TLS, to its host
+/// as written. With any other `sslmode`, or none, it connects over TLS
+/// (rustls on the aws-lc-rs provider, offering X25519MLKEM768 first),
+/// dials the DSN's host (an IP address, or `localhost` as `127.0.0.1`),
+/// and verifies the server's certificate for the name
+/// [`DB_COMPOSE_HOST`] against the certificates in `root_ca` alone; it
+/// never falls back to plaintext.
+///
 /// # Errors
 ///
-/// Returns an error if the admin DSN is invalid or the provisioning statements
-/// fail to execute.
+/// Returns an error if the admin DSN is invalid, its host cannot be
+/// dialled over TLS (a name other than `localhost`), `root_ca` cannot be
+/// read for a TLS connection, the connection, TLS handshake or server
+/// verification fails, or the provisioning statements fail to execute.
 pub fn provision_db_sync(
     admin_dsn: &str,
+    root_ca: &Path,
     db_user: &str,
     db_password: &str,
     db_name: &str,
     timeout: Duration,
 ) -> Result<DbProvisionReport> {
-    let mut config = admin_dsn
-        .parse::<postgres::Config>()
-        .context("Failed to parse PostgreSQL admin DSN")?;
-    config.connect_timeout(timeout);
-    let mut client = config
-        .connect(NoTls)
+    let mut client = connect_db(admin_dsn, root_ca, timeout)
         .context("Failed to connect to PostgreSQL as admin")?;
 
     let mut report = DbProvisionReport::default();
@@ -377,6 +507,7 @@ pub fn provision_db_sync(
     // DSN's password unchanged.
     grant_public_schema(
         admin_dsn,
+        root_ca,
         db_name,
         db_user,
         db_password,
@@ -393,6 +524,7 @@ pub fn provision_db_sync(
 /// this, step-ca's first `CREATE TABLE` fails with permission denied.
 fn grant_public_schema(
     admin_dsn: &str,
+    root_ca: &Path,
     db_name: &str,
     db_user: &str,
     db_password: &str,
@@ -412,13 +544,9 @@ fn grant_public_schema(
         admin.port,
         db_name,
         admin.sslmode.as_deref(),
+        admin.sslrootcert.as_deref(),
     );
-    let mut config = target_dsn
-        .parse::<postgres::Config>()
-        .context("Failed to parse PostgreSQL target DSN")?;
-    config.connect_timeout(timeout);
-    let mut client = config
-        .connect(NoTls)
+    let mut client = connect_db(&target_dsn, root_ca, timeout)
         .context("Failed to connect to PostgreSQL target database")?;
     client.execute(
         &format!("GRANT CREATE, USAGE ON SCHEMA public TO {role_ident}"),
@@ -534,8 +662,231 @@ mod tests {
     #[test]
     fn build_db_dsn_includes_sslmode() {
         let password = test_password();
-        let dsn = build_db_dsn("user", &password, "localhost", 5432, "db", Some("require"));
+        let dsn = build_db_dsn(
+            "user",
+            &password,
+            "localhost",
+            5432,
+            "db",
+            Some("require"),
+            None,
+        );
         assert!(dsn.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn build_db_dsn_without_sslrootcert_is_unchanged() {
+        let dsn = build_db_dsn("step", "pw", "127.0.0.1", 5433, "stepca", None, None);
+        assert_eq!(
+            dsn,
+            "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn parse_build_round_trip_keeps_sslrootcert() {
+        let dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/bootroot/root_ca.crt";
+        let parsed = parse_db_dsn(dsn).unwrap();
+        assert_eq!(parsed.sslmode.as_deref(), Some("verify-full"));
+        assert_eq!(
+            parsed.sslrootcert.as_deref(),
+            Some("/etc/bootroot/root_ca.crt")
+        );
+        let rebuilt = build_db_dsn(
+            &parsed.user,
+            &parsed.password,
+            &parsed.host,
+            parsed.port,
+            &parsed.database,
+            parsed.sslmode.as_deref(),
+            parsed.sslrootcert.as_deref(),
+        );
+        assert_eq!(rebuilt, dsn);
+    }
+
+    #[test]
+    fn parse_build_round_trip_without_sslrootcert() {
+        let dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=require";
+        let parsed = parse_db_dsn(dsn).unwrap();
+        assert!(parsed.sslrootcert.is_none());
+        let rebuilt = build_db_dsn(
+            &parsed.user,
+            &parsed.password,
+            &parsed.host,
+            parsed.port,
+            &parsed.database,
+            parsed.sslmode.as_deref(),
+            parsed.sslrootcert.as_deref(),
+        );
+        assert_eq!(rebuilt, dsn);
+    }
+
+    #[test]
+    fn for_compose_runtime_keeps_sslrootcert() {
+        let dsn =
+            "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/ca.crt";
+        assert_eq!(
+            for_compose_runtime(dsn).unwrap(),
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/ca.crt"
+        );
+    }
+
+    #[test]
+    fn for_host_runtime_with_port_keeps_sslrootcert() {
+        let dsn =
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/ca.crt";
+        assert_eq!(
+            for_host_runtime_with_port(dsn, 6543).unwrap(),
+            "postgresql://step:pw@127.0.0.1:6543/stepca?sslmode=verify-full&sslrootcert=/ca.crt"
+        );
+    }
+
+    #[test]
+    fn effective_admin_dsn_for_kv_keeps_sslrootcert() {
+        let dsn =
+            "postgresql://step:old@postgres:5432/postgres?sslmode=verify-full&sslrootcert=/ca.crt";
+        assert_eq!(
+            effective_admin_dsn_for_kv(dsn, "step", "new").unwrap(),
+            "postgresql://step:new@postgres:5432/postgres?sslmode=verify-full&sslrootcert=/ca.crt"
+        );
+    }
+
+    fn tcp_hosts(config: &postgres::Config) -> Vec<String> {
+        config
+            .get_hosts()
+            .iter()
+            .map(|host| match host {
+                postgres::config::Host::Tcp(name) => name.clone(),
+                #[cfg(unix)]
+                postgres::config::Host::Unix(path) => panic!("unexpected unix host {path:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn db_connect_config_verify_full_dials_hostaddr_and_verifies_postgres() {
+        let (config, transport) = db_connect_config(
+            "postgresql://step:pw@127.0.0.1:6543/stepca?sslmode=verify-full&sslrootcert=/ca.crt",
+        )
+        .unwrap();
+        assert_eq!(transport, DbTransport::VerifiedTls);
+        assert_eq!(tcp_hosts(&config), vec![DB_COMPOSE_HOST.to_string()]);
+        assert_eq!(config.get_hostaddrs(), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(config.get_ports(), &[6543]);
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
+        assert_eq!(config.get_user(), Some("step"));
+        assert_eq!(config.get_password(), Some(&b"pw"[..]));
+        assert_eq!(config.get_dbname(), Some("stepca"));
+    }
+
+    #[test]
+    fn db_connect_config_maps_localhost_to_loopback() {
+        for host in ["localhost", "LocalHost"] {
+            let (config, transport) = db_connect_config(&format!(
+                "postgresql://step:pw@{host}:5433/stepca?sslmode=verify-full"
+            ))
+            .unwrap();
+            assert_eq!(transport, DbTransport::VerifiedTls);
+            assert_eq!(tcp_hosts(&config), vec![DB_COMPOSE_HOST.to_string()]);
+            assert_eq!(config.get_hostaddrs(), &[IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        }
+    }
+
+    #[test]
+    fn db_connect_config_takes_tls_for_every_mode_but_disable() {
+        for query in [
+            "?sslmode=require",
+            "?sslmode=prefer",
+            "?sslmode=verify-ca",
+            "",
+        ] {
+            let (config, transport) =
+                db_connect_config(&format!("postgresql://step:pw@10.0.0.5:5433/stepca{query}"))
+                    .unwrap();
+            assert_eq!(transport, DbTransport::VerifiedTls, "{query}");
+            assert_eq!(config.get_ssl_mode(), SslMode::Require, "{query}");
+            assert_eq!(
+                config.get_hostaddrs(),
+                &["10.0.0.5".parse::<IpAddr>().unwrap()],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_connect_config_refuses_tls_to_a_host_name() {
+        for host in ["postgres", "db.internal"] {
+            let err = db_connect_config(&format!(
+                "postgresql://step:secret-pw@{host}:5432/stepca?sslmode=verify-full"
+            ))
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(&format!("`{host}`")), "{message}");
+            assert!(message.contains("verify the name `postgres`"), "{message}");
+            assert!(!message.contains("secret-pw"), "{message}");
+        }
+    }
+
+    #[test]
+    fn db_connect_config_disable_keeps_host_and_takes_plaintext() {
+        let (config, transport) =
+            db_connect_config("postgresql://step:pw@postgres:5432/stepca?sslmode=disable").unwrap();
+        assert_eq!(transport, DbTransport::Plain);
+        assert_eq!(tcp_hosts(&config), vec!["postgres".to_string()]);
+        assert_eq!(config.get_hostaddrs(), &[] as &[IpAddr]);
+        assert_eq!(config.get_ssl_mode(), SslMode::Disable);
+    }
+
+    #[test]
+    fn db_connect_config_drops_other_query_parameters() {
+        // `sslnegotiation=direct` and an unknown parameter would make
+        // tokio-postgres either negotiate differently or reject the DSN.
+        let (config, _) = db_connect_config(
+            "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full&sslnegotiation=direct&bogus=1&sslrootcert=/ca.crt",
+        )
+        .unwrap();
+        assert_eq!(
+            config.get_ssl_negotiation(),
+            postgres::config::SslNegotiation::Postgres
+        );
+        let (config, _) = db_connect_config(
+            "postgresql://step:pw@127.0.0.1:5433/stepca?bogus=1&sslnegotiation=direct&sslmode=disable",
+        )
+        .unwrap();
+        assert_eq!(
+            config.get_ssl_negotiation(),
+            postgres::config::SslNegotiation::Postgres
+        );
+    }
+
+    #[test]
+    fn db_connect_config_percent_decodes_the_password() {
+        for query in ["?sslmode=disable", "?sslmode=verify-full"] {
+            let (config, _) = db_connect_config(&format!(
+                "postgresql://step:p%40ss%2Fw@127.0.0.1:5433/stepca{query}"
+            ))
+            .unwrap();
+            assert_eq!(config.get_password(), Some(&b"p@ss/w"[..]), "{query}");
+        }
+    }
+
+    #[test]
+    fn connect_db_names_a_missing_root_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root_ca = dir.path().join("certs").join("root_ca.crt");
+        let err = connect_db(
+            "postgresql://step:secret-pw@127.0.0.1:9/stepca?sslmode=verify-full",
+            &root_ca,
+            Duration::from_millis(100),
+        )
+        .err()
+        .expect("a missing root file must fail the connection");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&root_ca.display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("secret-pw"), "{message}");
     }
 
     #[test]
@@ -555,7 +906,8 @@ mod tests {
     fn check_auth_sync_fails_on_closed_port() {
         let password = test_password();
         let dsn = format!("postgresql://user:{password}@127.0.0.1:9/db?sslmode=disable");
-        let err = check_auth_sync(&dsn, Duration::from_millis(100)).unwrap_err();
+        let root_ca = Path::new("/nonexistent/root_ca.crt");
+        let err = check_auth_sync(&dsn, root_ca, Duration::from_millis(100)).unwrap_err();
         let message = err.to_string();
         assert!(
             message.contains("authenticate") || message.contains("Timed out"),

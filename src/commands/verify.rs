@@ -11,6 +11,7 @@ use x509_parser::pem::Pem;
 use crate::cli::args::VerifyArgs;
 use crate::cli::output::print_verify_plan;
 use crate::cli::prompt::Prompt;
+use crate::commands::init::{CA_CERTS_DIR, CA_ROOT_CERT_FILENAME};
 use crate::i18n::Messages;
 use crate::state::{DeliveryMode, ServiceEntry, StateFile};
 
@@ -142,7 +143,8 @@ fn verify_db_connectivity(
     let timeout = std::time::Duration::from_secs(timeout_secs);
     check_tcp_sync(&parsed.host, parsed.port, timeout)
         .with_context(|| messages.error_db_check_failed())?;
-    check_auth_sync(&dsn, timeout).with_context(|| messages.error_db_auth_failed())?;
+    let root_ca = secrets_dir.join(CA_CERTS_DIR).join(CA_ROOT_CERT_FILENAME);
+    check_auth_sync(&dsn, &root_ca, timeout).with_context(|| messages.error_db_auth_failed())?;
     Ok(())
 }
 

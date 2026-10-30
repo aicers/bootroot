@@ -78,6 +78,17 @@ cargo test
 echo "[test-core] monitoring integration test"
 cargo test --test monitoring_integration -- --include-ignored
 
+# --- PostgreSQL Integration Test ---
+# `--include-ignored` because the PostgreSQL tests in this target are
+# `#[ignore]`: they start their own PostgreSQL containers, which keeps
+# them out of the plain `cargo test` above.  They publish on a port
+# reserved at run time, so they collide neither with a PostgreSQL already
+# on the host nor with the install below.  Keep the arguments identical to
+# the `PostgreSQL Integration Test (Docker)` step in
+# .github/workflows/ci.yml.
+echo "[test-core] PostgreSQL integration test"
+cargo test --test db_provision_integration -- --include-ignored
+
 # --- Install Infrastructure ---
 echo "[test-core] installing infrastructure"
 cargo run --bin bootroot -- infra install

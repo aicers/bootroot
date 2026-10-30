@@ -36,6 +36,11 @@ time = "0.3"
 # a dependency this crate already has, not a new dependency.
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-rustls = "0.26"
+# The rustls connector for the tokio-postgres the `postgres` crate already
+# runs on, which bootroot's PostgreSQL connections use for TLS. 0.14 has no
+# default features and no *ring* dependency: it computes the SCRAM
+# channel-binding hash with `sha2`, where 0.13 depended on *ring*.
+tokio-postgres-rustls = "0.14"
 toml_edit = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

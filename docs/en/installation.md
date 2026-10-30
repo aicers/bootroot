@@ -206,6 +206,20 @@ Selection guide:
 - Production / security first: `verify-full`
 - Internal test or lab: `require`
 
+The modes above describe step-ca's own connection. bootroot's own
+connections to PostgreSQL — those of `bootroot init` (database check and
+provisioning), `bootroot rotate db` and `bootroot verify --db-check` —
+use TLS for every `sslmode` except `disable`, and verify the server in
+full whichever of those modes is set: the server's certificate must chain
+to the CA root in `secrets/certs/root_ca.crt` and be valid for the name
+`postgres`. They offer the hybrid post-quantum key exchange
+X25519MLKEM768 first, and never fall back to plaintext. They dial the
+DSN's host, which must then be an IP address or `localhost` (dialled as
+`127.0.0.1`); any other host name, the compose service name `postgres`
+included, is refused, so pass `127.0.0.1` and the published port to
+`--db-admin-dsn`. A DSN's `sslrootcert` parameter is kept whenever
+bootroot rewrites the DSN.
+
 When using `bootroot infra install` followed by `bootroot init
 --enable db-provision`, the DB DSN is written to `secrets/config/ca.json`
 automatically.

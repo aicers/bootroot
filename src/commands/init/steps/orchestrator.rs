@@ -15,7 +15,9 @@ use super::super::types::{
 use super::InitRollback;
 use super::InitSecrets;
 use super::RollbackFile;
-use super::database::{PostgresEnv, check_db_connectivity, resolve_db_dsn_for_init};
+use super::database::{
+    PostgresEnv, check_db_connectivity, db_root_ca_path, resolve_db_dsn_for_init,
+};
 use super::http01_admin_tls::{
     build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
 };
@@ -782,6 +784,7 @@ async fn run_init_inner(
         check_db_connectivity(
             &db_info,
             &secrets.db_dsn,
+            &db_root_ca_path(&args.secrets_dir.secrets_dir),
             args.db_timeout.timeout_secs,
             messages,
         )
@@ -1675,17 +1678,20 @@ async fn maybe_rotate_env_db_password(
         host_port,
         "postgres",
         Some("disable"),
+        None,
     );
 
     let user_clone = parsed.user.clone();
     let password_clone = new_password.clone();
     let database_clone = parsed.database.clone();
     let admin_dsn_clone = admin_dsn.clone();
+    let root_ca = db_root_ca_path(secrets_dir);
     let timeout = std::time::Duration::from_secs(5);
 
     let provision_result = tokio::task::spawn_blocking(move || {
         bootroot::db::provision_db_sync(
             &admin_dsn_clone,
+            &root_ca,
             &user_clone,
             &password_clone,
             &database_clone,
@@ -1711,6 +1717,7 @@ async fn maybe_rotate_env_db_password(
         parsed.port,
         &parsed.database,
         parsed.sslmode.as_deref(),
+        parsed.sslrootcert.as_deref(),
     );
     let new_dsn = bootroot::db::for_compose_runtime(&rebuilt_dsn)
         .with_context(|| messages.error_invalid_db_dsn())?;

@@ -208,6 +208,19 @@ BOOTROOT_INSTANCE=bootroot
 - 운영/보안 우선: `verify-full`
 - 내부망 테스트/임시 환경: `require`
 
+위 모드는 step-ca 자신의 연결에 대한 설명입니다. bootroot가 직접
+PostgreSQL에 맺는 연결 — `bootroot init`(DB 점검과 프로비저닝),
+`bootroot rotate db`, `bootroot verify --db-check` — 은 `disable`을 제외한
+모든 `sslmode`에서 TLS를 사용하며, 어떤 모드든 서버를 완전히 검증합니다.
+서버 인증서는 `secrets/certs/root_ca.crt`의 CA 루트로 체인이 이어져야 하고
+`postgres`라는 이름에 대해 유효해야 합니다. 하이브리드 양자내성 키 교환
+X25519MLKEM768을 가장 먼저 제시하며, 평문으로 되돌아가지 않습니다. 연결은
+DSN의 호스트로 맺으므로 호스트는 IP 주소이거나 `localhost`(`127.0.0.1`로
+연결)여야 합니다. 그 밖의 호스트 이름은 compose 서비스 이름 `postgres`를
+포함해 모두 거부되므로, `--db-admin-dsn`에는 `127.0.0.1`과 게시된 포트를
+지정하세요. bootroot가 DSN을 다시 쓸 때에도 DSN의 `sslrootcert` 매개변수는
+유지됩니다.
+
 `bootroot infra install` 후 `bootroot init --enable db-provision`을 실행하면
 DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
 

@@ -24,6 +24,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   still verify at 2048 to 8192 bits, as before. Existing ACME account keys,
   certificates, private keys and HTTP-01 responder secrets keep working
   unchanged.
+- bootroot's own connections to PostgreSQL, made by `bootroot init` for its
+  database check and provisioning, by `bootroot rotate db` and by `bootroot
+  verify --db-check`, now use TLS whenever the DSN's `sslmode` is anything other
+  than `disable`; before, they never did, so `require` failed and `prefer`
+  connected in plaintext. They verify the server's certificate against the CA
+  root in `secrets/certs/root_ca.crt`, always for the name `postgres`, offer the
+  hybrid post-quantum key exchange X25519MLKEM768 first, and dial the DSN's
+  host, which must then be an IP address or `localhost` (dialled as
+  `127.0.0.1`); any other host name is refused. A DSN's `sslrootcert` parameter
+  is now kept when bootroot rewrites the DSN, where it was dropped before.
 
 ## [0.5.0] - 2026-10-26
 
