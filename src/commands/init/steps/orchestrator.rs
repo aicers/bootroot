@@ -1671,15 +1671,7 @@ async fn maybe_rotate_env_db_password(
     // attempt the wrong host port on a default install and silently skip
     // the `.env` password rotation via the warning path below.
     let host_port = bootroot::db::resolve_postgres_host_port(&compose_dir);
-    let admin_dsn = bootroot::db::build_db_dsn(
-        "step",
-        &temp_password,
-        "localhost",
-        host_port,
-        "postgres",
-        Some("disable"),
-        None,
-    );
+    let admin_dsn = env_password_rotation_admin_dsn(&temp_password, host_port, &parsed);
 
     let user_clone = parsed.user.clone();
     let password_clone = new_password.clone();
@@ -1797,6 +1789,30 @@ async fn maybe_rotate_env_db_password(
     let _ = run_compose(&restart, "docker compose restart step-ca", messages);
 
     Ok(Some(new_dsn))
+}
+
+/// Builds the host-side admin DSN `maybe_rotate_env_db_password`
+/// connects with: the `step` superuser with the temporary
+/// `POSTGRES_PASSWORD`, at `localhost` on the published port.
+///
+/// It carries the stored runtime DSN's `sslmode` and `sslrootcert`, so
+/// the rotation reaches the server over TLS whenever step-ca's own
+/// connection does, rather than sending the admin password in
+/// plaintext or being refused by a TLS-only server.
+fn env_password_rotation_admin_dsn(
+    temp_password: &str,
+    host_port: u16,
+    runtime: &bootroot::db::DbDsn,
+) -> String {
+    bootroot::db::build_db_dsn(
+        "step",
+        temp_password,
+        "localhost",
+        host_port,
+        "postgres",
+        runtime.sslmode.as_deref(),
+        runtime.sslrootcert.as_deref(),
+    )
 }
 
 /// Reads `bootroot/stepca/db_admin` and, when its user matches the
@@ -3181,6 +3197,39 @@ mod tests {
         assert!(
             !responder_tls_enabled,
             "responder TLS must be disabled when compose lacks the responder service"
+        );
+    }
+
+    /// `init`'s `POSTGRES_PASSWORD` rotation connects with the stored
+    /// runtime DSN's TLS settings, so a `verify-full` install is never
+    /// rotated over plaintext.
+    #[test]
+    fn env_password_rotation_admin_dsn_keeps_the_runtime_tls_settings() {
+        let password = format!(
+            "tmp-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time is before UNIX_EPOCH")
+                .as_nanos()
+        );
+        let runtime = bootroot::db::parse_db_dsn(
+            "postgresql://stepca:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt",
+        )
+        .expect("parse runtime dsn");
+        assert_eq!(
+            env_password_rotation_admin_dsn(&password, 5433, &runtime),
+            format!(
+                "postgresql://step:{password}@localhost:5433/postgres?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            )
+        );
+
+        let runtime = bootroot::db::parse_db_dsn(
+            "postgresql://stepca:pw@postgres:5432/stepca?sslmode=disable",
+        )
+        .expect("parse runtime dsn");
+        assert_eq!(
+            env_password_rotation_admin_dsn(&password, 5433, &runtime),
+            format!("postgresql://step:{password}@localhost:5433/postgres?sslmode=disable")
         );
     }
 

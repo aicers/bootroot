@@ -25,8 +25,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   certificates, private keys and HTTP-01 responder secrets keep working
   unchanged.
 - bootroot's own connections to PostgreSQL, made by `bootroot init` for its
-  database check and provisioning, by `bootroot rotate db` and by `bootroot
-  verify --db-check`, now use TLS whenever the DSN's `sslmode` is anything other
+  database check, provisioning and rotation of the temporary
+  `POSTGRES_PASSWORD`, by `bootroot rotate db` and by `bootroot verify
+  --db-check`, now use TLS 1.3 whenever the DSN's `sslmode` is anything other
   than `disable`; before, they never did, so `require` failed and `prefer`
   connected in plaintext. They verify the server's certificate against the CA
   root in `secrets/certs/root_ca.crt`, always for the name `postgres`, offer the

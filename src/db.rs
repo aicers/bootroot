@@ -290,8 +290,8 @@ pub fn validate_db_identifier(value: &str) -> Result<()> {
 enum DbTransport {
     /// `sslmode=disable`: plaintext, to the DSN's host as written.
     Plain,
-    /// Every other `sslmode`, or none: TLS, verified against the CA root
-    /// for the name [`DB_COMPOSE_HOST`].
+    /// Every other `sslmode`, or none: TLS 1.3, verified against the CA
+    /// root for the name [`DB_COMPOSE_HOST`].
     VerifiedTls,
 }
 
@@ -361,11 +361,11 @@ fn tls_dial_address(host: &str) -> Result<IpAddr> {
 /// Opens a connection to the `PostgreSQL` server a DSN names.
 ///
 /// `sslmode=disable` connects without TLS. Every other `sslmode`, or
-/// none, connects over TLS and verifies the server for the name
+/// none, connects over TLS 1.3 only and verifies the server for the name
 /// [`DB_COMPOSE_HOST`], with the certificates in `root_ca` as the only
-/// trust anchors; nothing falls back to plaintext. `root_ca` is read only
-/// for a TLS connection, so a plaintext one works before `step ca init`
-/// has written it.
+/// trust anchors; nothing falls back to plaintext or to TLS 1.2.
+/// `root_ca` is read only for a TLS connection, so a plaintext one works
+/// before `step ca init` has written it.
 fn connect_db(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<postgres::Client> {
     let (mut config, transport) = db_connect_config(dsn)?;
     config.connect_timeout(timeout);
@@ -376,7 +376,7 @@ fn connect_db(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<postgres::
                 format!("Failed to read PostgreSQL CA root {}", root_ca.display())
             })?;
             let tls_config =
-                crate::tls::build_client_config_from_pem(&pem, &[]).with_context(|| {
+                crate::tls::build_tls13_client_config_from_pem(&pem).with_context(|| {
                     format!("Failed to load PostgreSQL CA root {}", root_ca.display())
                 })?;
             Ok(config.connect(MakeRustlsConnect::new(tls_config))?)
@@ -426,8 +426,8 @@ pub fn check_auth_sync(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<(
 ///
 /// With `sslmode=disable` the admin DSN connects without TLS, to its host
 /// as written. With any other `sslmode`, or none, it connects over TLS
-/// (rustls on the aws-lc-rs provider, offering X25519MLKEM768 first),
-/// dials the DSN's host (an IP address, or `localhost` as `127.0.0.1`),
+/// 1.3 only (rustls on the aws-lc-rs provider, offering X25519MLKEM768
+/// first), dials the DSN's host (an IP address, or `localhost` as `127.0.0.1`),
 /// and verifies the server's certificate for the name
 /// [`DB_COMPOSE_HOST`] against the certificates in `root_ca` alone; it
 /// never falls back to plaintext.
@@ -436,8 +436,9 @@ pub fn check_auth_sync(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<(
 ///
 /// Returns an error if the admin DSN is invalid, its host cannot be
 /// dialled over TLS (a name other than `localhost`), `root_ca` cannot be
-/// read for a TLS connection, the connection, TLS handshake or server
-/// verification fails, or the provisioning statements fail to execute.
+/// read for a TLS connection, the connection, TLS handshake (a server
+/// without TLS 1.3 included) or server verification fails, or the
+/// provisioning statements fail to execute.
 pub fn provision_db_sync(
     admin_dsn: &str,
     root_ca: &Path,

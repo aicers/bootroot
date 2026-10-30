@@ -44,6 +44,13 @@ mod unix_integration {
     /// The `sslrootcert` a DSN carries: bootroot keeps it in the DSN but
     /// verifies against the root file it is handed.
     const IRRELEVANT_SSLROOTCERT: &str = "/irrelevant";
+    /// The protocol settings of a server that speaks only TLS 1.3 and
+    /// only the X25519MLKEM768 group.
+    const TLS13_MLKEM_ONLY: &str =
+        "-c ssl_min_protocol_version=TLSv1.3 -c ssl_groups=X25519MLKEM768";
+    /// The protocol settings of a server that speaks only TLS 1.2.
+    const TLS12_ONLY: &str =
+        "-c ssl_min_protocol_version=TLSv1.2 -c ssl_max_protocol_version=TLSv1.2";
 
     fn run_command(mut command: Command) -> Result<Output> {
         command.output().context("Failed to run command")
@@ -200,7 +207,7 @@ mod unix_integration {
     }
 
     /// A `PostgreSQL` container that accepts only `hostssl` connections,
-    /// only over TLS 1.3, and only with the X25519MLKEM768 group.
+    /// with the protocol settings it was started with.
     struct TlsPostgresContainer {
         name: String,
         port: u16,
@@ -217,7 +224,15 @@ mod unix_integration {
     }
 
     impl TlsPostgresContainer {
+        /// Starts a server that speaks only TLS 1.3 and only the
+        /// X25519MLKEM768 group.
         fn start(pki: &TestPki) -> Result<Self> {
+            Self::start_with(pki, TLS13_MLKEM_ONLY)
+        }
+
+        /// Starts a server with `protocol_settings` as its TLS protocol
+        /// and group options.
+        fn start_with(pki: &TestPki, protocol_settings: &str) -> Result<Self> {
             let name = format!("bootroot-db-tls-itest-{}", unique_suffix());
             let port = reserve_local_port()?;
             let admin_password =
@@ -242,8 +257,7 @@ mod unix_integration {
                  -c ssl=on \
                  -c ssl_cert_file={TLS_DIR}/server.crt \
                  -c ssl_key_file={TLS_DIR}/server.key \
-                 -c ssl_min_protocol_version=TLSv1.3 \
-                 -c ssl_groups=X25519MLKEM768 \
+                 {protocol_settings} \
                  -c hba_file={TLS_DIR}/pg_hba.conf\n"
             );
             let port_mapping = format!("127.0.0.1:{port}:5432");
@@ -558,6 +572,41 @@ mod unix_integration {
         assert_tls_failure(
             &err,
             "certificate not valid for name \"postgres\"",
+            &container.admin_password,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Requires local Docker and the declared PostgreSQL image"]
+    fn tls_connections_refuse_a_tls12_only_server() -> Result<()> {
+        let pki = generate_pki(SERVER_NAME)?;
+        let container = TlsPostgresContainer::start_with(&pki, TLS12_ONLY)?;
+        let root_ca = container.write_root("root_ca.crt", &pki.root)?;
+        let timeout = Duration::from_secs(10);
+        let admin_dsn = container.admin_dsn("127.0.0.1");
+
+        // The certificate is valid for `postgres` under the root file's
+        // CA, so the protocol version alone is what is refused.
+        let err = check_auth_sync(&admin_dsn, &root_ca, timeout)
+            .expect_err("a TLS 1.2-only server must be refused");
+        assert_tls_failure(
+            &err,
+            "fatal alert: ProtocolVersion",
+            &container.admin_password,
+        );
+        let err = provision_db_sync(
+            &admin_dsn,
+            &root_ca,
+            PROVISION_DB_USER,
+            INITIAL_ROLE_PASSWORD,
+            PROVISION_DB_NAME,
+            timeout,
+        )
+        .expect_err("provisioning to a TLS 1.2-only server must fail");
+        assert_tls_failure(
+            &err,
+            "fatal alert: ProtocolVersion",
             &container.admin_password,
         );
         Ok(())
