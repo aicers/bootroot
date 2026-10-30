@@ -676,10 +676,11 @@ mod tests {
 
     #[test]
     fn build_db_dsn_without_sslrootcert_is_unchanged() {
-        let dsn = build_db_dsn("step", "pw", "127.0.0.1", 5433, "stepca", None, None);
+        let password = test_password();
+        let dsn = build_db_dsn("step", &password, "127.0.0.1", 5433, "stepca", None, None);
         assert_eq!(
             dsn,
-            "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable"
+            format!("postgresql://step:{password}@127.0.0.1:5433/stepca?sslmode=disable")
         );
     }
 
@@ -743,11 +744,14 @@ mod tests {
 
     #[test]
     fn effective_admin_dsn_for_kv_keeps_sslrootcert() {
+        let password = test_password();
         let dsn =
             "postgresql://step:old@postgres:5432/postgres?sslmode=verify-full&sslrootcert=/ca.crt";
         assert_eq!(
-            effective_admin_dsn_for_kv(dsn, "step", "new").unwrap(),
-            "postgresql://step:new@postgres:5432/postgres?sslmode=verify-full&sslrootcert=/ca.crt"
+            effective_admin_dsn_for_kv(dsn, "step", &password).unwrap(),
+            format!(
+                "postgresql://step:{password}@postgres:5432/postgres?sslmode=verify-full&sslrootcert=/ca.crt"
+            )
         );
     }
 

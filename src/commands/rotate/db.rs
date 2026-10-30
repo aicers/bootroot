@@ -280,10 +280,17 @@ mod tests {
             "postgresql://stepca:old@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt",
         )
         .expect("parse dsn");
-        let rebuilt = rebuilt_runtime_dsn(&parsed, "new").expect("rebuild dsn");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let new = format!("new-{nonce}");
+        let rebuilt = rebuilt_runtime_dsn(&parsed, &new).expect("rebuild dsn");
         assert_eq!(
             rebuilt,
-            "postgresql://stepca:new@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            format!(
+                "postgresql://stepca:{new}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            )
         );
     }
 

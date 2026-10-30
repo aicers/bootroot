@@ -497,7 +497,11 @@ mod tests {
 
     #[test]
     fn provisioned_runtime_dsn_keeps_admin_sslmode_and_sslrootcert() {
-        let password = nonce_password("db");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let password = format!("db-{nonce}");
         let inputs = DbProvisionInputs {
             admin_dsn: String::new(),
             db_user: "stepca".to_string(),
