@@ -519,7 +519,10 @@ bootroot init
 
 `bootroot clean`은 CA를 포함한 모든 키, 토큰, 인증서를 폐기합니다.
 `bootroot init` 후에는 `bootroot service add`로 모든 서비스를 다시 추가하고,
-모든 소비자에게 새 CA 번들을 전달하세요.
+모든 소비자에게 새 CA 번들을 전달하세요. OpenBao나 HTTP-01 관리자 API가 TLS를
+제공하는 곳에서는 X25519MLKEM768을 제시하지 않는 이전 릴리스의
+`bootroot-agent`와 `bootroot-remote`를 거부하므로, 서비스를 다시 추가하기 전에
+모든 호스트에서 이번 릴리스의 바이너리를 실행하세요.
 
 ## bootroot-agent
 

@@ -478,7 +478,7 @@ jobs:
     name: Docker E2E (${{ matrix.scenario.label }})
     needs: [check, changes]
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -849,7 +849,7 @@ jobs:
     name: Registrar Redteam (docs-only)
     needs: [check, changes]
     if: needs.changes.outputs.docs_only == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7

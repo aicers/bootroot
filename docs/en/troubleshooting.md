@@ -385,6 +385,37 @@ certificate lifetime (24 hours by default) of the upgrade and the same
 command migrates it. See
 [The bootroot-internal credential](operations.md#the-bootroot-internal-credential).
 
+## A client is refused by OpenBao or the HTTP-01 admin API
+
+OpenBao's TLS listener and the HTTP-01 responder's admin API, when it serves
+TLS, accept only TLS 1.3 with the hybrid post-quantum key exchange
+X25519MLKEM768. A client that does not offer that group, or offers only TLS
+1.2, is refused at the handshake.
+
+The responder logs each refusal at WARN in its container log, with the client's
+address in `peer`:
+
+<!-- markdownlint-disable MD013 -->
+```text
+HTTP-01 admin API refused a TLS handshake: peer is incompatible: NoKxGroupsInCommon peer=<client address>
+```
+<!-- markdownlint-enable MD013 -->
+
+OpenBao logs the refusal in its own container log, at INFO, as Go's line rather
+than in bootroot's wording:
+
+```text
+http: TLS handshake error from <client address>: ...
+```
+
+The remedy is a client that offers the group: bootroot's binaries of this
+release, or a tool built on OpenSSL 3.5 or later or Go 1.24 or later. To check
+what a host's OpenSSL can do against either listener, run:
+
+```bash
+openssl s_client -connect <host>:<port> -tls1_3 -groups X25519MLKEM768
+```
+
 ## Silent rotation FD desync (issue #614)
 
 After `bootroot rotate ca-key` or `bootroot rotate force-reissue`,

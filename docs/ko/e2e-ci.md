@@ -1193,7 +1193,9 @@ scripts/preflight/run-all.sh
   디렉터리를 `PATH` 앞에 두는 것입니다. `-ext`를 실제로 호출하는
   스크립트는 하나뿐이지만 `openssl`을 검사하는 여섯 스크립트가 모두 이
   검사를 수행합니다. 매트릭스의 모든 단계가 같은 호스트에서 실행되기
-  때문입니다.
+  때문입니다. 하니스가 OpenBao의 TLS 리스너와 리스폰더 admin API에 호스트의
+  `openssl`과 `curl`로 접속하므로, 이 도구들도 X25519MLKEM768을 제시해야
+  합니다(OpenSSL 3.5 이상).
 
 ## init 자동화 입출력 규칙
 

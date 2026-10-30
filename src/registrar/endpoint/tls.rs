@@ -441,7 +441,10 @@ fn assemble_server_config(
         })?;
 
     let resolver = Arc::new(EndpointCertResolver::new(certified_key));
-    let config = ServerConfig::builder()
+    // TLS 1.3 only, on the process default provider's group list: the socket
+    // is host-local, so a classical key exchange on it cannot be recorded off
+    // the host, and the handshake logs it rather than refusing it.
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_client_cert_verifier(client_verifier)
         .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
     Ok((Arc::new(config), resolver))

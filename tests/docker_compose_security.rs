@@ -156,12 +156,13 @@ fn entry_text(entry: &str) -> &str {
         .trim_matches(['"', '\''])
 }
 
-/// step-ca's Prometheus metrics listener (issue #864). `bootroot init`
-/// writes `metricsAddress: ":9102"` into `ca.json`, which starts an
-/// unauthenticated, plaintext endpoint; the only boundary it has is the
-/// Compose network. The port is therefore `expose`d — so Prometheus can
-/// reach `step-ca:9102` — and must never appear under `ports:`, which
-/// would put internal telemetry on the host's network.
+/// step-ca's Prometheus metrics listener (issue #864). Without an `OpenBao`
+/// bind, `bootroot init` writes `metricsAddress: ":9102"` into `ca.json`,
+/// which starts an unauthenticated, plaintext endpoint whose only boundary
+/// is the Compose network; with one, step-ca listens on loopback inside its
+/// container instead. The port is `expose`d — so Prometheus can reach
+/// `step-ca:9102` when it listens there — and must never appear under
+/// `ports:`, which would put internal telemetry on the host's network.
 ///
 /// Every `ports:` syntax that names the port is rejected by looking for
 /// it anywhere in the section: the short `- "9102:9102"` and

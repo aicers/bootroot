@@ -46,9 +46,9 @@ const CA_JSON_DNS_NAMES_KEY: &str = "dnsNames";
 /// `command` cannot supply it.
 const CA_JSON_METRICS_ADDRESS_KEY: &str = "metricsAddress";
 
-/// The address step-ca serves `/metrics` on.
+/// The address step-ca serves `/metrics` on without an `OpenBao` bind.
 ///
-/// Fixed rather than operator-selectable: `monitoring/prometheus.yml`
+/// Not operator-selectable: `monitoring/prometheus.yml`
 /// scrapes `step-ca:9102` as a static target and both bundled Compose
 /// files declare `expose: "9102"` on the service, so any other value
 /// here would simply take the listener away from the scraper.
@@ -62,6 +62,12 @@ const CA_JSON_METRICS_ADDRESS_KEY: &str = "metricsAddress";
 /// puts unauthenticated internal telemetry on the host's network.
 const STEPCA_METRICS_ADDRESS: &str = ":9102";
 
+/// The address step-ca serves `/metrics` on when `OpenBao` is bound off
+/// loopback: the same port, answering inside the container alone, so no
+/// other container on the Compose network can read it and the monitoring
+/// profiles cannot scrape it.
+const STEPCA_METRICS_LOOPBACK_ADDRESS: &str = "127.0.0.1:9102";
+
 /// `ca.json` key, under `authority`, holding step-ca's issuance policy.
 /// step-ca reads it at boot and applies it to every provisioner.
 const CA_JSON_AUTHORITY_KEY: &str = "authority";
@@ -72,11 +78,30 @@ const CA_JSON_POLICY_KEY: &str = "policy";
 /// identifier, while the control node's own endpoints do.
 const STEPCA_POLICY_DENY_IP_RANGES: [&str; 2] = ["0.0.0.0/0", "::/0"];
 
+/// The `ca.json` keys `init` owns outright and step-ca reads at boot.
+pub(super) struct StepCaManagedKeys<'a> {
+    /// The top-level `dnsNames`.
+    pub(super) dns_names: &'a [String],
+    /// The top-level `metricsAddress`.
+    pub(super) metrics_address: &'a str,
+    /// The DNS names `authority.policy` denies.
+    pub(super) policy_deny_dns: &'a [String],
+}
+
+/// Returns the address step-ca serves `/metrics` on for the recorded
+/// `OpenBao` bind intent.
+pub(super) fn stepca_metrics_address(openbao_bind_intent: bool) -> &'static str {
+    if openbao_bind_intent {
+        STEPCA_METRICS_LOOPBACK_ADDRESS
+    } else {
+        STEPCA_METRICS_ADDRESS
+    }
+}
+
 /// Writes the `OpenBao` Agent templates step-ca renders its runtime
 /// configuration from.
 ///
-/// `dns_names`, the metrics address and the issuance policy denying
-/// `policy_deny_dns` are stamped into the generated
+/// `managed` is stamped into the generated
 /// `ca.json.ctmpl` rather than inherited from whatever `ca.json` holds
 /// when this runs: the step-ca agent sidecar re-renders `ca.json` from
 /// the *previous* template on its own schedule, so a render landing
@@ -88,8 +113,7 @@ pub(super) async fn write_stepca_templates(
     kv_mount: &str,
     cert_duration: &str,
     provisioner: &str,
-    dns_names: &[String],
-    policy_deny_dns: &[String],
+    managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<StepCaTemplatePaths> {
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
@@ -130,8 +154,7 @@ pub(super) async fn write_stepca_templates(
         kv_mount,
         cert_duration,
         provisioner,
-        dns_names,
-        policy_deny_dns,
+        managed,
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
@@ -217,17 +240,16 @@ fn build_ca_json_template(
     kv_mount: &str,
     cert_duration: &str,
     provisioner: &str,
-    dns_names: &[String],
-    policy_deny_dns: &[String],
+    managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<String> {
     const PLACEHOLDER: &str = "__BOOTROOT_CTMPL_DB__";
 
     let mut value: serde_json::Value =
         serde_json::from_str(contents).context(messages.error_parse_ca_json_failed())?;
-    set_ca_json_dns_names(&mut value, dns_names);
-    set_ca_json_metrics_address(&mut value);
-    set_ca_json_policy(&mut value, policy_deny_dns)?;
+    set_ca_json_dns_names(&mut value, managed.dns_names);
+    set_ca_json_metrics_address(&mut value, managed.metrics_address);
+    set_ca_json_policy(&mut value, managed.policy_deny_dns)?;
     let db = value
         .get_mut("db")
         .ok_or_else(|| anyhow::anyhow!(messages.error_ca_json_db_missing()))?;
@@ -447,13 +469,9 @@ fn set_ca_json_dns_names(value: &mut serde_json::Value, dns_names: &[String]) ->
 }
 
 /// Sets the top-level `metricsAddress` on a parsed `ca.json` to
-/// [`STEPCA_METRICS_ADDRESS`], returning whether the value actually
-/// changed.
-///
-/// Takes no argument for the same reason the constant is fixed: the
-/// scrape target is a compile-time constant on the Prometheus side.
-fn set_ca_json_metrics_address(value: &mut serde_json::Value) -> bool {
-    let desired = serde_json::Value::String(STEPCA_METRICS_ADDRESS.to_string());
+/// `address`, returning whether the value actually changed.
+fn set_ca_json_metrics_address(value: &mut serde_json::Value, address: &str) -> bool {
+    let desired = serde_json::Value::String(address.to_string());
     set_ca_json_key(value, CA_JSON_METRICS_ADDRESS_KEY, desired)
 }
 
@@ -617,9 +635,9 @@ pub(super) async fn write_password_file_with_backup(
 /// `claims.defaultTLSCertDuration`, the top-level `dnsNames` — what
 /// gives step-ca's own serving certificate the address
 /// `--stepca-bind` publishes it on — and the top-level
-/// `metricsAddress`, which is what starts the listener
-/// `monitoring/prometheus.yml` already scrapes — and `authority.policy`,
-/// which denies issuance for `policy_deny_dns` and every IP address.
+/// `metricsAddress`, which is what starts the metrics listener —
+/// and `authority.policy`, which denies issuance for
+/// `managed.policy_deny_dns` and every IP address.
 /// The document is parsed and re-serialised rather than regenerated, so
 /// keys bootroot does not model survive untouched.
 pub(super) async fn update_ca_json_with_backup(
@@ -627,8 +645,7 @@ pub(super) async fn update_ca_json_with_backup(
     db_dsn: &str,
     cert_duration: &str,
     provisioner: &str,
-    dns_names: &[String],
-    policy_deny_dns: &[String],
+    managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<CaJsonUpdate> {
     let path = secrets_dir.join("config").join("ca.json");
@@ -645,9 +662,9 @@ pub(super) async fn update_ca_json_with_backup(
              cannot set defaultTLSCertDuration"
         );
     }
-    let dns_names_changed = set_ca_json_dns_names(&mut value, dns_names);
-    let metrics_address_changed = set_ca_json_metrics_address(&mut value);
-    let policy_changed = set_ca_json_policy(&mut value, policy_deny_dns)?;
+    let dns_names_changed = set_ca_json_dns_names(&mut value, managed.dns_names);
+    let metrics_address_changed = set_ca_json_metrics_address(&mut value, managed.metrics_address);
+    let policy_changed = set_ca_json_policy(&mut value, managed.policy_deny_dns)?;
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     publish_ca_json(&path, &updated, messages).await?;
@@ -662,10 +679,9 @@ pub(super) async fn update_ca_json_with_backup(
     })
 }
 
-/// Re-applies `dns_names` to `ca.json`'s top-level `dnsNames`, the
-/// fixed metrics address to its `metricsAddress` and the issuance policy
-/// denying `policy_deny_dns` to its `authority.policy`, returning
-/// whether the file had drifted.
+/// Re-applies `managed` to `ca.json`: its top-level `dnsNames`, its
+/// `metricsAddress` and the issuance policy in its `authority.policy`,
+/// returning whether the file had drifted.
 ///
 /// `update_ca_json_with_backup` already writes all three, but the step-ca
 /// `OpenBao` Agent sidecar re-renders `ca.json` from its template on a
@@ -677,8 +693,7 @@ pub(super) async fn update_ca_json_with_backup(
 /// pre-`init` document.
 pub(super) async fn reconcile_ca_json_managed_keys(
     secrets_dir: &Path,
-    dns_names: &[String],
-    policy_deny_dns: &[String],
+    managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<bool> {
     let path = secrets_dir.join("config").join("ca.json");
@@ -690,9 +705,9 @@ pub(super) async fn reconcile_ca_json_managed_keys(
     // Every key is re-asserted before the early return is decided:
     // combining the calls into one `||` would skip the later keys on
     // exactly the runs where an earlier one had drifted.
-    let dns_names_changed = set_ca_json_dns_names(&mut value, dns_names);
-    let metrics_address_changed = set_ca_json_metrics_address(&mut value);
-    let policy_changed = set_ca_json_policy(&mut value, policy_deny_dns)?;
+    let dns_names_changed = set_ca_json_dns_names(&mut value, managed.dns_names);
+    let metrics_address_changed = set_ca_json_metrics_address(&mut value, managed.metrics_address);
+    let policy_changed = set_ca_json_policy(&mut value, managed.policy_deny_dns)?;
     if !dns_names_changed && !metrics_address_changed && !policy_changed {
         return Ok(false);
     }
@@ -814,6 +829,18 @@ mod tests {
     /// The step-ca container name a default install renders.
     const DEFAULT_CA_CONTAINER: &str = "bootroot-ca";
 
+    /// The managed keys of an install without an `OpenBao` bind.
+    fn managed_keys<'a>(
+        dns_names: &'a [String],
+        policy_deny_dns: &'a [String],
+    ) -> StepCaManagedKeys<'a> {
+        StepCaManagedKeys {
+            dns_names,
+            metrics_address: stepca_metrics_address(false),
+            policy_deny_dns,
+        }
+    }
+
     /// The issuance-policy deny list a default install renders.
     fn default_deny_dns() -> Vec<String> {
         build_stepca_policy_deny_dns_names(
@@ -924,8 +951,7 @@ mod tests {
             "secret",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1231,8 +1257,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1278,8 +1303,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1312,8 +1336,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "24h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1343,8 +1366,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1354,8 +1376,7 @@ mod tests {
             "secret",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1408,8 +1429,7 @@ mod tests {
             "secret",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1433,8 +1453,7 @@ mod tests {
 
         let changed = reconcile_ca_json_managed_keys(
             &secrets_dir,
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1453,8 +1472,7 @@ mod tests {
 
         let changed_again = reconcile_ca_json_managed_keys(
             &secrets_dir,
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1464,6 +1482,110 @@ mod tests {
             "an already-reconciled ca.json must not be rewritten"
         );
         assert_eq!(read_ca_json(&secrets_dir), after);
+    }
+
+    /// The address follows the recorded `OpenBao` bind, on the same port.
+    #[test]
+    fn stepca_metrics_address_follows_the_openbao_bind() {
+        assert_eq!(stepca_metrics_address(false), ":9102");
+        assert_eq!(stepca_metrics_address(true), "127.0.0.1:9102");
+    }
+
+    /// With a bind, `ca.json` and its template both carry the loopback
+    /// form, and moving between the two forms in either direction is a
+    /// change that takes a reload: the listener's address is read at boot.
+    #[tokio::test]
+    async fn update_ca_json_moves_the_metrics_address_with_the_bind() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+        let deny = default_deny_dns();
+        let keys = |bind| StepCaManagedKeys {
+            dns_names: &dns_names,
+            metrics_address: stepca_metrics_address(bind),
+            policy_deny_dns: &deny,
+        };
+        let update = async |bind| {
+            update_ca_json_with_backup(
+                &secrets_dir,
+                "postgresql://step@postgres:5432/stepca",
+                "48h",
+                "acme",
+                &keys(bind),
+                &messages,
+            )
+            .await
+            .unwrap()
+        };
+
+        assert!(!update(false).await.dns_names_changed);
+        assert_eq!(read_ca_json(&secrets_dir)["metricsAddress"], ":9102");
+        assert!(!update(false).await.stepca_reload_required());
+
+        let bound = update(true).await;
+        assert!(bound.metrics_address_changed);
+        assert!(bound.stepca_reload_required());
+        assert_eq!(
+            read_ca_json(&secrets_dir)["metricsAddress"],
+            "127.0.0.1:9102"
+        );
+        assert!(!update(true).await.stepca_reload_required());
+
+        let paths = write_stepca_templates(
+            &secrets_dir,
+            "secret",
+            "48h",
+            "acme",
+            &keys(true),
+            &messages,
+        )
+        .await
+        .unwrap();
+        let template = fs::read_to_string(&paths.ca_json_template_path).unwrap();
+        assert!(
+            template.contains("\"metricsAddress\": \"127.0.0.1:9102\""),
+            "{template}"
+        );
+
+        let unbound = update(false).await;
+        assert!(unbound.metrics_address_changed);
+        assert!(unbound.stepca_reload_required());
+        assert_eq!(read_ca_json(&secrets_dir)["metricsAddress"], ":9102");
+    }
+
+    /// The reconcile path re-asserts whichever form the bind chose: a render
+    /// that put the other one back counts as drift.
+    #[tokio::test]
+    async fn reconcile_ca_json_managed_keys_carries_the_metrics_address_of_the_bind() {
+        let temp_dir = tempdir().unwrap();
+        let secrets_dir = temp_dir.path().join("secrets");
+        write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
+        let messages = test_messages();
+        let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
+        let deny = default_deny_dns();
+        for bind in [true, false] {
+            let keys = StepCaManagedKeys {
+                dns_names: &dns_names,
+                metrics_address: stepca_metrics_address(bind),
+                policy_deny_dns: &deny,
+            };
+            assert!(
+                reconcile_ca_json_managed_keys(&secrets_dir, &keys, &messages)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                read_ca_json(&secrets_dir)["metricsAddress"],
+                stepca_metrics_address(bind)
+            );
+            assert!(
+                !reconcile_ca_json_managed_keys(&secrets_dir, &keys, &messages)
+                    .await
+                    .unwrap()
+            );
+        }
     }
 
     /// The direct reconciliation owns `metricsAddress`: step-ca serves
@@ -1483,8 +1605,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1509,8 +1630,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1548,8 +1668,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1584,8 +1703,7 @@ mod tests {
 
         let changed = reconcile_ca_json_managed_keys(
             &secrets_dir,
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1601,8 +1719,7 @@ mod tests {
 
         let changed_again = reconcile_ca_json_managed_keys(
             &secrets_dir,
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1633,8 +1750,7 @@ mod tests {
             "secret",
             "48h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1700,8 +1816,7 @@ mod tests {
             "secret",
             "24h",
             "acme",
-            &dns_names,
-            &default_deny_dns(),
+            &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
         .await
@@ -1799,8 +1914,7 @@ mod tests {
             "secret",
             "48h",
             "acme",
-            &dns_names,
-            &deny,
+            &managed_keys(&dns_names, &deny),
             &test_messages(),
         )
         .unwrap();
@@ -1872,8 +1986,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &deny,
+            &managed_keys(&dns_names, &deny),
             &messages,
         )
         .await
@@ -1906,8 +2019,7 @@ mod tests {
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
-            &dns_names,
-            &deny,
+            &managed_keys(&dns_names, &deny),
             &messages,
         )
         .await
@@ -1954,9 +2066,13 @@ mod tests {
         let deny = default_deny_dns();
 
         assert!(
-            reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &deny, &messages)
-                .await
-                .unwrap(),
+            reconcile_ca_json_managed_keys(
+                &secrets_dir,
+                &managed_keys(&dns_names, &deny),
+                &messages
+            )
+            .await
+            .unwrap(),
             "a ca.json without the policy must be reported as drifted"
         );
         let after = read_ca_json(&secrets_dir);
@@ -1985,9 +2101,13 @@ mod tests {
         assert_eq!(without_policy, before, "nothing but the policy may move");
 
         assert!(
-            !reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &deny, &messages)
-                .await
-                .unwrap(),
+            !reconcile_ca_json_managed_keys(
+                &secrets_dir,
+                &managed_keys(&dns_names, &deny),
+                &messages
+            )
+            .await
+            .unwrap(),
             "a settled policy must not be rewritten"
         );
         assert_eq!(read_ca_json(&secrets_dir), after);
@@ -2000,9 +2120,13 @@ mod tests {
             .remove("ip");
         write_ca_json(&secrets_dir, &edited.to_string());
         assert!(
-            reconcile_ca_json_managed_keys(&secrets_dir, &dns_names, &deny, &messages)
-                .await
-                .unwrap()
+            reconcile_ca_json_managed_keys(
+                &secrets_dir,
+                &managed_keys(&dns_names, &deny),
+                &messages
+            )
+            .await
+            .unwrap()
         );
         assert_eq!(read_ca_json(&secrets_dir), after);
     }

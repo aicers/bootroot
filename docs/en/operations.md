@@ -2013,6 +2013,11 @@ requests it cannot audit.
 - Use `bootroot monitoring down` to stop/remove monitoring containers.
 - To reset Grafana admin password to the initial state, run
   `bootroot monitoring down --reset-grafana-admin-password`.
+- On an installation bound with `--openbao-bind`, `bootroot init` puts the
+  metrics listeners of OpenBao and step-ca on loopback inside their containers,
+  so the monitoring profiles cannot scrape it. Read them with `docker compose
+  exec`, for example
+  `docker compose exec openbao wget -qO- 'http://127.0.0.1:9101/v1/sys/metrics?format=prometheus'`.
 
 ## Compose operations procedure (recommended)
 

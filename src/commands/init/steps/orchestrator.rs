@@ -39,9 +39,10 @@ use super::responder_setup::{
 };
 use super::secrets::{maybe_register_eab, record_cleared_agent_eab, resolve_init_secrets};
 use super::stepca_setup::{
-    build_stepca_policy_deny_dns_names, ensure_step_ca_initialized, reconcile_ca_json_managed_keys,
-    resolve_stepca_ca_dns_names, restart_stepca_openbao_agent, snapshot_stepca_ca_json_template,
-    update_ca_json_with_backup, write_password_file_with_backup, write_stepca_templates,
+    StepCaManagedKeys, build_stepca_policy_deny_dns_names, ensure_step_ca_initialized,
+    reconcile_ca_json_managed_keys, resolve_stepca_ca_dns_names, restart_stepca_openbao_agent,
+    snapshot_stepca_ca_json_template, stepca_metrics_address, update_ca_json_with_backup,
+    write_password_file_with_backup, write_stepca_templates,
 };
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::cli::output::{print_init_plan, print_init_summary};
@@ -873,6 +874,13 @@ async fn run_init_inner(
         &identity.container(BootrootContainer::OpenBao),
         &identity.container(BootrootContainer::Http01),
     );
+    // The metrics listener is unauthenticated, so an install bound off
+    // loopback confines it to the step-ca container.
+    let stepca_managed_keys = StepCaManagedKeys {
+        dns_names: &stepca_dns_names,
+        metrics_address: stepca_metrics_address(bind_intent),
+        policy_deny_dns: &stepca_policy_deny_dns,
+    };
     let step_ca_result = ensure_step_ca_initialized(&secrets_dir, &stepca_dns_names, messages)?;
     if step_ca_result == super::super::types::StepCaInitResult::Initialized {
         // Fix ownership: step-ca init may create files with different
@@ -890,8 +898,7 @@ async fn run_init_inner(
         &secrets.db_dsn,
         &args.cert_duration,
         &args.stepca_provisioner,
-        &stepca_dns_names,
-        &stepca_policy_deny_dns,
+        &stepca_managed_keys,
         messages,
     )
     .await?;
@@ -922,8 +929,7 @@ async fn run_init_inner(
         &args.openbao.kv_mount,
         &args.cert_duration,
         &args.stepca_provisioner,
-        &stepca_dns_names,
-        &stepca_policy_deny_dns,
+        &stepca_managed_keys,
         messages,
     )
     .await?;
@@ -943,13 +949,7 @@ async fn run_init_inner(
             &identity.container(BootrootContainer::OpenBaoAgentStepCa),
             rollback.docker(),
         );
-        reconcile_ca_json_managed_keys(
-            &secrets_dir,
-            &stepca_dns_names,
-            &stepca_policy_deny_dns,
-            messages,
-        )
-        .await?;
+        reconcile_ca_json_managed_keys(&secrets_dir, &stepca_managed_keys, messages).await?;
     }
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized
@@ -1312,7 +1312,7 @@ async fn run_init_inner(
 
         // The recreate below carries the audit override exactly when
         // `audit_override` is set, so the audit device follows it.
-        write_openbao_hcl_for_tls_recreate(compose_dir, audit_override, messages)?;
+        write_openbao_hcl_for_tls_recreate(compose_dir, bind_intent, audit_override, messages)?;
 
         // Record the infra cert entry in state so the rotation
         // pipeline can renew it.

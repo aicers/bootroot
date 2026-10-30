@@ -1891,6 +1891,10 @@ fail-closed 통제이므로 차오를수록 호출이 거부됩니다. 성공에
 - `bootroot monitoring down`으로 모니터링 컨테이너를 중지/삭제합니다.
 - Grafana 관리자 비밀번호를 초기 상태로 되돌리려면
   `bootroot monitoring down --reset-grafana-admin-password`를 사용합니다.
+- `--openbao-bind`로 바인딩한 설치에서는 `bootroot init`이 OpenBao와
+  step-ca의 메트릭 리스너를 각 컨테이너 내부의 루프백에 두므로 모니터링
+  프로필이 이 설치를 수집할 수 없습니다. `docker compose exec`로 읽으세요.
+  예: `docker compose exec openbao wget -qO- 'http://127.0.0.1:9101/v1/sys/metrics?format=prometheus'`
 
 ## Compose 운영 절차(권장)
 
