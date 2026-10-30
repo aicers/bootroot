@@ -289,6 +289,16 @@ jobs:
         # needs the host ports that stack would occupy.
         run: cargo test --test monitoring_integration -- --include-ignored
 
+      - name: PostgreSQL Integration Test (Docker)
+        # `--include-ignored` because the PostgreSQL tests in this target
+        # are `#[ignore]`: they start their own `PostgreSQL` containers,
+        # which keeps them out of the plain `cargo test` above. They
+        # publish on a port reserved at run time, so they collide neither
+        # with the runner's own PostgreSQL nor with `Install
+        # Infrastructure` below. Keep the arguments identical to the
+        # invocation in scripts/preflight/ci/test-core.sh.
+        run: cargo test --test db_provision_integration -- --include-ignored
+
       - name: Build all binaries
         run: cargo build --bins
 

@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,7 +10,9 @@ use bootroot::db::{
     resolve_postgres_host_port_with_env, validate_db_identifier,
 };
 
-use super::super::constants::{DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES};
+use super::super::constants::{
+    CA_CERTS_DIR, CA_ROOT_CERT_FILENAME, DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES,
+};
 use super::DbDsnNormalization;
 use super::prompts::{prompt_text, prompt_text_with_default};
 use crate::cli::args::{InitArgs, InitFeature};
@@ -107,15 +109,7 @@ pub(super) async fn resolve_db_dsn_for_init(
         let admin = parse_db_dsn(&inputs.admin_dsn)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
         ensure_db_host_reachable_from_compose(&admin.host, messages)?;
-        let host_side_dsn = build_db_dsn(
-            &inputs.db_user,
-            &inputs.db_password,
-            &admin.host,
-            admin.port,
-            &inputs.db_name,
-            admin.sslmode.as_deref(),
-        );
-        let dsn = for_compose_runtime(&host_side_dsn)
+        let dsn = provisioned_runtime_dsn(&inputs, &admin)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
         let timeout = Duration::from_secs(args.db_timeout.timeout_secs);
         let admin_dsn_for_provision = inputs.admin_dsn.clone();
@@ -132,9 +126,11 @@ pub(super) async fn resolve_db_dsn_for_init(
         let user = inputs.db_user.clone();
         let password = inputs.db_password.clone();
         let db_name = inputs.db_name.clone();
+        let root_ca = db_root_ca_path(&args.secrets_dir.secrets_dir);
         tokio::task::spawn_blocking(move || {
             provision_db_sync(
                 &admin_dsn_for_provision,
+                &root_ca,
                 &user,
                 &password,
                 &db_name,
@@ -166,6 +162,22 @@ pub(super) async fn resolve_db_dsn_for_init(
         },
         None,
     ))
+}
+
+/// Builds the compose-internal runtime DSN `db-provision` stores: the
+/// provisioned role, password and database at the admin DSN's server,
+/// with the admin DSN's `sslmode` and `sslrootcert`.
+fn provisioned_runtime_dsn(inputs: &DbProvisionInputs, admin: &DbDsn) -> Result<String> {
+    let host_side_dsn = build_db_dsn(
+        &inputs.db_user,
+        &inputs.db_password,
+        &admin.host,
+        admin.port,
+        &inputs.db_name,
+        admin.sslmode.as_deref(),
+        admin.sslrootcert.as_deref(),
+    );
+    for_compose_runtime(&host_side_dsn)
 }
 
 #[derive(Debug)]
@@ -257,6 +269,7 @@ fn build_admin_dsn_from_env(compose_dir: &Path, postgres_env: &PostgresEnv) -> O
         port,
         "postgres",
         postgres_env.sslmode.as_deref(),
+        None,
     ))
 }
 
@@ -284,9 +297,16 @@ fn build_dsn_from_env(postgres_env: &PostgresEnv) -> Option<String> {
     Some(dsn)
 }
 
+/// Returns the CA root file bootroot's TLS connections to `PostgreSQL`
+/// verify the server against: `<secrets dir>/certs/root_ca.crt`.
+pub(super) fn db_root_ca_path(secrets_dir: &Path) -> PathBuf {
+    secrets_dir.join(CA_CERTS_DIR).join(CA_ROOT_CERT_FILENAME)
+}
+
 pub(super) async fn check_db_connectivity(
     db: &DbDsn,
     dsn: &str,
+    root_ca: &Path,
     timeout_secs: u64,
     messages: &Messages,
 ) -> Result<()> {
@@ -295,7 +315,8 @@ pub(super) async fn check_db_connectivity(
         .await
         .with_context(|| messages.error_db_check_failed())?;
     let dsn_value = dsn.to_string();
-    tokio::task::spawn_blocking(move || check_auth_sync(&dsn_value, timeout))
+    let root_ca = root_ca.to_path_buf();
+    tokio::task::spawn_blocking(move || check_auth_sync(&dsn_value, &root_ca, timeout))
         .await
         .with_context(|| messages.error_db_auth_task_failed())?
         .with_context(|| messages.error_db_auth_failed())?;
@@ -449,6 +470,63 @@ mod tests {
         );
         assert_eq!(normalization.original_host, "127.0.0.1");
         assert_eq!(normalization.effective_host, "postgres");
+    }
+
+    #[test]
+    fn test_resolve_db_dsn_for_init_keeps_sslrootcert() {
+        let mut args = default_init_args();
+        args.db_dsn = Some(
+            "postgresql://user:pass@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+                .to_string(),
+        );
+
+        let (dsn, _normalization, _admin_dsn) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(resolve_db_dsn_for_init(
+                &args,
+                Path::new("."),
+                &PostgresEnv::default(),
+                &test_messages(),
+            ))
+            .expect("dsn should resolve");
+        assert_eq!(
+            dsn,
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+        );
+    }
+
+    #[test]
+    fn provisioned_runtime_dsn_keeps_admin_sslmode_and_sslrootcert() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let password = format!("db-{nonce}");
+        let inputs = DbProvisionInputs {
+            admin_dsn: String::new(),
+            db_user: "stepca".to_string(),
+            db_password: password.clone(),
+            db_name: "stepca".to_string(),
+        };
+        let admin = parse_db_dsn(
+            "postgresql://admin:pw@127.0.0.1:5433/postgres?sslmode=verify-full&sslrootcert=/etc/ca.crt",
+        )
+        .expect("parse admin dsn");
+        let dsn = provisioned_runtime_dsn(&inputs, &admin).expect("build dsn");
+        assert_eq!(
+            dsn,
+            format!(
+                "postgresql://stepca:{password}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            )
+        );
+    }
+
+    #[test]
+    fn test_db_root_ca_path_is_under_secrets_certs() {
+        assert_eq!(
+            db_root_ca_path(Path::new("/srv/secrets")),
+            Path::new("/srv/secrets/certs/root_ca.crt")
+        );
     }
 
     #[test]

@@ -68,9 +68,11 @@ pub(super) async fn rotate_db(
     let user_clone = parsed.user.clone();
     let password_clone = db_password.clone();
     let database_clone = parsed.database.clone();
+    let root_ca = ctx.paths.root_cert();
     tokio::task::spawn_blocking(move || {
         db::provision_db_sync(
             &admin_dsn,
+            &root_ca,
             &user_clone,
             &password_clone,
             &database_clone,
@@ -80,20 +82,8 @@ pub(super) async fn rotate_db(
     .await
     .context("DB provisioning task panicked")?
     .with_context(|| messages.error_db_provision_task_failed())?;
-    // Rebuild with the new password then force the stored DSN back to its
-    // compose-internal form. Routing through `for_compose_runtime` also
-    // self-heals a DSN that was previously written with a bad host/port
-    // pair (e.g. `postgres:5433` from Symptom 1 of issue #542).
-    let rebuilt_dsn = db::build_db_dsn(
-        &parsed.user,
-        &db_password,
-        &parsed.host,
-        parsed.port,
-        &parsed.database,
-        parsed.sslmode.as_deref(),
-    );
-    let new_dsn =
-        for_compose_runtime(&rebuilt_dsn).with_context(|| messages.error_invalid_db_dsn())?;
+    let new_dsn = rebuilt_runtime_dsn(&parsed, &db_password)
+        .with_context(|| messages.error_invalid_db_dsn())?;
 
     client
         .write_kv(
@@ -141,6 +131,24 @@ pub(super) async fn rotate_db(
     );
     println!("{}", messages.rotate_summary_restart_stepca());
     Ok(())
+}
+
+/// Rebuilds the stored runtime DSN with the new password, then forces it
+/// back to its compose-internal form. Routing through
+/// `for_compose_runtime` also self-heals a DSN that was previously written
+/// with a bad host/port pair (e.g. `postgres:5433` from Symptom 1 of issue
+/// #542). `sslmode` and `sslrootcert` are carried through.
+fn rebuilt_runtime_dsn(parsed: &db::DbDsn, db_password: &str) -> Result<String> {
+    let rebuilt_dsn = db::build_db_dsn(
+        &parsed.user,
+        db_password,
+        &parsed.host,
+        parsed.port,
+        &parsed.database,
+        parsed.sslmode.as_deref(),
+        parsed.sslrootcert.as_deref(),
+    );
+    for_compose_runtime(&rebuilt_dsn)
 }
 
 /// Resolves the admin DSN `rotate db` provisions with.
@@ -265,6 +273,26 @@ mod tests {
     use super::super::test_support::test_messages;
     use super::*;
     use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
+
+    #[test]
+    fn rebuilt_runtime_dsn_keeps_sslmode_and_sslrootcert() {
+        let parsed = db::parse_db_dsn(
+            "postgresql://stepca:old@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt",
+        )
+        .expect("parse dsn");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is before UNIX_EPOCH")
+            .as_nanos();
+        let new = format!("new-{nonce}");
+        let rebuilt = rebuilt_runtime_dsn(&parsed, &new).expect("rebuild dsn");
+        assert_eq!(
+            rebuilt,
+            format!(
+                "postgresql://stepca:{new}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            )
+        );
+    }
 
     #[test]
     fn resolve_db_admin_dsn_uses_cli_arg() {

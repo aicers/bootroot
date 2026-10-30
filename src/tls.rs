@@ -160,6 +160,30 @@ pub fn build_client_config_from_pem(pem_content: &str, pins: &[String]) -> Resul
     Ok(cfg)
 }
 
+/// Builds a [`ClientConfig`] that speaks only TLS 1.3 and whose trust
+/// root is the given PEM-encoded CA bundle (in-memory).
+///
+/// Every certificate in the bundle is a trust anchor and nothing else
+/// is, and the server is checked by rustls's standard verifier, as in
+/// [`build_client_config_from_pem`] without pins. That builder also
+/// accepts TLS 1.2, where the hybrid post-quantum key exchange the
+/// process-default provider prefers cannot be negotiated; this one
+/// refuses a server that does not offer TLS 1.3.
+///
+/// # Errors
+///
+/// Returns an error if the PEM content cannot be parsed.
+pub(crate) fn build_tls13_client_config_from_pem(pem_content: &str) -> Result<ClientConfig> {
+    install_crypto_provider();
+    let certs = parse_pem_to_cert_list(pem_content.as_bytes())?;
+    let root_store = certs_to_root_store(&certs)?;
+    Ok(
+        ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+}
+
 /// Builds a [`reqwest::Client`] whose trust store is the union of the
 /// Mozilla webpki root certificates (the same set the default `Client`
 /// ships with) and the given PEM-encoded CA bundle.
@@ -1170,5 +1194,100 @@ mod tests {
             config.crypto_provider().kx_groups[0].name(),
             rustls::NamedGroup::X25519MLKEM768
         );
+        let config = build_tls13_client_config_from_pem(&generate_ca_pem()).expect("client config");
+        assert_eq!(
+            config.crypto_provider().kx_groups[0].name(),
+            rustls::NamedGroup::X25519MLKEM768
+        );
+    }
+
+    /// The name the test servers below present a certificate for.
+    const HANDSHAKE_SERVER_NAME: &str = "postgres";
+
+    /// Returns a CA's PEM and a server configuration that presents a leaf
+    /// the CA issued for [`HANDSHAKE_SERVER_NAME`] and speaks only
+    /// `versions`.
+    fn server_config_speaking(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> (String, rustls::ServerConfig) {
+        install_crypto_provider();
+        let ca_key = KeyPair::generate().expect("CA key");
+        let mut ca_params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf = CertificateParams::new(vec![HANDSHAKE_SERVER_NAME.to_string()])
+            .expect("leaf parameters")
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf certificate");
+        let server = rustls::ServerConfig::builder_with_protocol_versions(versions)
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(leaf.der().to_vec())],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into(),
+            )
+            .expect("server config");
+        (ca.pem(), server)
+    }
+
+    /// Runs a handshake between `client` and `server` in memory and
+    /// returns the protocol version it settled on, or the first error
+    /// either side raised.
+    fn handshake(
+        client: ClientConfig,
+        server: rustls::ServerConfig,
+    ) -> Result<rustls::ProtocolVersion, rustls::Error> {
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client),
+            ServerName::try_from(HANDSHAKE_SERVER_NAME).expect("valid server name"),
+        )?;
+        let mut server = rustls::ServerConnection::new(Arc::new(server))?;
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut records = Vec::new();
+            client.write_tls(&mut records).expect("client records");
+            let client_sent = !records.is_empty();
+            let mut pending = records.as_slice();
+            while !pending.is_empty() {
+                server.read_tls(&mut pending).expect("server reads records");
+            }
+            server.process_new_packets()?;
+
+            let mut records = Vec::new();
+            server.write_tls(&mut records).expect("server records");
+            let server_sent = !records.is_empty();
+            let mut pending = records.as_slice();
+            while !pending.is_empty() {
+                client.read_tls(&mut pending).expect("client reads records");
+            }
+            client.process_new_packets()?;
+            assert!(client_sent || server_sent, "handshake stalled");
+        }
+        Ok(client
+            .protocol_version()
+            .expect("a completed handshake has a version"))
+    }
+
+    #[test]
+    fn tls13_client_config_completes_a_tls13_handshake() {
+        let (ca_pem, server) = server_config_speaking(&[&rustls::version::TLS13]);
+        let client = build_tls13_client_config_from_pem(&ca_pem).expect("client config");
+        assert_eq!(
+            handshake(client, server).expect("TLS 1.3 handshake"),
+            rustls::ProtocolVersion::TLSv1_3
+        );
+    }
+
+    #[test]
+    fn tls13_client_config_refuses_a_tls12_only_server() {
+        let (ca_pem, server) = server_config_speaking(&[&rustls::version::TLS12]);
+        // The general builder would settle on TLS 1.2 with this server.
+        let general = build_client_config_from_pem(&ca_pem, &[]).expect("client config");
+        assert_eq!(
+            handshake(general, server.clone()).expect("TLS 1.2 handshake"),
+            rustls::ProtocolVersion::TLSv1_2
+        );
+        let client = build_tls13_client_config_from_pem(&ca_pem).expect("client config");
+        handshake(client, server).expect_err("a TLS 1.2-only server must be refused");
     }
 }
