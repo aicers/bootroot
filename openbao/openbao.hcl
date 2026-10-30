@@ -1,9 +1,14 @@
-storage "file" {
-  path = "/openbao/file"
+storage "raft" {
+  path    = "/openbao/raft"
+  node_id = "openbao"
 }
+
+cluster_addr = "https://127.0.0.1:8201"
+api_addr     = "http://127.0.0.1:8200"
 
 listener "tcp" {
   address = "0.0.0.0:8200"
+  cluster_address = "127.0.0.1:8201"
   tls_disable = 1
   telemetry {
     disallow_metrics = true
@@ -12,6 +17,7 @@ listener "tcp" {
 
 listener "tcp" {
   address = "0.0.0.0:9101"
+  cluster_address = "127.0.0.1:9102"
   tls_disable = 1
   telemetry {
     metrics_only = true
@@ -32,5 +38,4 @@ audit {
   }
 }
 
-disable_mlock = true
 ui = true

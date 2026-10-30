@@ -472,7 +472,7 @@ cannot chown is a device that cannot write.
 
 **How it is established, and re-established.** That OpenBao reopens the
 device on `SIGHUP` is a claim about the *image*, so it is not taken on
-trust. It was established against **`openbao/openbao:2.5.5`**, the
+trust. It was established against **`openbao/openbao:2.7.2`**, the
 pinned tag (overridable through `OPENBAO_IMAGE`), and the Docker E2E
 registrar-internal-init scenario re-establishes it on **every pull
 request**, against the store-backed device it provisions: the check

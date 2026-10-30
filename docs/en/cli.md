@@ -681,7 +681,7 @@ substituted for the preloaded release payload.
 The registry images the default stack runs are pinned in
 `deploy/runtime-images.json`, one entry per runtime role:
 
-- `openbao` — `docker.io/openbao/openbao`, tag `2.5.5`: the OpenBao server
+- `openbao` — `docker.io/openbao/openbao`, tag `2.7.2`: the OpenBao server
   and the `openbao-agent-stepca` / `openbao-agent-responder` sidecars
   `init` generates.
 - `postgres` — `docker.io/library/postgres`, tag `18.4`: step-ca's
@@ -696,7 +696,7 @@ supported platforms. The pins live there, not in the Compose values:
 - Release preparation pulls each image by its digest for the release
   platform (`docker pull --platform linux/amd64 <repository>@<digest>`),
   tags it with the lookup tag the Compose defaults and the helper
-  containers name (`openbao/openbao:2.5.5`, `postgres:18.4`,
+  containers name (`openbao/openbao:2.7.2`, `postgres:18.4`,
   `smallstep/step-ca:0.30.2`), and saves the archive from that tag.
 - An offline install runs exactly the tags the archives restore. Leave the
   image variables unset or set them to those tags. Do not put a `@sha256:`

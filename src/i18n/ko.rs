@@ -63,6 +63,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_invalid_unseal_threshold: "유효하지 않은 언실 키 임계치 값입니다",
     error_eab_requires_both: "EAB에는 kid와 hmac이 모두 필요합니다",
     error_openbao_sealed: "OpenBao가 언실 키 적용 후에도 봉인 상태입니다",
+    error_openbao_not_active: "OpenBao가 언실 후 활성 노드가 되지 않았습니다",
     error_invalid_db_dsn: "PostgreSQL DSN이 올바르지 않습니다",
     error_db_host_not_single_host: "PostgreSQL 호스트가 단일 호스트 가드레일을 위반합니다: {host}",
     error_db_host_compose_runtime: "PostgreSQL 호스트 '{host}'는 step-ca 컨테이너 런타임에서 접근할 수 없습니다. db-dsn/db-admin-dsn에 '{expected}'를 사용하세요",

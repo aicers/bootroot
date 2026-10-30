@@ -2368,8 +2368,9 @@ services:
     #[test]
     fn extract_listener_blocks_handles_multiple_blocks() {
         let content = r#"
-storage "file" {
-  path = "/openbao/file"
+storage "raft" {
+  path    = "/openbao/raft"
+  node_id = "openbao"
 }
 
 listener "tcp" {

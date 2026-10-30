@@ -27,7 +27,7 @@
 # generates `.env` and creates the `secrets/` and `certs/` directories.
 services:
   openbao:
-    image: ${OPENBAO_IMAGE:-openbao/openbao:2.5.5}
+    image: ${OPENBAO_IMAGE:-openbao/openbao:2.7.2}
     container_name: ${BOOTROOT_INSTANCE:-bootroot}-openbao
     restart: always
     ports:
@@ -35,17 +35,20 @@ services:
     expose:
       - "9101"
     volumes:
-      - openbao-data:/openbao/file
+      - openbao-data:/openbao/raft
       - ./openbao:/openbao/config:ro
-    # The standard entrypoint chowns /openbao/config and /openbao/file but
-    # does not know about /openbao/audit.  That directory exists only when
-    # the audit override (secrets/openbao/docker-compose.openbao-audit.yml)
-    # bind-mounts the registrar endpoint's audit store there and the
-    # device writes /openbao/audit/audit.log; without it OpenBao audits to
-    # stdout.  When it exists, fix its ownership before delegating to the
-    # original entrypoint so the openbao user can write the audit log, and
-    # refuse to start if that fails.
-    entrypoint: ["sh", "-c", "if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl"]
+    # The container starts as root only for two chowns the image's own
+    # entrypoint does not do, and refuses to start if either fails.  A named
+    # volume mounted at /openbao/raft, a path the image does not have, is
+    # created root-owned.  /openbao/audit exists only when the audit override
+    # (secrets/openbao/docker-compose.openbao-audit.yml) bind-mounts the
+    # registrar endpoint's audit store there and the device writes
+    # /openbao/audit/audit.log; without it OpenBao audits to stdout.  The
+    # image's docker-entrypoint.sh then drops to the openbao user through
+    # su-exec, so the server itself runs as openbao, and turns `server` into
+    # `bao server -config=/openbao/config`.
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server"]
     # Audit records of the stdout device, and the server's own output, go
     # to the container log, which the journald driver hands to the host
     # journal; their retention is the host journal's.  `mode` is left at

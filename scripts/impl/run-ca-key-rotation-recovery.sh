@@ -271,12 +271,14 @@ unseal_openbao() {
   done
   local attempt
   for attempt in $(seq 1 15); do
-    local sealed
-    sealed="$(curl -sS "http://${STEPCA_HOST_IP}:8200/v1/sys/seal-status" 2>/dev/null | jq -r '.sealed' 2>/dev/null || echo "true")"
-    if [ "$sealed" = "false" ]; then return 0; fi
+    # 200 only on the active node: a Raft node is a standby until it wins
+    # its election, and this waits that out like the unseal paths in the CLI.
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "http://${STEPCA_HOST_IP}:8200/v1/sys/health" 2>/dev/null || true)"
+    if [ "$code" = "200" ]; then return 0; fi
     sleep 1
   done
-  fail "OpenBao did not unseal within timeout"
+  fail "OpenBao did not unseal and become active within timeout"
 }
 
 wait_for_responder_admin() {

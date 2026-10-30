@@ -63,6 +63,7 @@ pub(super) static STRINGS: Strings = Strings {
     error_invalid_unseal_threshold: "Invalid unseal threshold value",
     error_eab_requires_both: "EAB requires both kid and hmac",
     error_openbao_sealed: "OpenBao remains sealed after applying unseal keys",
+    error_openbao_not_active: "OpenBao did not become the active node after unsealing",
     error_invalid_db_dsn: "Invalid PostgreSQL DSN",
     error_db_host_not_single_host: "PostgreSQL host violates single-host guardrail: {host}",
     error_db_host_compose_runtime: "PostgreSQL host '{host}' is not reachable from step-ca container runtime; use '{expected}' in db-dsn/db-admin-dsn",

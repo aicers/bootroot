@@ -322,12 +322,17 @@ fn write_openbao_hcl_with_tls(compose_dir: &Path, messages: &Messages) -> Result
     // `sync_openbao_audit_device` switches the stanza to the store-backed
     // `file` device afterwards.
     let content = format!(
-        r#"storage "file" {{
-  path = "/openbao/file"
+        r#"storage "raft" {{
+  path    = "/openbao/raft"
+  node_id = "openbao"
 }}
+
+cluster_addr = "https://127.0.0.1:8201"
+api_addr     = "https://127.0.0.1:8200"
 
 listener "tcp" {{
   address = "0.0.0.0:8200"
+  cluster_address = "127.0.0.1:8201"
   tls_cert_file = "{OPENBAO_TLS_CONTAINER_CERT_PATH}"
   tls_key_file  = "{OPENBAO_TLS_CONTAINER_KEY_PATH}"
   telemetry {{
@@ -337,6 +342,7 @@ listener "tcp" {{
 
 listener "tcp" {{
   address = "0.0.0.0:9101"
+  cluster_address = "127.0.0.1:9102"
   tls_disable = 1
   telemetry {{
     metrics_only = true
@@ -357,7 +363,6 @@ audit {{
   }}
 }}
 
-disable_mlock = true
 ui = true
 "#,
     );
@@ -496,12 +501,17 @@ pub(crate) fn write_openbao_hcl_plaintext(compose_dir: &Path, messages: &Message
     // `OpenBaoClient::verify_audit_file`). Where the audit override applies,
     // `sync_openbao_audit_device` switches the stanza to the store-backed
     // `file` device afterwards.
-    let content = r#"storage "file" {
-  path = "/openbao/file"
+    let content = r#"storage "raft" {
+  path    = "/openbao/raft"
+  node_id = "openbao"
 }
+
+cluster_addr = "https://127.0.0.1:8201"
+api_addr     = "http://127.0.0.1:8200"
 
 listener "tcp" {
   address = "0.0.0.0:8200"
+  cluster_address = "127.0.0.1:8201"
   tls_disable = 1
   telemetry {
     disallow_metrics = true
@@ -510,6 +520,7 @@ listener "tcp" {
 
 listener "tcp" {
   address = "0.0.0.0:9101"
+  cluster_address = "127.0.0.1:9102"
   tls_disable = 1
   telemetry {
     metrics_only = true
@@ -530,7 +541,6 @@ audit {
   }
 }
 
-disable_mlock = true
 ui = true
 "#;
 
@@ -1086,6 +1096,7 @@ mod tests {
         assert!(content.contains("audit {"));
         assert!(content.contains("type = \"file\""));
         assert!(content.contains("file_path = \"stdout\""));
+        assert_raft_config(&content, "https://127.0.0.1:8200");
     }
 
     /// The bootroot-internal registrar credential authenticates at
@@ -1137,6 +1148,29 @@ mod tests {
         assert!(content.contains("audit {"));
         assert!(content.contains("type = \"file\""));
         assert!(content.contains("file_path = \"stdout\""));
+        assert_raft_config(&content, "http://127.0.0.1:8200");
+    }
+
+    /// `init` bootstraps Raft on the shipped file, then may rewrite it with
+    /// either writer and recreate the container. A node whose configured id
+    /// differs from the one recorded at bootstrap cannot become leader, so
+    /// all three configs must carry the same storage block.
+    #[test]
+    fn the_shipped_file_and_both_writers_carry_the_same_storage_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("openbao")).unwrap();
+        let messages = crate::i18n::test_messages();
+        let hcl_path = dir.path().join(OPENBAO_HCL_PATH);
+
+        write_openbao_hcl_with_tls(dir.path(), &messages).unwrap();
+        let tls = std::fs::read_to_string(&hcl_path).unwrap();
+        write_openbao_hcl_plaintext(dir.path(), &messages).unwrap();
+        let plaintext = std::fs::read_to_string(&hcl_path).unwrap();
+        let shipped = canonical_hcl();
+
+        assert_raft_config(&shipped, "http://127.0.0.1:8200");
+        assert_eq!(storage_block(&tls), storage_block(&shipped));
+        assert_eq!(storage_block(&plaintext), storage_block(&shipped));
     }
 
     /// The chown container must mount ONLY the `openbao/tls` directory and
@@ -1427,6 +1461,43 @@ mod tests {
         let rest = &content[start..];
         let end = rest.find("\n}\n").expect("stanza end") + 3;
         rest[..end].to_string()
+    }
+
+    fn storage_block(content: &str) -> &str {
+        let start = content.find("storage \"").expect("storage block");
+        let rest = &content[start..];
+        let end = rest.find("\n}\n").expect("storage block end") + 3;
+        &rest[..end]
+    }
+
+    /// Asserts the integrated-storage settings every server config carries.
+    fn assert_raft_config(content: &str, api_addr: &str) {
+        assert_eq!(
+            storage_block(content),
+            "storage \"raft\" {\n  path    = \"/openbao/raft\"\n  node_id = \"openbao\"\n}\n"
+        );
+        assert!(
+            content.contains("cluster_addr = \"https://127.0.0.1:8201\"\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!("api_addr     = \"{api_addr}\"\n")),
+            "{content}"
+        );
+        assert!(
+            content
+                .contains("address = \"0.0.0.0:8200\"\n  cluster_address = \"127.0.0.1:8201\"\n"),
+            "{content}"
+        );
+        assert!(
+            content
+                .contains("address = \"0.0.0.0:9101\"\n  cluster_address = \"127.0.0.1:9102\"\n"),
+            "{content}"
+        );
+        assert!(!content.contains("storage \"file\""), "{content}");
+        // Spelled in two parts so that the setting's name appears nowhere in
+        // the tree and a plain `git grep` for it stays empty.
+        assert!(!content.contains(concat!("disable_", "mlock")), "{content}");
     }
 
     fn canonical_hcl() -> String {

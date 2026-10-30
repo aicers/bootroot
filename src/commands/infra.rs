@@ -73,6 +73,10 @@ const STEPCA_USER_ENV_KEY: &str = "BOOTROOT_STEPCA_USER";
 /// `scripts/impl/run-reinit-recovery.sh`'s `wait_for_openbao_listening`.
 const OPENBAO_API_WAIT_ATTEMPTS: u32 = 60;
 const OPENBAO_API_WAIT_DELAY: Duration = Duration::from_millis(500);
+// Raft's election timeout is 15 seconds, so a node that has to wait one out
+// after an unseal still fits in this budget.
+const OPENBAO_ACTIVE_WAIT_BUDGET: Duration = Duration::from_secs(60);
+const OPENBAO_ACTIVE_WAIT_DELAY: Duration = Duration::from_millis(250);
 
 /// Assembles the `docker compose up` argv for `infra install`.
 ///
@@ -1497,6 +1501,48 @@ pub(crate) async fn wait_for_openbao_api_reachable_within(
     unreachable!("loop above returns on every iteration")
 }
 
+/// Polls `sys/health` until an unsealed `OpenBao` is the active node.
+///
+/// Integrated storage comes up as a standby and becomes active once it wins
+/// its election: right after an unseal `sys/health` was measured answering
+/// 429, then 200 about 250 ms later.  Every unseal waits here so the next call
+/// does not land in that window, where a request that has to write may fail
+/// with a 500 (`cannot write to readonly storage`, from persisting the audit
+/// salt).  That failure has not been reproduced; a plain KV write sent during
+/// a 429 succeeded.
+pub(crate) async fn wait_for_openbao_active(
+    client: &OpenBaoClient,
+    messages: &Messages,
+) -> Result<()> {
+    wait_for_openbao_active_within(
+        client,
+        OPENBAO_ACTIVE_WAIT_BUDGET,
+        OPENBAO_ACTIVE_WAIT_DELAY,
+        messages,
+    )
+    .await
+}
+
+/// [`wait_for_openbao_active`] with an explicit budget.
+async fn wait_for_openbao_active_within(
+    client: &OpenBaoClient,
+    budget: Duration,
+    delay: Duration,
+    messages: &Messages,
+) -> Result<()> {
+    // The budget bounds the whole wait, in-flight requests included: one
+    // request to a listener that accepts and stalls lasts as long as the
+    // client's request timeout, which is longer than the delay by far.
+    let poll = async {
+        while !matches!(client.is_active().await, Ok(true)) {
+            tokio::time::sleep(delay).await;
+        }
+    };
+    tokio::time::timeout(budget, poll)
+        .await
+        .map_err(|_| anyhow::anyhow!(messages.error_openbao_not_active()))
+}
+
 async fn auto_unseal_openbao(
     path: &Path,
     openbao_url: &str,
@@ -1537,7 +1583,7 @@ async fn auto_unseal_openbao(
     if status.sealed {
         anyhow::bail!(messages.error_openbao_sealed());
     }
-    Ok(())
+    wait_for_openbao_active(&client, messages).await
 }
 
 /// Checks whether `OpenBao` is sealed and, if so, prompts the user
@@ -1595,7 +1641,7 @@ async fn maybe_interactive_unseal(
     if final_status.sealed {
         anyhow::bail!(messages.error_openbao_sealed());
     }
-    Ok(())
+    wait_for_openbao_active(&client, messages).await
 }
 
 /// Returns the `OpenBao` exposed compose override path when a
@@ -2626,10 +2672,95 @@ pub(crate) fn docker_output(args: &[&str], messages: &Messages) -> Result<String
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::commands::compose_project::DOCKER_COMPOSE_SUBCOMMAND;
     use crate::i18n::test_messages;
+
+    /// A standby answers 429 until it wins its election; the wait keeps
+    /// polling through that and returns on the first 200.
+    #[tokio::test]
+    async fn the_active_wait_polls_through_a_standby() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        wait_for_openbao_active_within(
+            &client,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            &test_messages(),
+        )
+        .await
+        .expect("the node becomes active");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn the_active_wait_fails_when_the_budget_runs_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(1..)
+            .mount(&server)
+            .await;
+
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        let messages = test_messages();
+        let err = wait_for_openbao_active_within(
+            &client,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+            &messages,
+        )
+        .await
+        .expect_err("a standby is not active");
+        assert_eq!(err.to_string(), messages.error_openbao_not_active());
+        server.verify().await;
+    }
+
+    /// A listener that accepts and then stalls costs a full request timeout
+    /// per poll, so only a deadline over the whole wait keeps it to its
+    /// budget. Runs under paused time so the virtual clock auto-advances
+    /// through the budget without a real 60s wait.
+    #[tokio::test(start_paused = true)]
+    async fn the_active_wait_keeps_to_its_budget_when_the_server_stalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3600)))
+            .mount(&server)
+            .await;
+
+        let client = OpenBaoClient::new(&server.uri()).expect("client");
+        let messages = test_messages();
+        let start = tokio::time::Instant::now();
+        let err = wait_for_openbao_active(&client, &messages)
+            .await
+            .expect_err("a stalled node never reports active");
+        let elapsed = start.elapsed();
+
+        assert_eq!(err.to_string(), messages.error_openbao_not_active());
+        assert!(
+            elapsed <= OPENBAO_ACTIVE_WAIT_BUDGET + Duration::from_secs(1),
+            "the wait should end at its budget, took {elapsed:?}"
+        );
+    }
 
     const COMPOSE_WITH_STEPCA: &str = "services:\n  openbao:\n    image: openbao/openbao\n  \
         step-ca:\n    image: smallstep/step-ca:0.30.2\n";
