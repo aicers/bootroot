@@ -1805,12 +1805,12 @@ The command is considered failed when:
 
 ```bash
 bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # Switch a group-readable service to a key owned by the container's uid.
 bootroot service update --registration-id edge-proxy \
   --cert-group clear --cert-owner 999
-bootroot service update --registration-id edge-proxy --no-wrap
-bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # Retrofit a post-renew hook on an existing service (issue #614).
 bootroot service update --registration-id review \

@@ -1742,12 +1742,12 @@ cert-group 및 cert-owner 정책, 그리고 갱신 후(post-renew) 훅 구성을
 
 ```bash
 bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+bootroot service update --registration-id edge-proxy --no-wrap
+bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # 그룹-읽기 서비스를 컨테이너 uid가 소유하는 키로 전환합니다.
 bootroot service update --registration-id edge-proxy \
   --cert-group clear --cert-owner 999
-bootroot service update --registration-id edge-proxy --no-wrap
-bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 
 # 기존 서비스에 갱신 후 훅을 재구성 (이슈 #614).
 bootroot service update --registration-id review \

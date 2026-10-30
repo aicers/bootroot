@@ -1423,14 +1423,6 @@ mod tests {
         );
     }
 
-    /// On a bootstrap target this is the writer that *creates*
-    /// `agent.toml`, and the truncating write it replaced opened with
-    /// `O_TRUNC`, which follows a final symlink. So a destination an
-    /// operator pointed at a config kept elsewhere is written through,
-    /// which is the opposite answer from the control plane's editors of
-    /// the same file name — and for the opposite reason: there
-    /// `service add` creates the file by rename, so a link at the path
-    /// never survived in the first place.
     /// The artifact's `cert_owner_uid` lands in the remote `agent.toml`
     /// profile, which the agent then parses back onto the profile.
     #[tokio::test]
@@ -1465,6 +1457,14 @@ mod tests {
         assert_eq!(settings.profiles[0].cert_owner_uid, Some(999));
     }
 
+    /// On a bootstrap target this is the writer that *creates*
+    /// `agent.toml`, and the truncating write it replaced opened with
+    /// `O_TRUNC`, which follows a final symlink. So a destination an
+    /// operator pointed at a config kept elsewhere is written through,
+    /// which is the opposite answer from the control plane's editors of
+    /// the same file name — and for the opposite reason: there
+    /// `service add` creates the file by rename, so a link at the path
+    /// never survived in the first place.
     #[tokio::test]
     async fn remote_bootstrap_writes_agent_toml_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
