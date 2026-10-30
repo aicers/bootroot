@@ -33,7 +33,7 @@ use crate::cli::args::InitArgs;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::container_name::BootrootContainer;
-use crate::commands::infra::run_compose;
+use crate::commands::infra::{run_compose, wait_for_openbao_active};
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
 
@@ -43,7 +43,7 @@ const OPENBAO_AGENT_SECRETS_MOUNT: &str = "/openbao/secrets";
 // service defaults in docker-compose.yml and docker-compose.deploy.yml also
 // follow, so the Agents run the same OpenBao build as the server they
 // authenticate against. A test holds it to the declaration.
-const OPENBAO_AGENT_IMAGE: &str = "openbao/openbao:2.5.5";
+const OPENBAO_AGENT_IMAGE: &str = "openbao/openbao:2.7.2";
 
 pub(super) async fn bootstrap_openbao(
     client: &mut OpenBaoClient,
@@ -132,7 +132,7 @@ async fn unseal_openbao(
             .await
             .with_context(|| messages.error_openbao_unseal_failed())?;
         if !status.sealed {
-            return Ok(());
+            return wait_for_openbao_active(client, messages).await;
         }
     }
     let status = client
@@ -142,7 +142,7 @@ async fn unseal_openbao(
     if status.sealed {
         anyhow::bail!(messages.error_openbao_sealed());
     }
-    Ok(())
+    wait_for_openbao_active(client, messages).await
 }
 
 pub(super) async fn configure_openbao(

@@ -199,6 +199,10 @@ impl Messages {
         self.strings().error_openbao_sealed
     }
 
+    pub(crate) fn error_openbao_not_active(&self) -> &'static str {
+        self.strings().error_openbao_not_active
+    }
+
     pub(crate) fn error_invalid_db_dsn(&self) -> &'static str {
         self.strings().error_invalid_db_dsn
     }

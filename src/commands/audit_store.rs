@@ -56,7 +56,7 @@ const OPENBAO_AUDIT_CONTAINER_PATH: &str = OPENBAO_CONTAINER_AUDIT_DIR;
 /// The `openbao` service's other two mounts, re-declared verbatim
 /// because `!override` replaces the whole list and dropping one would
 /// silently unmount `OpenBao`'s storage or its configuration.
-const OPENBAO_DATA_MOUNT: &str = "openbao-data:/openbao/file";
+const OPENBAO_DATA_MOUNT: &str = "openbao-data:/openbao/raft";
 const OPENBAO_CONFIG_MOUNT: &str = "./openbao:/openbao/config:ro";
 
 /// Mode a freshly rendered override is created at.
@@ -2402,7 +2402,7 @@ mod tests {
 
         let content = fs::read_to_string(audit_override_path(&compose_dir)).expect("override");
         assert!(content.contains("volumes: !override"), "{content}");
-        assert!(content.contains("openbao-data:/openbao/file"), "{content}");
+        assert!(content.contains("openbao-data:/openbao/raft"), "{content}");
         assert!(
             content.contains("./openbao:/openbao/config:ro"),
             "{content}"
@@ -3701,7 +3701,8 @@ mod tests {
         const JOURNALD_LOGGING: &str = "    logging:
       driver: journald
 ";
-        const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server -config=/openbao/config/openbao.hcl\"]\n";
+        const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server\"]\n";
+        const START_AS_ROOT: &str = "    user: \"0:0\"\n";
         for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
             let content = repo_file(compose);
             let service = openbao_service_block(&content);
@@ -3736,6 +3737,7 @@ mod tests {
                 "{compose}: delivery mode must stay blocking"
             );
             assert!(service.contains(ENTRYPOINT), "{compose}: {service}");
+            assert!(service.contains(START_AS_ROOT), "{compose}: {service}");
             let entries = collect_openbao_volume_entries(&content);
             assert_eq!(
                 entries,
@@ -3797,7 +3799,7 @@ mod tests {
         let path = dir.path().join("docker-compose.audit.yml");
         fs::write(
             &path,
-            "services:\n  openbao:\n    volumes: !override\n      - openbao-data:/openbao/file\n",
+            "services:\n  openbao:\n    volumes: !override\n      - openbao-data:/openbao/raft\n",
         )
         .expect("write");
         let err = read_audit_override_store_dir(&path, &test_messages()).expect_err("refused");

@@ -383,7 +383,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:2.5.5 \
+  openbao/openbao:2.7.2 \
   agent -config /openbao/secrets/openbao/stepca/agent.hcl
 ```
 
@@ -395,7 +395,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:2.5.5 \
+  openbao/openbao:2.7.2 \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 
@@ -490,6 +490,25 @@ responder config and restart the responder.
 
    If you removed `secrets/templates`, restore it with
    `git checkout -- secrets/templates`.
+
+## Moving an existing installation to this release
+
+OpenBao now runs 2.7.2 on integrated (Raft) storage. OpenBao 2.7 cannot read
+the `file` storage earlier releases used, and bootroot does not migrate it, so
+an installation made with an earlier release is re-initialized. First put this
+release's compose file and `openbao/openbao.hcl` in place: `bootroot clean`
+leaves `openbao/openbao.hcl` as it is, and OpenBao 2.7 refuses to start on a
+copy that still declares `storage "file"`. Then run:
+
+```bash
+bootroot clean
+bootroot infra install
+bootroot init
+```
+
+`bootroot clean` discards every key, token and certificate, the CA included.
+After `bootroot init`, add every service again with `bootroot service add` and
+give every consumer the new CA bundle.
 
 ## bootroot-agent
 

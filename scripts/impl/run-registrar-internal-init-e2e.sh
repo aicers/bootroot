@@ -2621,7 +2621,7 @@ assert_the_audit_override_binds_the_store() {
     fail "the audit override moved the OpenBao audit path"
   grep -q "create_host_path: false" "$override" ||
     fail "the audit override lets Docker create an absent audit bind source"
-  grep -qF "openbao-data:/openbao/file" "$override" ||
+  grep -qF "openbao-data:/openbao/raft" "$override" ||
     fail "the audit override dropped OpenBao's storage mount"
   grep -qF "./openbao:/openbao/config:ro" "$override" ||
     fail "the audit override dropped OpenBao's configuration mount"

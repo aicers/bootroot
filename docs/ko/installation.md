@@ -396,7 +396,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:2.5.5 \
+  openbao/openbao:2.7.2 \
   agent -config /openbao/secrets/openbao/stepca/agent.hcl
 ```
 
@@ -408,7 +408,7 @@ docker run --rm \
   --network <network> \
   -v $(pwd)/secrets:/openbao/secrets \
   -e VAULT_ADDR=http://bootroot-openbao:8200 \
-  openbao/openbao:2.5.5 \
+  openbao/openbao:2.7.2 \
   agent -config /openbao/secrets/openbao/responder/agent.hcl
 ```
 
@@ -501,6 +501,25 @@ bootroot verify --registration-id edge-proxy \
 
    `secrets/templates`까지 지웠다면 `git checkout -- secrets/templates`로
    복원하세요.
+
+## 기존 설치를 이번 릴리스로 옮기기
+
+OpenBao는 이제 통합(Raft) 스토리지 위에서 2.7.2로 실행됩니다. OpenBao 2.7은
+이전 릴리스가 사용하던 `file` 스토리지를 읽을 수 없고 bootroot도 이를
+마이그레이션하지 않으므로, 이전 릴리스로 만든 설치는 다시 초기화합니다. 먼저
+이번 릴리스의 compose 파일과 `openbao/openbao.hcl`을 제자리에 두세요.
+`bootroot clean`은 `openbao/openbao.hcl`을 그대로 두며, OpenBao 2.7은
+`storage "file"`이 남아 있는 파일로는 시작하지 않습니다. 그런 다음 실행합니다:
+
+```bash
+bootroot clean
+bootroot infra install
+bootroot init
+```
+
+`bootroot clean`은 CA를 포함한 모든 키, 토큰, 인증서를 폐기합니다.
+`bootroot init` 후에는 `bootroot service add`로 모든 서비스를 다시 추가하고,
+모든 소비자에게 새 CA 번들을 전달하세요.
 
 ## bootroot-agent
 

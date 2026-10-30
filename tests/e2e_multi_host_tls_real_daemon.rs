@@ -69,7 +69,7 @@ const STARTUP_RETRIES: usize = 50;
 const STARTUP_DELAY: Duration = Duration::from_millis(100);
 const TEST_TTL_SECS: u64 = 60;
 const WRAP_TTL: &str = "300s";
-const OPENBAO_IMAGE: &str = "openbao/openbao:2.5.5";
+const OPENBAO_IMAGE: &str = "openbao/openbao:2.7.2";
 const OPENBAO_READY_TIMEOUT: Duration = Duration::from_mins(1);
 const OPENBAO_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RESPONDER_BIND_ATTEMPTS: u32 = 4;
@@ -240,7 +240,6 @@ impl DockerOpenBao {
               tls_cert_file = \"/openbao/tls/server.pem\"\n  \
               tls_key_file = \"/openbao/tls/server-key.pem\"\n\
             }\n\
-            disable_mlock = true\n\
             ui = false\n";
         let hcl_path = config_dir.join("openbao.hcl");
         fs::write(&hcl_path, hcl)?;

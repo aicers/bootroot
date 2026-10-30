@@ -196,10 +196,10 @@ ok "rendered model carries monitoring and responder services"
 SIDECARS="$(override sidecars '
 services:
   openbao-agent-stepca:
-    image: openbao/openbao:2.5.5
+    image: openbao/openbao:2.7.2
     command: ["agent", "-config=/dev/null"]
   openbao-agent-responder:
-    image: openbao/openbao:2.5.5
+    image: openbao/openbao:2.7.2
     command: ["agent", "-config=/dev/null"]')"
 expect_pass "generated OpenBao Agent sidecars run the declared image" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$SIDECARS"
@@ -209,7 +209,7 @@ services:
   postgres:
     image: docker.io/library/postgres:18.4
   openbao:
-    image: index.docker.io/openbao/openbao:2.5.5')"
+    image: index.docker.io/openbao/openbao:2.7.2')"
 expect_pass "Docker Hub shorthand and qualified spellings are one repository" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$QUALIFIED"
 
@@ -407,7 +407,7 @@ expect_fail "mismatched repository" \
 MIRROR="$(override mirror '
 services:
   openbao:
-    image: registry.example.com/openbao/openbao:2.5.5')"
+    image: registry.example.com/openbao/openbao:2.7.2')"
 expect_fail "dotted registry host is not a Docker Hub namespace" \
   "repository 'registry.example.com/openbao/openbao' does not match" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$MIRROR"
@@ -465,7 +465,7 @@ expect_fail "declared role with pull_policy build" "service 'postgres' sets pull
 BUILT_SIDECAR="$(override built-sidecar '
 services:
   openbao-agent-responder:
-    image: openbao/openbao:2.5.5
+    image: openbao/openbao:2.7.2
     build: ./docker/http01-responder
     command: ["agent", "-config=/dev/null"]')"
 expect_fail "OpenBao Agent sidecar replaced by a local build" \
@@ -505,7 +505,7 @@ services:
 CUSTOM_POSTGRES_IMAGE=postgres:99 expect_pass "fixture image variables are cleared too" \
   --declaration "$DECLARATION" check --compose-set "$DEPLOY" "$CUSTOM_VARIABLE"
 
-expect_fail "a pre-pull of another tag" "tag '2.5.4' does not match declared '2.5.5'" \
+expect_fail "a pre-pull of another tag" "tag '2.5.4' does not match declared '2.7.2'" \
   --declaration "$DECLARATION" reference --source fixture openbao openbao/openbao:2.5.4
 
 echo "[$LABEL] OK: declaration valid, sources consistent, all fixture cases behave"

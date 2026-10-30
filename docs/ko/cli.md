@@ -663,7 +663,7 @@ PostgreSQL 비밀번호 포함) 생성과 `secrets/`, `certs/` 디렉터리 생�
 기본 스택이 실행하는 레지스트리 이미지는 `deploy/runtime-images.json`에
 런타임 역할별 항목 하나씩으로 고정되어 있습니다.
 
-- `openbao` — `docker.io/openbao/openbao`, 태그 `2.5.5`: OpenBao 서버와
+- `openbao` — `docker.io/openbao/openbao`, 태그 `2.7.2`: OpenBao 서버와
   `init`이 생성하는 `openbao-agent-stepca` / `openbao-agent-responder`
   사이드카.
 - `postgres` — `docker.io/library/postgres`, 태그 `18.4`: step-ca의
@@ -678,7 +678,7 @@ Compose 값이 아니라 이 파일에 있습니다.
 - 릴리스 준비 단계는 각 이미지를 릴리스 플랫폼용으로 다이제스트로
   받고(`docker pull --platform linux/amd64 <repository>@<digest>`),
   Compose 기본값과 헬퍼 컨테이너가 가리키는 조회 태그
-  (`openbao/openbao:2.5.5`, `postgres:18.4`, `smallstep/step-ca:0.30.2`)를
+  (`openbao/openbao:2.7.2`, `postgres:18.4`, `smallstep/step-ca:0.30.2`)를
   붙인 뒤, 그 태그로 아카이브를 저장합니다.
 - 오프라인 설치는 아카이브가 복원한 태그를 그대로 실행합니다. 이미지
   변수는 설정하지 않거나 그 태그로 설정하세요. 오프라인 설치에서

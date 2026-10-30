@@ -26,7 +26,8 @@ use bootroot::openbao::OpenBaoClient;
 use super::prompts::prompt_unseal_keys;
 use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation, DOCKER_BIN};
 use crate::commands::infra::{
-    build_openbao_client, run_compose_with_exec, wait_for_openbao_api_reachable_within,
+    build_openbao_client, run_compose_with_exec, wait_for_openbao_active,
+    wait_for_openbao_api_reachable_within,
 };
 use crate::commands::openbao_unseal::read_unseal_keys_from_file;
 use crate::i18n::Messages;
@@ -362,7 +363,7 @@ async fn ensure_unsealed(
             .with_context(|| messages.error_openbao_unseal_failed())
             .with_context(|| messages.error_openbao_unseal_source_still_sealed(&source))?;
         if !status.sealed {
-            return Ok(());
+            return wait_for_openbao_active(client, messages).await;
         }
     }
     let status = client
@@ -372,7 +373,7 @@ async fn ensure_unsealed(
     if status.sealed {
         anyhow::bail!(messages.error_openbao_unseal_source_still_sealed(&source));
     }
-    Ok(())
+    wait_for_openbao_active(client, messages).await
 }
 
 #[cfg(test)]
@@ -778,6 +779,12 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"sealed": false})),
             )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/sys/health"))
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;

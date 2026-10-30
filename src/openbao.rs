@@ -520,6 +520,19 @@ impl OpenBaoClient {
         self.get_json("sys/seal-status", false, None).await
     }
 
+    /// Returns whether this node is the active node and serves writes.
+    ///
+    /// `sys/health` answers 200 only on an unsealed active node; every other
+    /// status (429 standby, 501 uninitialized, 503 sealed) reads as `false`.
+    ///
+    /// # Errors
+    /// Returns an error if the health endpoint cannot be reached.
+    pub async fn is_active(&self) -> Result<bool> {
+        let request = self.request_builder(Method::GET, "sys/health");
+        let response = self.send_request(request, "sys/health").await?;
+        Ok(response.status() == StatusCode::OK)
+    }
+
     /// Submits an unseal key to `OpenBao`.
     ///
     /// # Errors

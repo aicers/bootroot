@@ -433,7 +433,7 @@ truncate하지 않으므로 **단 한 바이트도 잃지 않습니다.** OpenBa
 
 **어떻게 확립하고, 어떻게 다시 확립하는가.** OpenBao가 `SIGHUP`에
 이 장치를 reopen한다는 것은 *이미지*에 대한 주장이므로 믿고 넘어가지
-않습니다. 고정된 태그인 **`openbao/openbao:2.5.5`**(`OPENBAO_IMAGE`로
+않습니다. 고정된 태그인 **`openbao/openbao:2.7.2`**(`OPENBAO_IMAGE`로
 재정의 가능)에 대해 확립했으며, Docker E2E registrar-internal-init
 시나리오가 자신이 프로비저닝한 저장소 기반 장치에 대해 **모든 풀
 리퀘스트마다** 이를 다시 확립합니다. 그 검사는 활성 로그를 옆으로 rename하고,

@@ -35,6 +35,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   host, which must then be an IP address or `localhost` (dialled as
   `127.0.0.1`); any other host name is refused. A DSN's `sslrootcert` parameter
   is now kept when bootroot rewrites the DSN, where it was dropped before.
+- OpenBao, the server and the two OpenBao Agent containers `bootroot init` adds,
+  now runs 2.7.2 instead of 2.5.5, and the server stores its data with
+  integrated (Raft) storage instead of the `file` backend, on the same
+  `openbao-data` volume, now mounted at `/openbao/raft`. OpenBao 2.7 cannot read
+  the `file` storage earlier releases wrote, and bootroot does not migrate it:
+  an installation made with an earlier release must be re-initialized, by
+  `bootroot clean` and a fresh `bootroot infra install` and `bootroot init`,
+  after which every service is added again and every consumer is given the new
+  CA bundle (see "Moving an existing installation to this release" in the
+  installation guide). The `openbao` container now starts as root, hands its
+  storage and audit directories to the `openbao` user, and runs the server as
+  that user.
 
 ## [0.5.0] - 2026-10-26
 

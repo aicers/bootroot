@@ -86,6 +86,7 @@ pub(crate) struct Strings {
     pub(crate) error_invalid_unseal_threshold: &'static str,
     pub(crate) error_eab_requires_both: &'static str,
     pub(crate) error_openbao_sealed: &'static str,
+    pub(crate) error_openbao_not_active: &'static str,
     pub(crate) error_invalid_db_dsn: &'static str,
     pub(crate) error_db_host_not_single_host: &'static str,
     pub(crate) error_db_host_compose_runtime: &'static str,
