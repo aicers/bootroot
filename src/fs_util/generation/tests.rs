@@ -437,3 +437,115 @@ async fn a_trust_update_on_a_tree_without_current_publishes_nothing() {
 fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
+
+/// A uid the test process is not.
+fn foreign_uid() -> u32 {
+    if super::super::current_process_euid() == 4_000_000_000 {
+        4_000_000_001
+    } else {
+        4_000_000_000
+    }
+}
+
+/// Whether a root-only test should run: it runs as root, and fails
+/// rather than skips when `BOOTROOT_E2E_REQUIRE_CERT_OWNER=1` asks for it
+/// and the process is not root, so a CI step that meant to run it as
+/// root cannot pass by skipping it.
+fn running_as_root_or_required() -> bool {
+    if super::super::current_process_euid() == 0 {
+        return true;
+    }
+    assert!(
+        std::env::var_os("BOOTROOT_E2E_REQUIRE_CERT_OWNER").is_none_or(|value| value != "1"),
+        "BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 requires this test to run as root"
+    );
+    false
+}
+
+/// A non-root process cannot give a generation's key to another uid:
+/// the publication fails naming the uid and the root requirement, and
+/// `current` still names the generation it named before. Skipped as
+/// root, where the chown succeeds.
+#[tokio::test]
+async fn an_owner_publication_a_non_root_process_cannot_apply_keeps_current() {
+    if super::super::current_process_euid() == 0 {
+        return;
+    }
+    let dir = TempDir::new().expect("tempdir");
+    let mut target = target(dir.path());
+    publish_generation(&target, issued("A"), &Probe::default())
+        .await
+        .expect("publish");
+
+    let uid = foreign_uid();
+    target.policy = CertGroupPolicy::with_owner(uid);
+    let err = publish_generation(&target, issued("B"), &Probe::default())
+        .await
+        .expect_err("a non-root process cannot give the key away");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(&format!("uid {uid} gid 0"))
+            && message.contains("bootroot-agent to run as root"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_link(target.current()).expect("current"),
+        Path::new("gen-1")
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.root.join("gen-1").join("key.pem")).expect("key"),
+        "key A"
+    );
+}
+
+/// As root, a generation published under an owner holds the key owned
+/// by that uid and group 0 at `0600`, the certificate and the bundle at
+/// `0644` owned by the writer, and every directory of the tree at
+/// `0755` — and a republication for trust re-asserts all of it. The uid
+/// is one the host's user database need not have.
+#[tokio::test]
+async fn cert_owner_generation_modes_as_root_only() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !running_as_root_or_required() {
+        return;
+    }
+    let dir = TempDir::new().expect("tempdir");
+    let mut target = target(dir.path());
+    let uid = 4_000_000_000;
+    target.policy = CertGroupPolicy::with_owner(uid);
+    std::fs::create_dir_all(&target.key_dir).expect("key dir");
+    let bundle_path = target.key_dir.join("ca-bundle.pem");
+    std::fs::write(&bundle_path, "bundle").expect("bundle");
+    target.bundle = Some((bundle_path, "ca-bundle.pem".into()));
+
+    publish_generation(&target, issued("A"), &Probe::default())
+        .await
+        .expect("publish as root");
+    publish_generation(&target, PairSource::Current, &Probe::default())
+        .await
+        .expect("republish as root");
+
+    let generation = target.root.join("gen-2");
+    assert_eq!(
+        std::fs::read_link(target.current()).expect("current"),
+        Path::new("gen-2")
+    );
+    let key = std::fs::metadata(generation.join("key.pem")).expect("key");
+    assert_eq!((key.uid(), key.gid()), (uid, 0));
+    assert_eq!(key.mode() & 0o7777, 0o600);
+    for public in ["cert.pem", "ca-bundle.pem"] {
+        let meta = std::fs::metadata(generation.join(public)).expect(public);
+        assert_eq!((meta.uid(), meta.gid()), (0, 0), "{public}");
+        assert_eq!(meta.mode() & 0o7777, 0o644, "{public}");
+    }
+    for tree_dir in [
+        target.key_dir.clone(),
+        target.key_dir.join(GENERATIONS_DIR_NAME),
+        target.root.clone(),
+        generation,
+    ] {
+        let meta = std::fs::metadata(&tree_dir).expect("dir");
+        assert_eq!(meta.mode() & 0o7777, 0o755, "{}", tree_dir.display());
+    }
+}

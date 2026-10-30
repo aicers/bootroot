@@ -182,6 +182,7 @@ fn profile(registration_id: &str, cert: &Path, key: &Path) -> crate::config::Dae
         hooks: crate::config::HookSettings::default(),
         eab: None,
         cert_group_gid: None,
+        cert_owner_uid: None,
     }
 }
 
@@ -1303,4 +1304,114 @@ async fn an_upgraded_host_starts_at_generation_one() {
         ])
     );
     assert_eq!(read_snapshot(&fixture.root), Some(snapshot("A", None)));
+}
+
+/// Every entry under `dir`, recursively, with what a write would change:
+/// its inode, mode and owner, and a symlink's target or a file's bytes.
+fn disk_state(dir: &Path) -> Vec<(PathBuf, u64, u32, u32, String)> {
+    let mut state = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("list") {
+            let path = entry.expect("entry").path();
+            let meta = std::fs::symlink_metadata(&path).expect("stat");
+            let contents = if meta.file_type().is_symlink() {
+                format!("-> {}", std::fs::read_link(&path).expect("link").display())
+            } else if meta.is_dir() {
+                pending.push(path.clone());
+                "dir".to_string()
+            } else {
+                std::fs::read_to_string(&path).expect("read")
+            };
+            state.push((path, meta.ino(), meta.mode(), meta.uid(), contents));
+        }
+    }
+    state.sort_unstable();
+    state
+}
+
+/// The refusal a non-root agent reports for a profile with an owner.
+fn owner_refusal(fixture: &Fixture, uid: u32) -> String {
+    format!(
+        "profile '{}' sets cert_owner_uid = {uid}, which needs bootroot-agent to run as root \
+         (it runs as uid {}); nothing was written",
+        crate::config::profile_domain(&fixture.settings, fixture.profile()),
+        crate::fs_util::current_process_euid()
+    )
+}
+
+/// A non-root agent refuses an owner profile before the ACME exchange:
+/// the directory URL names a port nothing listens on, and the error is
+/// the refusal rather than a connection failure. Skipped as root.
+#[tokio::test]
+async fn an_owner_profile_is_refused_before_any_acme_request_as_non_root() {
+    if crate::fs_util::current_process_euid() == 0 {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.settings.server = "https://127.0.0.1:1/directory".to_string();
+    fixture.settings.profiles[0].cert_owner_uid = Some(999);
+
+    let err = issue_certificate_with_bootstrap(
+        &fixture.settings,
+        fixture.profile(),
+        None,
+        IssuanceOptions::default(),
+        None,
+    )
+    .await
+    .expect_err("a non-root agent cannot apply an owner");
+
+    assert_eq!(err.to_string(), owner_refusal(&fixture, 999));
+}
+
+/// Both publications refuse an owner profile as a non-root process
+/// before they touch anything: the bundle, the generation tree and the
+/// configured pair are left exactly as an earlier issuance left them,
+/// even though the material carries a pinned chain that would otherwise
+/// have been merged into the bundle. Skipped as root.
+#[tokio::test]
+async fn an_owner_profile_publishes_nothing_as_non_root() {
+    if crate::fs_util::current_process_euid() == 0 {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.write_bundle("bundle one\n");
+    fixture
+        .publish(&material("A"), &Probe::default())
+        .await
+        .expect("publish A under the default policy");
+
+    let issuer = rcgen::KeyPair::generate().expect("key");
+    let issuer_der = rcgen::CertificateParams::new(vec!["issuer.example".to_string()])
+        .expect("params")
+        .self_signed(&issuer)
+        .expect("self-signed")
+        .der()
+        .to_vec();
+    fixture.settings.trust.trusted_ca_sha256 = vec![sha256_hex(&issuer_der)];
+    fixture.settings.profiles[0].cert_owner_uid = Some(999);
+    let mut chained = material("B");
+    chained.chain = vec![issuer_der];
+    let base = fixture
+        .cert
+        .parent()
+        .and_then(Path::parent)
+        .expect("the fixture's directory")
+        .to_path_buf();
+    let before = disk_state(&base);
+
+    let err = fixture
+        .publish(&chained, &Probe::default())
+        .await
+        .expect_err("publish_snapshot refuses the owner");
+    assert_eq!(err.to_string(), owner_refusal(&fixture, 999));
+    assert_eq!(disk_state(&base), before);
+
+    let err = publish_issued_material(&fixture.settings, fixture.profile(), &chained)
+        .await
+        .expect_err("publish_issued_material refuses the owner");
+    assert_eq!(err.to_string(), owner_refusal(&fixture, 999));
+    assert_eq!(disk_state(&base), before);
+    assert_eq!(fixture.configured(), pair("A"));
 }

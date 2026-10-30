@@ -232,6 +232,11 @@ struct ResolvedBootstrapArgs {
     /// `cert_group_gid` line that survives every rotation. See
     /// issue #593.
     cert_group_gid: Option<u32>,
+    /// Numeric uid that owns the issued private key under
+    /// `--cert-owner`. Carried verbatim from the bootstrap artifact, as
+    /// `cert_group_gid` is; the artifact-less direct-CLI path has no
+    /// flag for it.
+    cert_owner_uid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -396,6 +401,8 @@ struct BootstrapArtifact {
     wrap_expires_at: Option<String>,
     #[serde(default)]
     cert_group_gid: Option<u32>,
+    #[serde(default)]
+    cert_owner_uid: Option<u32>,
 }
 
 /// Hook entry as serialized in the bootstrap artifact JSON.
@@ -543,6 +550,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
     let wrap_token = artifact.as_ref().and_then(|a| a.wrap_token.clone());
     let wrap_expires_at = artifact.as_ref().and_then(|a| a.wrap_expires_at.clone());
     let cert_group_gid = artifact.as_ref().and_then(|a| a.cert_group_gid);
+    let cert_owner_uid = artifact.as_ref().and_then(|a| a.cert_owner_uid);
 
     // When an artifact is provided, its `post_renew_hooks` array is
     // authoritative — even if empty (an explicit "no hooks" choice) — and
@@ -613,6 +621,7 @@ async fn resolve_bootstrap_args(args: BootstrapArgs) -> Result<ResolvedBootstrap
         wrap_token,
         wrap_expires_at,
         cert_group_gid,
+        cert_owner_uid,
     })
 }
 
@@ -954,6 +963,36 @@ mod tests {
         // Artifact explicitly sets empty hooks — CLI hooks must NOT leak
         // through, even though the artifact array is empty.
         assert!(resolved.post_renew_hooks.is_empty());
+    }
+
+    /// The artifact's `cert_owner_uid` is carried onto the resolved
+    /// arguments, and an artifact without it resolves to `None`.
+    #[tokio::test]
+    async fn resolve_bootstrap_args_reads_the_artifact_cert_owner_uid() {
+        for (owner, expected) in [(Some(999), Some(999)), (None, None)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut artifact_json = serde_json::json!({
+                "schema_version": 5,
+                "openbao_url": "https://ob:8200",
+                "kv_mount": "kv",
+                "registration_id": "svc",
+                "service_name": "svc",
+                "role_id_path": "/r",
+                "secret_id_path": "/s",
+                "eab_file_path": "/e",
+                "agent_config_path": "/a",
+                "ca_bundle_path": "/ca",
+            });
+            if let Some(uid) = owner {
+                artifact_json["cert_owner_uid"] = serde_json::json!(uid);
+            }
+            let artifact_path = write_artifact_file(dir.path(), &artifact_json.to_string());
+            let resolved = resolve_bootstrap_args(default_bootstrap_args(artifact_path))
+                .await
+                .expect("resolve");
+            assert_eq!(resolved.cert_owner_uid, expected);
+            assert_eq!(resolved.cert_group_gid, None);
+        }
     }
 
     /// The artifact a registrar mint returns is one this parser accepts.

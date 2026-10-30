@@ -57,10 +57,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use super::parent_dir;
-use crate::cert_group::{
-    self, CA_BUNDLE_FILE_MODE, CERT_FILE_MODE, CertGroupPolicy, DIR_MODE_DEFAULT,
-    KEY_DIR_MODE_GROUP, KEY_FILE_MODE_DEFAULT, KEY_FILE_MODE_GROUP,
-};
+use crate::cert_group::{self, CA_BUNDLE_FILE_MODE, CERT_FILE_MODE, CertGroupPolicy};
 use crate::config::{DaemonProfileSettings, Settings};
 use crate::registrar::internal::PrivateKeyPem;
 
@@ -155,7 +152,8 @@ pub(crate) struct GenerationTarget {
     key_dir: PathBuf,
     /// `<key_dir>/.bootroot-generations/<registration_id>`.
     root: PathBuf,
-    /// The `--cert-group` policy the tree and its files are owned under.
+    /// The `--cert-group` or `--cert-owner` policy the tree and its
+    /// files are owned under.
     policy: CertGroupPolicy,
     /// The certificate's name inside a generation.
     cert_name: OsString,
@@ -235,9 +233,7 @@ impl GenerationTarget {
         GenerationPlan::Publish(Self {
             key_dir: parent_dir(&profile.paths.key),
             root,
-            policy: CertGroupPolicy {
-                gid: profile.cert_group_gid,
-            },
+            policy: CertGroupPolicy::for_profile(profile),
             cert_name: cert_name.to_os_string(),
             key_name: key_name.to_os_string(),
             bundle,
@@ -489,21 +485,17 @@ fn ensure_tree_dir(path: &Path, policy: CertGroupPolicy, create: bool) -> Result
     Ok(true)
 }
 
-/// Gives a directory of the tree the key directory's policy: `0700`, or
-/// `0750` and the policy's group.
+/// Gives a directory of the tree the key directory's policy: `0700`,
+/// `0750` and the policy's group, or `0755` under an owner, whose
+/// directories keep their owner and group.
 fn apply_dir_policy(path: &Path, policy: CertGroupPolicy) -> Result<()> {
-    let mode = if policy.is_active() {
-        KEY_DIR_MODE_GROUP
-    } else {
-        DIR_MODE_DEFAULT
-    };
-    apply_owner_and_mode(path, policy, mode)
+    apply_owner_and_mode(path, policy.group_gid(), policy.key_dir_mode())
 }
 
-/// Applies the policy's group and then `mode`, in that order, so nothing
-/// is group-readable under the writer's primary group first. A call that
+/// Applies `gid` and then `mode`, in that order, so nothing is
+/// group-readable under the writer's primary group first. A call that
 /// would change nothing is not made.
-fn apply_owner_and_mode(path: &Path, policy: CertGroupPolicy, mode: u32) -> Result<()> {
+fn apply_owner_and_mode(path: &Path, gid: Option<u32>, mode: u32) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("inspecting {}", path.display()))?;
     if meta.file_type().is_symlink() {
@@ -512,7 +504,7 @@ fn apply_owner_and_mode(path: &Path, policy: CertGroupPolicy, mode: u32) -> Resu
             path.display()
         );
     }
-    if let Some(gid) = policy.gid
+    if let Some(gid) = gid
         && meta.gid() != gid
     {
         std::os::unix::fs::chown(path, None, Some(gid))
@@ -562,29 +554,29 @@ fn commit(
         .create(&staged)
         .with_context(|| format!("creating {}", staged.display()))?;
     apply_dir_policy(&staged, target.policy)?;
-    let key_mode = if target.policy.is_active() {
-        KEY_FILE_MODE_GROUP
-    } else {
-        KEY_FILE_MODE_DEFAULT
+    let public = MemberOwner::Group(target.policy.group_gid());
+    let key_owner = match target.policy.owner_uid {
+        Some(uid) => MemberOwner::User(uid),
+        None => public,
     };
     write_member(
         &staged.join(&target.cert_name),
         cert_pem.as_bytes(),
         CERT_FILE_MODE,
-        target.policy,
+        public,
     )?;
     write_member(
         &staged.join(&target.key_name),
         key_pem.expose().as_bytes(),
-        key_mode,
-        target.policy,
+        target.policy.key_file_mode(),
+        key_owner,
     )?;
     if let (Some((_, bundle_name)), Some(bundle)) = (&target.bundle, bundle) {
         write_member(
             &staged.join(bundle_name),
             bundle,
             CA_BUNDLE_FILE_MODE,
-            target.policy,
+            public,
         )?;
     }
     probe.reach(PublicationPoint::Staged)?;
@@ -900,13 +892,28 @@ fn read_current_member(
     })
 }
 
+/// Who one file of a generation is given to.
+#[derive(Clone, Copy)]
+enum MemberOwner {
+    /// The writer, and the policy's group when it names one.
+    Group(Option<u32>),
+    /// This uid and group 0: the key under `--cert-owner`.
+    User(u32),
+}
+
 /// Writes one file of a staged generation at its final owner and mode,
 /// and flushes it.
 ///
 /// Created `0600` and widened only after the policy's group is on it,
 /// exactly as the configured files are staged; flushed last, so the
 /// owner and mode are as durable as the bytes.
-fn write_member(path: &Path, contents: &[u8], mode: u32, policy: CertGroupPolicy) -> Result<()> {
+///
+/// A file given to a uid ([`MemberOwner::User`]) is chowned and
+/// chmodded through the descriptor `create_new` just returned, never
+/// through its path, unconditionally: a root process giving a file away
+/// must not follow a name another account could have replaced in a
+/// tree directory that account owns.
+fn write_member(path: &Path, contents: &[u8], mode: u32, owner: MemberOwner) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -915,7 +922,15 @@ fn write_member(path: &Path, contents: &[u8], mode: u32, policy: CertGroupPolicy
         .with_context(|| format!("creating {}", path.display()))?;
     file.write_all(contents)
         .with_context(|| format!("writing {}", path.display()))?;
-    apply_owner_and_mode(path, policy, mode)?;
+    match owner {
+        MemberOwner::Group(gid) => apply_owner_and_mode(path, gid, mode)?,
+        MemberOwner::User(uid) => {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(cert_group::KEY_FILE_GROUP_OWNER))
+                .with_context(|| super::chown_policy_owner_context(uid, path))?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("setting mode {mode:o} on {}", path.display()))?;
+        }
+    }
     file.sync_all()
         .with_context(|| format!("flushing {}", path.display()))
 }

@@ -1368,6 +1368,7 @@ fn profile_with(instance_id: &str, service_name: &str, hostname: &str) -> Daemon
         hooks: HookSettings::default(),
         eab: None,
         cert_group_gid: None,
+        cert_owner_uid: None,
     }
 }
 

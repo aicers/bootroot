@@ -318,6 +318,7 @@ mod tests {
             hooks,
             eab: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
         };
 
         let settings = Settings {

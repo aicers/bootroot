@@ -4889,6 +4889,156 @@ fn test_service_update_cert_group_preserves_inline_trust() {
     );
 }
 
+/// The managed `agent.toml` the `--cert-owner` update tests start from:
+/// `[trust]` inside the markers, as `service add` writes it.
+const CERT_OWNER_AGENT_TOML: &str = "# BEGIN bootroot managed profile: edge-proxy\n\
+     [[profiles]]\n\
+     name = \"edge-proxy\"\n\
+     \n\
+     [trust]\n\
+     ca_bundle_path = \"/opt/demo-mtls/ca-bundle.pem\"\n\
+     trusted_ca_sha256 = [\"root-sha\", \"intermediate-sha\"]\n\
+     # END bootroot managed profile: edge-proxy\n";
+
+fn run_service_update(root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec!["service", "update", "--registration-id", "edge-proxy"];
+    args.extend_from_slice(extra);
+    std::process::Command::new(env!("CARGO_BIN_EXE_bootroot"))
+        .current_dir(root)
+        .args(&args)
+        .output()
+        .expect("run service update")
+}
+
+fn edge_proxy_entry(root: &std::path::Path) -> serde_json::Value {
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("state.json")).expect("read state"))
+            .expect("parse state");
+    state["services"]["edge-proxy"].clone()
+}
+
+/// `--cert-owner` re-renders the managed profile with the owner line,
+/// keeps `[trust]` exactly once and records the uid; the same value again
+/// succeeds and reports no change.
+#[cfg(unix)]
+#[test]
+fn test_service_update_cert_owner_rerenders_and_saves() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(&agent_toml, CERT_OWNER_AGENT_TOML).expect("seed agent.toml");
+
+    let output = run_service_update(temp_dir.path(), &["--cert-owner", "999"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("cert_owner_uid: unset -> 999"), "{stdout}");
+
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("cert_owner_uid = 999\n"),
+        "the managed profile must carry the owner, got: {agent_contents}"
+    );
+    assert!(
+        !agent_contents.contains("cert_group_gid"),
+        "{agent_contents}"
+    );
+    assert_eq!(
+        agent_contents.matches("[trust]").count(),
+        1,
+        "exactly one [trust] section expected, got: {agent_contents}"
+    );
+    assert!(
+        agent_contents.contains("trusted_ca_sha256 = [\"root-sha\", \"intermediate-sha\"]"),
+        "{agent_contents}"
+    );
+    assert_eq!(edge_proxy_entry(temp_dir.path())["cert_owner_uid"], 999);
+
+    let output = run_service_update(temp_dir.path(), &["--cert-owner", "999"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("No fields changed."), "{stdout}");
+    assert_eq!(
+        fs::read_to_string(&agent_toml).expect("read agent.toml"),
+        agent_contents
+    );
+}
+
+/// On a service with a group, `--cert-owner` alone is refused with the
+/// exclusivity message and changes neither `state.json` nor `agent.toml`;
+/// clearing the group in the same call switches the service to the owner.
+#[cfg(unix)]
+#[test]
+fn test_service_update_cert_owner_is_exclusive_with_cert_group() {
+    let temp_dir = tempdir().expect("create temp dir");
+    write_state_file(temp_dir.path(), "http://unused:8200").expect("write state.json");
+    write_state_with_app(temp_dir.path());
+    let state_path = temp_dir.path().join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["services"]["edge-proxy"]["cert_group_gid"] = json!(5001);
+    fs::write(
+        &state_path,
+        serde_json::to_string_pretty(&state).expect("serialize state"),
+    )
+    .expect("write state");
+    let agent_toml = temp_dir.path().join("agent.toml");
+    fs::write(&agent_toml, CERT_OWNER_AGENT_TOML).expect("seed agent.toml");
+    let state_before = fs::read_to_string(&state_path).expect("read state");
+
+    let output = run_service_update(temp_dir.path(), &["--cert-owner", "999"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains(
+            "--cert-owner and --cert-group are exclusive; service edge-proxy would have \
+             cert_group_gid 5001 and cert_owner_uid 999; clear one with \"--cert-group \
+             clear\" or \"--cert-owner clear\""
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&state_path).expect("read state"),
+        state_before
+    );
+    assert_eq!(
+        fs::read_to_string(&agent_toml).expect("read agent.toml"),
+        CERT_OWNER_AGENT_TOML
+    );
+
+    let output = run_service_update(
+        temp_dir.path(),
+        &["--cert-group", "clear", "--cert-owner", "999"],
+    );
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entry = edge_proxy_entry(temp_dir.path());
+    assert_eq!(entry["cert_owner_uid"], 999);
+    assert!(entry.get("cert_group_gid").is_none(), "{entry}");
+    let agent_contents = fs::read_to_string(&agent_toml).expect("read agent.toml");
+    assert!(
+        agent_contents.contains("cert_owner_uid = 999\n"),
+        "{agent_contents}"
+    );
+    assert!(
+        !agent_contents.contains("cert_group_gid"),
+        "{agent_contents}"
+    );
+}
+
 /// Issue #645 — when `[trust]` already lives *outside* the managed-block
 /// markers, the `--cert-group` re-render must update it in place and
 /// never produce a duplicate section, mirroring the `--reload-style`

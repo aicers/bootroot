@@ -1,4 +1,4 @@
-//! Operator-configurable group ownership policy for issued service
+//! Operator-configurable group or owner policy for issued service
 //! certificates and their parent directories.
 //!
 //! `bootroot-agent` writes service cert/key files at issuance and at
@@ -13,6 +13,17 @@
 //! readable (`0640`), and group ownership of all four (key, cert, both
 //! parent directories) is set to the operator-supplied gid.
 //!
+//! The flag `--cert-owner <uid>` is its owner counterpart, for a
+//! consumer that runs as a fixed numeric uid — typically a server in a
+//! container — whose gid is also a group of the host's own database, so
+//! a group-readable key would be readable by every member of that host
+//! group too. Under it the key file is owned by that uid and group 0 at
+//! `0600`, so only the uid (and root) can read it; the certificate and
+//! the CA bundle keep the writer's ownership at `0644`, and both parent
+//! directories become `0755` so the uid can reach the key. The owner is
+//! set on the staged inode through its open descriptor before the rename,
+//! which needs `bootroot-agent` to run as root.
+//!
 //! See `docs/services/cert-group.md` for the operator-facing overview.
 
 use std::ffi::CString;
@@ -23,6 +34,7 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 use tokio::fs;
 
+use crate::config::DaemonProfileSettings;
 use crate::fs_util::{self, StagedDurability, StagedMode, StagedOwner};
 
 /// Default mode for the cert/key parent directory when no `--cert-group`
@@ -51,35 +63,229 @@ pub const CERT_DIR_MODE_GROUP: u32 = 0o755;
 pub const KEY_DIR_MODE_GROUP: u32 = 0o750;
 /// Mode for the private key file when `--cert-group` is set.
 pub const KEY_FILE_MODE_GROUP: u32 = 0o640;
+/// Mode for the key and cert parent directories, and for every
+/// directory of the generation tree, when `--cert-owner` is set.
+///
+/// The owner uid is neither the directory's owner nor in its group, so
+/// it needs the "other" execute bit to reach the key. Listing reveals
+/// only file names, and every file there but the key is public trust
+/// material at `0644`; the key's own `0600` and owner keep every other
+/// non-root account out of it.
+pub const DIR_MODE_OWNER: u32 = 0o755;
+/// Mode for the private key file when `--cert-owner` is set. Owned by
+/// that uid and group 0, so only that uid and root can read it.
+pub const KEY_FILE_MODE_OWNER: u32 = 0o600;
+/// The group the private key is given under `--cert-owner`.
+pub const KEY_FILE_GROUP_OWNER: u32 = 0;
 
 /// Cert-access policy threaded through the issuance/rotation write
-/// path. `None` preserves the host-local default (operator-only).
+/// path. Neither field set preserves the host-local default
+/// (operator-only).
+///
+/// At most one of the two is set: `--cert-group` and `--cert-owner` are
+/// exclusive, and a profile carrying both is refused by validation. The
+/// mode and ownership choices of all three policies are made by the
+/// methods below, so no writer decides them on its own. Should both
+/// ever be set regardless, the owner policy wins and the gid is ignored:
+/// it is the stricter of the two for the key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CertGroupPolicy {
     /// Numeric gid that owns the cert/key files and their parent
     /// directories. `None` means "no group policy in effect".
     pub gid: Option<u32>,
+    /// Numeric uid that owns the private key file (with group 0, mode
+    /// `0600`). `None` means "no owner policy in effect".
+    pub owner_uid: Option<u32>,
 }
 
 impl CertGroupPolicy {
     /// Constructs a policy that opts into the group-readable mode set.
     #[must_use]
     pub fn with_gid(gid: u32) -> Self {
-        Self { gid: Some(gid) }
+        Self {
+            gid: Some(gid),
+            owner_uid: None,
+        }
+    }
+
+    /// Constructs a policy that gives the private key to `uid`.
+    #[must_use]
+    pub fn with_owner(uid: u32) -> Self {
+        Self {
+            gid: None,
+            owner_uid: Some(uid),
+        }
     }
 
     /// Returns the policy that preserves the host-local default
     /// (operator-only `0700`/`0600`/`0644`).
     #[must_use]
     pub fn none() -> Self {
-        Self { gid: None }
+        Self {
+            gid: None,
+            owner_uid: None,
+        }
+    }
+
+    /// Returns the policy a profile's `cert_group_gid` and
+    /// `cert_owner_uid` select.
+    #[must_use]
+    pub fn for_profile(profile: &DaemonProfileSettings) -> Self {
+        Self {
+            gid: profile.cert_group_gid,
+            owner_uid: profile.cert_owner_uid,
+        }
     }
 
     /// Returns true when this policy will alter cert/key ownership and
     /// modes from the host-local default.
     #[must_use]
     pub fn is_active(self) -> bool {
-        self.gid.is_some()
+        self.gid.is_some() || self.owner_uid.is_some()
+    }
+
+    /// Returns the gid the issued files and their directories are given,
+    /// which only the group policy names.
+    #[must_use]
+    pub fn group_gid(self) -> Option<u32> {
+        if self.owner_uid.is_some() {
+            None
+        } else {
+            self.gid
+        }
+    }
+
+    /// Returns the mode of the private key file: `0600` by default and
+    /// under an owner, `0640` under a group.
+    #[must_use]
+    pub fn key_file_mode(self) -> u32 {
+        if self.owner_uid.is_some() {
+            KEY_FILE_MODE_OWNER
+        } else if self.gid.is_some() {
+            KEY_FILE_MODE_GROUP
+        } else {
+            KEY_FILE_MODE_DEFAULT
+        }
+    }
+
+    /// Returns the mode of the directory holding the private key, which
+    /// every directory of the generation tree takes too: `0700` by
+    /// default, `0750` under a group, `0755` under an owner.
+    #[must_use]
+    pub fn key_dir_mode(self) -> u32 {
+        if self.owner_uid.is_some() {
+            DIR_MODE_OWNER
+        } else if self.gid.is_some() {
+            KEY_DIR_MODE_GROUP
+        } else {
+            DIR_MODE_DEFAULT
+        }
+    }
+
+    /// Returns the mode of the directory holding the certificate:
+    /// `0700` by default, `0755` under an owner, and under a group
+    /// `0755`, or `0750` when it is the key's directory too (`shared`).
+    #[must_use]
+    pub fn cert_dir_mode(self, shared: bool) -> u32 {
+        if self.owner_uid.is_some() {
+            DIR_MODE_OWNER
+        } else if self.gid.is_some() {
+            if shared {
+                KEY_DIR_MODE_GROUP
+            } else {
+                CERT_DIR_MODE_GROUP
+            }
+        } else {
+            DIR_MODE_DEFAULT
+        }
+    }
+
+    /// Returns who the staged private key is given to before it is
+    /// renamed into place: the owner uid and group 0 under an owner, the
+    /// policy's group otherwise.
+    #[must_use]
+    pub fn key_staged_owner(self) -> StagedOwner {
+        match self.owner_uid {
+            Some(uid) => StagedOwner::PolicyOwner(uid),
+            None => StagedOwner::PolicyGroup(self.gid),
+        }
+    }
+
+    /// Returns who the staged certificate or CA bundle is given to: the
+    /// policy's group, and the writer under an owner, since both are
+    /// public trust material.
+    #[must_use]
+    pub fn public_staged_owner(self) -> StagedOwner {
+        StagedOwner::PolicyGroup(self.group_gid())
+    }
+}
+
+/// Errors returned by `--cert-owner` parsing.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CertOwnerError {
+    /// The supplied value was empty or whitespace-only.
+    #[error("--cert-owner must not be empty")]
+    Empty,
+    /// The value is not all ASCII digits: a user name, a sign, or a
+    /// space inside it. Names are never resolved, because the uid
+    /// usually names a user inside a container that the host need not
+    /// have.
+    #[error("--cert-owner must be a numeric uid (got {0:?}); user names are not resolved")]
+    NotNumeric(String),
+    /// The digits do not fit a `u32`.
+    #[error("--cert-owner {0:?} is not a valid numeric uid")]
+    InvalidNumeric(String),
+    /// `--cert-owner 0` is refused: root already can read the key, and
+    /// the default writes it owned by the agent's own account.
+    #[error(
+        "--cert-owner 0 (root) is not permitted; without the flag the key is owned by the \
+         account bootroot-agent runs as"
+    )]
+    RootUid,
+    /// `4294967295` is `(uid_t)-1`, which `chown` reads as "leave the
+    /// owner unchanged".
+    #[error(
+        "--cert-owner 4294967295 is not permitted; chown reads it as \"leave the owner \
+         unchanged\""
+    )]
+    Unchanged,
+}
+
+/// Parses a `--cert-owner` value: a decimal uid from 1 to 4294967294,
+/// ASCII digits only after trimming whitespace. The same for both
+/// delivery modes, and never resolved against a user database.
+///
+/// # Errors
+///
+/// Returns [`CertOwnerError`] on empty input, a value that is not all
+/// digits, one out of range of `u32`, `0`, or `4294967295`.
+pub fn parse_cert_owner(raw: &str) -> Result<u32, CertOwnerError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CertOwnerError::Empty);
+    }
+    if !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CertOwnerError::NotNumeric(trimmed.to_string()));
+    }
+    let uid: u32 = trimmed
+        .parse()
+        .map_err(|_| CertOwnerError::InvalidNumeric(trimmed.to_string()))?;
+    validate_cert_owner_uid(uid)?;
+    Ok(uid)
+}
+
+/// Refuses the two uids no `cert_owner_uid` may hold, wherever it was
+/// read from: `0` and `4294967295`.
+///
+/// # Errors
+///
+/// Returns [`CertOwnerError::RootUid`] for `0` and
+/// [`CertOwnerError::Unchanged`] for `u32::MAX`.
+pub fn validate_cert_owner_uid(uid: u32) -> Result<(), CertOwnerError> {
+    match uid {
+        0 => Err(CertOwnerError::RootUid),
+        u32::MAX => Err(CertOwnerError::Unchanged),
+        _ => Ok(()),
     }
 }
 
@@ -353,14 +559,22 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 /// shared [`fs_util::publish_staged_blocking`]: the bytes are first
 /// written to a temporary file in the same directory created with
 /// `O_CREAT | O_EXCL` and `mode=0600`, the staged file is `chown`d
-/// (when policy is active) and promoted to `0640`, and only then is it
-/// `rename`d over the destination. The destination path is therefore
+/// (when policy is active) and given its final mode (`0640` under a
+/// group, `0600` otherwise), and only then is it `rename`d over the
+/// destination. The destination path is therefore
 /// never observable at a mode wider than the final policy: there is no
 /// window where the destination exists at the umask-derived mode
 /// (typically `0644`) before the clamp lands, and no window where the
 /// file is group-readable under the operator's primary gid before the
 /// chown lands. This addresses the atomic-write requirement called out
 /// in issue #593.
+///
+/// Under an owner policy the staged file is given to the owner uid and
+/// group 0 through its open descriptor, unconditionally, before its mode
+/// is set and before the rename ([`StagedOwner::PolicyOwner`]). Every
+/// write therefore re-asserts the owner, the consumer gets a fresh inode
+/// rather than a file rewritten in place, and a process that cannot
+/// give the file away — one not running as root — publishes nothing.
 ///
 /// # Errors
 ///
@@ -370,12 +584,9 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy) -> Result<()> {
     let dest = path.to_path_buf();
     let key_owned = key_pem.to_string();
-    let final_mode = if policy.is_active() {
-        KEY_FILE_MODE_GROUP
-    } else {
-        KEY_FILE_MODE_DEFAULT
-    };
-    tokio::task::spawn_blocking(move || publish_staged(&dest, &key_owned, final_mode, policy))
+    let final_mode = policy.key_file_mode();
+    let owner = policy.key_staged_owner();
+    tokio::task::spawn_blocking(move || publish_staged(&dest, &key_owned, final_mode, owner))
         .await
         .context("write_key_file task panicked")?
         .with_context(|| format!("Failed to write key file {}", path.display()))
@@ -391,7 +602,8 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 /// distinguish their publish from `state.json`'s.
 ///
 /// Ownership comes from the policy, not from whatever is at `dest`
-/// ([`StagedOwner::PolicyGroup`]). The rename installs a fresh inode,
+/// ([`StagedOwner::PolicyGroup`], or [`StagedOwner::PolicyOwner`] for a
+/// key under `--cert-owner`). The rename installs a fresh inode,
 /// so a file an earlier writer left owned by another user is
 /// republished owned by this one — where the truncating write the
 /// certificate and the bundle used to perform kept that owner.
@@ -429,7 +641,7 @@ pub async fn write_key_file(path: &Path, key_pem: &str, policy: CertGroupPolicy)
 ///
 /// [`fs_util::publish_staged_blocking`]: crate::fs_util::publish_staged_blocking
 /// [`fs_util::atomic_write_blocking`]: crate::fs_util::atomic_write_blocking
-fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolicy) -> Result<()> {
+fn publish_staged(dest: &Path, contents: &str, mode: u32, owner: StagedOwner) -> Result<()> {
     fs_util::publish_staged_blocking(
         dest,
         contents.as_bytes(),
@@ -438,7 +650,7 @@ fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolic
         // bundle — which is re-asserted on every publish so a mode an
         // earlier writer left behind cannot outlive it.
         StagedMode::Policy(mode),
-        StagedOwner::PolicyGroup(policy.gid),
+        owner,
         StagedDurability::RenameOnly,
     )
 }
@@ -446,7 +658,8 @@ fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolic
 /// Writes a public certificate file under the given policy.
 ///
 /// The cert mode (`0644`) is unchanged regardless of policy; only the
-/// group ownership is adjusted when `policy` is active.
+/// group ownership is adjusted under a group policy. Under an owner
+/// policy the certificate keeps the writer's ownership: it is public.
 ///
 /// Published the same way as the key beside it, through
 /// `publish_staged`: the bytes go to a temporary file in the same
@@ -463,17 +676,24 @@ fn publish_staged(dest: &Path, contents: &str, mode: u32, policy: CertGroupPolic
 pub async fn write_cert_file(path: &Path, cert_pem: &str, policy: CertGroupPolicy) -> Result<()> {
     let dest = path.to_path_buf();
     let cert_owned = cert_pem.to_string();
-    tokio::task::spawn_blocking(move || publish_staged(&dest, &cert_owned, CERT_FILE_MODE, policy))
-        .await
-        .context("write_cert_file task panicked")?
-        .with_context(|| format!("Failed to write cert file {}", path.display()))
+    tokio::task::spawn_blocking(move || {
+        publish_staged(
+            &dest,
+            &cert_owned,
+            CERT_FILE_MODE,
+            policy.public_staged_owner(),
+        )
+    })
+    .await
+    .context("write_cert_file task panicked")?
+    .with_context(|| format!("Failed to write cert file {}", path.display()))
 }
 
 /// Writes a CA bundle file under the given policy.
 ///
 /// The bundle mode ([`CA_BUNDLE_FILE_MODE`], `0644`) is unchanged
-/// regardless of policy; only the group ownership is adjusted when
-/// `policy` is active. Because the mode is applied to the staged file
+/// regardless of policy; only the group ownership is adjusted under a
+/// group policy, and an owner policy leaves it to the writer. Because the mode is applied to the staged file
 /// on every write, a bundle an earlier writer left stricter (the
 /// `bootroot-remote` bootstrap path creates it at `0600`) is still
 /// republished world-readable.
@@ -500,7 +720,12 @@ pub async fn write_bundle_file(
     let dest = path.to_path_buf();
     let bundle_owned = bundle_pem.to_string();
     tokio::task::spawn_blocking(move || {
-        publish_staged(&dest, &bundle_owned, CA_BUNDLE_FILE_MODE, policy)
+        publish_staged(
+            &dest,
+            &bundle_owned,
+            CA_BUNDLE_FILE_MODE,
+            policy.public_staged_owner(),
+        )
     })
     .await
     .context("write_bundle_file task panicked")?
@@ -510,8 +735,10 @@ pub async fn write_bundle_file(
 /// Ensures the directory containing the private key exists and has the
 /// mode/owner required by the policy.
 ///
-/// With policy active, the directory is `0750` and group-owned by the
-/// target gid. With no policy, the directory is `0700` (operator-only).
+/// Under a group policy, the directory is `0750` and group-owned by the
+/// target gid. Under an owner policy it is `0755`, with its owner and
+/// group unchanged, so the owner uid can traverse it to the key. With no
+/// policy, the directory is `0700` (operator-only).
 ///
 /// # Errors
 ///
@@ -520,15 +747,11 @@ pub async fn ensure_key_parent_dir(path: &Path, policy: CertGroupPolicy) -> Resu
     fs::create_dir_all(path)
         .await
         .with_context(|| format!("Failed to create key parent dir {}", path.display()))?;
-    let mode = if policy.is_active() {
-        KEY_DIR_MODE_GROUP
-    } else {
-        DIR_MODE_DEFAULT
-    };
+    let mode = policy.key_dir_mode();
     fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .with_context(|| format!("Failed to set mode {mode:o} on {}", path.display()))?;
-    if let Some(gid) = policy.gid {
+    if let Some(gid) = policy.group_gid() {
         chown_path(path, gid).await?;
     }
     Ok(())
@@ -542,7 +765,9 @@ pub async fn ensure_key_parent_dir(path: &Path, policy: CertGroupPolicy) -> Resu
 /// constraining its parent does not buy security but does block group
 /// peers from listing the directory. With policy active and the cert
 /// directory equal to the key directory, the stricter `0750` wins.
-/// With no policy, the cert directory is `0700` (operator-only).
+/// Under an owner policy the cert directory is `0755`, owner and group
+/// unchanged, whether or not it is the key's directory too. With no
+/// policy, the cert directory is `0700` (operator-only).
 ///
 /// `key_dir` is the resolved key parent directory used to detect the
 /// shared-parent case.
@@ -558,19 +783,14 @@ pub async fn ensure_cert_parent_dir(
     fs::create_dir_all(path)
         .await
         .with_context(|| format!("Failed to create cert parent dir {}", path.display()))?;
-    let mode = if policy.is_active() {
-        if same_directory(path, key_dir) {
-            KEY_DIR_MODE_GROUP
-        } else {
-            CERT_DIR_MODE_GROUP
-        }
-    } else {
-        DIR_MODE_DEFAULT
-    };
+    // Only the group policy's mode depends on whether the directory is
+    // the key's too, so only it pays for the two stats.
+    let shared = policy.group_gid().is_some() && same_directory(path, key_dir);
+    let mode = policy.cert_dir_mode(shared);
     fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .with_context(|| format!("Failed to set mode {mode:o} on {}", path.display()))?;
-    if let Some(gid) = policy.gid {
+    if let Some(gid) = policy.group_gid() {
         chown_path(path, gid).await?;
     }
     Ok(())
@@ -1038,5 +1258,189 @@ mod tests {
         let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(contents, "second");
         assert_eq!(mode, KEY_FILE_MODE_GROUP);
+    }
+
+    /// A uid the test process is not: what an owner policy must fail to
+    /// apply as a non-root process.
+    fn foreign_uid() -> u32 {
+        if fs_util::current_process_euid() == 4_000_000_000 {
+            4_000_000_001
+        } else {
+            4_000_000_000
+        }
+    }
+
+    #[test]
+    fn parse_cert_owner_accepts_numeric_uids() {
+        assert_eq!(parse_cert_owner("999"), Ok(999));
+        assert_eq!(parse_cert_owner(" 10001 "), Ok(10001));
+        assert_eq!(parse_cert_owner("4294967294"), Ok(4_294_967_294));
+    }
+
+    #[test]
+    fn parse_cert_owner_refuses_each_invalid_form() {
+        assert_eq!(parse_cert_owner(""), Err(CertOwnerError::Empty));
+        assert_eq!(parse_cert_owner("   "), Err(CertOwnerError::Empty));
+        for raw in ["postgres", "+999", "-1", "9 99", "0x10"] {
+            assert_eq!(
+                parse_cert_owner(raw),
+                Err(CertOwnerError::NotNumeric(raw.to_string())),
+                "{raw}"
+            );
+        }
+        assert_eq!(
+            parse_cert_owner("4294967296"),
+            Err(CertOwnerError::InvalidNumeric("4294967296".to_string()))
+        );
+        assert_eq!(parse_cert_owner("0"), Err(CertOwnerError::RootUid));
+        assert_eq!(parse_cert_owner("000"), Err(CertOwnerError::RootUid));
+        assert_eq!(
+            parse_cert_owner("4294967295"),
+            Err(CertOwnerError::Unchanged)
+        );
+    }
+
+    #[test]
+    fn cert_owner_errors_read_as_documented() {
+        assert_eq!(
+            CertOwnerError::Empty.to_string(),
+            "--cert-owner must not be empty"
+        );
+        assert_eq!(
+            CertOwnerError::NotNumeric("postgres".to_string()).to_string(),
+            "--cert-owner must be a numeric uid (got \"postgres\"); user names are not resolved"
+        );
+        assert_eq!(
+            CertOwnerError::InvalidNumeric("4294967296".to_string()).to_string(),
+            "--cert-owner \"4294967296\" is not a valid numeric uid"
+        );
+        assert_eq!(
+            CertOwnerError::RootUid.to_string(),
+            "--cert-owner 0 (root) is not permitted; without the flag the key is owned by the \
+             account bootroot-agent runs as"
+        );
+        assert_eq!(
+            CertOwnerError::Unchanged.to_string(),
+            "--cert-owner 4294967295 is not permitted; chown reads it as \"leave the owner \
+             unchanged\""
+        );
+    }
+
+    /// The three policies' modes, as the table in the issue states them.
+    #[test]
+    fn policy_mode_choices_for_each_policy() {
+        let default = CertGroupPolicy::none();
+        let group = CertGroupPolicy::with_gid(5001);
+        let owner = CertGroupPolicy::with_owner(999);
+
+        assert_eq!(default.key_file_mode(), 0o600);
+        assert_eq!(group.key_file_mode(), 0o640);
+        assert_eq!(owner.key_file_mode(), 0o600);
+
+        assert_eq!(default.key_dir_mode(), 0o700);
+        assert_eq!(group.key_dir_mode(), 0o750);
+        assert_eq!(owner.key_dir_mode(), 0o755);
+
+        for shared in [false, true] {
+            assert_eq!(default.cert_dir_mode(shared), 0o700);
+            assert_eq!(owner.cert_dir_mode(shared), 0o755);
+        }
+        assert_eq!(group.cert_dir_mode(false), 0o755);
+        assert_eq!(group.cert_dir_mode(true), 0o750);
+
+        assert_eq!(default.group_gid(), None);
+        assert_eq!(group.group_gid(), Some(5001));
+        assert_eq!(owner.group_gid(), None);
+
+        assert!(matches!(
+            owner.key_staged_owner(),
+            StagedOwner::PolicyOwner(999)
+        ));
+        assert!(matches!(
+            owner.public_staged_owner(),
+            StagedOwner::PolicyGroup(None)
+        ));
+        assert!(matches!(
+            group.key_staged_owner(),
+            StagedOwner::PolicyGroup(Some(5001))
+        ));
+        assert!(matches!(
+            default.key_staged_owner(),
+            StagedOwner::PolicyGroup(None)
+        ));
+    }
+
+    /// Both directories become `0755` under an owner, distinct or shared,
+    /// so the owner uid can reach the key.
+    #[tokio::test]
+    async fn ensure_parent_dirs_with_owner_use_0755() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = dir.path().join("kp");
+        let cp = dir.path().join("cp");
+        let policy = CertGroupPolicy::with_owner(foreign_uid());
+        ensure_key_parent_dir(&kp, policy).await.unwrap();
+        ensure_cert_parent_dir(&cp, &kp, policy).await.unwrap();
+        ensure_cert_parent_dir(&kp, &kp, policy).await.unwrap();
+        for path in [&kp, &cp] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, DIR_MODE_OWNER, "{}", path.display());
+        }
+    }
+
+    /// A non-root process cannot give the key to another uid: the write
+    /// fails on the chown, names the uid and the root requirement, and
+    /// leaves the key already in place untouched. Skipped as root, where
+    /// the chown succeeds.
+    #[tokio::test]
+    async fn write_key_file_with_foreign_owner_fails_as_non_root() {
+        if fs_util::current_process_euid() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k");
+        write_key_file(&key, "OLD", CertGroupPolicy::none())
+            .await
+            .unwrap();
+        let before = std::fs::metadata(&key).unwrap();
+
+        let uid = foreign_uid();
+        let err = write_key_file(&key, "NEW", CertGroupPolicy::with_owner(uid))
+            .await
+            .expect_err("a non-root process cannot give the key away");
+        let message = format!("{err:#}");
+        assert!(message.contains(&format!("uid {uid}")), "{message}");
+        assert!(
+            message.contains("bootroot-agent to run as root"),
+            "{message}"
+        );
+
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "OLD");
+        let after = std::fs::metadata(&key).unwrap();
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.permissions().mode(), before.permissions().mode());
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("k")]);
+    }
+
+    /// The certificate and the bundle are public and keep the writer's
+    /// ownership under an owner policy, so a non-root writer publishes
+    /// them at `0644` without a chown it has no privilege for.
+    #[tokio::test]
+    async fn write_cert_and_bundle_with_owner_keep_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("c.pem");
+        let bundle = dir.path().join("ca.pem");
+        let policy = CertGroupPolicy::with_owner(foreign_uid());
+        write_cert_file(&cert, "C", policy).await.unwrap();
+        write_bundle_file(&bundle, "B", policy).await.unwrap();
+        for path in [&cert, &bundle] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+            assert_eq!(meta.uid(), fs_util::current_process_euid());
+        }
     }
 }

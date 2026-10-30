@@ -737,6 +737,7 @@ fn build_service_entry_from_role(
         agent_server: resolved.agent_server.clone(),
         agent_responder_url: resolved.agent_responder_url.clone(),
         cert_group_gid: resolved.cert_group_gid,
+        cert_owner_uid: resolved.cert_owner_uid,
         remote_secret_id_path: resolved.remote_secret_id_path.clone(),
     }
 }
@@ -920,6 +921,7 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         && !args.no_wrap
         && args.rn_cidrs.is_empty()
         && args.cert_group.is_none()
+        && args.cert_owner.is_none()
         && !hooks_supplied
     {
         anyhow::bail!(messages.error_service_update_no_flags());
@@ -1028,22 +1030,25 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     // failed to re-render the managed profile, and a re-run with the
     // same flag must be able to drive the on-disk profile back into sync
     // rather than being short-circuited by the no-change early return.
+    //
+    // `--cert-owner` follows the same path, and the two are applied
+    // together before either is checked against the other, so
+    // `--cert-group clear --cert-owner <uid>` switches a service from a
+    // group to an owner in one call.
     let mut redeploy_hint: Option<CertGroupRedeployHint> = None;
-    let cert_group_supplied = args.cert_group.is_some();
-    if let Some(ref raw) = args.cert_group {
-        let old_value = entry.cert_group_gid;
-        let new_value = parse_cert_group_for_update(raw, entry.delivery_mode)?;
-        entry.cert_group_gid = new_value;
-        if old_value != new_value {
-            changes.push(messages.service_update_field_changed(
-                "cert_group_gid",
-                &display_cert_group(old_value),
-                &display_cert_group(new_value),
-            ));
-        }
+    let cert_group_supplied = args.cert_group.is_some() || args.cert_owner.is_some();
+    apply_cert_policy_update(
+        entry,
+        args.cert_group.as_deref(),
+        args.cert_owner.as_deref(),
+        &mut changes,
+        messages,
+    )?;
+    if cert_group_supplied {
         redeploy_hint = Some(CertGroupRedeployHint {
             delivery_mode: entry.delivery_mode,
             registration_id: args.registration_id.clone(),
+            flags: supplied_policy_flags(args),
         });
     }
 
@@ -1111,11 +1116,23 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
         // add` is the path that re-emits the artifact. Print a
         // loud follow-up so the next rotation actually picks up
         // the new policy.
+        let flags = hint
+            .flags
+            .iter()
+            .map(|(flag, _)| *flag)
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let fields = hint
+            .flags
+            .iter()
+            .map(|(_, field)| *field)
+            .collect::<Vec<_>>()
+            .join(" and ");
         eprintln!(
-            "warning: --cert-group changed for remote-bootstrap service {}.\n\
+            "warning: {flags} changed for remote-bootstrap service {}.\n\
              Re-emit the bootstrap artifact with `bootroot service add` \
              and re-run `bootroot-remote bootstrap --artifact <path>` on \
-             the remote agent host so the new cert_group_gid lands in the \
+             the remote agent host so the new {fields} lands in the \
              remote agent.toml.",
             hint.registration_id,
         );
@@ -1156,9 +1173,82 @@ pub(crate) fn run_service_update(args: &ServiceUpdateArgs, messages: &Messages) 
     Ok(())
 }
 
+/// Applies `service update --cert-group` and `--cert-owner` to `entry`,
+/// recording each change in `changes`.
+///
+/// Both flags are applied before the result is checked, so `--cert-group
+/// clear --cert-owner <uid>` switches a service from a group to an owner
+/// in one call; an entry that would end up with both is refused. Only
+/// the in-memory entry is touched: the caller has written nothing yet,
+/// so a refusal leaves `state.json` and `agent.toml` as they were.
+fn apply_cert_policy_update(
+    entry: &mut ServiceEntry,
+    cert_group: Option<&str>,
+    cert_owner: Option<&str>,
+    changes: &mut Vec<String>,
+    messages: &Messages,
+) -> Result<()> {
+    let group = cert_group
+        .map(|raw| parse_cert_group_for_update(raw, entry.delivery_mode))
+        .transpose()?;
+    let owner = cert_owner.map(parse_cert_owner_for_update).transpose()?;
+    let gid_after = group.unwrap_or(entry.cert_group_gid);
+    let uid_after = owner.unwrap_or(entry.cert_owner_uid);
+    if let (Some(gid), Some(uid)) = (gid_after, uid_after) {
+        anyhow::bail!(
+            "--cert-owner and --cert-group are exclusive; service {} would have cert_group_gid \
+             {gid} and cert_owner_uid {uid}; clear one with \"--cert-group clear\" or \
+             \"--cert-owner clear\"",
+            entry.registration_id
+        );
+    }
+    if group.is_some() && entry.cert_group_gid != gid_after {
+        changes.push(messages.service_update_field_changed(
+            "cert_group_gid",
+            &display_policy_id(entry.cert_group_gid),
+            &display_policy_id(gid_after),
+        ));
+    }
+    if owner.is_some() && entry.cert_owner_uid != uid_after {
+        changes.push(messages.service_update_field_changed(
+            "cert_owner_uid",
+            &display_policy_id(entry.cert_owner_uid),
+            &display_policy_id(uid_after),
+        ));
+    }
+    entry.cert_group_gid = gid_after;
+    entry.cert_owner_uid = uid_after;
+    Ok(())
+}
+
 struct CertGroupRedeployHint {
     delivery_mode: DeliveryMode,
     registration_id: String,
+    /// Each supplied policy flag and the field it sets.
+    flags: Vec<(&'static str, &'static str)>,
+}
+
+/// The policy flags `args` supplies, each with the field it sets.
+fn supplied_policy_flags(args: &ServiceUpdateArgs) -> Vec<(&'static str, &'static str)> {
+    let mut flags = Vec::new();
+    if args.cert_group.is_some() {
+        flags.push(("--cert-group", "cert_group_gid"));
+    }
+    if args.cert_owner.is_some() {
+        flags.push(("--cert-owner", "cert_owner_uid"));
+    }
+    flags
+}
+
+/// Parses `service update --cert-owner`: `clear` (any case) removes the
+/// owner, anything else is a uid as `service add` parses it.
+fn parse_cert_owner_for_update(raw: &str) -> Result<Option<u32>> {
+    if raw.trim().eq_ignore_ascii_case("clear") {
+        return Ok(None);
+    }
+    bootroot::cert_group::parse_cert_owner(raw)
+        .map(Some)
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 fn parse_cert_group_for_update(raw: &str, delivery_mode: DeliveryMode) -> Result<Option<u32>> {
@@ -1179,7 +1269,7 @@ fn parse_cert_group_for_update(raw: &str, delivery_mode: DeliveryMode) -> Result
     Ok(Some(gid))
 }
 
-fn display_cert_group(value: Option<u32>) -> String {
+fn display_policy_id(value: Option<u32>) -> String {
     match value {
         Some(gid) => gid.to_string(),
         None => "unset".to_string(),
@@ -1237,9 +1327,9 @@ where
 
 /// Re-renders just the managed profile block of the local
 /// `agent.toml` for the given entry. Used by `service update --cert-
-/// group ...` so the next agent restart and the next rotation pick up
-/// the new `cert_group_gid` line without requiring a full `service add`
-/// re-run.
+/// group ...` and `--cert-owner ...` so the next agent restart and the
+/// next rotation pick up the new `cert_group_gid` or `cert_owner_uid`
+/// line without requiring a full `service add` re-run.
 fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
     let agent_config_path = &entry.agent_config_path;
     if !agent_config_path.exists() {
@@ -1260,6 +1350,7 @@ fn rerender_local_managed_profile(entry: &ServiceEntry) -> Result<()> {
         &entry.cert_path,
         &entry.key_path,
         entry.cert_group_gid,
+        entry.cert_owner_uid,
     );
     let block = inject_hooks_into_managed_profile_block(&block, &entry.post_renew_hooks);
     // `service add` writes `[trust]` inside the managed-block markers, so
@@ -1406,6 +1497,7 @@ fn non_policy_fields_match(entry: &ServiceEntry, resolved: &ResolvedServiceAdd) 
         && entry.agent_server == resolved.agent_server
         && entry.agent_responder_url == resolved.agent_responder_url
         && entry.cert_group_gid == resolved.cert_group_gid
+        && entry.cert_owner_uid == resolved.cert_owner_uid
         && entry.remote_secret_id_path == resolved.remote_secret_id_path
 }
 
@@ -1431,10 +1523,11 @@ mod tests {
 
     use super::resolve::ResolvedServiceAdd;
     use super::{
-        OverrideCredentialRollback, ServiceAppRoleMaterialized, build_secret_id_options,
-        build_service_entry, build_service_entry_from_role, display_policy_value, display_wrap_ttl,
-        is_idempotent_remote_rerun, is_policy_only_mismatch, non_policy_fields_match,
-        policy_fields_match, prepare_override_credentials, rerender_local_managed_profile,
+        OverrideCredentialRollback, ServiceAppRoleMaterialized, apply_cert_policy_update,
+        build_secret_id_options, build_service_entry, build_service_entry_from_role,
+        display_policy_value, display_wrap_ttl, is_idempotent_remote_rerun,
+        is_policy_only_mismatch, non_policy_fields_match, policy_fields_match,
+        prepare_override_credentials, rerender_local_managed_profile,
         write_origin_credential_files,
     };
     use crate::i18n::{Messages, test_messages};
@@ -1575,6 +1668,7 @@ mod tests {
             agent_server: None,
             agent_responder_url: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
             secret_id_path_override: None,
             remote_secret_id_path: None,
         }
@@ -1917,6 +2011,82 @@ mod tests {
                 token_bound_cidrs: resolved.token_bound_cidrs.clone(),
             },
         )
+    }
+
+    /// A remote-bootstrap re-run whose `--cert-owner` differs from the
+    /// recorded one is not idempotent: the artifact must be re-emitted.
+    #[test]
+    fn non_policy_fields_match_differs_on_cert_owner_uid() {
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        let entry = sample_entry_from_resolved(&resolved);
+        assert!(non_policy_fields_match(&entry, &resolved));
+        resolved.cert_owner_uid = Some(999);
+        assert!(!non_policy_fields_match(&entry, &resolved));
+    }
+
+    #[test]
+    fn build_service_entry_persists_cert_owner_uid() {
+        let mut resolved = sample_resolved();
+        resolved.cert_owner_uid = Some(999);
+        let entry = sample_entry_from_resolved(&resolved);
+        assert_eq!(entry.cert_owner_uid, Some(999));
+        assert_eq!(entry.cert_group_gid, None);
+    }
+
+    /// `--cert-owner` alone on a service with a group is refused and
+    /// leaves the entry exactly as it was; clearing the group in the
+    /// same call switches it to the owner.
+    #[test]
+    fn apply_cert_policy_update_refuses_both_and_switches_in_one_call() {
+        let messages = test_messages();
+        let mut resolved = sample_resolved();
+        resolved.delivery_mode = DeliveryMode::RemoteBootstrap;
+        resolved.cert_group_gid = Some(5001);
+        let mut entry = sample_entry_from_resolved(&resolved);
+
+        let mut changes = Vec::new();
+        let err = apply_cert_policy_update(&mut entry, None, Some("999"), &mut changes, &messages)
+            .expect_err("a gid and an owner together are refused");
+        assert_eq!(
+            err.to_string(),
+            "--cert-owner and --cert-group are exclusive; service host1-test-svc-001 would \
+             have cert_group_gid 5001 and cert_owner_uid 999; clear one with \"--cert-group \
+             clear\" or \"--cert-owner clear\""
+        );
+        assert_eq!(entry.cert_group_gid, Some(5001));
+        assert_eq!(entry.cert_owner_uid, None);
+        assert_eq!(changes, Vec::<String>::new());
+
+        apply_cert_policy_update(
+            &mut entry,
+            Some("clear"),
+            Some("999"),
+            &mut changes,
+            &messages,
+        )
+        .expect("clearing the group in the same call switches to the owner");
+        assert_eq!(entry.cert_group_gid, None);
+        assert_eq!(entry.cert_owner_uid, Some(999));
+        assert_eq!(
+            changes,
+            vec![
+                "- cert_group_gid: 5001 -> unset".to_string(),
+                "- cert_owner_uid: unset -> 999".to_string(),
+            ]
+        );
+
+        let mut changes = Vec::new();
+        apply_cert_policy_update(&mut entry, None, Some("CLEAR"), &mut changes, &messages)
+            .expect("clear removes the owner");
+        assert_eq!(entry.cert_owner_uid, None);
+        assert_eq!(changes, vec!["- cert_owner_uid: 999 -> unset".to_string()]);
+
+        for bad in ["", "postgres", "0", "4294967295", "4294967296"] {
+            apply_cert_policy_update(&mut entry, None, Some(bad), &mut Vec::new(), &messages)
+                .expect_err("an invalid uid is refused");
+            assert_eq!(entry.cert_owner_uid, None);
+        }
     }
 
     #[test]

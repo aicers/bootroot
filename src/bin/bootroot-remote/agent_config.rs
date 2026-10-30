@@ -157,6 +157,7 @@ pub(super) async fn apply_agent_config_updates(
         &profile_paths.cert_path,
         &profile_paths.key_path,
         args.cert_group_gid,
+        args.cert_owner_uid,
     );
     let profile_block = inject_hooks_into_profile_block(&profile_block, args);
     let with_profile =
@@ -341,6 +342,7 @@ fn apply_agent_overrides(
     Ok(next)
 }
 
+#[allow(clippy::too_many_arguments)] // one argument per rendered field, as the shared renderer it wraps
 fn render_managed_profile_block(
     registration_id: &str,
     service_name: &str,
@@ -349,6 +351,7 @@ fn render_managed_profile_block(
     cert_path: &Path,
     key_path: &Path,
     cert_group_gid: Option<u32>,
+    cert_owner_uid: Option<u32>,
 ) -> String {
     render_profile(
         MANAGED_PROFILE_BEGIN_PREFIX,
@@ -360,6 +363,7 @@ fn render_managed_profile_block(
         cert_path,
         key_path,
         cert_group_gid,
+        cert_owner_uid,
     )
 }
 
@@ -627,6 +631,7 @@ mod tests {
             Path::new("/etc/bootroot-agent/certs/giganto.crt"),
             Path::new("/etc/bootroot-agent/certs/giganto.key"),
             None,
+            None,
         );
         let existing = format!("email = \"admin@example.com\"\n\n{local_block}\n");
 
@@ -639,6 +644,7 @@ mod tests {
             "node-01",
             Path::new("/etc/bootroot-agent/certs/giganto.crt"),
             Path::new("/etc/bootroot-agent/certs/giganto.key"),
+            None,
             None,
         );
         let updated = upsert_managed_profile_block(&stripped, "giganto", &remote_block);
@@ -697,6 +703,7 @@ mod tests {
             wrap_token: None,
             wrap_expires_at: None,
             cert_group_gid: None,
+            cert_owner_uid: None,
         }
     }
 
@@ -1424,6 +1431,40 @@ mod tests {
     /// the same file name — and for the opposite reason: there
     /// `service add` creates the file by rename, so a link at the path
     /// never survived in the first place.
+    /// The artifact's `cert_owner_uid` lands in the remote `agent.toml`
+    /// profile, which the agent then parses back onto the profile.
+    #[tokio::test]
+    async fn remote_bootstrap_renders_the_artifact_cert_owner_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agent.toml");
+        let mut args = test_bootstrap_args();
+        args.agent_config_path = config.clone();
+        args.cert_owner_uid = Some(999);
+        let pulled = PulledSecrets {
+            secret_id: Some("secret".to_string()),
+            eab_kid: None,
+            eab_hmac: None,
+            responder_hmac: "responder-hmac".to_string(),
+            trusted_ca_sha256: vec!["aa:bb".to_string()],
+            ca_bundle_pem: String::new(),
+        };
+
+        let (responder, trust) = apply_agent_config_updates(&args, &pulled, Locale::En).await;
+        assert!(
+            responder.error.is_none() && trust.error.is_none(),
+            "the write must succeed: {responder:?} {trust:?}"
+        );
+
+        let published = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            published.contains("cert_owner_uid = 999\n"),
+            "the profile must carry the owner: {published}"
+        );
+        assert!(!published.contains("cert_group_gid"), "{published}");
+        let settings = bootroot::config::Settings::new(Some(config)).expect("the agent parses it");
+        assert_eq!(settings.profiles[0].cert_owner_uid, Some(999));
+    }
+
     #[tokio::test]
     async fn remote_bootstrap_writes_agent_toml_through_a_symlink() {
         let dir = tempfile::tempdir().unwrap();

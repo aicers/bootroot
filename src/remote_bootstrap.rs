@@ -271,6 +271,11 @@ pub struct RemoteBootstrapArtifact {
     /// issue #593.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert_group_gid: Option<u32>,
+    /// Numeric uid that owns the issued private key under
+    /// `--cert-owner`. Omitted when `None`, like `cert_group_gid`, so the
+    /// member is additive and the schema version does not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_owner_uid: Option<u32>,
 }
 
 /// The seven target-host paths an artifact names.
@@ -348,6 +353,8 @@ pub struct ArtifactInputs<'a> {
     pub wrap: Option<ArtifactWrap<'a>>,
     /// `cert_group_gid`, omitted when `None`.
     pub cert_group_gid: Option<u32>,
+    /// `cert_owner_uid`, omitted when `None`.
+    pub cert_owner_uid: Option<u32>,
 }
 
 /// Builds the artifact from already-resolved inputs.
@@ -383,6 +390,7 @@ pub fn build_artifact(inputs: &ArtifactInputs<'_>) -> RemoteBootstrapArtifact {
         wrap_token: inputs.wrap.map(|wrap| wrap.token.to_string()),
         wrap_expires_at: inputs.wrap.map(|wrap| wrap.expires_at.to_string()),
         cert_group_gid: inputs.cert_group_gid,
+        cert_owner_uid: inputs.cert_owner_uid,
     }
 }
 
@@ -428,6 +436,7 @@ mod tests {
             post_renew_hooks: &[],
             wrap,
             cert_group_gid: None,
+            cert_owner_uid: None,
         }
     }
 
@@ -461,6 +470,22 @@ mod tests {
     fn the_artifact_serializes_pretty_printed() {
         let text = serialize_artifact(&build_artifact(&sample_inputs(None))).expect("serializes");
         assert!(text.starts_with("{\n  \"schema_version\": 5,\n"), "{text}");
+    }
+
+    /// `cert_owner_uid` is an additive member: serialized when set,
+    /// omitted when not, and the schema version is unchanged.
+    #[test]
+    fn the_artifact_carries_cert_owner_uid_only_when_set() {
+        let mut inputs = sample_inputs(None);
+        inputs.cert_owner_uid = Some(999);
+        let artifact = build_artifact(&inputs);
+        assert_eq!(artifact.schema_version, ARTIFACT_SCHEMA_VERSION);
+        let text = serde_json::to_string(&artifact).expect("serializes");
+        assert!(text.contains("\"cert_owner_uid\":999"), "{text}");
+
+        let text =
+            serde_json::to_string(&build_artifact(&sample_inputs(None))).expect("serializes");
+        assert!(!text.contains("cert_owner_uid"), "{text}");
     }
 
     #[test]

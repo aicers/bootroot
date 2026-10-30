@@ -1514,10 +1514,95 @@ Cert/key group-access policy:
     unrelated files into it is unsupported, since `0755` broadens
     traversal for whatever else lives there.
 
-Persistence: `cert_group_gid` is stored on `ServiceEntry`, rendered
-into the managed `agent.toml` profile block, threaded through the
-remote-bootstrap artifact, and surfaced on `DaemonProfileSettings`,
-so rotation always reapplies the same policy.
+Cert/key owner policy:
+
+- `--cert-owner <uid>`: numeric uid that should own the issued private
+  key. Meant for a server in a container that runs as a fixed uid and
+  reads its certificate and key from a bind-mounted directory, where the
+  container's gid is usually also a group of the host's own database
+  (gid 999 or 1000, for example) and a group-readable key would be
+  readable by every member of that host group too. Under this policy
+  only the uid (and root) can read the key.
+  - The value is a decimal uid, ASCII digits only after trimming
+    whitespace, from 1 to 4294967294. It is the same for both delivery
+    modes and is never resolved against any user database: the uid
+    usually names a user inside a container, which neither the control
+    host nor the remote agent host need have. Each of these is refused
+    before anything is written:
+    - an empty value: `--cert-owner must not be empty`;
+    - a value that is not all digits (a user name, a sign, a space
+      inside it): `--cert-owner must be a numeric uid (got "<value>");
+      user names are not resolved`;
+    - a value out of range of a 32-bit uid: `--cert-owner "<value>" is
+      not a valid numeric uid`;
+    - `0`: `--cert-owner 0 (root) is not permitted; without the flag
+      the key is owned by the account bootroot-agent runs as`;
+    - `4294967295`: `--cert-owner 4294967295 is not permitted; chown
+      reads it as "leave the owner unchanged"`.
+  - Set: on every issuance and rotation the agent writes:
+
+    | | `--cert-owner U` |
+    | --- | --- |
+    | key file | owner `U`, group `0`, `0600` |
+    | certificate file | writer, `0644` |
+    | CA bundle | writer, `0644` |
+    | key parent directory | `0755`, owner and group unchanged |
+    | certificate parent directory | `0755`, owner and group unchanged |
+    | generation tree directories | `0755` |
+    | generation members | key `U:0` `0600`, the others writer `0644` |
+
+    The key is given to `U:0` on its staged file, through the file's
+    open descriptor, before its mode is set and before it is renamed
+    into place, on every write. A renewal therefore re-asserts the owner
+    and the mode even if someone changed them in between, and the
+    consumer always gets a fresh file, never one rewritten in place.
+  - Directories: the uid must be able to traverse the directory holding
+    the key, and it is neither that directory's owner nor in its group,
+    so both the key and the certificate directories become `0755`.
+    Listing them reveals only file names, and every file in them other
+    than the key is public trust material; the key's own `0600` and
+    owner keep every other non-root account out of it. Under this
+    policy both directories are bootroot-owned output directories:
+    mixing unrelated files into them is unsupported, since `0755`
+    broadens traversal for whatever else lives there. Their owner is
+    not changed. Make them owned by root: an account that can write
+    either directory can replace the files in it, which no policy
+    changes. Under a root agent a directory it creates is root's, so
+    the uid can read the key but cannot rename, replace or remove
+    anything in the directory. Use one directory per `--cert-owner`
+    service: a directory shared with another profile takes the mode of
+    whichever profile wrote last (each key keeps its own owner and
+    mode).
+  - Mount the **directory** into the container, not single files: every
+    file is replaced by rename, and a file bind mount keeps showing the
+    old file. Mount it read-only, so the container cannot change the
+    key's mode either; the next write publishes a fresh `0600` key.
+  - If the uid also names an account on the host (uid 999 or 100, for
+    example), that one account can read the key, as the container can.
+    No group can.
+  - Exclusive with `--cert-group`: `service add` refuses the two flags
+    together, and `bootroot-agent` and `bootroot-remote bootstrap`
+    refuse a profile or artifact carrying both `cert_group_gid` and
+    `cert_owner_uid`.
+  - `bootroot-agent` must run as root (effective uid 0) to apply it:
+    giving a file to another uid needs `CAP_CHOWN`, and the check is on
+    the effective uid, so a non-root agent holding `CAP_CHOWN` is
+    refused too. A non-root agent fails the issuance before any ACME
+    request, and before the bundle, the generation or the pair is
+    touched, with `profile '<label>' sets cert_owner_uid = <uid>, which
+    needs bootroot-agent to run as root (it runs as uid <euid>); nothing
+    was written`. `service add` does not check its own caller's uid: the
+    agent writes the key, and it may run under another account.
+    `bootroot verify` runs the agent once as its own caller, so it must
+    run as root for such a service.
+  - The remote agent host must run a `bootroot-remote` release that
+    knows `cert_owner_uid`: an older one ignores the member and writes a
+    key owned by the account the agent runs as.
+
+Persistence: `cert_group_gid` and `cert_owner_uid` are stored on
+`ServiceEntry`, rendered into the managed `agent.toml` profile block,
+threaded through the remote-bootstrap artifact, and surfaced on
+`DaemonProfileSettings`, so rotation always reapplies the same policy.
 
 Atomicity: the key file, the certificate and the CA bundle are all
 written via stage-then-rename, through the same publish routine that
@@ -1606,9 +1691,9 @@ The command is considered failed when:
 
 ## bootroot service update
 
-Modifies per-service `secret_id` policy fields, cert-group policy, and
-post-renew hook configuration without re-running the full `service
-add` flow. At least one update flag is required.
+Modifies per-service `secret_id` policy fields, cert-group and
+cert-owner policy, and post-renew hook configuration without re-running
+the full `service add` flow. At least one update flag is required.
 
 ### Inputs
 
@@ -1642,6 +1727,25 @@ add` flow. At least one update flag is required.
   the re-render — so a previously-failed re-render can be repaired
   by simply re-running the command, with no risk of state.json
   drifting ahead of the on-disk managed profile.
+- `--cert-owner <uid-or-clear>`: change the cert/key owner policy on a
+  previously added service. Accepts the same numeric uid as
+  `service add`, with the same refusals, plus the literal string
+  `clear` (any case) to remove an existing owner and revert to the
+  default. It behaves exactly like `--cert-group`: a change is
+  reported as `cert_owner_uid: <old> -> <new>` (`unset` for none); for
+  `local-file` services the managed `agent.toml` profile block is
+  re-rendered before `state.json` is saved, on every invocation, even
+  with the value already in state; for `remote-bootstrap` services the
+  command prints the re-emit warning naming `cert_owner_uid`. The new
+  modes apply from the agent's next write. Both flags are applied
+  before the result is checked, and a service may not end up with both
+  a gid and an owner: `--cert-owner 999` alone on a service with a
+  group is refused without changing anything, with `--cert-owner and
+  --cert-group are exclusive; service <registration-id> would have
+  cert_group_gid <gid> and cert_owner_uid <uid>; clear one with
+  "--cert-group clear" or "--cert-owner clear"`. To switch a service
+  from a group to an owner in one call, pass
+  `--cert-group clear --cert-owner <uid>`.
 - `--reload-style`: reload style preset for the post-renew hook
   (`sighup`, `systemd`, `docker-restart`, or `none`). Same
   semantics as `service add`. Use `none` to clear a previously
@@ -1694,11 +1798,17 @@ The command is considered failed when:
 - Missing `state.json`
 - Service not found
 - No update flag provided
+- `--cert-group` and `--cert-owner` would leave the service with both a
+  gid and an owner
 
 ### Examples
 
 ```bash
 bootroot service update --registration-id edge-proxy --secret-id-ttl 12h
+
+# Switch a group-readable service to a key owned by the container's uid.
+bootroot service update --registration-id edge-proxy \
+  --cert-group clear --cert-owner 999
 bootroot service update --registration-id edge-proxy --no-wrap
 bootroot service update --registration-id edge-proxy --secret-id-wrap-ttl inherit
 

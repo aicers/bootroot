@@ -2082,6 +2082,12 @@ here: its UID is allocated per start, so it cannot own pre-provisioned
 persistent files across restarts, and directory group access alone
 cannot read `0600` files.
 
+A service added with `--cert-owner` needs an agent running as root: it
+gives the issued key to another uid, which takes `CAP_CHOWN`, and the
+agent refuses such a profile when its effective uid is not 0, even with
+`CAP_CHOWN` granted. This non-root unit therefore does not apply to it;
+run that service's agent as root.
+
 One-time preparation after `service add` (paths match the example unit
 below):
 
@@ -4010,9 +4016,22 @@ bootroot service add --registration-id web-app --service-name web-app \
   ...
 ```
 
-Use `--cert-group` when the container process runs as a non-root user
-that must read the bind-mounted key (see
-[CLI > bootroot service add](cli.md#bootroot-service-add)).
+When the container process runs as a non-root user that must read the
+bind-mounted key (see
+[CLI > bootroot service add](cli.md#bootroot-service-add)):
+
+- Use `--cert-owner <the container's uid>` when the server reads its
+  own key and the container's gid is also a group of the host's own
+  database (on Ubuntu, gid 999 is often `systemd-journal` and gid 1000
+  the first login user's group). The agent then writes the key owned by
+  that uid, group 0, mode `0600`, so no host group can read it, and
+  makes the key's directory `0755`; the uid need not exist on the host.
+  Some servers also refuse a group-readable key they do not own. This
+  needs the agent to run as root. Bind-mount the **directory**,
+  read-only, not single files: every file is replaced by rename, and a
+  file bind mount keeps showing the old file.
+- Use `--cert-group` otherwise: when several accounts share a group
+  that should read the key, or when the agent does not run as root.
 
 ### `docker-restart` hooks vs. the hardened unit
 

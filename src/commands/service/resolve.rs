@@ -61,6 +61,11 @@ pub(crate) struct ResolvedServiceAdd {
     /// operator did not opt into the group-readable cert policy and
     /// the agent preserves the host-local default. See issue #593.
     pub(crate) cert_group_gid: Option<u32>,
+    /// Parsed numeric uid for `--cert-owner`. `None` means the operator
+    /// did not opt into the owner policy. Exclusive with
+    /// [`ResolvedServiceAdd::cert_group_gid`]; clap refuses the two
+    /// flags together.
+    pub(crate) cert_owner_uid: Option<u32>,
     /// Operator-supplied absolute `--secret-id-path` override
     /// (local-file delivery only). `None` keeps the default location
     /// under `<secrets_dir>/services/<registration_id>/`. When `Some`, `secret_id`,
@@ -185,6 +190,7 @@ pub(super) fn resolve_service_add_args(
     let agent_responder_url = args.agent_responder_url.clone();
 
     let cert_group_gid = resolve_cert_group_for_add(args, delivery_mode, messages)?;
+    let cert_owner_uid = resolve_cert_owner_for_add(args)?;
 
     let SecretIdPathFlag {
         local_override: secret_id_path_override,
@@ -211,6 +217,7 @@ pub(super) fn resolve_service_add_args(
         agent_server,
         agent_responder_url,
         cert_group_gid,
+        cert_owner_uid,
         secret_id_path_override,
         remote_secret_id_path,
     })
@@ -368,6 +375,20 @@ pub(super) fn resolve_cert_group_for_add(
             .map_err(|err| anyhow::anyhow!("{err}"))?;
     }
     Ok(Some(gid))
+}
+
+/// Resolves `--cert-owner` for `service add`. The same for both
+/// delivery modes: the value is parsed as a numeric uid and never looked
+/// up, because it usually names a user inside a container that neither
+/// this host nor the remote agent host need have. The caller's own uid
+/// is not checked either: the agent, not `service add`, writes the key,
+/// and it refuses an owner it cannot apply.
+pub(super) fn resolve_cert_owner_for_add(args: &ServiceAddArgs) -> Result<Option<u32>> {
+    args.cert_owner
+        .as_deref()
+        .map(bootroot::cert_group::parse_cert_owner)
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 pub(super) fn validate_service_add(args: &ResolvedServiceAdd, messages: &Messages) -> Result<()> {
@@ -829,6 +850,7 @@ mod tests {
             no_wrap: false,
             rn_cidrs: Vec::new(),
             cert_group: None,
+            cert_owner: None,
         }
     }
 

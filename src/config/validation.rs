@@ -769,6 +769,28 @@ fn validate_profile(profile: &DaemonProfileSettings) -> Result<()> {
     if profile.paths.key.as_os_str().is_empty() {
         anyhow::bail!("profiles.paths.key must not be empty");
     }
+    if let (Some(gid), Some(uid)) = (profile.cert_group_gid, profile.cert_owner_uid) {
+        anyhow::bail!(
+            "profiles.cert_owner_uid and profiles.cert_group_gid are exclusive \
+             (cert_owner_uid = {uid}, cert_group_gid = {gid}); keep one of them"
+        );
+    }
+    if let Some(uid) = profile.cert_owner_uid {
+        // Neither the process's uid nor the user database is consulted:
+        // validation also runs in processes that never write a key, and
+        // the uid usually names a user inside a container.
+        match crate::cert_group::validate_cert_owner_uid(uid) {
+            Ok(()) => {}
+            Err(crate::cert_group::CertOwnerError::RootUid) => anyhow::bail!(
+                "profiles.cert_owner_uid must not be 0 (root); without it the key is owned by \
+                 the account bootroot-agent runs as"
+            ),
+            Err(_) => anyhow::bail!(
+                "profiles.cert_owner_uid must not be {uid}; chown reads it as \"leave the \
+                 owner unchanged\""
+            ),
+        }
+    }
     if let Some(gid) = profile.cert_group_gid {
         // gid 0 is `root`. The default agent identity already has
         // root or operator-only access; granting "the root group"
