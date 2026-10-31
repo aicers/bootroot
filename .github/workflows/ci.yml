@@ -98,7 +98,7 @@ jobs:
       # repository root only -- so anything added under a directory would
       # go unlinted without this.
       - name: Run Markdown Lint
-        uses: DavidAnson/markdownlint-cli2-action@v24
+        uses: DavidAnson/markdownlint-cli2-action@v25
         with:
           globs: "**/*.md"
 
