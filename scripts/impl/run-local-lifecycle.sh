@@ -904,7 +904,11 @@ run_verify_pair() {
   case "$label" in
     initial | after-db | after-ca-key | after-ca-key-full) edge_verify_args=(--db-check) ;;
   esac
-  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG" "${edge_verify_args[@]}"
+  # `${edge_verify_args[@]+…}`: under `set -u` an empty array is an
+  # unbound variable before bash 4.4, and every other label leaves it
+  # empty.
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG" \
+    ${edge_verify_args[@]+"${edge_verify_args[@]}"}
   verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
