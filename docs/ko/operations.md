@@ -67,6 +67,24 @@ bootroot monitoring status
 - PostgreSQL을 정기적으로 백업합니다.
 - 복구 테스트를 사전에 수행합니다.
 - 백업 저장소 접근 권한을 최소화합니다.
+- PostgreSQL은 compose 네트워크와 게시된 포트 모두에서 하이브리드
+  양자내성 키 교환 X25519MLKEM768을 쓰는 TLS 1.3으로만 TCP 연결을 받으며,
+  평문 TCP 연결은 거부됩니다.
+- 셸이 필요하면 컨테이너 안의 Unix 소켓을 사용합니다:
+  `docker compose exec postgres psql -U step -d stepca`.
+- 호스트의 `psql`은 OpenSSL 3.5 이상으로 빌드된 libpq가 필요하며,
+  `sslmode=verify-full sslrootcert=secrets/certs/root_ca.crt host=postgres
+  hostaddr=127.0.0.1 port=<POSTGRES_HOST_PORT>`로 연결합니다. 서버 인증서는
+  `postgres`라는 이름에 대해서만 유효합니다.
+- TLS 설정은 `bootroot init`이 작성하는
+  `secrets/postgres/docker-compose.postgres-tls.yml`과
+  `postgres/pg_hba.conf`에 있습니다. 이 스택에서 자신만의 `-f` 목록으로
+  `docker compose up`을 실행한다면
+  `secrets/postgres/docker-compose.postgres-tls.yml`을 반드시 포함해야
+  합니다. 빠뜨리면 Compose가 PostgreSQL을 TLS 없이 다시 생성해 step-ca가
+  연결하지 못합니다. `bootroot infra up`은 이 파일을 포함합니다. 초기화된
+  스택 위에서 다시 실행한 `bootroot infra install`은 포함하지 않으며, 그
+  뒤 `bootroot infra up`이 복원합니다.
 
 ## HTTP-01 리스폰더
 

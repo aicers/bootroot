@@ -109,9 +109,35 @@
 - `localhost`/`127.0.0.1`/`::1` 입력은 init 과정에서 `postgres`로 정규화되는지 확인
 - `db.internal` 같은 원격 호스트는 단일 호스트 가드레일에서 실패(설계된 동작)
 - init summary의 DB 호스트 변환 라인(`from -> to`) 확인
-- step-ca와 PostgreSQL을 서로 다른 머신에 분리 배치하려는 경우에는
-  로컬 예시의 `sslmode=disable`을 재사용하지 말고 PostgreSQL TLS와
-  `sslmode=require` 또는 `sslmode=verify-full`을 사용
+- 저장된 DSN은
+  `?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt`로 끝나야
+  합니다. PostgreSQL은 평문 TCP 연결을 거부합니다. `bootroot init`이
+  저장하는 모든 DSN에 둘 다 설정하므로, `sslmode`를 직접 고치지 말고
+  `init`을 다시 실행
+- `sslmode=disable`인 관리자 DSN(`.env`의 `POSTGRES_SSLMODE` 또는
+  `--db-admin-dsn`)은 PostgreSQL이 `pg_hba.conf` 오류로 거부합니다.
+  `sslmode`를 빼거나 `verify-full`로 설정
+
+### `docker compose up` 뒤 step-ca가 PostgreSQL에 연결하지 못함
+
+자신만의 `-f` 목록으로 `docker compose up`을 실행한 뒤 step-ca가 TLS
+오류(예: 서버가 SSL을 지원하지 않음)나 `pg_hba.conf` 오류로 실패한다면, 그
+실행이 PostgreSQL TLS 오버라이드를 빠뜨려 Compose가 PostgreSQL을 TLS 없이
+다시 생성한 것입니다. 평문으로 되돌아가는 경로는 없습니다.
+
+- `secrets/postgres/docker-compose.postgres-tls.yml`을 적용하는
+  `bootroot infra up`을 실행하거나, 그 파일을 `-f` 목록에 추가
+- 초기화된 스택 위에서 `bootroot infra install`을 다시 실행한 뒤에도
+  같은 상황이 되며, `bootroot infra up`이 복원
+
+### PostgreSQL을 기다리다 `init`이 실패함
+
+`init`은 PostgreSQL을 TLS 설정으로 다시 생성한 뒤 TLS 연결을 최대 60초
+기다립니다. 대기가 만료되면 오류에 PostgreSQL과 마지막 연결 오류가
+표시되므로 `docker logs <instance>-postgres`를 확인하세요. 키의 소유자나
+모드를 직접 바꾸면 PostgreSQL이 시작하지 못합니다. `bootroot rotate
+infra-cert`나 `init` 재실행이 이를 다시 적용합니다. 인증서 검증 오류나
+인증 오류는 대기를 즉시 끝냅니다.
 
 ### responder 체크 관련
 

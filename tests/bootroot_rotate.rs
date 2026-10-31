@@ -2406,7 +2406,7 @@ async fn test_rotate_db_writes_kv_and_restarts_stepca() {
     // host/port flip to the compose-internal pair (`postgres:5432`)
     // regardless of the admin/current DSN's host-side host/port.
     let expected_new_dsn =
-        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=disable".to_string();
+        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt".to_string();
 
     stub_openbao_for_db_rotation(&openbao, &expected_new_dsn).await;
 
@@ -2535,7 +2535,7 @@ async fn test_rotate_db_self_heals_corrupted_compose_port() {
     // After rotation, the step-ca DSN must be the canonical compose pair
     // — *not* `postgres:5433` (the corrupted input).
     let expected_new_dsn =
-        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=disable".to_string();
+        "postgresql://step:new-db-pass-123@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt".to_string();
 
     stub_openbao_for_db_rotation(&openbao, &expected_new_dsn).await;
 

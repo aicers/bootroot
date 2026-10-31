@@ -1,23 +1,29 @@
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bootroot::db::{
     DB_COMPOSE_HOST, DB_HOST_RUNTIME_HOST, DbDsn, build_db_dsn, check_auth_sync, check_tcp,
-    effective_admin_dsn_for_kv, for_compose_runtime, parse_db_dsn, provision_db_sync,
-    resolve_postgres_host_port_with_env, validate_db_identifier,
+    effective_admin_dsn_for_kv, for_compose_runtime, for_host_runtime_with_port, parse_db_dsn,
+    provision_db_sync, resolve_postgres_host_port_with_env, validate_db_identifier,
+    wait_for_db_sync,
 };
 
 use super::super::constants::{
     CA_CERTS_DIR, CA_ROOT_CERT_FILENAME, DEFAULT_DB_NAME, DEFAULT_DB_USER, SECRET_BYTES,
 };
+use super::super::types::DbCheckStatus;
 use super::DbDsnNormalization;
 use super::prompts::{prompt_text, prompt_text_with_default};
 use crate::cli::args::{InitArgs, InitFeature};
 use crate::commands::guardrails::is_single_host_db_host;
 use crate::i18n::Messages;
+
+/// How long `init` waits for `PostgreSQL`, recreated with its TLS
+/// settings, to accept a connection before it fails naming the server.
+const POSTGRES_TLS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 const POSTGRES_USER_ENV: &str = "POSTGRES_USER";
 const POSTGRES_PASSWORD_ENV: &str = "POSTGRES_PASSWORD";
@@ -78,12 +84,68 @@ impl fmt::Debug for PostgresEnv {
     }
 }
 
-pub(super) async fn resolve_db_dsn_for_init(
+/// What `resolve_db_dsn_for_init` settles before anything connects to
+/// `PostgreSQL`.
+pub(super) struct ResolvedDbDsn {
+    /// The DSN stored for step-ca, in compose form.
+    pub(super) dsn: String,
+    pub(super) normalization: DbDsnNormalization,
+    /// The provisioning `db-provision` runs once `PostgreSQL` serves TLS.
+    pub(super) provision: Option<DbProvisionPlan>,
+}
+
+/// Hand-written so a `#[derive(Debug)]` around one cannot print the
+/// password the stored DSN carries.
+impl fmt::Debug for ResolvedDbDsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedDbDsn")
+            .field("dsn", &"<redacted>")
+            .field("normalization", &self.normalization)
+            .field("provision", &self.provision)
+            .finish()
+    }
+}
+
+/// The inputs `db-provision` resolved, kept for the provisioning that
+/// runs after `step ca init`.
+pub(super) struct DbProvisionPlan {
+    /// The admin DSN provisioning connects with, carrying the password
+    /// from before provisioning's `ALTER ROLE`.
+    admin_dsn: String,
+    /// The admin DSN stored at `bootroot/stepca/db_admin`, carrying the
+    /// password provisioning leaves when the admin is the runtime role.
+    pub(super) admin_dsn_for_kv: String,
+    db_user: String,
+    db_password: String,
+    db_name: String,
+}
+
+/// Hand-written so a `#[derive(Debug)]` around one cannot print either
+/// password.
+impl fmt::Debug for DbProvisionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DbProvisionPlan")
+            .field("admin_dsn", &"<redacted>")
+            .field("admin_dsn_for_kv", &"<redacted>")
+            .field("db_user", &self.db_user)
+            .field("db_password", &"<redacted>")
+            .field("db_name", &self.db_name)
+            .finish()
+    }
+}
+
+/// Resolves the DSN `init` stores for step-ca, and with `db-provision`
+/// the provisioning inputs, without connecting to `PostgreSQL`.
+///
+/// Nothing connects here: `PostgreSQL` serves only TLS, with a
+/// certificate `step ca init` makes possible, so the provisioning and
+/// the database check run later, in [`connect_database_for_init`].
+pub(super) fn resolve_db_dsn_for_init(
     args: &InitArgs,
     compose_dir: &Path,
     postgres_env: &PostgresEnv,
     messages: &Messages,
-) -> Result<(String, DbDsnNormalization, Option<String>)> {
+) -> Result<ResolvedDbDsn> {
     // Under reinit mode the preserved `ca.json` runtime DSN is threaded
     // into `args.db_dsn` by `init_args_for_reinit`. The PostgreSQL role
     // it points at already exists with that password (Postgres state is
@@ -111,8 +173,6 @@ pub(super) async fn resolve_db_dsn_for_init(
         ensure_db_host_reachable_from_compose(&admin.host, messages)?;
         let dsn = provisioned_runtime_dsn(&inputs, &admin)
             .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-        let timeout = Duration::from_secs(args.db_timeout.timeout_secs);
-        let admin_dsn_for_provision = inputs.admin_dsn.clone();
         // When the provisioning admin and the runtime DB user are the
         // same role (e.g. `step` in the bundled E2E topology),
         // `provision_db_sync` runs `ALTER ROLE ... WITH PASSWORD
@@ -123,30 +183,26 @@ pub(super) async fn resolve_db_dsn_for_init(
         // post-ALTER credential is what reaches KV.
         let admin_dsn_for_kv =
             effective_admin_dsn_for_kv(&inputs.admin_dsn, &inputs.db_user, &inputs.db_password)?;
-        let user = inputs.db_user.clone();
-        let password = inputs.db_password.clone();
-        let db_name = inputs.db_name.clone();
-        let root_ca = db_root_ca_path(&args.secrets_dir.secrets_dir);
-        tokio::task::spawn_blocking(move || {
-            provision_db_sync(
-                &admin_dsn_for_provision,
-                &root_ca,
-                &user,
-                &password,
-                &db_name,
-                timeout,
-            )
-        })
-        .await
-        .with_context(|| messages.error_db_provision_task_failed())??;
-        return Ok((
+        let DbProvisionInputs {
+            admin_dsn,
+            db_user,
+            db_password,
+            db_name,
+        } = inputs;
+        return Ok(ResolvedDbDsn {
             dsn,
-            DbDsnNormalization {
+            normalization: DbDsnNormalization {
                 original_host: admin.host,
                 effective_host: DB_COMPOSE_HOST.to_string(),
             },
-            Some(admin_dsn_for_kv),
-        ));
+            provision: Some(DbProvisionPlan {
+                admin_dsn,
+                admin_dsn_for_kv,
+                db_user,
+                db_password,
+                db_name,
+            }),
+        });
     }
     let dsn = resolve_db_dsn(args, postgres_env, messages)?;
     let parsed =
@@ -154,19 +210,115 @@ pub(super) async fn resolve_db_dsn_for_init(
     ensure_db_host_reachable_from_compose(&parsed.host, messages)?;
     let effective_dsn =
         for_compose_runtime(&dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-    Ok((
-        effective_dsn,
-        DbDsnNormalization {
+    Ok(ResolvedDbDsn {
+        dsn: effective_dsn,
+        normalization: DbDsnNormalization {
             original_host: parsed.host,
             effective_host: DB_COMPOSE_HOST.to_string(),
         },
-        None,
-    ))
+        provision: None,
+    })
+}
+
+/// Reaches `PostgreSQL` for `init` once its certificate exists: waits
+/// for it to accept a connection, then provisions and checks.
+///
+/// With `wait` (the compose file declares `postgres`, which `init` has
+/// just recreated with its TLS settings) a connection is retried until
+/// it succeeds or [`POSTGRES_TLS_WAIT_TIMEOUT`] passes, while the server
+/// is not serving yet, each attempt bounded by `--db-timeout-secs`. It
+/// connects with the provisioning admin DSN when `provision` is given,
+/// and otherwise with the stored DSN in host form. Then `db-provision`
+/// runs, and `db-check` connects with the stored DSN in host form: the
+/// compose host `postgres` does not resolve on the host, and bootroot's
+/// TLS connections dial an address and verify that name.
+///
+/// Without `wait`, provisioning and the check each connect once.
+///
+/// # Errors
+///
+/// Returns an error when the stored DSN cannot be parsed, the wait ends
+/// on a failure or expires, provisioning fails, or the check fails.
+pub(super) async fn connect_database_for_init(
+    args: &InitArgs,
+    compose_dir: &Path,
+    postgres_env: &PostgresEnv,
+    stored_dsn: &str,
+    provision: Option<&DbProvisionPlan>,
+    wait: bool,
+    messages: &Messages,
+) -> Result<DbCheckStatus> {
+    let root_ca = db_root_ca_path(&args.secrets_dir.secrets_dir);
+    let timeout = Duration::from_secs(args.db_timeout.timeout_secs);
+    let host_port =
+        resolve_postgres_host_port_with_env(postgres_env.host_port.as_deref(), compose_dir);
+    let host_dsn = for_host_runtime_with_port(stored_dsn, host_port)
+        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+
+    if wait {
+        let wait_dsn = provision.map_or(host_dsn.as_str(), |plan| plan.admin_dsn.as_str());
+        println!("{}", messages.info_postgres_tls_waiting());
+        wait_for_postgres(wait_dsn, &root_ca, timeout, messages).await?;
+    }
+    if let Some(plan) = provision {
+        provision_db(plan, &root_ca, timeout, messages).await?;
+    }
+    if !args.has_feature(InitFeature::DbCheck) {
+        return Ok(DbCheckStatus::Skipped);
+    }
+    let db_info =
+        parse_db_dsn(&host_dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
+    check_db_connectivity(
+        &db_info,
+        &host_dsn,
+        &root_ca,
+        args.db_timeout.timeout_secs,
+        messages,
+    )
+    .await?;
+    Ok(DbCheckStatus::Ok)
+}
+
+/// Runs [`wait_for_db_sync`] against `dsn` on a blocking thread, with
+/// [`POSTGRES_TLS_WAIT_TIMEOUT`] from now as its deadline.
+async fn wait_for_postgres(
+    dsn: &str,
+    root_ca: &Path,
+    attempt_timeout: Duration,
+    messages: &Messages,
+) -> Result<()> {
+    let dsn = dsn.to_string();
+    let root_ca = root_ca.to_path_buf();
+    let deadline = Instant::now() + POSTGRES_TLS_WAIT_TIMEOUT;
+    tokio::task::spawn_blocking(move || wait_for_db_sync(&dsn, &root_ca, attempt_timeout, deadline))
+        .await
+        .with_context(|| messages.error_db_auth_task_failed())?
+        .with_context(|| messages.error_postgres_tls_wait_failed())
+}
+
+/// Runs `db-provision`'s `provision_db_sync` on a blocking thread.
+async fn provision_db(
+    plan: &DbProvisionPlan,
+    root_ca: &Path,
+    timeout: Duration,
+    messages: &Messages,
+) -> Result<()> {
+    let admin_dsn = plan.admin_dsn.clone();
+    let user = plan.db_user.clone();
+    let password = plan.db_password.clone();
+    let db_name = plan.db_name.clone();
+    let root_ca = root_ca.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        provision_db_sync(&admin_dsn, &root_ca, &user, &password, &db_name, timeout)
+    })
+    .await
+    .with_context(|| messages.error_db_provision_task_failed())??;
+    Ok(())
 }
 
 /// Builds the compose-internal runtime DSN `db-provision` stores: the
-/// provisioned role, password and database at the admin DSN's server,
-/// with the admin DSN's `sslmode` and `sslrootcert`.
+/// provisioned role, password and database, in the form
+/// `for_compose_runtime` gives every DSN stored for step-ca.
 fn provisioned_runtime_dsn(inputs: &DbProvisionInputs, admin: &DbDsn) -> Result<String> {
     let host_side_dsn = build_db_dsn(
         &inputs.db_user,
@@ -293,7 +445,7 @@ fn build_dsn_from_env(postgres_env: &PostgresEnv) -> Option<String> {
     let db = postgres_env.database.as_deref()?;
     let host = postgres_env.host.as_deref().unwrap_or(DB_COMPOSE_HOST);
     let port = postgres_env.port.as_deref().unwrap_or("5432");
-    let dsn = format!("postgresql://{user}:{password}@{host}:{port}/{db}?sslmode=disable");
+    let dsn = format!("postgresql://{user}:{password}@{host}:{port}/{db}?sslmode=verify-full");
     Some(dsn)
 }
 
@@ -336,6 +488,10 @@ mod tests {
 
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+
+    /// The query every DSN stored for step-ca ends with.
+    const STORED_DSN_TLS_QUERY: &str =
+        "?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt";
 
     /// The `POSTGRES_*` set an `infra install`-provisioned `.env`
     /// leaves behind, which is what the builders below see in practice.
@@ -387,15 +543,13 @@ mod tests {
         args.db_dsn =
             Some("postgresql://user:pass@db.internal:5432/stepca?sslmode=disable".to_string());
 
-        let err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect_err("remote db host should fail single-host guardrail");
+        let err = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect_err("remote db host should fail single-host guardrail");
         assert!(
             err.to_string()
                 .contains("not reachable from step-ca container")
@@ -407,18 +561,18 @@ mod tests {
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@localhost:5432/stepca".to_string());
 
-        let (dsn, normalization, _admin_dsn) = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect("dsn should resolve");
+        let ResolvedDbDsn {
+            dsn, normalization, ..
+        } = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("dsn should resolve");
         assert_eq!(
             dsn,
-            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
         assert_eq!(normalization.original_host, "localhost");
         assert_eq!(normalization.effective_host, "postgres");
@@ -429,18 +583,18 @@ mod tests {
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@postgres:5432/stepca".to_string());
 
-        let (dsn, normalization, _admin_dsn) = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect("dsn should resolve");
+        let ResolvedDbDsn {
+            dsn, normalization, ..
+        } = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("dsn should resolve");
         assert_eq!(
             dsn,
-            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
         assert_eq!(normalization.original_host, "postgres");
         assert_eq!(normalization.effective_host, "postgres");
@@ -455,48 +609,46 @@ mod tests {
         let mut args = default_init_args();
         args.db_dsn = Some("postgresql://user:pass@127.0.0.1:5433/stepca".to_string());
 
-        let (dsn, normalization, _admin_dsn) = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect("dsn should resolve");
+        let ResolvedDbDsn {
+            dsn, normalization, ..
+        } = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("dsn should resolve");
         assert_eq!(
             dsn,
-            "postgresql://user:pass@postgres:5432/stepca?sslmode=disable"
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
         assert_eq!(normalization.original_host, "127.0.0.1");
         assert_eq!(normalization.effective_host, "postgres");
     }
 
     #[test]
-    fn test_resolve_db_dsn_for_init_keeps_sslrootcert() {
+    fn test_resolve_db_dsn_for_init_replaces_sslrootcert() {
         let mut args = default_init_args();
         args.db_dsn = Some(
             "postgresql://user:pass@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
                 .to_string(),
         );
 
-        let (dsn, _normalization, _admin_dsn) = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect("dsn should resolve");
+        let ResolvedDbDsn { dsn, .. } = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("dsn should resolve");
         assert_eq!(
             dsn,
-            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+            "postgresql://user:pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
     }
 
     #[test]
-    fn provisioned_runtime_dsn_keeps_admin_sslmode_and_sslrootcert() {
+    fn provisioned_runtime_dsn_is_verify_full_against_the_stepca_root() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time is before UNIX_EPOCH")
@@ -515,9 +667,7 @@ mod tests {
         let dsn = provisioned_runtime_dsn(&inputs, &admin).expect("build dsn");
         assert_eq!(
             dsn,
-            format!(
-                "postgresql://stepca:{password}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
-            )
+            format!("postgresql://stepca:{password}@postgres:5432/stepca{STORED_DSN_TLS_QUERY}")
         );
     }
 
@@ -552,7 +702,7 @@ mod tests {
         let dsn = resolve_db_dsn(&args, &env, &test_messages()).unwrap();
         assert_eq!(
             dsn,
-            "postgresql://step:secret@postgres:5432/stepca?sslmode=disable"
+            "postgresql://step:secret@postgres:5432/stepca?sslmode=verify-full"
         );
     }
 
@@ -667,15 +817,13 @@ mod tests {
         args.db_password = Some(db_password);
         args.db_name = Some("stepdb".to_string());
 
-        let err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .unwrap_err();
+        let err = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("db-provision"));
     }
 
@@ -704,24 +852,28 @@ mod tests {
         args.db_password = Some("would-rotate-the-good-password".to_string());
         args.db_name = Some("stepca".to_string());
 
-        let (dsn, normalization, admin_dsn_for_kv) = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(resolve_db_dsn_for_init(
-                &args,
-                Path::new("."),
-                &PostgresEnv::default(),
-                &test_messages(),
-            ))
-            .expect("preserved DSN must be accepted under reinit_mode");
+        let ResolvedDbDsn {
+            dsn,
+            normalization,
+            provision,
+        } = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("preserved DSN must be accepted under reinit_mode");
         assert_eq!(
             dsn,
-            format!("postgresql://step:{preserved_password}@postgres:5432/stepca?sslmode=disable"),
+            format!(
+                "postgresql://step:{preserved_password}@postgres:5432/stepca{STORED_DSN_TLS_QUERY}"
+            ),
             "preserved DSN must reach KV verbatim (compose-normalised)"
         );
         assert_eq!(normalization.original_host, "127.0.0.1");
         assert_eq!(normalization.effective_host, "postgres");
         assert!(
-            admin_dsn_for_kv.is_none(),
+            provision.is_none(),
             "reinit must not synthesise an admin DSN; the preserved DSN is authoritative"
         );
     }
@@ -745,7 +897,7 @@ mod tests {
         let port = DEFAULT_POSTGRES_HOST_PORT;
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@{host}:{port}/postgres?sslmode=disable")
+            format!("postgresql://step:{password}@{host}:{port}/postgres?sslmode=verify-full")
         );
         assert_eq!((host, port), ("127.0.0.1", 5433));
     }
@@ -771,7 +923,7 @@ mod tests {
         let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@127.0.0.1:6543/postgres?sslmode=disable")
+            format!("postgresql://step:{password}@127.0.0.1:6543/postgres?sslmode=verify-full")
         );
     }
 
@@ -791,7 +943,7 @@ mod tests {
         let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@127.0.0.1:6544/postgres?sslmode=disable")
+            format!("postgresql://step:{password}@127.0.0.1:6544/postgres?sslmode=verify-full")
         );
     }
 
@@ -811,7 +963,7 @@ mod tests {
         let dsn = build_admin_dsn_from_env(dir.path(), &env).expect("dsn");
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@127.0.0.1:7777/postgres?sslmode=disable")
+            format!("postgresql://step:{password}@127.0.0.1:7777/postgres?sslmode=verify-full")
         );
     }
 
@@ -828,5 +980,69 @@ mod tests {
         let rendered = format!("{env:?}");
         assert!(!rendered.contains(&password), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// With `db-provision`, nothing connects: the resolver returns the
+    /// `verify-full` runtime DSN and the provisioning inputs, keeping
+    /// the admin DSN with the password from before provisioning's
+    /// `ALTER ROLE` for the connection and the one after it for the KV.
+    #[test]
+    fn test_resolve_db_dsn_for_init_returns_the_provisioning_plan() {
+        let admin_password = nonce_password("admin");
+        let db_password = nonce_password("step");
+        let mut args = default_init_args();
+        args.enable.push(InitFeature::DbProvision);
+        // Port 9 (discard): a connection attempt would fail the test.
+        args.db_admin.admin_dsn = Some(format!(
+            "postgresql://step:{admin_password}@127.0.0.1:9/postgres?sslmode=disable"
+        ));
+        args.db_user = Some("step".to_string());
+        args.db_password = Some(db_password.clone());
+        args.db_name = Some("stepca".to_string());
+
+        let resolved = resolve_db_dsn_for_init(
+            &args,
+            Path::new("."),
+            &PostgresEnv::default(),
+            &test_messages(),
+        )
+        .expect("db-provision inputs should resolve without connecting");
+
+        // Neither password reaches a `Debug` rendering of the result: not
+        // the runtime DSN's, nor the admin DSNs' inside the plan.
+        let rendered = format!("{resolved:?}");
+        assert!(!rendered.contains(&admin_password), "{rendered}");
+        assert!(!rendered.contains(&db_password), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        let ResolvedDbDsn {
+            dsn,
+            normalization,
+            provision,
+        } = resolved;
+        assert_eq!(
+            dsn,
+            format!("postgresql://step:{db_password}@postgres:5432/stepca{STORED_DSN_TLS_QUERY}")
+        );
+        assert_eq!(normalization.original_host, "127.0.0.1");
+        assert_eq!(normalization.effective_host, "postgres");
+        let plan = provision.expect("db-provision must return its plan");
+        assert_eq!(
+            plan.admin_dsn,
+            format!("postgresql://step:{admin_password}@127.0.0.1:9/postgres?sslmode=disable")
+        );
+        assert_eq!(
+            plan.admin_dsn_for_kv,
+            format!("postgresql://step:{db_password}@127.0.0.1:9/postgres?sslmode=disable")
+        );
+        assert_eq!(
+            (plan.db_user.as_str(), plan.db_name.as_str()),
+            ("step", "stepca")
+        );
+        assert_eq!(plan.db_password, db_password);
+
+        let rendered = format!("{plan:?}");
+        assert!(!rendered.contains(&admin_password), "{rendered}");
+        assert!(!rendered.contains(&db_password), "{rendered}");
     }
 }

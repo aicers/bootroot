@@ -617,6 +617,84 @@ mod unix_integration {
         Ok(())
     }
 
+    /// A database check that fails leaves `bootroot/stepca/db` and
+    /// `bootroot/stepca/db_admin` as they were: neither is written until
+    /// the database steps have passed.
+    #[tokio::test]
+    async fn init_failing_db_check_writes_no_db_dsn() -> Result<()> {
+        let temp_dir = tempdir().context("Failed to create temp dir")?;
+        let secrets_dir = create_secrets_dir(temp_dir.path())?;
+        let compose_file = temp_dir.path().join("docker-compose.yml");
+        fs::write(&compose_file, "services: {}").context("Failed to write compose file")?;
+        write_dotenv_file(temp_dir.path())?;
+
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).context("Failed to create bin dir")?;
+        write_fake_docker(&bin_dir)?;
+
+        let server = MockServer::start().await;
+        stub_openbao(&server).await;
+
+        // A port nothing listens on, so the check's connection is
+        // refused.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").context("Failed to bind a free port")?;
+        let free_port = listener
+            .local_addr()
+            .context("Failed to read the bound port")?
+            .port();
+        drop(listener);
+
+        let path = env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{}", bin_dir.display(), path);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(temp_dir.path())
+            .args([
+                "init",
+                "--openbao-url",
+                &server.uri(),
+                "--root-token",
+                ROOT_TOKEN,
+                "--enable",
+                "auto-generate,db-check",
+                "--db-timeout-secs",
+                "1",
+                "--secrets-dir",
+                secrets_dir.to_string_lossy().as_ref(),
+                "--compose-file",
+                compose_file.to_string_lossy().as_ref(),
+            ])
+            .env("PATH", combined_path)
+            .env("POSTGRES_HOST_PORT", free_port.to_string())
+            .env("BOOTROOT_LANG", "en");
+        let output = run_command_with_input(&mut command, "y\nn\n")
+            .context("Failed to run bootroot init")?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "init must fail: {stderr}");
+        assert!(
+            stderr.contains("DB connectivity check failed"),
+            "init must fail at the database check: {stderr}"
+        );
+        let requests = server
+            .received_requests()
+            .await
+            .context("wiremock must record requests")?;
+        for kv_path in ["bootroot/stepca/db", "bootroot/stepca/db_admin"] {
+            let data_path = format!("/v1/secret/data/{kv_path}");
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request.method.as_str() == "POST"
+                        && request.url.path() == data_path),
+                "{kv_path} must not be written when the database check fails"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn init_cancels_on_overwrite_prompt() -> Result<()> {
         let temp_dir = tempdir().context("Failed to create temp dir")?;

@@ -287,6 +287,14 @@ deployment's HMAC. Before `init` has run there is no override, and the
 responder runs on the bundle's `responder.toml.compose`, on which it serves
 challenges but refuses registrations with `503`.
 
+Once `bootroot init` has run, `infra up` also applies the PostgreSQL TLS
+override `init` wrote at `secrets/postgres/docker-compose.postgres-tls.yml`,
+when the compose file declares `postgres`. It starts PostgreSQL with TLS 1.3
+and X25519MLKEM768 only and mounts its certificate and `pg_hba.conf`; without
+it, Compose would recreate PostgreSQL without TLS and step-ca's
+`verify-full` connection would be refused. An override that publishes any
+guarded service on a non-loopback address is refused.
+
 ### Failure conditions
 
 The command is considered failed when:
@@ -604,6 +612,11 @@ rollback as `ca.json` rather than left one step ahead of it.
   `secrets/openbao/docker-compose.openbao-exposed.yml` and
   bind intent recorded in `state.json`
 
+`infra install` applies none of the overrides `bootroot init` writes, since
+it runs before `init`. Run again over an initialised stack, it recreates
+PostgreSQL without its TLS override, as it does the responder without its
+config override; `bootroot infra up` restores both.
+
 ### Failure conditions
 
 The command is considered failed when:
@@ -810,7 +823,10 @@ Input priority is **CLI flags > environment variables > prompts/defaults**.
   (dev/test only, environment variable: `OPENBAO_UNSEAL_FILE`)
 - `--stepca-password`: step-ca password value (stored at `secrets/password.txt`,
   environment variable: `STEPCA_PASSWORD`)
-- `--db-dsn`: PostgreSQL DSN for step-ca
+- `--db-dsn`: PostgreSQL DSN for step-ca. `init` stores it with host
+  `postgres`, port `5432`,
+  `sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt`, replacing
+  whatever `sslmode` and `sslrootcert` it carried
 - `--db-admin-dsn`: PostgreSQL admin DSN (environment variable: `BOOTROOT_DB_ADMIN_DSN`)
 - `--db-user`: PostgreSQL user for step-ca (environment variable: `BOOTROOT_DB_USER`)
 - `--db-password`: PostgreSQL password for step-ca (environment variable: `BOOTROOT_DB_PASSWORD`)
@@ -991,6 +1007,21 @@ port and defaults its host to `127.0.0.1` rather than the
 compose-internal `postgres` so the host-side `provision_db_sync`
 can reach it on the published port (#588 §1, §2).
 
+The database steps run after `step ca init`, since PostgreSQL serves the
+certificate it makes possible. Once PostgreSQL is recreated, `init` waits up
+to 60 seconds for it to accept a TLS connection — with the provisioning
+admin DSN under `db-provision`, and otherwise with the stored DSN on the
+published port — retrying only while the server is not serving yet (the
+connection is refused, reset or closed before the TLS handshake completes,
+or PostgreSQL is starting up). A certificate verification error, a refused
+handshake or an authentication error ends the wait at once and fails `init`
+naming PostgreSQL. Then `db-provision` provisions and `db-check` connects
+with the stored DSN on the published port. Only after all of them succeed
+does `init` write `bootroot/stepca/db` and, with `db-provision`,
+`bootroot/stepca/db_admin`, so a DSN that fails them never reaches OpenBao.
+A failed `init` does not undo the PostgreSQL change; run `init` again to
+complete it.
+
 DB DSN host handling:
 
 - `localhost`, `127.0.0.1`, and `::1` are normalized to `postgres` during
@@ -1016,7 +1047,13 @@ DB DSN host handling:
   in `state.json` → `infra_certs` as `postgres`: `server.crt` (mode `0644`) is
   a one-year leaf whose only name is `postgres`, followed by the intermediate
   CA that signed it, and `server.key` is owned by `999:0`, the `postgres` user
-  of the PostgreSQL image, at mode `0600`. Nothing serves it yet
+  of the PostgreSQL image, at mode `0600`
+- With that certificate, `<compose-dir>/postgres/pg_hba.conf` (mode `0644`)
+  and the compose override
+  `secrets/postgres/docker-compose.postgres-tls.yml`, written on every run;
+  PostgreSQL is recreated with them (`up -d --no-deps --force-recreate
+  postgres`) and from then on accepts TCP connections only over TLS 1.3
+  with X25519MLKEM768, authenticated with `scram-sha-256`
 - DB connectivity check status (when enabled)
 - DB host resolution summary (`from -> to`)
 - EAB registration summary
@@ -2956,7 +2993,7 @@ bootroot ca restart
 
 Tears down the local environment for a fresh start. Stops containers, removes
 volumes, and deletes generated secrets, `postgres/` (the PostgreSQL server
-certificate and its key), state, and `.env`. After cleaning,
+certificate, its key and `pg_hba.conf`), state, and `.env`. After cleaning,
 re-run `bootroot infra install` and `bootroot init` to start over.
 
 ### Inputs

@@ -187,9 +187,10 @@ CLI 사용법은 [CLI 문서](cli.md)와 [CLI 예제](cli-examples.md)에 정리
 `bootroot` 구성에서 이러한 토폴로지를 충분히 지원한다고 단정할 수는
 없습니다.
 
-이런 분리 배치에서는 로컬 PostgreSQL 예시의 `sslmode=disable`을 그대로
-재사용하면 안 됩니다. 원격 신뢰 경계에 맞게 PostgreSQL TLS와 적절한
-`sslmode`를 구성해야 합니다.
+이런 분리 배치에서는 step-ca의 PostgreSQL 연결이 신뢰 경계를 넘습니다.
+bootroot가 step-ca 옆에서 실행하는 PostgreSQL은 `postgres`라는 이름으로
+검증되는 TLS만 받습니다. 다른 곳의 PostgreSQL에는 자체 TLS와 그것을
+검증하는 DSN이 필요합니다.
 
 `bootroot service add`로 등록한 서비스는 step-ca가 설치된 머신에서
 동작할 수도 있고, 다른 머신에서 동작할 수도 있습니다. 두

@@ -21,7 +21,8 @@ pub(crate) use constants::{
     OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH, OPENBAO_INFRA_CERT_KEY,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH, OPENBAO_TLS_CONTAINER_KEY_PATH,
     OPENBAO_TLS_DEFAULT_NOT_AFTER, OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
-    POSTGRES_COMPOSE_DIR, POSTGRES_INFRA_CERT_KEY, POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_DIR,
+    POSTGRES_COMPOSE_DIR, POSTGRES_HBA_CONF_PATH, POSTGRES_INFRA_CERT_KEY, POSTGRES_TLS_CERT_PATH,
+    POSTGRES_TLS_COMPOSE_OVERRIDE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_NAME, POSTGRES_TLS_DIR,
     POSTGRES_TLS_KEY_PATH, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
     RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
     STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
@@ -29,8 +30,8 @@ pub(crate) use constants::{
 #[cfg(test)]
 pub(crate) use paths::SHIPPED_COMPOSE_CONFIG;
 pub(crate) use paths::{
-    ComposeServices, compose_has_openbao, compose_has_responder, compose_has_stepca,
-    compose_up_reaches_service, to_container_path,
+    ComposeServices, compose_has_openbao, compose_has_postgres, compose_has_responder,
+    compose_has_stepca, compose_up_reaches_service, to_container_path,
 };
 pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,

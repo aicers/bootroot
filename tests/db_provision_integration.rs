@@ -9,11 +9,12 @@ mod unix_integration {
     use std::process::{Command, Output};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::sleep;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
     use bootroot::db::{
-        DbProvisionReport, check_auth_sync, for_host_runtime_with_port, provision_db_sync,
+        DbConnectFailure, DbProvisionReport, check_auth_sync, for_host_runtime_with_port,
+        provision_db_sync, reduce_connect_error, wait_for_db_sync,
     };
     use bootroot::utils::generate_secret;
     use postgres::NoTls;
@@ -233,6 +234,15 @@ mod unix_integration {
         /// Starts a server with `protocol_settings` as its TLS protocol
         /// and group options.
         fn start_with(pki: &TestPki, protocol_settings: &str) -> Result<Self> {
+            let container = Self::launch(pki, protocol_settings)?;
+            container.wait_until_ready()?;
+            Ok(container)
+        }
+
+        /// Starts the container without waiting for the server, which
+        /// first runs the image's socket-only initialisation server and
+        /// only then listens on TCP.
+        fn launch(pki: &TestPki, protocol_settings: &str) -> Result<Self> {
             let name = format!("bootroot-db-tls-itest-{}", unique_suffix());
             let port = reserve_local_port()?;
             let admin_password =
@@ -288,14 +298,12 @@ mod unix_integration {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!("Failed to start TLS postgres container: {stderr}");
             }
-            let container = Self {
+            Ok(Self {
                 name,
                 port,
                 admin_password,
                 dir,
-            };
-            container.wait_until_ready()?;
-            Ok(container)
+            })
         }
 
         /// The admin DSN at `host`, asking for full verification.
@@ -608,6 +616,111 @@ mod unix_integration {
             &err,
             "fatal alert: ProtocolVersion",
             &container.admin_password,
+        );
+        Ok(())
+    }
+
+    /// `init`'s wait for `PostgreSQL` retries a server that is still
+    /// starting: the container below has not finished its first-boot
+    /// initialisation when the wait begins.
+    #[test]
+    #[ignore = "Requires local Docker and the declared PostgreSQL image"]
+    fn the_wait_retries_until_a_starting_server_serves_tls() -> Result<()> {
+        let pki = generate_pki(SERVER_NAME)?;
+        let container = TlsPostgresContainer::launch(&pki, TLS13_MLKEM_ONLY)?;
+        let root_ca = container.write_root("root_ca.crt", &pki.root)?;
+
+        wait_for_db_sync(
+            &container.admin_dsn("127.0.0.1"),
+            &root_ca,
+            Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .context("the wait must see the starting server through")?;
+        Ok(())
+    }
+
+    /// A server that answers ends the wait at once: a root it does not
+    /// chain to, and a wrong password, are final.
+    #[test]
+    #[ignore = "Requires local Docker and the declared PostgreSQL image"]
+    fn the_wait_ends_at_once_on_a_wrong_root_or_password() -> Result<()> {
+        let pki = generate_pki(SERVER_NAME)?;
+        let container = TlsPostgresContainer::start(&pki)?;
+        let (other_root_pem, _) = generate_ca("bootroot test other CA")?;
+        let other_root = container.write_root("other_root_ca.crt", &other_root_pem)?;
+        let root_ca = container.write_root("root_ca.crt", &pki.root)?;
+        let attempt = Duration::from_secs(5);
+        let wait_window = Duration::from_secs(60);
+
+        let started = Instant::now();
+        let err = wait_for_db_sync(
+            &container.admin_dsn("127.0.0.1"),
+            &other_root,
+            attempt,
+            started + wait_window,
+        )
+        .expect_err("a server under another CA must end the wait");
+        assert!(started.elapsed() < Duration::from_secs(10), "{err:#}");
+        assert_eq!(
+            reduce_connect_error(&err),
+            DbConnectFailure::Io(std::io::ErrorKind::InvalidData),
+            "{err:#}"
+        );
+        assert_tls_failure(&err, "UnknownIssuer", &container.admin_password);
+
+        let wrong_password = generate_secret(16).context("Failed to generate a password")?;
+        let wrong_dsn = format!(
+            "postgresql://{DB_USER}:{wrong_password}@127.0.0.1:{}/{DB_NAME}?sslmode=verify-full",
+            container.port
+        );
+        let started = Instant::now();
+        let err = wait_for_db_sync(&wrong_dsn, &root_ca, attempt, started + wait_window)
+            .expect_err("a wrong password must end the wait");
+        assert!(started.elapsed() < Duration::from_secs(10), "{err:#}");
+        assert_eq!(
+            reduce_connect_error(&err),
+            DbConnectFailure::SqlState("28P01".to_string()),
+            "{err:#}"
+        );
+
+        // A plaintext connection meets `pg_hba.conf`'s `reject` line,
+        // which is final too.
+        let plaintext_dsn = format!(
+            "postgresql://{DB_USER}:{}@127.0.0.1:{}/{DB_NAME}?sslmode=disable",
+            container.admin_password, container.port
+        );
+        let started = Instant::now();
+        let err = wait_for_db_sync(&plaintext_dsn, &root_ca, attempt, started + wait_window)
+            .expect_err("a plaintext connection must end the wait");
+        assert!(started.elapsed() < Duration::from_secs(10), "{err:#}");
+        assert_tls_failure(&err, "pg_hba.conf", &container.admin_password);
+        Ok(())
+    }
+
+    /// A port with nothing listening is retried until the deadline, and
+    /// the error then carries the last refusal.
+    #[test]
+    fn the_wait_retries_a_port_with_nothing_listening_until_the_deadline() -> Result<()> {
+        let port = reserve_local_port()?;
+        let dsn = format!("postgresql://{DB_USER}:pw@127.0.0.1:{port}/{DB_NAME}?sslmode=disable");
+        let started = Instant::now();
+        let err = wait_for_db_sync(
+            &dsn,
+            Path::new("/nonexistent/root_ca.crt"),
+            Duration::from_millis(500),
+            started + Duration::from_secs(2),
+        )
+        .expect_err("nothing listens on the port");
+        assert!(started.elapsed() >= Duration::from_millis(1500), "{err:#}");
+        assert_eq!(
+            reduce_connect_error(&err),
+            DbConnectFailure::Io(std::io::ErrorKind::ConnectionRefused),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}").contains("did not accept a connection before the wait expired"),
+            "{err:#}"
         );
         Ok(())
     }

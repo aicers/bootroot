@@ -1,6 +1,7 @@
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use postgres::NoTls;
@@ -26,6 +27,17 @@ pub const DEFAULT_POSTGRES_HOST_PORT: u16 = 5433;
 pub const POSTGRES_HOST_PORT_ENV: &str = "POSTGRES_HOST_PORT";
 /// The `sslmode` value under which bootroot connects without TLS.
 const SSLMODE_DISABLE: &str = "disable";
+/// The `sslmode` every DSN bootroot stores for step-ca carries, and the
+/// default of [`build_db_dsn`]: TLS, with the server verified for its
+/// name against `sslrootcert`.
+const SSLMODE_VERIFY_FULL: &str = "verify-full";
+/// The CA root step-ca verifies `PostgreSQL` against, as step-ca's
+/// container sees the secrets directory (mounted at `/home/step`).
+pub const STEPCA_DB_SSLROOTCERT: &str = "/home/step/certs/root_ca.crt";
+/// Pause between two connection attempts of [`wait_for_db_sync`].
+const DB_WAIT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// SQLSTATE `57P03` (`cannot_connect_now`): the server is starting up.
+const SQLSTATE_CANNOT_CONNECT_NOW: &str = "57P03";
 /// The DSN host bootroot dials as the IPv4 loopback address over TLS.
 const LOCALHOST: &str = "localhost";
 
@@ -99,8 +111,8 @@ pub fn parse_db_dsn(input: &str) -> Result<DbDsn> {
 
 /// Builds a `PostgreSQL` DSN from structured components.
 ///
-/// `sslmode` defaults to `disable`. `sslrootcert`, when given, follows it
-/// as written: it is a path and is not percent-encoded.
+/// `sslmode` defaults to `verify-full`. `sslrootcert`, when given,
+/// follows it as written: it is a path and is not percent-encoded.
 #[must_use]
 pub fn build_db_dsn(
     user: &str,
@@ -111,7 +123,7 @@ pub fn build_db_dsn(
     sslmode: Option<&str>,
     sslrootcert: Option<&str>,
 ) -> String {
-    let sslmode = sslmode.unwrap_or(SSLMODE_DISABLE);
+    let sslmode = sslmode.unwrap_or(SSLMODE_VERIFY_FULL);
     let mut dsn =
         format!("postgresql://{user}:{password}@{host}:{port}/{database}?sslmode={sslmode}");
     if let Some(sslrootcert) = sslrootcert {
@@ -121,15 +133,19 @@ pub fn build_db_dsn(
     dsn
 }
 
-/// Translates a DSN into its compose-internal form.
+/// Translates a DSN into the compose-internal form step-ca connects with.
 ///
 /// Rewrites the host to [`DB_COMPOSE_HOST`] and the port to
 /// [`DB_COMPOSE_PORT`] so step-ca (running inside the compose network) can
-/// reach `PostgreSQL` regardless of the host-side published port.
+/// reach `PostgreSQL` regardless of the host-side published port, and sets
+/// `sslmode=verify-full` with [`STEPCA_DB_SSLROOTCERT`] as `sslrootcert`,
+/// whatever the DSN said: the server accepts TCP connections only over
+/// TLS, and step-ca verifies it for the name [`DB_COMPOSE_HOST`] against
+/// the CA root. No other server can be named here, since host and port
+/// are pinned too, so the rewrite cannot mismatch a certificate.
 ///
-/// Preserves user, password, database, and the `sslmode` and `sslrootcert`
-/// query parameters. Other query parameters are dropped — see
-/// [`parse_db_dsn`] / [`build_db_dsn`].
+/// Preserves user, password and database. Other query parameters are
+/// dropped — see [`parse_db_dsn`] / [`build_db_dsn`].
 ///
 /// # Errors
 ///
@@ -142,8 +158,8 @@ pub fn for_compose_runtime(dsn: &str) -> Result<String> {
         DB_COMPOSE_HOST,
         DB_COMPOSE_PORT,
         &parsed.database,
-        parsed.sslmode.as_deref(),
-        parsed.sslrootcert.as_deref(),
+        Some(SSLMODE_VERIFY_FULL),
+        Some(STEPCA_DB_SSLROOTCERT),
     ))
 }
 
@@ -413,12 +429,131 @@ pub fn check_auth_sync(dsn: &str, root_ca: &Path, timeout: Duration) -> Result<(
     });
     match receiver.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!("Timed out while authenticating to PostgreSQL")
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AttemptTimedOut.into()),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             anyhow::bail!("DB auth check thread disconnected")
         }
+    }
+}
+
+/// The error [`check_auth_sync`] returns when its attempt outlives its
+/// timeout, so [`reduce_connect_error`] can tell it from the server's
+/// answer.
+#[derive(Debug)]
+struct AttemptTimedOut;
+
+impl std::fmt::Display for AttemptTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Timed out while authenticating to PostgreSQL")
+    }
+}
+
+impl std::error::Error for AttemptTimedOut {}
+
+/// What a failed connection attempt says about the server, reduced from
+/// its error chain by [`reduce_connect_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbConnectFailure {
+    /// An I/O error of this kind, with no answer from `PostgreSQL`: a
+    /// refused, reset or closed TCP connection, an attempt that timed
+    /// out, or a TLS verification failure or alert (`InvalidData`).
+    Io(io::ErrorKind),
+    /// tokio-postgres found the connection closed.
+    Closed,
+    /// `PostgreSQL` answered with this SQLSTATE.
+    SqlState(String),
+    /// The attempt outlived its own time bound.
+    TimedOut,
+    /// Anything else, such as a server that refused TLS or a DSN that
+    /// could not be used.
+    Other,
+}
+
+/// Reduces a connection error to what [`db_wait_should_retry`] decides
+/// over: the first SQLSTATE, closed connection, attempt timeout or
+/// `io::Error` along its chain, in that order of precedence per link.
+#[must_use]
+pub fn reduce_connect_error(err: &anyhow::Error) -> DbConnectFailure {
+    for cause in err.chain() {
+        if cause.downcast_ref::<AttemptTimedOut>().is_some() {
+            return DbConnectFailure::TimedOut;
+        }
+        if let Some(pg) = cause.downcast_ref::<postgres::Error>() {
+            if let Some(state) = pg.code() {
+                return DbConnectFailure::SqlState(state.code().to_string());
+            }
+            if pg.is_closed() {
+                return DbConnectFailure::Closed;
+            }
+        }
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            return DbConnectFailure::Io(io_err.kind());
+        }
+    }
+    DbConnectFailure::Other
+}
+
+/// Decides whether [`wait_for_db_sync`] tries again after a failed
+/// attempt.
+///
+/// Only a server that is not serving yet is waited for: a TCP
+/// connection refused, reset or closed before the TLS handshake
+/// completed, an attempt that timed out, or `PostgreSQL` answering
+/// SQLSTATE `57P03` (starting up). A certificate verification failure
+/// or TLS alert (`InvalidData`), a refused TLS handshake, an
+/// authentication failure or any other server error is final.
+#[must_use]
+pub fn db_wait_should_retry(failure: &DbConnectFailure) -> bool {
+    match failure {
+        DbConnectFailure::Io(kind) => matches!(
+            kind,
+            io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::TimedOut
+        ),
+        DbConnectFailure::Closed | DbConnectFailure::TimedOut => true,
+        DbConnectFailure::SqlState(code) => code == SQLSTATE_CANNOT_CONNECT_NOW,
+        DbConnectFailure::Other => false,
+    }
+}
+
+/// Waits until the `PostgreSQL` server a DSN names accepts a connection
+/// and runs a query, or `deadline` passes.
+///
+/// Each attempt is [`check_auth_sync`], bounded by `attempt_timeout` (and
+/// by what is left before `deadline`). A failure that
+/// [`db_wait_should_retry`] retries is followed by another attempt after
+/// a short pause; any other failure ends the wait at once.
+///
+/// # Errors
+///
+/// Returns the first failure that is not retried, or, when `deadline`
+/// passes, the last failure seen, each with context naming `PostgreSQL`.
+pub fn wait_for_db_sync(
+    dsn: &str,
+    root_ca: &Path,
+    attempt_timeout: Duration,
+    deadline: Instant,
+) -> Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A zero timeout would fail before dialling at all.
+        let attempt = attempt_timeout.min(remaining).max(Duration::from_millis(1));
+        let Err(err) = check_auth_sync(dsn, root_ca, attempt) else {
+            return Ok(());
+        };
+        if !db_wait_should_retry(&reduce_connect_error(&err)) {
+            return Err(err.context("Failed to connect to PostgreSQL"));
+        }
+        if Instant::now() + DB_WAIT_RETRY_INTERVAL >= deadline {
+            return Err(
+                err.context("PostgreSQL did not accept a connection before the wait expired")
+            );
+        }
+        std::thread::sleep(DB_WAIT_RETRY_INTERVAL);
     }
 }
 
@@ -676,12 +811,12 @@ mod tests {
     }
 
     #[test]
-    fn build_db_dsn_without_sslrootcert_is_unchanged() {
+    fn build_db_dsn_defaults_to_verify_full() {
         let password = test_password();
         let dsn = build_db_dsn("step", &password, "127.0.0.1", 5433, "stepca", None, None);
         assert_eq!(
             dsn,
-            format!("postgresql://step:{password}@127.0.0.1:5433/stepca?sslmode=disable")
+            format!("postgresql://step:{password}@127.0.0.1:5433/stepca?sslmode=verify-full")
         );
     }
 
@@ -723,14 +858,41 @@ mod tests {
         assert_eq!(rebuilt, dsn);
     }
 
+    /// Another `sslrootcert` names a file step-ca's container does not
+    /// have; the stored DSN always names the CA root as step-ca sees it.
     #[test]
-    fn for_compose_runtime_keeps_sslrootcert() {
+    fn for_compose_runtime_replaces_sslrootcert() {
         let dsn =
             "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/ca.crt";
         assert_eq!(
             for_compose_runtime(dsn).unwrap(),
-            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/ca.crt"
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
+    }
+
+    /// Every `sslmode`, or none, becomes `verify-full`: the server takes
+    /// TCP connections only over TLS, and `verify-ca` would accept any
+    /// other certificate the CA issued.
+    #[test]
+    fn for_compose_runtime_sets_verify_full_for_every_sslmode() {
+        for query in [
+            "?sslmode=disable",
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+            "?sslmode=verify-full",
+            "",
+        ] {
+            assert_eq!(
+                for_compose_runtime(&format!(
+                    "postgresql://step:pw@localhost:5433/stepca{query}"
+                ))
+                .unwrap(),
+                format!(
+                    "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert={STEPCA_DB_SSLROOTCERT}"
+                ),
+                "{query}"
+            );
+        }
     }
 
     #[test]
@@ -921,6 +1083,95 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_retries_while_the_server_is_not_serving() {
+        for kind in [
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                db_wait_should_retry(&DbConnectFailure::Io(kind)),
+                "{kind:?}"
+            );
+        }
+        assert!(db_wait_should_retry(&DbConnectFailure::Closed));
+        assert!(db_wait_should_retry(&DbConnectFailure::TimedOut));
+        assert!(db_wait_should_retry(&DbConnectFailure::SqlState(
+            "57P03".to_string()
+        )));
+    }
+
+    #[test]
+    fn the_wait_ends_on_a_final_answer() {
+        // rustls reports a failed certificate verification, and a TLS
+        // alert such as a refused key exchange group, as `InvalidData`.
+        assert!(!db_wait_should_retry(&DbConnectFailure::Io(
+            io::ErrorKind::InvalidData
+        )));
+        // A server that answers the SSLRequest with `N`.
+        assert!(!db_wait_should_retry(&DbConnectFailure::Other));
+        // Wrong password, and a `pg_hba.conf` `reject` line.
+        for code in ["28P01", "28000", "3D000", "57P01"] {
+            assert!(
+                !db_wait_should_retry(&DbConnectFailure::SqlState(code.to_string())),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_connect_error_reads_the_io_kind_under_context() {
+        let err = anyhow::Error::new(io::Error::from(io::ErrorKind::ConnectionRefused))
+            .context("Failed to authenticate to PostgreSQL");
+        assert_eq!(
+            reduce_connect_error(&err),
+            DbConnectFailure::Io(io::ErrorKind::ConnectionRefused)
+        );
+        let err = anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidData, "bad cert"))
+            .context("Failed to authenticate to PostgreSQL");
+        assert_eq!(
+            reduce_connect_error(&err),
+            DbConnectFailure::Io(io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn reduce_connect_error_recognises_an_attempt_timeout() {
+        let err = anyhow::Error::new(AttemptTimedOut);
+        assert_eq!(reduce_connect_error(&err), DbConnectFailure::TimedOut);
+    }
+
+    #[test]
+    fn reduce_connect_error_falls_back_to_other() {
+        let err = anyhow::anyhow!("server does not support TLS");
+        assert_eq!(reduce_connect_error(&err), DbConnectFailure::Other);
+    }
+
+    /// A missing CA root is not a server that is starting: it ends the
+    /// wait at once.
+    #[test]
+    fn wait_for_db_sync_ends_at_once_on_a_missing_root() {
+        let started = Instant::now();
+        let err = wait_for_db_sync(
+            "postgresql://step:pw@127.0.0.1:9/stepca?sslmode=verify-full",
+            Path::new("/nonexistent/root_ca.crt"),
+            Duration::from_secs(1),
+            started + Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("Failed to connect to PostgreSQL"),
+            "{message}"
+        );
+        assert!(message.contains("/nonexistent/root_ca.crt"), "{message}");
+    }
+
+    #[test]
     fn quote_ident_handles_simple_name() {
         assert_eq!(quote_ident("my_table"), "\"my_table\"");
     }
@@ -980,11 +1231,11 @@ mod tests {
 
     #[test]
     fn for_compose_runtime_rewrites_host_and_port() {
-        let dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable";
+        let dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full";
         let translated = for_compose_runtime(dsn).unwrap();
         assert_eq!(
             translated,
-            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
     }
 
@@ -997,15 +1248,18 @@ mod tests {
         let translated = for_compose_runtime(dsn).unwrap();
         assert_eq!(
             translated,
-            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
     }
 
     #[test]
-    fn for_compose_runtime_preserves_sslmode() {
+    fn for_compose_runtime_rewrites_require() {
         let dsn = "postgresql://step:pw@localhost:5432/stepca?sslmode=require";
         let translated = for_compose_runtime(dsn).unwrap();
-        assert!(translated.ends_with("sslmode=require"));
+        assert!(
+            translated.ends_with("sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"),
+            "{translated}"
+        );
     }
 
     #[test]
@@ -1026,11 +1280,11 @@ mod tests {
         // holding no value, so the file is what decides.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(".env"), "POSTGRES_HOST_PORT=5433\n").expect("write .env");
-        let host_dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=disable";
+        let host_dsn = "postgresql://step:pw@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt";
         let compose = for_compose_runtime(host_dsn).unwrap();
         assert_eq!(
             compose,
-            "postgresql://step:pw@postgres:5432/stepca?sslmode=disable"
+            "postgresql://step:pw@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
         );
         let round_trip = for_host_runtime_with_port(
             &compose,

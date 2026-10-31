@@ -10,10 +10,10 @@ use bootroot::openbao::SecretIdOptions;
 use super::super::constants::openbao_constants::{
     APPROLE_BOOTROOT_INFRA_ROTATE, APPROLE_BOOTROOT_RESPONDER, APPROLE_BOOTROOT_RUNTIME_ROTATE,
     APPROLE_BOOTROOT_STEPCA, INIT_SECRET_SHARES, INIT_SECRET_THRESHOLD, MAX_SECRET_ID_TTL,
-    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_PASSWORD,
-    POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE, POLICY_BOOTROOT_RESPONDER,
-    POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD, POLICY_BOOTROOT_STEPCA,
-    RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
+    PATH_AGENT_EAB, PATH_CA_TRUST, PATH_RESPONDER_HMAC, PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN,
+    PATH_STEPCA_PASSWORD, POLICY_BOOTROOT_AGENT, POLICY_BOOTROOT_INFRA_ROTATE,
+    POLICY_BOOTROOT_RESPONDER, POLICY_BOOTROOT_RUNTIME_ROTATE, POLICY_BOOTROOT_RUNTIME_SERVICE_ADD,
+    POLICY_BOOTROOT_STEPCA, RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::super::constants::{
     CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME,
@@ -239,7 +239,9 @@ pub(super) async fn configure_openbao(
     }
     let approles = AppRoleLabel::approle_map();
 
-    let mut kv_paths = vec![PATH_STEPCA_PASSWORD, PATH_STEPCA_DB, PATH_RESPONDER_HMAC];
+    // `bootroot/stepca/db` is not among them: `write_stepca_db_secrets`
+    // writes it once `PostgreSQL` has accepted the DSN.
+    let mut kv_paths = vec![PATH_STEPCA_PASSWORD, PATH_RESPONDER_HMAC];
     if secrets.eab.is_some() {
         kv_paths.push(PATH_AGENT_EAB);
     }
@@ -271,7 +273,6 @@ async fn write_openbao_secrets_with_retry(
         client,
         kv_mount,
         &secrets.stepca_password,
-        &secrets.db_dsn,
         &secrets.http_hmac,
         secrets.eab.as_ref(),
         messages,
@@ -288,7 +289,6 @@ async fn write_openbao_secrets_with_retry(
                 client,
                 kv_mount,
                 &secrets.stepca_password,
-                &secrets.db_dsn,
                 &secrets.http_hmac,
                 secrets.eab.as_ref(),
                 messages,
@@ -575,7 +575,6 @@ async fn write_openbao_secrets(
     client: &OpenBaoClient,
     kv_mount: &str,
     stepca_password: &str,
-    db_dsn: &str,
     http_hmac: &str,
     eab: Option<&EabCredentials>,
     messages: &Messages,
@@ -585,14 +584,6 @@ async fn write_openbao_secrets(
             kv_mount,
             PATH_STEPCA_PASSWORD,
             serde_json::json!({ "value": stepca_password }),
-        )
-        .await
-        .with_context(|| messages.error_openbao_kv_write_failed())?;
-    client
-        .write_kv(
-            kv_mount,
-            PATH_STEPCA_DB,
-            serde_json::json!({ "value": db_dsn }),
         )
         .await
         .with_context(|| messages.error_openbao_kv_write_failed())?;
@@ -611,6 +602,47 @@ async fn write_openbao_secrets(
                 PATH_AGENT_EAB,
                 serde_json::json!({ "kid": eab.kid, "hmac": eab.hmac }),
             )
+            .await
+            .with_context(|| messages.error_openbao_kv_write_failed())?;
+    }
+    Ok(())
+}
+
+/// Writes the DSN stored for step-ca to `bootroot/stepca/db` and, with
+/// `db-provision`, the admin DSN to `bootroot/stepca/db_admin`.
+///
+/// `init` calls this only once `PostgreSQL` has accepted a connection and
+/// provisioning and the database check have passed, so a DSN that fails
+/// any of them never reaches the KV. Each path this run creates is
+/// recorded for rollback before it is written, as `configure_openbao`
+/// does for its own; the mount exists, since `configure_openbao` ensured
+/// it.
+///
+/// `bootroot/stepca/db_admin` carries strictly higher privilege than
+/// `bootroot/stepca/db`: `rotate db` reads it with the operator or root
+/// token so the operator does not pass `--db-admin-dsn` on every
+/// rotation, and neither the step-ca runtime nor the infra agent policy
+/// may include it.
+pub(super) async fn write_stepca_db_secrets(
+    client: &OpenBaoClient,
+    kv_mount: &str,
+    db_dsn: &str,
+    admin_dsn: Option<&str>,
+    rollback: &mut InitRollback,
+    messages: &Messages,
+) -> Result<()> {
+    let writes = std::iter::once((PATH_STEPCA_DB, db_dsn))
+        .chain(admin_dsn.map(|admin_dsn| (PATH_STEPCA_DB_ADMIN, admin_dsn)));
+    for (path, value) in writes {
+        if !client
+            .kv_exists(kv_mount, path)
+            .await
+            .with_context(|| messages.error_openbao_kv_exists_failed())?
+        {
+            rollback.written_kv_paths.push(path.to_string());
+        }
+        client
+            .write_kv(kv_mount, path, serde_json::json!({ "value": value }))
             .await
             .with_context(|| messages.error_openbao_kv_write_failed())?;
     }

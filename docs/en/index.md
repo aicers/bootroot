@@ -207,9 +207,10 @@ automation path. For example, place `step-ca+PostgreSQL` on a CA machine,
 edge service machine. Also, we cannot guarantee that the current `bootroot`
 setup fully supports this topology class.
 
-In that split-deployment class, do not reuse the local PostgreSQL examples
-with `sslmode=disable`. Configure PostgreSQL TLS and choose an appropriate
-`sslmode` for the remote trust boundary.
+In that split-deployment class, step-ca's PostgreSQL connection crosses a
+trust boundary. The PostgreSQL bootroot runs beside step-ca accepts only
+TLS, verified for the name `postgres`; a PostgreSQL elsewhere needs its own
+TLS and a DSN that verifies it.
 
 Services added by `bootroot service add` may run either on the same machine as
 step-ca or on different machines. In both `--delivery-mode`s the runtime

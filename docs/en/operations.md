@@ -75,6 +75,22 @@ bootroot monitoring status
 - Back up the PostgreSQL database regularly.
 - Test restores in a staging environment.
 - Store backups in a secure location with restricted access.
+- PostgreSQL accepts TCP connections only over TLS 1.3 with the hybrid
+  post-quantum key exchange X25519MLKEM768, on the compose network and on
+  the published port alike; a plaintext TCP connection is refused.
+- For a shell, use the Unix socket inside the container:
+  `docker compose exec postgres psql -U step -d stepca`.
+- A `psql` on the host needs a libpq built on OpenSSL 3.5 or later, and
+  connects with `sslmode=verify-full sslrootcert=secrets/certs/root_ca.crt
+  host=postgres hostaddr=127.0.0.1 port=<POSTGRES_HOST_PORT>`: the server's
+  certificate is valid for the name `postgres` only.
+- The TLS settings live in `secrets/postgres/docker-compose.postgres-tls.yml`
+  and `postgres/pg_hba.conf`, which `bootroot init` writes. Anyone running
+  `docker compose up` on this stack with their own `-f` list must include
+  `secrets/postgres/docker-compose.postgres-tls.yml`, or Compose recreates
+  PostgreSQL without TLS and step-ca cannot connect. `bootroot infra up`
+  includes it; `bootroot infra install`, run again over an initialised
+  stack, does not, and `bootroot infra up` afterwards restores it.
 
 ## HTTP-01 responder
 

@@ -615,6 +615,32 @@ pub(crate) fn validate_stepca_override_scope(
     Ok(())
 }
 
+/// Validates that the `PostgreSQL` TLS compose override `init` writes
+/// does not publish any guarded service on a non-loopback address.
+///
+/// The override only sets `PostgreSQL`'s command and mounts, so no
+/// service is exempt — `postgres` included. Only `ports:` is read;
+/// otherwise the file is as trusted as the compose file.
+///
+/// # Errors
+///
+/// Returns an error naming the first guarded service that publishes a
+/// non-loopback port.
+pub(crate) fn validate_postgres_tls_override_scope(
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let content = fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&override_path.display().to_string()))?;
+    for service in GUARDED_SERVICES {
+        if has_unsafe_port_binding_for_service(&content, service) {
+            let name = service.trim_end_matches(':');
+            anyhow::bail!(messages.error_service_port_binding_unsafe(name));
+        }
+    }
+    Ok(())
+}
+
 /// Validates that `OpenBao` TLS is configured for non-loopback binding.
 ///
 /// Parses `tls_cert_file` and `tls_key_file` from `openbao.hcl` to
@@ -2196,6 +2222,65 @@ services:
         .unwrap();
         let result = validate_openbao_override_scope(&override_path, &messages);
         assert!(result.is_err());
+    }
+
+    /// The `PostgreSQL` TLS override exempts no service, `postgres`
+    /// included.
+    #[test]
+    fn validate_postgres_tls_override_scope_rejects_postgres_non_loopback() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("override.yml");
+        std::fs::write(
+            &override_path,
+            "\
+services:
+  postgres:
+    command:
+      - \"postgres\"
+    ports: !override
+      - \"0.0.0.0:5432:5432\"
+",
+        )
+        .unwrap();
+        let err = validate_postgres_tls_override_scope(&override_path, &messages).unwrap_err();
+        assert!(err.to_string().contains("postgres"), "{err}");
+    }
+
+    #[test]
+    fn validate_postgres_tls_override_scope_rejects_another_guarded_service() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("override.yml");
+        std::fs::write(
+            &override_path,
+            "\
+services:
+  openbao:
+    ports:
+      - \"192.168.1.10:8200:8200\"
+",
+        )
+        .unwrap();
+        assert!(validate_postgres_tls_override_scope(&override_path, &messages).is_err());
+    }
+
+    #[test]
+    fn validate_postgres_tls_override_scope_accepts_a_loopback_publish() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("override.yml");
+        std::fs::write(
+            &override_path,
+            "\
+services:
+  postgres:
+    ports:
+      - \"127.0.0.1:5433:5432\"
+",
+        )
+        .unwrap();
+        validate_postgres_tls_override_scope(&override_path, &messages).unwrap();
     }
 
     #[test]
