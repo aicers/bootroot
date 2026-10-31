@@ -545,6 +545,25 @@ impl Messages {
         )
     }
 
+    pub(crate) fn info_postgres_tls_config_written(
+        &self,
+        override_path: &str,
+        hba_path: &str,
+    ) -> String {
+        format_template(
+            self.strings().info_postgres_tls_config_written,
+            &[("override_path", override_path), ("hba_path", hba_path)],
+        )
+    }
+
+    pub(crate) fn info_postgres_tls_waiting(&self) -> &'static str {
+        self.strings().info_postgres_tls_waiting
+    }
+
+    pub(crate) fn error_postgres_tls_wait_failed(&self) -> &'static str {
+        self.strings().error_postgres_tls_wait_failed
+    }
+
     pub(crate) fn error_postgres_tls_provision_failed(&self) -> &'static str {
         self.strings().error_postgres_tls_provision_failed
     }

@@ -356,11 +356,10 @@ pub(crate) async fn expect_rollback_deletes(server: &MockServer, include_ca_trus
             .await;
     }
 
-    let mut secrets = vec![
-        "bootroot/stepca/password",
-        "bootroot/stepca/db",
-        "bootroot/responder/hmac",
-    ];
+    // `bootroot/stepca/db` is written only after the database steps,
+    // which follow `configure_openbao`'s batch, so a failure inside that
+    // batch has not created it.
+    let mut secrets = vec!["bootroot/stepca/password", "bootroot/responder/hmac"];
     if include_ca_trust {
         secrets.push("bootroot/ca");
     }

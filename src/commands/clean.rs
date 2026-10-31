@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
@@ -8,7 +8,10 @@ use crate::commands::compose_file::compose_file_dir;
 use crate::commands::compose_project::{ComposeIdentity, DOCKER_BIN};
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::{run_compose, run_compose_with_exec, run_docker_with_exec};
-use crate::commands::init::{POSTGRES_COMPOSE_DIR, prompt_yes_no};
+use crate::commands::init::{
+    POSTGRES_COMPOSE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_NAME,
+    prompt_yes_no,
+};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -49,21 +52,13 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
     let compose_dir = compose_file_dir(&args.compose_file.compose_file);
     let compose_dir = compose_dir.as_path();
 
-    let compose_str = args.compose_file.compose_file.to_string_lossy();
     let identity = ComposeIdentity::resolve_for_dir(compose_dir, None, messages)?;
-    let mut down_files: Vec<&str> = vec![&compose_str];
-
-    let agent_override_path = compose_dir.join(OPENBAO_AGENT_OVERRIDE);
-    let agent_override_str = agent_override_path.to_string_lossy();
-    if agent_override_path.exists() {
-        down_files.push(&agent_override_str);
-    }
-
-    let exposed_override_path = compose_dir.join(OPENBAO_EXPOSED_OVERRIDE);
-    let exposed_override_str = exposed_override_path.to_string_lossy();
-    if exposed_override_path.exists() {
-        down_files.push(&exposed_override_str);
-    }
+    let down_paths = clean_down_files(&args.compose_file.compose_file, compose_dir);
+    let down_strs: Vec<String> = down_paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let down_files: Vec<&str> = down_strs.iter().map(String::as_str).collect();
 
     let down = identity.compose(&down_files, None, &["down", "-v", "--remove-orphans"]);
     run_compose(&down, "docker compose down", messages)?;
@@ -77,6 +72,23 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 
     println!("{}", messages.clean_completed());
     Ok(())
+}
+
+/// Returns the compose files `clean` passes to `docker compose down`:
+/// the compose file, then each override `init` or `infra install` wrote
+/// that is present.
+fn clean_down_files(compose_file: &Path, compose_dir: &Path) -> Vec<PathBuf> {
+    let overrides = [
+        compose_dir.join(OPENBAO_AGENT_OVERRIDE),
+        compose_dir.join(OPENBAO_EXPOSED_OVERRIDE),
+        compose_dir
+            .join("secrets")
+            .join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR)
+            .join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME),
+    ];
+    std::iter::once(compose_file.to_path_buf())
+        .chain(overrides.into_iter().filter(|path| path.exists()))
+        .collect()
 }
 
 /// Removes only the `bootroot-openbao` container and its volume.
@@ -301,13 +313,40 @@ mod tests {
         assert!(!compose_dir.join("state.json").exists());
     }
 
-    /// A full clean leaves no private key behind.
+    /// The `PostgreSQL` TLS override joins `down` when `init` wrote it,
+    /// after the compose file and the other overrides.
+    #[test]
+    fn clean_down_files_carry_the_postgres_tls_override_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        let compose_file = root.path().join("docker-compose.yml");
+        assert_eq!(
+            clean_down_files(&compose_file, root.path()),
+            vec![compose_file.clone()]
+        );
+
+        let exposed = root.path().join(OPENBAO_EXPOSED_OVERRIDE);
+        std::fs::create_dir_all(exposed.parent().unwrap()).unwrap();
+        std::fs::write(&exposed, "services: {}").unwrap();
+        let postgres_tls = root
+            .path()
+            .join("secrets/postgres/docker-compose.postgres-tls.yml");
+        std::fs::create_dir_all(postgres_tls.parent().unwrap()).unwrap();
+        std::fs::write(&postgres_tls, "services: {}").unwrap();
+
+        assert_eq!(
+            clean_down_files(&compose_file, root.path()),
+            vec![compose_file, exposed, postgres_tls]
+        );
+    }
+
+    /// A full clean leaves no private key behind, nor `pg_hba.conf`.
     #[test]
     fn clean_removes_the_postgres_directory() {
         let root = tempfile::tempdir().unwrap();
         let tls_dir = root.path().join("postgres").join("tls");
         std::fs::create_dir_all(&tls_dir).unwrap();
         std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+        std::fs::write(root.path().join("postgres").join("pg_hba.conf"), "hba").unwrap();
 
         remove_clean_artifacts(
             root.path(),

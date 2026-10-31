@@ -1,14 +1,18 @@
+use std::fmt::Write as _;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::db::DB_COMPOSE_HOST;
+use bootroot::fs_util;
 
 use super::openbao_tls::{TLS_OUTPUT_MOUNT, chown_tls_output_dir, reject_symlinked_tls_output_dir};
-use crate::commands::infra::run_docker_with_exec;
+use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation};
+use crate::commands::infra::{run_compose, run_docker_with_exec};
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_TLS_DEFAULT_NOT_AFTER,
-    OPENBAO_TLS_DEFAULT_RENEW_BEFORE, POSTGRES_INFRA_CERT_KEY, POSTGRES_TLS_CERT_PATH,
+    OPENBAO_TLS_DEFAULT_RENEW_BEFORE, POSTGRES_HBA_CONF_PATH, POSTGRES_INFRA_CERT_KEY,
+    POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR, POSTGRES_TLS_COMPOSE_OVERRIDE_NAME,
     POSTGRES_TLS_DIR, POSTGRES_TLS_KEY_PATH,
 };
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
@@ -38,6 +42,38 @@ const POSTGRES_TLS_KEY_MODE: u32 = 0o600;
 /// Signal that reloads `PostgreSQL`'s certificate files and keeps its
 /// open sessions.
 const POSTGRES_RELOAD_SIGNAL: &str = "SIGHUP";
+
+/// Mode of `pg_hba.conf`: the server reads it as uid 999, which does not
+/// own it, and it holds no secret.
+const POSTGRES_HBA_CONF_MODE: u32 = 0o644;
+/// Where the container sees the certificate directory.
+const POSTGRES_TLS_CONTAINER_DIR: &str = "/tls";
+/// Where the container sees `pg_hba.conf`; outside `PGDATA`, so nothing
+/// is written into the data volume.
+const POSTGRES_HBA_CONTAINER_PATH: &str = "/etc/postgresql/pg_hba.conf";
+
+/// The server's command line under the override: TLS 1.3 only, with
+/// the hybrid post-quantum group alone, on the certificate `init` issues
+/// and with bootroot's `pg_hba.conf`. `PostgreSQL` 18 offers
+/// `X25519:prime256v1` unless told otherwise.
+const POSTGRES_TLS_SETTINGS: [&str; 6] = [
+    "ssl=on",
+    "ssl_cert_file=/tls/server.crt",
+    "ssl_key_file=/tls/server.key",
+    "ssl_min_protocol_version=TLSv1.3",
+    "ssl_groups=X25519MLKEM768",
+    "hba_file=/etc/postgresql/pg_hba.conf",
+];
+
+/// `pg_hba.conf`: the Unix socket inside the container stays `trust`, as
+/// in the image's own default, so its init scripts and `docker compose
+/// exec postgres psql` keep working; every TCP connection must be TLS and
+/// authenticate with `scram-sha-256`, and plaintext TCP is rejected.
+const POSTGRES_HBA_CONF: &str = "\
+local     all  all        trust
+hostssl   all  all  all   scram-sha-256
+host      all  all  all   reject
+";
 
 /// Builds the SANs list for the `PostgreSQL` TLS certificate: the compose
 /// service name alone.
@@ -284,12 +320,129 @@ pub(in crate::commands::init) fn record_postgres_infra_cert(
     Ok(())
 }
 
+/// Writes `<compose dir>/postgres/pg_hba.conf` and the compose override
+/// that starts `PostgreSQL` with its TLS settings, returning the
+/// override's path.
+///
+/// The override, `<secrets dir>/postgres/docker-compose.postgres-tls.yml`,
+/// carries the server's command line and mounts the certificate
+/// directory [`issue_postgres_tls_cert`] fills and `pg_hba.conf`, by
+/// absolute host paths. Both files are rewritten on every `init`, and
+/// published by rename without a flush: `init` regenerates them.
+///
+/// # Errors
+///
+/// Returns an error when the compose directory cannot be resolved, or
+/// either file or the override's directory cannot be written.
+pub(in crate::commands::init) async fn write_postgres_tls_files(
+    compose_dir: &Path,
+    secrets_dir: &Path,
+    messages: &Messages,
+) -> Result<PathBuf> {
+    let hba_path = compose_dir.join(POSTGRES_HBA_CONF_PATH);
+    // `PreserveOrUmask` would leave the file `0600` under a `077` umask,
+    // which uid 999 cannot read.
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&hba_path),
+        POSTGRES_HBA_CONF.as_bytes(),
+        fs_util::StagedMode::Policy(POSTGRES_HBA_CONF_MODE),
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&hba_path.display().to_string()))?;
+
+    let compose_root = std::fs::canonicalize(compose_dir)
+        .with_context(|| messages.error_resolve_path_failed(&compose_dir.display().to_string()))?;
+    let override_dir = secrets_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR);
+    fs_util::ensure_shared_secrets_dir(&override_dir).await?;
+    let override_path = override_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
+    // The same three decisions as the responder override: published by
+    // rename, not flushed, at the destination's mode or the umask's
+    // answer on a create.
+    fs_util::atomic_replace(
+        fs_util::Destination::operator_named(&override_path),
+        postgres_tls_override_contents(&compose_root).as_bytes(),
+        fs_util::StagedMode::PreserveOrUmask,
+    )
+    .await
+    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+
+    println!(
+        "{}",
+        messages.info_postgres_tls_config_written(
+            &override_path.display().to_string(),
+            &hba_path.display().to_string(),
+        )
+    );
+    Ok(override_path)
+}
+
+/// Builds the override's contents for a canonical compose directory.
+///
+/// The `volumes` entries merge with the base file's `postgres-data`
+/// mount; `command` replaces the image's default.
+fn postgres_tls_override_contents(compose_root: &Path) -> String {
+    let mut contents =
+        format!("services:\n  {DB_COMPOSE_HOST}:\n    command:\n      - \"postgres\"\n");
+    for setting in POSTGRES_TLS_SETTINGS {
+        let _ = write!(contents, "      - \"-c\"\n      - \"{setting}\"\n");
+    }
+    let _ = write!(
+        contents,
+        "    volumes:\n      - \"{tls}:{POSTGRES_TLS_CONTAINER_DIR}:ro\"\n      - \"{hba}:{POSTGRES_HBA_CONTAINER_PATH}:ro\"\n",
+        tls = compose_root.join(POSTGRES_TLS_DIR).display(),
+        hba = compose_root.join(POSTGRES_HBA_CONF_PATH).display(),
+    );
+    contents
+}
+
+/// Builds the invocation that recreates `PostgreSQL` with its TLS
+/// override: `-f <compose file> -f <override> up -d --no-deps
+/// --force-recreate postgres`, under the install's project.
+///
+/// `--force-recreate` so a re-run of `init`, and `reinit`, load a
+/// re-issued leaf even when Compose sees no change in the service;
+/// `--no-deps` so no other service is touched with a file set that
+/// lacks its own overrides.
+fn postgres_tls_recreate_invocation(
+    identity: &ComposeIdentity,
+    compose_file: &Path,
+    override_path: &Path,
+) -> ComposeInvocation {
+    identity.compose(
+        &[
+            &compose_file.to_string_lossy(),
+            &override_path.to_string_lossy(),
+        ],
+        None,
+        &["up", "-d", "--no-deps", "--force-recreate", DB_COMPOSE_HOST],
+    )
+}
+
+/// Recreates `PostgreSQL` with its TLS override.
+///
+/// # Errors
+///
+/// Returns an error when `docker compose` fails.
+pub(in crate::commands::init) fn recreate_postgres_with_tls(
+    identity: &ComposeIdentity,
+    compose_file: &Path,
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    run_compose(
+        &postgres_tls_recreate_invocation(identity, compose_file, override_path),
+        "docker compose up -d --force-recreate postgres (tls)",
+        messages,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::super::test_support::{test_messages, write_self_contained_fake_docker_exiting};
     use super::*;
+    use crate::commands::compose_project::DOCKER_COMPOSE_SUBCOMMAND;
     use crate::test_support::write_executable;
 
     /// A compose and a secrets directory under `base`, as `init` finds
@@ -577,5 +730,132 @@ esac
         let entry = state.infra_certs.get(POSTGRES_INFRA_CERT_KEY).unwrap();
         assert!(entry.cert_path.is_absolute());
         assert!(entry.key_path.is_absolute());
+    }
+
+    /// The exact override: absolute paths from the canonical compose
+    /// directory, and every setting of the server's command line.
+    #[test]
+    fn the_override_carries_the_command_and_both_mounts() {
+        let contents = postgres_tls_override_contents(Path::new("/srv/bootroot"));
+        assert_eq!(
+            contents,
+            "\
+services:
+  postgres:
+    command:
+      - \"postgres\"
+      - \"-c\"
+      - \"ssl=on\"
+      - \"-c\"
+      - \"ssl_cert_file=/tls/server.crt\"
+      - \"-c\"
+      - \"ssl_key_file=/tls/server.key\"
+      - \"-c\"
+      - \"ssl_min_protocol_version=TLSv1.3\"
+      - \"-c\"
+      - \"ssl_groups=X25519MLKEM768\"
+      - \"-c\"
+      - \"hba_file=/etc/postgresql/pg_hba.conf\"
+    volumes:
+      - \"/srv/bootroot/postgres/tls:/tls:ro\"
+      - \"/srv/bootroot/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro\"
+"
+        );
+    }
+
+    /// Both files land where the override's mounts and `infra up` look
+    /// for them; `pg_hba.conf` is `0644` whatever the umask, and the
+    /// override passes the scope check `init` and `infra up` run.
+    #[tokio::test]
+    async fn writing_the_files_publishes_pg_hba_and_the_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::create_dir_all(&tls_dir).unwrap();
+        let messages = test_messages();
+
+        let override_path = write_postgres_tls_files(&compose_dir, &secrets_dir, &messages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            override_path,
+            secrets_dir.join("postgres/docker-compose.postgres-tls.yml")
+        );
+        let compose_root = fs::canonicalize(&compose_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(&override_path).unwrap(),
+            postgres_tls_override_contents(&compose_root)
+        );
+        let hba = compose_dir.join("postgres/pg_hba.conf");
+        assert_eq!(
+            fs::read_to_string(&hba).unwrap(),
+            "\
+local     all  all        trust
+hostssl   all  all  all   scram-sha-256
+host      all  all  all   reject
+"
+        );
+        assert_eq!(
+            fs::metadata(&hba).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        crate::commands::guardrails::validate_postgres_tls_override_scope(
+            &override_path,
+            &messages,
+        )
+        .expect("the generated override publishes no port");
+    }
+
+    /// A `pg_hba.conf` narrowed by hand is put back to `0644`, which the
+    /// server needs to read it.
+    #[tokio::test]
+    async fn writing_the_files_resets_pg_hba_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::create_dir_all(&tls_dir).unwrap();
+        let hba = compose_dir.join("postgres/pg_hba.conf");
+        fs::write(&hba, "stale").unwrap();
+        fs::set_permissions(&hba, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_postgres_tls_files(&compose_dir, &secrets_dir, &test_messages())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&hba).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn the_recreate_applies_the_override_to_postgres_alone() {
+        let identity = ComposeIdentity::for_instance("insight");
+        let invocation = postgres_tls_recreate_invocation(
+            &identity,
+            Path::new("/srv/bootroot/docker-compose.yml"),
+            Path::new("/srv/bootroot/secrets/postgres/docker-compose.postgres-tls.yml"),
+        );
+        let args: Vec<String> = invocation
+            .command(&[])
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                DOCKER_COMPOSE_SUBCOMMAND,
+                "-f",
+                "/srv/bootroot/docker-compose.yml",
+                "-f",
+                "/srv/bootroot/secrets/postgres/docker-compose.postgres-tls.yml",
+                "-p",
+                "insight",
+                "up",
+                "-d",
+                "--no-deps",
+                "--force-recreate",
+                "postgres",
+            ]
+        );
     }
 }

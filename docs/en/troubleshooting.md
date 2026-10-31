@@ -108,9 +108,35 @@ If you see `dial tcp 127.0.0.1:5432: connect: connection refused`, DSN host in
 - `localhost`/`127.0.0.1`/`::1` input should be normalized to `postgres`
 - Remote hosts like `db.internal` fail by design under single-host guardrails
 - Check init summary DB host conversion line (`from -> to`)
-- If you intentionally split step-ca and PostgreSQL across machines, do not
-  reuse the local `sslmode=disable` example. Use PostgreSQL TLS with
-  `sslmode=require` or `sslmode=verify-full`.
+- The stored DSN must end with
+  `?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt`; PostgreSQL
+  refuses plaintext TCP connections. `bootroot init` sets both on whatever
+  DSN it stores, so re-run `init` rather than editing `sslmode` by hand.
+- An admin DSN with `sslmode=disable` (`POSTGRES_SSLMODE` in `.env`, or
+  `--db-admin-dsn`) is refused by PostgreSQL with a `pg_hba.conf` error. Drop
+  the `sslmode` or set `verify-full`.
+
+### step-ca cannot reach PostgreSQL after `docker compose up`
+
+If step-ca fails with a TLS error (for example, the server does not support
+SSL) or a `pg_hba.conf` error after a `docker compose up` run with your own
+`-f` list, that run left out the PostgreSQL TLS override and Compose
+recreated PostgreSQL without TLS. Nothing falls back to plaintext.
+
+- Run `bootroot infra up`, which applies
+  `secrets/postgres/docker-compose.postgres-tls.yml`, or add that file to
+  your `-f` list.
+- The same happens after `bootroot infra install` is run again over an
+  initialised stack; `bootroot infra up` restores it.
+
+### `init` fails waiting for PostgreSQL
+
+`init` recreates PostgreSQL with its TLS settings and waits up to 60 seconds
+for a TLS connection. If the wait expires, the error names PostgreSQL and
+the last connection error; check `docker logs <instance>-postgres`. A key
+whose owner or mode was changed by hand stops PostgreSQL from starting:
+`bootroot rotate infra-cert` or a re-run of `init` re-applies them. A
+certificate verification or authentication error ends the wait at once.
 
 ### responder check failures
 

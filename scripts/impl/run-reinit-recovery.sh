@@ -439,6 +439,23 @@ assert_post_reinit_contracts() {
     } >>"$RUN_LOG"
     fail "[$label] bootroot status against https://${OPENBAO_BIND_ADDR} failed after reinit"
   fi
+
+  # 6. PostgreSQL still serves TLS, and step-ca reaches it with
+  # `verify-full`.  The service registry is empty, so `bootroot verify
+  # --db-check` cannot run here; reinit's own `init` pass already waited
+  # for a TLS connection with the preserved DSN before it got this far.
+  local ssl
+  ssl="$(compose exec -T postgres psql -U step -d stepca -Atc 'show ssl' 2>>"$RUN_LOG")" ||
+    fail "[$label] could not read ssl from postgres after reinit"
+  if [ "$ssl" != "on" ]; then
+    fail "[$label] post-reinit postgres ssl='$ssl' expected 'on'"
+  fi
+  local dsn
+  dsn="$(jq -r '.db.dataSource // empty' "$ca_json")"
+  case "$dsn" in
+    *"@postgres:5432/"*"?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt") ;;
+    *) fail "[$label] post-reinit ca.json db.dataSource does not carry sslmode=verify-full against the CA root" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------

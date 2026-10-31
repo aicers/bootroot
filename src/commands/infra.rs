@@ -32,15 +32,16 @@ use crate::commands::guardrails::{
     validate_http01_admin_bind, validate_http01_admin_tls, validate_http01_override_binding,
     validate_http01_override_scope, validate_openbao_advertise_addr, validate_openbao_bind,
     validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
-    validate_stepca_advertise_addr, validate_stepca_bind, validate_stepca_override_binding,
-    validate_stepca_override_scope, write_http01_exposed_override, write_openbao_exposed_override,
-    write_stepca_exposed_override,
+    validate_postgres_tls_override_scope, validate_stepca_advertise_addr, validate_stepca_bind,
+    validate_stepca_override_binding, validate_stepca_override_scope,
+    write_http01_exposed_override, write_openbao_exposed_override, write_stepca_exposed_override,
 };
 use crate::commands::init::{
     ComposeServices, DEFAULT_KV_MOUNT, HTTP01_ADMIN_INFRA_CERT_KEY,
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_INFRA_CERT_KEY, OpenBaoAuditDevice, RESPONDER_COMPOSE_OVERRIDE_NAME,
-    RESPONDER_CONFIG_DIR, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME, compose_has_responder,
+    OPENBAO_INFRA_CERT_KEY, OpenBaoAuditDevice, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR,
+    POSTGRES_TLS_COMPOSE_OVERRIDE_NAME, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
+    STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME, compose_has_postgres, compose_has_responder,
     compose_has_stepca, compose_up_reaches_service, sync_openbao_audit_device,
 };
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
@@ -121,6 +122,9 @@ struct UpComposeOverrides<'a> {
     responder_config: Option<&'a str>,
     http01: Option<&'a str>,
     stepca: Option<&'a str>,
+    /// The `PostgreSQL` TLS override `init` wrote, rewriting `command:`
+    /// and adding mounts.
+    postgres_tls: Option<&'a str>,
 }
 
 /// Orders the `-f` arguments of an `infra up`.
@@ -135,6 +139,9 @@ struct UpComposeOverrides<'a> {
 /// The responder's rendered config is mounted before its exposed-port
 /// override, so a recreated container starts on the deployment's HMAC
 /// and, when HTTP-01 admin TLS is on, with TLS active.
+///
+/// The `PostgreSQL` TLS override comes last; it touches no other
+/// service, so a recreated `PostgreSQL` keeps serving TLS only.
 fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
     let mut files: Vec<&str> = vec![overrides.compose_file];
     files.extend(
@@ -144,6 +151,7 @@ fn up_compose_files<'a>(overrides: &UpComposeOverrides<'a>) -> Vec<&'a str> {
             overrides.responder_config,
             overrides.http01,
             overrides.stepca,
+            overrides.postgres_tls,
         ]
         .into_iter()
         .flatten(),
@@ -292,6 +300,18 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         } else {
             None
         };
+    // Without it Compose would see `PostgreSQL`'s configuration change
+    // and recreate it without TLS, which step-ca's `verify-full`
+    // connection then cannot reach.
+    let postgres_tls_override = resolve_postgres_tls_override(
+        &state_path,
+        compose_dir,
+        &args.compose_file.compose_file,
+        messages,
+    )?;
+    if let Some(path) = postgres_tls_override.as_deref() {
+        validate_postgres_tls_override_scope(path, messages)?;
+    }
 
     // Derive the effective OpenBao URL.  When the non-loopback override
     // is active, OpenBao listens on the bind address with TLS, so the
@@ -351,6 +371,9 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     let audit_override_str = audit_override
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    let postgres_tls_override_str = postgres_tls_override
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     let up_files = up_compose_files(&UpComposeOverrides {
         compose_file: &compose_str,
         openbao: openbao_override_str.as_deref(),
@@ -358,6 +381,7 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         responder_config: responder_config_override_str.as_deref(),
         http01: http01_override_str.as_deref(),
         stepca: stepca_override_str.as_deref(),
+        postgres_tls: postgres_tls_override_str.as_deref(),
     });
     let mut up_tail: Vec<&str> = vec!["up", "-d"];
     up_tail.extend(&svc_refs);
@@ -1816,6 +1840,37 @@ fn resolve_responder_compose_override(
     } else {
         Ok(None)
     }
+}
+
+/// Resolves the `PostgreSQL` TLS compose override `bootroot init` wrote.
+///
+/// Returns the path whenever the override is present under the recorded
+/// secrets directory and the compose file declares `postgres`, so that
+/// an `infra up` that recreates `PostgreSQL` keeps its TLS settings.
+///
+/// Returns `None` when there is no state file, the compose file does not
+/// declare `postgres`, or the override does not exist, which is the case
+/// before `bootroot init` has run.
+fn resolve_postgres_tls_override(
+    state_path: &Path,
+    compose_dir: &Path,
+    compose_file: &Path,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    if !state_path.exists() || !compose_has_postgres(compose_file, messages)? {
+        return Ok(None);
+    }
+    let state = StateFile::load(state_path)?;
+    let secrets_dir = state.secrets_dir();
+    let secrets_base = if secrets_dir.is_relative() {
+        compose_dir.join(secrets_dir)
+    } else {
+        secrets_dir.to_path_buf()
+    };
+    let override_path = secrets_base
+        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR)
+        .join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
+    Ok(override_path.exists().then_some(override_path))
 }
 
 /// Derives the effective `OpenBao` URL from a stored non-loopback bind
@@ -4201,6 +4256,7 @@ mod tests {
                 responder_config: None,
                 http01: None,
                 stepca: None,
+                postgres_tls: None,
             }),
             vec![compose, exposed_str.as_str(), audit_str.as_str()]
         );
@@ -4220,11 +4276,114 @@ mod tests {
                 responder_config: None,
                 http01: None,
                 stepca: None,
+                postgres_tls: None,
             })
         };
         assert_eq!(files(Some(exposed), None), vec![compose, exposed]);
         assert_eq!(files(None, Some(audit)), vec![compose, audit]);
         assert_eq!(files(None, None), vec![compose]);
+    }
+
+    /// The `PostgreSQL` TLS override goes last, after every other file.
+    #[test]
+    fn the_bring_up_file_order_ends_with_the_postgres_tls_override() {
+        let compose = "docker-compose.yml";
+        let stepca = "secrets/step-ca/docker-compose.stepca-exposed.yml";
+        let postgres_tls = "secrets/postgres/docker-compose.postgres-tls.yml";
+        let files = |stepca, postgres_tls| {
+            up_compose_files(&UpComposeOverrides {
+                compose_file: compose,
+                openbao: None,
+                audit: None,
+                responder_config: None,
+                http01: None,
+                stepca,
+                postgres_tls,
+            })
+        };
+        assert_eq!(
+            files(Some(stepca), Some(postgres_tls)),
+            vec![compose, stepca, postgres_tls]
+        );
+        assert_eq!(files(None, Some(postgres_tls)), vec![compose, postgres_tls]);
+    }
+
+    /// Writes a compose file that declares `postgres` and a state file
+    /// recording the default secrets directory, as an initialized
+    /// install has them.
+    fn postgres_compose_and_state(dir: &Path) -> (PathBuf, PathBuf) {
+        let compose_file = dir.join("docker-compose.yml");
+        std::fs::write(
+            &compose_file,
+            "services:\n  postgres:\n    image: postgres:18.4\n",
+        )
+        .unwrap();
+        let state_path = dir.join("state.json");
+        StateFile {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        }
+        .save(&state_path)
+        .unwrap();
+        (compose_file, state_path)
+    }
+
+    #[test]
+    fn resolve_postgres_tls_override_is_none_before_init() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_file, state_path) = postgres_compose_and_state(dir.path());
+        assert!(
+            resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_file(&state_path).unwrap();
+        assert!(
+            resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_postgres_tls_override_returns_the_path_init_wrote() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_file, state_path) = postgres_compose_and_state(dir.path());
+        let override_path = dir
+            .path()
+            .join("secrets/postgres/docker-compose.postgres-tls.yml");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, "services: {}").unwrap();
+
+        assert_eq!(
+            resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages)
+                .unwrap(),
+            Some(override_path)
+        );
+    }
+
+    /// A compose file that does not declare `postgres` gets no override,
+    /// even when one is left on disk.
+    #[test]
+    fn resolve_postgres_tls_override_skips_a_compose_file_without_postgres() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_file, state_path) = postgres_compose_and_state(dir.path());
+        std::fs::write(&compose_file, "services: {}\n").unwrap();
+        let override_path = dir
+            .path()
+            .join("secrets/postgres/docker-compose.postgres-tls.yml");
+        std::fs::create_dir_all(override_path.parent().unwrap()).unwrap();
+        std::fs::write(&override_path, "services: {}").unwrap();
+
+        assert!(
+            resolve_postgres_tls_override(&state_path, dir.path(), &compose_file, &messages)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

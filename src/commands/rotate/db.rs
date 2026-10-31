@@ -137,7 +137,8 @@ pub(super) async fn rotate_db(
 /// back to its compose-internal form. Routing through
 /// `for_compose_runtime` also self-heals a DSN that was previously written
 /// with a bad host/port pair (e.g. `postgres:5433` from Symptom 1 of issue
-/// #542). `sslmode` and `sslrootcert` are carried through.
+/// #542), and sets `sslmode=verify-full` with the CA root as step-ca
+/// sees it, whatever the stored DSN said.
 fn rebuilt_runtime_dsn(parsed: &db::DbDsn, db_password: &str) -> Result<String> {
     let rebuilt_dsn = db::build_db_dsn(
         &parsed.user,
@@ -275,7 +276,7 @@ mod tests {
     use crate::cli::args::{DbAdminDsnArgs, DbTimeoutArgs};
 
     #[test]
-    fn rebuilt_runtime_dsn_keeps_sslmode_and_sslrootcert() {
+    fn rebuilt_runtime_dsn_is_verify_full_against_the_stepca_root() {
         let parsed = db::parse_db_dsn(
             "postgresql://stepca:old@127.0.0.1:5433/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt",
         )
@@ -289,7 +290,7 @@ mod tests {
         assert_eq!(
             rebuilt,
             format!(
-                "postgresql://stepca:{new}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/etc/ca.crt"
+                "postgresql://stepca:{new}@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
             )
         );
     }

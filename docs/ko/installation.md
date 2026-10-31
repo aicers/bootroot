@@ -140,20 +140,31 @@ Bootroot의 기본 배포에서는 step-ca가 HTTPS 엔드포인트에서 CA 인
 의 약어이며, 데이터베이스 연결 정보를 의미합니다. 형식은 다음과 같습니다.
 
 ```text
-postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
+postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>&sslrootcert=<path>
 ```
 
-예시:
+예시(Docker Compose, `bootroot init`이 저장하는 형태):
 
-- Docker Compose:
-  `postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable`
-- 운영(SSL 강제):
-  `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
+```text
+postgresql://step:step-pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt
+```
 
-`sslmode=disable` 예시는 step-ca와 PostgreSQL이 같은 머신, 같은 로컬 신뢰
-경계 안에 있는 기본 토폴로지 전용입니다. PostgreSQL을 다른 머신이나 다른
-네트워크 신뢰 경계로 분리하는 경우에는 이 로컬 예시를 그대로 재사용하지 말고
-PostgreSQL TLS와 적절한 `sslmode`를 사용해야 합니다.
+bootroot가 실행하는 PostgreSQL은 하이브리드 양자내성 키 교환
+X25519MLKEM768을 쓰는 TLS 1.3으로만 TCP 연결을 받고, `scram-sha-256`으로
+인증하며, `bootroot init`이 `postgres`라는 이름으로 발급한 인증서를
+제공합니다. 평문 TCP 연결은 거부되며, 컨테이너 안의 Unix 소켓만
+`docker compose exec postgres psql`을 계속 제공합니다. 따라서 step-ca는
+`sslmode=verify-full`로 연결해 그 인증서를 CA 루트에 대해 `postgres`라는
+이름으로 검증합니다. step-ca 컨테이너는 CA 루트를
+`/home/step/certs/root_ca.crt`(호스트에서는 `secrets/certs/root_ca.crt`)에서
+봅니다. `verify-ca`는 같은 CA가 발급한 다른 인증서도 받아들이므로 쓰지
+않습니다.
+
+`bootroot init`은 step-ca용으로 저장하는 모든 DSN — `ca.json`과 OpenBao에
+— 에 `sslmode=verify-full`과 위 `sslrootcert`를 설정합니다. `--db-dsn`으로
+준 DSN, `POSTGRES_*`로 만든 DSN, `--enable db-provision`이 프로비저닝한
+DSN 모두 해당합니다. DSN에 있던 `sslmode`는 `disable`이나 `require`라도
+바뀌며, `sslrootcert`도 마찬가지입니다.
 
 **중요**: step-ca가 컨테이너에서 실행 중이면 `db.dataSource`의 호스트는
 **컨테이너 내부 기준**입니다. 최종적으로는 Compose 서비스 이름(예:
@@ -162,8 +173,6 @@ PostgreSQL TLS와 적절한 `sslmode`를 사용해야 합니다.
 `bootroot init`의 `--db-dsn`/`--db-admin-dsn` 입력에서는
 `localhost`/`127.0.0.1`/`::1`도 허용되며, 내부적으로 `postgres`로
 정규화됩니다. 반면 `db.internal` 같은 원격 호스트는 init에서 실패합니다.
-
-`<secret>` 자리는 실제 운영 비밀번호를 넣어야 합니다.
 
 `step-pass`는 이 repo의 **개발용 기본 비밀번호**입니다. `.env`의
 `POSTGRES_PASSWORD`와 맞춰져야 하므로, 로컬/Compose 예시에서 동일하게
@@ -192,43 +201,27 @@ BOOTROOT_INSTANCE=bootroot
 읽습니다. 자세한 내용은 [CLI](cli.md)의 "인스턴스 정체성과 Compose
 프로젝트" 절을 참고하세요.
 
-`sslmode`는 환경 정책에 맞게 `disable`, `require`, `verify-full` 중에서
-선택합니다. 운영에서는 `require` 또는 `verify-full`을 권장합니다.
-
-`require`와 `verify-full`의 차이는 다음과 같습니다.
-
-- `require`: TLS는 사용하지만 **서버 인증서의 호스트명 검증은 생략**합니다.
-  내부 네트워크이거나 별도 인증서 검증 체계가 없는 경우에 사용합니다.
-- `verify-full`: TLS 사용 + **서버 인증서 체인과 호스트명**을 모두 검증합니다.
-  운영 환경에서 가장 안전하며, DB 서버의 인증서가 올바르게 설정되어 있어야
-  합니다.
-
-선택 기준:
-
-- 운영/보안 우선: `verify-full`
-- 내부망 테스트/임시 환경: `require`
-
-위 모드는 step-ca 자신의 연결에 대한 설명입니다. bootroot가 직접
-PostgreSQL에 맺는 연결 — `bootroot init`(DB 점검, 프로비저닝, 임시
-`POSTGRES_PASSWORD` 교체), `bootroot rotate db`, `bootroot verify
---db-check` — 은 `disable`을 제외한 모든 `sslmode`에서 TLS 1.3을
-사용하며, 어떤 모드든 서버를 완전히 검증합니다. 서버 인증서는
-`secrets/certs/root_ca.crt`의 CA 루트로 체인이 이어져야 하고 `postgres`라는
-이름에 대해 유효해야 합니다. 하이브리드 양자내성 키 교환
+bootroot가 직접 PostgreSQL에 맺는 연결 — `bootroot init`(PostgreSQL 대기,
+프로비저닝, DB 점검, 임시 `POSTGRES_PASSWORD` 교체), `bootroot rotate db`,
+`bootroot verify --db-check` — 은 DSN의 `sslmode`가 무엇이든 TLS 1.3을
+사용해 서버를 완전히 검증하며, 기본값은 `verify-full`입니다. 서버
+인증서는 `secrets/certs/root_ca.crt`의 CA 루트로 체인이 이어져야 하고
+`postgres`라는 이름에 대해 유효해야 합니다. 하이브리드 양자내성 키 교환
 X25519MLKEM768을 가장 먼저 제시하며, 평문이나 TLS 1.2로 되돌아가지
-않습니다. 연결은 DSN의 호스트로 맺으므로 호스트는 IP 주소이거나
-`localhost`(`127.0.0.1`로 연결)여야 합니다. 그 밖의 호스트 이름은 compose
-서비스 이름 `postgres`를 포함해 모두 거부되므로, `--db-admin-dsn`에는
-`127.0.0.1`과 게시된 포트를 지정하세요. bootroot가 DSN을 다시 쓸 때에도
-DSN의 `sslrootcert` 매개변수는 유지됩니다.
+않습니다. 유일한 예외는 `POSTGRES_SSLMODE`나 `--db-admin-dsn`에서
+`sslmode=disable`을 요구하는 관리자 DSN으로, TLS 없이 연결하며
+PostgreSQL이 거부합니다. 연결은 DSN의 호스트로 맺으므로 호스트는 IP
+주소이거나 `localhost`(`127.0.0.1`로 연결)여야 합니다. 그 밖의 호스트
+이름은 compose 서비스 이름 `postgres`를 포함해 모두 거부되므로,
+`--db-admin-dsn`에는 `127.0.0.1`과 게시된 포트를 지정하세요. DSN의
+`sslrootcert`가 무엇을 가리키든 `secrets/certs/root_ca.crt`로 검증합니다.
 
 `bootroot infra install` 후 `bootroot init --enable db-provision`을 실행하면
 DB DSN이 `secrets/config/ca.json`에 자동으로 기록됩니다.
 
 ### 단일 호스트 가드레일
 
-비TLS 로컬 모델(`sslmode=disable`)을 사용할 때 bootroot는 단일 호스트
-가드레일을 강제합니다.
+bootroot는 단일 호스트 가드레일을 강제합니다.
 
 - DSN의 PostgreSQL 호스트는 로컬 값만 허용됩니다
   (`postgres`, `localhost`, `127.0.0.1`, `::1`).
@@ -334,10 +327,9 @@ bootroot는 `state.json`을 프로세스 작업 디렉터리 기준으로 해석
 위 조건을 위반하면 `bootroot init`, `bootroot infra up`,
 `bootroot rotate db`는 즉시 실패합니다.
 
-단일 호스트 신뢰 경계를 벗어나는 경우에는 DB 전송을 TLS 기반으로
-전환하세요(`sslmode=require` 또는 `sslmode=verify-full`). 다시 말해
-`sslmode=disable`은 같은 머신 기본 토폴로지에만 해당하며,
-step-ca/PostgreSQL 분리 배치에는 사용하면 안 됩니다.
+이 가드레일은 step-ca와 PostgreSQL을 한 호스트에 두며, `init`은 그
+위에서 step-ca의 DSN을 검증된 TLS로 compose 서비스 `postgres`에 고정합니다.
+step-ca와 PostgreSQL을 분리한 배치는 `init`이 구성하는 범위 밖입니다.
 
 ### 베어메탈
 

@@ -143,21 +143,31 @@ Restart commands:
 `db.dataSource` is the PostgreSQL DSN (Data Source Name). Format:
 
 ```text
-postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>
+postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=<mode>&sslrootcert=<path>
 ```
 
-Examples:
+Example (Docker Compose, as `bootroot init` stores it):
 
-- Docker Compose:
-  `postgresql://step:step-pass@postgres:5432/stepca?sslmode=disable`
-- Production (TLS enforced):
-  `postgresql://step:<secret>@db.internal:5432/stepca?sslmode=require`
+```text
+postgresql://step:step-pass@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt
+```
 
-The `sslmode=disable` example is only for the default topology where step-ca
-and PostgreSQL stay on the same machine and inside the same local trust
-boundary. If PostgreSQL moves to another machine or another network trust
-boundary, do not reuse the local-only example. Switch to PostgreSQL TLS with
-an appropriate `sslmode`.
+The PostgreSQL bootroot runs accepts TCP connections only over TLS 1.3 with
+the hybrid post-quantum key exchange X25519MLKEM768, authenticated with
+`scram-sha-256`, and serves the certificate `bootroot init` issues for the
+name `postgres`. A plaintext TCP connection is refused; only the Unix socket
+inside the container still serves `docker compose exec postgres psql`.
+step-ca therefore connects with `sslmode=verify-full`, verifying that
+certificate for `postgres` against the CA root, which step-ca's container
+sees at `/home/step/certs/root_ca.crt` (`secrets/certs/root_ca.crt` on the
+host). `verify-ca` is not used: it would accept any other certificate the
+same CA issued.
+
+`bootroot init` sets `sslmode=verify-full` and that `sslrootcert` on
+whatever DSN it stores for step-ca, in `ca.json` and in OpenBao: one given
+with `--db-dsn`, one built from `POSTGRES_*`, and the one
+`--enable db-provision` provisions. A `sslmode` the DSN carried, `disable`
+or `require` included, is replaced, as is its `sslrootcert`.
 
 **Important**: When step-ca runs in a container, the `db.dataSource` host is
 **inside the container network**. The effective host must be the Compose
@@ -166,8 +176,6 @@ service name (for example, `postgres`).
 In `bootroot init`, `--db-dsn`/`--db-admin-dsn` inputs can use
 `localhost`/`127.0.0.1`/`::1`; init normalizes them to `postgres`.
 Remote hosts like `db.internal` fail during init.
-
-`<secret>` is your real database password.
 
 `step-pass` is the development default for this repo. It must match
 `POSTGRES_PASSWORD` in `.env`, which is why the local/Compose examples use the
@@ -196,30 +204,21 @@ project every later command operates on. `bootroot infra install
 here. See
 [Instance identity and the Compose project](cli.md#instance-identity-and-the-compose-project).
 
-Choose `sslmode` based on your environment:
-
-- `require`: TLS enabled, but hostname verification is skipped
-- `verify-full`: TLS enabled and the server cert and hostname are verified
-
-Selection guide:
-
-- Production / security first: `verify-full`
-- Internal test or lab: `require`
-
-The modes above describe step-ca's own connection. bootroot's own
-connections to PostgreSQL — those of `bootroot init` (database check,
-provisioning and the rotation of the temporary `POSTGRES_PASSWORD`),
-`bootroot rotate db` and `bootroot verify --db-check` — use TLS 1.3 for
-every `sslmode` except `disable`, and verify the server in full
-whichever of those modes is set: the server's certificate must chain to
-the CA root in `secrets/certs/root_ca.crt` and be valid for the name
-`postgres`. They offer the hybrid post-quantum key exchange
-X25519MLKEM768 first, and never fall back to plaintext or to TLS 1.2.
-They dial the DSN's host, which must then be an IP address or
-`localhost` (dialled as `127.0.0.1`); any other host name, the compose
-service name `postgres` included, is refused, so pass `127.0.0.1` and
-the published port to `--db-admin-dsn`. A DSN's `sslrootcert` parameter
-is kept whenever bootroot rewrites the DSN.
+bootroot's own connections to PostgreSQL — those of `bootroot init` (the
+wait for PostgreSQL, provisioning, the database check and the rotation of
+the temporary `POSTGRES_PASSWORD`), `bootroot rotate db` and
+`bootroot verify --db-check` — use TLS 1.3 and verify the server in full
+whatever `sslmode` a DSN names, and default to `verify-full`: the server's
+certificate must chain to the CA root in `secrets/certs/root_ca.crt` and be
+valid for the name `postgres`. They offer the hybrid post-quantum key
+exchange X25519MLKEM768 first, and never fall back to plaintext or to
+TLS 1.2. The one exception is an admin DSN that asks for `sslmode=disable`,
+in `POSTGRES_SSLMODE` or `--db-admin-dsn`: it connects without TLS, and
+PostgreSQL refuses it. They dial the DSN's host, which must then be an IP
+address or `localhost` (dialled as `127.0.0.1`); any other host name, the
+compose service name `postgres` included, is refused, so pass `127.0.0.1`
+and the published port to `--db-admin-dsn`. They verify against
+`secrets/certs/root_ca.crt` whatever `sslrootcert` the DSN names.
 
 When using `bootroot infra install` followed by `bootroot init
 --enable db-provision`, the DB DSN is written to `secrets/config/ca.json`
@@ -227,8 +226,7 @@ automatically.
 
 ### Single-Host Guardrails
 
-When using the non-TLS local model (`sslmode=disable`), bootroot enforces
-single-host guardrails:
+bootroot enforces single-host guardrails:
 
 - PostgreSQL host in DSN must be local-only (`postgres`, `localhost`,
   `127.0.0.1`, or `::1`).
@@ -326,10 +324,9 @@ resolution order.
 If these conditions are violated, `bootroot init`, `bootroot infra up`, and
 `bootroot rotate db` fail fast.
 
-When moving beyond a single-host trust boundary, switch to TLS-based DB
-transport (`sslmode=require` or `sslmode=verify-full`). In other words,
-`sslmode=disable` is documented only for the same-machine default topology,
-not for split step-ca/PostgreSQL deployments.
+These guardrails keep step-ca and PostgreSQL on one host, where `init`
+pins step-ca's DSN to the compose service `postgres` over verified TLS. A
+split step-ca/PostgreSQL deployment is outside what `init` configures.
 
 ### Bare Metal
 

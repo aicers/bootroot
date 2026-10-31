@@ -88,6 +88,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   neither is reachable on the compose network and the `lan` and `public`
   monitoring profiles cannot scrape that installation; read the metrics with
   `docker compose exec`. Without `--openbao-bind` nothing changes.
+- step-ca's PostgreSQL now accepts TCP connections only over TLS 1.3 with the
+  hybrid post-quantum key exchange X25519MLKEM768, authenticated with
+  `scram-sha-256`, serving the certificate `bootroot init` issues for
+  `postgres`; a plaintext TCP connection is refused, and the Unix socket inside
+  the container still serves `docker compose exec postgres psql`. `init` writes
+  the settings as `secrets/postgres/docker-compose.postgres-tls.yml` and
+  `postgres/pg_hba.conf` and recreates PostgreSQL with them, and
+  `bootroot infra up` applies the override too; anyone who runs
+  `docker compose up` on this stack with their own list of files must add it.
+  The DSN bootroot stores for step-ca, in `ca.json` and in OpenBao, is now
+  `sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt`: `init` sets
+  both on a DSN given with `--db-dsn` or built from `POSTGRES_*`, and bootroot's
+  own admin connections default to `verify-full`; an admin DSN that asks for
+  `sslmode=disable`, in `POSTGRES_SSLMODE` or `--db-admin-dsn`, is now refused
+  by PostgreSQL. `init` now runs its database check and provisioning after
+  `step ca init`, over TLS, and waits for PostgreSQL to accept a TLS connection
+  before it starts step-ca.
 
 ## [0.5.0] - 2026-10-26
 

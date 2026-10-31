@@ -70,6 +70,11 @@ pub(crate) const OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.o
 pub(crate) const OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.openbao-audit.yml";
 pub(crate) const HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.http01-exposed.yml";
 pub(crate) const STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.stepca-exposed.yml";
+/// The override `init` writes under `<secrets dir>/postgres/` that starts
+/// `PostgreSQL` with its TLS settings and mounts the files they name.
+pub(crate) const POSTGRES_TLS_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.postgres-tls.yml";
+/// The directory under the secrets directory holding that override.
+pub(crate) const POSTGRES_TLS_COMPOSE_OVERRIDE_DIR: &str = "postgres";
 
 pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
 pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";
@@ -77,6 +82,7 @@ pub(crate) const POSTGRES_COMPOSE_DIR: &str = "postgres";
 pub(crate) const POSTGRES_TLS_DIR: &str = "postgres/tls";
 pub(crate) const POSTGRES_TLS_CERT_PATH: &str = "postgres/tls/server.crt";
 pub(crate) const POSTGRES_TLS_KEY_PATH: &str = "postgres/tls/server.key";
+pub(crate) const POSTGRES_HBA_CONF_PATH: &str = "postgres/pg_hba.conf";
 pub(crate) const RESPONDER_TLS_CERT_CONTAINER_PATH: &str = "/app/bootroot-http01/tls/server.crt";
 pub(crate) const RESPONDER_TLS_KEY_CONTAINER_PATH: &str = "/app/bootroot-http01/tls/server.key";
 pub(crate) const OPENBAO_TLS_CONTAINER_CERT_PATH: &str = "/openbao/config/tls/server.crt";

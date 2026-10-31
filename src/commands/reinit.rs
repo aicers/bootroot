@@ -1457,6 +1457,14 @@ mod tests {
             "services: {}",
         )
         .unwrap();
+        // The PostgreSQL TLS override `init` wrote — must survive, and
+        // the `init` reinit runs rewrites it.
+        fs::create_dir_all(secrets.join("postgres")).unwrap();
+        fs::write(
+            secrets.join("postgres/docker-compose.postgres-tls.yml"),
+            "services: {}",
+        )
+        .unwrap();
         // Wipe list.
         fs::write(secrets.join("openbao/unseal-keys.txt"), "keys").unwrap();
         fs::create_dir_all(secrets.join("openbao/stepca")).unwrap();
@@ -1492,6 +1500,12 @@ mod tests {
                 .join("openbao/docker-compose.openbao-exposed.yml")
                 .exists(),
             "operator-authored exposed override must be preserved"
+        );
+        assert!(
+            secrets
+                .join("postgres/docker-compose.postgres-tls.yml")
+                .exists(),
+            "the PostgreSQL TLS override must be preserved"
         );
         assert!(
             !secrets.join("openbao/unseal-keys.txt").exists(),

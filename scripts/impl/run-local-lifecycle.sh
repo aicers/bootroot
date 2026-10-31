@@ -48,8 +48,6 @@ SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
 POSTGRES_TLS_DIR="$(dirname "$COMPOSE_FILE")/postgres/tls"
 POSTGRES_TLS_FINGERPRINT=""
-# The tag both shipped compose files declare.
-POSTGRES_TLS_PROBE_IMAGE="postgres:18.4"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
 INFRA_UP_DELAY_SECS="${INFRA_UP_DELAY_SECS:-5}"
@@ -897,9 +895,16 @@ fingerprint_of() {
 
 run_verify_pair() {
   local label="$1"
+  local -a edge_verify_args=()
   log_phase "verify-${label}"
   prepare_stepca_validation_targets
-  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG"
+  # `verify --db-check` reaches step-ca's PostgreSQL over TLS with the
+  # DSN `ca.json` stores: after `init`, after `rotate db`, and after each
+  # CA rotation, which re-issues PostgreSQL's certificate.
+  case "$label" in
+    initial | after-db | after-ca-key | after-ca-key-full) edge_verify_args=(--db-check) ;;
+  esac
+  verify_service_with_retry "$EDGE_SERVICE" "$EDGE_AGENT_CONFIG" "${edge_verify_args[@]}"
   verify_service_with_retry "$WEB_SERVICE" "$WEB_AGENT_CONFIG"
   verify_service_with_retry "$REMOTE_SERVICE" "$REMOTE_AGENT_CONFIG"
   snapshot_cert_meta "$EDGE_SERVICE" "$label"
@@ -1125,6 +1130,10 @@ run_infra_up_after_init() {
   # responder override itself, and would recreate the container onto the
   # rendered config whatever `infra up` had done to it.
   assert_responder_runs_on_rendered_config
+  # An `infra up` that left the PostgreSQL TLS override out would change
+  # the service's configuration, and Compose would recreate it without
+  # TLS.
+  assert_postgres_ssl_settings "after-infra-up"
   # `infra up` replays the DNS aliases from state.json itself, so the
   # harness's own alias override is not applied again. Issuing for every
   # registered service through the responder is the proof that it still
@@ -1241,9 +1250,10 @@ force_reissue_all_services() {
 verify_service_with_retry() {
   local service="$1"
   local agent_config="$2"
+  shift 2
   local attempt
   for attempt in $(seq 1 "$VERIFY_ATTEMPTS"); do
-    if run_bootroot verify --registration-id "$service" --agent-config "$agent_config" >>"$RUN_LOG" 2>&1; then
+    if run_bootroot verify --registration-id "$service" --agent-config "$agent_config" "$@" >>"$RUN_LOG" 2>&1; then
       return 0
     fi
     if [ "$attempt" -eq "$VERIFY_ATTEMPTS" ]; then
@@ -1405,33 +1415,52 @@ assert_postgres_tls() {
   } >>"$RUN_LOG"
 }
 
-# The image itself is the judge of the two files: it refuses to start on
-# a key whose owner or mode it does not accept. Nothing serves this
-# certificate in the stack yet, so this throwaway server is what shows it
-# would.
-assert_postgres_starts_with_tls() {
-  local name="${RUN_INSTANCE}-postgres-tls-probe"
-  local attempt logs ready=0
-  docker run -d --name "$name" \
-    -e POSTGRES_PASSWORD=probe-only \
-    -v "$POSTGRES_TLS_DIR:/tls:ro" \
-    "$POSTGRES_TLS_PROBE_IMAGE" \
-    -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key \
-    >>"$RUN_LOG" 2>&1 || fail "could not start the throwaway postgres"
-  for attempt in $(seq 1 "$TIMEOUT_SECS"); do
-    # Read the whole log first: under `pipefail`, `grep -q` leaving early
-    # can fail `docker logs` on the pipe and hide a line it did find.
-    logs="$(docker logs "$name" 2>&1 || true)"
-    if grep -q 'database system is ready to accept connections' <<<"$logs"; then
-      ready=1
-      break
-    fi
-    sleep 1
-  done
-  docker logs "$name" >"$ARTIFACT_DIR/postgres-tls-probe.log" 2>&1 || true
-  docker rm -f -v "$name" >>"$RUN_LOG" 2>&1 || true
-  [ "$ready" = "1" ] ||
-    fail "the throwaway postgres did not become ready with ssl=on; see $ARTIFACT_DIR/postgres-tls-probe.log"
+# Asserts the settings `init` started PostgreSQL with, read over the
+# Unix socket inside the container: TLS on, and the hybrid group alone.
+assert_postgres_ssl_settings() {
+  local label="$1"
+  local container="${RUN_INSTANCE}-postgres"
+  local actual
+  actual="$(docker exec "$container" psql -U step -d stepca -Atc 'show ssl' 2>>"$RUN_LOG")" ||
+    fail "${label}: could not read ssl from postgres"
+  [ "$actual" = "on" ] || fail "${label}: postgres ssl is '${actual}', expected 'on'"
+  actual="$(docker exec "$container" psql -U step -d stepca -Atc 'show ssl_groups' 2>>"$RUN_LOG")" ||
+    fail "${label}: could not read ssl_groups from postgres"
+  [ "$actual" = "X25519MLKEM768" ] ||
+    fail "${label}: postgres ssl_groups is '${actual}', expected 'X25519MLKEM768'"
+}
+
+# Asserts PostgreSQL serves TCP over TLS 1.3 with X25519MLKEM768 only:
+# step-ca's stored DSN is `verify-full` against the CA root, a plaintext
+# connection inside the container meets `pg_hba.conf`'s `reject` line,
+# and on the published port a classical-only TLS client is refused
+# while a hybrid one verifies the server for the name `postgres`.
+assert_postgres_serves_tls_only() {
+  local label="$1"
+  local container="${RUN_INSTANCE}-postgres"
+  local dsn output
+  assert_postgres_ssl_settings "$label"
+
+  dsn="$(jq -r '.db.dataSource // empty' "$SECRETS_DIR/config/ca.json")"
+  [[ "$dsn" =~ ^postgresql://[^@]+@postgres:5432/stepca\?sslmode=verify-full\&sslrootcert=/home/step/certs/root_ca\.crt$ ]] ||
+    fail "${label}: ca.json db.dataSource is not step-ca's verify-full DSN: ${dsn//:*@/:<redacted>@}"
+
+  if output="$(docker exec -e PGCONNECT_TIMEOUT=5 "$container" \
+    psql -w "host=127.0.0.1 sslmode=disable user=step dbname=stepca" -Atc 'select 1' 2>&1)"; then
+    fail "${label}: postgres accepted a plaintext TCP connection"
+  fi
+  grep -q 'pg_hba.conf rejects connection' <<<"$output" ||
+    fail "${label}: plaintext TCP connection failed for another reason: ${output}"
+
+  if openssl s_client -starttls postgres -connect "127.0.0.1:${POSTGRES_HOST_PORT}" \
+    -groups X25519 </dev/null >>"$RUN_LOG" 2>&1; then
+    fail "${label}: postgres completed a TLS handshake offering only X25519"
+  fi
+  openssl s_client -starttls postgres -connect "127.0.0.1:${POSTGRES_HOST_PORT}" \
+    -groups X25519MLKEM768 -tls1_3 \
+    -CAfile "$SECRETS_DIR/certs/root_ca.crt" -verify_hostname postgres -verify_return_error \
+    </dev/null >>"$RUN_LOG" 2>&1 ||
+    fail "${label}: postgres refused a verified TLS 1.3 handshake offering X25519MLKEM768"
 }
 
 copy_remote_materials() {
@@ -1716,7 +1745,7 @@ run_rotations_with_verification() {
   local db_admin_dsn
   db_admin_dsn="$(jq -r '.db.dataSource // empty' "$SECRETS_DIR/config/ca.json")"
   if [ -z "${db_admin_dsn:-}" ]; then
-    db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT}/stepca?sslmode=disable"
+    db_admin_dsn="postgresql://step:step-pass@127.0.0.1:${POSTGRES_HOST_PORT}/stepca?sslmode=verify-full"
   else
     # Replace the Docker-internal host:port with the host-side mapping.
     db_admin_dsn="$(echo "$db_admin_dsn" \
@@ -1896,7 +1925,7 @@ main() {
   write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
   assert_postgres_tls "after-init"
-  assert_postgres_starts_with_tls
+  assert_postgres_serves_tls_only "after-init"
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"

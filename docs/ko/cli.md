@@ -274,6 +274,14 @@ HTTP-01 리스폰더가 함께 구동된다는 전제를 둡니다. 서로 다�
 없으며, 리스폰더는 번들의 `responder.toml.compose`로 동작하는데, 이
 설정에서는 챌린지에는 응답하지만 등록은 `503`으로 거부합니다.
 
+`bootroot init`이 실행된 뒤에는 compose 파일이 `postgres`를 선언하는 한
+`infra up`이 `init`이 `secrets/postgres/docker-compose.postgres-tls.yml`에
+작성한 PostgreSQL TLS 오버라이드도 적용합니다. 이 오버라이드는
+PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
+`pg_hba.conf`를 마운트합니다. 이것이 없으면 Compose가 PostgreSQL을 TLS
+없이 다시 생성해 step-ca의 `verify-full` 연결이 거부됩니다. 보호 대상
+서비스를 루프백이 아닌 주소에 게시하는 오버라이드는 거부됩니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
@@ -587,6 +595,11 @@ IP를 더하고, advertise 주소가 기록되어 있으면 그 IP도 더한 것
   compose 오버라이드 파일 및 `state.json`에 바인딩 의도
   기록
 
+`infra install`은 `init`보다 먼저 실행되므로 `bootroot init`이 작성하는
+오버라이드를 하나도 적용하지 않습니다. 초기화된 스택 위에서 다시
+실행하면 리스폰더를 설정 오버라이드 없이 다시 생성하듯 PostgreSQL도 TLS
+오버라이드 없이 다시 생성합니다. `bootroot infra up`이 둘 다 복원합니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
@@ -783,7 +796,10 @@ OpenBao 초기화/언실/정책/AppRole 구성, step-ca 초기화, 시크릿 등
   (dev/test 전용, 환경 변수: `OPENBAO_UNSEAL_FILE`)
 - `--stepca-password`: step-ca 키 암호 값 (저장 위치: `secrets/password.txt`,
   환경 변수: `STEPCA_PASSWORD`)
-- `--db-dsn`: step-ca용 PostgreSQL DSN
+- `--db-dsn`: step-ca용 PostgreSQL DSN. `init`은 호스트 `postgres`, 포트
+  `5432`,
+  `sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt`로 바꿔
+  저장하며, DSN에 있던 `sslmode`와 `sslrootcert`는 대체됩니다
 - `--db-admin-dsn`: PostgreSQL 관리자 DSN (환경 변수: `BOOTROOT_DB_ADMIN_DSN`)
 - `--db-user`: step-ca용 PostgreSQL 계정 (환경 변수: `BOOTROOT_DB_USER`)
 - `--db-password`: step-ca용 PostgreSQL 비밀번호 (환경 변수: `BOOTROOT_DB_PASSWORD`)
@@ -963,6 +979,21 @@ admin 사용자가 회전 대상 런타임 사용자와 같은 경우(번들된 
 운영자가 지정한 토폴로지를 위한 명시적 오버라이드로 유지됩니다
 (#588 §1, §2).
 
+DB 단계는 `step ca init` 뒤에 실행됩니다. PostgreSQL이 제공하는 인증서가
+그 뒤에야 만들어지기 때문입니다. PostgreSQL을 다시 생성한 뒤 `init`은
+PostgreSQL이 TLS 연결을 받을 때까지 최대 60초 기다립니다.
+`db-provision`에서는 프로비저닝 관리자 DSN으로, 그 밖에는 저장할 DSN을
+게시된 포트로 바꿔 연결하며, 서버가 아직 서비스하지 않는 동안(TLS
+핸드셰이크 전에 연결이 거부·재설정·종료되거나 PostgreSQL이 시작 중인
+경우)에만 다시 시도합니다. 인증서 검증 오류, 거부된 핸드셰이크, 인증
+오류는 대기를 즉시 끝내고 PostgreSQL을 명시하며 `init`을 실패시킵니다.
+이어서 `db-provision`이 프로비저닝하고 `db-check`가 저장할 DSN으로 게시된
+포트에 연결합니다. 이 모두가 성공한 뒤에야 `init`이
+`bootroot/stepca/db`와(`db-provision`일 때) `bootroot/stepca/db_admin`을
+기록하므로, 이를 통과하지 못한 DSN은 OpenBao에 들어가지 않습니다. 실패한
+`init`은 PostgreSQL 변경을 되돌리지 않으며, `init`을 다시 실행하면
+완료됩니다.
+
 DB DSN host 처리 규칙:
 
 - `localhost`, `127.0.0.1`, `::1` 입력은 init 시 내부적으로
@@ -992,7 +1023,12 @@ DB DSN host 처리 규칙:
   `infra_certs`에 `postgres`로 기록됩니다. `server.crt`(모드 `0644`)는 이름이
   `postgres` 하나뿐인 1년 유효 leaf 뒤에 이를 서명한 중간 CA가 이어지고,
   `server.key`는 PostgreSQL 이미지의 `postgres` 유저인 `999:0` 소유에 모드
-  `0600`입니다. 아직 이 인증서를 제공하는 서버는 없습니다
+  `0600`입니다
+- 그 인증서와 함께 `<compose-dir>/postgres/pg_hba.conf`(모드 `0644`)와
+  compose 오버라이드 `secrets/postgres/docker-compose.postgres-tls.yml`을
+  매 실행마다 작성합니다. PostgreSQL은 이 파일들로 다시 생성되며(`up -d
+  --no-deps --force-recreate postgres`), 이후 TCP 연결은
+  X25519MLKEM768을 쓰는 TLS 1.3과 `scram-sha-256` 인증으로만 받습니다
 - 다음 단계 안내
 - `--summary-json` 지정 시 자동화용 init 요약 JSON 파일 생성
 
@@ -2820,7 +2856,8 @@ bootroot ca restart
 
 로컬 환경을 완전히 정리해 처음부터 다시 시작할 수 있게 합니다.
 컨테이너를 중지하고, 볼륨을 삭제하고, 생성된 시크릿,
-`postgres/`(PostgreSQL 서버 인증서와 키), state, `.env`를 제거합니다.
+`postgres/`(PostgreSQL 서버 인증서와 키, `pg_hba.conf`), state, `.env`를
+제거합니다.
 정리 후 `bootroot infra install`과 `bootroot init`을 다시
 실행하면 됩니다.
 

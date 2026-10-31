@@ -9,14 +9,12 @@ use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 
 use super::super::paths::{compose_has_postgres, compose_has_responder, resolve_responder_url};
-use super::super::types::{
-    AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, OpenBaoConfigResult,
-};
+use super::super::types::{AppRoleLabel, InitPlan, InitSummary, OpenBaoConfigResult};
 use super::InitRollback;
 use super::InitSecrets;
 use super::RollbackFile;
 use super::database::{
-    PostgresEnv, check_db_connectivity, db_root_ca_path, resolve_db_dsn_for_init,
+    PostgresEnv, ResolvedDbDsn, connect_database_for_init, db_root_ca_path, resolve_db_dsn_for_init,
 };
 use super::http01_admin_tls::{
     build_http01_admin_tls_sans, issue_http01_admin_tls_cert, record_http01_admin_infra_cert,
@@ -24,14 +22,17 @@ use super::http01_admin_tls::{
 use super::openbao_setup::{
     apply_openbao_agent_compose_override, bootstrap_openbao, configure_openbao,
     setup_openbao_agents, validate_rotate_bound_cidrs, validate_secret_id_ttl,
-    write_ca_trust_fingerprints_with_retry,
+    write_ca_trust_fingerprints_with_retry, write_stepca_db_secrets,
 };
 use super::openbao_tls::{
     build_openbao_tls_sans, issue_openbao_tls_cert, record_openbao_infra_cert,
     write_openbao_hcl_for_tls_recreate,
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
-use super::postgres_tls::{issue_postgres_tls_cert, record_postgres_infra_cert};
+use super::postgres_tls::{
+    issue_postgres_tls_cert, record_postgres_infra_cert, recreate_postgres_with_tls,
+    write_postgres_tls_files,
+};
 use super::prompts::{confirm_overwrite, should_confirm};
 use super::registrar_internal::{self, EnabledEndpoint};
 use super::responder_setup::{
@@ -55,6 +56,7 @@ use crate::commands::guardrails::{
     client_url_from_bind_addr, ensure_all_services_localhost_binding, validate_http01_admin_tls,
     validate_http01_override_binding, validate_http01_override_scope,
     validate_openbao_override_binding, validate_openbao_override_scope, validate_openbao_tls,
+    validate_postgres_tls_override_scope,
 };
 use crate::commands::infra::{
     ensure_init_prereqs_ready, has_http01_admin_bind_intent, has_openbao_bind_intent,
@@ -777,55 +779,25 @@ async fn run_init_inner(
     // `PostgreSQL` credentials `infra install` generated into the
     // process environment.
     let postgres_env = PostgresEnv::from_process_env();
-    let (db_dsn, db_dsn_normalization, admin_dsn_for_kv) =
-        resolve_db_dsn_for_init(args, compose_dir, &postgres_env, messages).await?;
+    // Resolved without connecting: `PostgreSQL` serves only TLS, on a
+    // certificate that exists once `step ca init` has run below, so the
+    // provisioning and the database check run after it.
+    let ResolvedDbDsn {
+        dsn: db_dsn,
+        normalization: db_dsn_normalization,
+        provision: db_provision,
+    } = resolve_db_dsn_for_init(args, compose_dir, &postgres_env, messages)?;
     let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
-    let db_info = parse_db_dsn(&secrets.db_dsn)
-        .map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
-    let db_check = if args.has_feature(InitFeature::DbCheck) {
-        check_db_connectivity(
-            &db_info,
-            &secrets.db_dsn,
-            &db_root_ca_path(&args.secrets_dir.secrets_dir),
-            args.db_timeout.timeout_secs,
-            messages,
-        )
-        .await?;
-        DbCheckStatus::Ok
-    } else {
-        DbCheckStatus::Skipped
-    };
+    // Fails before any `OpenBao` write on a DSN that does not parse.
+    parse_db_dsn(&secrets.db_dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
 
+    // `bootroot/stepca/db` and `bootroot/stepca/db_admin` are not
+    // written here but after the database steps below, so a DSN that
+    // fails them never reaches the KV.
     let OpenBaoConfigResult {
         role_outputs,
         approles,
     } = configure_openbao(client, args, &secrets, rollback, messages).await?;
-
-    // Persist the admin DSN bootroot used to provision the runtime
-    // role/database. `rotate db` reads this with the operator/root
-    // token at rotate time so the operator no longer has to pass
-    // `--db-admin-dsn` on every rotation. The KV path carries strictly
-    // higher privilege than `PATH_STEPCA_DB`; the existing step-ca
-    // runtime and infra agent policies must not include it.
-    if let Some(admin_dsn) = admin_dsn_for_kv.as_deref() {
-        if !client
-            .kv_exists(&args.openbao.kv_mount, super::super::PATH_STEPCA_DB_ADMIN)
-            .await
-            .with_context(|| messages.error_openbao_kv_exists_failed())?
-        {
-            rollback
-                .written_kv_paths
-                .push(super::super::PATH_STEPCA_DB_ADMIN.to_string());
-        }
-        client
-            .write_kv(
-                &args.openbao.kv_mount,
-                super::super::PATH_STEPCA_DB_ADMIN,
-                serde_json::json!({ "value": admin_dsn }),
-            )
-            .await
-            .with_context(|| messages.error_openbao_kv_write_failed())?;
-    }
 
     let secrets_dir = args.secrets_dir.secrets_dir.clone();
 
@@ -893,10 +865,49 @@ async fn run_init_inner(
     // it from the preserved intermediate. Not tracked in
     // `rollback.tls_artifacts`: a failed `init` leaves the files for the
     // next run to overwrite.
+    //
+    // Then `PostgreSQL` is recreated to serve TLS only, on that
+    // certificate. Not rolled back either: a failed `init` is completed
+    // by running it again, which rewrites the same files.
     let postgres_tls_enabled = compose_has_postgres(&args.compose.compose_file, messages)?;
     if postgres_tls_enabled {
         issue_postgres_tls_cert(compose_dir, &secrets_dir, rollback.docker(), messages)?;
+        let postgres_tls_override =
+            write_postgres_tls_files(compose_dir, &secrets_dir, messages).await?;
+        validate_postgres_tls_override_scope(&postgres_tls_override, messages)?;
+        recreate_postgres_with_tls(
+            &identity,
+            &args.compose.compose_file,
+            &postgres_tls_override,
+            messages,
+        )?;
     }
+
+    // Waits for the recreated server, then provisions and checks. Only
+    // once all of them have passed does the DSN reach the KV, and
+    // before `ca.json`, its template and the step-ca sidecar restart
+    // below, which re-renders `ca.json` from `bootroot/stepca/db`.
+    let db_check = connect_database_for_init(
+        args,
+        compose_dir,
+        &postgres_env,
+        &secrets.db_dsn,
+        db_provision.as_ref(),
+        postgres_tls_enabled,
+        messages,
+    )
+    .await?;
+    write_stepca_db_secrets(
+        client,
+        &args.openbao.kv_mount,
+        &secrets.db_dsn,
+        db_provision
+            .as_ref()
+            .map(|plan| plan.admin_dsn_for_kv.as_str()),
+        rollback,
+        messages,
+    )
+    .await?;
 
     // Reconciles the `db` section, the ACME provisioner's cert duration,
     // the top-level `dnsNames`, the top-level `metricsAddress` and
@@ -2073,6 +2084,7 @@ fn validate_http01_exposed_override_for_init(
 mod tests {
     use super::super::test_support::{default_init_args, test_messages};
     use super::*;
+    use crate::commands::init::DbCheckStatus;
     use crate::state::AppRoleRotationTarget;
 
     /// Every pre-flight condition an `InitPlan` can carry, so
