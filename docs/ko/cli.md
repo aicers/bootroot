@@ -987,6 +987,12 @@ DB DSN host 처리 규칙:
 - DB host 해석 결과(`from -> to`)
 - EAB 등록 여부
 - step-ca/responder용 OpenBao Agent compose override 자동 적용
+- `<compose-dir>/postgres/tls/`의 PostgreSQL 서버 인증서: compose 파일이
+  `postgres` 서비스를 선언하면 매 실행마다 발급되고 `state.json` →
+  `infra_certs`에 `postgres`로 기록됩니다. `server.crt`(모드 `0644`)는 이름이
+  `postgres` 하나뿐인 1년 유효 leaf 뒤에 이를 서명한 중간 CA가 이어지고,
+  `server.key`는 PostgreSQL 이미지의 `postgres` 유저인 `999:0` 소유에 모드
+  `0600`입니다. 아직 이 인증서를 제공하는 서버는 없습니다
 - 다음 단계 안내
 - `--summary-json` 지정 시 자동화용 init 요약 JSON 파일 생성
 
@@ -2232,7 +2238,10 @@ step-ca가 사용하는 CA 키 쌍을 회전합니다. 기본 동작은 중간 C
 - Phase 0 — 사전 점검: 필수 파일 존재 확인, 현재 fingerprint 조회
 - Phase 1 — 백업: 현재 cert/key 파일 백업
 - Phase 2 — 생성: 새 CA 키 쌍 및 인증서 생성
-- Phase 3 — 가산적 trust: 전이 trust(기존 + 신규 fingerprint, 두 CA
+- Phase 3 — 가산적 trust: 먼저 `state.json` → `infra_certs`에 `postgres`
+  항목이 있으면 PostgreSQL 서버 인증서를 새 중간 CA로 재발급하고 `SIGHUP`으로
+  PostgreSQL을 재로드(`--skip reissue`로 건너뛸 수 없음)한 뒤, 전이
+  trust(기존 + 신규 fingerprint, 두 CA
   세대를 모두 담은 `ca-bundle.pem`)를 OpenBao(`bootroot/ca`, 모든
   `state.json` 서비스, 모든 registrar 관리 identity)에 기록해 서비스가
   기존/신규 인증서를 모두 수락하고 회전이 진행 중인 동안에도 `bootroot
@@ -2467,7 +2476,9 @@ OpenBao에 인증할 때 사용하는 클라이언트 인증서로, registrar �
 `state.json`의 `infra_certs`에 등록된 인프라 TLS 인증서를
 갱신합니다. 현재 대상은 **OpenBao 서버 TLS** 인증서(`openbao`
 항목)와, HTTP-01 responder의 admin API를 TLS로 프로비저닝한 경우
-**HTTP-01 admin TLS** 인증서(`bootroot-http01` 항목)입니다.
+**HTTP-01 admin TLS** 인증서(`bootroot-http01` 항목), 그리고 `bootroot
+init`이 compose 파일에서 `postgres` 서비스를 찾은 경우 `SIGHUP`으로
+재로드되는 **PostgreSQL 서버 TLS** 인증서(`postgres` 항목)입니다.
 갱신 대상은 `infra_certs` 데이터에서 결정되므로 새 항목 종류가
 추가되더라도 루프 본문은 바뀌지 않으며, 키별 디스패치 아암만
 추가됩니다.
@@ -2522,6 +2533,18 @@ OpenBao에 인증할 때 사용하는 클라이언트 인증서로, registrar �
     발급해 `<secrets-dir>/bootroot-http01/tls/server.crt` 및
     `<secrets-dir>/bootroot-http01/tls/server.key`에 기록합니다.
     두 파일 모두 기록 후 `chmod 0600`이 적용됩니다.
+  - `postgres` → PostgreSQL 서버 인증서를, 항목의 기록과 상관없이 `postgres`를
+    유일한 SAN으로 하고 leaf 뒤에 중간 CA를 묶어 새로 발급해
+    `<compose-dir>/postgres/tls/server.crt` 및
+    `<compose-dir>/postgres/tls/server.key`에 기록합니다. 기록 전에 일회용
+    root 컨테이너가 `openbao`와 마찬가지로 `<compose-dir>/postgres/tls`와 그
+    안의 모든 항목을 `<secrets-dir>` 소유자로 chown합니다. 이전 발급이 키를
+    uid 999 소유로 남겼고 `step`이 이를 덮어써야 하기 때문입니다. 이 경로의
+    심볼릭 링크도 같은 방식으로 거부됩니다(`PostgreSQL TLS 출력 디렉터리가
+    심볼릭 링크이므로 사용을 거부합니다`). 이후 디렉터리는 `0755`, `server.crt`는
+    `0644`, `server.key`는 `0600`이 되고, 이 디렉터리만 마운트한 마지막 일회용
+    root 컨테이너가 키에 `chown --no-dereference 999:0`을 실행해 PostgreSQL
+    이미지의 `postgres` 유저에게 넘깁니다.
 - 항목별 재발급이 성공하면 해당 항목의 `issued_at`이 갱신되고,
   재로드 전략이 실행되어 영향 받는 컨테이너가 새 자료를 인식하도록
   합니다. 알려진 인프라 인증서 키에 대해서는 기록된 항목을 신뢰하지
@@ -2536,6 +2559,9 @@ OpenBao에 인증할 때 사용하는 클라이언트 인증서로, registrar �
     정규화합니다.
   - `bootroot-http01` (HTTP-01 admin) → `ContainerSignal` → `docker
     kill -s SIGHUP <container>`
+  - `postgres` → `ContainerSignal` → `docker kill -s SIGHUP
+    <instance>-postgres`. PostgreSQL은 인증서 파일을 다시 읽고 열린 세션을
+    유지합니다.
 - `openbao` 컨테이너에 시그널을 보낸 뒤, 명령은 교체가 실제로
   적용되었는지 검증합니다. state에 기록된 OpenBao 리스너로 인증 없는
   TLS 연결을 열어 리스너가 제시하는 leaf 인증서를 읽고, 방금 기록한
@@ -2543,8 +2569,8 @@ OpenBao에 인증할 때 사용하는 클라이언트 인증서로, registrar �
   위해 제한된 기한 내에서 재시도합니다. 기한이 지나도 제공되는 leaf가
   여전히 다르거나 리스너에 연결할 수 없으면, 항목 이름을 포함하고 두
   경우를 구분하는 메시지와 함께 실패합니다. 이 검증은 `openbao`
-  항목에만 적용되며, `bootroot-http01` 항목에는 재로드 후 검증이
-  없습니다.
+  항목에만 적용되며, `bootroot-http01`과 `postgres` 항목에는 재로드
+  후 검증이 없습니다.
 - 모든 항목 처리가 끝나면 갱신된 `infra_certs` 맵을 `state.json`에
   다시 저장합니다.
 
@@ -2792,8 +2818,9 @@ bootroot ca restart
 ## bootroot clean
 
 로컬 환경을 완전히 정리해 처음부터 다시 시작할 수 있게 합니다.
-컨테이너를 중지하고, 볼륨을 삭제하고, 생성된 시크릿/state/`.env`를
-제거합니다. 정리 후 `bootroot infra install`과 `bootroot init`을 다시
+컨테이너를 중지하고, 볼륨을 삭제하고, 생성된 시크릿,
+`postgres/`(PostgreSQL 서버 인증서와 키), state, `.env`를 제거합니다.
+정리 후 `bootroot infra install`과 `bootroot init`을 다시
 실행하면 됩니다.
 
 ### 입력
@@ -2802,13 +2829,14 @@ bootroot ca restart
 - `--yes` / `-y`: 확인 프롬프트 생략
 - `--openbao-only`: `bootroot-openbao` 컨테이너와 해당 볼륨만
   제거합니다. `bootroot-postgres`, `bootroot-http01`, `bootroot-ca`,
-  `secrets/`, `state.json`, `.env`는 그대로 유지됩니다. OpenBao 상태만
+  `secrets/`, `postgres/`, `state.json`, `.env`는 그대로 유지됩니다.
+  OpenBao 상태만
   손상된 경우(예: 부분 init 실패 후) 사용합니다(#588 §5).
 
 ### 동작
 
 - `docker compose down -v --remove-orphans` 실행
-- `secrets/`, `state.json`, `.env` 삭제, 선택적으로 `certs/` 삭제
+- `secrets/`, `postgres/`, `state.json`, `.env` 삭제, 선택적으로 `certs/` 삭제
 - 파괴적 작업 전 확인 프롬프트 표시(`--yes` 미사용 시)
 - `--openbao-only` 사용 시 `openbao` compose 서비스만 중지·제거하고
   볼륨을 삭제합니다. 다른 서비스는 계속 실행되며 디스크 상태도

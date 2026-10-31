@@ -1,6 +1,7 @@
 target/
 certs/
 secrets/
+/postgres/
 secrets.bak/
 **/*.DS_Store
 .claude/

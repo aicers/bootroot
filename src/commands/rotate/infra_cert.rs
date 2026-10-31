@@ -15,7 +15,8 @@ use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::init::{
     HTTP01_ADMIN_INFRA_CERT_KEY, OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH,
-    reissue_http01_admin_tls_cert, reissue_openbao_tls_cert,
+    POSTGRES_INFRA_CERT_KEY, issue_postgres_tls_cert, reissue_http01_admin_tls_cert,
+    reissue_openbao_tls_cert,
 };
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy};
@@ -192,6 +193,10 @@ fn dispatch_reissue(
             docker,
             messages,
         ),
+        // A recorded `sans` is informational here: the name is fixed.
+        POSTGRES_INFRA_CERT_KEY => {
+            issue_postgres_tls_cert(compose_dir, secrets_dir, docker, messages)
+        }
         _ => bail!("Unknown infra cert key: {name}"),
     }
 }
@@ -202,7 +207,7 @@ fn dispatch_reissue(
 /// [`try_restart_container`], which no test drives and which is shared
 /// with a `&dyn Fn` seam in `rotate::ca`; giving it an executable would
 /// change that callback type for no caller.
-fn execute_reload_strategy(strategy: &ReloadStrategy, docker: &Path) -> Result<()> {
+pub(super) fn execute_reload_strategy(strategy: &ReloadStrategy, docker: &Path) -> Result<()> {
     match strategy {
         ReloadStrategy::ContainerRestart { container_name } => {
             try_restart_container(container_name)
@@ -455,7 +460,7 @@ mod tests {
         HTTP01_ADMIN_INFRA_CERT_KEY, HTTP01_ADMIN_TLS_CERT_REL_PATH,
         HTTP01_ADMIN_TLS_DEFAULT_RENEW_BEFORE, HTTP01_ADMIN_TLS_KEY_REL_PATH,
         OPENBAO_INFRA_CERT_KEY, OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_DEFAULT_RENEW_BEFORE,
-        OPENBAO_TLS_KEY_PATH,
+        OPENBAO_TLS_KEY_PATH, POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_DIR, POSTGRES_TLS_KEY_PATH,
     };
     use crate::commands::rotate::{run_rotate, run_rotate_with_exec};
     use crate::state::StateFile;
@@ -912,6 +917,115 @@ mod tests {
         );
         // The HTTP-01 admin entry gets no post-reload verification, so no
         // openbao_url is consulted and no probe runs.
+    }
+
+    /// `rotate infra-cert` routes the `postgres` entry to the issuance,
+    /// which runs the key's chown no other entry has, and signals the
+    /// container the entry records.
+    #[test]
+    fn run_rotate_infra_cert_renews_postgres_tls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let messages = test_messages();
+
+        let fake_docker = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake_docker, &args_log);
+
+        let compose_dir = dir.path().join("compose");
+        let secrets_dir = dir.path().join("secrets");
+        fs::create_dir_all(&secrets_dir).expect("secrets dir");
+
+        // The fake no-ops `step certificate create`, so the files the
+        // host-side chmod expects have to exist up front.
+        let tls_dir = compose_dir.join(POSTGRES_TLS_DIR);
+        fs::create_dir_all(&tls_dir).expect("tls dir");
+        fs::write(tls_dir.join("server.crt"), "fake-cert").expect("write cert");
+        fs::write(tls_dir.join("server.key"), "fake-key").expect("write key");
+
+        let mut infra_certs = BTreeMap::new();
+        infra_certs.insert(
+            POSTGRES_INFRA_CERT_KEY.to_string(),
+            InfraCertEntry {
+                cert_path: compose_dir.join(POSTGRES_TLS_CERT_PATH),
+                key_path: compose_dir.join(POSTGRES_TLS_KEY_PATH),
+                sans: vec!["postgres".to_string()],
+                renew_before: OPENBAO_TLS_DEFAULT_RENEW_BEFORE.to_string(),
+                reload_strategy: ReloadStrategy::ContainerSignal {
+                    container_name: "insight-postgres".to_string(),
+                    signal: "SIGHUP".to_string(),
+                },
+                issued_at: None,
+                expires_at: None,
+            },
+        );
+        let state = StateFile {
+            openbao_url: "https://192.0.2.1:1".to_string(),
+            secrets_dir: Some(secrets_dir.clone()),
+            infra_certs,
+            ..Default::default()
+        };
+        let state_file = dir.path().join("state.json");
+        state.save(&state_file).expect("write state");
+
+        let args = RotateArgs {
+            command: RotateCommand::InfraCert(RotateInfraCertArgs {}),
+            state_file: Some(state_file.clone()),
+            compose: ComposeFileArgs {
+                compose_file: compose_dir.join("docker-compose.yml"),
+            },
+            openbao: OpenBaoOverrideArgs {
+                openbao_url: None,
+                kv_mount: None,
+            },
+            secrets_dir: SecretsDirOverrideArgs {
+                secrets_dir: Some(secrets_dir),
+            },
+            runtime_auth: RuntimeAuthArgs {
+                auth_mode: AuthMode::Auto,
+                root_token: None,
+                root_token_file: None,
+                approle_role_id: None,
+                approle_secret_id: None,
+                approle_role_id_file: None,
+                approle_secret_id_file: None,
+            },
+            yes: true,
+            show_secrets: false,
+        };
+
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(run_rotate_with_exec(&args, &fake_docker, &messages))
+            .expect("run_rotate(InfraCert) must succeed for the postgres entry");
+
+        let reloaded = StateFile::load(&state_file).expect("state file must be readable");
+        let entry = reloaded
+            .infra_certs
+            .get(POSTGRES_INFRA_CERT_KEY)
+            .expect("postgres entry must still exist");
+        assert!(
+            entry.issued_at.is_some(),
+            "issued_at must be updated after renewal"
+        );
+
+        let invocations = decode_fake_docker_log(&args_log);
+        let position = |needle: &str| {
+            invocations
+                .iter()
+                .position(|argv| argv.iter().any(|arg| arg == needle))
+                .unwrap_or_else(|| panic!("no invocation carries {needle}: {invocations:?}"))
+        };
+        assert_eq!(invocations.len(), 4, "{invocations:?}");
+        assert!(position("create") < position("999:0"), "{invocations:?}");
+        assert_eq!(
+            invocations.last(),
+            Some(&vec![
+                "kill".to_string(),
+                "-s".to_string(),
+                "SIGHUP".to_string(),
+                "insight-postgres".to_string(),
+            ]),
+            "the reload must come last, once the key is back with uid 999"
+        );
     }
 
     /// The `openbao` key's strategy is resolved in code rather than read

@@ -73,12 +73,17 @@ pub(crate) const STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME: &str = "docker-compose.st
 
 pub(crate) const OPENBAO_TLS_CERT_PATH: &str = "openbao/tls/server.crt";
 pub(crate) const OPENBAO_TLS_KEY_PATH: &str = "openbao/tls/server.key";
+pub(crate) const POSTGRES_COMPOSE_DIR: &str = "postgres";
+pub(crate) const POSTGRES_TLS_DIR: &str = "postgres/tls";
+pub(crate) const POSTGRES_TLS_CERT_PATH: &str = "postgres/tls/server.crt";
+pub(crate) const POSTGRES_TLS_KEY_PATH: &str = "postgres/tls/server.key";
 pub(crate) const RESPONDER_TLS_CERT_CONTAINER_PATH: &str = "/app/bootroot-http01/tls/server.crt";
 pub(crate) const RESPONDER_TLS_KEY_CONTAINER_PATH: &str = "/app/bootroot-http01/tls/server.key";
 pub(crate) const OPENBAO_TLS_CONTAINER_CERT_PATH: &str = "/openbao/config/tls/server.crt";
 pub(crate) const OPENBAO_TLS_CONTAINER_KEY_PATH: &str = "/openbao/config/tls/server.key";
 pub(crate) const OPENBAO_HCL_PATH: &str = "openbao/openbao.hcl";
 pub(crate) const OPENBAO_INFRA_CERT_KEY: &str = "openbao";
+pub(crate) const POSTGRES_INFRA_CERT_KEY: &str = "postgres";
 pub(crate) const OPENBAO_TLS_DEFAULT_NOT_AFTER: &str = "8760h";
 /// The validity of the bootroot-internal registrar leaf: ten years, the
 /// lifetime of the root and intermediate certificates themselves.

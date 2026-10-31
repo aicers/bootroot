@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bootroot::db::DB_COMPOSE_HOST;
 use serde::Deserialize;
 
 use super::constants::{
@@ -72,6 +73,21 @@ pub(crate) fn compose_has_stepca(compose_file: &Path, messages: &Messages) -> Re
     Ok(compose_has_top_level_service(
         &compose_contents,
         STEPCA_SERVICE_NAME,
+    ))
+}
+
+/// Returns true when the compose file declares a top-level `postgres`
+/// service, the one bootroot issues a server certificate for.
+///
+/// Uses the structural scan rather than substring matching because the
+/// name also appears in image tags, environment variables and DSNs of
+/// compose files that do not bundle `PostgreSQL` itself.
+pub(crate) fn compose_has_postgres(compose_file: &Path, messages: &Messages) -> Result<bool> {
+    let compose_contents = std::fs::read_to_string(compose_file)
+        .with_context(|| messages.error_read_file_failed(&compose_file.display().to_string()))?;
+    Ok(compose_has_top_level_service(
+        &compose_contents,
+        DB_COMPOSE_HOST,
     ))
 }
 
@@ -723,6 +739,32 @@ services:
         for json in ["", "{}", r#"{"services": []}"#, "not json"] {
             assert!(ComposeServices::from_config_json(json).is_err(), "{json:?}");
         }
+    }
+
+    #[test]
+    fn compose_has_postgres_is_true_for_both_shipped_compose_files() {
+        for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(compose);
+            assert!(
+                compose_has_postgres(&path, &crate::i18n::test_messages()).unwrap(),
+                "{compose}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_has_postgres_ignores_image_and_environment_references() {
+        // `postgres` appears only in an image tag, a host value and a
+        // DSN: an external-database compose file must not satisfy it.
+        let dir = tempfile::tempdir().unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(
+            &compose_path,
+            "services:\n  step-ca:\n    image: postgres:18.4\n    environment:\n      \
+             postgres: postgres://postgres/stepca\n",
+        )
+        .unwrap();
+        assert!(!compose_has_postgres(&compose_path, &crate::i18n::test_messages()).unwrap());
     }
 
     #[test]

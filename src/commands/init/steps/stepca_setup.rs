@@ -16,6 +16,7 @@ use super::super::types::StepCaInitResult;
 use super::RollbackFile;
 use super::http01_admin_tls::build_http01_admin_tls_sans;
 use super::openbao_tls::build_openbao_tls_sans;
+use super::postgres_tls::build_postgres_tls_sans;
 use crate::commands::infra::run_docker;
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
@@ -476,9 +477,9 @@ fn set_ca_json_metrics_address(value: &mut serde_json::Value, address: &str) -> 
 }
 
 /// Builds the DNS names step-ca's issuance policy denies: every non-IP
-/// subject alternative name of the three control-node server
-/// certificates — step-ca's, `OpenBao`'s and the responder admin API's —
-/// for this install's container names.
+/// subject alternative name of the four control-node server
+/// certificates — step-ca's, `OpenBao`'s, the responder admin API's and
+/// `PostgreSQL`'s — for this install's container names.
 ///
 /// Derived from the SAN builders themselves rather than restated, so a
 /// name later added to one of those certificates is denied without a
@@ -496,6 +497,7 @@ pub(super) fn build_stepca_policy_deny_dns_names(
         .into_iter()
         .chain(build_openbao_tls_sans("", None, openbao_container))
         .chain(build_http01_admin_tls_sans("", None, responder_container))
+        .chain(build_postgres_tls_sans())
         .filter(|name| name.parse::<IpAddr>().is_err())
         .collect();
     names.sort_unstable();
@@ -1843,6 +1845,7 @@ mod tests {
                 "bootroot-openbao",
                 "localhost",
                 "openbao.internal",
+                "postgres",
                 "responder.internal",
                 "stepca.internal",
             ]
@@ -1870,6 +1873,7 @@ mod tests {
                 Some("192.168.1.9:8080"),
                 "insight-http01",
             ))
+            .chain(build_postgres_tls_sans())
             .collect();
         assert!(
             sans.iter().any(|san| san.parse::<IpAddr>().is_ok()),
@@ -1931,6 +1935,7 @@ mod tests {
                             "insight-openbao",
                             "localhost",
                             "openbao.internal",
+                            "postgres",
                             "responder.internal",
                             "stepca.internal"
                         ],

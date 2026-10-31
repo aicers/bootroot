@@ -21,8 +21,9 @@ pub(crate) use constants::{
     OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH, OPENBAO_INFRA_CERT_KEY,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH, OPENBAO_TLS_CONTAINER_KEY_PATH,
     OPENBAO_TLS_DEFAULT_NOT_AFTER, OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
-    RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
-    RESPONDER_TEMPLATE_DIR, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
+    POSTGRES_COMPOSE_DIR, POSTGRES_INFRA_CERT_KEY, POSTGRES_TLS_CERT_PATH, POSTGRES_TLS_DIR,
+    POSTGRES_TLS_KEY_PATH, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
+    RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, SECRET_BYTES, STEPCA_CA_JSON_TEMPLATE_NAME,
     STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
 #[cfg(test)]
@@ -38,6 +39,7 @@ pub(crate) use steps::openbao_tls::{
     OpenBaoAuditDevice, reissue_openbao_tls_cert, sync_openbao_audit_device,
     write_openbao_hcl_plaintext,
 };
+pub(crate) use steps::postgres_tls::issue_postgres_tls_cert;
 pub(crate) use steps::registrar_internal;
 pub(crate) use steps::stepca_setup::set_acme_cert_duration;
 pub(crate) use steps::{

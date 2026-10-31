@@ -5,10 +5,10 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::CleanArgs;
 use crate::commands::compose_file::compose_file_dir;
-use crate::commands::compose_project::ComposeIdentity;
+use crate::commands::compose_project::{ComposeIdentity, DOCKER_BIN};
 use crate::commands::container_name::BootrootContainer;
-use crate::commands::infra::{run_compose, run_docker};
-use crate::commands::init::prompt_yes_no;
+use crate::commands::infra::{run_compose, run_compose_with_exec, run_docker_with_exec};
+use crate::commands::init::{POSTGRES_COMPOSE_DIR, prompt_yes_no};
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -80,9 +80,10 @@ pub(crate) fn run_clean(args: &CleanArgs, messages: &Messages) -> Result<()> {
 }
 
 /// Removes only the `bootroot-openbao` container and its volume.
-/// Leaves every other compose service, `secrets/`, `state.json`, and
-/// `.env` intact so an operator can recover from a partial-init
-/// `OpenBao` state without losing application DB / step-ca state.
+/// Leaves every other compose service, `secrets/`, `postgres/`,
+/// `state.json`, and `.env` intact so an operator can recover from a
+/// partial-init `OpenBao` state without losing application DB / step-ca
+/// state.
 /// See issue #588 §5b.
 fn run_clean_openbao_only(args: &CleanArgs, messages: &Messages) -> Result<()> {
     let identity = ComposeIdentity::resolve(&args.compose_file.compose_file, None, messages)?;
@@ -110,6 +111,16 @@ pub(crate) fn remove_openbao_container_and_volumes(
     compose_file: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    remove_openbao_container_and_volumes_with_exec(compose_file, Path::new(DOCKER_BIN), messages)
+}
+
+/// [`remove_openbao_container_and_volumes`] with `docker` as the
+/// executable, so a test can name a fake.
+fn remove_openbao_container_and_volumes_with_exec(
+    compose_file: &Path,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
     let compose_str = compose_file.to_string_lossy();
     let compose_dir = compose_file_dir(compose_file);
     let compose_dir = compose_dir.as_path();
@@ -121,9 +132,9 @@ pub(crate) fn remove_openbao_container_and_volumes(
     let identity = ComposeIdentity::resolve_for_dir(compose_dir, None, messages)?;
 
     let stop = identity.compose(&[&compose_str], None, &["stop", "openbao"]);
-    let _ = run_compose(&stop, "docker compose stop openbao", messages);
+    let _ = run_compose_with_exec(&stop, "docker compose stop openbao", docker, messages);
     let rm = identity.compose(&[&compose_str], None, &["rm", "-fsv", "openbao"]);
-    run_compose(&rm, "docker compose rm openbao", messages)?;
+    run_compose_with_exec(&rm, "docker compose rm openbao", docker, messages)?;
 
     // Remove ONLY the openbao-owned named volumes. `docker compose down
     // -v` removes every named volume in the compose file regardless of
@@ -132,7 +143,12 @@ pub(crate) fn remove_openbao_container_and_volumes(
     for vol in OPENBAO_NAMED_VOLUMES {
         let full = format!("{}_{vol}", identity.project());
         let vol_args = ["volume", "rm", "-f", full.as_str()];
-        run_docker(&vol_args, &format!("docker volume rm {full}"), messages)?;
+        run_docker_with_exec(
+            &vol_args,
+            &format!("docker volume rm {full}"),
+            docker,
+            messages,
+        )?;
     }
     Ok(())
 }
@@ -173,8 +189,10 @@ pub(crate) fn inspect_label_via_docker(container: &str, label: &str) -> Result<O
 
 /// Removes artifacts created by `infra install` and `init`.
 ///
-/// `secrets/` and `.env` live in the compose file directory (Docker
-/// Compose resolves bind-mount paths relative to the compose file).
+/// `secrets/`, `postgres/` and `.env` live in the compose file directory
+/// (Docker Compose resolves bind-mount paths relative to the compose
+/// file).  Removing `postgres/` needs no privilege although its key is
+/// owned by uid 999: `postgres/tls` is the secrets-directory owner's.
 /// `state.json` lives at `StateFile::default_path()` (the process
 /// working directory), which may differ when `--compose-file` points
 /// elsewhere.
@@ -184,6 +202,7 @@ fn remove_clean_artifacts(
     messages: &Messages,
 ) -> Result<()> {
     remove_path_if_exists(&compose_dir.join("secrets"), messages)?;
+    remove_path_if_exists(&compose_dir.join(POSTGRES_COMPOSE_DIR), messages)?;
     remove_file_if_exists(state_path, messages)?;
     remove_file_if_exists(&compose_dir.join(".env"), messages)?;
     Ok(())
@@ -280,6 +299,60 @@ mod tests {
         // The compose subdirectory had no state.json to begin with;
         // confirm it was never created there by accident.
         assert!(!compose_dir.join("state.json").exists());
+    }
+
+    /// A full clean leaves no private key behind.
+    #[test]
+    fn clean_removes_the_postgres_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let tls_dir = root.path().join("postgres").join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+
+        remove_clean_artifacts(
+            root.path(),
+            &root.path().join("state.json"),
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap();
+
+        assert!(!root.path().join("postgres").exists());
+    }
+
+    /// `--openbao-only` touches the `openbao` container and its volume
+    /// and nothing on disk, so the `PostgreSQL` certificate survives it.
+    #[test]
+    fn clean_openbao_only_leaves_the_postgres_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let tls_dir = root.path().join("postgres").join("tls");
+        std::fs::create_dir_all(&tls_dir).unwrap();
+        std::fs::write(tls_dir.join("server.key"), "key").unwrap();
+        let fake = root.path().join("fake-docker");
+        let args_log = root.path().join("docker_args.log");
+        write_logging_fake_docker(&fake, &args_log);
+
+        remove_openbao_container_and_volumes_with_exec(
+            &root.path().join("docker-compose.yml"),
+            &fake,
+            &Messages::new("en").unwrap(),
+        )
+        .unwrap();
+
+        assert!(tls_dir.join("server.key").exists());
+        let log = std::fs::read_to_string(&args_log).unwrap();
+        assert!(
+            log.contains("rm -fsv openbao"),
+            "the fake must have stood in for docker, got: {log}"
+        );
+    }
+
+    /// Writes a fake `docker` that logs each invocation to `args_log`.
+    fn write_logging_fake_docker(path: &Path, args_log: &Path) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            args_log.display()
+        );
+        crate::test_support::write_executable(path, script.as_bytes());
     }
 
     /// Closes #588 §5b regression: `--openbao-only` must scope volume

@@ -18,6 +18,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   uid need not exist on the host; `0` and user names are refused, the flag
   cannot be combined with `--cert-group`, and `bootroot-agent` must run as root
   to apply it. `service update --cert-owner clear` removes it.
+- `bootroot init` now issues a TLS server certificate for step-ca's PostgreSQL
+  into `postgres/tls/` beside the compose file: one name, `postgres`, signed by
+  the intermediate CA for one year and bundled with it, with its key owned by
+  uid 999, the PostgreSQL image's `postgres` user, at mode `0600`. `state.json`
+  records it, `bootroot rotate infra-cert` renews it and reloads PostgreSQL with
+  `SIGHUP`, and `bootroot rotate ca-key` and every `init`, `reinit` included,
+  re-issue it. step-ca's issuance policy now also denies `postgres`, so no ACME
+  order can obtain a certificate for that name. `bootroot clean` removes the
+  directory with the rest.
 
 ### Changed
 

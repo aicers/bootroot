@@ -92,6 +92,10 @@ OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
 OPENBAO_REPO_TLS_DIR="$OPENBAO_REPO_DIR/tls"
 OPENBAO_SERVER_CRT="$OPENBAO_REPO_TLS_DIR/server.crt"
 OPENBAO_SERVER_KEY="$OPENBAO_REPO_TLS_DIR/server.key"
+POSTGRES_REPO_TLS_DIR="$ROOT_DIR/postgres/tls"
+POSTGRES_SERVER_CRT="$POSTGRES_REPO_TLS_DIR/server.crt"
+POSTGRES_SERVER_KEY="$POSTGRES_REPO_TLS_DIR/server.key"
+POSTGRES_FINGERPRINT_BEFORE=""
 OPENBAO_HCL_SNAPSHOT="$ARTIFACT_DIR/openbao.hcl.pristine"
 OPENBAO_CONFIG_SNAPSHOT="$ARTIFACT_DIR/openbao-config.pristine"
 OPENBAO_TLS_SNAPSHOT="$ARTIFACT_DIR/openbao-tls.pristine"
@@ -296,6 +300,7 @@ restore_ownership() {
   owner="$(id -u):$(id -g)"
   run_sudo chown -R -h "$owner" "$SECRETS_DIR" >/dev/null 2>&1 || true
   run_sudo chown -R -h "$owner" "$OPENBAO_REPO_TLS_DIR" >/dev/null 2>&1 || true
+  run_sudo chown -R -h "$owner" "$POSTGRES_REPO_TLS_DIR" >/dev/null 2>&1 || true
   run_sudo chown -R -h "$owner" "$WORKSPACE_DIR" >/dev/null 2>&1 || true
   run_sudo chown -R -h "$owner" "$ARTIFACT_DIR" >/dev/null 2>&1 || true
   OWNERSHIP_CHANGED=0
@@ -519,6 +524,11 @@ file_leaf_fingerprint() {
     | sed 's/^.*=//'
 }
 
+postgres_leaf_fingerprint() {
+  openssl x509 -in "$POSTGRES_SERVER_CRT" -noout -fingerprint -sha256 \
+    | sed 's/^.*=//'
+}
+
 # The leaf the listener actually presents.  `-servername` mirrors what a
 # real client sends; the handshake result is only used for a byte
 # comparison against the file, so no trust decision rides on it.
@@ -618,6 +628,20 @@ assert_metrics_confined_to_their_containers() {
   if compose exec -T openbao wget -qO- "http://step-ca:9102/metrics" >/dev/null 2>&1; then
     fail "step-ca metrics answered on step-ca:9102 from the compose network"
   fi
+}
+
+# `rotate infra-cert` renews every entry: the PostgreSQL leaf changes too,
+# and its key goes back to the server's user even though the directory
+# has moved to the new secrets owner.
+assert_postgres_leaf_rotated() {
+  local fingerprint key_state
+  fingerprint="$(postgres_leaf_fingerprint)"
+  [ -n "$fingerprint" ] || fail "failed to read the fingerprint of $POSTGRES_SERVER_CRT"
+  [ "$fingerprint" != "$POSTGRES_FINGERPRINT_BEFORE" ] \
+    || fail "the PostgreSQL leaf still has fingerprint ${fingerprint}; it was not re-issued"
+  key_state="$(stat -c '%u:%g %a' "$POSTGRES_SERVER_KEY")"
+  [ "$key_state" = "999:0 600" ] \
+    || fail "the PostgreSQL server.key is ${key_state}, expected 999:0 600"
 }
 
 assert_tls_files_mode_0644() {
@@ -741,12 +765,14 @@ main() {
   assert_post_init_baseline
   assert_listener_accepts_only_hybrid_tls13
   assert_metrics_confined_to_their_containers
+  POSTGRES_FINGERPRINT_BEFORE="$(postgres_leaf_fingerprint)"
 
   reown_secrets_tree
 
   log_phase "rotate-first"
   rotate_infra_cert "first"
   assert_rotation_outcome "first"
+  assert_postgres_leaf_rotated
 
   # The chown must be a no-op on a tree whose ownership is already
   # correct, so a second rotation on the unchanged deployment succeeds.
