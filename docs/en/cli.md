@@ -1615,8 +1615,9 @@ written via stage-then-rename, through the same publish routine that
 writes `state.json` and the `init` outputs — the bytes are first
 written to a sibling temp file created with `O_CREAT|O_EXCL` at
 `mode=0600`, the staged file is `chown`d (when the policy is active)
-and set to its final mode — `0640` for the key under an active policy,
-`0600` otherwise, `0644` for the certificate and the bundle — and only
+and set to its final mode — `0640` for the key under `--cert-group`,
+`0600` under `--cert-owner` or with neither policy, `0644` for the
+certificate and the bundle — and only
 then renamed over the destination. Two properties follow. The
 destination path is never
 observable at a mode wider than the final policy: there is no
