@@ -1054,6 +1054,13 @@ DB DSN host handling:
   PostgreSQL is recreated with them (`up -d --no-deps --force-recreate
   postgres`) and from then on accepts TCP connections only over TLS 1.3
   with X25519MLKEM768, authenticated with `scram-sha-256`
+- When the compose file does not declare `postgres`, nothing
+  PostgreSQL-related is issued or written, and a `postgres` entry an earlier
+  run recorded is removed from `state.json` → `infra_certs`, so
+  `rotate infra-cert` and `rotate ca-key` no longer renew it or signal its
+  container. The files already under `<compose-dir>/postgres/` and the
+  override under `secrets/postgres/` stay on disk until `bootroot clean`
+  removes them (with the default `secrets/` directory)
 - DB connectivity check status (when enabled)
 - DB host resolution summary (`from -> to`)
 - EAB registration summary

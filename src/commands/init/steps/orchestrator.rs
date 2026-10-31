@@ -30,7 +30,7 @@ use super::openbao_tls::{
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
 use super::postgres_tls::{
-    issue_postgres_tls_cert, record_postgres_infra_cert, recreate_postgres_with_tls,
+    issue_postgres_tls_cert, reconcile_postgres_infra_cert, recreate_postgres_with_tls,
     write_postgres_tls_files,
 };
 use super::prompts::{confirm_overwrite, should_confirm};
@@ -1507,16 +1507,18 @@ async fn run_init_inner(
             .with_context(|| messages.error_serialize_state_failed())?;
     }
 
-    // Deferred for the same reason as the HTTP-01 admin entry above.
-    if postgres_tls_enabled {
-        let state_path = StateFile::default_path();
-        let mut state = StateFile::load(&state_path)?;
-        record_postgres_infra_cert(
-            &mut state,
-            compose_dir,
-            &identity.container(BootrootContainer::Postgres),
-            messages,
-        )?;
+    // Deferred for the same reason as the HTTP-01 admin entry above. A
+    // compose file that no longer declares `postgres` drops an entry an
+    // earlier run recorded; one that never did leaves `state.json` alone.
+    let state_path = StateFile::default_path();
+    let mut state = StateFile::load(&state_path)?;
+    if reconcile_postgres_infra_cert(
+        &mut state,
+        postgres_tls_enabled,
+        compose_dir,
+        &identity.container(BootrootContainer::Postgres),
+        messages,
+    )? {
         state
             .save_async(&state_path)
             .await

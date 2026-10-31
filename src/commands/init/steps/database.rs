@@ -706,6 +706,34 @@ mod tests {
         );
     }
 
+    /// The DSN built from `POSTGRES_*` is stored as the outer resolver
+    /// leaves it: normalized for the compose runtime, with the root CA
+    /// step-ca verifies the server against.
+    #[test]
+    fn test_resolve_db_dsn_for_init_stores_the_env_built_dsn() {
+        // CodeQL flags "secret" as a hard-coded credential, but this is a
+        // test-only fixture value with no relation to any real credential.
+        // Dismiss as false positive.
+        let env = postgres_env(&[
+            (POSTGRES_USER_ENV, "step"),
+            (POSTGRES_PASSWORD_ENV, "secret"),
+            (POSTGRES_DB_ENV, "stepca"),
+            (POSTGRES_HOST_ENV, "postgres"),
+            (POSTGRES_PORT_ENV, "5432"),
+        ]);
+
+        let ResolvedDbDsn {
+            dsn, normalization, ..
+        } = resolve_db_dsn_for_init(&default_init_args(), Path::new("."), &env, &test_messages())
+            .expect("dsn should resolve");
+        assert_eq!(
+            dsn,
+            "postgresql://step:secret@postgres:5432/stepca?sslmode=verify-full&sslrootcert=/home/step/certs/root_ca.crt"
+        );
+        assert_eq!(normalization.original_host, "postgres");
+        assert_eq!(normalization.effective_host, "postgres");
+    }
+
     /// Without a user, a password and a database name there is nothing
     /// to build a DSN from, and the resolver must fall through to the
     /// prompt rather than synthesising one out of the defaults.
