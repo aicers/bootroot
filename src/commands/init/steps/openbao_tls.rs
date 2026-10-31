@@ -147,8 +147,8 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
 }
 
 /// Refuses to proceed when a TLS output directory (`openbao/tls`,
-/// `bootroot-http01/tls`) is itself a symlink, with the refusal
-/// `refusal` renders for its path.
+/// `bootroot-http01/tls`, `postgres/tls`) is itself a symlink, with the
+/// refusal `refusal` renders for its path.
 ///
 /// The bind-mount source is produced with `std::fs::canonicalize`, which
 /// resolves the final component too, so a symlink planted at the output
@@ -238,6 +238,9 @@ fn build_tls_output_chown_args<'a>(
 ///   responder override, and issues into it in the same run, before any
 ///   sweep; with `secrets/` owned by another user the write is refused
 ///   the same way (issue #1054).
+/// - `postgres/tls` is a sibling of `secrets/` too, and a previous
+///   issuance handed its key to uid 999, so `step` could not overwrite
+///   it.
 ///
 /// Reuses the image the `step certificate create` container runs in the
 /// very next statement, so no extra image or pull is introduced.  The

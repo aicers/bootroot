@@ -1011,6 +1011,12 @@ DB DSN host handling:
 - OpenBao init/unseal summary and AppRole outputs
 - `password.txt` and `secrets/config/ca.json` updates
 - step-ca init result and responder check status
+- PostgreSQL server certificate in `<compose-dir>/postgres/tls/`, issued on
+  every run when the compose file declares a `postgres` service, and recorded
+  in `state.json` → `infra_certs` as `postgres`: `server.crt` (mode `0644`) is
+  a one-year leaf whose only name is `postgres`, followed by the intermediate
+  CA that signed it, and `server.key` is owned by `999:0`, the `postgres` user
+  of the PostgreSQL image, at mode `0600`. Nothing serves it yet
 - DB connectivity check status (when enabled)
 - DB host resolution summary (`from -> to`)
 - EAB registration summary
@@ -2324,7 +2330,10 @@ Phases:
   fingerprints
 - Phase 1 — Backup: back up current cert/key files
 - Phase 2 — Generate: create new CA key pair(s) and certificate(s)
-- Phase 3 — Additive trust: write transitional trust (old + new
+- Phase 3 — Additive trust: first, when `state.json` → `infra_certs` has a
+  `postgres` entry, re-issue the PostgreSQL server certificate under the new
+  intermediate and reload PostgreSQL with `SIGHUP` (`--skip reissue` does not
+  skip this); then write transitional trust (old + new
   fingerprints, with a `ca-bundle.pem` carrying both CA generations) to
   OpenBao — `bootroot/ca`, every `state.json` service and every
   registrar-managed identity — so services accept both old and new
@@ -2586,7 +2595,9 @@ Renews infrastructure TLS certificates registered in `state.json` →
 `infra_certs`. Today this covers the **OpenBao server TLS** cert
 (`openbao` entry) and, when the HTTP-01 responder admin API was
 provisioned with TLS, the **HTTP-01 admin TLS** cert
-(`bootroot-http01` entry). The set is data-driven from
+(`bootroot-http01` entry), and, when `bootroot init` found a `postgres`
+service in the compose file, the **PostgreSQL server TLS** cert (`postgres`
+entry), reloaded with `SIGHUP`. The set is data-driven from
 `infra_certs`; the loop body does not change when a new entry type
 is added — only the per-key dispatch arm.
 
@@ -2644,6 +2655,18 @@ Behavior:
     `<secrets-dir>/bootroot-http01/tls/server.crt` and
     `<secrets-dir>/bootroot-http01/tls/server.key`. Both files are
     `chmod 0600`'d after write.
+  - `postgres` → re-issues the PostgreSQL server cert, with `postgres` as its
+    only SAN whatever the entry records and the intermediate CA bundled after
+    the leaf, and writes it to `<compose-dir>/postgres/tls/server.crt` and
+    `<compose-dir>/postgres/tls/server.key`. Before the write, a one-shot root
+    container chowns `<compose-dir>/postgres/tls` and everything in it to the
+    owner of `<secrets-dir>`, as for `openbao`: the previous issuance left the
+    key owned by uid 999, and `step` has to overwrite it. A symlink at that
+    path is refused the same way (`Refusing to use a symlink as the PostgreSQL
+    TLS output directory`). The directory is then `0755`, `server.crt` `0644`
+    and `server.key` `0600`, and a last one-shot root container, mounting only
+    that directory, runs `chown --no-dereference 999:0` on the key, which hands
+    it to the `postgres` user of the PostgreSQL image.
 - After each successful reissue the entry's `issued_at` is
   refreshed and the reload strategy runs so the affected container
   picks up the new material. For known infra-cert keys the effective
@@ -2659,6 +2682,9 @@ Behavior:
     normalized to the signal.
   - `bootroot-http01` (HTTP-01 admin) → `ContainerSignal` → `docker
     kill -s SIGHUP <container>`.
+  - `postgres` → `ContainerSignal` → `docker kill -s SIGHUP
+    <instance>-postgres`. PostgreSQL reloads its certificate files and keeps
+    open sessions.
 - After signalling the `openbao` container, the command verifies the
   swap took effect: it opens an unauthenticated TLS connection to the
   state-resident OpenBao listener, reads the leaf certificate the
@@ -2668,7 +2694,8 @@ Behavior:
   deadline expires, or the listener cannot be reached, the command
   fails with a message that names the entry and distinguishes the two
   cases. This check applies only to the `openbao` entry; the
-  `bootroot-http01` entry gets no post-reload verification.
+  `bootroot-http01` and `postgres` entries get no post-reload
+  verification.
 - Once every entry has been processed, the updated `infra_certs`
   map is persisted back to `state.json`.
 
@@ -2927,7 +2954,8 @@ bootroot ca restart
 ## bootroot clean
 
 Tears down the local environment for a fresh start. Stops containers, removes
-volumes, and deletes generated secrets, state, and `.env`. After cleaning,
+volumes, and deletes generated secrets, `postgres/` (the PostgreSQL server
+certificate and its key), state, and `.env`. After cleaning,
 re-run `bootroot infra install` and `bootroot init` to start over.
 
 ### Inputs
@@ -2936,14 +2964,15 @@ re-run `bootroot infra install` and `bootroot init` to start over.
 - `--yes` / `-y`: skip confirmation prompts
 - `--openbao-only`: remove only the `bootroot-openbao` container and
   its volume; leave `bootroot-postgres`, `bootroot-http01`,
-  `bootroot-ca`, `secrets/`, `state.json`, and `.env` intact. Useful
-  when only the OpenBao state is fouled (e.g. after a partial-init
+  `bootroot-ca`, `secrets/`, `postgres/`, `state.json`, and `.env`
+  intact. Useful when only the OpenBao state is fouled (e.g. after a partial-init
   failure — see #588 §5).
 
 ### Behavior
 
 - Runs `docker compose down -v --remove-orphans`
-- Removes `secrets/`, `state.json`, `.env`, and optionally `certs/`
+- Removes `secrets/`, `postgres/`, `state.json`, `.env`, and optionally
+  `certs/`
 - Prompts for confirmation before destructive actions (unless `--yes`)
 - With `--openbao-only`: only the `openbao` compose service is
   stopped, removed, and its volume dropped. Other services keep

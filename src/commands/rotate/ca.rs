@@ -9,6 +9,7 @@ use super::helpers::{
     confirm_action, ensure_file_exists, restart_compose_service, signal_bootroot_agent,
     try_restart_container,
 };
+use super::infra_cert::execute_reload_strategy;
 use super::registrar_endpoint::{self, EndpointHost, RetiredOwner, SocketDialer, WaitBudget};
 use super::registrar_internal;
 use super::registrar_targets::{kv_fanout_targets, registrar_only_targets};
@@ -17,18 +18,20 @@ use super::{
     STEP_CA_HELPER_IMAGE, SURFACE_MOVE_TIMEOUT,
 };
 use crate::cli::args::{RotateCaKeyArgs, RotateForceReissueArgs, RotateSkipPhase};
+use crate::commands::compose_file::compose_file_dir;
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
+    POSTGRES_INFRA_CERT_KEY, compute_ca_bundle_pem, compute_ca_fingerprints,
+    issue_postgres_tls_cert, read_ca_cert_fingerprint,
 };
 use crate::commands::trust::{
     self, RotationMode, RotationState, create_rotation_state_async, delete_rotation_state,
     load_rotation_state, update_rotation_state_async,
 };
 use crate::i18n::Messages;
-use crate::state::{DeliveryMode, ServiceEntry};
+use crate::state::{DeliveryMode, ServiceEntry, StateFile};
 
 /// Cadence shared by `--wait` polling for both `remote-bootstrap` (KV
 /// payload) and `local-file` (cert on disk) delivery so operators see
@@ -212,6 +215,18 @@ pub(super) async fn rotate_ca_key(
     // Phase 3 — Distribute transitional trust (additive)
     if start_phase < 3 {
         println!("{}", messages.rotate_ca_key_phase_trust_additive());
+
+        // First, before the additive trust: Phase 2 has just put the new
+        // intermediate on disk (and, in a full rotation, the new root in
+        // place of the old one), and Phase 4 restarts step-ca. A failure
+        // aborts before Phase 3 is recorded, and a resume repeats this.
+        reissue_postgres_tls_cert(
+            &ctx.state,
+            &compose_file_dir(&ctx.compose_file),
+            ctx.paths.secrets_dir(),
+            &ctx.docker,
+            messages,
+        )?;
 
         let transitional_fps = if rot_state.mode == RotationMode::Full {
             vec![
@@ -1563,6 +1578,27 @@ async fn wait_for_local_completion(
     }
 }
 
+/// Re-issues the `PostgreSQL` server certificate under the intermediate
+/// now on disk and reloads the server, when `state` records one.
+///
+/// An installation with no `postgres` entry is left as it is: its compose
+/// file declares no such service, or it was initialized before bootroot
+/// issued this certificate.
+fn reissue_postgres_tls_cert(
+    state: &StateFile,
+    compose_dir: &Path,
+    secrets_dir: &Path,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    let Some(entry) = state.infra_certs.get(POSTGRES_INFRA_CERT_KEY) else {
+        return Ok(());
+    };
+    issue_postgres_tls_cert(compose_dir, secrets_dir, docker, messages)
+        .with_context(|| messages.error_infra_tls_renew_failed(POSTGRES_INFRA_CERT_KEY))?;
+    execute_reload_strategy(&entry.reload_strategy, docker)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1570,7 +1606,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::super::test_support::test_messages;
+    use super::super::test_support::{
+        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
+        write_self_contained_fake_docker_exiting,
+    };
     use super::*;
     use crate::commands::compose_project::DOCKER_BIN;
 
@@ -1588,6 +1627,112 @@ mod tests {
             state_file: dir.join("state.json"),
             docker: PathBuf::from(DOCKER_BIN),
         }
+    }
+
+    /// A state recording the `postgres` entry, with the certificate's
+    /// directories under `dir` as the fake docker's no-op `step` needs
+    /// them. Returns the state and the compose and secrets directories.
+    fn state_with_postgres_entry(dir: &Path) -> (StateFile, PathBuf, PathBuf) {
+        let compose_dir = dir.join("compose");
+        let secrets_dir = dir.join("secrets");
+        let tls_dir = compose_dir.join("postgres").join("tls");
+        fs::create_dir_all(&tls_dir).expect("tls dir");
+        fs::create_dir_all(&secrets_dir).expect("secrets dir");
+        fs::write(tls_dir.join("server.crt"), "cert").expect("write cert");
+        fs::write(tls_dir.join("server.key"), "key").expect("write key");
+        let mut state = StateFile::default();
+        state.infra_certs.insert(
+            POSTGRES_INFRA_CERT_KEY.to_string(),
+            crate::state::InfraCertEntry {
+                cert_path: tls_dir.join("server.crt"),
+                key_path: tls_dir.join("server.key"),
+                sans: vec!["postgres".to_string()],
+                renew_before: "720h".to_string(),
+                reload_strategy: crate::state::ReloadStrategy::ContainerSignal {
+                    container_name: "insight-postgres".to_string(),
+                    signal: "SIGHUP".to_string(),
+                },
+                issued_at: None,
+                expires_at: None,
+            },
+        );
+        (state, compose_dir, secrets_dir)
+    }
+
+    /// The Phase 3 step re-issues and only then reloads: a signal sent
+    /// first would have the server re-read the leaf being replaced.
+    #[test]
+    fn phase3_postgres_step_reissues_then_reloads() {
+        let dir = tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+        let (state, compose_dir, secrets_dir) = state_with_postgres_entry(dir.path());
+
+        reissue_postgres_tls_cert(&state, &compose_dir, &secrets_dir, &fake, &test_messages())
+            .expect("the step must succeed against the fake docker");
+
+        let invocations = decode_fake_docker_log(&args_log);
+        assert_eq!(invocations.len(), 4, "{invocations:?}");
+        assert!(
+            invocations
+                .get(1)
+                .is_some_and(|argv| argv.iter().any(|arg| arg == "--bundle")),
+            "the second container must be the certificate write: {invocations:?}"
+        );
+        assert!(
+            invocations
+                .get(2)
+                .is_some_and(|argv| argv.iter().any(|arg| arg == "999:0")),
+            "the third container must hand over the key: {invocations:?}"
+        );
+        assert_eq!(
+            invocations.get(3),
+            Some(&vec![
+                "kill".to_string(),
+                "-s".to_string(),
+                "SIGHUP".to_string(),
+                "insight-postgres".to_string(),
+            ])
+        );
+    }
+
+    /// An installation with no entry is left as it is: nothing runs.
+    #[test]
+    fn phase3_postgres_step_does_nothing_without_an_entry() {
+        let dir = tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+
+        reissue_postgres_tls_cert(
+            &StateFile::default(),
+            &dir.path().join("compose"),
+            &dir.path().join("secrets"),
+            &fake,
+            &test_messages(),
+        )
+        .expect("no entry must be a no-op");
+
+        assert!(!args_log.exists(), "no docker command may run");
+        assert!(!dir.path().join("compose").exists());
+    }
+
+    /// A failure propagates, which is what keeps Phase 3 unrecorded so a
+    /// resume repeats the step, and the reload does not run after it.
+    #[test]
+    fn phase3_postgres_step_propagates_a_failed_issuance() {
+        let dir = tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker_exiting(&fake, &args_log, 1);
+        let (state, compose_dir, secrets_dir) = state_with_postgres_entry(dir.path());
+
+        reissue_postgres_tls_cert(&state, &compose_dir, &secrets_dir, &fake, &test_messages())
+            .expect_err("a failed issuance must fail the step");
+
+        let invocations = decode_fake_docker_log(&args_log);
+        assert_eq!(invocations.len(), 1, "{invocations:?}");
     }
 
     /// The sidecars are addressed by name, so a rotation against one

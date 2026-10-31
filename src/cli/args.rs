@@ -13,7 +13,8 @@ const INFRA_AFTER_HELP: &str = "\
 Teardown:
   This command brings the stack up or installs it; it does not tear it
   down. Use `bootroot clean` (top-level) to stop the compose stack and
-  wipe `secrets/`, `state.json`, `.env`, and (optionally) `certs/`.
+  wipe `secrets/`, `postgres/`, `state.json`, `.env`, and (optionally)
+  `certs/`.
   Run `bootroot clean --help` for details.";
 
 const CLEAN_LONG_ABOUT: &str = "\
@@ -23,14 +24,14 @@ Without flags, `bootroot clean`:
   - runs `docker compose down -v --remove-orphans` against the main
     compose file plus any auto-discovered infra openbao-agent and
     `openbao-exposed` overrides under `secrets/openbao/`;
-  - removes `secrets/`, `state.json`, and `.env`;
+  - removes `secrets/`, `postgres/`, `state.json`, and `.env`;
   - prompts before removing `certs/` (or removes it without prompting
     when `--yes` is given).
 
 Pass `--openbao-only` to wipe just the `bootroot-openbao` container and
 its `openbao-data` volume (recovery from a partial-init OpenBao state); every
-other compose service, `secrets/`, `state.json`, and `.env` stay
-intact.";
+other compose service, `secrets/`, `postgres/`, `state.json`, and `.env`
+stay intact.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -110,8 +111,8 @@ pub(crate) enum CliCommand {
     /// subcommand's `--help` for its exact contract.
     Rotate(RotateArgs),
     /// Tears down the bootroot stack and wipes its filesystem state
-    /// (`secrets/`, `state.json`, `.env`, and — with confirmation or
-    /// `--yes` — `certs/`).
+    /// (`secrets/`, `postgres/`, `state.json`, `.env`, and — with
+    /// confirmation or `--yes` — `certs/`).
     #[command(long_about = CLEAN_LONG_ABOUT)]
     Clean(CleanArgs),
     /// Manages `OpenBao` operator material outside the regular init and
@@ -1174,8 +1175,8 @@ pub(crate) struct CleanArgs {
 
     /// Removes only the `bootroot-openbao` container and its volume,
     /// leaving `bootroot-postgres`, `bootroot-http01`, `bootroot-ca`,
-    /// `secrets/`, `state.json`, and `.env` intact. Useful when only
-    /// the `OpenBao` state is fouled (e.g. after a partial-init
+    /// `secrets/`, `postgres/`, `state.json`, and `.env` intact. Useful when
+    /// only the `OpenBao` state is fouled (e.g. after a partial-init
     /// failure — see issue #588 §5).
     #[arg(long = "openbao-only")]
     pub(crate) openbao_only: bool,

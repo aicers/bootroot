@@ -46,6 +46,10 @@ COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
 CERTS_DIR="${CERTS_DIR:-$WORKSPACE_DIR/certs}"
+POSTGRES_TLS_DIR="$(dirname "$COMPOSE_FILE")/postgres/tls"
+POSTGRES_TLS_FINGERPRINT=""
+# The tag both shipped compose files declare.
+POSTGRES_TLS_PROBE_IMAGE="postgres:18.4"
 TIMEOUT_SECS="${TIMEOUT_SECS:-120}"
 INFRA_UP_ATTEMPTS="${INFRA_UP_ATTEMPTS:-6}"
 INFRA_UP_DELAY_SECS="${INFRA_UP_DELAY_SECS:-5}"
@@ -1346,6 +1350,90 @@ assert_no_root_owned_secrets() {
   fi
 }
 
+# Asserts the PostgreSQL server certificate: the key's owner and mode, a
+# single `postgres` SAN, one year of validity, a leaf signed by the
+# *current* intermediate and a chain to the current root. `-partial_chain`
+# is what tells intermediates apart: every rotation reuses the issuer
+# name, so the name alone would pass on a stale leaf.
+assert_postgres_tls() {
+  local label="$1"
+  local crt="$POSTGRES_TLS_DIR/server.crt"
+  local key="$POSTGRES_TLS_DIR/server.key"
+  local actual san leaf fingerprint
+
+  actual="$(stat -c '%u:%g %a' "$key")"
+  [ "$actual" = "999:0 600" ] ||
+    fail "${label}: postgres server.key is ${actual}, expected 999:0 600"
+  actual="$(stat -c '%a' "$crt")"
+  [ "$actual" = "644" ] || fail "${label}: postgres server.crt is mode ${actual}, expected 644"
+  actual="$(stat -c '%a' "$POSTGRES_TLS_DIR")"
+  [ "$actual" = "755" ] || fail "${label}: postgres/tls is mode ${actual}, expected 755"
+
+  san="$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>>"$RUN_LOG" |
+    sed -e '1d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')" ||
+    fail "${label}: could not read the subjectAltName of $crt"
+  [ "$san" = "DNS:postgres" ] ||
+    fail "${label}: postgres leaf has subjectAltName '${san}', expected 'DNS:postgres'"
+
+  # 8760h, give or take the hour either side of the moment it was issued.
+  openssl x509 -in "$crt" -noout -checkend "$((8759 * 3600))" >/dev/null ||
+    fail "${label}: postgres leaf expires sooner than 8760h after issuance"
+  if openssl x509 -in "$crt" -noout -checkend "$((8761 * 3600))" >/dev/null; then
+    fail "${label}: postgres leaf outlives 8760h"
+  fi
+
+  [ "$(grep -c 'BEGIN CERTIFICATE' "$crt")" = "2" ] ||
+    fail "${label}: postgres server.crt must hold the leaf and the intermediate"
+  leaf="$(openssl x509 -in "$crt")"
+  printf '%s\n' "$leaf" |
+    openssl verify -partial_chain -CAfile "$SECRETS_DIR/certs/intermediate_ca.crt" >>"$RUN_LOG" 2>&1 ||
+    fail "${label}: postgres leaf is not signed by the current intermediate"
+  printf '%s\n' "$leaf" |
+    openssl verify -CAfile "$SECRETS_DIR/certs/root_ca.crt" -untrusted "$crt" >>"$RUN_LOG" 2>&1 ||
+    fail "${label}: postgres server.crt does not verify against the current root"
+
+  fingerprint="$(printf '%s\n' "$leaf" | openssl x509 -noout -fingerprint -sha256)"
+  [ -n "$fingerprint" ] || fail "${label}: could not read the postgres leaf fingerprint"
+  [ "$fingerprint" != "$POSTGRES_TLS_FINGERPRINT" ] ||
+    fail "${label}: postgres leaf was not re-issued, its fingerprint is unchanged"
+  POSTGRES_TLS_FINGERPRINT="$fingerprint"
+
+  {
+    printf '[lifecycle] postgres tls %s: ' "$label"
+    stat -c '%u:%g %a %n' "$POSTGRES_TLS_DIR"/*
+    openssl x509 -noout -subject -issuer -ext subjectAltName -enddate -in "$crt"
+  } >>"$RUN_LOG"
+}
+
+# The image itself is the judge of the two files: it refuses to start on
+# a key whose owner or mode it does not accept. Nothing serves this
+# certificate in the stack yet, so this throwaway server is what shows it
+# would.
+assert_postgres_starts_with_tls() {
+  local name="${RUN_INSTANCE}-postgres-tls-probe"
+  local attempt logs ready=0
+  docker run -d --name "$name" \
+    -e POSTGRES_PASSWORD=probe-only \
+    -v "$POSTGRES_TLS_DIR:/tls:ro" \
+    "$POSTGRES_TLS_PROBE_IMAGE" \
+    -c ssl=on -c ssl_cert_file=/tls/server.crt -c ssl_key_file=/tls/server.key \
+    >>"$RUN_LOG" 2>&1 || fail "could not start the throwaway postgres"
+  for attempt in $(seq 1 "$TIMEOUT_SECS"); do
+    # Read the whole log first: under `pipefail`, `grep -q` leaving early
+    # can fail `docker logs` on the pipe and hide a line it did find.
+    logs="$(docker logs "$name" 2>&1 || true)"
+    if grep -q 'database system is ready to accept connections' <<<"$logs"; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+  docker logs "$name" >"$ARTIFACT_DIR/postgres-tls-probe.log" 2>&1 || true
+  docker rm -f -v "$name" >>"$RUN_LOG" 2>&1 || true
+  [ "$ready" = "1" ] ||
+    fail "the throwaway postgres did not become ready with ssl=on; see $ARTIFACT_DIR/postgres-tls-probe.log"
+}
+
 copy_remote_materials() {
   local control_service_dir="$SECRETS_DIR/services/$REMOTE_SERVICE"
   local remote_service_dir="$REMOTE_DIR/secrets/services/$REMOTE_SERVICE"
@@ -1677,6 +1765,7 @@ run_rotations_with_verification() {
   # as the secrets-directory owner after the ownership sweep, so the
   # reseeded root-owned keys must be converged back to owner-owned.
   assert_no_root_owned_secrets "rotate ca-key"
+  assert_postgres_tls "after-ca-key"
 
   log_phase "rotate-ca-key-full"
   run_bootroot rotate \
@@ -1693,6 +1782,8 @@ run_rotations_with_verification() {
   assert_fingerprint_changed "$EDGE_SERVICE" "after-ca-key" "after-ca-key-full"
   assert_fingerprint_changed "$WEB_SERVICE" "after-ca-key" "after-ca-key-full"
   assert_fingerprint_changed "$REMOTE_SERVICE" "after-ca-key" "after-ca-key-full"
+  assert_no_root_owned_secrets "rotate ca-key --full"
+  assert_postgres_tls "after-ca-key-full"
 }
 
 write_manifest() {
@@ -1804,6 +1895,8 @@ main() {
   write_agent_config "$EDGE_AGENT_CONFIG"
   write_agent_config "$WEB_AGENT_CONFIG"
   run_bootstrap_chain
+  assert_postgres_tls "after-init"
+  assert_postgres_starts_with_tls
 
   [ -x "$BOOTROOT_AGENT_BIN" ] || cargo build --bin bootroot-agent >>"$RUN_LOG" 2>&1
   export PATH="$(dirname "$BOOTROOT_AGENT_BIN"):$PATH"

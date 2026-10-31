@@ -770,12 +770,12 @@ container.
 
   The bundled step-ca refuses to issue for any IP address and for the
   control node's own names: `localhost`, `stepca.internal`,
-  `openbao.internal`, `responder.internal`, `<instance>-ca`,
+  `openbao.internal`, `responder.internal`, `postgres`, `<instance>-ca`,
   `<instance>-openbao` and `<instance>-http01` (`bootroot-ca`,
   `bootroot-openbao` and `bootroot-http01` on the default instance). These
-  are the names and addresses the step-ca, OpenBao and responder admin API
-  server certificates carry, so no service host can obtain a certificate
-  that impersonates those endpoints. The refusal is
+  are the names and addresses the step-ca, OpenBao, responder admin API and
+  PostgreSQL server certificates carry, so no service host can obtain a
+  certificate that impersonates those endpoints. The refusal is
   `authority.policy.x509.deny` in `ca.json`. bootroot owns that key and
   rewrites it on every `bootroot init`, so a policy written there by hand
   is replaced. An existing installation receives it on its next

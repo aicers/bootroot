@@ -773,10 +773,10 @@ bootroot가 제공하는 두 compose 파일(`docker-compose.yml`,
 
   번들된 step-ca는 어떤 IP 주소에 대해서도, 그리고 제어 노드 자체의
   이름인 `localhost`, `stepca.internal`, `openbao.internal`,
-  `responder.internal`, `<instance>-ca`, `<instance>-openbao`,
+  `responder.internal`, `postgres`, `<instance>-ca`, `<instance>-openbao`,
   `<instance>-http01`(기본 인스턴스에서는 `bootroot-ca`,
   `bootroot-openbao`, `bootroot-http01`)에 대해서도 인증서를 발급하지
-  않습니다. 이 이름과 주소는 step-ca, OpenBao, 리스폰더 관리자 API의 서버
+  않습니다. 이 이름과 주소는 step-ca, OpenBao, 리스폰더 관리자 API, PostgreSQL의 서버
   인증서가 담고 있는 것이므로, 어떤 서비스 호스트도 이 엔드포인트를
   사칭하는 인증서를 발급받을 수 없습니다. 이 거부는 `ca.json`의
   `authority.policy.x509.deny`입니다. 이 키는 bootroot가 관리하며 매

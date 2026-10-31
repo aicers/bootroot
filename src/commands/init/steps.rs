@@ -5,6 +5,7 @@ mod openbao_setup;
 pub(crate) mod openbao_tls;
 mod openbao_transition;
 mod orchestrator;
+pub(crate) mod postgres_tls;
 mod prompts;
 pub(crate) mod registrar_internal;
 mod responder_setup;

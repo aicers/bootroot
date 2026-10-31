@@ -538,6 +538,24 @@ impl Messages {
         )
     }
 
+    pub(crate) fn info_postgres_tls_provisioned(&self, path: &str) -> String {
+        format_template(
+            self.strings().info_postgres_tls_provisioned,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_postgres_tls_provision_failed(&self) -> &'static str {
+        self.strings().error_postgres_tls_provision_failed
+    }
+
+    pub(crate) fn error_postgres_tls_output_dir_symlink(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_postgres_tls_output_dir_symlink,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn info_openbao_hcl_tls_written(&self) -> &'static str {
         self.strings().info_openbao_hcl_tls_written
     }

@@ -8,7 +8,7 @@ use bootroot::db::parse_db_dsn;
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 
-use super::super::paths::{compose_has_responder, resolve_responder_url};
+use super::super::paths::{compose_has_postgres, compose_has_responder, resolve_responder_url};
 use super::super::types::{
     AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, OpenBaoConfigResult,
 };
@@ -31,6 +31,7 @@ use super::openbao_tls::{
     write_openbao_hcl_for_tls_recreate,
 };
 use super::openbao_transition::{OpenBaoTlsTransition, UnsealKeyInputs};
+use super::postgres_tls::{issue_postgres_tls_cert, record_postgres_infra_cert};
 use super::prompts::{confirm_overwrite, should_confirm};
 use super::registrar_internal::{self, EnabledEndpoint};
 use super::responder_setup::{
@@ -867,8 +868,8 @@ async fn run_init_inner(
     // step-ca refuses to issue for any IP address and for every DNS
     // name a control-node server certificate carries: a service host
     // holding the responder HMAC could otherwise be issued a certificate
-    // that impersonates `OpenBao`, step-ca or the responder admin API to
-    // every client verifying against this CA.
+    // that impersonates `OpenBao`, step-ca, the responder admin API or
+    // `PostgreSQL` to every client verifying against this CA.
     let stepca_policy_deny_dns = build_stepca_policy_deny_dns_names(
         &identity.container(BootrootContainer::StepCa),
         &identity.container(BootrootContainer::OpenBao),
@@ -886,6 +887,15 @@ async fn run_init_inner(
         // Fix ownership: step-ca init may create files with different
         // ownership.  Re-apply correct perms before anything reads them.
         fix_secrets_permissions(&secrets_dir).await?;
+    }
+
+    // Issued on every run, so a re-run of `init` and a `reinit` re-issue
+    // it from the preserved intermediate. Not tracked in
+    // `rollback.tls_artifacts`: a failed `init` leaves the files for the
+    // next run to overwrite.
+    let postgres_tls_enabled = compose_has_postgres(&args.compose.compose_file, messages)?;
+    if postgres_tls_enabled {
+        issue_postgres_tls_cert(compose_dir, &secrets_dir, rollback.docker(), messages)?;
     }
 
     // Reconciles the `db` section, the ACME provisioner's cert duration,
@@ -1480,6 +1490,22 @@ async fn run_init_inner(
             &responder_container,
         );
         record_http01_admin_infra_cert(&mut state, &secrets_dir, sans, &responder_container);
+        state
+            .save_async(&state_path)
+            .await
+            .with_context(|| messages.error_serialize_state_failed())?;
+    }
+
+    // Deferred for the same reason as the HTTP-01 admin entry above.
+    if postgres_tls_enabled {
+        let state_path = StateFile::default_path();
+        let mut state = StateFile::load(&state_path)?;
+        record_postgres_infra_cert(
+            &mut state,
+            compose_dir,
+            &identity.container(BootrootContainer::Postgres),
+            messages,
+        )?;
         state
             .save_async(&state_path)
             .await
