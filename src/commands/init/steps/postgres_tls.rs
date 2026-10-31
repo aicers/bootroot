@@ -320,6 +320,34 @@ pub(in crate::commands::init) fn record_postgres_infra_cert(
     Ok(())
 }
 
+/// Brings the `PostgreSQL` entry of `StateFile::infra_certs` in line with
+/// whether the compose file declares the service, returning whether the
+/// state has to be saved.
+///
+/// Present, the entry is recorded by [`record_postgres_infra_cert`].
+/// Absent, a recorded entry is removed so `rotate infra-cert` and
+/// `rotate ca-key` stop re-issuing a certificate for a server bootroot no
+/// longer manages and signalling its container; the files on disk stay.
+/// Without an entry to remove nothing changes, and `false` is returned.
+///
+/// # Errors
+///
+/// Returns an error when the service is present and the compose
+/// directory cannot be resolved.
+pub(in crate::commands::init) fn reconcile_postgres_infra_cert(
+    state: &mut StateFile,
+    postgres_present: bool,
+    compose_dir: &Path,
+    postgres_container: &str,
+    messages: &Messages,
+) -> Result<bool> {
+    if postgres_present {
+        record_postgres_infra_cert(state, compose_dir, postgres_container, messages)?;
+        return Ok(true);
+    }
+    Ok(state.infra_certs.remove(POSTGRES_INFRA_CERT_KEY).is_some())
+}
+
 /// Writes `<compose dir>/postgres/pg_hba.conf` and the compose override
 /// that starts `PostgreSQL` with its TLS settings, returning the
 /// override's path.
@@ -730,6 +758,266 @@ esac
         let entry = state.infra_certs.get(POSTGRES_INFRA_CERT_KEY).unwrap();
         assert!(entry.cert_path.is_absolute());
         assert!(entry.key_path.is_absolute());
+    }
+
+    /// The timestamp every seeded `PostgreSQL` entry carries, so a
+    /// re-record is told apart from a kept entry.
+    const OLD_ISSUED_AT: &str = "2000-01-01T00:00:00Z";
+
+    fn openbao_entry() -> InfraCertEntry {
+        InfraCertEntry {
+            cert_path: PathBuf::from("/srv/secrets/openbao/tls/server.crt"),
+            key_path: PathBuf::from("/srv/secrets/openbao/tls/server.key"),
+            sans: vec!["localhost".to_string()],
+            renew_before: "720h".to_string(),
+            reload_strategy: ReloadStrategy::ContainerRestart {
+                container_name: "bootroot-openbao".to_string(),
+            },
+            issued_at: Some(OLD_ISSUED_AT.to_string()),
+            expires_at: None,
+        }
+    }
+
+    fn stale_postgres_entry() -> InfraCertEntry {
+        InfraCertEntry {
+            cert_path: PathBuf::from("/old/postgres/tls/server.crt"),
+            key_path: PathBuf::from("/old/postgres/tls/server.key"),
+            sans: vec!["postgres".to_string()],
+            renew_before: "720h".to_string(),
+            reload_strategy: ReloadStrategy::ContainerSignal {
+                container_name: "old-postgres".to_string(),
+                signal: "SIGHUP".to_string(),
+            },
+            issued_at: Some(OLD_ISSUED_AT.to_string()),
+            expires_at: None,
+        }
+    }
+
+    /// `InfraCertEntry` has no `PartialEq`; its serialized form is what
+    /// `state.json` holds, so that is what is compared.
+    fn as_json(entry: &InfraCertEntry) -> serde_json::Value {
+        serde_json::to_value(entry).unwrap()
+    }
+
+    /// The entry with `issued_at` left out, which differs between two
+    /// recordings only by the clock.
+    fn as_json_without_issued_at(entry: &InfraCertEntry) -> serde_json::Value {
+        let mut value = as_json(entry);
+        value.as_object_mut().unwrap().remove("issued_at");
+        value
+    }
+
+    fn state_with(entries: &[(&str, InfraCertEntry)]) -> StateFile {
+        let mut state = StateFile::default();
+        for (key, entry) in entries {
+            state.infra_certs.insert((*key).to_string(), entry.clone());
+        }
+        state
+    }
+
+    #[test]
+    fn reconcile_without_postgres_drops_the_entry_and_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(&[
+            (POSTGRES_INFRA_CERT_KEY, stale_postgres_entry()),
+            ("openbao", openbao_entry()),
+        ]);
+
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            false,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(save);
+        assert_eq!(
+            state.infra_certs.keys().collect::<Vec<_>>(),
+            vec!["openbao"]
+        );
+        assert_eq!(
+            as_json(state.infra_certs.get("openbao").unwrap()),
+            as_json(&openbao_entry())
+        );
+    }
+
+    /// The last entry gone, the saved state carries no `infra_certs` key.
+    #[test]
+    fn reconcile_without_postgres_empties_a_postgres_only_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(&[(POSTGRES_INFRA_CERT_KEY, stale_postgres_entry())]);
+
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            false,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(save);
+        assert!(state.infra_certs.is_empty());
+        let state_path = dir.path().join("state.json");
+        state.save(&state_path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert!(
+            saved.get("infra_certs").is_none(),
+            "an empty map must not be serialized, got: {saved}"
+        );
+    }
+
+    /// Nothing to remove means nothing to save, so a fresh `init` without
+    /// the service writes `state.json` as it always has.
+    #[test]
+    fn reconcile_without_postgres_or_an_entry_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(&[("openbao", openbao_entry())]);
+
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            false,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(!save);
+        assert_eq!(
+            state.infra_certs.keys().collect::<Vec<_>>(),
+            vec!["openbao"]
+        );
+        assert_eq!(
+            as_json(state.infra_certs.get("openbao").unwrap()),
+            as_json(&openbao_entry())
+        );
+    }
+
+    /// A service added back after its removal is recorded again, as a
+    /// first `init` records it.
+    #[test]
+    fn reconcile_with_postgres_records_the_entry_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = StateFile::default();
+        let mut expected = StateFile::default();
+        record_postgres_infra_cert(
+            &mut expected,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            true,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(save);
+        let entry = state.infra_certs.get(POSTGRES_INFRA_CERT_KEY).unwrap();
+        assert_eq!(
+            as_json_without_issued_at(entry),
+            as_json_without_issued_at(expected.infra_certs.get(POSTGRES_INFRA_CERT_KEY).unwrap())
+        );
+        assert!(entry.issued_at.is_some());
+    }
+
+    #[test]
+    fn reconcile_with_postgres_replaces_a_stale_entry_and_keeps_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_with(&[
+            (POSTGRES_INFRA_CERT_KEY, stale_postgres_entry()),
+            ("openbao", openbao_entry()),
+        ]);
+
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            true,
+            dir.path(),
+            "insight-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(save);
+        let entry = state.infra_certs.get(POSTGRES_INFRA_CERT_KEY).unwrap();
+        assert_ne!(entry.issued_at.as_deref(), Some(OLD_ISSUED_AT));
+        assert_eq!(
+            entry.reload_strategy,
+            ReloadStrategy::ContainerSignal {
+                container_name: "insight-postgres".to_string(),
+                signal: "SIGHUP".to_string(),
+            }
+        );
+        assert_eq!(
+            entry.cert_path,
+            fs::canonicalize(dir.path())
+                .unwrap()
+                .join(POSTGRES_TLS_CERT_PATH)
+        );
+        assert_eq!(
+            as_json(state.infra_certs.get("openbao").unwrap()),
+            as_json(&openbao_entry())
+        );
+    }
+
+    /// `reinit` carries `infra_certs` through its minimal state, and the
+    /// `init` pass it ends with reconciles it like any other `init`.
+    #[tokio::test]
+    async fn reconcile_after_reinit_drops_the_carried_postgres_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        state_with(&[
+            (POSTGRES_INFRA_CERT_KEY, stale_postgres_entry()),
+            ("openbao", openbao_entry()),
+        ])
+        .save(&state_path)
+        .unwrap();
+        let snapshot = crate::commands::reinit::snapshot_deployment_intent(&state_path).unwrap();
+        let openbao = crate::cli::args::OpenBaoArgs {
+            openbao_url: "http://localhost:8200".to_string(),
+            kv_mount: "secret".to_string(),
+        };
+        let state_lock = crate::state_lock::hold_for_test(&state_path);
+        crate::commands::reinit::write_minimal_state(
+            &state_path,
+            &state_lock,
+            &snapshot,
+            &openbao,
+            Path::new("secrets"),
+            &test_messages(),
+        )
+        .await
+        .unwrap();
+
+        let mut state = StateFile::load(&state_path).unwrap();
+        assert!(state.infra_certs.contains_key(POSTGRES_INFRA_CERT_KEY));
+        let save = reconcile_postgres_infra_cert(
+            &mut state,
+            false,
+            dir.path(),
+            "bootroot-postgres",
+            &test_messages(),
+        )
+        .unwrap();
+
+        assert!(save);
+        assert_eq!(
+            state.infra_certs.keys().collect::<Vec<_>>(),
+            vec!["openbao"]
+        );
+        assert_eq!(
+            as_json(state.infra_certs.get("openbao").unwrap()),
+            as_json(&openbao_entry())
+        );
     }
 
     /// The exact override: absolute paths from the canonical compose

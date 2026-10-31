@@ -1029,6 +1029,13 @@ DB DSN host 처리 규칙:
   매 실행마다 작성합니다. PostgreSQL은 이 파일들로 다시 생성되며(`up -d
   --no-deps --force-recreate postgres`), 이후 TCP 연결은
   X25519MLKEM768을 쓰는 TLS 1.3과 `scram-sha-256` 인증으로만 받습니다
+- compose 파일이 `postgres`를 선언하지 않으면 PostgreSQL 관련 항목은 아무것도
+  발급하거나 작성하지 않고, 이전 실행이 기록한 `postgres` 항목은
+  `state.json` → `infra_certs`에서 제거합니다. 따라서 `rotate infra-cert`와
+  `rotate ca-key`는 더 이상 이 인증서를 갱신하거나 그 컨테이너에 시그널을
+  보내지 않습니다. 이미 `<compose-dir>/postgres/` 아래에 있는 파일과
+  `secrets/postgres/` 아래의 오버라이드는 `bootroot clean`이 (기본 `secrets/`
+  디렉터리와 함께) 제거할 때까지 디스크에 남습니다
 - 다음 단계 안내
 - `--summary-json` 지정 시 자동화용 init 요약 JSON 파일 생성
 
