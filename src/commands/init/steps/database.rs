@@ -86,13 +86,24 @@ impl fmt::Debug for PostgresEnv {
 
 /// What `resolve_db_dsn_for_init` settles before anything connects to
 /// `PostgreSQL`.
-#[derive(Debug)]
 pub(super) struct ResolvedDbDsn {
     /// The DSN stored for step-ca, in compose form.
     pub(super) dsn: String,
     pub(super) normalization: DbDsnNormalization,
     /// The provisioning `db-provision` runs once `PostgreSQL` serves TLS.
     pub(super) provision: Option<DbProvisionPlan>,
+}
+
+/// Hand-written so a `#[derive(Debug)]` around one cannot print the
+/// password the stored DSN carries.
+impl fmt::Debug for ResolvedDbDsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedDbDsn")
+            .field("dsn", &"<redacted>")
+            .field("normalization", &self.normalization)
+            .field("provision", &self.provision)
+            .finish()
+    }
 }
 
 /// The inputs `db-provision` resolved, kept for the provisioning that
@@ -989,11 +1000,7 @@ mod tests {
         args.db_password = Some(db_password.clone());
         args.db_name = Some("stepca".to_string());
 
-        let ResolvedDbDsn {
-            dsn,
-            normalization,
-            provision,
-        } = resolve_db_dsn_for_init(
+        let resolved = resolve_db_dsn_for_init(
             &args,
             Path::new("."),
             &PostgresEnv::default(),
@@ -1001,6 +1008,18 @@ mod tests {
         )
         .expect("db-provision inputs should resolve without connecting");
 
+        // Neither password reaches a `Debug` rendering of the result: not
+        // the runtime DSN's, nor the admin DSNs' inside the plan.
+        let rendered = format!("{resolved:?}");
+        assert!(!rendered.contains(&admin_password), "{rendered}");
+        assert!(!rendered.contains(&db_password), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+
+        let ResolvedDbDsn {
+            dsn,
+            normalization,
+            provision,
+        } = resolved;
         assert_eq!(
             dsn,
             format!("postgresql://step:{db_password}@postgres:5432/stepca{STORED_DSN_TLS_QUERY}")
