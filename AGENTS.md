@@ -533,7 +533,7 @@ Where the crate handles key material or secrets:
   finds nothing, and fails after the tag has already been pushed.
 <!-- END shared:changelog -->
 
-## CI Requirements
+## Validation
 
 - CI (workflow `CI`, `.github/workflows/ci.yml`) runs on pull requests and
   on pushes to `main`. Its jobs:
