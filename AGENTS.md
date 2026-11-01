@@ -533,33 +533,215 @@ Where the crate handles key material or secrets:
   finds nothing, and fails after the tag has already been pushed.
 <!-- END shared:changelog -->
 
-## CI Requirements
+## Validation
 
-- Before committing, ensure the `check` job (Quality Check) in `.github/workflows/ci.yml`
-  would pass for the changed files.
-- Before pushing or opening a PR, ensure all CI jobs pass (`check`,
-  `test-core`, and `test-docker-e2e-matrix` from `ci.yml`).
-- **Local preflight verification**: Run `scripts/preflight/run-all.sh`
-  before pushing. At minimum, run `scripts/preflight/ci/e2e-matrix.sh`.
-  It may be skipped only when your changes do not affect the Docker
-  lifecycle, E2E scripts, or any code paths exercised by the E2E tests
-  (rotation, service add/verify, daemon, config, etc.).
-- **When the matrix cannot run in your environment**: the matrix needs
-  passwordless `sudo` — its step 13 runs `bootroot init` as root through
-  `sudo -n`, and `--skip-hosts` does not stand in for it. On a machine
-  that cannot supply it, run the matrix as far as it goes and let CI's
-  `Docker E2E` jobs gate the arm that did not run. Say which was which
-  in the pull request body: the arm that ran and passed locally, the arm
-  that did not run, and why. This is not licence to weaken, skip,
-  `continue-on-error`, or delete a check to make a local run pass — and
-  a change exempt under the bullet above still needs no matrix at all.
-- **The host's TLS tools**: the Docker E2E harnesses reach OpenBao's TLS
-  listener and the responder admin API with the host's `curl` and
-  `openssl`, which must offer X25519MLKEM768 (OpenSSL 3.5 or later, as
-  on Ubuntu 26.04). On a host whose OpenSSL is older, or whose `openssl`
-  is LibreSSL, run the matrix as far as it goes and let CI's `Docker E2E`
-  jobs gate the rest, as the bullet above on a matrix that cannot run
-  already says.
+- CI (workflow `CI`, `.github/workflows/ci.yml`) runs on pull requests and
+  on pushes to `main`. Its jobs:
+  - `Markdown`: `markdownlint-cli2` over `**/*.md`, and the shared
+    instruction-block drift check. Not gated by the change filter.
+  - `Quality Check` (`check`), not gated either:
+    `cargo fmt -- --check --config group_imports=StdExternalCrate`,
+    `cargo clippy --all-targets -- -D warnings`,
+    `cargo doc --no-deps --document-private-items` with
+    `RUSTDOCFLAGS: -D warnings`, `ruff format --check .`, `ruff check .`,
+    `biome ci --error-on-warnings .`, `./scripts/check-docs.sh`, the seven
+    `./scripts/validate-*.sh` scripts, and `cargo audit`.
+  - `Unit & CLI Smoke` (`test-core`): `cargo test` of the whole crate,
+    the root-only cert-owner tests, the `monitoring_integration` and
+    `db_provision_integration` targets with `-- --include-ignored`, the
+    deploy compose no-build smoke, and an `infra install` / `init` /
+    `service add` / `verify` smoke run.
+  - `Docker E2E (<arm>)` (`test-docker-e2e-matrix`): sixteen arms on
+    `ubuntu-26.04`, one `scripts/impl/run-*.sh` scenario each.
+  - `Registrar Redteam (docs-only)`: the `registrar-redteam` arm alone,
+    run only for a documentation-only change, which skips the two jobs
+    above.
+- Run local checks on the host's own operating system: macOS on a Mac,
+  Linux on a Linux host. Do not use a container, a virtual machine or
+  another operating system in its place. The containers a Docker E2E arm
+  starts (OpenBao, step-ca, PostgreSQL, the HTTP-01 responder) are the
+  system under test, not a host: the bootroot binaries and the harness
+  run on the host itself. A CI job or matrix entry that exists only to
+  cover another operating system or platform is left to CI; every other
+  check applies on any host that can run its commands.
+- A change is documentation-only when every changed path matches the
+  `docs` filter of the `changes` job in `.github/workflows/ci.yml` and
+  none matches its `code` filter. For such a change run only
+  `markdownlint-cli2 "**/*.md" "#node_modules" "#target"` and, for a
+  change under `docs/` or to `mkdocs.yml`, `./scripts/check-docs.sh`
+  (see Documentation Build below). Build and test no code.
+- Local test scope. For any other change, run these before pushing, and
+  leave the rest to CI:
+  - `Quality Check` in full: `./scripts/preflight/ci/check.sh`, then each
+    `./scripts/validate-*.sh`. `check.sh` needs `ruff`, `biome`,
+    `cargo-audit` and `mkdocs-material` with `mkdocs-static-i18n` on the
+    host, as the job installs them.
+  - The unit tests of each changed `.rs` file's module, by module path.
+    For the library, `cargo test --lib <module path>::`; for a module of
+    a binary, `cargo test --bin <binary> <module path>::`, where
+    `<binary>` is `bootroot` (`src/main.rs` and the modules it declares,
+    such as `commands`, `cli` and `state`), `bootroot-remote`,
+    `bootroot-agent` or `bootroot-http01-responder`. A change to
+    `src/commands/rotate/infra_cert.rs` runs
+    `cargo test --bin bootroot commands::rotate::infra_cert::`, and one to
+    `src/registrar/verbs/limiter.rs` runs
+    `cargo test --lib registrar::verbs::limiter::`.
+  - The integration tests under `tests/` that drive the changed code:
+    `cargo test --test <file>`. A change to a `bootroot` subcommand runs
+    its `tests/bootroot_<subcommand>.rs` where one exists (`init` and
+    `infra` are in `tests/bootroot_cli.rs`); the change to
+    `src/commands/rotate/infra_cert.rs` above also runs
+    `cargo test --test bootroot_rotate`, and one to
+    `src/bin/bootroot-remote/bootstrap.rs` runs
+    `cargo test --bin bootroot-remote bootstrap::` and
+    `cargo test --test bootroot_remote`. For a change to monitoring, run
+    `cargo test --test monitoring_integration -- --include-ignored`; for
+    one to PostgreSQL provisioning (`src/db.rs`, the `init` database
+    step), `cargo test --test db_provision_integration -- --include-ignored`.
+  - Every test written or changed in the branch, and every test the issue
+    or the pull request's test plan names.
+  - `./scripts/preflight/ci/deploy-no-build-smoke.sh`, for a change to
+    `docker-compose.deploy.yml`, `deploy/`, `docker/`,
+    `openbao/openbao.hcl`, `responder.toml.compose`,
+    `scripts/runtime_images.py`, the `infra install` image-archive and
+    `--no-build` path in `src/commands/infra.rs`, or the smoke script
+    itself. It runs the `linux/amd64` images the pins approve; where the
+    host's Docker cannot run them, leave it to CI.
+  - Each Docker E2E arm, from the list below, whose area the change
+    touches, and only those arms. Never widen to the whole crate's
+    `cargo test` or to the whole matrix.
+
+  A change with no module of its own, such as `Cargo.toml`, `Cargo.lock`
+  or a workflow, runs `Quality Check`, every test written or changed in
+  the branch, and any arm the rule under the list below selects.
+  Tests compiled only on Linux, such as those behind
+  `#[cfg(target_os = "linux")]`, do not build on macOS; on a Mac, leave
+  them to `Unit & CLI Smoke`. An issue that says which tests or arms to
+  run locally overrides this list.
+- Run one arm by itself with
+  `scripts/preflight/ci/e2e-matrix.sh --only <arm>`, which builds the
+  binaries and runs that arm as CI does; repeat `--only` for several. Do
+  not run `scripts/preflight/run-all.sh` or `e2e-matrix.sh` without
+  `--only` as a pre-push step. `README.md` and `docs/*/e2e-ci.md`
+  describe `run-all.sh` as the full local equivalent of CI; for an agent,
+  this section governs. An arm, its script under `scripts/impl/`, and the
+  area that selects it:
+  - `local-no-hosts` (`run-local-lifecycle.sh`): the local-file delivery
+    path — `infra install` and `infra up`, `init`, `service add`,
+    `verify`, the `rotate` subcommands `force-reissue`,
+    `approle-secret-id`, `openbao-recovery`, `responder-hmac`,
+    `stepca-password`, `db` and `ca-key`, the `bootroot-agent` daemon and
+    fast-poll loop (`src/bin/bootroot-agent.rs`, `src/daemon.rs`,
+    `src/fast_poll.rs`, `src/acme*`), the HTTP-01 responder
+    (`src/bin/bootroot-http01-responder/`), `docker-compose.yml`,
+    `docker/` and `openbao/`. It is also the arm for code every arm passes
+    through, such as `src/openbao.rs`, `src/config*`, `src/tls.rs`,
+    `src/state*` and `src/main.rs`: run it, plus any other arm whose
+    behaviour the change alters. A changed file under `src/` that no arm
+    below names selects this arm.
+  - `local-hosts` (`run-local-lifecycle.sh`, `RESOLUTION_MODE="hosts"`):
+    a change to how step-ca and the responder are reached by host name,
+    or to the `hosts` branches of the lifecycle scripts.
+  - `remote-no-hosts` (`run-remote-lifecycle.sh`): the remote-bootstrap
+    delivery path — `src/bin/bootroot-remote/`, `src/remote_bootstrap.rs`,
+    `src/commands/service/remote_bootstrap.rs`, and the updates a remote
+    node's agent picks up from the `rotate` subcommands `force-reissue`,
+    `approle-secret-id`, `trust-sync` and `responder-hmac`
+    (`src/commands/rotate/approle.rs`, `src/commands/trust.rs`).
+  - `remote-hosts` (`run-remote-lifecycle.sh`, `RESOLUTION_MODE="hosts"`):
+    as `local-hosts`, for the remote path.
+  - `rotation` (`run-rotation-recovery.sh`): re-applying a rotated
+    secret_id, EAB, responder HMAC or trust bundle with `bootroot-remote
+    bootstrap` across many services against a mock OpenBao, and
+    recovering from a failed one — `src/bin/bootroot-remote/`,
+    `src/trust_bootstrap.rs` and `scripts/impl/mock-openbao-server.py`.
+    It never runs `bootroot rotate`.
+  - `reinit-recovery` (`run-reinit-recovery.sh`): `reinit` and `clean`
+    (`src/commands/reinit.rs`, `src/commands/clean.rs`), and the OpenBao
+    bind they must preserve.
+  - `stepca-san` (`run-stepca-san.sh`): `infra install --stepca-bind`, and
+    the `ca.json` keys `init` writes (`dnsNames`, `metricsAddress`) with
+    step-ca's OpenBao Agent template
+    (`src/commands/init/steps/stepca_setup.rs`).
+  - `openbao-tls-no-delta` (`run-openbao-tls-no-delta.sh`):
+    `--openbao-bind`, `--openbao-tls-required`, the `openbao-exposed`
+    override, and `init`'s move of OpenBao to TLS
+    (`src/commands/init/steps/openbao_tls.rs`, `openbao_transition.rs`).
+  - `openbao-tls-reown` (`run-openbao-tls-reown.sh`): `rotate infra-cert`
+    and the ownership of `openbao/tls` and `secrets/`
+    (`src/commands/rotate/infra_cert.rs`,
+    `src/commands/init/steps/openbao_tls.rs`).
+  - `two-instance` (`run-two-instance-isolation.sh`): the install
+    identity — `--instance-name`, Compose project and container names,
+    published host ports and the responder's DNS aliases
+    (`src/commands/compose_project.rs`, `container_name.rs`, `dotenv.rs`,
+    `dns_alias.rs`).
+  - `registrar-verbs` (`run-registrar-verbs-e2e.sh`): `src/registrar/verbs*`;
+    the arm runs the `#[ignore]`d `registrar::verbs::tests`.
+  - `registrar-internal` (`run-registrar-internal-e2e.sh`):
+    `src/registrar/internal*`; the arm runs the `#[ignore]`d
+    `registrar::internal::tests::live`.
+  - `registrar-internal-init` (`run-registrar-internal-init-e2e.sh`): an
+    endpoint-enabled `init` and the bootroot-internal credential
+    (`src/commands/init/steps/registrar_internal.rs`,
+    `src/commands/rotate/registrar_internal.rs`, `src/registrar_certs*`).
+  - `registrar-internal-init-routable` (the same script with
+    `BIND_MODE=routable`): a change to that path's handling of a routable
+    bind address.
+  - `registrar-redteam` (`run-registrar-redteam.sh`): the registrar
+    endpoint and its credential boundary — `src/registrar/endpoint*`,
+    `audit*`, `audit_store*` and `openbao_audit*`, the daemon's registrar
+    handler in `src/daemon.rs`, `src/commands/registrar*` and
+    `src/commands/audit_store*`.
+  - `registrar-ca-rotation` (`run-registrar-ca-rotation-e2e.sh`):
+    `rotate ca-key` on an endpoint host (`src/commands/rotate/ca.rs`,
+    `registrar_endpoint*`, `registrar_targets.rs`,
+    `src/registrar_renewal.rs`).
+
+  A change to an arm's script, to its block in `ci.yml` or
+  `e2e-matrix.sh`, or to a `scripts/impl/lib/` file it sources selects
+  that arm; for a library file sourced by many arms, run one of them and
+  leave the rest to CI.
+- What a host cannot run is left to CI. Say in the pull request body
+  which designated arms ran and passed locally, which did not run, and
+  why. This is not licence to weaken, skip, `continue-on-error`, or delete
+  a check to make a local run pass.
+  - Passwordless `sudo` (`sudo -n`): `local-hosts` and `remote-hosts` edit
+    `/etc/hosts`; `openbao-tls-reown` re-owns `secrets/` and rotates as
+    root; `registrar-internal-init` and its routable arm run `init` as
+    root, because an endpoint-enabled `init` publishes the
+    bootroot-internal credential root-owned; `registrar-redteam` and
+    `registrar-ca-rotation` run the endpoint daemon as root.
+  - Linux: the registrar endpoint is refused on any other operating
+    system (`src/config/validation.rs`), and `registrar-redteam` also
+    uses `setpriv`, so on macOS those two arms are left to CI.
+  - The host's TLS tools: the harnesses reach OpenBao's TLS listener and
+    the responder admin API with the host's `curl` and `openssl`, which
+    must offer X25519MLKEM768 (OpenSSL 3.5 or later, as on Ubuntu 26.04).
+    Where they do not — an older OpenSSL, or LibreSSL as macOS ships —
+    leave the arms that need them to CI.
+  - The bind-host guard of `reinit-recovery`, `stepca-san`, the two
+    `openbao-tls-*` arms and `registrar-internal-init-routable` defaults
+    to `172.17.0.1`, the Docker bridge gateway on Linux. Where Docker has
+    no such interface, set `OPENBAO_BIND_HOST`, `STEPCA_BIND_HOST` or
+    `BIND_HOST` to an address the host holds, as `docs/en/e2e-ci.md`
+    describes.
+  - Left to CI on every host: the whole crate's `cargo test`, the
+    cert-group regression and the root-only cert-owner tests (CI
+    provisions a group and runs them through `sudo` and `setpriv`), the
+    `Unit & CLI Smoke` CLI steps, every arm the change does not select,
+    `Registrar Redteam (docs-only)`, and the drift check in `Markdown`.
+    The generated regions of this file are never edited here.
+- When a CI job fails, reproduce it locally by name, fix it, and push. For
+  `Docker E2E (<arm>)`, run `e2e-matrix.sh --only <arm>`, not the
+  matrix. For
+  a failing test in `Unit & CLI Smoke`, rerun that test by name
+  (`cargo test --test <file> <name>` or
+  `cargo test --bin <binary> <module path>::<name>`), not the whole suite;
+  for a failing smoke step, rerun that step's commands from `ci.yml`. For
+  `Quality Check`, rerun the failing step's command.
+- Before requesting review, ensure every CI job passes on the pushed
+  branch.
 - The extended E2E suite is scheduled CI coverage in
   `e2e-extended.yml`, not a per-pull-request requirement. Run
   `scripts/preflight/ci/e2e-extended.sh` only for investigation or when

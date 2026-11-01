@@ -34,11 +34,14 @@ jobs:
         uses: dorny/paths-filter@v4
         with:
           filters: |
+            all:
+              - "**"
             docs:
               - "docs/**"
               - "**/*.md"
               - "mkdocs.yml"
               - ".markdownlint*"
+              - ".agent-instructions.toml"
             code:
               - "src/**"
               - "tests/**"
@@ -54,10 +57,20 @@ jobs:
               - "responder.toml.example"
               - ".github/workflows/**"
 
+      # Docs-only means every changed path is on the `docs` list and none is
+      # on `code`. Comparing the counts is what makes a path on neither list
+      # (`openbao/openbao.hcl`, `monitoring/**`, `.clippy.toml`, ...) count as
+      # code: "some path is docs and none is code" let such a path ride along
+      # with a Markdown edit and skip every test job.
       - name: Decide Docs-Only
         id: decide
+        env:
+          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
+          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
+          DOCS: ${{ steps.filter.outputs.docs }}
+          CODE: ${{ steps.filter.outputs.code }}
         run: |
-          if [ "${{ steps.filter.outputs.docs }}" = "true" ] && [ "${{ steps.filter.outputs.code }}" != "true" ]; then
+          if [ "${ALL_COUNT:-0}" -gt 0 ] && [ "$DOCS_COUNT" = "$ALL_COUNT" ] && [ "$DOCS" = "true" ] && [ "$CODE" != "true" ]; then
             echo "docs_only=true" >> "$GITHUB_OUTPUT"
           else
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
@@ -201,7 +214,7 @@ jobs:
   test-core:
     name: Unit & CLI Smoke
     needs: [check, changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -495,7 +508,7 @@ jobs:
   test-docker-e2e-matrix:
     name: Docker E2E (${{ matrix.scenario.label }})
     needs: [check, changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: ${{ !cancelled() && needs.check.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
