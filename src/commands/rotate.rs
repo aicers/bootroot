@@ -13,9 +13,11 @@ mod responder_hmac;
 mod stepca_password;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util::SecretsTree;
 use bootroot::openbao::OpenBaoClient;
 
 pub(crate) use self::helpers::signal_internal_registrar_agent;
@@ -172,6 +174,9 @@ pub(super) struct RotateContext {
     /// a test that builds a context — or drives that entry point — can
     /// point the whole tree at a fake without touching `PATH`.
     pub(super) docker: PathBuf,
+    /// The handle on [`StatePaths::secrets_dir`] every write, removal
+    /// and re-read below it goes through, opened once per run.
+    pub(super) secrets: Arc<SecretsTree>,
 }
 
 pub(crate) async fn run_rotate(args: &RotateArgs, messages: &Messages) -> Result<RotateOutcome> {
@@ -231,6 +236,7 @@ async fn run_rotate_with_exec(
         .clone()
         .unwrap_or_else(|| state.secrets_dir().to_path_buf());
     let paths = StatePaths::new(secrets_dir.clone());
+    let secrets = SecretsTree::open_shared(&secrets_dir).await?;
     let state_dir = state_path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
@@ -243,6 +249,7 @@ async fn run_rotate_with_exec(
         state_dir,
         state_file: state_path,
         docker: docker.to_path_buf(),
+        secrets,
     };
 
     // InfraCert operates on local files and Docker only — it must not
@@ -403,6 +410,14 @@ mod test_support {
 
     pub(super) use crate::i18n::test_messages;
     use crate::test_support::write_executable;
+
+    /// The handle a rotation opens on `secrets_dir`, as a test process
+    /// that owns the directory opens it: path-based.
+    pub(super) fn path_tree(secrets_dir: &Path) -> std::sync::Arc<bootroot::fs_util::SecretsTree> {
+        std::sync::Arc::new(
+            bootroot::fs_util::SecretsTree::open(secrets_dir).expect("open secrets tree"),
+        )
+    }
 
     /// Writes a fake `docker` at `path` that appends one record per
     /// invocation to `args_log` and reads nothing from its environment.

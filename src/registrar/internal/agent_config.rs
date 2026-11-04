@@ -314,14 +314,59 @@ pub fn render_internal_agent_config(
 /// parse, when it does not carry exactly the one internal profile, or
 /// when any fixed path or the trust table has drifted.
 pub fn load_internal_config(paths: &InternalPaths) -> Result<Settings, InternalCredentialError> {
+    let settings = Settings::from_file(Some(paths.agent_config()))
+        .map_err(|err| does_not_parse(paths, &err))?;
+    check_internal_config(paths, &settings)?;
+    Ok(settings)
+}
+
+/// [`load_internal_config`] over the config's bytes, already read by the
+/// caller.
+///
+/// For a caller that reads `agent.toml` itself — a root process over a
+/// `secrets/` another account owns reads it through
+/// [`crate::fs_util::SecretsTree`] without following a link — and still
+/// needs the same parse and the same checks.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Invalid`] under the same
+/// conditions as [`load_internal_config`].
+pub fn load_internal_config_from_str(
+    paths: &InternalPaths,
+    contents: &str,
+) -> Result<Settings, InternalCredentialError> {
+    let settings = Settings::from_toml_str(contents).map_err(|err| does_not_parse(paths, &err))?;
+    check_internal_config(paths, &settings)?;
+    Ok(settings)
+}
+
+/// The refusal for a config that does not parse.
+fn does_not_parse(paths: &InternalPaths, err: &dyn std::fmt::Display) -> InternalCredentialError {
+    InternalCredentialError::Invalid {
+        path: paths.agent_config(),
+        reason: format!("the generated config does not parse: {err}"),
+    }
+}
+
+/// Holds parsed `settings` to every invariant the generator gives the
+/// dedicated config: exactly the one internal profile, the fixed paths,
+/// and a non-empty pin list.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Invalid`] when the settings do not
+/// carry exactly the one internal profile, or when any fixed path or the
+/// trust table has drifted.
+pub fn check_internal_config(
+    paths: &InternalPaths,
+    settings: &Settings,
+) -> Result<(), InternalCredentialError> {
     let path = paths.agent_config();
     let invalid = |reason: String| InternalCredentialError::Invalid {
         path: path.clone(),
         reason,
     };
-    let settings = Settings::from_file(Some(path.clone()))
-        .map_err(|err| invalid(format!("the generated config does not parse: {err}")))?;
-
     let [profile] = settings.profiles.as_slice() else {
         return Err(invalid(format!(
             "expected exactly one profile, found {}",
@@ -357,7 +402,7 @@ pub fn load_internal_config(paths: &InternalPaths) -> Result<Settings, InternalC
     if settings.trust.trusted_ca_sha256.is_empty() {
         return Err(invalid("trust.trusted_ca_sha256 is empty".to_string()));
     }
-    Ok(settings)
+    Ok(())
 }
 
 /// Reports a configured path that is not the fixed one the layout gives

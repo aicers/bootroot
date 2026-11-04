@@ -37,16 +37,16 @@ pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,
 };
 pub(crate) use steps::openbao_tls::{
-    OpenBaoAuditDevice, hand_over_openbao_tls_key, reissue_openbao_tls_cert,
+    OpenBaoAuditDevice, hand_over_openbao_tls_key, reissue_openbao_tls_cert, step_scratch_parent,
     sync_openbao_audit_device, write_openbao_hcl_plaintext,
 };
 pub(crate) use steps::postgres_tls::{hand_over_postgres_tls_key, issue_postgres_tls_cert};
 pub(crate) use steps::registrar_internal;
 pub(crate) use steps::stepca_setup::set_acme_cert_duration;
 pub(crate) use steps::{
-    compute_ca_bundle_pem, compute_ca_fingerprints, infra_rotate_policy, parse_ttl_to_secs,
-    prompt_yes_no, read_ca_cert_fingerprint, run_init, run_init_locked,
-    validate_rotate_bound_cidrs, validate_secret_id_ttl,
+    compute_ca_bundle_pem, compute_ca_fingerprints, fingerprint_ca_cert, infra_rotate_policy,
+    parse_ttl_to_secs, prompt_yes_no, read_ca_cert_fingerprint, read_ca_cert_fingerprint_in,
+    run_init, run_init_locked, validate_rotate_bound_cidrs, validate_secret_id_ttl,
 };
 pub(crate) use types::{
     AppRoleLabel, DbCheckStatus, InitPlan, InitSummary, ResponderCheck, StepCaInitResult,

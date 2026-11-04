@@ -1684,3 +1684,149 @@ fn a_destination_naming_the_publication_lock_is_refused() {
     ensure_no_destination_is_the_lock(&cert, &dir.path().join("k.pem"), &ca_bundle_path_for(&cert))
         .expect("three ordinary destinations");
 }
+
+// ---------------------------------------------------------------------
+// Staging under a rooted handle
+// ---------------------------------------------------------------------
+
+/// A port nothing listens on: bound, read back and released.
+fn closed_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
+    listener.local_addr().expect("local addr").port()
+}
+
+/// A secrets directory carrying the deployment's CA certificates and an
+/// internal config whose ACME directory is `server`, fetched once.
+fn rooted_issue_host(server: &str) -> crate::test_support::SwapRoot {
+    use bootroot::registrar::internal::{InternalAgentConfigParams, render_internal_agent_config};
+
+    let root = crate::test_support::SwapRoot::new();
+    crate::commands::init::registrar_internal::test_fixtures::TestPki::new()
+        .write_ca(&root.secrets);
+    let paths = InternalPaths::new(&root.secrets);
+    std::fs::create_dir_all(paths.dir()).expect("internal dir");
+    let rendered = render_internal_agent_config(
+        &paths,
+        &InternalAgentConfigParams {
+            email: "ops@example.internal",
+            server,
+            domain: "example.internal",
+            hostname: "h1",
+            responder_url: "http://127.0.0.1:8080",
+            responder_hmac: &"hmac".into(),
+            eab_kid: None,
+            eab_hmac: None,
+            trusted_ca_sha256: &["00".repeat(32)],
+            endpoint_tables: None,
+        },
+    );
+    // The rendered ten attempts with their doubling delay would spend
+    // about a minute on a directory nothing serves.
+    let once = rendered.replace(
+        "directory_fetch_attempts = 10",
+        "directory_fetch_attempts = 1",
+    );
+    assert_ne!(once, rendered, "the rendered config sets the attempt count");
+    std::fs::write(paths.agent_config(), once).expect("write config");
+    root
+}
+
+/// Names in the directory holding `secrets/` that a rooted issuance's
+/// private staging directory would carry.
+fn scratch_dirs(root: &crate::test_support::SwapRoot) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(root.root())
+        .expect("list")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().starts_with(ISSUE_SCRATCH_PREFIX))
+        .collect()
+}
+
+/// In rooted mode the issuance stages beside `secrets/`, not below it:
+/// a failed issuance leaves nothing below the anchor and no staging
+/// directory beside it.
+#[tokio::test]
+async fn a_rooted_issuance_creates_nothing_below_the_anchor() {
+    let server = format!(
+        "https://127.0.0.1:{}/acme/acme/directory",
+        closed_local_port()
+    );
+    let root = rooted_issue_host(&server);
+    let before = crate::test_support::snapshot_tree(&root.secrets);
+    let args = issue_args(
+        root.root().join("out").join("leaf.pem"),
+        root.root().join("out").join("key.pem"),
+        root.secrets.clone(),
+    );
+    let tree = Arc::new(root.rooted());
+
+    let staging = Staging::for_tree(&tree, &crate::i18n::test_messages()).expect("staging");
+    assert!(
+        !staging.path().starts_with(&root.secrets),
+        "a rooted issuance stages outside secrets/"
+    );
+    staging.sweep().await;
+
+    let err = issue_staged(
+        &tree,
+        &args,
+        "client.h1.example.internal",
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .err()
+    .expect("nothing serves the ACME directory");
+    assert!(
+        format!("{err:#}").contains("through step-ca's ACME endpoint"),
+        "the run reached the issuance: {err:#}"
+    );
+    assert_eq!(crate::test_support::snapshot_tree(&root.secrets), before);
+    assert_eq!(
+        scratch_dirs(&root),
+        Vec::<std::ffi::OsString>::new(),
+        "the staging directory is swept"
+    );
+    assert!(!root.root().join("out").exists(), "nothing was published");
+}
+
+/// In rooted mode the internal config is read without following a link:
+/// a swapped `registrar-internal/` is refused naming it, and its absence
+/// keeps the refusal that names the missing config.
+#[tokio::test]
+async fn a_rooted_issuance_reads_the_internal_config_through_the_handle() {
+    let root = rooted_issue_host("https://127.0.0.1:9/acme/acme/directory");
+    let args = issue_args(
+        root.root().join("leaf.pem"),
+        root.root().join("key.pem"),
+        root.secrets.clone(),
+    );
+    let tree = Arc::new(root.rooted());
+    let internal = InternalPaths::new(&root.secrets).dir().to_path_buf();
+    let link = root.swap("registrar-internal", &root.outside);
+    let err = issue_staged(
+        &tree,
+        &args,
+        "client.h1.example.internal",
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .err()
+    .expect("a link at registrar-internal/ is refused");
+    crate::test_support::assert_error_names(&err, &link);
+    assert_eq!(link, internal);
+
+    std::fs::remove_file(&link).expect("rm link");
+    let err = issue_staged(
+        &tree,
+        &args,
+        "client.h1.example.internal",
+        &crate::i18n::test_messages(),
+    )
+    .await
+    .err()
+    .expect("an absent config is refused");
+    assert!(
+        format!("{err:#}").contains("carries no bootroot-internal registrar configuration"),
+        "{err:#}"
+    );
+    assert_eq!(scratch_dirs(&root), Vec::<std::ffi::OsString>::new());
+}

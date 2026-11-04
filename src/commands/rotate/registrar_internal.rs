@@ -61,9 +61,11 @@
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::eab::EabCredentials;
+use bootroot::fs_util::{RootedOwner, SecretsTree};
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, InternalPaths,
@@ -75,7 +77,7 @@ use bootroot::secret::HmacSecret;
 use bootroot::{cert_group, fs_util};
 
 use super::RotateContext;
-use super::helpers::signal_internal_registrar_agent;
+use super::helpers::{ca_cert_fingerprint, signal_internal_registrar_agent};
 use crate::commands::init::registrar_internal::{
     RegistrarInternalContext, RegistrarInternalInputs, RegistrarInternalIntent, StagedInternal,
     converge_internal_auth, current_internal_config, discard_snapshot, internal_acme_server,
@@ -84,7 +86,7 @@ use crate::commands::init::registrar_internal::{
 };
 use crate::commands::init::{
     DEFAULT_STEPCA_PROVISIONER, PATH_AGENT_EAB, PATH_RESPONDER_HMAC,
-    POLICY_BOOTROOT_REGISTRAR_INTERNAL, compute_ca_bundle_pem, read_ca_cert_fingerprint,
+    POLICY_BOOTROOT_REGISTRAR_INTERNAL, compute_ca_bundle_pem,
 };
 use crate::commands::trust::RotationMode;
 use crate::i18n::Messages;
@@ -159,8 +161,17 @@ impl Drop for InternalConfigLock {
 /// Returns an error naming the config the lock guards when the directory
 /// cannot be created, when the lock file cannot be opened, or when the
 /// lock cannot be taken.
-pub(super) async fn acquire_internal_config_lock(secrets_dir: &Path) -> Result<InternalConfigLock> {
-    let paths = InternalPaths::new(secrets_dir);
+///
+/// On a rooted `tree` the directory is probed and created, and the lock
+/// file opened, through the handle: a link at either is refused rather
+/// than followed, and the lock file is created only below the anchor.
+pub(super) async fn acquire_internal_config_lock(
+    tree: &Arc<SecretsTree>,
+) -> Result<InternalConfigLock> {
+    let paths = InternalPaths::new(tree.anchor());
+    if tree.is_rooted() {
+        return acquire_internal_config_lock_rooted(tree, &paths).await;
+    }
     if !tokio::fs::try_exists(paths.dir()).await.unwrap_or(false) {
         fs_util::ensure_secrets_dir(paths.dir())
             .await
@@ -183,6 +194,67 @@ pub(super) async fn acquire_internal_config_lock(secrets_dir: &Path) -> Result<I
                 paths.agent_config().display()
             )
         })
+}
+
+/// [`acquire_internal_config_lock`] through a rooted `tree`.
+async fn acquire_internal_config_lock_rooted(
+    tree: &Arc<SecretsTree>,
+    paths: &InternalPaths,
+) -> Result<InternalConfigLock> {
+    let dir = paths.dir().to_path_buf();
+    let config_path = paths.agent_config();
+    let lock_path = dir.join(INTERNAL_CONFIG_LOCK_FILE);
+    tree.run(move |tree| {
+        if tree.entry_kind(&dir)?.is_none() {
+            tree.ensure_dir_as_writer(&dir).with_context(|| {
+                format!(
+                    "creating {} to take the lock on the bootroot-internal config at {} in",
+                    dir.display(),
+                    config_path.display()
+                )
+            })?;
+        }
+        let file = tree
+            .open_lock(&lock_path, INTERNAL_CONFIG_LOCK_MODE)
+            .with_context(|| {
+                format!(
+                    "opening the bootroot-internal config lock {}",
+                    lock_path.display()
+                )
+            })?;
+        file.lock().with_context(|| {
+            format!(
+                "waiting for the bootroot-internal config lock {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(InternalConfigLock { file })
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "locking the bootroot-internal config at {} for update",
+            paths.agent_config().display()
+        )
+    })
+}
+
+/// Reads the internal config as text: through a rooted `tree` on a
+/// blocking thread, by path otherwise. The error keeps its kind, so a
+/// caller can still tell an absent config from an unreadable one.
+async fn read_internal_config_text(
+    tree: &Arc<SecretsTree>,
+    config_path: &Path,
+) -> std::io::Result<String> {
+    if !tree.is_rooted() {
+        return tokio::fs::read_to_string(config_path).await;
+    }
+    let path = config_path.to_path_buf();
+    let read = tree
+        .run(move |tree| Ok(tree.read(&path)))
+        .await
+        .map_err(std::io::Error::other)??;
+    String::from_utf8(read).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 /// The blocking half of [`acquire_internal_config_lock`].
@@ -290,11 +362,11 @@ impl InternalConfigCheck {
 /// rotation has written nothing at that point, and proceeding would
 /// leave the endpoint daemon on the old value.
 pub(super) async fn check_internal_config_change(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     change: InternalConfigChange<'_>,
 ) -> Result<InternalConfigCheck> {
-    let config_path = InternalPaths::new(secrets_dir).agent_config();
-    let contents = match tokio::fs::read_to_string(&config_path).await {
+    let config_path = InternalPaths::new(tree.anchor()).agent_config();
+    let contents = match read_internal_config_text(tree, &config_path).await {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(InternalConfigCheck::Absent);
@@ -332,11 +404,12 @@ pub(super) async fn check_internal_config_change(
 /// Returns an error when the config has disappeared since the check,
 /// cannot be read, or no longer parses.
 async fn rewrite_internal_config(
+    tree: &Arc<SecretsTree>,
     config_path: &Path,
     change: InternalConfigChange<'_>,
     _lock: &InternalConfigLock,
 ) -> Result<Option<String>> {
-    let contents = tokio::fs::read_to_string(config_path)
+    let contents = read_internal_config_text(tree, config_path)
         .await
         .with_context(|| {
             format!(
@@ -352,10 +425,24 @@ async fn rewrite_internal_config(
 /// One file, one rename: an agent reading it sees the whole previous
 /// version or the whole new one, and there is no second file to hold
 /// in step with it, so no snapshot or restore.
-async fn publish_internal_config(config_path: &Path, contents: &str) -> Result<()> {
+async fn publish_internal_config(
+    tree: &Arc<SecretsTree>,
+    config_path: &Path,
+    contents: &str,
+) -> Result<()> {
     // Root-owned unconditionally, exactly as `write_trust_pair`: this
     // is one of the protected files, and a rotation must not be the
     // publication that hands it to the invoking user.
+    if tree.is_rooted() {
+        return publish_root_owned_config(tree, config_path, contents)
+            .await
+            .with_context(|| {
+                format!(
+                    "writing the bootroot-internal config at {}",
+                    config_path.display()
+                )
+            });
+    }
     fs_util::atomic_write_fixed_owner(
         fs_util::Destination::bootroot_owned(config_path),
         contents.as_bytes(),
@@ -369,6 +456,28 @@ async fn publish_internal_config(config_path: &Path, contents: &str) -> Result<(
             config_path.display()
         )
     })
+}
+
+/// Publishes the internal config through a rooted `tree` as
+/// `atomic_write_fixed_owner` publishes it by path: `0600`, root-owned,
+/// the directory flushed.
+async fn publish_root_owned_config(
+    tree: &Arc<SecretsTree>,
+    config_path: &Path,
+    contents: &str,
+) -> Result<()> {
+    let path = config_path.to_path_buf();
+    let payload = contents.as_bytes().to_vec();
+    tree.run(move |tree| {
+        tree.publish(
+            fs_util::Destination::bootroot_owned(&path),
+            &payload,
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            RootedOwner::Fixed(fs_util::FixedOwner::root()),
+            fs_util::StagedDurability::FlushDirectory,
+        )
+    })
+    .await
 }
 
 /// Applies `change` to the internal config and reloads the endpoint
@@ -387,17 +496,18 @@ async fn publish_internal_config(config_path: &Path, contents: &str) -> Result<(
 /// cannot be signalled. The rotation's `OpenBao` writes have landed by
 /// then, so the error is reported rather than rolled back.
 pub(super) async fn apply_internal_config_change(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     change: InternalConfigChange<'_>,
     lock: &InternalConfigLock,
     messages: &Messages,
 ) -> Result<bool> {
+    let secrets_dir = tree.anchor();
     let config_path = InternalPaths::new(secrets_dir).agent_config();
     async {
-        let Some(next) = rewrite_internal_config(&config_path, change, lock).await? else {
+        let Some(next) = rewrite_internal_config(tree, &config_path, change, lock).await? else {
             return Ok(false);
         };
-        publish_internal_config(&config_path, &next).await?;
+        publish_internal_config(tree, &config_path, &next).await?;
         signal_internal_registrar_agent(secrets_dir, messages)?;
         Ok::<_, anyhow::Error>(true)
     }
@@ -488,12 +598,12 @@ pub(super) fn internal_rotation_applies(mode: &RotationMode, secrets_dir: &Path)
 /// either file cannot be published, or when the reload signal fails for
 /// a reason other than "no such process".
 pub(super) async fn publish_internal_trust(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     trust: &InternalTrustState,
     messages: &Messages,
 ) -> Result<()> {
-    write_internal_trust(secrets_dir, trust, messages).await?;
-    signal_internal_registrar_agent(secrets_dir, messages)
+    write_internal_trust(tree, trust, messages).await?;
+    signal_internal_registrar_agent(tree.anchor(), messages)
 }
 
 /// Writes the trust set without signalling.
@@ -520,27 +630,26 @@ pub(super) async fn publish_internal_trust(
 /// the last case the previous pair has been restored, or the failure to
 /// restore it is reported beside the failure that caused it.
 pub(super) async fn write_internal_trust(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     trust: &InternalTrustState,
     messages: &Messages,
 ) -> Result<()> {
-    let paths = InternalPaths::new(secrets_dir);
+    let paths = InternalPaths::new(tree.anchor());
     let config_path = paths.agent_config();
     // Held from before the read until after the rename or the restore,
     // so a responder-HMAC or EAB rotation's rewrite cannot land between
     // them and be put back by this one. Released as it drops, on every
     // path out.
-    let _lock = acquire_internal_config_lock(secrets_dir).await?;
-    let current = tokio::fs::read_to_string(&config_path)
+    let _lock = acquire_internal_config_lock(tree).await?;
+    let current = read_internal_config_text(tree, &config_path)
         .await
         .with_context(|| messages.error_read_file_failed(&config_path.display().to_string()))?;
     let next = upsert_internal_trust(&current, &paths, &trust.fingerprints)?;
 
-    let secrets_tree = bootroot::fs_util::SecretsTree::open_shared(secrets_dir).await?;
-    let snapshot = capture_members(&secrets_tree, &paths, &[AGENT_CONFIG_FILE, CA_BUNDLE_FILE])
+    let snapshot = capture_members(tree, &paths, &[AGENT_CONFIG_FILE, CA_BUNDLE_FILE])
         .await
         .context("capturing the bootroot-internal trust pair the rotation replaces")?;
-    if let Err(err) = write_trust_pair(&paths, &trust.bundle_pem, &next, messages).await {
+    if let Err(err) = write_trust_pair(tree, &paths, &trust.bundle_pem, &next, messages).await {
         if let Err(restore_err) = snapshot.restore().await {
             eprintln!(
                 "Warning: the bootroot-internal trust pair could not be fully restored after \
@@ -561,12 +670,16 @@ pub(super) async fn write_internal_trust(
 /// Split out so [`write_internal_trust`] can hold the prior pair around
 /// both renames rather than around each one.
 async fn write_trust_pair(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     bundle_pem: &str,
     config: &str,
     messages: &Messages,
 ) -> Result<()> {
     let config_path = paths.agent_config();
+    if tree.is_rooted() {
+        return write_trust_pair_rooted(tree, paths, bundle_pem, config, messages).await;
+    }
     // Root-owned unconditionally: this writer is reached only where the
     // internal credential set is present, and that set is what makes a
     // host a registrar host. There is no endpoint-enabled conditional
@@ -588,6 +701,37 @@ async fn write_trust_pair(
     )
     .await
     .with_context(|| messages.error_write_file_failed(&paths.ca_bundle().display().to_string()))
+}
+
+/// [`write_trust_pair`] through a rooted `tree`: the config as
+/// `atomic_write_fixed_owner` publishes it, and the bundle as
+/// `write_ca_bundle` with no group policy publishes it — `0644`,
+/// root-owned, not flushed.
+async fn write_trust_pair_rooted(
+    tree: &Arc<SecretsTree>,
+    paths: &InternalPaths,
+    bundle_pem: &str,
+    config: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let config_path = paths.agent_config();
+    publish_root_owned_config(tree, &config_path, config)
+        .await
+        .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
+    let bundle_path = paths.ca_bundle();
+    let target = bundle_path.clone();
+    let payload = bundle_pem.as_bytes().to_vec();
+    tree.run(move |tree| {
+        tree.publish(
+            fs_util::Destination::bootroot_owned(&target),
+            &payload,
+            fs_util::StagedMode::Policy(cert_group::CA_BUNDLE_FILE_MODE),
+            RootedOwner::Fixed(fs_util::FixedOwner::root()),
+            fs_util::StagedDurability::RenameOnly,
+        )
+    })
+    .await
+    .with_context(|| messages.error_write_file_failed(&bundle_path.display().to_string()))
 }
 
 /// Confirms the internal bundle and config still carry `expected`.
@@ -659,7 +803,7 @@ pub(super) async fn repair_internal_credential(
     // republishes are the ones it read, so a responder-HMAC or EAB
     // rotation either finishes before the read or waits for the
     // publication.
-    let _lock = acquire_internal_config_lock(ctx.paths.secrets_dir()).await?;
+    let _lock = acquire_internal_config_lock(&ctx.secrets).await?;
     let context = repair_context(ctx, client, messages).await?;
     replace_internal_credential(client, &context, &ctx.openbao_url, trust, reload, messages).await
 }
@@ -707,7 +851,7 @@ async fn replace_internal_credential(
     let staged = match issue_internal_material(&secrets_tree, &inputs, messages).await {
         Ok(staged) => staged.with_trust(trust.fingerprints.clone(), trust.bundle_pem.clone()),
         Err(err) => {
-            sweep_staging(&context.secrets_dir).await;
+            sweep_staging(&secrets_tree).await;
             return Err(err);
         }
     };
@@ -722,7 +866,7 @@ async fn replace_internal_credential(
     let prior = match PriorInternalAuth::capture(client).await {
         Ok(prior) => prior,
         Err(err) => {
-            sweep_staging(&context.secrets_dir).await;
+            sweep_staging(&secrets_tree).await;
             return Err(err);
         }
     };
@@ -738,7 +882,7 @@ async fn replace_internal_credential(
     .await
     {
         prior.restore(client).await;
-        sweep_staging(&context.secrets_dir).await;
+        sweep_staging(&secrets_tree).await;
         return Err(err);
     }
     match reload {
@@ -919,8 +1063,29 @@ async fn restore_internal_policy(client: &OpenBaoClient, prior: Option<&str>) {
 /// error a sweep would add would displace the one that matters. A
 /// directory that survives is reported so the unpublished key it holds
 /// is not silent.
-async fn sweep_staging(secrets_dir: &Path) {
-    let staging = staging_dir(&InternalPaths::new(secrets_dir));
+///
+/// On a rooted `tree` the probe and the removal go through the handle,
+/// so a link at the staging name or above it is never followed.
+async fn sweep_staging(tree: &Arc<SecretsTree>) {
+    let staging = staging_dir(&InternalPaths::new(tree.anchor()));
+    if tree.is_rooted() {
+        let target = staging.clone();
+        let swept = tree
+            .run(move |tree| {
+                if tree.entry_kind(&target)?.is_some() {
+                    tree.remove_dir_all(&target)?;
+                }
+                Ok(())
+            })
+            .await;
+        if let Err(err) = swept {
+            eprintln!(
+                "Warning: failed to remove the staging directory {}: {err:#}",
+                staging.display()
+            );
+        }
+        return;
+    }
     if !staging.exists() {
         return;
     }
@@ -1107,11 +1272,13 @@ pub(super) async fn finalized_trust(
 ///
 /// Returns an error when the root certificate cannot be read or parsed.
 pub(super) async fn active_root_fingerprint(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     messages: &Messages,
 ) -> Result<String> {
-    read_ca_cert_fingerprint(
-        &secrets_dir
+    ca_cert_fingerprint(
+        tree,
+        &tree
+            .anchor()
             .join(crate::commands::init::CA_CERTS_DIR)
             .join(crate::commands::init::CA_ROOT_CERT_FILENAME),
         messages,
@@ -1127,11 +1294,11 @@ pub(super) async fn active_root_fingerprint(
 /// Returns an error when the material cannot be loaded or the active
 /// root cannot be read.
 pub(super) async fn stored_root_matches_active(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     messages: &Messages,
 ) -> Result<bool> {
-    let material = load_material(&InternalPaths::new(secrets_dir))?;
-    let active = active_root_fingerprint(secrets_dir, messages).await?;
+    let material = load_material(&InternalPaths::new(tree.anchor()))?;
+    let active = active_root_fingerprint(tree, messages).await?;
     Ok(material.root_fingerprint.eq_ignore_ascii_case(&active))
 }
 
@@ -1175,9 +1342,9 @@ pub(super) async fn trust_state_for_repair(
             bundle_pem: super::ca::concat_unique_ca_certs_for_repair(ctx, messages).await?,
         });
     }
-    let root_fp = active_root_fingerprint(ctx.paths.secrets_dir(), messages).await?;
+    let root_fp = active_root_fingerprint(&ctx.secrets, messages).await?;
     let intermediate_fp =
-        read_ca_cert_fingerprint(&ctx.paths.intermediate_cert(), messages).await?;
+        ca_cert_fingerprint(&ctx.secrets, &ctx.paths.intermediate_cert(), messages).await?;
     finalized_trust(
         ctx.paths.secrets_dir(),
         &root_fp,
@@ -1213,14 +1380,14 @@ pub(super) async fn trust_state_for_repair(
 /// unmigrated entry in place behind a message saying nothing needs
 /// doing.
 async fn internal_credential_up_to_date(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     client: &OpenBaoClient,
     now: time::OffsetDateTime,
     messages: &Messages,
 ) -> Result<bool> {
-    let paths = InternalPaths::new(secrets_dir);
+    let paths = InternalPaths::new(tree.anchor());
     if !matches!(material_status(&paths), MaterialStatus::Present)
-        || !stored_root_matches_active(secrets_dir, messages)
+        || !stored_root_matches_active(tree, messages)
             .await
             .unwrap_or(false)
     {
@@ -1289,10 +1456,9 @@ pub(super) async fn rotate_registrar_internal_credential(
     // anything about the host's internal state.
     require_root_authority(client).await?;
 
-    let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     if !args.force
         && internal_credential_up_to_date(
-            &secrets_dir,
+            &ctx.secrets,
             client,
             time::OffsetDateTime::now_utc(),
             messages,
@@ -1343,6 +1509,7 @@ mod tests {
         TestLeaf, TestPki, write_signing_fake_docker,
     };
     use crate::commands::init::registrar_internal::{internal_acme_server, internal_responder_url};
+    use crate::commands::rotate::test_support::path_tree;
     use crate::i18n::test_messages;
 
     const ROOT_FP: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
@@ -1591,7 +1758,7 @@ mod tests {
             ],
             bundle_pem: bundle_pem("QURESVRJVkU"),
         };
-        let err = write_internal_trust(dir.path(), &additive, &test_messages())
+        let err = write_internal_trust(&path_tree(dir.path()), &additive, &test_messages())
             .await
             .expect_err("an unprivileged process cannot publish the protected config");
         let report = format!("{err:#}");
@@ -1649,6 +1816,7 @@ mod tests {
             state_dir: dir.path().to_path_buf(),
             state_file: dir.path().join("state.json"),
             docker: std::path::PathBuf::from(crate::commands::compose_project::DOCKER_BIN),
+            secrets: path_tree(dir.path()),
         };
         let err = repair_internal_credential(
             &ctx,
@@ -1692,6 +1860,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
             docker: std::path::PathBuf::from(crate::commands::compose_project::DOCKER_BIN),
+            secrets: path_tree(dir),
         }
     }
 
@@ -1941,14 +2110,14 @@ mod tests {
         std::fs::create_dir_all(&staging).expect("staging");
         std::fs::write(staging.join("key.pem"), "STAGED KEY").expect("staged key");
 
-        sweep_staging(dir.path()).await;
+        sweep_staging(&path_tree(dir.path())).await;
         assert!(!staging.exists(), "the staged key must not survive");
         // The published credential is untouched by the sweep.
         assert!(paths.key().exists());
         assert!(paths.agent_config().exists());
 
         // A host that never reached the staging stage is a no-op.
-        sweep_staging(dir.path()).await;
+        sweep_staging(&path_tree(dir.path())).await;
         assert!(!staging.exists());
     }
 
@@ -1970,11 +2139,12 @@ mod tests {
             0,
             "this test asserts what an unprivileged process cannot do, so it must not be root"
         );
-        let (_dir, paths) = provisioned_host();
+        let (dir, paths) = provisioned_host();
         let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
         let config_before = std::fs::read_to_string(paths.agent_config()).expect("config");
 
         let err = write_trust_pair(
+            &path_tree(dir.path()),
             &paths,
             &bundle_pem("QURESVRJVkU"),
             "email = \"ops@example.internal\"\n",
@@ -2013,7 +2183,7 @@ mod tests {
         let bundle_before = std::fs::read_to_string(paths.ca_bundle()).expect("bundle");
 
         write_internal_trust(
-            dir.path(),
+            &path_tree(dir.path()),
             &InternalTrustState {
                 fingerprints: vec![OLD_ROOT_FP.to_string()],
                 bundle_pem: bundle_pem("QURESVRJVkU"),
@@ -2333,7 +2503,7 @@ mod tests {
         let mut client = bootroot::openbao::OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("root-token".to_string());
         internal_credential_up_to_date(
-            dir.path(),
+            &path_tree(dir.path()),
             &client,
             time::OffsetDateTime::now_utc(),
             &test_messages(),
@@ -2578,7 +2748,7 @@ mod tests {
     async fn a_descriptor_copy_does_not_keep_a_dropped_lock_held() {
         let dir = TempDir::new().expect("tempdir");
         let paths = InternalPaths::new(dir.path());
-        let held = acquire_internal_config_lock(dir.path())
+        let held = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("take the lock");
         let copy = held.file.try_clone().expect("duplicate the descriptor");
@@ -2602,7 +2772,7 @@ mod tests {
         let bare = TempDir::new().expect("tempdir");
         for change in [set_hmac, InternalConfigChange::RemoveEab] {
             assert_eq!(
-                check_internal_config_change(bare.path(), change)
+                check_internal_config_change(&path_tree(bare.path()), change)
                     .await
                     .expect("an absent config is not an error"),
                 InternalConfigCheck::Absent
@@ -2615,13 +2785,13 @@ mod tests {
 
         let (dir, paths) = provisioned_host();
         assert_eq!(
-            check_internal_config_change(dir.path(), set_hmac)
+            check_internal_config_change(&path_tree(dir.path()), set_hmac)
                 .await
                 .expect("readable"),
             InternalConfigCheck::Applicable
         );
         assert_eq!(
-            check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
+            check_internal_config_change(&path_tree(dir.path()), InternalConfigChange::RemoveEab)
                 .await
                 .expect("readable"),
             InternalConfigCheck::Unchanged,
@@ -2633,7 +2803,7 @@ mod tests {
         );
         std::fs::write(paths.agent_config(), with_eab).expect("config");
         assert_eq!(
-            check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
+            check_internal_config_change(&path_tree(dir.path()), InternalConfigChange::RemoveEab)
                 .await
                 .expect("readable"),
             InternalConfigCheck::Applicable
@@ -2650,7 +2820,7 @@ mod tests {
         for change in [set_hmac, InternalConfigChange::RemoveEab] {
             let report = format!(
                 "{:#}",
-                check_internal_config_change(dir.path(), change)
+                check_internal_config_change(&path_tree(dir.path()), change)
                     .await
                     .expect_err("an unparseable config is refused")
             );
@@ -2694,18 +2864,23 @@ mod tests {
         std::fs::write(paths.agent_config(), doc.to_string()).expect("config");
 
         assert_eq!(
-            check_internal_config_change(dir.path(), set_hmac)
+            check_internal_config_change(&path_tree(dir.path()), set_hmac)
                 .await
                 .expect("readable"),
             InternalConfigCheck::Applicable
         );
-        let lock = acquire_internal_config_lock(dir.path())
+        let lock = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("the lock");
-        let rewritten = rewrite_internal_config(&paths.agent_config(), set_hmac, &lock)
-            .await
-            .expect("the rewrite")
-            .expect("the HMAC changes the file");
+        let rewritten = rewrite_internal_config(
+            &path_tree(dir.path()),
+            &paths.agent_config(),
+            set_hmac,
+            &lock,
+        )
+        .await
+        .expect("the rewrite")
+        .expect("the HMAC changes the file");
         std::fs::write(paths.agent_config(), rewritten).expect("config");
         assert_eq!(
             bootroot::registrar::internal::load_internal_config(&paths)
@@ -2720,7 +2895,7 @@ mod tests {
         std::fs::write(paths.agent_config(), "acme = \"old-hmac-in-a-string\"\n").expect("config");
         let report = format!(
             "{:#}",
-            check_internal_config_change(dir.path(), set_hmac)
+            check_internal_config_change(&path_tree(dir.path()), set_hmac)
                 .await
                 .expect_err("a non-table acme is refused")
         );
@@ -2743,7 +2918,7 @@ mod tests {
         let (dir, paths) = provisioned_host();
         // A directory where the lock file goes cannot be opened as one.
         std::fs::create_dir(paths.dir().join(INTERNAL_CONFIG_LOCK_FILE)).expect("mkdir");
-        let err = acquire_internal_config_lock(dir.path())
+        let err = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .err()
             .expect("the lock cannot be taken");
@@ -2774,9 +2949,10 @@ mod tests {
         let (dir, paths) = provisioned_host();
         std::fs::set_permissions(paths.agent_config(), std::fs::Permissions::from_mode(0o000))
             .expect("chmod");
-        let err = check_internal_config_change(dir.path(), InternalConfigChange::RemoveEab)
-            .await
-            .expect_err("an unreadable config is refused");
+        let err =
+            check_internal_config_change(&path_tree(dir.path()), InternalConfigChange::RemoveEab)
+                .await
+                .expect_err("an unreadable config is refused");
         let report = format!("{err:#}");
         assert!(
             report.contains(&paths.agent_config().display().to_string())
@@ -2798,7 +2974,7 @@ mod tests {
     async fn an_apply_reads_only_once_the_lock_is_released() {
         let (dir, paths) = provisioned_host();
         let secrets_dir = dir.path().to_path_buf();
-        let held = acquire_internal_config_lock(&secrets_dir)
+        let held = acquire_internal_config_lock(&path_tree(&secrets_dir))
             .await
             .expect("the test takes the lock");
 
@@ -2807,10 +2983,11 @@ mod tests {
         let applying = tokio::spawn(async move {
             let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
             let _ = started_tx.send(());
-            let lock = acquire_internal_config_lock(&secrets_dir)
+            let lock = acquire_internal_config_lock(&path_tree(&secrets_dir))
                 .await
                 .expect("the apply takes the lock");
             rewrite_internal_config(
+                &path_tree(&secrets_dir),
                 &config_path,
                 InternalConfigChange::SetResponderHmac(&hmac),
                 &lock,
@@ -2861,12 +3038,16 @@ mod tests {
             0,
             "this test asserts what an unprivileged process cannot do, so it must not be root"
         );
-        let (_dir, paths) = provisioned_host();
+        let (dir, paths) = provisioned_host();
         let before = std::fs::read(paths.agent_config()).expect("config");
 
-        let err = publish_internal_config(&paths.agent_config(), "email = \"x\"\n")
-            .await
-            .expect_err("an unprivileged process cannot publish the protected config");
+        let err = publish_internal_config(
+            &path_tree(dir.path()),
+            &paths.agent_config(),
+            "email = \"x\"\n",
+        )
+        .await
+        .expect_err("an unprivileged process cannot publish the protected config");
         let report = format!("{err:#}");
         assert!(
             report.contains(AGENT_CONFIG_FILE) && report.contains("root-owned"),
@@ -2890,12 +3071,12 @@ mod tests {
         let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
 
         let outcome = {
-            let lock = acquire_internal_config_lock(dir.path())
+            let lock = acquire_internal_config_lock(&path_tree(dir.path()))
                 .await
                 .expect("the lock");
             assert!(!lock_is_free(&paths), "held while the apply runs");
             apply_internal_config_change(
-                dir.path(),
+                &path_tree(dir.path()),
                 InternalConfigChange::SetResponderHmac(&hmac),
                 &lock,
                 &test_messages(),
@@ -2925,11 +3106,11 @@ mod tests {
         let before = std::fs::read(paths.agent_config()).expect("config");
         let inode = std::fs::metadata(paths.agent_config()).expect("meta").ino();
 
-        let lock = acquire_internal_config_lock(dir.path())
+        let lock = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("the lock");
         let published = apply_internal_config_change(
-            dir.path(),
+            &path_tree(dir.path()),
             InternalConfigChange::RemoveEab,
             &lock,
             &test_messages(),
@@ -2949,12 +3130,12 @@ mod tests {
     #[tokio::test]
     async fn an_apply_over_a_vanished_config_names_the_file() {
         let (dir, paths) = provisioned_host();
-        let lock = acquire_internal_config_lock(dir.path())
+        let lock = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("the lock");
         std::fs::remove_file(paths.agent_config()).expect("remove");
         let err = apply_internal_config_change(
-            dir.path(),
+            &path_tree(dir.path()),
             InternalConfigChange::RemoveEab,
             &lock,
             &test_messages(),
@@ -2972,13 +3153,13 @@ mod tests {
     #[tokio::test]
     async fn the_trust_writer_waits_for_and_releases_the_lock() {
         let (dir, paths) = provisioned_host();
-        let held = acquire_internal_config_lock(dir.path())
+        let held = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("the test takes the lock");
         let secrets_dir = dir.path().to_path_buf();
         let writing = tokio::spawn(async move {
             write_internal_trust(
-                &secrets_dir,
+                &path_tree(&secrets_dir),
                 &InternalTrustState {
                     fingerprints: vec![OLD_ROOT_FP.to_string()],
                     bundle_pem: bundle_pem("QURESVRJVkU"),
@@ -3041,7 +3222,7 @@ mod tests {
         client.set_token("root-token".to_string());
 
         let (dir, paths) = provisioned_host();
-        let held = acquire_internal_config_lock(dir.path())
+        let held = acquire_internal_config_lock(&path_tree(dir.path()))
             .await
             .expect("the rotation holds the lock");
 
@@ -3087,5 +3268,155 @@ mod tests {
             .expect("the repair task")
             .expect_err("issuance fails without CA material");
         assert!(lock_is_free(&paths), "the failed repair released the lock");
+    }
+
+    fn rooted_tree(dir: &std::path::Path) -> Arc<bootroot::fs_util::SecretsTree> {
+        Arc::new(bootroot::fs_util::SecretsTree::open_rooted_for_tests(dir).expect("rooted handle"))
+    }
+
+    /// Moves `registrar-internal/` out of the tree into `outside` and
+    /// plants a link to it at its name. Returns the link's path.
+    fn swap_internal(paths: &InternalPaths, outside: &std::path::Path) -> std::path::PathBuf {
+        let moved = outside.join("registrar-internal");
+        std::fs::rename(paths.dir(), &moved).expect("move aside");
+        std::os::unix::fs::symlink(&moved, paths.dir()).expect("plant link");
+        paths.dir().to_path_buf()
+    }
+
+    #[tokio::test]
+    async fn rooted_internal_config_lock_is_taken_through_the_handle() {
+        let (dir, paths) = provisioned_host();
+        let tree = rooted_tree(dir.path());
+        let lock = acquire_internal_config_lock(&tree).await.expect("the lock");
+        let lock_path = paths.dir().join(INTERNAL_CONFIG_LOCK_FILE);
+        assert!(lock_path.is_file());
+        drop(lock);
+
+        // A link at the lock file is refused, and its target is neither
+        // created nor changed.
+        let outside = TempDir::new().expect("outside");
+        let target = outside.path().join("planted");
+        std::fs::remove_file(&lock_path).expect("rm lock");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("plant link");
+        let err = acquire_internal_config_lock(&tree)
+            .await
+            .err()
+            .expect("a link at the lock file");
+        crate::test_support::assert_error_names(&err, &lock_path);
+        assert!(std::fs::symlink_metadata(&target).is_err());
+
+        // A missing `registrar-internal/` is created, as by path.
+        let (dir, paths) = provisioned_host();
+        std::fs::remove_dir_all(paths.dir()).expect("rm internal");
+        let tree = rooted_tree(dir.path());
+        drop(acquire_internal_config_lock(&tree).await.expect("the lock"));
+        let meta = std::fs::metadata(paths.dir()).expect("created");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o7777,
+            0o700
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_internal_config_sites_refuse_a_swapped_internal_dir() {
+        let (dir, paths) = provisioned_host();
+        let tree = rooted_tree(dir.path());
+        let lock = acquire_internal_config_lock(&tree).await.expect("the lock");
+        let outside = TempDir::new().expect("outside");
+        let link = swap_internal(&paths, outside.path());
+        let moved = outside.path().join("registrar-internal");
+        let staging_name = staging_dir(&paths).file_name().expect("name").to_owned();
+        std::fs::create_dir_all(moved.join(&staging_name)).expect("staging outside");
+        std::fs::write(moved.join(&staging_name).join("key.pem"), "OUTSIDE").expect("seed");
+        let before = crate::test_support::snapshot_tree(outside.path());
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+        let change = InternalConfigChange::SetResponderHmac(&hmac);
+
+        let err = check_internal_config_change(&tree, change)
+            .await
+            .expect_err("a link is not an absent config");
+        crate::test_support::assert_error_names(&err, &link);
+        let err = rewrite_internal_config(&tree, &paths.agent_config(), change, &lock)
+            .await
+            .expect_err("rewrite through a link");
+        crate::test_support::assert_error_names(&err, &link);
+        let err = publish_internal_config(&tree, &paths.agent_config(), "email = \"x\"\n")
+            .await
+            .expect_err("publish through a link");
+        crate::test_support::assert_error_names(&err, &link);
+        let err = write_trust_pair(
+            &tree,
+            &paths,
+            &bundle_pem("QURESVRJVkU"),
+            "email = \"x\"\n",
+            &test_messages(),
+        )
+        .await
+        .expect_err("trust pair through a link");
+        crate::test_support::assert_error_names(&err, &link);
+        // Best effort, as by path: it warns and removes nothing outside.
+        sweep_staging(&tree).await;
+        drop(lock);
+        let err = acquire_internal_config_lock(&tree)
+            .await
+            .err()
+            .expect("the lock through a link");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(crate::test_support::snapshot_tree(outside.path()), before);
+    }
+
+    /// Without a swap, the rooted read-modify-write reads the same bytes
+    /// and computes the same rewrite as the path-based one.
+    #[tokio::test]
+    async fn rooted_internal_config_check_and_rewrite_match_the_path_based_ones() {
+        let hmac = bootroot::secret::HmacSecret::from(ROTATED_HMAC);
+        let change = InternalConfigChange::SetResponderHmac(&hmac);
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let (dir, paths) = provisioned_host();
+            let tree = if rooted {
+                rooted_tree(dir.path())
+            } else {
+                path_tree(dir.path())
+            };
+            let check = check_internal_config_change(&tree, change)
+                .await
+                .expect("check");
+            let lock = acquire_internal_config_lock(&tree).await.expect("lock");
+            let rewritten = rewrite_internal_config(&tree, &paths.agent_config(), change, &lock)
+                .await
+                .expect("rewrite");
+            // The config names its own directory, which differs between
+            // the two runs' tempdirs.
+            let anchor = dir.path().display().to_string();
+            results.push((
+                check,
+                rewritten.map(|text| text.replace(&anchor, "<secrets>")),
+            ));
+            // A host without the config is absent through either handle.
+            std::fs::remove_file(paths.agent_config()).expect("rm config");
+            assert_eq!(
+                check_internal_config_change(&tree, change)
+                    .await
+                    .expect("absent"),
+                InternalConfigCheck::Absent
+            );
+        }
+        assert_eq!(results[0], results[1]);
+        assert!(results[1].1.is_some());
+    }
+
+    /// A rooted sweep removes the staging directory as the path-based
+    /// one does.
+    #[tokio::test]
+    async fn rooted_sweep_staging_removes_the_staging_directory() {
+        let (dir, paths) = provisioned_host();
+        let staging = staging_dir(&paths);
+        std::fs::create_dir_all(&staging).expect("staging");
+        std::fs::write(staging.join("key.pem"), "KEY").expect("seed");
+        sweep_staging(&rooted_tree(dir.path())).await;
+        assert!(!staging.exists());
+        // Absent is a no-op.
+        sweep_staging(&rooted_tree(dir.path())).await;
     }
 }

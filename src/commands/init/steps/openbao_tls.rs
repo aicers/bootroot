@@ -69,7 +69,7 @@ const STEP_SCRATCH_OUT: &str = "out";
 /// # Errors
 /// Returns an error if the current directory cannot be read or the
 /// containing directory cannot be resolved.
-pub(super) fn step_scratch_parent(anchor: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn step_scratch_parent(anchor: &Path) -> std::io::Result<PathBuf> {
     let absolute = std::path::absolute(anchor)?;
     let parent = absolute.parent().unwrap_or(Path::new("/"));
     std::fs::canonicalize(parent)

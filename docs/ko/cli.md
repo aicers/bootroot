@@ -239,9 +239,13 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
   때, 내용을 다른 곳에 전달하는 파일(CA 인증서, `ca.json`, step-ca 비밀번호,
   저장된 언실 키)을 읽을 때도 같은 방식으로 심볼릭 링크를 거부합니다. 따라서 그
   경우에는 생성 파일을 심볼릭 링크로 옮겨 두는 방식이 적용되지 않습니다.
-  `rotate infra-cert`, `rotate ca-key`, `rotate trust-sync`,
-  `rotate registrar-internal-credential`, `registrar issue`가 `init`과 공유하는
-  단계에도 같은 내용이 적용됩니다.
+  그러한 `secrets/` 위에서 root로 실행한 모든 `rotate` 하위 명령, `ca update`,
+  `openbao delete-unseal-keys`, `service add`, `service remove`,
+  `registrar issue`도 `secrets/` 아래에서 파일을 쓰거나 복사하거나 삭제하거나
+  다시 읽는 모든 곳에서 같은 내용이 적용됩니다(`secrets/` 밖의
+  `--secret-id-path`나 `registrar issue`의 출력 경로처럼 직접 지정한 경로는
+  지정한 그대로 둡니다). 이 경우 `registrar issue`는 발급한 인증서를
+  `secrets/` 아래가 아니라 그 옆의 전용 디렉터리에서 준비합니다.
 - **컨트롤 노드 자신의 `agent.toml`, 발급된 인증서와 키, CA 번들, 모든 자격
   증명은 경로 자체에 게시되며**, 그 자리에 있던 링크는 일반 파일로 대체됩니다.
   OpenBao 언실 키와 시크릿 트리의 EAB 파일은 이번 릴리스에서 이 그룹에

@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use bootroot::db::{
     self, effective_admin_dsn_for_kv, for_compose_runtime, for_host_runtime_with_port,
 };
+use bootroot::fs_util::SecretsTree;
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
@@ -56,7 +57,13 @@ pub(super) async fn rotate_db(
         None => bootroot::utils::generate_secret(SECRET_BYTES)
             .with_context(|| messages.error_generate_secret_failed())?,
     };
-    let current_dsn = read_ca_json_dsn(&ca_json_path, messages)?;
+    let current_dsn = {
+        let path = ca_json_path.clone();
+        let messages = messages.clone();
+        ctx.secrets
+            .run(move |tree| read_ca_json_dsn(tree, &path, &messages))
+            .await?
+    };
     let parsed = db::parse_db_dsn(&current_dsn).with_context(|| messages.error_invalid_db_dsn())?;
     ensure_single_host_db_host(&parsed.host, messages)?;
     let timeout = Duration::from_secs(args.timeout.timeout_secs);
@@ -245,7 +252,18 @@ async fn read_admin_dsn_from_kv(client: &OpenBaoClient, kv_mount: &str) -> Resul
         .map(str::to_string))
 }
 
-fn read_ca_json_dsn(path: &Path, messages: &Messages) -> Result<String> {
+/// Reads the step-ca database DSN from `ca.json` below the secrets
+/// directory: through `tree` without following a name when it is
+/// rooted, by path otherwise.
+fn read_ca_json_dsn(tree: &SecretsTree, path: &Path, messages: &Messages) -> Result<String> {
+    if tree.is_rooted() {
+        let bytes = tree
+            .read(path)
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+        let contents = String::from_utf8(bytes)
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+        return parse_ca_json_dsn(&contents, messages);
+    }
     let contents = fs::read_to_string(path)
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
     parse_ca_json_dsn(&contents, messages)
@@ -513,7 +531,12 @@ mod tests {
         )
         .expect("write ca.json");
 
-        let dsn = read_ca_json_dsn(&path, &messages).expect("read dataSource");
+        let dsn = read_ca_json_dsn(
+            &SecretsTree::open(dir.path()).expect("open"),
+            &path,
+            &messages,
+        )
+        .expect("read dataSource");
         assert_eq!(
             dsn,
             "postgresql://step:old@postgres:5432/stepca?sslmode=disable"
@@ -527,7 +550,42 @@ mod tests {
         let messages = test_messages();
         fs::write(&path, r#"{"db":{"type":"postgresql"}}"#).expect("write ca.json");
 
-        let err = read_ca_json_dsn(&path, &messages).expect_err("expected missing dataSource");
+        let err = read_ca_json_dsn(
+            &SecretsTree::open(dir.path()).expect("open"),
+            &path,
+            &messages,
+        )
+        .expect_err("expected missing dataSource");
         assert!(err.to_string().contains("ca.json"));
+    }
+
+    #[test]
+    fn rooted_read_ca_json_dsn_refuses_a_link_and_reads_nothing_through_it() {
+        let root = crate::test_support::SwapRoot::new();
+        let messages = test_messages();
+        let path = root.write(
+            "config/ca.json",
+            r#"{"db":{"type":"postgresql","dataSource":"postgresql://step:inside@postgres:5432/stepca"}}"#,
+        );
+        let tree = root.rooted();
+        assert_eq!(
+            read_ca_json_dsn(&tree, &path, &messages).expect("read"),
+            "postgresql://step:inside@postgres:5432/stepca"
+        );
+
+        fs::write(
+            root.outside.join("ca.json"),
+            r#"{"db":{"dataSource":"postgresql://step:OUTSIDE@elsewhere:5432/x"}}"#,
+        )
+        .expect("seed outside");
+        root.swap("config/ca.json", &root.outside.join("ca.json"));
+        let err = read_ca_json_dsn(&tree, &path, &messages).expect_err("leaf link");
+        crate::test_support::assert_error_names(&err, &path);
+        assert!(!format!("{err:#}").contains("OUTSIDE"));
+
+        let link = root.swap("config", &root.outside);
+        let err = read_ca_json_dsn(&tree, &path, &messages).expect_err("intermediate link");
+        crate::test_support::assert_error_names(&err, &link);
+        assert!(!format!("{err:#}").contains("OUTSIDE"));
     }
 }

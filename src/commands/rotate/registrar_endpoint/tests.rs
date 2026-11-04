@@ -13,6 +13,7 @@ use rustls::pki_types::CertificateDer;
 use tempfile::{TempDir, tempdir};
 
 use super::*;
+use crate::commands::rotate::test_support::path_tree;
 use crate::commands::trust::RotationMode;
 use crate::i18n::test_messages;
 
@@ -165,7 +166,7 @@ impl Host {
         std::fs::create_dir_all(&surface).expect("surface dir");
         let paths = StatePaths::new(secrets.clone());
         let host = if table {
-            EndpointHost::resolve(&secrets, &test_messages()).expect("host")
+            EndpointHost::resolve(&path_tree(&secrets), &secrets, &test_messages()).expect("host")
         } else {
             EndpointHost {
                 pin_file: surface.join(endpoint_pin::REGISTRAR_ENDPOINT_ANCHORS_FILE),
@@ -191,6 +192,12 @@ impl Host {
 
     fn secrets_dir(&self) -> PathBuf {
         self.dir.path().join("secrets")
+    }
+
+    /// The handle a rotation opens on the secrets directory: path-based
+    /// for a test process that owns it.
+    fn tree(&self) -> Arc<SecretsTree> {
+        path_tree(&self.secrets_dir())
     }
 
     /// Rewrites the internal config's `trusted_ca_sha256`.
@@ -509,7 +516,7 @@ fn the_endpoint_host_is_read_from_the_internal_config() {
 #[test]
 fn phase0_refuses_an_internal_config_without_client_cert_path() {
     let host = Host::with_endpoint_table(false);
-    let err = EndpointHost::resolve(&host.secrets_dir(), &test_messages())
+    let err = EndpointHost::resolve(&host.tree(), &host.secrets_dir(), &test_messages())
         .expect_err("no [registrar_endpoint] table");
     let text = err.to_string();
     assert!(
@@ -600,6 +607,7 @@ async fn phase0_preserves_the_current_client_pair() {
     write_pair(&host.endpoint.client, &pair);
 
     preserve_retired_pair(
+        &host.tree(),
         &host.endpoint.client,
         &host.paths,
         &generation,
@@ -625,6 +633,180 @@ async fn phase0_preserves_the_current_client_pair() {
     assert!(!host.paths.registrar_client_retired_staging().exists());
 }
 
+impl Host {
+    /// A rooted handle on the secrets directory, as a root run over a
+    /// `secrets/` another account owns opens it.
+    fn rooted(&self) -> Arc<SecretsTree> {
+        Arc::new(SecretsTree::open_rooted_for_tests(&self.secrets_dir()).expect("rooted"))
+    }
+}
+
+/// Every entry below `dir`, by relative path, with its kind, mode and
+/// contents.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (String, u32, Vec<u8>)> {
+    crate::test_support::snapshot_tree(dir)
+}
+
+/// Through a rooted handle the retired pair is preserved exactly as the
+/// path-based run preserves it.
+#[tokio::test]
+async fn rooted_preservation_matches_the_path_based_one() {
+    let mut results = Vec::new();
+    for rooted in [false, true] {
+        let host = Host::new();
+        let current = Generation::new();
+        let (_, _, generation) = current.write(host.dir.path(), "current");
+        let pair = current.leaf("client", (2099, 1, 1));
+        write_pair(&host.endpoint.client, &pair);
+        let tree = if rooted { host.rooted() } else { host.tree() };
+        preserve_retired_pair(
+            &tree,
+            &host.endpoint.client,
+            &host.paths,
+            &generation,
+            RetiredOwner::current_process(),
+            &test_messages(),
+        )
+        .await
+        .expect("preserved");
+        let retired = host.paths.registrar_client_retired();
+        // Each run mints its own pair, so the bytes are compared with the
+        // pair that run preserved rather than across runs.
+        let mut seen = vec![(
+            std::fs::metadata(&retired).expect("stat").mode() & 0o7777,
+            true,
+        )];
+        for (name, expected) in [(RETIRED_CERT_FILE, &pair.0), (RETIRED_KEY_FILE, &pair.1)] {
+            let path = retired.join(name);
+            seen.push((
+                std::fs::metadata(&path).expect("stat").mode() & 0o7777,
+                &std::fs::read_to_string(&path).expect("read") == expected,
+            ));
+        }
+        assert!(!host.paths.registrar_client_retired_staging().exists());
+        // The owner the production path would give root, as the ids the
+        // test process holds.
+        assert_eq!(
+            std::fs::metadata(&retired).expect("stat").uid(),
+            fs_util::current_process_euid()
+        );
+        results.push(seen);
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(
+        results[1],
+        vec![(0o700, true), (0o600, true), (0o600, true)]
+    );
+}
+
+/// A link at the retired pair's name is replaced, not followed: what it
+/// points at is left as it was.
+#[tokio::test]
+async fn rooted_preservation_replaces_a_link_at_the_target() {
+    let host = Host::new();
+    let current = Generation::new();
+    let (_, _, generation) = current.write(host.dir.path(), "current");
+    let pair = current.leaf("client", (2099, 1, 1));
+    write_pair(&host.endpoint.client, &pair);
+    let outside = host.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    std::fs::write(outside.join(RETIRED_KEY_FILE), "OUTSIDE").expect("seed");
+    std::os::unix::fs::symlink(&outside, host.paths.registrar_client_retired()).expect("link");
+    let before = snapshot(&outside);
+
+    preserve_retired_pair(
+        &host.rooted(),
+        &host.endpoint.client,
+        &host.paths,
+        &generation,
+        RetiredOwner::current_process(),
+        &test_messages(),
+    )
+    .await
+    .expect("preserved");
+    let retired = host.paths.registrar_client_retired();
+    assert!(
+        std::fs::symlink_metadata(&retired)
+            .expect("stat")
+            .file_type()
+            .is_dir()
+    );
+    assert_eq!(
+        std::fs::read_to_string(retired.join(RETIRED_KEY_FILE)).expect("read"),
+        pair.1
+    );
+    assert_eq!(snapshot(&outside), before);
+}
+
+/// Something put at the staging name after the sweep — a link or a real
+/// directory — fails the staging write, and nothing is written into it
+/// or through it.
+#[test]
+fn rooted_staging_refuses_what_appeared_at_its_name_after_the_sweep() {
+    let host = Host::new();
+    let tree = host.rooted();
+    let staging = host.paths.registrar_client_retired_staging();
+    let outside = host.dir.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let before = snapshot(&outside);
+
+    sweep_retired_staging(&tree, &host.paths, &test_messages()).expect("sweep");
+    std::os::unix::fs::symlink(&outside, &staging).expect("link at the staging name");
+    let err = write_retired_staging_rooted(
+        &tree,
+        &staging,
+        b"CERT",
+        b"KEY",
+        RetiredOwner::current_process(),
+    )
+    .expect_err("a link at the staging name");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(snapshot(&outside), before);
+
+    sweep_retired_staging(&tree, &host.paths, &test_messages()).expect("sweep the link");
+    assert!(std::fs::symlink_metadata(&staging).is_err());
+    std::fs::create_dir(&staging).expect("a planted directory");
+    let err = write_retired_staging_rooted(
+        &tree,
+        &staging,
+        b"CERT",
+        b"KEY",
+        RetiredOwner::current_process(),
+    )
+    .expect_err("a planted directory");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(
+        std::fs::read_dir(&staging).expect("list").next().is_none(),
+        "no file was written into the planted directory"
+    );
+}
+
+/// With `registrar-internal/` swapped for a link to a directory whose
+/// config names paths outside `secrets/`, the endpoint's paths are never
+/// read from it.
+#[test]
+fn rooted_endpoint_resolution_refuses_a_swapped_internal_dir() {
+    let host = Host::new();
+    let internal = InternalPaths::new(&host.secrets_dir()).dir().to_path_buf();
+    let elsewhere = host.dir.path().join("outside-internal");
+    std::fs::rename(&internal, &elsewhere).expect("move aside");
+    std::os::unix::fs::symlink(&elsewhere, &internal).expect("link");
+    let before = snapshot(host.dir.path());
+
+    let err = EndpointHost::resolve(&host.rooted(), &host.secrets_dir(), &test_messages())
+        .expect_err("a link at registrar-internal/ is refused");
+    crate::test_support::assert_error_names(&err, &internal);
+    assert_eq!(
+        snapshot(host.dir.path()),
+        before,
+        "nothing was written or removed"
+    );
+    // The same config read by path, as a non-root run reads it, still
+    // resolves: the refusal is the rooted walk's.
+    EndpointHost::resolve(&host.tree(), &host.secrets_dir(), &test_messages())
+        .expect("path-based resolution");
+}
+
 /// A fresh rotation replaces a retired pair a previous rotation left.
 #[tokio::test]
 async fn phase0_replaces_an_existing_retired_pair_on_a_fresh_rotation() {
@@ -638,6 +820,7 @@ async fn phase0_replaces_an_existing_retired_pair_on_a_fresh_rotation() {
     write_pair(&host.endpoint.client, &pair);
 
     preserve_retired_pair(
+        &host.tree(),
         &host.endpoint.client,
         &host.paths,
         &generation,
@@ -685,6 +868,7 @@ async fn phase0_refuses_a_client_pair_that_fails_a_check() {
         let (_, _, generation) = current.write(host.dir.path(), "current");
         write_pair(&host.endpoint.client, &pair);
         let err = preserve_retired_pair(
+            &host.tree(),
             &host.endpoint.client,
             &host.paths,
             &generation,
@@ -717,7 +901,7 @@ async fn an_interrupted_copy_is_swept_and_never_taken_for_a_pair() {
     std::fs::write(staging.join(RETIRED_CERT_FILE), &pair.0).expect("half a copy");
 
     // Resumed: the staging directory is removed and no pair is found.
-    sweep_retired_staging(&host.paths, &test_messages()).expect("sweep");
+    sweep_retired_staging(&host.tree(), &host.paths, &test_messages()).expect("sweep");
     assert!(!staging.exists());
     assert!(matches!(
         assess_retired_pair(&host.paths, &generation, &test_messages()),
@@ -726,6 +910,7 @@ async fn an_interrupted_copy_is_swept_and_never_taken_for_a_pair() {
 
     // Fresh: the copy is made again, whole.
     preserve_retired_pair(
+        &host.tree(),
         &host.endpoint.client,
         &host.paths,
         &generation,
@@ -754,7 +939,9 @@ async fn phase0_takes_the_publication_lock_for_the_client_pair() {
         .await
         .expect("lock");
     let messages = test_messages();
+    let tree = host.tree();
     let copy = preserve_retired_pair(
+        &tree,
         &host.endpoint.client,
         &host.paths,
         &generation,
@@ -1166,6 +1353,7 @@ impl Finalizing {
         let retired = old.leaf("client", (2099, 1, 1));
         write_pair(&host.endpoint.client, &retired);
         preserve_retired_pair(
+            &host.tree(),
             &host.endpoint.client,
             &host.paths,
             &old_generation,
@@ -1418,7 +1606,12 @@ async fn a_resumed_phase6_with_narrowed_trust_skips_the_before_dial() {
 #[tokio::test]
 async fn an_absent_retired_pair_needs_force_and_force_still_needs_the_current_pair() {
     let finalizing = Finalizing::new().await;
-    remove_retired_pair(&finalizing.host.paths, &test_messages()).expect("remove");
+    remove_retired_pair(
+        &finalizing.host.tree(),
+        &finalizing.host.paths,
+        &test_messages(),
+    )
+    .expect("remove");
     let endpoint = FakeEndpoint::default();
     endpoint.accept_only(&[&finalizing.current.0]);
 

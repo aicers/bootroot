@@ -35,14 +35,18 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::SecretsTree;
 use bootroot::registrar::endpoint_pin::{
     self, EndpointProbe, EndpointProbeError, ProbeClientPair, ProbeClientPairError, ProbeVerdict,
 };
-use bootroot::registrar::internal::{InternalPaths, load_internal_config};
+use bootroot::registrar::internal::{
+    InternalPaths, load_internal_config, load_internal_config_from_str,
+};
 use bootroot::registrar::{REGISTRAR_SURFACE_INSTANCE, registrar_endpoint_identity};
 use x509_parser::prelude::{ASN1Time, FromDer as _, X509Certificate};
 
@@ -108,12 +112,30 @@ impl EndpointHost {
     /// Returns an error naming the config when it cannot be loaded, and
     /// naming the key when one of the four material paths is unset —
     /// `client_cert_path` first, since the pin file is found beside it.
-    pub(super) fn resolve(secrets_dir: &Path, messages: &Messages) -> Result<Self> {
+    ///
+    /// On a rooted `tree` the config is read through the handle, without
+    /// following a link and only from a `registrar-internal/` the
+    /// root-by-policy check admits, and parsed from those bytes.
+    pub(super) fn resolve(
+        tree: &SecretsTree,
+        secrets_dir: &Path,
+        messages: &Messages,
+    ) -> Result<Self> {
         let paths = InternalPaths::new(secrets_dir);
         let config_path = paths.agent_config();
         let config = config_path.display().to_string();
-        let settings = load_internal_config(&paths)
-            .with_context(|| messages.error_rotate_endpoint_config_unusable(&config))?;
+        let settings = if tree.is_rooted() {
+            let bytes = tree
+                .read(&config_path)
+                .with_context(|| messages.error_rotate_endpoint_config_unusable(&config))?;
+            let contents = String::from_utf8(bytes)
+                .with_context(|| messages.error_rotate_endpoint_config_unusable(&config))?;
+            load_internal_config_from_str(&paths, &contents)
+                .with_context(|| messages.error_rotate_endpoint_config_unusable(&config))?
+        } else {
+            load_internal_config(&paths)
+                .with_context(|| messages.error_rotate_endpoint_config_unusable(&config))?
+        };
         let endpoint = &settings.registrar_endpoint;
         let require = |value: Option<&Path>, setting: &str| {
             value.map(Path::to_path_buf).ok_or_else(|| {
@@ -449,8 +471,12 @@ impl RetiredOwner {
 ///
 /// Returns an error naming the directory when it exists and cannot be
 /// removed.
-pub(super) fn sweep_retired_staging(paths: &StatePaths, messages: &Messages) -> Result<()> {
-    remove_dir_if_present(&paths.registrar_client_retired_staging(), messages)
+pub(super) fn sweep_retired_staging(
+    tree: &SecretsTree,
+    paths: &StatePaths,
+    messages: &Messages,
+) -> Result<()> {
+    remove_dir_if_present(tree, &paths.registrar_client_retired_staging(), messages)
 }
 
 /// Removes the preserved retired pair, if there is one.
@@ -459,12 +485,24 @@ pub(super) fn sweep_retired_staging(paths: &StatePaths, messages: &Messages) -> 
 ///
 /// Returns an error naming the directory when it exists and cannot be
 /// removed.
-pub(super) fn remove_retired_pair(paths: &StatePaths, messages: &Messages) -> Result<()> {
-    remove_dir_if_present(&paths.registrar_client_retired(), messages)
+pub(super) fn remove_retired_pair(
+    tree: &SecretsTree,
+    paths: &StatePaths,
+    messages: &Messages,
+) -> Result<()> {
+    remove_dir_if_present(tree, &paths.registrar_client_retired(), messages)
 }
 
-fn remove_dir_if_present(dir: &Path, messages: &Messages) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
+/// Removes `dir` below the secrets directory and everything in it, if
+/// it is there: through `tree` without following a name when it is
+/// rooted, by path otherwise.
+fn remove_dir_if_present(tree: &SecretsTree, dir: &Path, messages: &Messages) -> Result<()> {
+    let removed = if tree.is_rooted() {
+        tree.remove_dir_all(dir)
+    } else {
+        std::fs::remove_dir_all(dir)
+    };
+    match removed {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(anyhow::Error::new(err))
@@ -488,6 +526,7 @@ fn remove_dir_if_present(dir: &Path, messages: &Messages) -> Result<()> {
 /// Returns an error naming the failed check when the pair is not usable,
 /// or naming the path when a read, write, sync or rename fails.
 pub(super) async fn preserve_retired_pair(
+    tree: &Arc<SecretsTree>,
     client: &SurfacePair,
     paths: &StatePaths,
     current: &CaGeneration,
@@ -516,10 +555,31 @@ pub(super) async fn preserve_retired_pair(
 
     let staging = paths.registrar_client_retired_staging();
     let target = paths.registrar_client_retired();
-    remove_dir_if_present(&staging, messages)?;
+    if tree.is_rooted() {
+        let target_for_task = target.clone();
+        let messages_for_task = messages.clone();
+        tree.run(move |tree| {
+            replace_retired_pair_rooted(
+                tree,
+                &staging,
+                &target_for_task,
+                &cert_pem,
+                &key_pem,
+                owner,
+                &messages_for_task,
+            )
+        })
+        .await?;
+        println!(
+            "{}",
+            messages.rotate_ca_key_endpoint_retired_preserved(&target.display().to_string())
+        );
+        return Ok(());
+    }
+    remove_dir_if_present(tree, &staging, messages)?;
     write_retired_staging(&staging, &cert_pem, &key_pem, owner)
         .with_context(|| messages.error_write_file_failed(&staging.display().to_string()))?;
-    remove_dir_if_present(&target, messages)?;
+    remove_dir_if_present(tree, &target, messages)?;
     std::fs::rename(&staging, &target)
         .with_context(|| messages.error_write_file_failed(&target.display().to_string()))?;
     // The rename is what a resumed rotation relies on to find a complete
@@ -557,6 +617,57 @@ fn write_retired_staging(
         file.sync_all()?;
     }
     std::fs::File::open(staging)?.sync_all()
+}
+
+/// [`preserve_retired_pair`]'s staging, replacement and flush through a
+/// rooted `tree`: the staging directory is swept and created exclusively
+/// under `owner`, both files are created in it, and it is renamed over
+/// the target, which is removed first, before the anchor is flushed.
+fn replace_retired_pair_rooted(
+    tree: &SecretsTree,
+    staging: &Path,
+    target: &Path,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    owner: RetiredOwner,
+    messages: &Messages,
+) -> Result<()> {
+    remove_dir_if_present(tree, staging, messages)?;
+    write_retired_staging_rooted(tree, staging, cert_pem, key_pem, owner)
+        .with_context(|| messages.error_write_file_failed(&staging.display().to_string()))?;
+    remove_dir_if_present(tree, target, messages)?;
+    tree.rename(staging, target)
+        .with_context(|| messages.error_write_file_failed(&target.display().to_string()))?;
+    // As the path-based branch flushes the parent: the rename is what a
+    // resumed rotation relies on to find a complete pair.
+    tree.sync_dir(tree.anchor())
+        .with_context(|| messages.error_write_file_failed(&target.display().to_string()))?;
+    Ok(())
+}
+
+/// [`write_retired_staging`] through a rooted `tree`.
+///
+/// The directory is created exclusively, so one the owner of `secrets/`
+/// put at the name after the sweep fails the call and receives no file;
+/// both files are created at their final owner and mode, and the
+/// directory is flushed.
+fn write_retired_staging_rooted(
+    tree: &SecretsTree,
+    staging: &Path,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    owner: RetiredOwner,
+) -> std::io::Result<()> {
+    tree.create_dir_exclusive(staging, RETIRED_DIR_MODE, (owner.uid, owner.gid))?;
+    for (name, bytes) in [(RETIRED_CERT_FILE, cert_pem), (RETIRED_KEY_FILE, key_pem)] {
+        tree.create_new(
+            &staging.join(name),
+            bytes,
+            RETIRED_FILE_MODE,
+            Some((owner.uid, owner.gid)),
+        )?;
+    }
+    tree.sync_dir(staging)
 }
 
 /// What Phase 6 found at the retired pair's directory.

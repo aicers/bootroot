@@ -46,8 +46,34 @@ pub(crate) async fn save_unseal_keys(
 }
 
 /// Deletes the unseal keys file if it exists.
+///
+/// A root process over a `secrets/` another account owns removes it
+/// through the tree handle, so a link at `openbao/` is refused and a
+/// link at the file itself is removed rather than followed.
 pub(crate) fn delete_unseal_keys(secrets_dir: &Path, messages: &Messages) -> Result<()> {
-    let path = unseal_keys_path(secrets_dir);
+    let tree = fs_util::SecretsTree::open(secrets_dir)?;
+    delete_unseal_keys_in(&tree, messages)
+}
+
+/// [`delete_unseal_keys`] over an opened handle on the secrets
+/// directory.
+fn delete_unseal_keys_in(tree: &fs_util::SecretsTree, messages: &Messages) -> Result<()> {
+    let path = unseal_keys_path(tree.anchor());
+    if tree.is_rooted() {
+        match tree.remove_file(&path) {
+            Ok(()) => println!(
+                "{}",
+                messages.openbao_unseal_keys_deleted(&path.display().to_string())
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(anyhow::Error::new(err)).with_context(|| {
+                    messages.error_remove_file_failed(&path.display().to_string())
+                });
+            }
+        }
+        return Ok(());
+    }
     if path.exists() {
         std::fs::remove_file(&path)
             .with_context(|| messages.error_remove_file_failed(&path.display().to_string()))?;
@@ -237,6 +263,46 @@ mod tests {
         let err =
             read_unseal_keys_in(&tree, &path, &test_messages()).expect_err("intermediate link");
         crate::test_support::assert_error_names(&err, &link);
+    }
+
+    #[test]
+    fn rooted_delete_unseal_keys_follows_no_link() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = root.rooted();
+        let path = unseal_keys_path(&root.secrets);
+        delete_unseal_keys_in(&tree, &test_messages()).expect("absent is a no-op");
+
+        // A link at the file is removed itself; its target stays.
+        let before = root.outside_snapshot();
+        root.write("openbao/unseal-keys.txt", "key-1\n");
+        root.swap("openbao/unseal-keys.txt", &root.outside.join("secret"));
+        delete_unseal_keys_in(&tree, &test_messages()).expect("unlink the link");
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(root.outside_snapshot(), before);
+
+        // A link at `openbao/` is refused, and nothing outside is removed.
+        std::fs::write(root.outside.join("unseal-keys.txt"), "OUTSIDE\n").expect("seed");
+        let before = root.outside_snapshot();
+        let link = root.swap("openbao", &root.outside);
+        let err = delete_unseal_keys_in(&tree, &test_messages()).expect_err("intermediate link");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[test]
+    fn delete_unseal_keys_removes_the_file_in_either_mode() {
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let path = root.write("openbao/unseal-keys.txt", "key-1\n");
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                fs_util::SecretsTree::open(&root.secrets).expect("open")
+            };
+            delete_unseal_keys_in(&tree, &test_messages()).expect("delete");
+            assert!(!path.exists(), "rooted: {rooted}");
+            assert!(root.secrets.join("openbao").is_dir(), "rooted: {rooted}");
+        }
     }
 
     #[test]

@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 use super::agent_config::{
     INTERNAL_INSTANCE_ID, internal_agent_invocation, internal_registration_id,
-    internal_signal_pattern, load_internal_config, remove_internal_eab,
-    upsert_internal_responder_hmac, upsert_internal_trust,
+    internal_signal_pattern, load_internal_config, load_internal_config_from_str,
+    remove_internal_eab, upsert_internal_responder_hmac, upsert_internal_trust,
 };
 use super::material::{
     AcmeAccountKey, InternalMaterial, MaterialStatus, PrivateKeyPem, SET_FILES, is_protected,
@@ -439,6 +439,66 @@ async fn the_generated_config_and_its_rotated_form_both_load() {
         settings.trust.trusted_ca_sha256,
         vec![ROOT_FP.to_string(), OTHER_FP.to_string()]
     );
+}
+
+/// Parsing bytes the caller read gives exactly what loading the file
+/// gives: the same settings for a usable config and the same refusal for
+/// each kind of drift.
+#[tokio::test]
+async fn loading_from_bytes_matches_loading_the_file() {
+    let (_dir, paths) = provisioned_host().await;
+    let generated = generated_config(&paths);
+    let rotated =
+        upsert_internal_trust(&generated, &paths, &[ROOT_FP.to_string()]).expect("upsert");
+    let cases = [
+        generated.clone(),
+        rotated,
+        "not = [valid toml".to_string(),
+        generated.replace(REGISTRAR_INTERNAL_LABEL, "someone-else"),
+        generated.replace(
+            &paths.key().display().to_string(),
+            "/elsewhere/registrar.key",
+        ),
+        upsert_internal_trust(&generated, &paths, &[]).expect("upsert"),
+        String::new(),
+    ];
+    for contents in cases {
+        std::fs::write(paths.agent_config(), &contents).expect("write");
+        match (
+            load_internal_config(&paths),
+            load_internal_config_from_str(&paths, &contents),
+        ) {
+            (Ok(from_file), Ok(from_str)) => {
+                assert_eq!(format!("{from_file:?}"), format!("{from_str:?}"));
+            }
+            (
+                Err(InternalCredentialError::Invalid {
+                    path: file_path,
+                    reason: file_reason,
+                }),
+                Err(InternalCredentialError::Invalid {
+                    path: str_path,
+                    reason: str_reason,
+                }),
+            ) => {
+                assert_eq!(file_path, str_path);
+                // A parse error read from a file names the file after
+                // the same message; nothing else may differ.
+                assert!(
+                    file_reason.starts_with(&str_reason),
+                    "{file_reason:?} vs {str_reason:?}"
+                );
+                assert_eq!(
+                    file_reason.len() == str_reason.len(),
+                    !str_reason.contains("does not parse"),
+                    "{file_reason:?} vs {str_reason:?}"
+                );
+            }
+            (from_file, from_str) => {
+                panic!("the two loaders disagree on {contents:?}: {from_file:?} vs {from_str:?}")
+            }
+        }
+    }
 }
 
 /// The two secret-bearing files land at `0600`, and are never observable

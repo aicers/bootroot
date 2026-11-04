@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::SecretsTree;
 #[cfg(test)]
 use bootroot::remote_bootstrap::fingerprints_from_bundle;
 use bootroot::remote_bootstrap::{
@@ -136,8 +138,8 @@ fn build_artifact(
 /// `--secret-id-path` when one was given, and `control_secret_id_path`
 /// (where the control node keeps its own copy) otherwise.
 pub(super) async fn write_remote_bootstrap_artifact(
+    tree: &Arc<SecretsTree>,
     state: &StateFile,
-    secrets_dir: &Path,
     resolved: &ResolvedServiceAdd,
     control_secret_id_path: &Path,
     wrap_info: Option<&ArtifactWrapInfo>,
@@ -169,13 +171,7 @@ pub(super) async fn write_remote_bootstrap_artifact(
         resolved.cert_group_gid,
         resolved.cert_owner_uid,
     );
-    write_remote_bootstrap_artifact_file(
-        secrets_dir,
-        &resolved.registration_id,
-        &artifact,
-        messages,
-    )
-    .await
+    write_remote_bootstrap_artifact_file(tree, &resolved.registration_id, &artifact, messages).await
 }
 
 /// Reissues the bootstrap artifact for a recorded remote-bootstrap
@@ -183,8 +179,8 @@ pub(super) async fn write_remote_bootstrap_artifact(
 /// was given at add time and from the control-side path otherwise, so a
 /// re-run carries the same credential paths the first artifact did.
 pub(super) async fn write_remote_bootstrap_artifact_from_entry(
+    tree: &Arc<SecretsTree>,
     state: &StateFile,
-    secrets_dir: &Path,
     entry: &ServiceEntry,
     wrap_info: Option<&ArtifactWrapInfo>,
     ca_bundle_pem: &str,
@@ -215,19 +211,36 @@ pub(super) async fn write_remote_bootstrap_artifact_from_entry(
         entry.cert_group_gid,
         entry.cert_owner_uid,
     );
-    write_remote_bootstrap_artifact_file(secrets_dir, &entry.registration_id, &artifact, messages)
-        .await
+    write_remote_bootstrap_artifact_file(tree, &entry.registration_id, &artifact, messages).await
 }
 
+///
+/// On a rooted `tree` the directory and the artifact go through the
+/// handle: the directories are created writer-owned at `0700` and the
+/// artifact published as `atomic_write` publishes it, following no name.
 async fn write_remote_bootstrap_artifact_file(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     registration_id: &str,
     artifact: &RemoteBootstrapArtifact,
     messages: &Messages,
 ) -> Result<RemoteBootstrapResult> {
-    let artifact_dir = secrets_dir.join(REMOTE_BOOTSTRAP_DIR).join(registration_id);
-    fs_util::ensure_secrets_dir(&artifact_dir).await?;
+    let artifact_dir = tree
+        .anchor()
+        .join(REMOTE_BOOTSTRAP_DIR)
+        .join(registration_id);
     let artifact_path = artifact_dir.join(REMOTE_BOOTSTRAP_FILENAME);
+    if tree.is_rooted() {
+        let payload = remote_bootstrap::serialize_artifact(artifact)
+            .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
+        super::approle::publish_below_secrets(tree, &artifact_path, payload.as_bytes(), messages)
+            .await?;
+        return Ok(RemoteBootstrapResult {
+            bootstrap_file: artifact_path.display().to_string(),
+            remote_run_command: render_remote_run_command(artifact),
+            wrapped: artifact.wrap_token.is_some(),
+        });
+    }
+    fs_util::ensure_secrets_dir(&artifact_dir).await?;
     let payload = remote_bootstrap::serialize_artifact(artifact)
         .with_context(|| "Failed to serialize remote bootstrap artifact".to_string())?;
     // Published by rename at the policy's `0600`, applied while the file
@@ -1228,8 +1241,8 @@ mod tests {
         };
         let messages = Messages::new("en").unwrap();
         let result = super::write_remote_bootstrap_artifact_from_entry(
+            &std::sync::Arc::new(bootroot::fs_util::SecretsTree::open(dir.path()).unwrap()),
             &state,
-            dir.path(),
             entry,
             None,
             TEST_CA_PEM,
@@ -1282,5 +1295,70 @@ mod tests {
                 "secrets/services/edge-svc-001/eab.json".to_string(),
             )
         );
+    }
+
+    async fn write_artifact(
+        tree: &std::sync::Arc<bootroot::fs_util::SecretsTree>,
+    ) -> anyhow::Result<super::RemoteBootstrapResult> {
+        let state = crate::state::StateFile {
+            openbao_url: "https://127.0.0.1:8200".to_string(),
+            kv_mount: "secret".to_string(),
+            ..Default::default()
+        };
+        super::write_remote_bootstrap_artifact_from_entry(
+            tree,
+            &state,
+            &remote_entry(None),
+            None,
+            TEST_CA_PEM,
+            &crate::i18n::Messages::new("en").unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn rooted_artifact_write_refuses_a_swapped_remote_bootstrap_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        root.write(
+            "remote-bootstrap/services/edge-svc-001/bootstrap.json",
+            "{}",
+        );
+        let tree = std::sync::Arc::new(root.rooted());
+        let before = root.outside_snapshot();
+        let link = root.swap("remote-bootstrap", &root.outside);
+        let err = write_artifact(&tree)
+            .await
+            .err()
+            .expect("a link at remote-bootstrap/ is refused");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn rooted_artifact_write_matches_the_path_based_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let tree = std::sync::Arc::new(if rooted {
+                root.rooted()
+            } else {
+                bootroot::fs_util::SecretsTree::open(&root.secrets).unwrap()
+            });
+            let result = write_artifact(&tree).await.unwrap();
+            let path = std::path::PathBuf::from(&result.bootstrap_file);
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            results.push((
+                std::fs::read(&path).unwrap(),
+                mode(&path),
+                mode(path.parent().unwrap()),
+                result.remote_run_command,
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[1].1, 0o600);
+        assert_eq!(results[1].2, 0o700);
     }
 }

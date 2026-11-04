@@ -1,6 +1,20 @@
 use super::{Messages, format_template};
 
 impl Messages {
+    pub(crate) fn error_backup_destination_not_regular(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_backup_destination_not_regular,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_path_not_below_secrets_dir(&self, path: &str, anchor: &str) -> String {
+        format_template(
+            self.strings().error_path_not_below_secrets_dir,
+            &[("path", path), ("anchor", anchor)],
+        )
+    }
+
     pub(crate) fn rotate_summary_title(&self) -> &'static str {
         self.strings().rotate_summary_title
     }

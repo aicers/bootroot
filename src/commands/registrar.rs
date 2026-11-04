@@ -72,13 +72,16 @@
 
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::cert_group::CertGroupPolicy;
 use bootroot::config::{DaemonProfileSettings, Paths, Settings};
 use bootroot::fs_util::{StagedDurability, StagedMode, StagedOwner};
 use bootroot::input_validation::{validate_dns_label, validate_domain_name};
-use bootroot::registrar::internal::{InternalPaths, PrivateKeyPem, load_internal_config};
+use bootroot::registrar::internal::{
+    InternalPaths, PrivateKeyPem, load_internal_config, load_internal_config_from_str,
+};
 use bootroot::registrar::{
     REGISTRAR_CLIENT_LABEL, REGISTRAR_SURFACE_INSTANCE, registrar_client_identity,
 };
@@ -86,7 +89,7 @@ use bootroot::{acme, fs_util, publication_lock};
 use serde::Serialize;
 
 use crate::cli::args::{RegistrarCapabilitiesArgs, RegistrarIssueArgs};
-use crate::commands::init::{compute_ca_bundle_pem, compute_ca_fingerprints};
+use crate::commands::init::{compute_ca_bundle_pem, compute_ca_fingerprints, step_scratch_parent};
 use crate::i18n::Messages;
 
 /// The wire identifier every response on this surface carries, exactly.
@@ -156,6 +159,11 @@ const UNIT_DIRECTORIES: [&str; 5] = [
 /// at the caller's paths. Removed on both outcomes: it holds a private
 /// key that was never published.
 const STAGING_DIR_PREFIX: &str = "registrar-client-staging";
+
+/// The prefix of the private staging directory a root run over a
+/// `secrets/` another account owns issues into instead, beside the
+/// secrets directory rather than below it.
+const ISSUE_SCRATCH_PREFIX: &str = ".bootroot-registrar-issue-";
 
 /// The basename the CA bundle takes beside the issued certificate.
 ///
@@ -773,11 +781,8 @@ pub(crate) async fn run_registrar_issue(
     ensure_distinct_outputs(&args.cert_path, &args.key_path, &bundle_path)?;
     ensure_no_destination_is_the_lock(&args.cert_path, &args.key_path, &bundle_path)?;
     let secrets_dir = args.secrets_dir.secrets_dir.as_path();
-
-    let staging = staging_dir(secrets_dir);
-    let outcome = issue_into_staging(secrets_dir, &staging, args, &identity, messages).await;
-    sweep_staging(&staging).await;
-    let material = outcome?;
+    let secrets_tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    let material = issue_staged(&secrets_tree, args, &identity, messages).await?;
 
     publish_material(args, &material, messages).await?;
 
@@ -799,6 +804,81 @@ pub(crate) async fn run_registrar_issue(
         );
     }
     Ok(())
+}
+
+/// The directory one issuance stages its material in, before a byte of
+/// it reaches the caller's paths.
+enum Staging {
+    /// `secrets/registrar-client-staging.<pid>`, below the secrets
+    /// directory, for a handle that is not rooted.
+    InSecrets(PathBuf),
+    /// A private root-owned `0700` directory beside the secrets
+    /// directory, for a rooted handle: every level of its path is outside
+    /// what the owner of `secrets/` can rename, so the issuance's
+    /// path-based writes into it and the reads back follow no name that
+    /// owner controls, and nothing is created below `secrets/`.
+    Scratch(tempfile::TempDir),
+}
+
+impl Staging {
+    /// Chooses the staging directory for `tree`, creating the scratch
+    /// directory for a rooted one.
+    fn for_tree(tree: &fs_util::SecretsTree, messages: &Messages) -> Result<Self> {
+        if !tree.is_rooted() {
+            return Ok(Self::InSecrets(staging_dir(tree.anchor())));
+        }
+        let anchor = tree.anchor();
+        let parent = step_scratch_parent(anchor)
+            .with_context(|| messages.error_resolve_path_failed(&anchor.display().to_string()))?;
+        let dir = tempfile::Builder::new()
+            .prefix(ISSUE_SCRATCH_PREFIX)
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(&parent)
+            .with_context(|| {
+                messages.error_registrar_issue_scratch_dir_failed(&parent.display().to_string())
+            })?;
+        Ok(Self::Scratch(dir))
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::InSecrets(path) => path,
+            Self::Scratch(dir) => dir.path(),
+        }
+    }
+
+    /// Removes the staging directory, warning rather than failing.
+    async fn sweep(self) {
+        match self {
+            Self::InSecrets(path) => sweep_staging(&path).await,
+            Self::Scratch(dir) => {
+                let path = dir.path().to_path_buf();
+                let closed = tokio::task::spawn_blocking(move || dir.close()).await;
+                if let Ok(Err(err)) = closed {
+                    // codeql[rust/cleartext-logging]: output is a
+                    // filesystem path, not a secret value.
+                    eprintln!(
+                        "Warning: failed to remove the staging directory {}: {err}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Chooses the staging directory, runs the issuance into it, and sweeps
+/// it on both outcomes.
+async fn issue_staged(
+    tree: &Arc<fs_util::SecretsTree>,
+    args: &RegistrarIssueArgs,
+    identity: &str,
+    messages: &Messages,
+) -> Result<StagedMaterial> {
+    let staging = Staging::for_tree(tree, messages)?;
+    let outcome = issue_into_staging(tree, staging.path(), args, identity, messages).await;
+    staging.sweep().await;
+    outcome
 }
 
 /// Everything one issuance produced, read back out of the staging
@@ -830,13 +910,18 @@ struct StagedMaterial {
 /// read from `<secrets-dir>/certs/` by the same two helpers `init`
 /// issues the internal leaf with, so there is one source of anchors and
 /// not two.
+///
+/// On a rooted `tree` the config is read through the handle, without
+/// following a link and only from a `registrar-internal/` the
+/// root-by-policy check admits, and parsed from those bytes.
 async fn issue_into_staging(
-    secrets_dir: &Path,
+    secrets_tree: &Arc<fs_util::SecretsTree>,
     staging: &Path,
     args: &RegistrarIssueArgs,
     identity: &str,
     messages: &Messages,
 ) -> Result<StagedMaterial> {
+    let secrets_dir = secrets_tree.anchor();
     let internal_paths = InternalPaths::new(secrets_dir);
     // Absence is its own refusal, and is separated from malformation
     // here because `load_internal_config` cannot tell them apart: a
@@ -847,29 +932,46 @@ async fn issue_into_staging(
     // it probes before `bootroot init` has enabled the endpoint, and it
     // is the one it must be able to act on.
     let config_path = internal_paths.agent_config();
-    if !config_path.exists() {
-        anyhow::bail!(
+    let absent = || {
+        anyhow::anyhow!(
             "this host carries no bootroot-internal registrar configuration at {}, so there are \
              no ACME inputs to issue {identity} from; run `bootroot init` with \
              `[registrar_endpoint] enabled = true` first",
             config_path.display()
-        );
-    }
-    let internal = load_internal_config(&internal_paths).with_context(|| {
+        )
+    };
+    let reading = || {
         format!(
             "reading the ACME inputs for {identity} from the bootroot-internal registrar \
              configuration below {}",
             secrets_dir.display()
         )
-    })?;
+    };
+    let internal = if secrets_tree.is_rooted() {
+        let read_path = config_path.clone();
+        let read = secrets_tree
+            .run(move |tree| Ok(tree.read(&read_path)))
+            .await?;
+        let bytes = match read {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(absent()),
+            Err(err) => return Err(anyhow::Error::new(err).context(reading())),
+        };
+        let contents = String::from_utf8(bytes).with_context(reading)?;
+        load_internal_config_from_str(&internal_paths, &contents).with_context(reading)?
+    } else {
+        if !config_path.exists() {
+            return Err(absent());
+        }
+        load_internal_config(&internal_paths).with_context(reading)?
+    };
 
     fs_util::ensure_secrets_dir(staging)
         .await
         .with_context(|| messages.error_write_file_failed(&staging.display().to_string()))?;
 
-    let secrets_tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
-    let fingerprints = compute_ca_fingerprints(&secrets_tree, messages).await?;
-    let bundle_pem = compute_ca_bundle_pem(&secrets_tree, messages).await?;
+    let fingerprints = compute_ca_fingerprints(secrets_tree, messages).await?;
+    let bundle_pem = compute_ca_bundle_pem(secrets_tree, messages).await?;
     let staged_bundle = staging.join(CA_BUNDLE_FILE);
     // Seeded before the issuance rather than after it: this file is the
     // trust store the outbound ACME connection to step-ca is built from,

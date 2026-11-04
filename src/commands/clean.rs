@@ -299,6 +299,35 @@ mod tests {
         }
     }
 
+    /// `clean` removes `secrets/` itself with the standard library's
+    /// `remove_dir_all`, which unlinks a symbolic link it finds inside
+    /// the tree rather than descending through it: a link the owner of
+    /// `secrets/` planted there costs nothing outside it.
+    #[test]
+    fn clean_removes_a_link_inside_secrets_and_keeps_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let compose_dir = root.path().join("compose");
+        let secrets = compose_dir.join("secrets");
+        std::fs::create_dir_all(secrets.join("services")).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("secret"), "OUTSIDE").unwrap();
+        std::fs::write(outside.join("inner").join("file"), "OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(&outside, secrets.join("services").join("svc")).unwrap();
+        std::os::unix::fs::symlink(&outside, secrets.join("openbao")).unwrap();
+        let before = crate::test_support::snapshot_tree(&outside);
+
+        let messages = Messages::new("en").unwrap();
+        remove_clean_artifacts(&compose_dir, &root.path().join("state.json"), &messages).unwrap();
+
+        assert!(!secrets.exists(), "secrets/ is removed");
+        assert_eq!(
+            crate::test_support::snapshot_tree(&outside),
+            before,
+            "nothing a link pointed at is removed"
+        );
+    }
+
     /// Regression test: when the compose file lives in a subdirectory,
     /// `remove_clean_artifacts` must delete `state.json` at the
     /// process-level default path, not inside the compose directory.
