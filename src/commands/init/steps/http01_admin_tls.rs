@@ -1,4 +1,4 @@
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -45,7 +45,14 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
         |path| messages.error_http01_admin_tls_output_dir_symlink(path),
         messages,
     )?;
-    std::fs::create_dir_all(&tls_dir)
+    // Both levels `0700` under the tree's owner, through the tree
+    // handle: a root process over a `secrets/` another account owns
+    // follows no name on the way and stops at a symlink at either
+    // level. The `canonicalize` below still resolves `tls/` by name for
+    // the docker mounts, which take a path.
+    let tree = fs_util::SecretsTree::open(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    tree.ensure_dir(&tls_dir)
         .with_context(|| messages.error_write_file_failed(&tls_dir.display().to_string()))?;
     let tls_mount_root = std::fs::canonicalize(&tls_dir)
         .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string()))?;
@@ -111,8 +118,8 @@ pub(in crate::commands::init) fn issue_http01_admin_tls_cert(
     )
     .with_context(|| messages.error_http01_admin_tls_provision_failed())?;
 
-    set_key_permissions_sync(&key_path)?;
-    set_key_permissions_sync(&cert_path)?;
+    tree.set_file_mode(&key_path, fs_util::KEY_FILE_MODE)?;
+    tree.set_file_mode(&cert_path, fs_util::KEY_FILE_MODE)?;
 
     println!(
         "{}",
@@ -212,11 +219,6 @@ pub(in crate::commands::init) fn record_http01_admin_infra_cert(
     state
         .infra_certs
         .insert(HTTP01_ADMIN_INFRA_CERT_KEY.to_string(), entry);
-}
-
-fn set_key_permissions_sync(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
 /// Re-issues an existing HTTP-01 admin API infrastructure certificate.

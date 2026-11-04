@@ -559,19 +559,32 @@ pub(crate) fn write_audit_override(
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    fs_util::ensure_shared_secrets_dir_blocking(&override_dir)
+    let tree = open_override_tree(compose_dir, messages)?;
+    tree.ensure_dir(&override_dir)
         .with_context(|| messages.error_write_file_failed(&override_dir.display().to_string()))?;
     // `PreserveOrCreate`: a fresh file gets exactly this mode whatever
     // root's umask is, while an operator who narrowed the destination by
     // hand keeps that choice. The file carries one host path and nothing
     // secret.
-    fs_util::atomic_replace_dir_owner_blocking(
+    tree.publish(
         fs_util::Destination::operator_named(&override_path),
         content.as_bytes(),
         fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
     Ok(override_path)
+}
+
+/// Opens the handle on `compose_dir/secrets` both writers of the audit
+/// override publish through, so a root process over a `secrets/`
+/// another account owns follows no name there and refuses a symlink at
+/// the override rather than writing through it.
+fn open_override_tree(compose_dir: &Path, messages: &Messages) -> Result<fs_util::SecretsTree> {
+    let secrets_dir = compose_dir.join("secrets");
+    fs_util::SecretsTree::open(&secrets_dir)
+        .with_context(|| messages.error_write_file_failed(&secrets_dir.display().to_string()))
 }
 
 /// The rendered override's bytes for a given bind source.
@@ -1392,7 +1405,7 @@ pub(crate) fn prepare_audit_store_for_infra_up(
             &view.audit_store_dir.display().to_string(),
         ));
     }
-    upgrade_audit_override(&override_path, messages)?;
+    upgrade_audit_override(compose_dir, messages)?;
 
     match view.enforcement {
         AuditStoreEnforcement::Directory => {
@@ -1518,7 +1531,12 @@ fn verify_filesystem_reserve_for_infra_up(
 /// The source is first recovered from the existing override and is never
 /// derived from configuration: the rewrite changes Compose syntax, not where
 /// an already-running deployment writes its audit device.
-fn upgrade_audit_override(override_path: &Path, messages: &Messages) -> Result<()> {
+///
+/// The override is [`audit_override_path`] under `compose_dir`, and the
+/// rewrite is published through the handle on `compose_dir/secrets`.
+fn upgrade_audit_override(compose_dir: &Path, messages: &Messages) -> Result<()> {
+    let override_path = audit_override_path(compose_dir);
+    let override_path = override_path.as_path();
     let display = override_path.display().to_string();
     let content = std::fs::read_to_string(override_path)
         .with_context(|| messages.error_read_file_failed(&display))?;
@@ -1564,12 +1582,15 @@ fn upgrade_audit_override(override_path: &Path, messages: &Messages) -> Result<(
     if !replaced {
         anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
     }
-    fs_util::atomic_replace_dir_owner_blocking(
-        fs_util::Destination::operator_named(override_path),
-        rewritten.as_bytes(),
-        fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
-    )
-    .with_context(|| messages.error_write_file_failed(&display))
+    open_override_tree(compose_dir, messages)?
+        .publish(
+            fs_util::Destination::operator_named(override_path),
+            rewritten.as_bytes(),
+            fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
+            fs_util::RootedOwner::ContainingDir,
+            fs_util::StagedDurability::RenameOnly,
+        )
+        .with_context(|| messages.error_write_file_failed(&display))
 }
 
 /// Resolves the audit override for a bring-up, checking only what an
@@ -3518,7 +3539,7 @@ mod tests {
         )
         .expect("legacy override");
 
-        upgrade_audit_override(&path, &test_messages()).expect("upgrade");
+        upgrade_audit_override(dir.path(), &test_messages()).expect("upgrade");
         let upgraded = fs::read_to_string(&path).expect("upgraded override");
         assert!(
             upgraded.contains(&format!("source: {}", compose_quote(&source))),
@@ -3530,7 +3551,7 @@ mod tests {
             store
         );
 
-        upgrade_audit_override(&path, &test_messages()).expect("second upgrade");
+        upgrade_audit_override(dir.path(), &test_messages()).expect("second upgrade");
         assert_eq!(fs::read_to_string(&path).expect("second read"), upgraded);
     }
 

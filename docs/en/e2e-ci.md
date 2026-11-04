@@ -101,6 +101,7 @@ Primary scripts:
 - `scripts/impl/run-registrar-internal-init-e2e.sh`
 - `scripts/impl/run-registrar-redteam.sh`
 - `scripts/impl/run-registrar-ca-rotation-e2e.sh`
+- `scripts/impl/run-secrets-owner.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -1203,8 +1204,9 @@ The harnesses also assume three host tools, and each check fails in its
 prerequisite block rather than mid-run:
 
 - The bind-host guard in `run-reinit-recovery.sh`, `run-stepca-san.sh`,
-  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh` and the
-  routable mode of `run-registrar-internal-init-e2e.sh` lists the
+  `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`,
+  `run-secrets-owner.sh` and the routable mode of
+  `run-registrar-internal-init-e2e.sh` lists the
   machine's IPv4 addresses with `ip` (iproute2), falling back to
   `ifconfig`. A host with neither is told exactly that, because no value
   of `OPENBAO_BIND_HOST` / `STEPCA_BIND_HOST` / `BIND_HOST` fixes a check

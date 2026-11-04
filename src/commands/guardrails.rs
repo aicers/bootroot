@@ -340,13 +340,48 @@ pub(crate) fn reject_http01_admin_advertise_addr_for_specific_bind(
 /// assert: [`fs_util::StagedMode::PreserveOrUmask`] leaves an existing
 /// override alone and gives a fresh one what the umask would have given
 /// the truncating write this replaced.
-fn publish_compose_override(path: &Path, content: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace_blocking(
+///
+/// The file takes the owner of the directory it lands in, which is the
+/// owner of `secrets/` on a tree nobody re-owned by hand: a root-run
+/// `infra install` otherwise leaves it root's until the next ownership
+/// sweep. It is published through `tree`, so a root process over a
+/// `secrets/` another account owns follows no name on the way, and
+/// refuses a symlink at the override rather than writing through it.
+fn publish_compose_override(
+    tree: &fs_util::SecretsTree,
+    path: &Path,
+    content: &str,
+    messages: &Messages,
+) -> Result<()> {
+    tree.publish(
         fs_util::Destination::operator_named(path),
         content.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
+}
+
+/// Opens the `secrets/` handle under `compose_dir` and creates the
+/// override directory `name` in it, at `0700` under the owner of the
+/// tree, returning both.
+///
+/// `infra install` creates `compose_dir/secrets` before it renders any
+/// override, so the handle is the tree's; one that does not exist yet
+/// is created here, path-based, by the writer that will own it.
+fn ensure_override_dir(
+    compose_dir: &Path,
+    name: &str,
+    messages: &Messages,
+) -> Result<(fs_util::SecretsTree, PathBuf)> {
+    let secrets_dir = compose_dir.join("secrets");
+    let tree = fs_util::SecretsTree::open(&secrets_dir)
+        .with_context(|| messages.error_write_file_failed(&secrets_dir.display().to_string()))?;
+    let override_dir = secrets_dir.join(name);
+    tree.ensure_dir(&override_dir)
+        .with_context(|| messages.error_write_file_failed(&override_dir.display().to_string()))?;
+    Ok((tree, override_dir))
 }
 
 /// Generates the compose override file that exposes the HTTP-01 admin API
@@ -360,12 +395,7 @@ pub(crate) fn write_http01_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let override_dir = compose_dir.join("secrets").join("responder");
-    if !override_dir.exists() {
-        fs::create_dir_all(&override_dir).with_context(|| {
-            messages.error_write_file_failed(&override_dir.display().to_string())
-        })?;
-    }
+    let (tree, override_dir) = ensure_override_dir(compose_dir, "responder", messages)?;
     let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
@@ -375,7 +405,7 @@ services:
       - \"{bind_addr}:8080\"
 "
     );
-    publish_compose_override(&override_path, &content, messages)?;
+    publish_compose_override(&tree, &override_path, &content, messages)?;
     Ok(override_path)
 }
 
@@ -542,12 +572,7 @@ pub(crate) fn write_stepca_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<PathBuf> {
-    let override_dir = compose_dir.join("secrets").join("step-ca");
-    if !override_dir.exists() {
-        fs::create_dir_all(&override_dir).with_context(|| {
-            messages.error_write_file_failed(&override_dir.display().to_string())
-        })?;
-    }
+    let (tree, override_dir) = ensure_override_dir(compose_dir, "step-ca", messages)?;
     let override_path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
@@ -557,7 +582,7 @@ services:
       - \"{bind_addr}:9000\"
 "
     );
-    publish_compose_override(&override_path, &content, messages)?;
+    publish_compose_override(&tree, &override_path, &content, messages)?;
     Ok(override_path)
 }
 
@@ -1168,12 +1193,7 @@ pub(crate) fn write_openbao_exposed_override(
     bind_addr: &str,
     messages: &Messages,
 ) -> Result<std::path::PathBuf> {
-    let override_dir = compose_dir.join("secrets").join("openbao");
-    if !override_dir.exists() {
-        std::fs::create_dir_all(&override_dir).with_context(|| {
-            messages.error_write_file_failed(&override_dir.display().to_string())
-        })?;
-    }
+    let (tree, override_dir) = ensure_override_dir(compose_dir, "openbao", messages)?;
     let override_path = override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
     let content = format!(
         "\
@@ -1183,7 +1203,7 @@ services:
       - \"{bind_addr}:8200\"
 "
     );
-    publish_compose_override(&override_path, &content, messages)?;
+    publish_compose_override(&tree, &override_path, &content, messages)?;
     Ok(override_path)
 }
 
@@ -2132,6 +2152,50 @@ listener "tcp" {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("192.168.1.10:8200:8200"));
         assert!(content.contains("!override"));
+    }
+
+    /// Each exposure override's directory is created `0700`, and so is
+    /// a `secrets/` the writer had to create on the way, whatever the
+    /// umask would have given them.
+    #[test]
+    fn exposure_override_writers_create_their_directory_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        type Writer = fn(&Path, &str, &Messages) -> Result<PathBuf>;
+        let messages = crate::i18n::test_messages();
+        let writers: [(Writer, &str, &str); 3] = [
+            (
+                write_http01_exposed_override,
+                "responder",
+                "192.168.1.10:8080",
+            ),
+            (
+                write_stepca_exposed_override,
+                "step-ca",
+                "192.168.1.10:9000",
+            ),
+            (
+                write_openbao_exposed_override,
+                "openbao",
+                "192.168.1.10:8200",
+            ),
+        ];
+        for (write, name, bind) in writers {
+            for secrets_exists in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let secrets = dir.path().join("secrets");
+                if secrets_exists {
+                    std::fs::create_dir(&secrets).unwrap();
+                    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let path = write(dir.path(), bind, &messages).unwrap();
+                let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(path.parent(), Some(secrets.join(name).as_path()));
+                assert_eq!(mode(&secrets.join(name)), 0o700, "{name}");
+                assert_eq!(mode(&secrets), 0o700, "{name}");
+            }
+        }
     }
 
     #[test]

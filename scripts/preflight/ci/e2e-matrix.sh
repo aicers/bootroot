@@ -12,7 +12,7 @@ SECRETS_BACKUP_DIR=""
 # script runs them. `ARMS` holds the ones `--only` selected, space-separated
 # (a plain string rather than an array: bash 3.2 under `set -u` treats an
 # empty array as unset); empty means every arm.
-ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation"
+ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation secrets-owner"
 ARMS=""
 
 usage() {
@@ -37,12 +37,15 @@ of CI's `Docker E2E (<arm>)` job:
 14) registrar-internal-init-routable the same on a routable bind address (BIND_MODE=routable)
 15) registrar-redteam                registrar credential-boundary red-team gate
 16) registrar-ca-rotation            full CA rotation on a registrar endpoint host
+17) secrets-owner                    root-run infra install and init over a secrets/ another account owns
 
 Steps 13 and 14 run `bootroot init` as root through `sudo -n`, because an
 endpoint-enabled `init` publishes the bootroot-internal credential root-owned
-and refuses to publish it otherwise. Passwordless sudo is a prerequisite of
-the whole matrix, and of any --only selection that includes a hosts step or
-one of steps 9 and 13-16; --skip-hosts does not stand in for it.
+and refuses to publish it otherwise. Step 17 creates an account with
+`useradd`, hands it `secrets/` and runs `bootroot infra install` and `init`
+as root through `sudo -n`. Passwordless sudo is a prerequisite of the whole
+matrix, and of any --only selection that includes a hosts step or one of
+steps 9 and 13-17; --skip-hosts does not stand in for it.
 
 Options:
   --only <arm>  Run only the named arm (one of the labels above). Repeat it
@@ -328,6 +331,17 @@ if want registrar-ca-rotation; then
   BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
   "$ROOT_DIR/scripts/impl/run-registrar-ca-rotation-e2e.sh"
   cat "$ARTIFACT_DIR/wall-clock.json"
+fi
+
+if want secrets-owner; then
+  # Its own account owns `secrets/` for the whole run, so it takes no
+  # SECRETS_DIR: it replaces the checkout's `secrets/`, which is where
+  # `infra install` writes its overrides, and removes it at cleanup.
+  echo "[ci-local-e2e] run secrets owner (issue #1149)"
+  ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-secrets-owner-${RUN_ID}" \
+  COMPOSE_PROJECT_NAME="bootroot-e2e-ci-secrets-owner-${RUN_ID}" \
+  BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+  "$ROOT_DIR/scripts/impl/run-secrets-owner.sh"
 fi
 
 echo "[ci-local-e2e] done"

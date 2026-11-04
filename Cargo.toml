@@ -25,6 +25,13 @@ aws-lc-rs = "1"
 # the server is authenticated (RUSTSEC-2026-0349).
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 rustls-pemfile = "2"
+# The `*at` calls (`openat`, `mkdirat`, `renameat`, `unlinkat`, `statat`,
+# `readlinkat`) and `Dir` that `fs_util::SecretsTree` walks `secrets/`
+# with, so a root write there follows no name another account could have
+# swapped for a symlink. The standard library has no `*at` calls, and
+# reaching them through `libc` would mean new `unsafe`. Already in the lock
+# through `tempfile`, so no new package is added.
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

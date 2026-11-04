@@ -230,6 +230,7 @@ dependencies = [
  "postgres",
  "rcgen",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",

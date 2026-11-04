@@ -120,8 +120,11 @@ pub(super) async fn write_stepca_templates(
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
     // Under the tree's owner: the `OpenBao` Agent sidecar that renders
     // both templates below runs as that uid, and a `0700` directory a
-    // root-run `init` created is one it cannot open them through.
-    fs_util::ensure_shared_secrets_dir(&templates_dir).await?;
+    // root-run `init` created is one it cannot open them through. Both
+    // writes go through the tree handle, so a root process over a
+    // `secrets/` another account owns follows no name there.
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    tree.ensure_dir_async(&templates_dir).await?;
 
     let password_template_path = templates_dir.join(STEPCA_PASSWORD_TEMPLATE_NAME);
     let password_template = build_password_template(kv_mount);
@@ -136,10 +139,12 @@ pub(super) async fn write_stepca_templates(
     // That sidecar is also why both carry the tree's owner rather than
     // the writing process's: `0600` under a root-run `init` would leave
     // it re-rendering nothing.
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&password_template_path),
         password_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| {
@@ -159,10 +164,12 @@ pub(super) async fn write_stepca_templates(
         messages,
     )?;
     let ca_json_template_path = templates_dir.join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&ca_json_template_path),
         ca_json_template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| {
@@ -194,11 +201,24 @@ pub(super) async fn write_stepca_templates(
 /// `step ca init` is what creates `ca.json`, and every publisher here
 /// reads it before writing, so the mode is always the destination's own
 /// and [`fs_util::StagedMode::PreserveOrUmask`]'s create arm never runs.
-async fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_replace(
+///
+/// The publish carries the destination's own owner, as before, and goes
+/// through the handle on `secrets_dir`, so a root process over a
+/// `secrets/` another account owns follows no name there and refuses a
+/// symlink at `ca.json` rather than writing through it.
+async fn publish_ca_json(
+    secrets_dir: &Path,
+    path: &Path,
+    contents: &str,
+    messages: &Messages,
+) -> Result<()> {
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    tree.publish_async(
         fs_util::Destination::operator_named(path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
+        fs_util::RootedOwner::Destination,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))
@@ -589,7 +609,8 @@ pub(super) async fn write_password_file_with_backup(
     password: &str,
     messages: &Messages,
 ) -> Result<RollbackFile> {
-    fs_util::ensure_secrets_dir(secrets_dir).await?;
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    tree.ensure_dir_async(secrets_dir).await?;
     let password_path = secrets_dir.join("password.txt");
     let original = match tokio::fs::read_to_string(&password_path).await {
         Ok(contents) => Some(contents),
@@ -618,10 +639,12 @@ pub(super) async fn write_password_file_with_backup(
     // from this very directory. While bootroot itself ran as that owner
     // the distinction was invisible; an endpoint-enabled `init` runs as
     // root, and a `0600` root-owned password is one step-ca cannot open.
-    fs_util::atomic_write_dir_owner(
+    tree.publish_async(
         fs_util::Destination::bootroot_owned(&password_path),
         password.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::FlushDirectory,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&password_path.display().to_string()))?;
@@ -669,7 +692,7 @@ pub(super) async fn update_ca_json_with_backup(
     let policy_changed = set_ca_json_policy(&mut value, managed.policy_deny_dns)?;
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    publish_ca_json(&path, &updated, messages).await?;
+    publish_ca_json(secrets_dir, &path, &updated, messages).await?;
     Ok(CaJsonUpdate {
         rollback: RollbackFile {
             path,
@@ -715,7 +738,7 @@ pub(super) async fn reconcile_ca_json_managed_keys(
     }
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    publish_ca_json(&path, &updated, messages).await?;
+    publish_ca_json(secrets_dir, &path, &updated, messages).await?;
     Ok(true)
 }
 

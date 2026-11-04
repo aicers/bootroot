@@ -830,8 +830,9 @@ mod tests {
         let secrets_dir = dir.path().join("secrets");
         fs::create_dir_all(&secrets_dir).expect("secrets dir");
 
-        // Pre-create cert/key files so `set_key_permissions_sync`
-        // succeeds after the fake docker "issues" the cert.
+        // Pre-create cert/key files so the tree handle's
+        // `set_file_mode` succeeds after the fake docker "issues" the
+        // cert.
         let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
         fs::create_dir_all(&tls_dir).expect("tls dir");
         fs::write(tls_dir.join("server.crt"), "fake-cert").expect("write cert");
