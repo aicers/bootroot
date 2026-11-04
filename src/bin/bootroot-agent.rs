@@ -238,14 +238,14 @@ where
 /// Loads the settings a `SIGHUP` asks for, or logs why the reload is
 /// refused and returns `None` so the running invocation is kept.
 ///
-/// `endpoint` and `audit` are the registrar settings the process
-/// started with, which a reload may not move.
+/// `registrar_endpoint_settings` and `registrar_audit_settings` are the
+/// registrar settings the process started with, which a reload may not move.
 #[cfg(unix)]
 async fn reload_settings(
     args: &Args,
     opening: HandleOpening,
-    endpoint: &config::RegistrarEndpointSettings,
-    audit: &config::RegistrarSettings,
+    registrar_endpoint_settings: &config::RegistrarEndpointSettings,
+    registrar_audit_settings: &config::RegistrarSettings,
 ) -> Option<LoadedSettings> {
     let loaded = match load_settings_with(args, opening).await {
         Ok(loaded) => loaded,
@@ -255,9 +255,10 @@ async fn reload_settings(
         }
     };
     let settings = &loaded.0;
-    if let Err(err) =
-        config::check_registrar_endpoint_reload(endpoint, &settings.registrar_endpoint)
-    {
+    if let Err(err) = config::check_registrar_endpoint_reload(
+        registrar_endpoint_settings,
+        &settings.registrar_endpoint,
+    ) {
         error!("Reload rejected: {err}");
         return None;
     }
@@ -265,9 +266,11 @@ async fn reload_settings(
     // reload that would detach the filesystem mount verdict this process
     // took at start is refused. A `directory` daemon reloading another
     // `directory` configuration reaches none of this.
-    if endpoint.enabled
-        && let Err(rejection) =
-            config::check_registrar_audit_store_reload(audit, &settings.registrar)
+    if registrar_endpoint_settings.enabled
+        && let Err(rejection) = config::check_registrar_audit_store_reload(
+            registrar_audit_settings,
+            &settings.registrar,
+        )
     {
         error!("{}", audit_store_reload_rejection_message(&rejection));
         return None;

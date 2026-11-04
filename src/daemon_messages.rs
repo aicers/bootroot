@@ -294,9 +294,12 @@ mod tests {
         );
         assert_ne!(en, ko);
         for message in [&en, &ko] {
-            assert!(message.contains(&bundle.display().to_string()), "{message}");
+            assert!(
+                message.contains(&bundle.display().to_string()),
+                "the rendering names the bundle"
+            );
         }
-        assert!(!ko.is_ascii(), "{ko}");
+        assert!(!ko.is_ascii(), "the Korean rendering is not English");
     }
 
     #[test]
