@@ -1140,7 +1140,7 @@ pub(crate) struct InfraInstallArgs {
     /// directory are re-owned to it at every start, and its TLS key is
     /// handed to `<uid>:0` at mode `0600`. Recorded as
     /// `BOOTROOT_OPENBAO_USER` in the compose directory's `.env`; a later
-    /// install without the option keeps the recorded value
+    /// install without the option keeps the recorded value.
     // `allow_hyphen_values` so a leading `-` reaches the validator and is
     // refused with the option's own rule.
     #[arg(long = "openbao-user", allow_hyphen_values = true)]
