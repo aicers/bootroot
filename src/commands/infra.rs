@@ -47,7 +47,10 @@ use crate::commands::init::{
 };
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::commands::openbao_url::effective_openbao_url;
-use crate::commands::openbao_user::{OPENBAO_USER_ENV_KEY, install_openbao_user_with_env};
+use crate::commands::openbao_user::{
+    OPENBAO_USER_ENV_KEY, exported_openbao_user, install_openbao_user_with_env,
+    recorded_openbao_user,
+};
 use crate::i18n::Messages;
 use crate::state::{RegistrarEndpointState, StateFile};
 use crate::state_lock::StateLock;
@@ -262,6 +265,11 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         .compose_file
         .parent()
         .unwrap_or(Path::new("."));
+    // Every stack, not only one whose OpenBao TLS is validated below: the
+    // entrypoint re-owns the raft volume to whatever uid Compose hands
+    // it, so a malformed record, or an export Compose would prefer to it,
+    // is refused before the first Docker call.
+    recorded_openbao_user(compose_dir, messages)?;
     let state_path = StateFile::default_path();
     let openbao_override = resolve_openbao_exposed_override(&state_path, compose_dir, messages)?;
     // This runs before even a Compose pull. Filesystem mode renders and
@@ -514,7 +522,7 @@ fn run_infra_install_locked(
             .parent()
             .unwrap_or(Path::new(".")),
         args.openbao_user.as_deref(),
-        std::env::var(OPENBAO_USER_ENV_KEY).ok().as_deref(),
+        exported_openbao_user().as_deref(),
         messages,
     )?;
     // Only a value given now is written and passed on, as for the

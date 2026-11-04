@@ -96,8 +96,18 @@ pub(crate) fn recorded_openbao_user(
     compose_dir: &Path,
     messages: &Messages,
 ) -> Result<Option<OpenBaoUser>> {
-    let process_env = std::env::var(OPENBAO_USER_ENV_KEY).ok();
-    recorded_openbao_user_with_env(compose_dir, process_env.as_deref(), messages)
+    recorded_openbao_user_with_env(compose_dir, exported_openbao_user().as_deref(), messages)
+}
+
+/// Returns the process environment's `BOOTROOT_OPENBAO_USER`, `Some("")`
+/// when it is exported empty and `None` only when it is not exported.
+///
+/// An empty export is kept apart from an absent one because Docker
+/// Compose keeps them apart: an exported empty value still wins over
+/// `.env`. A value that is not valid UTF-8 is carried lossily, so it can
+/// match no record and is refused rather than ignored.
+pub(crate) fn exported_openbao_user() -> Option<String> {
+    std::env::var_os(OPENBAO_USER_ENV_KEY).map(|value| value.to_string_lossy().into_owned())
 }
 
 /// [`recorded_openbao_user`] with the process environment's value of
@@ -109,8 +119,9 @@ pub(crate) fn recorded_openbao_user(
 /// # Errors
 ///
 /// Returns an error naming `.env` and `BOOTROOT_OPENBAO_USER` when the
-/// recorded value is malformed, and one naming both values when
-/// `process_env` is non-empty and differs from the record.
+/// recorded value is malformed, one naming both values when
+/// `process_env` is non-empty and differs from the record, and one when
+/// `process_env` is empty while a value is recorded.
 pub(crate) fn recorded_openbao_user_with_env(
     compose_dir: &Path,
     process_env: Option<&str>,
@@ -153,18 +164,28 @@ pub(crate) fn install_openbao_user_with_env(
     Ok(Some(user))
 }
 
-/// Refuses a non-empty exported `BOOTROOT_OPENBAO_USER` that differs from
-/// `expected`: Docker Compose prefers it to `.env`, so `OpenBao` would run
-/// as a uid bootroot did not hand its files to.
+/// Refuses an exported `BOOTROOT_OPENBAO_USER` that Docker Compose would
+/// prefer to `expected`, so that `OpenBao` would run as a uid bootroot did
+/// not hand its files to: a non-empty value that differs from it, and an
+/// empty one while a value is recorded, which Compose passes on as empty
+/// and the entrypoint reads as "run as the image's `openbao` user".
 fn check_process_env(
     process_env: Option<&str>,
     expected: Option<OpenBaoUser>,
     env_path: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let Some(exported) = process_env.filter(|value| !value.is_empty()) else {
+    let Some(exported) = process_env else {
         return Ok(());
     };
+    if exported.is_empty() {
+        return match expected {
+            Some(expected) => anyhow::bail!(
+                messages.error_openbao_user_env_empty(env_path, &expected.to_string())
+            ),
+            None => Ok(()),
+        };
+    }
     match expected {
         Some(expected) if parse(exported) == Some(expected) => Ok(()),
         Some(expected) => anyhow::bail!(messages.error_openbao_user_env_mismatch(
@@ -290,13 +311,21 @@ mod tests {
         let messages = test_messages();
         fs::write(dir.path().join(".env"), "BOOTROOT_OPENBAO_USER=1:2\n").unwrap();
 
-        // Equal, also when spelled differently, or empty: accepted.
-        for exported in ["1:2", "01:2", ""] {
+        // Equal, also when spelled differently: accepted.
+        for exported in ["1:2", "01:2"] {
             assert!(
                 recorded_openbao_user_with_env(dir.path(), Some(exported), &messages).is_ok(),
                 "{exported:?} must be accepted"
             );
         }
+        // Exported empty: Compose would pass the empty value on and start
+        // OpenBao as the image's user, so it is refused too.
+        let error = recorded_openbao_user_with_env(dir.path(), Some(""), &messages)
+            .expect_err("an exported empty value must be refused while one is recorded")
+            .to_string();
+        assert!(error.contains("1:2"), "{error}");
+        assert!(error.contains(OPENBAO_USER_ENV_KEY), "{error}");
+        assert!(error.contains(".env"), "{error}");
         for exported in ["3:4", "garbage"] {
             let error = recorded_openbao_user_with_env(dir.path(), Some(exported), &messages)
                 .expect_err("a differing exported value must be refused")
@@ -306,8 +335,13 @@ mod tests {
             assert!(error.contains(OPENBAO_USER_ENV_KEY), "{error}");
         }
 
-        // Exported with nothing recorded: refused too.
+        // Exported with nothing recorded: refused too, unless it is empty,
+        // which Compose reads as unset just as the missing record is.
         let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            recorded_openbao_user_with_env(empty.path(), Some(""), &messages).unwrap(),
+            None
+        );
         let error = recorded_openbao_user_with_env(empty.path(), Some("3:4"), &messages)
             .expect_err("an exported value with no record must be refused")
             .to_string();
@@ -333,6 +367,9 @@ mod tests {
         );
         assert!(
             install_openbao_user_with_env(dir.path(), Some("5:6"), Some("5:6"), &messages).is_ok()
+        );
+        assert!(
+            install_openbao_user_with_env(dir.path(), Some("5:6"), Some(""), &messages).is_err()
         );
     }
 }

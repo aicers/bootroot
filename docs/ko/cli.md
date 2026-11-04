@@ -444,9 +444,9 @@ bootroot infra up
   `openbao` 사용자로 돌아간 OpenBao는 지정한 uid에게 넘겨진 raft 볼륨도
   TLS 키도 열 수 없기 때문입니다. `.env`의 잘못된 값은 이를 읽는 모든
   bootroot 명령이 거부합니다. Docker Compose는 export된
-  `BOOTROOT_OPENBAO_USER`를 `.env`보다 우선하므로, 셸이 `.env`에 기록된
-  값과 다른 비어 있지 않은 값을 export하고 있으면 bootroot는 실행을
-  거부합니다.
+  `BOOTROOT_OPENBAO_USER`를 빈 값이라도 `.env`보다 우선하므로, 셸이
+  `.env`에 기록된 값과 다른 값을 export하고 있거나, `.env`에 값이 기록되어
+  있는데 빈 값을 export하고 있으면 bootroot는 실행을 거부합니다.
 - `--registrar-endpoint-host <label>`: 이 호스트에서 레지스트라
   엔드포인트를 활성화합니다(선택). bootroot 호스트의 단일 DNS 레이블이며
   FQDN이나 조합된 이름은 허용되지 않습니다. `bootroot registrar issue

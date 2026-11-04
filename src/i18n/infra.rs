@@ -388,4 +388,11 @@ impl Messages {
             &[("exported", exported), ("path", path)],
         )
     }
+
+    pub(crate) fn error_openbao_user_env_empty(&self, path: &str, recorded: &str) -> String {
+        format_template(
+            self.strings().error_openbao_user_env_empty,
+            &[("path", path), ("recorded", recorded)],
+        )
+    }
 }

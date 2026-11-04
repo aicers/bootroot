@@ -768,7 +768,7 @@ pub(crate) fn validate_openbao_tls(
                     gid: meta.gid(),
                     mode: meta.mode(),
                 });
-                if let Some(issue) = handed_over_key_issue(path, facts, user.uid()) {
+                if let Some(issue) = handed_over_key_issue(path, facts, user.uid(), messages) {
                     issues.push(issue);
                 }
             }
@@ -810,14 +810,17 @@ const HANDED_OVER_KEY_MODE: u32 = 0o600;
 /// `BOOTROOT_OPENBAO_USER` names `expected_uid`, or `None` when the key is
 /// a regular file owned by `<expected_uid>:0` with mode `0600`.
 ///
-/// `facts` is `None` when the key's metadata could not be read.
+/// `facts` is `None` when the key's metadata could not be read. The
+/// issue is rendered through `messages`, as the list it joins is.
 fn handed_over_key_issue(
     path: &Path,
     facts: Option<KeyFileFacts>,
     expected_uid: u32,
+    messages: &Messages,
 ) -> Option<String> {
+    let path_display = path.display().to_string();
     let Some(facts) = facts else {
-        return Some(format!("key not found: {}", path.display()));
+        return Some(messages.openbao_tls_key_missing(&path_display));
     };
     let permissions = facts.mode & 0o7777;
     if facts.is_regular_file
@@ -827,12 +830,12 @@ fn handed_over_key_issue(
     {
         return None;
     }
-    Some(format!(
-        "key {} is owned by {}:{} with mode {permissions:04o}, expected {expected_uid}:0 \
-         {HANDED_OVER_KEY_MODE:04o} (run bootroot infra install or bootroot rotate infra-cert)",
-        path.display(),
-        facts.uid,
-        facts.gid,
+    Some(messages.openbao_tls_key_owner_mismatch(
+        &path_display,
+        &format!("{}:{}", facts.uid, facts.gid),
+        &format!("{permissions:04o}"),
+        &format!("{expected_uid}:0"),
+        &format!("{HANDED_OVER_KEY_MODE:04o}"),
     ))
 }
 
@@ -2078,9 +2081,15 @@ services:
     /// owner and mode found and the ones expected.
     #[test]
     fn handed_over_key_check_accepts_only_uid_group_zero_0600() {
+        let messages = crate::i18n::test_messages();
         let path = Path::new(HANDED_OVER_KEY);
         assert_eq!(
-            handed_over_key_issue(path, Some(key_facts(true, 4242, 0, 0o100_600)), 4242),
+            handed_over_key_issue(
+                path,
+                Some(key_facts(true, 4242, 0, 0o100_600)),
+                4242,
+                &messages
+            ),
             None
         );
         for (facts, found) in [
@@ -2096,7 +2105,8 @@ services:
                 "4242:0 with mode 0600",
             ),
         ] {
-            let issue = handed_over_key_issue(path, Some(facts), 4242).expect("must be reported");
+            let issue = handed_over_key_issue(path, Some(facts), 4242, &messages)
+                .expect("must be reported");
             assert_eq!(
                 issue,
                 format!(
@@ -2106,9 +2116,37 @@ services:
             );
         }
         assert_eq!(
-            handed_over_key_issue(path, None, 4242),
+            handed_over_key_issue(path, None, 4242, &messages),
             Some(format!("key not found: {HANDED_OVER_KEY}"))
         );
+    }
+
+    /// The handed-over key's issues are operator sentences, so they follow
+    /// the selected language rather than staying English.
+    #[test]
+    fn handed_over_key_issues_are_localized() {
+        let messages = Messages::new("ko").expect("valid language");
+        let path = Path::new(HANDED_OVER_KEY);
+        let mismatch = handed_over_key_issue(
+            path,
+            Some(key_facts(true, 4243, 0, 0o100_644)),
+            4242,
+            &messages,
+        )
+        .expect("must be reported");
+        assert!(mismatch.contains(HANDED_OVER_KEY), "{mismatch}");
+        assert!(
+            mismatch.contains("4243:0") && mismatch.contains("0644"),
+            "{mismatch}"
+        );
+        assert!(
+            mismatch.contains("4242:0") && mismatch.contains("0600"),
+            "{mismatch}"
+        );
+        assert!(!mismatch.contains("is owned by"), "{mismatch}");
+        let missing = handed_over_key_issue(path, None, 4242, &messages).expect("must be reported");
+        assert!(missing.contains(HANDED_OVER_KEY), "{missing}");
+        assert!(!missing.contains("not found"), "{missing}");
     }
 
     /// With the value set, `validate_openbao_tls` judges the key by its

@@ -774,6 +774,57 @@ fn test_infra_install_refuses_a_conflicting_openbao_user() {
     assert!(!harness.dir.path().join("docker-argv.log").exists());
 }
 
+/// `infra up` checks the recorded `BOOTROOT_OPENBAO_USER` against the
+/// exported one on every stack, not only one with a non-loopback `OpenBao`
+/// bind: on this loopback-only install an exported value that differs
+/// from the record, or an exported empty one, is refused before any
+/// docker command, since Compose would hand either to the entrypoint
+/// that re-owns the raft volume.
+#[cfg(unix)]
+#[test]
+fn test_infra_up_refuses_a_conflicting_openbao_user_without_tls() {
+    let harness = InstallHarness::new();
+    let output = harness.install_output(&["--openbao-user", "2001:2002"], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!harness.dir.path().join("state.json").exists());
+    let argv_log = harness.dir.path().join("docker-argv.log");
+
+    for (exported, expected_in_stderr) in [("3001:3002", "3001:3002"), ("", "2001:2002")] {
+        if argv_log.exists() {
+            std::fs::remove_file(&argv_log).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(harness.dir.path())
+            .args([
+                "infra",
+                "up",
+                "--compose-file",
+                harness.compose_file.to_string_lossy().as_ref(),
+                "--services",
+                "openbao",
+            ])
+            .env("PATH", format!("{}:{}", harness.bin_dir.display(), path))
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .env_remove("BOOTROOT_INSTANCE")
+            .env_remove("OPENBAO_UNSEAL_FILE")
+            .env("BOOTROOT_OPENBAO_USER", exported)
+            .output()
+            .expect("run infra up");
+        assert!(!output.status.success(), "{exported:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("BOOTROOT_OPENBAO_USER") && stderr.contains(expected_in_stderr),
+            "{exported:?}: {stderr}"
+        );
+        assert!(
+            !argv_log.exists(),
+            "{exported:?}: infra up must not reach docker: {}",
+            std::fs::read_to_string(&argv_log).unwrap_or_default()
+        );
+    }
+}
+
 /// A 39-character name is the boundary the limit is derived from, so it
 /// must be accepted end to end rather than only by the validator.
 #[cfg(unix)]

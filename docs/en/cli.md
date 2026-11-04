@@ -461,9 +461,9 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
   neither the raft volume nor the TLS key that were handed to the given
   uid. A malformed value in `.env` is refused by every bootroot command
   that reads it. Docker Compose prefers an exported
-  `BOOTROOT_OPENBAO_USER` to `.env`, so bootroot refuses to run while the
-  shell exports a non-empty value that differs from the one `.env`
-  records.
+  `BOOTROOT_OPENBAO_USER` to `.env`, even an empty one, so bootroot
+  refuses to run while the shell exports a value that differs from the
+  one `.env` records, or exports it empty while `.env` records one.
 - `--registrar-endpoint-host <label>`: enable the registrar endpoint on
   this host (optional). The bootroot host's single DNS label — never an
   FQDN or a composed name — validated as `bootroot registrar issue
