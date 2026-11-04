@@ -532,7 +532,7 @@ fn proxy_guard_rejects_a_file_without_the_responder() {
 /// that carry it must be the same text in both.
 const OPENBAO_START_AS_ROOT: &str = r#""0:0""#;
 const OPENBAO_USER_ENVIRONMENT: &str = "- BOOTROOT_OPENBAO_USER=${BOOTROOT_OPENBAO_USER:-}";
-const OPENBAO_ENTRYPOINT: &str = r#"["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]"#;
+const OPENBAO_ENTRYPOINT: &str = r#"["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; case \"$$BOOTROOT_OPENBAO_USER\" in *:*:* | *[!0-9:]*) echo 'BOOTROOT_OPENBAO_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo 'BOOTROOT_OPENBAO_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]"#;
 
 #[test]
 fn both_compose_files_run_openbao_as_the_recorded_user() {
@@ -567,6 +567,112 @@ fn both_compose_files_run_openbao_as_the_recorded_user() {
         entrypoints.push(entrypoint_line.to_string());
     }
     assert_eq!(entrypoints.first(), entrypoints.get(1));
+}
+
+/// The `postgres` service runs as the uid `BOOTROOT_POSTGRES_USER`
+/// records (`infra install --postgres-user`) or, unset, through the
+/// image's own entrypoint as its `postgres` user. As for `OpenBao`, both
+/// base compose files reach the value by interpolation and carry the same
+/// text: the `environment` entry, the wrapper and the `command` the
+/// wrapper's `entrypoint` would otherwise discard.
+const POSTGRES_USER_ENVIRONMENT: &str = "- BOOTROOT_POSTGRES_USER=${BOOTROOT_POSTGRES_USER:-}";
+const POSTGRES_COMMAND: &str = r#"["postgres"]"#;
+const POSTGRES_ENTRYPOINT: &str = r#"["sh", "-c", "if [ -z \"$$BOOTROOT_POSTGRES_USER\" ]; then exec docker-entrypoint.sh \"$$@\"; fi; case \"$$BOOTROOT_POSTGRES_USER\" in *:*:* | *[!0-9:]*) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac; uid=\"$${BOOTROOT_POSTGRES_USER%%:*}\"; gid=\"$${BOOTROOT_POSTGRES_USER#*:}\"; find /var/lib/postgresql '(' ! -user \"$$uid\" -o ! -group \"$$gid\" ')' -exec chown -h \"$$uid:$$gid\" {} + || exit 1; exec gosu \"$$uid:$$gid\" docker-entrypoint.sh \"$$@\"", "sh"]"#;
+
+#[test]
+fn both_compose_files_run_postgres_as_the_recorded_user() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut entrypoints = Vec::new();
+    for file_name in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+        let compose = fs::read_to_string(root.join(file_name)).expect("read compose file");
+        // No `user:`: the wrapper runs as root, as the image's entrypoint
+        // does, to re-own the data volume before it drops.
+        assert_eq!(
+            service_key_value(&compose, "postgres", "user"),
+            None,
+            "{file_name}"
+        );
+        let Some(SectionValue::Block(environment)) =
+            service_key_value(&compose, "postgres", "environment")
+        else {
+            panic!("{file_name}: postgres environment must be a block list");
+        };
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|entry| entry.contains("BOOTROOT_POSTGRES_USER"))
+                .collect::<Vec<_>>(),
+            vec![&POSTGRES_USER_ENVIRONMENT],
+            "{file_name}: the uid reaches the wrapper as an interpolated variable"
+        );
+        assert_eq!(
+            service_key_value(&compose, "postgres", "command"),
+            Some(SectionValue::Flow(vec![r#""postgres""#])),
+            "{file_name}: the entrypoint discards the image's CMD, so it is restored"
+        );
+        // Found by service, not as the file's first `entrypoint: ["sh"`
+        // line, which is OpenBao's. The flow reader splits on `,`, which
+        // the wrapper therefore must not hold.
+        let Some(SectionValue::Flow(entries)) =
+            service_key_value(&compose, "postgres", "entrypoint")
+        else {
+            panic!("{file_name}: postgres entrypoint must be a flow sequence");
+        };
+        let entrypoint = format!("[{}]", entries.join(", "));
+        assert_eq!(entrypoint, POSTGRES_ENTRYPOINT, "{file_name}");
+        assert_eq!(entries.len(), 4, "{file_name}: sh, -c, the script, $0");
+        // The script reads the shell variable, escaped from Compose as
+        // `$$`, and never has the value interpolated into its text.
+        assert!(
+            !entrypoint.replace("$${", "").contains("${"),
+            "{file_name}: no Compose interpolation in the script"
+        );
+        // The YAML holds no `\(` or `\)`, which are not YAML escapes.
+        assert!(!entrypoint.contains(r"\("), "{file_name}");
+        let line = compose
+            .lines()
+            .find(|line| {
+                line.trim_start().starts_with(
+                    "entrypoint: [\"sh\", \"-c\", \"if [ -z \\\"$$BOOTROOT_POSTGRES_USER",
+                )
+            })
+            .and_then(|line| line.trim_start().strip_prefix("entrypoint: "))
+            .expect("postgres entrypoint line");
+        assert_eq!(line, POSTGRES_ENTRYPOINT, "{file_name}");
+        assert_eq!(
+            compose
+                .lines()
+                .filter(|line| line.trim() == format!("command: {POSTGRES_COMMAND}"))
+                .count(),
+            1,
+            "{file_name}"
+        );
+        entrypoints.push(entrypoint);
+    }
+    assert_eq!(entrypoints.first(), entrypoints.get(1));
+}
+
+/// Both entrypoints refuse a value that is not two non-zero decimal
+/// numbers joined by one `:` before they re-own anything, so a hand-edited
+/// `.env` cannot reach `chown` on a direct `docker compose up`.
+#[test]
+fn both_entrypoints_check_the_value_before_any_chown() {
+    for (entrypoint, variable, first_chown) in [
+        (OPENBAO_ENTRYPOINT, "BOOTROOT_OPENBAO_USER", "chown -R -h"),
+        (POSTGRES_ENTRYPOINT, "BOOTROOT_POSTGRES_USER", "find "),
+    ] {
+        let check = format!(
+            r#"case \"$${variable}\" in *:*:* | *[!0-9:]*) echo '{variable} is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo '{variable} is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac;"#
+        );
+        let at = entrypoint.find(&check).expect("the check");
+        let empty_branch_end = entrypoint.find("; fi; ").expect("the empty-value branch");
+        assert!(empty_branch_end < at, "{variable}: after the empty branch");
+        assert!(
+            at < entrypoint.find(first_chown).expect("the first chown"),
+            "{variable}: before the first chown"
+        );
+        assert!(!check.contains(','), "{variable}: the check holds no comma");
+    }
 }
 
 #[test]

@@ -610,6 +610,7 @@ DEFAULT_IDENTITY_SCRIPTS=(
   run-openbao-tls-no-delta.sh
   run-openbao-tls-reown.sh
   run-openbao-user.sh
+  run-postgres-user.sh
   run-reinit-recovery.sh
   run-remote-lifecycle.sh
   run-rotation-recovery.sh

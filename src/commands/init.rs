@@ -40,7 +40,7 @@ pub(crate) use steps::openbao_tls::{
     OpenBaoAuditDevice, hand_over_openbao_tls_key, reissue_openbao_tls_cert,
     sync_openbao_audit_device, write_openbao_hcl_plaintext,
 };
-pub(crate) use steps::postgres_tls::issue_postgres_tls_cert;
+pub(crate) use steps::postgres_tls::{hand_over_postgres_tls_key, issue_postgres_tls_cert};
 pub(crate) use steps::registrar_internal;
 pub(crate) use steps::stepca_setup::set_acme_cert_duration;
 pub(crate) use steps::{

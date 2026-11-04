@@ -224,7 +224,8 @@ pub(crate) fn inspect_label_via_docker(container: &str, label: &str) -> Result<O
 /// `secrets/`, `postgres/` and `.env` live in the compose file directory
 /// (Docker Compose resolves bind-mount paths relative to the compose
 /// file).  Removing `postgres/` needs no privilege although its key is
-/// owned by uid 999: `postgres/tls` is the secrets-directory owner's.
+/// owned by the server's uid (999, or the one `BOOTROOT_POSTGRES_USER`
+/// records): `postgres/tls` is the secrets-directory owner's.
 /// `state.json` lives at `StateFile::default_path()` (the process
 /// working directory), which may differ when `--compose-file` points
 /// elsewhere.

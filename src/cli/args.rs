@@ -1146,6 +1146,20 @@ pub(crate) struct InfraInstallArgs {
     #[arg(long = "openbao-user", allow_hyphen_values = true)]
     pub(crate) openbao_user: Option<String>,
 
+    /// The host `<uid>:<gid>` the step-ca `PostgreSQL` container runs as
+    /// instead of the image's `postgres` user (uid 999): two decimal
+    /// numbers from 1 to 4294967294, never resolved against a user
+    /// database. This is the container's host identity, not the database
+    /// role step-ca connects as (`POSTGRES_USER`, `init --db-user`). Its
+    /// data volume is re-owned to it where needed at every start, and its
+    /// TLS key is handed to `<uid>:0` at mode `0600`. Recorded as
+    /// `BOOTROOT_POSTGRES_USER` in the compose directory's `.env`; a later
+    /// install without the option keeps the recorded value.
+    // `allow_hyphen_values` so a leading `-` reaches the validator and is
+    // refused with the option's own rule.
+    #[arg(long = "postgres-user", allow_hyphen_values = true)]
+    pub(crate) postgres_user: Option<String>,
+
     /// Enable the registrar endpoint on this host: records
     /// `registrar_endpoint = { enabled = true, host, domain }` in
     /// `state.json` for `bootroot init` to act on. The bootroot host's

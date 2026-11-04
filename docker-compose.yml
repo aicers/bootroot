@@ -26,6 +26,14 @@ services:
     #
     # - Empty: /openbao/raft and /openbao/audit go to the image's openbao
     #   user, and docker-entrypoint.sh drops to it through su-exec.
+    # - Set: the value is refused, before anything is re-owned, unless it is
+    #   <uid>:<gid> with two non-zero decimal numbers joined by one `:`, the
+    #   form bootroot writes, so a hand-edited `.env` (a name, `0:0`,
+    #   `1:2:3`) cannot reach chown and su-exec on a direct
+    #   `docker compose up`.  The script writes one line to stderr and exits
+    #   1; restart: always then retries, and each start is refused the same
+    #   way.  Range is left to bootroot, which parses the value before every
+    #   Docker call.
     # - Set to <uid>:<gid>: /openbao/raft is re-owned to it recursively, and
     #   /openbao/audit and its active audit.log (never their targets, `-h`)
     #   but nothing else there: the registrar keeps rotation-intent.json
@@ -36,7 +44,7 @@ services:
     user: "0:0"
     environment:
       - BOOTROOT_OPENBAO_USER=${BOOTROOT_OPENBAO_USER:-}
-    entrypoint: ["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]
+    entrypoint: ["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; case \"$$BOOTROOT_OPENBAO_USER\" in *:*:* | *[!0-9:]*) echo 'BOOTROOT_OPENBAO_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo 'BOOTROOT_OPENBAO_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]
     # Audit records of the stdout device, and the server's own output, go
     # to the container log.  The `local` driver bounds them at max-file
     # segments of max-size each and compresses rotated segments.  `mode`
@@ -65,10 +73,42 @@ services:
       - POSTGRES_USER=step
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       - POSTGRES_DB=stepca
+      - BOOTROOT_POSTGRES_USER=${BOOTROOT_POSTGRES_USER:-}
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql
+    # The image's docker-entrypoint.sh starts as root, re-owns the data
+    # directory to the image's built-in postgres user (uid 999) and drops to
+    # it.  Which uid the server runs as follows BOOTROOT_POSTGRES_USER,
+    # recorded in the `.env` beside this file by `bootroot infra install
+    # --postgres-user` and reaching the script only as the quoted environment
+    # variable above.  It is the container's host identity, not the database
+    # role (POSTGRES_USER).  No `user:` is set: the script runs as root.
+    #
+    # - Empty: docker-entrypoint.sh runs exactly as the image's own
+    #   entrypoint would.
+    # - Set: the value is refused, before anything is re-owned, unless it is
+    #   <uid>:<gid> with two non-zero decimal numbers joined by one `:`, the
+    #   form bootroot writes, so a hand-edited `.env` (a name, `0:0`,
+    #   `1:2:3`) cannot reach chown and gosu on a direct `docker compose up`.
+    #   The script writes one line to stderr and exits 1; restart: always
+    #   then retries, and each start is refused the same way.  Range is left
+    #   to bootroot, which parses the value before every Docker call.
+    # - Set to <uid>:<gid>: every entry under /var/lib/postgresql, the
+    #   directory included, whose uid or gid differs is re-owned to it.
+    #   `find` does not follow a link and `chown -h` re-owns the link, never
+    #   its target; re-owning only what differs keeps a restart over a large
+    #   data directory from touching every file.  The start is refused if
+    #   that fails.  gosu then drops to the uid before docker-entrypoint.sh
+    #   runs, which, no longer root, does not drop to postgres again; it
+    #   needs no passwd entry for the uid (initdb runs under nss_wrapper).
+    #
+    # An `entrypoint` discards the image's CMD, so `command` restores it.  The
+    # TLS override (secrets/postgres/docker-compose.postgres-tls.yml) replaces
+    # that `command` with the server's TLS settings.
+    entrypoint: ["sh", "-c", "if [ -z \"$$BOOTROOT_POSTGRES_USER\" ]; then exec docker-entrypoint.sh \"$$@\"; fi; case \"$$BOOTROOT_POSTGRES_USER\" in *:*:* | *[!0-9:]*) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; *[1-9]*:*[1-9]*) ;; *) echo 'BOOTROOT_POSTGRES_USER is not <uid>:<gid> with two non-zero decimal numbers' >&2; exit 1 ;; esac; uid=\"$${BOOTROOT_POSTGRES_USER%%:*}\"; gid=\"$${BOOTROOT_POSTGRES_USER#*:}\"; find /var/lib/postgresql '(' ! -user \"$$uid\" -o ! -group \"$$gid\" ')' -exec chown -h \"$$uid:$$gid\" {} + || exit 1; exec gosu \"$$uid:$$gid\" docker-entrypoint.sh \"$$@\"", "sh"]
+    command: ["postgres"]
 
   step-ca:
     image: smallstep/step-ca:0.30.2

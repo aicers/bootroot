@@ -925,6 +925,60 @@ mod tests {
     /// container the entry records.
     #[test]
     fn run_rotate_infra_cert_renews_postgres_tls() {
+        let invocations = renew_postgres_tls_with_env(None);
+        let position = |needle: &str| {
+            invocations
+                .iter()
+                .position(|argv| argv.iter().any(|arg| arg == needle))
+                .unwrap_or_else(|| panic!("no invocation carries {needle}: {invocations:?}"))
+        };
+        assert_eq!(invocations.len(), 4, "{invocations:?}");
+        assert!(position("create") < position("999:0"), "{invocations:?}");
+        assert_eq!(
+            invocations.last(),
+            Some(&vec![
+                "kill".to_string(),
+                "-s".to_string(),
+                "SIGHUP".to_string(),
+                "insight-postgres".to_string(),
+            ]),
+            "the reload must come last, once the key is back with uid 999"
+        );
+    }
+
+    /// With `BOOTROOT_POSTGRES_USER` recorded, the renewal hands the key to
+    /// `<uid>:0` instead of `999:0`, and still reloads last.
+    #[test]
+    fn run_rotate_infra_cert_renews_postgres_tls_for_the_recorded_user() {
+        let invocations = renew_postgres_tls_with_env(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+        let position = |needle: &str| {
+            invocations
+                .iter()
+                .position(|argv| argv.iter().any(|arg| arg == needle))
+                .unwrap_or_else(|| panic!("no invocation carries {needle}: {invocations:?}"))
+        };
+        assert_eq!(invocations.len(), 4, "{invocations:?}");
+        assert!(position("create") < position("4242:0"), "{invocations:?}");
+        assert!(
+            !invocations
+                .iter()
+                .any(|argv| argv.iter().any(|arg| arg == "999:0")),
+            "{invocations:?}"
+        );
+        assert_eq!(
+            invocations
+                .last()
+                .and_then(|argv| argv.first())
+                .map(String::as_str),
+            Some("kill"),
+            "{invocations:?}"
+        );
+    }
+
+    /// Runs `rotate infra-cert` over a state recording only the `postgres`
+    /// entry, with an `.env` holding `env` beside the compose file when
+    /// given, and returns the fake docker's invocations.
+    fn renew_postgres_tls_with_env(env: Option<&str>) -> Vec<Vec<String>> {
         let dir = tempfile::tempdir().expect("tempdir");
         let messages = test_messages();
 
@@ -942,6 +996,9 @@ mod tests {
         fs::create_dir_all(&tls_dir).expect("tls dir");
         fs::write(tls_dir.join("server.crt"), "fake-cert").expect("write cert");
         fs::write(tls_dir.join("server.key"), "fake-key").expect("write key");
+        if let Some(env) = env {
+            fs::write(compose_dir.join(".env"), env).expect("write .env");
+        }
 
         let mut infra_certs = BTreeMap::new();
         infra_certs.insert(
@@ -1008,25 +1065,7 @@ mod tests {
             "issued_at must be updated after renewal"
         );
 
-        let invocations = decode_fake_docker_log(&args_log);
-        let position = |needle: &str| {
-            invocations
-                .iter()
-                .position(|argv| argv.iter().any(|arg| arg == needle))
-                .unwrap_or_else(|| panic!("no invocation carries {needle}: {invocations:?}"))
-        };
-        assert_eq!(invocations.len(), 4, "{invocations:?}");
-        assert!(position("create") < position("999:0"), "{invocations:?}");
-        assert_eq!(
-            invocations.last(),
-            Some(&vec![
-                "kill".to_string(),
-                "-s".to_string(),
-                "SIGHUP".to_string(),
-                "insight-postgres".to_string(),
-            ]),
-            "the reload must come last, once the key is back with uid 999"
-        );
+        decode_fake_docker_log(&args_log)
     }
 
     /// The `openbao` key's strategy is resolved in code rather than read

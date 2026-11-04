@@ -79,6 +79,13 @@ pub(crate) fn openbao_user_script_path() -> PathBuf {
         .join("run-openbao-user.sh")
 }
 
+pub(crate) fn postgres_user_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("impl")
+        .join("run-postgres-user.sh")
+}
+
 pub(crate) fn secrets_owner_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")

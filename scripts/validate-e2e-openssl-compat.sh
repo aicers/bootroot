@@ -23,7 +23,7 @@ cd "$ROOT_DIR"
 IMPL_DIR="$ROOT_DIR/scripts/impl"
 LABEL="validate-e2e-openssl-compat"
 
-# All eight scripts that check for `openssl` gate on `x509 -ext`, not only
+# All nine scripts that check for `openssl` gate on `x509 -ext`, not only
 # `run-stepca-san.sh`, which is the sole caller: the matrix runs every
 # step against one host, so a host that cannot serve the SAN step cannot
 # serve the matrix. Pinning the set here is what keeps a later change
@@ -33,6 +33,7 @@ GATED_SCRIPTS=(
   run-local-lifecycle.sh
   run-openbao-tls-reown.sh
   run-openbao-user.sh
+  run-postgres-user.sh
   run-reinit-recovery.sh
   run-remote-lifecycle.sh
   run-secrets-owner.sh

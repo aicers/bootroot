@@ -100,6 +100,7 @@ PR 필수 Docker 조합 검증은 다음을 검증합니다.
 - `scripts/impl/run-registrar-ca-rotation-e2e.sh`
 - `scripts/impl/run-secrets-owner.sh`
 - `scripts/impl/run-openbao-user.sh`
+- `scripts/impl/run-postgres-user.sh`
 
 위 스크립트 가운데 셋은 프로젝트 이름을 전혀 전달받지 **않고** 스스로
 만들어 씁니다. `run-two-instance-isolation.sh`는 basename이 같은
@@ -1175,7 +1176,8 @@ scripts/preflight/run-all.sh
 
 - `run-reinit-recovery.sh`, `run-stepca-san.sh`,
   `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`,
-  `run-secrets-owner.sh`, `run-openbao-user.sh`, 그리고
+  `run-secrets-owner.sh`, `run-openbao-user.sh`, `run-postgres-user.sh`,
+  그리고
   `run-registrar-internal-init-e2e.sh`의 routable 모드의 bind host
   가드는 `ip`(iproute2)로, 없으면 `ifconfig`로 로컬 IPv4 주소를
   열거합니다. 둘 다 없는 호스트에는 그 사실을 그대로 알립니다.

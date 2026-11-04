@@ -10,12 +10,12 @@ use bootroot::fs_util;
 pub(crate) use bootroot::remote_bootstrap::client_url_from_bind_addr;
 use x509_parser::pem::parse_x509_pem;
 
+use crate::commands::container_user::{UserServer, recorded_user};
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, CA_ROOT_CERT_FILENAME,
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
-use crate::commands::openbao_user::recorded_openbao_user;
 use crate::i18n::Messages;
 
 const LOCAL_DB_HOSTS: [&str; 4] = ["postgres", "localhost", "127.0.0.1", "::1"];
@@ -691,7 +691,7 @@ pub(crate) fn validate_openbao_tls(
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let openbao_user = recorded_openbao_user(compose_dir, messages)?;
+    let openbao_user = recorded_user(UserServer::OpenBao, compose_dir, messages)?;
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
     let mut issues = Vec::new();
 

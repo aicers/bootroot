@@ -16,6 +16,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `infra up`, `init` and the rotations read it and a later `infra install`
   without the option keeps it. Without the option OpenBao runs exactly as
   before.
+- `bootroot infra install --postgres-user <uid>:<gid>` runs step-ca's
+  PostgreSQL as that host uid and gid instead of the image's `postgres` user
+  (uid 999): its data volume is re-owned to it where needed at every start, and
+  its TLS key is owned by that uid with group 0 and mode `0600`, on issuance and
+  on every renewal. It is the container's host identity, not the database role
+  step-ca connects as. The value is recorded in `.env`, where `infra up`, `init`
+  and the rotations read it, and a later `infra install` without the option
+  keeps it. Without the option PostgreSQL runs exactly as before.
 
 ### Changed
 
