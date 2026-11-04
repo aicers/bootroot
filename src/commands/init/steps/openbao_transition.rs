@@ -18,6 +18,7 @@
 //! sealed).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,7 +30,7 @@ use crate::commands::infra::{
     build_openbao_client, run_compose_with_exec, wait_for_openbao_active,
     wait_for_openbao_api_reachable_within,
 };
-use crate::commands::openbao_unseal::read_unseal_keys_from_file;
+use crate::commands::openbao_unseal::{read_unseal_keys_from_file, read_unseal_keys_in};
 use crate::i18n::Messages;
 
 /// Compose service name of the `OpenBao` server.
@@ -101,6 +102,9 @@ pub(super) struct UnsealKeyInputs<'a> {
     pub(super) explicit_file: Option<&'a Path>,
     /// `<secrets_dir>/openbao/unseal-keys.txt`.
     pub(super) default_file: PathBuf,
+    /// The handle on `<secrets_dir>`, through which a rooted run reads
+    /// `default_file` without following a link, on a blocking thread.
+    pub(super) secrets_tree: &'a Arc<bootroot::fs_util::SecretsTree>,
     /// Whether stdin is a terminal, i.e. whether prompting is possible.
     pub(super) interactive: bool,
 }
@@ -124,7 +128,7 @@ pub(super) struct UnsealKeyInputs<'a> {
 ///
 /// Returns an error when the selected source cannot be read, and when
 /// every source is absent.
-fn prepare_unseal_keys(
+async fn prepare_unseal_keys(
     inputs: &UnsealKeyInputs<'_>,
     messages: &Messages,
 ) -> Result<PreparedUnsealKeys> {
@@ -142,7 +146,23 @@ fn prepare_unseal_keys(
     if let Some(path) = inputs.explicit_file {
         return read_prepared_keys(path, messages);
     }
-    if inputs.default_file.exists() {
+    if inputs.secrets_tree.is_rooted() {
+        // The rooted read's `NotFound` is the absent default file the
+        // `exists` probe below answers path-based.
+        // The handle's read blocks, so it runs on a blocking thread.
+        let default_file = inputs.default_file.clone();
+        let task_messages = messages.clone();
+        if let Some(keys) = inputs
+            .secrets_tree
+            .run(move |tree| read_unseal_keys_in(tree, &default_file, &task_messages))
+            .await?
+        {
+            return Ok(PreparedUnsealKeys {
+                source: UnsealKeySource::File(inputs.default_file.clone()),
+                keys,
+            });
+        }
+    } else if inputs.default_file.exists() {
         return read_prepared_keys(&inputs.default_file, messages);
     }
     if inputs.interactive {
@@ -277,7 +297,7 @@ impl<'a> OpenBaoTlsTransition<'a> {
         recreated: &mut bool,
         messages: &Messages,
     ) -> Result<()> {
-        let prepared = prepare_unseal_keys(inputs, messages)?;
+        let prepared = prepare_unseal_keys(inputs, messages).await?;
 
         println!("{}", messages.init_openbao_tls_recreate());
         *recreated = true;
@@ -428,6 +448,16 @@ mod tests {
     /// handshaking with a real server.
     const UNREACHABLE_HTTPS_URL: &str = "https://127.0.0.1:1";
 
+    /// A path-based handle, as `init` holds on a tree its own user owns;
+    /// it reads nothing, so where it is anchored does not matter.
+    static PATH_BASED_TREE: std::sync::LazyLock<Arc<bootroot::fs_util::SecretsTree>> =
+        std::sync::LazyLock::new(|| {
+            Arc::new(
+                bootroot::fs_util::SecretsTree::open(Path::new("/nonexistent-bootroot-secrets"))
+                    .expect("a missing anchor opens path-based"),
+            )
+        });
+
     fn inputs<'a>(
         in_memory: &'a [String],
         explicit_file: Option<&'a Path>,
@@ -438,8 +468,41 @@ mod tests {
             in_memory,
             explicit_file,
             default_file,
+            secrets_tree: &PATH_BASED_TREE,
             interactive,
         }
+    }
+
+    /// As root over a foreign-owned `secrets/`, the default file is read
+    /// through the handle: absent falls through as the `exists` probe
+    /// did, and a link there is refused with nothing read from its
+    /// target.
+    #[tokio::test]
+    async fn rooted_default_file_is_read_through_the_handle() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = Arc::new(root.rooted());
+        let default_file = root.secrets.join("openbao").join("unseal-keys.txt");
+        let mut rooted_inputs = inputs(&[], None, default_file.clone(), true);
+        rooted_inputs.secrets_tree = &tree;
+
+        let prepared = prepare_unseal_keys(&rooted_inputs, &test_messages())
+            .await
+            .expect("absent");
+        assert_eq!(prepared.source, UnsealKeySource::Prompt);
+
+        root.write("openbao/unseal-keys.txt", "default-key\n");
+        let prepared = prepare_unseal_keys(&rooted_inputs, &test_messages())
+            .await
+            .expect("present");
+        assert_eq!(prepared.source, UnsealKeySource::File(default_file.clone()));
+        assert_eq!(prepared.keys, vec!["default-key".to_string()]);
+
+        root.swap("openbao/unseal-keys.txt", &root.outside.join("secret"));
+        let err = prepare_unseal_keys(&rooted_inputs, &test_messages())
+            .await
+            .expect_err("linked");
+        crate::test_support::assert_error_names(&err, &default_file);
+        assert!(!format!("{err:#}").contains("OUTSIDE-SECRET"));
     }
 
     #[test]
@@ -532,8 +595,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn in_memory_keys_win_over_every_file() {
+    #[tokio::test]
+    async fn in_memory_keys_win_over_every_file() {
         let dir = tempdir().expect("temp dir");
         let explicit = dir.path().join("explicit.txt");
         fs::write(&explicit, "explicit-key\n").expect("write");
@@ -545,14 +608,15 @@ mod tests {
             &inputs(&in_memory, Some(&explicit), default_file, true),
             &test_messages(),
         )
+        .await
         .expect("in-memory keys are available");
 
         assert_eq!(prepared.source, UnsealKeySource::InMemory);
         assert_eq!(prepared.keys, in_memory);
     }
 
-    #[test]
-    fn explicit_file_wins_over_the_default_file() {
+    #[tokio::test]
+    async fn explicit_file_wins_over_the_default_file() {
         let dir = tempdir().expect("temp dir");
         let explicit = dir.path().join("explicit.txt");
         fs::write(&explicit, "explicit-key\n").expect("write");
@@ -563,14 +627,15 @@ mod tests {
             &inputs(&[], Some(&explicit), default_file, true),
             &test_messages(),
         )
+        .await
         .expect("the explicit file is available");
 
         assert_eq!(prepared.source, UnsealKeySource::File(explicit));
         assert_eq!(prepared.keys, vec!["explicit-key".to_string()]);
     }
 
-    #[test]
-    fn default_file_is_used_when_no_flag_was_passed() {
+    #[tokio::test]
+    async fn default_file_is_used_when_no_flag_was_passed() {
         let dir = tempdir().expect("temp dir");
         let default_file = dir.path().join("unseal-keys.txt");
         fs::write(&default_file, "default-key\n").expect("write");
@@ -579,19 +644,21 @@ mod tests {
             &inputs(&[], None, default_file.clone(), true),
             &test_messages(),
         )
+        .await
         .expect("the default file is available");
 
         assert_eq!(prepared.source, UnsealKeySource::File(default_file));
         assert_eq!(prepared.keys, vec!["default-key".to_string()]);
     }
 
-    #[test]
-    fn prompt_is_the_last_resort_and_reads_nothing_up_front() {
+    #[tokio::test]
+    async fn prompt_is_the_last_resort_and_reads_nothing_up_front() {
         let dir = tempdir().expect("temp dir");
         let default_file = dir.path().join("unseal-keys.txt");
 
         let prepared =
             prepare_unseal_keys(&inputs(&[], None, default_file, true), &test_messages())
+                .await
                 .expect("an interactive stdin is a source");
 
         assert_eq!(prepared.source, UnsealKeySource::Prompt);
@@ -604,8 +671,8 @@ mod tests {
     /// An operator who pointed `--openbao-unseal-from-file` at the wrong
     /// file must see that file named, not a silent fallback to a stale
     /// default or a prompt.
-    #[test]
-    fn unreadable_explicit_file_does_not_fall_through() {
+    #[tokio::test]
+    async fn unreadable_explicit_file_does_not_fall_through() {
         let dir = tempdir().expect("temp dir");
         let missing = dir.path().join("nowhere.txt");
         let default_file = dir.path().join("unseal-keys.txt");
@@ -615,6 +682,7 @@ mod tests {
             &inputs(&[], Some(&missing), default_file, true),
             &test_messages(),
         )
+        .await
         .expect_err("an unreadable explicit file is terminal");
 
         let rendered = format!("{err:#}");
@@ -628,8 +696,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_explicit_file_does_not_fall_through() {
+    #[tokio::test]
+    async fn empty_explicit_file_does_not_fall_through() {
         let dir = tempdir().expect("temp dir");
         let explicit = dir.path().join("explicit.txt");
         fs::write(&explicit, "\n\n").expect("write");
@@ -640,6 +708,7 @@ mod tests {
             &inputs(&[], Some(&explicit), default_file, true),
             &test_messages(),
         )
+        .await
         .expect_err("an empty explicit file is terminal");
 
         let rendered = format!("{err:#}");
@@ -653,8 +722,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_source_absent_is_terminal() {
+    #[tokio::test]
+    async fn every_source_absent_is_terminal() {
         let dir = tempdir().expect("temp dir");
         let default_file = dir.path().join("unseal-keys.txt");
 
@@ -662,6 +731,7 @@ mod tests {
             &inputs(&[], None, default_file.clone(), false),
             &test_messages(),
         )
+        .await
         .expect_err("no source is available");
 
         let rendered = format!("{err:#}");

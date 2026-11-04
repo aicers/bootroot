@@ -242,7 +242,7 @@ pub(super) async fn verify_responder(
     args: &InitArgs,
     messages: &Messages,
     secrets: &InitSecrets,
-    secrets_dir: &Path,
+    secrets_tree: &std::sync::Arc<bootroot::fs_util::SecretsTree>,
 ) -> Result<ResponderCheck> {
     if args.has_skip(InitSkipPhase::ResponderCheck) {
         return Ok(ResponderCheck::Skipped);
@@ -252,7 +252,7 @@ pub(super) async fn verify_responder(
     };
     let ca_pem = if responder_url.starts_with("https://") {
         Some(
-            super::ca_certs::compute_ca_bundle_pem(secrets_dir, messages)
+            super::ca_certs::compute_ca_bundle_pem(secrets_tree, messages)
                 .await
                 .context("Failed to read step-ca root for responder TLS verification")?,
         )
@@ -378,7 +378,9 @@ mod tests {
             &args,
             &test_messages(),
             &test_secrets(),
-            temp_dir.path(),
+            &bootroot::fs_util::SecretsTree::open_shared(temp_dir.path())
+                .await
+                .expect("open"),
         )
         .await
         .expect("a responder that binds within the budget must not fail the check");
@@ -407,7 +409,9 @@ mod tests {
             &args,
             &test_messages(),
             &test_secrets(),
-            temp_dir.path(),
+            &bootroot::fs_util::SecretsTree::open_shared(temp_dir.path())
+                .await
+                .expect("open"),
         )
         .await
         .expect_err("a non-success status must fail the check");
@@ -454,7 +458,9 @@ mod tests {
             &args,
             &test_messages(),
             &test_secrets(),
-            temp_dir.path(),
+            &bootroot::fs_util::SecretsTree::open_shared(temp_dir.path())
+                .await
+                .expect("open"),
         )
         .await
         .expect_err("a malformed responder URL must fail the check");
@@ -489,7 +495,9 @@ mod tests {
             &args,
             &test_messages(),
             &test_secrets(),
-            temp_dir.path(),
+            &bootroot::fs_util::SecretsTree::open_shared(temp_dir.path())
+                .await
+                .expect("open"),
         )
         .await
         .expect_err("a zero readiness budget must be rejected");

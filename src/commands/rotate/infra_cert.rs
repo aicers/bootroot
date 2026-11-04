@@ -1,5 +1,5 @@
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,19 +75,23 @@ pub(super) async fn rotate_infra_certs(
         .collect();
 
     for (name, entry) in &entries {
-        dispatch_reissue(
-            name,
-            &compose_dir,
-            ctx.paths.secrets_dir(),
-            entry,
-            &ContainerNames {
-                openbao: &openbao_container,
-                responder: &responder_container,
-            },
-            &ctx.docker,
-            messages,
-        )
-        .with_context(|| messages.error_infra_tls_renew_failed(name))?;
+        // Each re-issue blocks (the `step` helpers, and the HTTP-01 admin
+        // certificate's work through the secrets tree handle), so it runs
+        // on a blocking thread.
+        let task = ReissueTask {
+            name: name.clone(),
+            compose_dir: compose_dir.clone(),
+            secrets_dir: ctx.paths.secrets_dir().to_path_buf(),
+            entry: entry.clone(),
+            openbao_container: openbao_container.clone(),
+            responder_container: responder_container.clone(),
+            docker: ctx.docker.clone(),
+            messages: messages.clone(),
+        };
+        tokio::task::spawn_blocking(move || task.run())
+            .await
+            .context("infra cert re-issue task panicked")?
+            .with_context(|| messages.error_infra_tls_renew_failed(name))?;
 
         // Resolve the reload strategy in code, not from the stored entry:
         // an already-initialized host (or a reinit that carried the
@@ -163,6 +167,36 @@ struct ContainerNames<'a> {
     responder: &'a str,
 }
 
+/// The owned inputs of one [`dispatch_reissue`], so that it can run on a
+/// blocking thread.
+struct ReissueTask {
+    name: String,
+    compose_dir: PathBuf,
+    secrets_dir: PathBuf,
+    entry: InfraCertEntry,
+    openbao_container: String,
+    responder_container: String,
+    docker: PathBuf,
+    messages: Messages,
+}
+
+impl ReissueTask {
+    fn run(&self) -> Result<()> {
+        dispatch_reissue(
+            &self.name,
+            &self.compose_dir,
+            &self.secrets_dir,
+            &self.entry,
+            &ContainerNames {
+                openbao: &self.openbao_container,
+                responder: &self.responder_container,
+            },
+            &self.docker,
+            &self.messages,
+        )
+    }
+}
+
 /// Dispatches certificate re-issuance by infra-cert key.
 ///
 /// Each infrastructure certificate type registers an arm here.
@@ -187,7 +221,7 @@ fn dispatch_reissue(
             messages,
         ),
         HTTP01_ADMIN_INFRA_CERT_KEY => reissue_http01_admin_tls_cert(
-            secrets_dir,
+            &bootroot::fs_util::SecretsTree::open(secrets_dir)?,
             entry,
             containers.responder,
             docker,

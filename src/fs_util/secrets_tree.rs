@@ -40,10 +40,42 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use super::{
-    Destination, KEY_FILE_MODE, SECRETS_DIR_MODE, StagedDurability, StagedMode, StagedOwner,
-    SymlinkPolicy, chown_containing_dir_context, chown_preserve_context, current_process_euid,
-    ensure_secrets_dir_blocking, ensure_shared_secrets_dir_blocking, publish_staged_blocking,
+    Destination, FixedOwner, KEY_FILE_MODE, SECRETS_DIR_MODE, StagedDurability, StagedMode,
+    StagedOwner, SymlinkPolicy, chown_containing_dir_context, chown_fixed_context,
+    chown_preserve_context, current_process_euid, ensure_secrets_dir_blocking,
+    ensure_shared_secrets_dir_blocking, publish_staged_blocking,
 };
+use crate::registrar::internal::INTERNAL_DIR;
+
+/// The levels directly below the anchor that are root-owned by policy,
+/// whatever account owns `secrets/` itself.
+///
+/// `registrar-internal` holds the bootroot-internal credential; the
+/// other two hold the retired registrar client pair a full CA rotation
+/// preserves on a registrar endpoint host, and its staging directory.
+/// The ownership sweep holds the same three back. The owner of
+/// `secrets/` cannot enter them, but it can rename one away and put a
+/// directory of its own at the name, which a descriptor walk would open
+/// because it is not a link. A rooted walk therefore requires each of
+/// them, when it opens one, to be owned by the writing process.
+pub const ROOT_BY_POLICY_DIRS: [&str; 3] = [
+    INTERNAL_DIR,
+    "registrar-client-retired",
+    "registrar-client-retired.staging",
+];
+
+/// What a directory entry is, read without following it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A directory.
+    Dir,
+    /// A regular file.
+    File,
+    /// A symbolic link, whatever it points at.
+    Symlink,
+    /// Anything else: a FIFO, a socket or a device.
+    Other,
+}
 
 /// Names tried for a staged temporary before a rooted publish gives up.
 ///
@@ -73,9 +105,9 @@ pub fn rooted_mode(writer_euid: u32, anchor_uid: u32) -> bool {
 
 /// Who owns the file a [`SecretsTree::publish`] renames into place.
 ///
-/// The two arms of [`StagedOwner`] the call sites under `secrets/` use,
-/// and the two a rooted publish knows how to reproduce through the
-/// staged file's descriptor.
+/// The arms of [`StagedOwner`] the call sites under `secrets/` use, and
+/// the ones a rooted publish knows how to reproduce through the staged
+/// file's descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootedOwner {
     /// The owner of the directory the file lands in:
@@ -84,6 +116,9 @@ pub enum RootedOwner {
     /// The owner of the file being replaced, and the writing process's
     /// for a fresh one: [`StagedOwner::Destination`].
     Destination,
+    /// Exactly this uid and gid, established unconditionally through the
+    /// staged file's descriptor before the rename: [`StagedOwner::Fixed`].
+    Fixed(FixedOwner),
 }
 
 impl From<RootedOwner> for StagedOwner {
@@ -91,6 +126,7 @@ impl From<RootedOwner> for StagedOwner {
         match owner {
             RootedOwner::ContainingDir => StagedOwner::ContainingDir,
             RootedOwner::Destination => StagedOwner::Destination,
+            RootedOwner::Fixed(fixed) => StagedOwner::Fixed(fixed),
         }
     }
 }
@@ -117,6 +153,9 @@ pub struct SecretsTree {
     anchor: PathBuf,
     fd: Option<OwnedFd>,
     rooted: bool,
+    /// The writing process's effective uid, recorded at open: the owner
+    /// a rooted walk requires of a level in [`ROOT_BY_POLICY_DIRS`].
+    writer_euid: u32,
 }
 
 /// What a rooted publish found at the destination's name, read once
@@ -181,6 +220,7 @@ impl SecretsTree {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         );
+        let writer_euid = current_process_euid();
         match opened {
             Ok(fd) => {
                 let anchor_uid = rustix::fs::fstat(&fd)
@@ -189,13 +229,15 @@ impl SecretsTree {
                 Ok(Self {
                     anchor: anchor.to_path_buf(),
                     fd: Some(fd),
-                    rooted: force_rooted || rooted_mode(current_process_euid(), anchor_uid),
+                    rooted: force_rooted || rooted_mode(writer_euid, anchor_uid),
+                    writer_euid,
                 })
             }
             Err(Errno::NOENT) if !force_rooted => Ok(Self {
                 anchor: anchor.to_path_buf(),
                 fd: None,
                 rooted: false,
+                writer_euid,
             }),
             Err(err) => {
                 Err(err).with_context(|| format!("Failed to open secrets dir {}", anchor.display()))
@@ -220,6 +262,396 @@ impl SecretsTree {
     /// method down its path-based branch.
     fn rooted_fd(&self) -> Option<&OwnedFd> {
         self.fd.as_ref().filter(|_| self.rooted)
+    }
+
+    /// Records `uid` as the writing process's effective uid, so a test
+    /// can make a directory it owns stand in for one another account
+    /// owns.
+    #[cfg(test)]
+    pub(crate) fn set_writer_euid_for_tests(&mut self, uid: u32) {
+        self.writer_euid = uid;
+    }
+
+    /// The anchor's descriptor for one of the methods that exist only in
+    /// rooted mode; on a path-based handle, an `Unsupported` error naming
+    /// `path`.
+    fn require_rooted(&self, path: &Path) -> std::io::Result<&OwnedFd> {
+        self.rooted_fd().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "{} cannot be reached through a path-based handle on the secrets directory \
+                     {}: this operation exists only for a root process over a secrets \
+                     directory another account owns",
+                    path.display(),
+                    self.anchor.display()
+                ),
+            )
+        })
+    }
+
+    /// [`SecretsTree::relative`] as an `InvalidInput` I/O error.
+    fn relative_io<'p>(&self, path: &'p Path) -> std::io::Result<Vec<&'p OsStr>> {
+        self.relative(path).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{err:#}"))
+        })
+    }
+
+    /// Refuses a level directly below the anchor whose name is in
+    /// [`ROOT_BY_POLICY_DIRS`] unless the opened directory is owned by
+    /// the writing process. `depth` is the level's index below the
+    /// anchor, `0` for an entry of the anchor itself.
+    fn check_root_by_policy(
+        &self,
+        depth: usize,
+        name: &OsStr,
+        dir: &File,
+        path: &Path,
+    ) -> std::io::Result<()> {
+        if depth != 0
+            || !ROOT_BY_POLICY_DIRS
+                .iter()
+                .any(|held| name == OsStr::new(held))
+        {
+            return Ok(());
+        }
+        let uid = dir
+            .metadata()
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?
+            .uid();
+        if uid == self.writer_euid {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Refusing to use {}: it must be owned by uid {} by policy, and is owned by uid \
+                 {uid}, so it is not the directory bootroot created there",
+                path.display(),
+                self.writer_euid
+            ),
+        ))
+    }
+
+    /// Opens each of `names` below the anchor in turn, without following
+    /// a link at any of them and subject to the root-by-policy check,
+    /// and returns the last; the anchor itself when `names` is empty.
+    /// Creates nothing. A missing level is `NotFound`.
+    fn walk_io(&self, anchor_fd: &OwnedFd, names: &[&OsStr]) -> std::io::Result<File> {
+        let mut current = anchor_fd.try_clone().map(File::from).map_err(|err| {
+            io_context(
+                &err,
+                &format!(
+                    "Failed to duplicate the descriptor of {}",
+                    self.anchor.display()
+                ),
+            )
+        })?;
+        let mut level = self.anchor.clone();
+        for (depth, name) in names.iter().enumerate() {
+            level.push(name);
+            current =
+                open_dir_nofollow(&current, name).map_err(|err| refused_level_io(err, &level))?;
+            self.check_root_by_policy(depth, name, &current, &level)?;
+        }
+        Ok(current)
+    }
+
+    /// The leaf name of `path` and the descriptor of its directory,
+    /// reached by [`SecretsTree::walk_io`].
+    fn parent_of<'p>(
+        &self,
+        anchor_fd: &OwnedFd,
+        path: &'p Path,
+        names: &[&'p OsStr],
+    ) -> std::io::Result<(&'p OsStr, usize, File)> {
+        let (leaf, dirs) = names.split_last().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} names the secrets directory itself, not an entry in it",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok((*leaf, dirs.len(), self.walk_io(anchor_fd, dirs)?))
+    }
+
+    /// Reads the regular file at `path`.
+    ///
+    /// Rooted only. The directories are walked as
+    /// [`SecretsTree::ensure_dir`] walks them, creating nothing; the leaf
+    /// is opened with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, confirmed a
+    /// regular file by `fstat`, and read from that descriptor. A link, a
+    /// FIFO, a device or a directory at the leaf is refused, and a FIFO
+    /// never blocks the read.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the leaf or any directory level is missing;
+    /// an `Unsupported` error on a path-based handle; and an error naming
+    /// the path if `path` is not below the anchor, a level is a link or
+    /// fails the root-by-policy check, or the leaf is not a regular file
+    /// or cannot be read.
+    pub fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        let mut file = open_file_nofollow(&dir, leaf).map_err(|err| refused_file_io(err, path))?;
+        let meta = file
+            .metadata()
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to read {}: it is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|err| io_context(&err, &format!("Failed to read {}", path.display())))?;
+        Ok(contents)
+    }
+
+    /// Removes the directory entry at `path` that is not a directory.
+    ///
+    /// Rooted only: `unlinkat` on the descriptor of the walked parent. A
+    /// symbolic link at the leaf is removed itself, which follows
+    /// nothing.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the leaf or any directory level is missing;
+    /// an `Unsupported` error on a path-based handle; and an error naming
+    /// the path if a level is a link or fails the root-by-policy check,
+    /// or the unlink fails.
+    pub fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        rustix::fs::unlinkat(&dir, leaf, AtFlags::empty())
+            .map_err(|err| errno_context(err, &format!("Failed to remove {}", path.display())))
+    }
+
+    /// Removes the directory at `path` and everything below it.
+    ///
+    /// Rooted only. The target is opened with
+    /// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` and listed through its
+    /// descriptor; each entry that opens the same way is recursed into,
+    /// every other entry is unlinked, and the directory itself is
+    /// finally unlinked with `AT_REMOVEDIR`. A symbolic link anywhere
+    /// inside is unlinked and never descended, and a symbolic link at
+    /// the target itself is unlinked, as `std::fs::remove_dir_all` does.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the target or any directory level above it
+    /// is missing; an `Unsupported` error on a path-based handle; and an
+    /// error naming the path if a level above the target is a link or
+    /// fails the root-by-policy check, the target is neither a directory
+    /// nor a link, or an entry cannot be listed or removed.
+    pub fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, depth, parent) = self.parent_of(anchor_fd, path, &names)?;
+        let stat = rustix::fs::statat(&parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|err| errno_context(err, &format!("Failed to stat {}", path.display())))?;
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => rustix::fs::unlinkat(&parent, leaf, AtFlags::empty())
+                .map_err(|err| errno_context(err, &format!("Failed to remove {}", path.display()))),
+            FileType::Directory => {
+                let dir =
+                    open_dir_nofollow(&parent, leaf).map_err(|err| refused_level_io(err, path))?;
+                self.check_root_by_policy(depth, leaf, &dir, path)?;
+                clear_dir_rooted(&dir, path)?;
+                drop(dir);
+                rustix::fs::unlinkat(&parent, leaf, AtFlags::REMOVEDIR).map_err(|err| {
+                    errno_context(err, &format!("Failed to remove {}", path.display()))
+                })
+            }
+            _ => Err(errno_context(
+                Errno::NOTDIR,
+                &format!("Refusing to remove {} as a directory", path.display()),
+            )),
+        }
+    }
+
+    /// Lists the directory at `path`, skipping `.` and `..`, with each
+    /// entry's kind read without following it.
+    ///
+    /// Rooted only: the directory is reached by the walk and listed
+    /// through its own descriptor; each kind comes from
+    /// `statat(dir, name, AT_SYMLINK_NOFOLLOW)`. An entry that vanished
+    /// between the listing and its `statat` is left out.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the directory or any level above it is
+    /// missing; an `Unsupported` error on a path-based handle; and an
+    /// error naming the path if a level is a link or fails the
+    /// root-by-policy check, or the directory cannot be listed.
+    pub fn read_dir(&self, path: &Path) -> std::io::Result<Vec<(OsString, EntryKind)>> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let dir = self.walk_io(anchor_fd, &names)?;
+        let mut listed = Vec::new();
+        for name in list_dir(&dir, path)? {
+            match rustix::fs::statat(&dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => listed.push((name, entry_kind_of(&stat))),
+                Err(Errno::NOENT) => {}
+                Err(err) => {
+                    return Err(errno_context(
+                        err,
+                        &format!("Failed to stat {}", path.join(&name).display()),
+                    ));
+                }
+            }
+        }
+        Ok(listed)
+    }
+
+    /// Returns what is at `path`, read without following it, or `None`
+    /// when nothing is, a missing directory level included.
+    ///
+    /// Rooted only: `statat(parent, leaf, AT_SYMLINK_NOFOLLOW)` through
+    /// the walked parent. It replaces an `exists()`, `is_dir()` or
+    /// `std::fs::metadata` probe in a rooted branch.
+    ///
+    /// # Errors
+    /// Returns an `Unsupported` error on a path-based handle, and an
+    /// error naming the path if a level above the leaf is a link or fails
+    /// the root-by-policy check, or the leaf cannot be stat'd.
+    pub fn entry_kind(&self, path: &Path) -> std::io::Result<Option<EntryKind>> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = match self.parent_of(anchor_fd, path, &names) {
+            Ok(found) => found,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        match rustix::fs::statat(&dir, leaf, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(entry_kind_of(&stat))),
+            Err(Errno::NOENT) => Ok(None),
+            Err(err) => Err(errno_context(
+                err,
+                &format!("Failed to stat {}", path.display()),
+            )),
+        }
+    }
+
+    /// Creates `path` as a directory, every missing level on the way
+    /// included, each created level at `0700` and owned by `owner`.
+    ///
+    /// Rooted only. Each level is opened from its parent's descriptor
+    /// with `O_NOFOLLOW`, created with `mkdirat` when missing, and given
+    /// its mode and owner through its own descriptor. A level that
+    /// already existed keeps its owner, and keeps its mode unless it is
+    /// `path` itself, which ends `0700` — as [`SecretsTree::ensure_dir`]
+    /// leaves the last level.
+    ///
+    /// # Errors
+    /// Returns an `Unsupported` error on a path-based handle, and an
+    /// error naming the path if `path` is not below the anchor, a level
+    /// is a link or fails the root-by-policy check, or a level cannot be
+    /// created or given its mode or owner.
+    pub fn ensure_dir_fixed(&self, path: &Path, owner: FixedOwner) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        if names.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} names the secrets directory itself, which keeps its own owner",
+                    path.display()
+                ),
+            ));
+        }
+        let mut current = self.walk_io(anchor_fd, &[])?;
+        let mut level = self.anchor.clone();
+        let last = names.len() - 1;
+        for (depth, name) in names.iter().enumerate() {
+            level.push(name);
+            let (dir, created) = match open_dir_nofollow(&current, name) {
+                Ok(dir) => (dir, false),
+                Err(Errno::NOENT) => {
+                    let created = match rustix::fs::mkdirat(&current, *name, Mode::RWXU) {
+                        Ok(()) => true,
+                        Err(Errno::EXIST) => false,
+                        Err(err) => {
+                            return Err(errno_context(
+                                err,
+                                &format!("Failed to create secrets dir {}", level.display()),
+                            ));
+                        }
+                    };
+                    let dir = open_dir_nofollow(&current, name)
+                        .map_err(|err| refused_level_io(err, &level))?;
+                    (dir, created)
+                }
+                Err(err) => return Err(refused_level_io(err, &level)),
+            };
+            self.check_root_by_policy(depth, name, &dir, &level)?;
+            if created || depth == last {
+                dir.set_permissions(std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
+                    .map_err(|err| {
+                        io_context(
+                            &err,
+                            &format!(
+                                "Failed to set mode {SECRETS_DIR_MODE:o} on {}",
+                                level.display()
+                            ),
+                        )
+                    })?;
+            }
+            if created {
+                let current_owner = dir
+                    .metadata()
+                    .map(|meta| (meta.uid(), meta.gid()))
+                    .map_err(|err| {
+                        io_context(&err, &format!("Failed to stat {}", level.display()))
+                    })?;
+                if current_owner != (owner.uid, owner.gid) {
+                    std::os::unix::fs::fchown(&dir, Some(owner.uid), Some(owner.gid))
+                        .map_err(|err| io_context(&err, &chown_fixed_context(owner, &level)))?;
+                }
+            }
+            current = dir;
+        }
+        Ok(())
+    }
+
+    /// Gives the existing directory at `path` the anchor's owner.
+    ///
+    /// Rooted only: the directory is opened with
+    /// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` from its walked parent and
+    /// `fchown`ed to the anchor's `fstat` uid and gid when they differ.
+    /// Its mode and its contents are left alone.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the directory or a level above it is
+    /// missing; an `Unsupported` error on a path-based handle; and an
+    /// error naming the path if a level is a link or fails the
+    /// root-by-policy check, or the directory cannot be stat'd or
+    /// chowned.
+    pub fn adopt_dir(&self, path: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let anchor_owner = rustix::fs::fstat(anchor_fd)
+            .map(|stat| (stat.st_uid, stat.st_gid))
+            .map_err(|err| {
+                errno_context(err, &format!("Failed to stat {}", self.anchor.display()))
+            })?;
+        let dir = self.walk_io(anchor_fd, &names)?;
+        let current = dir
+            .metadata()
+            .map(|meta| (meta.uid(), meta.gid()))
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
+        if current == anchor_owner {
+            return Ok(());
+        }
+        std::os::unix::fs::fchown(&dir, Some(anchor_owner.0), Some(anchor_owner.1))
+            .map_err(|err| io_context(&err, &created_level_owner_context(path, anchor_owner)))
     }
 
     /// Runs `op` against this handle on a blocking thread.
@@ -381,6 +813,7 @@ impl SecretsTree {
                 }
                 Err(err) => return Err(refused_level(err, &level)),
             };
+            self.check_root_by_policy(index, name, &dir, &level)?;
             if created {
                 set_mode(&dir, SECRETS_DIR_MODE, &level)?;
                 let staged = owner_of(&dir, &level)?;
@@ -583,7 +1016,7 @@ impl SecretsTree {
             return normalize_modes_by_path(&self.anchor);
         };
         let anchor = dup_dir(anchor_fd, &self.anchor)?;
-        normalize_modes_rooted(&anchor, &self.anchor)
+        normalize_modes_rooted(&anchor, &self.anchor, Some(self))
     }
 
     /// The path of the directory `names` reaches below the anchor.
@@ -597,14 +1030,7 @@ impl SecretsTree {
     /// a link at any of them, and returns the last; the anchor itself
     /// when `names` is empty. Creates nothing.
     fn walk(&self, anchor_fd: &OwnedFd, names: &[&OsStr]) -> Result<File> {
-        let mut current = dup_dir(anchor_fd, &self.anchor)?;
-        let mut level = self.anchor.clone();
-        for name in names {
-            level.push(name);
-            current =
-                open_dir_nofollow(&current, name).map_err(|err| refused_level(err, &level))?;
-        }
-        Ok(current)
+        Ok(self.walk_io(anchor_fd, names)?)
     }
 }
 
@@ -685,6 +1111,13 @@ fn chown_staged(
             Leaf::Regular { uid, gid, .. } => Some((uid, gid)),
             Leaf::Absent | Leaf::Symlink | Leaf::Other => None,
         },
+        RootedOwner::Fixed(fixed) => {
+            // Unconditional, as the path-based `Fixed` arm: the call is
+            // the authority check, and a process that cannot establish
+            // this owner publishes nothing.
+            return std::os::unix::fs::fchown(staged, Some(fixed.uid), Some(fixed.gid))
+                .with_context(|| chown_fixed_context(fixed, path));
+        }
     };
     let Some((uid, gid)) = wanted else {
         return Ok(());
@@ -698,12 +1131,19 @@ fn chown_staged(
     }
     std::os::unix::fs::fchown(staged, Some(uid), Some(gid)).with_context(|| match owner {
         RootedOwner::ContainingDir => chown_containing_dir_context(uid, gid, dir_path, path),
-        RootedOwner::Destination => chown_preserve_context(uid, gid, path),
+        RootedOwner::Destination | RootedOwner::Fixed(_) => chown_preserve_context(uid, gid, path),
     })
 }
 
 /// Lists and fixes one directory of a rooted [`SecretsTree::normalize_modes`].
-fn normalize_modes_rooted(dir: &File, dir_path: &Path) -> Result<()> {
+///
+/// `anchor_of` is the handle when `dir` is the anchor itself, so the
+/// root-by-policy check runs on the levels directly below it.
+fn normalize_modes_rooted(
+    dir: &File,
+    dir_path: &Path,
+    anchor_of: Option<&SecretsTree>,
+) -> Result<()> {
     let entries = rustix::fs::Dir::read_from(dir)
         .with_context(|| format!("Failed to read secrets dir {}", dir_path.display()))?;
     for entry in entries {
@@ -729,8 +1169,11 @@ fn normalize_modes_rooted(dir: &File, dir_path: &Path) -> Result<()> {
                     Err(Errno::NOENT) => continue,
                     Err(err) => return Err(refused_level(err, &path)),
                 };
+                if let Some(tree) = anchor_of {
+                    tree.check_root_by_policy(0, name, &child, &path)?;
+                }
                 set_mode(&child, SECRETS_DIR_MODE, &path)?;
-                normalize_modes_rooted(&child, &path)?;
+                normalize_modes_rooted(&child, &path, None)?;
             }
             FileType::RegularFile => {
                 let file = match open_file_nofollow(dir, name) {
@@ -915,6 +1358,122 @@ fn refused_file(err: Errno, path: &Path) -> anyhow::Error {
         "Failed to open {} as a regular file without following a symbolic link",
         path.display()
     ))
+}
+
+/// Removes every entry of the open directory `dir`, descending into each
+/// subdirectory through its own descriptor and unlinking everything
+/// else, links included, without following any of them.
+fn clear_dir_rooted(dir: &File, dir_path: &Path) -> std::io::Result<()> {
+    for name in list_dir(dir, dir_path)? {
+        let path = dir_path.join(&name);
+        let stat = match rustix::fs::statat(dir, name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => continue,
+            Err(err) => {
+                return Err(errno_context(
+                    err,
+                    &format!("Failed to stat {}", path.display()),
+                ));
+            }
+        };
+        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+            match open_dir_nofollow(dir, name.as_os_str()) {
+                Ok(child) => {
+                    clear_dir_rooted(&child, &path)?;
+                    drop(child);
+                    match rustix::fs::unlinkat(dir, name.as_os_str(), AtFlags::REMOVEDIR) {
+                        Ok(()) | Err(Errno::NOENT) => {}
+                        Err(err) => {
+                            return Err(errno_context(
+                                err,
+                                &format!("Failed to remove {}", path.display()),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                Err(Errno::NOENT) => continue,
+                // Swapped for something that is not a directory since
+                // the `statat`: unlinked below like any other entry.
+                Err(_) => {}
+            }
+        }
+        match rustix::fs::unlinkat(dir, name.as_os_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(err) => {
+                return Err(errno_context(
+                    err,
+                    &format!("Failed to remove {}", path.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The names in the open directory `dir`, `.` and `..` left out.
+fn list_dir(dir: &File, dir_path: &Path) -> std::io::Result<Vec<OsString>> {
+    let entries = rustix::fs::Dir::read_from(dir).map_err(|err| {
+        errno_context(
+            err,
+            &format!("Failed to read secrets dir {}", dir_path.display()),
+        )
+    })?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            errno_context(
+                err,
+                &format!("Failed to read secrets dir {}", dir_path.display()),
+            )
+        })?;
+        let raw = entry.file_name().to_bytes();
+        if raw == b"." || raw == b".." {
+            continue;
+        }
+        names.push(OsStr::from_bytes(raw).to_os_string());
+    }
+    Ok(names)
+}
+
+fn entry_kind_of(stat: &Stat) -> EntryKind {
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Directory => EntryKind::Dir,
+        FileType::RegularFile => EntryKind::File,
+        FileType::Symlink => EntryKind::Symlink,
+        _ => EntryKind::Other,
+    }
+}
+
+/// `err` with `context` prepended to its message, keeping its kind so a
+/// caller can still match `NotFound`.
+fn io_context(err: &std::io::Error, context: &str) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{context}: {err}"))
+}
+
+fn errno_context(err: Errno, context: &str) -> std::io::Error {
+    io_context(&std::io::Error::from(err), context)
+}
+
+/// [`refused_level`] as an I/O error that keeps the errno's kind.
+fn refused_level_io(err: Errno, path: &Path) -> std::io::Error {
+    errno_context(
+        err,
+        &format!(
+            "Failed to open secrets dir {} as a directory without following a symbolic link",
+            path.display()
+        ),
+    )
+}
+
+fn refused_file_io(err: Errno, path: &Path) -> std::io::Error {
+    errno_context(
+        err,
+        &format!(
+            "Failed to open {} as a regular file without following a symbolic link",
+            path.display()
+        ),
+    )
 }
 
 fn created_level_owner_context(path: &Path, owner: (u32, u32)) -> String {

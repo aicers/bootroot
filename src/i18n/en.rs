@@ -621,6 +621,8 @@ pub(super) static STRINGS: Strings = Strings {
     info_http01_admin_tls_provisioned: "HTTP-01 admin API TLS server certificate issued: {path}",
     error_http01_admin_tls_provision_failed: "Failed to issue HTTP-01 admin API TLS server certificate",
     error_http01_admin_tls_output_dir_symlink: "Refusing to use a symlink as the HTTP-01 admin API TLS output directory: {path}",
+    error_step_scratch_dir_failed: "Failed to create a private working directory for the step helper's output in {path}",
+    error_step_output_invalid: "Refusing the step helper's output {path}: it is not a regular file the helper wrote, so nothing was published",
     error_registrar_internal_provision_failed: "Failed to sign the bootroot-internal registrar certificate",
     error_registrar_internal_staging_symlink: "Refusing to use a symlink as the bootroot-internal registrar staging directory: {path}",
     warning_registrar_internal_acme_file_replaced: "Warning: the ACME account key at {path} is not one bootroot can read back; replacing it with a new one",

@@ -7,9 +7,13 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::cert_group::CertGroupPolicy;
-use crate::fs_util::{self, Destination, FixedOwner, KEY_FILE_MODE, StagedMode};
+use crate::cert_group::{CA_BUNDLE_FILE_MODE, CertGroupPolicy};
+use crate::fs_util::{
+    self, Destination, EntryKind, FixedOwner, KEY_FILE_MODE, RootedOwner, SecretsTree,
+    StagedDurability, StagedMode,
+};
 use crate::registrar::internal::{
     ACME_ACCOUNT_FILE, AGENT_CONFIG_FILE, CA_BUNDLE_FILE, CHAIN_FILE, InternalCredentialError,
     InternalPaths, KEY_FILE, ROOT_FINGERPRINT_FILE,
@@ -333,14 +337,47 @@ pub fn leaf_not_after(
 /// certificate data and take the same publish for atomicity rather than
 /// for secrecy.
 ///
+/// `paths` lies below `tree`'s anchor. A rooted handle creates the
+/// directory with [`SecretsTree::ensure_dir_fixed`] and publishes each
+/// file through its descriptors, under the same owner, mode and
+/// durability as the path-based writers; a path-based handle runs those
+/// writers.
+///
 /// # Errors
 ///
 /// Returns [`InternalCredentialError::Io`] when the directory cannot be
 /// created or a file cannot be published.
 pub async fn publish_material(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     material: &InternalMaterial,
 ) -> Result<(), InternalCredentialError> {
+    if tree.is_rooted() {
+        let tree = Arc::clone(tree);
+        let paths = paths.clone();
+        let material = material.clone();
+        return run_blocking(move || {
+            tree.ensure_dir_fixed(paths.dir(), protected_owner())
+                .map_err(|source| InternalCredentialError::Io {
+                    operation: "creating",
+                    path: paths.dir().into(),
+                    source,
+                })?;
+            write_atomic_root_in(&tree, &paths.key(), material.key.expose().as_bytes())?;
+            write_atomic_root_in(&tree, &paths.chain(), material.chain.as_bytes())?;
+            write_atomic_root_in(
+                &tree,
+                &paths.acme_account(),
+                material.acme_account.expose().as_bytes(),
+            )?;
+            write_atomic_root_in(
+                &tree,
+                &paths.root_fingerprint(),
+                format!("{}\n", material.root_fingerprint).as_bytes(),
+            )
+        })
+        .await;
+    }
     fs_util::ensure_secrets_dir(paths.dir())
         .await
         .map_err(|err| InternalCredentialError::Io {
@@ -405,6 +442,7 @@ enum PriorMember {
 /// not is removed again. Only a publication that completed discards the
 /// snapshot.
 pub struct SetSnapshot {
+    tree: Arc<SecretsTree>,
     paths: InternalPaths,
     prior: PathBuf,
     members: Vec<(&'static str, PriorMember)>,
@@ -423,8 +461,11 @@ pub struct SetSnapshot {
 /// be cleared, when a member cannot be inspected or read, or when the
 /// snapshot cannot be written. A publication that cannot be undone does
 /// not start.
-pub async fn capture_set(paths: &InternalPaths) -> Result<SetSnapshot, InternalCredentialError> {
-    capture_members(paths, &SET_FILES).await
+pub async fn capture_set(
+    tree: &Arc<SecretsTree>,
+    paths: &InternalPaths,
+) -> Result<SetSnapshot, InternalCredentialError> {
+    capture_members(tree, paths, &SET_FILES).await
 }
 
 /// Captures the prior state of `names`, a subset of the set.
@@ -434,15 +475,36 @@ pub async fn capture_set(paths: &InternalPaths) -> Result<SetSnapshot, InternalC
 /// private bundle and the config's pins, and copying the private key
 /// beside them would put a second copy of it on disk for no reason.
 ///
+/// `paths` lies below `tree`'s anchor, and the snapshot keeps the
+/// handle for its restore and its discard. A rooted handle inspects,
+/// reads, copies and removes every member through its descriptors.
+///
 /// # Errors
 ///
 /// Returns [`InternalCredentialError::Io`] under the same conditions as
 /// [`capture_set`].
 pub async fn capture_members(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     names: &[&'static str],
 ) -> Result<SetSnapshot, InternalCredentialError> {
     let prior = paths.dir().join(PRIOR_DIR);
+    if tree.is_rooted() {
+        let blocking_tree = Arc::clone(tree);
+        let blocking_paths = paths.clone();
+        let blocking_prior = prior.clone();
+        let names = names.to_vec();
+        let members = run_blocking(move || {
+            capture_members_rooted(&blocking_tree, &blocking_paths, &names, &blocking_prior)
+        })
+        .await?;
+        return Ok(SetSnapshot {
+            tree: Arc::clone(tree),
+            paths: paths.clone(),
+            prior,
+            members,
+        });
+    }
     if prior.exists() {
         // A snapshot that survived is one an earlier run could not
         // clear; the set beside it is the state to preserve now.
@@ -469,10 +531,87 @@ pub async fn capture_members(
     };
 
     Ok(SetSnapshot {
+        tree: Arc::clone(tree),
         paths: paths.clone(),
         prior,
         members,
     })
+}
+
+/// [`capture_members`] through a rooted handle: the stale snapshot is
+/// cleared, and each member's kind read and its bytes copied, without
+/// following a name below the anchor. Blocking.
+fn capture_members_rooted(
+    tree: &SecretsTree,
+    paths: &InternalPaths,
+    names: &[&'static str],
+    prior: &Path,
+) -> Result<Vec<(&'static str, PriorMember)>, InternalCredentialError> {
+    let removing = |source| InternalCredentialError::Io {
+        operation: "removing",
+        path: prior.to_path_buf(),
+        source,
+    };
+    if tree.entry_kind(prior).map_err(removing)?.is_some() {
+        tree.remove_dir_all(prior).map_err(removing)?;
+    }
+    match capture_into_rooted(tree, paths, names, prior) {
+        Ok(members) => Ok(members),
+        Err(err) => {
+            // Best effort, as the path-based capture: the capture failure
+            // is the error worth reporting.
+            let _ = tree.remove_dir_all(prior);
+            Err(err)
+        }
+    }
+}
+
+/// [`capture_into`] through a rooted handle. A member that is anything
+/// but a regular file — a symbolic link included — is left as found.
+fn capture_into_rooted(
+    tree: &SecretsTree,
+    paths: &InternalPaths,
+    names: &[&'static str],
+    prior: &Path,
+) -> Result<Vec<(&'static str, PriorMember)>, InternalCredentialError> {
+    let mut members = Vec::with_capacity(names.len());
+    let mut prior_dir_ready = false;
+    for name in names.iter().copied() {
+        let path = paths.dir().join(name);
+        let kind = tree
+            .entry_kind(&path)
+            .map_err(|source| InternalCredentialError::Io {
+                operation: "inspecting",
+                path: path.clone(),
+                source,
+            })?;
+        let state = match kind {
+            Some(EntryKind::File) => {
+                if !prior_dir_ready {
+                    tree.ensure_dir_fixed(prior, protected_owner())
+                        .map_err(|source| InternalCredentialError::Io {
+                            operation: "creating",
+                            path: prior.to_path_buf(),
+                            source,
+                        })?;
+                    prior_dir_ready = true;
+                }
+                let contents = tree
+                    .read(&path)
+                    .map_err(|source| InternalCredentialError::Io {
+                        operation: "reading",
+                        path: path.clone(),
+                        source,
+                    })?;
+                write_member_in(tree, name, &prior.join(name), &contents)?;
+                PriorMember::Snapshotted
+            }
+            Some(_) => PriorMember::Irregular,
+            None => PriorMember::Missing,
+        };
+        members.push((name, state));
+    }
+    Ok(members)
 }
 
 /// Copies each of `names` into `prior`, reporting what was found at
@@ -551,6 +690,13 @@ impl SetSnapshot {
     /// Returns the first [`InternalCredentialError::Io`] a member's
     /// restore produced.
     pub async fn restore(&self) -> Result<(), InternalCredentialError> {
+        if self.tree.is_rooted() {
+            let tree = Arc::clone(&self.tree);
+            let paths = self.paths.clone();
+            let prior = self.prior.clone();
+            let members = self.members.clone();
+            return run_blocking(move || restore_rooted(&tree, &paths, &prior, &members)).await;
+        }
         let mut first_error = None;
         for (name, state) in &self.members {
             let path = self.paths.dir().join(name);
@@ -579,6 +725,20 @@ impl SetSnapshot {
     /// Returns [`InternalCredentialError::Io`] when the snapshot
     /// directory cannot be removed.
     pub async fn discard(self) -> Result<(), InternalCredentialError> {
+        if self.tree.is_rooted() {
+            let tree = Arc::clone(&self.tree);
+            let prior = self.prior.clone();
+            return run_blocking(move || match tree.remove_dir_all(&prior) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(InternalCredentialError::Io {
+                    operation: "removing",
+                    path: prior.clone(),
+                    source,
+                }),
+            })
+            .await;
+        }
         if !self.prior.exists() {
             return Ok(());
         }
@@ -622,6 +782,148 @@ impl SetSnapshot {
                 })?;
         write_member(name, path, &contents).await
     }
+}
+
+/// [`SetSnapshot::restore`] through a rooted handle: each captured member
+/// is read back and republished, and each member that was missing is
+/// removed, without following a name below the anchor. Every member is
+/// attempted, and the first failure is reported. Blocking.
+fn restore_rooted(
+    tree: &SecretsTree,
+    paths: &InternalPaths,
+    prior: &Path,
+    members: &[(&'static str, PriorMember)],
+) -> Result<(), InternalCredentialError> {
+    let mut first_error = None;
+    for (name, state) in members {
+        let path = paths.dir().join(name);
+        let outcome = match state {
+            PriorMember::Snapshotted => restore_member_rooted(tree, prior, name, &path),
+            PriorMember::Missing => match tree.remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(source) => Err(InternalCredentialError::Io {
+                    operation: "removing",
+                    path: path.clone(),
+                    source,
+                }),
+            },
+            PriorMember::Irregular => Ok(()),
+        };
+        if let Err(err) = outcome
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// [`SetSnapshot::restore_member`] through a rooted handle: the backup is
+/// read and the member republished by the writer its name takes.
+fn restore_member_rooted(
+    tree: &SecretsTree,
+    prior: &Path,
+    name: &str,
+    path: &Path,
+) -> Result<(), InternalCredentialError> {
+    let backup = prior.join(name);
+    let contents = tree
+        .read(&backup)
+        .map_err(|source| InternalCredentialError::Io {
+            operation: "reading",
+            path: backup.clone(),
+            source,
+        })?;
+    if name == CA_BUNDLE_FILE {
+        // `write_ca_bundle` under no group policy: `0644`, the writing
+        // process's owner, which in rooted mode is the protected owner.
+        return publish_in(
+            tree,
+            path,
+            &contents,
+            StagedMode::Policy(CA_BUNDLE_FILE_MODE),
+            RootedOwner::Fixed(protected_owner()),
+            StagedDurability::RenameOnly,
+        );
+    }
+    write_member_in(tree, name, path, &contents)
+}
+
+/// [`write_member`] through a rooted handle. Blocking.
+fn write_member_in(
+    tree: &SecretsTree,
+    name: &str,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), InternalCredentialError> {
+    if is_protected(name) {
+        write_atomic_root_in(tree, path, contents)
+    } else {
+        // [`write_atomic`]: `0600`, the destination's owner, flushed.
+        publish_in(
+            tree,
+            path,
+            contents,
+            StagedMode::Policy(KEY_FILE_MODE),
+            RootedOwner::Destination,
+            StagedDurability::FlushDirectory,
+        )
+    }
+}
+
+/// [`write_atomic_root`] through a rooted handle. Blocking.
+fn write_atomic_root_in(
+    tree: &SecretsTree,
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), InternalCredentialError> {
+    publish_in(
+        tree,
+        path,
+        contents,
+        StagedMode::Policy(KEY_FILE_MODE),
+        RootedOwner::Fixed(protected_owner()),
+        StagedDurability::FlushDirectory,
+    )
+}
+
+/// Publishes `contents` at the bootroot-owned `path` through `tree`.
+fn publish_in(
+    tree: &SecretsTree,
+    path: &Path,
+    contents: &[u8],
+    mode: StagedMode,
+    owner: RootedOwner,
+    durability: StagedDurability,
+) -> Result<(), InternalCredentialError> {
+    tree.publish(
+        Destination::bootroot_owned(path),
+        contents,
+        mode,
+        owner,
+        durability,
+    )
+    .map_err(|err| InternalCredentialError::Io {
+        operation: "writing",
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!("{err:#}")),
+    })
+}
+
+/// Runs `op` on a blocking thread, as a rooted handle's methods require.
+async fn run_blocking<T, F>(op: F) -> Result<T, InternalCredentialError>
+where
+    F: FnOnce() -> Result<T, InternalCredentialError> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|err| InternalCredentialError::Io {
+            operation: "running",
+            path: PathBuf::new(),
+            source: std::io::Error::other(format!("secrets tree task panicked: {err}")),
+        })?
 }
 
 /// Removes a member a failed publication created where nothing was.

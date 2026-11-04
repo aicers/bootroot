@@ -242,13 +242,20 @@ rather than following a link at it:
   target host is in this group: that command is what creates the file there, so
   a link you put at its `--agent-config-path` is one you arranged yourself. Its
   adjacent `--eab-file-path` remains a credential path, so a link there is
-  replaced instead. A root-run `infra install`, `init`, `infra up` (for the
-  OpenBao audit override), `openbao save-unseal-keys` or `rotate infra-cert`
-  (for the HTTP-01 admin certificate) over a `secrets/` owned by another account
-  is the exception: it refuses a symbolic link at any directory it walks there
-  and at a generated file it would publish there, and stops with an error naming
-  the path instead of following it, so relocating a generated file by symlink
-  does not apply in that case.
+  replaced instead. A root-run `infra install`, `init`, `reinit`, `infra up`
+  (for the OpenBao audit override and the saved unseal keys),
+  `openbao save-unseal-keys` or `rotate infra-cert` (for the HTTP-01 admin
+  certificate) over a `secrets/` owned by another account is the exception: it
+  refuses a symbolic link at any directory it walks there and at a generated
+  file it would publish there, and stops with an error naming the path instead
+  of following it. Its removals of generated files, its restores after a failed
+  `init`, and its reads of the files whose contents it passes on (the CA
+  certificates, `ca.json`, the step-ca password and the saved unseal keys) there
+  refuse a symbolic link the same way, so relocating a generated file by symlink
+  does not apply in that case. The same applies to the steps
+  `rotate infra-cert`, `rotate ca-key`, `rotate trust-sync`,
+  `rotate registrar-internal-credential` and `registrar issue` share with
+  `init`.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
   link found there with a regular file. The OpenBao unseal-keys and secrets-tree

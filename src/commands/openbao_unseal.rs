@@ -138,6 +138,46 @@ pub(crate) fn run_save_unseal_keys(
 pub(crate) fn read_unseal_keys_from_file(path: &Path, messages: &Messages) -> Result<Vec<String>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    parse_unseal_keys(&contents, path, messages)
+}
+
+/// Reads the unseal keys bootroot saved at `path`, below `tree`'s
+/// anchor, through the handle's descriptors, parsing them as
+/// [`read_unseal_keys_from_file`] does.
+///
+/// For the auto-detected `openbao/unseal-keys.txt` a root process reads
+/// under a `secrets/` another account owns: a link there is refused
+/// rather than followed, so no file it points at is sent to the unseal
+/// endpoint. A key file the operator names stays path-based.
+///
+/// Returns `None` when the file, or a directory above it, is absent, so
+/// a caller falls through to whatever it does without saved keys.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read for any other reason —
+/// a link at any level, a FIFO, a directory — or holds no key.
+pub(crate) fn read_unseal_keys_in(
+    tree: &fs_util::SecretsTree,
+    path: &Path,
+    messages: &Messages,
+) -> Result<Option<Vec<String>>> {
+    let bytes = match tree.read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(messages.error_read_file_failed(&path.display().to_string())));
+        }
+    };
+    let contents = String::from_utf8(bytes)
+        .map_err(|err| anyhow::anyhow!(err))
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    parse_unseal_keys(&contents, path, messages).map(Some)
+}
+
+/// The non-empty, trimmed lines of a saved unseal-key file at `path`.
+fn parse_unseal_keys(contents: &str, path: &Path, messages: &Messages) -> Result<Vec<String>> {
     let keys: Vec<String> = contents
         .lines()
         .map(str::trim)
@@ -169,6 +209,34 @@ mod tests {
 
         let keys = read_unseal_keys_from_file(&file_path, &test_messages()).expect("keys");
         assert_eq!(keys, vec!["key-1".to_string(), "key-2".to_string()]);
+    }
+
+    #[test]
+    fn rooted_read_unseal_keys_in_reads_absent_and_refuses_a_link() {
+        let root = crate::test_support::SwapRoot::new();
+        let path = unseal_keys_path(&root.secrets);
+        let tree = root.rooted();
+        assert!(
+            read_unseal_keys_in(&tree, &path, &test_messages())
+                .expect("absent")
+                .is_none(),
+            "a missing openbao/ is no saved keys"
+        );
+        root.write("openbao/unseal-keys.txt", " key-1 \n\nkey-2\n");
+        assert_eq!(
+            read_unseal_keys_in(&tree, &path, &test_messages()).expect("keys"),
+            Some(vec!["key-1".to_string(), "key-2".to_string()])
+        );
+
+        root.swap("openbao/unseal-keys.txt", &root.outside.join("secret"));
+        let err = read_unseal_keys_in(&tree, &path, &test_messages()).expect_err("leaf link");
+        crate::test_support::assert_error_names(&err, &path);
+        assert!(!format!("{err:#}").contains("OUTSIDE-SECRET"));
+
+        let link = root.swap("openbao", &root.outside);
+        let err =
+            read_unseal_keys_in(&tree, &path, &test_messages()).expect_err("intermediate link");
+        crate::test_support::assert_error_names(&err, &link);
     }
 
     #[test]

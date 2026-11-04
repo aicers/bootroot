@@ -1,10 +1,14 @@
 //! Helpers shared by the tests that write an executable and then run
-//! it, or hand it to production to run.
+//! it, or hand it to production to run, and by the swap tests that
+//! replace a level below `secrets/` with a symbolic link out of it.
 
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+use bootroot::fs_util::SecretsTree;
 
 /// Mode every fake is written with: executable by its writer and by
 /// production spawning it on that writer's behalf, and by nobody else.
@@ -74,6 +78,127 @@ pub(crate) fn write_executable(path: &Path, contents: &[u8]) {
     // window the write was handed off to close.
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(FAKE_MODE))
         .unwrap_or_else(|err| panic!("{} must be made executable: {err}", path.display()));
+}
+
+/// A `tempdir` holding `secrets/` and a sibling `outside/` whose
+/// recorded contents a swap test compares before and after the site it
+/// drives.
+pub(crate) struct SwapRoot {
+    dir: tempfile::TempDir,
+    /// The `secrets/` directory the site's handle is opened on.
+    pub(crate) secrets: PathBuf,
+    /// A directory outside `secrets/` a planted link points at.
+    pub(crate) outside: PathBuf,
+}
+
+impl SwapRoot {
+    /// Creates `secrets/` and `outside/`, the latter holding a file
+    /// `secret` and a directory `inner/` with a file of its own.
+    pub(crate) fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).expect("mkdir secrets");
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod secrets");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join("inner")).expect("mkdir outside");
+        std::fs::write(outside.join("secret"), "OUTSIDE-SECRET\n").expect("seed outside");
+        std::fs::write(outside.join("inner").join("file"), "OUTSIDE-INNER\n")
+            .expect("seed outside");
+        Self {
+            dir,
+            secrets,
+            outside,
+        }
+    }
+
+    /// The `tempdir` holding both.
+    pub(crate) fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// A rooted handle on `secrets/`, as a root run over a foreign-owned
+    /// tree would open it.
+    pub(crate) fn rooted(&self) -> SecretsTree {
+        SecretsTree::open_rooted_for_tests(&self.secrets).expect("open rooted handle")
+    }
+
+    /// Creates `rel` below `secrets/` as a file holding `contents`, its
+    /// directories included.
+    pub(crate) fn write(&self, rel: &str, contents: &str) -> PathBuf {
+        let path = self.secrets.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir parent");
+        }
+        std::fs::write(&path, contents).expect("write");
+        path
+    }
+
+    /// Moves the entry at `rel` below `secrets/` aside, out of the tree,
+    /// and plants a link to `target` at its name. Returns the link's
+    /// path.
+    pub(crate) fn swap(&self, rel: &str, target: &Path) -> PathBuf {
+        let path = self.secrets.join(rel);
+        if std::fs::symlink_metadata(&path).is_ok() {
+            let aside = self.root().join(format!("aside-{}", rel.replace('/', "-")));
+            std::fs::rename(&path, aside).expect("move aside");
+        }
+        symlink(target, &path).expect("plant link");
+        path
+    }
+
+    /// Every entry below `outside/`, by relative path, with its kind,
+    /// mode and contents.
+    pub(crate) fn outside_snapshot(&self) -> BTreeMap<PathBuf, (String, u32, Vec<u8>)> {
+        snapshot_tree(&self.outside)
+    }
+}
+
+/// Every entry below `root`, by relative path: its kind, mode, and the
+/// contents of a file or the target of a link.
+pub(crate) fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, (String, u32, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (String, u32, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            let meta = std::fs::symlink_metadata(&path).expect("stat");
+            let rel = path.strip_prefix(root).expect("below root").to_path_buf();
+            let mode = meta.permissions().mode() & 0o7777;
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).expect("readlink");
+                out.insert(
+                    rel,
+                    (
+                        "link".into(),
+                        0,
+                        target.as_os_str().as_encoded_bytes().to_vec(),
+                    ),
+                );
+            } else if meta.is_dir() {
+                out.insert(rel, ("dir".into(), mode, Vec::new()));
+                walk(root, &path, out);
+            } else {
+                let contents = std::fs::read(&path).expect("read");
+                out.insert(rel, ("file".into(), mode, contents));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// Asserts the rendered error chain of `err` names `path`.
+///
+/// The failure message carries neither the path nor the chain: both are
+/// built from a `secrets/` path, and a panic message is a log sink to a
+/// name-based scanner. A failing case is rerun with the site's error
+/// printed by hand.
+pub(crate) fn assert_error_names(err: &anyhow::Error, path: &Path) {
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains(&path.display().to_string()),
+        "the error chain must name the path below secrets/ the site was given"
+    );
 }
 
 #[cfg(test)]

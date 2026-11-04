@@ -6292,6 +6292,9 @@ mod internal_factory {
         let dir = TempDir::new().expect("tempdir");
         let paths = InternalPaths::new(dir.path());
         publish_material(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
             &paths,
             &InternalMaterial {
                 key: PrivateKeyPem::new(
@@ -6473,9 +6476,17 @@ mod internal_factory {
                 acme_account: AcmeAccountKey::new("{\"account_key_pkcs8\":\"QUJD\"}".to_string()),
                 root_fingerprint: root_fingerprint.clone(),
             };
-            crate::registrar::internal::publish_material(&paths, &material)
+            crate::registrar::internal::publish_material(
+                &crate::fs_util::SecretsTree::open_shared(
+                    paths.dir().parent().expect("secrets dir"),
+                )
                 .await
-                .expect("publish");
+                .expect("open"),
+                &paths,
+                &material,
+            )
+            .await
+            .expect("publish");
             std::fs::write(paths.ca_bundle(), &root_pem).expect("bundle");
             std::fs::write(
                 paths.agent_config(),
@@ -6574,6 +6585,9 @@ async fn the_factory_returns_repair_required_on_a_root_mismatch() {
     let dir = TempDir::new().expect("tempdir");
     let paths = InternalPaths::new(dir.path());
     publish_material(
+        &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+            .await
+            .expect("open"),
         &paths,
         &InternalMaterial {
             key: PrivateKeyPem::new(

@@ -536,7 +536,8 @@ pub(super) async fn write_internal_trust(
         .with_context(|| messages.error_read_file_failed(&config_path.display().to_string()))?;
     let next = upsert_internal_trust(&current, &paths, &trust.fingerprints)?;
 
-    let snapshot = capture_members(&paths, &[AGENT_CONFIG_FILE, CA_BUNDLE_FILE])
+    let secrets_tree = bootroot::fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    let snapshot = capture_members(&secrets_tree, &paths, &[AGENT_CONFIG_FILE, CA_BUNDLE_FILE])
         .await
         .context("capturing the bootroot-internal trust pair the rotation replaces")?;
     if let Err(err) = write_trust_pair(&paths, &trust.bundle_pem, &next, messages).await {
@@ -684,6 +685,7 @@ async fn replace_internal_credential(
     messages: &Messages,
 ) -> Result<()> {
     let inputs = context.inputs();
+    let secrets_tree = bootroot::fs_util::SecretsTree::open_shared(&context.secrets_dir).await?;
 
     // The replacement is staged **before** anything in `OpenBao`
     // changes. The convergence below pins the entry to the staged leaf,
@@ -702,7 +704,7 @@ async fn replace_internal_credential(
     // private key, so a failed repair sweeps it here rather than leaving
     // it beside the credential until the next successful run happens to
     // overwrite it.
-    let staged = match issue_internal_material(&inputs, messages).await {
+    let staged = match issue_internal_material(&secrets_tree, &inputs, messages).await {
         Ok(staged) => staged.with_trust(trust.fingerprints.clone(), trust.bundle_pem.clone()),
         Err(err) => {
             sweep_staging(&context.secrets_dir).await;
@@ -725,7 +727,16 @@ async fn replace_internal_credential(
         }
     };
 
-    if let Err(err) = converge_and_publish(client, &staged, &inputs, openbao_url, messages).await {
+    if let Err(err) = converge_and_publish(
+        client,
+        &secrets_tree,
+        &staged,
+        &inputs,
+        openbao_url,
+        messages,
+    )
+    .await
+    {
         prior.restore(client).await;
         sweep_staging(&context.secrets_dir).await;
         return Err(err);
@@ -749,6 +760,7 @@ async fn replace_internal_credential(
 /// fails.
 async fn converge_and_publish(
     client: &OpenBaoClient,
+    secrets_tree: &std::sync::Arc<bootroot::fs_util::SecretsTree>,
     staged: &StagedInternal,
     inputs: &RegistrarInternalInputs<'_>,
     openbao_url: &str,
@@ -761,7 +773,7 @@ async fn converge_and_publish(
     let mut mounted_now = false;
     converge_internal_auth(client, inputs, staged.leaf_pem()?, &mut mounted_now).await?;
     verify_internal_login(staged, openbao_url).await?;
-    publish_internal_set(staged, inputs, messages).await
+    publish_internal_set(secrets_tree, staged, inputs, messages).await
 }
 
 /// The `auth/cert` artifacts a repair is about to rewrite, exactly as
@@ -960,10 +972,12 @@ async fn repair_context(
     };
     let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     let paths = InternalPaths::new(&secrets_dir);
-    let (existing, endpoint_tables) = match current_internal_config(&paths, messages).await? {
-        Some(current) => (Some(current.settings), current.endpoint_tables),
-        None => (None, None),
-    };
+    let secrets_tree = bootroot::fs_util::SecretsTree::open_shared(&secrets_dir).await?;
+    let (existing, endpoint_tables) =
+        match current_internal_config(&secrets_tree, &paths, messages).await? {
+            Some(current) => (Some(current.settings), current.endpoint_tables),
+            None => (None, None),
+        };
     // Only reached when the generated config is gone: the config is the
     // record of what `init` chose, and a repair keeps it. The fallbacks
     // below rebuild those endpoints through the same derivation `init`
@@ -1079,7 +1093,11 @@ pub(super) async fn finalized_trust(
 ) -> Result<InternalTrustState> {
     Ok(InternalTrustState {
         fingerprints: vec![root_fp.to_string(), intermediate_fp.to_string()],
-        bundle_pem: compute_ca_bundle_pem(secrets_dir, messages).await?,
+        bundle_pem: compute_ca_bundle_pem(
+            &bootroot::fs_util::SecretsTree::open_shared(secrets_dir).await?,
+            messages,
+        )
+        .await?,
     })
 }
 

@@ -1,5 +1,6 @@
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::io::Read as _;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -31,6 +32,123 @@ const OPENBAO_TLS_CERT_MODE: u32 = 0o644;
 /// Mode of the key once it is handed to `BOOTROOT_OPENBAO_USER`: only its
 /// owner, the server's uid, reads it.
 const OPENBAO_TLS_KEY_MODE: u32 = 0o600;
+
+/// The name prefix of the scratch directory a rooted issuance gives the
+/// `step` helper for its output, beside `secrets/`.
+pub(super) const STEP_SCRATCH_PREFIX: &str = ".bootroot-step-";
+
+/// The subdirectory of a [`StepScratch`] mounted at [`TLS_OUTPUT_MOUNT`].
+const STEP_SCRATCH_OUT: &str = "out";
+
+/// Returns the directory a rooted issuance creates its scratch directory
+/// in: the canonical form of the directory containing `anchor`.
+///
+/// The anchor may be relative (`secrets` by default), whose
+/// `Path::parent` is empty, so it is made absolute first. That directory
+/// and every level above it are outside what the owner of `secrets/` can
+/// rename, so resolving it by name is resolving a path root trusts, and
+/// the result is absolute, as a `docker run -v` source must be.
+///
+/// # Errors
+/// Returns an error if the current directory cannot be read or the
+/// containing directory cannot be resolved.
+pub(super) fn step_scratch_parent(anchor: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(anchor)?;
+    let parent = absolute.parent().unwrap_or(Path::new("/"));
+    std::fs::canonicalize(parent)
+}
+
+/// A private scratch directory outside `secrets/` that a `step` helper
+/// running as the owner of `secrets/` writes its output into, in place
+/// of a directory under `secrets/` a root container would have to
+/// re-own.
+///
+/// Docker takes a mount source as a path and its daemon resolves it as
+/// root, so a source below `secrets/` is one the owner of `secrets/` can
+/// swap at any level between the resolution and the mount. The scratch
+/// directory is root-owned `0700` in the directory containing the
+/// anchor, which that owner cannot rename anything in; only its `out/`
+/// subdirectory is handed to that owner, and only the helper container
+/// reaches it. Dropping the handle removes the whole directory, on
+/// success and on every error path alike.
+pub(super) struct StepScratch {
+    dir: tempfile::TempDir,
+    out: PathBuf,
+}
+
+impl StepScratch {
+    /// Creates the scratch directory beside `anchor`, with `out/` inside
+    /// it owned by `owner` (the uid and gid of `secrets/`).
+    ///
+    /// # Errors
+    /// Returns an error naming the containing directory if the scratch
+    /// directory or `out/` cannot be created or re-owned.
+    pub(super) fn create(anchor: &Path, owner: (u32, u32), messages: &Messages) -> Result<Self> {
+        let parent = step_scratch_parent(anchor)
+            .with_context(|| messages.error_resolve_path_failed(&anchor.display().to_string()))?;
+        let failed = || messages.error_step_scratch_dir_failed(&parent.display().to_string());
+        let dir = tempfile::Builder::new()
+            .prefix(STEP_SCRATCH_PREFIX)
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(&parent)
+            .with_context(failed)?;
+        let out = dir.path().join(STEP_SCRATCH_OUT);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&out)
+            .with_context(failed)?;
+        let opened = std::fs::File::open(&out).with_context(failed)?;
+        let current = opened.metadata().with_context(failed)?;
+        if (current.uid(), current.gid()) != owner {
+            std::os::unix::fs::fchown(&opened, Some(owner.0), Some(owner.1))
+                .with_context(failed)?;
+        }
+        Ok(Self { dir, out })
+    }
+
+    /// Returns the `-v` argument that mounts `out/` at
+    /// [`TLS_OUTPUT_MOUNT`]; its source is absolute.
+    pub(super) fn output_mount(&self) -> String {
+        format!("{}:{TLS_OUTPUT_MOUNT}", self.out.display())
+    }
+
+    /// Reads the helper's output `name` back from `out/`.
+    ///
+    /// The path down to `out/` is root's and trusted; the leaf is opened
+    /// with `O_NOFOLLOW | O_NONBLOCK` and must be a regular file, so a
+    /// link, a FIFO or anything else the container left there is refused.
+    ///
+    /// # Errors
+    /// Returns an error naming the expected output if it is missing, is
+    /// not a regular file, or cannot be read.
+    pub(super) fn read_output(&self, name: &str, messages: &Messages) -> Result<Vec<u8>> {
+        let path = self.out.join(name);
+        let refused = || messages.error_step_output_invalid(&path.display().to_string());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .with_context(refused)?;
+        if !file.metadata().with_context(refused)?.is_file() {
+            anyhow::bail!(refused());
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).with_context(refused)?;
+        Ok(contents)
+    }
+
+    /// Removes the scratch directory, reporting a failure at `warn`
+    /// rather than failing an issuance whose result is already published.
+    pub(super) fn finish(self) {
+        let path = self.dir.path().to_path_buf();
+        if let Err(err) = self.dir.close() {
+            tracing::warn!(
+                "Failed to remove the step helper's scratch directory {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
 
 /// The address `OpenBao`'s metrics listener takes by default, which is
 /// what lets the monitoring profiles scrape `openbao:9101`.
@@ -219,6 +337,12 @@ pub(super) fn reject_symlinked_tls_output_dir(
 /// directory and uses `--no-dereference`, so `chown -R` never follows a
 /// symlink out of that mount.  Mirrors `build_ownership_sweep_args` in
 /// `crate::commands::infra`.
+///
+/// Serves the path-based mode, and the two output directories outside
+/// `secrets/` (`openbao/tls`, `postgres/tls`) in every mode. A root run
+/// over a `secrets/` another account owns starts no such container for
+/// an output directory under `secrets/`: it gives the helper a
+/// [`StepScratch`] instead.
 fn build_tls_output_chown_args<'a>(
     mount: &'a str,
     user_arg: &'a str,
@@ -310,7 +434,14 @@ pub(super) fn build_tls_key_chown_args<'a>(
 ///
 /// Reuses the image the `step certificate create` container runs in the
 /// very next statement, so no extra image or pull is introduced.  The
-/// chown is a no-op when ownership is already correct. `label` names the
+/// chown is a no-op when ownership is already correct.
+///
+/// Serves the path-based mode, and `openbao/tls` and `postgres/tls`,
+/// which are outside `secrets/`, in every mode. In rooted mode the
+/// output directories under `secrets/` are not mounted at all: the
+/// daemon resolves a mount source as root, so a source the owner of
+/// `secrets/` can swap would turn this `chown -R` into a recursive
+/// re-own of any host tree. [`StepScratch`] takes their place. `label` names the
 /// docker command, and `failure` is the issuance error the chown's
 /// failure is reported under: the chown is part of the issuance, so a
 /// failure here has to name the step that failed and not just the docker

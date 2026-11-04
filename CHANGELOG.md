@@ -19,14 +19,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
-- A root-run `infra install`, `init`, `infra up` or `openbao save-unseal-keys`
-  over a `secrets/` directory owned by another account now stops with an error
-  naming the path when a directory it walks there, at any level, or a generated
-  file it would publish there under a name you may have relocated by symlink, is
-  a symbolic link, instead of following the link. The HTTP-01 admin
-  certificate's issuance in `init` and its re-issue in `rotate infra-cert`
-  likewise stop, instead of following a symbolic link, at the certificate's
-  directory or files there.
+- A root-run `infra install`, `init`, `reinit`, `infra up` or
+  `openbao save-unseal-keys` over a `secrets/` directory owned by another
+  account now stops with an error naming the path when a directory it walks
+  there, at any level, or a generated file it would publish there under a name
+  you may have relocated by symlink, is a symbolic link, instead of following
+  the link. The same holds when such a run removes generated files there,
+  restores files there after a failed `init`, or reads the CA certificates,
+  `ca.json`, the step-ca password or the saved unseal keys there to pass their
+  contents on. The HTTP-01 admin certificate's issuance in `init` and its
+  re-issue in `rotate infra-cert` likewise stop, instead of following a
+  symbolic link, at the certificate's directory or files there.
 
 ### Fixed
 
@@ -41,6 +44,22 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   longer follows a symbolic link it finds there, which could change the modes of
   files outside `secrets/`. Any run, root or not, now also creates every missing
   directory level under `secrets/` at mode `0700` instead of the umask's.
+
+### Security
+
+- A root-run `bootroot reinit`, `infra up`, `infra install` and `init` over a
+  `secrets/` directory owned by another account no longer follow a symbolic
+  link that account could have placed below `secrets/`, or a directory it put
+  in place of the root-owned bootroot-internal directory, when they remove
+  generated files, restore files after a failed `init`, provision the
+  bootroot-internal registrar credential, issue the HTTP-01 admin TLS
+  certificate, or read the CA certificates, `ca.json`, the step-ca password and
+  the saved unseal keys whose contents they pass on; the same applies to the
+  steps `rotate infra-cert`, `rotate ca-key`, `rotate trust-sync`,
+  `rotate registrar-internal-credential` and `registrar issue` share with
+  `init`. Issuing the HTTP-01 admin TLS certificate in that case, in `init` and
+  in `rotate infra-cert`, no longer runs a root container that re-owns its
+  output directory.
 
 ## [0.6.0] - 2026-10-31
 

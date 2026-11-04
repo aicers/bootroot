@@ -635,6 +635,8 @@ pub(crate) struct Strings {
     pub(crate) info_http01_admin_tls_provisioned: &'static str,
     pub(crate) error_http01_admin_tls_provision_failed: &'static str,
     pub(crate) error_http01_admin_tls_output_dir_symlink: &'static str,
+    pub(crate) error_step_scratch_dir_failed: &'static str,
+    pub(crate) error_step_output_invalid: &'static str,
     pub(crate) error_registrar_internal_provision_failed: &'static str,
     pub(crate) error_registrar_internal_staging_symlink: &'static str,
     pub(crate) warning_registrar_internal_acme_file_replaced: &'static str,

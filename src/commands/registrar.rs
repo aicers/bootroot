@@ -867,8 +867,9 @@ async fn issue_into_staging(
         .await
         .with_context(|| messages.error_write_file_failed(&staging.display().to_string()))?;
 
-    let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
-    let bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    let secrets_tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    let fingerprints = compute_ca_fingerprints(&secrets_tree, messages).await?;
+    let bundle_pem = compute_ca_bundle_pem(&secrets_tree, messages).await?;
     let staged_bundle = staging.join(CA_BUNDLE_FILE);
     // Seeded before the issuance rather than after it: this file is the
     // trust store the outbound ACME connection to step-ca is built from,
