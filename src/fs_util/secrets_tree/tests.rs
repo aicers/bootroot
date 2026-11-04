@@ -623,3 +623,265 @@ async fn async_wrappers_run_the_blocking_methods() {
     assert_eq!(std::fs::read(&dest).expect("read"), PAYLOAD);
     assert_eq!(mode_of(&secrets.join("x")), 0o700);
 }
+
+/// The message [`SecretsTree::relative`] refuses a path's spelling with,
+/// which a lookup failure never carries.
+const NOT_PLAIN: &str = "by plain names alone";
+
+/// Every entry below `root` with its owner, beside what [`snapshot`]
+/// records, for the refusals that must leave owners alone too.
+fn owners_below(root: &Path) -> BTreeMap<PathBuf, (u32, u32)> {
+    snapshot(root)
+        .into_keys()
+        .map(|rel| {
+            let owner = owner_of_path(&root.join(&rel));
+            (rel, owner)
+        })
+        .collect()
+}
+
+/// `path` with `suffix` appended to its bytes as they stand, so a
+/// spelling `Path::join` would normalise survives.
+fn spelled(path: &Path, suffix: &str) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
+}
+
+fn open_tree(secrets: &Path, rooted: bool) -> SecretsTree {
+    let tree = if rooted {
+        SecretsTree::open_rooted_for_tests(secrets)
+    } else {
+        SecretsTree::open(secrets)
+    }
+    .expect("open");
+    assert_eq!(tree.is_rooted(), rooted);
+    tree
+}
+
+/// A `secrets/` at `0755` holding `dir/` at `0755` and `dir/file` at
+/// `0644`, so a path that reaches an existing entry once its `.` is
+/// dropped would succeed — and chmod something — were it not refused.
+fn dotted_fixture(root: &Path) -> PathBuf {
+    let secrets = secrets_in(root);
+    let dir = secrets.join("dir");
+    std::fs::create_dir(&dir).expect("mkdir dir");
+    std::fs::write(dir.join("file"), "kept\n").expect("write file");
+    std::fs::set_permissions(dir.join("file"), std::fs::Permissions::from_mode(0o644))
+        .expect("chmod file");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod dir");
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod secrets");
+    secrets
+}
+
+/// Literal `.` components immediately below the anchor, inside the
+/// remainder and at its end, each spelled so that dropping the `.` would
+/// leave an entry that exists.
+fn dotted_paths(secrets: &Path) -> Vec<PathBuf> {
+    vec![
+        spelled(secrets, "/."),
+        spelled(secrets, "/./"),
+        spelled(secrets, "/./dir"),
+        spelled(secrets, "/./dir/file"),
+        spelled(secrets, "/dir/./file"),
+        spelled(secrets, "/dir/."),
+        spelled(secrets, "/dir/./"),
+        spelled(secrets, "/dir/file/."),
+        spelled(secrets, "/dir//./file"),
+    ]
+}
+
+fn assert_refused(err: &anyhow::Error, path: &Path, what: &str) {
+    let shown = format!("{err:#}");
+    assert!(
+        shown.contains(&path.display().to_string()),
+        "{what} {}: {shown}",
+        path.display()
+    );
+    assert!(
+        shown.contains(NOT_PLAIN),
+        "{what} {}: refused for another reason: {shown}",
+        path.display()
+    );
+}
+
+#[test]
+fn every_method_rejects_a_literal_dot_below_the_anchor() {
+    for rooted in [false, true] {
+        let root = tempdir().expect("tempdir");
+        let secrets = dotted_fixture(root.path());
+        let before = snapshot(root.path());
+        let owners = owners_below(root.path());
+        let tree = open_tree(&secrets, rooted);
+
+        for path in dotted_paths(&secrets) {
+            let what = format!("rooted={rooted}");
+            let err = tree.ensure_dir(&path).expect_err("ensure_dir");
+            assert_refused(&err, &path, &format!("{what} ensure_dir"));
+            for dest in [
+                Destination::bootroot_owned(&path),
+                Destination::operator_named(&path),
+            ] {
+                let err = tree
+                    .publish(
+                        dest,
+                        PAYLOAD,
+                        StagedMode::Policy(0o600),
+                        RootedOwner::ContainingDir,
+                        StagedDurability::RenameOnly,
+                    )
+                    .expect_err("publish");
+                assert_refused(&err, &path, &format!("{what} publish"));
+            }
+            let err = tree.set_file_mode(&path, 0o600).expect_err("set_file_mode");
+            assert_refused(&err, &path, &format!("{what} set_file_mode"));
+        }
+
+        assert_eq!(snapshot(root.path()), before, "rooted={rooted}");
+        assert_eq!(owners_below(root.path()), owners, "rooted={rooted}");
+        assert_eq!(mode_of(&secrets), 0o755, "the anchor is not chmodded");
+        assert_eq!(stray_temporaries(root.path()), Vec::<PathBuf>::new());
+    }
+}
+
+#[tokio::test]
+async fn async_wrappers_reject_a_literal_dot_below_the_anchor() {
+    for rooted in [false, true] {
+        let root = tempdir().expect("tempdir");
+        let secrets = dotted_fixture(root.path());
+        let before = snapshot(root.path());
+        let owners = owners_below(root.path());
+        let tree = Arc::new(open_tree(&secrets, rooted));
+
+        for path in dotted_paths(&secrets) {
+            let what = format!("rooted={rooted}");
+            let err = tree.ensure_dir_async(&path).await.expect_err("ensure_dir");
+            assert_refused(&err, &path, &format!("{what} ensure_dir_async"));
+            let err = tree
+                .publish_async(
+                    Destination::bootroot_owned(&path),
+                    PAYLOAD,
+                    StagedMode::Policy(0o600),
+                    RootedOwner::ContainingDir,
+                    StagedDurability::FlushDirectory,
+                )
+                .await
+                .expect_err("publish");
+            assert_refused(&err, &path, &format!("{what} publish_async"));
+        }
+
+        assert_eq!(snapshot(root.path()), before, "rooted={rooted}");
+        assert_eq!(owners_below(root.path()), owners, "rooted={rooted}");
+        assert_eq!(mode_of(&secrets), 0o755, "the anchor is not chmodded");
+        assert_eq!(stray_temporaries(root.path()), Vec::<PathBuf>::new());
+    }
+}
+
+/// A prefix spelled differently from the anchor still matches it by
+/// components, and the `.` below it is still found in the remainder.
+#[test]
+fn a_literal_dot_is_refused_below_a_differently_spelled_anchor_prefix() {
+    for rooted in [false, true] {
+        let root = tempdir().expect("tempdir");
+        let secrets = dotted_fixture(root.path());
+        let before = snapshot(root.path());
+        let tree = open_tree(&secrets, rooted);
+        let respelled = spelled(root.path(), "//./secrets");
+
+        for suffix in ["/./dir/file", "/dir/./file", "/dir/file/."] {
+            let path = spelled(&respelled, suffix);
+            let err = tree.set_file_mode(&path, 0o600).expect_err("set_file_mode");
+            assert_refused(&err, &path, &format!("rooted={rooted} set_file_mode"));
+            let err = tree.ensure_dir(&path).expect_err("ensure_dir");
+            assert_refused(&err, &path, &format!("rooted={rooted} ensure_dir"));
+        }
+        assert_eq!(snapshot(root.path()), before, "rooted={rooted}");
+
+        let file = spelled(&respelled, "/dir/file");
+        tree.set_file_mode(&file, 0o600)
+            .expect("the respelled prefix still matches the anchor");
+        assert_eq!(mode_of(&secrets.join("dir").join("file")), 0o600);
+    }
+}
+
+#[test]
+fn dotted_names_separators_and_the_anchor_keep_their_handling() {
+    for rooted in [false, true] {
+        let root = tempdir().expect("tempdir");
+        let secrets = dotted_fixture(root.path());
+        let tree = open_tree(&secrets, rooted);
+
+        let hidden = secrets.join(".hidden");
+        tree.ensure_dir(&hidden).expect("ensure_dir .hidden");
+        assert_eq!(mode_of(&hidden), 0o700, "rooted={rooted}");
+        let pem = hidden.join("file.pem");
+        tree.publish(
+            Destination::bootroot_owned(&pem),
+            PAYLOAD,
+            StagedMode::Policy(0o640),
+            RootedOwner::ContainingDir,
+            StagedDurability::FlushDirectory,
+        )
+        .expect("publish .hidden/file.pem");
+        assert_eq!(std::fs::read(&pem).expect("read"), PAYLOAD);
+        tree.set_file_mode(&pem, 0o600).expect("set_file_mode");
+        assert_eq!(mode_of(&pem), 0o600, "rooted={rooted}");
+
+        let doubled = spelled(&secrets, "//dir//file");
+        tree.publish(
+            Destination::bootroot_owned(&doubled),
+            PAYLOAD,
+            StagedMode::Policy(0o640),
+            RootedOwner::ContainingDir,
+            StagedDurability::RenameOnly,
+        )
+        .expect("publish through repeated separators");
+        assert_eq!(
+            std::fs::read(secrets.join("dir").join("file")).expect("read"),
+            PAYLOAD
+        );
+        tree.set_file_mode(&doubled, 0o604)
+            .expect("set_file_mode through repeated separators");
+        assert_eq!(mode_of(&secrets.join("dir").join("file")), 0o604);
+
+        tree.ensure_dir(&spelled(&secrets, "/dir/"))
+            .expect("ensure_dir with a trailing separator");
+        assert_eq!(mode_of(&secrets.join("dir")), 0o700, "rooted={rooted}");
+
+        tree.ensure_dir(&spelled(&secrets, "/"))
+            .expect("ensure_dir of the anchor with a trailing separator");
+        assert_eq!(mode_of(&secrets), 0o700, "rooted={rooted}");
+
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod secrets");
+        tree.ensure_dir(&secrets).expect("ensure_dir of the anchor");
+        assert_eq!(mode_of(&secrets), 0o700, "rooted={rooted}");
+    }
+}
+
+/// An anchor whose own spelling holds a `.` keeps accepting itself and
+/// the paths a site builds by joining plain names onto it.
+#[test]
+fn an_anchor_spelled_with_a_dot_accepts_names_joined_onto_it() {
+    for rooted in [false, true] {
+        let root = tempdir().expect("tempdir");
+        let secrets = dotted_fixture(root.path());
+        for anchor in [spelled(&secrets, "/."), spelled(&secrets, "/")] {
+            std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod secrets");
+            let tree = open_tree(&anchor, rooted);
+
+            tree.ensure_dir(&anchor).expect("ensure_dir of the anchor");
+            assert_eq!(mode_of(&secrets), 0o700, "{}", anchor.display());
+
+            let file = anchor.join("dir").join("file");
+            tree.set_file_mode(&file, 0o640).expect("set_file_mode");
+            assert_eq!(mode_of(&secrets.join("dir").join("file")), 0o640);
+
+            let below = spelled(&anchor.join("dir"), "/./file");
+            let err = tree.set_file_mode(&below, 0o600).expect_err("refused");
+            assert_refused(&err, &below, &anchor.display().to_string());
+        }
+    }
+}

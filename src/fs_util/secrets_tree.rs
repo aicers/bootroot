@@ -106,7 +106,9 @@ impl From<RootedOwner> for StagedOwner {
 ///
 /// Every method takes the full path the site builds and strips the
 /// anchor lexically. A path that is not below the anchor, or whose
-/// remainder holds anything but plain names, is refused in both modes.
+/// remainder holds anything but plain names — a `..`, a root, or a
+/// literal `.` as spelled, `secrets/.` included — is refused in both
+/// modes, before anything is opened.
 /// Every method is blocking; an async site runs them inside
 /// `spawn_blocking`, through [`SecretsTree::run`] or the `_async`
 /// wrappers.
@@ -277,6 +279,12 @@ impl SecretsTree {
 
     /// The names `path` holds below the anchor, outermost first; empty
     /// for the anchor itself.
+    ///
+    /// `Path::components` drops every `.` after the first component, so
+    /// the remainder's own spelling is checked as well: a literal `.`
+    /// anywhere below the anchor is refused, `secrets/.` included, even
+    /// though it names the same directory. Empty segments from repeated
+    /// or trailing separators are not components and stay accepted.
     fn relative<'p>(&self, path: &'p Path) -> Result<Vec<&'p OsStr>> {
         let rest = path.strip_prefix(&self.anchor).map_err(|_| {
             anyhow::anyhow!(
@@ -285,17 +293,33 @@ impl SecretsTree {
                 self.anchor.display()
             )
         })?;
-        rest.components()
+        let not_plain = || {
+            anyhow::anyhow!(
+                "{} must name an entry below the secrets directory {} by plain names alone",
+                path.display(),
+                self.anchor.display()
+            )
+        };
+        let names = rest
+            .components()
             .map(|component| match component {
                 Component::Normal(name) => Ok(name),
-                _ => anyhow::bail!(
-                    "{} must name an entry below the secrets directory {} by plain names \
-                     alone",
-                    path.display(),
-                    self.anchor.display()
-                ),
+                _ => Err(not_plain()),
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        let spelled = spelled_remainder(
+            self.anchor.as_os_str().as_bytes(),
+            path.as_os_str().as_bytes(),
+            self.anchor.components().count(),
+        )
+        .ok_or_else(not_plain)?;
+        if spelled
+            .split(|&byte| byte == b'/')
+            .any(|segment| segment == b".")
+        {
+            return Err(not_plain());
+        }
+        Ok(names)
     }
 
     /// Creates `path` as a directory at mode `0700`, every missing level
@@ -315,8 +339,8 @@ impl SecretsTree {
     /// chmodded through it.
     ///
     /// # Errors
-    /// Returns an error if `path` is not below the anchor, a level cannot
-    /// be opened as a directory without following a link, cannot be
+    /// Returns an error if `path` is not below the anchor or names a level
+    /// by anything but plain names, a level cannot be opened as a directory without following a link, cannot be
     /// created, or cannot be given its mode or owner.
     pub fn ensure_dir(&self, path: &Path) -> Result<()> {
         let names = self.relative(path)?;
@@ -393,8 +417,8 @@ impl SecretsTree {
     /// removes it.
     ///
     /// # Errors
-    /// Returns an error if `dest` is not below the anchor, a directory
-    /// level cannot be opened without following a link, the leaf is a
+    /// Returns an error if `dest` is not below the anchor or names a level
+    /// by anything but plain names, a directory level cannot be opened without following a link, the leaf is a
     /// link an operator-named destination would follow, or the temporary
     /// cannot be created, written, chowned, chmodded, flushed or renamed.
     pub fn publish(
@@ -506,8 +530,8 @@ impl SecretsTree {
     /// leaf is an error.
     ///
     /// # Errors
-    /// Returns an error if `path` is not below the anchor, a directory
-    /// level or the leaf cannot be opened without following a link, the
+    /// Returns an error if `path` is not below the anchor or names a level
+    /// by anything but plain names, a directory level or the leaf cannot be opened without following a link, the
     /// leaf is not a regular file, or the mode cannot be set.
     pub fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()> {
         let names = self.relative(path)?;
@@ -748,6 +772,65 @@ fn normalize_modes_by_path(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The bytes of `path` below the anchor, as `path` spells them, for a
+/// `path` already known to start with the anchor's
+/// `anchor_components` components.
+///
+/// A `path` that repeats the anchor's own bytes at a component boundary
+/// is cut there, so an anchor spelled with a `.` of its own (`secrets/.`)
+/// keeps accepting the paths built by joining names onto it. Any other
+/// spelling is cut after the same number of components as the anchor
+/// has, so a prefix that differs from the anchor only in separators or
+/// `.`s still matches as `Path::strip_prefix` matches it. `None` only if
+/// `path` has fewer components than that, which the caller has ruled
+/// out.
+fn spelled_remainder<'p>(
+    anchor: &[u8],
+    path: &'p [u8],
+    anchor_components: usize,
+) -> Option<&'p [u8]> {
+    if let Some(rest) = path.strip_prefix(anchor)
+        && (anchor.is_empty()
+            || anchor.ends_with(b"/")
+            || rest.is_empty()
+            || rest.starts_with(b"/"))
+    {
+        return Some(rest);
+    }
+    path.get(offset_after_components(path, anchor_components)?..)
+}
+
+/// The byte offset in `path` just past its first `count` components,
+/// counted as `Path::components` counts them on Unix: a leading `/` is
+/// the root, a leading `.` segment with no root before it is the one
+/// `.` it keeps, and every later empty or `.` segment is skipped.
+/// `None` when `path` has fewer than `count` components.
+fn offset_after_components(path: &[u8], count: usize) -> Option<usize> {
+    let mut seen = 0;
+    let mut pos = 0;
+    if count > 0 && (path.first() == Some(&b'/') || path == b"." || path.starts_with(b"./")) {
+        seen = 1;
+        pos = 1;
+    }
+    while seen < count {
+        let rest = path.get(pos..)?;
+        let start = pos + rest.iter().take_while(|&&byte| byte == b'/').count();
+        let segment = path.get(start..)?;
+        if segment.is_empty() {
+            return None;
+        }
+        let len = segment
+            .iter()
+            .position(|&byte| byte == b'/')
+            .unwrap_or(segment.len());
+        if segment.get(..len)? != b"." {
+            seen += 1;
+        }
+        pos = start + len;
+    }
+    Some(pos)
 }
 
 /// A second descriptor on the anchor, so a walk can hold its levels as
