@@ -33,6 +33,11 @@ set -euo pipefail
 #      run's summary, the DSN from `ca.json` — which re-issues the
 #      HTTP-01 admin certificate over the existing
 #      `bootroot-http01/tls/`, and repeats the assertions of step 5
+#   7. as root, runs `rotate stepca-password` with the root token, and
+#      asserts that it succeeds on its first attempt and leaves
+#      `password.txt.new` the account's at `0600`: the `step` helper
+#      that re-encrypts the CA keys with it runs as the account, so a
+#      root-owned staged password would fail the first run
 #
 # Running as root over a tree another account owns is the case in
 # which bootroot's writes under `secrets/` walk from the tree's
@@ -109,10 +114,11 @@ SECRETS_GID=""
 ACCOUNT_CREATED=0
 ROOT_WROTE=0
 ROOT_ENV=()
-# The first run's root token, set only while the second `init` runs, so
-# it reaches that command through `OPENBAO_ROOT_TOKEN` in the `env` list
-# below rather than through bootroot's own argument list.
-SECOND_INIT_ROOT_TOKEN=""
+# The first run's root token, set only while a command that needs it
+# runs (the second `init`, `rotate stepca-password`), so it reaches that
+# command through `OPENBAO_ROOT_TOKEN` in the `env` list below rather
+# than through bootroot's own argument list.
+ROOT_TOKEN_FOR_COMMAND=""
 # The first run's root token once its summary has been read, so that
 # every copy of an `init` log the run leaves (the run log, the error
 # handler's output, the uploaded artifact directory) has it masked.
@@ -231,8 +237,8 @@ root_env() {
   if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
     ROOT_ENV+=(COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME")
   fi
-  if [ -n "$SECOND_INIT_ROOT_TOKEN" ]; then
-    ROOT_ENV+=(OPENBAO_ROOT_TOKEN="$SECOND_INIT_ROOT_TOKEN")
+  if [ -n "$ROOT_TOKEN_FOR_COMMAND" ]; then
+    ROOT_ENV+=(OPENBAO_ROOT_TOKEN="$ROOT_TOKEN_FOR_COMMAND")
   fi
 }
 
@@ -579,7 +585,7 @@ run_second_init() {
   wait_for_postgres_admin
   wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
 
-  SECOND_INIT_ROOT_TOKEN="$root_token"
+  ROOT_TOKEN_FOR_COMMAND="$root_token"
   local status=0
   run_bootroot_as_root init \
     --compose-file "$COMPOSE_FILE" \
@@ -597,7 +603,7 @@ run_second_init() {
     --overwrite-state \
     --responder-url "https://${HTTP01_ADMIN_BIND_ADDR}" \
     --skip responder-check </dev/null >"$SECOND_INIT_RAW_LOG" 2>&1 || status=$?
-  SECOND_INIT_ROOT_TOKEN=""
+  ROOT_TOKEN_FOR_COMMAND=""
   redact_init_log "$SECOND_INIT_RAW_LOG" "$SECOND_INIT_LOG"
   if [ "$status" -ne 0 ]; then
     {
@@ -606,6 +612,40 @@ run_second_init() {
     } >>"$RUN_LOG"
     fail "second bootroot init failed"
   fi
+}
+
+# Rotates step-ca's key password as root over the account's `secrets/`.
+# The new password is staged as `password.txt.new`, which the `step`
+# helper re-encrypting the CA keys reads as the account, so the first
+# attempt must succeed and leave that file the account's at `0600`.
+# The root token reaches the command only through `OPENBAO_ROOT_TOKEN`
+# in `ROOT_ENV`, as the second `init`'s does; stdin is closed, so a
+# missing token would fail the run on the prompt rather than on what
+# this phase checks, hence the check first.
+rotate_stepca_password() {
+  log_phase "rotate-stepca-password"
+  local log="$ARTIFACT_DIR/rotate-stepca-password.log"
+  [ -n "$KNOWN_ROOT_TOKEN" ] \
+    || fail "rotate-stepca-password: no root token was read from the first init summary"
+
+  ROOT_TOKEN_FOR_COMMAND="$KNOWN_ROOT_TOKEN"
+  local status=0
+  run_bootroot_as_root rotate \
+    --compose-file "$COMPOSE_FILE" \
+    --openbao-url "https://${OPENBAO_BIND_ADDR}" \
+    --auth-mode root \
+    --yes \
+    stepca-password </dev/null >"$log" 2>&1 || status=$?
+  ROOT_TOKEN_FOR_COMMAND=""
+  if [ "$status" -ne 0 ]; then
+    {
+      echo "rotate stepca-password failed (tail):"
+      tail -n 120 "$log" || true
+    } >>"$RUN_LOG"
+    fail "bootroot rotate stepca-password failed; see $log"
+  fi
+  assert_entry_state "$SECRETS_DIR/password.txt.new" "${SECRETS_UID}:${SECRETS_GID} 600" \
+    "rotate-stepca-password"
 }
 
 # ---------------------------------------------------------------------------
@@ -749,6 +789,8 @@ main() {
   assert_stack_healthy
   assert_secrets_tree_ownership
   assert_no_step_scratch "after the second init"
+
+  rotate_stepca_password
 
   log_phase "done"
 }

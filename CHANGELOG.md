@@ -65,6 +65,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `bootroot service add` create under such a `secrets/` when run as root: an
   intermediate level they create, such as `services/` on a first `service add`,
   is now `0700` instead of the umask's mode.
+- A root-run `bootroot rotate stepca-password` over a `secrets/` directory
+  owned by another account no longer fails on its first attempt because the
+  `step` helper could not read the new password file. That file is now created
+  owned by the owner of `secrets/` at mode `0600`, instead of by root.
 
 ### Security
 

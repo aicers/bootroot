@@ -63,6 +63,22 @@ pub(super) fn ensure_file_exists(path: &Path, messages: &Messages) -> Result<()>
 /// It takes the directory flush. Losing the new password after step-ca
 /// has re-encrypted its keys with it leaves an intermediate CA key
 /// nobody can decrypt — not a rewrite, an unrecoverable CA.
+///
+/// On a rooted handle the file is given to the owner of the directory
+/// it lands in — the anchor, so the uid and gid of `secrets/` — rather
+/// than to the destination's owner. The `step crypto change-pass` helper
+/// that reads it runs as that account, and a fresh file would otherwise
+/// be root's at `0600`, which the helper cannot open; a root-owned
+/// leftover from an earlier failed run would keep that owner too. The
+/// owner is set on the staged temporary through its descriptor before
+/// the rename, so the file never sits at its final name under another
+/// owner, and the owner of whatever the name held is ignored. This
+/// widens nothing: the same account already reads the current password
+/// in `password.txt`, which its `OpenBao` Agent sidecar renders.
+///
+/// The path-based branch keeps the destination's owner: a handle that
+/// is not rooted is either the owner of `secrets/` writing as itself or
+/// root over a root-owned `secrets/`, whose helper runs as root.
 pub(super) async fn write_secret_file(
     tree: &Arc<SecretsTree>,
     path: &Path,
@@ -70,7 +86,8 @@ pub(super) async fn write_secret_file(
     messages: &Messages,
 ) -> Result<()> {
     if tree.is_rooted() {
-        return publish_secret_rooted(tree, path, contents, messages).await;
+        return publish_secret_rooted(tree, path, contents, RootedOwner::ContainingDir, messages)
+            .await;
     }
     if let Some(parent) = path.parent() {
         fs_util::ensure_secrets_dir(parent).await?;
@@ -110,7 +127,7 @@ pub(super) async fn write_secret_id_atomic(
         return write_secret_id_atomic_by_path(path, value, messages).await;
     }
     secret_id_parent(path, messages)?;
-    publish_secret_rooted(tree, path, value, messages).await
+    publish_secret_rooted(tree, path, value, RootedOwner::Destination, messages).await
 }
 
 /// [`write_secret_id_atomic`]'s path-based write, for a handle that is
@@ -148,12 +165,14 @@ fn secret_id_parent<'p>(path: &'p Path, messages: &Messages) -> Result<&'p Path>
 /// The rooted half of [`write_secret_file`] and
 /// [`write_secret_id_atomic`]: the parent is created writer-owned at
 /// `0700` as `ensure_secrets_dir` creates it, and the file is published
-/// as `atomic_write` publishes it — `0600`, the destination's owner
-/// kept, the directory flushed — through the handle.
+/// through the handle at `0600` with the directory flushed, as
+/// `atomic_write` publishes it. The caller chooses the owner: `owner`
+/// is established on the staged temporary before the rename.
 async fn publish_secret_rooted(
     tree: &Arc<SecretsTree>,
     path: &Path,
     contents: &str,
+    owner: RootedOwner,
     messages: &Messages,
 ) -> Result<()> {
     let target = path.to_path_buf();
@@ -167,7 +186,7 @@ async fn publish_secret_rooted(
             fs_util::Destination::bootroot_owned(&target),
             &payload,
             fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
-            RootedOwner::Destination,
+            owner,
             fs_util::StagedDurability::FlushDirectory,
         )
         .context(failed)
@@ -758,6 +777,123 @@ mod tests {
         }
         assert_eq!(results[0], results[1]);
         assert_eq!(results[1].1, 0o700);
+    }
+
+    /// On a rooted handle the staged step-ca password goes to the owner
+    /// of `secrets/`, whose `step` helper reads it, and replaces a link
+    /// planted at its name without touching the link's target, or a
+    /// leftover under another group; a rooted `write_secret_id_atomic`
+    /// still keeps the owner of the `secret_id` it replaces. `secrets/`
+    /// takes a supplementary gid so the directory's owner and the
+    /// writer's differ on Linux, where a fresh file takes the writer's
+    /// primary gid; single-gid runners skip.
+    #[tokio::test]
+    async fn rooted_write_secret_file_gives_the_file_to_the_anchor_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(gid) = bootroot::cert_group::one_supplementary_test_gid() else {
+            return;
+        };
+        let messages = test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        std::os::unix::fs::chown(&root.secrets, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let anchor = std::fs::metadata(&root.secrets).expect("stat secrets");
+        let tree = rooted_arc(&root);
+
+        let before = root.outside_snapshot();
+        root.swap("password.txt.new", &root.outside.join("secret"));
+        let password = root.secrets.join("password.txt.new");
+        write_secret_file(&tree, &password, "new-pw", &messages)
+            .await
+            .expect("write password");
+        let meta = std::fs::symlink_metadata(&password).expect("stat password");
+        assert!(meta.file_type().is_file(), "the link is replaced by a file");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!((meta.uid(), meta.gid()), (anchor.uid(), anchor.gid()));
+        assert_eq!(meta.gid(), gid);
+        assert_eq!(std::fs::read(&password).expect("read"), b"new-pw");
+        assert_eq!(root.outside_snapshot(), before);
+
+        // A leftover from an earlier run under another group is not kept:
+        // `Destination` would re-apply this gid, on any platform.
+        let egid = bootroot::cert_group::current_process_egid();
+        std::os::unix::fs::chown(&password, None, Some(egid)).expect("chgrp leftover");
+        write_secret_file(&tree, &password, "newer-pw", &messages)
+            .await
+            .expect("rewrite password");
+        let meta = std::fs::metadata(&password).expect("stat password");
+        assert_eq!((meta.uid(), meta.gid()), (anchor.uid(), anchor.gid()));
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(&password).expect("read"), b"newer-pw");
+
+        let secret_id = root.write("services/svc/secret_id", "old");
+        std::os::unix::fs::chown(&secret_id, None, Some(egid)).expect("chgrp secret_id");
+        let service_dir = root.secrets.join("services").join("svc");
+        std::os::unix::fs::chown(&service_dir, None, Some(gid)).expect("chgrp service dir");
+        let dir_gid = std::fs::metadata(&service_dir).expect("stat dir").gid();
+        let file_gid = std::fs::metadata(&secret_id).expect("stat file").gid();
+        assert_ne!(dir_gid, file_gid, "the check must not pass vacuously");
+
+        write_secret_id_atomic(&tree, &secret_id, "new", &messages)
+            .await
+            .expect("rewrite secret_id");
+        let meta = std::fs::metadata(&secret_id).expect("stat secret_id");
+        assert_eq!(meta.gid(), egid, "the replaced file's gid is kept");
+        assert_eq!(std::fs::read(&secret_id).expect("read"), b"new");
+    }
+
+    /// Whether a root-only test should run: it runs as root, and fails
+    /// rather than skips when `BOOTROOT_E2E_REQUIRE_CERT_OWNER=1` asks
+    /// for it and the process is not root, so a CI step that meant to
+    /// run it as root cannot pass by skipping it.
+    fn running_as_root_or_required() -> bool {
+        if bootroot::fs_util::current_process_euid() == 0 {
+            return true;
+        }
+        assert!(
+            std::env::var_os("BOOTROOT_E2E_REQUIRE_CERT_OWNER").is_none_or(|value| value != "1"),
+            "BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 requires this test to run as root"
+        );
+        false
+    }
+
+    /// As root over a `secrets/` another account owns, the handle is
+    /// rooted and the staged step-ca password replaces a root-owned
+    /// leftover with a file owned by the uid and gid of `secrets/` at
+    /// `0600`, which the `step` helper running as that account can read.
+    #[tokio::test]
+    async fn write_secret_file_gives_the_new_password_to_the_secrets_owner_as_root_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        const OWNER: u32 = 65_534;
+
+        if !running_as_root_or_required() {
+            return;
+        }
+        let dir = tempdir().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).expect("mkdir secrets");
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod secrets");
+        let password = secrets.join("password.txt.new");
+        std::fs::write(&password, "stale").expect("seed leftover");
+        std::fs::set_permissions(&password, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod leftover");
+        std::os::unix::fs::chown(&password, Some(0), Some(0)).expect("chown leftover");
+        std::os::unix::fs::chown(&secrets, Some(OWNER), Some(OWNER)).expect("chown secrets");
+
+        let tree = Arc::new(SecretsTree::open(&secrets).expect("open handle"));
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+        write_secret_file(&tree, &password, "new-pw", &test_messages())
+            .await
+            .expect("write password");
+
+        let meta = std::fs::symlink_metadata(&password).expect("stat password");
+        assert!(meta.file_type().is_file());
+        assert_eq!((meta.uid(), meta.gid()), (OWNER, OWNER));
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(&password).expect("read"), b"new-pw");
     }
 
     /// A path `state.json` spelled differently from the anchor is
