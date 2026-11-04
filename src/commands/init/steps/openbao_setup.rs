@@ -302,15 +302,17 @@ async fn write_openbao_secrets_with_retry(
     Ok(())
 }
 
+/// Writes the CA trust entry from the certificates under `secrets_tree`'s
+/// anchor, read through that handle.
 pub(super) async fn write_ca_trust_fingerprints_with_retry(
     client: &OpenBaoClient,
     kv_mount: &str,
-    secrets_dir: &Path,
+    secrets_tree: &std::sync::Arc<fs_util::SecretsTree>,
     rollback: &mut InitRollback,
     messages: &Messages,
 ) -> Result<bool> {
-    let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
-    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    let fingerprints = compute_ca_fingerprints(secrets_tree, messages).await?;
+    let ca_bundle_pem = compute_ca_bundle_pem(secrets_tree, messages).await?;
     let kv_exists = client
         .kv_exists(kv_mount, PATH_CA_TRUST)
         .await
@@ -737,10 +739,12 @@ pub(super) async fn setup_openbao_agents(
 /// so a root process over a `secrets/` another account owns follows no
 /// name on the way.
 async fn provision_agent_ca_bundle(secrets_dir: &Path, messages: &Messages) -> Result<String> {
-    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    // Opened before the read, so the certificates it concatenates are
+    // read through the same handle the bundle is published through.
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    let ca_bundle_pem = compute_ca_bundle_pem(&tree, messages).await?;
     let certs_dir = secrets_dir.join(CA_CERTS_DIR);
     let bundle_path = certs_dir.join(CA_BUNDLE_FILENAME);
-    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     tree.ensure_dir_async(&certs_dir)
         .await
         .with_context(|| messages.error_write_file_failed(&certs_dir.display().to_string()))?;

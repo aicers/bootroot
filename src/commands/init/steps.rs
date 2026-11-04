@@ -13,6 +13,7 @@ mod secrets;
 pub(crate) mod stepca_setup;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -52,7 +53,7 @@ pub(super) struct DbDsnNormalization {
     pub(super) effective_host: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct RollbackFile {
     pub(super) path: PathBuf,
     pub(super) original: Option<String>,
@@ -86,7 +87,19 @@ pub(super) struct InitRollback {
     /// not read at that point, and restoring it above is enough to undo
     /// the run.
     pub(super) openbao_recreated: bool,
+    /// TLS artifacts outside `secrets/` (`openbao/tls/*`), removed by
+    /// path.
     pub(super) tls_artifacts: Vec<PathBuf>,
+    /// The HTTP-01 admin TLS certificate and key under
+    /// `secrets/bootroot-http01/tls/`, removed through
+    /// [`InitRollback::secrets_tree`].
+    pub(super) http01_tls_artifacts: Vec<PathBuf>,
+    /// The handle `run_init_locked` opened on `--secrets-dir`. Every
+    /// rollback step under `secrets/` restores and removes through it,
+    /// so a root process over a `secrets/` another account owns follows
+    /// no name there; `None` (a rollback built without one) keeps the
+    /// path-based steps.
+    pub(super) secrets_tree: Option<Arc<fs_util::SecretsTree>>,
     pub(super) compose_file: Option<PathBuf>,
     /// Responder config backup for rolling back TLS-enabled config.
     pub(super) responder_config_backup: Option<RollbackFile>,
@@ -176,7 +189,7 @@ impl InitRollback {
         // calls so that a container restart switches OpenBao back to
         // HTTP, letting the original HTTP client reach it for cleanup.
         if let Some(file) = &self.hcl_backup
-            && let Err(err) = rollback_file(file, messages)
+            && let Err(err) = rollback_file(file, None, messages)
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
@@ -187,6 +200,15 @@ impl InitRollback {
                 eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
             }
         }
+        let artifacts = self.http01_tls_artifacts.clone();
+        self.with_secrets_tree(move |tree| {
+            for artifact in &artifacts {
+                if let Err(err) = remove_secrets_file(tree, artifact) {
+                    eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
+                }
+            }
+        })
+        .await;
         if self.openbao_recreated
             && let Some(compose_file) = &self.compose_file
         {
@@ -266,7 +288,7 @@ impl InitRollback {
         // plaintext.  Done after the container work so a failed restore
         // does not skip the Docker teardown above.
         if let Some(file) = &self.state_backup
-            && let Err(err) = rollback_file(file, messages)
+            && let Err(err) = rollback_file(file, None, messages)
         {
             eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
         }
@@ -275,10 +297,10 @@ impl InitRollback {
         // restart the container with only the config override (no
         // exposed port override) so the admin API returns to
         // loopback-only / plain-HTTP.
-        if let Some(file) = &self.responder_config_backup
-            && let Err(err) = rollback_file(file, messages)
-        {
-            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        if let Some(file) = self.responder_config_backup.clone() {
+            let messages = messages.clone();
+            self.with_secrets_tree(move |tree| report_rollback_file(&file, tree, &messages))
+                .await;
         }
         if self.responder_config_backup.is_some()
             && let Some(compose_file) = &self.compose_file
@@ -316,22 +338,25 @@ impl InitRollback {
         // deleted when this run created it and put back verbatim when
         // this run merely rewrote one it found, so a re-run that fails
         // after convergence leaves the established credential working.
-        for dir in [
+        let dirs: Vec<PathBuf> = [
             &self.registrar_internal_dir,
             &self.registrar_internal_staging,
         ]
         .into_iter()
         .flatten()
-        {
-            if dir.exists()
-                && let Err(err) = std::fs::remove_dir_all(dir)
-            {
-                eprintln!(
-                    "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
-                    dir.display()
-                );
+        .cloned()
+        .collect();
+        self.with_secrets_tree(move |tree| {
+            for dir in &dirs {
+                if let Err(err) = remove_secrets_dir_all(tree, dir) {
+                    eprintln!(
+                        "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
+                        dir.display()
+                    );
+                }
             }
-        }
+        })
+        .await;
         // Restored before deleted, and never both: an entry this run
         // created has no prior body and is removed, while one it found
         // and rewrote is put back exactly as it was read.
@@ -393,12 +418,27 @@ impl InitRollback {
                 eprintln!("Rollback: failed to delete policy {policy}: {err}");
             }
         }
-        if let Some(file) = &self.password_backup
-            && let Err(err) = rollback_file(file, messages)
-        {
-            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+        if let Some(file) = self.password_backup.clone() {
+            let messages = messages.clone();
+            self.with_secrets_tree(move |tree| report_rollback_file(&file, tree, &messages))
+                .await;
         }
-        self.restore_stepca_ca_json(docker, messages);
+        self.restore_stepca_ca_json(docker, messages).await;
+    }
+
+    /// Runs `op` on a blocking thread with this run's handle on
+    /// `secrets/`: every operation through the handle blocks, and
+    /// [`InitRollback::rollback`] is async.  Awaited before the next step,
+    /// so the rollback keeps its order; a task that panicked is reported
+    /// like any other rollback failure.
+    async fn with_secrets_tree<F>(&self, op: F)
+    where
+        F: FnOnce(Option<&fs_util::SecretsTree>) + Send + 'static,
+    {
+        let tree = self.secrets_tree.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || op(tree.as_deref())).await {
+            eprintln!("Rollback: a secrets-directory step did not complete: {err}");
+        }
     }
 
     /// Restores `ca.json` together with the Agent template it is
@@ -412,17 +452,19 @@ impl InitRollback {
     /// triggered by the restart already produces the pre-`init` name set,
     /// and `ca.json` goes back after it so the file left on disk is the
     /// pre-`init` document either way.
-    fn restore_stepca_ca_json(&self, docker: &Path, messages: &Messages) {
-        if let Some(file) = &self.stepca_ca_json_template_backup
-            && let Err(err) = rollback_file(file, messages)
-        {
-            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
-        }
-        if let Some(file) = &self.ca_json_backup
-            && let Err(err) = rollback_file(file, messages)
-        {
-            eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
-        }
+    async fn restore_stepca_ca_json(&self, docker: &Path, messages: &Messages) {
+        let files: Vec<RollbackFile> = [&self.stepca_ca_json_template_backup, &self.ca_json_backup]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let task_messages = messages.clone();
+        self.with_secrets_tree(move |tree| {
+            for file in &files {
+                report_rollback_file(file, tree, &task_messages);
+            }
+        })
+        .await;
         // The sidecar loads its templates at start-up, so one that `init`
         // restarted onto the regenerated template keeps rendering the new
         // name set until it is restarted again.  Skipped when `init` never
@@ -527,6 +569,75 @@ fn rollback_openbao_agent_invocation(
     )
 }
 
+/// Reads the text file at `path`, below `tree`'s anchor.
+///
+/// A rooted handle reads it through its descriptors on a blocking
+/// thread, refusing a link at any level and anything but a regular file
+/// at the leaf; a path-based one reads it by path, as every caller did
+/// before. Either way a missing file, or a missing directory above it,
+/// is `ErrorKind::NotFound`.
+pub(super) async fn read_to_string_in(
+    tree: &Arc<fs_util::SecretsTree>,
+    path: &Path,
+) -> std::io::Result<String> {
+    if !tree.is_rooted() {
+        return tokio::fs::read_to_string(path).await;
+    }
+    let tree = Arc::clone(tree);
+    let owned = path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || tree.read(&owned))
+        .await
+        .map_err(std::io::Error::other)??;
+    String::from_utf8(bytes).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not UTF-8: {err}", path.display()),
+        )
+    })
+}
+
+/// Removes the file at `path` below `secrets/` if it is there: through a
+/// rooted `tree`, by path otherwise.
+fn remove_secrets_file(tree: Option<&fs_util::SecretsTree>, path: &Path) -> std::io::Result<()> {
+    if let Some(tree) = tree.filter(|tree| tree.is_rooted()) {
+        return match tree.remove_file(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    }
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Removes the directory at `path` below `secrets/` and everything in it
+/// if it is there: through a rooted `tree`, by path otherwise.
+fn remove_secrets_dir_all(tree: Option<&fs_util::SecretsTree>, path: &Path) -> std::io::Result<()> {
+    if let Some(tree) = tree.filter(|tree| tree.is_rooted()) {
+        return match tree.remove_dir_all(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    }
+    if path.exists() {
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+/// Runs [`rollback_file`] and reports a failure, as every rollback step
+/// does, without stopping the rollback.
+fn report_rollback_file(
+    file: &RollbackFile,
+    tree: Option<&fs_util::SecretsTree>,
+    messages: &Messages,
+) {
+    if let Err(err) = rollback_file(file, tree, messages) {
+        eprintln!("Rollback: failed to restore {}: {err}", file.path.display());
+    }
+}
+
 /// Restores one snapshotted file, or removes it when `init` created it.
 ///
 /// The restore publishes by rename. This runs on the failure path, where
@@ -547,7 +658,42 @@ fn rollback_openbao_agent_invocation(
 /// [`fs_util::StagedMode::PreserveOrUmask`]'s create arm covers only the
 /// case where `init` deleted it outright, and hands that create to the
 /// umask exactly as the truncating write this replaced did.
-fn rollback_file(file: &RollbackFile, messages: &Messages) -> Result<()> {
+///
+/// `tree` is the handle on `secrets/` for a file below it, `None` for one
+/// outside it (`openbao.hcl`, `state.json`). A rooted handle restores
+/// through its descriptors — the same staged publish, owner, mode and
+/// durability — and removes with an `unlinkat` on the walked parent, so
+/// a link at any level is refused or removed itself, never followed.
+fn rollback_file(
+    file: &RollbackFile,
+    tree: Option<&fs_util::SecretsTree>,
+    messages: &Messages,
+) -> Result<()> {
+    if let Some(tree) = tree.filter(|tree| tree.is_rooted()) {
+        if let Some(contents) = &file.original {
+            tree.publish(
+                fs_util::Destination::operator_named(&file.path),
+                contents.as_bytes(),
+                fs_util::StagedMode::PreserveOrUmask,
+                fs_util::RootedOwner::Destination,
+                fs_util::StagedDurability::RenameOnly,
+            )
+            .with_context(|| {
+                messages.error_restore_file_failed(&file.path.display().to_string())
+            })?;
+        } else {
+            match tree.remove_file(&file.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(anyhow::Error::new(err).context(
+                        messages.error_remove_file_failed(&file.path.display().to_string()),
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
     if let Some(contents) = &file.original {
         fs_util::atomic_replace_blocking(
             fs_util::Destination::operator_named(&file.path),
@@ -585,6 +731,154 @@ mod rollback_tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn rooted_rollback_file_restores_and_removes_through_the_handle() {
+        let messages = crate::i18n::test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        let path = root.write("config/ca.json", "init-era");
+        let tree = root.rooted();
+        let restore = RollbackFile {
+            path: path.clone(),
+            original: Some("pre-init".to_string()),
+        };
+        super::rollback_file(&restore, Some(&tree), &messages).expect("restore");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "pre-init");
+        let remove = RollbackFile {
+            path: path.clone(),
+            original: None,
+        };
+        super::rollback_file(&remove, Some(&tree), &messages).expect("remove");
+        assert!(!path.exists());
+        super::rollback_file(&remove, Some(&tree), &messages).expect("already removed");
+    }
+
+    #[test]
+    fn rooted_rollback_file_refuses_a_swapped_dir_and_a_linked_leaf() {
+        let messages = crate::i18n::test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        let path = root.write("config/ca.json", "init-era");
+        std::fs::write(root.outside.join("ca.json"), "outside").unwrap();
+        let tree = root.rooted();
+        let before = root.outside_snapshot();
+        let link = root.swap("config", &root.outside);
+        for original in [Some("pre-init".to_string()), None] {
+            let file = RollbackFile {
+                path: path.clone(),
+                original,
+            };
+            let err =
+                super::rollback_file(&file, Some(&tree), &messages).expect_err("swapped directory");
+            crate::test_support::assert_error_names(&err, &link);
+        }
+        assert_eq!(root.outside_snapshot(), before);
+
+        // The leaf a link: an operator-named restore is refused, and a
+        // removal unlinks the link itself.
+        let root = crate::test_support::SwapRoot::new();
+        let path = root.write("config/ca.json", "init-era");
+        let tree = root.rooted();
+        let before = root.outside_snapshot();
+        root.swap("config/ca.json", &root.outside.join("secret"));
+        let file = RollbackFile {
+            path: path.clone(),
+            original: Some("pre-init".to_string()),
+        };
+        let err = super::rollback_file(&file, Some(&tree), &messages).expect_err("linked leaf");
+        crate::test_support::assert_error_names(&err, &path);
+        let file = RollbackFile {
+            path: path.clone(),
+            original: None,
+        };
+        super::rollback_file(&file, Some(&tree), &messages).expect("unlink the link");
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// Path-based, the restore delivers through a link at the leaf as the
+    /// operator-named publish always has.
+    #[test]
+    fn path_based_rollback_file_follows_a_linked_leaf() {
+        let messages = crate::i18n::test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        let path = root.secrets.join("config").join("ca.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        root.swap("config/ca.json", &root.outside.join("secret"));
+        let tree = bootroot::fs_util::SecretsTree::open(&root.secrets).unwrap();
+        let file = RollbackFile {
+            path,
+            original: Some("pre-init".to_string()),
+        };
+        super::rollback_file(&file, Some(&tree), &messages).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(root.outside.join("secret")).unwrap(),
+            "pre-init"
+        );
+    }
+
+    /// A swapped `bootroot-http01/` or `registrar-internal/` fails its
+    /// own rollback step, which is reported, and the rollback carries on
+    /// to the next step; nothing outside `secrets/` is removed.
+    #[tokio::test]
+    async fn rooted_rollback_reports_swapped_dirs_and_continues() {
+        let messages = crate::i18n::test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        let cert = root.write("bootroot-http01/tls/server.crt", "CERT");
+        let key = root.write("bootroot-http01/tls/server.key", "KEY");
+        root.write("registrar-internal/key.pem", "KEY");
+        root.write("registrar-internal/.staging/key.pem", "KEY");
+        let password = root.write("password.txt", "init-era");
+        std::fs::create_dir_all(root.outside.join("tls")).unwrap();
+        std::fs::write(root.outside.join("tls").join("server.crt"), "OUT").unwrap();
+        std::fs::write(root.outside.join("key.pem"), "OUT").unwrap();
+        let tree = std::sync::Arc::new(root.rooted());
+        let before = root.outside_snapshot();
+        root.swap("bootroot-http01", &root.outside);
+        root.swap("registrar-internal", &root.outside);
+
+        let rollback = InitRollback {
+            http01_tls_artifacts: vec![cert, key],
+            registrar_internal_dir: Some(root.secrets.join("registrar-internal")),
+            registrar_internal_staging: Some(
+                root.secrets.join("registrar-internal").join(".staging"),
+            ),
+            password_backup: Some(RollbackFile {
+                path: password.clone(),
+                original: Some("pre-init".to_string()),
+            }),
+            secrets_tree: Some(tree),
+            ..Default::default()
+        };
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+
+        assert_eq!(root.outside_snapshot(), before);
+        assert_eq!(
+            std::fs::read_to_string(&password).unwrap(),
+            "pre-init",
+            "the rollback carried on past the refused steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_rollback_removes_the_http01_and_internal_artifacts() {
+        let messages = crate::i18n::test_messages();
+        let root = crate::test_support::SwapRoot::new();
+        let cert = root.write("bootroot-http01/tls/server.crt", "CERT");
+        let key = root.write("bootroot-http01/tls/server.key", "KEY");
+        root.write("registrar-internal/.staging/key.pem", "KEY");
+        let rollback = InitRollback {
+            http01_tls_artifacts: vec![cert.clone(), key.clone()],
+            registrar_internal_dir: Some(root.secrets.join("registrar-internal")),
+            secrets_tree: Some(std::sync::Arc::new(root.rooted())),
+            ..Default::default()
+        };
+        let client = OpenBaoClient::new("http://127.0.0.1:1").unwrap();
+        rollback.rollback(&client, "secret", &messages).await;
+        assert!(!cert.exists());
+        assert!(!key.exists());
+        assert!(!root.secrets.join("registrar-internal").exists());
     }
 
     /// Regression: rollback after a TLS rewrite must restore
@@ -1318,6 +1612,80 @@ pub(super) mod test_support {
             "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\nexit {exit_code}\n"
         );
         write_executable(path, script.as_bytes());
+    }
+
+    /// What [`write_output_fake_docker`] leaves at one output name.
+    pub(in crate::commands::init::steps) enum FakeOutput<'a> {
+        /// A regular file with these contents.
+        File(&'a str),
+        /// A symbolic link to this target, in place of the file.
+        Link(&'a Path),
+    }
+
+    /// Writes a fake `docker` that logs its argv to `args_log` and, on
+    /// the `step certificate create` call, leaves each of `outputs` in
+    /// the host source of its `:/output` mount, as the helper container
+    /// would. Returns the executable's path, under `dir`.
+    pub(in crate::commands::init::steps) fn write_output_fake_docker(
+        dir: &Path,
+        args_log: &Path,
+        outputs: &[(&str, FakeOutput<'_>)],
+    ) -> PathBuf {
+        use std::fmt::Write as _;
+
+        let quote = |path: &Path| {
+            let shown = path.display().to_string();
+            assert!(
+                !shown.contains('\''),
+                "the path is interpolated into a single-quoted shell word"
+            );
+            shown
+        };
+        let mut writes = String::new();
+        for (index, (name, output)) in outputs.iter().enumerate() {
+            match output {
+                FakeOutput::File(contents) => {
+                    let source = dir.join(format!("fake-docker-output-{index}"));
+                    std::fs::write(&source, contents).expect("output source");
+                    let _ = writeln!(writes, "  cat '{}' > \"$out/{name}\"", quote(&source));
+                }
+                FakeOutput::Link(target) => {
+                    let _ = writeln!(writes, "  ln -s '{}' \"$out/{name}\"", quote(target));
+                }
+            }
+        }
+        let script = format!(
+            "#!/bin/sh\nset -eu\n{{ printf '%s ' \"$@\"; printf '\\n'; }} >> '{log}'\n\
+             out=''\ncreate=0\n\
+             for arg in \"$@\"; do\n  case \"$arg\" in\n    \
+             *:/output) out=\"${{arg%:/output}}\" ;;\n    create) create=1 ;;\n  esac\ndone\n\
+             if [ \"$create\" = 1 ]; then\n  umask 077\n{writes}fi\nexit 0\n",
+            log = quote(args_log),
+        );
+        let path = dir.join("fake-output-docker");
+        write_executable(&path, script.as_bytes());
+        path
+    }
+
+    /// The `.bootroot-step-*` scratch directories left in `dir`.
+    pub(in crate::commands::init::steps) fn step_scratch_dirs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".bootroot-step-"))
+            })
+            .collect()
+    }
+
+    /// The value following each `-v` in a logged argv line.
+    pub(in crate::commands::init::steps) fn volume_sources(line: &str) -> Vec<String> {
+        let args: Vec<&str> = line.split_whitespace().collect();
+        args.windows(2)
+            .filter(|pair| pair.first() == Some(&"-v"))
+            .filter_map(|pair| pair.get(1).map(|value| (*value).to_string()))
+            .collect()
     }
 
     pub(in crate::commands::init::steps) fn default_init_args() -> InitArgs {

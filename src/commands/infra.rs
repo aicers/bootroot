@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bootroot::db::POSTGRES_HOST_PORT_ENV;
+use bootroot::fs_util::SecretsTree;
 use bootroot::host_port::{
     HTTP01_ADMIN_HOST_PORT_ENV, OPENBAO_HOST_PORT_ENV, STEPCA_HOST_PORT_ENV,
     resolve_http01_admin_host_port_with_env, resolve_openbao_host_port_with_env,
@@ -45,7 +46,9 @@ use crate::commands::init::{
     compose_has_stepca, compose_up_reaches_service, hand_over_openbao_tls_key,
     sync_openbao_audit_device,
 };
-use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
+use crate::commands::openbao_unseal::{
+    prompt_unseal_keys_interactive, read_unseal_keys_from_file, read_unseal_keys_in,
+};
 use crate::commands::openbao_url::effective_openbao_url;
 use crate::commands::openbao_user::{
     OPENBAO_USER_ENV_KEY, exported_openbao_user, install_openbao_user_with_env,
@@ -242,6 +245,68 @@ pub(crate) fn read_compose_config(compose_file: &Path, messages: &Messages) -> R
     )
 }
 
+/// What `infra up` finds at the auto-detected unseal-key location when no
+/// `--openbao-unseal-from-file` is given.
+enum DefaultUnsealKeys {
+    /// The file exists and is read by name later (path-based mode).
+    File(PathBuf),
+    /// The keys, already read through the rooted handle.
+    Keys(Vec<String>),
+    /// No file there, so `infra up` falls through to the interactive unseal.
+    Absent,
+}
+
+/// Looks for the saved unseal keys at `compose_dir/secrets/openbao/unseal-keys.txt`.
+///
+/// Over a rooted handle the file is read through it, so a link at any
+/// level is refused rather than followed and its target never reaches the
+/// unseal endpoint; otherwise the file is probed by name as before.
+fn detect_default_unseal_keys(
+    compose_dir: &Path,
+    tree: Option<&SecretsTree>,
+    messages: &Messages,
+) -> Result<DefaultUnsealKeys> {
+    let default_path = compose_dir.join(UNSEAL_KEYS_PATH);
+    if let Some(tree) = tree.filter(|tree| tree.is_rooted()) {
+        return Ok(read_unseal_keys_in(tree, &default_path, messages)?
+            .map_or(DefaultUnsealKeys::Absent, DefaultUnsealKeys::Keys));
+    }
+    Ok(if default_path.exists() {
+        DefaultUnsealKeys::File(default_path)
+    } else {
+        DefaultUnsealKeys::Absent
+    })
+}
+
+/// Opens the handle on `compose_dir/secrets` and runs
+/// [`detect_default_unseal_keys`] through it, on a blocking thread, since
+/// both block.
+///
+/// As root over a `secrets/` another account owns, the auto-detected file
+/// is read through the handle instead of probed and read by name: absent
+/// falls through to the interactive unseal, and any other failure, a link
+/// included, stops `infra up`.
+async fn detect_default_unseal_keys_blocking(
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<DefaultUnsealKeys> {
+    let compose_dir = compose_dir.to_path_buf();
+    let messages = messages.clone();
+    tokio::task::spawn_blocking(move || {
+        let tree = match SecretsTree::open(&compose_dir.join("secrets")) {
+            Ok(tree) => Some(tree),
+            // Only root reads through the handle, and root opens any
+            // directory; a non-root run that cannot open `secrets/` keeps
+            // the probe, which answers "absent" for it as before.
+            Err(_) if bootroot::fs_util::current_process_euid() != 0 => None,
+            Err(err) => return Err(err),
+        };
+        detect_default_unseal_keys(&compose_dir, tree.as_ref(), &messages)
+    })
+    .await
+    .context("unseal-key detection task panicked")?
+}
+
 /// Determines whether `infra install` runs the preliminary `docker compose
 /// pull --ignore-pull-failures` before `up`.
 ///
@@ -277,15 +342,30 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     // enforced, so Docker cannot start OpenBao against an unmounted store.
     // The audit device in `openbao.hcl` is set to match whether the
     // override below is applied, before any Docker call too.
-    let audit_override = crate::commands::audit_store::prepare_openbao_audit_for_infra_up(
-        &state_path,
-        &args.compose_file.compose_file,
-        args.agent_config.as_deref(),
-        crate::commands::audit_store::production_uid(),
-        &args.services,
-        &|compose_file| read_compose_config(compose_file, messages),
-        messages,
-    )?;
+    // Blocking throughout (the override is read and republished through
+    // the secrets tree handle, the store checked, `openbao.hcl` rewritten
+    // and the Compose configuration read), so it runs on a blocking
+    // thread.
+    let audit_override = {
+        let state_path = state_path.clone();
+        let compose_file = args.compose_file.compose_file.clone();
+        let agent_config = args.agent_config.clone();
+        let services = args.services.clone();
+        let messages = messages.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::commands::audit_store::prepare_openbao_audit_for_infra_up(
+                &state_path,
+                &compose_file,
+                agent_config.as_deref(),
+                crate::commands::audit_store::production_uid(),
+                &services,
+                &|compose_file| read_compose_config(compose_file, &messages),
+                &messages,
+            )
+        })
+        .await
+        .context("audit store preparation task panicked")??
+    };
     // Skip responder overrides when the compose file does not declare
     // the responder service — a stored intent from a previous install
     // must not cause a hard failure against a custom compose file.
@@ -421,14 +501,18 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         .compose_file
         .parent()
         .unwrap_or(Path::new("."));
-    let unseal_file = args.openbao_unseal_from_file.clone().or_else(|| {
-        let default_path = compose_dir.join(UNSEAL_KEYS_PATH);
-        if default_path.exists() {
-            Some(default_path)
-        } else {
-            None
-        }
-    });
+    let mut detected_keys = None;
+    let unseal_file = match args.openbao_unseal_from_file.clone() {
+        Some(path) => Some(path),
+        None => match detect_default_unseal_keys_blocking(compose_dir, messages).await? {
+            DefaultUnsealKeys::File(path) => Some(path),
+            DefaultUnsealKeys::Keys(keys) => {
+                detected_keys = Some(keys);
+                None
+            }
+            DefaultUnsealKeys::Absent => None,
+        },
+    };
     // Resolve the secrets_dir from state when present so the unseal
     // helpers can anchor TLS trust on the step-ca root/intermediate
     // bundle.  Without this, the rustls client built by
@@ -437,8 +521,19 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
     // OpenBao listens on `https://<non-loopback>:8200`.
     let effective_secrets_dir = resolve_effective_secrets_dir(&state_path, compose_dir);
     if let Some(path) = unseal_file.as_deref() {
+        println!("{}", messages.warning_openbao_unseal_from_file());
+        let keys = read_unseal_keys_from_file(path, messages)?;
         auto_unseal_openbao(
-            path,
+            &keys,
+            &effective_openbao_url,
+            effective_secrets_dir.as_deref(),
+            messages,
+        )
+        .await?;
+    } else if let Some(keys) = detected_keys {
+        println!("{}", messages.warning_openbao_unseal_from_file());
+        auto_unseal_openbao(
+            &keys,
             &effective_openbao_url,
             effective_secrets_dir.as_deref(),
             messages,
@@ -688,6 +783,10 @@ fn run_infra_install_locked(
         }
     }
     println!("{}", messages.infra_install_dirs_created());
+    // The handle the bind-intent clears below remove their overrides
+    // through: as root over a `secrets/` another account owns, no name
+    // there is followed.
+    let secrets_tree = SecretsTree::open(&secrets_dir)?;
 
     // Resolve the host-side published ports once: the preflight binds
     // them, the `.env` upsert and the compose subprocess environment
@@ -717,7 +816,13 @@ fn run_infra_install_locked(
         )?;
         println!("{}", messages.info_openbao_bind_intent_recorded(bind_addr));
     } else {
-        clear_openbao_bind_intent(state_lock, compose_dir, &openbao_url, messages)?;
+        clear_openbao_bind_intent(
+            state_lock,
+            compose_dir,
+            &secrets_tree,
+            &openbao_url,
+            messages,
+        )?;
     }
 
     if let Some(ref bind_addr) = http01_admin_bind {
@@ -735,7 +840,7 @@ fn run_infra_install_locked(
             messages.info_http01_admin_bind_intent_recorded(bind_addr)
         );
     } else {
-        clear_http01_admin_bind_intent(state_lock, compose_dir, messages)?;
+        clear_http01_admin_bind_intent(state_lock, compose_dir, &secrets_tree, messages)?;
     }
 
     if let Some(ref bind_addr) = stepca_bind {
@@ -749,7 +854,7 @@ fn run_infra_install_locked(
         )?;
         println!("{}", messages.info_stepca_bind_intent_recorded(bind_addr));
     } else {
-        clear_stepca_bind_intent(state_lock, compose_dir, messages)?;
+        clear_stepca_bind_intent(state_lock, compose_dir, &secrets_tree, messages)?;
     }
 
     // Recorded, never cleared: without the flags the predicate `init`
@@ -1628,14 +1733,13 @@ async fn wait_for_openbao_active_within(
         .map_err(|_| anyhow::anyhow!(messages.error_openbao_not_active()))
 }
 
+/// Unseals `OpenBao` with `keys`, read from a key file by the caller.
 async fn auto_unseal_openbao(
-    path: &Path,
+    keys: &[String],
     openbao_url: &str,
     secrets_dir: Option<&Path>,
     messages: &Messages,
 ) -> Result<()> {
-    println!("{}", messages.warning_openbao_unseal_from_file());
-    let keys = read_unseal_keys_from_file(path, messages)?;
     let client = build_openbao_client(openbao_url, secrets_dir, messages)?;
 
     // `docker compose up -d` returns once the container is Started, not
@@ -1655,7 +1759,7 @@ async fn auto_unseal_openbao(
         return Ok(());
     }
 
-    for key in &keys {
+    for key in keys {
         client
             .unseal(key)
             .await
@@ -2063,21 +2167,54 @@ fn save_openbao_bind_intent_to(
 fn clear_openbao_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<()> {
     clear_openbao_bind_intent_to(
         &StateFile::default_path(),
         compose_dir,
+        secrets_tree,
         openbao_url,
         messages,
     )
 }
 
+/// Removes the exposure override at `override_path`, below
+/// `secrets_tree`'s anchor `compose_dir/secrets`, when one is there.
+///
+/// A rooted handle unlinks it through the walked parent's descriptor and
+/// takes `NotFound` as nothing to remove; a path-based one probes and
+/// removes it by path, as it always did.
+fn remove_exposure_override(
+    secrets_tree: &SecretsTree,
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    if secrets_tree.is_rooted() {
+        return match secrets_tree.remove_file(override_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow::Error::new(err)
+                .context(messages.error_remove_file_failed(&override_path.display().to_string()))),
+        };
+    }
+    if override_path.exists() {
+        std::fs::remove_file(override_path).with_context(|| {
+            messages.error_remove_file_failed(&override_path.display().to_string())
+        })?;
+    }
+    Ok(())
+}
+
 /// Inner implementation that accepts explicit paths for testability.
+///
+/// `secrets_tree` is the handle on `compose_dir/secrets` the override is
+/// removed through.
 fn clear_openbao_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<()> {
@@ -2107,11 +2244,7 @@ fn clear_openbao_bind_intent_to(
         .join("secrets")
         .join("openbao")
         .join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if override_path.exists() {
-        std::fs::remove_file(&override_path).with_context(|| {
-            messages.error_remove_file_failed(&override_path.display().to_string())
-        })?;
-    }
+    remove_exposure_override(secrets_tree, &override_path, messages)?;
     // Restore openbao.hcl to plaintext so OpenBao does not try to
     // load TLS certificates that are no longer issued or renewed.
     crate::commands::init::write_openbao_hcl_plaintext(compose_dir, messages)?;
@@ -2191,7 +2324,8 @@ fn save_http01_admin_bind_intent_to(
     } else {
         secrets_dir.to_path_buf()
     };
-    crate::commands::init::strip_responder_tls_config(&secrets_base, messages)?;
+    let secrets_tree = SecretsTree::open(&secrets_base)?;
+    crate::commands::init::strip_responder_tls_config(&secrets_tree, messages)?;
     Ok(())
 }
 
@@ -2199,14 +2333,21 @@ fn save_http01_admin_bind_intent_to(
 fn clear_http01_admin_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
-    clear_http01_admin_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
+    clear_http01_admin_bind_intent_to(
+        &StateFile::default_path(),
+        compose_dir,
+        secrets_tree,
+        messages,
+    )
 }
 
 fn clear_http01_admin_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
     if !state_path.exists() {
@@ -2226,11 +2367,7 @@ fn clear_http01_admin_bind_intent_to(
         .join("secrets")
         .join("responder")
         .join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if override_path.exists() {
-        std::fs::remove_file(&override_path).with_context(|| {
-            messages.error_remove_file_failed(&override_path.display().to_string())
-        })?;
-    }
+    remove_exposure_override(secrets_tree, &override_path, messages)?;
     println!("{}", messages.info_http01_admin_bind_intent_cleared());
     Ok(())
 }
@@ -2340,14 +2477,21 @@ fn sync_state_openbao_url_to(
 fn clear_stepca_bind_intent(
     _state_lock: &StateLock,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
-    clear_stepca_bind_intent_to(&StateFile::default_path(), compose_dir, messages)
+    clear_stepca_bind_intent_to(
+        &StateFile::default_path(),
+        compose_dir,
+        secrets_tree,
+        messages,
+    )
 }
 
 fn clear_stepca_bind_intent_to(
     state_path: &Path,
     compose_dir: &Path,
+    secrets_tree: &SecretsTree,
     messages: &Messages,
 ) -> Result<()> {
     if !state_path.exists() {
@@ -2366,11 +2510,7 @@ fn clear_stepca_bind_intent_to(
         .join("secrets")
         .join("step-ca")
         .join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
-    if override_path.exists() {
-        std::fs::remove_file(&override_path).with_context(|| {
-            messages.error_remove_file_failed(&override_path.display().to_string())
-        })?;
-    }
+    remove_exposure_override(secrets_tree, &override_path, messages)?;
     println!("{}", messages.info_stepca_bind_intent_cleared());
     Ok(())
 }
@@ -2794,6 +2934,169 @@ mod tests {
     use super::*;
     use crate::commands::compose_project::DOCKER_COMPOSE_SUBCOMMAND;
     use crate::i18n::test_messages;
+
+    /// The handle `infra install` opens on `compose_dir/secrets`.
+    fn compose_tree(compose_dir: &Path) -> SecretsTree {
+        SecretsTree::open(&compose_dir.join("secrets")).expect("open secrets tree")
+    }
+
+    /// `ROOT_BY_POLICY_DIRS`, which a rooted walk requires to be owned by
+    /// the writing process, names exactly what the ownership sweep holds
+    /// back, so neither list can grow without the other.
+    #[test]
+    fn root_by_policy_dirs_are_exactly_what_the_sweep_holds_back() {
+        let dir = tempdir().unwrap();
+        let mut names: Vec<&str> = bootroot::fs_util::ROOT_BY_POLICY_DIRS.to_vec();
+        names.extend(["openbao", "services", "password.txt"]);
+        for name in &names {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        let targets = ownership_sweep_targets(dir.path(), &test_messages()).unwrap();
+        let swept: Vec<String> = targets
+            .iter()
+            .filter_map(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        let mut skipped: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| !swept.iter().any(|s| s == name))
+            .collect();
+        skipped.sort_unstable();
+        let mut expected = bootroot::fs_util::ROOT_BY_POLICY_DIRS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(skipped, expected);
+    }
+
+    /// As root over a foreign-owned `secrets/`, each bind-intent clear
+    /// removes its override through the handle and refuses a swapped
+    /// directory rather than removing a file it points at.
+    #[test]
+    fn rooted_clear_bind_intents_refuse_a_swapped_override_dir() {
+        type Clear = fn(&Path, &Path, &SecretsTree, &Messages) -> Result<()>;
+        type Case = (&'static str, &'static str, Clear, fn(&mut StateFile));
+        let cases: [Case; 3] = [
+            (
+                "openbao",
+                OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME,
+                |state, dir, tree, messages| {
+                    clear_openbao_bind_intent_to(
+                        state,
+                        dir,
+                        tree,
+                        "http://127.0.0.1:8200",
+                        messages,
+                    )
+                },
+                |state| state.openbao_bind_addr = Some("192.168.1.10:8200".to_string()),
+            ),
+            (
+                "responder",
+                HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME,
+                clear_http01_admin_bind_intent_to,
+                |state| state.http01_admin_bind_addr = Some("192.168.1.10:8080".to_string()),
+            ),
+            (
+                "step-ca",
+                STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
+                clear_stepca_bind_intent_to,
+                |state| state.stepca_bind_addr = Some("192.168.1.10:9000".to_string()),
+            ),
+        ];
+        for (sub, name, clear, record) in cases {
+            for swapped in [false, true] {
+                let root = crate::test_support::SwapRoot::new();
+                let compose_dir = root.root();
+                let state_path = compose_dir.join("state.json");
+                let mut state = StateFile::default();
+                record(&mut state);
+                state.save(&state_path).unwrap();
+                root.write(&format!("{sub}/{name}"), "services: {}\n");
+                std::fs::write(root.outside.join(name), "outside").unwrap();
+                let tree = root.rooted();
+                let before = root.outside_snapshot();
+                if swapped {
+                    let link = root.swap(sub, &root.outside);
+                    let err = clear(&state_path, compose_dir, &tree, &test_messages())
+                        .expect_err("swapped override dir");
+                    crate::test_support::assert_error_names(&err, &link);
+                } else if sub == "openbao" {
+                    // The openbao clear goes on to rewrite openbao.hcl,
+                    // which needs a compose layout this test does not
+                    // build; the override removal precedes it.
+                    let _ = clear(&state_path, compose_dir, &tree, &test_messages());
+                    assert!(!root.secrets.join(sub).join(name).exists(), "{sub}");
+                } else {
+                    clear(&state_path, compose_dir, &tree, &test_messages()).unwrap();
+                    assert!(!root.secrets.join(sub).join(name).exists(), "{sub}");
+                }
+                assert_eq!(root.outside_snapshot(), before, "{sub} swapped={swapped}");
+            }
+        }
+    }
+
+    /// `infra up`'s auto-detected unseal-key file, over a rooted handle:
+    /// read through it, absent falls through, and a link at the leaf or
+    /// at `openbao/` is refused naming the path with nothing read from
+    /// it.
+    #[test]
+    fn rooted_default_unseal_keys_are_read_through_the_handle() {
+        let root = crate::test_support::SwapRoot::new();
+        let compose_dir = root.root();
+        let path = compose_dir.join(UNSEAL_KEYS_PATH);
+        let tree = root.rooted();
+        let messages = test_messages();
+        assert!(matches!(
+            detect_default_unseal_keys(compose_dir, Some(&tree), &messages).expect("absent"),
+            DefaultUnsealKeys::Absent
+        ));
+        root.write("openbao/unseal-keys.txt", "key-1\nkey-2\n");
+        let DefaultUnsealKeys::Keys(keys) =
+            detect_default_unseal_keys(compose_dir, Some(&tree), &messages).expect("keys")
+        else {
+            panic!("the keys are read through the handle");
+        };
+        assert_eq!(keys, vec!["key-1".to_string(), "key-2".to_string()]);
+
+        let before = root.outside_snapshot();
+        root.swap("openbao/unseal-keys.txt", &root.outside.join("secret"));
+        let Err(err) = detect_default_unseal_keys(compose_dir, Some(&tree), &messages) else {
+            panic!("a linked leaf is refused");
+        };
+        crate::test_support::assert_error_names(&err, &path);
+        assert!(!format!("{err:#}").contains("OUTSIDE-SECRET"));
+
+        let link = root.swap("openbao", &root.outside);
+        let Err(err) = detect_default_unseal_keys(compose_dir, Some(&tree), &messages) else {
+            panic!("a linked openbao/ is refused");
+        };
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// Outside rooted mode the default file is probed by name, and a link
+    /// below `secrets/` is followed as before.
+    #[test]
+    fn path_based_default_unseal_keys_are_probed_by_name() {
+        let root = crate::test_support::SwapRoot::new();
+        let compose_dir = root.root();
+        let tree = SecretsTree::open(&root.secrets).expect("path-based handle");
+        assert!(!tree.is_rooted());
+        let messages = test_messages();
+        for handle in [Some(&tree), None] {
+            assert!(matches!(
+                detect_default_unseal_keys(compose_dir, handle, &messages).expect("absent"),
+                DefaultUnsealKeys::Absent
+            ));
+        }
+        std::fs::write(root.outside.join("unseal-keys.txt"), "key-1\n").expect("outside keys");
+        root.swap("openbao", &root.outside);
+        let DefaultUnsealKeys::File(found) =
+            detect_default_unseal_keys(compose_dir, Some(&tree), &messages).expect("file")
+        else {
+            panic!("the path-based probe follows the link");
+        };
+        assert_eq!(found, compose_dir.join(UNSEAL_KEYS_PATH));
+    }
 
     /// A standby answers 429 until it wins its election; the wait keeps
     /// polling through that and returns on the first 200.
@@ -4996,7 +5299,14 @@ mod tests {
         let override_path = override_dir.join(OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), loopback_url, &messages).unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            loopback_url,
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5034,8 +5344,14 @@ mod tests {
         };
         state.save(&state_path).unwrap();
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
-            .unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            "http://127.0.0.1:8200",
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.openbao_bind_addr.is_none());
@@ -5049,8 +5365,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
-            .unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            "http://127.0.0.1:8200",
+            &messages,
+        )
+        .unwrap();
 
         assert!(!state_path.exists());
     }
@@ -5094,7 +5416,14 @@ mod tests {
         .unwrap();
 
         let loopback_url = "http://127.0.0.1:8200";
-        clear_openbao_bind_intent_to(&state_path, dir.path(), loopback_url, &messages).unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            loopback_url,
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5406,8 +5735,14 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
-            .unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            "http://127.0.0.1:8200",
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5459,8 +5794,14 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
-            .unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            "http://127.0.0.1:8200",
+            &messages,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&hcl_path).unwrap();
         assert!(
@@ -5505,8 +5846,14 @@ services:
         )
         .unwrap();
 
-        clear_openbao_bind_intent_to(&state_path, dir.path(), "http://127.0.0.1:8200", &messages)
-            .unwrap();
+        clear_openbao_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            "http://127.0.0.1:8200",
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.openbao_bind_addr.is_none());
@@ -5625,7 +5972,13 @@ services:
         let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_http01_admin_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5689,7 +6042,13 @@ services:
         )
         .unwrap();
 
-        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_http01_admin_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -5846,7 +6205,13 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_http01_admin_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
         assert!(!state_path.exists());
     }
 
@@ -5902,7 +6267,13 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"\n";
         let override_path = override_dir.join(HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_http01_admin_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.http01_admin_bind_addr.is_none());
@@ -6247,7 +6618,13 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         let override_path = override_dir.join(STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME);
         std::fs::write(&override_path, "placeholder").unwrap();
 
-        clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_stepca_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(
@@ -6269,7 +6646,13 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             .save(&state_path)
             .unwrap();
 
-        clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+        clear_stepca_bind_intent_to(
+            &state_path,
+            dir.path(),
+            &compose_tree(dir.path()),
+            &messages,
+        )
+        .unwrap();
 
         let reloaded = StateFile::load(&state_path).unwrap();
         assert!(reloaded.stepca_bind_addr.is_none());
@@ -6284,7 +6667,15 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.json");
-        assert!(clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).is_ok());
+        assert!(
+            clear_stepca_bind_intent_to(
+                &state_path,
+                dir.path(),
+                &compose_tree(dir.path()),
+                &messages
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -6972,10 +7363,28 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             state.http01_admin_bind_addr = Some("192.168.1.10:8080".to_string());
             state.save(&state_path).unwrap();
 
-            clear_openbao_bind_intent_to(&state_path, dir.path(), INSTALL_OPENBAO_URL, &messages)
-                .unwrap();
-            clear_http01_admin_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
-            clear_stepca_bind_intent_to(&state_path, dir.path(), &messages).unwrap();
+            clear_openbao_bind_intent_to(
+                &state_path,
+                dir.path(),
+                &compose_tree(dir.path()),
+                INSTALL_OPENBAO_URL,
+                &messages,
+            )
+            .unwrap();
+            clear_http01_admin_bind_intent_to(
+                &state_path,
+                dir.path(),
+                &compose_tree(dir.path()),
+                &messages,
+            )
+            .unwrap();
+            clear_stepca_bind_intent_to(
+                &state_path,
+                dir.path(),
+                &compose_tree(dir.path()),
+                &messages,
+            )
+            .unwrap();
             sync_state_openbao_url_to(&state_path, "http://localhost:28200", &messages).unwrap();
 
             let after = StateFile::load(&state_path).unwrap();

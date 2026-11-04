@@ -16,18 +16,46 @@ use crate::i18n::Messages;
 /// HMACs are 32 bytes; we accept down to 16 to tolerate other CAs).
 const MIN_EAB_HMAC_BYTES: usize = 16;
 
-pub(super) fn resolve_init_secrets(
-    args: &InitArgs,
+/// Reads the step-ca password a reinit preserves in `password.txt`.
+///
+/// In reinit mode, if `password.txt` already exists, the stored password
+/// is preferred so that step-ca CA material (encrypted with that
+/// password) remains usable.  Without this, the auto-gen path of
+/// [`resolve_init_secrets`] would overwrite the existing password and
+/// lock the operator out of the preserved `root_ca_key` /
+/// `intermediate_ca_key`.  Returns `None` outside reinit mode and when
+/// the file is absent.
+///
+/// `secrets_tree` is the handle on `--secrets-dir`. A rooted handle
+/// reads `password.txt` through its descriptors, so a link there is
+/// refused rather than its target being written to the KV and back.
+/// Blocking: an async caller runs it on a blocking thread.
+pub(super) fn read_preserved_stepca_password(
+    reinit_mode: bool,
+    secrets_tree: &bootroot::fs_util::SecretsTree,
     messages: &Messages,
-    db_dsn: String,
-) -> Result<InitSecrets> {
-    // In reinit mode, if `password.txt` already exists, prefer the
-    // stored password so that step-ca CA material (encrypted with that
-    // password) remains usable.  Without this, the auto-gen path below
-    // would overwrite the existing password and lock the operator out
-    // of the preserved root_ca_key / intermediate_ca_key.
-    let preserved_stepca_password = if args.reinit_mode {
-        let password_path = args.secrets_dir.secrets_dir.join("password.txt");
+) -> Result<Option<String>> {
+    Ok(if reinit_mode && secrets_tree.is_rooted() {
+        let password_path = secrets_tree.anchor().join("password.txt");
+        match secrets_tree.read(&password_path) {
+            Ok(bytes) => Some(
+                String::from_utf8(bytes)
+                    .map_err(|err| anyhow::anyhow!(err))
+                    .with_context(|| {
+                        messages.error_read_file_failed(&password_path.display().to_string())
+                    })?
+                    .trim_end_matches('\n')
+                    .to_string(),
+            ),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(
+                    messages.error_read_file_failed(&password_path.display().to_string()),
+                ));
+            }
+        }
+    } else if reinit_mode {
+        let password_path = secrets_tree.anchor().join("password.txt");
         if password_path.exists() {
             Some(
                 std::fs::read_to_string(&password_path)
@@ -42,7 +70,18 @@ pub(super) fn resolve_init_secrets(
         }
     } else {
         None
-    };
+    })
+}
+
+/// Resolves the secrets `init` writes, preferring
+/// `preserved_stepca_password`, what [`read_preserved_stepca_password`]
+/// returned, for the step-ca password.
+pub(super) fn resolve_init_secrets(
+    args: &InitArgs,
+    preserved_stepca_password: Option<String>,
+    messages: &Messages,
+    db_dsn: String,
+) -> Result<InitSecrets> {
     // Under reinit mode the previous step-ca password and HTTP-01 HMAC
     // are either preserved from the source tree (`password.txt`) or are
     // gone with the wiped OpenBao KV (`http_hmac`, previously at
@@ -497,8 +536,18 @@ mod tests {
         args.no_eab = true;
         args.http_hmac = Some("provided-hmac".to_string());
 
-        let resolved =
-            resolve_init_secrets(&args, &messages, "ignored-dsn".to_string()).expect("resolve");
+        let resolved = resolve_init_secrets(
+            &args,
+            read_preserved_stepca_password(
+                args.reinit_mode,
+                &bootroot::fs_util::SecretsTree::open(&args.secrets_dir.secrets_dir).expect("open"),
+                &messages,
+            )
+            .expect("read"),
+            &messages,
+            "ignored-dsn".to_string(),
+        )
+        .expect("resolve");
         assert_eq!(
             resolved.stepca_password, "preserved-secret",
             "reinit_mode must preserve existing password.txt verbatim"
@@ -529,7 +578,18 @@ mod tests {
         args.no_eab = true;
         args.http_hmac = Some("provided-hmac".to_string());
 
-        let resolved = resolve_init_secrets(&args, &messages, "dsn".to_string()).expect("resolve");
+        let resolved = resolve_init_secrets(
+            &args,
+            read_preserved_stepca_password(
+                args.reinit_mode,
+                &bootroot::fs_util::SecretsTree::open(&args.secrets_dir.secrets_dir).expect("open"),
+                &messages,
+            )
+            .expect("read"),
+            &messages,
+            "dsn".to_string(),
+        )
+        .expect("resolve");
         assert_ne!(
             resolved.stepca_password, "should-be-ignored",
             "outside reinit_mode, auto-generate must run"
@@ -564,8 +624,18 @@ mod tests {
         args.http_hmac = None;
         args.enable = Vec::new();
 
-        let resolved =
-            resolve_init_secrets(&args, &messages, "ignored-dsn".to_string()).expect("resolve");
+        let resolved = resolve_init_secrets(
+            &args,
+            read_preserved_stepca_password(
+                args.reinit_mode,
+                &bootroot::fs_util::SecretsTree::open(&args.secrets_dir.secrets_dir).expect("open"),
+                &messages,
+            )
+            .expect("read"),
+            &messages,
+            "ignored-dsn".to_string(),
+        )
+        .expect("resolve");
         assert!(
             !resolved.http_hmac.is_empty(),
             "reinit_mode must auto-generate a fresh HTTP HMAC instead of prompting"
@@ -600,8 +670,18 @@ mod tests {
         args.enable = Vec::new();
         args.http_hmac = Some("provided-hmac".to_string());
 
-        let resolved =
-            resolve_init_secrets(&args, &messages, "ignored-dsn".to_string()).expect("resolve");
+        let resolved = resolve_init_secrets(
+            &args,
+            read_preserved_stepca_password(
+                args.reinit_mode,
+                &bootroot::fs_util::SecretsTree::open(&args.secrets_dir.secrets_dir).expect("open"),
+                &messages,
+            )
+            .expect("read"),
+            &messages,
+            "ignored-dsn".to_string(),
+        )
+        .expect("resolve");
         assert!(
             !resolved.stepca_password.is_empty(),
             "reinit_mode must auto-generate a fresh step-ca password instead of prompting"
@@ -661,5 +741,33 @@ mod tests {
         let creds = validate_eab("kid-1", &encoded).expect("valid EAB");
         assert_eq!(creds.kid, "kid-1");
         assert_eq!(creds.hmac.expose(), encoded);
+    }
+
+    /// In reinit mode, as root over a foreign-owned `secrets/`, a
+    /// `password.txt` swapped for a link is refused rather than its
+    /// target written to the KV and back.
+    #[test]
+    fn rooted_reinit_password_read_refuses_a_linked_leaf() {
+        let root = crate::test_support::SwapRoot::new();
+        let mut args = super::super::test_support::default_init_args();
+        args.secrets_dir.secrets_dir.clone_from(&root.secrets);
+        args.reinit_mode = true;
+        args.http_hmac = Some("hmac".to_string());
+        args.no_eab = true;
+        let messages = super::super::test_support::test_messages();
+        root.write("password.txt", "preserved\n");
+        let tree = root.rooted();
+        let preserved = read_preserved_stepca_password(args.reinit_mode, &tree, &messages)
+            .expect("preserved password");
+        let resolved =
+            resolve_init_secrets(&args, preserved, &messages, "dsn".to_string()).expect("resolve");
+        assert_eq!(resolved.stepca_password, "preserved");
+
+        let leaf = root.swap("password.txt", &root.outside.join("secret"));
+        let Err(err) = read_preserved_stepca_password(args.reinit_mode, &tree, &messages) else {
+            panic!("a linked password.txt is refused");
+        };
+        crate::test_support::assert_error_names(&err, &leaf);
+        assert!(!format!("{err:#}").contains("OUTSIDE-SECRET"));
     }
 }

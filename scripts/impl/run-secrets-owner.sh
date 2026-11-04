@@ -25,7 +25,14 @@ set -euo pipefail
 #      override applied, no `infra up` in between, and checks that the
 #      stack comes up healthy
 #   5. asserts that `find secrets` prints no entry whose uid or gid is
-#      not the account's, and no directory whose mode is not `0700`
+#      not the account's, and no directory whose mode is not `0700`, and
+#      that no `.bootroot-step-*` scratch directory the HTTP-01 admin
+#      issuance used is left beside `secrets/`
+#   6. as root, runs a second `init` over the stack the first left —
+#      OpenBao now on TLS at the bind, the root token from the first
+#      run's summary, the DSN from `ca.json` — which re-issues the
+#      HTTP-01 admin certificate over the existing
+#      `bootroot-http01/tls/`, and repeats the assertions of step 5
 #
 # Running as root over a tree another account owns is the case in
 # which bootroot's writes under `secrets/` walk from the tree's
@@ -66,6 +73,9 @@ RUN_LOG="$ARTIFACT_DIR/run.log"
 INIT_LOG="$ARTIFACT_DIR/init.log"
 INIT_RAW_LOG="$ARTIFACT_DIR/init.raw.log"
 INIT_SUMMARY_JSON="$ARTIFACT_DIR/init-summary.json"
+SECOND_INIT_LOG="$ARTIFACT_DIR/init-second.log"
+SECOND_INIT_RAW_LOG="$ARTIFACT_DIR/init-second.raw.log"
+SECOND_INIT_SUMMARY_JSON="$ARTIFACT_DIR/init-second-summary.json"
 
 # Non-loopback bind for all three exposed services.  Defaults to the
 # docker bridge gateway for the reason `run-openbao-tls-reown.sh` gives:
@@ -99,6 +109,14 @@ SECRETS_GID=""
 ACCOUNT_CREATED=0
 ROOT_WROTE=0
 ROOT_ENV=()
+# The first run's root token, set only while the second `init` runs, so
+# it reaches that command through `OPENBAO_ROOT_TOKEN` in the `env` list
+# below rather than through bootroot's own argument list.
+SECOND_INIT_ROOT_TOKEN=""
+# The first run's root token once its summary has been read, so that
+# every copy of an `init` log the run leaves (the run log, the error
+# handler's output, the uploaded artifact directory) has it masked.
+KNOWN_ROOT_TOKEN=""
 CURRENT_PHASE="startup"
 REPO_OPENBAO_SNAPSHOT_TAKEN=0
 
@@ -136,10 +154,44 @@ on_error() {
     echo "--- run.log (tail) ---" >&2
     tail -n 120 "$RUN_LOG" >&2 || true
   fi
-  if [ -f "$INIT_RAW_LOG" ]; then
-    echo "--- init.raw.log (tail) ---" >&2
-    tail -n 80 "$INIT_RAW_LOG" >&2 || true
+  # Only the redacted copies are printed: a raw log still on disk here
+  # (the error struck before its run redacted it) is redacted first.
+  redact_init_log "$INIT_RAW_LOG" "$INIT_LOG" || true
+  redact_init_log "$SECOND_INIT_RAW_LOG" "$SECOND_INIT_LOG" || true
+  if [ -f "$INIT_LOG" ]; then
+    echo "--- init.log (redacted tail) ---" >&2
+    tail -n 80 "$INIT_LOG" >&2 || true
   fi
+  if [ -f "$SECOND_INIT_LOG" ]; then
+    echo "--- init-second.log (redacted tail) ---" >&2
+    tail -n 80 "$SECOND_INIT_LOG" >&2 || true
+  fi
+}
+
+# Writes `raw` to `redacted` with the summary's root-token line masked
+# (the line is `- root token: <token>`, so the pattern is not anchored)
+# and, once `KNOWN_ROOT_TOKEN` is set, every other occurrence of the
+# token, then removes `raw`, so only the redacted copy is left to print
+# or upload.  A missing `raw` is a no-op.
+redact_init_log() {
+  local raw="$1" redacted="$2"
+  [ -f "$raw" ] || return 0
+  local args=(-e 's/\(root token: \).*/\1<redacted>/')
+  if [ -n "$KNOWN_ROOT_TOKEN" ]; then
+    local escaped
+    escaped="$(printf '%s' "$KNOWN_ROOT_TOKEN" | sed 's/[][\.*^$|/]/\\&/g')"
+    args+=(-e "s|${escaped}|<redacted>|g")
+  fi
+  sed "${args[@]}" "$raw" >"$redacted" && rm -f "$raw"
+}
+
+# Sets `KNOWN_ROOT_TOKEN` from the first run's summary when it exists.
+# The summary is root-owned `0600` (root wrote it), so it is read
+# through `sudo`.
+load_known_root_token() {
+  run_sudo test -f "$INIT_SUMMARY_JSON" 2>/dev/null || return 0
+  KNOWN_ROOT_TOKEN="$(run_sudo jq -r '.root_token // empty' "$INIT_SUMMARY_JSON" 2>>"$RUN_LOG")" \
+    || KNOWN_ROOT_TOKEN=""
 }
 
 # ---------------------------------------------------------------------------
@@ -178,6 +230,9 @@ root_env() {
   )
   if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
     ROOT_ENV+=(COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT_NAME")
+  fi
+  if [ -n "$SECOND_INIT_ROOT_TOKEN" ]; then
+    ROOT_ENV+=(OPENBAO_ROOT_TOKEN="$SECOND_INIT_ROOT_TOKEN")
   fi
 }
 
@@ -470,7 +525,8 @@ run_init() {
   # init runs, so init's overwrite prompts fire.  Answer them with their
   # per-prompt flags and run with stdin closed so the run stays
   # non-interactive.
-  if ! run_bootroot_as_root init \
+  local status=0
+  run_bootroot_as_root init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
     --openbao-url "http://${OPENBAO_BIND_ADDR}" \
@@ -487,14 +543,69 @@ run_init() {
     --db-user "step" \
     --db-name "stepca" \
     --responder-url "https://${HTTP01_ADMIN_BIND_ADDR}" \
-    --skip responder-check </dev/null >"$INIT_RAW_LOG" 2>&1; then
+    --skip responder-check </dev/null >"$INIT_RAW_LOG" 2>&1 || status=$?
+  load_known_root_token
+  redact_init_log "$INIT_RAW_LOG" "$INIT_LOG"
+  if [ "$status" -ne 0 ]; then
     {
-      echo "bootroot init failed (raw tail):"
-      tail -n 200 "$INIT_RAW_LOG" || true
+      echo "bootroot init failed (redacted tail):"
+      tail -n 200 "$INIT_LOG" || true
     } >>"$RUN_LOG"
     fail "bootroot init failed"
   fi
-  sed 's/^\(root token: \).*/\1<redacted>/' "$INIT_RAW_LOG" >"$INIT_LOG"
+}
+
+# A second `init` over the stack the first left, with the first run's
+# flags except where that stack differs: OpenBao serves TLS at the bind
+# now, so `--openbao-url` is `https://`; it is already initialized, so
+# the root token from the first run's summary is passed (through
+# `OPENBAO_ROOT_TOKEN`, as `init` has no token-file flag) or `init` stops
+# at its partial-initialization check; and the database is provisioned,
+# so `--db-dsn` takes the DSN `ca.json` holds in place of the
+# `db-provision` flags, as `run_second_init` in `run-stepca-san.sh`
+# does.  It re-issues the HTTP-01 admin certificate over the existing
+# `bootroot-http01/tls/`.  The first run's summary is root-owned `0600`,
+# so it is read through `sudo`.
+run_second_init() {
+  log_phase "second-init"
+  local root_token db_dsn
+  root_token="$(run_sudo jq -r '.root_token // empty' "$INIT_SUMMARY_JSON" 2>>"$RUN_LOG")" \
+    || fail "failed to read the first init summary $INIT_SUMMARY_JSON"
+  [ -n "$root_token" ] || fail "the first init summary carries no root_token"
+  KNOWN_ROOT_TOKEN="$root_token"
+  db_dsn="$(run_sudo jq -r '.db.dataSource // empty' "$SECRETS_DIR/config/ca.json" 2>>"$RUN_LOG")" \
+    || fail "failed to read db.dataSource from $SECRETS_DIR/config/ca.json"
+  [ -n "$db_dsn" ] || fail "ca.json carries no db.dataSource"
+  wait_for_postgres_admin
+  wait_for_openbao_listening "https://${OPENBAO_BIND_ADDR}"
+
+  SECOND_INIT_ROOT_TOKEN="$root_token"
+  local status=0
+  run_bootroot_as_root init \
+    --compose-file "$COMPOSE_FILE" \
+    --secrets-dir "$SECRETS_DIR" \
+    --openbao-url "https://${OPENBAO_BIND_ADDR}" \
+    --summary-json "$SECOND_INIT_SUMMARY_JSON" \
+    --enable auto-generate,show-secrets \
+    --stepca-password "$DEFAULT_STEPCA_PASSWORD" \
+    --http-hmac "$DEFAULT_HTTP_HMAC" \
+    --db-dsn "$db_dsn" \
+    --no-eab \
+    --save-unseal-keys \
+    --overwrite-password \
+    --overwrite-ca-json \
+    --overwrite-state \
+    --responder-url "https://${HTTP01_ADMIN_BIND_ADDR}" \
+    --skip responder-check </dev/null >"$SECOND_INIT_RAW_LOG" 2>&1 || status=$?
+  SECOND_INIT_ROOT_TOKEN=""
+  redact_init_log "$SECOND_INIT_RAW_LOG" "$SECOND_INIT_LOG"
+  if [ "$status" -ne 0 ]; then
+    {
+      echo "second bootroot init failed (redacted tail):"
+      tail -n 200 "$SECOND_INIT_LOG" || true
+    } >>"$RUN_LOG"
+    fail "second bootroot init failed"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -586,6 +697,18 @@ assert_secrets_tree_ownership() {
     || fail "directories under $SECRETS_DIR are not 0700: ${wrong_mode//$'\n'/; }"
 }
 
+# A rooted issuance of the HTTP-01 admin certificate hands the `step`
+# helper a `.bootroot-step-*` scratch directory beside `secrets/` and
+# removes it on every exit path; none may be left after `init`.
+assert_no_step_scratch() {
+  local label="$1" parent leftover
+  parent="$(dirname "$SECRETS_DIR")"
+  leftover="$(run_sudo find "$parent" -mindepth 1 -maxdepth 1 -name '.bootroot-step-*' \
+    -printf '%p\n' 2>>"$RUN_LOG")" || fail "${label}: find over $parent failed"
+  [ -z "$leftover" ] \
+    || fail "${label}: step scratch directories left beside $SECRETS_DIR: ${leftover//$'\n'/; }"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -620,6 +743,12 @@ main() {
   run_init
   assert_stack_healthy
   assert_secrets_tree_ownership
+  assert_no_step_scratch "after init"
+
+  run_second_init
+  assert_stack_healthy
+  assert_secrets_tree_ownership
+  assert_no_step_scratch "after the second init"
 
   log_phase "done"
 }

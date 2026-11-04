@@ -621,6 +621,8 @@ pub(super) static STRINGS: Strings = Strings {
     info_http01_admin_tls_provisioned: "HTTP-01 관리자 API TLS 서버 인증서 발급됨: {path}",
     error_http01_admin_tls_provision_failed: "HTTP-01 관리자 API TLS 서버 인증서 발급에 실패했습니다",
     error_http01_admin_tls_output_dir_symlink: "HTTP-01 관리자 API TLS 출력 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
+    error_step_scratch_dir_failed: "step 도우미의 출력을 받을 전용 작업 디렉터리를 {path}에 만들지 못했습니다",
+    error_step_output_invalid: "step 도우미의 출력 {path}을(를) 거부합니다: 도우미가 쓴 일반 파일이 아니므로 아무것도 게시하지 않았습니다",
     error_registrar_internal_provision_failed: "bootroot 내부 registrar 인증서 서명에 실패했습니다",
     error_registrar_internal_staging_symlink: "bootroot 내부 registrar 스테이징 디렉터리가 심볼릭 링크이므로 사용을 거부합니다: {path}",
     warning_registrar_internal_acme_file_replaced: "경고: {path}의 ACME 계정 키는 bootroot가 다시 읽을 수 있는 키가 아니므로 새 키로 교체합니다",

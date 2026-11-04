@@ -544,7 +544,11 @@ pub(super) async fn rotate_ca_key(
             rot_state.new_root_fp.clone(),
             rot_state.new_intermediate_fp.clone(),
         ];
-        let ca_bundle_pem = compute_ca_bundle_pem(ctx.paths.secrets_dir(), messages).await?;
+        let ca_bundle_pem = compute_ca_bundle_pem(
+            &bootroot::fs_util::SecretsTree::open_shared(ctx.paths.secrets_dir()).await?,
+            messages,
+        )
+        .await?;
         // Re-enumerated rather than reused from Phase 3: an identity
         // minted in between must be narrowed too, and a resumed run may
         // not have run Phase 3 at all.
@@ -1127,8 +1131,9 @@ pub(super) async fn rotate_trust_sync(
     let registration_ids = kv_fanout_targets(ctx, client, messages).await?;
 
     let secrets_dir = ctx.paths.secrets_dir();
-    let fingerprints = compute_ca_fingerprints(secrets_dir, messages).await?;
-    let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
+    let secrets_tree = bootroot::fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    let fingerprints = compute_ca_fingerprints(&secrets_tree, messages).await?;
+    let ca_bundle_pem = compute_ca_bundle_pem(&secrets_tree, messages).await?;
 
     crate::commands::trust::write_trust_to_openbao(
         client,

@@ -1105,9 +1105,8 @@ pub(crate) fn apply_audit_store(
     match plan_audit_store(inputs, messages)? {
         AuditStorePlan::Idle => Ok(None),
         AuditStorePlan::Unwind(override_path) => {
-            std::fs::remove_file(&override_path).with_context(|| {
-                messages.error_write_file_failed(&override_path.display().to_string())
-            })?;
+            let tree = open_override_tree(&compose_file_dir(inputs.compose_file), messages)?;
+            remove_audit_override(&tree, &override_path, messages)?;
             Ok(None)
         }
         AuditStorePlan::Provision(view) => match view.enforcement {
@@ -1526,6 +1525,24 @@ fn verify_filesystem_reserve_for_infra_up(
     Ok(())
 }
 
+/// Removes the rendered audit override at `override_path`, below
+/// `tree`'s anchor. A rooted handle unlinks it through the walked
+/// parent's descriptor; a path-based one removes it by path, as it
+/// always did.
+fn remove_audit_override(
+    tree: &fs_util::SecretsTree,
+    override_path: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    if tree.is_rooted() {
+        return tree.remove_file(override_path).with_context(|| {
+            messages.error_write_file_failed(&override_path.display().to_string())
+        });
+    }
+    std::fs::remove_file(override_path)
+        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))
+}
+
 /// Rewrites the former scalar audit bind to the guarded long form.
 ///
 /// The source is first recovered from the existing override and is never
@@ -1535,11 +1552,34 @@ fn verify_filesystem_reserve_for_infra_up(
 /// The override is [`audit_override_path`] under `compose_dir`, and the
 /// rewrite is published through the handle on `compose_dir/secrets`.
 fn upgrade_audit_override(compose_dir: &Path, messages: &Messages) -> Result<()> {
+    let tree = open_override_tree(compose_dir, messages)?;
+    upgrade_audit_override_in(&tree, compose_dir, messages)
+}
+
+/// [`upgrade_audit_override`] through the handle `tree` on
+/// `compose_dir/secrets`, which serves both its read and its publish.
+fn upgrade_audit_override_in(
+    tree: &fs_util::SecretsTree,
+    compose_dir: &Path,
+    messages: &Messages,
+) -> Result<()> {
     let override_path = audit_override_path(compose_dir);
     let override_path = override_path.as_path();
     let display = override_path.display().to_string();
-    let content = std::fs::read_to_string(override_path)
-        .with_context(|| messages.error_read_file_failed(&display))?;
+    let content = if tree.is_rooted() {
+        // Read through the handle the rewrite is published through, so a
+        // root process over a `secrets/` another account owns republishes
+        // nothing a link there pointed at.
+        let bytes = tree
+            .read(override_path)
+            .with_context(|| messages.error_read_file_failed(&display))?;
+        String::from_utf8(bytes)
+            .map_err(|err| anyhow::anyhow!(err))
+            .with_context(|| messages.error_read_file_failed(&display))?
+    } else {
+        std::fs::read_to_string(override_path)
+            .with_context(|| messages.error_read_file_failed(&display))?
+    };
     if read_audit_override_bind_source(&content).is_none() {
         anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
     }
@@ -1582,15 +1622,14 @@ fn upgrade_audit_override(compose_dir: &Path, messages: &Messages) -> Result<()>
     if !replaced {
         anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
     }
-    open_override_tree(compose_dir, messages)?
-        .publish(
-            fs_util::Destination::operator_named(override_path),
-            rewritten.as_bytes(),
-            fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
-            fs_util::RootedOwner::ContainingDir,
-            fs_util::StagedDurability::RenameOnly,
-        )
-        .with_context(|| messages.error_write_file_failed(&display))
+    tree.publish(
+        fs_util::Destination::operator_named(override_path),
+        rewritten.as_bytes(),
+        fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
+    )
+    .with_context(|| messages.error_write_file_failed(&display))
 }
 
 /// Resolves the audit override for a bring-up, checking only what an
@@ -3521,6 +3560,79 @@ mod tests {
             read_audit_override_store_dir(&path, &test_messages()).expect("read legacy form"),
             store
         );
+    }
+
+    /// The override a pre-long-form `init` rendered, binding `source`.
+    fn legacy_override(source: &str) -> String {
+        format!(
+            "services:\n  openbao:\n    volumes: !override\n      - {OPENBAO_DATA_MOUNT}\n      - {}\n      - {OPENBAO_CONFIG_MOUNT}\n",
+            compose_quote(&format!("{source}:{OPENBAO_AUDIT_CONTAINER_PATH}"))
+        )
+    }
+
+    #[test]
+    fn rooted_upgrade_rewrites_the_override_and_refuses_a_linked_one() {
+        let root = crate::test_support::SwapRoot::new();
+        let compose_dir = root.root();
+        let path = audit_override_path(compose_dir);
+        let rel = format!("openbao/{OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME}");
+        root.write(&rel, &legacy_override("/srv/audit/openbao"));
+        let tree = root.rooted();
+        upgrade_audit_override_in(&tree, compose_dir, &test_messages()).expect("upgrade");
+        assert!(
+            fs::read_to_string(&path)
+                .expect("upgraded")
+                .contains("create_host_path: false")
+        );
+
+        fs::write(root.outside.join("secret"), legacy_override("/outside")).expect("seed");
+        let before = root.outside_snapshot();
+        root.swap(&rel, &root.outside.join("secret"));
+        let err = upgrade_audit_override_in(&tree, compose_dir, &test_messages())
+            .expect_err("linked override");
+        crate::test_support::assert_error_names(&err, &path);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[test]
+    fn rooted_unwind_refuses_a_swapped_override_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        let path = audit_override_path(root.root());
+        fs::write(
+            root.outside.join(OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME),
+            "outside",
+        )
+        .expect("seed");
+        let tree = root.rooted();
+        let before = root.outside_snapshot();
+        let link = root.swap("openbao", &root.outside);
+
+        let err = remove_audit_override(&tree, &path, &test_messages()).expect_err("swapped dir");
+
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+
+        // Path-based, the removal follows the link as it always has.
+        let path_based = fs_util::SecretsTree::open(&root.secrets).expect("open");
+        remove_audit_override(&path_based, &path, &test_messages()).expect("path-based");
+        assert!(
+            !root
+                .outside
+                .join(OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn rooted_unwind_removes_the_override() {
+        let root = crate::test_support::SwapRoot::new();
+        let path = audit_override_path(root.root());
+        root.write(
+            &format!("openbao/{OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME}"),
+            "x",
+        );
+        remove_audit_override(&root.rooted(), &path, &test_messages()).expect("removed");
+        assert!(!path.exists());
     }
 
     #[test]

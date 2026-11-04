@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::db::parse_db_dsn;
@@ -39,7 +40,10 @@ use super::responder_setup::{
     apply_responder_compose_override, verify_responder, write_responder_compose_override,
     write_responder_files,
 };
-use super::secrets::{maybe_register_eab, record_cleared_agent_eab, resolve_init_secrets};
+use super::secrets::{
+    maybe_register_eab, read_preserved_stepca_password, record_cleared_agent_eab,
+    resolve_init_secrets,
+};
 use super::stepca_setup::{
     StepCaManagedKeys, build_stepca_policy_deny_dns_names, ensure_step_ca_initialized,
     reconcile_ca_json_managed_keys, resolve_stepca_ca_dns_names, restart_stepca_openbao_agent,
@@ -329,14 +333,9 @@ pub(crate) async fn run_init_locked(
     // the plaintext loopback listener.
     let registrar_intent = registrar_internal::registrar_endpoint_intent(&state_path)?;
 
-    let (registrar_endpoint, audit_override) = prepare_endpoint_and_audit_store(
-        registrar_intent,
-        &args.compose.compose_file,
-        args.agent_config.as_deref(),
-        &state_path,
-        crate::commands::audit_store::production_uid(),
-        messages,
-    )?;
+    let (registrar_endpoint, audit_override) =
+        prepare_endpoint_and_audit_store_blocking(registrar_intent, args, &state_path, messages)
+            .await?;
 
     // Only check openbao + postgres; step-ca may not be bootstrapped yet.
     ensure_init_prereqs_ready(&args.compose.compose_file, messages)?;
@@ -357,11 +356,20 @@ pub(crate) async fn run_init_locked(
     // volume; the next `init` cannot authenticate.
     diagnose_partial_init(&client, args, messages).await?;
 
-    let mut rollback = InitRollback::default();
+    // The one handle on `--secrets-dir` this run reads, removes and
+    // restores through, and the one its rollback uses: as root over a
+    // `secrets/` another account owns, none of those follows a name
+    // that account could have replaced.
+    let secrets_tree = fs_util::SecretsTree::open_shared(&args.secrets_dir.secrets_dir).await?;
+    let mut rollback = InitRollback {
+        secrets_tree: Some(Arc::clone(&secrets_tree)),
+        ..InitRollback::default()
+    };
     let result = run_init_inner(
         &mut client,
         state_lock,
         args,
+        &secrets_tree,
         messages,
         &mut rollback,
         bind_intent,
@@ -439,6 +447,40 @@ pub(crate) async fn run_init_locked(
 /// Checks the operator's endpoint tables, then provisions the shared
 /// audit store or unwinds it — both before a single Docker call.
 ///
+/// Runs [`prepare_endpoint_and_audit_store`] for `args` on a blocking
+/// thread and awaits it.
+///
+/// It blocks throughout: the configuration is loaded, the audit store
+/// laid out and its override written or removed, through the secrets
+/// tree handle.
+///
+/// # Errors
+///
+/// Returns every error [`prepare_endpoint_and_audit_store`] returns.
+async fn prepare_endpoint_and_audit_store_blocking(
+    registrar_intent: Option<registrar_internal::RegistrarInternalIntent>,
+    args: &InitArgs,
+    state_path: &Path,
+    messages: &Messages,
+) -> Result<(Option<EnabledEndpoint>, Option<std::path::PathBuf>)> {
+    let compose_file = args.compose.compose_file.clone();
+    let agent_config = args.agent_config.clone();
+    let state_path = state_path.to_path_buf();
+    let messages = messages.clone();
+    tokio::task::spawn_blocking(move || {
+        prepare_endpoint_and_audit_store(
+            registrar_intent,
+            &compose_file,
+            agent_config.as_deref(),
+            &state_path,
+            crate::commands::audit_store::production_uid(),
+            &messages,
+        )
+    })
+    .await
+    .context("endpoint and audit store preparation task panicked")?
+}
+
 /// The order is the contract. On an enabled predicate the
 /// `--agent-config` file's `[registrar]` and `[registrar_endpoint]`
 /// tables are what `init` renders into the endpoint daemon's config, so
@@ -721,6 +763,7 @@ async fn run_init_inner(
     client: &mut OpenBaoClient,
     _state_lock: &StateLock,
     args: &InitArgs,
+    secrets_tree: &Arc<fs_util::SecretsTree>,
     messages: &Messages,
     rollback: &mut InitRollback,
     bind_intent: bool,
@@ -787,7 +830,14 @@ async fn run_init_inner(
         normalization: db_dsn_normalization,
         provision: db_provision,
     } = resolve_db_dsn_for_init(args, compose_dir, &postgres_env, messages)?;
-    let mut secrets = resolve_init_secrets(args, messages, db_dsn)?;
+    let preserved_stepca_password = {
+        let reinit_mode = args.reinit_mode;
+        let task_messages = messages.clone();
+        secrets_tree
+            .run(move |tree| read_preserved_stepca_password(reinit_mode, tree, &task_messages))
+            .await?
+    };
+    let mut secrets = resolve_init_secrets(args, preserved_stepca_password, messages, db_dsn)?;
     // Fails before any `OpenBao` write on a DSN that does not parse.
     parse_db_dsn(&secrets.db_dsn).map_err(|_| anyhow::anyhow!(messages.error_invalid_db_dsn()))?;
 
@@ -915,7 +965,7 @@ async fn run_init_inner(
     // generated `ca.json.ctmpl` is built from the patched document
     // (notably `db.type`).
     let ca_json_update = update_ca_json_with_backup(
-        &secrets_dir,
+        secrets_tree,
         &secrets.db_dsn,
         &args.cert_duration,
         &args.stepca_provisioner,
@@ -944,7 +994,7 @@ async fn run_init_inner(
     // co-owned with the sidecar, so `rollback.ca_json_backup` is only
     // durable if the template it is re-rendered from is restored with it.
     rollback.stepca_ca_json_template_backup =
-        Some(snapshot_stepca_ca_json_template(&secrets_dir, messages).await?);
+        Some(snapshot_stepca_ca_json_template(secrets_tree, messages).await?);
     let stepca_templates = write_stepca_templates(
         &secrets_dir,
         &args.openbao.kv_mount,
@@ -970,7 +1020,7 @@ async fn run_init_inner(
             &identity.container(BootrootContainer::OpenBaoAgentStepCa),
             rollback.docker(),
         );
-        reconcile_ca_json_managed_keys(&secrets_dir, &stepca_managed_keys, messages).await?;
+        reconcile_ca_json_managed_keys(secrets_tree, &stepca_managed_keys, messages).await?;
     }
 
     if step_ca_result == super::super::types::StepCaInitResult::Initialized
@@ -1030,13 +1080,26 @@ async fn run_init_inner(
         let config_path = secrets_dir
             .join(RESPONDER_CONFIG_DIR)
             .join(RESPONDER_CONFIG_NAME);
+        let original = if secrets_tree.is_rooted() {
+            // Read through the handle the rollback restores it through,
+            // so a link there is refused rather than snapshotted.
+            match super::read_to_string_in(secrets_tree, &config_path).await {
+                Ok(contents) => Some(contents),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(anyhow::Error::new(err).context(
+                        messages.error_read_file_failed(&config_path.display().to_string()),
+                    ));
+                }
+            }
+        } else if config_path.exists() {
+            Some(std::fs::read_to_string(&config_path)?)
+        } else {
+            None
+        };
         rollback.responder_config_backup = Some(RollbackFile {
             path: config_path.clone(),
-            original: if config_path.exists() {
-                Some(std::fs::read_to_string(&config_path)?)
-            } else {
-                None
-            },
+            original,
         });
         rollback.compose_file = Some(args.compose.compose_file.clone());
     }
@@ -1097,14 +1160,22 @@ async fn run_init_inner(
             state.http01_admin_advertise_addr.as_deref(),
             &identity.container(BootrootContainer::Http01),
         );
-        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
-        issue_http01_admin_tls_cert(&secrets_dir, &san_refs, rollback.docker(), messages)?;
-        // Track TLS artifacts for rollback cleanup.
+        // The issuance works through the handle, whose operations block,
+        // so it runs on a blocking thread.
+        let docker = rollback.docker().to_path_buf();
+        let task_messages = messages.clone();
+        secrets_tree
+            .run(move |tree| {
+                let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
+                issue_http01_admin_tls_cert(tree, &san_refs, &docker, &task_messages)
+            })
+            .await?;
+        // Track TLS artifacts for rollback cleanup, through the handle.
         rollback
-            .tls_artifacts
+            .http01_tls_artifacts
             .push(secrets_dir.join(HTTP01_ADMIN_TLS_CERT_REL_PATH));
         rollback
-            .tls_artifacts
+            .http01_tls_artifacts
             .push(secrets_dir.join(HTTP01_ADMIN_TLS_KEY_REL_PATH));
     }
     if let Some(override_path) = responder_compose_override.as_ref() {
@@ -1148,7 +1219,7 @@ async fn run_init_inner(
     let _trust_changed = write_ca_trust_fingerprints_with_retry(
         client,
         &args.openbao.kv_mount,
-        &secrets_dir,
+        secrets_tree,
         rollback,
         messages,
     )
@@ -1163,7 +1234,7 @@ async fn run_init_inner(
         args,
         messages,
         &secrets,
-        &secrets_dir,
+        secrets_tree,
     )
     .await?;
     let eab_update = maybe_register_eab(client, args, messages, rollback, &secrets).await?;
@@ -1224,7 +1295,9 @@ async fn run_init_inner(
                 rollback,
                 &args.secrets_dir.secrets_dir,
             );
-            let staged = registrar_internal::issue_internal_material(&inputs, messages).await?;
+            let staged =
+                registrar_internal::issue_internal_material(secrets_tree, &inputs, messages)
+                    .await?;
             registrar_internal::provision_internal_auth(client, &inputs, &staged, rollback).await?;
             Some((staged, provisioning))
         }
@@ -1249,7 +1322,7 @@ async fn run_init_inner(
         &args.compose.compose_file,
         &args.openbao.kv_mount,
         client,
-        &args.secrets_dir.secrets_dir,
+        secrets_tree,
         messages,
     )
     .await?
@@ -1390,6 +1463,7 @@ async fn run_init_inner(
                     in_memory: &bootstrap.unseal_keys,
                     explicit_file: args.openbao_unseal_from_file.as_deref(),
                     default_file: unseal_keys_path(&args.secrets_dir.secrets_dir),
+                    secrets_tree,
                     interactive: std::io::stdin().is_terminal(),
                 },
                 &mut rollback.openbao_recreated,
@@ -1430,6 +1504,7 @@ async fn run_init_inner(
             (staged_internal.as_ref(), internal_context.as_ref())
         {
             registrar_internal::verify_and_publish_internal(
+                secrets_tree,
                 staged,
                 &context.inputs(),
                 &state.openbao_url,
@@ -1638,11 +1713,13 @@ async fn maybe_rotate_env_db_password(
     compose_file: &Path,
     kv_mount: &str,
     client: &OpenBaoClient,
-    secrets_dir: &Path,
+    secrets_tree: &Arc<fs_util::SecretsTree>,
     messages: &Messages,
 ) -> Result<Option<String>> {
     use crate::commands::dotenv::{read_dotenv, update_dotenv_key_async};
     use crate::commands::init::{PATH_STEPCA_DB, PATH_STEPCA_DB_ADMIN};
+
+    let secrets_dir = secrets_tree.anchor();
 
     // Docker Compose reads .env from the compose file's directory.
     let compose_dir = crate::commands::compose_file::compose_file_dir(compose_file);
@@ -1674,11 +1751,22 @@ async fn maybe_rotate_env_db_password(
 
     // Read the current DB DSN from ca.json (if it exists).
     let ca_json_path = secrets_dir.join("config").join("ca.json");
-    if !ca_json_path.exists() {
-        return Ok(None);
-    }
-    let Ok(ca_json_contents) = tokio::fs::read_to_string(&ca_json_path).await else {
-        return Ok(None);
+    let ca_json_contents = if secrets_tree.is_rooted() {
+        // Through the handle the patch below is published through: any
+        // failure, a refused link included, is `None` as every read
+        // failure here always was.
+        let Ok(contents) = super::read_to_string_in(secrets_tree, &ca_json_path).await else {
+            return Ok(None);
+        };
+        contents
+    } else {
+        if !ca_json_path.exists() {
+            return Ok(None);
+        }
+        let Ok(contents) = tokio::fs::read_to_string(&ca_json_path).await else {
+            return Ok(None);
+        };
+        contents
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) else {
         return Ok(None);
@@ -1801,12 +1889,26 @@ async fn maybe_rotate_env_db_password(
     if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&ca_json_contents) {
         doc["db"]["dataSource"] = serde_json::Value::String(new_dsn.clone());
         if let Ok(updated) = serde_json::to_string_pretty(&doc) {
-            let _ = fs_util::atomic_replace(
-                fs_util::Destination::operator_named(&ca_json_path),
-                updated.as_bytes(),
-                fs_util::StagedMode::PreserveOrUmask,
-            )
-            .await;
+            if secrets_tree.is_rooted() {
+                // A rooted refusal follows nothing, so discarding it is
+                // as safe as discarding any other failure here.
+                let _ = secrets_tree
+                    .publish_async(
+                        fs_util::Destination::operator_named(&ca_json_path),
+                        updated.as_bytes(),
+                        fs_util::StagedMode::PreserveOrUmask,
+                        fs_util::RootedOwner::Destination,
+                        fs_util::StagedDurability::RenameOnly,
+                    )
+                    .await;
+            } else {
+                let _ = fs_util::atomic_replace(
+                    fs_util::Destination::operator_named(&ca_json_path),
+                    updated.as_bytes(),
+                    fs_util::StagedMode::PreserveOrUmask,
+                )
+                .await;
+            }
         }
     }
 
@@ -2082,6 +2184,43 @@ mod tests {
     use super::*;
     use crate::commands::init::DbCheckStatus;
     use crate::state::AppRoleRotationTarget;
+
+    /// As root over a foreign-owned `secrets/`, a `config/` swapped for a
+    /// link makes the `.env` password rotation return as it does on any
+    /// unreadable `ca.json` — `None`, before any database or `OpenBao`
+    /// call — and nothing outside is read into a DSN or written.
+    #[tokio::test]
+    async fn rooted_env_password_rotation_skips_a_swapped_config_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        let compose_file = root.root().join("docker-compose.yml");
+        std::fs::write(&compose_file, "services: {}\n").unwrap();
+        std::fs::write(root.root().join(".env"), "POSTGRES_PASSWORD=temporary\n").unwrap();
+        root.write(
+            "config/ca.json",
+            r#"{"db":{"dataSource":"postgresql://step:inside@postgres:5432/stepca"}}"#,
+        );
+        std::fs::write(
+            root.outside.join("ca.json"),
+            r#"{"db":{"dataSource":"postgresql://step:outside@postgres:5432/stepca"}}"#,
+        )
+        .unwrap();
+        let tree = Arc::new(root.rooted());
+        let before = root.outside_snapshot();
+        root.swap("config", &root.outside);
+        let client = OpenBaoClient::new("http://127.0.0.1:1").expect("client");
+
+        let rotated =
+            maybe_rotate_env_db_password(&compose_file, "secret", &client, &tree, &test_messages())
+                .await
+                .expect("an unreadable ca.json is not a failure");
+
+        assert!(rotated.is_none());
+        assert_eq!(root.outside_snapshot(), before);
+        assert_eq!(
+            std::fs::read_to_string(root.root().join(".env")).unwrap(),
+            "POSTGRES_PASSWORD=temporary\n"
+        );
+    }
 
     /// Every pre-flight condition an `InitPlan` can carry, so
     /// `plan_with(ALL_ARTIFACTS)` reads as "all three files exist".

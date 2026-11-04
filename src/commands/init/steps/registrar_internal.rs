@@ -41,8 +41,10 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util::SecretsTree;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::registrar::internal::{
     ACME_ACCOUNT_FILE, AcmeAccountKey, CERT_AUTH_MOUNT, CERT_AUTH_ROLE, EndpointTables,
@@ -57,7 +59,9 @@ use bootroot::{cert_group, config, fs_util};
 
 use super::InitRollback;
 use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
-use super::openbao_tls::{TLS_OUTPUT_MOUNT, chown_tls_output_dir, reject_symlinked_tls_output_dir};
+use super::openbao_tls::{
+    StepScratch, TLS_OUTPUT_MOUNT, chown_tls_output_dir, reject_symlinked_tls_output_dir,
+};
 use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::constants::REGISTRAR_INTERNAL_NOT_AFTER;
 use crate::commands::init::constants::openbao_constants::{
@@ -236,7 +240,11 @@ pub(crate) struct CurrentInternalConfig {
 ///
 /// Returns an error naming the file when it exists but cannot be read,
 /// is not valid TOML, or does not deserialize as the daemon's settings.
+/// A rooted `tree` reads it through its descriptors, so a link at
+/// `registrar-internal/` or at the file, or a `registrar-internal/` the
+/// writing process does not own, is a file that cannot be read.
 pub(crate) async fn current_internal_config(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     messages: &Messages,
 ) -> Result<Option<CurrentInternalConfig>> {
@@ -247,7 +255,7 @@ pub(crate) async fn current_internal_config(
                 .error_registrar_internal_tables_unreadable(&path.display().to_string(), &reason)
         )
     };
-    let text = match tokio::fs::read_to_string(&path).await {
+    let text = match super::read_to_string_in(tree, &path).await {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(refuse(err.to_string())),
@@ -732,10 +740,20 @@ pub(crate) async fn converge_internal_auth(
 /// Returns an error if the staging directory is a symlink or cannot be
 /// created, the leaf cannot be signed, or the CA material cannot be
 /// read.
+///
+/// `tree` is the handle on `inputs.secrets_dir`. A rooted handle stages
+/// through its descriptors, and the leaf is signed into a
+/// [`StepScratch`] outside `secrets/` rather than into staging, so no
+/// root container re-owns anything and nothing below the anchor but the
+/// anchor itself is mounted.
 pub(crate) async fn issue_internal_material(
+    tree: &Arc<SecretsTree>,
     inputs: &RegistrarInternalInputs<'_>,
     messages: &Messages,
 ) -> Result<StagedInternal> {
+    if tree.is_rooted() {
+        return issue_internal_material_rooted(tree, inputs, messages).await;
+    }
     let paths = InternalPaths::new(inputs.secrets_dir);
     let staging = staging_dir(&paths);
 
@@ -763,9 +781,10 @@ pub(crate) async fn issue_internal_material(
     // host with no CA certificates fails here, before a container is
     // started, and nothing but the helper's outputs is in staging while
     // the directory is being handed over.
-    let fingerprints = compute_ca_fingerprints(inputs.secrets_dir, messages).await?;
-    let bundle_pem = compute_ca_bundle_pem(inputs.secrets_dir, messages).await?;
+    let fingerprints = compute_ca_fingerprints(tree, messages).await?;
+    let bundle_pem = compute_ca_bundle_pem(tree, messages).await?;
     let intermediate_pem = read_ca_file(
+        tree,
         &inputs
             .secrets_dir
             .join(CA_CERTS_DIR)
@@ -774,7 +793,13 @@ pub(crate) async fn issue_internal_material(
     )
     .await?;
 
-    sign_internal_leaf(inputs, &staging, messages)?;
+    {
+        let staging = staging.clone();
+        sign_on_blocking_thread(inputs, messages, move |signing, messages| {
+            sign_internal_leaf(signing, &staging, messages)
+        })
+        .await?;
+    }
 
     let staged_cert = staging.join(STAGED_LEAF_FILE);
     let staged_key = staging.join(STAGED_KEY_FILE);
@@ -794,7 +819,108 @@ pub(crate) async fn issue_internal_material(
     .await
     .with_context(|| messages.error_write_file_failed(&staged_bundle.display().to_string()))?;
 
-    let account = stage_account_key(&paths, &staging, messages).await?;
+    let account = stage_account_key(tree, &paths, &staging, messages).await?;
+    staged_internal(
+        paths,
+        staging,
+        fingerprints,
+        bundle_pem,
+        &leaf_pem,
+        key_pem,
+        &intermediate_pem,
+        account,
+    )
+}
+
+/// [`issue_internal_material`] for a root process over a `secrets/`
+/// another account owns.
+///
+/// Staging is cleared and created root-owned through the handle, the CA
+/// material is read through it, the leaf and its key come back from a
+/// [`StepScratch`] and are held in memory, and the staged bundle and
+/// account key are published into staging through it. A walk into a
+/// `registrar-internal/` the writing process does not own fails before
+/// anything is read, written or started.
+async fn issue_internal_material_rooted(
+    tree: &Arc<SecretsTree>,
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+) -> Result<StagedInternal> {
+    let paths = InternalPaths::new(inputs.secrets_dir);
+    let staging = staging_dir(&paths);
+    {
+        let staging = staging.clone();
+        let failed = messages.error_write_file_failed(&staging.display().to_string());
+        tree.run(move |tree| {
+            match tree.remove_dir_all(&staging) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(anyhow::Error::new(err).context(failed)),
+            }
+            tree.ensure_dir_fixed(&staging, fs_util::FixedOwner::root())
+                .map_err(|err| anyhow::Error::new(err).context(failed))
+        })
+        .await?;
+    }
+
+    let fingerprints = compute_ca_fingerprints(tree, messages).await?;
+    let bundle_pem = compute_ca_bundle_pem(tree, messages).await?;
+    let intermediate_pem = read_ca_file(
+        tree,
+        &inputs
+            .secrets_dir
+            .join(CA_CERTS_DIR)
+            .join(CA_INTERMEDIATE_CERT_FILENAME),
+        messages,
+    )
+    .await?;
+
+    let (leaf_pem, key_pem) =
+        sign_on_blocking_thread(inputs, messages, sign_internal_leaf_rooted).await?;
+
+    let staged_bundle = staging.join("ca-bundle.pem");
+    {
+        let destination = staged_bundle.clone();
+        let contents = bundle_pem.clone();
+        tree.run(move |tree| {
+            tree.publish(
+                fs_util::Destination::bootroot_owned(&destination),
+                contents.as_bytes(),
+                fs_util::StagedMode::Policy(cert_group::CA_BUNDLE_FILE_MODE),
+                fs_util::RootedOwner::Fixed(fs_util::FixedOwner::root()),
+                fs_util::StagedDurability::RenameOnly,
+            )
+        })
+        .await
+        .with_context(|| messages.error_write_file_failed(&staged_bundle.display().to_string()))?;
+    }
+
+    let account = stage_account_key(tree, &paths, &staging, messages).await?;
+    staged_internal(
+        paths,
+        staging,
+        fingerprints,
+        bundle_pem,
+        &leaf_pem,
+        key_pem,
+        &intermediate_pem,
+        account,
+    )
+}
+
+/// Assembles the staged set from what [`issue_internal_material`] read
+/// and signed.
+#[allow(clippy::too_many_arguments)] // Each part is one staged member.
+fn staged_internal(
+    paths: InternalPaths,
+    staging: PathBuf,
+    fingerprints: Vec<String>,
+    bundle_pem: String,
+    leaf_pem: &str,
+    key_pem: String,
+    intermediate_pem: &str,
+    account: String,
+) -> Result<StagedInternal> {
     let root_fingerprint = fingerprints
         .first()
         .cloned()
@@ -817,6 +943,48 @@ pub(crate) async fn issue_internal_material(
     })
 }
 
+/// What signing the internal leaf needs from [`RegistrarInternalInputs`],
+/// owned so the signing can run on a blocking thread.
+pub(super) struct LeafSigning {
+    /// The identity's two parts.
+    intent: RegistrarInternalIntent,
+    /// The state-recorded secrets directory.
+    secrets_dir: PathBuf,
+    /// The `docker` executable the leaf is signed through.
+    docker: PathBuf,
+}
+
+impl LeafSigning {
+    /// Copies out of `inputs` what the signing reads.
+    pub(super) fn from_inputs(inputs: &RegistrarInternalInputs<'_>) -> Self {
+        Self {
+            intent: inputs.intent.clone(),
+            secrets_dir: inputs.secrets_dir.to_path_buf(),
+            docker: inputs.docker.to_path_buf(),
+        }
+    }
+}
+
+/// Runs `sign` on a blocking thread and awaits it.
+///
+/// Both signers block throughout: they create and read files, remove
+/// the scratch directory and wait on the `step` helper container.
+async fn sign_on_blocking_thread<R, F>(
+    inputs: &RegistrarInternalInputs<'_>,
+    messages: &Messages,
+    sign: F,
+) -> Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce(&LeafSigning, &Messages) -> Result<R> + Send + 'static,
+{
+    let signing = LeafSigning::from_inputs(inputs);
+    let messages = messages.clone();
+    tokio::task::spawn_blocking(move || sign(&signing, &messages))
+        .await
+        .context("registrar internal leaf signing task panicked")?
+}
+
 /// Signs the internal leaf against the intermediate key, into `staging`.
 ///
 /// `step certificate create` in the step-ca helper image, exactly as the
@@ -830,12 +998,8 @@ pub(crate) async fn issue_internal_material(
 /// needs it, and `step` creates both files at `0600`. Neither is
 /// widened here: the key is read back and published at its final mode
 /// by the material publisher, and the staging copy is removed.
-fn sign_internal_leaf(
-    inputs: &RegistrarInternalInputs<'_>,
-    staging: &Path,
-    messages: &Messages,
-) -> Result<()> {
-    let secrets_dir = inputs.secrets_dir;
+fn sign_internal_leaf(inputs: &LeafSigning, staging: &Path, messages: &Messages) -> Result<()> {
+    let secrets_dir = inputs.secrets_dir.as_path();
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let secrets_mount = format!("{}:/home/step", mount_root.display());
@@ -850,7 +1014,7 @@ fn sign_internal_leaf(
     chown_tls_output_dir(
         &staging_mount,
         &user_arg,
-        inputs.docker,
+        &inputs.docker,
         "docker registrar internal staging chown",
         messages.error_registrar_internal_provision_failed(),
         messages,
@@ -893,10 +1057,89 @@ fn sign_internal_leaf(
     run_docker_with_exec(
         &args,
         "docker step certificate create (registrar internal)",
-        inputs.docker,
+        &inputs.docker,
         messages,
     )
     .with_context(|| messages.error_registrar_internal_provision_failed())
+}
+
+/// [`sign_internal_leaf`] for a root process over a `secrets/` another
+/// account owns, returning the leaf and its key.
+///
+/// The helper writes into a [`StepScratch`] beside `secrets/` instead of
+/// into staging: no root container re-owns anything, and the only mount
+/// below the anchor is the anchor itself. The two outputs are read back
+/// without following a link and held in memory, so nothing is created
+/// or published under the anchor here; the scratch directory, which
+/// only the helper container can reach below root, is gone on every
+/// exit path.
+fn sign_internal_leaf_rooted(
+    inputs: &LeafSigning,
+    messages: &Messages,
+) -> Result<(String, String)> {
+    let secrets_dir = inputs.secrets_dir.as_path();
+    // The anchor and everything above it are outside what the owner of
+    // `secrets/` can rename, so this mount source is root's to resolve.
+    let mount_root = std::fs::canonicalize(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let secrets_mount = format!("{}:/home/step", mount_root.display());
+    let meta = std::fs::metadata(secrets_dir)
+        .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
+    let user_arg = format!("{}:{}", meta.uid(), meta.gid());
+
+    let scratch = StepScratch::create(secrets_dir, (meta.uid(), meta.gid()), messages)?;
+    let output_mount = scratch.output_mount();
+
+    let san = inputs.intent.san();
+    let intermediate_cert = format!("/home/step/{CA_CERTS_DIR}/{CA_INTERMEDIATE_CERT_FILENAME}");
+    let output_cert = format!("{TLS_OUTPUT_MOUNT}/{STAGED_LEAF_FILE}");
+    let output_key = format!("{TLS_OUTPUT_MOUNT}/{STAGED_KEY_FILE}");
+    let args: [&str; 28] = [
+        "run",
+        "--user",
+        &user_arg,
+        "--rm",
+        "-v",
+        &secrets_mount,
+        "-v",
+        &output_mount,
+        STEP_CA_HELPER_IMAGE,
+        "step",
+        "certificate",
+        "create",
+        &san,
+        &output_cert,
+        &output_key,
+        "--ca",
+        &intermediate_cert,
+        "--ca-key",
+        "/home/step/secrets/intermediate_ca_key",
+        "--ca-password-file",
+        "/home/step/password.txt",
+        "--no-password",
+        "--insecure",
+        "--san",
+        &san,
+        "--not-after",
+        REGISTRAR_INTERNAL_NOT_AFTER,
+        "--force",
+    ];
+    run_docker_with_exec(
+        &args,
+        "docker step certificate create (registrar internal)",
+        &inputs.docker,
+        messages,
+    )
+    .with_context(|| messages.error_registrar_internal_provision_failed())?;
+
+    let leaf = scratch.read_output(STAGED_LEAF_FILE, messages)?;
+    let key = scratch.read_output(STAGED_KEY_FILE, messages)?;
+    scratch.finish();
+    let leaf_pem = String::from_utf8(leaf)
+        .map_err(|_| anyhow::anyhow!(messages.error_registrar_internal_provision_failed()))?;
+    let key_pem = String::from_utf8(key)
+        .map_err(|_| anyhow::anyhow!(messages.error_registrar_internal_provision_failed()))?;
+    Ok((leaf_pem, key_pem))
 }
 
 /// Stages the persistent ACME account key and returns its contents.
@@ -912,13 +1155,18 @@ fn sign_internal_leaf(
 ///
 /// Nothing is registered with step-ca here. The daemon registers the
 /// account on its first order, as any agent with a new account key does.
+///
+/// A rooted `tree` reads the published key and stages the new one
+/// through its descriptors; a read it refuses is treated as any other
+/// unreadable key, and a fresh one is created.
 async fn stage_account_key(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     staging: &Path,
     messages: &Messages,
 ) -> Result<String> {
     let published = paths.acme_account();
-    let contents = match tokio::fs::read_to_string(&published).await {
+    let contents = match super::read_to_string_in(tree, &published).await {
         Ok(existing) if bootroot::acme::is_account_key(&existing) => existing,
         Ok(_) => {
             eprintln!(
@@ -932,6 +1180,18 @@ async fn stage_account_key(
         Err(_) => new_account_key()?,
     };
     let staged = staging.join(ACME_ACCOUNT_FILE);
+    if tree.is_rooted() {
+        tree.publish_async(
+            fs_util::Destination::bootroot_owned(&staged),
+            contents.as_bytes(),
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            fs_util::RootedOwner::Destination,
+            fs_util::StagedDurability::FlushDirectory,
+        )
+        .await
+        .with_context(|| messages.error_write_file_failed(&staged.display().to_string()))?;
+        return Ok(contents);
+    }
     fs_util::atomic_write(
         fs_util::Destination::bootroot_owned(&staged),
         contents.as_bytes(),
@@ -958,13 +1218,14 @@ fn new_account_key() -> Result<String> {
 /// Returns an error when the recorded URL is plaintext, when the
 /// certificate login fails, or when any file cannot be published.
 pub(super) async fn verify_and_publish_internal(
+    tree: &Arc<SecretsTree>,
     staged: &StagedInternal,
     inputs: &RegistrarInternalInputs<'_>,
     openbao_url: &str,
     messages: &Messages,
 ) -> Result<()> {
     verify_internal_login(staged, openbao_url).await?;
-    publish_internal_set(staged, inputs, messages).await
+    publish_internal_set(tree, staged, inputs, messages).await
 }
 
 /// Proves the staged credential can authenticate at `auth/cert` over
@@ -1017,15 +1278,20 @@ pub(crate) async fn verify_internal_login(
 /// file cannot be published. In the latter case the prior set has been
 /// restored, or the failure to restore it is reported beside the
 /// failure that caused it.
+///
+/// `tree` is the handle on the secrets directory the set lies below; a
+/// rooted one captures, publishes, restores and removes through its
+/// descriptors.
 pub(crate) async fn publish_internal_set(
+    tree: &Arc<SecretsTree>,
     staged: &StagedInternal,
     inputs: &RegistrarInternalInputs<'_>,
     messages: &Messages,
 ) -> Result<()> {
-    let snapshot = capture_set(&staged.paths)
+    let snapshot = capture_set(tree, &staged.paths)
         .await
         .context("capturing the bootroot-internal set the publication replaces")?;
-    if let Err(err) = publish_internal_files(staged, inputs, messages).await {
+    if let Err(err) = publish_internal_files(tree, staged, inputs, messages).await {
         if let Err(restore_err) = snapshot.restore().await {
             eprintln!(
                 "Warning: the bootroot-internal set could not be fully restored after a \
@@ -1041,7 +1307,16 @@ pub(crate) async fn publish_internal_set(
 
     // The staging copies are the only thing left that holds the key at a
     // second path; remove them once the published set is complete.
-    if let Err(err) = tokio::fs::remove_dir_all(&staged.staging).await {
+    let removed = if tree.is_rooted() {
+        let staging = staged.staging.clone();
+        tree.run(move |tree| Ok(tree.remove_dir_all(&staging)?))
+            .await
+    } else {
+        tokio::fs::remove_dir_all(&staged.staging)
+            .await
+            .map_err(anyhow::Error::new)
+    };
+    if let Err(err) = removed {
         eprintln!(
             "Warning: failed to remove the staging directory {}: {err}",
             staged.staging.display()
@@ -1068,10 +1343,27 @@ pub(crate) async fn discard_snapshot(snapshot: SetSnapshot) {
 /// Split out so that [`publish_internal_set`] can hold the prior set
 /// around the whole sequence rather than around each file.
 async fn publish_internal_files(
+    tree: &Arc<SecretsTree>,
     staged: &StagedInternal,
     inputs: &RegistrarInternalInputs<'_>,
     messages: &Messages,
 ) -> Result<()> {
+    if tree.is_rooted() {
+        tree.publish_async(
+            fs_util::Destination::bootroot_owned(&staged.paths.ca_bundle()),
+            staged.bundle_pem.as_bytes(),
+            fs_util::StagedMode::Policy(cert_group::CA_BUNDLE_FILE_MODE),
+            fs_util::RootedOwner::Fixed(fs_util::FixedOwner::root()),
+            fs_util::StagedDurability::RenameOnly,
+        )
+        .await
+        .with_context(|| {
+            messages.error_write_file_failed(&staged.paths.ca_bundle().display().to_string())
+        })?;
+        publish_material(tree, &staged.paths, &staged.material).await?;
+        let config = internal_agent_config(staged, inputs);
+        return publish_internal_agent_config(tree, &staged.paths, &config, messages).await;
+    }
     fs_util::write_ca_bundle(
         &staged.paths.ca_bundle(),
         &staged.bundle_pem,
@@ -1082,10 +1374,10 @@ async fn publish_internal_files(
         messages.error_write_file_failed(&staged.paths.ca_bundle().display().to_string())
     })?;
 
-    publish_material(&staged.paths, &staged.material).await?;
+    publish_material(tree, &staged.paths, &staged.material).await?;
 
     let config = internal_agent_config(staged, inputs);
-    publish_internal_agent_config(&staged.paths, &config, messages).await
+    publish_internal_agent_config(tree, &staged.paths, &config, messages).await
 }
 
 /// Renders the `agent.toml` the publication writes.
@@ -1122,10 +1414,25 @@ fn internal_agent_config(staged: &StagedInternal, inputs: &RegistrarInternalInpu
 /// ownership is selected here rather than inherited from the material
 /// writer, so neither publication can lose it by way of the other.
 async fn publish_internal_agent_config(
+    tree: &Arc<SecretsTree>,
     paths: &InternalPaths,
     config: &str,
     messages: &Messages,
 ) -> Result<()> {
+    if tree.is_rooted() {
+        return tree
+            .publish_async(
+                fs_util::Destination::bootroot_owned(&paths.agent_config()),
+                config.as_bytes(),
+                fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+                fs_util::RootedOwner::Fixed(fs_util::FixedOwner::root()),
+                fs_util::StagedDurability::FlushDirectory,
+            )
+            .await
+            .with_context(|| {
+                messages.error_write_file_failed(&paths.agent_config().display().to_string())
+            });
+    }
     fs_util::atomic_write_fixed_owner(
         fs_util::Destination::bootroot_owned(&paths.agent_config()),
         config.as_bytes(),
@@ -1136,8 +1443,10 @@ async fn publish_internal_agent_config(
     .with_context(|| messages.error_write_file_failed(&paths.agent_config().display().to_string()))
 }
 
-async fn read_ca_file(path: &Path, messages: &Messages) -> Result<String> {
-    tokio::fs::read_to_string(path)
+/// Reads the CA file at `path` below `tree`'s anchor, through the handle
+/// when it is rooted.
+async fn read_ca_file(tree: &Arc<SecretsTree>, path: &Path, messages: &Messages) -> Result<String> {
+    super::read_to_string_in(tree, path)
         .await
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))
 }
@@ -1344,9 +1653,17 @@ mod endpoint_tables_tests {
     async fn carried_over_endpoint_tables(
         paths: &InternalPaths,
     ) -> anyhow::Result<Option<EndpointTables>> {
-        Ok(current_internal_config(paths, &test_messages())
-            .await?
-            .and_then(|current| current.endpoint_tables))
+        Ok(current_internal_config(
+            &bootroot::fs_util::SecretsTree::open_shared(
+                paths.dir().parent().expect("secrets dir"),
+            )
+            .await
+            .expect("open"),
+            paths,
+            &test_messages(),
+        )
+        .await?
+        .and_then(|current| current.endpoint_tables))
     }
 
     fn internal_config(paths: &InternalPaths, tables: Option<&EndpointTables>) -> String {
@@ -1583,9 +1900,17 @@ mod endpoint_tables_tests {
         let broken = rendered.replacen("poll_attempts = 15", "poll_attempts = \"bad\"", 1);
         assert_ne!(broken, rendered, "the fixture edits the rendered value");
         std::fs::write(paths.agent_config(), &broken).expect("write the current config");
-        let err = current_internal_config(&paths, &test_messages())
+        let err = current_internal_config(
+            &bootroot::fs_util::SecretsTree::open_shared(
+                paths.dir().parent().expect("secrets dir"),
+            )
             .await
-            .expect_err("an undeserializable value refuses");
+            .expect("open"),
+            &paths,
+            &test_messages(),
+        )
+        .await
+        .expect_err("an undeserializable value refuses");
         let message = err.to_string();
         assert!(
             message.contains(&paths.agent_config().display().to_string()),
@@ -1603,10 +1928,18 @@ mod endpoint_tables_tests {
         std::fs::create_dir_all(paths.dir()).expect("the internal directory");
         std::fs::write(paths.agent_config(), internal_config(&paths, None))
             .expect("write the current config");
-        let current = current_internal_config(&paths, &test_messages())
+        let current = current_internal_config(
+            &bootroot::fs_util::SecretsTree::open_shared(
+                paths.dir().parent().expect("secrets dir"),
+            )
             .await
-            .expect("a readable file")
-            .expect("a present file");
+            .expect("open"),
+            &paths,
+            &test_messages(),
+        )
+        .await
+        .expect("a readable file")
+        .expect("a present file");
         assert_eq!(current.settings.email, "ops@example.internal");
         assert_eq!(
             current.settings.acme.http_responder_url,
@@ -2522,6 +2855,56 @@ mod publication_tests {
     };
     use crate::i18n::test_messages;
 
+    /// As root over a foreign-owned `secrets/`, a `registrar-internal/`
+    /// swapped for a link after the handle was opened stops the
+    /// publication — its capture, its restore and its discard alike —
+    /// with nothing outside touched.
+    #[tokio::test]
+    async fn rooted_publication_refuses_a_swapped_registrar_internal_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(&secrets).expect("secrets");
+        let paths = InternalPaths::new(&secrets);
+        provisioned_host(&paths);
+        std::fs::remove_file(paths.key()).expect("no key, so the capture copies nothing");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(outside.join(PRIOR_DIR)).expect("outside");
+        std::fs::write(outside.join(KEY_FILE), "OUTSIDE").expect("outside");
+        let before = crate::test_support::snapshot_tree(&outside);
+        let tree = std::sync::Arc::new(
+            bootroot::fs_util::SecretsTree::open_rooted_for_tests(&secrets).expect("rooted"),
+        );
+        // A snapshot captured before the swap — of a missing member, which
+        // a non-root process can capture — so its restore and its discard
+        // walk through the swapped name too. A protected member's copy is
+        // published `root:root`, which only a root run can drive.
+        let snapshot = bootroot::registrar::internal::capture_members(&tree, &paths, &[KEY_FILE])
+            .await
+            .expect("capture before the swap");
+        std::fs::rename(paths.dir(), dir.path().join("internal-aside")).expect("aside");
+        std::os::unix::fs::symlink(&outside, paths.dir()).expect("plant");
+        let shown = paths.dir().display().to_string();
+
+        let err = publish_internal_set(
+            &tree,
+            &staged(&secrets),
+            &context(&secrets).inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect_err("a swapped registrar-internal is refused");
+        crate::test_support::assert_error_names(&err, paths.dir());
+        let Err(err) = bootroot::registrar::internal::capture_set(&tree, &paths).await else {
+            panic!("the capture walks the swapped name");
+        };
+        assert!(format!("{err:?}").contains(&shown), "{err:?}");
+        let err = snapshot.restore().await.expect_err("restore refused");
+        assert!(format!("{err:?}").contains(&shown), "{err:?}");
+        let err = snapshot.discard().await.expect_err("discard refused");
+        assert!(format!("{err:?}").contains(&shown), "{err:?}");
+        assert_eq!(crate::test_support::snapshot_tree(&outside), before);
+    }
+
     const ACTIVE_ROOT: &str = "aa11bb22cc33dd44ee55ff6677889900aa11bb22cc33dd44ee55ff6677889900";
     const ACTIVE_INT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const OLD_ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -2612,9 +2995,16 @@ mod publication_tests {
         let dir = TempDir::new().expect("tempdir");
         let context = context(dir.path());
         let staged = staged(dir.path());
-        let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
-            .await
-            .expect_err("an unprivileged process cannot publish the protected set");
+        let err = publish_internal_set(
+            &bootroot::fs_util::SecretsTree::open_shared(dir.path())
+                .await
+                .expect("open"),
+            &staged,
+            &context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect_err("an unprivileged process cannot publish the protected set");
         let report = format!("{err:#}");
         assert!(
             report.contains(KEY_FILE) && report.contains("root-owned"),
@@ -2669,9 +3059,16 @@ mod publication_tests {
 
         let context = context(dir.path());
         let staged = staged(dir.path());
-        let err = publish_internal_set(&staged, &context.inputs(), &test_messages())
-            .await
-            .expect_err("an unprivileged process cannot publish the protected set");
+        let err = publish_internal_set(
+            &bootroot::fs_util::SecretsTree::open_shared(dir.path())
+                .await
+                .expect("open"),
+            &staged,
+            &context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect_err("an unprivileged process cannot publish the protected set");
         let report = format!("{err:#}");
         assert!(
             report.contains(KEY_FILE) && report.contains("root-owned"),
@@ -2712,6 +3109,9 @@ mod publication_tests {
         std::fs::create_dir_all(paths.dir()).expect("the internal directory");
 
         let err = publish_internal_agent_config(
+            &bootroot::fs_util::SecretsTree::open_shared(dir.path())
+                .await
+                .expect("open"),
             &paths,
             "email = \"ops@example.internal\"\n",
             &test_messages(),
@@ -2832,10 +3232,126 @@ mod offline_signing_tests {
 
     use super::test_fixtures::{INTERNAL_SAN, TestLeaf, TestPki, write_signing_fake_docker};
     use super::{
-        RegistrarInternalContext, RegistrarInternalIntent, issue_internal_material, staging_dir,
+        LeafSigning, RegistrarInternalContext, RegistrarInternalIntent, issue_internal_material,
+        sign_internal_leaf_rooted, staging_dir,
     };
     use crate::commands::init::constants::REGISTRAR_INTERNAL_NOT_AFTER;
+    use crate::commands::init::steps::test_support::{
+        FakeOutput, step_scratch_dirs, volume_sources, write_output_fake_docker,
+    };
     use crate::i18n::test_messages;
+
+    /// As root over a foreign-owned `secrets/`, the leaf is signed into a
+    /// scratch directory beside the anchor: no chown container runs, the
+    /// only mount below the anchor is the anchor, and nothing is created
+    /// under it.
+    #[test]
+    fn rooted_signing_runs_no_chown_and_creates_nothing_under_the_anchor() {
+        let host = Host::new();
+        let before = crate::test_support::snapshot_tree(&host.secrets_dir);
+
+        let (leaf, key) = sign_internal_leaf_rooted(
+            &LeafSigning::from_inputs(&host.context.inputs()),
+            &test_messages(),
+        )
+        .expect("signed");
+
+        assert_eq!(leaf, host.leaf.cert_pem);
+        assert_eq!(key, host.leaf.key_pem);
+        let log = std::fs::read_to_string(&host.args_log).expect("log");
+        assert!(!log.contains("chown"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+        let volumes = volume_sources(log.lines().next().expect("step run"));
+        let anchor = std::fs::canonicalize(&host.secrets_dir).expect("anchor");
+        assert_eq!(
+            volumes.first().map(String::as_str),
+            Some(format!("{}:/home/step", anchor.display()).as_str())
+        );
+        let output = volumes
+            .get(1)
+            .and_then(|volume| volume.strip_suffix(":/output"))
+            .map(std::path::Path::new)
+            .expect("output mount");
+        assert_eq!(
+            output.parent().and_then(std::path::Path::parent),
+            Some(
+                std::fs::canonicalize(host.dir.path())
+                    .expect("root")
+                    .as_path()
+            )
+        );
+        assert_eq!(volumes.len(), 2, "{volumes:?}");
+        assert_eq!(
+            crate::test_support::snapshot_tree(&host.secrets_dir),
+            before
+        );
+        assert_eq!(
+            step_scratch_dirs(host.dir.path()),
+            Vec::<std::path::PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn rooted_signing_refuses_a_linked_key_output() {
+        let host = Host::new();
+        let outside = host.dir.path().join("outside-key.pem");
+        std::fs::write(&outside, "OUTSIDE-KEY").expect("outside");
+        let args_log = host.dir.path().join("link_args.log");
+        let docker = write_output_fake_docker(
+            host.dir.path(),
+            &args_log,
+            &[
+                ("leaf.pem", FakeOutput::File(&host.leaf.cert_pem)),
+                ("key.pem", FakeOutput::Link(&outside)),
+            ],
+        );
+        let mut context = Host::new().context;
+        context.secrets_dir.clone_from(&host.secrets_dir);
+        context.docker = docker;
+
+        let err = sign_internal_leaf_rooted(
+            &LeafSigning::from_inputs(&context.inputs()),
+            &test_messages(),
+        )
+        .expect_err("a linked key is refused");
+
+        assert!(format!("{err:#}").contains("key.pem"), "{err:#}");
+        assert_eq!(
+            step_scratch_dirs(host.dir.path()),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside"),
+            "OUTSIDE-KEY"
+        );
+    }
+
+    /// A walk into a `registrar-internal/` swapped for a link stops the
+    /// issuance before any container starts.
+    #[tokio::test]
+    async fn rooted_issuance_refuses_a_swapped_registrar_internal_dir() {
+        let host = Host::new();
+        std::fs::create_dir_all(host.paths().dir()).expect("internal dir");
+        let outside = host.dir.path().join("outside");
+        std::fs::create_dir_all(outside.join(".staging")).expect("outside");
+        std::fs::write(outside.join(".staging").join("keep"), "keep").expect("outside");
+        let before = crate::test_support::snapshot_tree(&outside);
+        let tree = std::sync::Arc::new(
+            bootroot::fs_util::SecretsTree::open_rooted_for_tests(&host.secrets_dir)
+                .expect("rooted"),
+        );
+        std::fs::rename(host.paths().dir(), host.dir.path().join("internal-aside")).expect("aside");
+        std::os::unix::fs::symlink(&outside, host.paths().dir()).expect("plant");
+
+        let err = issue_internal_material(&tree, &host.context.inputs(), &test_messages())
+            .await
+            .err()
+            .expect("a swapped registrar-internal is refused");
+
+        crate::test_support::assert_error_names(&err, host.paths().dir());
+        assert!(host.invocations().is_empty(), "no container started");
+        assert_eq!(crate::test_support::snapshot_tree(&outside), before);
+    }
 
     /// A host with its CA certificates in place and a fake `docker`
     /// standing in for the signing helper.
@@ -2918,9 +3434,15 @@ mod offline_signing_tests {
         use std::os::unix::fs::MetadataExt;
 
         let host = Host::new();
-        issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds without ACME");
+        issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds without ACME");
 
         let invocations = host.invocations();
         assert_eq!(
@@ -3009,9 +3531,15 @@ mod offline_signing_tests {
     #[tokio::test]
     async fn the_signed_leaf_is_staged_and_nothing_is_published() {
         let host = Host::new();
-        let staged = issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds");
+        let staged = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds");
         let staging = staging_dir(&host.paths());
 
         assert_eq!(staged.leaf_pem().expect("a leaf"), host.leaf.cert_pem);
@@ -3043,9 +3571,15 @@ mod offline_signing_tests {
     #[tokio::test]
     async fn a_first_provisioning_creates_an_account_key() {
         let host = Host::new();
-        let staged = issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds");
+        let staged = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds");
 
         let account = staged.material.acme_account.expose();
         assert!(
@@ -3080,9 +3614,15 @@ mod offline_signing_tests {
         );
         std::fs::write(paths.acme_account(), &existing).expect("the published account key");
 
-        let staged = issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds");
+        let staged = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds");
         assert_eq!(staged.material.acme_account.expose(), existing);
         assert_eq!(
             std::fs::read_to_string(staging_dir(&paths).join(ACME_ACCOUNT_FILE))
@@ -3105,9 +3645,15 @@ mod offline_signing_tests {
         std::fs::create_dir_all(paths.dir()).expect("the internal directory");
         std::fs::write(paths.acme_account(), "not an account key").expect("a broken key");
 
-        let staged = issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds");
+        let staged = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds");
         assert!(bootroot::acme::is_account_key(
             staged.material.acme_account.expose()
         ));
@@ -3167,9 +3713,15 @@ mod offline_signing_tests {
         std::fs::create_dir_all(&staging).expect("stale staging");
         std::fs::write(staging.join("stale"), "STALE KEY").expect("a stale file");
 
-        issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .expect("the offline signing succeeds");
+        issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .expect("the offline signing succeeds");
         assert!(!staging.join("stale").exists());
     }
 
@@ -3188,10 +3740,16 @@ mod offline_signing_tests {
         std::os::unix::fs::symlink(&elsewhere, &staging).expect("the symlink");
 
         let messages = test_messages();
-        let err = issue_internal_material(&host.context.inputs(), &messages)
-            .await
-            .err()
-            .expect("a symlinked staging directory is refused");
+        let err = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &messages,
+        )
+        .await
+        .err()
+        .expect("a symlinked staging directory is refused");
         assert!(
             format!("{err:#}").contains(
                 &messages.error_registrar_internal_staging_symlink(&staging.display().to_string())
@@ -3212,10 +3770,16 @@ mod offline_signing_tests {
         host.context.docker = failing;
 
         let messages = test_messages();
-        let err = issue_internal_material(&host.context.inputs(), &messages)
-            .await
-            .err()
-            .expect("a failing helper fails the signing");
+        let err = issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &messages,
+        )
+        .await
+        .err()
+        .expect("a failing helper fails the signing");
         assert!(
             format!("{err:#}").contains(messages.error_registrar_internal_provision_failed()),
             "{err:#}"
@@ -3230,10 +3794,16 @@ mod offline_signing_tests {
     async fn missing_ca_material_fails_before_any_container_runs() {
         let host = Host::new();
         std::fs::remove_dir_all(host.secrets_dir.join("certs")).expect("remove the CA");
-        issue_internal_material(&host.context.inputs(), &test_messages())
-            .await
-            .err()
-            .expect("there is nothing to sign against");
+        issue_internal_material(
+            &bootroot::fs_util::SecretsTree::open_shared(&host.secrets_dir)
+                .await
+                .expect("open"),
+            &host.context.inputs(),
+            &test_messages(),
+        )
+        .await
+        .err()
+        .expect("there is nothing to sign against");
         assert!(
             host.invocations().is_empty(),
             "no container may run without CA material"

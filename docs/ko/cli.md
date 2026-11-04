@@ -231,11 +231,17 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
   `--agent-config-path`에 놓인 링크는 운영자가 직접 마련한 것입니다. 바로 옆의
   `--eab-file-path`는 자격 증명 경로이므로, 그곳의 링크는 대체됩니다. 다만
   다른 계정이 소유한 `secrets/` 위에서 root로 실행한 `infra install`, `init`,
-  `infra up`(OpenBao 감사 오버라이드), `openbao save-unseal-keys`,
-  `rotate infra-cert`(HTTP-01 관리 인증서)는 예외입니다. 이 명령들은 그 안에서
-  거치는 모든 디렉터리와 게시할 생성 파일에 놓인 심볼릭 링크를 따라가지 않고
-  거부하며, 해당 경로를 명시한 오류와 함께 멈춥니다. 따라서 그 경우에는 생성
-  파일을 심볼릭 링크로 옮겨 두는 방식이 적용되지 않습니다.
+  `reinit`, `infra up`(OpenBao 감사 오버라이드와 저장된 언실 키),
+  `openbao save-unseal-keys`, `rotate infra-cert`(HTTP-01 관리 인증서)는
+  예외입니다. 이 명령들은 그 안에서 거치는 모든 디렉터리와 게시할 생성 파일에
+  놓인 심볼릭 링크를 따라가지 않고 거부하며, 해당 경로를 명시한 오류와 함께
+  멈춥니다. 그 안에서 생성 파일을 삭제할 때, 실패한 `init` 뒤에 파일을 복원할
+  때, 내용을 다른 곳에 전달하는 파일(CA 인증서, `ca.json`, step-ca 비밀번호,
+  저장된 언실 키)을 읽을 때도 같은 방식으로 심볼릭 링크를 거부합니다. 따라서 그
+  경우에는 생성 파일을 심볼릭 링크로 옮겨 두는 방식이 적용되지 않습니다.
+  `rotate infra-cert`, `rotate ca-key`, `rotate trust-sync`,
+  `rotate registrar-internal-credential`, `registrar issue`가 `init`과 공유하는
+  단계에도 같은 내용이 적용됩니다.
 - **컨트롤 노드 자신의 `agent.toml`, 발급된 인증서와 키, CA 번들, 모든 자격
   증명은 경로 자체에 게시되며**, 그 자리에 있던 링크는 일반 파일로 대체됩니다.
   OpenBao 언실 키와 시크릿 트리의 EAB 파일은 이번 릴리스에서 이 그룹에

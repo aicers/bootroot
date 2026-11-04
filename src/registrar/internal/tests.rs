@@ -94,9 +94,15 @@ fn write_companions(paths: &InternalPaths) {
 async fn provisioned_host() -> (TempDir, InternalPaths) {
     let dir = TempDir::new().expect("tempdir");
     let paths = InternalPaths::new(dir.path());
-    publish_material(&paths, &material())
-        .await
-        .expect("publish the material");
+    publish_material(
+        &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+            .await
+            .expect("open"),
+        &paths,
+        &material(),
+    )
+    .await
+    .expect("publish the material");
     write_companions(&paths);
     (dir, paths)
 }
@@ -497,9 +503,15 @@ async fn the_credential_files_are_published_under_the_protected_owner() {
         );
     }
 
-    publish_material(&paths, &material())
-        .await
-        .expect("republish the material");
+    publish_material(
+        &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+            .await
+            .expect("open"),
+        &paths,
+        &material(),
+    )
+    .await
+    .expect("republish the material");
     for path in [
         paths.key(),
         paths.chain(),
@@ -1434,7 +1446,14 @@ mod snapshot {
     async fn a_restore_puts_every_member_back_at_its_own_mode() {
         let (dir, paths) = provisioned_host().await;
         let config_before = std::fs::read_to_string(paths.agent_config()).expect("config");
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
 
         // A publication that replaced the bundle and the key and then
         // failed on the chain.
@@ -1484,7 +1503,14 @@ mod snapshot {
         let dir = TempDir::new().expect("tempdir");
         let paths = InternalPaths::new(dir.path());
         std::fs::create_dir_all(paths.dir()).expect("layout dir");
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
 
         std::fs::write(paths.ca_bundle(), "NEW BUNDLE").expect("new bundle");
         std::fs::write(paths.key(), "NEW KEY").expect("new key");
@@ -1504,7 +1530,14 @@ mod snapshot {
         std::fs::remove_file(paths.chain()).expect("remove the chain");
         std::fs::create_dir_all(paths.chain().join("nested")).expect("a directory at the chain");
 
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
         std::fs::write(paths.key(), "NEW KEY").expect("new key");
         snapshot.restore().await.expect("restore");
 
@@ -1528,7 +1561,14 @@ mod snapshot {
         std::fs::create_dir_all(&prior).expect("stale snapshot");
         std::fs::write(prior.join("key.pem"), "ANCIENT KEY").expect("stale key");
 
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
         assert_eq!(
             std::fs::read_to_string(prior.join("key.pem")).expect("captured key"),
             key_pem()
@@ -1553,7 +1593,14 @@ mod snapshot {
     async fn the_protected_snapshot_and_restore_carry_the_protected_owner() {
         let (_dir, paths) = provisioned_host().await;
         let owner = protected_test_owner();
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
         let prior = paths.dir().join(PRIOR_DIR);
 
         for name in [
@@ -1610,7 +1657,14 @@ mod snapshot {
         std::fs::set_permissions(paths.chain(), std::fs::Permissions::from_mode(0o000))
             .expect("make the chain unreadable");
 
-        let Err(err) = capture_set(&paths).await else {
+        let Err(err) = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        else {
             panic!("a member that cannot be read must fail the capture");
         };
         assert!(
@@ -1634,7 +1688,14 @@ mod snapshot {
     #[tokio::test]
     async fn the_capture_holds_the_secrets_at_0600_beside_the_credential() {
         let (_dir, paths) = provisioned_host().await;
-        let snapshot = capture_set(&paths).await.expect("capture");
+        let snapshot = capture_set(
+            &crate::fs_util::SecretsTree::open_shared(paths.dir().parent().expect("secrets dir"))
+                .await
+                .expect("open"),
+            &paths,
+        )
+        .await
+        .expect("capture");
         let prior = paths.dir().join(PRIOR_DIR);
         assert_eq!(snapshot.dir(), prior);
         assert_eq!(mode_of(&prior.join("key.pem")), KEY_FILE_MODE);
@@ -2688,5 +2749,141 @@ mod internal_profile {
         let mut half = internal_profile(&paths);
         half.paths.key = elsewhere.join("key.pem");
         assert!(internal_profile_paths(&half).is_none());
+    }
+}
+
+/// The set's publication, capture and restore through a rooted handle:
+/// what a root run over a `secrets/` another account owns does, with
+/// `protected_owner()` the test's own uid so an unprivileged test can
+/// drive it.
+mod rooted {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::{material, mode_of, owner_of, protected_test_owner, write_companions};
+    use crate::fs_util::SecretsTree;
+    use crate::registrar::internal::material::{PRIOR_DIR, capture_set, publish_material};
+    use crate::registrar::internal::{InternalPaths, KEY_FILE};
+
+    fn rooted(secrets: &Path) -> Arc<SecretsTree> {
+        Arc::new(SecretsTree::open_rooted_for_tests(secrets).expect("rooted handle"))
+    }
+
+    fn path_based(secrets: &Path) -> Arc<SecretsTree> {
+        Arc::new(SecretsTree::open(secrets).expect("path-based handle"))
+    }
+
+    /// Every member's bytes, mode and owner, by name.
+    /// One member's name, bytes, mode and owner.
+    type Member = (String, Vec<u8>, u32, (u32, u32));
+
+    fn published(paths: &InternalPaths) -> Vec<Member> {
+        [
+            paths.key(),
+            paths.chain(),
+            paths.acme_account(),
+            paths.root_fingerprint(),
+        ]
+        .iter()
+        .map(|path| {
+            (
+                path.file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(path).expect("read"),
+                mode_of(path),
+                owner_of(path),
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rooted_publication_matches_the_path_based_one() {
+        let mut results = Vec::new();
+        for is_rooted in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let paths = InternalPaths::new(dir.path());
+            let tree = if is_rooted {
+                rooted(dir.path())
+            } else {
+                path_based(dir.path())
+            };
+            publish_material(&tree, &paths, &material())
+                .await
+                .expect("publish");
+            assert_eq!(mode_of(paths.dir()), 0o700);
+            assert_eq!(owner_of(paths.dir()), protected_test_owner());
+            results.push(published(&paths));
+        }
+        assert_eq!(results.first(), results.get(1));
+    }
+
+    #[tokio::test]
+    async fn a_rooted_restore_puts_the_set_back_as_the_path_based_one_does() {
+        let mut results = Vec::new();
+        for is_rooted in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let paths = InternalPaths::new(dir.path());
+            let tree = if is_rooted {
+                rooted(dir.path())
+            } else {
+                path_based(dir.path())
+            };
+            publish_material(&tree, &paths, &material())
+                .await
+                .expect("publish");
+            write_companions(&paths);
+            let snapshot = capture_set(&tree, &paths).await.expect("capture");
+            assert_eq!(mode_of(&paths.dir().join(PRIOR_DIR)), 0o700);
+            std::fs::write(paths.key(), "NEW KEY").expect("new key");
+            std::fs::write(paths.ca_bundle(), "NEW BUNDLE").expect("new bundle");
+            snapshot.restore().await.expect("restore");
+            snapshot.discard().await.expect("discard");
+            assert!(!paths.dir().join(PRIOR_DIR).exists());
+            let mut state = published(&paths);
+            state.push((
+                "ca-bundle".to_string(),
+                std::fs::read(paths.ca_bundle()).expect("bundle"),
+                mode_of(&paths.ca_bundle()),
+                owner_of(&paths.ca_bundle()),
+            ));
+            results.push(state);
+        }
+        assert_eq!(results.first(), results.get(1));
+    }
+
+    /// The replacement in the threat: the owner of `secrets/` renames the
+    /// root-owned `registrar-internal/` away and puts a real directory of
+    /// its own at the name. A descriptor walk would open it, so the walk
+    /// checks its owner and refuses it before anything is read from or
+    /// written into it.
+    #[tokio::test]
+    async fn a_registrar_internal_the_writer_does_not_own_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let paths = InternalPaths::new(dir.path());
+        std::fs::create_dir_all(paths.dir()).expect("planted directory");
+        std::fs::write(paths.key(), "PLANTED").expect("planted key");
+        let mut tree = SecretsTree::open_rooted_for_tests(dir.path()).expect("rooted");
+        tree.set_writer_euid_for_tests(crate::fs_util::current_process_euid().wrapping_add(1));
+        let tree = Arc::new(tree);
+
+        let Err(err) = publish_material(&tree, &paths, &material()).await else {
+            panic!("a foreign registrar-internal is refused");
+        };
+        assert!(
+            format!("{err:?}").contains(&paths.dir().display().to_string()),
+            "{err:?}"
+        );
+        assert!(capture_set(&tree, &paths).await.is_err());
+        assert_eq!(std::fs::read(paths.key()).expect("planted"), b"PLANTED");
+        let names: Vec<_> = std::fs::read_dir(paths.dir())
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE)]);
     }
 }

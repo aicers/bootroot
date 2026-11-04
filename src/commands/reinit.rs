@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util::{EntryKind, SecretsTree};
 
 use crate::cli::args::{
     ComposeFileArgs, DbAdminDsnArgs, DbTimeoutArgs, InfraUpArgs, InitArgs, OpenBaoArgs, ReinitArgs,
@@ -239,8 +241,14 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     // 8. Stop and remove the OpenBao container + volumes.
     remove_openbao_container_and_volumes(compose_file, messages)?;
 
-    // 9. Remove OpenBao runtime/bootstrap artifacts (narrow).
-    remove_openbao_runtime_state(&effective_secrets_dir, messages)?;
+    // 9. Remove OpenBao runtime/bootstrap artifacts (narrow). The handle
+    //    is opened once here and also serves the preserved `ca.json`
+    //    read below: as root over a `secrets/` another account owns,
+    //    neither follows a name that account could have replaced.
+    //    The handle's operations block, so they run on blocking
+    //    threads.
+    let secrets_tree = SecretsTree::open_shared(&effective_secrets_dir).await?;
+    remove_openbao_runtime_state_blocking(&secrets_tree, messages).await?;
 
     // 10. Rewrite state.json with intent-only fields before infra up.
     //     Keep the registrar predicate out of this transient state:
@@ -304,10 +312,12 @@ pub(crate) async fn run_reinit(args: &ReinitArgs, messages: &Messages) -> Result
     //     `--root-token-output`, if set, is threaded into the init args
     //     so the freshly issued root token is persisted with mode 0600
     //     after init succeeds.
+    let preserved_ca_json = secrets_tree.run(|tree| Ok(read_ca_json(tree))).await?;
     let init_args = init_args_for_reinit(
         args,
         &snapshot,
         &effective_secrets_dir,
+        preserved_ca_json.as_ref(),
         std::env::var(OPENBAO_HOST_PORT_ENV).ok().as_deref(),
     );
     run_init_locked(&init_args, &state_lock, messages).await?;
@@ -653,14 +663,33 @@ pub(crate) fn effective_secrets_dir(args: &ReinitArgs, snapshot: &DeploymentInte
         .unwrap_or_else(|| args.secrets_dir.secrets_dir.clone())
 }
 
+/// Runs [`remove_openbao_runtime_state`] on a blocking thread, since
+/// every operation through the handle blocks.
+async fn remove_openbao_runtime_state_blocking(
+    tree: &Arc<SecretsTree>,
+    messages: &Messages,
+) -> Result<()> {
+    let messages = messages.clone();
+    tree.run(move |tree| remove_openbao_runtime_state(tree, &messages))
+        .await
+}
+
 /// Removes only `OpenBao` runtime/bootstrap artifacts.  Explicitly
 /// preserves step-ca CA material, operator-authored compose overrides,
 /// `PostgreSQL` state, and non-credential service config.
-pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messages) -> Result<()> {
+///
+/// Works below `tree`'s anchor. A rooted handle removes every entry
+/// through its descriptors and follows no name below the anchor; a
+/// path-based one runs the removals by path, as they always ran.
+pub(crate) fn remove_openbao_runtime_state(tree: &SecretsTree, messages: &Messages) -> Result<()> {
+    if tree.is_rooted() {
+        return remove_openbao_runtime_state_rooted(tree, messages);
+    }
+    let secrets_dir = tree.anchor();
     let openbao_dir = secrets_dir.join("openbao");
 
     // 1. unseal-keys.txt
-    remove_file_if_exists(&openbao_dir.join("unseal-keys.txt"), messages)?;
+    remove_file_if_exists(tree, &openbao_dir.join("unseal-keys.txt"), messages)?;
 
     // 2. Generated openbao-agent runtime files under secrets/openbao/
     //    (stepca / responder agent configs and any rendered secret files)
@@ -673,7 +702,7 @@ pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messag
         }
     }
     let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
-    remove_file_if_exists(&agent_override, messages)?;
+    remove_file_if_exists(tree, &agent_override, messages)?;
 
     // 3. Stale per-registration credential files under
     //    secrets/services/<registration_id>/.
@@ -692,14 +721,88 @@ pub(crate) fn remove_openbao_runtime_state(secrets_dir: &Path, messages: &Messag
                 continue;
             }
             for name in STALE_SERVICE_CREDENTIAL_FILES {
-                remove_file_if_exists(&path.join(name), messages)?;
+                remove_file_if_exists(tree, &path.join(name), messages)?;
             }
         }
     }
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path, messages: &Messages) -> Result<()> {
+/// [`remove_openbao_runtime_state`] through a rooted handle: the same
+/// removals, each reached through the anchor's descriptor. An entry of
+/// `services/` that is not a directory, a symbolic link included, is
+/// skipped without being followed.
+fn remove_openbao_runtime_state_rooted(tree: &SecretsTree, messages: &Messages) -> Result<()> {
+    let secrets_dir = tree.anchor();
+    let openbao_dir = secrets_dir.join("openbao");
+    remove_file_if_exists(tree, &openbao_dir.join("unseal-keys.txt"), messages)?;
+    for sub in ["stepca", "responder"] {
+        let path = openbao_dir.join(sub);
+        let kind = tree
+            .entry_kind(&path)
+            .with_context(|| messages.error_remove_dir_failed(&path.display().to_string()))?;
+        // A link at the target is unlinked itself, never followed, as
+        // `std::fs::remove_dir_all` removes one by path.
+        if matches!(kind, Some(EntryKind::Dir | EntryKind::Symlink)) {
+            match tree.remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(anyhow::Error::new(err)
+                        .context(messages.error_remove_dir_failed(&path.display().to_string())));
+                }
+            }
+        }
+    }
+    let agent_override = openbao_dir.join("docker-compose.openbao-agent.override.yml");
+    remove_file_if_exists(tree, &agent_override, messages)?;
+
+    let services_root = secrets_dir.join("services");
+    let services_kind = tree
+        .entry_kind(&services_root)
+        .with_context(|| messages.error_read_dir_failed(&services_root.display().to_string()))?;
+    if services_kind == Some(EntryKind::Symlink) {
+        // An intermediate level of every file removed below: refused, as
+        // a link at `openbao/` is, rather than skipped.
+        return Err(anyhow::Error::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symbolic link, which is not followed",
+                services_root.display()
+            ),
+        ))
+        .context(messages.error_read_dir_failed(&services_root.display().to_string())));
+    }
+    if services_kind == Some(EntryKind::Dir) {
+        let entries = tree.read_dir(&services_root).with_context(|| {
+            messages.error_read_dir_failed(&services_root.display().to_string())
+        })?;
+        for (name, kind) in entries {
+            if kind != EntryKind::Dir {
+                continue;
+            }
+            let path = services_root.join(name);
+            for file in STALE_SERVICE_CREDENTIAL_FILES {
+                remove_file_if_exists(tree, &path.join(file), messages)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes the file at `path`, below `tree`'s anchor, when one is there.
+/// A rooted handle unlinks it through the walked parent's descriptor
+/// and takes `NotFound` as already removed; a path-based one probes and
+/// removes by path, as it always did.
+fn remove_file_if_exists(tree: &SecretsTree, path: &Path, messages: &Messages) -> Result<()> {
+    if tree.is_rooted() {
+        return match tree.remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow::Error::new(err)
+                .context(messages.error_remove_file_failed(&path.display().to_string()))),
+        };
+    }
     if path.exists() {
         std::fs::remove_file(path)
             .with_context(|| messages.error_remove_file_failed(&path.display().to_string()))?;
@@ -1053,9 +1156,8 @@ fn write_reinit_plan<W: Write>(
 /// partial-init that crashed before `update_ca_json_with_backup` ran),
 /// is malformed, or has no `db.dataSource` field.  In those cases the
 /// existing env-derived DSN resolution is left in place.
-fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
-    let value = read_ca_json(secrets_dir)?;
-    value
+fn preserved_db_dsn_from_ca_json(ca_json: &serde_json::Value) -> Option<String> {
+    ca_json
         .get("db")
         .and_then(|db| db.get("dataSource"))
         .and_then(serde_json::Value::as_str)
@@ -1063,10 +1165,19 @@ fn preserved_db_dsn_from_ca_json(secrets_dir: &Path) -> Option<String> {
 }
 
 /// Reads `<secrets_dir>/config/ca.json` once for the `preserved_*`
-/// helpers below.  Returns `None` when the file is absent or malformed
+/// helpers, which take the parsed value so that the read, which is
+/// blocking, runs on a blocking thread and the helpers do not.  Returns `None` when the file is absent or malformed
 /// so callers fall back to their CLI/default values.
-fn read_ca_json(secrets_dir: &Path) -> Option<serde_json::Value> {
-    let ca_json_path = secrets_dir.join("config").join("ca.json");
+///
+/// `secrets_dir` is `tree`'s anchor. A rooted handle reads the file
+/// through its descriptors and maps a refusal to `None`, as every read
+/// error is mapped here.
+fn read_ca_json(tree: &SecretsTree) -> Option<serde_json::Value> {
+    let ca_json_path = tree.anchor().join("config").join("ca.json");
+    if tree.is_rooted() {
+        let contents = tree.read(&ca_json_path).ok()?;
+        return serde_json::from_slice(&contents).ok();
+    }
     if !ca_json_path.exists() {
         return None;
     }
@@ -1084,9 +1195,8 @@ fn read_ca_json(secrets_dir: &Path) -> Option<serde_json::Value> {
 /// Accepts both the on-disk shape (`authority.provisioners`) and the
 /// flat `provisioners` shape emitted by older `step ca init` builds,
 /// matching `set_acme_cert_duration`'s discovery logic.
-fn preserved_stepca_provisioner_from_ca_json(secrets_dir: &Path) -> Option<String> {
-    let value = read_ca_json(secrets_dir)?;
-    locate_provisioners(&value)?.iter().find_map(|p| {
+fn preserved_stepca_provisioner_from_ca_json(ca_json: &serde_json::Value) -> Option<String> {
+    locate_provisioners(ca_json)?.iter().find_map(|p| {
         let is_acme = p
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -1105,9 +1215,8 @@ fn preserved_stepca_provisioner_from_ca_json(secrets_dir: &Path) -> Option<Strin
 /// so a deployment initialized with a non-default `--cert-duration`
 /// keeps that value on the second init pass rather than silently
 /// snapping back to `DEFAULT_CERT_DURATION`.
-fn preserved_cert_duration_from_ca_json(secrets_dir: &Path) -> Option<String> {
-    let value = read_ca_json(secrets_dir)?;
-    locate_provisioners(&value)?.iter().find_map(|p| {
+fn preserved_cert_duration_from_ca_json(ca_json: &serde_json::Value) -> Option<String> {
+    locate_provisioners(ca_json)?.iter().find_map(|p| {
         let is_acme = p
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -1167,6 +1276,9 @@ fn locate_provisioners(value: &serde_json::Value) -> Option<&Vec<serde_json::Val
 /// `preserved_stepca_provisioner_from_ca_json` and
 /// `preserved_cert_duration_from_ca_json`.
 ///
+/// `preserved_ca_json` is what [`read_ca_json`] returned for
+/// `effective_secrets_dir`.
+///
 /// `openbao_host_port_env` is what the invoking environment's
 /// `OPENBAO_HOST_PORT` held; it is a parameter so the host-port
 /// derivation below can be exercised without the process-global
@@ -1175,6 +1287,7 @@ fn init_args_for_reinit(
     args: &ReinitArgs,
     snapshot: &DeploymentIntent,
     effective_secrets_dir: &Path,
+    preserved_ca_json: Option<&serde_json::Value>,
     openbao_host_port_env: Option<&str>,
 ) -> Box<InitArgs> {
     let mut openbao = args.openbao.clone();
@@ -1197,10 +1310,12 @@ fn init_args_for_reinit(
         openbao.openbao_url =
             reinit_runtime_openbao_url(&openbao.openbao_url, snapshot.registrar_endpoint.as_ref());
     }
-    let db_dsn = preserved_db_dsn_from_ca_json(effective_secrets_dir);
-    let stepca_provisioner = preserved_stepca_provisioner_from_ca_json(effective_secrets_dir)
+    let db_dsn = preserved_ca_json.and_then(preserved_db_dsn_from_ca_json);
+    let stepca_provisioner = preserved_ca_json
+        .and_then(preserved_stepca_provisioner_from_ca_json)
         .unwrap_or_else(|| crate::commands::init::DEFAULT_STEPCA_PROVISIONER.to_string());
-    let cert_duration = preserved_cert_duration_from_ca_json(effective_secrets_dir)
+    let cert_duration = preserved_ca_json
+        .and_then(preserved_cert_duration_from_ca_json)
         .unwrap_or_else(|| crate::commands::init::DEFAULT_CERT_DURATION.to_string());
     Box::new(InitArgs {
         openbao,
@@ -1439,6 +1554,155 @@ mod tests {
         assert_eq!(rewritten.infra_certs.len(), 1, "infra_certs must survive");
     }
 
+    /// Seeds the files `remove_openbao_runtime_state` removes under
+    /// `root.secrets`.
+    fn seed_runtime_state(root: &crate::test_support::SwapRoot) {
+        root.write("openbao/unseal-keys.txt", "keys");
+        root.write("openbao/stepca/agent.hcl", "x");
+        root.write("openbao/responder/agent.hcl", "x");
+        root.write("openbao/docker-compose.openbao-agent.override.yml", "x");
+        root.write("services/svc/role_id", "r");
+        root.write("services/svc/secret_id", "s");
+        root.write("services/svc/notes.toml", "keep");
+    }
+
+    #[test]
+    fn rooted_remove_openbao_runtime_state_removes_what_the_path_based_one_does() {
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            seed_runtime_state(&root);
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).unwrap()
+            };
+            remove_openbao_runtime_state(&tree, &test_messages()).unwrap();
+            for gone in [
+                "openbao/unseal-keys.txt",
+                "openbao/stepca",
+                "openbao/responder",
+                "openbao/docker-compose.openbao-agent.override.yml",
+                "services/svc/role_id",
+                "services/svc/secret_id",
+            ] {
+                assert!(
+                    fs::symlink_metadata(root.secrets.join(gone)).is_err(),
+                    "rooted={rooted}: {gone} must be removed"
+                );
+            }
+            assert!(root.secrets.join("services/svc/notes.toml").exists());
+        }
+    }
+
+    #[test]
+    fn rooted_remove_openbao_runtime_state_refuses_a_swapped_openbao_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        seed_runtime_state(&root);
+        fs::write(root.outside.join("unseal-keys.txt"), "outside").unwrap();
+        fs::create_dir_all(root.outside.join("stepca")).unwrap();
+        let tree = root.rooted();
+        let before = root.outside_snapshot();
+        let link = root.swap("openbao", &root.outside);
+
+        let err = remove_openbao_runtime_state(&tree, &test_messages()).unwrap_err();
+
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[test]
+    fn rooted_runtime_state_removal_skips_linked_entries_refuses_linked_services() {
+        let root = crate::test_support::SwapRoot::new();
+        seed_runtime_state(&root);
+        fs::write(root.outside.join("role_id"), "outside").unwrap();
+        fs::write(root.outside.join("inner").join("role_id"), "outside").unwrap();
+        let before = root.outside_snapshot();
+
+        // `services/<id>` a link to a directory outside: skipped.
+        let tree = root.rooted();
+        let link = root.swap("services/other", &root.outside.join("inner"));
+        remove_openbao_runtime_state(&tree, &test_messages()).unwrap();
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "the link is left alone"
+        );
+        assert_eq!(root.outside_snapshot(), before);
+
+        // `services/` itself a link: refused naming it, not followed.
+        let root = crate::test_support::SwapRoot::new();
+        seed_runtime_state(&root);
+        fs::write(root.outside.join("inner").join("role_id"), "outside").unwrap();
+        let before = root.outside_snapshot();
+        let tree = root.rooted();
+        let link = root.swap("services", &root.outside);
+        let err = remove_openbao_runtime_state(&tree, &test_messages()).unwrap_err();
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// A link at `openbao/stepca` is unlinked itself, as the path-based
+    /// `remove_dir_all` removes one, and what it points at is left.
+    #[test]
+    fn rooted_remove_openbao_runtime_state_unlinks_a_linked_agent_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        seed_runtime_state(&root);
+        fs::write(root.outside.join("inner").join("agent.hcl"), "outside").unwrap();
+        let before = root.outside_snapshot();
+        let tree = root.rooted();
+        let link = root.swap("openbao/stepca", &root.outside.join("inner"));
+        remove_openbao_runtime_state(&tree, &test_messages()).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err(), "the link is removed");
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// The path-based removal follows a `services/<id>` link to a
+    /// directory, as it always has: a non-root run, or a root run over a
+    /// root-owned tree, keeps today's behaviour.
+    #[test]
+    fn path_based_remove_openbao_runtime_state_follows_a_services_link() {
+        let root = crate::test_support::SwapRoot::new();
+        seed_runtime_state(&root);
+        fs::write(root.outside.join("inner").join("role_id"), "outside").unwrap();
+        root.swap("services/other", &root.outside.join("inner"));
+        let tree = SecretsTree::open(&root.secrets).unwrap();
+        assert!(!tree.is_rooted());
+        remove_openbao_runtime_state(&tree, &test_messages()).unwrap();
+        assert!(!root.outside.join("inner").join("role_id").exists());
+    }
+
+    #[test]
+    fn rooted_read_ca_json_maps_a_linked_leaf_to_none() {
+        let root = crate::test_support::SwapRoot::new();
+        fs::write(
+            root.outside.join("secret"),
+            r#"{"db":{"dataSource":"postgres://outside"}}"#,
+        )
+        .unwrap();
+        root.write(
+            "config/ca.json",
+            r#"{"db":{"dataSource":"postgres://inside"}}"#,
+        );
+        let tree = root.rooted();
+        assert_eq!(
+            read_ca_json(&tree)
+                .as_ref()
+                .and_then(preserved_db_dsn_from_ca_json)
+                .as_deref(),
+            Some("postgres://inside")
+        );
+        root.swap("config/ca.json", &root.outside.join("secret"));
+        assert!(read_ca_json(&tree).is_none());
+        // The path-based read follows the link, as it always has.
+        let path_based = SecretsTree::open(&root.secrets).unwrap();
+        assert_eq!(
+            read_ca_json(&path_based)
+                .as_ref()
+                .and_then(preserved_db_dsn_from_ca_json)
+                .as_deref(),
+            Some("postgres://outside")
+        );
+    }
+
     #[test]
     fn remove_openbao_runtime_state_preserves_stepca_material_and_postgres() {
         let dir = tempdir().unwrap();
@@ -1481,7 +1745,7 @@ mod tests {
         fs::write(secrets.join("services/svc/notes.toml"), "keep").unwrap();
 
         let messages = test_messages();
-        remove_openbao_runtime_state(&secrets, &messages).unwrap();
+        remove_openbao_runtime_state(&SecretsTree::open(&secrets).unwrap(), &messages).unwrap();
 
         assert!(
             secrets.join("config/ca.json").exists(),
@@ -2583,6 +2847,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -2621,6 +2887,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -2704,6 +2972,8 @@ mod tests {
             &reinit_args,
             &snapshot,
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -2762,6 +3032,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(init_args.openbao.openbao_url, "http://localhost:18200");
@@ -2773,6 +3045,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             Some("18201"),
         );
         assert_eq!(from_env.openbao.openbao_url, "http://localhost:18201");
@@ -2813,6 +3087,8 @@ mod tests {
             &reinit_args,
             &snapshot,
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -2875,6 +3151,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -2916,6 +3194,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert!(
@@ -2933,7 +3213,8 @@ mod tests {
         let config_dir = dir.path().join("config");
         fs::create_dir_all(&config_dir).expect("create config dir");
         fs::write(config_dir.join("ca.json"), r#"{"address":":9000"}"#).expect("write ca.json");
-        assert!(preserved_db_dsn_from_ca_json(dir.path()).is_none());
+        let ca_json = read_ca_json(&SecretsTree::open(dir.path()).unwrap()).unwrap();
+        assert!(preserved_db_dsn_from_ca_json(&ca_json).is_none());
     }
 
     /// Regression for Round 5 reviewer item: a deployment initialised
@@ -2984,6 +3265,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -3031,6 +3314,8 @@ mod tests {
             &reinit_args,
             &DeploymentIntent::default(),
             &reinit_args.secrets_dir.secrets_dir,
+            read_ca_json(&SecretsTree::open(&reinit_args.secrets_dir.secrets_dir).unwrap())
+                .as_ref(),
             None,
         );
         assert_eq!(
@@ -3056,8 +3341,9 @@ mod tests {
             r#"{"authority":{"provisioners":[{"type":"JWK","name":"admin"}]}}"#,
         )
         .expect("write ca.json");
-        assert!(preserved_stepca_provisioner_from_ca_json(dir.path()).is_none());
-        assert!(preserved_cert_duration_from_ca_json(dir.path()).is_none());
+        let ca_json = read_ca_json(&SecretsTree::open(dir.path()).unwrap()).unwrap();
+        assert!(preserved_stepca_provisioner_from_ca_json(&ca_json).is_none());
+        assert!(preserved_cert_duration_from_ca_json(&ca_json).is_none());
     }
 
     /// Regression for Round 6 reviewer item: an operator-supplied
@@ -3200,7 +3486,13 @@ mod tests {
         let effective = effective_secrets_dir(&reinit_args, &snapshot);
         assert_eq!(effective, snapshot_secrets);
 
-        let init_args = init_args_for_reinit(&reinit_args, &snapshot, &effective, None);
+        let init_args = init_args_for_reinit(
+            &reinit_args,
+            &snapshot,
+            &effective,
+            read_ca_json(&SecretsTree::open(&effective).unwrap()).as_ref(),
+            None,
+        );
         assert_eq!(
             init_args.secrets_dir.secrets_dir, snapshot_secrets,
             "init args must carry the snapshotted secrets_dir so the \

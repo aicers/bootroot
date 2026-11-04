@@ -669,6 +669,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_step_scratch_dir_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_step_scratch_dir_failed,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_step_output_invalid(&self, path: &str) -> String {
+        format_template(self.strings().error_step_output_invalid, &[("path", path)])
+    }
+
     pub(crate) fn error_registrar_internal_provision_failed(&self) -> &'static str {
         self.strings().error_registrar_internal_provision_failed
     }

@@ -2,6 +2,7 @@ use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
@@ -13,10 +14,10 @@ use super::super::constants::{
 };
 use super::super::paths::StepCaTemplatePaths;
 use super::super::types::StepCaInitResult;
-use super::RollbackFile;
 use super::http01_admin_tls::build_http01_admin_tls_sans;
 use super::openbao_tls::build_openbao_tls_sans;
 use super::postgres_tls::build_postgres_tls_sans;
+use super::{RollbackFile, read_to_string_in};
 use crate::commands::infra::run_docker;
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
@@ -117,13 +118,36 @@ pub(super) async fn write_stepca_templates(
     managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<StepCaTemplatePaths> {
-    let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
     // Under the tree's owner: the `OpenBao` Agent sidecar that renders
     // both templates below runs as that uid, and a `0700` directory a
     // root-run `init` created is one it cannot open them through. Both
-    // writes go through the tree handle, so a root process over a
-    // `secrets/` another account owns follows no name there.
+    // writes, and the `ca.json` read between them, go through the tree
+    // handle, so a root process over a `secrets/` another account owns
+    // follows no name there.
     let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    write_stepca_templates_in(
+        &tree,
+        kv_mount,
+        cert_duration,
+        provisioner,
+        managed,
+        messages,
+    )
+    .await
+}
+
+/// [`write_stepca_templates`] through the handle `tree` on the secrets
+/// directory.
+async fn write_stepca_templates_in(
+    tree: &Arc<fs_util::SecretsTree>,
+    kv_mount: &str,
+    cert_duration: &str,
+    provisioner: &str,
+    managed: &StepCaManagedKeys<'_>,
+    messages: &Messages,
+) -> Result<StepCaTemplatePaths> {
+    let secrets_dir = tree.anchor();
+    let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
     tree.ensure_dir_async(&templates_dir).await?;
 
     let password_template_path = templates_dir.join(STEPCA_PASSWORD_TEMPLATE_NAME);
@@ -152,7 +176,10 @@ pub(super) async fn write_stepca_templates(
     })?;
 
     let ca_json_path = secrets_dir.join("config").join("ca.json");
-    let ca_json_contents = tokio::fs::read_to_string(&ca_json_path)
+    // Read through the same handle: as root over a `secrets/` another
+    // account owns, a link at `config/` or `ca.json` is refused rather
+    // than read into the template.
+    let ca_json_contents = read_to_string_in(tree, &ca_json_path)
         .await
         .with_context(|| messages.error_read_file_failed(&ca_json_path.display().to_string()))?;
     let ca_json_template = build_ca_json_template(
@@ -231,15 +258,19 @@ async fn publish_ca_json(
 /// re-renders it from this template, so the rollback entry for `ca.json`
 /// is only durable when the template is restored alongside it.  A
 /// missing template yields `original: None`, which rolls back to "no
-/// template" — the correct pre-`init` state on a fresh install.
+/// template" — the correct pre-`init` state on a fresh install, where
+/// `templates/` itself is absent too.
+///
+/// Read below `tree`'s anchor, through the handle when it is rooted.
 pub(super) async fn snapshot_stepca_ca_json_template(
-    secrets_dir: &Path,
+    tree: &Arc<fs_util::SecretsTree>,
     messages: &Messages,
 ) -> Result<RollbackFile> {
-    let path = secrets_dir
+    let path = tree
+        .anchor()
         .join(RESPONDER_TEMPLATE_DIR)
         .join(STEPCA_CA_JSON_TEMPLATE_NAME);
-    let original = match tokio::fs::read_to_string(&path).await {
+    let original = match read_to_string_in(tree, &path).await {
         Ok(contents) => Some(contents),
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => {
@@ -610,9 +641,21 @@ pub(super) async fn write_password_file_with_backup(
     messages: &Messages,
 ) -> Result<RollbackFile> {
     let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    write_password_file_with_backup_in(&tree, password, messages).await
+}
+
+/// [`write_password_file_with_backup`] through the handle `tree` on the
+/// secrets directory, which serves both the snapshot read and the
+/// publish.
+async fn write_password_file_with_backup_in(
+    tree: &Arc<fs_util::SecretsTree>,
+    password: &str,
+    messages: &Messages,
+) -> Result<RollbackFile> {
+    let secrets_dir = tree.anchor();
     tree.ensure_dir_async(secrets_dir).await?;
     let password_path = secrets_dir.join("password.txt");
-    let original = match tokio::fs::read_to_string(&password_path).await {
+    let original = match read_to_string_in(tree, &password_path).await {
         Ok(contents) => Some(contents),
         Err(err) if err.kind() == ErrorKind::NotFound => None,
         Err(err) => {
@@ -665,16 +708,20 @@ pub(super) async fn write_password_file_with_backup(
 /// `managed.policy_deny_dns` and every IP address.
 /// The document is parsed and re-serialised rather than regenerated, so
 /// keys bootroot does not model survive untouched.
+///
+/// `ca.json` is read below `tree`'s anchor, through the handle when it
+/// is rooted; the publish opens its own handle on the same anchor.
 pub(super) async fn update_ca_json_with_backup(
-    secrets_dir: &Path,
+    tree: &Arc<fs_util::SecretsTree>,
     db_dsn: &str,
     cert_duration: &str,
     provisioner: &str,
     managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<CaJsonUpdate> {
+    let secrets_dir = tree.anchor();
     let path = secrets_dir.join("config").join("ca.json");
-    let contents = tokio::fs::read_to_string(&path)
+    let contents = read_to_string_in(tree, &path)
         .await
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
     let mut value: serde_json::Value =
@@ -716,13 +763,17 @@ pub(super) async fn update_ca_json_with_backup(
 /// later render — carries the same values.  No backup is taken: the
 /// rollback entry from `update_ca_json_with_backup` already holds the
 /// pre-`init` document.
+///
+/// `ca.json` is read below `tree`'s anchor, through the handle when it
+/// is rooted.
 pub(super) async fn reconcile_ca_json_managed_keys(
-    secrets_dir: &Path,
+    tree: &Arc<fs_util::SecretsTree>,
     managed: &StepCaManagedKeys<'_>,
     messages: &Messages,
 ) -> Result<bool> {
+    let secrets_dir = tree.anchor();
     let path = secrets_dir.join("config").join("ca.json");
-    let contents = tokio::fs::read_to_string(&path)
+    let contents = read_to_string_in(tree, &path)
         .await
         .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
     let mut value: serde_json::Value =
@@ -851,8 +902,147 @@ mod tests {
     use super::super::test_support::{test_messages, write_self_contained_fake_docker};
     use super::*;
 
+    /// A shared path-based handle on `secrets_dir`, as `init` opens on a
+    /// tree its own user owns.
+    fn shared_tree(secrets_dir: &Path) -> Arc<fs_util::SecretsTree> {
+        Arc::new(fs_util::SecretsTree::open(secrets_dir).expect("open secrets tree"))
+    }
+
     /// The step-ca container name a default install renders.
     const DEFAULT_CA_CONTAINER: &str = "bootroot-ca";
+
+    /// As root over a foreign-owned `secrets/`, each read `init` takes of
+    /// a file it republishes refuses a link at the leaf, names the path,
+    /// and carries none of the link target's bytes anywhere.
+    #[tokio::test]
+    async fn rooted_stepca_reads_refuse_a_linked_leaf() {
+        let messages = test_messages();
+        let dns = vec!["localhost".to_string()];
+        let deny = default_deny_dns();
+        let keys = managed_keys(&dns, &deny);
+        let outside_json = r#"{"db":{"type":"x","dataSource":"OUTSIDE"},"authority":{"provisioners":[{"type":"ACME","name":"acme"}]}}"#;
+
+        // `config/ca.json`: `update_ca_json_with_backup`,
+        // `reconcile_ca_json_managed_keys` and `write_stepca_templates`.
+        let root = crate::test_support::SwapRoot::new();
+        fs::write(root.outside.join("secret"), outside_json).unwrap();
+        root.write("config/ca.json", outside_json);
+        let tree = Arc::new(root.rooted());
+        let leaf = root.swap("config/ca.json", &root.outside.join("secret"));
+        let err = update_ca_json_with_backup(
+            &tree,
+            "postgresql://inside",
+            "24h",
+            "acme",
+            &keys,
+            &messages,
+        )
+        .await
+        .err()
+        .expect("update refuses a linked ca.json");
+        crate::test_support::assert_error_names(&err, &leaf);
+        let err = reconcile_ca_json_managed_keys(&tree, &keys, &messages)
+            .await
+            .expect_err("reconcile refuses a linked ca.json");
+        crate::test_support::assert_error_names(&err, &leaf);
+        let err = write_stepca_templates_in(&tree, "secret", "24h", "acme", &keys, &messages)
+            .await
+            .err()
+            .expect("the template refuses a linked ca.json");
+        crate::test_support::assert_error_names(&err, &leaf);
+        assert!(
+            !root
+                .secrets
+                .join("templates")
+                .join(STEPCA_CA_JSON_TEMPLATE_NAME)
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(root.outside.join("secret")).unwrap(),
+            outside_json
+        );
+
+        // `templates/ca.json.ctmpl`: the rollback snapshot.
+        let root = crate::test_support::SwapRoot::new();
+        fs::create_dir_all(root.secrets.join("templates")).unwrap();
+        let tree = Arc::new(root.rooted());
+        let absent = snapshot_stepca_ca_json_template(&tree, &messages)
+            .await
+            .expect("a missing template is no snapshot");
+        assert!(absent.original.is_none());
+        let leaf = root.swap(
+            &format!("templates/{STEPCA_CA_JSON_TEMPLATE_NAME}"),
+            &root.outside.join("secret"),
+        );
+        let err = snapshot_stepca_ca_json_template(&tree, &messages)
+            .await
+            .expect_err("the snapshot refuses a linked template");
+        crate::test_support::assert_error_names(&err, &leaf);
+
+        // `password.txt`: the rollback snapshot of the step-ca password.
+        let root = crate::test_support::SwapRoot::new();
+        let tree = Arc::new(root.rooted());
+        let leaf = root.swap("password.txt", &root.outside.join("secret"));
+        let new_password = test_password();
+        let err = write_password_file_with_backup_in(&tree, &new_password, &messages)
+            .await
+            .expect_err("the password snapshot refuses a linked password.txt");
+        crate::test_support::assert_error_names(&err, &leaf);
+        assert_eq!(
+            fs::read_to_string(root.outside.join("secret")).unwrap(),
+            "OUTSIDE-SECRET\n"
+        );
+    }
+
+    /// A fresh install has no `templates/` at all when the snapshot is
+    /// taken: the rooted read reports the missing level as `NotFound`,
+    /// which is no snapshot rather than an error.
+    #[tokio::test]
+    async fn rooted_template_snapshot_of_a_missing_templates_dir_is_none() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = Arc::new(root.rooted());
+        let snapshot = snapshot_stepca_ca_json_template(&tree, &test_messages())
+            .await
+            .expect("snapshot");
+        assert!(snapshot.original.is_none());
+    }
+
+    #[tokio::test]
+    async fn rooted_password_backup_matches_the_path_based_one() {
+        let new_password = test_password();
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let path = root.write("password.txt", "old\n");
+            let tree = if rooted {
+                Arc::new(root.rooted())
+            } else {
+                shared_tree(&root.secrets)
+            };
+            let backup = write_password_file_with_backup_in(&tree, &new_password, &test_messages())
+                .await
+                .expect("backup");
+            results.push((backup.original, fs::read_to_string(&path).unwrap()));
+        }
+        // `assert!` rather than `assert_eq!`: the compared values hold
+        // the password, which a failure message must not print.
+        assert!(
+            results.first() == results.get(1),
+            "the rooted backup must match the path-based one"
+        );
+        assert!(
+            results.first() == Some(&(Some("old\n".to_string()), new_password)),
+            "the backup must hold the old password and the file the new one"
+        );
+    }
+
+    /// A fresh random password for a test to publish, drawn rather than
+    /// written as a literal so no fixed value is ever passed where a
+    /// password is expected.
+    fn test_password() -> String {
+        bootroot::utils::generate_secret(crate::commands::init::SECRET_BYTES)
+            .expect("draw a test password")
+    }
 
     /// The managed keys of an install without an `OpenBao` bind.
     fn managed_keys<'a>(
@@ -1278,7 +1468,7 @@ mod tests {
             build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
         let first = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1324,7 +1514,7 @@ mod tests {
         );
 
         let second = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1357,7 +1547,7 @@ mod tests {
         let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
 
         let update = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "24h",
             "acme",
@@ -1387,7 +1577,7 @@ mod tests {
         );
 
         update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1477,7 +1667,7 @@ mod tests {
             build_stepca_ca_dns_names(Some("192.168.139.144:9000"), None, DEFAULT_CA_CONTAINER);
 
         let changed = reconcile_ca_json_managed_keys(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
@@ -1496,7 +1686,7 @@ mod tests {
         );
 
         let changed_again = reconcile_ca_json_managed_keys(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
@@ -1534,7 +1724,7 @@ mod tests {
         };
         let update = async |bind| {
             update_ca_json_with_backup(
-                &secrets_dir,
+                &shared_tree(&secrets_dir),
                 "postgresql://step@postgres:5432/stepca",
                 "48h",
                 "acme",
@@ -1597,7 +1787,7 @@ mod tests {
                 policy_deny_dns: &deny,
             };
             assert!(
-                reconcile_ca_json_managed_keys(&secrets_dir, &keys, &messages)
+                reconcile_ca_json_managed_keys(&shared_tree(&secrets_dir), &keys, &messages)
                     .await
                     .unwrap()
             );
@@ -1606,7 +1796,7 @@ mod tests {
                 stepca_metrics_address(bind)
             );
             assert!(
-                !reconcile_ca_json_managed_keys(&secrets_dir, &keys, &messages)
+                !reconcile_ca_json_managed_keys(&shared_tree(&secrets_dir), &keys, &messages)
                     .await
                     .unwrap()
             );
@@ -1626,7 +1816,7 @@ mod tests {
         let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
 
         let first = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1651,7 +1841,7 @@ mod tests {
         );
 
         let second = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1689,7 +1879,7 @@ mod tests {
         let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
 
         let update = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -1727,7 +1917,7 @@ mod tests {
         let dns_names = build_stepca_ca_dns_names(None, None, DEFAULT_CA_CONTAINER);
 
         let changed = reconcile_ca_json_managed_keys(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
@@ -1743,7 +1933,7 @@ mod tests {
         assert_eq!(after["db"]["dataSource"].as_str().unwrap(), "dsn");
 
         let changed_again = reconcile_ca_json_managed_keys(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             &managed_keys(&dns_names, &default_deny_dns()),
             &messages,
         )
@@ -1826,7 +2016,7 @@ mod tests {
         write_ca_json(&secrets_dir, CA_JSON_FIXTURE);
         let messages = test_messages();
 
-        let fresh = snapshot_stepca_ca_json_template(&secrets_dir, &messages)
+        let fresh = snapshot_stepca_ca_json_template(&shared_tree(&secrets_dir), &messages)
             .await
             .unwrap();
         assert!(
@@ -1850,9 +2040,10 @@ mod tests {
 
         // A second init snapshots the template the sidecar is currently
         // rendering from, which is what rollback has to put back.
-        let before_rewrite = snapshot_stepca_ca_json_template(&secrets_dir, &messages)
-            .await
-            .unwrap();
+        let before_rewrite =
+            snapshot_stepca_ca_json_template(&shared_tree(&secrets_dir), &messages)
+                .await
+                .unwrap();
         assert_eq!(before_rewrite.original.as_deref(), Some(existing.as_str()));
     }
 
@@ -2010,7 +2201,7 @@ mod tests {
         let deny = default_deny_dns();
 
         let first = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -2043,7 +2234,7 @@ mod tests {
         );
 
         let second = update_ca_json_with_backup(
-            &secrets_dir,
+            &shared_tree(&secrets_dir),
             "postgresql://step@postgres:5432/stepca",
             "48h",
             "acme",
@@ -2095,7 +2286,7 @@ mod tests {
 
         assert!(
             reconcile_ca_json_managed_keys(
-                &secrets_dir,
+                &shared_tree(&secrets_dir),
                 &managed_keys(&dns_names, &deny),
                 &messages
             )
@@ -2130,7 +2321,7 @@ mod tests {
 
         assert!(
             !reconcile_ca_json_managed_keys(
-                &secrets_dir,
+                &shared_tree(&secrets_dir),
                 &managed_keys(&dns_names, &deny),
                 &messages
             )
@@ -2149,7 +2340,7 @@ mod tests {
         write_ca_json(&secrets_dir, &edited.to_string());
         assert!(
             reconcile_ca_json_managed_keys(
-                &secrets_dir,
+                &shared_tree(&secrets_dir),
                 &managed_keys(&dns_names, &deny),
                 &messages
             )
