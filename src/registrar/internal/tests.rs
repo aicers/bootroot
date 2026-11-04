@@ -3111,6 +3111,13 @@ mod daemon_config {
         let err = refused(&tree, &config);
         assert_error_names(&err, &config);
         assert!(format!("{err:#}").contains("[openbao]"));
+        // In the daemon's locale, as the start and reload logs render it.
+        assert!(
+            format!("{err:#}").contains(
+                crate::daemon_messages::DaemonMessages::from_environment()
+                    .daemon_config_carries_openbao()
+            )
+        );
     }
 
     /// An absent config is an empty document, which fails the layout

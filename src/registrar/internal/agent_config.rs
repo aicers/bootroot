@@ -37,6 +37,7 @@ use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::Settings;
+use crate::daemon_messages::DaemonMessages;
 use crate::fs_util::SecretsTree;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
 use crate::registrar::internal::{
@@ -423,9 +424,8 @@ pub fn load_daemon_config_in(
     )?;
     if settings.openbao.is_some() {
         return Err(invalid(
-            "it carries an [openbao] table, which the registrar endpoint daemon's config never \
-             carries: the fast-poll loop it would arm rewrites files below the secrets directory \
-             by name"
+            DaemonMessages::from_environment()
+                .daemon_config_carries_openbao()
                 .to_string(),
         ));
     }

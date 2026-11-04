@@ -12,6 +12,7 @@ use crate::acme::client::AcmeClient;
 use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
 use crate::cert_group::{CA_BUNDLE_FILE_MODE, CertGroupPolicy};
+use crate::daemon_messages::DaemonMessages;
 use crate::fs_util;
 use crate::fs_util::generation::{self, GenerationPlan, GenerationTarget, PairSource, Probe};
 use crate::fs_util::{RootedOwner, SecretsTree};
@@ -312,9 +313,7 @@ pub(crate) async fn write_merged_ca_bundle(
     if let Some(tree) = tree.filter(|tree| fs_util::takes_rooted_branch(tree, bundle_path)) {
         if policy.group_gid().is_some() {
             anyhow::bail!(
-                "refusing to write the CA bundle at {} under a cert group: a root process \
-                 publishes below a secrets directory another account owns only as root",
-                bundle_path.display()
+                DaemonMessages::from_environment().rooted_ca_bundle_under_cert_group(bundle_path)
             );
         }
         let path = bundle_path.to_path_buf();
@@ -1809,6 +1808,12 @@ mod tests {
                 .await
                 .expect_err("refused");
             assert_error_names(&err, &fixture.bundle);
+            // In the daemon's locale, as the renewal and start logs render it.
+            assert_eq!(
+                err.to_string(),
+                crate::daemon_messages::DaemonMessages::from_environment()
+                    .rooted_ca_bundle_under_cert_group(&fixture.bundle)
+            );
             assert_eq!(std::fs::read(&fixture.bundle).expect("bundle"), before);
         }
 

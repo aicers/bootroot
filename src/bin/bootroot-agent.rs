@@ -154,58 +154,125 @@ async fn run(args: Args) -> anyhow::Result<()> {
             secrets_tree,
         }));
         #[cfg(unix)]
-        loop {
-            tokio::select! {
-                result = &mut task => return handle_daemon_result(result),
-                _ = hup.recv() => {
-                    match load_settings(&args).await {
-                        Ok((settings, final_eab, secrets_tree)) => {
-                            if let Err(err) = config::check_registrar_endpoint_reload(
-                                &registrar_endpoint_settings,
-                                &settings.registrar_endpoint,
-                            ) {
-                                error!("Reload rejected: {err}");
-                                continue;
-                            }
-                            // Localized, and narrower than the endpoint
-                            // guard above: only a reload that would detach
-                            // the filesystem mount verdict this process took
-                            // at start is refused. A `directory` daemon
-                            // reloading another `directory` configuration
-                            // reaches none of this.
-                            if registrar_endpoint_settings.enabled
-                                && let Err(rejection) =
-                                    config::check_registrar_audit_store_reload(
-                                        &registrar_audit_settings,
-                                        &settings.registrar,
-                                    )
-                            {
-                                error!("{}", audit_store_reload_rejection_message(&rejection));
-                                continue;
-                            }
-                            info!("Reload signal received. Restarting daemon with new config.");
-                            pending = Some((settings, final_eab, secrets_tree));
-                            // A coordinated stop, never an abort: the
-                            // daemon may own the registrar endpoint,
-                            // whose accept task and connection fleet
-                            // have to stop accepting, drain and be
-                            // joined before this invocation is joined.
-                            shutdown.stop();
-                            report_stopped_invocation((&mut task).await);
-                            break;
-                        }
-                        Err(err) => {
-                            error!("Reload failed: {err}");
-                        }
-                    }
-                }
-            }
+        match supervise_invocation(&mut task, &shutdown, &mut hup, || {
+            reload_settings(
+                &args,
+                HandleOpening::AsTheProcessRuns,
+                &registrar_endpoint_settings,
+                &registrar_audit_settings,
+            )
+        })
+        .await
+        {
+            InvocationEnd::Exited(result) => return handle_daemon_result(result),
+            InvocationEnd::Reloaded(loaded) => pending = Some(*loaded),
         }
         #[cfg(not(unix))]
         {
             return handle_daemon_result(task.await);
         }
     }
+}
+
+/// How one supervised daemon invocation ended.
+#[cfg(unix)]
+enum InvocationEnd {
+    /// The invocation's task ended on its own.
+    Exited(Result<anyhow::Result<()>, tokio::task::JoinError>),
+    /// A `SIGHUP` reload was accepted; the invocation has been stopped
+    /// and joined, and these are the settings to start the next one with.
+    Reloaded(Box<LoadedSettings>),
+}
+
+/// A source of `SIGHUP` deliveries.
+#[cfg(unix)]
+trait Hangups {
+    /// Waits for the next delivery.
+    async fn recv(&mut self) -> Option<()>;
+}
+
+#[cfg(unix)]
+impl Hangups for tokio::signal::unix::Signal {
+    async fn recv(&mut self) -> Option<()> {
+        tokio::signal::unix::Signal::recv(self).await
+    }
+}
+
+/// Supervises one running invocation until its task ends or a `SIGHUP`
+/// reload is accepted.
+///
+/// A reload `reload` refuses — a failed load, a rooted refusal among
+/// them, or a rejected registrar change — is logged by `reload` and
+/// leaves the running invocation, its settings and its handle on the
+/// secrets directory in place. An accepted one stops the invocation
+/// with a coordinated stop, never an abort: the daemon may own the
+/// registrar endpoint, whose accept task and connection fleet have to
+/// stop accepting, drain and be joined before this invocation is joined.
+#[cfg(unix)]
+async fn supervise_invocation<H, R, F>(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    shutdown: &DaemonShutdown,
+    hangups: &mut H,
+    mut reload: R,
+) -> InvocationEnd
+where
+    H: Hangups,
+    R: FnMut() -> F,
+    F: std::future::Future<Output = Option<LoadedSettings>>,
+{
+    loop {
+        tokio::select! {
+            result = &mut *task => return InvocationEnd::Exited(result),
+            _ = hangups.recv() => {
+                if let Some(loaded) = reload().await {
+                    info!("Reload signal received. Restarting daemon with new config.");
+                    shutdown.stop();
+                    report_stopped_invocation((&mut *task).await);
+                    return InvocationEnd::Reloaded(Box::new(loaded));
+                }
+            }
+        }
+    }
+}
+
+/// Loads the settings a `SIGHUP` asks for, or logs why the reload is
+/// refused and returns `None` so the running invocation is kept.
+///
+/// `endpoint` and `audit` are the registrar settings the process
+/// started with, which a reload may not move.
+#[cfg(unix)]
+async fn reload_settings(
+    args: &Args,
+    opening: HandleOpening,
+    endpoint: &config::RegistrarEndpointSettings,
+    audit: &config::RegistrarSettings,
+) -> Option<LoadedSettings> {
+    let loaded = match load_settings_with(args, opening).await {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            error!("Reload failed: {err}");
+            return None;
+        }
+    };
+    let settings = &loaded.0;
+    if let Err(err) =
+        config::check_registrar_endpoint_reload(endpoint, &settings.registrar_endpoint)
+    {
+        error!("Reload rejected: {err}");
+        return None;
+    }
+    // Localized, and narrower than the endpoint guard above: only a
+    // reload that would detach the filesystem mount verdict this process
+    // took at start is refused. A `directory` daemon reloading another
+    // `directory` configuration reaches none of this.
+    if endpoint.enabled
+        && let Err(rejection) =
+            config::check_registrar_audit_store_reload(audit, &settings.registrar)
+    {
+        error!("{}", audit_store_reload_rejection_message(&rejection));
+        return None;
+    }
+    Some(loaded)
 }
 
 /// The settings one load produced, the EAB in force, and the handle on
@@ -357,14 +424,20 @@ fn handle_daemon_result(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use bootroot::DaemonShutdown;
     use bootroot::registrar::internal::{
         InternalAgentConfigParams, InternalPaths, render_internal_agent_config,
     };
     use bootroot::{config, eab, profile};
+    use tokio::sync::{mpsc, oneshot};
 
-    use super::{HandleOpening, load_settings_with};
+    use super::{
+        HandleOpening, Hangups, InvocationEnd, load_settings_with, reload_settings,
+        supervise_invocation,
+    };
 
     const TEST_KEY_PATH: &str = "unused.key";
 
@@ -609,6 +682,93 @@ mod tests {
             panic!("a linked registrar-internal is refused");
         };
         assert!(format!("{err:#}").contains(&internal.display().to_string()));
+    }
+
+    impl Hangups for mpsc::Receiver<()> {
+        async fn recv(&mut self) -> Option<()> {
+            mpsc::Receiver::recv(self).await
+        }
+    }
+
+    /// A `SIGHUP` whose reload meets a rooted refusal — here a link at
+    /// `registrar-internal` — leaves the running invocation running with
+    /// the settings and the handle it started with: nothing stops or
+    /// replaces it, and it ends only when its own task does.
+    #[tokio::test]
+    async fn a_refused_reload_keeps_the_running_invocation() {
+        let tree = Tree::new();
+        tree.write_internal_config("");
+        let argv = args(&["--config", &arg(&tree.internal_config())]);
+        let (settings, _, handle) = load_settings_with(&argv, HandleOpening::ForcedRooted)
+            .await
+            .expect("the start-time load");
+        let settings = Arc::new(settings);
+        let handle = handle.expect("a handle");
+        assert!(handle.is_rooted());
+
+        // The running invocation holds its settings and handle until it
+        // is told to finish, then hands them back with whether a stop
+        // was asked of it.
+        let shutdown = DaemonShutdown::new();
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let (held_tx, held_rx) = oneshot::channel();
+        let mut task = tokio::spawn({
+            let settings = Arc::clone(&settings);
+            let handle = Arc::clone(&handle);
+            let stop = shutdown.receiver();
+            async move {
+                let _ = finish_rx.await;
+                let stop_requested = *stop.borrow();
+                let _ = held_tx.send((settings, handle, stop_requested));
+                Ok(())
+            }
+        });
+
+        let internal = tree.secrets.join("registrar-internal");
+        std::fs::rename(&internal, tree.outside.join("moved")).expect("move out");
+        std::os::unix::fs::symlink(tree.outside.join("moved"), &internal).expect("link");
+
+        let (hup_tx, mut hups) = mpsc::channel::<()>(1);
+        let (attempt_tx, mut attempts) = mpsc::unbounded_channel();
+        let endpoint = settings.registrar_endpoint.clone();
+        let audit = settings.registrar.clone();
+        let supervisor = supervise_invocation(&mut task, &shutdown, &mut hups, || {
+            let attempt_tx = attempt_tx.clone();
+            let reload = reload_settings(&argv, HandleOpening::ForcedRooted, &endpoint, &audit);
+            async move {
+                let loaded = reload.await;
+                let _ = attempt_tx.send(loaded.is_some());
+                loaded
+            }
+        });
+        let driver = async {
+            // Two deliveries: the second is only taken once the
+            // supervisor is back waiting after the first.
+            for _ in 0..2 {
+                hup_tx.send(()).await.expect("deliver SIGHUP");
+                assert_eq!(attempts.recv().await, Some(false), "the reload is refused");
+            }
+            assert!(!*shutdown.receiver().borrow(), "no stop was asked");
+            finish_tx
+                .send(())
+                .expect("the invocation is still running after the refused reloads");
+        };
+        let (end, ()) = tokio::join!(supervisor, driver);
+
+        match end {
+            InvocationEnd::Exited(Ok(Ok(()))) => {}
+            InvocationEnd::Exited(other) => panic!("the invocation ended badly: {other:?}"),
+            InvocationEnd::Reloaded(_) => panic!("a refused reload replaced the invocation"),
+        }
+        let (held_settings, held_handle, stop_requested) = held_rx
+            .await
+            .expect("the invocation hands back what it held");
+        assert!(
+            Arc::ptr_eq(&held_settings, &settings),
+            "its original settings"
+        );
+        assert!(Arc::ptr_eq(&held_handle, &handle), "its original handle");
+        assert!(!stop_requested, "the invocation was never asked to stop");
     }
 
     /// A local-file service at the default layout opens a handle on its
