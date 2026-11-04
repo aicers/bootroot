@@ -1845,5 +1845,35 @@ mod tests {
             assert_eq!(rooted, by_path);
             assert_eq!(rooted.len(), 2);
         }
+
+        /// A `registrar-internal` swapped for a link to a directory
+        /// holding a valid bundle appends none of its certificates to
+        /// the published surface chain, and changes nothing outside.
+        #[test]
+        fn a_swapped_registrar_internal_appends_nothing() {
+            let fixture = fixture();
+            let outside_pem = test_cert_pem("outside.example");
+            std::fs::write(fixture.root.outside.join("ca-bundle.pem"), &outside_pem)
+                .expect("outside bundle");
+            let tree = fixture.root.rooted();
+            let before = fixture.root.outside_snapshot();
+            fixture
+                .root
+                .swap("registrar-internal", &fixture.root.outside);
+
+            // The outside bundle is one a path-based read through the
+            // link would append.
+            let mut followed = fixture.chain.clone();
+            append_configured_anchors(&mut followed, &fixture.bundle, None);
+            assert!(
+                followed.contains(&parse_pem_der(&outside_pem)),
+                "the outside bundle is valid and reachable by name"
+            );
+
+            let mut chain = fixture.chain.clone();
+            append_configured_anchors(&mut chain, &fixture.bundle, Some(&*tree));
+            assert_eq!(chain, fixture.chain, "nothing was appended");
+            assert_eq!(fixture.root.outside_snapshot(), before);
+        }
     }
 }

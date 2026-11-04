@@ -874,6 +874,34 @@ mod tests {
         );
     }
 
+    /// An account key the path-based branch created is the key the
+    /// rooted handle reads back: the same PKCS#8 bytes, and the file is
+    /// left as it was — bytes, mode and owner — rather than recreated.
+    #[test]
+    fn a_path_based_account_key_is_read_back_through_the_rooted_handle() {
+        use crate::test_swap::{SwapRoot, mode_and_owner};
+
+        let root = SwapRoot::new();
+        std::fs::create_dir(root.secrets.join("registrar-internal")).unwrap();
+        let path = root.secrets.join("registrar-internal/acme-account.json");
+        let rng = SystemRandom::new();
+        let created = load_or_create_account_key(&path, &rng, None).unwrap();
+        let persisted = (std::fs::read(&path).unwrap(), mode_and_owner(&path));
+
+        let tree = root.rooted();
+        assert!(
+            fs_util::takes_rooted_branch(&tree, &path),
+            "the key is read through the handle"
+        );
+        let read = load_or_create_account_key(&path, &rng, Some(&*tree)).unwrap();
+        assert_eq!(read, created, "the rooted read returns the created key");
+        assert_eq!(
+            (std::fs::read(&path).unwrap(), mode_and_owner(&path)),
+            persisted,
+            "the persisted key is neither rewritten nor re-owned"
+        );
+    }
+
     /// A rooted handle does not reach an account key the operator named
     /// outside its anchor: that one stays path-based.
     #[test]

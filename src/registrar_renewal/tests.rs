@@ -2708,14 +2708,6 @@ async fn rooted_renewal(harness: &Harness, tree: Option<Arc<SecretsTree>>) -> Re
     .await
 }
 
-/// The mode, uid and gid of `path`, not following a link.
-fn meta_of(path: &Path) -> (u32, u32, u32) {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let meta = std::fs::symlink_metadata(path).expect("stat");
-    (meta.mode() & 0o7777, meta.uid(), meta.gid())
-}
-
 /// Over a tree the test owns, a rooted renewal publishes the merged
 /// bundle with the mode and owner the path-based one gives it.
 #[tokio::test]
@@ -2738,7 +2730,7 @@ async fn a_rooted_renewal_publishes_the_bundle_as_the_path_based_one_does() {
             harness.ca.pem,
             "the pinned anchor is the merged bundle"
         );
-        results.push(meta_of(&bundle));
+        results.push(crate::test_swap::mode_and_owner(&bundle));
     }
     assert_eq!(results.first(), results.get(1));
     assert_eq!(
@@ -2749,11 +2741,25 @@ async fn a_rooted_renewal_publishes_the_bundle_as_the_path_based_one_does() {
 
 /// A link at `registrar-internal`, or at the bundle, fails the rooted
 /// publication naming it before anything live changes; nothing outside
-/// is written; the pass's failure is an ordinary failed attempt, and
-/// the endpoint keeps the configuration it had.
+/// is written; the pass's own per-leaf step records the refusal as an
+/// ordinary failed attempt, and the endpoint keeps the configuration it
+/// had.
+///
+/// At `registrar-internal` the first refusal is the publication lock's,
+/// which `publish_candidate` takes before it stages the bundle; at the
+/// bundle it is the staging read's.
 #[tokio::test]
 async fn a_swapped_registrar_internal_fails_the_rooted_renewal_and_changes_nothing() {
-    for level in ["registrar-internal", "registrar-internal/ca-bundle.pem"] {
+    for (level, refusal) in [
+        (
+            "registrar-internal",
+            "opening the registrar publication lock",
+        ),
+        (
+            "registrar-internal/ca-bundle.pem",
+            "refusing to replace the unreadable CA bundle",
+        ),
+    ] {
         let harness = rooted_harness();
         let renewal = rooted_renewal(&harness, Some(rooted_tree(&harness))).await;
         let pair = harness.pair(SurfaceLeaf::EndpointServer);
@@ -2772,12 +2778,20 @@ async fn a_swapped_registrar_internal_fails_the_rooted_renewal_and_changes_nothi
         std::os::unix::fs::symlink(&target, &link).expect("plant link");
 
         let material = harness.ca.material(&pair.name, -1, 60);
-        let err = renewal
-            .renew_leaf_with_material(&pair, material)
-            .await
-            .expect_err("the rooted publication refuses the link");
-        crate::test_swap::assert_error_names(&err, &link);
-        renewal.record_failure(pair.leaf, &format!("{err:#}"));
+        renewal
+            .attempt_leaf(&pair, std::future::ready(Ok(material)))
+            .await;
+
+        let entry = renewal.state().leaf(pair.leaf).expect("an entry");
+        let RenewalAttempt::Failed { reason } = &entry.attempt else {
+            panic!("the refused publication is recorded as a failed attempt, at {level}");
+        };
+        assert!(
+            reason.contains(refusal),
+            "the recorded reason is the refusal, at {level}"
+        );
+        crate::test_swap::assert_error_names(&anyhow::anyhow!("{reason}"), &link);
+        assert_eq!(entry.not_after, facts.not_after);
 
         assert_eq!(crate::test_swap::snapshot_tree(&outside), before, "{level}");
         assert_eq!(facts.cert, digest_of(&pair.cert_path));
@@ -2786,9 +2800,6 @@ async fn a_swapped_registrar_internal_fails_the_rooted_renewal_and_changes_nothi
             Arc::ptr_eq(&facts.acceptor, &harness.endpoint.active_tls()),
             "the active configuration stays installed"
         );
-        let entry = renewal.state().leaf(pair.leaf).expect("an entry");
-        assert!(matches!(entry.attempt, RenewalAttempt::Failed { .. }));
-        assert_eq!(entry.not_after, facts.not_after);
         assert_no_artifacts_left(&pair.key_path);
     }
 }
@@ -2814,6 +2825,147 @@ async fn the_rooted_staging_read_refuses_a_link_and_keeps_the_absent_arm() {
         .stage_bundle(&bundle, &[harness.ca.der()])
         .expect_err("a linked bundle is refused");
     crate::test_swap::assert_error_names(&err, &bundle);
+}
+
+/// The rooted staging read, called directly, refuses a
+/// `registrar-internal` swapped for a link to a directory holding a
+/// valid bundle, naming the link, and merges nothing from it; nothing
+/// outside changes.
+#[tokio::test]
+async fn the_rooted_staging_read_refuses_a_swapped_registrar_internal() {
+    let harness = rooted_harness();
+    let renewal = rooted_renewal(&harness, Some(rooted_tree(&harness))).await;
+    let bundle = harness.bundle_path();
+    let outside = harness.dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("mkdir outside");
+    std::fs::write(outside.join("ca-bundle.pem"), &harness.ca.pem).expect("outside bundle");
+    let before = crate::test_swap::snapshot_tree(&outside);
+    let internal = harness.plan.secrets_dir.join("registrar-internal");
+    std::fs::rename(&internal, harness.dir.path().join("aside")).expect("move aside");
+    std::os::unix::fs::symlink(&outside, &internal).expect("plant link");
+
+    let err = renewal
+        .stage_bundle(&bundle, &[harness.ca.der()])
+        .expect_err("the swapped directory is refused");
+    crate::test_swap::assert_error_names(&err, &internal);
+    assert!(
+        format!("{err:#}").contains("refusing to replace the unreadable CA bundle"),
+        "the refusal is the staging read's"
+    );
+    assert_eq!(crate::test_swap::snapshot_tree(&outside), before);
+}
+
+/// A bundle leaf linked to an outside file is replaced, not followed:
+/// the rooted bundle write puts a regular file at its name holding the
+/// intended bundle, with the mode and owner the rooted merge gives a
+/// regular bundle, and the outside file is left as it was.
+#[tokio::test]
+async fn the_rooted_bundle_write_replaces_a_linked_leaf() {
+    use crate::test_swap::mode_and_owner;
+
+    let harness = rooted_harness();
+    let tree = rooted_tree(&harness);
+    let bundle = harness.bundle_path();
+    crate::acme::flow::write_merged_ca_bundle(
+        &bundle,
+        &[harness.ca.der()],
+        &harness.settings.trust.trusted_ca_sha256,
+        CertGroupPolicy::none(),
+        Some(&tree),
+    )
+    .await
+    .expect("the rooted merge publishes a regular bundle");
+    let published = mode_and_owner(&bundle);
+
+    let outside = harness.dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("mkdir outside");
+    std::fs::write(outside.join("ca-bundle.pem"), "OUTSIDE\n").expect("outside");
+    std::fs::set_permissions(
+        outside.join("ca-bundle.pem"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod outside");
+    let before = crate::test_swap::snapshot_tree(&outside);
+    std::fs::remove_file(&bundle).expect("remove the bundle");
+    std::os::unix::fs::symlink(outside.join("ca-bundle.pem"), &bundle).expect("leaf link");
+
+    FilesystemPaths::new(Some(Arc::clone(&tree)))
+        .write_bundle(&bundle, &harness.ca.pem)
+        .await
+        .expect("the leaf link is replaced");
+
+    let meta = std::fs::symlink_metadata(&bundle).expect("stat");
+    assert!(
+        meta.file_type().is_file(),
+        "a regular file replaced the link"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bundle).expect("bundle"),
+        harness.ca.pem
+    );
+    assert_eq!(mode_and_owner(&bundle), published);
+    assert_eq!(crate::test_swap::snapshot_tree(&outside), before);
+}
+
+/// A rooted snapshot of an existing bundle restored over a leaf link
+/// replaces the link with a regular file holding the captured bytes,
+/// mode and owner, and leaves the outside file as it was.
+#[tokio::test]
+async fn a_rooted_restore_replaces_a_linked_leaf() {
+    use crate::test_swap::mode_and_owner;
+
+    let harness = rooted_harness();
+    let tree = rooted_tree(&harness);
+    let bundle = harness.bundle_path();
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o640))
+        .expect("chmod the bundle");
+    let captured = (
+        std::fs::read(&bundle).expect("bundle"),
+        mode_and_owner(&bundle),
+    );
+    let artifacts =
+        Artifacts::create(&harness.pair(SurfaceLeaf::EndpointServer).key_path).expect("artifacts");
+    let snapshot =
+        Snapshot::capture(&bundle, "bundle.snapshot", &artifacts, Some(&*tree)).expect("capture");
+    assert!(snapshot.rooted);
+    let prior = snapshot.prior.as_ref().expect("a captured file");
+    assert_eq!(
+        (prior.mode, prior.uid, prior.gid),
+        captured.1,
+        "the snapshot captured the bundle's mode and owner"
+    );
+
+    let outside = harness.dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("mkdir outside");
+    std::fs::write(outside.join("ca-bundle.pem"), "OUTSIDE\n").expect("outside");
+    std::fs::set_permissions(
+        outside.join("ca-bundle.pem"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod outside");
+    let before = crate::test_swap::snapshot_tree(&outside);
+    std::fs::remove_file(&bundle).expect("remove the bundle");
+    std::os::unix::fs::symlink(outside.join("ca-bundle.pem"), &bundle).expect("leaf link");
+
+    FilesystemPaths::new(Some(Arc::clone(&tree)))
+        .restore(&snapshot)
+        .await
+        .expect("the leaf link is replaced");
+
+    let meta = std::fs::symlink_metadata(&bundle).expect("stat");
+    assert!(
+        meta.file_type().is_file(),
+        "a regular file replaced the link"
+    );
+    assert_eq!(
+        (
+            std::fs::read(&bundle).expect("bundle"),
+            mode_and_owner(&bundle)
+        ),
+        captured
+    );
+    assert_eq!(crate::test_swap::snapshot_tree(&outside), before);
+    artifacts.close().expect("close");
 }
 
 /// A rooted snapshot captures the bytes, the mode and the owner the
@@ -2847,7 +2999,10 @@ async fn a_rooted_snapshot_and_restore_match_the_path_based_ones() {
             .restore(&snapshot)
             .await
             .expect("restore");
-        let restored = (std::fs::read(&bundle).expect("bundle"), meta_of(&bundle));
+        let restored = (
+            std::fs::read(&bundle).expect("bundle"),
+            crate::test_swap::mode_and_owner(&bundle),
+        );
 
         // A captured absence, restored, removes what the publication put
         // there.
