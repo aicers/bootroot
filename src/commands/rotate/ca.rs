@@ -1702,6 +1702,41 @@ mod tests {
         );
     }
 
+    /// With `BOOTROOT_POSTGRES_USER` recorded beside the compose file, the
+    /// re-issued key goes to `<uid>:0`, before the reload.
+    #[test]
+    fn phase3_postgres_step_hands_the_key_to_the_recorded_user() {
+        let dir = tempdir().expect("tempdir");
+        let fake = dir.path().join("fake-docker");
+        let args_log = dir.path().join("docker_args.log");
+        write_self_contained_fake_docker(&fake, &args_log);
+        let (state, compose_dir, secrets_dir) = state_with_postgres_entry(dir.path());
+        fs::write(
+            compose_dir.join(".env"),
+            "BOOTROOT_POSTGRES_USER=4242:4343\n",
+        )
+        .expect("write .env");
+
+        reissue_postgres_tls_cert(&state, &compose_dir, &secrets_dir, &fake, &test_messages())
+            .expect("the step must succeed against the fake docker");
+
+        let invocations = decode_fake_docker_log(&args_log);
+        assert_eq!(invocations.len(), 4, "{invocations:?}");
+        assert!(
+            invocations.get(2).is_some_and(|argv| {
+                argv.iter().any(|arg| arg == "4242:0") && !argv.iter().any(|arg| arg == "999:0")
+            }),
+            "the third container must hand the key to <uid>:0: {invocations:?}"
+        );
+        assert_eq!(
+            invocations
+                .get(3)
+                .and_then(|argv| argv.first())
+                .map(String::as_str),
+            Some("kill")
+        );
+    }
+
     /// An installation with no entry is left as it is: nothing runs.
     #[test]
     fn phase3_postgres_step_does_nothing_without_an_entry() {

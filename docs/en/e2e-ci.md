@@ -103,6 +103,7 @@ Primary scripts:
 - `scripts/impl/run-registrar-ca-rotation-e2e.sh`
 - `scripts/impl/run-secrets-owner.sh`
 - `scripts/impl/run-openbao-user.sh`
+- `scripts/impl/run-postgres-user.sh`
 
 Three of those scripts are handed no project name at all, and derive their
 own instead. `run-two-instance-isolation.sh` installs two instances into two
@@ -1206,7 +1207,8 @@ prerequisite block rather than mid-run:
 
 - The bind-host guard in `run-reinit-recovery.sh`, `run-stepca-san.sh`,
   `run-openbao-tls-no-delta.sh`, `run-openbao-tls-reown.sh`,
-  `run-secrets-owner.sh`, `run-openbao-user.sh` and the routable mode of
+  `run-secrets-owner.sh`, `run-openbao-user.sh`, `run-postgres-user.sh` and
+  the routable mode of
   `run-registrar-internal-init-e2e.sh` lists the
   machine's IPv4 addresses with `ip` (iproute2), falling back to
   `ifconfig`. A host with neither is told exactly that, because no value

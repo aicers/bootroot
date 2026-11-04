@@ -12,7 +12,7 @@ SECRETS_BACKUP_DIR=""
 # script runs them. `ARMS` holds the ones `--only` selected, space-separated
 # (a plain string rather than an array: bash 3.2 under `set -u` treats an
 # empty array as unset); empty means every arm.
-ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation secrets-owner openbao-user"
+ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation secrets-owner openbao-user postgres-user"
 ARMS=""
 
 usage() {
@@ -39,15 +39,18 @@ of CI's `Docker E2E (<arm>)` job:
 16) registrar-ca-rotation            full CA rotation on a registrar endpoint host
 17) secrets-owner                    root-run infra install and init over a secrets/ another account owns
 18) openbao-user                     OpenBao run as the account infra install --openbao-user names
+19) postgres-user                    PostgreSQL run as the account infra install --postgres-user names
 
 Steps 13 and 14 run `bootroot init` as root through `sudo -n`, because an
 endpoint-enabled `init` publishes the bootroot-internal credential root-owned
 and refuses to publish it otherwise. Step 17 creates an account with
 `useradd`, hands it `secrets/` and runs `bootroot infra install` and `init`
 as root through `sudo -n`; step 18 does the same, gives OpenBao that account
-through `--openbao-user`, and also runs `bootroot infra up` as root.
+through `--openbao-user`, and also runs `bootroot infra up` as root; step 19
+does what step 18 does, gives PostgreSQL a second account through
+`--postgres-user`, and also runs `bootroot rotate infra-cert` as root.
 Passwordless sudo is a prerequisite of the whole matrix, and of any --only
-selection that includes a hosts step or one of steps 9 and 13-18;
+selection that includes a hosts step or one of steps 9 and 13-19;
 --skip-hosts does not stand in for it.
 
 Options:
@@ -355,6 +358,16 @@ if want openbao-user; then
   COMPOSE_PROJECT_NAME="bootroot-e2e-ci-openbao-user-${RUN_ID}" \
   BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
   "$ROOT_DIR/scripts/impl/run-openbao-user.sh"
+fi
+
+if want postgres-user; then
+  # As for openbao-user, its own account owns `secrets/` for the whole
+  # run, so it takes no SECRETS_DIR.
+  echo "[ci-local-e2e] run PostgreSQL user (issue #1151)"
+  ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-postgres-user-${RUN_ID}" \
+  COMPOSE_PROJECT_NAME="bootroot-e2e-ci-postgres-user-${RUN_ID}" \
+  BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+  "$ROOT_DIR/scripts/impl/run-postgres-user.sh"
 fi
 
 echo "[ci-local-e2e] done"

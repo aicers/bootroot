@@ -308,9 +308,12 @@ PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
 검증은 그 uid 소유인 OpenBao 키를 읽지 않고, 키가 `<uid>:0` 소유, 모드
 `0600`인 일반 파일인지 확인합니다.
 
+`infra up`에는 `--postgres-user`도 없으며 `.env`에 기록된
+`BOOTROOT_POSTGRES_USER`를 그대로 둡니다.
+
 이 버전으로 업그레이드한 뒤 처음 실행하는 `infra up`은 서비스 정의가
-바뀌었으므로 `openbao` 컨테이너를 재생성합니다. 컨테이너는 봉인된 상태로
-올라오며, 다른 재시작 때와 같이 언실합니다.
+바뀌었으므로 `openbao`와 `postgres` 컨테이너를 재생성합니다. OpenBao는
+봉인된 상태로 올라오며, 다른 재시작 때와 같이 언실합니다.
 
 ### 실패 조건
 
@@ -449,10 +452,41 @@ bootroot infra up
   설치된 스택에서 `.env`의 값을 제거하는 것은 지원하지 않습니다. 이미지의
   `openbao` 사용자로 돌아간 OpenBao는 지정한 uid에게 넘겨진 raft 볼륨도
   TLS 키도 열 수 없기 때문입니다. `.env`의 잘못된 값은 이를 읽는 모든
-  bootroot 명령이 거부합니다. Docker Compose는 export된
-  `BOOTROOT_OPENBAO_USER`를 빈 값이라도 `.env`보다 우선하므로, 셸이
-  `.env`에 기록된 값과 다른 값을 export하고 있거나, `.env`에 값이 기록되어
-  있는데 빈 값을 export하고 있으면 bootroot는 실행을 거부합니다.
+  bootroot 명령이 거부하며, OpenBao의 엔트리포인트도 0이 아닌 10진수 두
+  개를 `:` 하나로 이은 값이 아니면 소유자를 바꾸기 전에 시작을 거부합니다.
+  Docker Compose는 export된 `BOOTROOT_OPENBAO_USER`를 빈 값이라도
+  `.env`보다 우선하므로, 셸이 `.env`에 기록된 값과 다른 값을 export하고
+  있거나, `.env`에 값이 기록되어 있는데 빈 값을 export하고 있으면 bootroot는
+  실행을 거부합니다.
+- `--postgres-user <uid>:<gid>`: step-ca의 PostgreSQL을 이미지의 `postgres`
+  사용자(uid 999) 대신 이 호스트 uid와 gid로 실행합니다(선택). 이는
+  PostgreSQL 컨테이너의 호스트 신원이며 데이터베이스 역할이 아닙니다.
+  step-ca가 접속하는 역할은 `init --db-user`로 정하는 `POSTGRES_USER`
+  그대로입니다. 값은 `--openbao-user`와 똑같이 검증되며, 아무것도 쓰기
+  전에 거부됩니다. 값은 정규화된 10진수로 compose 디렉터리의 `.env`에
+  `BOOTROOT_POSTGRES_USER`로 기록되고, 두 기본 compose 파일이 이를
+  보간으로 읽으므로, 기본 파일만 지정하는 경우를 포함해 그 디렉터리에서
+  실행되는 모든 `docker compose`가 PostgreSQL을 그 uid로 시작합니다.
+  PostgreSQL의 엔트리포인트는 시작할 때마다 아직 root로 실행되는 동안
+  데이터 볼륨에서 소유자가 다른 항목의 소유자를(링크의 대상은 제외) 그
+  uid와 gid로 바꾼 뒤 그 값으로 전환합니다. 기존 클러스터는 그 uid로
+  시작되고, 새 볼륨은 그 uid로 초기화됩니다. `init`, `rotate infra-cert`,
+  `rotate ca-key`가 발급하는 TLS 키는 `999:0` 대신 `<uid>:0` 소유가 되며
+  모드는 그대로 `0600`이고, `postgres/tls/`와 `server.crt`는 `secrets/`
+  소유자의 것으로 남습니다. 디스크에 PostgreSQL TLS 키가 이미 있으면
+  `infra install`이 스택을 시작하기 전에 그 키를 해당 uid에게 넘기므로,
+  설치된 스택에서 옵션을 새로 지정하거나 값을 바꿔도 PostgreSQL이 키를
+  읽을 수 있습니다. 이후 옵션 없이 실행한 `infra install`은 기록된 값을
+  유지하며, 값을 지우는 명령은 없습니다. 설치된 스택에서 `.env`의 값을
+  제거하는 것은 지원하지 않습니다. uid 999로 돌아간 PostgreSQL은
+  `rotate infra-cert`가 키를 다시 발급하기 전까지 지정한 uid에게 넘겨진
+  키를 읽을 수 없기 때문입니다. `.env`의 잘못된 값은 이를 읽는 모든
+  bootroot 명령이 거부하며, PostgreSQL의 엔트리포인트도 0이 아닌 10진수
+  두 개를 `:` 하나로 이은 값이 아니면 소유자를 바꾸기 전에 시작을
+  거부합니다. Docker Compose는 export된 `BOOTROOT_POSTGRES_USER`를 빈
+  값이라도 `.env`보다 우선하므로, 셸이 `.env`에 기록된 값과 다른 값을
+  export하고 있거나, `.env`에 값이 기록되어 있는데 빈 값을 export하고
+  있으면 bootroot는 실행을 거부합니다.
 - `--registrar-endpoint-host <label>`: 이 호스트에서 레지스트라
   엔드포인트를 활성화합니다(선택). bootroot 호스트의 단일 DNS 레이블이며
   FQDN이나 조합된 이름은 허용되지 않습니다. `bootroot registrar issue
@@ -1080,7 +1114,8 @@ DB DSN host 처리 규칙:
   `infra_certs`에 `postgres`로 기록됩니다. `server.crt`(모드 `0644`)는 이름이
   `postgres` 하나뿐인 1년 유효 leaf 뒤에 이를 서명한 중간 CA가 이어지고,
   `server.key`는 PostgreSQL 이미지의 `postgres` 유저인 `999:0` 소유에 모드
-  `0600`입니다
+  `0600`입니다. `infra install --postgres-user`가
+  `BOOTROOT_POSTGRES_USER`를 기록했다면 `<uid>:0` 소유입니다
 - 그 인증서와 함께 `<compose-dir>/postgres/pg_hba.conf`(모드 `0644`)와
   compose 오버라이드 `secrets/postgres/docker-compose.postgres-tls.yml`을
   매 실행마다 작성합니다. PostgreSQL은 이 파일들로 다시 생성되며(`up -d
@@ -2651,12 +2686,15 @@ init`이 compose 파일에서 `postgres` 서비스를 찾은 경우 `SIGHUP`으�
     `<compose-dir>/postgres/tls/server.key`에 기록합니다. 기록 전에 일회용
     root 컨테이너가 `openbao`와 마찬가지로 `<compose-dir>/postgres/tls`와 그
     안의 모든 항목을 `<secrets-dir>` 소유자로 chown합니다. 이전 발급이 키를
-    uid 999 소유로 남겼고 `step`이 이를 덮어써야 하기 때문입니다. 이 경로의
+    서버의 uid 소유로 남겼고 `step`이 이를 덮어써야 하기 때문입니다. 이 경로의
     심볼릭 링크도 같은 방식으로 거부됩니다(`PostgreSQL TLS 출력 디렉터리가
     심볼릭 링크이므로 사용을 거부합니다`). 이후 디렉터리는 `0755`, `server.crt`는
     `0644`, `server.key`는 `0600`이 되고, 이 디렉터리만 마운트한 마지막 일회용
     root 컨테이너가 키에 `chown --no-dereference 999:0`을 실행해 PostgreSQL
-    이미지의 `postgres` 유저에게 넘깁니다.
+    이미지의 `postgres` 유저에게 넘깁니다. `.env`에
+    `BOOTROOT_POSTGRES_USER`가 기록되어 있으면(`infra install
+    --postgres-user`) `chown --no-dereference <uid>:0`을 실행해 그 uid에게
+    넘깁니다.
 - 항목별 재발급이 성공하면 해당 항목의 `issued_at`이 갱신되고,
   재로드 전략이 실행되어 영향 받는 컨테이너가 새 자료를 인식하도록
   합니다. 알려진 인프라 인증서 키에 대해서는 기록된 항목을 신뢰하지

@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bootroot::fs_util;
 
+use crate::commands::container_user::{ContainerUser, UserServer, recorded_user};
 use crate::commands::infra::run_docker_with_exec;
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_HCL_PATH, OPENBAO_INFRA_CERT_KEY,
     OPENBAO_TLS_CERT_PATH, OPENBAO_TLS_CONTAINER_CERT_PATH, OPENBAO_TLS_CONTAINER_KEY_PATH,
     OPENBAO_TLS_DEFAULT_NOT_AFTER, OPENBAO_TLS_DEFAULT_RENEW_BEFORE, OPENBAO_TLS_KEY_PATH,
 };
-use crate::commands::openbao_user::{OpenBaoUser, recorded_openbao_user};
 use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
@@ -23,15 +23,32 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// chown that precedes it re-owns exactly this path.
 pub(super) const TLS_OUTPUT_MOUNT: &str = "/output";
 
-/// Mode of `openbao/tls` when the key is handed to `BOOTROOT_OPENBAO_USER`,
-/// so the server's uid, which owns neither the directory nor the
-/// certificate, can traverse it.
-const OPENBAO_TLS_DIR_MODE: u32 = 0o755;
+/// Mode of a TLS directory whose key is handed to a recorded server user
+/// (`BOOTROOT_OPENBAO_USER`, `BOOTROOT_POSTGRES_USER`), so the server's
+/// uid, which owns neither the directory nor the certificate, can
+/// traverse it.
+const HANDED_OVER_TLS_DIR_MODE: u32 = 0o755;
 /// Mode of the certificate, which is public.
-const OPENBAO_TLS_CERT_MODE: u32 = 0o644;
-/// Mode of the key once it is handed to `BOOTROOT_OPENBAO_USER`: only its
+const HANDED_OVER_TLS_CERT_MODE: u32 = 0o644;
+/// Mode of the key once it is handed to the recorded user: only its
 /// owner, the server's uid, reads it.
-const OPENBAO_TLS_KEY_MODE: u32 = 0o600;
+const HANDED_OVER_TLS_KEY_MODE: u32 = 0o600;
+
+/// `OpenBao`'s side of [`hand_over_tls_key`].
+const OPENBAO_TLS_HANDOVER: TlsKeyHandover = TlsKeyHandover {
+    server: UserServer::OpenBao,
+    tls_dir: OPENBAO_TLS_DIR,
+    cert_path: OPENBAO_TLS_CERT_PATH,
+    key_path: OPENBAO_TLS_KEY_PATH,
+    dir_chown_label: "docker openbao tls output chown",
+    key_chown_label: "docker openbao tls key chown",
+    symlink_refusal: Messages::error_openbao_tls_output_dir_symlink,
+    not_regular_file: Messages::error_openbao_tls_key_not_regular_file,
+    failure: Messages::error_openbao_tls_key_handover_failed,
+};
+
+/// `openbao/tls`, relative to the compose directory.
+const OPENBAO_TLS_DIR: &str = "openbao/tls";
 
 /// The name prefix of the scratch directory a rooted issuance gives the
 /// `step` helper for its output, beside `secrets/`.
@@ -185,7 +202,7 @@ const OPENBAO_AUDIT_STORE_FILE_PATH: &str = "/openbao/audit/audit.log";
 ///   for the rationale);
 /// - set, the directory is set to `0755`, the certificate to `0644` and
 ///   the key to `0600`, and the key is handed to `<uid>:0` (see
-///   [`hand_key_to_openbao_user`]).
+///   [`hand_key_to_user`]).
 ///
 /// A malformed recorded value is refused before any docker command.
 pub(in crate::commands::init) fn issue_openbao_tls_cert(
@@ -195,7 +212,7 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let openbao_user = recorded_openbao_user(compose_dir, messages)?;
+    let openbao_user = recorded_user(UserServer::OpenBao, compose_dir, messages)?;
     let cert_path = compose_dir.join(OPENBAO_TLS_CERT_PATH);
     let key_path = compose_dir.join(OPENBAO_TLS_KEY_PATH);
 
@@ -277,13 +294,14 @@ pub(in crate::commands::init) fn issue_openbao_tls_cert(
     .with_context(|| messages.error_openbao_tls_provision_failed())?;
 
     match openbao_user {
-        Some(user) => hand_key_to_openbao_user(
+        Some(user) => hand_key_to_user(
             &tls_dir,
             &tls_mount,
             &cert_path,
             &key_path,
             user,
             docker,
+            OPENBAO_TLS_HANDOVER.key_chown_label,
             messages.error_openbao_tls_provision_failed(),
             messages,
         )?,
@@ -377,8 +395,9 @@ fn build_tls_output_chown_args<'a>(
 }
 
 /// Builds the `docker run` argv that hands a TLS private key to the uid
-/// of the server that reads it: `PostgreSQL`'s `999:0`, or `OpenBao`'s
-/// `<uid>:0` from `BOOTROOT_OPENBAO_USER`.
+/// of the server that reads it: `PostgreSQL`'s `<uid>:0` from
+/// `BOOTROOT_POSTGRES_USER` or, unset, the image's `999:0`, and
+/// `OpenBao`'s `<uid>:0` from `BOOTROOT_OPENBAO_USER`.
 ///
 /// Kept pure so tests can assert it mounts ONLY the output directory and
 /// uses `--no-dereference`, like the output-directory chown it mirrors.
@@ -429,8 +448,9 @@ pub(super) fn build_tls_key_chown_args<'a>(
 ///   sweep; with `secrets/` owned by another user the write is refused
 ///   the same way (issue #1054).
 /// - `postgres/tls` is a sibling of `secrets/` too, and a previous
-///   issuance handed its key to uid 999, so `step` could not overwrite
-///   it.
+///   issuance handed its key to the server's uid (the image's 999, or
+///   the one `BOOTROOT_POSTGRES_USER` records), so `step` could not
+///   overwrite it.
 ///
 /// Reuses the image the `step certificate create` container runs in the
 /// very next statement, so no extra image or pull is introduced.  The
@@ -458,7 +478,7 @@ pub(super) fn chown_tls_output_dir(
     run_docker_with_exec(&args, label, docker, messages).context(failure)
 }
 
-/// Sets the modes of `openbao/tls`, its certificate and its key for a
+/// Sets the modes of a TLS directory, its certificate and its key for a
 /// server running as `user`, then hands the key to `<uid>:0`.
 ///
 /// Called while the secrets-directory owner owns all three — after the
@@ -469,28 +489,30 @@ pub(super) fn chown_tls_output_dir(
 /// traverse it, the certificate `0644`, the key `0600`; group `0` grants
 /// nothing at that mode and keeps the key out of any host group. A
 /// certificate that is missing or not a regular file is left alone, since
-/// `set_permissions` would follow a link out of the directory.
+/// `set_permissions` would follow a link out of the directory. `label`
+/// names the key chown's docker command.
 #[allow(clippy::too_many_arguments)] // Each is one concrete path or the failure to report.
-fn hand_key_to_openbao_user(
+fn hand_key_to_user(
     tls_dir: &Path,
     tls_mount: &str,
     cert_path: &Path,
     key_path: &Path,
-    user: OpenBaoUser,
+    user: ContainerUser,
     docker: &Path,
+    label: &str,
     failure: &'static str,
     messages: &Messages,
 ) -> Result<()> {
-    set_mode(tls_dir, OPENBAO_TLS_DIR_MODE)?;
+    set_mode(tls_dir, HANDED_OVER_TLS_DIR_MODE)?;
     if std::fs::symlink_metadata(cert_path).is_ok_and(|meta| meta.file_type().is_file()) {
-        set_mode(cert_path, OPENBAO_TLS_CERT_MODE)?;
+        set_mode(cert_path, HANDED_OVER_TLS_CERT_MODE)?;
     }
-    set_mode(key_path, OPENBAO_TLS_KEY_MODE)?;
+    set_mode(key_path, HANDED_OVER_TLS_KEY_MODE)?;
     let owner = user.key_owner();
     let key = format!("{TLS_OUTPUT_MOUNT}/server.key");
     run_docker_with_exec(
         &build_tls_key_chown_args(tls_mount, &owner, &key, STEP_CA_HELPER_IMAGE),
-        "docker openbao tls key chown",
+        label,
         docker,
         messages,
     )
@@ -502,45 +524,66 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
-/// Hands an existing `OpenBao` TLS key to the uid `BOOTROOT_OPENBAO_USER`
-/// records, without issuing a new certificate.
+/// What one server's TLS key hand-over acts on: the server whose recorded
+/// user it reads, its TLS directory, certificate and key relative to the
+/// compose directory, the docker command labels, and its own refusals.
+pub(super) struct TlsKeyHandover {
+    pub(super) server: UserServer,
+    pub(super) tls_dir: &'static str,
+    pub(super) cert_path: &'static str,
+    pub(super) key_path: &'static str,
+    pub(super) dir_chown_label: &'static str,
+    pub(super) key_chown_label: &'static str,
+    /// The refusal of a symlinked TLS directory.
+    pub(super) symlink_refusal: fn(&Messages, &str) -> String,
+    /// The refusal of a key that is not a regular file.
+    pub(super) not_regular_file: fn(&Messages, &str) -> String,
+    /// The error a failed helper container is reported under.
+    pub(super) failure: fn(&Messages) -> &'static str,
+}
+
+/// Hands an existing TLS key to the uid the server's recorded user
+/// (`BOOTROOT_OPENBAO_USER`, `BOOTROOT_POSTGRES_USER`) names, without
+/// issuing a new certificate.
 ///
 /// `infra install` runs this after its `.env` upsert, so adopting the
 /// option on an installed stack, or changing the recorded value, does not
-/// leave `OpenBao` in front of a key its new uid cannot read. It runs the
-/// steps [`issue_openbao_tls_cert`] runs after its certificate write,
-/// preceded by the same output-directory chown to the secrets-directory
-/// owner, which takes back a key a previous hand-over gave away. With no
-/// recorded value, or no key on disk, it runs nothing.
+/// leave the server in front of a key its new uid cannot read. It runs
+/// the steps an issuance runs after its certificate write, preceded by
+/// the same output-directory chown to the secrets-directory owner, which
+/// takes back a key a previous hand-over gave away. With no recorded
+/// value, or no key on disk, it runs nothing.
 ///
 /// # Errors
 ///
 /// Returns an error when the recorded value is malformed (before any
-/// docker command), when `openbao/tls` is a symlink, when the key is not
-/// a regular file, when a helper container fails, or when a mode cannot
-/// be set.
-pub(crate) fn hand_over_openbao_tls_key(
+/// docker command), when the TLS directory is a symlink, when the key is
+/// not a regular file, when a helper container fails, or when a mode
+/// cannot be set.
+pub(super) fn hand_over_tls_key(
+    spec: &TlsKeyHandover,
     compose_dir: &Path,
     secrets_dir: &Path,
     docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let Some(user) = recorded_openbao_user(compose_dir, messages)? else {
+    let Some(user) = recorded_user(spec.server, compose_dir, messages)? else {
         return Ok(());
     };
-    let tls_dir = compose_dir.join("openbao").join("tls");
+    let tls_dir = compose_dir.join(spec.tls_dir);
     reject_symlinked_tls_output_dir(
         &tls_dir,
-        |path| messages.error_openbao_tls_output_dir_symlink(path),
+        |path| (spec.symlink_refusal)(messages, path),
         messages,
     )?;
-    let cert_path = compose_dir.join(OPENBAO_TLS_CERT_PATH);
-    let key_path = compose_dir.join(OPENBAO_TLS_KEY_PATH);
+    let cert_path = compose_dir.join(spec.cert_path);
+    let key_path = compose_dir.join(spec.key_path);
     match std::fs::symlink_metadata(&key_path) {
         Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => anyhow::bail!(
-            messages.error_openbao_tls_key_not_regular_file(&key_path.display().to_string())
-        ),
+        Ok(_) => anyhow::bail!((spec.not_regular_file)(
+            messages,
+            &key_path.display().to_string()
+        )),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => {
             return Err(err).with_context(|| {
@@ -560,18 +603,41 @@ pub(crate) fn hand_over_openbao_tls_key(
         &tls_mount,
         &user_arg,
         docker,
-        "docker openbao tls output chown",
-        messages.error_openbao_tls_key_handover_failed(),
+        spec.dir_chown_label,
+        (spec.failure)(messages),
         messages,
     )?;
-    hand_key_to_openbao_user(
+    hand_key_to_user(
         &tls_dir,
         &tls_mount,
         &cert_path,
         &key_path,
         user,
         docker,
-        messages.error_openbao_tls_key_handover_failed(),
+        spec.key_chown_label,
+        (spec.failure)(messages),
+        messages,
+    )
+}
+
+/// Hands an existing `OpenBao` TLS key to the uid `BOOTROOT_OPENBAO_USER`
+/// records, without issuing a new certificate: [`hand_over_tls_key`] over
+/// `openbao/tls`.
+///
+/// # Errors
+///
+/// As [`hand_over_tls_key`].
+pub(crate) fn hand_over_openbao_tls_key(
+    compose_dir: &Path,
+    secrets_dir: &Path,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    hand_over_tls_key(
+        &OPENBAO_TLS_HANDOVER,
+        compose_dir,
+        secrets_dir,
+        docker,
         messages,
     )
 }
@@ -579,7 +645,7 @@ pub(crate) fn hand_over_openbao_tls_key(
 /// Sets cert + key to modes the `OpenBao` container can read, when
 /// `BOOTROOT_OPENBAO_USER` is unset and the server runs as the image's
 /// `openbao` user.  With the value set the key is handed to the server's
-/// uid instead ([`hand_key_to_openbao_user`]).
+/// uid instead ([`hand_key_to_user`]).
 ///
 /// `docker-compose.yml` mounts `./openbao` as `:ro`, so the `OpenBao`
 /// image's standard entrypoint cannot chown its config dir to the

@@ -7,10 +7,11 @@ use bootroot::db::DB_COMPOSE_HOST;
 use bootroot::fs_util;
 
 use super::openbao_tls::{
-    TLS_OUTPUT_MOUNT, build_tls_key_chown_args, chown_tls_output_dir,
-    reject_symlinked_tls_output_dir,
+    TLS_OUTPUT_MOUNT, TlsKeyHandover, build_tls_key_chown_args, chown_tls_output_dir,
+    hand_over_tls_key, reject_symlinked_tls_output_dir,
 };
 use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation};
+use crate::commands::container_user::{ContainerUser, UserServer, recorded_user};
 use crate::commands::infra::{run_compose, run_docker_with_exec};
 use crate::commands::init::{
     CA_CERTS_DIR, CA_INTERMEDIATE_CERT_FILENAME, OPENBAO_TLS_DEFAULT_NOT_AFTER,
@@ -22,8 +23,10 @@ use crate::commands::rotate::STEP_CA_HELPER_IMAGE;
 use crate::i18n::Messages;
 use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 
-/// The owner the private key is handed to: uid 999, the `postgres` user
-/// of the Debian-based official image, and group 0.
+/// The owner the private key is handed to when `BOOTROOT_POSTGRES_USER`
+/// is unset: uid 999, the `postgres` user of the Debian-based official
+/// image, and group 0. With the value set, the key goes to `<uid>:0`
+/// instead.
 ///
 /// `PostgreSQL` accepts a key its own user owns only with no group or
 /// world access. Group 0 grants nothing at `0600` and keeps the file out
@@ -32,8 +35,9 @@ use crate::state::{InfraCertEntry, ReloadStrategy, StateFile};
 /// should its mode ever be widened.
 const POSTGRES_TLS_KEY_OWNER: &str = "999:0";
 
-/// Mode of the output directory, so the container's `postgres` user can
-/// traverse it.
+/// Mode of the output directory, so the server's uid — the image's
+/// `postgres` user, or the one `BOOTROOT_POSTGRES_USER` records — which
+/// does not own it, can traverse it.
 const POSTGRES_TLS_DIR_MODE: u32 = 0o755;
 /// Mode of the certificate and its chain, which are public.
 const POSTGRES_TLS_CERT_MODE: u32 = 0o644;
@@ -46,8 +50,9 @@ const POSTGRES_TLS_KEY_MODE: u32 = 0o600;
 /// open sessions.
 const POSTGRES_RELOAD_SIGNAL: &str = "SIGHUP";
 
-/// Mode of `pg_hba.conf`: the server reads it as uid 999, which does not
-/// own it, and it holds no secret.
+/// Mode of `pg_hba.conf`: the server reads it as its own uid (999, or the
+/// one `BOOTROOT_POSTGRES_USER` records), which does not own it, and it
+/// holds no secret.
 const POSTGRES_HBA_CONF_MODE: u32 = 0o644;
 /// Where the container sees the certificate directory.
 const POSTGRES_TLS_CONTAINER_DIR: &str = "/tls";
@@ -98,21 +103,33 @@ pub(in crate::commands::init) fn build_postgres_tls_sans() -> Vec<String> {
 /// certificate is bundled with the intermediate: `PostgreSQL` sends the
 /// whole file as its chain, and its clients anchor on the root alone.
 ///
+/// The key goes to the server's uid: `<uid>:0` when the `.env` beside
+/// the compose file records `BOOTROOT_POSTGRES_USER`, else the image's
+/// `999:0`. The value is read here so every caller — `init`, `reinit`,
+/// `rotate infra-cert`, `rotate ca-key` — follows it, and a malformed one
+/// is refused before any docker command.
+///
 /// Every issuance runs the same way, because a previous one left the key
-/// owned by uid 999: the directory goes back to the secrets-directory
-/// owner first, so `step`, running as that owner, can overwrite the key.
+/// owned by the server's uid: the directory goes back to the
+/// secrets-directory owner first, so `step`, running as that owner, can
+/// overwrite the key.
 ///
 /// # Errors
 ///
-/// Returns an error when the output directory is a symlink or cannot be
-/// created, when one of the helper containers fails, or when a mode
-/// cannot be set.
+/// Returns an error when the recorded `BOOTROOT_POSTGRES_USER` is
+/// malformed or an exported one differs from it, when the output
+/// directory is a symlink or cannot be created, when one of the helper
+/// containers fails, or when a mode cannot be set.
 pub(crate) fn issue_postgres_tls_cert(
     compose_dir: &Path,
     secrets_dir: &Path,
     docker: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let key_owner = recorded_user(UserServer::Postgres, compose_dir, messages)?.map_or_else(
+        || POSTGRES_TLS_KEY_OWNER.to_string(),
+        ContainerUser::key_owner,
+    );
     let tls_dir = compose_dir.join(POSTGRES_TLS_DIR);
     let cert_path = compose_dir.join(POSTGRES_TLS_CERT_PATH);
     let key_path = compose_dir.join(POSTGRES_TLS_KEY_PATH);
@@ -206,13 +223,8 @@ pub(crate) fn issue_postgres_tls_cert(
     set_postgres_tls_file_modes(&cert_path, &key_path)?;
 
     run_docker_with_exec(
-        &build_tls_key_chown_args(
-            &tls_mount,
-            POSTGRES_TLS_KEY_OWNER,
-            &output_key,
-            STEP_CA_HELPER_IMAGE,
-        ),
-        "docker postgres tls key chown",
+        &build_tls_key_chown_args(&tls_mount, &key_owner, &output_key, STEP_CA_HELPER_IMAGE),
+        POSTGRES_TLS_HANDOVER.key_chown_label,
         docker,
         messages,
     )
@@ -223,6 +235,46 @@ pub(crate) fn issue_postgres_tls_cert(
         messages.info_postgres_tls_provisioned(&cert_path.display().to_string())
     );
     Ok(())
+}
+
+/// `PostgreSQL`'s side of [`hand_over_tls_key`].
+const POSTGRES_TLS_HANDOVER: TlsKeyHandover = TlsKeyHandover {
+    server: UserServer::Postgres,
+    tls_dir: POSTGRES_TLS_DIR,
+    cert_path: POSTGRES_TLS_CERT_PATH,
+    key_path: POSTGRES_TLS_KEY_PATH,
+    dir_chown_label: "docker postgres tls output chown",
+    key_chown_label: "docker postgres tls key chown",
+    symlink_refusal: Messages::error_postgres_tls_output_dir_symlink,
+    not_regular_file: Messages::error_postgres_tls_key_not_regular_file,
+    failure: Messages::error_postgres_tls_key_handover_failed,
+};
+
+/// Hands an existing `PostgreSQL` TLS key to the uid
+/// `BOOTROOT_POSTGRES_USER` records, without issuing a new certificate:
+/// [`hand_over_tls_key`] over `postgres/tls`.
+///
+/// `infra install` runs this beside its `OpenBao` hand-over, so adopting
+/// or changing `--postgres-user` on an installed stack does not leave
+/// `PostgreSQL` in front of a key it cannot read. With no recorded value,
+/// or no key on disk, it runs nothing.
+///
+/// # Errors
+///
+/// As [`hand_over_tls_key`].
+pub(crate) fn hand_over_postgres_tls_key(
+    compose_dir: &Path,
+    secrets_dir: &Path,
+    docker: &Path,
+    messages: &Messages,
+) -> Result<()> {
+    hand_over_tls_key(
+        &POSTGRES_TLS_HANDOVER,
+        compose_dir,
+        secrets_dir,
+        docker,
+        messages,
+    )
 }
 
 /// Sets the certificate to `0644` and the key to `0600`, while the
@@ -351,7 +403,7 @@ pub(in crate::commands::init) async fn write_postgres_tls_files(
 ) -> Result<PathBuf> {
     let hba_path = compose_dir.join(POSTGRES_HBA_CONF_PATH);
     // `PreserveOrUmask` would leave the file `0600` under a `077` umask,
-    // which uid 999 cannot read.
+    // which the server's uid, which does not own it, cannot read.
     fs_util::atomic_replace(
         fs_util::Destination::operator_named(&hba_path),
         POSTGRES_HBA_CONF.as_bytes(),
@@ -393,7 +445,9 @@ pub(in crate::commands::init) async fn write_postgres_tls_files(
 /// Builds the override's contents for a canonical compose directory.
 ///
 /// The `volumes` entries merge with the base file's `postgres-data`
-/// mount; `command` replaces the image's default.
+/// mount; `command` replaces the base file's `command: ["postgres"]`,
+/// which the `postgres` entrypoint wrapper passes on to the image's own
+/// entrypoint.
 fn postgres_tls_override_contents(compose_root: &Path) -> String {
     let mut contents =
         format!("services:\n  {DB_COMPOSE_HOST}:\n    command:\n      - \"postgres\"\n");
@@ -704,6 +758,263 @@ esac
         );
         assert!(!log.exists(), "nothing may be mounted for a symlink");
         assert!(elsewhere.read_dir().unwrap().next().is_none());
+    }
+
+    /// With `BOOTROOT_POSTGRES_USER` recorded, the issuance runs the same
+    /// three containers in the same order and only the key's owner
+    /// changes: `<uid>:0` instead of `999:0`.
+    #[test]
+    fn issuance_hands_the_key_to_the_recorded_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::write(
+            compose_dir.join(".env"),
+            "POSTGRES_PASSWORD=x\nBOOTROOT_POSTGRES_USER=4242:4343\n",
+        )
+        .unwrap();
+        let fake = dir.path().join("fake-docker");
+        let log_path = dir.path().join("docker.log");
+        write_mode_logging_fake(&fake, &log_path, &tls_dir);
+
+        issue_postgres_tls_cert(&compose_dir, &secrets_dir, &fake, &test_messages()).unwrap();
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        let records = invocation_records(&log);
+        assert_eq!(records.len(), 3, "{log}");
+        assert!(records.first().unwrap().contains("-R --no-dereference"));
+        assert!(records.get(1).unwrap().contains("certificate create"));
+        let mount = format!(
+            "{}:{TLS_OUTPUT_MOUNT}",
+            fs::canonicalize(&tls_dir).unwrap().display()
+        );
+        assert_eq!(
+            records.get(2).unwrap().lines().next().unwrap().trim_end(),
+            format!(
+                "run --rm --user root --entrypoint chown -v {mount} {STEP_CA_HELPER_IMAGE} \
+                 --no-dereference 4242:0 {TLS_OUTPUT_MOUNT}/server.key"
+            )
+        );
+        assert!(!log.contains("999:0"), "{log}");
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&tls_dir), 0o755);
+        assert_eq!(mode_of(&tls_dir.join("server.crt")), 0o644);
+        assert_eq!(mode_of(&tls_dir.join("server.key")), 0o600);
+    }
+
+    /// An empty recorded value is unset: the key goes to `999:0`.
+    #[test]
+    fn issuance_with_an_empty_recorded_user_keeps_uid_999() {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::write(compose_dir.join(".env"), "BOOTROOT_POSTGRES_USER=\n").unwrap();
+        let fake = dir.path().join("fake-docker");
+        let log = dir.path().join("docker.log");
+        write_mode_logging_fake(&fake, &log, &tls_dir);
+
+        issue_postgres_tls_cert(&compose_dir, &secrets_dir, &fake, &test_messages()).unwrap();
+
+        let log = fs::read_to_string(&log).unwrap();
+        let records = invocation_records(&log);
+        assert!(
+            records
+                .last()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with(&format!(
+                    "--no-dereference 999:0 {TLS_OUTPUT_MOUNT}/server.key"
+                )),
+            "{log}"
+        );
+    }
+
+    /// A malformed recorded value fails the issuance before any docker
+    /// command, and before the output directory is created.
+    #[test]
+    fn issuance_refuses_a_malformed_recorded_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::write(compose_dir.join(".env"), "BOOTROOT_POSTGRES_USER=0:0\n").unwrap();
+        let fake = dir.path().join("fake-docker");
+        let log = dir.path().join("docker.log");
+        write_self_contained_fake_docker_exiting(&fake, &log, 0);
+
+        let error = issue_postgres_tls_cert(&compose_dir, &secrets_dir, &fake, &test_messages())
+            .expect_err("a malformed value must fail the issuance");
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("BOOTROOT_POSTGRES_USER") && chain.contains(".env"),
+            "{chain}"
+        );
+        assert!(!log.exists(), "no docker command may run");
+        assert!(!tls_dir.exists());
+    }
+
+    /// A compose directory holding `postgres/tls/server.{crt,key}` from an
+    /// earlier issuance, a fake docker that logs its argv, and, when
+    /// given, an `.env` holding `env`.
+    fn handover_fixture(
+        env: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (compose_dir, secrets_dir, tls_dir) = issuance_dirs(dir.path());
+        fs::create_dir_all(&tls_dir).unwrap();
+        fs::write(tls_dir.join("server.crt"), "cert").unwrap();
+        fs::write(tls_dir.join("server.key"), "key").unwrap();
+        fs::set_permissions(
+            tls_dir.join("server.key"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if let Some(env) = env {
+            fs::write(compose_dir.join(".env"), env).unwrap();
+        }
+        let fake = dir.path().join("fake-docker");
+        let log = dir.path().join("docker.log");
+        write_self_contained_fake_docker_exiting(&fake, &log, 0);
+        (dir, fake, log, compose_dir, secrets_dir, tls_dir)
+    }
+
+    /// `infra install`'s hand-over of the `PostgreSQL` key: `postgres/tls`
+    /// goes back to the secrets-directory owner first, then the key goes
+    /// to `<uid>:0`, each through a root helper mounting that directory
+    /// alone; no certificate is written.
+    #[test]
+    fn hand_over_rechowns_the_directory_then_hands_the_key() {
+        let (_dir, fake, log, compose_dir, secrets_dir, tls_dir) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+
+        hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &test_messages()).unwrap();
+
+        let log = fs::read_to_string(&log).unwrap();
+        let invocations: Vec<&str> = log.lines().collect();
+        assert_eq!(invocations.len(), 2, "no certificate write: {log}");
+        let meta = fs::metadata(&secrets_dir).unwrap();
+        let mount = format!(
+            "{}:{TLS_OUTPUT_MOUNT}",
+            fs::canonicalize(&tls_dir).unwrap().display()
+        );
+        assert_eq!(
+            invocations.first().unwrap().trim_end(),
+            format!(
+                "run --rm --user root --entrypoint chown -v {mount} {STEP_CA_HELPER_IMAGE} \
+                 -R --no-dereference {}:{} {TLS_OUTPUT_MOUNT}",
+                meta.uid(),
+                meta.gid()
+            )
+        );
+        assert_eq!(
+            invocations.get(1).unwrap().trim_end(),
+            format!(
+                "run --rm --user root --entrypoint chown -v {mount} {STEP_CA_HELPER_IMAGE} \
+                 --no-dereference 4242:0 {TLS_OUTPUT_MOUNT}/server.key"
+            )
+        );
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&tls_dir), 0o755);
+        assert_eq!(mode_of(&tls_dir.join("server.crt")), 0o644);
+        assert_eq!(mode_of(&tls_dir.join("server.key")), 0o600);
+    }
+
+    /// No recorded value, an `.env` recording only `OpenBao`'s, or no key
+    /// on disk: the hand-over runs nothing and leaves the key as it was.
+    #[test]
+    fn hand_over_runs_nothing_without_a_value_or_a_key() {
+        let messages = test_messages();
+        for env in [
+            None,
+            Some("BOOTROOT_POSTGRES_USER=\n"),
+            Some("BOOTROOT_OPENBAO_USER=4242:4343\n"),
+        ] {
+            let (_dir, fake, log, compose_dir, secrets_dir, tls_dir) = handover_fixture(env);
+            hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages).unwrap();
+            assert!(!log.exists(), "{env:?}");
+            assert_eq!(
+                fs::metadata(tls_dir.join("server.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644,
+                "{env:?}: the key is left as it was"
+            );
+        }
+
+        let (_dir, fake, log, compose_dir, secrets_dir, tls_dir) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+        fs::remove_file(tls_dir.join("server.key")).unwrap();
+        hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages).unwrap();
+        assert!(!log.exists());
+    }
+
+    /// A malformed value, a key that is not a regular file and a
+    /// symlinked `postgres/tls` are refused before any docker command,
+    /// each with `PostgreSQL`'s own message.
+    #[test]
+    fn hand_over_refuses_a_malformed_value_a_symlinked_key_or_directory() {
+        let messages = test_messages();
+        let (_dir, fake, log, compose_dir, secrets_dir, _) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=postgres:postgres\n"));
+        let error = hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages)
+            .expect_err("a malformed value must be refused");
+        assert!(format!("{error:#}").contains("BOOTROOT_POSTGRES_USER"));
+        assert!(!log.exists());
+
+        let (dir, fake, log, compose_dir, secrets_dir, tls_dir) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+        let key = tls_dir.join("server.key");
+        fs::remove_file(&key).unwrap();
+        let elsewhere = dir.path().join("elsewhere.key");
+        fs::write(&elsewhere, "key").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &key).unwrap();
+        let error = hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages)
+            .expect_err("a symlinked key must be refused");
+        assert_eq!(
+            error.to_string(),
+            messages.error_postgres_tls_key_not_regular_file(&key.display().to_string())
+        );
+        assert!(!log.exists());
+
+        let (dir, fake, log, compose_dir, secrets_dir, tls_dir) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+        let moved = dir.path().join("moved-tls");
+        fs::rename(&tls_dir, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &tls_dir).unwrap();
+        let error = hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages)
+            .expect_err("a symlinked directory must be refused");
+        assert_eq!(
+            error.to_string(),
+            messages.error_postgres_tls_output_dir_symlink(&tls_dir.display().to_string())
+        );
+        assert!(!log.exists());
+    }
+
+    /// A failing helper is reported as the hand-over failing, under
+    /// `PostgreSQL`'s own message.
+    #[test]
+    fn a_failing_hand_over_reports_the_postgres_key() {
+        let (dir, _, _, compose_dir, secrets_dir, _) =
+            handover_fixture(Some("BOOTROOT_POSTGRES_USER=4242:4343\n"));
+        let fake = dir.path().join("failing-docker");
+        let log = dir.path().join("failing.log");
+        write_self_contained_fake_docker_exiting(&fake, &log, 1);
+        let messages = test_messages();
+        let error = hand_over_postgres_tls_key(&compose_dir, &secrets_dir, &fake, &messages)
+            .expect_err("a failing helper must fail the hand-over");
+        assert!(
+            format!("{error:#}").contains(messages.error_postgres_tls_key_handover_failed()),
+            "{error:#}"
+        );
     }
 
     #[test]

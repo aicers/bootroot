@@ -323,9 +323,12 @@ guarded service on a non-loopback address is refused.
 OpenBao's key, which belongs to that uid: it requires the key to be a
 regular file owned by `<uid>:0` at mode `0600`.
 
+`infra up` takes no `--postgres-user` either, and leaves
+`BOOTROOT_POSTGRES_USER` as `.env` records it.
+
 After upgrading to this version, the first `infra up` recreates the
-`openbao` container because its service definition changed; it comes back
-sealed and is unsealed as after any restart.
+`openbao` and `postgres` containers because their service definitions
+changed; OpenBao comes back sealed and is unsealed as after any restart.
 
 ### Failure conditions
 
@@ -467,10 +470,43 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
   supported: OpenBao, back on the image's `openbao` user, could then open
   neither the raft volume nor the TLS key that were handed to the given
   uid. A malformed value in `.env` is refused by every bootroot command
-  that reads it. Docker Compose prefers an exported
+  that reads it, and OpenBao's entrypoint also refuses to start, before it
+  re-owns anything, on a value that is not two non-zero decimal numbers
+  joined by one `:`. Docker Compose prefers an exported
   `BOOTROOT_OPENBAO_USER` to `.env`, even an empty one, so bootroot
   refuses to run while the shell exports a value that differs from the
   one `.env` records, or exports it empty while `.env` records one.
+- `--postgres-user <uid>:<gid>`: run step-ca's PostgreSQL as this host uid
+  and gid instead of the image's `postgres` user, uid 999 (optional). This
+  is the host identity of the PostgreSQL container, not a database role:
+  the role step-ca connects as stays `POSTGRES_USER`, set by `init
+  --db-user`. The value is validated exactly as `--openbao-user` is, and
+  refused before anything is written. It is recorded in canonical decimal
+  as `BOOTROOT_POSTGRES_USER` in the compose directory's `.env`, and both
+  base compose files read it from there by interpolation, so every
+  `docker compose` run in that directory — including one that names only
+  the base file — starts PostgreSQL as that uid. At every start
+  PostgreSQL's entrypoint, still running as root, re-owns every entry of
+  its data volume whose owner differs (never a link's target) to the uid
+  and gid, then drops to them; an existing cluster is started as the uid,
+  and a fresh volume is initialised as it. The TLS key `init`, `rotate
+  infra-cert` and `rotate ca-key` issue is then owned by `<uid>:0` instead
+  of `999:0`, still at mode `0600`, while `postgres/tls/` and `server.crt`
+  stay with the owner of `secrets/`; when a PostgreSQL TLS key is already
+  on disk, `infra install` hands it to the uid before it starts the stack,
+  so adopting the option, or changing the value, on an installed stack
+  leaves PostgreSQL able to read its key. A later `infra install` without
+  the option keeps the recorded value, and no command clears it. Removing
+  it from `.env` on an installed stack is not supported: PostgreSQL, back
+  on uid 999, cannot read a key handed to the given uid until `rotate
+  infra-cert` re-issues it. A malformed value in `.env` is refused by
+  every bootroot command that reads it, and PostgreSQL's entrypoint also
+  refuses to start, before it re-owns anything, on a value that is not two
+  non-zero decimal numbers joined by one `:`. Docker Compose prefers an
+  exported `BOOTROOT_POSTGRES_USER` to `.env`, even an empty one, so
+  bootroot refuses to run while the shell exports a value that differs
+  from the one `.env` records, or exports it empty while `.env` records
+  one.
 - `--registrar-endpoint-host <label>`: enable the registrar endpoint on
   this host (optional). The bootroot host's single DNS label — never an
   FQDN or a composed name — validated as `bootroot registrar issue
@@ -1109,7 +1145,8 @@ DB DSN host handling:
   in `state.json` → `infra_certs` as `postgres`: `server.crt` (mode `0644`) is
   a one-year leaf whose only name is `postgres`, followed by the intermediate
   CA that signed it, and `server.key` is owned by `999:0`, the `postgres` user
-  of the PostgreSQL image, at mode `0600`
+  of the PostgreSQL image, at mode `0600` — or by `<uid>:0` when
+  `infra install --postgres-user` recorded `BOOTROOT_POSTGRES_USER`
 - With that certificate, `<compose-dir>/postgres/pg_hba.conf` (mode `0644`)
   and the compose override
   `secrets/postgres/docker-compose.postgres-tls.yml`, written on every run;
@@ -2782,12 +2819,15 @@ Behavior:
     `<compose-dir>/postgres/tls/server.key`. Before the write, a one-shot root
     container chowns `<compose-dir>/postgres/tls` and everything in it to the
     owner of `<secrets-dir>`, as for `openbao`: the previous issuance left the
-    key owned by uid 999, and `step` has to overwrite it. A symlink at that
-    path is refused the same way (`Refusing to use a symlink as the PostgreSQL
-    TLS output directory`). The directory is then `0755`, `server.crt` `0644`
-    and `server.key` `0600`, and a last one-shot root container, mounting only
-    that directory, runs `chown --no-dereference 999:0` on the key, which hands
-    it to the `postgres` user of the PostgreSQL image.
+    key owned by the server's uid, and `step` has to overwrite it. A symlink
+    at that path is refused the same way (`Refusing to use a symlink as the
+    PostgreSQL TLS output directory`). The directory is then `0755`,
+    `server.crt` `0644` and `server.key` `0600`, and a last one-shot root
+    container, mounting only that directory, runs `chown --no-dereference
+    999:0` on the key, which hands it to the `postgres` user of the
+    PostgreSQL image — or `chown --no-dereference <uid>:0` when `.env`
+    records `BOOTROOT_POSTGRES_USER` (`infra install --postgres-user`),
+    which hands it to that uid.
 - After each successful reissue the entry's `issued_at` is
   refreshed and the reload strategy runs so the affected container
   picks up the new material. For known infra-cert keys the effective
