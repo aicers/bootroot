@@ -1185,19 +1185,32 @@ impl RegistrarCertRenewal {
         };
 
         for pair in &due {
-            if let Err(err) = self.renew_leaf(pair, &inputs).await {
-                self.record_failure(pair.leaf, &format!("{err:#}"));
-            }
+            self.attempt_leaf(pair, self.issue_with_retry(pair, &inputs))
+                .await;
         }
     }
 
-    /// Issues, validates, stages, publishes and exchanges one leaf.
+    /// Issues, validates, stages, publishes and exchanges one leaf, and
+    /// records a failed attempt when any of it fails.
     ///
     /// Every step that can fail happens before the first live write, and
     /// the one step after the last live write cannot fail.
-    async fn renew_leaf(&self, pair: &SurfacePairPaths, inputs: &SurfaceAcmeInputs) -> Result<()> {
-        let material = self.issue_with_retry(pair, inputs).await?;
-        self.renew_leaf_with_material(pair, material).await
+    ///
+    /// The issuance is taken as a future rather than run here, so a test
+    /// drives this exact step — publication and failure bookkeeping both
+    /// — over material it minted itself, without a CA to reach.
+    async fn attempt_leaf(
+        &self,
+        pair: &SurfacePairPaths,
+        issuance: impl Future<Output = Result<crate::acme::IssuedMaterial>>,
+    ) {
+        let outcome = match issuance.await {
+            Ok(material) => self.renew_leaf_with_material(pair, material).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            self.record_failure(pair.leaf, &format!("{err:#}"));
+        }
     }
 
     /// Everything after the issuance: the private working directory, the
