@@ -84,6 +84,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -94,8 +95,10 @@ use crate::config::{
     DaemonProfileSettings, HookSettings, Paths, RegistrarEndpointSettings, Settings,
 };
 use crate::eab::EabCredentials;
+use crate::fs_util::SecretsTree;
 use crate::registrar::internal::{
-    InternalCredential, InternalPaths, active_root_fingerprint, load_internal_config,
+    InternalCredential, InternalPaths, active_root_fingerprint, check_internal_config,
+    load_internal_config,
 };
 use crate::registrar::{
     REGISTRAR_CLIENT_LABEL, REGISTRAR_ENDPOINT_LABEL, REGISTRAR_SURFACE_INSTANCE,
@@ -510,7 +513,17 @@ fn unset_path(setting: &str) -> anyhow::Error {
 /// composed from is known, names the four configured paths.
 /// There is no fallback on any of these: no self-signed leaf, no
 /// borrowed one, and no second source for either ACME input.
-pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Result<()> {
+///
+/// `tree` is the handle `bootroot-agent` opened on the secrets
+/// directory its `--config` names, `None` when it opened none. A root
+/// daemon over a `secrets/` another account owns holds a rooted one,
+/// and every name below that directory this issuance reads back or
+/// writes — the host label, the account key, the CA bundle and the
+/// publication lock beside it — is reached through it.
+pub async fn ensure_registrar_surface_certificates(
+    settings: &Settings,
+    tree: Option<&Arc<SecretsTree>>,
+) -> Result<()> {
     if !settings.registrar_endpoint.enabled {
         return Ok(());
     }
@@ -518,7 +531,7 @@ pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Resul
     // step is what resolves the host label the pairs' names are composed
     // from, so nothing here can name a leaf, and the four paths are the
     // only material identifiers that exist yet.
-    let plan = resolve_surface_plan(settings).with_context(|| {
+    let plan = resolve_surface_plan(settings, tree.map(|tree| &**tree)).with_context(|| {
         format!(
             "resolving the registrar surface issuance for the material at {}",
             describe_configured_paths(&settings.registrar_endpoint)
@@ -539,7 +552,7 @@ pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Resul
             )
         })?;
     for pair in pending {
-        issue_surface_pair(settings, &pair, &plan.host, &inputs).await?;
+        issue_surface_pair(settings, &pair, &plan.host, &inputs, tree).await?;
     }
     Ok(())
 }
@@ -565,14 +578,18 @@ pub async fn ensure_registrar_surface_certificates(settings: &Settings) -> Resul
 /// it checks the live handshake itself.
 ///
 /// Does nothing unless `registrar_endpoint.enabled` is true.
+///
+/// `tree` is the handle the reload's settings were read through, passed
+/// to [`ensure_registrar_surface_certificates`].
 pub async fn refresh_registrar_surface_after_reload(
     settings: &Settings,
     endpoint: &crate::registrar::RegistrarEndpoint,
+    tree: Option<&Arc<SecretsTree>>,
 ) {
     refresh_after_reload_with(
         settings,
         endpoint,
-        ensure_registrar_surface_certificates(settings),
+        ensure_registrar_surface_certificates(settings, tree),
     )
     .await;
 }
@@ -695,7 +712,15 @@ pub(crate) struct SurfacePlan {
 /// internal agent config is absent, unparseable or fails the loader's
 /// invariants, or when one of the four material paths is unset. No name
 /// is ever composed from a guessed label.
-pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
+///
+/// With `tree` rooted and `settings` the daemon's own checked config
+/// ([`checked_daemon_settings`]), the host label is taken from those
+/// settings, which were read through the handle and held to the layout
+/// below its anchor, and `agent.toml` is not read again by name.
+pub(crate) fn resolve_surface_plan(
+    settings: &Settings,
+    tree: Option<&SecretsTree>,
+) -> Result<SurfacePlan> {
     let state_file = settings.registrar.state_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "registrar.state_file is required when registrar_endpoint.enabled is true, and no \
@@ -710,12 +735,18 @@ pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
     // invariants rather than trusted blind. Never a new configuration
     // key, never the system hostname, and never parsed back out of the
     // internal leaf's SAN.
-    let internal = load_internal_config(&internal_paths).with_context(|| {
-        format!(
-            "reading the bootroot host label from the rendered internal agent config at {}",
-            internal_paths.agent_config().display()
-        )
-    })?;
+    let loaded;
+    let internal = if let Some(internal) = checked_daemon_settings(settings, tree) {
+        internal
+    } else {
+        loaded = load_internal_config(&internal_paths).with_context(|| {
+            format!(
+                "reading the bootroot host label from the rendered internal agent config at {}",
+                internal_paths.agent_config().display()
+            )
+        })?;
+        &loaded
+    };
     let host = internal
         .profiles
         .first()
@@ -736,6 +767,28 @@ pub(crate) fn resolve_surface_plan(settings: &Settings) -> Result<SurfacePlan> {
         host,
         pairs,
     })
+}
+
+/// Returns `settings` when they are the rooted registrar endpoint
+/// daemon's own config, already read through `tree` and held to the
+/// layout below its anchor; `None` otherwise.
+///
+/// The test is in memory: `tree` is rooted and `settings` pass
+/// [`check_internal_config`] against `InternalPaths::new(tree.anchor())`.
+/// Settings `bootroot-agent` read through a rooted handle opened from
+/// its `--config` always pass it; a service agent's config, whose
+/// handle comes from its `secret_id` path, does not. Whatever spelling
+/// of the secrets directory `[registrar] state_file` resolves to plays
+/// no part, so a `state.json` that names it differently from
+/// `--config` cannot send a caller back to a read by name.
+pub(crate) fn checked_daemon_settings<'s>(
+    settings: &'s Settings,
+    tree: Option<&SecretsTree>,
+) -> Option<&'s Settings> {
+    let tree = tree.filter(|tree| tree.is_rooted())?;
+    check_internal_config(&InternalPaths::new(tree.anchor()), settings)
+        .ok()
+        .map(|()| settings)
 }
 
 /// Evaluates both pairs and returns the ones an issuance has to replace.
@@ -885,6 +938,10 @@ pub(crate) async fn read_acme_inputs_with(
 /// is not an error — a start-time issuance has simply not got one yet,
 /// and the next pass asks again.
 ///
+/// `tree` is the daemon's handle on the secrets directory, through
+/// which a rooted daemon reaches the account key, the CA bundle and the
+/// publication lock below it.
+///
 /// # Errors
 ///
 /// Returns an error naming both configured paths and the failure.
@@ -893,6 +950,7 @@ pub(crate) async fn issue_surface_pair(
     pair: &SurfacePairPaths,
     host: &str,
     inputs: &SurfaceAcmeInputs,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<()> {
     let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
     let profile = issuance
@@ -914,6 +972,7 @@ pub(crate) async fn issue_surface_pair(
         inputs.eab.clone(),
         pair.leaf.issuance_options(),
         bootstrap_pins,
+        tree,
     )
     .await
     .with_context(describe)?
@@ -923,7 +982,8 @@ pub(crate) async fn issue_surface_pair(
     publish_surface_material(
         &issuance,
         profile,
-        crate::acme::publish_issued_material(&issuance, profile, &material),
+        tree,
+        crate::acme::publish_issued_material(&issuance, profile, &material, tree),
     )
     .await
     .with_context(describe)
@@ -949,6 +1009,9 @@ pub(crate) async fn issue_surface_pair(
 /// held while it runs — the property the lock exists for, and one no
 /// assertion made afterwards can see.
 ///
+/// With `tree` rooted, the lock in `registrar-internal/` beside the
+/// bundle is opened through it ([`crate::publication_lock::hold_in`]).
+///
 /// # Errors
 ///
 /// Returns an error when the lock cannot be taken, or whatever
@@ -956,6 +1019,7 @@ pub(crate) async fn issue_surface_pair(
 async fn publish_surface_material<Fut>(
     issuance: &Settings,
     profile: &crate::config::DaemonProfileSettings,
+    tree: Option<&Arc<SecretsTree>>,
     publish: Fut,
 ) -> Result<()>
 where
@@ -970,7 +1034,7 @@ where
     }
     destinations.push(&profile.paths.cert);
     destinations.push(&profile.paths.key);
-    let _lock = crate::publication_lock::hold(&destinations).await?;
+    let _lock = crate::publication_lock::hold_in(tree, &destinations).await?;
     publish.await
 }
 
@@ -1003,6 +1067,7 @@ pub(crate) async fn issue_surface_pair_material(
     pair: &SurfacePairPaths,
     host: &str,
     inputs: &SurfaceAcmeInputs,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<crate::acme::IssuedMaterial> {
     let issuance = issuance_settings(settings, pair, host, &inputs.responder_hmac);
     let profile = issuance
@@ -1016,6 +1081,7 @@ pub(crate) async fn issue_surface_pair_material(
         inputs.eab.clone(),
         pair.leaf.issuance_options(),
         bootstrap_pins,
+        tree,
     )
     .await
     .with_context(|| {

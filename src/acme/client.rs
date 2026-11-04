@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use crate::acme::types::{Authorization, Order};
 use crate::config::{AcmeSettings, TrustSettings};
 use crate::eab::EabCredentials;
+use crate::fs_util::{self, RootedOwner, SecretsTree};
 use crate::tls::{build_bootstrap_client_config, build_http_client};
 
 const ALG_ES256: &str = "ES256";
@@ -100,28 +101,29 @@ pub fn create_account_key() -> Result<String> {
 /// renewals; one that does not keeps the ephemeral-key behaviour it has
 /// always had.
 ///
+/// With `tree` rooted and `path` below its anchor — the registrar
+/// endpoint daemon run as root over a `secrets/` another account owns —
+/// the key is read and created through the handle, following no name:
+/// the read replaces the existence probe (`NotFound` creates the key),
+/// and the creation publishes into the existing directory, creating
+/// none, with the mode, owner and flush the path-based write gives it.
+///
 /// # Errors
 ///
 /// Returns an error if the key cannot be generated, written, read, or
 /// decoded. The error never quotes the file's contents.
-fn load_or_create_account_key(path: &std::path::Path, rng: &SystemRandom) -> Result<Vec<u8>> {
+fn load_or_create_account_key(
+    path: &std::path::Path,
+    rng: &SystemRandom,
+    tree: Option<&SecretsTree>,
+) -> Result<Vec<u8>> {
+    if let Some(tree) = tree.filter(|tree| fs_util::takes_rooted_branch(tree, path)) {
+        return load_or_create_account_key_in(tree, path, rng);
+    }
     if path.exists() {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading the ACME account key at {}", path.display()))?;
-        let parsed: serde_json::Value = serde_json::from_str(&contents)
-            .with_context(|| format!("parsing the ACME account key at {}", path.display()))?;
-        let encoded = parsed
-            .get(ACCOUNT_KEY_FIELD)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the ACME account key at {} carries no `{ACCOUNT_KEY_FIELD}` field",
-                    path.display()
-                )
-            })?;
-        return base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .with_context(|| format!("decoding the ACME account key at {}", path.display()));
+        return parse_account_key_file(&contents, path);
     }
 
     let (payload, pkcs8) = generate_account_key(rng)?;
@@ -131,13 +133,66 @@ fn load_or_create_account_key(path: &std::path::Path, rng: &SystemRandom) -> Res
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    crate::fs_util::atomic_write_blocking(
-        crate::fs_util::Destination::bootroot_owned(path),
+    fs_util::atomic_write_blocking(
+        fs_util::Destination::bootroot_owned(path),
         payload.as_bytes(),
-        crate::fs_util::StagedMode::Policy(crate::fs_util::KEY_FILE_MODE),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
     )
     .with_context(|| format!("writing the ACME account key at {}", path.display()))?;
     Ok(pkcs8)
+}
+
+/// The rooted half of [`load_or_create_account_key`]. Blocking.
+fn load_or_create_account_key_in(
+    tree: &SecretsTree,
+    path: &std::path::Path,
+    rng: &SystemRandom,
+) -> Result<Vec<u8>> {
+    match tree.read(path) {
+        Ok(bytes) => {
+            let contents = String::from_utf8(bytes).map_err(|_| {
+                anyhow::anyhow!(
+                    "reading the ACME account key at {}: it is not UTF-8",
+                    path.display()
+                )
+            })?;
+            return parse_account_key_file(&contents, path);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(anyhow::Error::new(err))
+                .with_context(|| format!("reading the ACME account key at {}", path.display()));
+        }
+    }
+    let (payload, pkcs8) = generate_account_key(rng)?;
+    tree.publish(
+        fs_util::Destination::bootroot_owned(path),
+        payload.as_bytes(),
+        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        RootedOwner::Destination,
+        fs_util::StagedDurability::FlushDirectory,
+    )
+    .with_context(|| format!("writing the ACME account key at {}", path.display()))?;
+    Ok(pkcs8)
+}
+
+/// Decodes the PKCS#8 key out of the persisted account key read from
+/// `path`, naming `path` and never quoting the contents.
+fn parse_account_key_file(contents: &str, path: &std::path::Path) -> Result<Vec<u8>> {
+    let parsed: serde_json::Value = serde_json::from_str(contents)
+        .with_context(|| format!("parsing the ACME account key at {}", path.display()))?;
+    let encoded = parsed
+        .get(ACCOUNT_KEY_FIELD)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "the ACME account key at {} carries no `{ACCOUNT_KEY_FIELD}` field",
+                path.display()
+            )
+        })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("decoding the ACME account key at {}", path.display()))
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -173,22 +228,27 @@ impl AcmeClient {
         settings: &AcmeSettings,
         trust: &TrustSettings,
     ) -> Result<Self> {
-        Self::new_with_bootstrap(directory_url, settings, trust, None)
+        Self::new_with_bootstrap(directory_url, settings, trust, None, None)
     }
 
     /// Creates an ACME client for the registrar bundle-repair path.
     ///
     /// `bootstrap_pins` is used only while the configured output bundle is
     /// absent or has no parseable certificates.  It never reads that bundle.
+    ///
+    /// `tree` is the registrar endpoint daemon's handle on the secrets
+    /// directory, through which a rooted daemon reads and creates the
+    /// account key below it; `None` for every other caller.
     pub(crate) fn new_with_bootstrap(
         directory_url: String,
         settings: &AcmeSettings,
         trust: &TrustSettings,
         bootstrap_pins: Option<&[String]>,
+        tree: Option<&SecretsTree>,
     ) -> Result<Self> {
         let rng = aws_lc_rs::rand::SystemRandom::new();
         let pkcs8 = match settings.account_key_path.as_deref() {
-            Some(path) => load_or_create_account_key(path, &rng)?,
+            Some(path) => load_or_create_account_key(path, &rng, tree)?,
             None => EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
                 .map_err(|_| anyhow::anyhow!("Failed to generate account key"))?
                 .as_ref()
@@ -743,6 +803,90 @@ mod tests {
             PREVIOUS_RELEASE_KEY_AUTHORIZATION
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    /// The account key below `registrar-internal/`, through a rooted
+    /// handle: a link at the directory or at the key is refused naming
+    /// it, and nothing outside `secrets/` is read, created or written.
+    #[test]
+    fn a_rooted_account_key_refuses_a_swapped_level_or_leaf() {
+        use crate::test_swap::{SwapRoot, assert_error_names};
+
+        for (level, existing) in [
+            ("registrar-internal", false),
+            ("registrar-internal", true),
+            ("registrar-internal/acme-account.json", true),
+        ] {
+            let root = SwapRoot::new();
+            std::fs::create_dir(root.secrets.join("registrar-internal")).unwrap();
+            let path = root.secrets.join("registrar-internal/acme-account.json");
+            if existing {
+                std::fs::write(
+                    root.outside.join("acme-account.json"),
+                    create_account_key().unwrap(),
+                )
+                .unwrap();
+            }
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+            let target = if level == "registrar-internal/acme-account.json" {
+                root.outside.join("acme-account.json")
+            } else {
+                root.outside.clone()
+            };
+            let link = root.swap(level, &target);
+
+            let err = load_or_create_account_key(&path, &SystemRandom::new(), Some(&*tree))
+                .expect_err("a link below secrets/ is refused");
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before, "{level}");
+        }
+    }
+
+    /// Over a tree the test owns, the rooted account key is created with
+    /// the mode and owner the path-based one gets, and read back as the
+    /// same key.
+    #[test]
+    fn a_rooted_account_key_matches_the_path_based_one() {
+        use crate::test_swap::{SwapRoot, mode_and_owner};
+
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = SwapRoot::new();
+            std::fs::create_dir(root.secrets.join("registrar-internal")).unwrap();
+            let path = root.secrets.join("registrar-internal/acme-account.json");
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                root.path_based()
+            };
+            let rng = SystemRandom::new();
+            let created = load_or_create_account_key(&path, &rng, Some(&*tree)).unwrap();
+            let read = load_or_create_account_key(&path, &rng, Some(&*tree)).unwrap();
+            assert_eq!(created, read, "the key is read back, not recreated");
+            assert!(is_account_key(&std::fs::read_to_string(&path).unwrap()));
+            results.push(mode_and_owner(&path));
+        }
+        assert_eq!(results.first(), results.get(1));
+        assert_eq!(
+            results.first().map(|(mode, ..)| *mode),
+            Some(fs_util::KEY_FILE_MODE)
+        );
+    }
+
+    /// A rooted handle does not reach an account key the operator named
+    /// outside its anchor: that one stays path-based.
+    #[test]
+    fn an_account_key_outside_the_anchor_stays_path_based() {
+        let root = crate::test_swap::SwapRoot::new();
+        let tree = root.rooted();
+        let path = root.outside.join("operator").join("acme-account.json");
+        let rng = SystemRandom::new();
+        let created = load_or_create_account_key(&path, &rng, Some(&*tree)).unwrap();
+        assert_eq!(
+            load_or_create_account_key(&path, &rng, None).unwrap(),
+            created
+        );
     }
 
     #[test]
@@ -1334,6 +1478,7 @@ mod tests {
                 &trust_test_settings(),
                 &trust,
                 Some(&trust.trusted_ca_sha256),
+                None,
             )?;
             client.fetch_directory().await?;
             server.handle.abort();
@@ -1351,6 +1496,7 @@ mod tests {
                 &trust_test_settings(),
                 &trust,
                 Some(&pins),
+                None,
             )?;
             assert!(client.fetch_directory().await.is_err());
             server.handle.abort();
@@ -1365,6 +1511,7 @@ mod tests {
                 &trust_test_settings(),
                 &trust,
                 Some(&[]),
+                None,
             );
             let Err(error) = result else {
                 panic!("empty pins must not create a bootstrap client");

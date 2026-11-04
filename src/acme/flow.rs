@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
@@ -10,9 +11,11 @@ use x509_parser::pem::Pem;
 use crate::acme::client::AcmeClient;
 use crate::acme::responder_client;
 use crate::acme::types::{AuthorizationStatus, ChallengeStatus, ChallengeType, OrderStatus};
-use crate::cert_group::CertGroupPolicy;
+use crate::cert_group::{CA_BUNDLE_FILE_MODE, CertGroupPolicy};
+use crate::daemon_messages::DaemonMessages;
 use crate::fs_util;
 use crate::fs_util::generation::{self, GenerationPlan, GenerationTarget, PairSource, Probe};
+use crate::fs_util::{RootedOwner, SecretsTree};
 use crate::registrar::internal::PrivateKeyPem;
 
 fn contact_from_email(email: &str) -> String {
@@ -291,13 +294,48 @@ pub(crate) fn merge_ca_bundle(
 /// apply, and a merge computed from bytes another writer has already
 /// replaced would publish a bundle missing an anchor this host was told
 /// to trust.
+///
+/// With `tree` rooted and `bundle_path` below its anchor — the
+/// registrar endpoint daemon run as root over a `secrets/` another
+/// account owns — the read and the publish go through the handle and
+/// follow no name ([`publish_ca_bundle_in`]); a rooted refusal of the
+/// read refuses the write as an unreadable bundle does. A profile with
+/// a cert group is refused there, since the rooted publish gives the
+/// bundle the owner the no-group publish gives it and nothing else.
 pub(crate) async fn write_merged_ca_bundle(
     bundle_path: &Path,
     chain: &[Vec<u8>],
     trusted: &[String],
     policy: CertGroupPolicy,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<()> {
     let _bundle = crate::ca_bundle_lock::hold(bundle_path).await;
+    if let Some(tree) = tree.filter(|tree| fs_util::takes_rooted_branch(tree, bundle_path)) {
+        if policy.group_gid().is_some() {
+            anyhow::bail!(
+                DaemonMessages::from_environment().rooted_ca_bundle_under_cert_group(bundle_path)
+            );
+        }
+        let path = bundle_path.to_path_buf();
+        let chain = chain.to_vec();
+        let trusted = trusted.to_vec();
+        return tree
+            .run(move |tree| {
+                let existing = match tree.read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => {
+                        return Err(anyhow::Error::new(err).context(format!(
+                            "refusing to overwrite unreadable CA bundle at {}",
+                            path.display()
+                        )));
+                    }
+                };
+                let bundle = merge_ca_bundle(existing.as_deref(), &chain, &trusted);
+                publish_ca_bundle_in(tree, &path, &bundle)
+            })
+            .await;
+    }
     let existing = match tokio::fs::read(bundle_path).await {
         Ok(bytes) => Some(bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -310,6 +348,35 @@ pub(crate) async fn write_merged_ca_bundle(
     };
     let bundle = merge_ca_bundle(existing.as_deref(), chain, trusted);
     fs_util::write_ca_bundle(bundle_path, &bundle, policy).await
+}
+
+/// Publishes `bundle_pem` at `bundle_path` through a rooted `tree`, as
+/// [`fs_util::write_ca_bundle`] publishes it under
+/// [`CertGroupPolicy::none`]: `0644`, renamed into place without a
+/// directory flush, and owned by root — the owner that no-chown publish
+/// leaves on a root writer, and the one the provisioning and rotation
+/// commands publish the same file under. No directory is created: the
+/// bundle's directory is the one the daemon's config was read from.
+///
+/// Blocking.
+///
+/// # Errors
+///
+/// Returns an error naming the path when a directory level is a link
+/// or is refused by the handle, or the file cannot be published.
+pub(crate) fn publish_ca_bundle_in(
+    tree: &SecretsTree,
+    bundle_path: &Path,
+    bundle_pem: &str,
+) -> Result<()> {
+    tree.publish(
+        fs_util::Destination::bootroot_owned(bundle_path),
+        bundle_pem.as_bytes(),
+        fs_util::StagedMode::Policy(CA_BUNDLE_FILE_MODE),
+        RootedOwner::Fixed(crate::registrar::internal::material::protected_owner()),
+        fs_util::StagedDurability::RenameOnly,
+    )
+    .with_context(|| format!("Failed to write CA bundle file {}", bundle_path.display()))
 }
 
 async fn register_acme_account(
@@ -571,8 +638,9 @@ pub(crate) async fn issue_certificate_material(
     eab_creds: Option<crate::eab::EabCredentials>,
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<Option<IssuedMaterial>> {
-    run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await
+    run_issuance(settings, profile, eab_creds, options, bootstrap_pins, tree).await
 }
 
 /// Issues a certificate under `options` with optional pin-only bootstrap
@@ -591,7 +659,7 @@ pub(crate) async fn issue_certificate_with_bootstrap(
 ) -> Result<()> {
     ensure_can_write_owner(settings, profile)?;
     let Some(material) =
-        run_issuance(settings, profile, eab_creds, options, bootstrap_pins).await?
+        run_issuance(settings, profile, eab_creds, options, bootstrap_pins, None).await?
     else {
         return Ok(());
     };
@@ -599,7 +667,9 @@ pub(crate) async fn issue_certificate_with_bootstrap(
         GenerationPublication::Snapshot => {
             publish_snapshot(settings, profile, &material, &Probe::default()).await
         }
-        GenerationPublication::None => publish_issued_material(settings, profile, &material).await,
+        GenerationPublication::None => {
+            publish_issued_material(settings, profile, &material, None).await
+        }
     }
 }
 
@@ -621,6 +691,9 @@ pub(crate) async fn issue_certificate_with_bootstrap(
 /// one goes on to call this, and a second acquisition here would
 /// deadlock it against itself.
 ///
+/// `tree` is the registrar endpoint daemon's handle on the secrets
+/// directory, which [`publish_bundle`] merges the CA bundle through.
+///
 /// # Errors
 ///
 /// Returns an error when the profile sets `cert_owner_uid` and this
@@ -631,9 +704,10 @@ pub(crate) async fn publish_issued_material(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     material: &IssuedMaterial,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<()> {
     ensure_can_write_owner(settings, profile)?;
-    publish_bundle(settings, profile, material).await?;
+    publish_bundle(settings, profile, material, tree).await?;
     publish_pair(profile, material, &Probe::default()).await
 }
 
@@ -692,7 +766,7 @@ pub(crate) async fn publish_snapshot(
     probe: &Probe,
 ) -> Result<()> {
     ensure_can_write_owner(settings, profile)?;
-    publish_bundle(settings, profile, material).await?;
+    publish_bundle(settings, profile, material, None).await?;
     publish_profile_generation(settings, profile, material, probe).await?;
     publish_pair(profile, material, probe).await
 }
@@ -744,6 +818,8 @@ pub(crate) async fn publish_profile_generation(
 /// merge, and with an empty chain the bundle is left alone with a
 /// warning; neither is a refusal.
 ///
+/// `tree` is passed through to [`write_merged_ca_bundle`].
+///
 /// # Errors
 ///
 /// Returns an error when the returned chain carries a fingerprint that
@@ -752,6 +828,7 @@ pub(crate) async fn publish_bundle(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     material: &IssuedMaterial,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<()> {
     let Some(bundle_path) = &settings.trust.ca_bundle_path else {
         return Ok(());
@@ -766,6 +843,7 @@ pub(crate) async fn publish_bundle(
         &material.chain,
         &settings.trust.trusted_ca_sha256,
         crate::cert_group::CertGroupPolicy::for_profile(profile),
+        tree,
     )
     .await?;
     info!("CA bundle saved to: {:?}", bundle_path);
@@ -806,19 +884,23 @@ pub(crate) async fn publish_pair(
 }
 
 /// Everything from the ACME directory through the downloaded
-/// certificate, with no write of any kind.
+/// certificate, with no write of any kind — except the creation of a
+/// missing ACME account key, through `tree` when the daemon holds a
+/// rooted one.
 async fn run_issuance(
     settings: &crate::config::Settings,
     profile: &crate::config::DaemonProfileSettings,
     eab_creds: Option<crate::eab::EabCredentials>,
     options: IssuanceOptions,
     bootstrap_pins: Option<&[String]>,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<Option<IssuedMaterial>> {
     let mut client = AcmeClient::new_with_bootstrap(
         settings.server.clone(),
         &settings.acme,
         &settings.trust,
         bootstrap_pins,
+        tree.map(|tree| &**tree),
     )?;
 
     client.fetch_directory().await?;
@@ -878,7 +960,7 @@ async fn run_issuance(
         LeafPublication::LeafOnly => leaf_pem,
         LeafPublication::LeafWithChain => {
             if let Some(bundle_path) = &settings.trust.ca_bundle_path {
-                append_configured_anchors(&mut chain, bundle_path);
+                append_configured_anchors(&mut chain, bundle_path, tree.map(|tree| &**tree));
             }
             let mut published = leaf_pem;
             for der in &chain {
@@ -935,12 +1017,27 @@ async fn run_issuance(
 /// publishes both registrar surface leaves. `LeafPublication::LeafOnly`
 /// — every ordinary service issuance — is unaffected, and reaches its
 /// consumers' trust through `[trust].ca_bundle_path` as it always has.
-fn append_configured_anchors(chain: &mut Vec<Vec<u8>>, bundle_path: &Path) {
+///
+/// With `tree` rooted and the bundle below its anchor, the bundle is
+/// read through the handle without following a name, and a refusal is
+/// an unreadable bundle: nothing is appended.
+fn append_configured_anchors(
+    chain: &mut Vec<Vec<u8>>,
+    bundle_path: &Path,
+    tree: Option<&SecretsTree>,
+) {
     // A missing, malformed, or unreadable bundle remains on the existing
     // bootstrap/repair path. `write_merged_ca_bundle` is still the sole
     // authority for rejecting an unreadable replacement target, and it runs
     // before this material is published.
-    let Ok(bundle) = std::fs::read_to_string(bundle_path) else {
+    let read = match tree.filter(|tree| fs_util::takes_rooted_branch(tree, bundle_path)) {
+        Some(tree) => tree
+            .read(bundle_path)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok()),
+        None => std::fs::read_to_string(bundle_path).ok(),
+    };
+    let Some(bundle) = read else {
         return;
     };
     let Ok(anchors) = crate::tls::parse_pem_to_cert_list(bundle.as_bytes()) else {
@@ -1071,6 +1168,7 @@ mod tests {
                 &chain,
                 &settings.trust.trusted_ca_sha256,
                 policy,
+                None,
             )
             .await?;
         }
@@ -1531,7 +1629,7 @@ mod tests {
         let intermediate_der = parse_pem_der(&intermediate_pem);
         let root_der = parse_pem_der(&root_pem);
         let mut chain = vec![intermediate_der];
-        append_configured_anchors(&mut chain, &bundle_path);
+        append_configured_anchors(&mut chain, &bundle_path, None);
 
         assert_eq!(chain.len(), 2);
         assert!(chain.iter().any(|certificate| certificate == &root_der));
@@ -1570,6 +1668,7 @@ mod tests {
             std::slice::from_ref(&intermediate_der),
             &trusted,
             CertGroupPolicy::none(),
+            None,
         )
         .await
         .expect_err("must refuse to overwrite an unreadable bundle");
@@ -1578,5 +1677,173 @@ mod tests {
             message.contains("refusing to overwrite unreadable CA bundle"),
             "expected fail-closed context, got: {message}"
         );
+    }
+
+    /// The rooted bundle merge, over `secrets/registrar-internal/`.
+    mod rooted {
+        use std::sync::Arc;
+
+        use super::*;
+        use crate::fs_util::SecretsTree;
+        use crate::test_swap::{SwapRoot, assert_error_names, mode_and_owner};
+
+        const BUNDLE: &str = "registrar-internal/ca-bundle.pem";
+
+        struct Fixture {
+            root: SwapRoot,
+            bundle: PathBuf,
+            root_pem: String,
+            chain: Vec<Vec<u8>>,
+            trusted: Vec<String>,
+        }
+
+        /// A `registrar-internal/ca-bundle.pem` holding a pinned root, and
+        /// an issued chain carrying a pinned intermediate.
+        fn fixture() -> Fixture {
+            fixture_with(
+                test_cert_pem("root.example"),
+                &test_cert_pem("intermediate.example"),
+            )
+        }
+
+        fn fixture_with(root_pem: String, intermediate_pem: &str) -> Fixture {
+            let root = SwapRoot::new();
+            let bundle = root.write(BUNDLE, &root_pem);
+            let intermediate = parse_pem_der(intermediate_pem);
+            let trusted = vec![
+                sha256_hex(&parse_pem_der(&root_pem)),
+                sha256_hex(&intermediate),
+            ];
+            Fixture {
+                root,
+                bundle,
+                root_pem,
+                chain: vec![intermediate],
+                trusted,
+            }
+        }
+
+        async fn merge(
+            fixture: &Fixture,
+            policy: CertGroupPolicy,
+            tree: Option<&Arc<SecretsTree>>,
+        ) -> Result<()> {
+            write_merged_ca_bundle(
+                &fixture.bundle,
+                &fixture.chain,
+                &fixture.trusted,
+                policy,
+                tree,
+            )
+            .await
+        }
+
+        /// Over a tree the test owns, the rooted merge publishes the
+        /// bytes, mode and owner the path-based one does.
+        #[tokio::test]
+        async fn a_rooted_merge_matches_the_path_based_one() {
+            let root_pem = test_cert_pem("root.example");
+            let intermediate_pem = test_cert_pem("intermediate.example");
+            let mut results = Vec::new();
+            for rooted in [false, true] {
+                let fixture = fixture_with(root_pem.clone(), &intermediate_pem);
+                let tree = rooted.then(|| fixture.root.rooted());
+                merge(&fixture, CertGroupPolicy::none(), tree.as_ref())
+                    .await
+                    .expect("merge");
+                results.push((
+                    std::fs::read(&fixture.bundle).expect("bundle"),
+                    mode_and_owner(&fixture.bundle),
+                ));
+            }
+            assert_eq!(results.first(), results.get(1));
+            let (bytes, (mode, ..)) = results.first().expect("a result");
+            assert_eq!(*mode, CA_BUNDLE_FILE_MODE);
+            assert_eq!(
+                String::from_utf8_lossy(bytes)
+                    .matches("BEGIN CERTIFICATE")
+                    .count(),
+                2,
+                "the pinned root on disk survives the merge"
+            );
+        }
+
+        /// A link at `registrar-internal` refuses the merge naming it; a
+        /// link at the bundle refuses its read, so nothing is merged
+        /// from or written through it. Nothing outside changes.
+        #[tokio::test]
+        async fn a_swapped_level_or_leaf_refuses_the_merge() {
+            for level in ["registrar-internal", BUNDLE] {
+                let fixture = fixture();
+                std::fs::write(
+                    fixture.root.outside.join("ca-bundle.pem"),
+                    &fixture.root_pem,
+                )
+                .expect("outside bundle");
+                let tree = fixture.root.rooted();
+                let before = fixture.root.outside_snapshot();
+                let target = if level == BUNDLE {
+                    fixture.root.outside.join("ca-bundle.pem")
+                } else {
+                    fixture.root.outside.clone()
+                };
+                let link = fixture.root.swap(level, &target);
+
+                let err = merge(&fixture, CertGroupPolicy::none(), Some(&tree))
+                    .await
+                    .expect_err("refused");
+                assert_error_names(&err, &link);
+                assert_eq!(fixture.root.outside_snapshot(), before, "{level}");
+            }
+        }
+
+        /// A cert group the rooted publish cannot reproduce is refused
+        /// naming the bundle, before anything is read or written.
+        #[tokio::test]
+        async fn a_cert_group_is_refused_below_the_anchor() {
+            let fixture = fixture();
+            let tree = fixture.root.rooted();
+            let before = std::fs::read(&fixture.bundle).expect("bundle");
+            let err = merge(&fixture, CertGroupPolicy::with_gid(4242), Some(&tree))
+                .await
+                .expect_err("refused");
+            assert_error_names(&err, &fixture.bundle);
+            // In the daemon's locale, as the renewal and start logs render it.
+            assert_eq!(
+                err.to_string(),
+                crate::daemon_messages::DaemonMessages::from_environment()
+                    .rooted_ca_bundle_under_cert_group(&fixture.bundle)
+            );
+            assert_eq!(std::fs::read(&fixture.bundle).expect("bundle"), before);
+        }
+
+        /// A linked bundle appends no outside certificate to the
+        /// published surface chain.
+        #[test]
+        fn a_linked_bundle_appends_nothing() {
+            let fixture = fixture();
+            let outside_pem = test_cert_pem("outside.example");
+            std::fs::write(fixture.root.outside.join("ca-bundle.pem"), &outside_pem)
+                .expect("outside bundle");
+            let tree = fixture.root.rooted();
+            fixture
+                .root
+                .swap(BUNDLE, &fixture.root.outside.join("ca-bundle.pem"));
+
+            let mut chain = fixture.chain.clone();
+            append_configured_anchors(&mut chain, &fixture.bundle, Some(&*tree));
+            assert_eq!(chain, fixture.chain, "nothing was appended");
+
+            // Read through the handle, a regular bundle is appended as
+            // the path-based read appends it.
+            let fixture = self::fixture();
+            let tree = fixture.root.rooted();
+            let mut rooted = fixture.chain.clone();
+            append_configured_anchors(&mut rooted, &fixture.bundle, Some(&*tree));
+            let mut by_path = fixture.chain.clone();
+            append_configured_anchors(&mut by_path, &fixture.bundle, None);
+            assert_eq!(rooted, by_path);
+            assert_eq!(rooted.len(), 2);
+        }
     }
 }

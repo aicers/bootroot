@@ -46,7 +46,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   yourself outside `secrets/` are unaffected. `rotate ca-key` in that case also
   refuses an existing CA key backup that is a symbolic link rather than keeping
   it, and `registrar issue` stages the certificate it issues in a private
-  directory beside `secrets/` rather than below it.
+  directory beside `secrets/` rather than below it. The registrar endpoint
+  daemon and a local-file service's `bootroot-agent`, run as root over such a
+  `secrets/`, likewise stop with an error naming the path at a symbolic link
+  below `secrets/` where they read their configuration or a service's
+  credential files or write there; at start the daemon does not start, and on
+  `SIGHUP` it logs `Reload failed` and keeps running. In that case the
+  registrar endpoint daemon also refuses a configuration whose internal
+  profile, ACME account key or CA bundle is not at the fixed layout below the
+  directory its `--config` names, or that carries an `[openbao]` table.
 
 ### Fixed
 
@@ -91,7 +99,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   could have placed below `secrets/` when they write, copy, remove or re-read
   files there, so such a link can no longer make them overwrite, delete or read
   a file elsewhere on the host, take their lock file elsewhere, or publish to
-  every service host a CA bundle it points at.
+  every service host a CA bundle it points at. The registrar endpoint daemon
+  and a local-file service's `bootroot-agent`, run as root over such a
+  `secrets/`, likewise no longer follow such a link when they read their
+  configuration, write the registrar's CA bundle and ACME account key, or
+  write and read a service's `secret_id`, `role_id` and `eab.json`, so a link
+  can no longer choose the configuration the daemon runs under or the identity
+  of the certificates it issues, make either process write a file elsewhere,
+  or have a file it points at sent as a login credential or to the ACME
+  server.
 
 ## [0.6.0] - 2026-10-31
 

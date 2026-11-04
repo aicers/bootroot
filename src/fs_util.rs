@@ -56,6 +56,19 @@ pub fn path_is_within(candidate: &Path, prefix: &Path) -> std::io::Result<bool> 
     Ok(absolute_lexical(candidate)?.starts_with(absolute_lexical(prefix)?))
 }
 
+/// Reports whether a site handed `tree` takes its rooted branch for
+/// `path`: the handle is rooted, and `path` lies lexically below the
+/// handle's anchor (not the anchor itself).
+///
+/// The one rule every long-running site that holds an optional handle
+/// applies before it reaches a name below `secrets/`. Anything else —
+/// no handle, a path-based one, or a path the operator named outside
+/// the anchor — keeps the site's path-based code.
+#[must_use]
+pub fn takes_rooted_branch(tree: &SecretsTree, path: &Path) -> bool {
+    tree.is_rooted() && path != tree.anchor() && path.starts_with(tree.anchor())
+}
+
 /// The directory holding `path`: its parent, or the process cwd when
 /// `path` is a bare file name.
 fn parent_dir(path: &Path) -> PathBuf {

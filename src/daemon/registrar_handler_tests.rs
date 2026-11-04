@@ -892,6 +892,7 @@ async fn an_unmounted_store_keeps_daemon_duties_running() {
         cli_overrides: crate::config::CliOverrides::default(),
         shutdown: shutdown.clone(),
         registrar_endpoint,
+        secrets_tree: None,
     }));
 
     let response = endpoint
@@ -1012,6 +1013,7 @@ async fn disabled_endpoint_configurations_do_not_enter_the_mount_refusal_path() 
             cli_overrides: crate::config::CliOverrides::default(),
             shutdown: shutdown.clone(),
             registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+            secrets_tree: None,
         }));
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1244,6 +1246,7 @@ async fn an_enabled_directory_endpoint_starts_the_ordinary_daemon_duties() {
         cli_overrides: crate::config::CliOverrides::default(),
         shutdown: shutdown.clone(),
         registrar_endpoint: endpoint.registrar_endpoint(),
+        secrets_tree: None,
     }));
 
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1348,6 +1351,7 @@ async fn an_unarmable_registrar_renewal_stops_the_daemon() {
         cli_overrides: crate::config::CliOverrides::default(),
         shutdown: DaemonShutdown::new(),
         registrar_endpoint: endpoint.registrar_endpoint(),
+        secrets_tree: None,
     })
     .await
     .expect_err("an endpoint whose renewal cannot be armed must stop the daemon");
@@ -1402,6 +1406,7 @@ async fn a_reload_whose_issuance_fails_keeps_the_daemon_serving() {
             cli_overrides: crate::config::CliOverrides::default(),
             shutdown: shutdown.clone(),
             registrar_endpoint: endpoint.registrar_endpoint(),
+            secrets_tree: None,
         }))
     };
     let enabled_count = || {
@@ -1542,6 +1547,7 @@ async fn an_unopenable_production_audit_store_stops_the_daemon() {
         cli_overrides: crate::config::CliOverrides::default(),
         shutdown: DaemonShutdown::new(),
         registrar_endpoint: endpoint.registrar_endpoint(),
+        secrets_tree: None,
     })
     .await
     .expect_err("an unopenable production audit store must stop the daemon");

@@ -1,6 +1,7 @@
 //! Localized operator messages emitted by `bootroot-agent`.
 
 use std::ffi::OsStr;
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -17,7 +18,9 @@ pub fn audit_store_reload_rejection_message(rejection: &AuditStoreReloadRejectio
     DaemonMessages::from_environment().audit_store_reload_rejected(rejection)
 }
 
-/// The localized messages used by the unavailable registrar handler.
+/// The localized messages `bootroot-agent` gives the operator: the
+/// unavailable registrar handler's, and the rooted registrar endpoint
+/// daemon's refusals.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DaemonMessages {
     locale: Locale,
@@ -105,6 +108,44 @@ impl DaemonMessages {
                  활성화된 엔드포인트가 리로드 이후에도 유지되므로 감사 저장소의 파일 시스템 \
                  마운트 판정은 프로세스 수명 동안 고정됩니다. 따라서 실행 중인 데몬은 그대로 \
                  두었습니다. 변경을 적용하려면 서비스를 다시 시작하세요."
+            ),
+        }
+    }
+
+    /// Returns why a rooted registrar endpoint daemon refuses a config
+    /// that carries an `[openbao]` table.
+    ///
+    /// Read by the daemon at start and on every `SIGHUP`, so a start
+    /// that fails and a reload logged as failed both carry it.
+    #[must_use]
+    pub(crate) fn daemon_config_carries_openbao(self) -> &'static str {
+        match self.locale {
+            Locale::En => {
+                "it carries an [openbao] table, which the registrar endpoint daemon's config never \
+                 carries: the fast-poll loop it would arm rewrites files below the secrets \
+                 directory by name"
+            }
+            Locale::Ko => {
+                "레지스트라 엔드포인트 데몬의 설정에는 들어가지 않는 [openbao] 테이블이 들어 \
+                 있습니다: 이 테이블이 켜는 fast-poll 루프는 secrets 디렉터리 아래의 파일을 \
+                 이름으로 다시 씁니다"
+            }
+        }
+    }
+
+    /// Returns the refusal of a CA bundle publish under a cert group
+    /// below a `secrets/` another account owns, naming `bundle_path`.
+    #[must_use]
+    pub(crate) fn rooted_ca_bundle_under_cert_group(self, bundle_path: &Path) -> String {
+        let path = bundle_path.display();
+        match self.locale {
+            Locale::En => format!(
+                "refusing to write the CA bundle at {path} under a cert group: a root process \
+                 publishes below a secrets directory another account owns only as root"
+            ),
+            Locale::Ko => format!(
+                "인증서 그룹을 지정한 채로 {path}의 CA 번들을 쓰지 않습니다: root 프로세스는 \
+                 다른 계정이 소유한 secrets 디렉터리 아래에 root 소유로만 게시합니다"
             ),
         }
     }
@@ -228,6 +269,37 @@ mod tests {
             audit_store_reload_rejection_message(&rejection),
             DaemonMessages::from_environment().audit_store_reload_rejected(&rejection)
         );
+    }
+
+    /// The rooted daemon's two refusals read in either locale, and each
+    /// rendering keeps what the operator acts on: the `[openbao]` table
+    /// it names, or the bundle's path.
+    #[test]
+    fn rooted_daemon_refusals_are_available_in_both_locales() {
+        let english = DaemonMessages::new("en").expect("English is supported");
+        let korean = DaemonMessages::new("ko").expect("Korean is supported");
+
+        let (en, ko) = (
+            english.daemon_config_carries_openbao(),
+            korean.daemon_config_carries_openbao(),
+        );
+        assert_ne!(en, ko);
+        assert!(en.contains("[openbao]") && ko.contains("[openbao]"));
+        assert!(!ko.is_ascii(), "{ko}");
+
+        let bundle = Path::new("/srv/secrets/registrar-internal/ca-bundle.pem");
+        let (en, ko) = (
+            english.rooted_ca_bundle_under_cert_group(bundle),
+            korean.rooted_ca_bundle_under_cert_group(bundle),
+        );
+        assert_ne!(en, ko);
+        for message in [&en, &ko] {
+            assert!(
+                message.contains(&bundle.display().to_string()),
+                "the rendering names the bundle"
+            );
+        }
+        assert!(!ko.is_ascii(), "the Korean rendering is not English");
     }
 
     #[test]

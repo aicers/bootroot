@@ -36,6 +36,8 @@ pub mod utils;
 mod daemon;
 mod fast_poll;
 #[cfg(test)]
+pub(crate) mod test_swap;
+#[cfg(test)]
 pub(crate) mod test_tracing;
 
 pub use agent_args::Args;

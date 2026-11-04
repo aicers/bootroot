@@ -259,7 +259,23 @@ rather than following a link at it:
   `secrets/` (paths you name yourself, such as a `--secret-id-path` outside
   `secrets/` or the destinations of `registrar issue`, are left as you chose
   them). In that case `registrar issue` stages the certificate it issues in a
-  private directory beside `secrets/` rather than below it.
+  private directory beside `secrets/` rather than below it. The two processes
+  that stay running over such a `secrets/` as root do the same: the registrar
+  endpoint daemon, started with
+  `--config <secrets-dir>/registrar-internal/agent.toml`, when it reads that
+  configuration, merges `registrar-internal/ca-bundle.pem`, creates or reads
+  `registrar-internal/acme-account.json`, takes its publication lock there and
+  rolls a failed renewal back; and a local-file service's `bootroot-agent` run
+  as root (a profile using `--cert-owner`), when it writes `secret_id` and
+  `eab.json` below `secrets/services/<service>/` and reads `role_id`,
+  `secret_id` and its `--eab-file` there. In that case the daemon also refuses
+  a configuration whose internal profile, account key or CA bundle is not at
+  the fixed layout below the directory its `--config` names, after any
+  `BOOTROOT_*` environment overrides, or that carries an `[openbao]` table. A
+  refused configuration stops the daemon at start, and a refused `SIGHUP`
+  reload is logged as `Reload failed` while the daemon keeps running on the
+  configuration it has. A local-file agent whose `secret_id_path` was moved
+  off that default layout keeps reading and writing those files by path.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
   link found there with a regular file. The OpenBao unseal-keys and secrets-tree

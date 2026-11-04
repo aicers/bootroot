@@ -245,7 +245,21 @@ flush하지 않습니다. 이후 EAB 갱신에서 에이전트가 같은 경로�
   다시 읽는 모든 곳에서 같은 내용이 적용됩니다(`secrets/` 밖의
   `--secret-id-path`나 `registrar issue`의 출력 경로처럼 직접 지정한 경로는
   지정한 그대로 둡니다). 이 경우 `registrar issue`는 발급한 인증서를
-  `secrets/` 아래가 아니라 그 옆의 전용 디렉터리에서 준비합니다.
+  `secrets/` 아래가 아니라 그 옆의 전용 디렉터리에서 준비합니다. 그러한
+  `secrets/` 위에서 root로 계속 실행되는 두 프로세스도 마찬가지입니다.
+  `--config <secrets-dir>/registrar-internal/agent.toml`로 시작한 registrar
+  엔드포인트 데몬은 그 설정을 읽을 때, `registrar-internal/ca-bundle.pem`을
+  병합할 때, `registrar-internal/acme-account.json`을 만들거나 읽을 때, 그곳에서
+  게시 잠금을 잡을 때, 실패한 갱신을 되돌릴 때 그렇게 동작합니다. root로 실행한
+  로컬 파일 서비스의 `bootroot-agent`(`--cert-owner`를 쓰는 프로필)는
+  `secrets/services/<service>/` 아래에 `secret_id`와 `eab.json`을 쓸 때, 그곳의
+  `role_id`, `secret_id`, `--eab-file`을 읽을 때 그렇게 동작합니다. 이 경우
+  데몬은 `BOOTROOT_*` 환경 변수 재정의를 적용한 뒤에도 내부 프로필, 계정 키,
+  CA 번들이 `--config`가 가리키는 디렉터리 아래의 고정 배치에 있지 않거나
+  `[openbao]` 테이블을 담은 설정도 거부합니다. 거부된 설정이면 데몬은 시작
+  시점에 멈추고, 거부된 `SIGHUP` 재적재는 `Reload failed`로 기록되며 데몬은
+  기존 설정으로 계속 실행됩니다. `secret_id_path`를 이 기본 배치 밖으로 옮긴
+  로컬 파일 에이전트는 계속 경로로 해당 파일을 읽고 씁니다.
 - **컨트롤 노드 자신의 `agent.toml`, 발급된 인증서와 키, CA 번들, 모든 자격
   증명은 경로 자체에 게시되며**, 그 자리에 있던 링크는 일반 파일로 대체됩니다.
   OpenBao 언실 키와 시크릿 트리의 EAB 파일은 이번 릴리스에서 이 그룹에

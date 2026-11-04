@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::cert_group::CertGroupPolicy;
+use crate::fs_util::{RootedOwner, SecretsTree};
 use crate::kv_payload::{
     EabPayload, TrustPayload, parse_eab_payload, parse_responder_hmac, parse_secret_id,
     parse_trust_payload,
@@ -1183,6 +1184,10 @@ pub(crate) struct EabRefreshHandle {
     /// Publishes the refreshed value into the shared `default_eab` so running
     /// renewals read it without a restart.
     pub(crate) sender: watch::Sender<Option<eab::EabCredentials>>,
+    /// The agent's handle on the secrets directory. When it is rooted and
+    /// `path` is below its anchor, `eab.json` is written and removed
+    /// through it, following no name.
+    pub(crate) tree: Option<Arc<SecretsTree>>,
 }
 
 /// Attaches an [`OpenBaoClient`] + renewal trigger to the generic
@@ -1200,6 +1205,9 @@ pub(crate) struct LiveFastPollHooks<F> {
     pub(crate) secret_id_path: PathBuf,
     /// EAB refresh target, present only when EAB is sourced from `--eab-file`.
     pub(crate) eab_refresh: Option<EabRefreshHandle>,
+    /// The agent's handle on the secrets directory. When it is rooted,
+    /// the `secret_id` apply below its anchor publishes through it.
+    pub(crate) secrets_tree: Option<Arc<SecretsTree>>,
 }
 
 /// Writes the CA bundle and upserts the `agent.toml` `[trust]` section for a
@@ -1308,23 +1316,33 @@ async fn apply_responder_hmac_to_disk(config_path: &Path, hmac: &str) -> Result<
 /// returns `Ok`. The `default_eab` update goes through the shared `watch`
 /// sender so both the periodic-check and force-reissue paths read the current
 /// value at their next issuance without a restart.
+///
+/// With the handle's tree rooted and `eab.json` below its anchor, the write
+/// and the removal go through the tree ([`eab::write_eab_file_in`],
+/// [`eab::remove_eab_file_in`]) and follow no name.
 async fn apply_eab_to_state(handle: &EabRefreshHandle, payload: &EabPayload) -> Result<()> {
+    let rooted = handle
+        .tree
+        .as_ref()
+        .filter(|tree| fs_util::takes_rooted_branch(tree, &handle.path));
     match payload {
         EabPayload::Populated { kid, hmac } => {
-            eab::write_eab_file(&handle.path, kid, hmac)
-                .await
-                .with_context(|| {
-                    format!("Failed to write eab.json to {}", handle.path.display())
-                })?;
+            match rooted {
+                Some(tree) => eab::write_eab_file_in(tree, &handle.path, kid, hmac).await,
+                None => eab::write_eab_file(&handle.path, kid, hmac).await,
+            }
+            .with_context(|| format!("Failed to write eab.json to {}", handle.path.display()))?;
             handle.sender.send_replace(Some(eab::EabCredentials {
                 kid: kid.clone(),
                 hmac: crate::secret::HmacSecret::new(hmac.clone()),
             }));
         }
         EabPayload::Clear => {
-            eab::remove_eab_file(&handle.path).await.with_context(|| {
-                format!("Failed to remove eab.json at {}", handle.path.display())
-            })?;
+            match rooted {
+                Some(tree) => eab::remove_eab_file_in(tree, &handle.path).await,
+                None => eab::remove_eab_file(&handle.path).await,
+            }
+            .with_context(|| format!("Failed to remove eab.json at {}", handle.path.display()))?;
             handle.sender.send_replace(None);
         }
     }
@@ -1398,7 +1416,28 @@ where
         // a first-sighting re-write is byte-identical; `login()` trims on
         // read either way.
         let body = format!("{secret_id}\n");
+        let rooted = self
+            .secrets_tree
+            .as_ref()
+            .filter(|tree| fs_util::takes_rooted_branch(tree, &secret_id_path))
+            .map(Arc::clone);
         Box::pin(async move {
+            if let Some(tree) = rooted {
+                // What `atomic_write` gives the file, through the handle:
+                // into the existing directory, creating none.
+                return tree
+                    .publish_async(
+                        fs_util::Destination::bootroot_owned(&secret_id_path),
+                        body.as_bytes(),
+                        fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+                        RootedOwner::Destination,
+                        fs_util::StagedDurability::FlushDirectory,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failed to write secret_id to {}", secret_id_path.display())
+                    });
+            }
             fs_util::atomic_write(
                 fs_util::Destination::bootroot_owned(&secret_id_path),
                 body.as_bytes(),
@@ -1447,6 +1486,7 @@ pub(crate) async fn run_fast_poll_loop(
     settings: Arc<config::Settings>,
     config_path: PathBuf,
     eab_refresh: Option<EabRefreshHandle>,
+    secrets_tree: Option<Arc<SecretsTree>>,
     semaphore: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
     renew_fn: impl Fn(config::DaemonProfileSettings, Arc<Semaphore>) -> BoxRenew + Send + Sync + 'static,
@@ -1498,7 +1538,7 @@ pub(crate) async fn run_fast_poll_loop(
     // rebuild below re-reads them from the freshly written agent.toml.
     let client = build_openbao_client(&openbao, &settings.trust.trusted_ca_sha256)?;
     let client = Arc::new(Mutex::new(client));
-    if let Err(err) = login(&client, &openbao).await {
+    if let Err(err) = login(&client, &openbao, secrets_tree.as_ref()).await {
         warn!("Initial OpenBao AppRole login failed: {err:#}. Will retry on the next tick.");
     }
 
@@ -1522,6 +1562,7 @@ pub(crate) async fn run_fast_poll_loop(
         config_path,
         secret_id_path: openbao.secret_id_path.clone(),
         eab_refresh,
+        secrets_tree: secrets_tree.clone(),
         trigger: move |profile_label: String| {
             let settings = Arc::clone(&settings_for_hooks);
             let semaphore = Arc::clone(&semaphore_for_hooks);
@@ -1700,6 +1741,7 @@ pub(crate) async fn run_fast_poll_loop(
                 &client,
                 &openbao,
                 &config_path_for_rebuild,
+                secrets_tree.as_ref(),
                 &mut needs_relogin,
             )
             .await;
@@ -1721,7 +1763,7 @@ pub(crate) async fn run_fast_poll_loop(
 
         let mut sleep_for = openbao.fast_poll_interval;
         if needs_relogin {
-            if let Err(err) = login(&client, &openbao).await {
+            if let Err(err) = login(&client, &openbao, secrets_tree.as_ref()).await {
                 warn!("OpenBao AppRole re-login failed: {err:#}");
             }
             // A failed login is nearly always an OpenBao-side problem
@@ -1783,6 +1825,7 @@ async fn rebuild_client_after_trust_apply(
     client: &Arc<Mutex<OpenBaoClient>>,
     openbao: &config::OpenBaoSettings,
     config_path: &Path,
+    tree: Option<&Arc<SecretsTree>>,
     needs_relogin: &mut bool,
 ) -> bool {
     let rebuild_pins = match read_trust_pins_from_config(config_path).await {
@@ -1804,7 +1847,7 @@ async fn rebuild_client_after_trust_apply(
         }
     };
     *client.lock().await = rebuilt;
-    if let Err(err) = login(client, openbao).await {
+    if let Err(err) = login(client, openbao, tree).await {
         warn!(
             "OpenBao re-login after CA bundle rebuild failed: {err:#}. Will retry on the next tick."
         );
@@ -1899,14 +1942,21 @@ async fn read_trust_pins_from_config(config_path: &Path) -> Result<Vec<String>> 
     Ok(pins)
 }
 
+/// Logs in to `OpenBao` with the `AppRole` `role_id` and `secret_id` the
+/// `[openbao]` table names.
+///
+/// With `tree` rooted, either file below its anchor is read through the
+/// handle and follows no name; a refusal fails the login naming the path,
+/// before anything is sent.
 async fn login(
     client: &Arc<Mutex<OpenBaoClient>>,
     openbao: &config::OpenBaoSettings,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> Result<()> {
-    let role_id = read_trimmed(&openbao.role_id_path)
+    let role_id = read_trimmed_in(tree, &openbao.role_id_path)
         .await
         .with_context(|| format!("Failed to read {}", openbao.role_id_path.display()))?;
-    let secret_id = read_trimmed(&openbao.secret_id_path)
+    let secret_id = read_trimmed_in(tree, &openbao.secret_id_path)
         .await
         .with_context(|| format!("Failed to read {}", openbao.secret_id_path.display()))?;
     let token = {
@@ -1919,6 +1969,21 @@ async fn login(
 
 async fn read_trimmed(path: &Path) -> Result<String> {
     let body = fs::read_to_string(path).await?;
+    Ok(body.trim().to_string())
+}
+
+/// [`read_trimmed`], through `tree` when it is rooted and `path` is below
+/// its anchor.
+async fn read_trimmed_in(tree: Option<&Arc<SecretsTree>>, path: &Path) -> Result<String> {
+    let Some(tree) = tree.filter(|tree| fs_util::takes_rooted_branch(tree, path)) else {
+        return read_trimmed(path).await;
+    };
+    let target = path.to_path_buf();
+    let bytes = tree
+        .run(move |tree| tree.read(&target).map_err(anyhow::Error::from))
+        .await?;
+    let body =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not UTF-8", path.display()))?;
     Ok(body.trim().to_string())
 }
 
@@ -3387,6 +3452,7 @@ mod tests {
         let handle = EabRefreshHandle {
             path: eab_path.clone(),
             sender: tx,
+            tree: None,
         };
         let shared = eab::SharedEab::from_receiver(rx);
 
@@ -3817,7 +3883,7 @@ mod tests {
 
         // The second renewal merges its chain into the bundle...
         let renewed = generation_material("B", vec![issuer]);
-        publish_bundle(&host.settings, &profile, &renewed)
+        publish_bundle(&host.settings, &profile, &renewed, None)
             .await
             .expect("the renewal's bundle merge");
         assert_eq!(std::fs::read_to_string(&host.bundle_path).unwrap(), merged);
@@ -4454,9 +4520,14 @@ mod pin_rotation_tests {
         .unwrap();
 
         let mut needs_relogin = false;
-        let rebuilt_ok =
-            rebuild_client_after_trust_apply(&client, &openbao, &config_path, &mut needs_relogin)
-                .await;
+        let rebuilt_ok = rebuild_client_after_trust_apply(
+            &client,
+            &openbao,
+            &config_path,
+            None,
+            &mut needs_relogin,
+        )
+        .await;
         assert!(
             rebuilt_ok,
             "recovering the freshly applied pins and rebuilding must succeed"
@@ -4497,9 +4568,14 @@ mod pin_rotation_tests {
         std::fs::write(&config_path, "email = \"a@b.c\"\n").unwrap();
 
         let mut needs_relogin = false;
-        let rebuilt_ok =
-            rebuild_client_after_trust_apply(&client, &openbao, &config_path, &mut needs_relogin)
-                .await;
+        let rebuilt_ok = rebuild_client_after_trust_apply(
+            &client,
+            &openbao,
+            &config_path,
+            None,
+            &mut needs_relogin,
+        )
+        .await;
         assert!(
             !rebuilt_ok,
             "unrecoverable fresh pins must fail the rebuild closed so the version rolls back"
@@ -4526,5 +4602,244 @@ mod pin_rotation_tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("does-not-exist.toml");
         assert!(read_trust_pins_from_config(&config_path).await.is_err());
+    }
+}
+
+/// A root agent over a `secrets/` another account owns: the fast-poll
+/// loop's writes and reads below `secrets/services/<id>/` go through
+/// the rooted handle and follow no name.
+#[cfg(test)]
+mod rooted_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::test_swap::{SwapRoot, assert_error_names, mode_and_owner};
+
+    const SERVICE: &str = "services/svc";
+
+    fn settings() -> Arc<config::Settings> {
+        Arc::new(
+            config::Settings::from_toml_str(
+                "domain = \"example.internal\"\n\n[[profiles]]\nregistration_id = \"svc\"\n\
+                 service_name = \"svc\"\ninstance_id = \"001\"\nhostname = \"node-01\"\n\n\
+                 [profiles.paths]\ncert = \"/tmp/cert.pem\"\nkey = \"/tmp/key.pem\"\n",
+            )
+            .expect("settings"),
+        )
+    }
+
+    type Trigger = fn(String) -> std::future::Ready<Result<()>>;
+
+    fn no_renewal(_label: String) -> std::future::Ready<Result<()>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn hooks(root: &SwapRoot, tree: Option<Arc<SecretsTree>>) -> LiveFastPollHooks<Trigger> {
+        LiveFastPollHooks {
+            client: Arc::new(Mutex::new(
+                OpenBaoClient::new("http://127.0.0.1:1").expect("client"),
+            )),
+            trigger: no_renewal,
+            settings: settings(),
+            config_path: root.root().join("agent.toml"),
+            secret_id_path: root.secrets.join(SERVICE).join("secret_id"),
+            eab_refresh: None,
+            secrets_tree: tree,
+        }
+    }
+
+    /// A link at `services` or at `services/<id>` refuses the
+    /// `secret_id` apply naming it; nothing outside is written.
+    #[tokio::test]
+    async fn apply_secret_id_refuses_a_swapped_level() {
+        for level in ["services", SERVICE] {
+            let root = SwapRoot::new();
+            root.write(&format!("{SERVICE}/secret_id"), "old\n");
+            let hooks = hooks(&root, Some(root.rooted()));
+            let before = root.outside_snapshot();
+            let link = root.swap(level, &root.outside);
+
+            let err = hooks
+                .apply_secret_id("svc", "new")
+                .await
+                .expect_err("a link above secret_id is refused");
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before, "{level}");
+        }
+    }
+
+    /// Over a tree the test owns, the rooted apply gives the bytes, mode
+    /// and owner the path-based one gives; a link at the leaf is replaced
+    /// and its target left alone.
+    #[tokio::test]
+    async fn apply_secret_id_matches_the_path_based_write() {
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = SwapRoot::new();
+            let path = root.write(&format!("{SERVICE}/secret_id"), "old\n");
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                root.path_based()
+            };
+            hooks(&root, Some(tree))
+                .apply_secret_id("svc", "new")
+                .await
+                .expect("apply");
+            results.push((std::fs::read(&path).expect("read"), mode_and_owner(&path)));
+        }
+        assert_eq!(results.first(), results.get(1));
+
+        let root = SwapRoot::new();
+        root.write(&format!("{SERVICE}/secret_id"), "old\n");
+        let before = root.outside_snapshot();
+        let link = root.swap(
+            &format!("{SERVICE}/secret_id"),
+            &root.outside.join("secret"),
+        );
+        hooks(&root, Some(root.rooted()))
+            .apply_secret_id("svc", "new")
+            .await
+            .expect("a bootroot-owned leaf link is replaced");
+        assert!(std::fs::symlink_metadata(&link).expect("stat").is_file());
+        assert_eq!(std::fs::read(&link).expect("read"), b"new\n");
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// A link at `services/<id>` refuses both EAB applies naming it,
+    /// writes or removes nothing outside, and leaves the in-memory EAB
+    /// where it was: the durable write comes first.
+    #[tokio::test]
+    async fn apply_eab_to_state_refuses_a_swapped_level() {
+        for payload in [
+            EabPayload::Populated {
+                kid: "kid-1".to_string(),
+                hmac: "hmac-1".to_string(),
+            },
+            EabPayload::Clear,
+        ] {
+            let root = SwapRoot::new();
+            root.write(&format!("{SERVICE}/eab.json"), "{}\n");
+            std::fs::write(root.outside.join("eab.json"), "OUTSIDE\n").expect("outside");
+            let (sender, receiver) = watch::channel(None);
+            let handle = EabRefreshHandle {
+                path: root.secrets.join(SERVICE).join("eab.json"),
+                sender,
+                tree: Some(root.rooted()),
+            };
+            let before = root.outside_snapshot();
+            let link = root.swap(SERVICE, &root.outside);
+
+            let err = apply_eab_to_state(&handle, &payload)
+                .await
+                .expect_err("a link above eab.json is refused");
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before);
+            assert!(
+                receiver.borrow().is_none(),
+                "the in-memory EAB is unchanged"
+            );
+        }
+    }
+
+    /// A fake `OpenBao` that records whether anything connected.
+    struct FakeOpenBao {
+        listener: std::net::TcpListener,
+    }
+
+    impl FakeOpenBao {
+        fn start() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            Self { listener }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.listener.local_addr().expect("addr"))
+        }
+
+        fn received_nothing(&self) -> bool {
+            matches!(
+                self.listener.accept(),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+            )
+        }
+    }
+
+    fn openbao(root: &SwapRoot, url: &str) -> config::OpenBaoSettings {
+        config::OpenBaoSettings {
+            url: url.to_string(),
+            allow_plaintext_http: false,
+            kv_mount: "secret".to_string(),
+            role_id_path: root.secrets.join(SERVICE).join("role_id"),
+            secret_id_path: root.secrets.join(SERVICE).join("secret_id"),
+            ca_bundle_path: None,
+            fast_poll_interval: Duration::from_secs(5),
+            state_path: root.root().join("state.json"),
+        }
+    }
+
+    /// With `secret_id` a link to a file outside `secrets/`, or
+    /// `services/<id>` a link out of it, the login fails naming the path
+    /// and `OpenBao` is sent nothing — at the first login as at every
+    /// re-login, which are the same call.
+    #[tokio::test]
+    async fn login_refuses_a_linked_credential_and_sends_nothing() {
+        for level in [format!("{SERVICE}/secret_id"), SERVICE.to_string()] {
+            let root = SwapRoot::new();
+            root.write(&format!("{SERVICE}/role_id"), "role\n");
+            root.write(&format!("{SERVICE}/secret_id"), "secret\n");
+            std::fs::write(root.outside.join("role_id"), "OUTSIDE-ROLE\n").expect("outside");
+            std::fs::write(root.outside.join("secret_id"), "OUTSIDE-SECRET\n").expect("outside");
+            let tree = root.rooted();
+            let fake = FakeOpenBao::start();
+            let settings = openbao(&root, &fake.url());
+            let client = Arc::new(Mutex::new(
+                OpenBaoClient::new(&settings.url).expect("client"),
+            ));
+            let target = if level.ends_with("secret_id") {
+                root.outside.join("secret_id")
+            } else {
+                root.outside.clone()
+            };
+            let link = root.swap(&level, &target);
+
+            for attempt in ["initial", "re-login"] {
+                let err = login(&client, &settings, Some(&tree))
+                    .await
+                    .expect_err("a linked credential is refused");
+                assert_error_names(&err, &link);
+                assert!(fake.received_nothing(), "{attempt}: OpenBao was contacted");
+            }
+        }
+    }
+
+    /// A `secret_id_path` outside the anchor, or no handle, reads by
+    /// path as before: the login reads the files and reaches `OpenBao`.
+    #[tokio::test]
+    async fn login_outside_the_anchor_reads_by_path() {
+        let root = SwapRoot::new();
+        let fake = FakeOpenBao::start();
+        let mut settings = openbao(&root, &fake.url());
+        let elsewhere = root.root().join("operator");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        std::fs::write(elsewhere.join("role_id"), "role\n").expect("role");
+        std::fs::write(elsewhere.join("secret_id"), "secret\n").expect("secret");
+        settings.role_id_path = elsewhere.join("role_id");
+        settings.secret_id_path = elsewhere.join("secret_id");
+        let client = Arc::new(Mutex::new(
+            OpenBaoClient::new(&settings.url).expect("client"),
+        ));
+
+        let tree = root.rooted();
+        let login = tokio::spawn(async move { login(&client, &settings, Some(&tree)).await });
+        let listener = tokio::net::TcpListener::from_std(fake.listener).expect("async listener");
+        let accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        login.abort();
+        assert!(
+            matches!(accepted, Ok(Ok(_))),
+            "the path-based login reached OpenBao"
+        );
     }
 }

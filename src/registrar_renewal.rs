@@ -90,7 +90,7 @@ use tracing::{debug, error, info};
 
 use crate::cert_group::{CERT_FILE_MODE, CertGroupPolicy, KEY_FILE_MODE_DEFAULT};
 use crate::config::Settings;
-use crate::fs_util::{Destination, FixedOwner, StagedMode};
+use crate::fs_util::{Destination, FixedOwner, RootedOwner, SecretsTree, StagedMode};
 use crate::registrar::endpoint::ActivatedEndpoint;
 use crate::registrar::endpoint::tls::build_server_config_from_staged;
 use crate::registrar::endpoint_pin::{
@@ -101,8 +101,8 @@ use crate::registrar::{
     recognize_registrar_client_name, recognize_registrar_endpoint_name, single_dns_san,
 };
 use crate::registrar_certs::{
-    SurfaceAcmeInputs, SurfaceLeaf, SurfacePairPaths, SurfacePlan, issue_surface_pair_material,
-    read_acme_inputs, resolve_surface_plan,
+    SurfaceAcmeInputs, SurfaceLeaf, SurfacePairPaths, SurfacePlan, checked_daemon_settings,
+    issue_surface_pair_material, read_acme_inputs, resolve_surface_plan,
 };
 use crate::{daemon, fs_util, tls, utils};
 
@@ -506,6 +506,9 @@ pub(crate) struct Snapshot {
     path: PathBuf,
     /// The file that was there, or `None` when the path was absent.
     prior: Option<PriorFile>,
+    /// Whether the path was captured through a rooted handle, so its
+    /// restore goes through that handle too.
+    rooted: bool,
 }
 
 /// What was at a live path, and how it was owned.
@@ -524,19 +527,35 @@ impl Snapshot {
     /// Captures `path` into `artifacts` under the artifact basename
     /// `name`.
     ///
+    /// With `tree` rooted and `path` below its anchor, the bytes, the
+    /// mode and the owner come from one descriptor opened without
+    /// following a name ([`SecretsTree::read_with_meta`]), and the
+    /// snapshot's restore goes through the handle as well. The artifact
+    /// is written beside the surface key either way.
+    ///
     /// # Errors
     ///
     /// Returns an error when the file exists and cannot be read or
-    /// stat'ed, or when the artifact cannot be written. Reaching one of
-    /// those before the first live write is what keeps a publication
-    /// from starting without a way back.
-    fn capture(path: &Path, name: &str, artifacts: &Artifacts) -> Result<Self> {
+    /// stat'ed — through a rooted handle, also when a level is a link —
+    /// or when the artifact cannot be written. Reaching one of those
+    /// before the first live write is what keeps a publication from
+    /// starting without a way back.
+    fn capture(
+        path: &Path,
+        name: &str,
+        artifacts: &Artifacts,
+        tree: Option<&SecretsTree>,
+    ) -> Result<Self> {
+        if let Some(tree) = tree.filter(|tree| fs_util::takes_rooted_branch(tree, path)) {
+            return Self::capture_in(tree, path, name, artifacts);
+        }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self {
                     path: path.to_path_buf(),
                     prior: None,
+                    rooted: false,
                 });
             }
             Err(err) => {
@@ -565,6 +584,43 @@ impl Snapshot {
                 uid: metadata.uid(),
                 gid: metadata.gid(),
             }),
+            rooted: false,
+        })
+    }
+
+    /// The rooted half of [`Snapshot::capture`].
+    fn capture_in(
+        tree: &SecretsTree,
+        path: &Path,
+        name: &str,
+        artifacts: &Artifacts,
+    ) -> Result<Self> {
+        let (bytes, meta) = match tree.read_with_meta(path) {
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    path: path.to_path_buf(),
+                    prior: None,
+                    rooted: true,
+                });
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "reading {} to capture a rollback snapshot",
+                    path.display()
+                )));
+            }
+        };
+        let artifact = artifacts.write(name, &bytes, KEY_FILE_MODE_DEFAULT)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            prior: Some(PriorFile {
+                artifact,
+                mode: meta.mode,
+                uid: meta.uid,
+                gid: meta.gid,
+            }),
+            rooted: true,
         })
     }
 
@@ -610,22 +666,45 @@ pub(crate) trait LivePaths: Send + Sync {
 /// nothing else.
 pub(crate) struct FilesystemPaths {
     policy: CertGroupPolicy,
+    /// The daemon's handle on the secrets directory. When it is rooted,
+    /// the bundle below its anchor is written, and every snapshot
+    /// captured through it is restored, through the handle.
+    tree: Option<Arc<SecretsTree>>,
 }
 
 impl FilesystemPaths {
     /// The policy both surface leaves are issued under: root-owned
     /// material with no cert group, exactly as start-time issuance
     /// publishes them.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(tree: Option<Arc<SecretsTree>>) -> Self {
         Self {
             policy: CertGroupPolicy::none(),
+            tree,
         }
+    }
+
+    /// The handle, when `path` takes its rooted branch.
+    fn rooted_for(&self, path: &Path) -> Option<&Arc<SecretsTree>> {
+        self.tree
+            .as_ref()
+            .filter(|tree| fs_util::takes_rooted_branch(tree, path))
     }
 }
 
 impl LivePaths for FilesystemPaths {
     fn write_bundle<'a>(&'a self, path: &'a Path, contents: &'a str) -> LiveWrite<'a> {
-        Box::pin(async move { fs_util::write_ca_bundle(path, contents, self.policy).await })
+        Box::pin(async move {
+            if let Some(tree) = self.rooted_for(path) {
+                let path = path.to_path_buf();
+                let contents = contents.to_owned();
+                return tree
+                    .run(move |tree| {
+                        crate::acme::flow::publish_ca_bundle_in(tree, &path, &contents)
+                    })
+                    .await;
+            }
+            fs_util::write_ca_bundle(path, contents, self.policy).await
+        })
     }
 
     fn write_pair<'a>(
@@ -642,6 +721,9 @@ impl LivePaths for FilesystemPaths {
 
     fn restore<'a>(&'a self, snapshot: &'a Snapshot) -> LiveWrite<'a> {
         Box::pin(async move {
+            if snapshot.rooted {
+                return self.restore_rooted(snapshot).await;
+            }
             let Some(prior) = snapshot.prior.as_ref() else {
                 // The path was absent when the snapshot was taken, so
                 // restoring it means removing whatever the publication
@@ -676,6 +758,54 @@ impl LivePaths for FilesystemPaths {
     }
 }
 
+impl FilesystemPaths {
+    /// Restores a snapshot [`Snapshot::capture`] took through the rooted
+    /// handle, through that handle: the absence it captured by removing
+    /// the entry at its name (`NotFound` is that absence already), or the
+    /// file by publishing its bytes with the captured mode and owner, as
+    /// `atomic_write_fixed_owner` publishes them path-based.
+    async fn restore_rooted(&self, snapshot: &Snapshot) -> Result<()> {
+        let tree = self.tree.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} was captured through the secrets directory handle, and the writer restoring \
+                 it holds none",
+                snapshot.path.display()
+            )
+        })?;
+        let path = snapshot.path.clone();
+        let Some(prior) = snapshot.prior.as_ref() else {
+            return tree
+                .run(move |tree| match tree.remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(err) => Err(anyhow::Error::new(err).context(format!(
+                        "removing {} to restore the absence a snapshot captured",
+                        path.display()
+                    ))),
+                })
+                .await;
+        };
+        let bytes = tokio::fs::read(&prior.artifact).await.with_context(|| {
+            format!(
+                "reading the rollback snapshot of {}",
+                snapshot.path.display()
+            )
+        })?;
+        let (mode, uid, gid) = (prior.mode, prior.uid, prior.gid);
+        tree.run(move |tree| {
+            tree.publish(
+                Destination::bootroot_owned(&path),
+                &bytes,
+                StagedMode::Policy(mode),
+                RootedOwner::Fixed(FixedOwner::restored(uid, gid)),
+                fs_util::StagedDurability::FlushDirectory,
+            )
+            .with_context(|| format!("restoring {} from its snapshot", path.display()))
+        })
+        .await
+    }
+}
+
 // ---------------------------------------------------------------------
 // The adapter
 // ---------------------------------------------------------------------
@@ -703,19 +833,35 @@ pub(crate) struct RenewalCadence {
 impl RenewalCadence {
     /// Reads the cadence off the rendered internal agent config.
     ///
+    /// With `tree` rooted and `settings` the daemon's own config, read
+    /// through it and held to the layout below its anchor
+    /// ([`checked_daemon_settings`]), the cadence is taken from
+    /// `settings` and `agent.toml` is not read again by name. Otherwise
+    /// it is read below `secrets_dir`, as it always has been.
+    ///
     /// # Errors
     ///
     /// Returns an error when that config is absent, unparseable or
     /// fails the loader's invariants, or when it carries no profile.
-    pub(crate) fn from_internal_config(secrets_dir: &Path) -> Result<Self> {
+    pub(crate) fn from_internal_config(
+        secrets_dir: &Path,
+        settings: &Settings,
+        tree: Option<&SecretsTree>,
+    ) -> Result<Self> {
         let paths = InternalPaths::new(secrets_dir);
-        let internal = load_internal_config(&paths).with_context(|| {
-            format!(
-                "reading the registrar renewal cadence from the rendered internal agent config \
-                 at {}",
-                paths.agent_config().display()
-            )
-        })?;
+        let loaded;
+        let internal = if let Some(internal) = checked_daemon_settings(settings, tree) {
+            internal
+        } else {
+            loaded = load_internal_config(&paths).with_context(|| {
+                format!(
+                    "reading the registrar renewal cadence from the rendered internal agent \
+                     config at {}",
+                    paths.agent_config().display()
+                )
+            })?;
+            &loaded
+        };
         let profile = internal.profiles.first().ok_or_else(|| {
             anyhow::anyhow!(
                 "the rendered internal agent config at {} carries no profile to take the \
@@ -733,7 +879,7 @@ impl RenewalCadence {
             // under a different budget from the profile it takes every
             // other cadence value from would be a second retry policy
             // wearing the first one's name.
-            retry_backoff: daemon::select_retry_backoff(&internal, profile).to_vec(),
+            retry_backoff: daemon::select_retry_backoff(internal, profile).to_vec(),
         })
     }
 }
@@ -748,6 +894,10 @@ pub(crate) struct RegistrarCertRenewal {
     state: RegistrarCertRenewalState,
     cadence: RenewalCadence,
     live: Box<dyn LivePaths>,
+    /// The daemon's handle on the secrets directory: the bundle's read,
+    /// its snapshot, the account key and the publication lock below the
+    /// anchor go through it when it is rooted.
+    secrets_tree: Option<Arc<SecretsTree>>,
 }
 
 impl RegistrarCertRenewal {
@@ -790,11 +940,13 @@ impl RegistrarCertRenewal {
     pub(crate) async fn prepare(
         settings: Arc<Settings>,
         endpoint: Arc<ActivatedEndpoint>,
+        tree: Option<Arc<SecretsTree>>,
     ) -> Result<Self> {
-        let plan = resolve_surface_plan(&settings)
+        let plan = resolve_surface_plan(&settings, tree.as_deref())
             .context("resolving the registrar surface renewal plan")?;
-        let cadence = RenewalCadence::from_internal_config(&plan.secrets_dir)?;
-        Self::assemble(settings, plan, endpoint, cadence).await
+        let cadence =
+            RenewalCadence::from_internal_config(&plan.secrets_dir, &settings, tree.as_deref())?;
+        Self::assemble(settings, plan, endpoint, cadence, tree).await
     }
 
     /// Initializes the accessor and assembles the adapter around an
@@ -816,6 +968,7 @@ impl RegistrarCertRenewal {
         plan: SurfacePlan,
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
+        secrets_tree: Option<Arc<SecretsTree>>,
     ) -> Result<Self> {
         let state = endpoint.renewal_state();
         for pair in &plan.pairs {
@@ -864,7 +1017,8 @@ impl RegistrarCertRenewal {
             endpoint,
             state,
             cadence,
-            live: Box::new(FilesystemPaths::new()),
+            live: Box::new(FilesystemPaths::new(secrets_tree.clone())),
+            secrets_tree,
         })
     }
 
@@ -894,7 +1048,22 @@ impl RegistrarCertRenewal {
         endpoint: Arc<ActivatedEndpoint>,
         cadence: RenewalCadence,
     ) -> Result<Self> {
-        Self::assemble(settings, plan, endpoint, cadence).await
+        Self::assemble(settings, plan, endpoint, cadence, None).await
+    }
+
+    /// The assembly step over a handle on the secrets directory, for a
+    /// test that drives the rooted publication.
+    #[cfg(test)]
+    pub(crate) async fn for_test_in(
+        settings: Arc<Settings>,
+        plan: SurfacePlan,
+        endpoint: Arc<ActivatedEndpoint>,
+        cadence: RenewalCadence,
+        tree: Option<Arc<SecretsTree>>,
+    ) -> Self {
+        Self::assemble(settings, plan, endpoint, cadence, tree)
+            .await
+            .expect("the fixture writes both leaves before the adapter reads them")
     }
 
     /// Returns the accessor this adapter writes.
@@ -1097,9 +1266,14 @@ impl RegistrarCertRenewal {
         let produced: Mutex<Option<crate::acme::IssuedMaterial>> = Mutex::new(None);
         utils::retry_with_backoff_and_sleep(
             || async {
-                let material =
-                    issue_surface_pair_material(&self.settings, pair, &self.plan.host, inputs)
-                        .await?;
+                let material = issue_surface_pair_material(
+                    &self.settings,
+                    pair,
+                    &self.plan.host,
+                    inputs,
+                    self.secrets_tree.as_ref(),
+                )
+                .await?;
                 // The guard is taken and dropped inside this statement;
                 // nothing holds it across an `.await`.
                 *produced.lock().unwrap_or_else(PoisonError::into_inner) = Some(material);
@@ -1182,8 +1356,11 @@ impl RegistrarCertRenewal {
         // past the last restore a failure can perform, so no writer in
         // another process can land inside the transaction. Outside the
         // bundle lock, in the one order every writer takes them.
-        let _publication =
-            crate::publication_lock::hold(&[bundle_path, &pair.cert_path, &pair.key_path]).await?;
+        let _publication = crate::publication_lock::hold_in(
+            self.secrets_tree.as_ref(),
+            &[bundle_path, &pair.cert_path, &pair.key_path],
+        )
+        .await?;
 
         // Taken before the read the merge is computed from and held
         // past the last restore a failure can perform, so no other
@@ -1232,9 +1409,17 @@ impl RegistrarCertRenewal {
         })?;
 
         // Only now, with nothing left that can fail before a write.
-        let bundle_snapshot = Snapshot::capture(bundle_path, "bundle.snapshot", artifacts)?;
-        let cert_snapshot = Snapshot::capture(&pair.cert_path, "cert.snapshot", artifacts)?;
-        let key_snapshot = Snapshot::capture(&pair.key_path, "key.snapshot", artifacts)?;
+        // The bundle is below the secrets directory and reached through
+        // the handle when it is rooted; the pair is operator-named and
+        // stays path-based, as its write does.
+        let bundle_snapshot = Snapshot::capture(
+            bundle_path,
+            "bundle.snapshot",
+            artifacts,
+            self.secrets_tree.as_deref(),
+        )?;
+        let cert_snapshot = Snapshot::capture(&pair.cert_path, "cert.snapshot", artifacts, None)?;
+        let key_snapshot = Snapshot::capture(&pair.key_path, "key.snapshot", artifacts, None)?;
 
         if let Err(err) = self.live.write_bundle(bundle_path, &staged_bundle).await {
             return Err(self.roll_back(err, &[&bundle_snapshot]).await);
@@ -1310,7 +1495,15 @@ impl RegistrarCertRenewal {
             );
         }
         crate::acme::verify_chain_fingerprints(chain, &self.settings.trust.trusted_ca_sha256)?;
-        let existing = match std::fs::read(bundle_path) {
+        let read = match self
+            .secrets_tree
+            .as_deref()
+            .filter(|tree| fs_util::takes_rooted_branch(tree, bundle_path))
+        {
+            Some(tree) => tree.read(bundle_path),
+            None => std::fs::read(bundle_path),
+        };
+        let existing = match read {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => {
