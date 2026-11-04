@@ -79,16 +79,21 @@ INIT_LOG="$ARTIFACT_DIR/init.log"
 INIT_RAW_LOG="$ARTIFACT_DIR/init.raw.log"
 INIT_SUMMARY_JSON="$ARTIFACT_DIR/init-summary.json"
 
-# Non-loopback bind for all three exposed services, as `run-openbao-user.sh`
-# binds them, for the reason `run-openbao-tls-reown.sh` gives: every host
-# that can run this harness has the `docker0` interface, and a specific
-# (non-wildcard) bind needs no advertise address.
+# Non-loopback bind for step-ca only, for the reason
+# `run-openbao-tls-reown.sh` gives: every host that can run this harness
+# has the `docker0` interface, and a specific (non-wildcard) bind needs
+# no advertise address.  OpenBao and the HTTP-01 admin API stay on
+# loopback, unlike in `run-openbao-user.sh`: step 2 runs `infra install`
+# again on the initialised stack, and an install that records an OpenBao
+# or HTTP-01 admin bind puts `openbao.hcl` back to plaintext and strips
+# the responder's TLS until the next `init` issues fresh certificates, so
+# the `infra up` that follows it would refuse to expose either.  A step-ca
+# bind records state only and survives the second install, and nothing
+# this harness checks needs the other two exposed.
 BIND_HOST_DEFAULT="172.17.0.1"
 BIND_HOST="${BIND_HOST:-$BIND_HOST_DEFAULT}"
-OPENBAO_BIND_ADDR="${BIND_HOST}:8200"
 STEPCA_BIND_ADDR="${BIND_HOST}:9000"
-HTTP01_ADMIN_BIND_ADDR="${BIND_HOST}:8080"
-EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+OPENBAO_LOOPBACK_URL="http://127.0.0.1:8200"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
 OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
@@ -309,9 +314,14 @@ ensure_bind_host_available() {
   fi
 }
 
+# As root: root wrote the `.env` Compose reads, and it is not the
+# invoking user's until `restore_ownership` runs after this.
 capture_artifacts() {
-  compose ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
-  compose logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
+  root_env
+  run_sudo env "${ROOT_ENV[@]}" docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" \
+    -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" ps >"$ARTIFACT_DIR/compose-ps.log" 2>&1 || true
+  run_sudo env "${ROOT_ENV[@]}" docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" \
+    -f "$COMPOSE_FILE" -f "$COMPOSE_TEST_FILE" logs --no-color >"$ARTIFACT_DIR/compose-logs.log" 2>&1 || true
   if [ -d "$SECRETS_DIR" ]; then
     run_sudo find "$SECRETS_DIR" -printf '%U:%G %m %y %p\n' \
       >"$ARTIFACT_DIR/secrets-tree.log" 2>&1 || true
@@ -399,10 +409,11 @@ remove_accounts() {
   return "$status"
 }
 
-# See `run-openbao-tls-no-delta.sh`: `init` rewrites the repo-level
-# `openbao/openbao.hcl` (mounted `:ro`) to a TLS listener and drops the
-# issued server cert under `openbao/tls/`.  Both persist after the
-# script exits, so restore the checkout to its pre-run state.
+# See `run-openbao-tls-no-delta.sh`: bootroot rewrites the repo-level
+# `openbao/openbao.hcl` (mounted `:ro`) — `infra install` and `infra up`
+# set its audit device — and may write under `openbao/config/` and
+# `openbao/tls/`.  All of it persists after the script exits, so restore
+# the checkout to its pre-run state.
 snapshot_repo_openbao_config() {
   if [ -f "$OPENBAO_REPO_HCL" ]; then
     cp "$OPENBAO_REPO_HCL" "$OPENBAO_HCL_SNAPSHOT"
@@ -569,11 +580,7 @@ install_infra() {
   run_bootroot_as_root infra install \
     --compose-file "$COMPOSE_FILE" \
     --openbao-user "${SECRETS_UID}:${SECRETS_GID}" \
-    --openbao-bind "$OPENBAO_BIND_ADDR" \
-    --openbao-tls-required \
-    --stepca-bind "$STEPCA_BIND_ADDR" \
-    --http01-admin-bind "$HTTP01_ADMIN_BIND_ADDR" \
-    --http01-admin-tls-required "$@" >>"$RUN_LOG" 2>&1
+    --stepca-bind "$STEPCA_BIND_ADDR" "$@" >>"$RUN_LOG" 2>&1
 }
 
 install_without_postgres_user() {
@@ -581,31 +588,18 @@ install_without_postgres_user() {
   install_infra || fail "bootroot infra install failed"
 }
 
-# Applied the way `run-openbao-user.sh` applies it: the override
-# republishes OpenBao on the bind address only, and `init` is pointed at
-# that address below.
-apply_exposed_override() {
-  log_phase "apply-override"
-  run_sudo test -f "$EXPOSED_OVERRIDE_PATH" \
-    || fail "expected infra install to write $EXPOSED_OVERRIDE_PATH"
-  root_env
-  run_sudo env "${ROOT_ENV[@]}" docker compose -p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" \
-    -f "$EXPOSED_OVERRIDE_PATH" up -d openbao >>"$RUN_LOG" 2>&1 \
-    || fail "failed to apply the openbao-exposed override"
-  wait_for_openbao_listening "http://${OPENBAO_BIND_ADDR}"
-}
-
 run_init() {
   log_phase "init"
   wait_for_postgres_admin
-  # `infra install` writes state.json (to record the bind intents) before
+  wait_for_openbao_listening "$OPENBAO_LOOPBACK_URL"
+  # `infra install` writes state.json (to record the bind intent) before
   # init runs, so init's overwrite prompts fire.  Answer them with their
   # per-prompt flags and run with stdin closed so the run stays
   # non-interactive.
   if ! run_bootroot_as_root init \
     --compose-file "$COMPOSE_FILE" \
     --secrets-dir "$SECRETS_DIR" \
-    --openbao-url "http://${OPENBAO_BIND_ADDR}" \
+    --openbao-url "$OPENBAO_LOOPBACK_URL" \
     --summary-json "$INIT_SUMMARY_JSON" \
     --enable auto-generate,show-secrets,db-provision \
     --stepca-password "$DEFAULT_STEPCA_PASSWORD" \
@@ -618,7 +612,7 @@ run_init() {
     --confirm-db-provision \
     --db-user "step" \
     --db-name "stepca" \
-    --responder-url "https://${HTTP01_ADMIN_BIND_ADDR}" \
+    --responder-url "http://localhost:8080" \
     --skip responder-check </dev/null >"$INIT_RAW_LOG" 2>&1; then
     {
       echo "bootroot init failed (raw tail):"
@@ -680,7 +674,7 @@ assert_stack_healthy() {
   for _ in $(seq 1 "$HEALTH_ATTEMPTS"); do
     if run_bootroot_as_root status \
       --compose-file "$COMPOSE_FILE" \
-      --openbao-url "https://${OPENBAO_BIND_ADDR}" >"$log" 2>&1; then
+      --openbao-url "$OPENBAO_LOOPBACK_URL" >"$log" 2>&1; then
       cp "$log" "$ARTIFACT_DIR/status.log"
       return 0
     fi
@@ -938,10 +932,6 @@ main() {
   prepare_secrets_dir
 
   install_without_postgres_user
-  # `infra install` brings the stack up on the base compose file, so
-  # OpenBao is still published on loopback at this point.
-  wait_for_openbao_listening "http://127.0.0.1:8200"
-  apply_exposed_override
   run_init
   log_phase "assert-healthy"
   assert_stack_healthy "after-init"
