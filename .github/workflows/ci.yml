@@ -295,14 +295,17 @@ jobs:
         # BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 turns the tests' non-root skip
         # into a failure, so a runner that silently stopped being root
         # cannot pass this step by skipping; `sudo` strips it by default,
-        # hence --preserve-env. `as_root_only` selects the one library test
-        # of the same kind (the generation tree under an owner).
+        # hence --preserve-env. `as_root_only` selects the library test of
+        # the same kind (the generation tree under an owner) and the
+        # binary's (`rotate stepca-password`'s staged password given to the
+        # owner of a foreign-owned `secrets/`).
         env:
           BOOTROOT_E2E_REQUIRE_CERT_OWNER: "1"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo --preserve-env=BOOTROOT_E2E_REQUIRE_CERT_OWNER
         run: |
           cargo test --test e2e_cert_owner_chown
           cargo test --lib as_root_only
+          cargo test --bin bootroot as_root_only
 
       # --- E2E Integration Testing (Docker) ---
       - name: Set secrets directory
