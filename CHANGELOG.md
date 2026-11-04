@@ -4,6 +4,33 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A root-run `infra install`, `init`, `infra up` or `openbao save-unseal-keys`
+  over a `secrets/` directory owned by another account now stops with an error
+  naming the path when a directory it walks there, at any level, or a generated
+  file it would publish there under a name you may have relocated by symlink, is
+  a symbolic link, instead of following the link. The HTTP-01 admin
+  certificate's issuance in `init` and its re-issue in `rotate infra-cert`
+  likewise stop, instead of following a symbolic link, at the certificate's
+  directory or files there.
+
+### Fixed
+
+- A root-run `infra install`, `init` or `openbao save-unseal-keys` over a
+  `secrets/` directory owned by another account now gives every directory it
+  creates there mode `0700`, intermediate levels included, and the owner of the
+  directory it is created in, and gives the compose overrides, the HTTP-01 admin
+  TLS directory, the OpenBao Agent CA bundle and the saved OpenBao unseal keys it
+  writes there the owner of their directory, instead of leaving directories at
+  the umask's mode and files owned by root until the next `infra up`. In that
+  case the mode normalisation `init` runs after a fresh `step ca init` also no
+  longer follows a symbolic link it finds there, which could change the modes of
+  files outside `secrets/`. Any run, root or not, now also creates every missing
+  directory level under `secrets/` at mode `0700` instead of the umask's.
+
 ## [0.6.0] - 2026-10-31
 
 ### Added
@@ -3082,6 +3109,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.6.0...HEAD
 [0.6.0]: https://github.com/aicers/bootroot/compare/0.5.0...0.6.0
 [0.5.0]: https://github.com/aicers/bootroot/compare/0.4.0...0.5.0
 [0.4.0]: https://github.com/aicers/bootroot/compare/0.3.0...0.4.0

@@ -380,16 +380,20 @@ pub(in crate::commands::init) async fn write_postgres_tls_files(
 
     let compose_root = std::fs::canonicalize(compose_dir)
         .with_context(|| messages.error_resolve_path_failed(&compose_dir.display().to_string()))?;
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let override_dir = secrets_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_DIR);
-    fs_util::ensure_shared_secrets_dir(&override_dir).await?;
+    tree.ensure_dir_async(&override_dir).await?;
     let override_path = override_dir.join(POSTGRES_TLS_COMPOSE_OVERRIDE_NAME);
-    // The same three decisions as the responder override: published by
+    // The same decisions as the responder override: published by
     // rename, not flushed, at the destination's mode or the umask's
-    // answer on a create.
-    fs_util::atomic_replace(
+    // answer on a create, under the owner of the directory it lands in,
+    // and through the tree handle.
+    tree.publish_async(
         fs_util::Destination::operator_named(&override_path),
         postgres_tls_override_contents(&compose_root).as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;

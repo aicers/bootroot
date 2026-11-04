@@ -163,7 +163,9 @@ knowing when you operate around a running stack.
   carries whatever mode the write had reached: the `0600` a staged file starts
   at, the finished file's own mode, or — for the files whose mode the umask
   decides — what the umask gave it. Nothing reads it and nothing cleans it up,
-  so delete it. A write that merely fails removes its own temporary.
+  so delete it. A write that merely fails removes its own temporary. The
+  root-run writes under a `secrets/` owned by another account, described below,
+  name it `.tmp-bootroot-<pid>-<n>` instead.
 
 Whether the containing directory is flushed after the rename is decided per
 file, because that flush costs a disk round trip on every write:
@@ -207,6 +209,14 @@ it. Those files are `state.json`, `ca.json`, `openbao.hcl`, the compose
 overrides and the ones `init` restores when it rolls back: on a host running
 `umask 077` they are created at `0600`, on the default `umask 022` at `0644`.
 
+Ownership under `secrets/` follows the tree: when you run `infra install`,
+`init` or `openbao save-unseal-keys` as root over a `secrets/` owned by another
+account, every directory they create there is `0700` and owned by the owner of
+the directory it is created in, and the compose overrides, the HTTP-01 admin TLS
+directory, the OpenBao Agent CA bundle and the saved OpenBao unseal keys they
+write there take the owner of the directory they land in, so the account
+`secrets/` belongs to can read them without waiting for the next `infra up`.
+
 `.env` is the exception in that second group. It preserves an existing mode like
 the rest, but a fresh one is created `0600` rather than left to your umask,
 because `infra install` writes `POSTGRES_PASSWORD` into it and it sits in the
@@ -232,7 +242,13 @@ rather than following a link at it:
   target host is in this group: that command is what creates the file there, so
   a link you put at its `--agent-config-path` is one you arranged yourself. Its
   adjacent `--eab-file-path` remains a credential path, so a link there is
-  replaced instead.
+  replaced instead. A root-run `infra install`, `init`, `infra up` (for the
+  OpenBao audit override), `openbao save-unseal-keys` or `rotate infra-cert`
+  (for the HTTP-01 admin certificate) over a `secrets/` owned by another account
+  is the exception: it refuses a symbolic link at any directory it walks there
+  and at a generated file it would publish there, and stops with an error naming
+  the path instead of following it, so relocating a generated file by symlink
+  does not apply in that case.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
   link found there with a regular file. The OpenBao unseal-keys and secrets-tree

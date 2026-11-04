@@ -1904,22 +1904,16 @@ async fn rebuilt_admin_dsn_for_kv(
 /// This adjusts modes only; it does not change ownership. Every `step`
 /// helper container already runs as the secrets-directory owner, so the
 /// material it creates is host-owned and needs only its modes tightened.
+///
+/// The walk is the tree handle's: a root process over a `secrets/`
+/// another account owns lists every directory from its own descriptor
+/// and follows no symbolic link it finds there, where the walk by path
+/// would have changed the modes of whatever the link pointed at.
 async fn fix_secrets_permissions(secrets_dir: &Path) -> Result<()> {
-    fix_permissions_recursive(secrets_dir).await
-}
-
-async fn fix_permissions_recursive(dir: &Path) -> Result<()> {
-    let mut entries = tokio::fs::read_dir(dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.is_dir() {
-            fs_util::ensure_secrets_dir(&path).await?;
-            Box::pin(fix_permissions_recursive(&path)).await?;
-        } else if path.is_file() {
-            fs_util::set_key_permissions(&path).await?;
-        }
-    }
-    Ok(())
+    let secrets_dir = secrets_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || fs_util::SecretsTree::open(&secrets_dir)?.normalize_modes())
+        .await
+        .context("Secrets permission fix task panicked")?
 }
 
 /// Async because the state write is: publishing `state.json` costs

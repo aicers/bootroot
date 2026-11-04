@@ -23,7 +23,7 @@ cd "$ROOT_DIR"
 IMPL_DIR="$ROOT_DIR/scripts/impl"
 LABEL="validate-e2e-openssl-compat"
 
-# All six scripts that check for `openssl` gate on `x509 -ext`, not only
+# All seven scripts that check for `openssl` gate on `x509 -ext`, not only
 # `run-stepca-san.sh`, which is the sole caller: the matrix runs every
 # step against one host, so a host that cannot serve the SAN step cannot
 # serve the matrix. Pinning the set here is what keeps a later change
@@ -34,6 +34,7 @@ GATED_SCRIPTS=(
   run-openbao-tls-reown.sh
   run-reinit-recovery.sh
   run-remote-lifecycle.sh
+  run-secrets-owner.sh
   run-stepca-san.sh
 )
 
@@ -302,7 +303,7 @@ check_gating_is_not_narrowed() {
   discovered="$(cd "$IMPL_DIR" && { grep -lE '^ensure_openssl\(\) \{' ./*.sh || true; } | sed 's|^\./||' | sort | tr '\n' ' ')"
   local expected
   expected="$(printf '%s\n' "${GATED_SCRIPTS[@]}" | sort | tr '\n' ' ')"
-  expect_eq "the gated set is exactly the six scripts that check for openssl" \
+  expect_eq "the gated set is exactly the seven scripts that check for openssl" \
     "$discovered" "$expected"
 
   local script

@@ -16,19 +16,29 @@ pub(crate) fn unseal_keys_path(secrets_dir: &Path) -> std::path::PathBuf {
 }
 
 /// Saves unseal keys to a file with restricted permissions.
+///
+/// The file and a directory created for it take the owner of the
+/// directory they land in — the owner of `secrets/` on a tree nobody
+/// re-owned by hand, which is the owner the ownership sweep gives the
+/// file at the next `infra up` and the one a non-root `infra up` reads
+/// it as to auto-unseal. Both go through the tree handle, so a root
+/// process over a `secrets/` another account owns follows no name there.
 pub(crate) async fn save_unseal_keys(
     secrets_dir: &Path,
     keys: &[String],
     messages: &Messages,
 ) -> Result<std::path::PathBuf> {
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let dir = secrets_dir.join(UNSEAL_KEYS_DIR);
-    fs_util::ensure_secrets_dir(&dir).await?;
+    tree.ensure_dir_async(&dir).await?;
     let path = dir.join(UNSEAL_KEYS_FILENAME);
     let contents = keys.join("\n") + "\n";
-    fs_util::atomic_write(
+    tree.publish_async(
         fs_util::Destination::bootroot_owned(&path),
         contents.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::FlushDirectory,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;

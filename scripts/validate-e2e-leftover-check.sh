@@ -612,6 +612,7 @@ DEFAULT_IDENTITY_SCRIPTS=(
   run-reinit-recovery.sh
   run-remote-lifecycle.sh
   run-rotation-recovery.sh
+  run-secrets-owner.sh
   run-stepca-san.sh
 )
 

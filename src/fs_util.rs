@@ -9,6 +9,9 @@ use tokio::fs;
 use crate::cert_group::{self, CertGroupPolicy};
 
 pub mod generation;
+mod secrets_tree;
+
+pub use secrets_tree::{RootedOwner, SecretsTree, rooted_mode};
 
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
@@ -944,15 +947,22 @@ impl StagedMode {
     /// staged publish that follows reports the real error, and guessing
     /// a mode here would only replace it with a worse one.
     fn resolve(self, path: &Path) -> Option<u32> {
-        let existing = || {
+        self.resolve_existing(
             std::fs::metadata(path)
                 .map(|meta| meta.permissions().mode() & 0o7777)
-                .ok()
-        };
+                .ok(),
+        )
+    }
+
+    /// [`StagedMode::resolve`] against a destination mode already read,
+    /// `None` meaning no destination: the answer a rooted
+    /// [`SecretsTree::publish`] takes from the leaf it read without
+    /// following it.
+    fn resolve_existing(self, existing: Option<u32>) -> Option<u32> {
         match self {
             StagedMode::Policy(mode) => Some(mode),
-            StagedMode::PreserveOrCreate(create_mode) => Some(existing().unwrap_or(create_mode)),
-            StagedMode::PreserveOrUmask => existing(),
+            StagedMode::PreserveOrCreate(create_mode) => Some(existing.unwrap_or(create_mode)),
+            StagedMode::PreserveOrUmask => existing,
         }
     }
 }
@@ -1054,6 +1064,13 @@ pub enum StagedOwner {
     /// running as the tree's owner — makes no privileged call at all
     /// and this arm leaves exactly what [`StagedOwner::Destination`]
     /// left.
+    ///
+    /// The staged file is chowned through its descriptor, but the
+    /// directory is still stat'd and the publish still renamed by name.
+    /// A root process writing under a `secrets/` another account owns
+    /// therefore publishes through [`SecretsTree::publish`] with
+    /// [`RootedOwner::ContainingDir`], which reads the owner off the
+    /// directory's own descriptor and renames between that descriptor.
     ContainingDir,
 }
 
@@ -1343,6 +1360,15 @@ pub(crate) fn chown_policy_owner_context(uid: u32, path: &Path) -> String {
 /// reached — while the destination itself still holds the previous
 /// file.
 ///
+/// Every owner policy stats and chowns the staged file through its open
+/// descriptor rather than its temporary name, which someone able to
+/// write the directory could have replaced with a symlink by then. The
+/// directory and the destination are still reached by name, so a root
+/// process writing under a `secrets/` another account owns goes through
+/// [`SecretsTree::publish`] instead, which walks from the tree's
+/// descriptor and renames between the directory's own descriptor; for
+/// every other writer that method calls this one.
+///
 /// A destination that is a symlink is renamed over rather than followed,
 /// which destroys the operator's link. That is the decided behaviour
 /// here — a caller wanting the link resolved says so with
@@ -1383,19 +1409,21 @@ pub fn publish_staged_blocking(
             if let Some((dest_uid, dest_gid)) =
                 std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid()))
             {
-                let tmp_meta = std::fs::metadata(tmp.path())
+                let tmp_meta = tmp
+                    .as_file()
+                    .metadata()
                     .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
                 // Skipping a chown that would change nothing keeps an
                 // unprivileged writer whose ownership already matches
                 // from failing on a call it did not need to make.
                 if tmp_meta.uid() != dest_uid || tmp_meta.gid() != dest_gid {
-                    std::os::unix::fs::chown(tmp.path(), Some(dest_uid), Some(dest_gid))
+                    std::os::unix::fs::fchown(tmp.as_file(), Some(dest_uid), Some(dest_gid))
                         .with_context(|| chown_preserve_context(dest_uid, dest_gid, path))?;
                 }
             }
         }
         StagedOwner::PolicyGroup(Some(gid)) => {
-            std::os::unix::fs::chown(tmp.path(), None, Some(gid)).with_context(|| {
+            std::os::unix::fs::fchown(tmp.as_file(), None, Some(gid)).with_context(|| {
                 format!("Failed to chown {} to gid {gid}", tmp.path().display())
             })?;
         }
@@ -1407,21 +1435,25 @@ pub fn publish_staged_blocking(
             let owner = std::fs::metadata(&parent)
                 .map(|meta| (meta.uid(), meta.gid()))
                 .with_context(|| format!("Failed to stat {}", parent.display()))?;
-            let staged = std::fs::metadata(tmp.path())
+            let staged = tmp
+                .as_file()
+                .metadata()
                 .map(|meta| (meta.uid(), meta.gid()))
                 .with_context(|| format!("Failed to stat temp file for {}", path.display()))?;
             // Skipping a chown that would change nothing keeps the
             // ordinary non-root writer off a call it does not need.
             if staged != owner {
-                std::os::unix::fs::chown(tmp.path(), Some(owner.0), Some(owner.1)).with_context(
-                    || chown_containing_dir_context(owner.0, owner.1, &parent, path),
-                )?;
+                std::os::unix::fs::fchown(tmp.as_file(), Some(owner.0), Some(owner.1))
+                    .with_context(|| {
+                        chown_containing_dir_context(owner.0, owner.1, &parent, path)
+                    })?;
             }
         }
         StagedOwner::PolicyOwner(uid) => {
-            // Unconditional, as the `Fixed` arm below, and through the
-            // descriptor: the path could name a link someone else put
-            // there by now, and root would follow it.
+            // Unconditional, as the `Fixed` arm below. Through the
+            // descriptor, as every arm here is: the path could name a
+            // link someone else put there by now, and root would follow
+            // it.
             std::os::unix::fs::fchown(
                 tmp.as_file(),
                 Some(uid),
@@ -1435,7 +1467,7 @@ pub fn publish_staged_blocking(
             // every publish, and the call is the authority check. A
             // process that cannot make the staged inode `root:root`
             // must not go on to rename it into place under its own uid.
-            std::os::unix::fs::chown(tmp.path(), Some(fixed.uid), Some(fixed.gid))
+            std::os::unix::fs::fchown(tmp.as_file(), Some(fixed.uid), Some(fixed.gid))
                 .with_context(|| chown_fixed_context(fixed, path))?;
         }
     }
@@ -1521,9 +1553,17 @@ pub async fn ensure_secrets_dir(path: &Path) -> Result<()> {
 ///
 /// The owner is read from the nearest ancestor that already exists,
 /// which is the tree's, and an already-present directory is left on its
-/// own owner: this never re-owns what somebody else made. For a
-/// bootroot running as that owner — every non-root run — the chown is
-/// skipped and this is [`ensure_secrets_dir`] exactly.
+/// own owner: this never re-owns what somebody else made. Every level
+/// this call creates is set to `0700`, intermediate ones included; a
+/// level that already existed keeps its mode unless it is `path`
+/// itself, which ends `0700`. For a bootroot running as that owner —
+/// every non-root run — the chown is skipped.
+///
+/// Path-based: it creates, stats, chmods and chowns by name. A root
+/// process writing under a `secrets/` another account owns goes
+/// through [`SecretsTree::ensure_dir`] instead, which walks from
+/// the tree's descriptor and follows no name; this is that method's
+/// answer for every other writer.
 ///
 /// # Errors
 /// Returns an error if the directory cannot be created, its permissions
@@ -1564,7 +1604,18 @@ pub fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
         let Some(current) = cursor else {
             return ensure_secrets_dir_blocking(path);
         };
-        match std::fs::metadata(current) {
+        // A relative path's last ancestor is the empty path, which
+        // names the working directory but which no stat accepts. Read
+        // it as `.`, so `secrets/a/b` under a missing `secrets/` still
+        // finds an existing ancestor and every level below it is
+        // recorded as created, rather than the walk running off the
+        // top and leaving all but the last level at the umask's mode.
+        let probe = if current.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            current
+        };
+        match std::fs::metadata(probe) {
             Ok(meta) if meta.is_dir() => break (meta.uid(), meta.gid()),
             Ok(_) => return ensure_secrets_dir_blocking(path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1572,13 +1623,18 @@ pub fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
                 cursor = current.parent();
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("Failed to stat {}", current.display()));
+                return Err(err).with_context(|| format!("Failed to stat {}", probe.display()));
             }
         }
     };
 
     ensure_secrets_dir_blocking(path)?;
     for dir in created {
+        // Every level this call created, not only the last one
+        // `ensure_secrets_dir_blocking` chmods: `create_dir_all` leaves
+        // the intermediate ones at the umask's mode.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(SECRETS_DIR_MODE))
+            .with_context(|| format!("Failed to set mode on secrets dir {}", dir.display()))?;
         let meta =
             std::fs::metadata(&dir).with_context(|| format!("Failed to stat {}", dir.display()))?;
         // Skipping a chown that would change nothing keeps the ordinary
@@ -3489,6 +3545,83 @@ mod tests {
         let after = std::fs::metadata(&nested).unwrap();
         assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
         assert_eq!(after.ino(), before.ino());
+    }
+
+    /// The marker a re-executed child of
+    /// [`a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout`]
+    /// carries, telling it that it, not the parent, runs the body.
+    const RELATIVE_DIR_CHILD_MARKER: &str = "BOOTROOT_RELATIVE_DIR_TEST_CHILD";
+
+    /// A relative path whose every level is missing still has each of
+    /// them created `0700`.
+    ///
+    /// `secrets/a/b` under a working directory with no `secrets/` walks
+    /// up to the empty path, which names the working directory but
+    /// which no stat accepts; read as missing, it ended the walk with
+    /// no existing ancestor, and only `b/` was chmodded. A relative path
+    /// needs a working directory the test chooses, and the working
+    /// directory belongs to the process, so the body runs in a child of
+    /// this test binary started in a fresh `tempdir`. The child also
+    /// sets a `022` umask, so a level left to `mkdir` would show up as
+    /// `0755` whatever umask the parent was started under.
+    #[test]
+    fn a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout() {
+        const TEST_NAME: &str = "fs_util::tests::\
+            a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout";
+        let levels = [
+            Path::new("secrets"),
+            Path::new("secrets/a"),
+            Path::new("secrets/a/b"),
+        ];
+
+        if std::env::var_os(RELATIVE_DIR_CHILD_MARKER).is_some() {
+            // SAFETY: `umask` is a libc call with no memory effects.
+            // This process is the child spawned below for this one test
+            // (`--exact`, `--test-threads=1`), so no other test is
+            // running beside it to observe the change.
+            unsafe { libc::umask(0o022) };
+            ensure_shared_secrets_dir_blocking(Path::new("secrets/a/b")).unwrap();
+            for level in levels {
+                assert_eq!(
+                    std::fs::metadata(level).unwrap().permissions().mode() & 0o7777,
+                    SECRETS_DIR_MODE,
+                    "{}",
+                    level.display()
+                );
+            }
+            return;
+        }
+
+        let cwd = tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(&exe)
+            .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+            .env(RELATIVE_DIR_CHILD_MARKER, "1")
+            .current_dir(cwd.path())
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "child failed:\n{report}");
+        assert!(
+            report.contains("test result: ok. 1 passed"),
+            "`--exact {TEST_NAME}` must name exactly one test, and libtest \
+             calls a run of none a success:\n{report}"
+        );
+        // The child ran where it was put: the levels exist in this
+        // `tempdir`, at the mode the child already asserted.
+        for level in levels {
+            let meta = std::fs::metadata(cwd.path().join(level)).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                SECRETS_DIR_MODE,
+                "{}",
+                level.display()
+            );
+        }
     }
 
     /// The general wrappers are untouched by the fixed-owner arm: they

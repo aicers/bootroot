@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use bootroot::cert_group::CertGroupPolicy;
+use bootroot::cert_group::CA_BUNDLE_FILE_MODE;
 use bootroot::fs_util;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::openbao::SecretIdOptions;
@@ -724,13 +725,34 @@ pub(super) async fn setup_openbao_agents(
 /// The `OpenBao` TLS listener presents a leaf-only certificate, so the
 /// agent needs root **and** intermediate concatenated to build the
 /// chain.  Reuses [`compute_ca_bundle_pem`] (root + intermediate) and
-/// writes `secrets/certs/ca-bundle.pem` at `0644` via
-/// [`fs_util::write_ca_bundle`] so the separate agent container can read
-/// the bind-mounted file.
+/// writes `secrets/certs/ca-bundle.pem` at `0644` so the separate agent
+/// container can read the bind-mounted file.
+///
+/// Published as [`fs_util::write_ca_bundle`] publishes a bundle — by
+/// rename at [`CA_BUNDLE_FILE_MODE`], without a flush — except for the
+/// owner: the file takes the owner of `secrets/certs`, the uid the
+/// sidecars run as, where that helper leaves it to the writing process
+/// and a root-run `init` left it root's. `secrets/certs` is created at
+/// `0700` under the tree's owner, and both go through the tree handle,
+/// so a root process over a `secrets/` another account owns follows no
+/// name on the way.
 async fn provision_agent_ca_bundle(secrets_dir: &Path, messages: &Messages) -> Result<String> {
     let ca_bundle_pem = compute_ca_bundle_pem(secrets_dir, messages).await?;
-    let bundle_path = secrets_dir.join(CA_CERTS_DIR).join(CA_BUNDLE_FILENAME);
-    fs_util::write_ca_bundle(&bundle_path, &ca_bundle_pem, CertGroupPolicy::none()).await?;
+    let certs_dir = secrets_dir.join(CA_CERTS_DIR);
+    let bundle_path = certs_dir.join(CA_BUNDLE_FILENAME);
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
+    tree.ensure_dir_async(&certs_dir)
+        .await
+        .with_context(|| messages.error_write_file_failed(&certs_dir.display().to_string()))?;
+    tree.publish_async(
+        fs_util::Destination::bootroot_owned(&bundle_path),
+        ca_bundle_pem.as_bytes(),
+        fs_util::StagedMode::Policy(CA_BUNDLE_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
+    )
+    .await
+    .with_context(|| format!("Failed to write CA bundle file {}", bundle_path.display()))?;
     to_container_path(secrets_dir, &bundle_path, OPENBAO_AGENT_SECRETS_MOUNT)
 }
 
@@ -757,12 +779,16 @@ async fn write_openbao_agent_files(
     // the value `write_openbao_agent_compose_override` puts in `user:`
     // below. A `0700` level a root-run `init` created under its own uid
     // is one neither can traverse, so all three carry the tree's owner.
+    //
+    // Every write below goes through the tree handle, so a root process
+    // over a `secrets/` another account owns follows no name there.
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let base_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
-    fs_util::ensure_shared_secrets_dir(&base_dir).await?;
+    tree.ensure_dir_async(&base_dir).await?;
     let stepca_dir = base_dir.join(OPENBAO_AGENT_STEPCA_DIR);
     let responder_dir = base_dir.join(OPENBAO_AGENT_RESPONDER_DIR);
-    fs_util::ensure_shared_secrets_dir(&stepca_dir).await?;
-    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
+    tree.ensure_dir_async(&stepca_dir).await?;
+    tree.ensure_dir_async(&responder_dir).await?;
 
     let stepca_role = find_role_output(role_outputs, AppRoleLabel::Stepca, messages)?;
     let responder_role = find_role_output(role_outputs, AppRoleLabel::Responder, messages)?;
@@ -781,13 +807,26 @@ async fn write_openbao_agent_files(
     // the service-side credential.
     let stepca_role_id_path = stepca_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
     let stepca_secret_id_path = stepca_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
-    write_agent_credential(&stepca_role_id_path, &stepca_role.role_id, messages).await?;
-    write_agent_credential(&stepca_secret_id_path, &stepca_role.secret_id, messages).await?;
+    write_agent_credential(&tree, &stepca_role_id_path, &stepca_role.role_id, messages).await?;
+    write_agent_credential(
+        &tree,
+        &stepca_secret_id_path,
+        &stepca_role.secret_id,
+        messages,
+    )
+    .await?;
 
     let responder_role_id_path = responder_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
     let responder_secret_id_path = responder_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
-    write_agent_credential(&responder_role_id_path, &responder_role.role_id, messages).await?;
     write_agent_credential(
+        &tree,
+        &responder_role_id_path,
+        &responder_role.role_id,
+        messages,
+    )
+    .await?;
+    write_agent_credential(
+        &tree,
         &responder_secret_id_path,
         &responder_role.secret_id,
         messages,
@@ -836,19 +875,23 @@ async fn write_openbao_agent_files(
     // is regenerated in full from `state.json` and the template paths on
     // the next `init`. Both carry the tree's owner, which is the uid
     // the sidecar reading them runs as.
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&stepca_agent_config),
         stepca_config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| {
         messages.error_write_file_failed(&stepca_agent_config.display().to_string())
     })?;
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&responder_agent_config),
         responder_config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| {
@@ -898,8 +941,9 @@ async fn write_openbao_agent_compose_override(
     identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let agent_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
-    fs_util::ensure_shared_secrets_dir(&agent_dir).await?;
+    tree.ensure_dir_async(&agent_dir).await?;
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
     let override_path = agent_dir.join(OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME);
@@ -958,12 +1002,15 @@ services:
         user = user
     );
     // Published by rename, not flushed, at the destination's mode or
-    // the umask's answer on a create — the compose-override decisions
+    // the umask's answer on a create, under the owner of the directory
+    // it lands in — the compose-override decisions
     // `crate::commands::guardrails` records.
-    fs_util::atomic_replace(
+    tree.publish_async(
         fs_util::Destination::operator_named(&override_path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
@@ -979,11 +1026,18 @@ services:
 /// the uid that owns the secrets tree, so a `0600` file a root-run
 /// `init` left under its own uid is one that sidecar cannot read — and
 /// an `AppRole` it cannot read is an agent that never authenticates.
-async fn write_agent_credential(path: &Path, value: &str, messages: &Messages) -> Result<()> {
-    fs_util::atomic_write_dir_owner(
+async fn write_agent_credential(
+    tree: &Arc<fs_util::SecretsTree>,
+    path: &Path,
+    value: &str,
+    messages: &Messages,
+) -> Result<()> {
+    tree.publish_async(
         fs_util::Destination::bootroot_owned(path),
         value.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::FlushDirectory,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&path.display().to_string()))

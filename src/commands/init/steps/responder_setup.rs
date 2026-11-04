@@ -36,10 +36,13 @@ pub(super) async fn write_responder_files(
     // one and renders the config into the other, as the uid that owns
     // the tree. A `0700` level a root-run `init` created under its own
     // uid stops both, so each is created under the tree's owner.
+    // Through the tree handle, so a root process over a `secrets/`
+    // another account owns follows no name there.
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let templates_dir = secrets_dir.join(RESPONDER_TEMPLATE_DIR);
-    fs_util::ensure_shared_secrets_dir(&templates_dir).await?;
+    tree.ensure_dir_async(&templates_dir).await?;
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
-    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
+    tree.ensure_dir_async(&responder_dir).await?;
 
     // Both files publish by rename at the policy's `0600`, applied to
     // the staged temporary — the config carries the responder HMAC, so
@@ -57,20 +60,24 @@ pub(super) async fn write_responder_files(
     // uid, and `0600` under a root-run `init` locks it out of both.
     let template_path = templates_dir.join(RESPONDER_TEMPLATE_NAME);
     let template = build_responder_template(kv_mount, tls_enabled);
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&template_path),
         template.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&template_path.display().to_string()))?;
 
     let config_path = responder_dir.join(RESPONDER_CONFIG_NAME);
     let config = build_responder_config(hmac, tls_enabled);
-    fs_util::atomic_replace_dir_owner(
+    tree.publish_async(
         fs_util::Destination::operator_named(&config_path),
         config.as_bytes(),
         fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&config_path.display().to_string()))?;
@@ -145,8 +152,9 @@ pub(super) async fn write_responder_compose_override(
     if !compose_has_responder(compose_file, messages)? {
         return Ok(None);
     }
+    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
     let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
-    fs_util::ensure_shared_secrets_dir(&responder_dir).await?;
+    tree.ensure_dir_async(&responder_dir).await?;
     let override_path = responder_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
     let config_dir = config_path
         .parent()
@@ -159,8 +167,11 @@ pub(super) async fn write_responder_compose_override(
         .to_string_lossy();
 
     let tls_volume = if tls_enabled {
+        // `0700` under the tree's owner at both levels, like every
+        // directory `init` creates under `secrets/`: a root-run `init`
+        // otherwise left `bootroot-http01/` root's at the umask's mode.
         let tls_dir = secrets_dir.join("bootroot-http01").join("tls");
-        fs_util::ensure_secrets_dir(&tls_dir).await?;
+        tree.ensure_dir_async(&tls_dir).await?;
         let tls_dir = std::fs::canonicalize(&tls_dir)
             .with_context(|| messages.error_resolve_path_failed(&tls_dir.display().to_string()))?;
         format!(
@@ -188,11 +199,14 @@ services:
     // exposure overrides in `crate::commands::guardrails` record, for
     // the same reader: `docker compose` parses this file on every
     // invocation, and it is regenerated from `state.json` by the `init`
-    // step that writes it.
-    fs_util::atomic_replace(
+    // step that writes it. Like them it takes the owner of the
+    // directory it lands in.
+    tree.publish_async(
         fs_util::Destination::operator_named(&override_path),
         contents.as_bytes(),
         fs_util::StagedMode::PreserveOrUmask,
+        fs_util::RootedOwner::ContainingDir,
+        fs_util::StagedDurability::RenameOnly,
     )
     .await
     .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
