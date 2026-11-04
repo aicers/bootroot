@@ -1604,7 +1604,18 @@ pub fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
         let Some(current) = cursor else {
             return ensure_secrets_dir_blocking(path);
         };
-        match std::fs::metadata(current) {
+        // A relative path's last ancestor is the empty path, which
+        // names the working directory but which no stat accepts. Read
+        // it as `.`, so `secrets/a/b` under a missing `secrets/` still
+        // finds an existing ancestor and every level below it is
+        // recorded as created, rather than the walk running off the
+        // top and leaving all but the last level at the umask's mode.
+        let probe = if current.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            current
+        };
+        match std::fs::metadata(probe) {
             Ok(meta) if meta.is_dir() => break (meta.uid(), meta.gid()),
             Ok(_) => return ensure_secrets_dir_blocking(path),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1612,7 +1623,7 @@ pub fn ensure_shared_secrets_dir_blocking(path: &Path) -> Result<()> {
                 cursor = current.parent();
             }
             Err(err) => {
-                return Err(err).with_context(|| format!("Failed to stat {}", current.display()));
+                return Err(err).with_context(|| format!("Failed to stat {}", probe.display()));
             }
         }
     };
@@ -3534,6 +3545,83 @@ mod tests {
         let after = std::fs::metadata(&nested).unwrap();
         assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
         assert_eq!(after.ino(), before.ino());
+    }
+
+    /// The marker a re-executed child of
+    /// [`a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout`]
+    /// carries, telling it that it, not the parent, runs the body.
+    const RELATIVE_DIR_CHILD_MARKER: &str = "BOOTROOT_RELATIVE_DIR_TEST_CHILD";
+
+    /// A relative path whose every level is missing still has each of
+    /// them created `0700`.
+    ///
+    /// `secrets/a/b` under a working directory with no `secrets/` walks
+    /// up to the empty path, which names the working directory but
+    /// which no stat accepts; read as missing, it ended the walk with
+    /// no existing ancestor, and only `b/` was chmodded. A relative path
+    /// needs a working directory the test chooses, and the working
+    /// directory belongs to the process, so the body runs in a child of
+    /// this test binary started in a fresh `tempdir`. The child also
+    /// sets a `022` umask, so a level left to `mkdir` would show up as
+    /// `0755` whatever umask the parent was started under.
+    #[test]
+    fn a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout() {
+        const TEST_NAME: &str = "fs_util::tests::\
+            a_relative_shared_secrets_dir_with_no_existing_level_is_0700_throughout";
+        let levels = [
+            Path::new("secrets"),
+            Path::new("secrets/a"),
+            Path::new("secrets/a/b"),
+        ];
+
+        if std::env::var_os(RELATIVE_DIR_CHILD_MARKER).is_some() {
+            // SAFETY: `umask` is a libc call with no memory effects.
+            // This process is the child spawned below for this one test
+            // (`--exact`, `--test-threads=1`), so no other test is
+            // running beside it to observe the change.
+            unsafe { libc::umask(0o022) };
+            ensure_shared_secrets_dir_blocking(Path::new("secrets/a/b")).unwrap();
+            for level in levels {
+                assert_eq!(
+                    std::fs::metadata(level).unwrap().permissions().mode() & 0o7777,
+                    SECRETS_DIR_MODE,
+                    "{}",
+                    level.display()
+                );
+            }
+            return;
+        }
+
+        let cwd = tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(&exe)
+            .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
+            .env(RELATIVE_DIR_CHILD_MARKER, "1")
+            .current_dir(cwd.path())
+            .output()
+            .unwrap();
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "child failed:\n{report}");
+        assert!(
+            report.contains("test result: ok. 1 passed"),
+            "`--exact {TEST_NAME}` must name exactly one test, and libtest \
+             calls a run of none a success:\n{report}"
+        );
+        // The child ran where it was put: the levels exist in this
+        // `tempdir`, at the mode the child already asserted.
+        for level in levels {
+            let meta = std::fs::metadata(cwd.path().join(level)).unwrap();
+            assert_eq!(
+                meta.permissions().mode() & 0o7777,
+                SECRETS_DIR_MODE,
+                "{}",
+                level.display()
+            );
+        }
     }
 
     /// The general wrappers are untouched by the fixed-owner arm: they
