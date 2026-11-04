@@ -86,9 +86,10 @@ use std::path::{Path, PathBuf};
 pub use agent_config::{
     EndpointTables, InternalAgentConfigParams, REGISTRAR_ENDPOINT_TABLE, REGISTRAR_TABLE,
     build_internal_trust_updates, check_internal_config, internal_agent_invocation,
-    internal_registration_id, internal_signal_pattern, load_internal_config,
-    load_internal_config_from_str, remove_internal_eab, render_internal_agent_config,
-    upsert_internal_responder_hmac, upsert_internal_trust,
+    internal_config_anchor, internal_registration_id, internal_signal_pattern,
+    load_daemon_config_in, load_internal_config, load_internal_config_from_str,
+    remove_internal_eab, render_internal_agent_config, upsert_internal_responder_hmac,
+    upsert_internal_trust,
 };
 pub use client::{
     InternalCredential, RootAuthority, is_expired_token_error, require_https,

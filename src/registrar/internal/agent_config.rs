@@ -37,8 +37,11 @@ use anyhow::{Context, Result};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::config::Settings;
+use crate::fs_util::SecretsTree;
 use crate::registrar::REGISTRAR_INTERNAL_LABEL;
-use crate::registrar::internal::{InternalCredentialError, InternalPaths};
+use crate::registrar::internal::{
+    AGENT_CONFIG_FILE, INTERNAL_DIR, InternalCredentialError, InternalPaths,
+};
 use crate::secret::HmacSecret;
 use crate::toml_util::{remove_sections, toml_encode_string, upsert_section_keys};
 
@@ -338,6 +341,94 @@ pub fn load_internal_config_from_str(
 ) -> Result<Settings, InternalCredentialError> {
     let settings = Settings::from_toml_str(contents).map_err(|err| does_not_parse(paths, &err))?;
     check_internal_config(paths, &settings)?;
+    Ok(settings)
+}
+
+/// Returns the secrets directory a `bootroot-agent --config` path names,
+/// when it is spelled as the registrar endpoint daemon's own config:
+/// `<anchor>/registrar-internal/agent.toml`.
+///
+/// Taken from the path alone, never from anything the file contains,
+/// so what decides how the file is read is not a value its bytes can
+/// change. A path of any other shape — every service agent's config
+/// among them — names no anchor. Neither does one whose anchor would be
+/// empty (`registrar-internal/agent.toml` relative to the working
+/// directory), which names no directory a handle could be opened on.
+#[must_use]
+pub fn internal_config_anchor(config_path: &Path) -> Option<&Path> {
+    if config_path.file_name()? != AGENT_CONFIG_FILE {
+        return None;
+    }
+    let dir = config_path.parent()?;
+    if dir.file_name()? != INTERNAL_DIR {
+        return None;
+    }
+    dir.parent().filter(|anchor| !anchor.as_os_str().is_empty())
+}
+
+/// Reads the registrar endpoint daemon's config at `config_path`
+/// through `tree`, parses it with the `BOOTROOT_*` environment overlay,
+/// and holds it to the layout below the handle's anchor.
+///
+/// For a root daemon over a `secrets/` another account owns, whose
+/// `--config` is `<anchor>/registrar-internal/agent.toml`
+/// ([`internal_config_anchor`]). The file is read without following a
+/// name ([`SecretsTree::read`]) and decoded as
+/// [`Settings::from_required_file`] decodes a file; an absent file is
+/// an empty document, as [`Settings::new`]'s optional file source
+/// treats it, and so fails the checks below. The parsed settings must
+/// pass [`check_internal_config`] against
+/// `InternalPaths::new(tree.anchor())`, so every path the daemon goes
+/// on to write is at the fixed layout below the directory `--config`
+/// names, and must carry no `[openbao]` table: the generator never
+/// writes one, and the fast-poll loop it would arm rewrites files below
+/// `secrets/` by name.
+///
+/// Blocking.
+///
+/// # Errors
+///
+/// Returns [`InternalCredentialError::Io`] naming `config_path` when it
+/// cannot be read through the handle — a symbolic link at any level, a
+/// `registrar-internal/` the process does not own, or anything but a
+/// regular file at the leaf — and [`InternalCredentialError::Invalid`]
+/// naming `config_path` when it does not parse, fails
+/// [`check_internal_config`], or carries an `[openbao]` table.
+pub fn load_daemon_config_in(
+    tree: &SecretsTree,
+    config_path: &Path,
+) -> Result<Settings, InternalCredentialError> {
+    let contents = match tree.read(config_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(source) => {
+            return Err(InternalCredentialError::Io {
+                operation: "reading the registrar endpoint daemon config",
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let invalid = |reason: String| InternalCredentialError::Invalid {
+        path: config_path.to_path_buf(),
+        reason,
+    };
+    let settings = Settings::from_toml_str_with_env(&crate::config::decode_config_bytes(&contents))
+        .map_err(|err| invalid(format!("the config does not parse: {err}")))?;
+    check_internal_config(&InternalPaths::new(tree.anchor()), &settings).map_err(
+        |err| match err {
+            InternalCredentialError::Invalid { reason, .. } => invalid(reason),
+            other => other,
+        },
+    )?;
+    if settings.openbao.is_some() {
+        return Err(invalid(
+            "it carries an [openbao] table, which the registrar endpoint daemon's config never \
+             carries: the fast-poll loop it would arm rewrites files below the secrets directory \
+             by name"
+                .to_string(),
+        ));
+    }
     Ok(settings)
 }
 

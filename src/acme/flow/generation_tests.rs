@@ -1035,7 +1035,7 @@ fn the_default_issuance_publishes_a_generation() {
 #[tokio::test]
 async fn the_registrar_publication_creates_no_generation_tree() {
     let fixture = Fixture::new();
-    publish_issued_material(&fixture.settings, fixture.profile(), &material("A"))
+    publish_issued_material(&fixture.settings, fixture.profile(), &material("A"), None)
         .await
         .expect("publish");
 
@@ -1408,7 +1408,7 @@ async fn an_owner_profile_publishes_nothing_as_non_root() {
     assert_eq!(err.to_string(), owner_refusal(&fixture, 999));
     assert_eq!(disk_state(&base), before);
 
-    let err = publish_issued_material(&fixture.settings, fixture.profile(), &chained)
+    let err = publish_issued_material(&fixture.settings, fixture.profile(), &chained, None)
         .await
         .expect_err("publish_issued_material refuses the owner");
     assert_eq!(err.to_string(), owner_refusal(&fixture, 999));

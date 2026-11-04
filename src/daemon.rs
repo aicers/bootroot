@@ -19,6 +19,7 @@ use tracing::{error, info, warn};
 
 #[cfg(target_os = "linux")]
 use crate::config::openbao_duration;
+use crate::fs_util::SecretsTree;
 #[cfg(target_os = "linux")]
 use crate::registrar::AuditStoreMountGate;
 use crate::registrar::RegistrarEndpoint;
@@ -169,6 +170,17 @@ pub struct DaemonInvocation {
     /// The activated registrar endpoint, held by the caller across
     /// reloads so its socket inode survives one.
     pub registrar_endpoint: RegistrarEndpoint,
+    /// The handle on the secrets directory the settings were loaded
+    /// against, or `None` when the load opened none.
+    ///
+    /// `bootroot-agent` opens one when `--config` is the registrar
+    /// endpoint daemon's own `<secrets>/registrar-internal/agent.toml`,
+    /// or else when `[openbao] secret_id_path` is a local-file service's
+    /// default `<secrets>/services/<id>/secret_id`. When it is rooted —
+    /// the process is root and another account owns `secrets/` — the
+    /// registrar renewal and the fast-poll loop reach every name below
+    /// it through the handle and follow none.
+    pub secrets_tree: Option<Arc<SecretsTree>>,
 }
 
 /// Runs the agent daemon loop for all profiles.
@@ -202,6 +214,7 @@ async fn run_daemon_reporting(
         cli_overrides,
         shutdown,
         registrar_endpoint,
+        secrets_tree,
     } = invocation;
     let max_concurrent = profile::max_concurrent_issuances(&settings)?;
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
@@ -214,7 +227,8 @@ async fn run_daemon_reporting(
         // entries, so one that cannot arm them fails the invocation
         // rather than serving without them.
         Some((endpoint, built)) => {
-            let renewal = prepare_registrar_cert_renewal(&settings, &endpoint).await?;
+            let renewal =
+                prepare_registrar_cert_renewal(&settings, &endpoint, secrets_tree.as_ref()).await?;
             Some((endpoint, built, renewal))
         }
         None => None,
@@ -326,6 +340,7 @@ async fn run_daemon_reporting(
         let eab_refresh = eab_refresh_path.map(|path| fast_poll::EabRefreshHandle {
             path,
             sender: eab_tx,
+            tree: secrets_tree.clone(),
         });
         handles.push(tokio::spawn(async move {
             let renew = move |profile: config::DaemonProfileSettings,
@@ -351,6 +366,7 @@ async fn run_daemon_reporting(
                 settings_for_loop,
                 config_path_for_fast,
                 eab_refresh,
+                secrets_tree,
                 semaphore_for_fast,
                 shutdown_rx_fast,
                 renew,
@@ -1144,10 +1160,12 @@ fn spawn_registrar_endpoint(
 async fn prepare_registrar_cert_renewal(
     settings: &Arc<config::Settings>,
     endpoint: &Arc<crate::registrar::endpoint::ActivatedEndpoint>,
+    tree: Option<&Arc<SecretsTree>>,
 ) -> anyhow::Result<crate::registrar_renewal::RegistrarCertRenewal> {
     crate::registrar_renewal::RegistrarCertRenewal::prepare(
         Arc::clone(settings),
         Arc::clone(endpoint),
+        tree.cloned(),
     )
     .await
     .context("arming certificate renewal for the enabled registrar endpoint")
@@ -2302,6 +2320,7 @@ mod tests {
                 cli_overrides: config::CliOverrides::default(),
                 shutdown: shutdown.clone(),
                 registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+                secrets_tree: None,
             },
             Some(scheduled_tx),
         ));
@@ -2376,6 +2395,7 @@ mod tests {
             cli_overrides: config::CliOverrides::default(),
             shutdown: shutdown.clone(),
             registrar_endpoint: crate::registrar::RegistrarEndpoint::default(),
+            secrets_tree: None,
         }));
         acme.accept()
             .await

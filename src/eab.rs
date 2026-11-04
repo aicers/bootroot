@@ -273,22 +273,74 @@ pub async fn load_credentials(
             Err(err) => return Err(err).context("Failed to read EAB file"),
         };
 
-        if content.trim().is_empty() {
-            return Ok(None);
-        }
-
-        let creds: EabCredentials =
-            serde_json::from_str(&content).context("Failed to parse EAB JSON")?;
-
-        if creds.kid.is_empty() || creds.hmac.is_empty() {
-            warn!("EAB file has empty kid or hmac field; treating as no credentials");
-            return Ok(None);
-        }
-
-        return Ok(Some(creds));
+        return parse_credentials(&content);
     }
 
     Ok(None)
+}
+
+/// [`load_credentials`] for an agent holding a handle on the secrets
+/// directory.
+///
+/// With `tree` rooted and `file_path` below its anchor — a root agent
+/// over a `secrets/` another account owns, reading a local-file
+/// service's `eab.json` — the file is read through the handle and
+/// follows no name: a symbolic link at any level, or anything but a
+/// regular file at the leaf, fails the load naming the path. It is then
+/// parsed exactly as [`load_credentials`] parses it, an absent file,
+/// empty contents and an empty `kid` or `hmac` all giving no EAB. CLI
+/// values take precedence as they do there. Any other case is
+/// [`load_credentials`] unchanged.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`load_credentials`],
+/// and when the handle refuses the file.
+pub async fn load_credentials_in(
+    tree: &Arc<SecretsTree>,
+    cli_kid: Option<String>,
+    cli_hmac: Option<HmacSecret>,
+    file_path: Option<PathBuf>,
+) -> anyhow::Result<Option<EabCredentials>> {
+    let rooted_file = file_path
+        .as_deref()
+        .is_some_and(|path| fs_util::takes_rooted_branch(tree, path));
+    if !rooted_file || (cli_kid.is_some() && cli_hmac.is_some()) {
+        return load_credentials(cli_kid, cli_hmac, file_path).await;
+    }
+    let Some(path) = file_path else {
+        return Ok(None);
+    };
+    let read = tree
+        .run(move |tree| match tree.read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(anyhow::Error::new(err).context("Failed to read EAB file")),
+        })
+        .await?;
+    let Some(bytes) = read else {
+        return Ok(None);
+    };
+    let content = String::from_utf8(bytes).context("Failed to read EAB file")?;
+    parse_credentials(&content)
+}
+
+/// Parses the contents of an `--eab-file`: empty contents, and an empty
+/// `kid` or `hmac`, are no credentials.
+fn parse_credentials(content: &str) -> anyhow::Result<Option<EabCredentials>> {
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let creds: EabCredentials =
+        serde_json::from_str(content).context("Failed to parse EAB JSON")?;
+
+    if creds.kid.is_empty() || creds.hmac.is_empty() {
+        warn!("EAB file has empty kid or hmac field; treating as no credentials");
+        return Ok(None);
+    }
+
+    Ok(Some(creds))
 }
 #[cfg(test)]
 mod tests {
@@ -666,6 +718,103 @@ mod tests {
         assert!(remove_eab_file_in(&tree, &path).await.unwrap());
         assert!(std::fs::symlink_metadata(&path).is_err());
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "OUTSIDE\n");
+    }
+
+    /// A root agent reading a local-file service's `eab.json` through
+    /// its rooted handle refuses a link at `services/<id>` or at the file
+    /// itself, naming it, and reads nothing outside `secrets/`.
+    #[tokio::test]
+    async fn rooted_load_credentials_refuses_a_swapped_level_or_leaf() {
+        use crate::test_swap::{SwapRoot, assert_error_names};
+
+        for level in ["services/svc", "services/svc/eab.json"] {
+            let root = SwapRoot::new();
+            root.write(
+                "services/svc/eab.json",
+                r#"{"kid":"kid-in","hmac":"hmac-in"}"#,
+            );
+            let outside_eab = root.outside.join("eab.json");
+            std::fs::write(&outside_eab, r#"{"kid":"kid-out","hmac":"hmac-out"}"#).unwrap();
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+            let target = if level == "services/svc/eab.json" {
+                outside_eab.clone()
+            } else {
+                root.outside.clone()
+            };
+            let link = root.swap(level, &target);
+
+            let err = load_credentials_in(
+                &tree,
+                None,
+                None,
+                Some(root.secrets.join("services/svc/eab.json")),
+            )
+            .await
+            .expect_err("a link below secrets/ is refused");
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before, "{level}");
+        }
+    }
+
+    /// Through the handle, `eab.json` is parsed exactly as the
+    /// path-based load parses it: credentials, an absent file, empty
+    /// contents and an empty field alike; CLI values still win.
+    #[tokio::test]
+    async fn rooted_load_credentials_matches_the_path_based_load() {
+        let root = crate::test_swap::SwapRoot::new();
+        let path = root.secrets.join("services/svc/eab.json");
+        for contents in [
+            Some(r#"{"kid":"kid-1","key":"hmac-1"}"#),
+            None,
+            Some("  \n"),
+            Some(r#"{"kid":"","hmac":"hmac-1"}"#),
+        ] {
+            match contents {
+                Some(contents) => {
+                    root.write("services/svc/eab.json", contents);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            let rooted = load_credentials_in(&root.rooted(), None, None, Some(path.clone()))
+                .await
+                .unwrap()
+                .map(|creds| (creds.kid, creds.hmac.expose().to_string()));
+            let by_path = load_credentials(None, None, Some(path.clone()))
+                .await
+                .unwrap()
+                .map(|creds| (creds.kid, creds.hmac.expose().to_string()));
+            assert_eq!(rooted, by_path, "{contents:?}");
+        }
+        let pinned = load_credentials_in(
+            &root.rooted(),
+            Some("cli-kid".to_string()),
+            Some(HmacSecret::from("cli-hmac")),
+            Some(path),
+        )
+        .await
+        .unwrap()
+        .expect("CLI values");
+        assert_eq!(pinned.kid, "cli-kid");
+    }
+
+    /// An `--eab-file` the operator named outside the anchor is read as
+    /// it always was, a link it is included.
+    #[tokio::test]
+    async fn rooted_load_credentials_leaves_a_file_outside_the_anchor_path_based() {
+        let root = crate::test_swap::SwapRoot::new();
+        let target = root.outside.join("eab.json");
+        std::fs::write(&target, r#"{"kid":"kid-out","hmac":"hmac-out"}"#).unwrap();
+        let link = root.root().join("eab-link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let creds = load_credentials_in(&root.rooted(), None, None, Some(link))
+            .await
+            .unwrap()
+            .expect("credentials");
+        assert_eq!(creds.kid, "kid-out");
     }
 
     #[test]

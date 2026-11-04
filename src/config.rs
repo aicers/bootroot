@@ -874,6 +874,48 @@ pub struct OpenBaoSettings {
     pub state_path: PathBuf,
 }
 
+/// The directory below `secrets/` that `service add` gives each
+/// local-file service's `AppRole` files, one subdirectory per
+/// registration.
+pub const SERVICE_SECRETS_DIR: &str = "services";
+
+/// The file name `service add` writes a local-file service's
+/// `secret_id` under.
+pub const SERVICE_SECRET_ID_FILE: &str = "secret_id";
+
+/// Returns the secrets directory a local-file service's
+/// `[openbao] secret_id_path` names, when it is spelled as the default
+/// layout `service add` writes: `<anchor>/services/<registration_id>/secret_id`.
+///
+/// The leaf must be named `secret_id`, its directory must be one plain
+/// name (which need not match a profile), and that directory's parent
+/// must be named `services`; its parent is the anchor. Any other
+/// spelling — an override `service add` was given — names no anchor,
+/// and neither does one whose anchor would be empty.
+#[must_use]
+pub fn service_secrets_anchor(secret_id_path: &Path) -> Option<&Path> {
+    if secret_id_path.file_name()? != SERVICE_SECRET_ID_FILE {
+        return None;
+    }
+    let service_dir = secret_id_path.parent()?;
+    if !matches!(
+        service_dir.components().next_back(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        return None;
+    }
+    let services = service_dir.parent()?;
+    if !matches!(
+        services.components().next_back(),
+        Some(std::path::Component::Normal(name)) if name == SERVICE_SECRETS_DIR
+    ) {
+        return None;
+    }
+    services
+        .parent()
+        .filter(|anchor| !anchor.as_os_str().is_empty())
+}
+
 #[must_use]
 pub fn profile_domain(settings: &Settings, profile: &DaemonProfileSettings) -> String {
     format!(
@@ -1079,18 +1121,31 @@ impl Settings {
     pub fn new(config_path: Option<PathBuf>) -> Result<Self, ConfigError> {
         // 3. Environment Variables (double-underscore for nesting)
         // e.g. BOOTROOT_EMAIL, BOOTROOT_PATHS__CERT, BOOTROOT_DAEMON__RENEW_BEFORE
-        let s = Self::file_builder(config_path)?.add_source(
-            Environment::with_prefix("BOOTROOT")
-                .separator("__")
-                .try_parsing(true)
-                .ignore_empty(true)
-                .list_separator(",")
-                .with_list_parse_key("retry.backoff_secs")
-                .with_list_parse_key("trust.trusted_ca_sha256"),
-        );
+        let s = Self::file_builder(config_path)?.add_source(environment_overlay());
 
         // 4. Build
         s.build()?.try_deserialize()
+    }
+
+    /// Creates settings from a TOML document already in memory, with the
+    /// same `BOOTROOT_*` environment overlay [`Settings::new`] applies.
+    ///
+    /// The defaults, then the document, then the environment, in the
+    /// order [`Settings::new`] layers them over a file. For a caller that
+    /// has read the configuration file itself — a root process reading
+    /// it below a `secrets/` another account owns, through
+    /// [`crate::fs_util::SecretsTree`] — and must run on exactly the
+    /// settings `Settings::new` would have built from those bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the document is not valid TOML or the
+    /// configuration cannot be deserialized.
+    pub fn from_toml_str_with_env(contents: &str) -> Result<Self, ConfigError> {
+        defaults::apply_defaults(Config::builder())?
+            .add_source(File::from_str(contents, FileFormat::Toml))
+            .add_source(environment_overlay())
+            .build()?
+            .try_deserialize()
     }
 
     /// Creates a new `Settings` instance from `config_path` alone, without
@@ -1124,7 +1179,7 @@ impl Settings {
             std::fs::read(config_path).map_err(|error| ConfigError::Foreign(Box::new(error)))?;
         // Match `config::File`'s lossy decoding so invalid UTF-8 retains its
         // previous behavior instead of becoming a new load failure.
-        let contents = String::from_utf8_lossy(strip_utf8_bom(&contents));
+        let contents = decode_config_bytes(&contents);
 
         Self::from_str_with_format(&contents, format)
     }
@@ -1221,6 +1276,26 @@ fn required_file_format(config_path: &Path) -> Result<FileFormat, ConfigError> {
             config_path.display()
         )))
     }
+}
+
+/// The `BOOTROOT_*` environment layer [`Settings::new`] and
+/// [`Settings::from_toml_str_with_env`] put over the file.
+fn environment_overlay() -> Environment {
+    Environment::with_prefix("BOOTROOT")
+        .separator("__")
+        .try_parsing(true)
+        .ignore_empty(true)
+        .list_separator(",")
+        .with_list_parse_key("retry.backoff_secs")
+        .with_list_parse_key("trust.trusted_ca_sha256")
+}
+
+/// Decodes a configuration file's bytes as [`Settings::from_required_file`]
+/// decodes them: a leading UTF-8 byte-order mark dropped, and invalid
+/// UTF-8 replaced rather than refused, as `config::File` reads a file.
+#[must_use]
+pub fn decode_config_bytes(contents: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(strip_utf8_bom(contents))
 }
 
 /// Removes a UTF-8 byte-order mark before parsing.
@@ -1542,6 +1617,94 @@ mod tests {
 
         assert!(Settings::from_required_file(&unsupported).is_err());
         assert!(Settings::from_required_file(&extensionless).is_err());
+    }
+
+    /// The in-memory parse a rooted daemon reads its config with builds
+    /// exactly what `Settings::new` builds from the same file in the
+    /// same process — the same defaults, the same document and the same
+    /// `BOOTROOT_*` overlay — a leading byte-order mark included.
+    /// Nothing here changes the environment; both see the one the test
+    /// runs in.
+    #[test]
+    fn from_toml_str_with_env_matches_settings_new_over_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for bom in [false, true] {
+            let path = dir.path().join(format!("agent-{bom}.toml"));
+            let mut file = std::fs::File::create(&path).unwrap();
+            if bom {
+                file.write_all(b"\xEF\xBB\xBF").unwrap();
+            }
+            file.write_all(
+                br#"email = "file@example.com"
+domain = "trusted.domain"
+[acme]
+http_responder_url = "http://localhost:8080"
+http_responder_hmac = "dev-hmac"
+account_key_path = "secrets/registrar-internal/acme-account.json"
+[trust]
+ca_bundle_path = "secrets/registrar-internal/ca-bundle.pem"
+trusted_ca_sha256 = ["aa"]
+
+[[profiles]]
+registration_id = "edge-proxy"
+service_name = "edge-proxy"
+instance_id = "001"
+hostname = "edge-node-01"
+
+[profiles.paths]
+cert = "certs/edge-proxy-a.pem"
+key = "certs/edge-proxy-a.key"
+"#,
+            )
+            .unwrap();
+            drop(file);
+
+            let from_file = Settings::new(Some(path.clone())).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let from_str = Settings::from_toml_str_with_env(&decode_config_bytes(&bytes)).unwrap();
+            assert_eq!(
+                format!("{from_str:?}"),
+                format!("{from_file:?}"),
+                "bom: {bom}"
+            );
+            assert_eq!(from_str.email, "file@example.com");
+        }
+    }
+
+    /// An empty document is the defaults under the overlay, as
+    /// `Settings::new` reads a file that is not there.
+    #[test]
+    fn from_toml_str_with_env_reads_an_empty_document_as_settings_new_reads_an_absent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let from_file = Settings::new(Some(dir.path().join("absent.toml"))).unwrap();
+        let from_str = Settings::from_toml_str_with_env("").unwrap();
+        assert_eq!(format!("{from_str:?}"), format!("{from_file:?}"));
+    }
+
+    /// The default layout `service add` writes names its secrets
+    /// directory; an override, or a spelling that only resembles it,
+    /// names none.
+    #[test]
+    fn service_secrets_anchor_recognises_only_the_default_layout() {
+        assert_eq!(
+            service_secrets_anchor(Path::new("/srv/secrets/services/edge/secret_id")),
+            Some(Path::new("/srv/secrets"))
+        );
+        assert_eq!(
+            service_secrets_anchor(Path::new("secrets/services/edge/secret_id")),
+            Some(Path::new("secrets"))
+        );
+        for other in [
+            "/srv/secrets/services/edge/role_id",
+            "/srv/secrets/services/secret_id",
+            "/srv/secrets/other/edge/secret_id",
+            "/etc/bootroot/edge/secret_id",
+            "/srv/secrets/services/../secret_id",
+            "services/edge/secret_id",
+            "secret_id",
+        ] {
+            assert_eq!(service_secrets_anchor(Path::new(other)), None, "{other}");
+        }
     }
 
     #[test]

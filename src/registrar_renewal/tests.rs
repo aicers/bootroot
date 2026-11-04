@@ -360,7 +360,7 @@ impl FaultyPaths {
         let restores = Arc::new(AtomicUsize::new(0));
         (
             Box::new(Self {
-                inner: FilesystemPaths::new(),
+                inner: FilesystemPaths::new(None),
                 fail_bundle,
                 fail_pair,
                 fail_rollback,
@@ -1034,7 +1034,7 @@ fn the_cadence_takes_the_profiles_own_retry_budget() {
          renew_before = \"24h\"\n\n[profiles.retry]\nbackoff_secs = [7, 11]\n",
     );
 
-    let cadence = RenewalCadence::from_internal_config(dir.path())
+    let cadence = RenewalCadence::from_internal_config(dir.path(), &base_settings(), None)
         .expect("the rendered internal config loads");
 
     assert_eq!(
@@ -1055,7 +1055,7 @@ fn the_cadence_falls_back_to_the_top_level_retry_budget() {
     let dir = TempDir::new().expect("tempdir");
     write_internal_agent_config(dir.path(), "");
 
-    let cadence = RenewalCadence::from_internal_config(dir.path())
+    let cadence = RenewalCadence::from_internal_config(dir.path(), &base_settings(), None)
         .expect("the rendered internal config loads");
 
     assert_eq!(
@@ -2228,7 +2228,7 @@ impl GatedPairWrite {
         release: tokio::sync::oneshot::Receiver<()>,
     ) -> Box<dyn LivePaths> {
         Box::new(Self {
-            inner: FilesystemPaths::new(),
+            inner: FilesystemPaths::new(None),
             reached: Mutex::new(Some(reached)),
             release: Mutex::new(Some(release)),
         })
@@ -2364,6 +2364,7 @@ async fn the_profile_bundle_writer_waits_for_the_shared_bundle_lock() {
                 &chain,
                 &trusted,
                 CertGroupPolicy::none(),
+                None,
             )
             .await
         }
@@ -2447,6 +2448,7 @@ async fn an_interleaved_profile_merge_survives_a_registrar_rollback() {
                 &chain,
                 &trusted,
                 CertGroupPolicy::none(),
+                None,
             )
             .await
         }
@@ -2539,7 +2541,7 @@ impl LockProbingPaths {
         let probes = Arc::new(AtomicUsize::new(0));
         (
             Box::new(Self {
-                inner: FilesystemPaths::new(),
+                inner: FilesystemPaths::new(None),
                 unheld: Arc::clone(&unheld),
                 probes: Arc::clone(&probes),
                 fail_pair,
@@ -2671,4 +2673,316 @@ async fn a_rolled_back_publication_holds_the_lock_through_the_restore() {
         unheld.is_empty(),
         "a CLI issuance could publish into {unheld:?} while this transaction was rolling back"
     );
+}
+
+// ---------------------------------------------------------------------
+// A rooted daemon: the private bundle through the handle
+// ---------------------------------------------------------------------
+
+/// The harness with its CA bundle at the generator's place,
+/// `secrets/registrar-internal/ca-bundle.pem`, as a rooted daemon has it.
+fn rooted_harness() -> Harness {
+    let mut harness = Harness::build();
+    let bundle = InternalPaths::new(&harness.plan.secrets_dir).ca_bundle();
+    std::fs::create_dir_all(bundle.parent().expect("registrar-internal"))
+        .expect("create registrar-internal");
+    std::fs::write(&bundle, &harness.ca.pem).expect("write the private bundle");
+    let mut settings = (*harness.settings).clone();
+    settings.trust.ca_bundle_path = Some(bundle);
+    harness.settings = Arc::new(settings);
+    harness
+}
+
+fn rooted_tree(harness: &Harness) -> Arc<SecretsTree> {
+    Arc::new(SecretsTree::open_rooted_for_tests(&harness.plan.secrets_dir).expect("rooted handle"))
+}
+
+async fn rooted_renewal(harness: &Harness, tree: Option<Arc<SecretsTree>>) -> RegistrarCertRenewal {
+    RegistrarCertRenewal::for_test_in(
+        Arc::clone(&harness.settings),
+        harness.plan.clone(),
+        Arc::clone(&harness.endpoint),
+        cadence(),
+        tree,
+    )
+    .await
+}
+
+/// The mode, uid and gid of `path`, not following a link.
+fn meta_of(path: &Path) -> (u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::symlink_metadata(path).expect("stat");
+    (meta.mode() & 0o7777, meta.uid(), meta.gid())
+}
+
+/// Over a tree the test owns, a rooted renewal publishes the merged
+/// bundle with the mode and owner the path-based one gives it.
+#[tokio::test]
+async fn a_rooted_renewal_publishes_the_bundle_as_the_path_based_one_does() {
+    let mut results = Vec::new();
+    for rooted in [false, true] {
+        let harness = rooted_harness();
+        let tree = rooted.then(|| rooted_tree(&harness));
+        let renewal = rooted_renewal(&harness, tree).await;
+        let pair = harness.pair(SurfaceLeaf::EndpointServer);
+        let material = harness.ca.material(&pair.name, -1, 60);
+
+        renewal
+            .renew_leaf_with_material(&pair, material)
+            .await
+            .expect("the renewal publishes");
+        let bundle = harness.bundle_path();
+        assert_eq!(
+            std::fs::read_to_string(&bundle).expect("bundle"),
+            harness.ca.pem,
+            "the pinned anchor is the merged bundle"
+        );
+        results.push(meta_of(&bundle));
+    }
+    assert_eq!(results.first(), results.get(1));
+    assert_eq!(
+        results.first().map(|(mode, ..)| *mode),
+        Some(crate::cert_group::CA_BUNDLE_FILE_MODE)
+    );
+}
+
+/// A link at `registrar-internal`, or at the bundle, fails the rooted
+/// publication naming it before anything live changes; nothing outside
+/// is written; the pass's failure is an ordinary failed attempt, and
+/// the endpoint keeps the configuration it had.
+#[tokio::test]
+async fn a_swapped_registrar_internal_fails_the_rooted_renewal_and_changes_nothing() {
+    for level in ["registrar-internal", "registrar-internal/ca-bundle.pem"] {
+        let harness = rooted_harness();
+        let renewal = rooted_renewal(&harness, Some(rooted_tree(&harness))).await;
+        let pair = harness.pair(SurfaceLeaf::EndpointServer);
+        let facts = LiveFacts::capture(&harness, pair.leaf, &renewal.state());
+        let outside = harness.dir.path().join("outside");
+        std::fs::create_dir(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("ca-bundle.pem"), &harness.ca.pem).expect("outside bundle");
+        let before = crate::test_swap::snapshot_tree(&outside);
+        let link = harness.plan.secrets_dir.join(level);
+        std::fs::rename(&link, harness.dir.path().join("aside")).expect("move aside");
+        let target = if level == "registrar-internal/ca-bundle.pem" {
+            outside.join("ca-bundle.pem")
+        } else {
+            outside.clone()
+        };
+        std::os::unix::fs::symlink(&target, &link).expect("plant link");
+
+        let material = harness.ca.material(&pair.name, -1, 60);
+        let err = renewal
+            .renew_leaf_with_material(&pair, material)
+            .await
+            .expect_err("the rooted publication refuses the link");
+        crate::test_swap::assert_error_names(&err, &link);
+        renewal.record_failure(pair.leaf, &format!("{err:#}"));
+
+        assert_eq!(crate::test_swap::snapshot_tree(&outside), before, "{level}");
+        assert_eq!(facts.cert, digest_of(&pair.cert_path));
+        assert_eq!(facts.key, digest_of(&pair.key_path));
+        assert!(
+            Arc::ptr_eq(&facts.acceptor, &harness.endpoint.active_tls()),
+            "the active configuration stays installed"
+        );
+        let entry = renewal.state().leaf(pair.leaf).expect("an entry");
+        assert!(matches!(entry.attempt, RenewalAttempt::Failed { .. }));
+        assert_eq!(entry.not_after, facts.not_after);
+        assert_no_artifacts_left(&pair.key_path);
+    }
+}
+
+/// The rooted staging read refuses a linked bundle naming it, and keeps
+/// the path-based read's arms: an absent bundle stages the chain alone.
+#[tokio::test]
+async fn the_rooted_staging_read_refuses_a_link_and_keeps_the_absent_arm() {
+    let harness = rooted_harness();
+    let renewal = rooted_renewal(&harness, Some(rooted_tree(&harness))).await;
+    let bundle = harness.bundle_path();
+
+    std::fs::remove_file(&bundle).expect("remove the bundle");
+    let staged = renewal
+        .stage_bundle(&bundle, &[harness.ca.der()])
+        .expect("an absent bundle stages the chain");
+    assert_eq!(staged, harness.ca.pem);
+
+    let outside = harness.dir.path().join("outside.pem");
+    std::fs::write(&outside, &harness.ca.pem).expect("outside bundle");
+    std::os::unix::fs::symlink(&outside, &bundle).expect("plant link");
+    let err = renewal
+        .stage_bundle(&bundle, &[harness.ca.der()])
+        .expect_err("a linked bundle is refused");
+    crate::test_swap::assert_error_names(&err, &bundle);
+}
+
+/// A rooted snapshot captures the bytes, the mode and the owner the
+/// path-based one captures, and its restore puts them back as the
+/// path-based restore does; a captured absence removes what is there.
+#[tokio::test]
+async fn a_rooted_snapshot_and_restore_match_the_path_based_ones() {
+    let mut results = Vec::new();
+    for rooted in [false, true] {
+        let harness = rooted_harness();
+        let bundle = harness.bundle_path();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod the bundle");
+        let tree = rooted.then(|| rooted_tree(&harness));
+        let artifacts = Artifacts::create(&harness.pair(SurfaceLeaf::EndpointServer).key_path)
+            .expect("artifacts");
+        let snapshot = Snapshot::capture(&bundle, "bundle.snapshot", &artifacts, tree.as_deref())
+            .expect("capture");
+        assert_eq!(snapshot.rooted, rooted);
+        let prior = snapshot.prior.as_ref().expect("a captured file");
+        let captured = (
+            std::fs::read(&prior.artifact).expect("artifact"),
+            prior.mode,
+            prior.uid,
+            prior.gid,
+        );
+
+        std::fs::write(&bundle, "REPLACED\n").expect("replace the bundle");
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        FilesystemPaths::new(tree.clone())
+            .restore(&snapshot)
+            .await
+            .expect("restore");
+        let restored = (std::fs::read(&bundle).expect("bundle"), meta_of(&bundle));
+
+        // A captured absence, restored, removes what the publication put
+        // there.
+        let missing = harness
+            .plan
+            .secrets_dir
+            .join("registrar-internal/absent.pem");
+        let absent = Snapshot::capture(&missing, "absent.snapshot", &artifacts, tree.as_deref())
+            .expect("capture an absence");
+        assert!(absent.prior.is_none());
+        std::fs::write(&missing, "PUBLISHED\n").expect("publish");
+        FilesystemPaths::new(tree)
+            .restore(&absent)
+            .await
+            .expect("restore the absence");
+        assert!(std::fs::symlink_metadata(&missing).is_err());
+        artifacts.close().expect("close");
+
+        results.push((captured.1, captured.2, captured.3, restored.1));
+        assert_eq!(captured.0, harness.ca.pem.as_bytes());
+        assert_eq!(restored.0, harness.ca.pem.as_bytes());
+    }
+    assert_eq!(results.first(), results.get(1));
+    assert_eq!(results.first().map(|result| result.0), Some(0o640));
+}
+
+/// The rooted capture, bundle write and restore each refuse a link at
+/// `registrar-internal` naming it, and write nothing outside; a leaf
+/// link refuses the capture, and a captured absence's restore removes
+/// the link itself rather than its target.
+#[tokio::test]
+async fn the_rooted_snapshot_writer_and_restore_refuse_a_swapped_level() {
+    let harness = rooted_harness();
+    let tree = rooted_tree(&harness);
+    let bundle = harness.bundle_path();
+    let artifacts =
+        Artifacts::create(&harness.pair(SurfaceLeaf::EndpointServer).key_path).expect("artifacts");
+    let snapshot =
+        Snapshot::capture(&bundle, "bundle.snapshot", &artifacts, Some(&*tree)).expect("capture");
+    let absent_path = harness
+        .plan
+        .secrets_dir
+        .join("registrar-internal/absent.pem");
+    let absent = Snapshot::capture(&absent_path, "absent.snapshot", &artifacts, Some(&*tree))
+        .expect("capture an absence");
+
+    let outside = harness.dir.path().join("outside");
+    std::fs::create_dir(&outside).expect("mkdir outside");
+    std::fs::write(outside.join("ca-bundle.pem"), "OUTSIDE\n").expect("outside");
+    std::fs::write(outside.join("absent.pem"), "OUTSIDE\n").expect("outside");
+    let before = crate::test_swap::snapshot_tree(&outside);
+    let internal = harness.plan.secrets_dir.join("registrar-internal");
+    std::fs::rename(&internal, harness.dir.path().join("aside")).expect("move aside");
+    std::os::unix::fs::symlink(&outside, &internal).expect("plant link");
+
+    let live = FilesystemPaths::new(Some(Arc::clone(&tree)));
+    let err = Snapshot::capture(&bundle, "again.snapshot", &artifacts, Some(&*tree))
+        .err()
+        .expect("the capture refuses the link");
+    crate::test_swap::assert_error_names(&err, &internal);
+    let err = live
+        .write_bundle(&bundle, "NEW\n")
+        .await
+        .expect_err("the write refuses the link");
+    crate::test_swap::assert_error_names(&err, &internal);
+    let err = live
+        .restore(&snapshot)
+        .await
+        .expect_err("the restore refuses");
+    crate::test_swap::assert_error_names(&err, &internal);
+    let err = live
+        .restore(&absent)
+        .await
+        .expect_err("the removal refuses");
+    crate::test_swap::assert_error_names(&err, &internal);
+    assert_eq!(crate::test_swap::snapshot_tree(&outside), before);
+
+    // Put the directory back, and plant a leaf link instead.
+    std::fs::remove_file(&internal).expect("remove the link");
+    std::fs::rename(harness.dir.path().join("aside"), &internal).expect("restore");
+    let target = outside.join("absent.pem");
+    std::os::unix::fs::symlink(&target, &absent_path).expect("leaf link");
+    let err = Snapshot::capture(&absent_path, "leaf.snapshot", &artifacts, Some(&*tree))
+        .err()
+        .expect("the capture refuses a leaf link");
+    crate::test_swap::assert_error_names(&err, &absent_path);
+    live.restore(&absent)
+        .await
+        .expect("the link itself is removed");
+    assert!(std::fs::symlink_metadata(&absent_path).is_err());
+    assert_eq!(std::fs::read(&target).expect("target"), b"OUTSIDE\n");
+    artifacts.close().expect("close");
+}
+
+/// With `registrar-internal` swapped for a link to a directory holding a
+/// config with another cadence, a rooted daemon takes its cadence from
+/// the settings it read through its handle, and opens no file by name —
+/// whatever spelling `state.json` gives the secrets directory. Settings
+/// that are not the daemon's checked config read the file as before.
+#[test]
+fn a_rooted_cadence_comes_from_the_daemon_settings() {
+    let dir = TempDir::new().expect("tempdir");
+    let secrets = dir.path().join("secrets");
+    write_internal_agent_config(&secrets, "\n[profiles.daemon]\ncheck_interval = \"7h\"\n");
+    let on_disk = std::fs::read_to_string(InternalPaths::new(&secrets).agent_config())
+        .expect("read the internal config");
+    let daemon = Settings::from_toml_str(
+        &on_disk.replace("check_interval = \"7h\"", "check_interval = \"2h\""),
+    )
+    .expect("daemon settings");
+    let tree = SecretsTree::open_rooted_for_tests(&secrets).expect("rooted");
+
+    // The file on disk says seven hours; the daemon's settings two.
+    let by_name = RenewalCadence::from_internal_config(&secrets, &daemon, None).expect("by name");
+    assert_eq!(by_name.check_interval, Duration::from_hours(7));
+    // An alias `Path` equality tells apart from the anchor: a check made
+    // against the spelling given would fail and read the file by name.
+    let alias = dir.path().join("secrets-alias");
+    std::os::unix::fs::symlink(&secrets, &alias).expect("alias the secrets directory");
+    for spelled in [secrets.clone(), alias] {
+        let cadence =
+            RenewalCadence::from_internal_config(&spelled, &daemon, Some(&tree)).expect("rooted");
+        assert_eq!(cadence.check_interval, Duration::from_hours(2));
+    }
+
+    // A link out of the tree is never followed by the rooted daemon.
+    let outside = dir.path().join("outside");
+    std::fs::rename(secrets.join("registrar-internal"), &outside).expect("move out");
+    std::os::unix::fs::symlink(&outside, secrets.join("registrar-internal")).expect("link");
+    let cadence =
+        RenewalCadence::from_internal_config(&secrets, &daemon, Some(&tree)).expect("rooted");
+    assert_eq!(cadence.check_interval, Duration::from_hours(2));
+
+    // A service agent's settings fail the check and read the file.
+    let cadence = RenewalCadence::from_internal_config(&secrets, &base_settings(), Some(&tree))
+        .expect("by name");
+    assert_eq!(cadence.check_interval, Duration::from_hours(7));
 }

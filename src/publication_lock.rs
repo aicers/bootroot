@@ -62,8 +62,12 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+
+use crate::fs_util::SecretsTree;
+use crate::registrar::internal::InternalPaths;
 
 /// The lock file each directory a publication writes into carries.
 pub const LOCK_FILE_NAME: &str = ".bootroot-registrar-publish.lock";
@@ -145,6 +149,140 @@ pub(crate) async fn hold_refusing_links(destinations: &[&Path]) -> Result<Public
         .context("the publication lock task panicked")?
 }
 
+/// Takes the publication lock covering `destinations` as [`hold`] does,
+/// opening the lock in `registrar-internal/` through `tree` when it is
+/// rooted.
+///
+/// For the registrar endpoint daemon run as root over a `secrets/`
+/// another account owns. Its CA bundle is the one destination the
+/// generator puts below the anchor, in
+/// `InternalPaths::new(tree.anchor()).dir()`; that directory's lock file
+/// is opened with [`SecretsTree::open_lock`], which follows no name,
+/// creates only the lock file, and never creates, re-modes or re-owns a
+/// directory. A missing `registrar-internal/` fails the lock with an
+/// error naming the path. Every other directory, an operator-named one
+/// below the anchor included, is created, resolved and locked exactly
+/// as [`hold`] does it.
+///
+/// All entries are sorted and de-duplicated together: the rooted one by
+/// the canonicalized anchor joined with its names below the anchor —
+/// canonicalizing the anchor follows only its own name and those above
+/// it, which the owner of `secrets/` cannot rename — and the others by
+/// their canonicalized path, as [`hold`] keys them. So every writer
+/// naming the same set, [`hold`]'s callers in other processes included,
+/// takes it in one order and no directory is locked twice; where a
+/// rooted and a path-based entry share a key, the rooted one is kept.
+///
+/// With no handle, a path-based one, or no destination in
+/// `registrar-internal/`, this is [`hold`].
+///
+/// # Errors
+///
+/// Returns an error as [`hold`] does, and when the rooted lock file
+/// cannot be opened through the handle — a link at any level, a
+/// `registrar-internal/` the process does not own or that is missing,
+/// or anything but a regular file at the lock's name.
+pub(crate) async fn hold_in(
+    tree: Option<&Arc<SecretsTree>>,
+    destinations: &[&Path],
+) -> Result<PublicationLock> {
+    let Some(tree) = tree.filter(|tree| tree.is_rooted()) else {
+        return hold(destinations).await;
+    };
+    let internal_dir = InternalPaths::new(tree.anchor()).dir().to_path_buf();
+    let mut rooted = false;
+    let mut others = Vec::with_capacity(destinations.len());
+    for destination in destinations {
+        let dir = parent_of(destination);
+        if dir == internal_dir {
+            rooted = true;
+        } else {
+            others.push(dir);
+        }
+    }
+    if !rooted {
+        return hold(destinations).await;
+    }
+    let tree = Arc::clone(tree);
+    tokio::task::spawn_blocking(move || hold_rooted_blocking(&tree, &internal_dir, &others))
+        .await
+        .context("the publication lock task panicked")?
+}
+
+/// One directory a rooted [`hold_in`] locks, keyed for the shared order.
+#[derive(Debug, PartialEq, Eq)]
+enum LockTarget {
+    /// `registrar-internal/`, its lock opened through the handle.
+    Rooted(PathBuf),
+    /// Any other directory, canonicalized and locked as [`hold`] does.
+    Path(PathBuf),
+}
+
+/// The blocking half of [`hold_in`] on a rooted handle.
+fn hold_rooted_blocking(
+    tree: &SecretsTree,
+    internal_dir: &Path,
+    others: &[PathBuf],
+) -> Result<PublicationLock> {
+    let ordered = rooted_lock_order(tree, internal_dir, others)?;
+    let mut files = Vec::with_capacity(ordered.len());
+    for (_, target) in &ordered {
+        files.push(match target {
+            LockTarget::Rooted(path) => {
+                let file = tree.open_lock(path, LOCK_FILE_MODE).map_err(|err| {
+                    anyhow::Error::new(err).context(format!(
+                        "opening the registrar publication lock {}",
+                        path.display()
+                    ))
+                })?;
+                flock_exclusive(&file, path)?;
+                file
+            }
+            LockTarget::Path(dir) => lock(&dir.join(LOCK_FILE_NAME), LockEntry::Follow)?,
+        });
+    }
+    Ok(PublicationLock { files })
+}
+
+/// The directories a rooted [`hold_in`] locks, keyed, sorted and
+/// de-duplicated: the order every writer naming the same set takes them
+/// in.
+fn rooted_lock_order(
+    tree: &SecretsTree,
+    internal_dir: &Path,
+    others: &[PathBuf],
+) -> Result<Vec<(PathBuf, LockTarget)>> {
+    let anchor = tree.anchor();
+    let below = internal_dir
+        .strip_prefix(anchor)
+        .context("the registrar-internal directory is below the anchor it is built from")?;
+    let canonical_anchor = std::fs::canonicalize(anchor).with_context(|| {
+        format!(
+            "resolving {} to take the registrar publication lock below it",
+            anchor.display()
+        )
+    })?;
+    let mut ordered: Vec<(PathBuf, LockTarget)> = Vec::with_capacity(others.len() + 1);
+    ordered.push((
+        canonical_anchor.join(below),
+        LockTarget::Rooted(internal_dir.join(LOCK_FILE_NAME)),
+    ));
+    for dir in others {
+        let canonical = resolve_lock_dir(dir)?;
+        ordered.push((canonical.clone(), LockTarget::Path(canonical)));
+    }
+    // One order for every writer, as `hold_blocking_with` keeps it, with
+    // the rooted entry first among equal keys so de-duplication keeps it.
+    ordered.sort_unstable_by(|(left, left_target), (right, right_target)| {
+        left.cmp(right).then_with(|| {
+            matches!(right_target, LockTarget::Rooted(_))
+                .cmp(&matches!(left_target, LockTarget::Rooted(_)))
+        })
+    });
+    ordered.dedup_by(|(later, _), (kept, _)| later == kept);
+    Ok(ordered)
+}
+
 /// How a lock file already in place is treated when it is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockEntry {
@@ -165,22 +303,7 @@ fn hold_blocking(dirs: &[PathBuf]) -> Result<PublicationLock> {
 fn hold_blocking_with(dirs: &[PathBuf], entry: LockEntry) -> Result<PublicationLock> {
     let mut ordered: Vec<PathBuf> = Vec::with_capacity(dirs.len());
     for dir in dirs {
-        // The publication creates these directories itself a moment
-        // later; creating them here is what gives the lock a place to
-        // live on a first provisioning, and resolving them afterwards
-        // is what makes two spellings of one directory one lock.
-        std::fs::create_dir_all(dir).with_context(|| {
-            format!(
-                "creating {} to take the registrar publication lock in",
-                dir.display()
-            )
-        })?;
-        ordered.push(std::fs::canonicalize(dir).with_context(|| {
-            format!(
-                "resolving {} to take the registrar publication lock in",
-                dir.display()
-            )
-        })?);
+        ordered.push(resolve_lock_dir(dir)?);
     }
     // Sorted, so two writers naming one set of directories in opposite
     // orders still take them in the same order and neither can hold
@@ -194,6 +317,28 @@ fn hold_blocking_with(dirs: &[PathBuf], entry: LockEntry) -> Result<PublicationL
         files.push(lock(&dir.join(LOCK_FILE_NAME), entry)?);
     }
     Ok(PublicationLock { files })
+}
+
+/// Creates `dir` and resolves it to the canonical path its lock is
+/// keyed by.
+///
+/// The publication creates these directories itself a moment later;
+/// creating them here is what gives the lock a place to live on a first
+/// provisioning, and resolving them afterwards is what makes two
+/// spellings of one directory one lock.
+fn resolve_lock_dir(dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).with_context(|| {
+        format!(
+            "creating {} to take the registrar publication lock in",
+            dir.display()
+        )
+    })?;
+    std::fs::canonicalize(dir).with_context(|| {
+        format!(
+            "resolving {} to take the registrar publication lock in",
+            dir.display()
+        )
+    })
 }
 
 /// Opens one lock file and takes its exclusive `flock`.
@@ -237,6 +382,13 @@ fn lock(path: &Path, entry: LockEntry) -> Result<File> {
             return Err(link_refusal(path));
         }
     }
+    flock_exclusive(&file, path)?;
+    Ok(file)
+}
+
+/// Takes the exclusive `flock` on the open lock file `file`, waiting for
+/// whichever holder has it.
+fn flock_exclusive(file: &File, path: &Path) -> Result<()> {
     // SAFETY: `file` owns an open descriptor that outlives the call, and
     // `flock` dereferences nothing — it takes that descriptor and an
     // operation constant and reports a status.
@@ -249,7 +401,7 @@ fn lock(path: &Path, entry: LockEntry) -> Result<File> {
             )),
         );
     }
-    Ok(file)
+    Ok(())
 }
 
 /// The error for a lock file [`LockEntry::RefuseLinks`] will not open.
@@ -469,6 +621,161 @@ mod tests {
         assert!(!is_free(root.path()), "the lock is held again");
         drop(held);
         assert!(is_free(root.path()));
+    }
+
+    /// The rooted lock, over `secrets/registrar-internal/`.
+    mod rooted {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        use super::*;
+        use crate::test_swap::{SwapRoot, assert_error_names};
+
+        fn internal(root: &SwapRoot) -> PathBuf {
+            root.secrets.join("registrar-internal")
+        }
+
+        fn bundle(root: &SwapRoot) -> PathBuf {
+            internal(root).join("ca-bundle.pem")
+        }
+
+        /// The lock is taken in `registrar-internal/` through the
+        /// handle, on the same lock file every path-based writer opens,
+        /// and the directory keeps its mode and owner.
+        #[tokio::test]
+        async fn the_rooted_lock_is_the_shared_one_and_changes_no_directory() {
+            let root = SwapRoot::new();
+            std::fs::create_dir(internal(&root)).expect("mkdir");
+            std::fs::set_permissions(internal(&root), std::fs::Permissions::from_mode(0o710))
+                .expect("chmod");
+            let before = std::fs::metadata(internal(&root)).expect("stat");
+            let tree = root.rooted();
+            let elsewhere = root.root().join("live");
+
+            let held = hold_in(
+                Some(&tree),
+                &[&bundle(&root), &elsewhere.join("registrar.pem")],
+            )
+            .await
+            .expect("the rooted acquisition");
+            assert!(!is_free(&internal(&root)), "registrar-internal/ is held");
+            assert!(!is_free(&elsewhere), "the operator-named directory is held");
+            drop(held);
+            assert!(is_free(&internal(&root)));
+
+            let after = std::fs::metadata(internal(&root)).expect("stat");
+            assert_eq!(after.mode(), before.mode());
+            assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+            let lock = std::fs::symlink_metadata(internal(&root).join(LOCK_FILE_NAME))
+                .expect("the lock file");
+            assert!(lock.is_file());
+            assert_eq!(lock.mode() & 0o7777, LOCK_FILE_MODE);
+        }
+
+        /// A link at the lock file is refused naming it, and its target
+        /// is left as it was.
+        #[tokio::test]
+        async fn a_linked_lock_file_is_refused() {
+            let root = SwapRoot::new();
+            std::fs::create_dir(internal(&root)).expect("mkdir");
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+            let link = root.swap(
+                &format!("registrar-internal/{LOCK_FILE_NAME}"),
+                &root.outside.join("secret"),
+            );
+
+            let Err(err) = hold_in(Some(&tree), &[&bundle(&root)]).await else {
+                panic!("a linked lock file is refused");
+            };
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before);
+        }
+
+        /// A link at `registrar-internal` is refused naming it, and no
+        /// lock file is created where it points.
+        #[tokio::test]
+        async fn a_swapped_registrar_internal_is_refused() {
+            let root = SwapRoot::new();
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+            let link = root.swap("registrar-internal", &root.outside);
+
+            let Err(err) = hold_in(Some(&tree), &[&bundle(&root)]).await else {
+                panic!("a linked registrar-internal is refused");
+            };
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before);
+        }
+
+        /// A missing `registrar-internal/` fails the lock naming it, and
+        /// nothing is created.
+        #[tokio::test]
+        async fn a_missing_registrar_internal_is_not_created() {
+            let root = SwapRoot::new();
+            let tree = root.rooted();
+
+            let Err(err) = hold_in(Some(&tree), &[&bundle(&root)]).await else {
+                panic!("a missing registrar-internal fails the lock");
+            };
+            assert_error_names(&err, &internal(&root));
+            assert!(
+                std::fs::read_dir(&root.secrets)
+                    .expect("list")
+                    .next()
+                    .is_none(),
+                "nothing was created below secrets/"
+            );
+        }
+
+        /// Two writers naming one set in either order take it in one
+        /// order, keyed as `hold` keys a path-based writer's entries; an
+        /// operator-named directory below the anchor is handled as
+        /// `hold` handles it, and a directory named twice is one entry.
+        #[test]
+        fn either_order_is_one_lock_order() {
+            let root = SwapRoot::new();
+            std::fs::create_dir(internal(&root)).expect("mkdir");
+            let tree = root.rooted();
+            let operator = root.secrets.join("endpoint");
+            let live = root.root().join("live");
+
+            let forward =
+                rooted_lock_order(&tree, &internal(&root), &[operator.clone(), live.clone()])
+                    .expect("forward");
+            let backward = rooted_lock_order(
+                &tree,
+                &internal(&root),
+                &[live.clone(), operator.clone(), internal(&root)],
+            )
+            .expect("backward");
+            assert_eq!(forward, backward);
+            assert_eq!(forward.len(), 3, "registrar-internal/ is locked once");
+            let rooted: Vec<_> = forward
+                .iter()
+                .filter(|(_, target)| matches!(target, LockTarget::Rooted(_)))
+                .collect();
+            assert_eq!(rooted.len(), 1, "the rooted entry is the one kept");
+            assert!(operator.is_dir(), "the operator-named directory is created");
+            for (key, target) in &forward {
+                let dir = match target {
+                    LockTarget::Rooted(path) => path.parent().expect("a directory"),
+                    LockTarget::Path(dir) => dir.as_path(),
+                };
+                assert_eq!(*key, std::fs::canonicalize(dir).expect("resolve"));
+            }
+        }
+
+        /// A path-based handle, or none, is `hold`.
+        #[tokio::test]
+        async fn a_path_based_handle_is_hold() {
+            let root = SwapRoot::new();
+            let tree = root.path_based();
+            let held = hold_in(Some(&tree), &[&bundle(&root)])
+                .await
+                .expect("the acquisition");
+            assert!(!is_free(&internal(&root)), "created and held as hold does");
+            drop(held);
+        }
     }
 
     /// A writer that shares no directory with another waits for

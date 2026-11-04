@@ -2947,3 +2947,181 @@ mod rooted {
         assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE)]);
     }
 }
+
+/// The registrar endpoint daemon's own config, read by a root daemon
+/// over a `secrets/` another account owns: through the handle opened on
+/// the directory `--config` names, and held to the layout below it.
+mod daemon_config {
+    use std::path::{Path, PathBuf};
+
+    use crate::config::Settings;
+    use crate::fs_util::SecretsTree;
+    use crate::registrar::internal::{
+        InternalCredentialError, InternalPaths, internal_config_anchor, load_daemon_config_in,
+    };
+    use crate::test_swap::{SwapRoot, assert_error_names, render_internal_config};
+
+    const CONFIG: &str = "registrar-internal/agent.toml";
+
+    fn write_config(root: &SwapRoot, contents: &str) -> PathBuf {
+        root.write(CONFIG, contents)
+    }
+
+    fn refused(tree: &SecretsTree, config: &Path) -> anyhow::Error {
+        anyhow::Error::from(
+            load_daemon_config_in(tree, config).expect_err("the daemon config is refused"),
+        )
+    }
+
+    #[test]
+    fn the_anchor_is_taken_from_the_config_path_alone() {
+        assert_eq!(
+            internal_config_anchor(Path::new("/srv/secrets/registrar-internal/agent.toml")),
+            Some(Path::new("/srv/secrets"))
+        );
+        assert_eq!(
+            internal_config_anchor(Path::new("secrets/registrar-internal/agent.toml")),
+            Some(Path::new("secrets"))
+        );
+        for other in [
+            "/etc/bootroot/agent.toml",
+            "/srv/secrets/registrar-internal/other.toml",
+            "/srv/secrets/services/edge/agent.toml",
+            "/srv/secrets/registrar-internal/agent.toml/..",
+            "registrar-internal/agent.toml",
+            "agent.toml",
+        ] {
+            assert_eq!(internal_config_anchor(Path::new(other)), None, "{other}");
+        }
+    }
+
+    /// The rooted read gives the settings `Settings::new` gives over the
+    /// same file in the same process, the `BOOTROOT_*` overlay included.
+    #[test]
+    fn a_rooted_read_parses_the_config_as_settings_new_does() {
+        let root = SwapRoot::new();
+        let config = write_config(&root, &render_internal_config(&root.secrets, "host-a"));
+        let tree = root.rooted();
+
+        let settings = load_daemon_config_in(&tree, &config).expect("the config loads");
+        let expected = Settings::new(Some(config.clone())).expect("Settings::new loads it");
+        assert_eq!(format!("{settings:?}"), format!("{expected:?}"));
+        assert_eq!(
+            settings.profiles.first().map(|p| p.hostname.as_str()),
+            Some("host-a")
+        );
+    }
+
+    /// A link at `registrar-internal`, or at the config itself, is
+    /// refused naming it, and nothing outside `secrets/` is read — the
+    /// outside config would pass every check had it been followed.
+    #[test]
+    fn a_swapped_level_or_leaf_is_refused_naming_it() {
+        for level in ["registrar-internal", CONFIG] {
+            let root = SwapRoot::new();
+            write_config(&root, &render_internal_config(&root.secrets, "host-a"));
+            let outside_config = root.outside.join("agent.toml");
+            std::fs::write(
+                &outside_config,
+                render_internal_config(&root.secrets, "evil"),
+            )
+            .expect("outside config");
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+            let target = if level == CONFIG {
+                outside_config.clone()
+            } else {
+                root.outside.clone()
+            };
+            let link = root.swap(level, &target);
+
+            let err = refused(&tree, &root.secrets.join(CONFIG));
+            assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before, "{level}");
+        }
+    }
+
+    /// The replacement of `registrar-internal/` by a directory of the
+    /// owner's own is refused by the root-by-policy check.
+    #[test]
+    fn a_registrar_internal_the_daemon_does_not_own_is_refused() {
+        let root = SwapRoot::new();
+        let config = write_config(&root, &render_internal_config(&root.secrets, "host-a"));
+        let mut tree = SecretsTree::open_rooted_for_tests(&root.secrets).expect("rooted");
+        tree.set_writer_euid_for_tests(crate::fs_util::current_process_euid().wrapping_add(1));
+
+        let err = refused(&tree, &config);
+        assert_error_names(&err, &root.secrets.join("registrar-internal"));
+    }
+
+    /// A config whose account key, bundle or profile is away from the
+    /// layout below the `--config` anchor is refused naming `--config`.
+    #[test]
+    fn a_config_naming_other_paths_is_refused() {
+        let root = SwapRoot::new();
+        let paths = InternalPaths::new(&root.secrets);
+        let rendered = render_internal_config(&root.secrets, "host-a");
+        let elsewhere = root.outside.join("elsewhere");
+        for moved in [paths.ca_bundle(), paths.acme_account(), paths.chain()] {
+            let contents = rendered.replace(
+                &moved.display().to_string(),
+                &elsewhere.display().to_string(),
+            );
+            assert_ne!(contents, rendered, "the path is rendered");
+            let config = write_config(&root, &contents);
+            let tree = root.rooted();
+            let err = load_daemon_config_in(&tree, &config).expect_err("refused");
+            assert!(
+                matches!(err, InternalCredentialError::Invalid { ref path, .. } if *path == config)
+            );
+        }
+    }
+
+    /// A config whose paths are at the layout below another directory
+    /// than the one `--config` names is refused too: the anchor is
+    /// `--config`'s, never the file's.
+    #[test]
+    fn a_config_rendered_for_another_secrets_directory_is_refused() {
+        let root = SwapRoot::new();
+        let config = write_config(&root, &render_internal_config(&root.outside, "host-a"));
+        let tree = root.rooted();
+        let err = load_daemon_config_in(&tree, &config).expect_err("refused");
+        assert!(
+            matches!(err, InternalCredentialError::Invalid { ref path, .. } if *path == config)
+        );
+    }
+
+    /// An `[openbao]` table would arm the fast-poll loop, which rewrites
+    /// files below `secrets/` by name; the rooted daemon refuses it,
+    /// naming `--config` and the table.
+    #[test]
+    fn an_openbao_table_is_refused_naming_it() {
+        let root = SwapRoot::new();
+        let config = write_config(
+            &root,
+            &format!(
+                "{}\n[openbao]\nurl = \"https://127.0.0.1:8200\"\nrole_id_path = \"{r}\"\n\
+                 secret_id_path = \"{s}\"\n",
+                render_internal_config(&root.secrets, "host-a"),
+                r = root.secrets.join("role_id").display(),
+                s = root.secrets.join("secret_id").display(),
+            ),
+        );
+        let tree = root.rooted();
+        let err = refused(&tree, &config);
+        assert_error_names(&err, &config);
+        assert!(format!("{err:#}").contains("[openbao]"));
+    }
+
+    /// An absent config is an empty document, which fails the layout
+    /// check naming `--config`, as `Settings::new` reads no file.
+    #[test]
+    fn an_absent_config_is_refused_naming_it() {
+        let root = SwapRoot::new();
+        std::fs::create_dir(root.secrets.join("registrar-internal")).expect("mkdir");
+        let tree = root.rooted();
+        let config = root.secrets.join(CONFIG);
+        let err = refused(&tree, &config);
+        assert_error_names(&err, &config);
+    }
+}

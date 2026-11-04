@@ -175,12 +175,12 @@ pub(super) fn is_protected(name: &str) -> bool {
 /// performs is not gated by this: those call sites name
 /// [`FixedOwner::root`] themselves.
 #[cfg(not(test))]
-fn protected_owner() -> FixedOwner {
+pub(crate) fn protected_owner() -> FixedOwner {
     FixedOwner::root()
 }
 
 #[cfg(test)]
-fn protected_owner() -> FixedOwner {
+pub(crate) fn protected_owner() -> FixedOwner {
     FixedOwner::current_process()
 }
 
