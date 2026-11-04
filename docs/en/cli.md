@@ -311,12 +311,23 @@ it, Compose would recreate PostgreSQL without TLS and step-ca's
 `verify-full` connection would be refused. An override that publishes any
 guarded service on a non-loopback address is refused.
 
+`infra up` takes no `--openbao-user` and leaves `BOOTROOT_OPENBAO_USER` as
+`.env` records it. When it is recorded, the TLS check above does not read
+OpenBao's key, which belongs to that uid: it requires the key to be a
+regular file owned by `<uid>:0` at mode `0600`.
+
+After upgrading to this version, the first `infra up` recreates the
+`openbao` container because its service definition changed; it comes back
+sealed and is unsealed as after any restart.
+
 ### Failure conditions
 
 The command is considered failed when:
 
 - docker compose/pull failures
 - Missing or unhealthy containers
+- `BOOTROOT_OPENBAO_USER` is recorded and OpenBao's TLS key is not a
+  regular file owned by `<uid>:0` at mode `0600`
 - A non-loopback OpenBao bind intent is stored but TLS certificate/key or
   `openbao.hcl` TLS configuration is missing
 - A non-loopback OpenBao bind intent is stored but the compose override
@@ -425,6 +436,34 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
 - `--http01-admin-host-port <N>`: host-side HTTP-01 responder admin API
   published port. Overrides `HTTP01_ADMIN_HOST_PORT` from `.env` and the
   process environment. Default **8080**.
+- `--openbao-user <uid>:<gid>`: run the OpenBao server as this host uid
+  and gid instead of the image's `openbao` user (optional). The value is
+  two decimal numbers of ASCII digits, each from `1` to `4294967294`,
+  separated by one `:`; surrounding whitespace is trimmed, and `0`,
+  `4294967295`, names, signs, a missing half or a third field are refused
+  before anything is written. It is never looked up in a user database
+  and need not exist on the host. It is recorded in canonical decimal
+  (`01:02` as `1:2`) as `BOOTROOT_OPENBAO_USER` in the compose
+  directory's `.env`, and both base compose files read it from there by
+  interpolation, so every `docker compose` run in that directory —
+  including one that names only the base file — starts OpenBao as that
+  uid. At every start OpenBao's entrypoint re-owns the raft volume, and
+  the audit directory and its active `audit.log` (never the registrar's
+  `rotation-intent.json` or the rotated audit generations), to it. The
+  TLS key `init` and `rotate infra-cert` issue is then owned by `<uid>:0`
+  at mode `0600` instead of being `0644`, and when an OpenBao TLS key is
+  already on disk, `infra install` hands it to the uid before it starts
+  the stack, so adopting the option, or changing the value, on an
+  installed stack leaves OpenBao able to read its key. A later
+  `infra install` without the option keeps the recorded value, and no
+  command clears it. Removing it from `.env` on an installed stack is not
+  supported: OpenBao, back on the image's `openbao` user, could then open
+  neither the raft volume nor the TLS key that were handed to the given
+  uid. A malformed value in `.env` is refused by every bootroot command
+  that reads it. Docker Compose prefers an exported
+  `BOOTROOT_OPENBAO_USER` to `.env`, so bootroot refuses to run while the
+  shell exports a non-empty value that differs from the one `.env`
+  records.
 - `--registrar-endpoint-host <label>`: enable the registrar endpoint on
   this host (optional). The bootroot host's single DNS label — never an
   FQDN or a composed name — validated as `bootroot registrar issue
@@ -1165,6 +1204,15 @@ keys that leave the vault sealed — fails the run and is named in the
 error rather than falling through to the next source. When no source is
 available at all, `init` fails **before** recreating the container, so
 the running OpenBao is left untouched.
+
+The listener's certificate and key are written to
+`<compose-dir>/openbao/tls/server.{crt,key}`. Without
+`infra install --openbao-user`, both are `0644`, so the image's `openbao`
+user can read them. With it, `openbao/tls` is `0755`, `server.crt` is
+`0644`, and `server.key` is handed to `<uid>:0` at mode `0600` by a
+one-shot root container that mounts only that directory and runs
+`chown --no-dereference`; `init` then checks the key's owner and mode
+rather than reading it.
 
 ### Failure conditions
 
@@ -2707,10 +2755,15 @@ Behavior:
     directory`): the mount source is resolved, so a link there would
     move both the chown and the certificate write onto its target.
     bootroot only ever creates that path as a real directory; symlinks
-    anywhere above it resolve as before. Both files are then
+    anywhere above it resolve as before. Without
+    `infra install --openbao-user`, both files are then
     `chmod 0644`'d so the in-container `openbao` user (which is in
     neither the runner's primary group nor any shared group) can
-    read them via the "other" permission bits.
+    read them via the "other" permission bits. With it, the directory
+    is set to `0755`, `server.crt` to `0644` and `server.key` to
+    `0600`, and the key is handed to `<uid>:0` by a second one-shot
+    root container that mounts only that directory and runs `chown
+    --no-dereference`.
   - `bootroot-http01` → re-issues the HTTP-01 responder admin API
     cert and writes it to
     `<secrets-dir>/bootroot-http01/tls/server.crt` and

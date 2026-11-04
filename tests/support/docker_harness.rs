@@ -72,6 +72,13 @@ pub(crate) fn openbao_tls_reown_script_path() -> PathBuf {
         .join("run-openbao-tls-reown.sh")
 }
 
+pub(crate) fn openbao_user_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("impl")
+        .join("run-openbao-user.sh")
+}
+
 pub(crate) fn secrets_owner_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("scripts")

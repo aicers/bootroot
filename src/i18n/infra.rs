@@ -351,4 +351,41 @@ impl Messages {
             &[("name", name), ("max", &max.to_string())],
         )
     }
+
+    pub(crate) fn error_openbao_user_invalid(&self, value: &str) -> String {
+        format_template(
+            self.strings().error_openbao_user_invalid,
+            &[("value", value)],
+        )
+    }
+
+    pub(crate) fn error_openbao_user_recorded_invalid(&self, path: &str, value: &str) -> String {
+        format_template(
+            self.strings().error_openbao_user_recorded_invalid,
+            &[("path", path), ("value", value)],
+        )
+    }
+
+    pub(crate) fn error_openbao_user_env_mismatch(
+        &self,
+        exported: &str,
+        path: &str,
+        recorded: &str,
+    ) -> String {
+        format_template(
+            self.strings().error_openbao_user_env_mismatch,
+            &[
+                ("exported", exported),
+                ("path", path),
+                ("recorded", recorded),
+            ],
+        )
+    }
+
+    pub(crate) fn error_openbao_user_env_unrecorded(&self, exported: &str, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_user_env_unrecorded,
+            &[("exported", exported), ("path", path)],
+        )
+    }
 }

@@ -297,12 +297,23 @@ PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
 없이 다시 생성해 step-ca의 `verify-full` 연결이 거부됩니다. 보호 대상
 서비스를 루프백이 아닌 주소에 게시하는 오버라이드는 거부됩니다.
 
+`infra up`에는 `--openbao-user`가 없으며 `.env`에 기록된
+`BOOTROOT_OPENBAO_USER`를 그대로 둡니다. 값이 기록되어 있으면 위의 TLS
+검증은 그 uid 소유인 OpenBao 키를 읽지 않고, 키가 `<uid>:0` 소유, 모드
+`0600`인 일반 파일인지 확인합니다.
+
+이 버전으로 업그레이드한 뒤 처음 실행하는 `infra up`은 서비스 정의가
+바뀌었으므로 `openbao` 컨테이너를 재생성합니다. 컨테이너는 봉인된 상태로
+올라오며, 다른 재시작 때와 같이 언실합니다.
+
 ### 실패 조건
 
 다음 조건이면 실패로 판정합니다.
 
 - docker compose/pull 실패
 - 컨테이너 미기동 또는 헬스 체크 실패
+- `BOOTROOT_OPENBAO_USER`가 기록되어 있으나 OpenBao TLS 키가 `<uid>:0`
+  소유, 모드 `0600`인 일반 파일이 아닌 경우
 - 비루프백 OpenBao 바인딩 의도가 저장되어 있으나 TLS 인증서/키 또는
   `openbao.hcl` TLS 설정이 누락된 경우
 - 비루프백 OpenBao 바인딩 의도가 저장되어 있으나 compose 오버라이드
@@ -411,6 +422,31 @@ bootroot infra up
 - `--http01-admin-host-port <N>`: 호스트 측 HTTP-01 응답기 admin API
   게시 포트입니다. `.env`의 `HTTP01_ADMIN_HOST_PORT`와 프로세스 환경
   변수보다 우선합니다. 기본값은 **8080**입니다.
+- `--openbao-user <uid>:<gid>`: OpenBao 서버를 이미지의 `openbao`
+  사용자 대신 이 호스트 uid와 gid로 실행합니다(선택). 값은 ASCII 숫자로
+  된 10진수 두 개를 `:` 하나로 구분한 것이며, 각각 `1`부터
+  `4294967294`까지입니다. 앞뒤 공백은 제거되며, `0`, `4294967295`, 이름,
+  부호, 한쪽이 빠진 값이나 세 번째 필드는 아무것도 쓰기 전에 거부됩니다.
+  사용자 데이터베이스에서 조회하지 않으므로 호스트에 존재하지 않아도
+  됩니다. 값은 정규화된 10진수(`01:02`는 `1:2`)로 compose 디렉터리의
+  `.env`에 `BOOTROOT_OPENBAO_USER`로 기록되고, 두 기본 compose 파일이 이를
+  보간으로 읽으므로, 기본 파일만 지정하는 경우를 포함해 그 디렉터리에서
+  실행되는 모든 `docker compose`가 OpenBao를 그 uid로 시작합니다. OpenBao의
+  엔트리포인트는 시작할 때마다 raft 볼륨과, 감사 디렉터리 및 활성
+  `audit.log`(레지스트라의 `rotation-intent.json`이나 회전된 감사 세대는
+  제외)의 소유자를 그 값으로 바꿉니다. `init`과 `rotate infra-cert`가
+  발급하는 TLS 키는 `0644` 대신 `<uid>:0` 소유, 모드 `0600`이 되며, 디스크에
+  OpenBao TLS 키가 이미 있으면 `infra install`이 스택을 시작하기 전에 그
+  키를 해당 uid에게 넘기므로, 설치된 스택에서 옵션을 새로 지정하거나 값을
+  바꿔도 OpenBao가 키를 읽을 수 있습니다. 이후 옵션 없이 실행한
+  `infra install`은 기록된 값을 유지하며, 값을 지우는 명령은 없습니다.
+  설치된 스택에서 `.env`의 값을 제거하는 것은 지원하지 않습니다. 이미지의
+  `openbao` 사용자로 돌아간 OpenBao는 지정한 uid에게 넘겨진 raft 볼륨도
+  TLS 키도 열 수 없기 때문입니다. `.env`의 잘못된 값은 이를 읽는 모든
+  bootroot 명령이 거부합니다. Docker Compose는 export된
+  `BOOTROOT_OPENBAO_USER`를 `.env`보다 우선하므로, 셸이 `.env`에 기록된
+  값과 다른 비어 있지 않은 값을 export하고 있으면 bootroot는 실행을
+  거부합니다.
 - `--registrar-endpoint-host <label>`: 이 호스트에서 레지스트라
   엔드포인트를 활성화합니다(선택). bootroot 호스트의 단일 DNS 레이블이며
   FQDN이나 조합된 이름은 허용되지 않습니다. `bootroot registrar issue
@@ -1132,6 +1168,14 @@ OpenBao와 step-ca/responder가 서로 다른 머신에 배치되면, 이 섹션
 않는 키)는 다음 소스로 넘어가지 않고 해당 소스를 명시한 오류로 실패합니다.
 사용할 수 있는 소스가 하나도 없으면 `init`은 컨테이너를 재생성하기 **전에**
 실패하므로 실행 중인 OpenBao는 그대로 유지됩니다.
+
+리스너의 인증서와 키는 `<compose-dir>/openbao/tls/server.{crt,key}`에
+기록됩니다. `infra install --openbao-user`가 없으면 둘 다 `0644`이므로
+이미지의 `openbao` 사용자가 읽을 수 있습니다. 옵션이 있으면
+`openbao/tls`는 `0755`, `server.crt`는 `0644`가 되고, `server.key`는 그
+디렉터리만 마운트해 `chown --no-dereference`를 실행하는 일회성 root
+컨테이너가 `<uid>:0`, 모드 `0600`으로 넘깁니다. 이 경우 `init`은 키를
+읽지 않고 소유자와 모드를 확인합니다.
 
 ### 실패 조건
 
@@ -2584,10 +2628,13 @@ init`이 compose 파일에서 `postgres` 서비스를 찾은 경우 `SIGHUP`으�
     구성요소까지 해석되므로, 이 위치의 링크는 chown과 인증서 기록을
     모두 링크 대상으로 옮기게 됩니다. bootroot는 이 경로를 항상 실제
     디렉터리로만 생성하며, 상위 경로의 심볼릭 링크는 기존과 동일하게
-    해석됩니다. 두 파일은
+    해석됩니다. `infra install --openbao-user`가 없으면 두 파일은
     `chmod 0644`로 설정되어, 컨테이너 내부의 `openbao` 유저(러너의
     기본 그룹이나 공유 그룹에 속하지 않음)가 "other" 권한 비트로
-    파일을 읽을 수 있도록 합니다.
+    파일을 읽을 수 있도록 합니다. 옵션이 있으면 디렉터리는 `0755`,
+    `server.crt`는 `0644`, `server.key`는 `0600`으로 설정되고, 그
+    디렉터리만 마운트해 `chown --no-dereference`를 실행하는 두 번째
+    일회성 root 컨테이너가 키를 `<uid>:0`에게 넘깁니다.
   - `bootroot-http01` → HTTP-01 responder admin API 인증서를 새로
     발급해 `<secrets-dir>/bootroot-http01/tls/server.crt` 및
     `<secrets-dir>/bootroot-http01/tls/server.key`에 기록합니다.

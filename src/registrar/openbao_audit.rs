@@ -2875,8 +2875,9 @@ impl DeviceLayout {
         staging.set_len(end)?;
 
         // Ownership from the device directory rather than hard-coded:
-        // the Compose entrypoint chowns it to the image's own
-        // `openbao:openbao` and the numeric ids come from the image.
+        // the Compose entrypoint chowns it to the uid `OpenBao` runs as —
+        // the image's own `openbao:openbao`, whose numeric ids come from
+        // the image, or the `uid:gid` `BOOTROOT_OPENBAO_USER` records.
         //
         // Applied to the descriptor this pass created rather than to the
         // path it created it at. The device directory is writable by the

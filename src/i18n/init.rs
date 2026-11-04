@@ -594,6 +594,17 @@ impl Messages {
         )
     }
 
+    pub(crate) fn error_openbao_tls_key_handover_failed(&self) -> &'static str {
+        self.strings().error_openbao_tls_key_handover_failed
+    }
+
+    pub(crate) fn error_openbao_tls_key_not_regular_file(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_tls_key_not_regular_file,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn error_openbao_hcl_write_failed(&self) -> &'static str {
         self.strings().error_openbao_hcl_write_failed
     }

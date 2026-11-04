@@ -12,7 +12,7 @@ SECRETS_BACKUP_DIR=""
 # script runs them. `ARMS` holds the ones `--only` selected, space-separated
 # (a plain string rather than an array: bash 3.2 under `set -u` treats an
 # empty array as unset); empty means every arm.
-ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation secrets-owner"
+ALL_ARMS="local-no-hosts local-hosts remote-no-hosts remote-hosts rotation reinit-recovery stepca-san openbao-tls-no-delta openbao-tls-reown two-instance registrar-verbs registrar-internal registrar-internal-init registrar-internal-init-routable registrar-redteam registrar-ca-rotation secrets-owner openbao-user"
 ARMS=""
 
 usage() {
@@ -38,14 +38,17 @@ of CI's `Docker E2E (<arm>)` job:
 15) registrar-redteam                registrar credential-boundary red-team gate
 16) registrar-ca-rotation            full CA rotation on a registrar endpoint host
 17) secrets-owner                    root-run infra install and init over a secrets/ another account owns
+18) openbao-user                     OpenBao run as the account infra install --openbao-user names
 
 Steps 13 and 14 run `bootroot init` as root through `sudo -n`, because an
 endpoint-enabled `init` publishes the bootroot-internal credential root-owned
 and refuses to publish it otherwise. Step 17 creates an account with
 `useradd`, hands it `secrets/` and runs `bootroot infra install` and `init`
-as root through `sudo -n`. Passwordless sudo is a prerequisite of the whole
-matrix, and of any --only selection that includes a hosts step or one of
-steps 9 and 13-17; --skip-hosts does not stand in for it.
+as root through `sudo -n`; step 18 does the same, gives OpenBao that account
+through `--openbao-user`, and also runs `bootroot infra up` as root.
+Passwordless sudo is a prerequisite of the whole matrix, and of any --only
+selection that includes a hosts step or one of steps 9 and 13-18;
+--skip-hosts does not stand in for it.
 
 Options:
   --only <arm>  Run only the named arm (one of the labels above). Repeat it
@@ -342,6 +345,16 @@ if want secrets-owner; then
   COMPOSE_PROJECT_NAME="bootroot-e2e-ci-secrets-owner-${RUN_ID}" \
   BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
   "$ROOT_DIR/scripts/impl/run-secrets-owner.sh"
+fi
+
+if want openbao-user; then
+  # As for secrets-owner, its own account owns `secrets/` for the whole
+  # run, so it takes no SECRETS_DIR.
+  echo "[ci-local-e2e] run OpenBao user (issue #1150)"
+  ARTIFACT_DIR="$ROOT_DIR/tmp/e2e/ci-openbao-user-${RUN_ID}" \
+  COMPOSE_PROJECT_NAME="bootroot-e2e-ci-openbao-user-${RUN_ID}" \
+  BOOTROOT_BIN="$ROOT_DIR/target/debug/bootroot" \
+  "$ROOT_DIR/scripts/impl/run-openbao-user.sh"
 fi
 
 echo "[ci-local-e2e] done"
