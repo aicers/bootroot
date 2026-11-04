@@ -650,8 +650,10 @@ assert_account_processes() {
     assert_container_processes_are_the_accounts "$container" "after init"
   done
   # A here-string, not a pipe, for the reason `ensure_openssl` gives.
+  # `docker top` refuses a column list without `pid`: the daemon maps
+  # each row back to the container through that column.
   local listing
-  listing="$(docker top "$OPENBAO_CONTAINER" -o args 2>>"$RUN_LOG")" \
+  listing="$(docker top "$OPENBAO_CONTAINER" -o pid,args 2>>"$RUN_LOG")" \
     || fail "after init: docker top ${OPENBAO_CONTAINER} failed"
   grep -qE '(^|[ /])bao server' <<<"$listing" \
     || fail "after init: ${OPENBAO_CONTAINER} lists no bao server process"
