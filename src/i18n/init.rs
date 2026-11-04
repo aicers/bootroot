@@ -12,6 +12,13 @@ impl Messages {
         self.strings().init_failed_rollback
     }
 
+    pub(crate) fn init_rollback_secrets_step_incomplete(&self, error: &str) -> String {
+        format_template(
+            self.strings().init_rollback_secrets_step_incomplete,
+            &[("error", error)],
+        )
+    }
+
     pub(crate) fn prompt_openbao_root_token(&self) -> &'static str {
         self.strings().prompt_openbao_root_token
     }

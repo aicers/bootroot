@@ -26,6 +26,7 @@ pub(super) static STRINGS: Strings = Strings {
     monitoring_up_already_running: "bootroot monitoring up: already running (run `bootroot monitoring down` first if you want to restart)",
     error_service_no_container: "Service has no running container: {service}",
     init_failed_rollback: "bootroot init: failed, attempting rollback",
+    init_rollback_secrets_step_incomplete: "Rollback: a secrets-directory step did not complete: {error}",
     prompt_openbao_root_token: "OpenBao root token: ",
     error_openbao_root_token_required: "OpenBao root token is required; pass --root-token, --root-token-file, or the OPENBAO_ROOT_TOKEN env var",
     warning_openbao_unseal_from_file: "WARNING: Auto-unseal from file is for dev/test only and unsafe for production.",

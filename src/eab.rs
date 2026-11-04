@@ -602,6 +602,13 @@ mod tests {
         Arc::new(SecretsTree::open_rooted_for_tests(secrets).unwrap())
     }
 
+    fn owner_of(path: &Path) -> (u32, u32) {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        (meta.uid(), meta.gid())
+    }
+
     #[tokio::test]
     async fn rooted_write_eab_file_matches_the_path_based_write() {
         let mut results = Vec::new();
@@ -628,6 +635,8 @@ mod tests {
                 std::fs::read(&path).unwrap(),
                 mode_of(&path),
                 mode_of(path.parent().unwrap()),
+                owner_of(&path),
+                owner_of(path.parent().unwrap()),
             ));
             assert!(remove_eab_file_in(&tree, &path).await.unwrap());
             assert!(!remove_eab_file_in(&tree, &path).await.unwrap());

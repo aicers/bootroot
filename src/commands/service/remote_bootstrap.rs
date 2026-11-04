@@ -1336,11 +1336,16 @@ mod tests {
 
     #[tokio::test]
     async fn rooted_artifact_write_matches_the_path_based_write() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let mut results = Vec::new();
         for rooted in [false, true] {
             let root = crate::test_support::SwapRoot::new();
+            let remote_bootstrap = root.secrets.join("remote-bootstrap");
+            assert!(
+                std::fs::symlink_metadata(&remote_bootstrap).is_err(),
+                "the write must create the whole remote-bootstrap/ hierarchy"
+            );
             let tree = std::sync::Arc::new(if rooted {
                 root.rooted()
             } else {
@@ -1350,11 +1355,29 @@ mod tests {
             let path = std::path::PathBuf::from(&result.bootstrap_file);
             let mode =
                 |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+            let owner = |p: &std::path::Path| {
+                let meta = std::fs::symlink_metadata(p).unwrap();
+                (meta.uid(), meta.gid())
+            };
+            // `remote-bootstrap/services/<id>/`, `remote-bootstrap/services/`
+            // and `remote-bootstrap/`, each created by the write.
+            let created: Vec<&std::path::Path> = path.ancestors().skip(1).take(3).collect();
+            assert_eq!(created.last().copied(), Some(remote_bootstrap.as_path()));
+            if rooted {
+                // Rooted intermediates are `0700` on purpose; path-based
+                // ones follow the umask, so the modes are not compared
+                // across the two.
+                for dir in &created {
+                    assert_eq!(mode(dir), 0o700, "{}", dir.display());
+                }
+            }
             results.push((
                 std::fs::read(&path).unwrap(),
                 mode(&path),
                 mode(path.parent().unwrap()),
                 result.remote_run_command,
+                owner(&path),
+                created.iter().map(|dir| owner(dir)).collect::<Vec<_>>(),
             ));
         }
         assert_eq!(results[0], results[1]);

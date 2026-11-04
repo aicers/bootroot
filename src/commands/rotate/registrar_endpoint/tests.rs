@@ -641,9 +641,9 @@ impl Host {
     }
 }
 
-/// Every entry below `dir`, by relative path, with its kind, mode and
-/// contents.
-fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (String, u32, Vec<u8>)> {
+/// `dir` itself and every entry below it, by relative path, with its
+/// kind, mode, owner and contents.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, crate::test_support::Entry> {
     crate::test_support::snapshot_tree(dir)
 }
 
@@ -659,12 +659,13 @@ async fn rooted_preservation_matches_the_path_based_one() {
         let pair = current.leaf("client", (2099, 1, 1));
         write_pair(&host.endpoint.client, &pair);
         let tree = if rooted { host.rooted() } else { host.tree() };
+        let owner = RetiredOwner::current_process();
         preserve_retired_pair(
             &tree,
             &host.endpoint.client,
             &host.paths,
             &generation,
-            RetiredOwner::current_process(),
+            owner,
             &test_messages(),
         )
         .await
@@ -685,11 +686,20 @@ async fn rooted_preservation_matches_the_path_based_one() {
         }
         assert!(!host.paths.registrar_client_retired_staging().exists());
         // The owner the production path would give root, as the ids the
-        // test process holds.
-        assert_eq!(
-            std::fs::metadata(&retired).expect("stat").uid(),
-            fs_util::current_process_euid()
-        );
+        // test process holds, on the directory and on each file, read
+        // without following a link.
+        for path in [
+            retired.clone(),
+            retired.join(RETIRED_CERT_FILE),
+            retired.join(RETIRED_KEY_FILE),
+        ] {
+            let meta = std::fs::symlink_metadata(&path).expect("stat");
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (owner.uid, owner.gid),
+                "rooted={rooted}"
+            );
+        }
         results.push(seen);
     }
     assert_eq!(results[0], results[1]);

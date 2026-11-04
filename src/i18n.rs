@@ -49,6 +49,7 @@ pub(crate) struct Strings {
     pub(crate) monitoring_up_already_running: &'static str,
     pub(crate) error_service_no_container: &'static str,
     pub(crate) init_failed_rollback: &'static str,
+    pub(crate) init_rollback_secrets_step_incomplete: &'static str,
     pub(crate) prompt_openbao_root_token: &'static str,
     pub(crate) error_openbao_root_token_required: &'static str,
     pub(crate) warning_openbao_unseal_from_file: &'static str,
@@ -841,6 +842,32 @@ pub(crate) fn test_messages() -> Messages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rollback's report of a secrets-directory task that did not
+    /// complete renders a real task error in both languages, and in
+    /// English reads as the sentence printed before it was localized.
+    #[tokio::test]
+    async fn init_rollback_secrets_step_incomplete_renders_a_task_error() {
+        const PANIC: &str = "the secrets-directory step panicked";
+        let err = tokio::task::spawn_blocking(|| panic!("{PANIC}"))
+            .await
+            .expect_err("the task panicked");
+        let error = err.to_string();
+        assert!(!error.contains('{'), "{error}");
+        for locale in ["en", "ko"] {
+            let text = Messages::new(locale)
+                .unwrap()
+                .init_rollback_secrets_step_incomplete(&error);
+            assert!(text.contains(&error), "{locale}: {text}");
+            assert!(!text.contains('{'), "{locale} left a placeholder: {text}");
+        }
+        assert_eq!(
+            Messages::new("en")
+                .unwrap()
+                .init_rollback_secrets_step_incomplete(&error),
+            format!("Rollback: a secrets-directory step did not complete: {err}")
+        );
+    }
 
     /// Nine messages name a container an operator reads or runs.  On a
     /// non-default instance a hard-coded `bootroot-*` names something

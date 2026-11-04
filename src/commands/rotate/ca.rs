@@ -2829,7 +2829,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let messages = test_messages();
-        // Parity: the rooted copy gives the bytes and mode `fs::copy` does.
+        // Parity: the rooted copy gives the bytes, mode and owner
+        // `fs::copy` does.
         let mut results = Vec::new();
         for rooted in [false, true] {
             let root = crate::test_support::SwapRoot::new();
@@ -2842,7 +2843,12 @@ mod tests {
                 SecretsTree::open(&root.secrets).expect("open")
             };
             backup_file(&tree, &src, &dst, &messages).expect("backup");
-            results.push((fs::read(&dst).expect("read"), mode_of(&dst)));
+            let meta = fs::symlink_metadata(&dst).expect("stat");
+            results.push((
+                fs::read(&dst).expect("read"),
+                mode_of(&dst),
+                (meta.uid(), meta.gid()),
+            ));
             // An existing regular backup is kept, as a resumed rotation
             // keeps it.
             fs::write(&src, "NEWER\n").expect("rewrite source");
@@ -2850,7 +2856,10 @@ mod tests {
             assert_eq!(fs::read(&dst).expect("read"), b"KEY\n");
         }
         assert_eq!(results[0], results[1]);
-        assert_eq!(results[1], (b"KEY\n".to_vec(), 0o640));
+        assert_eq!(
+            (results[1].0.as_slice(), results[1].1),
+            (b"KEY\n".as_slice(), 0o640)
+        );
 
         // A link at the source is refused and nothing is written.
         let root = crate::test_support::SwapRoot::new();

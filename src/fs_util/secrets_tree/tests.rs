@@ -38,37 +38,44 @@ fn writer() -> (u32, u32) {
     )
 }
 
-/// Every entry below `root`, by relative path: its kind, mode, and the
-/// contents of a file or the target of a link. What the swap tests
-/// compare before and after to show nothing outside `secrets/` moved.
-fn snapshot(root: &Path) -> BTreeMap<PathBuf, (String, u32, Vec<u8>)> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (String, u32, Vec<u8>)>) {
-        for entry in std::fs::read_dir(dir).expect("read_dir") {
-            let path = entry.expect("entry").path();
-            let meta = std::fs::symlink_metadata(&path).expect("stat");
-            let rel = path.strip_prefix(root).expect("below root").to_path_buf();
-            let mode = meta.permissions().mode() & 0o7777;
-            if meta.file_type().is_symlink() {
-                let target = std::fs::read_link(&path).expect("readlink");
-                out.insert(
-                    rel,
-                    (
-                        "link".into(),
-                        0,
-                        target.as_os_str().as_encoded_bytes().to_vec(),
-                    ),
-                );
-            } else if meta.is_dir() {
-                out.insert(rel, ("dir".into(), mode, Vec::new()));
-                walk(root, &path, out);
-            } else {
-                let contents = std::fs::read(&path).expect("read");
-                out.insert(rel, ("file".into(), mode, contents));
+/// One recorded entry: its kind, mode, uid, gid, and the contents of a
+/// file or the target of a link.
+type Entry = (String, u32, u32, u32, Vec<u8>);
+
+/// `root` itself, under the empty relative path, and every entry below
+/// it, by relative path, read without following a link. What the swap
+/// tests compare before and after to show nothing outside `secrets/`
+/// moved or changed owner.
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Entry> {
+    fn record(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+        let meta = std::fs::symlink_metadata(path).expect("stat");
+        let rel = path.strip_prefix(root).expect("below root").to_path_buf();
+        let mode = meta.permissions().mode() & 0o7777;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(path).expect("readlink");
+            out.insert(
+                rel,
+                (
+                    "link".into(),
+                    0,
+                    uid,
+                    gid,
+                    target.as_os_str().as_encoded_bytes().to_vec(),
+                ),
+            );
+        } else if meta.is_dir() {
+            out.insert(rel, ("dir".into(), mode, uid, gid, Vec::new()));
+            for entry in std::fs::read_dir(path).expect("read_dir") {
+                record(root, &entry.expect("entry").path(), out);
             }
+        } else {
+            let contents = std::fs::read(path).expect("read");
+            out.insert(rel, ("file".into(), mode, uid, gid, contents));
         }
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
+    record(root, root, &mut out);
     out
 }
 
@@ -1170,6 +1177,21 @@ fn rooted_read_dir_and_entry_kind_read_without_following() {
 }
 
 #[test]
+fn rooted_read_dir_refuses_a_link_at_the_listed_directory() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let before = snapshot(&fixture.outside);
+    let b = fixture.secrets.join("a").join("b");
+    std::fs::rename(&b, fixture.root.join("b-aside")).expect("move b aside");
+    symlink(&fixture.outside, &b).expect("plant link");
+    let err = tree
+        .read_dir(&b)
+        .expect_err("a link at the listed directory");
+    assert_names(&err, &b);
+    assert_eq!(snapshot(&fixture.outside), before);
+}
+
+#[test]
 fn rooted_ensure_dir_fixed_creates_missing_levels_0700_under_the_owner() {
     let fixture = SwapFixture::new();
     let tree = fixture.rooted();
@@ -1216,13 +1238,16 @@ fn rooted_adopt_dir_keeps_an_owned_dir_and_refuses_links() {
     tree.adopt_dir(&b).expect("adopt");
     assert_eq!(owner_of_path(&b), owner_of_path(&fixture.secrets));
 
+    let before = snapshot(&fixture.outside);
     let leaf_link = fixture.secrets.join("leaf-link");
     symlink(&fixture.outside, &leaf_link).expect("leaf link");
     let err = tree.adopt_dir(&leaf_link).expect_err("leaf link");
     assert_names(&err, &leaf_link);
+    assert_eq!(snapshot(&fixture.outside), before);
     fixture.swap_intermediate();
     let err = tree.adopt_dir(&b).expect_err("intermediate link");
     assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
 }
 
 #[test]
@@ -1602,14 +1627,17 @@ fn rooted_read_with_meta_returns_the_read_descriptor_s_mode_and_owner() {
         }
     );
 
+    let before = snapshot(&fixture.outside);
     fixture.swap_leaf();
     let err = tree.read_with_meta(&fixture.leaf()).expect_err("leaf link");
     assert_names(&err, &fixture.leaf());
+    assert_eq!(snapshot(&fixture.outside), before);
     fixture.swap_intermediate();
     let err = tree
         .read_with_meta(&fixture.leaf())
         .expect_err("intermediate link");
     assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
 }
 
 #[test]
