@@ -468,11 +468,16 @@ mod tests {
         }
     }
 
-    /// Over a tree the test's user owns, the rooted patch gives the bytes
-    /// and the mode the path-based one gives.
+    /// Over a tree the test's user owns, the rooted patch gives the bytes,
+    /// the mode and the owner the path-based one gives.
     #[test]
     fn rooted_patches_match_the_path_based_patches() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let owner_of = |path: &Path| {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            (meta.uid(), meta.gid())
+        };
 
         let messages = test_messages();
         let mut results = Vec::new();
@@ -493,6 +498,8 @@ mod tests {
                 mode_of(&ca_json),
                 std::fs::read(&ctmpl).unwrap(),
                 mode_of(&ctmpl),
+                owner_of(&ca_json),
+                owner_of(&ctmpl),
             ));
         }
         assert_eq!(results[0], results[1]);

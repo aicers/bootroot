@@ -202,13 +202,16 @@ impl InitRollback {
             }
         }
         let artifacts = self.http01_tls_artifacts.clone();
-        self.with_secrets_tree(move |tree| {
-            for artifact in &artifacts {
-                if let Err(err) = remove_secrets_file(tree, artifact) {
-                    eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
+        self.with_secrets_tree(
+            move |tree| {
+                for artifact in &artifacts {
+                    if let Err(err) = remove_secrets_file(tree, artifact) {
+                        eprintln!("Rollback: failed to remove {}: {err}", artifact.display());
+                    }
                 }
-            }
-        })
+            },
+            messages,
+        )
         .await;
         if self.openbao_recreated
             && let Some(compose_file) = &self.compose_file
@@ -299,9 +302,12 @@ impl InitRollback {
         // exposed port override) so the admin API returns to
         // loopback-only / plain-HTTP.
         if let Some(file) = self.responder_config_backup.clone() {
-            let messages = messages.clone();
-            self.with_secrets_tree(move |tree| report_rollback_file(&file, tree, &messages))
-                .await;
+            let task_messages = messages.clone();
+            self.with_secrets_tree(
+                move |tree| report_rollback_file(&file, tree, &task_messages),
+                messages,
+            )
+            .await;
         }
         if self.responder_config_backup.is_some()
             && let Some(compose_file) = &self.compose_file
@@ -347,16 +353,19 @@ impl InitRollback {
         .flatten()
         .cloned()
         .collect();
-        self.with_secrets_tree(move |tree| {
-            for dir in &dirs {
-                if let Err(err) = remove_secrets_dir_all(tree, dir) {
-                    eprintln!(
-                        "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
-                        dir.display()
-                    );
+        self.with_secrets_tree(
+            move |tree| {
+                for dir in &dirs {
+                    if let Err(err) = remove_secrets_dir_all(tree, dir) {
+                        eprintln!(
+                            "Rollback: failed to remove the bootroot-internal credential at {}: {err}",
+                            dir.display()
+                        );
+                    }
                 }
-            }
-        })
+            },
+            messages,
+        )
         .await;
         // Restored before deleted, and never both: an entry this run
         // created has no prior body and is removed, while one it found
@@ -420,9 +429,12 @@ impl InitRollback {
             }
         }
         if let Some(file) = self.password_backup.clone() {
-            let messages = messages.clone();
-            self.with_secrets_tree(move |tree| report_rollback_file(&file, tree, &messages))
-                .await;
+            let task_messages = messages.clone();
+            self.with_secrets_tree(
+                move |tree| report_rollback_file(&file, tree, &task_messages),
+                messages,
+            )
+            .await;
         }
         self.restore_stepca_ca_json(docker, messages).await;
     }
@@ -431,15 +443,29 @@ impl InitRollback {
     /// `secrets/`: every operation through the handle blocks, and
     /// [`InitRollback::rollback`] is async.  Awaited before the next step,
     /// so the rollback keeps its order; a task that panicked is reported
-    /// like any other rollback failure.
-    async fn with_secrets_tree<F>(&self, op: F)
+    /// like any other rollback failure, in the operator's language, and
+    /// the rest of the rollback still runs.
+    async fn with_secrets_tree<F>(&self, op: F, messages: &Messages)
+    where
+        F: FnOnce(Option<&fs_util::SecretsTree>) + Send + 'static,
+    {
+        if let Some(line) = self.run_secrets_task(op, messages).await {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Runs `op` as [`InitRollback::with_secrets_tree`] does and returns
+    /// the line to report when the task did not complete, `None` when it
+    /// did.
+    async fn run_secrets_task<F>(&self, op: F, messages: &Messages) -> Option<String>
     where
         F: FnOnce(Option<&fs_util::SecretsTree>) + Send + 'static,
     {
         let tree = self.secrets_tree.clone();
-        if let Err(err) = tokio::task::spawn_blocking(move || op(tree.as_deref())).await {
-            eprintln!("Rollback: a secrets-directory step did not complete: {err}");
-        }
+        tokio::task::spawn_blocking(move || op(tree.as_deref()))
+            .await
+            .err()
+            .map(|err| messages.init_rollback_secrets_step_incomplete(&err.to_string()))
     }
 
     /// Restores `ca.json` together with the Agent template it is
@@ -460,11 +486,14 @@ impl InitRollback {
             .cloned()
             .collect();
         let task_messages = messages.clone();
-        self.with_secrets_tree(move |tree| {
-            for file in &files {
-                report_rollback_file(file, tree, &task_messages);
-            }
-        })
+        self.with_secrets_tree(
+            move |tree| {
+                for file in &files {
+                    report_rollback_file(file, tree, &task_messages);
+                }
+            },
+            messages,
+        )
         .await;
         // The sidecar loads its templates at start-up, so one that `init`
         // restarted onto the regenerated template keeps rendering the new
@@ -718,6 +747,39 @@ mod rollback_tests {
     use super::{
         ComposeIdentity, ComposeInvocation, DEFAULT_INSTANCE_NAME, InitRollback, RollbackFile,
     };
+
+    /// A secrets-directory task that panics is reported in the operator's
+    /// language with the task's error, and the rollback goes on to run
+    /// the next task.
+    #[tokio::test]
+    async fn run_secrets_task_reports_a_failed_task_in_the_operator_s_language() {
+        const PANIC: &str = "the secrets-directory step panicked";
+        let messages = crate::i18n::Messages::new("ko").expect("ko");
+        let rollback = InitRollback::default();
+        let line = rollback
+            .run_secrets_task(|_| panic!("{PANIC}"), &messages)
+            .await;
+        let line = line.expect("a failed task is reported");
+        // The task's error names the task by an id the runtime assigns,
+        // so it is read back from behind the Korean sentence rather than
+        // rebuilt.
+        let error = line
+            .strip_prefix(&messages.init_rollback_secrets_step_incomplete(""))
+            .expect("the Korean sentence")
+            .to_string();
+        assert!(error.contains(PANIC), "{error}");
+        assert_eq!(line, messages.init_rollback_secrets_step_incomplete(&error));
+
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&ran);
+        rollback
+            .with_secrets_tree(
+                move |_| flag.store(true, std::sync::atomic::Ordering::SeqCst),
+                &messages,
+            )
+            .await;
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     /// The identity a rollback falls back to when no `.env` is readable.
     fn default_rollback_identity() -> ComposeIdentity {

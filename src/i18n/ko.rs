@@ -26,6 +26,7 @@ pub(super) static STRINGS: Strings = Strings {
     monitoring_up_already_running: "bootroot 모니터링 기동: 이미 실행 중입니다 (재시작하려면 `bootroot monitoring down`을 먼저 실행하세요)",
     error_service_no_container: "실행 중인 컨테이너가 없습니다: {service}",
     init_failed_rollback: "bootroot init: 실패, 롤백 시도 중",
+    init_rollback_secrets_step_incomplete: "롤백: secrets 디렉터리 단계가 완료되지 않았습니다: {error}",
     prompt_openbao_root_token: "OpenBao 루트 토큰: ",
     error_openbao_root_token_required: "OpenBao 루트 토큰이 필요합니다; --root-token, --root-token-file 또는 OPENBAO_ROOT_TOKEN 환경 변수를 전달하세요",
     warning_openbao_unseal_from_file: "경고: 파일에서 자동 언실은 dev/test 전용이며 운영에서는 안전하지 않습니다.",

@@ -7,15 +7,15 @@
 //! library's tests cannot reach it.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::fs_util::SecretsTree;
 
-/// One recorded entry below `outside/`: its kind, mode, and the
-/// contents of a file or the target of a link.
-pub(crate) type Entry = (String, u32, Vec<u8>);
+/// One recorded entry: its kind, mode, uid, gid, and the contents of a
+/// file or the target of a link.
+pub(crate) type Entry = (String, u32, u32, u32, Vec<u8>);
 
 /// A `tempdir` holding `secrets/` and a sibling `outside/`.
 pub(crate) struct SwapRoot {
@@ -87,42 +87,44 @@ impl SwapRoot {
         path
     }
 
-    /// Every entry below `outside/`, by relative path.
+    /// `outside/` itself and every entry below it, by relative path.
     pub(crate) fn outside_snapshot(&self) -> BTreeMap<PathBuf, Entry> {
         snapshot_tree(&self.outside)
     }
 }
 
-/// Every entry below `root`, by relative path: its kind, mode, and the
-/// contents of a file or the target of a link.
+/// `root` itself, under the empty relative path, and every entry below
+/// it, by relative path, read without following a link.
 pub(crate) fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, Entry> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
-        for entry in std::fs::read_dir(dir).expect("read_dir") {
-            let path = entry.expect("entry").path();
-            let meta = std::fs::symlink_metadata(&path).expect("stat");
-            let rel = path.strip_prefix(root).expect("below root").to_path_buf();
-            let mode = meta.permissions().mode() & 0o7777;
-            if meta.file_type().is_symlink() {
-                let target = std::fs::read_link(&path).expect("readlink");
-                out.insert(
-                    rel,
-                    (
-                        "link".into(),
-                        0,
-                        target.as_os_str().as_encoded_bytes().to_vec(),
-                    ),
-                );
-            } else if meta.is_dir() {
-                out.insert(rel, ("dir".into(), mode, Vec::new()));
-                walk(root, &path, out);
-            } else {
-                let contents = std::fs::read(&path).expect("read");
-                out.insert(rel, ("file".into(), mode, contents));
+    fn record(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+        let meta = std::fs::symlink_metadata(path).expect("stat");
+        let rel = path.strip_prefix(root).expect("below root").to_path_buf();
+        let mode = meta.permissions().mode() & 0o7777;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(path).expect("readlink");
+            out.insert(
+                rel,
+                (
+                    "link".into(),
+                    0,
+                    uid,
+                    gid,
+                    target.as_os_str().as_encoded_bytes().to_vec(),
+                ),
+            );
+        } else if meta.is_dir() {
+            out.insert(rel, ("dir".into(), mode, uid, gid, Vec::new()));
+            for entry in std::fs::read_dir(path).expect("read_dir") {
+                record(root, &entry.expect("entry").path(), out);
             }
+        } else {
+            let contents = std::fs::read(path).expect("read");
+            out.insert(rel, ("file".into(), mode, uid, gid, contents));
         }
     }
     let mut out = BTreeMap::new();
-    walk(root, root, &mut out);
+    record(root, root, &mut out);
     out
 }
 

@@ -1183,4 +1183,61 @@ instance_id = \"001\"\n\n\
             assert!(!delete_secrets_dir_if_present(tree, &root.secrets.join("absent")).unwrap());
         }
     }
+
+    /// Over equivalent populated trees, the rooted removal removes what
+    /// the path-based one removes, reports it the same way, and keeps the
+    /// same parents.
+    #[test]
+    fn rooted_secrets_dir_removal_matches_the_path_based_removal() {
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            root.write("services/svc/secret_id", "SECRET-ID");
+            root.write("services/svc/nested/file", "NESTED");
+            root.write("remote-bootstrap/services/svc/bootstrap.json", "{}");
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).unwrap()
+            };
+            assert_eq!(tree.is_rooted(), rooted);
+            let service_dir = root.secrets.join("services").join("svc");
+            let bootstrap_dir = root
+                .secrets
+                .join("remote-bootstrap")
+                .join("services")
+                .join("svc");
+            for dir in [&service_dir, &bootstrap_dir] {
+                assert!(
+                    delete_secrets_dir_if_present(&tree, dir).unwrap(),
+                    "rooted={rooted}: {}",
+                    dir.display()
+                );
+                assert!(
+                    !delete_secrets_dir_if_present(&tree, dir).unwrap(),
+                    "rooted={rooted}: {}",
+                    dir.display()
+                );
+            }
+            for dir in [&service_dir, &bootstrap_dir] {
+                assert!(
+                    std::fs::symlink_metadata(dir).is_err(),
+                    "rooted={rooted}: {} is removed",
+                    dir.display()
+                );
+            }
+            for parent in [
+                root.secrets.join("services"),
+                root.secrets.join("remote-bootstrap").join("services"),
+            ] {
+                assert!(
+                    std::fs::symlink_metadata(&parent)
+                        .unwrap()
+                        .file_type()
+                        .is_dir(),
+                    "rooted={rooted}: {} is kept",
+                    parent.display()
+                );
+            }
+        }
+    }
 }
