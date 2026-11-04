@@ -781,12 +781,12 @@ mod tests {
 
     /// On a rooted handle the staged step-ca password goes to the owner
     /// of `secrets/`, whose `step` helper reads it, and replaces a link
-    /// planted at its name without touching the link's target; a
-    /// rooted `write_secret_id_atomic` still keeps the owner of the
-    /// `secret_id` it replaces. `secrets/` takes a supplementary gid so
-    /// the directory's owner and the writer's differ on Linux, where a
-    /// fresh file takes the writer's primary gid; single-gid runners
-    /// skip.
+    /// planted at its name without touching the link's target, or a
+    /// leftover under another group; a rooted `write_secret_id_atomic`
+    /// still keeps the owner of the `secret_id` it replaces. `secrets/`
+    /// takes a supplementary gid so the directory's owner and the
+    /// writer's differ on Linux, where a fresh file takes the writer's
+    /// primary gid; single-gid runners skip.
     #[tokio::test]
     async fn rooted_write_secret_file_gives_the_file_to_the_anchor_owner() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -815,7 +815,18 @@ mod tests {
         assert_eq!(std::fs::read(&password).expect("read"), b"new-pw");
         assert_eq!(root.outside_snapshot(), before);
 
+        // A leftover from an earlier run under another group is not kept:
+        // `Destination` would re-apply this gid, on any platform.
         let egid = bootroot::cert_group::current_process_egid();
+        std::os::unix::fs::chown(&password, None, Some(egid)).expect("chgrp leftover");
+        write_secret_file(&tree, &password, "newer-pw", &messages)
+            .await
+            .expect("rewrite password");
+        let meta = std::fs::metadata(&password).expect("stat password");
+        assert_eq!((meta.uid(), meta.gid()), (anchor.uid(), anchor.gid()));
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+        assert_eq!(std::fs::read(&password).expect("read"), b"newer-pw");
+
         let secret_id = root.write("services/svc/secret_id", "old");
         std::os::unix::fs::chown(&secret_id, None, Some(egid)).expect("chgrp secret_id");
         let service_dir = root.secrets.join("services").join("svc");
