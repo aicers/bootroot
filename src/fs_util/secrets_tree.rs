@@ -340,8 +340,9 @@ impl SecretsTree {
     ///
     /// # Errors
     /// Returns an error if `path` is not below the anchor or names a level
-    /// by anything but plain names, a level cannot be opened as a directory without following a link, cannot be
-    /// created, or cannot be given its mode or owner.
+    /// by anything but plain names, a level cannot be opened as a
+    /// directory without following a link, cannot be created, or cannot
+    /// be given its mode or owner.
     pub fn ensure_dir(&self, path: &Path) -> Result<()> {
         let names = self.relative(path)?;
         let Some(anchor_fd) = self.rooted_fd() else {
@@ -418,9 +419,10 @@ impl SecretsTree {
     ///
     /// # Errors
     /// Returns an error if `dest` is not below the anchor or names a level
-    /// by anything but plain names, a directory level cannot be opened without following a link, the leaf is a
-    /// link an operator-named destination would follow, or the temporary
-    /// cannot be created, written, chowned, chmodded, flushed or renamed.
+    /// by anything but plain names, a directory level cannot be opened
+    /// without following a link, the leaf is a link an operator-named
+    /// destination would follow, or the temporary cannot be created,
+    /// written, chowned, chmodded, flushed or renamed.
     pub fn publish(
         &self,
         dest: Destination<'_>,
@@ -531,8 +533,9 @@ impl SecretsTree {
     ///
     /// # Errors
     /// Returns an error if `path` is not below the anchor or names a level
-    /// by anything but plain names, a directory level or the leaf cannot be opened without following a link, the
-    /// leaf is not a regular file, or the mode cannot be set.
+    /// by anything but plain names, a directory level or the leaf cannot
+    /// be opened without following a link, the leaf is not a regular
+    /// file, or the mode cannot be set.
     pub fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()> {
         let names = self.relative(path)?;
         let Some(anchor_fd) = self.rooted_fd() else {

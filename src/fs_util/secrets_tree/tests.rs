@@ -885,3 +885,65 @@ fn an_anchor_spelled_with_a_dot_accepts_names_joined_onto_it() {
         }
     }
 }
+
+/// The byte walk cuts a path after exactly the components
+/// `Path::components` yields for it, whatever separators and `.`s the
+/// spelling holds, and reports a path that is too short.
+#[test]
+fn offset_after_components_counts_as_path_components_does() {
+    let spellings = [
+        "",
+        ".",
+        "./",
+        "/",
+        "//",
+        "a",
+        "a/",
+        "./a",
+        "/./a",
+        "a//b",
+        "a/./b",
+        "a/b/.",
+        "a/b/./",
+        "//./a//./b/./c",
+        "./a/./b",
+        "/a/.hidden/b",
+        "a/../b",
+    ];
+    for spelling in spellings {
+        let total = Path::new(spelling).components().count();
+        for count in 0..=total {
+            let offset = offset_after_components(spelling.as_bytes(), count)
+                .unwrap_or_else(|| panic!("{spelling:?} has {count} components"));
+            let (head, tail) = spelling.split_at(offset);
+            let components: Vec<_> = Path::new(spelling).components().collect();
+            assert_eq!(
+                Path::new(head).components().collect::<Vec<_>>(),
+                components.get(..count).expect("count is within total"),
+                "{spelling:?} cut after {count}"
+            );
+            if count == 0 {
+                assert_eq!(tail, spelling);
+                continue;
+            }
+            // Past the cut every later `.` and empty segment is one
+            // `Path::components` skips, so the rest are its names.
+            let rest: Vec<_> = tail
+                .split('/')
+                .filter(|segment| !segment.is_empty() && *segment != ".")
+                .map(OsStr::new)
+                .collect();
+            let expected: Vec<_> = components
+                .iter()
+                .skip(count)
+                .map(|component| component.as_os_str())
+                .collect();
+            assert_eq!(rest, expected, "{spelling:?} cut after {count}");
+        }
+        assert_eq!(
+            offset_after_components(spelling.as_bytes(), total + 1),
+            None,
+            "{spelling:?}"
+        );
+    }
+}
