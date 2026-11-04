@@ -246,6 +246,7 @@ struct InstallHarness {
     bin_dir: std::path::PathBuf,
     argv_log: std::path::PathBuf,
     instance_env_log: std::path::PathBuf,
+    openbao_user_env_log: std::path::PathBuf,
 }
 
 #[cfg(unix)]
@@ -267,6 +268,7 @@ impl InstallHarness {
         // Compose renders `container_name:` from `BOOTROOT_INSTANCE`, so
         // what the child process sees is as load-bearing as the argv.
         let instance_env_log = dir.path().join("docker-instance-env.log");
+        let openbao_user_env_log = dir.path().join("docker-openbao-user-env.log");
         let fake_docker = format!(
             r#"#!/bin/sh
 set -eu
@@ -274,6 +276,7 @@ printf '%s\n' "$*" >>"{log}"
 
 if [ "${{1:-}}" = "compose" ]; then
   printf '%s\n' "${{BOOTROOT_INSTANCE-<unset>}}" >>"{env_log}"
+  printf '%s\n' "${{BOOTROOT_OPENBAO_USER-<unset>}}" >>"{user_log}"
   printf "cid-openbao"
   exit 0
 fi
@@ -286,7 +289,8 @@ fi
 exit 0
 "#,
             log = argv_log.display(),
-            env_log = instance_env_log.display()
+            env_log = instance_env_log.display(),
+            user_log = openbao_user_env_log.display()
         );
         let docker_path = bin_dir.join("docker");
         fs::write(&docker_path, fake_docker).expect("write fake docker");
@@ -299,7 +303,46 @@ exit 0
             bin_dir,
             argv_log,
             instance_env_log,
+            openbao_user_env_log,
         }
+    }
+
+    /// Runs `infra install --services openbao` with `extra` appended and
+    /// `BOOTROOT_OPENBAO_USER` set to `exported` (removed when `None`) in
+    /// bootroot's own environment, returning the raw output.
+    fn install_output(&self, extra: &[&str], exported: Option<&str>) -> std::process::Output {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bootroot"));
+        command
+            .current_dir(self.dir.path())
+            .args([
+                "infra",
+                "install",
+                "--compose-file",
+                self.compose_file.to_string_lossy().as_ref(),
+                "--services",
+                "openbao",
+                "--openbao-host-port",
+                &Self::free_port().to_string(),
+            ])
+            .args(extra)
+            .env("PATH", format!("{}:{}", self.bin_dir.display(), path))
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .env_remove("BOOTROOT_INSTANCE");
+        match exported {
+            Some(value) => command.env("BOOTROOT_OPENBAO_USER", value),
+            None => command.env_remove("BOOTROOT_OPENBAO_USER"),
+        };
+        command.output().expect("run infra install")
+    }
+
+    /// The `BOOTROOT_OPENBAO_USER` each `docker compose` subprocess saw.
+    fn compose_openbao_user_env(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.openbao_user_env_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Picks a port that is free right now, so the install's host-port
@@ -353,6 +396,7 @@ exit 0
             Some(value) => command.env("BOOTROOT_INSTANCE", value),
             None => command.env_remove("BOOTROOT_INSTANCE"),
         };
+        command.env_remove("BOOTROOT_OPENBAO_USER");
 
         let output = command.output().expect("run infra install");
         assert!(
@@ -601,6 +645,182 @@ fn test_infra_install_rejects_invalid_instance_names() {
         assert!(
             !harness.dir.path().join(".env").exists(),
             "{invalid:?} must not leave an .env behind"
+        );
+    }
+}
+
+/// An invalid `--openbao-user` is refused with the option's own error
+/// before anything is written: no `.env`, no `secrets/`, no docker call.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_rejects_invalid_openbao_users() {
+    for invalid in [
+        "0:1",
+        "1:0",
+        "4294967295:1",
+        "a:1",
+        "1",
+        "1:2:3",
+        "+1:1",
+        "",
+    ] {
+        let harness = InstallHarness::new();
+        let output = harness.install_output(&["--openbao-user", invalid], None);
+        assert!(!output.status.success(), "{invalid:?} must be rejected");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--openbao-user") && stderr.contains("4294967294"),
+            "{invalid:?} error must name the option and its rule: {stderr}"
+        );
+        for written in [".env", "secrets", "certs", "docker-argv.log"] {
+            assert!(
+                !harness.dir.path().join(written).exists(),
+                "{invalid:?} must not leave {written} behind"
+            );
+        }
+    }
+}
+
+/// `--openbao-user` is recorded in canonical form, handed to the install's
+/// own `docker compose` subprocesses, and kept by a later install without
+/// it; an install that never gave it records nothing.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_records_and_keeps_the_openbao_user() {
+    let without = InstallHarness::new();
+    let output = without.install_output(&[], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!without.dotenv().contains("BOOTROOT_OPENBAO_USER"));
+    assert!(
+        without
+            .compose_openbao_user_env()
+            .iter()
+            .all(|value| value == "<unset>"),
+        "{:?}",
+        without.compose_openbao_user_env()
+    );
+
+    let harness = InstallHarness::new();
+    let output = harness.install_output(&["--openbao-user", " 01:02 "], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        harness.dotenv().contains("BOOTROOT_OPENBAO_USER=1:2\n"),
+        "{}",
+        harness.dotenv()
+    );
+    // As for the host-port flags, the `pull` and `up` the install runs
+    // carry the flag's value, so it wins over an inherited shell variable.
+    let argv = std::fs::read_to_string(&harness.argv_log).unwrap();
+    let compose_lines: Vec<&str> = argv
+        .lines()
+        .filter(|line| line.starts_with("compose "))
+        .collect();
+    let seen = harness.compose_openbao_user_env();
+    assert_eq!(compose_lines.len(), seen.len(), "{argv}\n{seen:?}");
+    let up_and_pull: Vec<&String> = compose_lines
+        .iter()
+        .zip(&seen)
+        .filter(|(line, _)| line.contains(" up ") || line.contains(" pull "))
+        .map(|(_, value)| value)
+        .collect();
+    assert!(
+        !up_and_pull.is_empty() && up_and_pull.iter().all(|value| *value == "1:2"),
+        "compose pull and up must see the flag's value: {argv}\n{seen:?}"
+    );
+
+    let output = harness.install_output(&[], None);
+    assert!(output.status.success(), "{output:?}");
+    let dotenv = harness.dotenv();
+    assert_eq!(
+        dotenv.matches("BOOTROOT_OPENBAO_USER=").count(),
+        1,
+        "{dotenv}"
+    );
+    assert!(dotenv.contains("BOOTROOT_OPENBAO_USER=1:2\n"), "{dotenv}");
+}
+
+/// An exported `BOOTROOT_OPENBAO_USER` that differs from the value the
+/// install records, or a malformed recorded value, is refused before any
+/// docker command; an exported value equal to it is not.
+#[cfg(unix)]
+#[test]
+fn test_infra_install_refuses_a_conflicting_openbao_user() {
+    let harness = InstallHarness::new();
+    let output = harness.install_output(&["--openbao-user", "1:2"], Some("3:4"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("3:4") && stderr.contains("1:2"), "{stderr}");
+    assert!(!harness.dir.path().join(".env").exists());
+    assert!(!harness.dir.path().join("docker-argv.log").exists());
+
+    let output = harness.install_output(&["--openbao-user", "1:2"], Some("1:2"));
+    assert!(output.status.success(), "{output:?}");
+
+    std::fs::write(
+        harness.dir.path().join(".env"),
+        harness
+            .dotenv()
+            .replace("BOOTROOT_OPENBAO_USER=1:2", "BOOTROOT_OPENBAO_USER=0:0"),
+    )
+    .unwrap();
+    std::fs::remove_file(harness.dir.path().join("docker-argv.log")).unwrap();
+    let output = harness.install_output(&[], None);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("BOOTROOT_OPENBAO_USER") && stderr.contains(".env"),
+        "{stderr}"
+    );
+    assert!(!harness.dir.path().join("docker-argv.log").exists());
+}
+
+/// `infra up` checks the recorded `BOOTROOT_OPENBAO_USER` against the
+/// exported one on every stack, not only one with a non-loopback `OpenBao`
+/// bind: on this loopback-only install an exported value that differs
+/// from the record, or an exported empty one, is refused before any
+/// docker command, since Compose would hand either to the entrypoint
+/// that re-owns the raft volume.
+#[cfg(unix)]
+#[test]
+fn test_infra_up_refuses_a_conflicting_openbao_user_without_tls() {
+    let harness = InstallHarness::new();
+    let output = harness.install_output(&["--openbao-user", "2001:2002"], None);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!harness.dir.path().join("state.json").exists());
+    let argv_log = harness.dir.path().join("docker-argv.log");
+
+    for (exported, expected_in_stderr) in [("3001:3002", "3001:3002"), ("", "2001:2002")] {
+        if argv_log.exists() {
+            std::fs::remove_file(&argv_log).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        let output = Command::new(env!("CARGO_BIN_EXE_bootroot"))
+            .current_dir(harness.dir.path())
+            .args([
+                "infra",
+                "up",
+                "--compose-file",
+                harness.compose_file.to_string_lossy().as_ref(),
+                "--services",
+                "openbao",
+            ])
+            .env("PATH", format!("{}:{}", harness.bin_dir.display(), path))
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .env_remove("BOOTROOT_INSTANCE")
+            .env_remove("OPENBAO_UNSEAL_FILE")
+            .env("BOOTROOT_OPENBAO_USER", exported)
+            .output()
+            .expect("run infra up");
+        assert!(!output.status.success(), "{exported:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("BOOTROOT_OPENBAO_USER") && stderr.contains(expected_in_stderr),
+            "{exported:?}: {stderr}"
+        );
+        assert!(
+            !argv_log.exists(),
+            "{exported:?}: infra up must not reach docker: {}",
+            std::fs::read_to_string(&argv_log).unwrap_or_default()
         );
     }
 }

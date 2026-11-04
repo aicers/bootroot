@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -14,6 +15,7 @@ use crate::commands::init::{
     HTTP01_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_EXPOSED_COMPOSE_OVERRIDE_NAME, OPENBAO_HCL_PATH,
     RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME, STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME,
 };
+use crate::commands::openbao_user::recorded_openbao_user;
 use crate::i18n::Messages;
 
 const LOCAL_DB_HOSTS: [&str; 4] = ["postgres", "localhost", "127.0.0.1", "::1"];
@@ -674,14 +676,22 @@ pub(crate) fn validate_postgres_tls_override_scope(
 /// `tls_disable = 1`), and the server certificate chains to the local
 /// step-ca root.
 ///
+/// With `BOOTROOT_OPENBAO_USER` recorded in the `.env` beside the compose
+/// file, the key is not read: it belongs to the server's uid, which a
+/// non-root operator is not. It is instead required to be a regular file
+/// owned by that uid, group `0`, mode `0600` — what
+/// `issue_openbao_tls_cert` and `infra install` leave it.
+///
 /// # Errors
 ///
-/// Returns an error describing which TLS prerequisites are missing.
+/// Returns an error describing which TLS prerequisites are missing, or
+/// refusing a malformed recorded `BOOTROOT_OPENBAO_USER`.
 pub(crate) fn validate_openbao_tls(
     compose_dir: &Path,
     secrets_dir: &Path,
     messages: &Messages,
 ) -> Result<()> {
+    let openbao_user = recorded_openbao_user(compose_dir, messages)?;
     let hcl_path = compose_dir.join(OPENBAO_HCL_PATH);
     let mut issues = Vec::new();
 
@@ -749,10 +759,25 @@ pub(crate) fn validate_openbao_tls(
     } else {
         None
     };
-    if let Some(ref path) = key_host_path
-        && fs::read(path).is_err()
-    {
-        issues.push(format!("key not found or not readable: {}", path.display()));
+    if let Some(ref path) = key_host_path {
+        match openbao_user {
+            Some(user) => {
+                let facts = fs::symlink_metadata(path).ok().map(|meta| KeyFileFacts {
+                    is_regular_file: meta.file_type().is_file(),
+                    uid: meta.uid(),
+                    gid: meta.gid(),
+                    mode: meta.mode(),
+                });
+                if let Some(issue) = handed_over_key_issue(path, facts, user.uid(), messages) {
+                    issues.push(issue);
+                }
+            }
+            None => {
+                if fs::read(path).is_err() {
+                    issues.push(format!("key not found or not readable: {}", path.display()));
+                }
+            }
+        }
     }
 
     // Validate certificate chains to the local step-ca root.
@@ -766,6 +791,52 @@ pub(crate) fn validate_openbao_tls(
         anyhow::bail!(messages.error_openbao_bind_tls_missing(&issues.join("; ")));
     }
     Ok(())
+}
+
+/// What [`validate_openbao_tls`] reads of a handed-over key, from
+/// `symlink_metadata`, so the check itself runs on plain values.
+#[derive(Debug, Clone, Copy)]
+struct KeyFileFacts {
+    is_regular_file: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
+/// Mode a key handed to `BOOTROOT_OPENBAO_USER` carries.
+const HANDED_OVER_KEY_MODE: u32 = 0o600;
+
+/// Returns the issue to report for `OpenBao`'s key when
+/// `BOOTROOT_OPENBAO_USER` names `expected_uid`, or `None` when the key is
+/// a regular file owned by `<expected_uid>:0` with mode `0600`.
+///
+/// `facts` is `None` when the key's metadata could not be read. The
+/// issue is rendered through `messages`, as the list it joins is.
+fn handed_over_key_issue(
+    path: &Path,
+    facts: Option<KeyFileFacts>,
+    expected_uid: u32,
+    messages: &Messages,
+) -> Option<String> {
+    let path_display = path.display().to_string();
+    let Some(facts) = facts else {
+        return Some(messages.openbao_tls_key_missing(&path_display));
+    };
+    let permissions = facts.mode & 0o7777;
+    if facts.is_regular_file
+        && facts.uid == expected_uid
+        && facts.gid == 0
+        && permissions == HANDED_OVER_KEY_MODE
+    {
+        return None;
+    }
+    Some(messages.openbao_tls_key_owner_mismatch(
+        &path_display,
+        &format!("{}:{}", facts.uid, facts.gid),
+        &format!("{permissions:04o}"),
+        &format!("{expected_uid}:0"),
+        &format!("{HANDED_OVER_KEY_MODE:04o}"),
+    ))
 }
 
 /// Validates that HTTP-01 admin API TLS is configured for non-loopback
@@ -1992,6 +2063,125 @@ services:
         let dir = tempfile::tempdir().unwrap();
         setup_tls_env(dir.path());
         assert!(validate_openbao_tls(dir.path(), &dir.path().join("secrets"), &messages).is_ok());
+    }
+
+    const HANDED_OVER_KEY: &str = "/compose/openbao/tls/server.key";
+
+    fn key_facts(is_regular_file: bool, uid: u32, gid: u32, mode: u32) -> KeyFileFacts {
+        KeyFileFacts {
+            is_regular_file,
+            uid,
+            gid,
+            mode,
+        }
+    }
+
+    /// With `BOOTROOT_OPENBAO_USER` set, the key passes only as a regular
+    /// file `<uid>:0 0600`, and every other shape is reported with the
+    /// owner and mode found and the ones expected.
+    #[test]
+    fn handed_over_key_check_accepts_only_uid_group_zero_0600() {
+        let messages = crate::i18n::test_messages();
+        let path = Path::new(HANDED_OVER_KEY);
+        assert_eq!(
+            handed_over_key_issue(
+                path,
+                Some(key_facts(true, 4242, 0, 0o100_600)),
+                4242,
+                &messages
+            ),
+            None
+        );
+        for (facts, found) in [
+            (key_facts(true, 4243, 0, 0o100_600), "4243:0 with mode 0600"),
+            (
+                key_facts(true, 4242, 4343, 0o100_600),
+                "4242:4343 with mode 0600",
+            ),
+            (key_facts(true, 4242, 0, 0o100_640), "4242:0 with mode 0640"),
+            (key_facts(true, 4242, 0, 0o100_644), "4242:0 with mode 0644"),
+            (
+                key_facts(false, 4242, 0, 0o120_600),
+                "4242:0 with mode 0600",
+            ),
+        ] {
+            let issue = handed_over_key_issue(path, Some(facts), 4242, &messages)
+                .expect("must be reported");
+            assert_eq!(
+                issue,
+                format!(
+                    "key {HANDED_OVER_KEY} is owned by {found}, expected 4242:0 0600 \
+                     (run bootroot infra install or bootroot rotate infra-cert)"
+                )
+            );
+        }
+        assert_eq!(
+            handed_over_key_issue(path, None, 4242, &messages),
+            Some(format!("key not found: {HANDED_OVER_KEY}"))
+        );
+    }
+
+    /// The handed-over key's issues are operator sentences, so they follow
+    /// the selected language rather than staying English.
+    #[test]
+    fn handed_over_key_issues_are_localized() {
+        let messages = Messages::new("ko").expect("valid language");
+        let path = Path::new(HANDED_OVER_KEY);
+        let mismatch = handed_over_key_issue(
+            path,
+            Some(key_facts(true, 4243, 0, 0o100_644)),
+            4242,
+            &messages,
+        )
+        .expect("must be reported");
+        assert!(mismatch.contains(HANDED_OVER_KEY), "{mismatch}");
+        assert!(
+            mismatch.contains("4243:0") && mismatch.contains("0644"),
+            "{mismatch}"
+        );
+        assert!(
+            mismatch.contains("4242:0") && mismatch.contains("0600"),
+            "{mismatch}"
+        );
+        assert!(!mismatch.contains("is owned by"), "{mismatch}");
+        let missing = handed_over_key_issue(path, None, 4242, &messages).expect("must be reported");
+        assert!(missing.contains(HANDED_OVER_KEY), "{missing}");
+        assert!(!missing.contains("not found"), "{missing}");
+    }
+
+    /// With the value set, `validate_openbao_tls` judges the key by its
+    /// owner and mode rather than by reading it: a key this test process
+    /// can read, but which is not `<uid>:0 0600`, is refused.
+    #[test]
+    fn validate_openbao_tls_checks_the_handed_over_key_owner() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        setup_tls_env(dir.path());
+        std::fs::write(dir.path().join(".env"), "BOOTROOT_OPENBAO_USER=4242:4343\n").unwrap();
+        let error = validate_openbao_tls(dir.path(), &dir.path().join("secrets"), &messages)
+            .expect_err("a key not handed to the uid must be refused")
+            .to_string();
+        assert!(error.contains("expected 4242:0 0600"), "{error}");
+        assert!(
+            error.contains("run bootroot infra install or bootroot rotate infra-cert"),
+            "{error}"
+        );
+    }
+
+    /// A malformed recorded value fails closed.
+    #[test]
+    fn validate_openbao_tls_refuses_a_malformed_recorded_user() {
+        let messages = crate::i18n::test_messages();
+        let dir = tempfile::tempdir().unwrap();
+        setup_tls_env(dir.path());
+        std::fs::write(dir.path().join(".env"), "BOOTROOT_OPENBAO_USER=root\n").unwrap();
+        let error = validate_openbao_tls(dir.path(), &dir.path().join("secrets"), &messages)
+            .expect_err("a malformed value must be refused")
+            .to_string();
+        assert!(
+            error.contains("BOOTROOT_OPENBAO_USER") && error.contains(".env"),
+            "{error}"
+        );
     }
 
     /// Regression: a TLS-enabled `:8200` API listener plus a plaintext

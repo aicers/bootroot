@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 use bootroot::db::DB_COMPOSE_HOST;
 use bootroot::fs_util;
 
-use super::openbao_tls::{TLS_OUTPUT_MOUNT, chown_tls_output_dir, reject_symlinked_tls_output_dir};
+use super::openbao_tls::{
+    TLS_OUTPUT_MOUNT, build_tls_key_chown_args, chown_tls_output_dir,
+    reject_symlinked_tls_output_dir,
+};
 use crate::commands::compose_project::{ComposeIdentity, ComposeInvocation};
 use crate::commands::infra::{run_compose, run_docker_with_exec};
 use crate::commands::init::{
@@ -203,7 +206,12 @@ pub(crate) fn issue_postgres_tls_cert(
     set_postgres_tls_file_modes(&cert_path, &key_path)?;
 
     run_docker_with_exec(
-        &build_postgres_key_chown_args(&tls_mount, &output_key, STEP_CA_HELPER_IMAGE),
+        &build_tls_key_chown_args(
+            &tls_mount,
+            POSTGRES_TLS_KEY_OWNER,
+            &output_key,
+            STEP_CA_HELPER_IMAGE,
+        ),
         "docker postgres tls key chown",
         docker,
         messages,
@@ -251,32 +259,6 @@ fn own_new_parent_dir(parent: &Path, uid: u32, gid: u32) -> Result<()> {
     }
     std::os::unix::fs::chown(parent, Some(uid), Some(gid))
         .with_context(|| format!("Failed to set owner of {}", parent.display()))
-}
-
-/// Builds the `docker run` argv that hands the private key to
-/// `PostgreSQL`'s user.
-///
-/// Kept pure so tests can assert it mounts ONLY the output directory and
-/// uses `--no-dereference`, like the output-directory chown it mirrors.
-/// `chown` keeps the `0600` mode.
-fn build_postgres_key_chown_args<'a>(mount: &'a str, key: &'a str, image: &'a str) -> Vec<&'a str> {
-    vec![
-        "run",
-        "--rm",
-        // Intentional root: only root can chown to an arbitrary uid.
-        "--user",
-        "root",
-        // Run `chown` directly: the image's default entrypoint warns
-        // about a `ca.json` this container deliberately does not mount.
-        "--entrypoint",
-        "chown",
-        "-v",
-        mount,
-        image,
-        "--no-dereference",
-        POSTGRES_TLS_KEY_OWNER,
-        key,
-    ]
 }
 
 /// Records the `PostgreSQL` TLS certificate in `StateFile::infra_certs`.

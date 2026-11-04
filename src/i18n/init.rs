@@ -334,6 +334,30 @@ impl Messages {
         )
     }
 
+    pub(crate) fn openbao_tls_key_missing(&self, path: &str) -> String {
+        format_template(self.strings().openbao_tls_key_missing, &[("path", path)])
+    }
+
+    pub(crate) fn openbao_tls_key_owner_mismatch(
+        &self,
+        path: &str,
+        owner: &str,
+        mode: &str,
+        expected_owner: &str,
+        expected_mode: &str,
+    ) -> String {
+        format_template(
+            self.strings().openbao_tls_key_owner_mismatch,
+            &[
+                ("path", path),
+                ("owner", owner),
+                ("mode", mode),
+                ("expected_owner", expected_owner),
+                ("expected_mode", expected_mode),
+            ],
+        )
+    }
+
     pub(crate) fn error_openbao_bind_invalid_format(&self) -> &'static str {
         self.strings().error_openbao_bind_invalid_format
     }
@@ -590,6 +614,17 @@ impl Messages {
     pub(crate) fn error_openbao_tls_output_dir_symlink(&self, path: &str) -> String {
         format_template(
             self.strings().error_openbao_tls_output_dir_symlink,
+            &[("path", path)],
+        )
+    }
+
+    pub(crate) fn error_openbao_tls_key_handover_failed(&self) -> &'static str {
+        self.strings().error_openbao_tls_key_handover_failed
+    }
+
+    pub(crate) fn error_openbao_tls_key_not_regular_file(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_openbao_tls_key_not_regular_file,
             &[("path", path)],
         )
     }

@@ -187,8 +187,12 @@ pub fn resolve_http01_admin_host_port_with_env(env_value: Option<&str>, compose_
 /// A line carrying no `=` is skipped rather than ending the scan, so a
 /// stray operator-authored line cannot hide the keys below it and leave
 /// the preflight binding a port Compose never publishes.
+///
+/// Shared with the binary's other readers of `.env` keys, such as the
+/// `OpenBao` user record, so every key is read with the same quoting
+/// and empty-value rules.
 #[must_use]
-fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
+pub fn read_env_file_value(compose_dir: &Path, key: &str) -> Option<String> {
     let contents = std::fs::read_to_string(compose_dir.join(".env")).ok()?;
     for line in contents.lines() {
         let trimmed = line.trim();

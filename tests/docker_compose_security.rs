@@ -525,6 +525,50 @@ fn proxy_guard_rejects_a_file_without_the_responder() {
     assert_stepca_validates_through_the_responder(&orphaned, "fixture");
 }
 
+/// The `openbao` service runs as the uid `BOOTROOT_OPENBAO_USER` records
+/// (`infra install --openbao-user`) or, unset, as the image's `openbao`
+/// user. Both base compose files reach the value by interpolation, so a
+/// caller that passes only the base file gets the same uid; the three keys
+/// that carry it must be the same text in both.
+const OPENBAO_START_AS_ROOT: &str = r#""0:0""#;
+const OPENBAO_USER_ENVIRONMENT: &str = "- BOOTROOT_OPENBAO_USER=${BOOTROOT_OPENBAO_USER:-}";
+const OPENBAO_ENTRYPOINT: &str = r#"["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]"#;
+
+#[test]
+fn both_compose_files_run_openbao_as_the_recorded_user() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut entrypoints = Vec::new();
+    for file_name in ["docker-compose.yml", "docker-compose.deploy.yml"] {
+        let compose = fs::read_to_string(root.join(file_name)).expect("read compose file");
+        assert_eq!(
+            service_key_value(&compose, "openbao", "user"),
+            Some(SectionValue::Unreadable(OPENBAO_START_AS_ROOT)),
+            "{file_name}: the entrypoint starts as root for its chowns"
+        );
+        assert_eq!(
+            service_key_value(&compose, "openbao", "environment"),
+            Some(SectionValue::Block(vec![OPENBAO_USER_ENVIRONMENT])),
+            "{file_name}: the uid reaches the entrypoint as an interpolated variable"
+        );
+        let entrypoint_line = compose
+            .lines()
+            .find(|line| line.trim_start().starts_with("entrypoint: [\"sh\""))
+            .and_then(|line| line.trim_start().strip_prefix("entrypoint: "))
+            .expect("openbao entrypoint");
+        assert_eq!(entrypoint_line, OPENBAO_ENTRYPOINT, "{file_name}");
+        // The script reads the shell variable, escaped from Compose, and
+        // never has the value interpolated into its text.
+        assert!(!entrypoint_line.contains("${BOOTROOT_OPENBAO_USER"));
+        assert!(
+            entrypoint_line.contains(
+                r#"exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"#
+            )
+        );
+        entrypoints.push(entrypoint_line.to_string());
+    }
+    assert_eq!(entrypoints.first(), entrypoints.get(1));
+}
+
 #[test]
 fn postgres_volume_uses_postgresql_root_for_postgres_18() {
     let compose_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docker-compose.yml");

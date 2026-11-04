@@ -583,6 +583,10 @@ jobs:
             script: run-secrets-owner.sh
             resolution: ""
             artifact: ci-secrets-owner
+          - label: openbao-user
+            script: run-openbao-user.sh
+            resolution: ""
+            artifact: ci-openbao-user
     steps:
       - uses: actions/checkout@v7
 
@@ -599,7 +603,7 @@ jobs:
         run: cargo build --bin bootroot --bin bootroot-remote --bin bootroot-agent
 
       - name: Run E2E scenario (lifecycle)
-        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-internal-init-routable' && matrix.scenario.label != 'registrar-redteam' && matrix.scenario.label != 'registrar-ca-rotation' && matrix.scenario.label != 'secrets-owner'
+        if: matrix.scenario.label != 'rotation' && matrix.scenario.label != 'reinit-recovery' && matrix.scenario.label != 'stepca-san' && matrix.scenario.label != 'openbao-tls-no-delta' && matrix.scenario.label != 'openbao-tls-reown' && matrix.scenario.label != 'two-instance' && matrix.scenario.label != 'registrar-verbs' && matrix.scenario.label != 'registrar-internal' && matrix.scenario.label != 'registrar-internal-init' && matrix.scenario.label != 'registrar-internal-init-routable' && matrix.scenario.label != 'registrar-redteam' && matrix.scenario.label != 'registrar-ca-rotation' && matrix.scenario.label != 'secrets-owner' && matrix.scenario.label != 'openbao-user'
         run: |
           ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
           # Local arms run the daemon-only model: every service agent is
@@ -743,6 +747,29 @@ jobs:
             [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
             [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
             [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/secrets-tree.log" ] && cat "$ARTIFACT_DIR/secrets-tree.log" || true
+            [ -f "$ARTIFACT_DIR/status.log" ] && tail -n 80 "$ARTIFACT_DIR/status.log" || true
+            [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true
+            exit 1
+          }
+
+      - name: Run E2E scenario (OpenBao user)
+        if: matrix.scenario.label == 'openbao-user'
+        # No SECRETS_DIR, as for secrets-owner: the script hands the
+        # checkout's own `secrets/` to an account it creates, gives OpenBao
+        # that account through `infra install --openbao-user`, and runs
+        # `infra install`, `init` and `infra up` as root.
+        run: |
+          ARTIFACT_DIR="$(pwd)/tmp/e2e/${{ matrix.scenario.artifact }}-${GITHUB_RUN_ID}"
+          ARTIFACT_DIR="$ARTIFACT_DIR" \
+          COMPOSE_PROJECT_NAME="bootroot-e2e-ci-openbao-user-${GITHUB_RUN_ID}" \
+          BOOTROOT_BIN="$(pwd)/target/debug/bootroot" \
+          ./scripts/impl/run-openbao-user.sh || {
+            echo "openbao-user failed"
+            [ -f "$ARTIFACT_DIR/phases.log" ] && cat "$ARTIFACT_DIR/phases.log" || true
+            [ -f "$ARTIFACT_DIR/run.log" ] && tail -n 200 "$ARTIFACT_DIR/run.log" || true
+            [ -f "$ARTIFACT_DIR/init.log" ] && tail -n 200 "$ARTIFACT_DIR/init.log" || true
+            [ -f "$ARTIFACT_DIR/processes.log" ] && cat "$ARTIFACT_DIR/processes.log" || true
             [ -f "$ARTIFACT_DIR/secrets-tree.log" ] && cat "$ARTIFACT_DIR/secrets-tree.log" || true
             [ -f "$ARTIFACT_DIR/status.log" ] && tail -n 80 "$ARTIFACT_DIR/status.log" || true
             [ -f "$ARTIFACT_DIR/compose-logs.log" ] && tail -n 200 "$ARTIFACT_DIR/compose-logs.log" || true

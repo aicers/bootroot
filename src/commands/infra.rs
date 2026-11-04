@@ -42,10 +42,15 @@ use crate::commands::init::{
     OPENBAO_INFRA_CERT_KEY, OpenBaoAuditDevice, POSTGRES_TLS_COMPOSE_OVERRIDE_DIR,
     POSTGRES_TLS_COMPOSE_OVERRIDE_NAME, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
     STEPCA_EXPOSED_COMPOSE_OVERRIDE_NAME, compose_has_postgres, compose_has_responder,
-    compose_has_stepca, compose_up_reaches_service, sync_openbao_audit_device,
+    compose_has_stepca, compose_up_reaches_service, hand_over_openbao_tls_key,
+    sync_openbao_audit_device,
 };
 use crate::commands::openbao_unseal::{prompt_unseal_keys_interactive, read_unseal_keys_from_file};
 use crate::commands::openbao_url::effective_openbao_url;
+use crate::commands::openbao_user::{
+    OPENBAO_USER_ENV_KEY, exported_openbao_user, install_openbao_user_with_env,
+    recorded_openbao_user,
+};
 use crate::i18n::Messages;
 use crate::state::{RegistrarEndpointState, StateFile};
 use crate::state_lock::StateLock;
@@ -260,6 +265,11 @@ pub(crate) async fn run_infra_up(args: &InfraUpArgs, messages: &Messages) -> Res
         .compose_file
         .parent()
         .unwrap_or(Path::new("."));
+    // Every stack, not only one whose OpenBao TLS is validated below: the
+    // entrypoint re-owns the raft volume to whatever uid Compose hands
+    // it, so a malformed record, or an export Compose would prefer to it,
+    // is refused before the first Docker call.
+    recorded_openbao_user(compose_dir, messages)?;
     let state_path = StateFile::default_path();
     let openbao_override = resolve_openbao_exposed_override(&state_path, compose_dir, messages)?;
     // This runs before even a Compose pull. Filesystem mode renders and
@@ -501,6 +511,27 @@ fn run_infra_install_locked(
     if let Some(ref instance_name) = args.instance_name {
         validate_instance_name(instance_name, messages)?;
     }
+
+    // The OpenBao user too: a malformed `--openbao-user`, a malformed
+    // value an earlier install recorded, or an exported
+    // `BOOTROOT_OPENBAO_USER` Docker Compose would prefer to either, is
+    // refused before anything is written.
+    let openbao_user = install_openbao_user_with_env(
+        args.compose_file
+            .compose_file
+            .parent()
+            .unwrap_or(Path::new(".")),
+        args.openbao_user.as_deref(),
+        exported_openbao_user().as_deref(),
+        messages,
+    )?;
+    // Only a value given now is written and passed on, as for the
+    // host-port flags: without the option a recorded value is kept.
+    let openbao_user_flag = args
+        .openbao_user
+        .as_ref()
+        .and(openbao_user)
+        .map(|user| user.to_string());
 
     // The registrar endpoint predicate is checked before any work too:
     // a malformed value, or one that would re-target an endpoint already
@@ -765,6 +796,7 @@ fn run_infra_install_locked(
         &stepca_user,
         &instance_name,
         &host_port_entries,
+        openbao_user_flag.as_deref(),
         messages,
     )?;
 
@@ -803,16 +835,29 @@ fn run_infra_install_locked(
         0
     };
 
+    // An installed stack already has an OpenBao TLS key. When `.env` now
+    // names an OpenBao user — given this time or recorded by an earlier
+    // install — hand that key to it before `up` recreates OpenBao as that
+    // uid, so adopting or changing the value does not leave the server in
+    // front of a key it cannot read. No value or no key: nothing runs.
+    hand_over_openbao_tls_key(compose_dir, &secrets_dir, Path::new(DOCKER_BIN), messages)?;
+
     let compose_str = args.compose_file.compose_file.to_string_lossy();
     let svc_refs: Vec<&str> = args.services.iter().map(String::as_str).collect();
 
     // Build the compose process environment.  When the operator passed a
-    // `--*-host-port` flag, override any inherited value of the matching
-    // variable for the compose subprocess so the flag wins regardless of
-    // shell env (Docker Compose otherwise prefers shell env over `.env`).
+    // `--*-host-port` flag or `--openbao-user`, override any inherited
+    // value of the matching variable for the compose subprocess so the
+    // flag wins regardless of shell env (Docker Compose otherwise prefers
+    // shell env over `.env`).
     let host_port_env_refs: Vec<(&str, &str)> = host_port_entries
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
+        .chain(
+            openbao_user_flag
+                .as_deref()
+                .map(|value| (OPENBAO_USER_ENV_KEY, value)),
+        )
         .collect();
 
     // The identity this install acts on.  For the project an exported
@@ -1272,11 +1317,16 @@ impl HostPorts {
 /// `instance_name` is the install's identity.  Both paths carry it, so
 /// every later compose-driving command can read the project back from
 /// the `.env` beside the compose file without a flag of its own.
+///
+/// `openbao_user` is the canonical `--openbao-user` value when the option
+/// was given. Like the host-port flags it is upserted only then, so an
+/// install without the option keeps a recorded `BOOTROOT_OPENBAO_USER`.
 fn write_install_dotenv(
     env_path: &Path,
     stepca_user: &str,
     instance_name: &str,
     host_port_entries: &[(&'static str, String)],
+    openbao_user: Option<&str>,
     messages: &Messages,
 ) -> Result<()> {
     if env_path.exists() {
@@ -1300,6 +1350,14 @@ fn write_install_dotenv(
         for (key, value) in host_port_entries {
             crate::commands::dotenv::update_dotenv_key(env_path, key, value, messages)?;
         }
+        if let Some(value) = openbao_user {
+            crate::commands::dotenv::update_dotenv_key(
+                env_path,
+                OPENBAO_USER_ENV_KEY,
+                value,
+                messages,
+            )?;
+        }
         return Ok(());
     }
     let postgres_password = bootroot::utils::generate_secret(32)
@@ -1317,6 +1375,9 @@ fn write_install_dotenv(
             .iter()
             .map(|(key, value)| (*key, value.as_str())),
     );
+    if let Some(value) = openbao_user {
+        entries.push((OPENBAO_USER_ENV_KEY, value));
+    }
     write_dotenv(env_path, &entries, messages)?;
     println!("{}", messages.infra_install_env_written());
     Ok(())
@@ -3375,6 +3436,7 @@ mod tests {
             openbao_host_port: None,
             stepca_host_port: None,
             http01_admin_host_port: None,
+            openbao_user: None,
             registrar_endpoint_host: None,
             registrar_endpoint_domain: None,
             no_build: false,
@@ -3864,7 +3926,15 @@ mod tests {
             (STEPCA_HOST_PORT_ENV, "19000".to_string()),
             (HTTP01_ADMIN_HOST_PORT_ENV, "18080".to_string()),
         ];
-        write_install_dotenv(&env_path, "1000:1000", "bootroot", &entries, &messages).unwrap();
+        write_install_dotenv(
+            &env_path,
+            "1000:1000",
+            "bootroot",
+            &entries,
+            None,
+            &messages,
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
         assert!(
             contents.contains("OPENBAO_HOST_PORT=18200"),
@@ -3899,7 +3969,15 @@ mod tests {
             (STEPCA_HOST_PORT_ENV, "19000".to_string()),
             (HTTP01_ADMIN_HOST_PORT_ENV, "18080".to_string()),
         ];
-        write_install_dotenv(&env_path, "1000:1000", "bootroot", &entries, &messages).unwrap();
+        write_install_dotenv(
+            &env_path,
+            "1000:1000",
+            "bootroot",
+            &entries,
+            None,
+            &messages,
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
         for expected in [
             "POSTGRES_HOST_PORT=15433",
@@ -3922,7 +4000,7 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join(".env");
-        write_install_dotenv(&env_path, "1000:1000", "bootroot", &[], &messages).unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "bootroot", &[], None, &messages).unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
         assert!(
             !contents.contains("OPENBAO_HOST_PORT"),
@@ -3939,7 +4017,7 @@ mod tests {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join(".env");
-        write_install_dotenv(&env_path, "1000:1000", "insight", &[], &messages).unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "insight", &[], None, &messages).unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
         assert!(
             contents.contains("BOOTROOT_INSTANCE=insight"),
@@ -3961,7 +4039,7 @@ mod tests {
             "POSTGRES_PASSWORD=keepme\nBOOTROOT_INSTANCE=insight\nOPERATOR_KEY=untouched\n",
         )
         .unwrap();
-        write_install_dotenv(&env_path, "1000:1000", "security", &[], &messages).unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "security", &[], None, &messages).unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
         assert_eq!(
             contents
@@ -3979,15 +4057,101 @@ mod tests {
         );
     }
 
+    /// `--openbao-user` lands in a fresh `.env` and is upserted into an
+    /// existing one; an install without it writes no key and keeps one an
+    /// earlier install recorded.
+    #[test]
+    fn install_dotenv_records_the_openbao_user_only_when_given() {
+        let messages = crate::i18n::test_messages();
+
+        let fresh_without = tempfile::tempdir().unwrap();
+        let env_path = fresh_without.path().join(".env");
+        write_install_dotenv(&env_path, "1000:1000", "bootroot", &[], None, &messages).unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        assert!(
+            !contents.contains(OPENBAO_USER_ENV_KEY),
+            "no option, no key: {contents}"
+        );
+
+        let fresh_with = tempfile::tempdir().unwrap();
+        let env_path = fresh_with.path().join(".env");
+        write_install_dotenv(
+            &env_path,
+            "1000:1000",
+            "bootroot",
+            &[],
+            Some("1:2"),
+            &messages,
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        assert!(
+            contents.contains("BOOTROOT_OPENBAO_USER=1:2\n"),
+            "{contents}"
+        );
+        assert!(contents.contains("POSTGRES_PASSWORD="), "{contents}");
+
+        // A later install without the option keeps the recorded value.
+        write_install_dotenv(&env_path, "1000:1000", "bootroot", &[], None, &messages).unwrap();
+        let kept = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(kept.matches("BOOTROOT_OPENBAO_USER=").count(), 1, "{kept}");
+        assert!(kept.contains("BOOTROOT_OPENBAO_USER=1:2\n"), "{kept}");
+
+        // A later install with another value rewrites it in place.
+        write_install_dotenv(
+            &env_path,
+            "1000:1000",
+            "bootroot",
+            &[],
+            Some("3:4"),
+            &messages,
+        )
+        .unwrap();
+        let changed = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(
+            changed.matches("BOOTROOT_OPENBAO_USER=").count(),
+            1,
+            "{changed}"
+        );
+        assert!(changed.contains("BOOTROOT_OPENBAO_USER=3:4\n"), "{changed}");
+
+        // An existing `.env` without the key gets it appended, and an
+        // install without the option leaves such a file without it.
+        let existing = tempfile::tempdir().unwrap();
+        let env_path = existing.path().join(".env");
+        std::fs::write(&env_path, "POSTGRES_PASSWORD=keepme\n").unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "bootroot", &[], None, &messages).unwrap();
+        assert!(
+            !std::fs::read_to_string(&env_path)
+                .unwrap()
+                .contains(OPENBAO_USER_ENV_KEY)
+        );
+        write_install_dotenv(
+            &env_path,
+            "1000:1000",
+            "bootroot",
+            &[],
+            Some("5:6"),
+            &messages,
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        assert!(
+            contents.contains("BOOTROOT_OPENBAO_USER=5:6\n")
+                && contents.contains("POSTGRES_PASSWORD=keepme"),
+            "{contents}"
+        );
+    }
+
     /// Repeated installs must converge, not accumulate.
     #[test]
     fn install_dotenv_instance_write_is_idempotent() {
         let messages = crate::i18n::test_messages();
         let dir = tempfile::tempdir().unwrap();
         let env_path = dir.path().join(".env");
-        write_install_dotenv(&env_path, "1000:1000", "insight", &[], &messages).unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "insight", &[], None, &messages).unwrap();
         let first = std::fs::read_to_string(&env_path).unwrap();
-        write_install_dotenv(&env_path, "1000:1000", "insight", &[], &messages).unwrap();
+        write_install_dotenv(&env_path, "1000:1000", "insight", &[], None, &messages).unwrap();
         let second = std::fs::read_to_string(&env_path).unwrap();
         assert_eq!(first, second);
     }
@@ -6442,6 +6606,7 @@ tls_key_path = \"/app/bootroot-http01/tls/server.key\"
             openbao_host_port: None,
             stepca_host_port: None,
             http01_admin_host_port: None,
+            openbao_user: None,
             registrar_endpoint_host: None,
             registrar_endpoint_domain: None,
             no_build: false,

@@ -271,7 +271,9 @@ pub(crate) enum InfraCommand {
     /// `--http01-admin-tls-required`) and, for wildcard binds, separate
     /// `--*-bind-wildcard` and `--*-advertise-addr` flags. These are
     /// deliberate guardrails — see issue #588 for the rationale.
-    Install(InfraInstallArgs),
+    // Boxed: the install arguments are several times the size of every
+    // other variant's.
+    Install(Box<InfraInstallArgs>),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1131,6 +1133,18 @@ pub(crate) struct InfraInstallArgs {
     /// number changes. When unset, the published default is 8080.
     #[arg(long = "http01-admin-host-port")]
     pub(crate) http01_admin_host_port: Option<u16>,
+
+    /// The host `<uid>:<gid>` the `OpenBao` server runs as instead of the
+    /// image's `openbao` user: two decimal numbers from 1 to 4294967294,
+    /// never resolved against a user database. Its raft volume and audit
+    /// directory are re-owned to it at every start, and its TLS key is
+    /// handed to `<uid>:0` at mode `0600`. Recorded as
+    /// `BOOTROOT_OPENBAO_USER` in the compose directory's `.env`; a later
+    /// install without the option keeps the recorded value.
+    // `allow_hyphen_values` so a leading `-` reaches the validator and is
+    // refused with the option's own rule.
+    #[arg(long = "openbao-user", allow_hyphen_values = true)]
+    pub(crate) openbao_user: Option<String>,
 
     /// Enable the registrar endpoint on this host: records
     /// `registrar_endpoint = { enabled = true, host, domain }` in

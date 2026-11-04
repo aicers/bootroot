@@ -551,7 +551,7 @@ Where the crate handles key material or secrets:
     `db_provision_integration` targets with `-- --include-ignored`, the
     deploy compose no-build smoke, and an `infra install` / `init` /
     `service add` / `verify` smoke run.
-  - `Docker E2E (<arm>)` (`test-docker-e2e-matrix`): seventeen arms on
+  - `Docker E2E (<arm>)` (`test-docker-e2e-matrix`): eighteen arms on
     `ubuntu-26.04`, one `scripts/impl/run-*.sh` scenario each.
   - `Registrar Redteam (docs-only)`: the `registrar-redteam` arm alone,
     run only for a documentation-only change, which skips the two jobs
@@ -705,6 +705,14 @@ Where the crate handles key material or secrets:
     overrides in `src/commands/guardrails.rs`, `init`'s writers under
     `secrets/` in `src/commands/init/steps/`, `src/commands/openbao_unseal.rs`
     and the audit override in `src/commands/audit_store.rs`).
+  - `openbao-user` (`run-openbao-user.sh`): `infra install --openbao-user`
+    — the uid `OpenBao` runs as, the `openbao` service's `environment` and
+    entrypoint in both base compose files, the hand-over of `OpenBao`'s
+    TLS key to that uid and bootroot's check of it
+    (`src/commands/openbao_user.rs`, the `--openbao-user` handling in
+    `src/commands/infra.rs`, `issue_openbao_tls_cert` and
+    `hand_over_openbao_tls_key` in `src/commands/init/steps/openbao_tls.rs`,
+    `validate_openbao_tls` in `src/commands/guardrails.rs`).
 
   A change to an arm's script, to its block in `ci.yml` or
   `e2e-matrix.sh`, or to a `scripts/impl/lib/` file it sources selects
@@ -721,20 +729,23 @@ Where the crate handles key material or secrets:
     bootroot-internal credential root-owned; `registrar-redteam` and
     `registrar-ca-rotation` run the endpoint daemon as root;
     `secrets-owner` creates an account, hands it `secrets/` and runs
-    `infra install` and `init` as root.
+    `infra install` and `init` as root; `openbao-user` does the same, gives
+    `OpenBao` that account through `--openbao-user`, and runs `infra up`
+    as root too.
   - Linux: the registrar endpoint is refused on any other operating
     system (`src/config/validation.rs`), and `registrar-redteam` also
     uses `setpriv`, so on macOS those two arms are left to CI.
-    `secrets-owner` creates its account with `useradd` and reads owners
-    and modes with GNU `stat` and `find`, so it is left to CI there too.
+    `secrets-owner` and `openbao-user` create their account with
+    `useradd` and read owners and modes with GNU `stat` and `find`, so
+    they are left to CI there too.
   - The host's TLS tools: the harnesses reach OpenBao's TLS listener and
     the responder admin API with the host's `curl` and `openssl`, which
     must offer X25519MLKEM768 (OpenSSL 3.5 or later, as on Ubuntu 26.04).
     Where they do not — an older OpenSSL, or LibreSSL as macOS ships —
     leave the arms that need them to CI.
   - The bind-host guard of `reinit-recovery`, `stepca-san`, the two
-    `openbao-tls-*` arms, `registrar-internal-init-routable` and
-    `secrets-owner` defaults
+    `openbao-tls-*` arms, `registrar-internal-init-routable`,
+    `secrets-owner` and `openbao-user` defaults
     to `172.17.0.1`, the Docker bridge gateway on Linux. Where Docker has
     no such interface, set `OPENBAO_BIND_HOST`, `STEPCA_BIND_HOST` or
     `BIND_HOST` to an address the host holds, as `docs/en/e2e-ci.md`

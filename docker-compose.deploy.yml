@@ -37,18 +37,33 @@ services:
     volumes:
       - openbao-data:/openbao/raft
       - ./openbao:/openbao/config:ro
-    # The container starts as root only for two chowns the image's own
-    # entrypoint does not do, and refuses to start if either fails.  A named
-    # volume mounted at /openbao/raft, a path the image does not have, is
-    # created root-owned.  /openbao/audit exists only when the audit override
-    # (secrets/openbao/docker-compose.openbao-audit.yml) bind-mounts the
-    # registrar endpoint's audit store there and the device writes
+    # The container starts as root only for the chowns the image's own
+    # entrypoint does not do, and refuses to start if any of them fails.  A
+    # named volume mounted at /openbao/raft, a path the image does not have,
+    # is created root-owned.  /openbao/audit exists only when the audit
+    # override (secrets/openbao/docker-compose.openbao-audit.yml) bind-mounts
+    # the registrar endpoint's audit store there and the device writes
     # /openbao/audit/audit.log; without it OpenBao audits to stdout.  The
-    # image's docker-entrypoint.sh then drops to the openbao user through
-    # su-exec, so the server itself runs as openbao, and turns `server` into
+    # image's docker-entrypoint.sh turns `server` into
     # `bao server -config=/openbao/config`.
+    #
+    # Which uid the server runs as follows BOOTROOT_OPENBAO_USER, recorded in
+    # the `.env` beside this file by `bootroot infra install --openbao-user`
+    # and reaching the script only as the quoted environment variable below:
+    #
+    # - Empty: /openbao/raft and /openbao/audit go to the image's openbao
+    #   user, and docker-entrypoint.sh drops to it through su-exec.
+    # - Set to <uid>:<gid>: /openbao/raft is re-owned to it recursively, and
+    #   /openbao/audit and its active audit.log (never their targets, `-h`)
+    #   but nothing else there: the registrar keeps rotation-intent.json
+    #   root-owned and authenticates it by that owner, and OpenBao never
+    #   writes the rotated audit-*.log generations.  su-exec then drops to
+    #   the uid before docker-entrypoint.sh runs, which, no longer root, does
+    #   not drop again.
     user: "0:0"
-    entrypoint: ["sh", "-c", "chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server"]
+    environment:
+      - BOOTROOT_OPENBAO_USER=${BOOTROOT_OPENBAO_USER:-}
+    entrypoint: ["sh", "-c", "if [ -z \"$$BOOTROOT_OPENBAO_USER\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; chown -R -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \"$$BOOTROOT_OPENBAO_USER\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \"$$BOOTROOT_OPENBAO_USER\" docker-entrypoint.sh server"]
     # Audit records of the stdout device, and the server's own output, go
     # to the container log, which the journald driver hands to the host
     # journal; their retention is the host journal's.  `mode` is left at

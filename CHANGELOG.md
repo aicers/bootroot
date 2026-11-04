@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `bootroot infra install --openbao-user <uid>:<gid>` runs OpenBao as that host
+  uid and gid instead of the image's `openbao` user: the raft volume and the
+  audit directory are re-owned to it at every start, its TLS key is owned by
+  that uid with group 0 and mode `0600` instead of being readable by everyone,
+  on issuance and on every renewal, and the value is recorded in `.env`, where
+  `infra up`, `init` and the rotations read it and a later `infra install`
+  without the option keeps it. Without the option OpenBao runs exactly as
+  before.
+
 ### Changed
 
 - A root-run `infra install`, `init`, `infra up` or `openbao save-unseal-keys`

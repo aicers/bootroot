@@ -3722,8 +3722,12 @@ mod tests {
         const JOURNALD_LOGGING: &str = "    logging:
       driver: journald
 ";
-        const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server\"]\n";
+        const ENTRYPOINT: &str = "    entrypoint: [\"sh\", \"-c\", \"if [ -z \\\"$$BOOTROOT_OPENBAO_USER\\\" ]; then chown openbao:openbao /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown openbao:openbao /openbao/audit && chmod 700 /openbao/audit || exit 1; fi; exec docker-entrypoint.sh server; fi; chown -R -h \\\"$$BOOTROOT_OPENBAO_USER\\\" /openbao/raft || exit 1; if [ -e /openbao/audit ]; then chown -h \\\"$$BOOTROOT_OPENBAO_USER\\\" /openbao/audit && chmod 700 /openbao/audit || exit 1; if [ -e /openbao/audit/audit.log ] || [ -L /openbao/audit/audit.log ]; then chown -h \\\"$$BOOTROOT_OPENBAO_USER\\\" /openbao/audit/audit.log || exit 1; fi; fi; exec su-exec \\\"$$BOOTROOT_OPENBAO_USER\\\" docker-entrypoint.sh server\"]\n";
         const START_AS_ROOT: &str = "    user: \"0:0\"\n";
+        // The uid the server runs as reaches the entrypoint only as this
+        // quoted variable, never as part of the script text.
+        const OPENBAO_USER_ENVIRONMENT: &str =
+            "    environment:\n      - BOOTROOT_OPENBAO_USER=${BOOTROOT_OPENBAO_USER:-}\n";
         for compose in ["docker-compose.yml", "docker-compose.deploy.yml"] {
             let content = repo_file(compose);
             let service = openbao_service_block(&content);
@@ -3759,6 +3763,10 @@ mod tests {
             );
             assert!(service.contains(ENTRYPOINT), "{compose}: {service}");
             assert!(service.contains(START_AS_ROOT), "{compose}: {service}");
+            assert!(
+                service.contains(OPENBAO_USER_ENVIRONMENT),
+                "{compose}: {service}"
+            );
             let entries = collect_openbao_volume_entries(&content);
             assert_eq!(
                 entries,

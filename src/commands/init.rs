@@ -37,8 +37,8 @@ pub(crate) use steps::http01_admin_tls::{
     reissue_http01_admin_tls_cert, strip_responder_tls_config,
 };
 pub(crate) use steps::openbao_tls::{
-    OpenBaoAuditDevice, reissue_openbao_tls_cert, sync_openbao_audit_device,
-    write_openbao_hcl_plaintext,
+    OpenBaoAuditDevice, hand_over_openbao_tls_key, reissue_openbao_tls_cert,
+    sync_openbao_audit_device, write_openbao_hcl_plaintext,
 };
 pub(crate) use steps::postgres_tls::issue_postgres_tls_cert;
 pub(crate) use steps::registrar_internal;
