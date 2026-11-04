@@ -53,11 +53,11 @@ pub(super) async fn rotate_responder_hmac(
     // On such a host the lock is then held from here — before the value
     // reaches `OpenBao`, where a repair would read it — until the
     // responder has been handed it.
-    let internal_lock = if check_internal_config_change(&secrets_dir, change)
+    let internal_lock = if check_internal_config_change(&ctx.secrets, change)
         .await?
         .found()
     {
-        Some(acquire_internal_config_lock(&secrets_dir).await?)
+        Some(acquire_internal_config_lock(&ctx.secrets).await?)
     } else {
         None
     };
@@ -96,7 +96,7 @@ pub(super) async fn rotate_responder_hmac(
     // nothing, so its `http_responder_hmac` is rewritten here and the
     // daemon is sent `SIGHUP`.
     let internal_outcome = match &internal_lock {
-        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await,
+        Some(lock) => apply_internal_config_change(&ctx.secrets, change, lock, messages).await,
         None => Ok(false),
     };
 

@@ -1,6 +1,13 @@
 use super::{Messages, format_template};
 
 impl Messages {
+    pub(crate) fn error_registrar_issue_scratch_dir_failed(&self, path: &str) -> String {
+        format_template(
+            self.strings().error_registrar_issue_scratch_dir_failed,
+            &[("path", path)],
+        )
+    }
+
     pub(crate) fn registrar_capabilities_summary(
         &self,
         api_version: &str,

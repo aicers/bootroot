@@ -252,10 +252,14 @@ rather than following a link at it:
   `init`, and its reads of the files whose contents it passes on (the CA
   certificates, `ca.json`, the step-ca password and the saved unseal keys) there
   refuse a symbolic link the same way, so relocating a generated file by symlink
-  does not apply in that case. The same applies to the steps
-  `rotate infra-cert`, `rotate ca-key`, `rotate trust-sync`,
-  `rotate registrar-internal-credential` and `registrar issue` share with
-  `init`.
+  does not apply in that case. The same applies, run as root over such a
+  `secrets/`, to every `rotate` subcommand, `ca update`,
+  `openbao delete-unseal-keys`, `service add`, `service remove` and
+  `registrar issue`, wherever they write, copy, remove or re-read files below
+  `secrets/` (paths you name yourself, such as a `--secret-id-path` outside
+  `secrets/` or the destinations of `registrar issue`, are left as you chose
+  them). In that case `registrar issue` stages the certificate it issues in a
+  private directory beside `secrets/` rather than below it.
 - **The control node's own `agent.toml`, the issued certificate and key, the CA
   bundle, and every credential are published at the path itself**, replacing a
   link found there with a regular file. The OpenBao unseal-keys and secrets-tree

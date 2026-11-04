@@ -6,9 +6,11 @@ pub(crate) mod resolve;
 mod secrets;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::SecretsTree;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 
 use crate::cli::args::{ServiceAddArgs, ServiceInfoArgs, ServiceUpdateArgs};
@@ -98,6 +100,7 @@ fn role_id_sibling_path(secret_id_path: &Path) -> std::path::PathBuf {
 /// `secret_id` is cleared. The default (no-override) path overwrites, so
 /// it never fails here; the rollback is gated on `is_override`.
 async fn write_origin_credential_files(
+    tree: &Arc<SecretsTree>,
     role_id_path: &Path,
     secret_id_path: &Path,
     role_id: &str,
@@ -105,9 +108,9 @@ async fn write_origin_credential_files(
     is_override: bool,
     messages: &Messages,
 ) -> Result<()> {
-    approle::write_role_id_file(role_id_path, role_id, is_override, messages).await?;
+    approle::write_role_id_file(tree, role_id_path, role_id, is_override, messages).await?;
     if let Err(err) =
-        approle::write_secret_id_file(secret_id_path, secret_id, is_override, messages).await
+        approle::write_secret_id_file(tree, secret_id_path, secret_id, is_override, messages).await
     {
         if is_override {
             let _ = tokio::fs::remove_file(role_id_path).await;
@@ -608,6 +611,9 @@ async fn run_service_add_apply(
     )
     .await?;
     let secrets_dir = state.secrets_dir();
+    // Every write `service add` makes below the secrets directory goes
+    // through this one handle.
+    let secrets_tree = SecretsTree::open_shared(secrets_dir).await?;
     // The resolved `secret_id` path is the single source of truth for
     // this add: the origin writes, the local config renderer, and the
     // persisted state entry all use this same in-memory value (the state
@@ -619,6 +625,7 @@ async fn run_service_add_apply(
     let secret_id_path = resolved_secret_id_path(resolved, secrets_dir);
     let role_id_path = role_id_sibling_path(&secret_id_path);
     write_origin_credential_files(
+        &secrets_tree,
         &role_id_path,
         &secret_id_path,
         &approle_result.role_id,
@@ -647,7 +654,7 @@ async fn run_service_add_apply(
     let applied = if matches!(resolved.delivery_mode, DeliveryMode::LocalFile) {
         Some(
             local_config::apply_local_service_configs(
-                secrets_dir,
+                &secrets_tree,
                 resolved,
                 &secret_id_path,
                 &service_sync_material,
@@ -665,8 +672,8 @@ async fn run_service_add_apply(
         let artifact_wrap_info = create_artifact_wrap_info(&client, resolved, messages).await?;
         Some(
             remote_bootstrap::write_remote_bootstrap_artifact(
+                &secrets_tree,
                 state,
-                secrets_dir,
                 resolved,
                 &secret_id_path,
                 artifact_wrap_info.as_ref(),
@@ -854,9 +861,10 @@ async fn run_service_add_remote_idempotent(
     } else {
         None
     };
+    let secrets_tree = SecretsTree::open_shared(secrets_dir).await?;
     let remote_bootstrap = remote_bootstrap::write_remote_bootstrap_artifact_from_entry(
+        &secrets_tree,
         state,
-        secrets_dir,
         entry,
         artifact_wrap_info.as_ref(),
         &ca_bundle_pem,
@@ -1552,6 +1560,7 @@ mod tests {
         let messages = test_messages();
 
         let err = write_origin_credential_files(
+            &std::sync::Arc::new(bootroot::fs_util::SecretsTree::open(dir.path()).unwrap()),
             &role_id_path,
             &secret_id_path,
             "rid",
@@ -1588,6 +1597,7 @@ mod tests {
         let messages = test_messages();
 
         write_origin_credential_files(
+            &std::sync::Arc::new(bootroot::fs_util::SecretsTree::open(dir.path()).unwrap()),
             &role_id_path,
             &secret_id_path,
             "rid",

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use tokio::fs;
 use tokio::sync::watch;
 use tracing::warn;
 
-use crate::fs_util::{self, KEY_FILE_MODE, StagedMode};
+use crate::fs_util::{self, EntryKind, KEY_FILE_MODE, RootedOwner, SecretsTree, StagedMode};
 use crate::secret::HmacSecret;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -58,6 +59,70 @@ impl SharedEab {
 /// cannot be created, read, or written.
 pub async fn write_eab_file(path: &Path, kid: &str, hmac: &str) -> anyhow::Result<bool> {
     write_key_file(path, &serialize_eab_payload(kid, hmac)?).await
+}
+
+/// [`write_eab_file`] for a `path` below the secrets directory `tree` is
+/// opened on.
+///
+/// On a path-based handle this is exactly [`write_eab_file`]. On a
+/// rooted one every step goes through the handle and follows no name:
+/// the parent is created writer-owned at `0700`, the leaf is read
+/// without following it, a regular file already holding the payload has
+/// its mode repaired through its own descriptor, a symbolic link is
+/// replaced, and anything else is published as [`write_eab_file`]
+/// publishes it.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`write_eab_file`], and
+/// on a rooted handle also when a directory level is a symbolic link.
+pub async fn write_eab_file_in(
+    tree: &Arc<SecretsTree>,
+    path: &Path,
+    kid: &str,
+    hmac: &str,
+) -> anyhow::Result<bool> {
+    let payload = serialize_eab_payload(kid, hmac)?;
+    if !tree.is_rooted() {
+        return write_key_file(path, &payload).await;
+    }
+    let path = path.to_path_buf();
+    tree.run(move |tree| write_key_file_rooted(tree, &path, &payload))
+        .await
+}
+
+/// [`write_key_file`] through a rooted `tree`. Blocking.
+fn write_key_file_rooted(tree: &SecretsTree, path: &Path, contents: &str) -> anyhow::Result<bool> {
+    if let Some(parent) = path.parent() {
+        tree.ensure_dir_as_writer(parent)?;
+    }
+    let next = if contents.ends_with('\n') {
+        contents.to_string()
+    } else {
+        format!("{contents}\n")
+    };
+    // A link is republished, which replaces it, whatever its target
+    // holds; an absent leaf is written.
+    if tree.entry_kind(path)? == Some(EntryKind::File) {
+        let current = tree
+            .read(path)
+            .with_context(|| format!("Failed to read existing EAB file: {}", path.display()))?;
+        if current == next.as_bytes() {
+            // Repair a mode on an existing file this writer did not
+            // create, through the descriptor of the file it opened.
+            tree.set_file_mode(path, KEY_FILE_MODE)?;
+            return Ok(false);
+        }
+    }
+    tree.publish(
+        fs_util::Destination::bootroot_owned(path),
+        next.as_bytes(),
+        StagedMode::Policy(KEY_FILE_MODE),
+        RootedOwner::Destination,
+        fs_util::StagedDurability::FlushDirectory,
+    )
+    .with_context(|| format!("Failed to write EAB file: {}", path.display()))?;
+    Ok(true)
 }
 
 /// Serializes EAB credentials into the exact newline-terminated pretty
@@ -144,6 +209,30 @@ pub async fn remove_eab_file(path: &Path) -> anyhow::Result<bool> {
             Err(err).with_context(|| format!("Failed to remove stale EAB file: {}", path.display()))
         }
     }
+}
+
+/// [`remove_eab_file`] for a `path` below the secrets directory `tree` is
+/// opened on: through the handle on a rooted one, so a link at a
+/// directory level is refused and a link at the file itself is removed
+/// rather than followed.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`remove_eab_file`],
+/// and on a rooted handle also when a directory level is a symbolic
+/// link.
+pub async fn remove_eab_file_in(tree: &Arc<SecretsTree>, path: &Path) -> anyhow::Result<bool> {
+    if !tree.is_rooted() {
+        return remove_eab_file(path).await;
+    }
+    let target = path.to_path_buf();
+    tree.run(move |tree| match tree.remove_file(&target) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to remove stale EAB file: {}", target.display())),
+    })
+    .await
 }
 
 /// Loads EAB credentials from CLI arguments or a JSON file.
@@ -431,6 +520,152 @@ mod tests {
         assert!(remove_eab_file(&path).await.unwrap());
         assert!(!remove_eab_file(&path).await.unwrap());
         assert!(!path.exists());
+    }
+
+    /// A `secrets/` holding `services/` and a sibling `outside/` with a
+    /// recorded file, the layout the rooted tests below swap links into.
+    fn rooted_layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir_all(secrets.join("services").join("svc")).unwrap();
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        (dir, secrets, outside)
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn rooted_tree(secrets: &Path) -> Arc<SecretsTree> {
+        Arc::new(SecretsTree::open_rooted_for_tests(secrets).unwrap())
+    }
+
+    #[tokio::test]
+    async fn rooted_write_eab_file_matches_the_path_based_write() {
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let (_dir, secrets, _outside) = rooted_layout();
+            let tree = if rooted {
+                rooted_tree(&secrets)
+            } else {
+                Arc::new(SecretsTree::open(&secrets).unwrap())
+            };
+            // `services/new/` is missing: the write creates it.
+            let path = secrets.join("services").join("new").join("eab.json");
+            assert!(
+                write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                    .await
+                    .unwrap()
+            );
+            results.push((
+                std::fs::read(&path).unwrap(),
+                mode_of(&path),
+                mode_of(path.parent().unwrap()),
+            ));
+            assert!(remove_eab_file_in(&tree, &path).await.unwrap());
+            assert!(!remove_eab_file_in(&tree, &path).await.unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[1].1, KEY_FILE_MODE);
+        assert_eq!(results[1].2, 0o700);
+    }
+
+    #[tokio::test]
+    async fn rooted_write_eab_file_refuses_a_swapped_level_and_writes_nothing_outside() {
+        let (_dir, secrets, outside) = rooted_layout();
+        let tree = rooted_tree(&secrets);
+        let services = secrets.join("services");
+        std::fs::rename(&services, outside.parent().unwrap().join("aside")).unwrap();
+        std::os::unix::fs::symlink(&outside, &services).unwrap();
+
+        let path = services.join("svc").join("eab.json");
+        let err = write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+            .await
+            .expect_err("a link at services/ is refused");
+        assert!(format!("{err:#}").contains(&services.display().to_string()));
+        let err = remove_eab_file_in(&tree, &path)
+            .await
+            .expect_err("a link at services/ is refused");
+        assert!(format!("{err:#}").contains(&services.display().to_string()));
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was created outside secrets/"
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_write_eab_file_replaces_an_identical_leaf_link_without_touching_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, secrets, outside) = rooted_layout();
+        let tree = rooted_tree(&secrets);
+        let payload = serialize_eab_payload("kid-1", "hmac-1").unwrap();
+        let target = outside.join("eab.json");
+        std::fs::write(&target, &payload).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path = secrets.join("services").join("svc").join("eab.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(
+            write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                .await
+                .unwrap()
+        );
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file(), "the link was replaced");
+        assert_eq!(mode_of(&path), KEY_FILE_MODE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), payload);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), payload);
+        assert_eq!(mode_of(&target), 0o644, "the former target kept its mode");
+    }
+
+    #[tokio::test]
+    async fn rooted_write_eab_file_repairs_the_mode_of_an_identical_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, secrets, _outside) = rooted_layout();
+        let tree = rooted_tree(&secrets);
+        let payload = serialize_eab_payload("kid-1", "hmac-1").unwrap();
+        let path = secrets.join("services").join("svc").join("eab.json");
+        std::fs::write(&path, &payload).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            !write_eab_file_in(&tree, &path, "kid-1", "hmac-1")
+                .await
+                .unwrap()
+        );
+        assert_eq!(mode_of(&path), KEY_FILE_MODE);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn rooted_remove_eab_file_removes_a_leaf_link_and_keeps_its_target() {
+        let (_dir, secrets, outside) = rooted_layout();
+        let tree = rooted_tree(&secrets);
+        let target = outside.join("eab.json");
+        std::fs::write(&target, "OUTSIDE\n").unwrap();
+        let path = secrets.join("services").join("svc").join("eab.json");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(remove_eab_file_in(&tree, &path).await.unwrap());
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OUTSIDE\n");
     }
 
     #[test]

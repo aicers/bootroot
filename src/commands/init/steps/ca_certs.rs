@@ -156,7 +156,11 @@ fn read_text_in(tree: &SecretsTree, path: &Path, messages: &Messages) -> Result<
 
 /// The SHA-256 fingerprint of the PEM certificate in `contents`, read
 /// from `path`.
-fn fingerprint_ca_cert(contents: &[u8], path: &Path, messages: &Messages) -> Result<String> {
+pub(crate) fn fingerprint_ca_cert(
+    contents: &[u8],
+    path: &Path,
+    messages: &Messages,
+) -> Result<String> {
     let (_, pem) = parse_x509_pem(contents).map_err(|_| {
         anyhow::anyhow!(messages.error_ca_cert_parse_failed(&path.display().to_string()))
     })?;

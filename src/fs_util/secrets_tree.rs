@@ -77,6 +77,18 @@ pub enum EntryKind {
     Other,
 }
 
+/// The mode and owner of a file [`SecretsTree::read_with_meta`] read,
+/// from the `fstat` of the descriptor it read through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileMeta {
+    /// The permission bits, masked with `0o7777`.
+    pub mode: u32,
+    /// The owning uid.
+    pub uid: u32,
+    /// The owning gid.
+    pub gid: u32,
+}
+
 /// Names tried for a staged temporary before a rooted publish gives up.
 ///
 /// The owner of `secrets/` can pre-create names in a directory it owns,
@@ -393,28 +405,7 @@ impl SecretsTree {
     /// fails the root-by-policy check, or the leaf is not a regular file
     /// or cannot be read.
     pub fn read(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        use std::io::Read as _;
-
-        let anchor_fd = self.require_rooted(path)?;
-        let names = self.relative_io(path)?;
-        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
-        let mut file = open_file_nofollow(&dir, leaf).map_err(|err| refused_file_io(err, path))?;
-        let meta = file
-            .metadata()
-            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
-        if !meta.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "Refusing to read {}: it is not a regular file",
-                    path.display()
-                ),
-            ));
-        }
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .map_err(|err| io_context(&err, &format!("Failed to read {}", path.display())))?;
-        Ok(contents)
+        self.read_with_meta(path).map(|(contents, _)| contents)
     }
 
     /// Removes the directory entry at `path` that is not a directory.
@@ -652,6 +643,311 @@ impl SecretsTree {
         }
         std::os::unix::fs::fchown(&dir, Some(anchor_owner.0), Some(anchor_owner.1))
             .map_err(|err| io_context(&err, &created_level_owner_context(path, anchor_owner)))
+    }
+
+    /// Creates `path` as a directory, every missing level on the way
+    /// included, each created level at `0700` and owned by the writing
+    /// process.
+    ///
+    /// Rooted only: the counterpart of [`super::ensure_secrets_dir`],
+    /// which leaves what it creates to the writer as well. Each missing
+    /// level is created with `mkdirat(parent, name, 0700)`, opened with
+    /// `O_DIRECTORY | O_NOFOLLOW` and `fchmod`ed `0700` through its own
+    /// descriptor, and no owner is changed. A level that already existed
+    /// keeps its owner, and keeps its mode unless it is `path` itself,
+    /// which ends `0700`. For the anchor itself the anchor's descriptor
+    /// is `fchmod`ed `0700`, as [`SecretsTree::ensure_dir`] does.
+    ///
+    /// # Errors
+    /// Returns an `Unsupported` error on a path-based handle, and an
+    /// error naming the path if `path` is not below the anchor, a level
+    /// is a link or fails the root-by-policy check, or a level cannot be
+    /// created or given its mode.
+    pub fn ensure_dir_as_writer(&self, path: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let mut current = self.walk_io(anchor_fd, &[])?;
+        if names.is_empty() {
+            return set_mode_io(&current, SECRETS_DIR_MODE, &self.anchor);
+        }
+        let mut level = self.anchor.clone();
+        let last = names.len() - 1;
+        for (depth, name) in names.iter().enumerate() {
+            level.push(name);
+            let (dir, created) = match open_dir_nofollow(&current, name) {
+                Ok(dir) => (dir, false),
+                Err(Errno::NOENT) => {
+                    let created = match rustix::fs::mkdirat(&current, *name, Mode::RWXU) {
+                        Ok(()) => true,
+                        // A racing create: the level is now an existing
+                        // one, and is opened as such.
+                        Err(Errno::EXIST) => false,
+                        Err(err) => {
+                            return Err(errno_context(
+                                err,
+                                &format!("Failed to create secrets dir {}", level.display()),
+                            ));
+                        }
+                    };
+                    let dir = open_dir_nofollow(&current, name)
+                        .map_err(|err| refused_level_io(err, &level))?;
+                    (dir, created)
+                }
+                Err(err) => return Err(refused_level_io(err, &level)),
+            };
+            self.check_root_by_policy(depth, name, &dir, &level)?;
+            if created || depth == last {
+                set_mode_io(&dir, SECRETS_DIR_MODE, &level)?;
+            }
+            current = dir;
+        }
+        Ok(())
+    }
+
+    /// Creates the regular file at `path`, which must not exist, holding
+    /// `contents` at exactly `mode`.
+    ///
+    /// Rooted only. The file is created with
+    /// `openat(dir, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW)` in
+    /// its walked directory, written, `fchmod`ed to `mode` through its
+    /// descriptor so the umask does not narrow it, `fchown`ed to `owner`
+    /// when one is given and differs from what it has, and `fsync`ed. It
+    /// is not renamed: the name it is created at is the final one. A
+    /// failure once the file exists removes it again.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` if anything, a symbolic link included, is
+    /// at the name; an `Unsupported` error on a path-based handle; and an
+    /// error naming the path if `path` is not below the anchor, a
+    /// directory level is missing, is a link or fails the root-by-policy
+    /// check, or the file cannot be written, given its mode or owner, or
+    /// flushed.
+    pub fn create_new(
+        &self,
+        path: &Path,
+        contents: &[u8],
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        let fd = rustix::fs::openat(
+            &dir,
+            leaf,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|err| errno_context(err, &format!("Failed to create {}", path.display())))?;
+        let mut file = File::from(fd);
+        let written = (|| {
+            file.write_all(contents)
+                .map_err(|err| io_context(&err, &format!("Failed to write {}", path.display())))?;
+            set_mode_io(&file, mode, path)?;
+            if let Some((uid, gid)) = owner {
+                let current = file
+                    .metadata()
+                    .map(|meta| (meta.uid(), meta.gid()))
+                    .map_err(|err| {
+                        io_context(&err, &format!("Failed to stat {}", path.display()))
+                    })?;
+                if current != (uid, gid) {
+                    std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+                        .map_err(|err| io_context(&err, &chown_preserve_context(uid, gid, path)))?;
+                }
+            }
+            file.sync_all()
+                .map_err(|err| io_context(&err, &format!("Failed to fsync {}", path.display())))
+        })();
+        if written.is_err() {
+            // Best effort: the create is already failing, and its own
+            // error is the one to report.
+            let _ = rustix::fs::unlinkat(&dir, leaf, AtFlags::empty());
+        }
+        written
+    }
+
+    /// Creates the directory at `path`, which must not exist, at `mode`
+    /// and owned by `owner`.
+    ///
+    /// Rooted only. The directory is created with `mkdirat` in its walked
+    /// parent and then opened with `O_DIRECTORY | O_NOFOLLOW`. Before
+    /// any mode or owner change, the opened directory must be owned by
+    /// the writing process and empty, as the one `mkdirat` just created
+    /// is, and must pass the root-by-policy check: a directory somebody
+    /// else put at the name between the create and the open is refused
+    /// and receives nothing. Only then is it `fchmod`ed to `mode` and
+    /// `fchown`ed to `owner` through its descriptor.
+    ///
+    /// # Errors
+    /// Returns `AlreadyExists` naming the path if anything is at the
+    /// name; an `Unsupported` error on a path-based handle; and an error
+    /// naming the path if `path` is not below the anchor, a level above it
+    /// is missing, is a link or fails the root-by-policy check, the
+    /// opened directory is not the one just created, or it cannot be
+    /// given its mode or owner.
+    pub fn create_dir_exclusive(
+        &self,
+        path: &Path,
+        mode: u32,
+        owner: (u32, u32),
+    ) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, depth, parent) = self.parent_of(anchor_fd, path, &names)?;
+        rustix::fs::mkdirat(&parent, leaf, Mode::RWXU)
+            .map_err(|err| errno_context(err, &format!("Failed to create {}", path.display())))?;
+        let dir = open_dir_nofollow(&parent, leaf).map_err(|err| refused_level_io(err, path))?;
+        let found = dir
+            .metadata()
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?
+            .uid();
+        if found != self.writer_euid || !list_dir(&dir, path)?.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Refusing to use {}: it is not the empty directory this process just \
+                     created there (owned by uid {found}, expected uid {})",
+                    path.display(),
+                    self.writer_euid
+                ),
+            ));
+        }
+        self.check_root_by_policy(depth, leaf, &dir, path)?;
+        set_mode_io(&dir, mode, path)?;
+        if (found, dir_gid(&dir, path)?) != owner {
+            std::os::unix::fs::fchown(&dir, Some(owner.0), Some(owner.1))
+                .map_err(|err| io_context(&err, &chown_preserve_context(owner.0, owner.1, path)))?;
+        }
+        Ok(())
+    }
+
+    /// Renames the entry at `from` to `to`, both below the anchor.
+    ///
+    /// Rooted only: `renameat` between the two walked parents' descriptors.
+    /// Neither name is followed: a symbolic link at `from` is renamed
+    /// itself, and one at `to` is replaced.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if `from` or a level above either name is
+    /// missing; an `Unsupported` error on a path-based handle; and an
+    /// error naming the paths if either is not below the anchor, a level
+    /// above either is a link or fails the root-by-policy check, or the
+    /// rename fails.
+    pub fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(from)?;
+        let from_names = self.relative_io(from)?;
+        let to_names = self.relative_io(to)?;
+        let (from_leaf, _, from_dir) = self.parent_of(anchor_fd, from, &from_names)?;
+        let (to_leaf, _, to_dir) = self.parent_of(anchor_fd, to, &to_names)?;
+        rustix::fs::renameat(&from_dir, from_leaf, &to_dir, to_leaf).map_err(|err| {
+            errno_context(
+                err,
+                &format!("Failed to rename {} to {}", from.display(), to.display()),
+            )
+        })
+    }
+
+    /// Flushes the directory at `path`, the anchor itself included.
+    ///
+    /// Rooted only: `fsync` of the directory's own descriptor, reached by
+    /// the walk.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the directory or a level above it is
+    /// missing; an `Unsupported` error on a path-based handle; and an
+    /// error naming the path if a level is a link or fails the
+    /// root-by-policy check, or the flush fails.
+    pub fn sync_dir(&self, path: &Path) -> std::io::Result<()> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let dir = self.walk_io(anchor_fd, &names)?;
+        dir.sync_all().map_err(|err| {
+            io_context(
+                &err,
+                &format!("Failed to fsync directory {}", path.display()),
+            )
+        })
+    }
+
+    /// Opens, creating it at `mode` when missing, the lock file at
+    /// `path`, and returns it for the caller to lock.
+    ///
+    /// Rooted only:
+    /// `openat(dir, leaf, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK)` in
+    /// the walked directory, then `fstat` of the opened descriptor, which
+    /// must be a regular file. A FIFO at the name never blocks the open.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if a directory level is missing; an
+    /// `Unsupported` error on a path-based handle; and an error naming
+    /// the path if `path` is not below the anchor, a level is a link or
+    /// fails the root-by-policy check, the leaf is a symbolic link or
+    /// anything but a regular file, or it cannot be opened.
+    pub fn open_lock(&self, path: &Path, mode: u32) -> std::io::Result<File> {
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        let fd = rustix::fs::openat(
+            &dir,
+            leaf,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::from_raw_mode(mode_t_of(mode)),
+        )
+        .map_err(|err| refused_file_io(err, path))?;
+        let file = File::from(fd);
+        let meta = file
+            .metadata()
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to lock {}: it is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(file)
+    }
+
+    /// Reads the regular file at `path`, as [`SecretsTree::read`] does,
+    /// and returns its mode and owner from the `fstat` of the same
+    /// descriptor.
+    ///
+    /// # Errors
+    /// Returns an error under the same conditions as
+    /// [`SecretsTree::read`].
+    pub fn read_with_meta(&self, path: &Path) -> std::io::Result<(Vec<u8>, FileMeta)> {
+        use std::io::Read as _;
+
+        let anchor_fd = self.require_rooted(path)?;
+        let names = self.relative_io(path)?;
+        let (leaf, _, dir) = self.parent_of(anchor_fd, path, &names)?;
+        let mut file = open_file_nofollow(&dir, leaf).map_err(|err| refused_file_io(err, path))?;
+        let meta = file
+            .metadata()
+            .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))?;
+        if !meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Refusing to read {}: it is not a regular file",
+                    path.display()
+                ),
+            ));
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|err| io_context(&err, &format!("Failed to read {}", path.display())))?;
+        Ok((
+            contents,
+            FileMeta {
+                mode: meta.mode() & 0o7777,
+                uid: meta.uid(),
+                gid: meta.gid(),
+            },
+        ))
     }
 
     /// Runs `op` against this handle on a blocking thread.
@@ -1474,6 +1770,30 @@ fn refused_file_io(err: Errno, path: &Path) -> std::io::Error {
             path.display()
         ),
     )
+}
+
+fn set_mode_io(file: &File, mode: u32, path: &Path) -> std::io::Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|err| {
+            io_context(
+                &err,
+                &format!("Failed to set mode {mode:o} on {}", path.display()),
+            )
+        })
+}
+
+fn dir_gid(dir: &File, path: &Path) -> std::io::Result<u32> {
+    dir.metadata()
+        .map(|meta| meta.gid())
+        .map_err(|err| io_context(&err, &format!("Failed to stat {}", path.display())))
+}
+
+/// `mode` as the platform's `mode_t`, which is a `u16` on macOS.
+///
+/// Only the permission bits are kept, so the conversion cannot fail.
+fn mode_t_of(mode: u32) -> rustix::fs::RawMode {
+    rustix::fs::RawMode::try_from(mode & 0o7777)
+        .expect("permission bits masked with 0o7777 fit every platform's mode_t")
 }
 
 fn created_level_owner_context(path: &Path, owner: (u32, u32)) -> String {

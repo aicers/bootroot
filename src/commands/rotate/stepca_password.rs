@@ -65,7 +65,7 @@ pub(super) async fn rotate_stepca_password(
     )?;
 
     fs_util::ensure_secrets_dir(secrets_dir).await?;
-    write_secret_file(&new_password_path, &new_password, messages).await?;
+    write_secret_file(&ctx.secrets, &new_password_path, &new_password, messages).await?;
 
     change_stepca_passphrase(
         secrets_dir,

@@ -59,11 +59,11 @@ pub(super) async fn rotate_eab_clear(
     // it or waits to read the cleared value.
     let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
     let change = InternalConfigChange::RemoveEab;
-    let internal_lock = if check_internal_config_change(&secrets_dir, change)
+    let internal_lock = if check_internal_config_change(&ctx.secrets, change)
         .await?
         .found()
     {
-        Some(acquire_internal_config_lock(&secrets_dir).await?)
+        Some(acquire_internal_config_lock(&ctx.secrets).await?)
     } else {
         None
     };
@@ -86,7 +86,7 @@ pub(super) async fn rotate_eab_clear(
     let fanout_outcome =
         clear_service_eab_records(client, &kv_mount, &registration_ids, &empty, messages).await;
     let internal_outcome = match &internal_lock {
-        Some(lock) => apply_internal_config_change(&secrets_dir, change, lock, messages).await,
+        Some(lock) => apply_internal_config_change(&ctx.secrets, change, lock, messages).await,
         None => Ok(false),
     };
     drop(internal_lock);

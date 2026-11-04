@@ -1,13 +1,15 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bootroot::fs_util::{EntryKind, SecretsTree};
 use bootroot::openbao::OpenBaoClient;
 
 use super::helpers::{
-    confirm_action, ensure_file_exists, restart_compose_service, signal_bootroot_agent,
-    try_restart_container,
+    ca_cert_fingerprint, confirm_action, ensure_file_exists, restart_compose_service,
+    signal_bootroot_agent, try_restart_container,
 };
 use super::infra_cert::execute_reload_strategy;
 use super::registrar_endpoint::{self, EndpointHost, RetiredOwner, SocketDialer, WaitBudget};
@@ -23,7 +25,7 @@ use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::container_name::BootrootContainer;
 use crate::commands::infra::run_docker;
 use crate::commands::init::{
-    POSTGRES_INFRA_CERT_KEY, compute_ca_bundle_pem, compute_ca_fingerprints,
+    POSTGRES_INFRA_CERT_KEY, compute_ca_bundle_pem, compute_ca_fingerprints, fingerprint_ca_cert,
     issue_postgres_tls_cert, read_ca_cert_fingerprint,
 };
 use crate::commands::trust::{
@@ -56,9 +58,9 @@ pub(super) async fn rotate_ca_key(
         ensure_file_exists(&ctx.paths.stepca_root_key(), messages)?;
     }
 
-    let root_fp = read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
+    let root_fp = ca_cert_fingerprint(&ctx.secrets, &ctx.paths.root_cert(), messages).await?;
     let current_inter_fp =
-        read_ca_cert_fingerprint(&ctx.paths.intermediate_cert(), messages).await?;
+        ca_cert_fingerprint(&ctx.secrets, &ctx.paths.intermediate_cert(), messages).await?;
 
     println!(
         "{}",
@@ -94,10 +96,24 @@ pub(super) async fn rotate_ca_key(
         resumed = true;
         state
     } else {
-        if ctx.paths.intermediate_cert_bak().exists() || ctx.paths.intermediate_key_bak().exists() {
+        if any_present(
+            &ctx.secrets,
+            &[
+                ctx.paths.intermediate_cert_bak(),
+                ctx.paths.intermediate_key_bak(),
+            ],
+        )
+        .await?
+        {
             eprintln!("{}", messages.warning_stale_backup());
         }
-        if args.full && (ctx.paths.root_cert_bak().exists() || ctx.paths.root_key_bak().exists()) {
+        if args.full
+            && any_present(
+                &ctx.secrets,
+                &[ctx.paths.root_cert_bak(), ctx.paths.root_key_bak()],
+            )
+            .await?
+        {
             eprintln!("{}", messages.warning_stale_backup());
         }
         let prompt = if args.full {
@@ -152,24 +168,28 @@ pub(super) async fn rotate_ca_key(
     // Phase 1 — Backup
     if start_phase < 1 {
         println!("{}", messages.rotate_ca_key_phase_backup());
+        let mut backups = Vec::new();
         if rot_state.mode == RotationMode::Full {
-            backup_file(&ctx.paths.root_cert(), &ctx.paths.root_cert_bak(), messages)?;
-            backup_file(
-                &ctx.paths.stepca_root_key(),
-                &ctx.paths.root_key_bak(),
-                messages,
-            )?;
+            backups.push((ctx.paths.root_cert(), ctx.paths.root_cert_bak()));
+            backups.push((ctx.paths.stepca_root_key(), ctx.paths.root_key_bak()));
         }
-        backup_file(
-            &ctx.paths.intermediate_cert(),
-            &ctx.paths.intermediate_cert_bak(),
-            messages,
-        )?;
-        backup_file(
-            &ctx.paths.stepca_intermediate_key(),
-            &ctx.paths.intermediate_key_bak(),
-            messages,
-        )?;
+        backups.push((
+            ctx.paths.intermediate_cert(),
+            ctx.paths.intermediate_cert_bak(),
+        ));
+        backups.push((
+            ctx.paths.stepca_intermediate_key(),
+            ctx.paths.intermediate_key_bak(),
+        ));
+        let messages_for_task = messages.clone();
+        ctx.secrets
+            .run(move |tree| {
+                for (src, dst) in &backups {
+                    backup_file(tree, src, dst, &messages_for_task)?;
+                }
+                Ok(())
+            })
+            .await?;
         rot_state.phase = 1;
         if start_phase == 0 && rot_state.new_intermediate_fp.is_empty() {
             create_rotation_state_async(&ctx.state_dir, &rot_state, messages).await?;
@@ -185,24 +205,27 @@ pub(super) async fn rotate_ca_key(
         if rot_state.mode == RotationMode::Full {
             // Phase 2a — Generate new root CA
             println!("{}", messages.rotate_ca_key_phase_generate_root());
-            let pre_root_fp = read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
+            let pre_root_fp =
+                ca_cert_fingerprint(&ctx.secrets, &ctx.paths.root_cert(), messages).await?;
             if pre_root_fp != rot_state.old_root_fp && !rot_state.old_root_fp.is_empty() {
                 rot_state.new_root_fp = pre_root_fp;
             } else {
                 generate_new_root(ctx, messages)?;
                 rot_state.new_root_fp =
-                    read_ca_cert_fingerprint(&ctx.paths.root_cert(), messages).await?;
+                    ca_cert_fingerprint(&ctx.secrets, &ctx.paths.root_cert(), messages).await?;
             }
         }
 
         // Phase 2b — Generate new intermediate CA (signed by current root on disk)
         println!("{}", messages.rotate_ca_key_phase_generate());
-        let pre_fp = read_ca_cert_fingerprint(&ctx.paths.intermediate_cert(), messages).await?;
+        let pre_fp =
+            ca_cert_fingerprint(&ctx.secrets, &ctx.paths.intermediate_cert(), messages).await?;
         if pre_fp != rot_state.old_intermediate_fp && !rot_state.old_intermediate_fp.is_empty() {
             rot_state.new_intermediate_fp = pre_fp;
         } else {
             generate_new_intermediate(ctx, messages)?;
-            let new_fp = read_ca_cert_fingerprint(&ctx.paths.intermediate_cert(), messages).await?;
+            let new_fp =
+                ca_cert_fingerprint(&ctx.secrets, &ctx.paths.intermediate_cert(), messages).await?;
             rot_state.new_intermediate_fp = new_fp;
         }
 
@@ -254,7 +277,7 @@ pub(super) async fn rotate_ca_key(
         }
         bundle_sources.push(ctx.paths.intermediate_cert_bak());
         bundle_sources.push(ctx.paths.intermediate_cert());
-        let ca_bundle_pem = concat_unique_ca_certs(&bundle_sources, messages).await?;
+        let ca_bundle_pem = concat_unique_ca_certs(&ctx.secrets, &bundle_sources, messages).await?;
         // Enumerated here, inside the phase, so a resumed rotation sees
         // identities minted since the run that failed; a failure aborts
         // before `bootroot/ca` is written and Phase 3 stays unrecorded.
@@ -289,7 +312,7 @@ pub(super) async fn rotate_ca_key(
         // credential match.
         if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
             registrar_internal::write_internal_trust(
-                ctx.paths.secrets_dir(),
+                &ctx.secrets,
                 &registrar_internal::InternalTrustState {
                     fingerprints: transitional_fps.clone(),
                     bundle_pem: ca_bundle_pem.clone(),
@@ -581,7 +604,7 @@ pub(super) async fn rotate_ca_key(
         // specified to leave alone.
         if registrar_internal::internal_rotation_applies(&rot_state.mode, ctx.paths.secrets_dir()) {
             registrar_internal::publish_internal_trust(
-                ctx.paths.secrets_dir(),
+                &ctx.secrets,
                 &registrar_internal::InternalTrustState {
                     fingerprints: final_fps.clone(),
                     bundle_pem: ca_bundle_pem.clone(),
@@ -693,14 +716,26 @@ fn phase7_cleanup(
     messages: &Messages,
 ) -> Result<()> {
     println!("{}", messages.rotate_ca_key_phase_cleanup());
-    registrar_endpoint::sweep_retired_staging(&ctx.paths, messages)?;
-    registrar_endpoint::remove_retired_pair(&ctx.paths, messages)?;
+    let tree = &*ctx.secrets;
+    registrar_endpoint::sweep_retired_staging(tree, &ctx.paths, messages)?;
+    registrar_endpoint::remove_retired_pair(tree, &ctx.paths, messages)?;
     if cleanup {
-        let _ = fs::remove_file(ctx.paths.intermediate_cert_bak());
-        let _ = fs::remove_file(ctx.paths.intermediate_key_bak());
+        let mut backups = vec![
+            ctx.paths.intermediate_cert_bak(),
+            ctx.paths.intermediate_key_bak(),
+        ];
         if *mode == RotationMode::Full {
-            let _ = fs::remove_file(ctx.paths.root_cert_bak());
-            let _ = fs::remove_file(ctx.paths.root_key_bak());
+            backups.push(ctx.paths.root_cert_bak());
+            backups.push(ctx.paths.root_key_bak());
+        }
+        // Best effort, as it always was: a backup that cannot be
+        // removed is left for the operator, and the rotation is done.
+        for backup in backups {
+            if tree.is_rooted() {
+                let _ = tree.remove_file(&backup);
+            } else {
+                let _ = fs::remove_file(backup);
+            }
         }
     }
     delete_rotation_state(&ctx.state_dir, messages)
@@ -720,15 +755,25 @@ async fn endpoint_phase0(
     resumed: bool,
     messages: &Messages,
 ) -> Result<EndpointHost> {
-    let secrets_dir = ctx.paths.secrets_dir();
-    let host = EndpointHost::resolve(secrets_dir, messages)?;
+    let secrets_dir = ctx.paths.secrets_dir().to_path_buf();
+    let messages_for_task = messages.clone();
+    let host = ctx
+        .secrets
+        .run(move |tree| EndpointHost::resolve(tree, &secrets_dir, &messages_for_task))
+        .await?;
     let accepted = registrar_endpoint::phase0_accepted_fingerprints(
         resumed.then_some(state),
         &state.old_root_fp,
         &state.old_intermediate_fp,
     );
     registrar_endpoint::check_pin_file(&host.pin_file, &accepted, messages)?;
-    registrar_endpoint::sweep_retired_staging(&ctx.paths, messages)?;
+    let paths = ctx.paths.clone();
+    let messages_for_task = messages.clone();
+    ctx.secrets
+        .run(move |tree| {
+            registrar_endpoint::sweep_retired_staging(tree, &paths, &messages_for_task)
+        })
+        .await?;
     if !resumed {
         let current = registrar_endpoint::CaGeneration::load(
             &ctx.paths.root_cert(),
@@ -736,6 +781,7 @@ async fn endpoint_phase0(
             messages,
         )?;
         registrar_endpoint::preserve_retired_pair(
+            &ctx.secrets,
             &host.client,
             &ctx.paths,
             &current,
@@ -800,6 +846,7 @@ pub(super) async fn concat_unique_ca_certs_for_repair(
     messages: &Messages,
 ) -> Result<String> {
     concat_unique_ca_certs(
+        &ctx.secrets,
         &[
             ctx.paths.root_cert(),
             ctx.paths.root_cert_bak(),
@@ -833,10 +880,21 @@ fn transitional_fingerprints(state: &RotationState) -> Vec<String> {
 /// fingerprint in the transitional pin list. Missing files are an
 /// error: silently omitting a source would republish a bundle that no
 /// longer covers the pins.
+///
+/// On a rooted `tree` each source is read once, through the handle, and
+/// both the fingerprint and the bundled bytes come from that one read.
 async fn concat_unique_ca_certs(
+    tree: &Arc<SecretsTree>,
     paths: &[std::path::PathBuf],
     messages: &Messages,
 ) -> Result<String> {
+    if tree.is_rooted() {
+        let paths = paths.to_vec();
+        let messages = messages.clone();
+        return tree
+            .run(move |tree| concat_unique_ca_certs_rooted(tree, &paths, &messages))
+            .await;
+    }
     let mut bundle = String::new();
     let mut seen: Vec<String> = Vec::new();
     for path in paths {
@@ -854,6 +912,57 @@ async fn concat_unique_ca_certs(
         }
     }
     Ok(bundle)
+}
+
+/// [`concat_unique_ca_certs`] through a rooted `tree`. Blocking.
+fn concat_unique_ca_certs_rooted(
+    tree: &SecretsTree,
+    paths: &[std::path::PathBuf],
+    messages: &Messages,
+) -> Result<String> {
+    let mut bundle = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for path in paths {
+        let contents = match tree.read(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(messages.error_ca_cert_missing(&path.display().to_string()));
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(messages.error_read_file_failed(&path.display().to_string())));
+            }
+        };
+        let fingerprint = fingerprint_ca_cert(&contents, path, messages)?;
+        if seen.contains(&fingerprint) {
+            continue;
+        }
+        seen.push(fingerprint);
+        let pem = String::from_utf8(contents)
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+        bundle.push_str(&pem);
+        if !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+    }
+    Ok(bundle)
+}
+
+/// Whether anything is at any of `paths` below the secrets directory:
+/// read without following a name through a rooted `tree`, by `exists()`
+/// otherwise. Only ever a warning's condition, so an entry that cannot
+/// be read counts as absent, as `exists()` counts it.
+async fn any_present(tree: &Arc<SecretsTree>, paths: &[PathBuf]) -> Result<bool> {
+    if !tree.is_rooted() {
+        return Ok(paths.iter().any(|path| path.exists()));
+    }
+    let paths = paths.to_vec();
+    tree.run(move |tree| {
+        Ok(paths
+            .iter()
+            .any(|path| matches!(tree.entry_kind(path), Ok(Some(_)))))
+    })
+    .await
 }
 
 /// Resolves the `--user <uid>:<gid>` value for a `step` helper container
@@ -954,7 +1063,32 @@ fn generate_new_intermediate(ctx: &RotateContext, messages: &Messages) -> Result
     Ok(())
 }
 
-fn backup_file(src: &Path, dst: &Path, messages: &Messages) -> Result<()> {
+/// Copies the CA file `src` to its backup `dst`, both below the secrets
+/// directory, unless a backup is already there.
+///
+/// On a rooted `tree` the destination is read without following it: a
+/// regular file is kept, as a resumed rotation keeps it, and anything
+/// else, a symbolic link included, is refused. The source is read
+/// through the handle and the backup created exclusively at the source's
+/// permission bits, owned by the writer, as `fs::copy` leaves it.
+fn backup_file(tree: &SecretsTree, src: &Path, dst: &Path, messages: &Messages) -> Result<()> {
+    if tree.is_rooted() {
+        match tree.entry_kind(dst)? {
+            Some(EntryKind::File) => return Ok(()),
+            Some(_) => {
+                anyhow::bail!(
+                    messages.error_backup_destination_not_regular(&dst.display().to_string())
+                );
+            }
+            None => {}
+        }
+        let (contents, meta) = tree
+            .read_with_meta(src)
+            .with_context(|| messages.error_read_file_failed(&src.display().to_string()))?;
+        tree.create_new(dst, &contents, meta.mode, None)
+            .with_context(|| messages.error_write_file_failed(&dst.display().to_string()))?;
+        return Ok(());
+    }
     if dst.exists() {
         return Ok(());
     }
@@ -1612,7 +1746,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::super::test_support::{
-        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
+        decode_fake_docker_log, path_tree, test_messages, write_self_contained_fake_docker,
         write_self_contained_fake_docker_exiting,
     };
     use super::*;
@@ -1631,6 +1765,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
             docker: PathBuf::from(DOCKER_BIN),
+            secrets: path_tree(&dir.join("secrets")),
         }
     }
 
@@ -1976,9 +2111,13 @@ mod tests {
         fs::write(&old_inter, &old_inter_pem).expect("write old intermediate");
         fs::write(&new_inter, &new_inter_pem).expect("write new intermediate");
 
-        let bundle = concat_unique_ca_certs(&[root, old_inter, new_inter], &messages)
-            .await
-            .expect("bundle");
+        let bundle = concat_unique_ca_certs(
+            &path_tree(dir.path()),
+            &[root, old_inter, new_inter],
+            &messages,
+        )
+        .await
+        .expect("bundle");
 
         assert!(bundle.contains(root_pem.trim()));
         assert!(bundle.contains(old_inter_pem.trim()));
@@ -2003,9 +2142,10 @@ mod tests {
         fs::write(&inter, &inter_pem).expect("write intermediate");
         fs::write(&inter_bak, &inter_pem).expect("write intermediate backup");
 
-        let bundle = concat_unique_ca_certs(&[root, inter_bak, inter], &messages)
-            .await
-            .expect("bundle");
+        let bundle =
+            concat_unique_ca_certs(&path_tree(dir.path()), &[root, inter_bak, inter], &messages)
+                .await
+                .expect("bundle");
 
         assert_eq!(bundle.matches("BEGIN CERTIFICATE").count(), 2);
         assert!(bundle.contains(root_pem.trim()));
@@ -2025,7 +2165,8 @@ mod tests {
         fs::write(&root, &root_pem).expect("write root");
         let missing = dir.path().join("intermediate_ca.crt.bak");
 
-        let result = concat_unique_ca_certs(&[root, missing], &messages).await;
+        let result =
+            concat_unique_ca_certs(&path_tree(dir.path()), &[root, missing], &messages).await;
         assert!(result.is_err());
     }
 
@@ -2642,5 +2783,139 @@ mod tests {
             Phase5Action::RemoteReissueRequest,
             "remote service with no leaf on disk must get a request"
         );
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).expect("stat").mode() & 0o7777
+    }
+
+    #[test]
+    fn rooted_backup_file_copies_once_and_follows_no_link() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let messages = test_messages();
+        // Parity: the rooted copy gives the bytes and mode `fs::copy` does.
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let src = root.write("secrets/root_ca_key", "KEY\n");
+            fs::set_permissions(&src, fs::Permissions::from_mode(0o640)).expect("chmod");
+            let dst = root.secrets.join("secrets").join("root_ca_key.bak");
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).expect("open")
+            };
+            backup_file(&tree, &src, &dst, &messages).expect("backup");
+            results.push((fs::read(&dst).expect("read"), mode_of(&dst)));
+            // An existing regular backup is kept, as a resumed rotation
+            // keeps it.
+            fs::write(&src, "NEWER\n").expect("rewrite source");
+            backup_file(&tree, &src, &dst, &messages).expect("kept");
+            assert_eq!(fs::read(&dst).expect("read"), b"KEY\n");
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[1], (b"KEY\n".to_vec(), 0o640));
+
+        // A link at the source is refused and nothing is written.
+        let root = crate::test_support::SwapRoot::new();
+        let tree = root.rooted();
+        let src = root.write("secrets/root_ca_key", "KEY\n");
+        let dst = root.secrets.join("secrets").join("root_ca_key.bak");
+        root.swap("secrets/root_ca_key", &root.outside.join("secret"));
+        let err = backup_file(&tree, &src, &dst, &messages).expect_err("source link");
+        crate::test_support::assert_error_names(&err, &src);
+        assert!(fs::symlink_metadata(&dst).is_err());
+
+        // A link at the destination is refused, not kept, and its target
+        // is left as it was.
+        let root = crate::test_support::SwapRoot::new();
+        let tree = root.rooted();
+        let src = root.write("secrets/root_ca_key", "KEY\n");
+        let dst = root.secrets.join("secrets").join("root_ca_key.bak");
+        let before = root.outside_snapshot();
+        std::os::unix::fs::symlink(root.outside.join("secret"), &dst).expect("plant link");
+        let err = backup_file(&tree, &src, &dst, &messages).expect_err("destination link");
+        crate::test_support::assert_error_names(&err, &dst);
+        assert_eq!(root.outside_snapshot(), before);
+
+        // A link at the level above both is refused.
+        let link = root.swap("secrets", &root.outside);
+        let err = backup_file(&tree, &src, &dst, &messages).expect_err("level link");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[test]
+    fn rooted_phase7_cleanup_removes_nothing_through_a_swapped_certs_dir() {
+        let dir = tempdir().expect("tempdir");
+        let mut ctx = ctx_for_instance(dir.path(), "insight");
+        let secrets = ctx.paths.secrets_dir().to_path_buf();
+        fs::create_dir_all(secrets.join("certs")).expect("certs");
+        fs::create_dir_all(secrets.join("secrets")).expect("secrets");
+        fs::write(ctx.paths.intermediate_key_bak(), "key").expect("key bak");
+        ctx.secrets = Arc::new(SecretsTree::open_rooted_for_tests(&secrets).expect("rooted"));
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("intermediate_ca.crt.bak"), "OUTSIDE").expect("seed");
+        fs::write(outside.join("root_ca.crt.bak"), "OUTSIDE").expect("seed");
+        fs::remove_dir(secrets.join("certs")).expect("rm certs");
+        std::os::unix::fs::symlink(&outside, secrets.join("certs")).expect("plant link");
+        let before = crate::test_support::snapshot_tree(&outside);
+
+        phase7_cleanup(&ctx, &RotationMode::Full, true, &test_messages()).expect("cleanup");
+        assert_eq!(crate::test_support::snapshot_tree(&outside), before);
+        assert!(
+            !ctx.paths.intermediate_key_bak().exists(),
+            "a backup below an unswapped level is still removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn rooted_concat_unique_ca_certs_reads_each_source_once_and_follows_no_link() {
+        let messages = test_messages();
+        let (_, root_pem) = build_issuer("Root CA");
+        let (_, inter_pem) = build_issuer("Intermediate CA");
+        let mut bundles = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let sources = vec![
+                root.write("certs/root_ca.crt", &root_pem),
+                root.write("certs/intermediate_ca.crt.bak", &inter_pem),
+                root.write("certs/intermediate_ca.crt", &inter_pem),
+            ];
+            let tree = Arc::new(if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).expect("open")
+            });
+            bundles.push(
+                concat_unique_ca_certs(&tree, &sources, &messages)
+                    .await
+                    .expect("bundle"),
+            );
+        }
+        assert_eq!(bundles[0], bundles[1]);
+        assert_eq!(bundles[1].matches("BEGIN CERTIFICATE").count(), 2);
+
+        let root = crate::test_support::SwapRoot::new();
+        let tree = Arc::new(root.rooted());
+        let root_cert = root.write("certs/root_ca.crt", &root_pem);
+        let inter = root.write("certs/intermediate_ca.crt", &inter_pem);
+        fs::write(root.outside.join("intermediate_ca.crt"), &root_pem).expect("seed");
+        root.swap(
+            "certs/intermediate_ca.crt",
+            &root.outside.join("intermediate_ca.crt"),
+        );
+        let err = concat_unique_ca_certs(&tree, &[root_cert.clone(), inter.clone()], &messages)
+            .await
+            .expect_err("a source that is a link");
+        crate::test_support::assert_error_names(&err, &inter);
+
+        let link = root.swap("certs", &root.outside);
+        let err = concat_unique_ca_certs(&tree, &[root_cert, inter], &messages)
+            .await
+            .expect_err("a swapped certs/");
+        crate::test_support::assert_error_names(&err, &link);
     }
 }

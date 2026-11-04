@@ -19,7 +19,8 @@ use anyhow::{Context, Result};
 use bootroot::fs_util;
 use bootroot::openbao::{InitResponse, OpenBaoClient};
 pub(crate) use ca_certs::{
-    compute_ca_bundle_pem, compute_ca_fingerprints, read_ca_cert_fingerprint,
+    compute_ca_bundle_pem, compute_ca_fingerprints, fingerprint_ca_cert, read_ca_cert_fingerprint,
+    read_ca_cert_fingerprint_in,
 };
 pub(crate) use openbao_setup::{
     infra_rotate_policy, parse_ttl_to_secs, validate_rotate_bound_cidrs, validate_secret_id_ttl,

@@ -1352,3 +1352,288 @@ fn root_by_policy_dirs_must_be_owned_by_the_recorded_writer() {
         .ensure_dir_fixed(&secrets.join("other"), FixedOwner::current_process())
         .expect("ordinary level");
 }
+
+#[test]
+fn rooted_ensure_dir_as_writer_creates_missing_levels_0700_as_the_writer() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let first = fixture.secrets.join("new");
+    let second = first.join("deeper");
+    tree.ensure_dir_as_writer(&second).expect("ensure");
+    assert_eq!(mode_of(&first), 0o700);
+    assert_eq!(mode_of(&second), 0o700);
+    assert_eq!(owner_of_path(&first), writer());
+    assert_eq!(owner_of_path(&second), writer());
+
+    // An existing intermediate level keeps its mode; the last one ends
+    // 0700.
+    std::fs::set_permissions(&first, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+    std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    tree.ensure_dir_as_writer(&second).expect("again");
+    assert_eq!(mode_of(&first), 0o750);
+    assert_eq!(mode_of(&second), 0o700);
+
+    // The anchor itself is chmodded through its descriptor.
+    std::fs::set_permissions(&fixture.secrets, std::fs::Permissions::from_mode(0o750))
+        .expect("chmod anchor");
+    tree.ensure_dir_as_writer(&fixture.secrets).expect("anchor");
+    assert_eq!(mode_of(&fixture.secrets), 0o700);
+
+    let before = snapshot(&fixture.outside);
+    let outside_mode = mode_of(&fixture.outside);
+    let leaf_link = fixture.secrets.join("leaf-link");
+    symlink(&fixture.outside, &leaf_link).expect("leaf link");
+    let err = tree
+        .ensure_dir_as_writer(&leaf_link)
+        .expect_err("leaf link");
+    assert_names(&err, &leaf_link);
+    fixture.swap_intermediate();
+    let err = tree
+        .ensure_dir_as_writer(&fixture.secrets.join("a").join("c").join("d"))
+        .expect_err("intermediate link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
+    assert_eq!(mode_of(&fixture.outside), outside_mode);
+}
+
+#[test]
+fn rooted_create_new_writes_the_exact_mode_and_refuses_an_existing_entry() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let fresh = fixture.secrets.join("a").join("b").join("fresh");
+    // 0o666 survives any umask that clears a write bit only because of
+    // the fchmod: the test never changes the umask itself.
+    tree.create_new(&fresh, PAYLOAD, 0o666, Some(writer()))
+        .expect("create_new");
+    assert_eq!(std::fs::read(&fresh).expect("read"), PAYLOAD);
+    assert_eq!(mode_of(&fresh), 0o666);
+    assert_eq!(owner_of_path(&fresh), writer());
+
+    let err = tree
+        .create_new(&fresh, b"again", 0o600, None)
+        .expect_err("existing file");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_names(&err, &fresh);
+    assert_eq!(std::fs::read(&fresh).expect("read"), PAYLOAD);
+
+    let before = snapshot(&fixture.outside);
+    fixture.swap_leaf();
+    let err = tree
+        .create_new(&fixture.leaf(), PAYLOAD, 0o600, None)
+        .expect_err("leaf link");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_names(&err, &fixture.leaf());
+    assert_eq!(snapshot(&fixture.outside), before);
+
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let before = snapshot(&fixture.outside);
+    fixture.swap_intermediate();
+    let err = tree
+        .create_new(
+            &fixture.secrets.join("a").join("b").join("new"),
+            PAYLOAD,
+            0o600,
+            None,
+        )
+        .expect_err("intermediate link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
+}
+
+#[test]
+fn rooted_create_dir_exclusive_creates_once_and_refuses_what_it_did_not_create() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let dir = fixture.secrets.join("staging");
+    tree.create_dir_exclusive(&dir, 0o750, writer())
+        .expect("create");
+    assert_eq!(mode_of(&dir), 0o750);
+    assert_eq!(owner_of_path(&dir), writer());
+    let err = tree
+        .create_dir_exclusive(&dir, 0o700, writer())
+        .expect_err("existing");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_names(&err, &dir);
+
+    let before = snapshot(&fixture.outside);
+    let link = fixture.secrets.join("link");
+    symlink(&fixture.outside, &link).expect("leaf link");
+    let err = tree
+        .create_dir_exclusive(&link, 0o700, writer())
+        .expect_err("leaf link");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_names(&err, &link);
+    fixture.swap_intermediate();
+    let err = tree
+        .create_dir_exclusive(&fixture.secrets.join("a").join("new"), 0o700, writer())
+        .expect_err("intermediate link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
+
+    // A directory owned by another uid at the name once it is opened is
+    // not the one just created: refused before any mode or owner change.
+    let fixture = SwapFixture::new();
+    let mut foreign = fixture.rooted();
+    foreign.set_writer_euid_for_tests(current_process_euid().wrapping_add(1));
+    let planted = fixture.secrets.join("planted");
+    let err = foreign
+        .create_dir_exclusive(&planted, 0o750, writer())
+        .expect_err("foreign owner");
+    assert_names(&err, &planted);
+    assert_ne!(
+        mode_of(&planted),
+        0o750,
+        "the refused directory was not chmodded"
+    );
+    assert_eq!(owner_of_path(&planted), writer(), "nor re-owned");
+}
+
+#[test]
+fn rooted_rename_and_sync_dir_refuse_links_on_the_way() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let from = fixture.secrets.join("a").join("b").join("file");
+    let to = fixture.secrets.join("moved");
+    tree.rename(&from, &to).expect("rename");
+    assert_eq!(std::fs::read(&to).expect("read"), b"inside\n");
+    assert!(std::fs::symlink_metadata(&from).is_err());
+    tree.sync_dir(&fixture.secrets).expect("sync anchor");
+    tree.sync_dir(&fixture.secrets.join("a").join("b"))
+        .expect("sync level");
+
+    let before = snapshot(&fixture.outside);
+    fixture.swap_intermediate();
+    let err = tree
+        .rename(&to, &fixture.secrets.join("a").join("b").join("back"))
+        .expect_err("destination parent link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    let err = tree
+        .rename(&fixture.secrets.join("a").join("b").join("file"), &to)
+        .expect_err("source parent link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    let err = tree
+        .sync_dir(&fixture.secrets.join("a").join("b"))
+        .expect_err("sync through a link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    let err = tree
+        .sync_dir(&fixture.secrets.join("a"))
+        .expect_err("sync a link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
+}
+
+/// A link at either name is not followed: one at `from` is moved
+/// itself, and one at `to` is replaced; what either points at is kept.
+#[test]
+fn rooted_rename_moves_or_replaces_a_leaf_link_and_keeps_its_target() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let before = snapshot(&fixture.outside);
+    fixture.swap_leaf();
+    let moved = fixture.secrets.join("moved-link");
+    tree.rename(&fixture.leaf(), &moved).expect("rename a link");
+    assert!(
+        std::fs::symlink_metadata(&moved)
+            .expect("stat")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(std::fs::symlink_metadata(fixture.leaf()).is_err());
+
+    let staged = fixture.secrets.join("staged");
+    std::fs::write(&staged, "staged\n").expect("seed staged");
+    tree.rename(&staged, &moved).expect("rename over a link");
+    let meta = std::fs::symlink_metadata(&moved).expect("stat");
+    assert!(meta.file_type().is_file(), "the link was replaced");
+    assert_eq!(std::fs::read(&moved).expect("read"), b"staged\n");
+    assert_eq!(snapshot(&fixture.outside), before);
+}
+
+#[test]
+fn rooted_open_lock_creates_a_regular_file_and_refuses_anything_else() {
+    let fixture = SwapFixture::new();
+    let tree = fixture.rooted();
+    let lock = fixture.secrets.join("a").join("b").join(".lock");
+    let file = tree.open_lock(&lock, 0o600).expect("open lock");
+    file.try_lock().expect("lock taken");
+    drop(file);
+    assert_eq!(mode_of(&lock), 0o600);
+    tree.open_lock(&lock, 0o600).expect("reopen existing");
+
+    let before = snapshot(&fixture.outside);
+    fixture.swap_leaf();
+    let err = tree
+        .open_lock(&fixture.leaf(), 0o600)
+        .expect_err("leaf link");
+    assert_names(&err, &fixture.leaf());
+
+    let fifo = fixture.secrets.join("fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success());
+    let err = tree.open_lock(&fifo, 0o600).expect_err("fifo");
+    assert_names(&err, &fifo);
+
+    fixture.swap_intermediate();
+    let err = tree
+        .open_lock(&fixture.secrets.join("a").join("b").join(".lock"), 0o600)
+        .expect_err("intermediate link");
+    assert_names(&err, &fixture.secrets.join("a"));
+    assert_eq!(snapshot(&fixture.outside), before);
+}
+
+#[test]
+fn rooted_read_with_meta_returns_the_read_descriptor_s_mode_and_owner() {
+    let fixture = SwapFixture::new();
+    std::fs::set_permissions(fixture.leaf(), std::fs::Permissions::from_mode(0o640))
+        .expect("chmod");
+    let tree = fixture.rooted();
+    let (contents, meta) = tree.read_with_meta(&fixture.leaf()).expect("read");
+    assert_eq!(contents, b"inside\n");
+    assert_eq!(
+        meta,
+        FileMeta {
+            mode: 0o640,
+            uid: writer().0,
+            gid: writer().1,
+        }
+    );
+
+    fixture.swap_leaf();
+    let err = tree.read_with_meta(&fixture.leaf()).expect_err("leaf link");
+    assert_names(&err, &fixture.leaf());
+    fixture.swap_intermediate();
+    let err = tree
+        .read_with_meta(&fixture.leaf())
+        .expect_err("intermediate link");
+    assert_names(&err, &fixture.secrets.join("a"));
+}
+
+#[test]
+fn descriptor_only_writers_are_unsupported_on_a_path_based_handle() {
+    let fixture = SwapFixture::new();
+    let tree = SecretsTree::open(&fixture.secrets).expect("open");
+    let leaf = fixture.leaf();
+    let dir = fixture.secrets.join("a");
+    let errors = [
+        tree.ensure_dir_as_writer(&dir)
+            .expect_err("ensure_dir_as_writer"),
+        tree.create_new(&dir.join("x"), PAYLOAD, 0o600, None)
+            .expect_err("create_new"),
+        tree.create_dir_exclusive(&dir.join("y"), 0o700, writer())
+            .expect_err("create_dir_exclusive"),
+        tree.rename(&leaf, &dir.join("z")).expect_err("rename"),
+        tree.sync_dir(&dir).expect_err("sync_dir"),
+        tree.open_lock(&dir.join("lock"), 0o600)
+            .expect_err("open_lock"),
+        tree.read_with_meta(&leaf).expect_err("read_with_meta"),
+    ];
+    for err in errors {
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    }
+    assert!(leaf.exists());
+    assert!(!dir.join("x").exists() && !dir.join("y").exists() && !dir.join("lock").exists());
+}

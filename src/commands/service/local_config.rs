@@ -1,9 +1,11 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::cert_group::CertGroupPolicy;
 use bootroot::fs_util;
+use bootroot::fs_util::SecretsTree;
 use bootroot::toml_util::toml_encode_string;
 use bootroot::trust_bootstrap::{
     AgentConfigBaselineParams, LOCAL_FILE_PROFILE_MARKERS, apply_agent_config_baseline_defaults,
@@ -23,7 +25,7 @@ use crate::state::PostRenewHookEntry;
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn apply_local_service_configs(
-    secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     resolved: &ResolvedServiceAdd,
     secret_id_path: &Path,
     sync_material: &ServiceSyncMaterial,
@@ -142,7 +144,8 @@ pub(super) async fn apply_local_service_configs(
     )
     .await?;
     let eab_path = provision_local_eab_file(
-        secrets_dir,
+        tree,
+        tree.anchor(),
         secret_id_path,
         is_override,
         sync_material,
@@ -308,6 +311,7 @@ fn state_path_basename(registration_id: &str) -> String {
 /// the durable "open enrollment" representation `--eab-file` expects).
 /// Returns the `eab.json` path either way.
 async fn provision_local_eab_file(
+    tree: &Arc<SecretsTree>,
     secrets_dir: &Path,
     secret_id_path: &Path,
     is_override: bool,
@@ -321,14 +325,19 @@ async fn provision_local_eab_file(
         sync_material.eab_hmac.as_deref(),
     ) {
         (Some(kid), Some(hmac)) if !kid.is_empty() && !hmac.is_empty() => {
-            write_local_eab_file(&eab_path, kid, hmac, is_override, messages).await?;
+            write_local_eab_file(tree, &eab_path, kid, hmac, is_override, messages).await?;
         }
         _ => {
-            bootroot::eab::remove_eab_file(&eab_path)
-                .await
-                .with_context(|| {
-                    messages.error_write_file_failed(&eab_path.display().to_string())
-                })?;
+            // The default location is below the secrets directory and is
+            // removed through the handle; an override is operator-named.
+            let removed = if is_override {
+                bootroot::eab::remove_eab_file(&eab_path).await
+            } else {
+                bootroot::eab::remove_eab_file_in(tree, &eab_path).await
+            };
+            removed.with_context(|| {
+                messages.error_write_file_failed(&eab_path.display().to_string())
+            })?;
         }
     }
     Ok(eab_path)
@@ -346,6 +355,7 @@ async fn provision_local_eab_file(
 /// The shared writer's ownership/`ensure_secrets_dir` semantics are left
 /// intact for remote and agent callers.
 async fn write_local_eab_file(
+    tree: &Arc<SecretsTree>,
     path: &Path,
     kid: &str,
     hmac: &str,
@@ -359,7 +369,7 @@ async fn write_local_eab_file(
             .await
             .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     } else {
-        bootroot::eab::write_eab_file(path, kid, hmac)
+        bootroot::eab::write_eab_file_in(tree, path, kid, hmac)
             .await
             .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     }
@@ -855,10 +865,16 @@ mod tests {
         let mut material = test_sync_material();
         material.eab_kid = Some("kid-1".to_string());
         material.eab_hmac = Some("hmac-1".to_string());
-        let eab_path =
-            provision_local_eab_file(secrets_dir, &secret_id_path, false, &material, &messages)
-                .await
-                .unwrap();
+        let eab_path = provision_local_eab_file(
+            &Arc::new(SecretsTree::open(secrets_dir).unwrap()),
+            secrets_dir,
+            &secret_id_path,
+            false,
+            &material,
+            &messages,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             eab_path,
             secrets_dir.join("services/edge-proxy/eab.json"),
@@ -872,9 +888,16 @@ mod tests {
         assert_eq!(creds.hmac.expose(), "hmac-1");
 
         let cleared = test_sync_material();
-        provision_local_eab_file(secrets_dir, &secret_id_path, false, &cleared, &messages)
-            .await
-            .unwrap();
+        provision_local_eab_file(
+            &Arc::new(SecretsTree::open(secrets_dir).unwrap()),
+            secrets_dir,
+            &secret_id_path,
+            false,
+            &cleared,
+            &messages,
+        )
+        .await
+        .unwrap();
         assert!(
             !eab_path.exists(),
             "stale eab.json must be removed when KV holds no EAB"
@@ -905,10 +928,16 @@ mod tests {
         let mut material = test_sync_material();
         material.eab_kid = Some("kid-1".to_string());
         material.eab_hmac = Some("hmac-1".to_string());
-        let eab_path =
-            provision_local_eab_file(&secrets_dir, &secret_id_path, true, &material, &messages)
-                .await
-                .unwrap();
+        let eab_path = provision_local_eab_file(
+            &Arc::new(SecretsTree::open(&secrets_dir).unwrap()),
+            &secrets_dir,
+            &secret_id_path,
+            true,
+            &material,
+            &messages,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(eab_path, agent_dir.join("eab.json"));
         let meta = std::fs::metadata(&eab_path).unwrap();
@@ -944,10 +973,16 @@ mod tests {
         let mut material = test_sync_material();
         material.eab_kid = Some(String::new());
         material.eab_hmac = Some(String::new());
-        let eab_path =
-            provision_local_eab_file(secrets_dir, &secret_id_path, false, &material, &messages)
-                .await
-                .unwrap();
+        let eab_path = provision_local_eab_file(
+            &Arc::new(SecretsTree::open(secrets_dir).unwrap()),
+            secrets_dir,
+            &secret_id_path,
+            false,
+            &material,
+            &messages,
+        )
+        .await
+        .unwrap();
         assert!(
             !eab_path.exists(),
             "empty-string EAB must not produce an eab.json"

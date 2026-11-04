@@ -29,7 +29,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `ca.json`, the step-ca password or the saved unseal keys there to pass their
   contents on. The HTTP-01 admin certificate's issuance in `init` and its
   re-issue in `rotate infra-cert` likewise stop, instead of following a
-  symbolic link, at the certificate's directory or files there.
+  symbolic link, at the certificate's directory or files there. Every
+  `bootroot rotate` subcommand, `bootroot ca update`,
+  `bootroot openbao delete-unseal-keys`, `bootroot service add`,
+  `bootroot service remove` and `bootroot registrar issue`, run as root over
+  such a `secrets/`, likewise stop with an error naming the path at a symbolic
+  link wherever they write, copy, remove or re-read files there; paths you name
+  yourself outside `secrets/` are unaffected. `rotate ca-key` in that case also
+  refuses an existing CA key backup that is a symbolic link rather than keeping
+  it, and `registrar issue` stages the certificate it issues in a private
+  directory beside `secrets/` rather than below it.
 
 ### Fixed
 
@@ -43,7 +52,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   case the mode normalisation `init` runs after a fresh `step ca init` also no
   longer follows a symbolic link it finds there, which could change the modes of
   files outside `secrets/`. Any run, root or not, now also creates every missing
-  directory level under `secrets/` at mode `0700` instead of the umask's.
+  directory level under `secrets/` at mode `0700` instead of the umask's. The
+  same holds for the directories the `bootroot rotate` subcommands and
+  `bootroot service add` create under such a `secrets/` when run as root: an
+  intermediate level they create, such as `services/` on a first `service add`,
+  is now `0700` instead of the umask's mode.
 
 ### Security
 
@@ -59,7 +72,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `rotate registrar-internal-credential` and `registrar issue` share with
   `init`. Issuing the HTTP-01 admin TLS certificate in that case, in `init` and
   in `rotate infra-cert`, no longer runs a root container that re-owns its
-  output directory.
+  output directory. Every `bootroot rotate` subcommand, `bootroot ca update`,
+  `bootroot openbao delete-unseal-keys`, `bootroot service add`,
+  `bootroot service remove` and `bootroot registrar issue`, run as root over
+  such a `secrets/`, likewise no longer follow a symbolic link that account
+  could have placed below `secrets/` when they write, copy, remove or re-read
+  files there, so such a link can no longer make them overwrite, delete or read
+  a file elsewhere on the host, take their lock file elsewhere, or publish to
+  every service host a CA bundle it points at.
 
 ## [0.6.0] - 2026-10-31
 

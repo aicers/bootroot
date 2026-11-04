@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::{RootedOwner, SecretsTree};
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use bootroot::service_material::{
     ProvisionedServiceRole, ServiceProvisionError, ServiceProvisionStep, ServiceRoleTtls,
@@ -114,21 +116,23 @@ pub(super) async fn reapply_service_policy(
 }
 
 pub(super) async fn write_secret_id_file(
+    tree: &Arc<SecretsTree>,
     secret_id_path: &Path,
     secret_id: &str,
     is_override: bool,
     messages: &Messages,
 ) -> Result<()> {
-    write_service_credential_file(secret_id_path, secret_id, is_override, messages).await
+    write_service_credential_file(tree, secret_id_path, secret_id, is_override, messages).await
 }
 
 pub(super) async fn write_role_id_file(
+    tree: &Arc<SecretsTree>,
     role_id_path: &Path,
     role_id: &str,
     is_override: bool,
     messages: &Messages,
 ) -> Result<()> {
-    write_service_credential_file(role_id_path, role_id, is_override, messages).await
+    write_service_credential_file(tree, role_id_path, role_id, is_override, messages).await
 }
 
 /// Writes a freshly-minted service credential (`secret_id` or its
@@ -143,12 +147,20 @@ pub(super) async fn write_role_id_file(
 /// must already exist, the fresh file is chowned to the agent-owning
 /// parent, mode `0600`, created no-clobber, and never follows a
 /// final-component symlink.
+///
+/// On a rooted `tree` the default location is written through the
+/// handle: the directory is created writer-owned at `0700` and the file
+/// published as `atomic_write` publishes it, following no name.
 async fn write_service_credential_file(
+    tree: &Arc<SecretsTree>,
     path: &Path,
     contents: &str,
     is_override: bool,
     messages: &Messages,
 ) -> Result<()> {
+    if !is_override && tree.is_rooted() {
+        return publish_below_secrets(tree, path, contents.as_bytes(), messages).await;
+    }
     if is_override {
         fs_util::create_owned_credential_noclobber(path, contents.as_bytes())
             .await
@@ -177,6 +189,35 @@ async fn write_service_credential_file(
         .with_context(|| messages.error_write_file_failed(&path.display().to_string()))?;
     }
     Ok(())
+}
+
+/// Publishes `contents` at `path` below the secrets directory through a
+/// rooted `tree`, as `ensure_secrets_dir` and `atomic_write` do by path:
+/// the parent created writer-owned at `0700`, the file at `0600` under
+/// the owner of the file it replaces, and the directory flushed.
+pub(super) async fn publish_below_secrets(
+    tree: &Arc<SecretsTree>,
+    path: &Path,
+    contents: &[u8],
+    messages: &Messages,
+) -> Result<()> {
+    let target = path.to_path_buf();
+    let payload = contents.to_vec();
+    let failed = messages.error_write_file_failed(&path.display().to_string());
+    tree.run(move |tree| {
+        if let Some(parent) = target.parent() {
+            tree.ensure_dir_as_writer(parent)?;
+        }
+        tree.publish(
+            fs_util::Destination::bootroot_owned(&target),
+            &payload,
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            RootedOwner::Destination,
+            fs_util::StagedDurability::FlushDirectory,
+        )
+        .context(failed)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -233,6 +274,7 @@ mod tests {
     #[tokio::test]
     async fn write_secret_id_file_default_creates_dir_and_overwrites() {
         let dir = tempdir().unwrap();
+        let tree = Arc::new(SecretsTree::open(&dir.path().join("secrets")).unwrap());
         let secret_id_path = dir
             .path()
             .join("secrets")
@@ -241,7 +283,7 @@ mod tests {
             .join("secret_id");
         let messages = crate::i18n::test_messages();
 
-        write_secret_id_file(&secret_id_path, "sid-1", false, &messages)
+        write_secret_id_file(&tree, &secret_id_path, "sid-1", false, &messages)
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid-1");
@@ -249,7 +291,7 @@ mod tests {
         assert_eq!(mode_of(secret_id_path.parent().unwrap()), 0o700);
 
         // The default path overwrites a stale file, as before.
-        write_secret_id_file(&secret_id_path, "sid-2", false, &messages)
+        write_secret_id_file(&tree, &secret_id_path, "sid-2", false, &messages)
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&secret_id_path).unwrap(), "sid-2");
@@ -260,23 +302,84 @@ mod tests {
     #[tokio::test]
     async fn write_role_id_file_override_is_0600_and_noclobber() {
         let dir = tempdir().unwrap();
+        let tree = Arc::new(SecretsTree::open(dir.path()).unwrap());
         let agent_dir = dir.path().join("agent").join("svc");
         std::fs::create_dir_all(&agent_dir).unwrap();
         let role_id_path = agent_dir.join("role_id");
         let messages = crate::i18n::test_messages();
 
-        write_role_id_file(&role_id_path, "rid", true, &messages)
+        write_role_id_file(&tree, &role_id_path, "rid", true, &messages)
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&role_id_path).unwrap(), "rid");
         assert_eq!(mode_of(&role_id_path), fs_util::KEY_FILE_MODE);
 
-        let err = write_role_id_file(&role_id_path, "rid-2", true, &messages)
+        let err = write_role_id_file(&tree, &role_id_path, "rid-2", true, &messages)
             .await
             .unwrap_err();
         assert!(
             format!("{err:#}").contains("Refusing to overwrite"),
             "override role_id write must be no-clobber, got: {err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn rooted_credential_writes_refuse_a_swapped_services_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        root.write("services/svc/secret_id", "old");
+        let tree = Arc::new(root.rooted());
+        let messages = crate::i18n::test_messages();
+        let before = root.outside_snapshot();
+        let link = root.swap("services", &root.outside);
+        let path = root.secrets.join("services").join("svc").join("secret_id");
+
+        let err = write_secret_id_file(&tree, &path, "sid", false, &messages)
+            .await
+            .unwrap_err();
+        crate::test_support::assert_error_names(&err, &link);
+        let err = write_role_id_file(
+            &tree,
+            &root.secrets.join("services").join("svc").join("role_id"),
+            "rid",
+            false,
+            &messages,
+        )
+        .await
+        .unwrap_err();
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn rooted_credential_writes_match_the_path_based_writes() {
+        use std::os::unix::fs::MetadataExt;
+
+        let messages = crate::i18n::test_messages();
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let tree = Arc::new(if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).unwrap()
+            });
+            let service_dir = root.secrets.join("services").join("svc");
+            let secret_id = service_dir.join("secret_id");
+            write_secret_id_file(&tree, &secret_id, "sid", false, &messages)
+                .await
+                .unwrap();
+            results.push((
+                std::fs::read(&secret_id).unwrap(),
+                mode_of(&secret_id),
+                std::fs::metadata(&secret_id).unwrap().uid(),
+                mode_of(&service_dir),
+            ));
+            if rooted {
+                // `services/` is an intermediate level the rooted write
+                // created at `0700`.
+                assert_eq!(mode_of(&root.secrets.join("services")), 0o700);
+            }
+        }
+        assert_eq!(results[0], results[1]);
     }
 }

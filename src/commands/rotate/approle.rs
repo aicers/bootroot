@@ -1,13 +1,18 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::{EntryKind, RootedOwner, SecretsTree};
 use bootroot::input_validation::validate_registration_id;
 use bootroot::openbao::{OpenBaoClient, SecretIdOptions};
 use bootroot::registrar::RegistrarBindingState;
 use bootroot::service_material::service_role_name;
 
-use super::helpers::{confirm_action, restart_container, write_secret_id_atomic};
+use super::helpers::{
+    confirm_action, rebase_onto_anchor, restart_container, write_secret_id_atomic,
+    write_secret_id_atomic_by_path,
+};
 use super::registrar_targets::{read_registrar_binding_state, registrar_only_targets};
 use super::{ROLE_ID_FILENAME, RotateContext, if_due};
 use crate::cli::args::{InfraRoleTarget, RotateAppRoleSecretIdArgs};
@@ -266,7 +271,7 @@ async fn self_mint_own_secret_id(
         .login_approle(role_id, &new_secret_id)
         .await
         .with_context(|| messages.error_self_mint_verify_failed(role_name))?;
-    write_secret_id_atomic(secret_id_path, &new_secret_id, messages).await?;
+    write_rotate_credential_file(&ctx.secrets, secret_id_path, &new_secret_id, messages).await?;
     // The path argument of the summary line is the credential file
     // path, not the secret value.
     println!(
@@ -279,6 +284,29 @@ async fn self_mint_own_secret_id(
     );
     println!("{}", messages.rotate_summary_self_mint_login_ok(role_name));
     Ok(true)
+}
+
+/// Replaces the rotate command's own credential file, the operator's
+/// `--approle-secret-id-file`.
+///
+/// The documented locations are outside the secrets directory, and a
+/// file there keeps the path-based write. On a rooted handle a file the
+/// operator put below the secrets directory is rebased onto the anchor
+/// and written through the handle, as every other write there is.
+async fn write_rotate_credential_file(
+    tree: &Arc<SecretsTree>,
+    path: &Path,
+    value: &str,
+    messages: &Messages,
+) -> Result<()> {
+    if tree.is_rooted()
+        && fs_util::path_is_within(path, tree.anchor())
+            .with_context(|| format!("Failed to resolve {}", path.display()))?
+    {
+        let rebased = rebase_onto_anchor(tree, path, messages)?;
+        return write_secret_id_atomic(tree, &rebased, value, messages).await;
+    }
+    write_secret_id_atomic_by_path(path, value, messages).await
 }
 
 /// Per-service facts the caller needs to print an accurate summary:
@@ -640,7 +668,14 @@ async fn rotate_service_secret_id_once(
         .clone();
     let is_remote = matches!(entry.delivery_mode, DeliveryMode::RemoteBootstrap);
     if !is_remote {
-        ensure_role_id_file(&entry, ctx.state.secrets_dir(), client, messages).await?;
+        ensure_role_id_file(
+            &entry,
+            ctx.state.secrets_dir(),
+            &ctx.secrets,
+            client,
+            messages,
+        )
+        .await?;
     }
     let secret_id_options = SecretIdOptions {
         ttl: entry.approle.secret_id_ttl.clone(),
@@ -670,6 +705,7 @@ async fn rotate_service_secret_id_once(
             &entry.approle.secret_id_path,
             &new_secret_id,
             ctx.state.secrets_dir(),
+            &ctx.secrets,
             messages,
         )
         .await?;
@@ -761,7 +797,8 @@ async fn rotate_infra_approle_secret_id(
 
     let agent_dir = infra_agent_dir(ctx, target);
     let secret_id_path = agent_dir.join(OPENBAO_AGENT_SECRET_ID_NAME);
-    let role_id = ensure_infra_role_id_file(&agent_dir, role_name, client, messages).await?;
+    let role_id =
+        ensure_infra_role_id_file(&ctx.secrets, &agent_dir, role_name, client, messages).await?;
 
     let secret_id_options = SecretIdOptions {
         ttl: None,
@@ -773,7 +810,7 @@ async fn rotate_infra_approle_secret_id(
         .create_secret_id(role_name, &secret_id_options)
         .await
         .with_context(|| messages.error_infra_secret_id_mint_failed(role_name))?;
-    write_secret_id_atomic(&secret_id_path, &new_secret_id, messages).await?;
+    write_secret_id_atomic(&ctx.secrets, &secret_id_path, &new_secret_id, messages).await?;
     let container = resolve_container_name(
         &ctx.compose_file,
         infra_agent_container_kind(target),
@@ -811,12 +848,17 @@ async fn rotate_infra_approle_secret_id(
 /// `OpenBao` when it is missing (mirrors the service flow's
 /// `ensure_role_id_file`).
 async fn ensure_infra_role_id_file(
+    tree: &Arc<SecretsTree>,
     agent_dir: &Path,
     role_name: &str,
     client: &OpenBaoClient,
     messages: &Messages,
 ) -> Result<String> {
     let role_id_path = agent_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
+    if tree.is_rooted() {
+        return ensure_infra_role_id_file_rooted(tree, agent_dir, role_name, client, messages)
+            .await;
+    }
     if let Ok(existing) = tokio::fs::read_to_string(&role_id_path).await {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
@@ -850,6 +892,53 @@ async fn ensure_infra_role_id_file(
     )
     .await
     .with_context(|| messages.error_write_file_failed(&role_id_path.display().to_string()))?;
+    Ok(role_id)
+}
+
+/// [`ensure_infra_role_id_file`] through a rooted handle: the existing
+/// `role_id` is read without following a link, and a backfill creates
+/// the directory under the owner of the nearest existing level and
+/// publishes the file under the owner of its directory, as the
+/// path-based branch does by name.
+async fn ensure_infra_role_id_file_rooted(
+    tree: &Arc<SecretsTree>,
+    agent_dir: &Path,
+    role_name: &str,
+    client: &OpenBaoClient,
+    messages: &Messages,
+) -> Result<String> {
+    let role_id_path = agent_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
+    let read_path = role_id_path.clone();
+    // Any failure, a refused link included, falls through to the
+    // backfill, as the path-based `if let Ok` does: the publish replaces
+    // a link at the leaf, and a refused level fails the `ensure_dir`.
+    let existing = tree.run(move |tree| Ok(tree.read(&read_path).ok())).await?;
+    if let Some(existing) = existing.and_then(|bytes| String::from_utf8(bytes).ok()) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let role_id = client
+        .read_role_id(role_name)
+        .await
+        .with_context(|| messages.error_openbao_role_id_failed())?;
+    let dir = agent_dir.to_path_buf();
+    let target = role_id_path.clone();
+    let payload = role_id.clone().into_bytes();
+    let failed = messages.error_write_file_failed(&role_id_path.display().to_string());
+    tree.run(move |tree| {
+        tree.ensure_dir(&dir)?;
+        tree.publish(
+            fs_util::Destination::bootroot_owned(&target),
+            &payload,
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            RootedOwner::ContainingDir,
+            fs_util::StagedDurability::FlushDirectory,
+        )
+        .context(failed)
+    })
+    .await?;
     Ok(role_id)
 }
 
@@ -1015,9 +1104,15 @@ fn print_cidr_binding_decision(
 async fn ensure_role_id_file(
     entry: &ServiceEntry,
     secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     client: &OpenBaoClient,
     messages: &Messages,
 ) -> Result<()> {
+    if tree.is_rooted()
+        && fs_util::path_is_within(&entry.approle.secret_id_path, secrets_dir).unwrap_or(true)
+    {
+        return ensure_role_id_file_rooted(entry, tree, client, messages).await;
+    }
     let service_dir = entry
         .approle
         .secret_id_path
@@ -1059,6 +1154,51 @@ async fn ensure_role_id_file(
     Ok(())
 }
 
+/// [`ensure_role_id_file`] for a `secret_id_path` classified inside the
+/// secrets tree, through a rooted handle.
+///
+/// The recorded path is rebased onto the anchor, and the leaf is read
+/// without following it: any existing entry but a symbolic link returns
+/// early, as `exists()` does, while an absent leaf or a link is written
+/// (the publish replaces a link). The directory is created writer-owned
+/// and the file published as the path-based branch does by name.
+async fn ensure_role_id_file_rooted(
+    entry: &ServiceEntry,
+    tree: &Arc<SecretsTree>,
+    client: &OpenBaoClient,
+    messages: &Messages,
+) -> Result<()> {
+    let secret_id_path = rebase_onto_anchor(tree, &entry.approle.secret_id_path, messages)?;
+    let service_dir = secret_id_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let role_id_path = service_dir.join(ROLE_ID_FILENAME);
+    let probe = role_id_path.clone();
+    let found = tree.run(move |tree| Ok(tree.entry_kind(&probe)?)).await?;
+    if !matches!(found, None | Some(EntryKind::Symlink)) {
+        return Ok(());
+    }
+    let role_id = client
+        .read_role_id(&entry.approle.role_name)
+        .await
+        .with_context(|| messages.error_openbao_role_id_failed())?;
+    let target = role_id_path.clone();
+    let failed = messages.error_write_file_failed(&role_id_path.display().to_string());
+    tree.run(move |tree| {
+        tree.ensure_dir_as_writer(&service_dir)?;
+        tree.publish(
+            fs_util::Destination::bootroot_owned(&target),
+            role_id.as_bytes(),
+            fs_util::StagedMode::Policy(fs_util::KEY_FILE_MODE),
+            RootedOwner::Destination,
+            fs_util::StagedDurability::FlushDirectory,
+        )
+        .context(failed)
+    })
+    .await
+}
+
 /// Rewrites a local-file service's `secret_id` in place during rotation.
 ///
 /// For the default secrets-tree location `write_secret_id_atomic`
@@ -1079,6 +1219,7 @@ async fn write_service_secret_id_file(
     secret_id_path: &Path,
     secret_id: &str,
     secrets_dir: &Path,
+    tree: &Arc<SecretsTree>,
     messages: &Messages,
 ) -> Result<()> {
     let is_override = !fs_util::path_is_within(secret_id_path, secrets_dir).unwrap_or(true);
@@ -1107,8 +1248,13 @@ async fn write_service_secret_id_file(
                     messages.error_write_file_failed(&secret_id_path.display().to_string())
                 })?;
         }
+    } else if tree.is_rooted() {
+        // `state.json`'s spelling of the path need not be the anchor's,
+        // so the handle is given the path rebased onto it.
+        let rebased = rebase_onto_anchor(tree, secret_id_path, messages)?;
+        write_secret_id_atomic(tree, &rebased, secret_id, messages).await?;
     } else {
-        write_secret_id_atomic(secret_id_path, secret_id, messages).await?;
+        write_secret_id_atomic(tree, secret_id_path, secret_id, messages).await?;
     }
     Ok(())
 }
@@ -1145,7 +1291,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::super::test_support::{
-        decode_fake_docker_log, test_messages, write_self_contained_fake_docker,
+        decode_fake_docker_log, path_tree, test_messages, write_self_contained_fake_docker,
     };
     use super::*;
     use crate::commands::compose_project::DOCKER_BIN;
@@ -1230,6 +1376,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             state_file: dir.join("state.json"),
             docker: docker.to_path_buf(),
+            secrets: path_tree(&dir.join("secrets")),
         }
     }
 
@@ -1641,9 +1788,15 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
-        ensure_role_id_file(&entry, &secrets_dir, &client, &messages)
-            .await
-            .expect("override role_id recovery should succeed");
+        ensure_role_id_file(
+            &entry,
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &client,
+            &messages,
+        )
+        .await
+        .expect("override role_id recovery should succeed");
 
         let role_id_path = agent_dir.join(ROLE_ID_FILENAME);
         assert_eq!(
@@ -1684,9 +1837,15 @@ mod tests {
         let mut client = OpenBaoClient::new(&server.uri()).expect("client");
         client.set_token("scoped-token".to_string());
         let messages = test_messages();
-        ensure_role_id_file(&entry, &secrets_dir, &client, &messages)
-            .await
-            .expect("default role_id recovery should succeed");
+        ensure_role_id_file(
+            &entry,
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &client,
+            &messages,
+        )
+        .await
+        .expect("default role_id recovery should succeed");
 
         let role_id_path = service_dir.join(ROLE_ID_FILENAME);
         assert_eq!(
@@ -1723,9 +1882,15 @@ mod tests {
             .expect("test process must be able to chgrp the seeded secret_id");
         let messages = test_messages();
 
-        write_service_secret_id_file(&secret_id_path, "new", &secrets_dir, &messages)
-            .await
-            .expect("override secret_id rotation should succeed");
+        write_service_secret_id_file(
+            &secret_id_path,
+            "new",
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &messages,
+        )
+        .await
+        .expect("override secret_id rotation should succeed");
 
         assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "new");
         let meta = fs::metadata(&secret_id_path).unwrap();
@@ -1760,9 +1925,15 @@ mod tests {
         let secret_id_path = agent_dir.join("secret_id");
         let messages = test_messages();
 
-        write_service_secret_id_file(&secret_id_path, "fresh", &secrets_dir, &messages)
-            .await
-            .expect("missing override secret_id must be recreated");
+        write_service_secret_id_file(
+            &secret_id_path,
+            "fresh",
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &messages,
+        )
+        .await
+        .expect("missing override secret_id must be recreated");
 
         assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "fresh");
         let meta = fs::metadata(&secret_id_path).unwrap();
@@ -1791,9 +1962,15 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &secret_id_path).expect("plant symlink");
         let messages = test_messages();
 
-        let err = write_service_secret_id_file(&secret_id_path, "new", &secrets_dir, &messages)
-            .await
-            .expect_err("a symlinked relocated secret_id must be rejected");
+        let err = write_service_secret_id_file(
+            &secret_id_path,
+            "new",
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &messages,
+        )
+        .await
+        .expect_err("a symlinked relocated secret_id must be rejected");
         assert!(
             format!("{err:#}").contains("Refusing to rewrite a symlink"),
             "expected a symlink rejection, got: {err:#}"
@@ -1817,9 +1994,15 @@ mod tests {
         let secret_id_path = service_dir.join("secret_id");
         let messages = test_messages();
 
-        write_service_secret_id_file(&secret_id_path, "sid", &secrets_dir, &messages)
-            .await
-            .expect("default secret_id rotation should succeed");
+        write_service_secret_id_file(
+            &secret_id_path,
+            "sid",
+            &secrets_dir,
+            &path_tree(&secrets_dir),
+            &messages,
+        )
+        .await
+        .expect("default secret_id rotation should succeed");
 
         assert_eq!(fs::read_to_string(&secret_id_path).unwrap(), "sid");
         assert_eq!(
@@ -3010,5 +3193,294 @@ mod tests {
             msg.contains(RUNTIME_ROTATE_ROLE),
             "error must name the expected credential, got: {msg}"
         );
+    }
+
+    async fn role_id_server(role: &str) -> MockServer {
+        let server = MockServer::start().await;
+        mount_role_id_mock(role, "svc-role-id").mount(&server).await;
+        server
+    }
+
+    fn scoped_client(server: &MockServer) -> OpenBaoClient {
+        let mut client = OpenBaoClient::new(&server.uri()).expect("client");
+        client.set_token("scoped-token".to_string());
+        client
+    }
+
+    fn rooted_arc(root: &crate::test_support::SwapRoot) -> Arc<SecretsTree> {
+        Arc::new(root.rooted())
+    }
+
+    #[tokio::test]
+    async fn rooted_infra_role_id_backfill_refuses_a_swapped_openbao_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        root.write("openbao/stepca/role_id", "");
+        let tree = rooted_arc(&root);
+        let server = role_id_server(APPROLE_BOOTROOT_STEPCA).await;
+        let before = root.outside_snapshot();
+        let link = root.swap("openbao", &root.outside);
+        let agent_dir = root.secrets.join("openbao").join("stepca");
+
+        let err = ensure_infra_role_id_file(
+            &tree,
+            &agent_dir,
+            APPROLE_BOOTROOT_STEPCA,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect_err("a link at openbao/ is refused");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn rooted_infra_role_id_backfill_matches_the_path_based_backfill() {
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let tree = if rooted {
+                rooted_arc(&root)
+            } else {
+                path_tree(&root.secrets)
+            };
+            let server = role_id_server(APPROLE_BOOTROOT_STEPCA).await;
+            let agent_dir = root.secrets.join("openbao").join("stepca");
+            let role_id = ensure_infra_role_id_file(
+                &tree,
+                &agent_dir,
+                APPROLE_BOOTROOT_STEPCA,
+                &scoped_client(&server),
+                &test_messages(),
+            )
+            .await
+            .expect("backfill");
+            let path = agent_dir.join(OPENBAO_AGENT_ROLE_ID_NAME);
+            results.push((
+                role_id,
+                fs::read(&path).expect("read"),
+                mode_of(&path),
+                owner_of(&path),
+                mode_of(&agent_dir),
+            ));
+            // The second call reads the file back rather than backfilling.
+            assert_eq!(
+                ensure_infra_role_id_file(
+                    &tree,
+                    &agent_dir,
+                    APPROLE_BOOTROOT_STEPCA,
+                    &scoped_client(&server),
+                    &test_messages(),
+                )
+                .await
+                .expect("read back"),
+                "svc-role-id"
+            );
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path)
+            .expect("stat")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn owner_of(path: &Path) -> (u32, u32) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).expect("stat");
+        (meta.uid(), meta.gid())
+    }
+
+    #[tokio::test]
+    async fn rooted_role_id_recovery_refuses_a_swapped_services_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        root.write("services/svc/secret_id", "sid");
+        let tree = rooted_arc(&root);
+        let server = role_id_server(&service_role_name("svc")).await;
+        let mut entry = make_service_entry(root.root(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = root.secrets.join("services").join("svc").join("secret_id");
+        let before = root.outside_snapshot();
+        let link = root.swap("services", &root.outside);
+
+        let err = ensure_role_id_file(
+            &entry,
+            &root.secrets,
+            &tree,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect_err("a link at services/ is refused");
+        crate::test_support::assert_error_names(&err, &link);
+        let err = write_service_secret_id_file(
+            &entry.approle.secret_id_path,
+            "new",
+            &root.secrets,
+            &tree,
+            &test_messages(),
+        )
+        .await
+        .expect_err("a link at services/ is refused");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+    }
+
+    /// A rooted handle leaves an override exactly as the path-based run
+    /// leaves it: written in the operator's directory, no-clobber.
+    #[tokio::test]
+    async fn rooted_role_id_and_secret_id_keep_an_override_path_based() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = rooted_arc(&root);
+        let agent_dir = root.root().join("agent").join("svc");
+        fs::create_dir_all(&agent_dir).expect("agent dir");
+        let server = role_id_server(&service_role_name("svc")).await;
+        let mut entry = make_service_entry(root.root(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = agent_dir.join("secret_id");
+
+        ensure_role_id_file(
+            &entry,
+            &root.secrets,
+            &tree,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect("override role_id");
+        assert_eq!(
+            fs::read_to_string(agent_dir.join(ROLE_ID_FILENAME)).expect("read"),
+            "svc-role-id"
+        );
+        write_service_secret_id_file(
+            &entry.approle.secret_id_path,
+            "sid",
+            &root.secrets,
+            &tree,
+            &test_messages(),
+        )
+        .await
+        .expect("override secret_id");
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("secret_id")).expect("read"),
+            "sid"
+        );
+        assert_eq!(mode_of(&agent_dir.join("secret_id")), 0o600);
+    }
+
+    /// A recorded path spelled differently from the anchor, but lexically
+    /// below it, is rebased and written through the handle.
+    #[tokio::test]
+    async fn rooted_role_id_and_secret_id_rebase_a_differently_spelled_path() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = rooted_arc(&root);
+        let server = role_id_server(&service_role_name("svc")).await;
+        let mut entry = make_service_entry(root.root(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = root
+            .root()
+            .join("x")
+            .join("..")
+            .join("secrets")
+            .join("services")
+            .join("svc")
+            .join("secret_id");
+
+        ensure_role_id_file(
+            &entry,
+            &root.secrets,
+            &tree,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect("rebased role_id");
+        write_service_secret_id_file(
+            &entry.approle.secret_id_path,
+            "sid",
+            &root.secrets,
+            &tree,
+            &test_messages(),
+        )
+        .await
+        .expect("rebased secret_id");
+        let service_dir = root.secrets.join("services").join("svc");
+        assert_eq!(
+            fs::read_to_string(service_dir.join(ROLE_ID_FILENAME)).expect("read"),
+            "svc-role-id"
+        );
+        assert_eq!(
+            fs::read_to_string(service_dir.join("secret_id")).expect("read"),
+            "sid"
+        );
+        assert_eq!(mode_of(&service_dir), 0o700);
+        assert_eq!(mode_of(&root.secrets.join("services")), 0o700);
+        assert!(!root.root().join("x").exists());
+    }
+
+    /// A path below the secrets directory `state.json` records but not
+    /// below the anchor this run opened is refused, naming both, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn rooted_role_id_and_secret_id_refuse_a_path_outside_the_anchor() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = rooted_arc(&root);
+        let recorded = root.root().join("recorded-secrets");
+        let server = role_id_server(&service_role_name("svc")).await;
+        let mut entry = make_service_entry(root.root(), "svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = recorded.join("services").join("svc").join("secret_id");
+
+        let err = ensure_role_id_file(
+            &entry,
+            &recorded,
+            &tree,
+            &scoped_client(&server),
+            &test_messages(),
+        )
+        .await
+        .expect_err("not below the anchor");
+        crate::test_support::assert_error_names(&err, &entry.approle.secret_id_path);
+        crate::test_support::assert_error_names(&err, &root.secrets);
+        let err = write_service_secret_id_file(
+            &entry.approle.secret_id_path,
+            "sid",
+            &recorded,
+            &tree,
+            &test_messages(),
+        )
+        .await
+        .expect_err("not below the anchor");
+        crate::test_support::assert_error_names(&err, &entry.approle.secret_id_path);
+        crate::test_support::assert_error_names(&err, &root.secrets);
+        assert!(!recorded.exists(), "nothing was written path-based");
+    }
+
+    /// The rotate credential file below the anchor goes through the
+    /// handle; one outside it keeps the path-based write.
+    #[tokio::test]
+    async fn rooted_rotate_credential_file_is_written_through_the_handle_below_the_anchor() {
+        let root = crate::test_support::SwapRoot::new();
+        root.write("rotate/secret_id", "old");
+        let tree = rooted_arc(&root);
+        let before = root.outside_snapshot();
+        let link = root.swap("rotate", &root.outside);
+        let err = write_rotate_credential_file(
+            &tree,
+            &root.secrets.join("rotate").join("secret_id"),
+            "new",
+            &test_messages(),
+        )
+        .await
+        .expect_err("a link at rotate/ is refused");
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+
+        let elsewhere = root.root().join("etc").join("rotate").join("secret_id");
+        write_rotate_credential_file(&tree, &elsewhere, "new", &test_messages())
+            .await
+            .expect("outside the anchor");
+        assert_eq!(fs::read_to_string(&elsewhere).expect("read"), "new");
+        assert_eq!(mode_of(&elsewhere), 0o600);
     }
 }

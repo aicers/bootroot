@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::{RootedOwner, SecretsTree};
 
 use crate::cli::args::{CaRestartArgs, CaUpdateArgs};
 use crate::commands::compose_project::ComposeIdentity;
@@ -24,12 +25,14 @@ pub(crate) fn run_ca_update(args: &CaUpdateArgs, messages: &Messages) -> Result<
     bootroot::config::validate_cert_duration_vs_default_renew_before(&args.cert_duration)?;
 
     let secrets_dir = &args.secrets_dir.secrets_dir;
+    let tree = SecretsTree::open(secrets_dir)?;
     let ca_json_path = secrets_dir.join("config").join("ca.json");
     let ctmpl_path = secrets_dir
         .join(RESPONDER_TEMPLATE_DIR)
         .join(STEPCA_CA_JSON_TEMPLATE_NAME);
 
     patch_ca_json_ctmpl(
+        &tree,
         &ctmpl_path,
         &args.cert_duration,
         &args.stepca_provisioner,
@@ -38,6 +41,7 @@ pub(crate) fn run_ca_update(args: &CaUpdateArgs, messages: &Messages) -> Result<
     .with_context(|| format!("failed to patch {}", ctmpl_path.display()))?;
 
     patch_ca_json(
+        &tree,
         &ca_json_path,
         &args.cert_duration,
         &args.stepca_provisioner,
@@ -94,13 +98,13 @@ fn wait_for_stepca_ready(
 }
 
 fn patch_ca_json(
+    tree: &SecretsTree,
     path: &Path,
     cert_duration: &str,
     provisioner: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    let contents = read_ca_json_text(tree, path, messages)?;
     let mut value: serde_json::Value =
         serde_json::from_str(&contents).context(messages.error_parse_ca_json_failed())?;
     if !set_acme_cert_duration(&mut value, cert_duration, Some(provisioner)) {
@@ -111,17 +115,17 @@ fn patch_ca_json(
     }
     let updated =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
-    publish_ca_json(path, &updated, messages)
+    publish_ca_json(tree, path, &updated, messages)
 }
 
 fn patch_ca_json_ctmpl(
+    tree: &SecretsTree,
     path: &Path,
     cert_duration: &str,
     provisioner: &str,
     messages: &Messages,
 ) -> Result<()> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+    let contents = read_ca_json_text(tree, path, messages)?;
     let (masked, directives) = mask_go_template_directives(&contents);
     let mut value: serde_json::Value =
         serde_json::from_str(&masked).context(messages.error_parse_ca_json_failed())?;
@@ -134,7 +138,21 @@ fn patch_ca_json_ctmpl(
     let serialized =
         serde_json::to_string_pretty(&value).context(messages.error_serialize_ca_json_failed())?;
     let restored = unmask_go_template_directives(&serialized, &directives);
-    publish_ca_json(path, &restored, messages)
+    publish_ca_json(tree, path, &restored, messages)
+}
+
+/// Reads `ca.json` or its template below the secrets directory: through
+/// a rooted `tree` without following a name, by path otherwise.
+fn read_ca_json_text(tree: &SecretsTree, path: &Path, messages: &Messages) -> Result<String> {
+    if tree.is_rooted() {
+        let bytes = tree
+            .read(path)
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()))?;
+        return String::from_utf8(bytes)
+            .with_context(|| messages.error_read_file_failed(&path.display().to_string()));
+    }
+    std::fs::read_to_string(path)
+        .with_context(|| messages.error_read_file_failed(&path.display().to_string()))
 }
 
 /// Publishes a patched `ca.json` — or its `.ctmpl` template — by rename.
@@ -158,7 +176,28 @@ fn patch_ca_json_ctmpl(
 /// rebuilt from `ca.json` by `init`. A crash that loses the entry leaves
 /// the previous document in place and costs the next render or a re-run
 /// of `bootroot ca update`, not an unrecoverable state.
-fn publish_ca_json(path: &Path, contents: &str, messages: &Messages) -> Result<()> {
+///
+/// On a rooted `tree` the same publish goes through the handle: the
+/// directories are walked without following a link, and a link at the
+/// file itself is refused, since following it is what an operator-named
+/// destination asks for and root must not.
+fn publish_ca_json(
+    tree: &SecretsTree,
+    path: &Path,
+    contents: &str,
+    messages: &Messages,
+) -> Result<()> {
+    if tree.is_rooted() {
+        return tree
+            .publish(
+                fs_util::Destination::operator_named(path),
+                contents.as_bytes(),
+                fs_util::StagedMode::PreserveOrUmask,
+                RootedOwner::Destination,
+                fs_util::StagedDurability::RenameOnly,
+            )
+            .with_context(|| messages.error_write_file_failed(&path.display().to_string()));
+    }
     fs_util::atomic_replace_blocking(
         fs_util::Destination::operator_named(path),
         contents.as_bytes(),
@@ -293,7 +332,14 @@ mod tests {
         let path = dir.path().join("ca.json.ctmpl");
         std::fs::write(&path, sample_ctmpl()).unwrap();
 
-        patch_ca_json_ctmpl(&path, "48h", "acme", &test_messages()).unwrap();
+        patch_ca_json_ctmpl(
+            &SecretsTree::open(dir.path()).unwrap(),
+            &path,
+            "48h",
+            "acme",
+            &test_messages(),
+        )
+        .unwrap();
 
         let patched = std::fs::read_to_string(&path).unwrap();
         assert!(
@@ -316,7 +362,14 @@ mod tests {
         )
         .unwrap();
 
-        patch_ca_json(&path, "72h", "acme", &test_messages()).unwrap();
+        patch_ca_json(
+            &SecretsTree::open(dir.path()).unwrap(),
+            &path,
+            "72h",
+            "acme",
+            &test_messages(),
+        )
+        .unwrap();
 
         let patched = std::fs::read_to_string(&path).unwrap();
         assert!(patched.contains("\"defaultTLSCertDuration\": \"72h\""));
@@ -332,7 +385,14 @@ mod tests {
         )
         .unwrap();
 
-        let err = patch_ca_json(&path, "48h", "acme", &test_messages()).unwrap_err();
+        let err = patch_ca_json(
+            &SecretsTree::open(dir.path()).unwrap(),
+            &path,
+            "48h",
+            "acme",
+            &test_messages(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("ACME provisioner"));
     }
 
@@ -346,8 +406,96 @@ mod tests {
         )
         .unwrap();
 
-        let err = patch_ca_json(&path, "48h", "acme", &test_messages()).unwrap_err();
+        let err = patch_ca_json(
+            &SecretsTree::open(dir.path()).unwrap(),
+            &path,
+            "48h",
+            "acme",
+            &test_messages(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ACME provisioner"), "unexpected error: {msg}");
+    }
+
+    const CA_JSON: &str = r#"{"authority":{"provisioners":[{"type":"ACME","name":"acme"}]}}"#;
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// Both patches refuse a link at the directory they walk, and at the
+    /// file itself, and write nothing outside `secrets/`.
+    #[test]
+    fn rooted_patches_refuse_a_swapped_level_or_file() {
+        let messages = test_messages();
+        for (rel, dir_name) in [
+            ("config/ca.json", "config"),
+            ("templates/ca.json.ctmpl", "templates"),
+        ] {
+            let run_patch = |tree: &SecretsTree, path: &Path| {
+                if dir_name == "config" {
+                    patch_ca_json(tree, path, "48h", "acme", &messages)
+                } else {
+                    patch_ca_json_ctmpl(tree, path, "48h", "acme", &messages)
+                }
+            };
+            let root = crate::test_support::SwapRoot::new();
+            let contents = if dir_name == "config" {
+                CA_JSON.to_string()
+            } else {
+                sample_ctmpl()
+            };
+            let path = root.write(rel, &contents);
+            std::fs::write(root.outside.join(path.file_name().unwrap()), &contents).unwrap();
+            let tree = root.rooted();
+            let before = root.outside_snapshot();
+
+            root.swap(rel, &root.outside.join(path.file_name().unwrap()));
+            let err = run_patch(&tree, &path).expect_err("a link at the file");
+            crate::test_support::assert_error_names(&err, &path);
+            assert_eq!(root.outside_snapshot(), before, "{rel}");
+
+            let link = root.swap(dir_name, &root.outside);
+            let err = run_patch(&tree, &path).expect_err("a link at the directory");
+            crate::test_support::assert_error_names(&err, &link);
+            assert_eq!(root.outside_snapshot(), before, "{rel}");
+        }
+    }
+
+    /// Over a tree the test's user owns, the rooted patch gives the bytes
+    /// and the mode the path-based one gives.
+    #[test]
+    fn rooted_patches_match_the_path_based_patches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let messages = test_messages();
+        let mut results = Vec::new();
+        for rooted in [false, true] {
+            let root = crate::test_support::SwapRoot::new();
+            let ca_json = root.write("config/ca.json", CA_JSON);
+            let ctmpl = root.write("templates/ca.json.ctmpl", &sample_ctmpl());
+            std::fs::set_permissions(&ca_json, std::fs::Permissions::from_mode(0o640)).unwrap();
+            let tree = if rooted {
+                root.rooted()
+            } else {
+                SecretsTree::open(&root.secrets).unwrap()
+            };
+            patch_ca_json(&tree, &ca_json, "72h", "acme", &messages).unwrap();
+            patch_ca_json_ctmpl(&tree, &ctmpl, "72h", "acme", &messages).unwrap();
+            results.push((
+                std::fs::read(&ca_json).unwrap(),
+                mode_of(&ca_json),
+                std::fs::read(&ctmpl).unwrap(),
+                mode_of(&ctmpl),
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[1].1, 0o640, "the destination's mode is kept");
     }
 }

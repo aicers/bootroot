@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bootroot::fs_util;
+use bootroot::fs_util::SecretsTree;
 use bootroot::openbao::OpenBaoClient;
 use bootroot::service_material::{
     ResourceOutcome, ServiceResource, service_kv_path, teardown_service_material,
@@ -26,6 +27,10 @@ use crate::state_lock::StateLock;
 
 /// On-disk artifacts eligible for deletion under `--delete-artifacts`.
 struct ArtifactPlan {
+    /// The service's directories below the secrets directory, removed
+    /// through the tree handle.
+    secrets_dirs: Vec<PathBuf>,
+    /// Directories elsewhere, at paths the operator chose.
     dirs: Vec<PathBuf>,
     /// Directories removed only if deleting `dirs` left them empty.
     dirs_if_empty: Vec<PathBuf>,
@@ -109,7 +114,10 @@ pub(crate) async fn run_service_remove(
         .map(|suffix| service_kv_path(&entry.registration_id, suffix))
         .collect();
     let artifacts = if args.delete_artifacts {
-        Some(build_artifact_plan(&state, &entry))
+        Some((
+            build_artifact_plan(&state, &entry),
+            SecretsTree::open(state.secrets_dir())?,
+        ))
     } else {
         None
     };
@@ -117,7 +125,7 @@ pub(crate) async fn run_service_remove(
     print_remove_plan(
         &entry,
         &kv_paths,
-        artifacts.as_ref(),
+        artifacts.as_ref().map(|(plan, _)| plan),
         args.strip_config,
         messages,
     );
@@ -167,8 +175,8 @@ pub(crate) async fn run_service_remove(
 
     // On-disk artifacts (opt-in). These are local, but a failure here
     // also keeps the entry so a re-run can retry.
-    if let Some(plan) = artifacts.as_ref() {
-        delete_artifacts(plan, &mut report, messages);
+    if let Some((plan, tree)) = artifacts.as_ref() {
+        delete_artifacts(tree, plan, &mut report, messages);
     }
 
     // Strip the managed profile block whenever the operator asked for it,
@@ -299,13 +307,15 @@ fn service_kv_suffixes(entry: &ServiceEntry) -> Vec<&'static str> {
 
 fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan {
     let secrets_dir = state.secrets_dir();
-    let dirs = vec![
+    let secrets_dirs = vec![
         secrets_dir
             .join(SERVICE_SECRET_DIR)
             .join(&entry.registration_id),
         secrets_dir
             .join(REMOTE_BOOTSTRAP_DIR)
             .join(&entry.registration_id),
+    ];
+    let dirs = vec![
         // Every generation the agent published for this profile holds a
         // copy of the private key, so deleting the key without them
         // would leave it on disk.
@@ -335,6 +345,7 @@ fn build_artifact_plan(state: &StateFile, entry: &ServiceEntry) -> ArtifactPlan 
         files.push(service_eab_file_path(secret_id_path));
     }
     ArtifactPlan {
+        secrets_dirs,
         dirs,
         dirs_if_empty,
         files,
@@ -365,7 +376,7 @@ fn print_remove_plan(
         println!("{}", messages.service_remove_plan_kv(path));
     }
     if let Some(plan) = artifacts {
-        for dir in &plan.dirs {
+        for dir in plan.secrets_dirs.iter().chain(&plan.dirs) {
             println!(
                 "{}",
                 messages.service_remove_plan_artifact(&dir.display().to_string())
@@ -410,7 +421,16 @@ fn confirm_removal(registration_id: &str, messages: &Messages) -> Result<bool> {
 ///
 /// Every resource is attempted; a failure keeps the entry so a re-run
 /// can retry.
-fn delete_artifacts(plan: &ArtifactPlan, report: &mut TeardownReport, messages: &Messages) {
+fn delete_artifacts(
+    tree: &SecretsTree,
+    plan: &ArtifactPlan,
+    report: &mut TeardownReport,
+    messages: &Messages,
+) {
+    for dir in &plan.secrets_dirs {
+        let result = delete_secrets_dir_if_present(tree, dir);
+        report.record(&format!("directory {}", dir.display()), result, messages);
+    }
     for dir in &plan.dirs {
         let result = delete_dir_if_present(dir);
         report.record(&format!("directory {}", dir.display()), result, messages);
@@ -431,6 +451,23 @@ fn delete_artifacts(plan: &ArtifactPlan, report: &mut TeardownReport, messages: 
     for file in &plan.files {
         let result = delete_file_if_present(file);
         report.record(&format!("file {}", file.display()), result, messages);
+    }
+}
+
+/// [`delete_dir_if_present`] for a directory below the secrets
+/// directory: through a rooted `tree` without following a name, so a
+/// link at the directory is removed itself and a link above it is
+/// refused; by path otherwise.
+fn delete_secrets_dir_if_present(tree: &SecretsTree, path: &Path) -> Result<bool> {
+    if !tree.is_rooted() {
+        return delete_dir_if_present(path);
+    }
+    match tree.remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to remove directory {}", path.display()))
+        }
     }
 }
 
@@ -1094,5 +1131,56 @@ instance_id = \"001\"\n\n\
             after, contents,
             "unmarked operator profile must be left intact: {after}"
         );
+    }
+
+    /// Through a rooted handle a link at the service's directory is
+    /// removed itself, and the directory it points at is kept.
+    #[test]
+    fn rooted_delete_artifacts_removes_a_link_and_keeps_its_target() {
+        let root = crate::test_support::SwapRoot::new();
+        let state = StateFile {
+            secrets_dir: Some(root.secrets.clone()),
+            ..sample_state()
+        };
+        let mut entry = sample_entry("svc", DeliveryMode::LocalFile);
+        entry.approle.secret_id_path = root.secrets.join("services").join("svc").join("secret_id");
+        entry.key_path = root.root().join("svc").join("key.pem");
+        entry.cert_path = root.root().join("svc").join("cert.pem");
+        root.write("remote-bootstrap/services/svc/bootstrap.json", "{}");
+        let plan = build_artifact_plan(&state, &entry);
+        let tree = root.rooted();
+        let before = root.outside_snapshot();
+        std::fs::create_dir_all(root.secrets.join("services")).unwrap();
+        let link = root.swap("services/svc", &root.outside);
+
+        let mut report = TeardownReport::default();
+        delete_artifacts(&tree, &plan, &mut report, &test_messages());
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "the link is removed"
+        );
+        assert!(!root.secrets.join("remote-bootstrap/services/svc").exists());
+        assert_eq!(root.outside_snapshot(), before, "its target is kept");
+    }
+
+    /// A link above the service's directory is refused, and nothing it
+    /// points at is removed.
+    #[test]
+    fn rooted_delete_artifacts_refuses_a_swapped_services_dir() {
+        let root = crate::test_support::SwapRoot::new();
+        let tree = root.rooted();
+        std::fs::create_dir_all(root.outside.join("svc")).unwrap();
+        std::fs::write(root.outside.join("svc").join("secret_id"), "OUTSIDE").unwrap();
+        let before = root.outside_snapshot();
+        let link = root.swap("services", &root.outside);
+        let err = delete_secrets_dir_if_present(&tree, &link.join("svc")).unwrap_err();
+        crate::test_support::assert_error_names(&err, &link);
+        assert_eq!(root.outside_snapshot(), before);
+
+        // Absent is not a failure, through either handle.
+        let path_based = SecretsTree::open(&root.secrets).unwrap();
+        for tree in [&tree, &path_based] {
+            assert!(!delete_secrets_dir_if_present(tree, &root.secrets.join("absent")).unwrap());
+        }
     }
 }

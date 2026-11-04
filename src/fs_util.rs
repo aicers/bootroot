@@ -11,7 +11,9 @@ use crate::cert_group::{self, CertGroupPolicy};
 pub mod generation;
 mod secrets_tree;
 
-pub use secrets_tree::{EntryKind, ROOT_BY_POLICY_DIRS, RootedOwner, SecretsTree, rooted_mode};
+pub use secrets_tree::{
+    EntryKind, FileMeta, ROOT_BY_POLICY_DIRS, RootedOwner, SecretsTree, rooted_mode,
+};
 
 pub const KEY_FILE_MODE: u32 = 0o600;
 const SECRETS_DIR_MODE: u32 = 0o700;
