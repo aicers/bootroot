@@ -2066,7 +2066,9 @@ root starts. Before using one, every command checks:
 - that `compose-overrides/` and each file in it are not symbolic links, are
   owned by a trusted account, and are not group- or world-writable;
 - that `compose-overrides/` is not at or below the secrets directory, which
-  the containers can write.
+  the containers can write. `infra install` and `init` check this before they
+  write the first override, so a secrets directory that is the compose
+  directory or one of its parents stops them with nothing written.
 
 The trusted accounts are root, the account running the bootroot command, and
 the owner of the compose directory, which can already replace the compose file

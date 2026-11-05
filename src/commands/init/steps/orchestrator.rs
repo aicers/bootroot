@@ -321,6 +321,15 @@ pub(crate) async fn run_init_locked(
 
     ensure_all_services_localhost_binding(&args.compose.compose_file, messages)?;
 
+    // Every override this run writes it also hands Compose, unread; a
+    // `compose-overrides/` inside the secrets tree the containers mount
+    // read-write is refused before the first of them is written.
+    compose_overrides::refuse_inside_secrets(
+        &compose_file_dir(&args.compose.compose_file),
+        &args.secrets_dir.secrets_dir,
+        messages,
+    )?;
+
     // Check whether a non-loopback OpenBao bind intent is stored in
     // state.  TLS is validated inside `run_init_inner` (after
     // `ensure_step_ca_initialized`) so that failures trigger rollback.

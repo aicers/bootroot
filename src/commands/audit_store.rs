@@ -1355,7 +1355,7 @@ pub(crate) fn prepare_audit_store_for_infra_up(
         .is_some_and(|recorded| recorded.enabled);
     let secrets_dir = state.as_ref().map_or_else(
         || compose_dir.join(DEFAULT_SECRETS_DIR),
-        |state| resolve_secrets_dir(state, compose_dir),
+        |state| compose_overrides::recorded_secrets_dir(state, compose_dir),
     );
     // The `0.7.0` location is probed only where the endpoint predicate
     // makes the override required.
@@ -1629,7 +1629,7 @@ pub(crate) fn resolve_audit_override(
     {
         return Ok(None);
     }
-    let secrets_dir = resolve_secrets_dir(&state, compose_dir);
+    let secrets_dir = compose_overrides::recorded_secrets_dir(&state, compose_dir);
     let legacy = ComposeOverride::OpenBaoAudit.legacy_path(compose_dir, &secrets_dir);
     let Some(override_path) = compose_overrides::read(
         compose_dir,
@@ -1651,17 +1651,6 @@ pub(crate) fn resolve_audit_override(
         ))
     })?;
     Ok(Some(override_path))
-}
-
-/// Returns the secrets directory `state` records, resolved against
-/// `compose_dir` when relative.
-fn resolve_secrets_dir(state: &StateFile, compose_dir: &Path) -> PathBuf {
-    let secrets_dir = state.secrets_dir();
-    if secrets_dir.is_absolute() {
-        secrets_dir.to_path_buf()
-    } else {
-        compose_dir.join(secrets_dir)
-    }
 }
 
 /// The uid a production run requires the store to be owned by.

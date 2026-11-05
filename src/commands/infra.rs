@@ -799,6 +799,10 @@ fn run_infra_install_locked(
         }
     }
     println!("{}", messages.infra_install_dirs_created());
+    // Refused before the exposure overrides below are written: a
+    // `secrets/` that resolves to the compose directory or above it would
+    // put them inside the tree step-ca mounts read-write.
+    compose_overrides::refuse_inside_secrets(compose_dir, &secrets_dir, messages)?;
 
     // Resolve the host-side published ports once: the preflight binds
     // them, the `.env` upsert and the compose subprocess environment
@@ -1854,18 +1858,6 @@ async fn maybe_interactive_unseal(
     wait_for_openbao_active(&client, messages).await
 }
 
-/// Returns the secrets directory `state` records, resolved against
-/// `compose_dir` when relative: the directory an override read by
-/// `infra up` must not sit inside.
-fn state_secrets_dir(state: &StateFile, compose_dir: &Path) -> PathBuf {
-    let secrets_dir = state.secrets_dir();
-    if secrets_dir.is_absolute() {
-        secrets_dir.to_path_buf()
-    } else {
-        compose_dir.join(secrets_dir)
-    }
-}
-
 /// Returns the `OpenBao` exposed compose override path when a
 /// non-loopback bind intent is stored in `StateFile`.
 ///
@@ -1884,7 +1876,7 @@ fn find_openbao_exposed_override(
     state.openbao_bind_addr.as_ref()?;
     compose_overrides::read(
         compose_dir,
-        &state_secrets_dir(&state, compose_dir),
+        &compose_overrides::recorded_secrets_dir(&state, compose_dir),
         ComposeOverride::OpenBaoExposed,
         None,
         &crate::i18n::test_messages(),
@@ -1923,7 +1915,7 @@ pub(crate) fn resolve_openbao_exposed_override(
     };
     let override_path = compose_overrides::read_required(
         compose_dir,
-        &state_secrets_dir(&state, compose_dir),
+        &compose_overrides::recorded_secrets_dir(&state, compose_dir),
         ComposeOverride::OpenBaoExposed,
         messages.error_openbao_override_file_missing(),
         messages,
@@ -1956,14 +1948,17 @@ pub(crate) fn resolve_http01_exposed_override(
     };
     let override_path = compose_overrides::read_required(
         compose_dir,
-        &state_secrets_dir(&state, compose_dir),
+        &compose_overrides::recorded_secrets_dir(&state, compose_dir),
         ComposeOverride::Http01Exposed,
         messages.error_http01_admin_override_file_missing(),
         messages,
     )?;
     validate_http01_override_scope(&override_path, messages)?;
     validate_http01_override_binding(&override_path, bind_addr, messages)?;
-    validate_http01_admin_tls(&state_secrets_dir(&state, compose_dir), messages)?;
+    validate_http01_admin_tls(
+        &compose_overrides::recorded_secrets_dir(&state, compose_dir),
+        messages,
+    )?;
     Ok(Some(override_path))
 }
 
@@ -1991,7 +1986,7 @@ pub(crate) fn resolve_stepca_exposed_override(
     };
     let override_path = compose_overrides::read_required(
         compose_dir,
-        &state_secrets_dir(&state, compose_dir),
+        &compose_overrides::recorded_secrets_dir(&state, compose_dir),
         ComposeOverride::StepCaExposed,
         messages.error_stepca_override_file_missing(),
         messages,
@@ -2024,7 +2019,7 @@ fn resolve_responder_compose_override(
         return Ok(None);
     }
     let state = StateFile::load(state_path)?;
-    let secrets_dir = state_secrets_dir(&state, compose_dir);
+    let secrets_dir = compose_overrides::recorded_secrets_dir(&state, compose_dir);
     let legacy = ComposeOverride::Responder.legacy_path(compose_dir, &secrets_dir);
     compose_overrides::read(
         compose_dir,
@@ -2056,7 +2051,7 @@ fn resolve_postgres_tls_override(
         return Ok(None);
     }
     let state = StateFile::load(state_path)?;
-    let secrets_dir = state_secrets_dir(&state, compose_dir);
+    let secrets_dir = compose_overrides::recorded_secrets_dir(&state, compose_dir);
     let legacy = ComposeOverride::PostgresTls.legacy_path(compose_dir, &secrets_dir);
     compose_overrides::read(
         compose_dir,

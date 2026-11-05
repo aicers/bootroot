@@ -147,16 +147,14 @@ fn clean_down_files(
 /// Returns the secrets directory `state.json` records, resolved against
 /// `compose_dir` when relative, or `compose_dir/secrets` without one.
 fn clean_secrets_dir(state_path: &Path, compose_dir: &Path) -> PathBuf {
-    let recorded = state_path
+    state_path
         .exists()
         .then(|| StateFile::load(state_path).ok())
         .flatten()
-        .map(|state| state.secrets_dir().to_path_buf());
-    match recorded {
-        Some(dir) if dir.is_absolute() => dir,
-        Some(dir) => compose_dir.join(dir),
-        None => compose_dir.join(DEFAULT_SECRETS_DIR),
-    }
+        .map_or_else(
+            || compose_dir.join(DEFAULT_SECRETS_DIR),
+            |state| compose_overrides::recorded_secrets_dir(&state, compose_dir),
+        )
 }
 
 /// Removes only the `bootroot-openbao` container and its volume.
