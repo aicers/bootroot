@@ -77,10 +77,10 @@ bootroot monitoring status
   hostaddr=127.0.0.1 port=<POSTGRES_HOST_PORT>`로 연결합니다. 서버 인증서는
   `postgres`라는 이름에 대해서만 유효합니다.
 - TLS 설정은 `bootroot init`이 작성하는
-  `secrets/postgres/docker-compose.postgres-tls.yml`과
+  `compose-overrides/docker-compose.postgres-tls.yml`과
   `postgres/pg_hba.conf`에 있습니다. 이 스택에서 자신만의 `-f` 목록으로
   `docker compose up`을 실행한다면
-  `secrets/postgres/docker-compose.postgres-tls.yml`을 반드시 포함해야
+  `compose-overrides/docker-compose.postgres-tls.yml`을 반드시 포함해야
   합니다. 빠뜨리면 Compose가 PostgreSQL을 TLS 없이 다시 생성해 step-ca가
   연결하지 못합니다. `bootroot infra up`은 이 파일을 포함합니다. 초기화된
   스택 위에서 다시 실행한 `bootroot infra install`은 포함하지 않으며, 그
@@ -1792,7 +1792,7 @@ rm <audit_store_dir>.img
 1. 스택을 중지합니다.
 2. 디렉터리를 새 경로로 옮깁니다.
 3. `[registrar] audit_store_dir`을 갱신하고 렌더링된 오버라이드
-   `secrets/openbao/docker-compose.openbao-audit.yml`을 삭제합니다.
+   `compose-overrides/docker-compose.openbao-audit.yml`을 삭제합니다.
 4. root로 `bootroot init`을 `--agent-config`와 함께 다시 실행합니다.
 
 **이 단계들은 `filesystem` 모드에는 적용되지 않으며**, 이 빌드는 그것을
@@ -1925,6 +1925,58 @@ fail-closed 통제이므로 차오를수록 호출이 거부됩니다. 성공에
 - 기본 점검 순서:
   `docker compose ps` -> `docker compose logs --tail=200 <service>`
   -> `bootroot verify --registration-id <service>`.
+
+### compose 파일 옆의 compose 오버라이드 {#compose-overrides-beside-the-compose-file}
+
+`bootroot infra install`과 `bootroot init`은 `docker compose -f`에 넘기는
+Compose 오버라이드 파일을 compose 파일이 있는 디렉터리의 `compose-overrides/`에
+작성합니다. `--openbao-bind`, `--http01-admin-bind`, `--stepca-bind`의 노출
+오버라이드, 리스폰더 설정 오버라이드, OpenBao Agent 오버라이드, PostgreSQL TLS
+오버라이드, 그리고 레지스트라 엔드포인트 호스트의 감사 오버라이드입니다. 이
+디렉터리를 마운트하는 컨테이너는 없습니다. umask와 관계없이 디렉터리는 `0755`,
+그 안의 모든 파일은 `0644`이며 기록한 계정이 소유합니다.
+
+bootroot는 `docker compose`를 root로 실행하는 경우가 많으므로, 오버라이드는
+root가 무엇을 시작할지를 정합니다. 모든 명령은 오버라이드를 쓰기 전에 다음을
+확인합니다.
+
+- compose 디렉터리를 그룹이나 다른 사용자가 쓸 수 없어야 합니다(umask `002`로
+  만든 체크아웃이라면 그 디렉터리에 `chmod g-w,o-w`를 실행하세요).
+- `compose-overrides/`와 그 안의 각 파일은 심볼릭 링크가 아니어야 하고,
+  신뢰하는 계정이 소유해야 하며, 그룹이나 다른 사용자가 쓸 수 없어야 합니다.
+- `compose-overrides/`는 컨테이너가 쓸 수 있는 secrets 디렉터리와 같거나 그
+  아래에 있으면 안 됩니다. `infra install`과 `init`은 첫 오버라이드를 쓰기
+  전에 이를 확인하므로, secrets 디렉터리가 compose 디렉터리이거나 그 상위
+  디렉터리이면 아무것도 쓰지 않고 멈춥니다.
+
+신뢰하는 계정은 root, bootroot 명령을 실행하는 계정, compose 디렉터리의
+소유자입니다. compose 디렉터리의 소유자는 이미 compose 파일과 `.env`를 바꿀 수
+있습니다. `secrets/`를 소유한 계정은 이들 중 하나가 아니라면 신뢰하지 않습니다.
+bootroot는 compose 디렉터리의 상위 디렉터리를 검사하지 않으므로, 이들 계정만 쓸
+수 있게 유지하세요. root 소유의 `compose-overrides/`는 root가 아닌 운영자도 읽을
+수 있지만, 그곳에 오버라이드를 쓰는 명령은 경로를 명시한 권한 오류로 실패합니다.
+
+**`0.7.0`에서 업그레이드하는 경우.** `0.7.0`까지의 릴리스는 오버라이드를
+`secrets/` 아래(`secrets/openbao/`, `secrets/responder/`, `secrets/step-ca/`,
+`secrets/postgres/`)에 두었습니다. bootroot는 더 이상 그곳의 파일을 읽지 않으며,
+아무것도 옮기지 않습니다. `infra up`, `init`, `reinit`은 필요한 오버라이드가 예전
+위치에만 있으면 두 경로를 모두 명시한 오류와 함께 멈춥니다. 다음 두 방법 중
+하나로 다시 만드세요.
+
+- 노출 오버라이드는 이 호스트의 바인드 옵션으로 `bootroot infra install`을 다시
+  실행하고, 나머지는 `bootroot init --root-token <token>`을 다시 실행합니다(바인드
+  옵션을 쓰는 경우 그 `infra install` 다음에). `init`을 다시 실행하면 `init`이
+  발급하는 것도 다시 발급됩니다.
+- 또는 예전 파일을 검토한 뒤 root로 새 경로에 모드 `0644`로 복사합니다.
+
+  ```bash
+  install -d -m 0755 compose-overrides
+  install -m 0644 secrets/postgres/docker-compose.postgres-tls.yml \
+    compose-overrides/docker-compose.postgres-tls.yml
+  ```
+
+새 파일이 생기면 예전 파일은 무시되며, `bootroot clean`이 `secrets/`와 함께
+제거합니다.
 
 ## systemd 운영 절차(bootroot-agent 권장)
 

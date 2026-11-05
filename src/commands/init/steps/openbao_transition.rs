@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn recreate_args_do_not_depend_on_a_compose_delta() {
         let compose = PathBuf::from("docker-compose.yml");
-        let override_path = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
+        let override_path = PathBuf::from("compose-overrides/docker-compose.openbao-exposed.yml");
         let identity = ComposeIdentity::for_instance("bootroot");
         let command = openbao_recreate_invocation(&identity, &compose, Some(&override_path), None)
             .command(&[]);
@@ -561,8 +561,8 @@ mod tests {
 
     #[test]
     fn the_recreate_pins_the_order_of_both_overrides() {
-        let exposed = PathBuf::from("secrets/openbao/docker-compose.openbao-exposed.yml");
-        let audit = PathBuf::from("secrets/openbao/docker-compose.openbao-audit.yml");
+        let exposed = PathBuf::from("compose-overrides/docker-compose.openbao-exposed.yml");
+        let audit = PathBuf::from("compose-overrides/docker-compose.openbao-audit.yml");
 
         // Base compose file, then the exposed-port override when there
         // is one, then the audit override. Pinned so it is testable and

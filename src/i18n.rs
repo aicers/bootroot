@@ -2,6 +2,7 @@ use anyhow::Result;
 use bootroot::locale::Locale;
 
 pub(crate) mod audit_store;
+pub(crate) mod compose_overrides;
 pub(crate) mod en;
 pub(crate) mod infra;
 pub(crate) mod init;
@@ -797,6 +798,15 @@ pub(crate) struct Strings {
     pub(crate) audit_reserve_step_verify: &'static str,
     pub(crate) audit_reserve_step_closing_rename: &'static str,
     pub(crate) audit_reserve_step_rollback: &'static str,
+    pub(crate) error_compose_override_symlink: &'static str,
+    pub(crate) error_compose_override_not_directory: &'static str,
+    pub(crate) error_compose_override_not_regular_file: &'static str,
+    pub(crate) error_compose_override_untrusted_owner: &'static str,
+    pub(crate) error_compose_override_writable: &'static str,
+    pub(crate) error_compose_override_inside_secrets: &'static str,
+    pub(crate) error_compose_override_legacy_exposure: &'static str,
+    pub(crate) error_compose_override_legacy_init: &'static str,
+    pub(crate) warning_clean_compose_override_skipped: &'static str,
 }
 
 /// `Clone` so a message bundle can cross into a `spawn_blocking`

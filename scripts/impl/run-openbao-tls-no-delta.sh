@@ -43,6 +43,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-openbao-tls-no-delta-$(da
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
@@ -75,7 +77,7 @@ OPENBAO_CONTAINER_NAME="bootroot-openbao"
 OPENBAO_BIND_HOST_DEFAULT="172.17.0.1"
 OPENBAO_BIND_HOST="${OPENBAO_BIND_HOST:-$OPENBAO_BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:8200}"
-EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+EXPOSED_OVERRIDE_PATH="$COMPOSE_OVERRIDES_DIR/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
 OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
@@ -327,6 +329,7 @@ reset_workspace() {
     "$SECRETS_DIR/templates" "$SECRETS_DIR/responder" \
     "$SECRETS_DIR/password.txt" "$SECRETS_DIR/password.txt.new"
   rm -f "$ROOT_DIR/.env"
+  rm -rf "$COMPOSE_OVERRIDES_DIR"
 }
 
 install_infra_with_bind() {

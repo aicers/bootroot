@@ -124,7 +124,7 @@ SSL) or a `pg_hba.conf` error after a `docker compose up` run with your own
 recreated PostgreSQL without TLS. Nothing falls back to plaintext.
 
 - Run `bootroot infra up`, which applies
-  `secrets/postgres/docker-compose.postgres-tls.yml`, or add that file to
+  `compose-overrides/docker-compose.postgres-tls.yml`, or add that file to
   your `-f` list.
 - The same happens after `bootroot infra install` is run again over an
   initialised stack; `bootroot infra up` restores it.
@@ -137,6 +137,27 @@ the last connection error; check `docker logs <instance>-postgres`. A key
 whose owner or mode was changed by hand stops PostgreSQL from starting:
 `bootroot rotate infra-cert` or a re-run of `init` re-applies them. A
 certificate verification or authentication error ends the wait at once.
+
+### A compose override is refused
+
+`infra up`, `init`, `reinit` and `clean` check every compose override before
+passing it to `docker compose`; see
+[Operations](operations.md#compose-overrides-beside-the-compose-file).
+
+- `Refusing <path>: its mode … lets the group or others write it`: run
+  `chmod g-w,o-w` on the path the error names. For the compose directory
+  itself this is usually a checkout made under umask `002`.
+- `Refusing <path>: it is owned by uid …`: the file or `compose-overrides/`
+  belongs to an account other than root, the one running bootroot, or the
+  owner of the compose directory. Review its contents, then remove it and
+  re-run the command that writes it (`infra install` with the host's bind
+  options, or `init`).
+- `Refusing <path>: it is a symbolic link`: replace the link with the file.
+- `… does not exist, but … from an earlier bootroot release does`: the
+  override is only at its place below `secrets/` from releases up to
+  `0.7.0`. Recreate it as the error says.
+- `bootroot clean` does not stop on a refused override: it leaves it off
+  `docker compose down`, warns, and removes `compose-overrides/` anyway.
 
 ### responder check failures
 
@@ -312,7 +333,7 @@ are gone with it.
   that holds `state.json`.
 - Run `bootroot init` instead if the deployment was never initialised, if
   `infra install` was re-run to record a changed bind, or if
-  `secrets/responder/docker-compose.responder.override.yml` is missing.
+  `compose-overrides/docker-compose.responder.override.yml` is missing.
 - A manually deployed responder needs a real `hmac_secret` in its
   `responder.toml`.
 

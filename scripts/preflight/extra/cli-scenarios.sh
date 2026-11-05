@@ -62,7 +62,7 @@ run_init_scenario() {
   reset_openbao
 
   log "Cleaning local secrets and outputs"
-  rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json" "$ROOT_DIR/.env"
+  rm -rf "$ROOT_DIR/secrets" "$ROOT_DIR/compose-overrides" "$ROOT_DIR/certs" "$ROOT_DIR/tmp" "$ROOT_DIR/state.json" "$ROOT_DIR/.env"
   mkdir -p "$ROOT_DIR/tmp"
 
   log "Installing infrastructure"

@@ -12,6 +12,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-ca-key-recovery-$(date +%
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
@@ -317,11 +319,14 @@ YAML
   # Include the responder compose override (written by bootroot init) so
   # that recreating bootroot-http01 preserves both the rendered config
   # mount and the DNS aliases.
-  local responder_override="$SECRETS_DIR/responder/docker-compose.responder.override.yml"
+  # `init` always writes it beside the compose file, so a missing one
+  # fails here rather than silently recreating the responder without it.
+  local responder_override
+  responder_override="$(dirname "$COMPOSE_FILE")/compose-overrides/docker-compose.responder.override.yml"
+  [ -f "$responder_override" ] \
+    || fail "expected init to write the responder override at $responder_override"
   local -a compose_args=(-p "${COMPOSE_PROJECT_NAME:-bootroot}" -f "$COMPOSE_FILE" -f "$override")
-  if [ -f "$responder_override" ]; then
-    compose_args+=(-f "$responder_override")
-  fi
+  compose_args+=(-f "$responder_override")
   docker compose "${compose_args[@]}" up -d bootroot-http01 >>"$RUN_LOG" 2>&1
 }
 
@@ -612,6 +617,7 @@ install_infra() {
   chmod 700 "$CERTS_DIR"
   # Remove stale .env so infra install generates a fresh bootstrap password.
   rm -f "$ROOT_DIR/.env"
+  rm -rf "$COMPOSE_OVERRIDES_DIR"
   run_bootroot infra install --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1
 }
 

@@ -40,6 +40,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-reinit-recovery-$(date +%
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
@@ -72,7 +74,7 @@ OPENBAO_CONTAINER_NAME="bootroot-openbao"
 OPENBAO_BIND_HOST_DEFAULT="172.17.0.1"
 OPENBAO_BIND_HOST="${OPENBAO_BIND_HOST:-$OPENBAO_BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${OPENBAO_BIND_ADDR:-${OPENBAO_BIND_HOST}:8200}"
-EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+EXPOSED_OVERRIDE_PATH="$COMPOSE_OVERRIDES_DIR/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
 OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
@@ -344,9 +346,9 @@ snapshot_pre_reinit() {
   openssl x509 -in "$SECRETS_DIR/certs/intermediate_ca.crt" -noout -fingerprint -sha256 \
     >"$dir/intermediate_ca.fingerprint"
   cp "$WORKSPACE_DIR/state.json" "$dir/state.json"
-  if [ -f "$EXPOSED_OVERRIDE_PATH" ]; then
-    cp "$EXPOSED_OVERRIDE_PATH" "$dir/docker-compose.openbao-exposed.yml"
-  fi
+  [ -f "$EXPOSED_OVERRIDE_PATH" ] \
+    || fail "[$label] expected infra install to write $EXPOSED_OVERRIDE_PATH"
+  cp "$EXPOSED_OVERRIDE_PATH" "$dir/docker-compose.openbao-exposed.yml"
 }
 
 assert_post_reinit_contracts() {
@@ -396,6 +398,15 @@ assert_post_reinit_contracts() {
   # 3. Non-loopback bind survives.
   [ -f "$EXPOSED_OVERRIDE_PATH" ] \
     || fail "[$label] expected compose override $EXPOSED_OVERRIDE_PATH to survive reinit"
+  cmp -s "$dir/docker-compose.openbao-exposed.yml" "$EXPOSED_OVERRIDE_PATH" \
+    || fail "[$label] compose override $EXPOSED_OVERRIDE_PATH changed across reinit"
+  # The OpenBao Agent override is removed with the runtime state and
+  # rewritten by the init pass, beside the exposure override.
+  [ -f "$COMPOSE_OVERRIDES_DIR/docker-compose.openbao-agent.override.yml" ] \
+    || fail "[$label] expected the init pass to rewrite the OpenBao Agent override"
+  if find "$SECRETS_DIR" -name 'docker-compose.*.yml' -print -quit | grep -q .; then
+    fail "[$label] a compose override was written below $SECRETS_DIR"
+  fi
   local bind
   bind="$(jq -r '.openbao_bind_addr // empty' "$WORKSPACE_DIR/state.json")"
   if [ "$bind" != "$OPENBAO_BIND_ADDR" ]; then
@@ -491,6 +502,7 @@ reset_workspace() {
     "$SECRETS_DIR/secrets" "$SECRETS_DIR/openbao" \
     "$SECRETS_DIR/password.txt" "$SECRETS_DIR/password.txt.new"
   rm -f "$ROOT_DIR/.env"
+  rm -rf "$COMPOSE_OVERRIDES_DIR"
 }
 
 list_local_ipv4() {

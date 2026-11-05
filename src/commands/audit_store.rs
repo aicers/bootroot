@@ -39,8 +39,9 @@ use bootroot::registrar::audit_store::{
 use serde::Deserialize;
 
 use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::ComposeIdentity;
-use crate::commands::init::OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME;
+use crate::commands::init::DEFAULT_SECRETS_DIR;
 use crate::i18n::Messages;
 use crate::state::StateFile;
 
@@ -58,9 +59,6 @@ const OPENBAO_AUDIT_CONTAINER_PATH: &str = OPENBAO_CONTAINER_AUDIT_DIR;
 /// silently unmount `OpenBao`'s storage or its configuration.
 const OPENBAO_DATA_MOUNT: &str = "openbao-data:/openbao/raft";
 const OPENBAO_CONFIG_MOUNT: &str = "./openbao:/openbao/config:ro";
-
-/// Mode a freshly rendered override is created at.
-const OVERRIDE_FILE_MODE: u32 = 0o644;
 
 /// The command a rendered "run this again" step names on this surface.
 ///
@@ -507,18 +505,17 @@ fn agent_config_read_message(
     }
 }
 
-/// Returns the rendered audit override's path under `compose_dir`.
+/// Returns the rendered audit override's path in
+/// `compose_dir/compose-overrides`, without checking it.
 ///
 /// Its own name, alongside and independent of the exposed-port
 /// override: that one rewrites `ports:` and this one rewrites
 /// `volumes:`, so the two compose without interacting and both may be
 /// passed with `-f` in one invocation.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn audit_override_path(compose_dir: &Path) -> PathBuf {
-    compose_dir
-        .join("secrets")
-        .join("openbao")
-        .join(OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME)
+    compose_overrides::path(compose_dir, ComposeOverride::OpenBaoAudit)
 }
 
 /// Renders the override that replaces the `openbao` service's
@@ -529,18 +526,10 @@ pub(crate) fn audit_override_path(compose_dir: &Path) -> PathBuf {
 /// removes the attribute entirely, which would leave `OpenBao` with no
 /// mounts at all.
 ///
-/// The directory and the file both take the secrets tree's ownership
-/// rather than the writing process's, because this is the one override
-/// a **root-run** `bootroot init` renders and an unprivileged
-/// `bootroot infra up` reads back. It also lands in
-/// `<compose dir>/secrets/openbao` — the directory both `OpenBao` Agent
-/// sidecars run out of, and which every other writer reaches through
-/// [`fs_util::ensure_shared_secrets_dir`] for exactly this reason. A
-/// `0700` level created under root's own uid is one neither the
-/// sidecars nor the operator can traverse, and it is created here
-/// first: this call runs before any other step of `init` touches the
-/// tree, so whatever owner it establishes is the one every later level
-/// inherits.
+/// Published in `<compose dir>/compose-overrides/` through
+/// [`compose_overrides::write`], at `0644` and owned by the writing
+/// process: outside the `secrets/` tree the `OpenBao` Agent sidecars
+/// mount read-write.
 ///
 /// # Errors
 ///
@@ -554,37 +543,12 @@ pub(crate) fn write_audit_override(
 ) -> Result<PathBuf> {
     let bind_source = bootroot::registrar::audit_store::openbao_dir(store_dir);
     let content = render_audit_override(&bind_source, messages)?;
-    let override_path = audit_override_path(compose_dir);
-    let override_dir = override_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let tree = open_override_tree(compose_dir, messages)?;
-    tree.ensure_dir(&override_dir)
-        .with_context(|| messages.error_write_file_failed(&override_dir.display().to_string()))?;
-    // `PreserveOrCreate`: a fresh file gets exactly this mode whatever
-    // root's umask is, while an operator who narrowed the destination by
-    // hand keeps that choice. The file carries one host path and nothing
-    // secret.
-    tree.publish(
-        fs_util::Destination::operator_named(&override_path),
-        content.as_bytes(),
-        fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
+    compose_overrides::write(
+        compose_dir,
+        ComposeOverride::OpenBaoAudit,
+        &content,
+        messages,
     )
-    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
-    Ok(override_path)
-}
-
-/// Opens the handle on `compose_dir/secrets` both writers of the audit
-/// override publish through, so a root process over a `secrets/`
-/// another account owns follows no name there and refuses a symlink at
-/// the override rather than writing through it.
-fn open_override_tree(compose_dir: &Path, messages: &Messages) -> Result<fs_util::SecretsTree> {
-    let secrets_dir = compose_dir.join("secrets");
-    fs_util::SecretsTree::open(&secrets_dir)
-        .with_context(|| messages.error_write_file_failed(&secrets_dir.display().to_string()))
 }
 
 /// The rendered override's bytes for a given bind source.
@@ -852,6 +816,9 @@ pub(crate) struct AuditStoreInitInputs<'a> {
     /// the file the stop names and the directory the override lands in
     /// from ever being two different deployments.
     pub(crate) compose_file: &'a Path,
+    /// The secrets directory the run uses: the rendered override is read
+    /// only from a `compose-overrides/` outside it.
+    pub(crate) secrets_dir: &'a Path,
     /// The operator's `bootroot-agent` configuration file, when
     /// `--agent-config` was supplied.
     pub(crate) agent_config: Option<&'a Path>,
@@ -900,8 +867,16 @@ fn select_audit_store_plan(
     inputs: &AuditStoreInitInputs<'_>,
     messages: &Messages,
 ) -> Result<AuditStorePlan> {
-    let override_path = audit_override_path(&compose_file_dir(inputs.compose_file));
-    let rendered_present = override_path.exists();
+    // `init` renders this override itself, so a file left at its
+    // `0.7.0` place is neither read nor probed.
+    let rendered = compose_overrides::read(
+        &compose_file_dir(inputs.compose_file),
+        inputs.secrets_dir,
+        ComposeOverride::OpenBaoAudit,
+        None,
+        messages,
+    )?;
+    let rendered_present = rendered.is_some();
 
     // A rendered override makes the flag mandatory even on a host whose
     // predicate is off, which keeps the deletion of an override from
@@ -925,11 +900,7 @@ fn select_audit_store_plan(
     }
 
     if !inputs.endpoint_recorded {
-        return Ok(if rendered_present {
-            AuditStorePlan::Unwind(override_path)
-        } else {
-            AuditStorePlan::Idle
-        });
+        return Ok(rendered.map_or(AuditStorePlan::Idle, AuditStorePlan::Unwind));
     }
 
     Ok(AuditStorePlan::Provision(Box::new(view)))
@@ -971,8 +942,13 @@ fn plan_audit_store(
         ));
     }
 
-    let override_path = audit_override_path(&compose_file_dir(inputs.compose_file));
-    if override_path.exists() {
+    if let Some(override_path) = compose_overrides::read(
+        &compose_file_dir(inputs.compose_file),
+        inputs.secrets_dir,
+        ComposeOverride::OpenBaoAudit,
+        None,
+        messages,
+    )? {
         let rendered_store = read_audit_override_store_dir(&override_path, messages)?;
         // `Path`'s own equality compares components, so the rendered
         // spelling and the configured one agree wherever they name
@@ -1104,11 +1080,7 @@ pub(crate) fn apply_audit_store(
 ) -> Result<Option<PathBuf>> {
     match plan_audit_store(inputs, messages)? {
         AuditStorePlan::Idle => Ok(None),
-        AuditStorePlan::Unwind(override_path) => {
-            let tree = open_override_tree(&compose_file_dir(inputs.compose_file), messages)?;
-            remove_audit_override(&tree, &override_path, messages)?;
-            Ok(None)
-        }
+        AuditStorePlan::Unwind(_) => unwind_audit_override(inputs, messages),
         AuditStorePlan::Provision(view) => match view.enforcement {
             AuditStoreEnforcement::Directory => {
                 // The explicit opt-out, and its own complete path. The
@@ -1235,6 +1207,20 @@ pub(crate) fn apply_audit_store(
     }
 }
 
+/// Removes the rendered audit override from `compose-overrides/` for
+/// [`AuditStorePlan::Unwind`], leaving the store as it is.
+fn unwind_audit_override(
+    inputs: &AuditStoreInitInputs<'_>,
+    messages: &Messages,
+) -> Result<Option<PathBuf>> {
+    compose_overrides::remove(
+        &compose_file_dir(inputs.compose_file),
+        ComposeOverride::OpenBaoAudit,
+        messages,
+    )?;
+    Ok(None)
+}
+
 /// The spelling a rendered command must name a path by: absolute, and
 /// lexically normalized.
 ///
@@ -1358,16 +1344,31 @@ pub(crate) fn prepare_audit_store_for_infra_up(
     // the override lands beside that same file.
     let compose_dir = compose_file_dir(compose_file);
     let compose_dir = compose_dir.as_path();
-    let override_path = audit_override_path(compose_dir);
-    let override_present = override_path.exists();
-    let endpoint_recorded = if state_path.exists() {
-        StateFile::load(state_path)?
-            .registrar_endpoint
-            .as_ref()
-            .is_some_and(|recorded| recorded.enabled)
+    let state = if state_path.exists() {
+        Some(StateFile::load(state_path)?)
     } else {
-        false
+        None
     };
+    let endpoint_recorded = state
+        .as_ref()
+        .and_then(|state| state.registrar_endpoint.as_ref())
+        .is_some_and(|recorded| recorded.enabled);
+    let secrets_dir = state.as_ref().map_or_else(
+        || compose_dir.join(DEFAULT_SECRETS_DIR),
+        |state| compose_overrides::recorded_secrets_dir(state, compose_dir),
+    );
+    // The `0.7.0` location is probed only where the endpoint predicate
+    // makes the override required.
+    let legacy = endpoint_recorded
+        .then(|| ComposeOverride::OpenBaoAudit.legacy_path(compose_dir, &secrets_dir));
+    let checked = compose_overrides::read(
+        compose_dir,
+        &secrets_dir,
+        ComposeOverride::OpenBaoAudit,
+        legacy.as_deref(),
+        messages,
+    )?;
+    let override_present = checked.is_some();
 
     // This is intentionally before loading the configuration. A host that
     // never enabled the endpoint has no override, so `infra up` must keep its
@@ -1390,9 +1391,9 @@ pub(crate) fn prepare_audit_store_for_infra_up(
     if !endpoint_recorded {
         return Ok(None);
     }
-    if !override_present {
+    let Some(override_path) = checked else {
         anyhow::bail!(messages.error_audit_store_override_missing());
-    }
+    };
 
     // The old short form remains a supported input. Compare before rewriting
     // it so the upgrade never silently points an existing deployment at the
@@ -1404,7 +1405,7 @@ pub(crate) fn prepare_audit_store_for_infra_up(
             &view.audit_store_dir.display().to_string(),
         ));
     }
-    upgrade_audit_override(compose_dir, messages)?;
+    upgrade_audit_override(compose_dir, &override_path, messages)?;
 
     match view.enforcement {
         AuditStoreEnforcement::Directory => {
@@ -1525,61 +1526,25 @@ fn verify_filesystem_reserve_for_infra_up(
     Ok(())
 }
 
-/// Removes the rendered audit override at `override_path`, below
-/// `tree`'s anchor. A rooted handle unlinks it through the walked
-/// parent's descriptor; a path-based one removes it by path, as it
-/// always did.
-fn remove_audit_override(
-    tree: &fs_util::SecretsTree,
-    override_path: &Path,
-    messages: &Messages,
-) -> Result<()> {
-    if tree.is_rooted() {
-        return tree.remove_file(override_path).with_context(|| {
-            messages.error_write_file_failed(&override_path.display().to_string())
-        });
-    }
-    std::fs::remove_file(override_path)
-        .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))
-}
-
 /// Rewrites the former scalar audit bind to the guarded long form.
 ///
 /// The source is first recovered from the existing override and is never
 /// derived from configuration: the rewrite changes Compose syntax, not where
 /// an already-running deployment writes its audit device.
 ///
-/// The override is [`audit_override_path`] under `compose_dir`, and the
-/// rewrite is published through the handle on `compose_dir/secrets`.
-fn upgrade_audit_override(compose_dir: &Path, messages: &Messages) -> Result<()> {
-    let tree = open_override_tree(compose_dir, messages)?;
-    upgrade_audit_override_in(&tree, compose_dir, messages)
-}
-
-/// [`upgrade_audit_override`] through the handle `tree` on
-/// `compose_dir/secrets`, which serves both its read and its publish.
-fn upgrade_audit_override_in(
-    tree: &fs_util::SecretsTree,
+/// `override_path` is the path [`compose_overrides::read`] checked, and
+/// the rewrite is published through [`compose_overrides::write`]: a
+/// long-form file is never rewritten, and a short-form one in a
+/// directory the running account cannot write stops with the
+/// permission error naming the path.
+fn upgrade_audit_override(
     compose_dir: &Path,
+    override_path: &Path,
     messages: &Messages,
 ) -> Result<()> {
-    let override_path = audit_override_path(compose_dir);
-    let override_path = override_path.as_path();
     let display = override_path.display().to_string();
-    let content = if tree.is_rooted() {
-        // Read through the handle the rewrite is published through, so a
-        // root process over a `secrets/` another account owns republishes
-        // nothing a link there pointed at.
-        let bytes = tree
-            .read(override_path)
-            .with_context(|| messages.error_read_file_failed(&display))?;
-        String::from_utf8(bytes)
-            .map_err(|err| anyhow::anyhow!(err))
-            .with_context(|| messages.error_read_file_failed(&display))?
-    } else {
-        std::fs::read_to_string(override_path)
-            .with_context(|| messages.error_read_file_failed(&display))?
-    };
+    let content = std::fs::read_to_string(override_path)
+        .with_context(|| messages.error_read_file_failed(&display))?;
     if read_audit_override_bind_source(&content).is_none() {
         anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
     }
@@ -1622,14 +1587,13 @@ fn upgrade_audit_override_in(
     if !replaced {
         anyhow::bail!(messages.error_audit_store_override_unreadable(&display));
     }
-    tree.publish(
-        fs_util::Destination::operator_named(override_path),
-        rewritten.as_bytes(),
-        fs_util::StagedMode::PreserveOrCreate(OVERRIDE_FILE_MODE),
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
-    )
-    .with_context(|| messages.error_write_file_failed(&display))
+    compose_overrides::write(
+        compose_dir,
+        ComposeOverride::OpenBaoAudit,
+        &rewritten,
+        messages,
+    )?;
+    Ok(())
 }
 
 /// Resolves the audit override for a bring-up, checking only what an
@@ -1665,10 +1629,18 @@ pub(crate) fn resolve_audit_override(
     {
         return Ok(None);
     }
-    let override_path = audit_override_path(compose_dir);
-    if !override_path.exists() {
+    let secrets_dir = compose_overrides::recorded_secrets_dir(&state, compose_dir);
+    let legacy = ComposeOverride::OpenBaoAudit.legacy_path(compose_dir, &secrets_dir);
+    let Some(override_path) = compose_overrides::read(
+        compose_dir,
+        &secrets_dir,
+        ComposeOverride::OpenBaoAudit,
+        Some(&legacy),
+        messages,
+    )?
+    else {
         anyhow::bail!(messages.error_audit_store_override_missing());
-    }
+    };
     let store_dir = read_audit_override_store_dir(&override_path, messages)?;
     check_store_directory(&store_dir, expected_uid).map_err(|err| {
         anyhow::anyhow!(layout_error_message(
@@ -1701,6 +1673,9 @@ mod tests {
     use crate::state::RegistrarEndpointState;
 
     const AGENT_CONFIG_NAME: &str = "agent.toml";
+
+    /// A secrets directory no fixture's `compose-overrides/` is inside.
+    const SECRETS_DIR_FOR_TESTS: &str = "/nonexistent/bootroot-test-secrets";
 
     /// 16 MiB — the `filesystem`-mode floor, and the smallest reserve
     /// a test can ask a host to have room for.
@@ -1846,6 +1821,7 @@ mod tests {
         ) -> AuditStoreInitInputs<'a> {
             AuditStoreInitInputs {
                 compose_file,
+                secrets_dir: Path::new(SECRETS_DIR_FOR_TESTS),
                 agent_config,
                 state_path,
                 endpoint_recorded,
@@ -2432,6 +2408,77 @@ mod tests {
     // Provisioning
     // ---------------------------------------------------------------
 
+    /// `init` on an endpoint host that has only the `0.7.0` audit
+    /// override renders the new one: the old file is neither read for
+    /// its store (so a stale one cannot refuse the run) nor touched.
+    #[test]
+    fn init_with_only_the_old_audit_override_renders_the_new_one() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
+        let agent_config = fixture.agent_config(true);
+        let secrets = compose_dir.join("secrets");
+        let legacy = ComposeOverride::OpenBaoAudit.legacy_path(&compose_dir, &secrets);
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("legacy dir");
+        let old_render =
+            write_audit_override(&compose_dir, Path::new("/elsewhere"), &test_messages())
+                .expect("render an old one");
+        fs::rename(&old_render, &legacy).expect("move it to the old place");
+        let selected = apply_audit_store(
+            &AuditStoreInitInputs {
+                compose_file: &compose_file,
+                secrets_dir: &secrets,
+                agent_config: Some(&agent_config),
+                state_path: &state,
+                endpoint_recorded: true,
+                expected_uid: current_process_euid(),
+            },
+            &test_messages(),
+        )
+        .expect("provisioned");
+        let rendered = audit_override_path(&compose_dir);
+        assert_eq!(selected.as_deref(), Some(rendered.as_path()));
+        assert_eq!(
+            read_audit_override_store_dir(&rendered, &test_messages()).expect("read"),
+            fixture.store_dir()
+        );
+        assert_eq!(
+            read_audit_override_store_dir(&legacy, &test_messages()).expect("old file"),
+            PathBuf::from("/elsewhere")
+        );
+    }
+
+    /// `infra up` with the predicate recorded stops when the audit
+    /// override exists only at its `0.7.0` place, naming both paths.
+    #[test]
+    fn infra_up_stops_on_a_legacy_only_audit_override() {
+        let fixture = Fixture::new();
+        let state = fixture.state(Some(true));
+        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
+        let agent_config = fixture.agent_config(true);
+        let legacy =
+            ComposeOverride::OpenBaoAudit.legacy_path(&compose_dir, &compose_dir.join("secrets"));
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("legacy dir");
+        fs::write(&legacy, "services: {}\n").expect("legacy override");
+        let err = prepare_audit_store_for_infra_up(
+            &state,
+            &compose_file,
+            Some(&agent_config),
+            current_process_euid(),
+            &test_messages(),
+        )
+        .expect_err("legacy-only");
+        assert_eq!(
+            err.to_string(),
+            test_messages().error_compose_override_legacy_init(
+                &audit_override_path(&compose_dir).display().to_string(),
+                &legacy.display().to_string()
+            )
+        );
+    }
+
     #[test]
     fn an_agreeing_run_creates_the_layout_and_renders_the_override() {
         let fixture = Fixture::new();
@@ -2803,6 +2850,7 @@ mod tests {
         let err = apply_audit_store(
             &AuditStoreInitInputs {
                 compose_file: &compose_file,
+                secrets_dir: Path::new(SECRETS_DIR_FOR_TESTS),
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: true,
@@ -2849,6 +2897,7 @@ mod tests {
         preflight_audit_store(
             &AuditStoreInitInputs {
                 compose_file: &compose_file,
+                secrets_dir: Path::new(SECRETS_DIR_FOR_TESTS),
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: true,
@@ -2878,6 +2927,7 @@ mod tests {
         let selected = apply_audit_store(
             &AuditStoreInitInputs {
                 compose_file: &compose_file,
+                secrets_dir: Path::new(SECRETS_DIR_FOR_TESTS),
                 agent_config: Some(&agent_config),
                 state_path: &state,
                 endpoint_recorded: false,
@@ -3570,69 +3620,75 @@ mod tests {
         )
     }
 
+    /// A short-form override at the new path is rewritten there through
+    /// the module's writer, at `0644` and owned by the writer, and what
+    /// it is read from is the path the reader checked.
     #[test]
-    fn rooted_upgrade_rewrites_the_override_and_refuses_a_linked_one() {
-        let root = crate::test_support::SwapRoot::new();
-        let compose_dir = root.root();
-        let path = audit_override_path(compose_dir);
-        let rel = format!("openbao/{OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME}");
-        root.write(&rel, &legacy_override("/srv/audit/openbao"));
-        let tree = root.rooted();
-        upgrade_audit_override_in(&tree, compose_dir, &test_messages()).expect("upgrade");
-        assert!(
-            fs::read_to_string(&path)
-                .expect("upgraded")
-                .contains("create_host_path: false")
-        );
-
-        fs::write(root.outside.join("secret"), legacy_override("/outside")).expect("seed");
-        let before = root.outside_snapshot();
-        root.swap(&rel, &root.outside.join("secret"));
-        let err = upgrade_audit_override_in(&tree, compose_dir, &test_messages())
-            .expect_err("linked override");
-        crate::test_support::assert_error_names(&err, &path);
-        assert_eq!(root.outside_snapshot(), before);
-    }
-
-    #[test]
-    fn rooted_unwind_refuses_a_swapped_override_dir() {
-        let root = crate::test_support::SwapRoot::new();
-        let path = audit_override_path(root.root());
-        fs::write(
-            root.outside.join(OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME),
-            "outside",
+    fn upgrade_rewrites_a_short_form_override_in_compose_overrides() {
+        let dir = traversable_tempdir();
+        let compose_dir = dir.path();
+        let messages = test_messages();
+        let written = compose_overrides::write(
+            compose_dir,
+            ComposeOverride::OpenBaoAudit,
+            &legacy_override("/srv/audit/openbao"),
+            &messages,
         )
-        .expect("seed");
-        let tree = root.rooted();
-        let before = root.outside_snapshot();
-        let link = root.swap("openbao", &root.outside);
-
-        let err = remove_audit_override(&tree, &path, &test_messages()).expect_err("swapped dir");
-
-        crate::test_support::assert_error_names(&err, &link);
-        assert_eq!(root.outside_snapshot(), before);
-
-        // Path-based, the removal follows the link as it always has.
-        let path_based = fs_util::SecretsTree::open(&root.secrets).expect("open");
-        remove_audit_override(&path_based, &path, &test_messages()).expect("path-based");
-        assert!(
-            !root
-                .outside
-                .join(OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME)
-                .exists()
+        .expect("short form");
+        let checked = compose_overrides::read(
+            compose_dir,
+            Path::new(SECRETS_DIR_FOR_TESTS),
+            ComposeOverride::OpenBaoAudit,
+            None,
+            &messages,
+        )
+        .expect("read")
+        .expect("present");
+        assert_eq!(checked, written);
+        upgrade_audit_override(compose_dir, &checked, &messages).expect("upgrade");
+        let upgraded = fs::read_to_string(&checked).expect("upgraded");
+        assert!(upgraded.contains("create_host_path: false"), "{upgraded}");
+        assert_eq!(
+            fs::metadata(&checked).expect("meta").permissions().mode() & 0o777,
+            0o644
         );
+        assert!(!compose_dir.join("secrets").exists());
     }
 
+    /// The unwind removes the override from `compose-overrides/` even
+    /// where a root run over a foreign-owned `secrets/` would have taken
+    /// a rooted handle on that tree: the override is outside it, so no
+    /// handle is involved, and nothing below `secrets/` is touched.
     #[test]
-    fn rooted_unwind_removes_the_override() {
-        let root = crate::test_support::SwapRoot::new();
-        let path = audit_override_path(root.root());
-        root.write(
-            &format!("openbao/{OPENBAO_AUDIT_COMPOSE_OVERRIDE_NAME}"),
-            "x",
-        );
-        remove_audit_override(&root.rooted(), &path, &test_messages()).expect("removed");
-        assert!(!path.exists());
+    fn the_unwind_removes_the_override_beside_a_rooted_secrets_tree() {
+        let fixture = Fixture::new();
+        let compose_dir = fixture.compose_dir();
+        let compose_file = fixture.compose_file();
+        let secrets = compose_dir.join("secrets");
+        fs::create_dir(&secrets).expect("secrets");
+        let legacy = ComposeOverride::OpenBaoAudit.legacy_path(&compose_dir, &secrets);
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("legacy dir");
+        fs::write(&legacy, "old").expect("legacy override");
+        let _rooted = fs_util::SecretsTree::open_rooted_for_tests(&secrets).expect("rooted");
+        let rendered = write_audit_override(&compose_dir, &fixture.store_dir(), &test_messages())
+            .expect("render");
+        let agent_config = fixture.agent_config(false);
+        let state = fixture.state(Some(false));
+        let applied = apply_audit_store(
+            &AuditStoreInitInputs {
+                compose_file: &compose_file,
+                secrets_dir: &secrets,
+                agent_config: Some(&agent_config),
+                state_path: &state,
+                endpoint_recorded: false,
+                expected_uid: current_process_euid(),
+            },
+            &test_messages(),
+        )
+        .expect("unwind");
+        assert!(applied.is_none());
+        assert!(!rendered.exists());
+        assert_eq!(fs::read_to_string(&legacy).expect("left alone"), "old");
     }
 
     #[test]
@@ -3651,7 +3707,7 @@ mod tests {
         )
         .expect("legacy override");
 
-        upgrade_audit_override(dir.path(), &test_messages()).expect("upgrade");
+        upgrade_audit_override(dir.path(), &path, &test_messages()).expect("upgrade");
         let upgraded = fs::read_to_string(&path).expect("upgraded override");
         assert!(
             upgraded.contains(&format!("source: {}", compose_quote(&source))),
@@ -3663,77 +3719,46 @@ mod tests {
             store
         );
 
-        upgrade_audit_override(dir.path(), &test_messages()).expect("second upgrade");
+        upgrade_audit_override(dir.path(), &path, &test_messages()).expect("second upgrade");
         assert_eq!(fs::read_to_string(&path).expect("second read"), upgraded);
     }
 
-    /// The one override rendered by root and read unprivileged, so its
-    /// mode cannot be left to the umask `bootroot init` happens to run
-    /// under.
+    /// The one override rendered by root and read unprivileged: it is
+    /// `0644` in a `0755` `compose-overrides/`, whatever the umask, owned
+    /// by the writer, and a mode narrowed by hand is not kept.
     #[test]
     fn a_freshly_rendered_override_is_readable_by_the_operator() {
         let dir = traversable_tempdir();
         let compose_dir = dir.path().join("compose");
         fs::create_dir(&compose_dir).expect("compose dir");
-        let rendered = write_audit_override(
-            &compose_dir,
-            &dir.path().join("audit-store"),
-            &test_messages(),
-        )
-        .expect("render");
-        assert_eq!(
-            fs::symlink_metadata(&rendered)
+        let render = || {
+            write_audit_override(
+                &compose_dir,
+                &dir.path().join("audit-store"),
+                &test_messages(),
+            )
+            .expect("render")
+        };
+        let mode = |path: &Path| {
+            fs::symlink_metadata(path)
                 .expect("metadata")
                 .permissions()
                 .mode()
-                & 0o7777,
-            0o644
-        );
-        // `secrets/openbao` is the directory both OpenBao Agent sidecars
-        // run out of, so it carries the secrets tree's own mode rather
-        // than one this renderer picked — the same `0700` every other
-        // level of that tree is created at, and the mode `init`'s later
-        // recursive permission sweep would apply to it regardless.
+                & 0o7777
+        };
+        let rendered = render();
+        assert_eq!(mode(&rendered), 0o644);
         let override_dir = rendered.parent().expect("parent");
+        assert_eq!(override_dir, compose_overrides::overrides_dir(&compose_dir));
+        assert_eq!(mode(override_dir), 0o755);
         assert_eq!(
-            fs::symlink_metadata(override_dir)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o700
+            fs::symlink_metadata(&rendered).expect("metadata").uid(),
+            current_process_euid()
         );
 
-        // A destination an operator narrowed by hand keeps that choice
-        // across the next render.
         fs::set_permissions(&rendered, fs::Permissions::from_mode(0o600)).expect("chmod");
-        write_audit_override(
-            &compose_dir,
-            &dir.path().join("audit-store"),
-            &test_messages(),
-        )
-        .expect("re-render");
-        assert_eq!(
-            fs::symlink_metadata(&rendered)
-                .expect("metadata")
-                .permissions()
-                .mode()
-                & 0o7777,
-            0o600
-        );
-
-        // The half that only a root-run `init` can get wrong, asserted
-        // for the shape rather than the privilege: the file takes the
-        // containing directory's owner, not the writing process's, so a
-        // root render inside an operator-owned tree stays readable to
-        // the unprivileged `infra up` that has to read it back.
-        let dir_meta = fs::symlink_metadata(override_dir).expect("metadata");
-        let file_meta = fs::symlink_metadata(&rendered).expect("metadata");
-        assert_eq!(
-            (file_meta.uid(), file_meta.gid()),
-            (dir_meta.uid(), dir_meta.gid()),
-            "the rendered override must belong to the secrets tree, not to the writer"
-        );
+        let rendered = render();
+        assert_eq!(mode(&rendered), 0o644);
     }
 
     /// Both characters outside the store path contract are refused before

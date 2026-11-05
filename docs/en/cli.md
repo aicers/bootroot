@@ -205,16 +205,29 @@ and the CA bundle. For the files whose mode nobody decided the mode is taken
 from the file already at the destination, so a file you narrow by hand stays
 narrowed across every later write, and a fresh create takes what the process
 umask allows — the same `0666`-under-your-umask an ordinary `open(2)` would give
-it. Those files are `state.json`, `ca.json`, `openbao.hcl`, the compose
-overrides and the ones `init` restores when it rolls back: on a host running
-`umask 077` they are created at `0600`, on the default `umask 022` at `0644`.
+it. Those files are `state.json`, `ca.json`, `openbao.hcl` and the ones
+`init` restores when it rolls back: on a host running `umask 077` they are
+created at `0600`, on the default `umask 022` at `0644`.
+
+The compose overrides are in neither group. They live in
+`<compose-dir>/compose-overrides/`, outside `secrets/`, and are always written
+at `0644` in a `0755` directory, owned by the account that writes them,
+whatever the umask; a mode narrowed by hand is not kept. A symbolic link at one
+of their names is replaced by the file, not followed. Before passing one to
+`docker compose`, every command checks that the compose directory is not
+group- or world-writable, and that `compose-overrides/` and the file are not
+links, are owned by root, the account running bootroot or the owner of the
+compose directory, and are not group- or world-writable. It stops with an
+error naming the path otherwise. See [Operations][compose-overrides].
+
+[compose-overrides]: operations.md#compose-overrides-beside-the-compose-file
 
 Ownership under `secrets/` follows the tree: when you run `infra install`,
 `init` or `openbao save-unseal-keys` as root over a `secrets/` owned by another
 account, every directory they create there is `0700` and owned by the owner of
-the directory it is created in, and the compose overrides, the HTTP-01 admin TLS
-directory, the OpenBao Agent CA bundle and the saved OpenBao unseal keys they
-write there take the owner of the directory they land in, so the account
+the directory it is created in, and the HTTP-01 admin TLS directory, the
+OpenBao Agent CA bundle and the saved OpenBao unseal keys they write there take
+the owner of the directory they land in, so the account
 `secrets/` belongs to can read them without waiting for the next `infra up`.
 
 `.env` is the exception in that second group. It preserves an existing mode like
@@ -234,8 +247,8 @@ rather than following a link at it:
 
 - **Configuration you may have relocated is written through the link.** For
   `.env`, `ca.json` and its template, `openbao.hcl`, the HTTP-01 responder
-  config and template, the OpenBao Agent configs, the generated compose
-  overrides, `state.json` and the two `init` output files, bootroot resolves the
+  config and template, the OpenBao Agent configs, `state.json` and the two
+  `init` output files, bootroot resolves the
   link first and publishes to its target, so the link keeps naming the file it
   named before. A chain of links that loops back on itself names no target and
   is refused. The `agent.toml` that `bootroot-remote bootstrap` writes on a
@@ -243,7 +256,7 @@ rather than following a link at it:
   a link you put at its `--agent-config-path` is one you arranged yourself. Its
   adjacent `--eab-file-path` remains a credential path, so a link there is
   replaced instead. A root-run `infra install`, `init`, `reinit`, `infra up`
-  (for the OpenBao audit override and the saved unseal keys),
+  (for the saved unseal keys),
   `openbao save-unseal-keys` or `rotate infra-cert` (for the HTTP-01 admin
   certificate) over a `secrets/` owned by another account is the exception: it
   refuses a symbolic link at any directory it walks there and at a generated
@@ -323,7 +336,7 @@ are in place and automatically applies the compose override so OpenBao
 listens on the stored address.
 
 Once `bootroot init` has run, `infra up` also applies the responder config
-override `init` generated under `secrets/responder/`, whatever the HTTP-01
+override `init` generated in `compose-overrides/`, whatever the HTTP-01
 admin bind is. That override is what mounts the rendered responder config,
 so a responder that `infra up` recreates keeps the config carrying the
 deployment's HMAC. Before `init` has run there is no override, and the
@@ -331,7 +344,7 @@ responder runs on the bundle's `responder.toml.compose`, on which it serves
 challenges but refuses registrations with `503`.
 
 Once `bootroot init` has run, `infra up` also applies the PostgreSQL TLS
-override `init` wrote at `secrets/postgres/docker-compose.postgres-tls.yml`,
+override `init` wrote at `compose-overrides/docker-compose.postgres-tls.yml`,
 when the compose file declares `postgres`. It starts PostgreSQL with TLS 1.3
 and X25519MLKEM768 only and mounts its certificate and `pg_hba.conf`; without
 it, Compose would recreate PostgreSQL without TLS and step-ca's
@@ -362,6 +375,12 @@ The command is considered failed when:
   `openbao.hcl` TLS configuration is missing
 - A non-loopback OpenBao bind intent is stored but the compose override
   file is missing
+- An override `infra up` needs exists only at its place below `secrets/`
+  from releases up to `0.7.0`; the error names both paths (see
+  [Operations](operations.md#compose-overrides-beside-the-compose-file))
+- The compose directory, `compose-overrides/` or an override in it is a
+  link, owned by an account other than root, the account running bootroot
+  or the owner of the compose directory, or group- or world-writable
 
 ### Examples
 
@@ -441,7 +460,7 @@ and `--no-build` uses them as-is instead of rebuilding from source. See
 - `--stepca-bind <IP>:<port>`: publish step-ca's ACME directory on a
   non-loopback address for multi-host deployments (optional). Records
   `stepca_bind_addr` in state and generates a compose override at
-  `secrets/step-ca/docker-compose.stepca-exposed.yml`. The override is
+  `compose-overrides/docker-compose.stepca-exposed.yml`. The override is
   **not** applied during `infra install`; `bootroot init` and `infra up`
   apply it. Default remains `127.0.0.1:9000`. There is no
   `--stepca-tls-required` companion — step-ca's ACME directory always
@@ -727,7 +746,7 @@ rollback as `ca.json` rather than left one step ahead of it.
 - Container status/health summary
 - Completion message
 - When `--openbao-bind` is used: compose override file at
-  `secrets/openbao/docker-compose.openbao-exposed.yml` and
+  `compose-overrides/docker-compose.openbao-exposed.yml` and
   bind intent recorded in `state.json`
 
 `infra install` applies none of the overrides `bootroot init` writes, since
@@ -1169,7 +1188,7 @@ DB DSN host handling:
   `infra install --postgres-user` recorded `BOOTROOT_POSTGRES_USER`
 - With that certificate, `<compose-dir>/postgres/pg_hba.conf` (mode `0644`)
   and the compose override
-  `secrets/postgres/docker-compose.postgres-tls.yml`, written on every run;
+  `compose-overrides/docker-compose.postgres-tls.yml`, written on every run;
   PostgreSQL is recreated with them (`up -d --no-deps --force-recreate
   postgres`) and from then on accepts TCP connections only over TLS 1.3
   with X25519MLKEM768, authenticated with `scram-sha-256`
@@ -1178,8 +1197,8 @@ DB DSN host handling:
   run recorded is removed from `state.json` → `infra_certs`, so
   `rotate infra-cert` and `rotate ca-key` no longer renew it or signal its
   container. The files already under `<compose-dir>/postgres/` and the
-  override under `secrets/postgres/` stay on disk until `bootroot clean`
-  removes them (with the default `secrets/` directory)
+  override in `compose-overrides/` stay on disk until `bootroot clean`
+  removes them
 - DB connectivity check status (when enabled)
 - DB host resolution summary (`from -> to`)
 - EAB registration summary
@@ -3294,6 +3313,10 @@ operator-managed runbook for those.
   requires the override the init pass has not written. Run `bootroot
   init` as root once on such a host before reinitialising it. See
   [The shared audit store](operations.md#the-shared-audit-store).
+  The same preflight reads each exposure override whose bind intent
+  `state.json` records, as the bring-up will: one that is missing, exists
+  only at its place below `secrets/` from releases up to `0.7.0`, or fails
+  the ownership and mode checks stops reinit before anything is removed.
 
 ### Behavior
 
@@ -3334,13 +3357,13 @@ operator-managed runbook for those.
 - Removes only OpenBao runtime/bootstrap artifacts:
   `secrets/openbao/unseal-keys.txt`, the generated infra OpenBao Agent
   config trees under `secrets/openbao/{stepca,responder}`,
-  `secrets/openbao/docker-compose.openbao-agent.override.yml`, and
+  `compose-overrides/docker-compose.openbao-agent.override.yml`, and
   stale per-service AppRole credential files
   (`secrets/services/<svc>/{role_id,secret_id,secret_id.wrapped}`).
 - Preserves step-ca material (`secrets/config/ca.json`,
   `secrets/secrets/root_ca_key`, `secrets/secrets/intermediate_ca_key`),
   `secrets/password.txt`, the PostgreSQL container/volume, and
-  operator-authored compose overrides under `secrets/openbao/`.
+  the `infra install` exposure overrides in `compose-overrides/`.
 - Rewrites `state.json` with deployment intent only — service
   registry, AppRoles, and policies are intentionally empty.
 - Brings OpenBao back up via `infra up --services openbao` so any

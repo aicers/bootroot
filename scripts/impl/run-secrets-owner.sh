@@ -59,6 +59,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-secrets-owner-$(date +%s)
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 # Not overridable: `infra install` writes its overrides under the
@@ -91,7 +93,7 @@ BIND_HOST="${BIND_HOST:-$BIND_HOST_DEFAULT}"
 OPENBAO_BIND_ADDR="${BIND_HOST}:8200"
 STEPCA_BIND_ADDR="${BIND_HOST}:9000"
 HTTP01_ADMIN_BIND_ADDR="${BIND_HOST}:8080"
-EXPOSED_OVERRIDE_PATH="$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml"
+EXPOSED_OVERRIDE_PATH="$COMPOSE_OVERRIDES_DIR/docker-compose.openbao-exposed.yml"
 OPENBAO_REPO_DIR="$ROOT_DIR/openbao"
 OPENBAO_REPO_HCL="$OPENBAO_REPO_DIR/openbao.hcl"
 OPENBAO_REPO_CONFIG_DIR="$OPENBAO_REPO_DIR/config"
@@ -222,6 +224,19 @@ run_sudo() {
     return
   fi
   sudo -n "$@"
+}
+
+# A command as the account that owns `secrets/`, whether this harness
+# runs as root or through `sudo`, with directory $1 as its working
+# directory.  Root enters $1 before dropping to the account, because the
+# account cannot search the runner's home above the checkout; relative
+# paths in the command then test only the permissions of $1 and below.
+run_as_account_in() {
+  local dir="$1"
+  shift
+  # shellcheck disable=SC2016 # expanded by the child shell, not here
+  run_sudo sh -c 'cd "$1" && shift && exec "$@"' sh "$dir" \
+    setpriv --reuid="$SECRETS_UID" --regid="$SECRETS_GID" --clear-groups "$@"
 }
 
 # The environment a root-run command needs, as `env` arguments.  `env`
@@ -365,7 +380,9 @@ cleanup() {
 # Root ran `infra install` and `init`, and `secrets/` is the account's,
 # so the trees root wrote (`openbao/`, `postgres/`, `.env`, the
 # workspace) and `secrets/` itself are handed back to the invoking user
-# before anything else in cleanup touches them.
+# before anything else in cleanup touches them.  The root-owned
+# `compose-overrides/` is removed rather than handed back: left in the
+# checkout, the next run would apply it.
 restore_ownership() {
   if [ "$ROOT_WROTE" != "1" ]; then
     return 0
@@ -378,6 +395,7 @@ restore_ownership() {
       run_sudo chown -R -h "$owner" "$path" >/dev/null 2>&1 || true
     fi
   done
+  run_sudo rm -rf "$COMPOSE_OVERRIDES_DIR" >/dev/null 2>&1 || true
   ROOT_WROTE=0
 }
 
@@ -490,7 +508,7 @@ prepare_secrets_dir() {
   ROOT_WROTE=1
   rm -f "$WORKSPACE_DIR/state.json"
   run_sudo rm -f "$ROOT_DIR/.env"
-  run_sudo rm -rf "$SECRETS_DIR"
+  run_sudo rm -rf "$SECRETS_DIR" "$COMPOSE_OVERRIDES_DIR"
   run_sudo install -d -m 0700 -o "$SECRETS_UID" -g "$SECRETS_GID" "$SECRETS_DIR" \
     || fail "failed to create $SECRETS_DIR for ${SECRETS_ACCOUNT}"
   assert_entry_state "$SECRETS_DIR" "${SECRETS_UID}:${SECRETS_GID} 700" "prepared"
@@ -510,9 +528,8 @@ install_infra_with_binds() {
 
 # Applied the way `run-openbao-tls-reown.sh` applies it: the override
 # republishes OpenBao on the bind address only, and `init` is pointed
-# at that address below.  As root, because the override sits in a
-# directory only the account and root can traverse, and root wrote the
-# `.env` Compose reads.
+# at that address below.  As root, because root wrote the `.env`
+# Compose reads.
 apply_exposed_override() {
   log_phase "apply-override"
   run_sudo test -f "$EXPOSED_OVERRIDE_PATH" \
@@ -671,16 +688,108 @@ assert_entry_owner() {
     || fail "${label}: ${path} is owned by ${actual}, expected the account's ${SECRETS_UID}:${SECRETS_GID}"
 }
 
-# What `infra install` itself leaves, before `init` re-modes the tree.
+# What `infra install` itself leaves: the three exposure overrides in a
+# `compose-overrides/` beside the compose file, root's because root
+# wrote them, and none below the account's `secrets/`.
 assert_install_ownership() {
   log_phase "assert-install"
-  local expected_dir="${SECRETS_UID}:${SECRETS_GID} 700"
-  assert_entry_state "$SECRETS_DIR/openbao" "$expected_dir" "after infra install"
-  assert_entry_state "$SECRETS_DIR/responder" "$expected_dir" "after infra install"
-  assert_entry_state "$SECRETS_DIR/step-ca" "$expected_dir" "after infra install"
-  assert_entry_owner "$SECRETS_DIR/openbao/docker-compose.openbao-exposed.yml" "after infra install"
-  assert_entry_owner "$SECRETS_DIR/responder/docker-compose.http01-exposed.yml" "after infra install"
-  assert_entry_owner "$SECRETS_DIR/step-ca/docker-compose.stepca-exposed.yml" "after infra install"
+  assert_entry_state "$COMPOSE_OVERRIDES_DIR" "0:0 755" "after infra install"
+  local name
+  for name in docker-compose.openbao-exposed.yml docker-compose.http01-exposed.yml \
+    docker-compose.stepca-exposed.yml; do
+    assert_entry_state "$COMPOSE_OVERRIDES_DIR/$name" "0:0 644" "after infra install"
+  done
+  assert_no_override_below_secrets "after infra install"
+}
+
+# No `docker-compose.*.yml` anywhere below `secrets/`.
+assert_no_override_below_secrets() {
+  local label="$1" found
+  found="$(run_sudo find "$SECRETS_DIR" -name 'docker-compose.*.yml' -printf '%p\n' \
+    2>>"$RUN_LOG")" || fail "${label}: find over $SECRETS_DIR failed"
+  [ -z "$found" ] \
+    || fail "${label}: compose overrides below $SECRETS_DIR: ${found//$'\n'/; }"
+}
+
+# After `init`: every override is root's in `compose-overrides/`, none is
+# below `secrets/`, and the account that owns `secrets/` cannot add one.
+assert_overrides_out_of_reach() {
+  log_phase "assert-overrides"
+  assert_entry_state "$COMPOSE_OVERRIDES_DIR" "0:0 755" "after init"
+  local name
+  for name in docker-compose.openbao-exposed.yml docker-compose.http01-exposed.yml \
+    docker-compose.stepca-exposed.yml docker-compose.responder.override.yml \
+    docker-compose.openbao-agent.override.yml docker-compose.postgres-tls.yml; do
+    assert_entry_state "$COMPOSE_OVERRIDES_DIR/$name" "0:0 644" "after init"
+  done
+  assert_no_override_below_secrets "after init"
+  if run_as_account_in "$COMPOSE_OVERRIDES_DIR" sh -c ': >planted.yml' \
+    >>"$RUN_LOG" 2>&1; then
+    run_sudo rm -f "$COMPOSE_OVERRIDES_DIR/planted.yml"
+    fail "${SECRETS_ACCOUNT} could create a file in $COMPOSE_OVERRIDES_DIR"
+  fi
+}
+
+# Every container of the project: its name, whether it is privileged,
+# and the sorted set of its mounts, one container per line.
+container_mounts() {
+  local id
+  for id in $(docker ps -aq --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME:-bootroot}"); do
+    docker inspect -f '{{.Name}} privileged={{.HostConfig.Privileged}}' "$id"
+    docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}}{{"\n"}}{{end}}' "$id" \
+      | sed '/^$/d' | sort | sed "s|^|  |"
+  done
+}
+
+# The account plants a file at the `0.7.0` place of each of the seven
+# overrides, as it could on a released install, and root then runs
+# `infra up`.  None of them may be read: the run succeeds, and no
+# container ends up privileged or carrying a mount it did not have.
+assert_legacy_overrides_ignored() {
+  log_phase "legacy-overrides"
+  local before="$ARTIFACT_DIR/containers-before.txt" after="$ARTIFACT_DIR/containers-after.txt"
+  container_mounts >"$before"
+  local planted='services:
+  openbao:
+    privileged: true
+    volumes:
+      - /:/host
+  step-ca:
+    privileged: true
+    volumes:
+      - /:/host
+  postgres:
+    privileged: true
+    volumes:
+      - /:/host
+  bootroot-http01:
+    privileged: true
+    volumes:
+      - /:/host
+'
+  local path
+  for path in openbao/docker-compose.openbao-exposed.yml openbao/docker-compose.openbao-audit.yml \
+    openbao/docker-compose.openbao-agent.override.yml responder/docker-compose.http01-exposed.yml \
+    responder/docker-compose.responder.override.yml step-ca/docker-compose.stepca-exposed.yml \
+    postgres/docker-compose.postgres-tls.yml; do
+    # shellcheck disable=SC2016 # expanded by the child shell, not here
+    run_as_account_in "$SECRETS_DIR" sh -c 'mkdir -p "$(dirname "$1")" && printf "%s" "$2" >"$1"' sh \
+      "$path" "$planted" >>"$RUN_LOG" 2>&1 \
+      || fail "failed to plant $SECRETS_DIR/$path as ${SECRETS_ACCOUNT}"
+  done
+  run_bootroot_as_root infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1 \
+    || fail "infra up as root failed with the legacy overrides planted"
+  container_mounts >"$after"
+  if grep -q 'privileged=true' "$after"; then
+    fail "a container is privileged after infra up; see $after"
+  fi
+  if grep -q ':/host$' "$after"; then
+    fail "a container mounts a planted volume after infra up; see $after"
+  fi
+  local added
+  added="$(comm -13 <(grep '^  ' "$before" | sort -u) <(grep '^  ' "$after" | sort -u))"
+  [ -z "$added" ] \
+    || fail "infra up added mounts no container had before: ${added//$'\n'/; }"
 }
 
 # `bootroot status` fails when any core container is missing or
@@ -783,6 +892,7 @@ main() {
   run_init
   assert_stack_healthy
   assert_secrets_tree_ownership
+  assert_overrides_out_of_reach
   assert_no_step_scratch "after init"
 
   run_second_init
@@ -791,6 +901,9 @@ main() {
   assert_no_step_scratch "after the second init"
 
   rotate_stepca_password
+
+  assert_legacy_overrides_ignored
+  assert_stack_healthy
 
   log_phase "done"
 }

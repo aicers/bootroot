@@ -17,10 +17,9 @@ use super::super::constants::openbao_constants::{
     POLICY_BOOTROOT_STEPCA, RECOMMENDED_SECRET_ID_TTL, TOKEN_TTL,
 };
 use super::super::constants::{
-    CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME,
-    OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR, OPENBAO_AGENT_RESPONDER_DIR,
-    OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME, OPENBAO_AGENT_SECRET_ID_NAME,
-    OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
+    CA_BUNDLE_FILENAME, CA_CERTS_DIR, OPENBAO_AGENT_CONFIG_NAME, OPENBAO_AGENT_DIR,
+    OPENBAO_AGENT_RESPONDER_DIR, OPENBAO_AGENT_RESPONDER_SERVICE, OPENBAO_AGENT_ROLE_ID_NAME,
+    OPENBAO_AGENT_SECRET_ID_NAME, OPENBAO_AGENT_STEPCA_DIR, OPENBAO_AGENT_STEPCA_SERVICE,
 };
 use super::super::paths::{
     OpenBaoAgentPaths, StepCaTemplatePaths, compose_has_openbao, compose_logs_to_journald,
@@ -31,6 +30,8 @@ use super::ca_certs::{compute_ca_bundle_pem, compute_ca_fingerprints};
 use super::prompts::{confirm_overwrite, prompt_text, prompt_unseal_keys};
 use super::{InitBootstrap, InitRollback, InitSecrets};
 use crate::cli::args::InitArgs;
+use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::CA_TRUST_KEY;
 use crate::commands::container_name::BootrootContainer;
@@ -945,12 +946,8 @@ async fn write_openbao_agent_compose_override(
     identity: &ComposeIdentity,
     messages: &Messages,
 ) -> Result<Option<PathBuf>> {
-    let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
-    let agent_dir = secrets_dir.join(OPENBAO_AGENT_DIR);
-    tree.ensure_dir_async(&agent_dir).await?;
     let mount_root = std::fs::canonicalize(secrets_dir)
         .with_context(|| messages.error_resolve_path_failed(&secrets_dir.display().to_string()))?;
-    let override_path = agent_dir.join(OPENBAO_AGENT_COMPOSE_OVERRIDE_NAME);
     let depends_on = if compose_has_openbao(compose_file, messages)? {
         "    depends_on:\n      - openbao\n"
     } else {
@@ -1005,19 +1002,16 @@ services:
         secrets_path = mount_root.display(),
         user = user
     );
-    // Published by rename, not flushed, at the destination's mode or
-    // the umask's answer on a create, under the owner of the directory
-    // it lands in — the compose-override decisions
-    // `crate::commands::guardrails` records.
-    tree.publish_async(
-        fs_util::Destination::operator_named(&override_path),
-        contents.as_bytes(),
-        fs_util::StagedMode::PreserveOrUmask,
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
+    // Published in `<compose dir>/compose-overrides/`, outside the
+    // tree these sidecars mount read-write, at `0644` under the writing
+    // process.
+    let override_path = compose_overrides::write_async(
+        &compose_file_dir(compose_file),
+        ComposeOverride::OpenBaoAgent,
+        contents,
+        messages,
     )
-    .await
-    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    .await?;
     Ok(Some(override_path))
 }
 
@@ -1337,6 +1331,11 @@ services:
         .await
         .unwrap()
         .expect("override path");
+        assert_eq!(
+            override_path,
+            compose_overrides::path(temp_dir.path(), ComposeOverride::OpenBaoAgent)
+        );
+        assert!(!secrets_dir.join(OPENBAO_AGENT_DIR).exists());
         let contents = fs::read_to_string(&override_path).unwrap();
 
         assert!(contents.contains("openbao-agent-stepca"));

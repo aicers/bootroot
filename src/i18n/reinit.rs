@@ -60,10 +60,10 @@ impl Messages {
         self.strings().reinit_plan_preserved_postgres
     }
 
-    pub(crate) fn reinit_plan_preserved_compose_overrides(&self, secrets_dir: &str) -> String {
+    pub(crate) fn reinit_plan_preserved_compose_overrides(&self, dir: &str) -> String {
         format_template(
             self.strings().reinit_plan_preserved_compose_overrides,
-            &[("secrets_dir", secrets_dir)],
+            &[("dir", dir)],
         )
     }
 

@@ -260,8 +260,8 @@ compose 파일 옆에 놓이기 때문입니다.
   `*_HOST_PORT` 항목이 여기에 기록됩니다.
 - `secrets/`. step-ca와 OpenBao Agent 사이드카가 bind-mount하는 CA
   자재, 렌더링된 설정, AppRole 자격 증명이 들어 있습니다.
-- `bootroot infra install`과 `bootroot init`이 생성하는 오버라이드
-  (`secrets/openbao/`, `secrets/responder/`).
+- `bootroot infra install`과 `bootroot init`이 `compose-overrides/`에 생성하는
+  오버라이드.
 
 compose 파일은 `./openbao`, `./secrets`,
 `./responder.toml.compose`를 자신의 디렉터리 기준으로 해석하므로 두 번째

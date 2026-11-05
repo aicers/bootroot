@@ -60,7 +60,8 @@ Options:
                 is built.
   --skip-hosts  Skip hosts steps (they alone need write access to /etc/hosts;
                 steps 13 and 14 still need sudo -n)
-  --fresh-secrets   Temporarily replace ./secrets with a clean directory and restore it on exit
+  --fresh-secrets   Temporarily replace ./secrets and ./compose-overrides with clean
+                    ones and restore both on exit
 EOF
 }
 
@@ -111,10 +112,34 @@ want() {
   return 1
 }
 
+# Removes the test's copy of $1 below $ROOT_DIR and puts the backed-up
+# one back.  An arm that ran bootroot as root leaves its copy root-owned,
+# so removal falls back to `sudo -n`; a copy that still cannot be removed
+# keeps the backup where it is rather than nesting it inside.
+restore_from_backup() {
+  local name="$1"
+  if [ -e "$ROOT_DIR/$name" ] || [ -L "$ROOT_DIR/$name" ]; then
+    rm -rf "${ROOT_DIR:?}/${name:?}" 2>/dev/null || sudo -n rm -rf "${ROOT_DIR:?}/${name:?}" || true
+  fi
+  if [ ! -e "$SECRETS_BACKUP_DIR/$name" ] && [ ! -L "$SECRETS_BACKUP_DIR/$name" ]; then
+    return 0
+  fi
+  if [ -e "$ROOT_DIR/$name" ] || [ -L "$ROOT_DIR/$name" ]; then
+    echo "[ci-local-e2e] could not remove $ROOT_DIR/$name; original left at $SECRETS_BACKUP_DIR/$name" >&2
+    return 1
+  fi
+  mv "$SECRETS_BACKUP_DIR/$name" "$ROOT_DIR/$name"
+}
+
+# `compose-overrides/` travels with `secrets/`: the arms delete the
+# deployment's overrides and write their own, so restoring `secrets/`
+# alone would pair the original secrets with the test's overrides.
 restore_secrets() {
-  if [ -n "$SECRETS_BACKUP_DIR" ] && [ -d "$SECRETS_BACKUP_DIR/secrets" ]; then
-    rm -rf "$ROOT_DIR/secrets"
-    mv "$SECRETS_BACKUP_DIR/secrets" "$ROOT_DIR/secrets"
+  [ -n "$SECRETS_BACKUP_DIR" ] && [ -d "$SECRETS_BACKUP_DIR" ] || return 0
+  local failed=0
+  restore_from_backup secrets || failed=1
+  restore_from_backup compose-overrides || failed=1
+  if [ "$failed" -eq 0 ]; then
     rm -rf "$SECRETS_BACKUP_DIR"
   fi
 }
@@ -124,6 +149,9 @@ if [ "$FRESH_SECRETS" -eq 1 ]; then
   mkdir -p "$SECRETS_BACKUP_DIR"
   if [ -d "$ROOT_DIR/secrets" ]; then
     mv "$ROOT_DIR/secrets" "$SECRETS_BACKUP_DIR/secrets"
+  fi
+  if [ -e "$ROOT_DIR/compose-overrides" ] || [ -L "$ROOT_DIR/compose-overrides" ]; then
+    mv "$ROOT_DIR/compose-overrides" "$SECRETS_BACKUP_DIR/compose-overrides"
   fi
   mkdir -p "$ROOT_DIR/secrets"
   chmod 700 "$ROOT_DIR/secrets" || true

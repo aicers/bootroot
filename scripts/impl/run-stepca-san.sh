@@ -65,6 +65,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-stepca-san-$(date +%s)}"
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 SECRETS_DIR="${SECRETS_DIR:-$ROOT_DIR/secrets}"
@@ -111,7 +113,7 @@ STEPCA_BIND_HOST_DEFAULT="172.17.0.1"
 STEPCA_BIND_HOST="${STEPCA_BIND_HOST:-$STEPCA_BIND_HOST_DEFAULT}"
 STEPCA_BIND_PORT="${STEPCA_BIND_PORT:-9000}"
 STEPCA_BIND_ADDR="${STEPCA_BIND_ADDR:-${STEPCA_BIND_HOST}:${STEPCA_BIND_PORT}}"
-STEPCA_OVERRIDE_PATH="$SECRETS_DIR/step-ca/docker-compose.stepca-exposed.yml"
+STEPCA_OVERRIDE_PATH="$COMPOSE_OVERRIDES_DIR/docker-compose.stepca-exposed.yml"
 
 DEFAULT_STEPCA_PASSWORD="stepca-san"
 DEFAULT_HTTP_HMAC="dev-hmac"
@@ -315,6 +317,7 @@ reset_workspace() {
     "$SECRETS_DIR/templates" "$SECRETS_DIR/responder" \
     "$SECRETS_DIR/password.txt" "$SECRETS_DIR/password.txt.new"
   rm -f "$ROOT_DIR/.env"
+  rm -rf "$COMPOSE_OVERRIDES_DIR"
 }
 
 # ---------------------------------------------------------------------------

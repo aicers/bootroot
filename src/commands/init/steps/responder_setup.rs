@@ -7,14 +7,16 @@ use bootroot::fs_util;
 
 use super::super::constants::openbao_constants::PATH_RESPONDER_HMAC;
 use super::super::constants::{
-    DEFAULT_RESPONDER_TOKEN_TTL_SECS, RESPONDER_COMPOSE_OVERRIDE_NAME, RESPONDER_CONFIG_DIR,
-    RESPONDER_CONFIG_NAME, RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME,
-    RESPONDER_TLS_CERT_CONTAINER_PATH, RESPONDER_TLS_KEY_CONTAINER_PATH,
+    DEFAULT_RESPONDER_TOKEN_TTL_SECS, RESPONDER_CONFIG_DIR, RESPONDER_CONFIG_NAME,
+    RESPONDER_TEMPLATE_DIR, RESPONDER_TEMPLATE_NAME, RESPONDER_TLS_CERT_CONTAINER_PATH,
+    RESPONDER_TLS_KEY_CONTAINER_PATH,
 };
 use super::super::paths::{ResponderPaths, compose_has_responder};
 use super::super::types::ResponderCheck;
 use super::InitSecrets;
 use crate::cli::args::{InitArgs, InitSkipPhase};
+use crate::commands::compose_file::compose_file_dir;
+use crate::commands::compose_overrides::{self, ComposeOverride};
 use crate::commands::compose_project::ComposeIdentity;
 use crate::commands::constants::RESPONDER_SERVICE_NAME;
 use crate::commands::infra::run_compose;
@@ -153,9 +155,6 @@ pub(super) async fn write_responder_compose_override(
         return Ok(None);
     }
     let tree = fs_util::SecretsTree::open_shared(secrets_dir).await?;
-    let responder_dir = secrets_dir.join(RESPONDER_CONFIG_DIR);
-    tree.ensure_dir_async(&responder_dir).await?;
-    let override_path = responder_dir.join(RESPONDER_COMPOSE_OVERRIDE_NAME);
     let config_dir = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("responder config has no parent directory"))?;
@@ -194,22 +193,15 @@ services:
         dir = config_dir.display(),
         file_name = file_name,
     );
-    // Published by rename, not flushed, at the destination's mode or
-    // the umask's answer on a create — the same three decisions the
-    // exposure overrides in `crate::commands::guardrails` record, for
-    // the same reader: `docker compose` parses this file on every
-    // invocation, and it is regenerated from `state.json` by the `init`
-    // step that writes it. Like them it takes the owner of the
-    // directory it lands in.
-    tree.publish_async(
-        fs_util::Destination::operator_named(&override_path),
-        contents.as_bytes(),
-        fs_util::StagedMode::PreserveOrUmask,
-        fs_util::RootedOwner::ContainingDir,
-        fs_util::StagedDurability::RenameOnly,
+    // Published in `<compose dir>/compose-overrides/`, outside every
+    // container mount, at `0644` under the writing process.
+    let override_path = compose_overrides::write_async(
+        &compose_file_dir(compose_file),
+        ComposeOverride::Responder,
+        contents,
+        messages,
     )
-    .await
-    .with_context(|| messages.error_write_file_failed(&override_path.display().to_string()))?;
+    .await?;
     Ok(Some(override_path))
 }
 
@@ -617,6 +609,17 @@ services:
         .await
         .unwrap()
         .expect("override path");
+        assert_eq!(
+            override_path,
+            compose_overrides::path(temp_dir.path(), ComposeOverride::Responder)
+        );
+        assert!(
+            !secrets_dir
+                .join(RESPONDER_CONFIG_DIR)
+                .join(ComposeOverride::Responder.file_name())
+                .exists(),
+            "nothing is written below secrets/"
+        );
         let contents = fs::read_to_string(&override_path).unwrap();
         let config_dir = std::fs::canonicalize(paths.config_path.parent().unwrap()).unwrap();
 

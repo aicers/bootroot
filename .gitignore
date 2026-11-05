@@ -2,6 +2,7 @@ target/
 certs/
 secrets/
 /postgres/
+/compose-overrides/
 secrets.bak/
 **/*.DS_Store
 .claude/

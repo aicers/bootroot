@@ -620,7 +620,7 @@ bootroot infra install --stepca-bind 192.168.1.10:9000
 ```
 
 - 이 플래그는 관리형 compose 오버라이드를
-    `secrets/step-ca/docker-compose.stepca-exposed.yml`에 기록하고
+    `compose-overrides/docker-compose.stepca-exposed.yml`에 기록하고
     `state.json`에 `stepca_bind_addr`를 저장합니다. 플래그가 없으면
     기본 `127.0.0.1:9000` 게시가 그대로 유지됩니다.
 - `bootroot init`이 step-ca를 구성하면서 저장된 오버라이드를

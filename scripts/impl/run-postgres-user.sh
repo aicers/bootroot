@@ -51,6 +51,8 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT_DIR/tmp/e2e/docker-postgres-user-$(date +%s)
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+# Where `infra install` and `init` write every compose override.
+COMPOSE_OVERRIDES_DIR="$(dirname "$COMPOSE_FILE")/compose-overrides"
 COMPOSE_TEST_FILE="${COMPOSE_TEST_FILE:-$ROOT_DIR/docker-compose.test.yml}"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ARTIFACT_DIR/workspace}"
 # Not overridable: `infra install` writes its overrides under the
@@ -378,6 +380,9 @@ restore_ownership() {
       run_sudo chown -R -h "$owner" "$path" >/dev/null 2>&1 || true
     fi
   done
+  # Removed rather than handed back: the overrides root wrote there,
+  # left in the checkout, would be applied by the next run.
+  run_sudo rm -rf "$COMPOSE_OVERRIDES_DIR" >/dev/null 2>&1 || true
   ROOT_WROTE=0
 }
 
@@ -568,7 +573,7 @@ prepare_secrets_dir() {
   ROOT_WROTE=1
   rm -f "$WORKSPACE_DIR/state.json"
   run_sudo rm -f "$DOTENV_PATH"
-  run_sudo rm -rf "$SECRETS_DIR"
+  run_sudo rm -rf "$SECRETS_DIR" "$COMPOSE_OVERRIDES_DIR"
   run_sudo install -d -m 0700 -o "$SECRETS_UID" -g "$SECRETS_GID" "$SECRETS_DIR" \
     || fail "failed to create $SECRETS_DIR for ${SECRETS_ACCOUNT}"
   assert_entry_state "$SECRETS_DIR" "${SECRETS_UID}:${SECRETS_GID} 700" "prepared"
