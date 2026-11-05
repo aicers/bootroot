@@ -378,9 +378,10 @@ The command is considered failed when:
 - An override `infra up` needs exists only at its place below `secrets/`
   from releases up to `0.7.0`; the error names both paths (see
   [Operations](operations.md#compose-overrides-beside-the-compose-file))
-- The compose directory, `compose-overrides/` or an override in it is a
-  link, owned by an account other than root, the account running bootroot
-  or the owner of the compose directory, or group- or world-writable
+- The compose directory is not a directory, or is group- or world-writable
+- `compose-overrides/` or an override in it is a link, owned by an account
+  other than root, the account running bootroot or the owner of the compose
+  directory, or group- or world-writable
 
 ### Examples
 

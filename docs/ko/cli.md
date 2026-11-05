@@ -360,9 +360,11 @@ PostgreSQL을 TLS 1.3과 X25519MLKEM768로만 시작하고 인증서와
 - `infra up`에 필요한 오버라이드가 `0.7.0`까지의 릴리스가 쓰던 `secrets/`
   아래 위치에만 있는 경우. 오류에 두 경로가 모두 나옵니다
   ([운영](operations.md#compose-overrides-beside-the-compose-file) 참고)
-- compose 디렉터리, `compose-overrides/` 또는 그 안의 오버라이드가 링크이거나,
-  root, bootroot를 실행하는 계정, compose 디렉터리의 소유자 이외의 계정이
-  소유하거나, 그룹이나 다른 사용자가 쓸 수 있는 경우
+- compose 디렉터리가 디렉터리가 아니거나, 그룹이나 다른 사용자가 쓸 수 있는
+  경우
+- `compose-overrides/` 또는 그 안의 오버라이드가 링크이거나, root, bootroot를
+  실행하는 계정, compose 디렉터리의 소유자 이외의 계정이 소유하거나, 그룹이나
+  다른 사용자가 쓸 수 있는 경우
 
 ### 예시
 
