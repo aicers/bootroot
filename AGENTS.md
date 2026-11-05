@@ -544,7 +544,7 @@ Where the crate handles key material or secrets:
     `cargo clippy --all-targets -- -D warnings`,
     `cargo doc --no-deps --document-private-items` with
     `RUSTDOCFLAGS: -D warnings`, `ruff format --check .`, `ruff check .`,
-    `biome ci --error-on-warnings .`, `./scripts/check-docs.sh`, the seven
+    `biome ci --error-on-warnings .`, `./scripts/check-docs.sh`, the eight
     `./scripts/validate-*.sh` scripts, and `cargo audit`.
   - `Unit & CLI Smoke` (`test-core`): `cargo test` of the whole crate,
     the root-only cert-owner tests, the `monitoring_integration` and
