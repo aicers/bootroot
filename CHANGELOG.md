@@ -4,6 +4,16 @@ This file documents recent notable changes to this project. The format of this
 file is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A root-run `bootroot service add` or `bootroot rotate approle-secret-id`,
+  over a `secrets/` directory owned by another account, now creates the
+  directories and files it adds there owned by the owner of the directory they
+  are created in, instead of by root until the next `infra up`. A file it
+  replaces keeps its owner.
+
 ## [0.8.1] - 2026-11-05
 
 ### Fixed
@@ -3230,6 +3240,7 @@ byte for byte.
 
 - Initial public release of the bootroot
 
+[Unreleased]: https://github.com/aicers/bootroot/compare/0.8.1...HEAD
 [0.8.1]: https://github.com/aicers/bootroot/compare/0.8.0...0.8.1
 [0.8.0]: https://github.com/aicers/bootroot/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/aicers/bootroot/compare/0.6.0...0.7.0

@@ -3317,6 +3317,36 @@ mod tests {
         );
     }
 
+    /// As root over a `secrets/` another account owns, a missing
+    /// `registrar-internal/` is still created owned by the writing
+    /// process, root, at `0700`: it is held back from the anchor's owner,
+    /// and every later rooted walk refuses it unless it is root's.
+    #[tokio::test]
+    async fn internal_config_lock_creates_the_internal_dir_as_root_as_root_only() {
+        use crate::test_support::assert_owner_and_mode;
+
+        if !crate::test_support::running_as_root_or_required() {
+            return;
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let secrets = crate::test_support::foreign_owned_secrets(dir.path());
+        let tree = Arc::new(bootroot::fs_util::SecretsTree::open(&secrets).expect("open handle"));
+        assert!(tree.is_rooted(), "root over a foreign-owned tree is rooted");
+        let paths = InternalPaths::new(&secrets);
+        assert!(std::fs::symlink_metadata(paths.dir()).is_err());
+
+        let lock = acquire_internal_config_lock(&tree).await.expect("the lock");
+        drop(lock);
+
+        assert_owner_and_mode(paths.dir(), (0, 0), 0o700, "registrar-internal/");
+        // A later rooted walk takes it as root's by policy.
+        drop(
+            acquire_internal_config_lock(&tree)
+                .await
+                .expect("the lock again"),
+        );
+    }
+
     #[tokio::test]
     async fn rooted_internal_config_sites_refuse_a_swapped_internal_dir() {
         let (dir, paths) = provisioned_host();

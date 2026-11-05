@@ -298,10 +298,11 @@ jobs:
         # BOOTROOT_E2E_REQUIRE_CERT_OWNER=1 turns the tests' non-root skip
         # into a failure, so a runner that silently stopped being root
         # cannot pass this step by skipping; `sudo` strips it by default,
-        # hence --preserve-env. `as_root_only` selects the library test of
-        # the same kind (the generation tree under an owner) and the
-        # binary's (`rotate stepca-password`'s staged password given to the
-        # owner of a foreign-owned `secrets/`).
+        # hence --preserve-env. `as_root_only` selects the library and
+        # binary tests of the same kind: the generation tree under an
+        # owner, and the owner and mode of what bootroot's writers create
+        # or replace below a `secrets/` another account owns, which only a
+        # root run over such a tree reaches.
         env:
           BOOTROOT_E2E_REQUIRE_CERT_OWNER: "1"
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo --preserve-env=BOOTROOT_E2E_REQUIRE_CERT_OWNER

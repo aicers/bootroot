@@ -38,6 +38,14 @@ set -euo pipefail
 #      `password.txt.new` the account's at `0600`: the `step` helper
 #      that re-encrypts the CA keys with it runs as the account, so a
 #      root-owned staged password would fail the first run
+#   8. as root, runs `service add --delivery-mode remote-bootstrap` with
+#      the root token, with no `services/` or `remote-bootstrap/` below
+#      `secrets/` yet, and asserts that the five directories it creates
+#      are the account's at `0700` and `role_id`, `secret_id` and
+#      `bootstrap.json` the account's at `0600`, then repeats the
+#      assertions of step 5.  This runs before the `infra up` below,
+#      whose ownership sweep would re-own what `service add` left and
+#      hide a root-owned entry
 #
 # Running as root over a tree another account owns is the case in
 # which bootroot's writes under `secrets/` walk from the tree's
@@ -667,6 +675,56 @@ rotate_stepca_password() {
     "rotate-stepca-password"
 }
 
+# Registers a remote-bootstrap service as root over the account's
+# `secrets/`, which holds no `services/` or `remote-bootstrap/` yet, and
+# checks that every directory and file it creates there is the
+# account's from the start rather than from the next ownership sweep.
+# The remote host's paths are recorded, not created, so they need not
+# exist here.  The root token reaches the command as
+# `rotate_stepca_password` passes it, with stdin closed.
+add_remote_bootstrap_service() {
+  log_phase "service-add"
+  local log="$ARTIFACT_DIR/service-add.log"
+  local service="edge-proxy" remote_dir="/srv/bootroot-remote"
+  [ -n "$KNOWN_ROOT_TOKEN" ] \
+    || fail "service-add: no root token was read from the first init summary"
+
+  ROOT_TOKEN_FOR_COMMAND="$KNOWN_ROOT_TOKEN"
+  local status=0
+  run_bootroot_as_root service add \
+    --registration-id "$service" \
+    --service-name "$service" \
+    --delivery-mode remote-bootstrap \
+    --hostname "edge-node-02" \
+    --domain "trusted.domain" \
+    --agent-config "$remote_dir/agent.toml" \
+    --cert-path "$remote_dir/certs/${service}.crt" \
+    --key-path "$remote_dir/certs/${service}.key" \
+    --instance-id "101" \
+    --auth-mode root </dev/null >"$log" 2>&1 || status=$?
+  ROOT_TOKEN_FOR_COMMAND=""
+  if [ "$status" -ne 0 ]; then
+    {
+      echo "service add failed (tail):"
+      tail -n 120 "$log" || true
+    } >>"$RUN_LOG"
+    fail "bootroot service add failed; see $log"
+  fi
+
+  local expected_dir="${SECRETS_UID}:${SECRETS_GID} 700"
+  local expected_file="${SECRETS_UID}:${SECRETS_GID} 600"
+  local dir
+  for dir in services "services/$service" remote-bootstrap remote-bootstrap/services \
+    "remote-bootstrap/services/$service"; do
+    assert_entry_state "$SECRETS_DIR/$dir" "$expected_dir" "service-add"
+  done
+  assert_entry_state "$SECRETS_DIR/services/$service/role_id" "$expected_file" "service-add"
+  assert_entry_state "$SECRETS_DIR/services/$service/secret_id" "$expected_file" "service-add"
+  assert_entry_state "$SECRETS_DIR/remote-bootstrap/services/$service/bootstrap.json" \
+    "$expected_file" "service-add"
+  assert_secrets_tree_ownership
+}
+
 # ---------------------------------------------------------------------------
 # Assertions
 # ---------------------------------------------------------------------------
@@ -906,6 +964,9 @@ main() {
   assert_no_step_scratch "after the second init"
 
   rotate_stepca_password
+  # Before `assert_legacy_overrides_ignored`: its `infra up` runs the
+  # ownership sweep, which would re-own what `service add` leaves.
+  add_remote_bootstrap_service
 
   assert_legacy_overrides_ignored
   assert_stack_healthy

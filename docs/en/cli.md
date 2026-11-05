@@ -229,6 +229,11 @@ the directory it is created in, and the HTTP-01 admin TLS directory, the
 OpenBao Agent CA bundle and the saved OpenBao unseal keys they write there take
 the owner of the directory they land in, so the account
 `secrets/` belongs to can read them without waiting for the next `infra up`.
+`service add` and `rotate approle-secret-id`, run as root over such a
+`secrets/`, follow the same rule: every directory they create there is `0700`
+and owned by the owner of the directory it is created in, a file they create
+takes the owner of the directory it lands in, and a file they replace keeps its
+owner.
 
 `.env` is the exception in that second group. It preserves an existing mode like
 the rest, but a fresh one is created `0600` rather than left to your umask,

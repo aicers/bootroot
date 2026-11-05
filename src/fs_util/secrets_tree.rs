@@ -128,6 +128,16 @@ pub enum RootedOwner {
     /// The owner of the file being replaced, and the writing process's
     /// for a fresh one: [`StagedOwner::Destination`].
     Destination,
+    /// The owner of the regular file being replaced, as
+    /// [`RootedOwner::Destination`], and for a fresh file — nothing at
+    /// the name, or a link the publish replaces — the owner of the
+    /// directory it lands in, as [`RootedOwner::ContainingDir`].
+    ///
+    /// For a writer that creates its file below `secrets/` on behalf of
+    /// the tree's owner yet must keep the owner an operator gave a file
+    /// it rewrites. It maps to [`StagedOwner::Destination`] on a
+    /// path-based handle, where the fresh-file case is the writer's own.
+    DestinationOrContainingDir,
     /// Exactly this uid and gid, established unconditionally through the
     /// staged file's descriptor before the rename: [`StagedOwner::Fixed`].
     Fixed(FixedOwner),
@@ -137,7 +147,9 @@ impl From<RootedOwner> for StagedOwner {
     fn from(owner: RootedOwner) -> Self {
         match owner {
             RootedOwner::ContainingDir => StagedOwner::ContainingDir,
-            RootedOwner::Destination => StagedOwner::Destination,
+            RootedOwner::Destination | RootedOwner::DestinationOrContainingDir => {
+                StagedOwner::Destination
+            }
             RootedOwner::Fixed(fixed) => StagedOwner::Fixed(fixed),
         }
     }
@@ -657,6 +669,14 @@ impl SecretsTree {
     /// keeps its owner, and keeps its mode unless it is `path` itself,
     /// which ends `0700`. For the anchor itself the anchor's descriptor
     /// is `fchmod`ed `0700`, as [`SecretsTree::ensure_dir`] does.
+    ///
+    /// For the held-back directories directly below the anchor
+    /// (`registrar-internal/` and the other root-by-policy names), which
+    /// must be the writing process's. [`SecretsTree::ensure_dir`] would
+    /// give a created one the anchor's owner, and every later rooted
+    /// walk refuses it by policy. Every other directory a writer creates
+    /// below the anchor goes through [`SecretsTree::ensure_dir`], so it
+    /// takes the owner of the level it is created in.
     ///
     /// # Errors
     /// Returns an `Unsupported` error on a path-based handle, and an
@@ -1401,11 +1421,17 @@ fn chown_staged(
     owner: RootedOwner,
     found: &Leaf,
 ) -> Result<()> {
-    let wanted = match owner {
-        RootedOwner::ContainingDir => Some(owner_of(dir, dir_path)?),
+    // The owner to give the staged file, and whether it is the
+    // directory's, which a failed chown's remediation names.
+    let (wanted, from_dir) = match owner {
+        RootedOwner::ContainingDir => (Some(owner_of(dir, dir_path)?), true),
         RootedOwner::Destination => match *found {
-            Leaf::Regular { uid, gid, .. } => Some((uid, gid)),
-            Leaf::Absent | Leaf::Symlink | Leaf::Other => None,
+            Leaf::Regular { uid, gid, .. } => (Some((uid, gid)), false),
+            Leaf::Absent | Leaf::Symlink | Leaf::Other => (None, false),
+        },
+        RootedOwner::DestinationOrContainingDir => match *found {
+            Leaf::Regular { uid, gid, .. } => (Some((uid, gid)), false),
+            Leaf::Absent | Leaf::Symlink | Leaf::Other => (Some(owner_of(dir, dir_path)?), true),
         },
         RootedOwner::Fixed(fixed) => {
             // Unconditional, as the path-based `Fixed` arm: the call is
@@ -1425,9 +1451,12 @@ fn chown_staged(
     if current == (uid, gid) {
         return Ok(());
     }
-    std::os::unix::fs::fchown(staged, Some(uid), Some(gid)).with_context(|| match owner {
-        RootedOwner::ContainingDir => chown_containing_dir_context(uid, gid, dir_path, path),
-        RootedOwner::Destination | RootedOwner::Fixed(_) => chown_preserve_context(uid, gid, path),
+    std::os::unix::fs::fchown(staged, Some(uid), Some(gid)).with_context(|| {
+        if from_dir {
+            chown_containing_dir_context(uid, gid, dir_path, path)
+        } else {
+            chown_preserve_context(uid, gid, path)
+        }
     })
 }
 

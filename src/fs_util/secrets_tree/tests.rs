@@ -411,6 +411,78 @@ fn rooted_publish_matches_the_path_based_publish() {
     }
 }
 
+/// `DestinationOrContainingDir` gives a fresh file and one replacing a
+/// leaf link the directory's owner, keeps the owner of a regular file it
+/// replaces, and maps to `StagedOwner::Destination` by path. The
+/// directory takes a supplementary gid and the replaced file the
+/// writer's egid, so the two owners differ on every platform; a fresh
+/// file discriminates only on Linux, where it takes the writer's primary
+/// gid rather than inheriting its directory's. Single-gid runners skip.
+#[test]
+fn rooted_publish_destination_or_containing_dir_keeps_only_a_replaced_file_owner() {
+    assert!(matches!(
+        StagedOwner::from(RootedOwner::DestinationOrContainingDir),
+        StagedOwner::Destination
+    ));
+    let Some(gid) = crate::cert_group::one_supplementary_test_gid() else {
+        return;
+    };
+    let egid = crate::cert_group::current_process_egid();
+    let dir_owner = (current_process_euid(), gid);
+    for case in ["fresh", "regular", "link"] {
+        let root = tempdir().expect("tempdir");
+        let secrets = secrets_in(root.path());
+        let dir = secrets.join("dir");
+        std::fs::create_dir(&dir).expect("mkdir");
+        std::os::unix::fs::chown(&dir, None, Some(gid))
+            .expect("test process must be able to chgrp to a supplementary gid");
+        let dest = dir.join("file");
+        let target = root.path().join("target");
+        match case {
+            "regular" => {
+                std::fs::write(&dest, "previous\n").expect("seed");
+                std::os::unix::fs::chown(&dest, None, Some(egid)).expect("chgrp");
+            }
+            "link" => {
+                std::fs::write(&target, "outside\n").expect("seed target");
+                std::os::unix::fs::chown(&target, None, Some(egid)).expect("chgrp target");
+                symlink(&target, &dest).expect("plant link");
+            }
+            _ => {}
+        }
+        let tree = SecretsTree::open_rooted_for_tests(&secrets).expect("open");
+
+        tree.publish(
+            Destination::bootroot_owned(&dest),
+            PAYLOAD,
+            StagedMode::Policy(0o600),
+            RootedOwner::DestinationOrContainingDir,
+            StagedDurability::FlushDirectory,
+        )
+        .expect("publish");
+
+        let meta = std::fs::symlink_metadata(&dest).expect("stat");
+        assert!(meta.is_file(), "{case}");
+        assert_eq!(mode_of(&dest), 0o600, "{case}");
+        assert_eq!(std::fs::read(&dest).expect("read"), PAYLOAD, "{case}");
+        let expected = if case == "regular" {
+            (current_process_euid(), egid)
+        } else {
+            dir_owner
+        };
+        assert_eq!(owner_of_path(&dest), expected, "{case}");
+        if case == "link" {
+            assert_eq!(std::fs::read(&target).expect("read target"), b"outside\n");
+            assert_eq!(
+                owner_of_path(&target).1,
+                egid,
+                "the former target keeps its group"
+            );
+        }
+        assert_eq!(stray_temporaries(&secrets), Vec::<PathBuf>::new(), "{case}");
+    }
+}
+
 /// `publish_staged_blocking` stats and chowns the staged file through
 /// its descriptor now; for a writer whose names nobody races, each owner
 /// policy still publishes what it did.
