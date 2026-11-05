@@ -227,9 +227,16 @@ run_sudo() {
 }
 
 # A command as the account that owns `secrets/`, whether this harness
-# runs as root or through `sudo`.
-run_as_account() {
-  run_sudo setpriv --reuid="$SECRETS_UID" --regid="$SECRETS_GID" --clear-groups "$@"
+# runs as root or through `sudo`, with directory $1 as its working
+# directory.  Root enters $1 before dropping to the account, because the
+# account cannot search the runner's home above the checkout; relative
+# paths in the command then test only the permissions of $1 and below.
+run_as_account_in() {
+  local dir="$1"
+  shift
+  # shellcheck disable=SC2016 # expanded by the child shell, not here
+  run_sudo sh -c 'cd "$1" && shift && exec "$@"' sh "$dir" \
+    setpriv --reuid="$SECRETS_UID" --regid="$SECRETS_GID" --clear-groups "$@"
 }
 
 # The environment a root-run command needs, as `env` arguments.  `env`
@@ -716,9 +723,8 @@ assert_overrides_out_of_reach() {
     assert_entry_state "$COMPOSE_OVERRIDES_DIR/$name" "0:0 644" "after init"
   done
   assert_no_override_below_secrets "after init"
-  # shellcheck disable=SC2016 # expanded by the child shell, not here
-  if run_as_account sh -c ': >"$1"' sh \
-    "$COMPOSE_OVERRIDES_DIR/planted.yml" >>"$RUN_LOG" 2>&1; then
+  if run_as_account_in "$COMPOSE_OVERRIDES_DIR" sh -c ': >planted.yml' \
+    >>"$RUN_LOG" 2>&1; then
     run_sudo rm -f "$COMPOSE_OVERRIDES_DIR/planted.yml"
     fail "${SECRETS_ACCOUNT} could create a file in $COMPOSE_OVERRIDES_DIR"
   fi
@@ -767,8 +773,8 @@ assert_legacy_overrides_ignored() {
     responder/docker-compose.responder.override.yml step-ca/docker-compose.stepca-exposed.yml \
     postgres/docker-compose.postgres-tls.yml; do
     # shellcheck disable=SC2016 # expanded by the child shell, not here
-    run_as_account sh -c 'mkdir -p "$(dirname "$1")" && printf "%s" "$2" >"$1"' sh \
-      "$SECRETS_DIR/$path" "$planted" >>"$RUN_LOG" 2>&1 \
+    run_as_account_in "$SECRETS_DIR" sh -c 'mkdir -p "$(dirname "$1")" && printf "%s" "$2" >"$1"' sh \
+      "$path" "$planted" >>"$RUN_LOG" 2>&1 \
       || fail "failed to plant $SECRETS_DIR/$path as ${SECRETS_ACCOUNT}"
   done
   run_bootroot_as_root infra up --compose-file "$COMPOSE_FILE" >>"$RUN_LOG" 2>&1 \
